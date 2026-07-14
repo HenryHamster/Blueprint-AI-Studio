@@ -105,6 +105,13 @@ async def _check_version_calcification(
         age_days = max(0, (_utcnow() - ref_time).days)
 
     blocker_label = rq._BLOCKER_LABELS.get(blocker, blocker)
+    # Tag the calcifying blocker with WHERE its check runs so the operator knows
+    # whether resolving it needs a fix that lands in the candidate tree
+    # (candidate-side) or is inert until this version itself promotes
+    # (deployed-side / release-machinery self-reference).
+    _site_phrase = rq.blocker_execution_site_label(blocker)
+    if _site_phrase:
+        blocker_label = f"{blocker_label} ({_site_phrase})"
     session.add(
         Alert(
             project_id=version.project_id,

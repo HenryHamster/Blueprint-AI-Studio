@@ -31,7 +31,12 @@ from app.models import (
     notify_tasks_terminated,
 )
 from app.auth import get_current_user
-from app.admin import _get_user_project, _get_user_project_with_role, _user_project_ids
+from app.admin import (
+    _get_user_project,
+    _get_user_project_with_role,
+    _member_project_ids,
+    _user_project_ids,
+)
 from app.task_locking import lock_project_or_429
 from app.build_config_lint import build_config_lint_warnings
 from app.ci_resolution import (
@@ -94,7 +99,7 @@ def _build_capability_proof_summary(proof_records: Dict[str, Any]) -> Dict[str, 
 @limiter.limit("30/minute")
 async def get_all_projects(
     request: Request,
-    limit: int = Query(50, ge=1, le=100),
+    limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
     archived: bool = Query(False),
     session: AsyncSession = Depends(get_session),
@@ -1143,10 +1148,21 @@ async def delete_project_admin(
     await session.delete(project)
     await session.commit()
 
-    # Evict from GitHub token cache
-    from app.routers.agent import _github_token_cache
+    # Evict from GitHub token cache (both the per-project entry and the repo's
+    # mint-anchored install token — the project is gone, nothing should keep
+    # serving a token for its repo).
+    #
+    # Then forget the project -> repo mapping itself. The project no longer
+    # exists, so keeping it would leak an entry for the process lifetime AND
+    # leave a stale mapping that lets a later invalidate_github_token_cache()
+    # for this (recycled) id reach into a repo it no longer owns.
+    from app.routers.agent import (
+        forget_project_repo,
+        invalidate_github_token_cache,
+    )
 
-    _github_token_cache.pop(str(project_id), None)
+    invalidate_github_token_cache(str(project_id))
+    forget_project_repo(str(project_id))
 
     return {
         "message": f"Project {project_id} deleted",
@@ -1210,7 +1226,20 @@ async def reset_project_admin(
         # the same safe cancellation/VM-teardown path as force-delete.
         from app.vm_lifecycle import _ensure_vm_deleted
 
-        all_cancelled_ids = [t.id for t in active_tasks]
+        all_cancelled_ids = (
+            (
+                await session.execute(
+                    select(Task.id)
+                    .where(
+                        Task.project_id == project_id,
+                        Task.status.in_(ACTIVE_STATUSES),
+                    )
+                    .limit(1000)
+                )
+            )
+            .scalars()
+            .all()
+        )
 
         result = await session.execute(
             update(Task)
@@ -1254,9 +1283,9 @@ async def reset_project_admin(
     reset_project_state(str(project_id))
 
     # Evict from GitHub token cache so the next cycle re-fetches cleanly.
-    from app.routers.agent import _github_token_cache
+    from app.routers.agent import invalidate_github_token_cache
 
-    _github_token_cache.pop(str(project_id), None)
+    invalidate_github_token_cache(str(project_id))
 
     return {
         "message": f"Project {project_id} reset to clean",
@@ -1324,14 +1353,41 @@ async def pause_all_autonomous(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
-    """Disable autonomous mode on all projects at once."""
-    user_project_ids = _user_project_ids(current_user["user_id"])
+    """Disable autonomous mode on all projects at once.
+
+    Only pauses projects where the caller holds member+ role — viewers are
+    documented read-only and may not mutate project state. This route takes no
+    ``project_id``, so it is inherently the "pause everything I can" bulk shape:
+    scoping viewer-only projects out silently is correct (a caller who is member
+    on 3 projects and viewer on a 4th should pause the 3, not be rejected
+    outright). ``skipped_count`` reports what was left running rather than
+    hiding it.
+    """
+    user_project_ids = _member_project_ids(current_user["user_id"])
     user_project_count = int(
         (
             await session.scalar(
                 select(func.count())
                 .select_from(ProjectMember)
-                .where(ProjectMember.user_id == current_user["user_id"])
+                .where(
+                    ProjectMember.user_id == current_user["user_id"],
+                    ProjectMember.role.in_(["member", "owner"]),
+                )
+            )
+        )
+        or 0
+    )
+    # Projects the caller can see but not pause (viewer-only), still autonomous.
+    skipped_count = int(
+        (
+            await session.scalar(
+                select(func.count())
+                .select_from(Project)
+                .where(
+                    Project.id.in_(_user_project_ids(current_user["user_id"])),
+                    Project.id.notin_(_member_project_ids(current_user["user_id"])),
+                    Project.autonomous_enabled.is_(True),
+                )
             )
         )
         or 0
@@ -1360,7 +1416,7 @@ async def pause_all_autonomous(
     for p in projects:
         p.autonomous_enabled = False
     await session.commit()
-    return {"paused": len(projects)}
+    return {"paused": len(projects), "skipped_count": skipped_count}
 
 
 @router.get("/projects/{project_id}/directions/task-counts")

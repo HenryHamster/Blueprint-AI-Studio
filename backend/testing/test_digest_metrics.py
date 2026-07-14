@@ -7102,6 +7102,10 @@ async def test_park_wake_health_metrics_surface(db_session):
     assert log_fields["expired"] == 1
     assert log_fields["stranded"] == 1
 
+    # Snapshot before expire_all(): it expires ``project`` too (never
+    # refreshed below), so the post-sweep ``project.id`` read would raise
+    # MissingGreenlet under real ORM expiry.
+    project_id = project.id
     db_session.expire_all()
     await db_session.refresh(deliver_task)
     await db_session.refresh(expire_task)
@@ -7116,7 +7120,7 @@ async def test_park_wake_health_metrics_surface(db_session):
     assert (strand_task.context or {}).get("failure_class") == PARK_WAKE_STRANDED
 
     # --- Read-only health AFTER the sweep: backlog drained, nothing parked. ---
-    post = await compute_park_wake_health(db_session, project_id=project.id)
+    post = await compute_park_wake_health(db_session, project_id=project_id)
     assert post["parked_task_count"] == 0
     assert post["oldest_parked_age_seconds"] is None
     assert post["fired_undelivered_count"] == 0

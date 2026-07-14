@@ -20,8 +20,12 @@ Covers _verify_pr_merged:
   - GitHub API confirms merged → returns True, updates task.context
   - GitHub API 401 → invalidates token cache and retries with fresh token
   - Transient GitHub errors (500, 502, 503) → returns False without failing task
+  - Transient failures (5xx, network error, rate-limit 403 remapped to 500) STAMP
+    the negative cache → the next cycle inside the TTL issues zero GitHub calls
   - Closed-but-not-merged → marks task FAILED, creates alert, returns True
 """
+
+import time
 
 import pytest
 import pytest_asyncio
@@ -33,6 +37,7 @@ from sqlalchemy.pool import StaticPool
 from sqlmodel import SQLModel, select
 
 from app.rollup_management import _cleanup_branches, _verify_pr_merged
+from app.rollup_pr_verification import _PR_MERGE_NEGATIVE_TTL_S
 from app.models import (
     Alert,
     AlertSeverity,
@@ -1043,11 +1048,7 @@ async def test_verify_pr_merged_on_distinct_promotion_target_alerts_without_pr_m
     result = await _verify_pr_merged(task, cleanup_db)
     await cleanup_db.commit()
     alerts = (
-        (
-            await cleanup_db.execute(
-                select(Alert).where(Alert.task_id == task.id)
-            )
-        )
+        (await cleanup_db.execute(select(Alert).where(Alert.task_id == task.id)))
         .scalars()
         .all()
     )
@@ -1094,11 +1095,7 @@ async def test_verify_pr_merged_on_single_branch_sets_pr_merged(cleanup_db, mock
     result = await _verify_pr_merged(task, cleanup_db)
     await cleanup_db.commit()
     alerts = (
-        (
-            await cleanup_db.execute(
-                select(Alert).where(Alert.task_id == task.id)
-            )
-        )
+        (await cleanup_db.execute(select(Alert).where(Alert.task_id == task.id)))
         .scalars()
         .all()
     )
@@ -1205,11 +1202,7 @@ async def test_verify_pr_merged_success_close_on_distinct_promotion_target_alert
     result = await _verify_pr_merged(task, cleanup_db)
     await cleanup_db.commit()
     alerts = (
-        (
-            await cleanup_db.execute(
-                select(Alert).where(Alert.task_id == task.id)
-            )
-        )
+        (await cleanup_db.execute(select(Alert).where(Alert.task_id == task.id)))
         .scalars()
         .all()
     )
@@ -1259,12 +1252,50 @@ async def test_verify_pr_merged_401_retries_with_fresh_token(cleanup_db, mocker)
 
 
 @pytest.mark.asyncio
-async def test_verify_pr_merged_401_retry_transient_does_not_negative_cache(
-    cleanup_db, mocker
-):
-    """When a 401 prompts a fresh-token retry and the retry encounters a transient
-    error (503), return False without poisoning the negative cache. This ensures
-    transient GitHub instability during auth-retry doesn't block rollup convergence."""
+async def test_verify_pr_merged_401_retry_transient_negative_caches(cleanup_db, mocker):
+    """When a 401 prompts a fresh-token retry and the retry hits a transient error
+    (503), the negative cache IS stamped so the next dispatch cycle within the TTL
+    issues NO further GitHub call.
+
+    DELIBERATELY REVERSES TWO PRIOR MERGED FIXES — READ THIS BEFORE "RE-FIXING" IT.
+    This test previously asserted the OPPOSITE ("must not poison negative cache").
+    That was not an oversight: the no-cache-on-transient behavior was introduced on
+    purpose, twice, on 2026-06-29:
+
+      * PR #12281 "fix: explicit GitHub failure-path handling for rollup ancestry
+        credit" — added the ``except Exception`` early return for non-HTTP (network)
+        errors that skips the stamp. Its stated rationale was ONLY that stamping was
+        "inconsistent with the HTTP 5xx path which already returned early without
+        cache poisoning". That is an appeal to consistency with a path that was
+        itself never justified — it argued from symmetry, not from behavior.
+      * PR #12303 "fix: do not cache transient PR refresh failures" — wrapped the
+        401 fresh-token retry so a transient failure there also skips the stamp.
+        Its stated rationale was that stamping would "poison the negative cache,
+        PREVENTING RETRIES and delaying rollup convergence".
+
+    #12303's rationale is FACTUALLY FALSE, and that is why it is being reversed:
+    ``_PR_MERGE_NEGATIVE_TTL_S = 30``. The stamp does not prevent retries — it
+    delays exactly ONE retry by at most 30 seconds. (#12281's own body even calls it
+    "the 30-second negative cache", so the TTL was known.) Neither PR cited an
+    incident, a latency requirement, or considered call VOLUME.
+
+    The cost of that mistaken belief: ``_check_candidate_task_deps`` re-verifies
+    every same-base COMPLETED ``create`` dep of every candidate on every ~5s
+    dispatch cycle, and the 30s negative cache is the ONLY throttle. Skipping the
+    stamp on the transient class restored full 5s cadence — at up to 3 HTTP calls
+    per verify (``_github_request_uncoalesced`` retries 5xx) — draining the shared
+    5000/hr installation-token budget precisely when GitHub was already unhealthy.
+    Worse, ``github_pulls.get_pull_request`` maps ANY non-200/401/404/410 to
+    ``HTTPException(500)``, so a RATE-LIMIT 403 was classified transient and
+    therefore NOT cached: the system's response to "you are out of quota" was to
+    re-ask every 5 seconds.
+
+    So the trade the first two passes made is real but tiny in one direction and
+    unbounded in the other: caching costs AT MOST ~30s of extra merge-detection
+    latency on a transient blip; not caching costs an unbounded call amplification
+    against a shared budget whose exhaustion has twice stalled production. This is
+    the third pass over this behavior; the first two walked it the wrong way.
+    """
     project = await _make_project(cleanup_db)
     task = await _make_task(cleanup_db, project.id, context={})
     await _make_artifact(cleanup_db, task.id, "https://github.com/owner/repo/pull/77")
@@ -1285,16 +1316,23 @@ async def test_verify_pr_merged_401_retry_transient_does_not_negative_cache(
             HTTPException(status_code=503, detail="Service Unavailable"),
         ],
     )
+    from app.rollup_pr_verification import _pr_merge_negative_cache
+
+    _pr_merge_negative_cache.pop(task.id, None)
 
     result = await _verify_pr_merged(task, cleanup_db)
 
     assert result is False
-    # Crucially: no negative cache entry for this transient-on-retry case
-    from app.rollup_pr_verification import _pr_merge_negative_cache
-    assert task.id not in _pr_merge_negative_cache, (
-        "Transient error on fresh-token retry must not poison negative cache"
+    assert task.id in _pr_merge_negative_cache, (
+        "A transient error on the fresh-token retry must stamp the negative cache "
+        "— otherwise the dep is re-verified every dispatch cycle"
     )
     mock_invalidate.assert_called_once_with(str(task.project_id))
+    assert mock_get_pr.call_count == 2
+
+    # Next dispatch cycle, inside the TTL: served from the negative cache, ZERO
+    # additional GitHub calls (the whole point of the fix).
+    assert await _verify_pr_merged(task, cleanup_db) is False
     assert mock_get_pr.call_count == 2
 
 
@@ -1326,6 +1364,130 @@ async def test_verify_pr_merged_transient_errors_return_false(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [500, 502, 503])
+async def test_verify_pr_merged_transient_error_negative_caches_next_cycle(
+    cleanup_db, mocker, status_code
+):
+    """A transient GitHub 5xx STAMPS the negative cache: the next verification
+    inside the 30s TTL issues NO GitHub call at all.
+
+    Call-count assertion is the point — the pre-fix code returned False early
+    WITHOUT stamping, so every ~5s dispatch cycle re-issued the lookup (each up
+    to 3 HTTP calls, since ``_github_request_uncoalesced`` retries 5xx up to
+    ``max_retries=3``) for every candidate's every same-base COMPLETED create dep.
+    """
+    project = await _make_project(cleanup_db)
+    task = await _make_task(cleanup_db, project.id, context={})
+    await _make_artifact(cleanup_db, task.id, "https://github.com/owner/repo/pull/98")
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("token", "owner", "repo"),
+    )
+    mock_get_pr = mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        side_effect=HTTPException(status_code=status_code, detail="Error"),
+    )
+    from app.rollup_pr_verification import _pr_merge_negative_cache
+
+    _pr_merge_negative_cache.pop(task.id, None)
+
+    assert await _verify_pr_merged(task, cleanup_db) is False
+    assert mock_get_pr.call_count == 1
+    assert task.id in _pr_merge_negative_cache
+
+    # Cycles 2 and 3, both inside the TTL → still exactly ONE GitHub call total.
+    assert await _verify_pr_merged(task, cleanup_db) is False
+    assert await _verify_pr_merged(task, cleanup_db) is False
+    assert mock_get_pr.call_count == 1
+
+    # Once the TTL lapses the lookup resumes (recovery is not delayed beyond it).
+    _pr_merge_negative_cache[task.id] = time.time() - _PR_MERGE_NEGATIVE_TTL_S - 1
+    assert await _verify_pr_merged(task, cleanup_db) is False
+    assert mock_get_pr.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_verify_pr_merged_network_error_negative_caches_next_cycle(
+    cleanup_db, mocker
+):
+    """A non-HTTPException fetch error (network/DNS/timeout) is transient too, and
+    must likewise stamp the negative cache instead of re-fetching every cycle."""
+    project = await _make_project(cleanup_db)
+    task = await _make_task(cleanup_db, project.id, context={})
+    await _make_artifact(cleanup_db, task.id, "https://github.com/owner/repo/pull/97")
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("token", "owner", "repo"),
+    )
+    mock_get_pr = mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        side_effect=ConnectionError("connection reset by peer"),
+    )
+    from app.rollup_pr_verification import _pr_merge_negative_cache
+
+    _pr_merge_negative_cache.pop(task.id, None)
+
+    assert await _verify_pr_merged(task, cleanup_db) is False
+    assert task.id in _pr_merge_negative_cache
+    assert mock_get_pr.call_count == 1
+
+    assert await _verify_pr_merged(task, cleanup_db) is False
+    assert mock_get_pr.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_verify_pr_merged_rate_limit_403_negative_caches_next_cycle(
+    cleanup_db, mocker
+):
+    """A GitHub rate-limit **403** is mapped by ``github_pulls.get_pull_request`` to
+    an HTTPException(500) (any non-200/401/404 becomes a 500), so the transient
+    classifier treats it as transient — meaning the un-cached class was BROADER
+    than 5xx/network. Verify end-to-end (through the real ``get_pull_request``)
+    that a 403 stamps the negative cache and the next cycle inside the TTL issues
+    ZERO HTTP requests. Otherwise budget exhaustion self-amplifies: the response to
+    "you are out of quota" was to ask again 720x/hr.
+    """
+    project = await _make_project(cleanup_db)
+    task = await _make_task(cleanup_db, project.id, context={})
+    await _make_artifact(cleanup_db, task.id, "https://github.com/owner/repo/pull/96")
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("token", "owner", "repo"),
+    )
+    rate_limited = MagicMock()
+    rate_limited.status_code = 403
+    rate_limited.text = "API rate limit exceeded"
+    rate_limited.json = MagicMock(return_value={"message": "API rate limit exceeded"})
+    # Patch the transport, NOT get_pull_request — the 403 → 500 remap under test
+    # lives inside the real github_pulls.get_pull_request.
+    mock_request = mocker.patch(
+        "app.github._github_request",
+        new_callable=AsyncMock,
+        return_value=rate_limited,
+    )
+    from app.rollup_pr_verification import _pr_merge_negative_cache
+
+    _pr_merge_negative_cache.pop(task.id, None)
+
+    assert await _verify_pr_merged(task, cleanup_db) is False
+    assert mock_request.call_count == 1
+    assert task.id in _pr_merge_negative_cache, (
+        "A rate-limit 403 (remapped to 500) must stamp the negative cache"
+    )
+
+    assert await _verify_pr_merged(task, cleanup_db) is False
+    assert mock_request.call_count == 1
+
+
+@pytest.mark.asyncio
 async def test_verify_pr_merged_closed_not_merged_fails_task(cleanup_db, mocker):
     """PR closed without merging → task marked FAILED, alert created, returns True."""
     project = await _make_project(cleanup_db)
@@ -1345,10 +1507,13 @@ async def test_verify_pr_merged_closed_not_merged_fails_task(cleanup_db, mocker)
     )
     # No CHANGES_REQUESTED review, but also no positive cleanup signal — the
     # FIX A non-rejection classifier requires BOTH, so this stays FAILED.
+    # NOTE: rollup_management calls get_pull_request_reviews_CHECKED, which returns
+    # (reviews, status). Patching the list-only wrapper would VOID silently — the
+    # patch succeeds, nothing calls it, and the real helper makes a live HTTP call.
     mocker.patch(
-        "app.github.get_pull_request_reviews",
+        "app.github.get_pull_request_reviews_checked",
         new_callable=AsyncMock,
-        return_value=[],
+        return_value=([], "complete"),
     )
     mocker.patch(
         "app.failure_classification.classify_failure",
@@ -1378,10 +1543,14 @@ async def test_verify_pr_merged_closed_not_merged_fails_task(cleanup_db, mocker)
 # ── FIX A: non-rejection PR-close → CANCELLED ──────────────────────────────
 
 
-def _mock_verify_pr_closed_deps(mocker, *, pr_data, reviews):
+def _mock_verify_pr_closed_deps(mocker, *, pr_data, reviews, reviews_status="complete"):
     """Common mocks for the closed-unmerged FIX A tests: token, PR fetch,
     reviews fetch, and a captured write_session so callers can assert the
-    persisted terminal state. Returns (write_session, alert_mock)."""
+    persisted terminal state. Returns (write_session, alert_mock).
+
+    ``reviews_status`` is the enumeration outcome from
+    ``get_pull_request_reviews_checked`` — "complete" / "truncated" / "failed".
+    """
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -1392,10 +1561,12 @@ def _mock_verify_pr_closed_deps(mocker, *, pr_data, reviews):
         new_callable=AsyncMock,
         return_value=pr_data,
     )
+    # Must patch the _CHECKED variant: that is what rollup_management imports.
+    # Patching the list-only wrapper voids silently and leaks a live HTTP call.
     mocker.patch(
-        "app.github.get_pull_request_reviews",
+        "app.github.get_pull_request_reviews_checked",
         new_callable=AsyncMock,
-        return_value=reviews,
+        return_value=(reviews, reviews_status),
     )
     mocker.patch("app.routers.agent_status.record_task_result")
     alert_mock = mocker.patch(
@@ -1472,9 +1643,7 @@ async def test_verify_pr_closed_by_bot_no_review_lands_cancelled(cleanup_db, moc
 
 
 @pytest.mark.asyncio
-async def test_verify_pr_closed_with_changes_requested_stays_failed(
-    cleanup_db, mocker
-):
+async def test_verify_pr_closed_with_changes_requested_stays_failed(cleanup_db, mocker):
     """GUARDRAIL: a CHANGES_REQUESTED review is a genuine rejection — even on a
     bot-authored PR, the task stays FAILED + alert."""
     project = await _make_project(cleanup_db)
@@ -1505,6 +1674,91 @@ async def test_verify_pr_closed_with_changes_requested_stays_failed(
 
 
 @pytest.mark.asyncio
+async def test_verify_pr_closed_with_truncated_reviews_stays_failed(cleanup_db, mocker):
+    """GUARDRAIL (fail closed on TRUNCATION): the reviews list came back truncated —
+    we hold real pages and KNOW more reviews exist that we never saw. GitHub serves
+    reviews oldest-first, so the missing ones are exactly the NEWEST — where a late
+    CHANGES_REQUESTED would be. We cannot rule out a rejection, so a bot-authored
+    cleanup-close (which would otherwise land CANCELLED) must STAY FAILED.
+
+    Without this guard a rollup with >100 reviews that was genuinely rejected gets
+    silently downgraded FAILED -> CANCELLED with no alert.
+    """
+    project = await _make_project(cleanup_db)
+    task = await _make_task(cleanup_db, project.id, context={})
+    await _make_artifact(cleanup_db, task.id, "https://github.com/owner/repo/pull/55")
+
+    mocker.patch(
+        "app.failure_classification.classify_failure", return_value="CODE_ERROR"
+    )
+    _, alert_mock = _mock_verify_pr_closed_deps(
+        mocker,
+        # Bot-authored + no CHANGES_REQUESTED in what we DID see => every other
+        # signal points at CANCELLED. Only the truncation flag holds the line.
+        pr_data={
+            "merged": False,
+            "state": "closed",
+            "user": {"login": "blueprint-app[bot]", "type": "Bot"},
+        },
+        reviews=[{"state": "COMMENTED"}, {"state": "APPROVED"}],
+        reviews_status="truncated",
+    )
+
+    result = await _verify_pr_merged(task, cleanup_db)
+
+    assert result is True
+    assert task.status == TaskStatus.FAILED, (
+        "a TRUNCATED reviews list cannot rule out a CHANGES_REQUESTED — the newest "
+        "reviews are precisely the ones missing, so the close must NOT be treated "
+        "as a non-rejection"
+    )
+    assert task.context.get("failure_detail") != "pr_closed_non_rejection"
+    alert_mock.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_verify_pr_closed_with_failed_reviews_fetch_still_cancels(
+    cleanup_db, mocker
+):
+    """The truncation guard must NOT fire on a mere FETCH FAILURE.
+
+    A page-1 non-200 (rate limit / 502) enumerated NOTHING — that is absence of
+    evidence, exactly like the 401 path, and the positive-cleanup-signal
+    requirement already gates the verdict. Fail-closing here would let one
+    rate-limited reviews fetch — the very failure mode this PR's premise is built
+    on — flip a routine bot cleanup-close into a terminal FAILED + operator alert.
+
+    This is the counterpart to test_verify_pr_closed_with_truncated_reviews_stays_failed:
+    TRUNCATED and FAILED are different signals with opposite safe answers.
+    """
+    project = await _make_project(cleanup_db)
+    task = await _make_task(cleanup_db, project.id, context={})
+    await _make_artifact(cleanup_db, task.id, "https://github.com/owner/repo/pull/55")
+
+    _, alert_mock = _mock_verify_pr_closed_deps(
+        mocker,
+        pr_data={
+            "merged": False,
+            "state": "closed",
+            "user": {"login": "blueprint-app[bot]", "type": "Bot"},
+        },
+        reviews=[],
+        reviews_status="failed",  # page-1 403/502: we saw nothing
+    )
+
+    result = await _verify_pr_merged(task, cleanup_db)
+
+    assert result is True
+    assert task.status == TaskStatus.CANCELLED, (
+        "a transient reviews-fetch failure must NEVER on its own flip the verdict — "
+        "the bot-close cleanup signal still stands, and fail-closing here would make "
+        "a 502 stricter than a 401"
+    )
+    assert task.context.get("failure_detail") == "pr_closed_non_rejection"
+    alert_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_verify_pr_closed_with_pr_rejected_marker_stays_failed(
     cleanup_db, mocker
 ):
@@ -1512,9 +1766,7 @@ async def test_verify_pr_closed_with_pr_rejected_marker_stays_failed(
     bot author and no CHANGES_REQUESTED review (the reviews lookup is short-
     circuited by the marker)."""
     project = await _make_project(cleanup_db)
-    task = await _make_task(
-        cleanup_db, project.id, context={"pr_rejected": True}
-    )
+    task = await _make_task(cleanup_db, project.id, context={"pr_rejected": True})
     await _make_artifact(cleanup_db, task.id, "https://github.com/owner/repo/pull/55")
 
     mocker.patch(
@@ -1598,7 +1850,9 @@ async def test_all_children_failed_parent_persists_failure_category(cleanup_db, 
     CODE_ERROR > AGENT_TIMEOUT > infra classes.
     """
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     # Prevent GitHub token fetch (not needed for this path)
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
@@ -1652,7 +1906,9 @@ async def test_all_children_failed_parent_persists_failure_category(cleanup_db, 
 async def test_all_children_failed_with_only_infra_failures(cleanup_db, mocker):
     """When all failed children have infra categories, the parent keeps that category."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -1696,7 +1952,9 @@ async def test_zero_diff_rollup_pr_closed_without_spawning_review(cleanup_db, mo
     """A rollup PR with 0 additions + 0 deletions is closed immediately:
     parent goes COMPLETED, staging branch deleted, no review task spawned."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -1879,7 +2137,9 @@ async def test_unverified_pr_size_defers_instead_of_spawning_review(cleanup_db, 
     lines_changed=999 → review spawned on potentially-empty PRs → ~15
     VM-hours/day wasted per the audit."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -1948,7 +2208,9 @@ async def test_marker_commit_failure_rescues_pr_number(cleanup_db, mocker):
     retry cycle's crash-recovery check resumes the existing PR rather than
     creating a duplicate orphan."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -2052,7 +2314,9 @@ async def test_marker_commit_failure_skips_rescue_when_db_already_has_marker(
     succeeded or a prior cycle wrote it), the rescue path must NOT overwrite
     it — the existing value is authoritative."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -2146,7 +2410,9 @@ async def test_parent_mutated_during_pr_creation_runs_rescue_and_returns(
     ``parent.context`` and the rollup ``github_webhook`` returned 500.
     """
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -2258,7 +2524,9 @@ async def test_target_branch_404_fails_parent(cleanup_db, mocker):
     transitions to FAILED with a rollup-PR-creation-failed message (the 404
     raises a non-transient exception that the outer handler converts to FAILED)."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -2311,7 +2579,9 @@ async def test_staging_branch_missing_all_children_completed_marks_completed(
     the work already landed on the target branch. Parent transitions to
     COMPLETED with a 'no actionable changes' message."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -2467,7 +2737,9 @@ def _mock_rollup_merge_conflict_deps(mocker, *, mergeable_state, head_sha="deadb
       3. mergeable_state refetch after failed merge (line ~966)
     """
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -2782,7 +3054,9 @@ async def test_requeue_called_when_below_limit_with_mixed_children(cleanup_db, m
     """When some children failed and _requeue_count < MAX_PARENT_REQUEUES (3),
     _requeue_parent_task is invoked instead of proceeding to partial rollup."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -2836,7 +3110,9 @@ async def test_partial_rollup_proceeds_when_requeue_limit_exhausted(cleanup_db, 
     while others failed, the rollup proceeds with the merged subset only —
     create_pull_request is invoked and _requeue_parent_task is NOT called."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -2909,7 +3185,9 @@ async def test_parent_failure_stamps_deploy_monitoring(cleanup_db, mocker):
     task_results deque AND in the per-direction streak (when direction_id set)
     so anomaly detection and direction-hold logic can see the failure."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -2974,7 +3252,9 @@ async def test_parent_failure_after_pr_verification_stamps_deploy_monitoring(
     to FAILED so completed_count drops to zero, the parent is marked FAILED in
     the all_done branch. That terminal path must also reach deploy_monitoring."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -3044,7 +3324,9 @@ def _mock_high_risk_gate_deps(mocker, *, get_pull_request_responses):
     create_pull_request is skipped and control reaches the gate at line 846.
     """
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch(
         "app.rollup_management._dispatch_rollup_approval_alert",
         new_callable=AsyncMock,
@@ -3234,7 +3516,9 @@ async def test_malformed_pr_url_artifact_force_merges_in_rollup(cleanup_db, mock
     from app.rollup_management import _check_and_trigger_rollup
 
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -3497,18 +3781,29 @@ async def test_merge_conflict_empty_mergeability_repoll_resolves_and_merges(
     exhausted, merge is retried in the same sweep and succeeds — no deferral,
     no fix spawn."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
         return_value=("token", "owner", "repo"),
     )
-    mocker.patch("app.github.get_branch_sha", new_callable=AsyncMock, return_value="abc123")
-    mocker.patch("app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[])
+    mocker.patch(
+        "app.github.get_branch_sha", new_callable=AsyncMock, return_value="abc123"
+    )
+    mocker.patch(
+        "app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[]
+    )
     mocker.patch(
         "app.security.scan_pr_for_injection",
         new_callable=AsyncMock,
-        return_value={"blocked": False, "findings": [], "summary": "clean", "report": ""},
+        return_value={
+            "blocked": False,
+            "findings": [],
+            "summary": "clean",
+            "report": "",
+        },
     )
     mocker.patch("app.github.get_pr_files", new_callable=AsyncMock, return_value=[])
     mocker.patch(
@@ -3539,7 +3834,11 @@ async def test_merge_conflict_empty_mergeability_repoll_resolves_and_merges(
         new_callable=AsyncMock,
         side_effect=[
             {"merged": False, "message": "mergeable state is null"},
-            {"merged": True, "sha": "abc", "message": "Pull Request successfully merged"},
+            {
+                "merged": True,
+                "sha": "abc",
+                "message": "Pull Request successfully merged",
+            },
         ],
     )
     mocker.patch("app.github.delete_branch", new_callable=AsyncMock, return_value=True)
@@ -3592,18 +3891,29 @@ async def test_merge_conflict_empty_mergeability_defers_when_repoll_exhausted(
     sweep falls through to the normal deferral path — counters are bumped, no
     fix task is spawned."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
         return_value=("token", "owner", "repo"),
     )
-    mocker.patch("app.github.get_branch_sha", new_callable=AsyncMock, return_value="abc123")
-    mocker.patch("app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[])
+    mocker.patch(
+        "app.github.get_branch_sha", new_callable=AsyncMock, return_value="abc123"
+    )
+    mocker.patch(
+        "app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[]
+    )
     mocker.patch(
         "app.security.scan_pr_for_injection",
         new_callable=AsyncMock,
-        return_value={"blocked": False, "findings": [], "summary": "clean", "report": ""},
+        return_value={
+            "blocked": False,
+            "findings": [],
+            "summary": "clean",
+            "report": "",
+        },
     )
     mocker.patch("app.github.get_pr_files", new_callable=AsyncMock, return_value=[])
     mocker.patch(

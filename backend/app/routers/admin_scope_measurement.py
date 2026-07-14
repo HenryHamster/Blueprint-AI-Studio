@@ -697,6 +697,17 @@ async def get_first_attempt_measurement(
             Task.created_at >= cutoff,
             Task.project_id == project_id,
         )
+        .options(
+            load_only(
+                Task.id,
+                Task.status,
+                Task.context,
+                Task.created_at,
+                Task.project_id,
+                Task.completed_at,
+                raiseload=True,
+            )
+        )
         .order_by(Task.created_at.desc(), Task.id.desc())
         .limit(_MAX_AGGREGATION_SCAN + 1)
     )

@@ -7,18 +7,24 @@ import {
   resolveTerminalStatus, nextAuthorityHeld, autonomousActive, FrameCoalescer,
   buildPriorDecisionsText,
   buildRetiredContextText,
-  buildStagedDirectionsText,
+  buildStagedDirectionsText, formatDirectionGroundingText,
   MESSAGE_POLL_LIMIT,
   buildSurfaceCatalog, nextFocus, parseTickVerdict, parseAgendaContinue,
+  parseOperatorDecision, OPERATOR_DECISION_VERDICT,
   openFoundLeads, classifyTickOutcome, shouldRunAutonomousTurn,
   AUTONOMOUS_FLOOR_TICK_MS,
   serializeLedger, restoreLedger, refreshSurfaceCatalog,
   EXAM_RECORDS_CAP, EXAM_NOTE_CAP, EXAM_LEDGER_MAX_BYTES,
   MAX_IMAGE_BASE64_LENGTH, MAX_IMAGE_DOWNLOAD_BYTES, MAX_IMAGES_PER_TURN, MAX_TEXT_ATTACHMENT_BYTES,
   modelContextLimit, compactionThreshold, buildCompactionCheckpoint,
+  formatStrategicMemoryNotes, formatCheckpointState, resolveCheckpointGrounding,
+  type CheckpointGrounding, type CheckpointStateResponse,
+  decisionsRegisterText, serializeDecisionsReg, restoreDecisionsReg,
+  isSettledDecisionVerdict,
+  DECISIONS_REGISTER_CAP, DECISIONS_REG_MAX_BYTES,
   DEFAULT_CONTEXT_LIMIT, COMPACTION_THRESHOLD_RATIO,
   type ExamSurface, type ExamRecord, type ContentBlock,
-  type CompactionCheckpointContext,
+  type CompactionCheckpointContext, type DecisionsRegisterEntry,
 } from './strategic-resident-lib.js';
 import { buildFetchGuidance, STRATEGIC_FETCH_VERBS } from './strategic-helpers.js';
 
@@ -748,6 +754,38 @@ describe('buildBootstrapPrompt', () => {
     const p = buildBootstrapPrompt(base); // priorSessionContextText not set
     expect(p).not.toContain('## Prior session context');
   });
+
+  it('decisions_register_reaches_bootstrap_on_full_restart', () => {
+    // On a full session restart the durable decisions register is restored from
+    // the persisted context and rendered by decisionsRegisterText, then threaded
+    // into the bootstrap prompt so the first (usually operator-reply) turn is not
+    // blind to settled decisions. This test exercises that seam end-to-end.
+    const register: DecisionsRegisterEntry[] = [
+      { at: '2026-07-10T00:00:00Z', atTick: 3, verdict: 'SETTLED', surfaceKey: 'direction:d-a5940d77', note: 'attestation tiering approved by operator' },
+      { at: '2026-07-11T00:00:00Z', atTick: 7, verdict: 'REJECTED', surfaceKey: 'direction:d-68d4ef5a', note: 'operator declined project-baked image rollout' },
+    ];
+    const p = buildBootstrapPrompt({
+      ...base,
+      decisionsRegisterText: decisionsRegisterText(register, DECISIONS_REGISTER_CAP),
+    });
+    expect(p).toContain('## Decisions register (durable cross-tick memory)');
+    expect(p).toContain('direction:d-a5940d77');
+    expect(p).toContain('attestation tiering approved by operator');
+    expect(p).toContain('operator declined project-baked image rollout');
+  });
+
+  it('omits the decisions register on a clean restart (empty register)', () => {
+    // A clean restart restores an empty register; decisionsRegisterText([]) === ''
+    // so the section must be omitted (byte-for-byte no-op against the base prompt).
+    const withEmpty = buildBootstrapPrompt({
+      ...base,
+      decisionsRegisterText: decisionsRegisterText([], DECISIONS_REGISTER_CAP),
+    });
+    expect(withEmpty).not.toContain('## Decisions register');
+    // Omitted field behaves identically to an empty string.
+    expect(buildBootstrapPrompt(base)).not.toContain('## Decisions register');
+    expect(withEmpty).toEqual(buildBootstrapPrompt(base));
+  });
 });
 
 describe('retired/prior-context renderers', () => {
@@ -932,6 +970,229 @@ describe('buildAutonomousPrompt (dynamic, evidence-gated)', () => {
     expect(p).toContain('genuinely independent');
     expect(p).toContain('dispatch BOTH now');
     expect(p).toContain('staging one behind the other');
+  });
+});
+
+describe('decisionsRegisterText decisions register', () => {
+  it('test_decisions_register_rendered_in_prompt_and_checkpoint', () => {
+    const register: DecisionsRegisterEntry[] = [
+      { atTick: 1, at: '2026-07-10T12:00:00Z', surfaceKey: 'direction:d-1', verdict: 'found', note: 'Found high churn in recent activity - needs review' },
+      { atTick: 2, at: '2026-07-10T12:05:00Z', surfaceKey: 'direction:d-1', verdict: 'advanced', note: 'Spawned plan task to investigate churn root cause' },
+      { atTick: 3, at: '2026-07-10T12:10:00Z', surfaceKey: 'qualification', verdict: 'clear', note: 'Examined latest qualification findings - nothing new actionable' },
+    ];
+
+    // 1. decisionsRegisterText formats entries with full-fidelity notes.
+    const text = decisionsRegisterText(register, 20);
+    expect(text).toContain('Decisions register');
+    expect(text).toContain('tick-1 [found] direction:d-1');
+    expect(text).toContain('Found high churn');
+    expect(text).toContain('tick-2 [advanced] direction:d-1');
+    expect(text).toContain('Spawned plan task');
+    expect(text).toContain('tick-3 [clear] qualification');
+    expect(text).toContain('Examined latest qualification findings');
+
+    // 2. Decisions register renders into the autonomous prompt.
+    const prompt = buildAutonomousPrompt([], [], [], false, 3, text);
+    expect(prompt).toContain('Decisions register');
+    expect(prompt).toContain('tick-1 [found]');
+
+    // 3. Decisions register renders into the compaction checkpoint.
+    const checkpoint = buildCompactionCheckpoint({
+      roleIdentity: 'role',
+      examLedgerJson: '',
+      recentInteractions: '',
+      autonomousState: '',
+      decisionsRegisterText: text,
+    });
+    expect(checkpoint).toContain('Decisions register');
+    expect(checkpoint).toContain('tick-1 [found]');
+
+    // 4. Empty register returns empty string.
+    expect(decisionsRegisterText([], 20)).toBe('');
+
+    // 5. Checkpoint with no decisions register omits the section.
+    const noReg = buildCompactionCheckpoint({
+      roleIdentity: 'role',
+      examLedgerJson: '',
+      recentInteractions: '',
+      autonomousState: '',
+    });
+    expect(noReg).not.toContain('Decisions register');
+  });
+});
+
+describe('isSettledDecisionVerdict (durable register admission)', () => {
+  it('accepts only settled decision verdicts (advanced/found/clear)', () => {
+    expect(isSettledDecisionVerdict('advanced')).toBe(true);
+    expect(isSettledDecisionVerdict('found')).toBe(true);
+    expect(isSettledDecisionVerdict('clear')).toBe(true);
+  });
+
+  it('rejects interrupted and unevidenced non-decisions', () => {
+    expect(isSettledDecisionVerdict('interrupted')).toBe(false);
+    expect(isSettledDecisionVerdict('unevidenced')).toBe(false);
+  });
+
+  it('rejects unknown / malformed verdict strings', () => {
+    expect(isSettledDecisionVerdict('')).toBe(false);
+    expect(isSettledDecisionVerdict('Advanced')).toBe(false);
+    expect(isSettledDecisionVerdict('nonsense')).toBe(false);
+  });
+
+  it('filters interrupted/unevidenced entries out of the rendered register', () => {
+    // Simulate the handler's admission gate: only settled verdicts are pushed to
+    // the durable register. A mix of tick outcomes narrows to just the decisions.
+    const allTickVerdicts: DecisionsRegisterEntry[] = [
+      { atTick: 1, at: '2026-07-10T12:00:00Z', surfaceKey: 'direction:d-1', verdict: 'found', note: 'found a lead' },
+      { atTick: 2, at: '2026-07-10T12:05:00Z', surfaceKey: 'qualification', verdict: 'interrupted', note: 'turn interrupted before completion' },
+      { atTick: 3, at: '2026-07-10T12:10:00Z', surfaceKey: 'direction:d-1', verdict: 'advanced', note: 'spawned a plan task' },
+      { atTick: 4, at: '2026-07-10T12:15:00Z', surfaceKey: 'ci-compliance', verdict: 'unevidenced', note: 'no valid TICK-VERDICT marker line' },
+      { atTick: 5, at: '2026-07-10T12:20:00Z', surfaceKey: 'vm-cost', verdict: 'clear', note: 'nothing actionable' },
+    ];
+    const register = allTickVerdicts.filter(e => isSettledDecisionVerdict(e.verdict));
+    expect(register).toHaveLength(3);
+
+    const text = decisionsRegisterText(register, 20);
+    expect(text).toContain('tick-1 [found]');
+    expect(text).toContain('tick-3 [advanced]');
+    expect(text).toContain('tick-5 [clear]');
+    expect(text).not.toContain('[interrupted]');
+    expect(text).not.toContain('[unevidenced]');
+  });
+});
+
+describe('parseOperatorDecision (operator-settled corrections)', () => {
+  it('extracts the trailing OPERATOR-DECISION marker note', () => {
+    const text = [
+      'Understood — I will drop the images-first rewrite.',
+      'OPERATOR-DECISION: Do NOT pursue the images-first compute rewrite; operator settled on the table-based path.',
+    ].join('\n');
+    expect(parseOperatorDecision(text)).toBe(
+      'Do NOT pursue the images-first compute rewrite; operator settled on the table-based path.',
+    );
+  });
+
+  it('returns null when no marker is present', () => {
+    expect(parseOperatorDecision('Thanks, that answers my question.')).toBeNull();
+  });
+
+  it('ignores a mid-reply mention and reads the LAST marker line', () => {
+    const text = [
+      'You asked earlier about OPERATOR-DECISION: markers in the transcript.',
+      'Here is my actual answer.',
+      'OPERATOR-DECISION: Ship the fix behind a flag.',
+    ].join('\n');
+    expect(parseOperatorDecision(text)).toBe('Ship the fix behind a flag.');
+  });
+
+  it('strips a leading dash and is case-insensitive on the label', () => {
+    expect(parseOperatorDecision('operator-decision: — reverse the retirement of d-abc')).toBe(
+      'reverse the retirement of d-abc',
+    );
+  });
+
+  it('returns null for an empty note or non-string input', () => {
+    expect(parseOperatorDecision('OPERATOR-DECISION:   ')).toBeNull();
+    // @ts-expect-error deliberate non-string input
+    expect(parseOperatorDecision(undefined)).toBeNull();
+  });
+
+  it('an operator verdict is admitted to the durable register and survives round-trip', () => {
+    expect(isSettledDecisionVerdict(OPERATOR_DECISION_VERDICT)).toBe(true);
+    const entry: DecisionsRegisterEntry = {
+      atTick: 7,
+      at: '2026-07-12T09:00:00Z',
+      surfaceKey: 'operator:message',
+      verdict: OPERATOR_DECISION_VERDICT,
+      note: 'Do NOT re-propose the images-first rewrite.',
+    };
+    const restored = restoreDecisionsReg(serializeDecisionsReg([entry]));
+    expect(restored).not.toBeNull();
+    expect(restored?.[0].verdict).toBe(OPERATOR_DECISION_VERDICT);
+    expect(restored?.[0].note).toBe('Do NOT re-propose the images-first rewrite.');
+    expect(decisionsRegisterText([entry], 20)).toContain('[operator] operator:message');
+  });
+});
+
+describe('buildBootstrapPrompt operator-decision instruction', () => {
+  const base = {
+    contextPrefix: '', projectName: 'Blueprint', problemModelJson: '{}',
+    runningUpdate: '', directionsText: '', stagedDirectionsText: '',
+    retiredDirectionsText: '', previousDecisionOutcomesText: '',
+    strategicMemoryNotesText: '', visionJson: '', openMessagesText: '',
+    sessionId: 's-1', fetchGuidanceText: '', priorSessionContextText: '',
+    skillsText: '', decisionsRegisterText: '',
+  };
+  it('instructs the strategist to emit an OPERATOR-DECISION marker on a settlement', () => {
+    const p = buildBootstrapPrompt(base);
+    expect(p).toContain('OPERATOR-DECISION:');
+    expect(p).toContain('durable decisions register');
+  });
+});
+
+describe('serializeDecisionsReg / restoreDecisionsReg round-trip', () => {
+  const makeEntry = (tick: number, key: string): DecisionsRegisterEntry => ({
+    atTick: tick,
+    at: `2026-07-10T12:0${tick}:00Z`,
+    surfaceKey: key,
+    verdict: 'found',
+    note: `Settled decision at tick ${tick} — full-fidelity text, not truncated`,
+  });
+
+  it('test_decisions_reg_roundtrip_restores_entries_across_restart', () => {
+    const reg = [
+      makeEntry(1, 'direction:d-abc'),
+      makeEntry(2, 'qualification'),
+      makeEntry(3, 'direction:d-xyz'),
+    ];
+    const serialized = serializeDecisionsReg(reg);
+    // Must be valid JSON.
+    const parsed: unknown = JSON.parse(serialized);
+    expect(parsed).toBeTruthy();
+    const restored = restoreDecisionsReg(serialized);
+    expect(restored).not.toBeNull();
+    expect(restored).toHaveLength(3);
+    if (restored !== null) {
+      expect(restored[0].atTick).toBe(1);
+      expect(restored[0].surfaceKey).toBe('direction:d-abc');
+      expect(restored[0].note).toContain('full-fidelity text');
+      expect(restored[2].surfaceKey).toBe('direction:d-xyz');
+    }
+  });
+
+  it('test_decisions_reg_restore_returns_null_on_bad_input', () => {
+    expect(restoreDecisionsReg(null)).toBeNull();
+    expect(restoreDecisionsReg(undefined)).toBeNull();
+    expect(restoreDecisionsReg('')).toBeNull();
+    expect(restoreDecisionsReg('not-json')).toBeNull();
+    // Non-array entries field degrades to empty array (graceful fallback, not null).
+    expect(restoreDecisionsReg('{"entries":"not-array"}')).toEqual([]);
+  });
+
+  it('test_decisions_reg_serialize_empty_register_restores_to_empty_array', () => {
+    const serialized = serializeDecisionsReg([]);
+    const restored = restoreDecisionsReg(serialized);
+    expect(restored).toEqual([]);
+  });
+
+  it('test_decisions_reg_serialize_fits_within_byte_budget', () => {
+    // Build a register with notes long enough to stress the byte budget.
+    const bigReg: DecisionsRegisterEntry[] = Array.from({ length: DECISIONS_REGISTER_CAP }, (_, i) => ({
+      atTick: i,
+      at: `2026-07-10T12:00:00Z`,
+      surfaceKey: `direction:d-${i}`,
+      verdict: 'found',
+      note: 'x'.repeat(500),
+    }));
+    const serialized = serializeDecisionsReg(bigReg);
+    expect(Buffer.byteLength(serialized, 'utf8')).toBeLessThanOrEqual(DECISIONS_REG_MAX_BYTES);
+    const restored = restoreDecisionsReg(serialized);
+    expect(restored).not.toBeNull();
+    // All restored entries must be valid.
+    for (const e of restored ?? []) {
+      expect(typeof e.surfaceKey).toBe('string');
+      expect(typeof e.note).toBe('string');
+    }
   });
 });
 
@@ -1644,6 +1905,334 @@ describe('buildCompactionCheckpoint', () => {
     const result = buildCompactionCheckpoint(fullCtx);
     expect(result).toContain('Resume from this checkpoint');
   });
+
+  it('buildCompactionCheckpoint carries durable self-model grounding', () => {
+    const ctx: CompactionCheckpointContext = {
+      roleIdentity: 'You are the resident strategist for Acme.',
+      examLedgerJson: JSON.stringify({ records: [], tick: 0, corrective: false }),
+      recentInteractions: '',
+      autonomousState: 'Examination tick: 0',
+      problemModelJson: JSON.stringify({ goals: ['improve testing'] }),
+      visionJson: JSON.stringify({ future: 'testable code' }),
+      strategicMemoryNotesText: '- Prefer concrete action over abstract discussion\n- Verify findings before escalating',
+      openMessagesText: 'msg: improve test coverage',
+      priorSessionContextText: 'Prior session explored auth flows.',
+      directionsText: '- d-1 (active) — improve test coverage',
+      runningUpdate: 'Coverage improved by 12%',
+    };
+    const result = buildCompactionCheckpoint(ctx);
+
+    // The self-model grounding section appears as a top-level section.
+    expect(result).toContain('## Self-model grounding');
+
+    // Every grounding field that was present renders as a sub-section.
+    expect(result).toContain('### Problem model');
+    expect(result).toContain('improve testing');
+    expect(result).toContain('### Vision');
+    expect(result).toContain('testable code');
+    expect(result).toContain('### Standing behavioral lessons');
+    expect(result).toContain('Prefer concrete action');
+    expect(result).toContain('### Open operator messages');
+    expect(result).toContain('improve test coverage');
+    expect(result).toContain('### Prior session context');
+    expect(result).toContain('explored auth flows');
+    expect(result).toContain('### Active directions');
+    expect(result).toContain('d-1 (active)');
+    expect(result).toContain('### Running update');
+    expect(result).toContain('12%');
+
+    // Existing sections (role identity, ledger, interactions, state) are untouched.
+    expect(result).toContain('You are the resident strategist for Acme');
+    expect(result).toContain('Examination ledger (carried forward)');
+    expect(result).toContain('Examination tick: 0');
+  });
+
+  it('test_checkpoint_grounding_marked_snapshot_not_current', () => {
+    // Grounding IS populated — verify it is marked as a session-start snapshot
+    // and includes a directive to ./fetch current state rather than rely on stale data.
+    const ctx: CompactionCheckpointContext = {
+      roleIdentity: 'You are the resident strategist for Test.',
+      examLedgerJson: JSON.stringify({ records: [], tick: 0, corrective: false }),
+      recentInteractions: '',
+      autonomousState: 'Examination tick: 0',
+      problemModelJson: JSON.stringify({ goals: ['improve testing'] }),
+      directionsText: '- d-1 active',
+      visionJson: JSON.stringify({ future: 'testable code' }),
+      openMessagesText: 'msg: improve test coverage',
+    };
+    const result = buildCompactionCheckpoint(ctx);
+
+    // Grounding section header contains "(session-start snapshot)" marker.
+    expect(result).toContain('## Self-model grounding (session-start snapshot)');
+    // The "Snapshot note" preamble warns the data may be stale.
+    expect(result).toContain('Snapshot note');
+    expect(result).toMatch(/may not reflect/);
+    // ./fetch directives let the model recover current state.
+    expect(result).toContain('./fetch problem-model');
+    expect(result).toContain('./fetch direction <id>');
+    expect(result).toContain('./fetch message');
+    // The top-level header must not claim the model 'retains ... all durable state'.
+    expect(result).not.toMatch(/retain.*all durable state/);
+
+    // WITHOUT grounding fields — the snapshot/stale markers MUST NOT appear.
+    const minimalCtx: CompactionCheckpointContext = {
+      roleIdentity: 'role only',
+      examLedgerJson: '',
+      recentInteractions: '',
+      autonomousState: '',
+    };
+    const minimalResult = buildCompactionCheckpoint(minimalCtx);
+    expect(minimalResult).not.toContain('(session-start snapshot)');
+    expect(minimalResult).not.toContain('Snapshot note');
+    expect(minimalResult).not.toContain('may not reflect');
+  });
+
+  it('omits self-model grounding when no fields are populated', () => {
+    const result = buildCompactionCheckpoint({
+      roleIdentity: 'role only',
+      examLedgerJson: '',
+      recentInteractions: '',
+      autonomousState: '',
+    });
+    expect(result).not.toContain('## Self-model grounding');
+    expect(result).not.toContain('### Problem model');
+  });
+});
+
+describe('formatStrategicMemoryNotes', () => {
+  it('renders "- [set_at] note" per well-formed entry', () => {
+    const out = formatStrategicMemoryNotes([
+      { note: 'prefer concrete action', set_at: '2026-07-01T00:00:00Z' },
+      { note: 'verify before escalating', set_at: '2026-07-02T00:00:00Z' },
+    ]);
+    expect(out).toBe(
+      '- [2026-07-01T00:00:00Z] prefer concrete action\n' +
+      '- [2026-07-02T00:00:00Z] verify before escalating',
+    );
+  });
+
+  it('omits the timestamp when set_at is absent', () => {
+    expect(formatStrategicMemoryNotes([{ note: 'no timestamp' }])).toBe('- no timestamp');
+  });
+
+  it('skips entries with a missing/blank note and drops non-object entries', () => {
+    const out = formatStrategicMemoryNotes([
+      { note: '   ' },
+      { set_at: '2026-07-01T00:00:00Z' },
+      'garbage',
+      null,
+      { note: 'kept' },
+    ]);
+    expect(out).toBe('- kept');
+  });
+
+  it('degrades to empty string for empty / non-array input', () => {
+    expect(formatStrategicMemoryNotes([])).toBe('');
+    expect(formatStrategicMemoryNotes(undefined)).toBe('');
+    expect(formatStrategicMemoryNotes('nope')).toBe('');
+  });
+});
+
+describe('formatCheckpointState', () => {
+  it('maps a populated response into pretty-printed JSON + formatted notes + string', () => {
+    const resp: CheckpointStateResponse = {
+      problem_model: { goals: ['ship refresh'] },
+      vision: { future: 'coherent strategist' },
+      strategic_memory_notes: [{ note: 'do not re-derive', set_at: '2026-07-01T00:00:00Z' }],
+      running_update: 'refresh landed',
+    };
+    const g = formatCheckpointState(resp);
+    expect(g.problemModelJson).toBe(JSON.stringify({ goals: ['ship refresh'] }, null, 2));
+    expect(g.visionJson).toBe(JSON.stringify({ future: 'coherent strategist' }, null, 2));
+    expect(g.strategicMemoryNotesText).toBe('- [2026-07-01T00:00:00Z] do not re-derive');
+    expect(g.runningUpdate).toBe('refresh landed');
+  });
+
+  it('coerces empty {} / missing / mistyped fields to empty strings (no throw)', () => {
+    const g = formatCheckpointState({
+      problem_model: {},
+      vision: undefined,
+      strategic_memory_notes: 'not-an-array',
+      running_update: 42,
+    });
+    expect(g.problemModelJson).toBe('');
+    expect(g.visionJson).toBe('');
+    expect(g.strategicMemoryNotesText).toBe('');
+    expect(g.runningUpdate).toBe('');
+    // A fully empty response object must not throw.
+    expect(() => formatCheckpointState({})).not.toThrow();
+  });
+});
+
+describe('resolveCheckpointGrounding', () => {
+  const snapshot: CheckpointGrounding = {
+    problemModelJson: JSON.stringify({ goals: ['STALE goal'] }, null, 2),
+    visionJson: JSON.stringify({ future: 'STALE vision' }, null, 2),
+    strategicMemoryNotesText: '- STALE lesson',
+    runningUpdate: 'STALE running update',
+  };
+
+  it('refreshed checkpoint state overrides session-start snapshot', () => {
+    // The refreshed grounding is derived from a checkpoint-state response the
+    // operator updated mid-session; every field must win over the snapshot.
+    const refreshed = formatCheckpointState({
+      problem_model: { goals: ['FRESH goal'] },
+      vision: { future: 'FRESH vision' },
+      strategic_memory_notes: [{ note: 'FRESH lesson', set_at: '2026-07-11T00:00:00Z' }],
+      running_update: 'FRESH running update',
+    });
+    const resolved = resolveCheckpointGrounding(snapshot, refreshed);
+    expect(resolved.problemModelJson).toContain('FRESH goal');
+    expect(resolved.problemModelJson).not.toContain('STALE');
+    expect(resolved.visionJson).toContain('FRESH vision');
+    expect(resolved.visionJson).not.toContain('STALE');
+    expect(resolved.strategicMemoryNotesText).toBe('- [2026-07-11T00:00:00Z] FRESH lesson');
+    expect(resolved.runningUpdate).toBe('FRESH running update');
+
+    // And end-to-end: the rendered checkpoint carries the fresh values, marked
+    // as refreshed rather than a session-start snapshot.
+    const checkpoint = buildCompactionCheckpoint({
+      roleIdentity: 'role',
+      examLedgerJson: '',
+      recentInteractions: '',
+      autonomousState: '',
+      ...resolved,
+      groundingRefreshed: true,
+    });
+    expect(checkpoint).toContain('FRESH goal');
+    expect(checkpoint).not.toContain('STALE');
+    expect(checkpoint).toContain('## Self-model grounding (refreshed at compaction)');
+    expect(checkpoint).not.toContain('(session-start snapshot)');
+  });
+
+  it('falls back to the snapshot when no refresh occurred (refreshed null/undefined)', () => {
+    expect(resolveCheckpointGrounding(snapshot, null)).toEqual({
+      problemModelJson: snapshot.problemModelJson,
+      visionJson: snapshot.visionJson,
+      strategicMemoryNotesText: snapshot.strategicMemoryNotesText,
+      runningUpdate: snapshot.runningUpdate,
+    });
+    expect(resolveCheckpointGrounding(snapshot, undefined).problemModelJson)
+      .toContain('STALE goal');
+  });
+
+  it('a refreshed field that was cleared mid-session collapses to undefined (not the stale value)', () => {
+    // Operator wiped the running update; the refreshed empty must win so the
+    // checkpoint drops the section rather than re-showing the stale text.
+    const refreshed: CheckpointGrounding = {
+      problemModelJson: JSON.stringify({ goals: ['FRESH goal'] }, null, 2),
+      visionJson: '',
+      strategicMemoryNotesText: '',
+      runningUpdate: '',
+    };
+    const resolved = resolveCheckpointGrounding(snapshot, refreshed);
+    expect(resolved.problemModelJson).toContain('FRESH goal');
+    expect(resolved.visionJson).toBeUndefined();
+    expect(resolved.strategicMemoryNotesText).toBeUndefined();
+    expect(resolved.runningUpdate).toBeUndefined();
+  });
+});
+
+describe('formatCheckpointState open_messages field', () => {
+  it('sets openMessagesText to empty string when open_messages is missing', () => {
+    const g = formatCheckpointState({ problem_model: { k: 'v' } });
+    expect(g.openMessagesText).toBe('');
+  });
+
+  it('sets openMessagesText to empty string when open_messages is an empty array', () => {
+    const g = formatCheckpointState({ open_messages: [] });
+    expect(g.openMessagesText).toBe('');
+  });
+
+  it('sets openMessagesText to empty string even when open_messages has entries (caller fills it)', () => {
+    // openMessagesText is always '' from formatCheckpointState; the handler
+    // overrides it with buildOpenMessagesText after the call.
+    const g = formatCheckpointState({
+      open_messages: [{ id: 'msg-1', content: 'hello', type: 'QUESTION', from: 'user' }],
+    });
+    expect(g.openMessagesText).toBe('');
+  });
+});
+
+describe('resolveCheckpointGrounding open_messages', () => {
+  const snapshot: CheckpointGrounding = {
+    problemModelJson: '{}',
+    visionJson: '{}',
+    strategicMemoryNotesText: '',
+    runningUpdate: '',
+    openMessagesText: 'STALE open message',
+  };
+
+  it('refreshed openMessagesText wins over the snapshot', () => {
+    const refreshed: CheckpointGrounding = {
+      problemModelJson: '{}',
+      visionJson: '{}',
+      strategicMemoryNotesText: '',
+      runningUpdate: '',
+      openMessagesText: 'FRESH open message',
+    };
+    const resolved = resolveCheckpointGrounding(snapshot, refreshed);
+    expect(resolved.openMessagesText).toBe('FRESH open message');
+  });
+
+  it('empty refreshed openMessagesText collapses to undefined (resolved messages win over stale snapshot)', () => {
+    // The operator resolved all messages mid-session; the refreshed empty feed
+    // must WIN so the checkpoint omits the section rather than re-showing stale text.
+    const refreshed: CheckpointGrounding = {
+      problemModelJson: '{}',
+      visionJson: '{}',
+      strategicMemoryNotesText: '',
+      runningUpdate: '',
+      openMessagesText: '',
+    };
+    const resolved = resolveCheckpointGrounding(snapshot, refreshed);
+    expect(resolved.openMessagesText).toBeUndefined();
+  });
+
+  it('falls back to the snapshot openMessagesText when refresh is null', () => {
+    const resolved = resolveCheckpointGrounding(snapshot, null);
+    expect(resolved.openMessagesText).toBe('STALE open message');
+  });
+
+  it('snapshot with no openMessagesText falls back to undefined when refresh is null', () => {
+    const snapshotNoMsgs: CheckpointGrounding = {
+      problemModelJson: '{}',
+      visionJson: '{}',
+      strategicMemoryNotesText: '',
+      runningUpdate: '',
+    };
+    const resolved = resolveCheckpointGrounding(snapshotNoMsgs, null);
+    expect(resolved.openMessagesText).toBeUndefined();
+  });
+});
+
+describe('buildCompactionCheckpoint groundingRefreshed note', () => {
+  it('uses the refreshed-at-compaction note when groundingRefreshed is true', () => {
+    const result = buildCompactionCheckpoint({
+      roleIdentity: 'role',
+      examLedgerJson: '',
+      recentInteractions: '',
+      autonomousState: '',
+      problemModelJson: JSON.stringify({ goals: ['g'] }),
+      groundingRefreshed: true,
+    });
+    expect(result).toContain('## Self-model grounding (refreshed at compaction)');
+    expect(result).toContain('Refreshed note');
+    expect(result).not.toContain('(session-start snapshot)');
+    expect(result).not.toContain('Snapshot note');
+  });
+
+  it('defaults to the session-start snapshot note when groundingRefreshed is falsy', () => {
+    const result = buildCompactionCheckpoint({
+      roleIdentity: 'role',
+      examLedgerJson: '',
+      recentInteractions: '',
+      autonomousState: '',
+      problemModelJson: JSON.stringify({ goals: ['g'] }),
+    });
+    expect(result).toContain('## Self-model grounding (session-start snapshot)');
+    expect(result).not.toContain('(refreshed at compaction)');
+  });
 });
 
 describe('residentConfig compaction knobs', () => {
@@ -1670,5 +2259,111 @@ describe('residentConfig compaction knobs', () => {
   it('clamps compaction cooldown to minimum 60s', () => {
     const c = residentConfig({ strategic_session_compaction_cooldown_seconds: 10 });
     expect(c.compactionCooldownMs).toBe(60_000);
+  });
+
+  describe('serializeDecisionsRegister / restoreDecisionsRegister', () => {
+    const makeEntry = (surfaceKey: string, atTick: number, note?: string): DecisionsRegisterEntry => ({
+      atTick,
+      at: '2026-07-10T12:00:00Z',
+      surfaceKey,
+      verdict: 'clear',
+      note: note ?? 'ok',
+    });
+
+    it('round-trips a register through serialize → restore', () => {
+      const reg = [makeEntry('direction:d-1', 1), makeEntry('qualification', 2)];
+      const serialized = serializeDecisionsReg(reg);
+      const restored = restoreDecisionsReg(serialized);
+      expect(restored).not.toBeNull();
+      const r = restored as DecisionsRegisterEntry[];
+      expect(r).toHaveLength(2);
+      expect(r[0].surfaceKey).toBe('direction:d-1');
+      expect(r[1].surfaceKey).toBe('qualification');
+      expect(r[0].atTick).toBe(1);
+      expect(r[1].verdict).toBe('clear');
+    });
+
+    it('restoreDecisionsReg returns null for undefined / empty / malformed input', () => {
+      expect(restoreDecisionsReg(undefined)).toBeNull();
+      expect(restoreDecisionsReg(null)).toBeNull();
+      expect(restoreDecisionsReg('')).toBeNull();
+      expect(restoreDecisionsReg('not json{')).toBeNull();
+      expect(restoreDecisionsReg('"just a string"')).toBeNull();
+      expect(restoreDecisionsReg('{}')).toEqual([]);
+    });
+
+    it('empty register returns a valid empty entries array from serializeDecisionsReg', () => {
+      const serialized = serializeDecisionsReg([]);
+      const parsed = JSON.parse(serialized) as { entries: DecisionsRegisterEntry[] };
+      expect(parsed.entries).toEqual([]);
+    });
+
+    it('caps at DECISIONS_REGISTER_CAP entries on restore', () => {
+      const many = Array.from({ length: 60 }, (_, i) => makeEntry(`surface-${i}`, i));
+      const serialized = serializeDecisionsReg(many);
+      const restored = restoreDecisionsReg(serialized);
+      expect(restored).not.toBeNull();
+      const r = restored as DecisionsRegisterEntry[];
+      expect(r.length).toBeLessThanOrEqual(50);
+      // Should keep the most recent entries (suffix of the original).
+      expect(r[r.length - 1].surfaceKey).toBe('surface-59');
+    });
+  });
+});
+
+describe('formatDirectionGroundingText', () => {
+  it('returns empty string for empty or null directions', () => {
+    expect(formatDirectionGroundingText([])).toBe('');
+    expect(formatDirectionGroundingText(null)).toBe('');
+    expect(formatDirectionGroundingText(undefined)).toBe('');
+  });
+
+  it('formats a single active direction with id and text', () => {
+    const result = formatDirectionGroundingText([
+      { id: 'dir-1', text: 'Improve onboarding flow', status: 'active' },
+    ]);
+    expect(result).toMatch(/refreshed from heartbeat/);
+    expect(result).toContain('./fetch direction dir-1');
+    expect(result).toContain('Improve onboarding flow');
+    expect(result).not.toContain('[ACTIVE]');
+  });
+
+  it('appends status tag for non-active directions', () => {
+    const result = formatDirectionGroundingText([
+      { id: 'dir-2', text: 'Deprecated initiative', status: 'completed' },
+    ]);
+    expect(result).toContain('[COMPLETED]');
+  });
+
+  it('handles missing text gracefully', () => {
+    const result = formatDirectionGroundingText([
+      { id: 'dir-3', text: '', status: 'active' },
+    ]);
+    expect(result).toContain('./fetch direction dir-3');
+    expect(result).not.toContain('—');
+  });
+
+  it('renders multiple directions separated by newlines', () => {
+    const result = formatDirectionGroundingText([
+      { id: 'a', text: 'One', status: 'active' },
+      { id: 'b', text: 'Two', status: 'paused' },
+      { id: 'c', text: 'Three', status: 'active' },
+    ]);
+    const lines = result.split('\n');
+    expect(lines[0]).toBe('(refreshed from heartbeat)');
+    expect(lines).toHaveLength(4); // header + 3 entries
+    expect(lines[1]).toContain('./fetch direction a');
+    expect(lines[2]).toContain('./fetch direction b');
+    expect(lines[2]).toContain('[PAUSED]');
+    expect(lines[3]).toContain('./fetch direction c');
+  });
+
+  it('truncates text beyond 120 characters', () => {
+    const longText = 'a'.repeat(200);
+    const result = formatDirectionGroundingText([
+      { id: 'dir-long', text: longText, status: 'active' },
+    ]);
+    expect(result).toContain('a'.repeat(120));
+    expect(result).not.toContain('a'.repeat(121));
   });
 });

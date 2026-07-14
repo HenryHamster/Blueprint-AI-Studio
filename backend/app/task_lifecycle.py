@@ -6791,7 +6791,10 @@ async def park_task(
 
         acct_id = get_task_llm_account_id(task)
         if acct_id and not (task.context or {}).get("_slot_released"):
-            await release_max_plan_account(acct_id)
+            await release_max_plan_account(
+                acct_id,
+                project_id=str(task.project_id) if task.project_id else None,
+            )
             task.context = {**(task.context or {}), "_slot_released": True}
     except Exception:
         logger.exception("[PARK] slot release failed for task %s", task.id)
@@ -6961,7 +6964,7 @@ async def deliver_wake(
         action == WakeAction.FINALIZE
         and registration.wake_source_kind == COMPUTE_JOB_TERMINAL_WAKE_KIND
     ):
-        from app.compute_jobs import build_compute_result_logs
+        from app.compute_jobs import build_compute_result_logs_async
         from app.models import ComputeJob
         from app.task_completion import (
             _COMPUTE_WAKE_POST_COMMIT_META_KEY,
@@ -7005,7 +7008,7 @@ async def deliver_wake(
                 emit_task_terminated_notify(session, str(task.id))
             return True
         registration.result_state = "finalized"
-        logs = build_compute_result_logs(job)
+        logs = await build_compute_result_logs_async(job)
         # _handle_compute_experiment_completion gates the artifact and sets the
         # task to its honest terminal status (COMPLETED on pass, FAILED on a missed
         # gate) and stamps the job result reference. With owns_commit=False it does

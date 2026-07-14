@@ -4,10 +4,10 @@ Provides ``encrypt_field`` / ``decrypt_field`` for any single-column value store
 in the database that should be encrypted at rest.  The encryption key is loaded
 from the ``GITHUB_PAT_ENCRYPTION_KEY`` environment variable.
 
-When no key is configured, both functions are no-ops (pass-through) so that local
-development and test environments without a key still work — the column is stored
-in plaintext.  In production the key MUST be set; the app logs a warning on every
-operation when it is missing.
+When no key is configured, both functions raise ``RuntimeError`` by default to
+prevent silent plaintext storage.  Local development and test environments can
+opt into plaintext mode by setting ``ALLOW_PLAINTEXT_CREDENTIALS=true`` —
+``encrypt_field`` and ``decrypt_field`` then pass through values unchanged.
 
 Decryption gracefully handles values that are already in plaintext (e.g. rows
 that predate the encryption migration) by falling through to return the value
@@ -22,23 +22,39 @@ from cryptography.fernet import Fernet, InvalidToken
 logger = logging.getLogger(__name__)
 
 ENCRYPTION_KEY_ENV = "GITHUB_PAT_ENCRYPTION_KEY"
+ALLOW_PLAINTEXT_CREDENTIALS_ENV = "ALLOW_PLAINTEXT_CREDENTIALS"
+
+
+def is_encryption_active() -> bool:
+    """Return ``True`` if Fernet encryption is properly configured and active.
+
+    Returns ``False`` when no encryption key is configured or the key is invalid,
+    meaning :func:`encrypt_field` and :func:`decrypt_field` will either raise
+    (when ``ALLOW_PLAINTEXT_CREDENTIALS`` is absent) or pass through values
+    unchanged (when the opt-in flag is set for development).
+    """
+    return _get_fernet() is not None
 
 
 def _get_fernet() -> Fernet | None:
     """Return a ``Fernet`` instance configured from ``GITHUB_PAT_ENCRYPTION_KEY``.
 
-    Returns ``None`` when the environment variable is unset, which causes
-    :func:`encrypt_field` / :func:`decrypt_field` to pass through values
-    unchanged.  The key must be a valid Fernet key (32 url-safe base64 bytes),
+    Returns ``None`` when the environment variable is unset or the key is
+    invalid.  The key must be a valid Fernet key (32 url-safe base64 bytes),
     typically generated with ``cryptography.fernet.Fernet.generate_key()``.
+
+    Suppresses the per-call warning when ``ALLOW_PLAINTEXT_CREDENTIALS`` is
+    explicitly set (the startup check in :mod:`app.main` handles the advisory
+    message once per boot for development environments).
     """
     key = os.getenv(ENCRYPTION_KEY_ENV)
     if not key:
-        logger.warning(
-            "%s not set — field encryption is a no-op; "
-            "sensitive column values will be stored in plaintext",
-            ENCRYPTION_KEY_ENV,
-        )
+        if not os.getenv(ALLOW_PLAINTEXT_CREDENTIALS_ENV):
+            logger.warning(
+                "%s not set — field encryption is a no-op; "
+                "sensitive column values will be stored in plaintext",
+                ENCRYPTION_KEY_ENV,
+            )
         return None
     try:
         return Fernet(key.encode())
@@ -47,16 +63,40 @@ def _get_fernet() -> Fernet | None:
         return None
 
 
+def _require_encryption_available():
+    """Guard: raise ``RuntimeError`` if encryption would silently pass through.
+
+    When no valid encryption key is configured **and** the development opt-in
+    flag ``ALLOW_PLAINTEXT_CREDENTIALS`` is not set, the caller must not proceed
+    with a silent no-op — credentials would be stored or returned in plaintext
+    without the operator's explicit consent.
+    """
+    if is_encryption_active():
+        return
+    if not os.getenv(ALLOW_PLAINTEXT_CREDENTIALS_ENV):
+        raise RuntimeError(
+            f"{ENCRYPTION_KEY_ENV} is not available and "
+            f"{ALLOW_PLAINTEXT_CREDENTIALS_ENV} is not set. "
+            f"Set {ALLOW_PLAINTEXT_CREDENTIALS_ENV}=true for development "
+            "environments without encryption, or configure a valid "
+            f"{ENCRYPTION_KEY_ENV} for production use."
+        )
+
+
 def encrypt_field(value: str | None) -> str | None:
     """Encrypt *value* using Fernet symmetric encryption.
 
     Returns ``None`` when *value* is ``None``.
-    Returns *value* unchanged when no encryption key is configured.
+    Raises ``RuntimeError`` when no encryption key is configured and
+    ``ALLOW_PLAINTEXT_CREDENTIALS`` is not set.
+    Returns *value* unchanged when no key is configured **and** the opt-in
+    flag is set (development mode).
     """
     if value is None:
         return None
     f = _get_fernet()
     if f is None:
+        _require_encryption_available()
         return value
     return f.encrypt(value.encode()).decode()
 
@@ -65,7 +105,10 @@ def decrypt_field(value: str | None) -> str | None:
     """Decrypt *value* that was previously encrypted with :func:`encrypt_field`.
 
     Returns ``None`` when *value* is ``None``.
-    Returns *value* unchanged when no encryption key is configured.
+    Raises ``RuntimeError`` when no encryption key is configured and
+    ``ALLOW_PLAINTEXT_CREDENTIALS`` is not set.
+    Returns *value* unchanged when no key is configured **and** the opt-in
+    flag is set (development mode).
     If decryption fails (e.g. *value* is still in plaintext from before the
     encryption migration was applied), the value is returned as-is so that
     a rolling deploy does not break existing data.
@@ -74,6 +117,7 @@ def decrypt_field(value: str | None) -> str | None:
         return None
     f = _get_fernet()
     if f is None:
+        _require_encryption_available()
         return value
     try:
         return f.decrypt(value.encode()).decode()

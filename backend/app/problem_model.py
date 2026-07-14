@@ -35,7 +35,11 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from app.evidence_primitive import EvidenceRef, EvidenceStatus, classify_evidence
+from app.evidence_primitive import (
+    EvidenceRef,
+    EvidenceStatus,
+    classify_evidence,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +191,17 @@ class Capability(BaseModel):
     ``extra='forbid'``. The reconciliation sweep
     (``metrics_integrity_sweep.check_capability_claim_reconciliation``) overrides
     the derived status to ``contradicted`` when a proven ref is disproved."""
+
+    proof_exempt: bool = Field(default=False)
+    """When True, this working capability is declared exempt from proof
+    requirements. An exempt capability:
+    - classifies as ``"proven"`` in :func:`working_capability_proof_status`
+      (satisfies the proof gate without machine-verified evidence),
+    - is skipped by the proof earn loop,
+    - does not count as unproven in the release-qualifier gate,
+    - is reported separately (not in delta) by the metrics sweep.
+    Defaults to False; existing capabilities without this field are
+    unaffected (backward-compatible)."""
 
 
 # ---------------------------------------------------------------------------
@@ -618,6 +633,7 @@ def capability_evidence_status(cap: Capability) -> EvidenceStatus:
     (``metrics_integrity_sweep.check_capability_claim_reconciliation``) overrides
     the result to ``contradicted`` when a proven ref is definitively disproved."""
     return classify_evidence(cap.evidence_refs)
+
 
 
 def parse_problem_model(raw: dict | None) -> ProblemModel:

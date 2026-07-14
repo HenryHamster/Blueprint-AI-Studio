@@ -44,15 +44,20 @@ from app.models import (
 from app.compute import provision_agent_vm  # noqa: F401  (re-exported for test patches; see main.py:108 docstring)
 from app.deployed_sha import resolve_deployed_sha
 from app.auth import get_current_user, get_current_user_optional, verify_agent_jwt
-from app.admin_helpers import _get_user_project, _get_user_task
+from app.admin_helpers import _get_user_project
 from app.schemas import ArtifactDownloadResponse
 from app.admin import router as admin_router
 from app.routers.admin_projects import router as admin_projects_router
 from app.routers.admin_project_strategic_session import router as admin_project_strategic_session_router
 from app.routers.admin_settings import router as admin_settings_router
+from app.routers.admin_migration_exemptions import (
+    router as admin_migration_exemptions_router,
+)
 from app.routers.admin_debug import router as admin_debug_router
 from app.routers.admin_pool_accounts import router as admin_pool_accounts_router
 from app.routers.admin_project_config import router as admin_project_config_router
+from app.routers.admin_project_tools import router as admin_project_tools_router
+from app.routers.admin_project_tools import asset_router as admin_project_tools_asset_router
 from app.routers.admin_warm_pool import router as admin_warm_pool_router
 from app.routers.admin_runners import router as admin_runners_router
 from app.routers.runner import router as runner_router
@@ -107,7 +112,7 @@ logger = logging.getLogger(__name__)
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0468"
+EXPECTED_SCHEMA_REVISION = "0530"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -168,6 +173,57 @@ _current_sha: str = os.getenv("DEPLOY_SHA", "unknown")
 
 
 # Webhook dedup state moved to app.routers.github
+
+
+def _verify_encryption_config():
+    """Validate encryption configuration at startup.
+
+    On Cloud Run (``K_REVISION`` is set): require ``GITHUB_PAT_ENCRYPTION_KEY``
+    to be configured — raise ``RuntimeError`` so the deploy fails immediately
+    instead of silently storing credentials in plaintext.
+
+    In development/test (``K_REVISION`` not set): warn when both the encryption
+    key and ``ALLOW_PLAINTEXT_CREDENTIALS`` are absent, so developers know to
+    either configure a key or set the opt-in flag.
+    """
+    from app.field_encryption import (
+        ENCRYPTION_KEY_ENV,
+        ALLOW_PLAINTEXT_CREDENTIALS_ENV,
+        is_encryption_active,
+    )
+
+    if is_encryption_active():
+        return
+
+    on_cloud_run = bool(os.getenv("K_REVISION"))
+    if on_cloud_run:
+        msg = (
+            f"[STARTUP] {ENCRYPTION_KEY_ENV} is not set — field encryption is "
+            "unavailable. This is a fatal configuration error in production. "
+            "Set the environment variable to a valid Fernet key before deploying."
+        )
+        logger.error(msg)
+        raise RuntimeError(msg)
+    else:
+        allow_plaintext = os.getenv(ALLOW_PLAINTEXT_CREDENTIALS_ENV)
+        if not allow_plaintext:
+            logger.warning(
+                "[STARTUP] %s is not set and %s is not set — "
+                "field encryption will be a no-op. "
+                "Set %s=true if this is intentional for development, "
+                "or configure %s for production-grade encryption.",
+                ENCRYPTION_KEY_ENV,
+                ALLOW_PLAINTEXT_CREDENTIALS_ENV,
+                ALLOW_PLAINTEXT_CREDENTIALS_ENV,
+                ENCRYPTION_KEY_ENV,
+            )
+        else:
+            logger.warning(
+                "[STARTUP] %s is not set but %s=true — "
+                "credentials will be stored in plaintext (development mode).",
+                ENCRYPTION_KEY_ENV,
+                ALLOW_PLAINTEXT_CREDENTIALS_ENV,
+            )
 
 
 async def _verify_schema_version():
@@ -656,33 +712,42 @@ async def _init_deployment_state():
             state.current_revision = _current_revision
             state.current_sha = _current_sha
             state.deployed_at = _utcnow()
+            # Snapshot the scalars read after the commit attempts below: a
+            # contended commit degrades via rollback inside
+            # _best_effort_deploy_state_commit, which expires ``state`` — a
+            # subsequent attribute read would raise MissingGreenlet (#14328
+            # snapshot-before-rollback pattern).
+            rolled_back_from_sha = state.rolled_back_from_sha
+            rollback_count = state.rollback_count
+            last_known_good_revision = state.last_known_good_revision
             session.add(state)
             await _best_effort_deploy_state_commit(session)
 
             logger.warning(
-                f"[DEPLOY] ROLLBACK DETECTED — reverted from {state.rolled_back_from_sha[:8]} to {_current_sha[:8]} "
-                f"(consecutive rollbacks: {state.rollback_count})"
+                f"[DEPLOY] ROLLBACK DETECTED — reverted from {(rolled_back_from_sha or '')[:8]} to {_current_sha[:8]} "
+                f"(consecutive rollbacks: {rollback_count})"
             )
 
             await _create_rollback_alerts(
-                session, state.rolled_back_from_sha or "", _current_sha
+                session, rolled_back_from_sha or "", _current_sha
             )
             await _best_effort_deploy_state_commit(session)
 
-            if state.rollback_count >= 3:
+            if rollback_count >= 3:
+                halted_at = _utcnow()
                 state.status = DeploymentStatus.HALTED
-                state.halted_at = _utcnow()
+                state.halted_at = halted_at
                 session.add(state)
                 await _best_effort_deploy_state_commit(session)
                 logger.error(
-                    f"[DEPLOY] HALTED — {state.rollback_count} consecutive rollbacks, manual intervention required"
+                    f"[DEPLOY] HALTED — {rollback_count} consecutive rollbacks, manual intervention required"
                 )
                 _runtime_config["max_concurrent_vms"] = 0
                 await _create_halted_alerts(
                     session,
-                    state.rollback_count,
-                    state.last_known_good_revision,
-                    state.halted_at,
+                    rollback_count,
+                    last_known_good_revision,
+                    halted_at,
                 )
                 await _best_effort_deploy_state_commit(session)
             return
@@ -748,9 +813,14 @@ async def _init_deployment_state():
             deploy_monitoring["window_start"] = _utcnow()
             state.status = DeploymentStatus.MONITORING
         session.add(state)
+        # Snapshot before the commit attempt: a contended commit degrades via
+        # rollback inside _best_effort_deploy_state_commit, which expires
+        # ``state`` — reading state.status afterwards would raise
+        # MissingGreenlet (#14328 snapshot-before-rollback pattern).
+        status_snapshot = state.status
         await _best_effort_deploy_state_commit(session)
         logger.info(
-            f"[DEPLOY] New deploy detected — revision={_current_revision}, status={state.status}, starting monitoring window"
+            f"[DEPLOY] New deploy detected — revision={_current_revision}, status={status_snapshot}, starting monitoring window"
         )
 
 
@@ -835,9 +905,12 @@ app.include_router(admin_router)
 app.include_router(admin_projects_router)
 app.include_router(admin_project_strategic_session_router)
 app.include_router(admin_settings_router)
+app.include_router(admin_migration_exemptions_router)
 app.include_router(admin_debug_router)
 app.include_router(admin_pool_accounts_router)
 app.include_router(admin_project_config_router)
+app.include_router(admin_project_tools_router)
+app.include_router(admin_project_tools_asset_router)
 app.include_router(admin_warm_pool_router)
 app.include_router(admin_runners_router)
 app.include_router(runner_router)
@@ -1458,7 +1531,7 @@ async def resolve_artifact_download_url(
         StorageUriError,
         generate_download_signed_url,
         parse_artifact_uri,
-        task_id_for_artifact_uri,
+        verify_artifact_project_ownership,
     )
 
     # 1. Scheme + bucket allowlist. Reject malformed/out-of-bucket before any
@@ -1469,43 +1542,59 @@ async def resolve_artifact_download_url(
         logger.info("[ARTIFACT] rejected download reference: %s", exc)
         raise HTTPException(status_code=400, detail="Invalid artifact reference")
 
-    # 2. Bind the reference to its owning task or compute job, then authorize
-    # the caller for that project's membership. A reference that doesn't resolve
-    # to something the caller may access is indistinguishable from "not found".
-    owning_task_id = task_id_for_artifact_uri(storage_uri)
-    if owning_task_id is not None:
-        task = await _get_user_task(owning_task_id, current_user["user_id"], session)
-        if task.project_id != project_id:
-            # Reference belongs to a different project than the one the operator
-            # is viewing — reject as not-found rather than confirming it exists.
-            raise HTTPException(status_code=404, detail="Artifact not found")
-    else:
-        owning_compute_job_id = compute_job_id_for_artifact_uri(storage_uri)
-        if owning_compute_job_id is None:
-            raise HTTPException(status_code=404, detail="Artifact not found")
-        from app.models import ComputeJob  # noqa: PLC0415
+    # 2a. User membership in the claimed project.
+    await _get_user_project(project_id, current_user["user_id"], session)
+
+    # 2b. Artifact→project ownership via the centralized helper. A reference
+    # that doesn't resolve to a task or compute-job prefix is rejected as
+    # not-found so unrecognised prefixes can't be probed.
+    try:
+        await verify_artifact_project_ownership(storage_uri, project_id, session)
+    except StorageUriError:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+
+    # 2c. Compute-job URIs have an additional guard: only the recorded terminal
+    # outputs are signable; unknown siblings under the same prefix are
+    # indistinguishable from "not found".
+    owning_compute_job_id = compute_job_id_for_artifact_uri(storage_uri)
+    if owning_compute_job_id is not None:
+        from app.models import ComputeJob, Artifact, ComputeJobFile  # noqa: PLC0415
 
         job = await session.get(ComputeJob, owning_compute_job_id)
-        if job is None:
-            raise HTTPException(status_code=404, detail="Artifact not found")
-        await _get_user_project(job.project_id, current_user["user_id"], session)
-        if job.project_id != project_id:
-            raise HTTPException(status_code=404, detail="Artifact not found")
-
-        # Project membership is necessary but not sufficient for compute-job
-        # URIs. Only the recorded terminal outputs are allowed; unknown siblings
-        # under the same prefix are indistinguishable from "not found".
         allowed_uris: set[str] = set()
-        if job.result_reference:
+        if job and job.result_reference:
             allowed_uris.add(job.result_reference)
-        if job.artifact_id is not None:
-            from app.models import Artifact  # noqa: PLC0415
-
+        if job and job.artifact_id is not None:
             artifact = await session.get(Artifact, job.artifact_id)
             if artifact is not None and artifact.storage_uri:
                 allowed_uris.add(artifact.storage_uri)
+        # Individually-addressable viewable files (images/videos) recorded in the
+        # job's `viewable_files` manifest are also signable — they let the canvas
+        # preview a run's plots/images inline. Only URIs actually recorded in the
+        # manifest are allowed; unknown siblings under the same prefix stay 404.
+        if job:
+            viewable = (job.polling_metadata or {}).get("viewable_files")
+            if isinstance(viewable, list):
+                for entry in viewable:
+                    if not isinstance(entry, dict):
+                        continue
+                    viewable_uri = entry.get("storage_uri")
+                    if isinstance(viewable_uri, str) and viewable_uri:
+                        allowed_uris.add(viewable_uri)
         if storage_uri not in allowed_uris:
-            raise HTTPException(status_code=404, detail="Artifact not found")
+            # 2c-iii. Per-file compute job media: individually-addressable
+            # viewable files extracted from the bundle are recorded as
+            # ComputeJobFile rows — query by storage_uri and verify the
+            # owning job matches.
+            from sqlalchemy import select as _select  # noqa: PLC0415
+
+            cjf_query = _select(ComputeJobFile).where(
+                ComputeJobFile.storage_uri == storage_uri
+            )
+            cjf_result = await session.execute(cjf_query)
+            cjf = cjf_result.scalar_one_or_none()
+            if cjf is None or cjf.compute_job_id != owning_compute_job_id:
+                raise HTTPException(status_code=404, detail="Artifact not found")
 
     # 3. Sign. Validation already passed, so any failure here is a storage
     # outage, not a bad reference.
@@ -1515,7 +1604,7 @@ async def resolve_artifact_download_url(
         # Defensive: should be unreachable since step 1 validated the URI.
         raise HTTPException(status_code=400, detail="Invalid artifact reference")
     except Exception as exc:
-        logger.warning("[ARTIFACT] signing failed for task %s: %s", owning_task_id, exc)
+        logger.warning("[ARTIFACT] signing failed for %s: %s", storage_uri, exc)
         raise HTTPException(status_code=503, detail="Artifact storage unavailable")
     return {"url": url}
 

@@ -19,6 +19,7 @@ from typing import Any, Dict, List
 import uuid
 from datetime import datetime
 
+from pydantic import BaseModel
 from sqlalchemy import (
     Boolean,
     Column,
@@ -286,6 +287,21 @@ class ReleaseVersion(SQLModel, table=True):
         back_populates="version"
     )
 
+    # Cumulative tally of merged tasks that failed to record criterion evidence,
+    # persisted per open version so operators can see the gap without trawling
+    # logs.  Shape (all counts are cumulative since the version was opened):
+    #   {
+    #     "no_criteria": int,          -- task carried no criterion_ids at all
+    #     "verdict_not_proven": int,   -- task merged but verdict was not proven
+    #     "no_active_criteria": int,   -- criterion_ids present but no active rows
+    #     "unmatched_criterion_ids": list[str],  -- keys that found no active row
+    #   }
+    # NULL until the first gap is recorded (additive migration).
+    merge_evidence_gaps: Dict[str, Any] | None = Field(
+        default=None,
+        sa_column=Column(JSONB, nullable=True),
+    )
+
     created_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
@@ -305,6 +321,10 @@ class ReleaseVersion(SQLModel, table=True):
         Index("ix_releaseversion_project_opened_at", "project_id", "opened_at"),
         Index("ix_releaseversion_project_served_at", "project_id", "served_at"),
         Index("ix_releaseversion_project_promoted_at", "project_id", "promoted_at"),
+        # Standalone status index for cross-project scans (metrics sweep,
+        # release qualifier sweep, etc.) that filter by status without
+        # a project_id constraint.
+        Index("ix_releaseversion_status", "status"),
         UniqueConstraint(
             "project_id",
             "version_number",
@@ -963,4 +983,287 @@ class AuditFindingResolution(SQLModel, table=True):
             name="uq_auditfindingresolution_version_key",
         ),
     )
+
+
+class QualificationDimensionResult(SQLModel, table=True):
+    """Per-(candidate_sha, dimension) qualification fact ledger (Phase 1).
+
+    Design doc "From Batch Attempts to a Per-Dimension Fact Ledger: Restructuring
+    Qualification for Failure-Isolation and Incremental Scoring" (section 3).
+
+    Today a qualification attempt is monolithic: ``_finalize_qualification``
+    computes every gate/dimension, folds them into one ``last_qualification``
+    blob (overwritten every finalize) plus one immutable ``QualificationVerdict``
+    row, and a single failed gate discards the whole audit.  This table records
+    ONE row PER dimension PER candidate tree, so a later re-check of one gate can
+    re-run and re-record only its own ``(release_version_id, candidate_sha,
+    dimension)`` fact without discarding the other dimensions that already
+    passed for the same tree.
+
+    Phase 1 is a DUAL-WRITE: ``_finalize_qualification`` writes these rows
+    ALONGSIDE the existing ``last_qualification`` / ``QualificationVerdict``
+    writes and changes no decision logic.  Writes are best-effort — a failure to
+    record a dimension row must NEVER break or roll back a qualification or
+    promotion (mirrors ``_record_qualification_verdict``).
+
+    A unique constraint on ``(release_version_id, candidate_sha, dimension)``
+    makes a repeat write for the same tree an UPSERT (latest write wins) rather
+    than a duplicate; ``release_qualifier._upsert_dimension_result`` performs
+    that SELECT-then-INSERT/UPDATE upsert.
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+
+    project_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("project.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        ),
+    )
+
+    release_version_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("releaseversion.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        ),
+    )
+
+    # The candidate tree (automain HEAD SHA) this dimension result is FOR.
+    # Nullable per migration linter rules and to match QualificationVerdict; in
+    # practice always set at finalize (the upsert key relies on it).
+    candidate_sha: str | None = Field(
+        default=None,
+        sa_column=Column(String(40), nullable=True),
+    )
+
+    # Which qualification dimension this row records — one of: audit,
+    # migration_identity, migration_apply, ci, smoketest, merge_grade,
+    # test_erosion, acceptance_window, debt_pressure, challenge.
+    dimension: str = Field(
+        sa_column=Column(String(32), nullable=False),
+    )
+
+    # Outcome for this dimension: passed | failed | blocked | unavailable | pending.
+    status: str = Field(
+        sa_column=Column(String(16), nullable=False),
+    )
+
+    # Per-dimension score in [0,1] when the dimension is numerically scored
+    # (audit / test_erosion / smoketest / merge-grade coverage / debt pressure /
+    # acceptance fraction).  NULL for the boolean/verdict dimensions.
+    sub_score: float | None = Field(
+        default=None,
+        sa_column=Column(Float, nullable=True),
+    )
+
+    # Hard-blocker code when this dimension forced the composite confidence to
+    # 0.0 (e.g. ci_not_green, migration_apply_drift, audit_missing), else NULL.
+    blocker: str | None = Field(
+        default=None,
+        sa_column=Column(String(64), nullable=True),
+    )
+
+    # Content hash of the audited surface, for cross-SHA fact reuse in later
+    # phases (a commit differing only in CI/fixture files can reuse the fact).
+    audited_surface_hash: str | None = Field(
+        default=None,
+        sa_column=Column(String(64), nullable=True),
+    )
+
+    # Dimension-specific evidence (ci_resolution, migration detail, merge-grade
+    # certificate, acceptance aggregate, debt snapshot, challenge summary, ...).
+    detail: Any | None = Field(
+        default=None,
+        sa_column=Column(JSONB, nullable=True),
+    )
+
+    # The child agent task that produced this dimension's evidence, when any
+    # (audit / smoketest / challenge / merge-grade); NULL for gates computed
+    # inline (ci / migration_identity / migration_apply).
+    producing_task_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(GUID(), nullable=True),
+    )
+
+    computed_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "release_version_id",
+            "candidate_sha",
+            "dimension",
+            name="uq_qualdimresult_version_sha_dimension",
+        ),
+    )
+
+
+class CategoryVerdict(SQLModel, table=True):
+    """Per-(candidate_sha, category) RE-GRADEABLE acceptance verdict.
+
+    Goal-verification redesign persistence layer.  Replaces the *monotonic*
+    ``CriterionEvidence`` accumulation (where a criterion, once it had any
+    evidence row, could never lose coverage) with a per-candidate verdict that
+    a re-grade OVERWRITES — so a category that regressed on a newer candidate
+    tree flips back to ``not_met`` instead of staying satisfied forever.
+
+    One row PER ``(version_id, candidate_sha, category_key)``.  Re-grading a
+    single category is an UPSERT on that key: it rewrites ONLY its own row and
+    never touches another category's verdict (within-candidate isolation).  The
+    active category set is authored as ``VersionAcceptanceCriterion`` rows
+    (``category_key`` here corresponds to ``VersionAcceptanceCriterion``'s
+    ``criterion_key``); an active criterion with no ``met`` verdict for a
+    candidate is NOT met (fail-closed) — see
+    :func:`app.category_verdict_ledger.is_candidate_fully_met`.
+
+    ``category_key`` is nullable and the ``candidate_sha`` is nullable per the
+    migration-linter rules and to mirror ``QualificationDimensionResult``; in
+    practice both are always set at grade time (the upsert key relies on them).
+    """
+
+    __tablename__ = "categoryverdict"
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+
+    version_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("releaseversion.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        ),
+    )
+
+    # The candidate tree (automain HEAD SHA) this verdict is FOR.  Nullable per
+    # migration-linter rules; the upsert key relies on it in practice.
+    candidate_sha: str | None = Field(
+        default=None,
+        sa_column=Column(String(40), nullable=True),
+    )
+
+    # The acceptance category — corresponds to
+    # ``VersionAcceptanceCriterion.criterion_key`` for the version.
+    category_key: str | None = Field(
+        default=None,
+        sa_column=Column(String(64), nullable=True),
+    )
+
+    # Verdict for this category on this candidate: met | not_met | partial.
+    status: str = Field(
+        sa_column=Column(String(16), nullable=False),
+    )
+
+    # How the verdict was reached: judged (LLM grader) | machine (deterministic).
+    tier: str = Field(
+        sa_column=Column(String(16), nullable=False),
+    )
+
+    # Human/agent-readable description of what is still missing when the verdict
+    # is not_met/partial; NULL when fully met.
+    gap: str | None = Field(
+        default=None,
+        sa_column=Column(Text, nullable=True),
+    )
+
+    # Supporting citations (file paths, PR refs, evidence blobs) backing the
+    # verdict.  Free-form JSON (list or dict).
+    citations: Any | None = Field(
+        default=None,
+        sa_column=Column(JSONB, nullable=True),
+    )
+
+    graded_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+
+    # The grader run (agent task / attempt id) that produced this verdict, for
+    # provenance and cache-key invalidation.  Nullable.
+    grader_run_id: str | None = Field(
+        default=None,
+        sa_column=Column(String(64), nullable=True),
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "version_id",
+            "candidate_sha",
+            "category_key",
+            name="uq_categoryverdict_version_sha_category",
+        ),
+    )
+
+
+class ResidualVerdict(SQLModel, table=True):
+    """Per-(candidate_sha) "is any goal aspect uncaptured by the categories?".
+
+    Goal-verification redesign persistence layer.  The category verdicts prove
+    each authored acceptance criterion; the residual records whether the union
+    of those categories still LEAVES a gap — a goal aspect no category covers.
+    A non-null ``uncaptured_gap`` means the candidate cannot be considered fully
+    met even if every category is ``met``
+    (:func:`app.category_verdict_ledger.is_candidate_fully_met`).
+
+    One row PER ``(version_id, candidate_sha)``; a re-grade UPSERTs it.
+    """
+
+    __tablename__ = "residualverdict"
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+
+    version_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("releaseversion.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        ),
+    )
+
+    # The candidate tree (automain HEAD SHA) this residual is FOR.  Nullable per
+    # migration-linter rules; the upsert key relies on it in practice.
+    candidate_sha: str | None = Field(
+        default=None,
+        sa_column=Column(String(40), nullable=True),
+    )
+
+    # Description of the goal aspect no acceptance category captures; NULL/absent
+    # means the categories fully span the goal (no residual gap).
+    uncaptured_gap: str | None = Field(
+        default=None,
+        sa_column=Column(Text, nullable=True),
+    )
+
+    graded_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "version_id",
+            "candidate_sha",
+            name="uq_residualverdict_version_sha",
+        ),
+    )
+
+
+class DimensionState(BaseModel):
+    """Read-side projection of a single qualification dimension's state.
+
+    Not a DB model — derived from ``last_qualification`` by
+    :func:`app.qualification_state_resolver.resolve_dimension_states`.
+    """
+
+    key: str
+    label: str
+    status: str  # "passed" | "failed" | "unavailable" | "not_applicable" | "pending"
+    score: float | None = None
+    reason: str | None = None
 

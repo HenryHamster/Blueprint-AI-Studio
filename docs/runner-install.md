@@ -71,6 +71,12 @@ This does all of the following for you:
   blueprint-runner.service`;
 - runs `loginctl enable-linger "$USER"` so the runner starts at boot even with no
   active login session;
+- **bootstraps the agent's Node.js dependencies** (`npm ci` in `agent/`) as a
+  best-effort step — so the runner can claim agent tasks immediately without
+  a manual `cd agent && npm install` step. Pass `--no-agent-deps` to skip this
+  (e.g. if you manage deps on your own cycle or have a compute-only runner).
+  If `npm` is not on `PATH`, a clear warning is printed (the install still
+  succeeds);
 - verifies the unit is **active** and **enabled** and prints the `journalctl`
   follow command — it returns non-zero (and does not claim success) if any step
   fails.
@@ -192,6 +198,19 @@ python3 scripts/local_runner.py --check
 Exit code `0` means the orchestrator is reachable, the token is valid, and at
 least one task class is claimable. Non-zero means something is misconfigured —
 read the preflight output for details.
+
+The preflight now also checks for missing agent Node.js dependencies. If the
+agent source (`agent/src/index.ts`) exists on this host but `npm install` was
+never run, you will see:
+
+```
+    agent deps  : MISSING — run `cd agent && npm install` (or re-run
+                  `blueprint-runner install`, which now bootstraps them).
+```
+
+This is an **actionable** warning — it prints only when agent source is detected
+on the host but the `tsx` development-server entry point is unavailable. A
+compute-only runner (no agent source) stays quiet.
 
 ---
 

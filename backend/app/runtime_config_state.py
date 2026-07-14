@@ -25,6 +25,23 @@ logger = logging.getLogger(__name__)
 # Lock for multi-key runtime config updates (prevents reading partial state between two assignments)
 runtime_config_lock = asyncio.Lock()
 
+_GATE_MODES = ("off", "observe", "enforce")
+
+
+def resolve_capability_proof_gate_mode_default(default: str = "observe") -> str:
+    """Resolve the boot-time ``capability_proof_gate_mode`` from the environment.
+
+    Reads ``CAPABILITY_PROOF_GATE_MODE`` and validates it against the three legal
+    modes, falling back to ``default`` (``"observe"`` — see the staged-rollout
+    note on the ``runtime_config`` entry) for an unset or unrecognized value.
+
+    Extracted as a named pure helper (rather than an inline dict-literal
+    expression) so the shipped default is directly unit-testable without reloading
+    this heavy module.
+    """
+    raw = os.getenv("CAPABILITY_PROOF_GATE_MODE", default).lower()
+    return raw if raw in _GATE_MODES else default
+
 # --- Runtime Config (adjustable via admin API) ---
 runtime_config: Dict = {
     "max_concurrent_vms": int(os.getenv("MAX_CONCURRENT_VMS", "8")),
@@ -271,6 +288,50 @@ runtime_config: Dict = {
     if os.getenv("COMPLETION_DEBT_WEIGHT_MODE", "observe").lower()
     in ("off", "observe", "enforce")
     else "observe",
+    # Rollout mode for the capability proof gate — controls whether prerequisite
+    # resolution gates on machine-verified proof (enforce) or allows self-reported
+    # working status (off/observe).
+    #   off     — proof status is advisory only; never blocks prerequisite resolution.
+    #   observe — proof status is recorded and surfaced but does not block.
+    #   enforce — unproven capabilities do not satisfy prerequisite resolution.
+    #
+    # STAGED ROLLOUT (audit finding #4 — "default-off means none of this
+    # enforcement binds by default"): the gate now ships default **"observe"**,
+    # not "off". Observe is the safe first stage — it records and surfaces the
+    # unproven-capability delta and logs on every self-reported resolution WITHOUT
+    # changing any resolution or promotion behaviour, so the enforcement plumbing
+    # is exercised (and its blind spots become visible) the moment the platform
+    # boots, instead of lying inert until an operator remembers to flip it.
+    #   Operational risk of default-observe: NONE beyond extra WARNING logs and a
+    #   recorded (never-blocking) release dimension — observe cannot gate a spawn,
+    #   a blocked-resume, or a promotion.
+    #   Explicit flip criterion off/observe -> enforce (operator-gated, via
+    #   PATCH /api/admin/settings or the auto-graduation sweep): flip to "enforce"
+    #   only once fleet-wide proof coverage of *working* capabilities clears
+    #   ``capability_proof_gate_auto_graduation_enforce_threshold`` (0.95) — the
+    #   same ratio the auto-graduation sweep already tracks — so enforce does not
+    #   strand real work behind capabilities that are genuinely proven but simply
+    #   have not been through the earn loop yet.
+    "capability_proof_gate_mode": resolve_capability_proof_gate_mode_default(),
+    # Auto-graduation sweep for the capability proof gate. When enabled, the
+    # metrics-integrity sweep automatically advances the gate mode (off→observe→enforce)
+    # based on fleet-wide proof coverage. Disabled by default — operators must opt in.
+    # The thresholds are the minimum proof-coverage ratios required for each step:
+    # observe_threshold for off→observe, enforce_threshold for observe→enforce.
+    "capability_proof_gate_auto_graduation_enabled": os.getenv(
+        "CAPABILITY_PROOF_GATE_AUTO_GRADUATION_ENABLED", "false"
+    ).lower()
+    in ("1", "true", "yes"),
+    "capability_proof_gate_auto_graduation_observe_threshold": float(
+        os.getenv(
+            "CAPABILITY_PROOF_GATE_AUTO_GRADUATION_OBSERVE_THRESHOLD", "0.5"
+        )
+    ),
+    "capability_proof_gate_auto_graduation_enforce_threshold": float(
+        os.getenv(
+            "CAPABILITY_PROOF_GATE_AUTO_GRADUATION_ENFORCE_THRESHOLD", "0.95"
+        )
+    ),
     # Co-change auto-decomposition: split a medium research finding's files into
     # independent co-change/dir clusters and spawn one small sub-finding per
     # cluster (research_completion -> cochange_decomposition.py). Default OFF:
@@ -478,9 +539,11 @@ runtime_config: Dict = {
             "haiku": "claude-haiku-4-5-20251001",
         },
         "openai": {
-            "opus": "gpt-5.4",
-            "sonnet": "gpt-5.3-codex",
-            "haiku": "gpt-5.4-mini",
+            # GPT-5.6 picker trio (2026-07): sol=frontier, terra=balanced,
+            # luna=fast/affordable. gpt-5.3-codex left the picker this cycle.
+            "opus": "gpt-5.6-sol",
+            "sonnet": "gpt-5.6-terra",
+            "haiku": "gpt-5.6-luna",
         },
         "gemini": {
             "opus": "gemini-2.5-pro",
@@ -605,22 +668,24 @@ runtime_config: Dict = {
             # strategic (max) gets high because the prose *is* the deliverable
             # (design docs and strategic reviews).
             "low": {
-                "model": "gpt-5.4-mini",
+                "model": "gpt-5.6-luna",
                 "reasoning_effort": "low",
                 "verbosity": "low",
             },
             "medium": {
-                "model": "gpt-5.4-mini",
+                "model": "gpt-5.6-terra",
                 "reasoning_effort": "medium",
                 "verbosity": "low",
             },
             "high": {
-                "model": "gpt-5.4",
+                "model": "gpt-5.6-sol",
                 "reasoning_effort": "high",
                 "verbosity": "medium",
             },
+            # xhigh (not the 5.6-only max/ultra levels) so a fallback or an
+            # operator override to an older-gen model keeps a valid level.
             "max": {
-                "model": "gpt-5.4",
+                "model": "gpt-5.6-sol",
                 "reasoning_effort": "xhigh",
                 "verbosity": "high",
             },
@@ -933,6 +998,15 @@ runtime_config: Dict = {
     # Takes precedence over the boolean pair when set to "shadow" or "on".
     # Default "off" preserves the legacy boolean-flag semantics.
     "review_fix_lane_pilot_mode": "off",
+    # Event-driven qualification trigger mode.  Controls whether the sweep-based
+    # qualification trigger resolver (qualification_triggers.py) actually fires
+    # run_qualification for matched versions:
+    #   "observe" (default) — resolver runs and logs would-fire decisions without
+    #                          spawning any qualification.  Compare against actual
+    #                          strategist/sweep activity before flipping to "on".
+    #   "on"                — resolver fires run_qualification for matched versions.
+    #   "off"               — resolver does not run at all (legacy behavior).
+    "auto_qualification_triggers": "observe",
     # Account-agnostic lease: when True, a same-tenant IDLE pool member may be
     # leased for a task whose resolved account (and model) differ from the
     # member's frozen boot account, and the warm-claim path re-materializes the
@@ -950,6 +1024,18 @@ runtime_config: Dict = {
     # only read-only (non-merging) task types are accepted.
     # Set via /api/admin/settings.
     "cloud_run_task_type_allowlist": [],
+    # Operator-approved, audited Alembic migration-divergence exemptions. Each
+    # entry is a dict carrying the AuthorizedDivergence match fields (revision,
+    # parent_revision, deployed_identity, integration_identity, created_table,
+    # integration_revision) PLUS audit metadata (added_by, added_at ISO-8601,
+    # reason). The effective exemption list the deployed migration-safety gates
+    # consult is (baked AUTHORIZED_DIVERGENCES) UNION (valid entries here), so a
+    # NEW operator-approved exemption is honored WITHOUT a redeploy — see
+    # migration_reconciliation.effective_authorized_divergences(). Default EMPTY
+    # (no runtime exemptions until an operator adds one), so the change is inert
+    # on merge. Malformed entries are dropped defensively on rehydrate — this
+    # value gates a safety check and a garbage row must never weaken it.
+    "migration_divergence_exemptions": [],
     # Per-project warm-pool enablement scope (allowlist). An EMPTY list (the
     # default) means the pool is fleet-wide — the legacy all-or-nothing behavior
     # where the maintainer reconciles every demand-active project once
@@ -1309,6 +1395,9 @@ _DORMANT_MODE_KNOBS = {
     ),
     "completion_debt_weight_mode": (
         "Completion-debt pressure signal observe-mode: recorded in sub_scores, not blended into confidence"
+    ),
+    "capability_proof_gate_mode": (
+        "Capability proof gate not yet enforcing (off/observe)"
     ),
 }
 # Master feature flags that ship OFF still owe an enablement decision.
@@ -1830,11 +1919,16 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     "task_type_provider_overrides",
                     "autonomous_periodic_tasks",
                     "health_check_urls",
-                    "notification_config",
                     "deploy_repo_identity",
                 ):
                     if key in config_json:
                         _set(key, config_json[key])
+                if "notification_config" in config_json:
+                    nc = config_json["notification_config"]
+                    if isinstance(nc, dict) and nc.get("webhook_url"):
+                        from app.field_encryption import decrypt_field
+                        nc = {**nc, "webhook_url": decrypt_field(nc["webhook_url"]) or ""}
+                    _set("notification_config", nc)
                 if "autonomous_spawn_budget_mode" in config_json:
                     raw_mode = (
                         str(config_json["autonomous_spawn_budget_mode"] or "")
@@ -2086,6 +2180,33 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     )
                     if raw_mode in ("off", "observe", "enforce"):
                         _set("metrics_integrity_sweep_mode", raw_mode)
+                # Capability proof gate: mode + auto-graduation config. Persisted
+                # so an operator enable/tune survives a Cloud Run restart and
+                # reaches the leader across instances.
+                if "capability_proof_gate_mode" in config_json:
+                    raw_mode = (
+                        str(config_json["capability_proof_gate_mode"] or "")
+                        .strip()
+                        .lower()
+                    )
+                    if raw_mode in ("off", "observe", "enforce"):
+                        _set("capability_proof_gate_mode", raw_mode)
+                if "capability_proof_gate_auto_graduation_enabled" in config_json:
+                    _set(
+                        "capability_proof_gate_auto_graduation_enabled",
+                        bool(config_json["capability_proof_gate_auto_graduation_enabled"]),
+                    )
+                for _cap_grad_float_key in (
+                    "capability_proof_gate_auto_graduation_observe_threshold",
+                    "capability_proof_gate_auto_graduation_enforce_threshold",
+                ):
+                    if _cap_grad_float_key in config_json:
+                        try:
+                            _fval = float(config_json[_cap_grad_float_key])
+                            if 0.0 <= _fval <= 1.0:
+                                _set(_cap_grad_float_key, _fval)
+                        except (TypeError, ValueError):
+                            pass
                 for _mi_int_key in (
                     "metrics_integrity_sweep_interval_minutes",
                     "metrics_integrity_sweep_max_checks",
@@ -2243,6 +2364,30 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                         _set(
                             "cloud_run_task_type_allowlist",
                             sorted({str(t).strip() for t in raw_allow if str(t).strip()}),
+                        )
+                if "migration_divergence_exemptions" in config_json:
+                    # Persisted operator-approved Alembic migration-divergence
+                    # exemptions. Validate/normalize each entry through the SAME
+                    # helper the resolver uses so the DB store and the live gate
+                    # agree on what counts as well-formed, and DROP malformed
+                    # rows — this value gates a deploy-safety check, so a garbage
+                    # row must never weaken it. Lazy import avoids a module-level
+                    # cycle (migration_reconciliation reads runtime_config).
+                    raw_exemptions = config_json["migration_divergence_exemptions"]
+                    if isinstance(raw_exemptions, (list, tuple)):
+                        from app.migration_reconciliation import (
+                            normalize_runtime_divergence_exemption,
+                        )
+
+                        normalized_exemptions = [
+                            norm
+                            for entry in raw_exemptions
+                            if (norm := normalize_runtime_divergence_exemption(entry))
+                            is not None
+                        ]
+                        _set(
+                            "migration_divergence_exemptions",
+                            normalized_exemptions,
                         )
                 if "warm_pool_account_retarget_enabled" in config_json:
                     _set(
@@ -2674,3 +2819,15 @@ def is_review_fix_lane_pilot_shadow_mode_enabled() -> bool:
     can actually be created.
     """
     return is_improvement_lanes_enabled() and get_lane_pilot_mode() == "shadow"
+
+
+def get_auto_qualification_triggers_mode() -> str:
+    """Return the event-driven qualification trigger mode.
+
+    Values: "observe" (default, logs decisions without spawning),
+    "on" (actively fires run_qualification), "off" (resolver does not run).
+    """
+    raw = runtime_config.get("auto_qualification_triggers", "observe")
+    if raw in ("on", "observe", "off"):
+        return raw
+    return "observe"

@@ -2988,3 +2988,109 @@ class TestDeadLetterRouter:
             json={"project_id": str(project.id), "ids": [str(uuid.uuid4())] * 201},
         )
         assert resp.status_code == 422  # Pydantic validation error
+
+
+# ---------------------------------------------------------------------------
+# Encryption of webhook_url at rest
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_webhook_url_encrypted_at_rest_when_key_set(db_session, monkeypatch):
+    """When GITHUB_PAT_ENCRYPTION_KEY is set, webhook_url is encrypted in the DB
+    and transparently decrypted by list_dead_letters / redrive_dead_letter."""
+    from cryptography.fernet import Fernet
+    from app.field_encryption import decrypt_field
+    from app.notification_dispatch import list_dead_letters as _list_dl
+
+    key = Fernet.generate_key().decode()
+    monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", key)
+
+    _reset_stats()
+    pid = uuid.uuid4()
+
+    entry = _RetryEntry(
+        project_id=pid,
+        event_type="encrypt_test",
+        payload={"k": "v"},
+        body={"event_type": "encrypt_test"},
+        attempts=0,
+        next_retry_at=0,
+        webhook_url="https://hooks.secret.example.com/abc123token",
+    )
+    await nd._write_dead_letter(entry, reason="exhausted", last_status=500)
+
+    from sqlmodel import select as _select
+
+    rows = (
+        (
+            await db_session.execute(
+                _select(NotificationDeadLetter).where(
+                    NotificationDeadLetter.project_id == str(pid),
+                    NotificationDeadLetter.event_type == "encrypt_test",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 1
+    stored = rows[0].webhook_url
+    # The DB value must be encrypted (different from plaintext)
+    assert stored != "https://hooks.secret.example.com/abc123token"
+    # The stored value must decrypt correctly
+    assert decrypt_field(stored) == "https://hooks.secret.example.com/abc123token"
+
+    # list_dead_letters transparently decrypts
+    items, total = await _list_dl(db_session, project_id=pid)
+    assert total >= 1
+    dl_row = next(i for i in items if i["event_type"] == "encrypt_test")
+    assert dl_row["webhook_url"] == "https://hooks.secret.example.com/abc123token"
+
+    # redrive_dead_letter transparently decrypts
+    from app.notification_dispatch import redrive_dead_letter as _redrive
+
+    dl_id = str(rows[0].id)
+    result = await _redrive(db_session, dead_letter_id=dl_id, project_id=str(pid))
+    assert result["status"] == "redriven"
+    assert len(nd._retry_queue) >= 1
+    redriven = next(e for e in nd._retry_queue if e.event_type == "encrypt_test")
+    assert redriven.webhook_url == "https://hooks.secret.example.com/abc123token"
+
+
+@pytest.mark.asyncio
+async def test_webhook_url_not_encrypted_without_key(db_session, monkeypatch):
+    """When GITHUB_PAT_ENCRYPTION_KEY is NOT set, webhook_url is stored and
+    retrieved as plaintext (graceful degradation for dev/test environments)."""
+    monkeypatch.delenv("GITHUB_PAT_ENCRYPTION_KEY", raising=False)
+    _reset_stats()
+    pid = uuid.uuid4()
+
+    entry = _RetryEntry(
+        project_id=pid,
+        event_type="no_key_test",
+        payload={"k": "v"},
+        body={"event_type": "no_key_test"},
+        attempts=0,
+        next_retry_at=0,
+        webhook_url="https://hooks.plain.example.com/notoken",
+    )
+    await nd._write_dead_letter(entry, reason="exhausted", last_status=500)
+
+    from sqlmodel import select as _select
+
+    rows = (
+        (
+            await db_session.execute(
+                _select(NotificationDeadLetter).where(
+                    NotificationDeadLetter.project_id == str(pid),
+                    NotificationDeadLetter.event_type == "no_key_test",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 1
+    # Without the key, encrypt_field is a no-op
+    assert rows[0].webhook_url == "https://hooks.plain.example.com/notoken"

@@ -23,6 +23,7 @@ from app.database import get_session
 from app.deploy_identity import deploy_repo_identity as _deploy_repo_identity
 from app.inline_llm import validate_inline_llm_runtime_config
 from app.url_security import _is_safe_external_url
+from app.notification_dispatch import _attempt_delivery
 from app.shared_state import limiter, circuit_breakers as _circuit_breakers
 from app.models import (
     DeploymentState,
@@ -54,6 +55,7 @@ from app.autonomous_spawn_budget import (
     normalize_autonomous_spawn_budget_categories,
     normalize_autonomous_spawn_budget_mode,
 )
+from app.field_encryption import encrypt_field
 
 _VALID_PROVIDER_SELECTION_MODES = frozenset({"balanced", "preferred", "exclusive"})
 
@@ -106,6 +108,10 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "autonomous_research_interval_minutes",
         "autonomous_spawn_budget_categories",
         "autonomous_spawn_budget_mode",
+        "capability_proof_gate_mode",
+        "capability_proof_gate_auto_graduation_enabled",
+        "capability_proof_gate_auto_graduation_observe_threshold",
+        "capability_proof_gate_auto_graduation_enforce_threshold",
         "cloud_run_task_type_allowlist",
         "evergreen_fill_mode",
         "evergreen_fill_interval_minutes",
@@ -307,6 +313,15 @@ router = APIRouter(
 )
 
 
+def _encrypt_notification_config(config: dict) -> dict:
+    """Return a copy of config with webhook_url encrypted for DB persistence."""
+    if not config:
+        return config
+    url = config.get("webhook_url", "")
+    encrypted_url = encrypt_field(url) if url else url
+    return {**config, "webhook_url": encrypted_url or ""}
+
+
 def _build_notification_config_response(config: dict, *, is_admin: bool) -> dict:
     """Return notification config, masking webhook_url for non-admin callers.
 
@@ -339,6 +354,7 @@ def _build_notification_config_response(config: dict, *, is_admin: bool) -> dict
                 "RUNNER_LOW_DISK",
                 "RUNNER_OUTAGE_ESCALATED",
                 "RUNNER_LOCAL_HOLD",
+                "RUNNER_CONTAINER_HOLD",
             ],
         ),
         "throttle_seconds": config.get("throttle_seconds", 30),
@@ -423,6 +439,22 @@ async def get_settings(
         ),
         "metrics_integrity_sweep_mode": str(
             _runtime_config.get("metrics_integrity_sweep_mode", "observe")
+        ),
+        "capability_proof_gate_mode": str(
+            _runtime_config.get("capability_proof_gate_mode", "off") or "off"
+        ),
+        "capability_proof_gate_auto_graduation_enabled": bool(
+            _runtime_config.get("capability_proof_gate_auto_graduation_enabled", False)
+        ),
+        "capability_proof_gate_auto_graduation_observe_threshold": float(
+            _runtime_config.get(
+                "capability_proof_gate_auto_graduation_observe_threshold", 0.5
+            )
+        ),
+        "capability_proof_gate_auto_graduation_enforce_threshold": float(
+            _runtime_config.get(
+                "capability_proof_gate_auto_graduation_enforce_threshold", 0.95
+            )
         ),
         "metrics_integrity_sweep_interval_minutes": int(
             _runtime_config.get("metrics_integrity_sweep_interval_minutes", 60)
@@ -1141,6 +1173,42 @@ async def _apply_settings(
         _runtime_config["metrics_integrity_sweep_mode"] = val
         if val == "enforce":
             _debt_keys_to_resolve.append("dormant_knob:metrics_integrity_sweep_mode")
+    if "capability_proof_gate_mode" in payload:
+        val = str(payload["capability_proof_gate_mode"] or "").strip().lower()
+        if val not in ("off", "observe", "enforce"):
+            raise HTTPException(
+                status_code=400,
+                detail="capability_proof_gate_mode must be one of: off, observe, enforce",
+            )
+        _runtime_config["capability_proof_gate_mode"] = val
+        if val == "enforce":
+            _debt_keys_to_resolve.append("dormant_knob:capability_proof_gate_mode")
+    if "capability_proof_gate_auto_graduation_enabled" in payload:
+        val = payload["capability_proof_gate_auto_graduation_enabled"]
+        if not isinstance(val, bool):
+            raise HTTPException(
+                status_code=400,
+                detail="capability_proof_gate_auto_graduation_enabled must be a boolean",
+            )
+        _runtime_config["capability_proof_gate_auto_graduation_enabled"] = val
+    for _cap_grad_key, _cap_grad_default in (
+        ("capability_proof_gate_auto_graduation_observe_threshold", 0.5),
+        ("capability_proof_gate_auto_graduation_enforce_threshold", 0.95),
+    ):
+        if _cap_grad_key in payload:
+            try:
+                fval = float(payload[_cap_grad_key])
+            except (ValueError, TypeError):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{_cap_grad_key} must be a number",
+                )
+            if not (0.0 <= fval <= 1.0):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{_cap_grad_key} must be between 0.0 and 1.0",
+                )
+            _runtime_config[_cap_grad_key] = round(fval, 4)
     for _mi_key, _mi_lo, _mi_hi in (
         ("metrics_integrity_sweep_interval_minutes", 1, 1440),
         ("metrics_integrity_sweep_max_checks", 1, 1000),
@@ -3001,6 +3069,7 @@ async def _apply_settings(
                 "RUNNER_LOW_DISK",
                 "RUNNER_OUTAGE_ESCALATED",
                 "RUNNER_LOCAL_HOLD",
+                "RUNNER_CONTAINER_HOLD",
             ]
         )
         enabled_events = val.get(
@@ -3023,6 +3092,7 @@ async def _apply_settings(
                 "RUNNER_LOW_DISK",
                 "RUNNER_OUTAGE_ESCALATED",
                 "RUNNER_LOCAL_HOLD",
+                "RUNNER_CONTAINER_HOLD",
             ],
         )
         if not isinstance(enabled_events, list):
@@ -3063,14 +3133,18 @@ async def _apply_settings(
         if not webhook_url:
             raise HTTPException(status_code=400, detail="No webhook URL configured")
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.post(
-                    webhook_url,
-                    json={"type": "TEST", "message": "Blueprint test notification"},
-                )
-            if resp.status_code >= 400:
+            status_code = await _attempt_delivery(
+                webhook_url,
+                {"type": "TEST", "message": "Blueprint test notification"},
+            )
+            if status_code == 0:
                 raise HTTPException(
-                    status_code=502, detail=f"Webhook returned {resp.status_code}"
+                    status_code=502,
+                    detail="Webhook delivery blocked or failed (SSRF check or unreachable)",
+                )
+            if status_code >= 400:
+                raise HTTPException(
+                    status_code=502, detail=f"Webhook returned {status_code}"
                 )
         except httpx.RequestError as e:
             raise HTTPException(status_code=502, detail=f"Webhook request failed: {e}")
@@ -3449,30 +3523,33 @@ async def _apply_settings(
                             "residual_audit_defer_escalation_threshold", 5
                         )
                     ),
-                    "notification_config": _runtime_config.get(
-                        "notification_config",
-                        {
-                            "webhook_url": "",
-                            "enabled_events": [
-                                "TASK_FAILED",
-                                "APPROVAL_NEEDED",
-                                "DEPLOY_HEALTH_ALERT",
-                                "REMEDIATION_ESCALATED",
-                                "RESIDUAL_FIX_ESCALATED",
-                                "DIRECTION_BURN_PAUSE",
-                                "MERGE_UNVERIFIED",
-                                "SPEND_HOLD_CREATED",
-                                "SPEND_HOLD_EXPIRING",
-                                "RUNNER_DEACTIVATED",
-                                "RUNNER_DEGRADED",
-                                "RUNNER_DEGRADED_ESCALATED",
-                                "RUNNER_FLEET_OFFLINE",
-                                "RUNNER_LOW_DISK",
-                                "RUNNER_OUTAGE_ESCALATED",
-                                "RUNNER_LOCAL_HOLD",
-                            ],
-                            "throttle_seconds": 30,
-                        },
+                    "notification_config": _encrypt_notification_config(
+                        _runtime_config.get(
+                            "notification_config",
+                            {
+                                "webhook_url": "",
+                                "enabled_events": [
+                                    "TASK_FAILED",
+                                    "APPROVAL_NEEDED",
+                                    "DEPLOY_HEALTH_ALERT",
+                                    "REMEDIATION_ESCALATED",
+                                    "RESIDUAL_FIX_ESCALATED",
+                                    "DIRECTION_BURN_PAUSE",
+                                    "MERGE_UNVERIFIED",
+                                    "SPEND_HOLD_CREATED",
+                                    "SPEND_HOLD_EXPIRING",
+                                    "RUNNER_DEACTIVATED",
+                                    "RUNNER_DEGRADED",
+                                    "RUNNER_DEGRADED_ESCALATED",
+                                    "RUNNER_FLEET_OFFLINE",
+                                    "RUNNER_LOW_DISK",
+                                    "RUNNER_OUTAGE_ESCALATED",
+                                    "RUNNER_LOCAL_HOLD",
+                                    "RUNNER_CONTAINER_HOLD",
+                                ],
+                                "throttle_seconds": 30,
+                            },
+                        )
                     ),
                     "promotion_enabled": bool(
                         _runtime_config.get("promotion_enabled", False)
@@ -3548,6 +3625,28 @@ async def _apply_settings(
                     # operator's enforce graduation survives a Cloud Run restart.
                     "completion_debt_weight_mode": str(
                         _runtime_config.get("completion_debt_weight_mode", "observe")
+                    ),
+                    # Persist the capability proof gate mode so an operator
+                    # graduation (manual or auto) survives a Cloud Run restart.
+                    "capability_proof_gate_mode": str(
+                        _runtime_config.get("capability_proof_gate_mode", "off") or "off"
+                    ),
+                    # Persist capability proof gate auto-graduation config so an
+                    # operator enable/tune survives a Cloud Run restart.
+                    "capability_proof_gate_auto_graduation_enabled": bool(
+                        _runtime_config.get(
+                            "capability_proof_gate_auto_graduation_enabled", False
+                        )
+                    ),
+                    "capability_proof_gate_auto_graduation_observe_threshold": float(
+                        _runtime_config.get(
+                            "capability_proof_gate_auto_graduation_observe_threshold", 0.5
+                        )
+                    ),
+                    "capability_proof_gate_auto_graduation_enforce_threshold": float(
+                        _runtime_config.get(
+                            "capability_proof_gate_auto_graduation_enforce_threshold", 0.95
+                        )
                     ),
                     "adversarial_spawn_gate_infra_failure_mode": str(
                         _runtime_config.get(
@@ -3639,6 +3738,15 @@ async def _apply_settings(
                         _runtime_config.get(
                             "direction_review_recommendation_threshold", 2
                         )
+                    ),
+                    # Preserve the operator-approved migration-divergence exemption
+                    # store when persisting settings. This dict is rebuilt wholesale
+                    # and overwrites state.runtime_config_json, so without echoing the
+                    # key here an unrelated settings PATCH would silently drop
+                    # exemptions written via the dedicated admin router on the next
+                    # restart. Managed by admin_migration_exemptions; only echoed here.
+                    "migration_divergence_exemptions": _runtime_config.get(
+                        "migration_divergence_exemptions", []
                     ),
                 }
                 if "direction_refractory_minutes" not in _runtime_config:

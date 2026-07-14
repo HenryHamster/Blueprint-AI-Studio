@@ -21,7 +21,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import delete
+from sqlalchemy import delete, func
 from sqlalchemy import select as sa_select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
@@ -38,6 +38,7 @@ from app.models import (
     Project,
     Task,
     TaskStatus,
+    UiLoadTimingBaseline,
     UiLoadTimingSample,
     _utcnow,
     get_task_total_vm_cost_usd_or_none,
@@ -374,6 +375,7 @@ async def get_fix_loop_convergence(
         .where(
             Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
             Task.created_at >= cutoff,
+            Task.fix_loop_history != {},
         )
         .options(
             load_only(
@@ -389,7 +391,7 @@ async def get_fix_loop_convergence(
     if project_id is not None:
         stmt = stmt.where(Task.project_id == project_id)
 
-    _LIMIT = 1000
+    _LIMIT = 200
     result = await session.execute(stmt.limit(_LIMIT))
     tasks = result.scalars().all()
     if len(tasks) >= _LIMIT:
@@ -509,13 +511,14 @@ async def get_fix_loop_convergence_trend(
     """
     cutoff = _utcnow() - timedelta(days=days)
 
-    _TREND_LIMIT = 10_000
+    _TREND_LIMIT = 2_000
 
     stmt = (
         select(Task)
         .where(
             Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
             Task.created_at >= cutoff,
+            Task.fix_loop_history != {},
         )
         .options(
             load_only(
@@ -1887,15 +1890,116 @@ async def record_ui_load_timing(
     return {"ok": True}
 
 
+@router.post("/ui-load-timing/pin-baseline")
+async def pin_ui_load_timing_baseline(
+    payload: Dict[str, Any],
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+) -> Dict[str, Any]:
+    """Compute and persist an immutable baseline from current samples.
+
+    Reads all existing UiLoadTimingSample rows, computes p50/p90/count per
+    (surface, sample_type), and stores the result as an immutable baseline
+    that survives the 200-sample FIFO cap. The ``label`` field (max 128
+    chars) is a human-readable tag, e.g. "Before lazy-load wave".
+    """
+    label = str(payload.get("label", "") or "")[:128]
+    dialect_name = resolve_dialect_name(session)
+
+    # rows is a list of (surface, sample_type, count, p50, p90).
+    rows: list[tuple[str, str, int, int, int]] = []
+
+    if dialect_name == "postgresql":
+        # Grouped aggregate query with Postgres percentile_cont avoids loading
+        # every UiLoadTimingSample row into Python memory (the previous unbounded
+        # SELECT * performed a full table scan on every pin call).
+        result = await session.execute(
+            sa_select(
+                UiLoadTimingSample.surface,
+                UiLoadTimingSample.sample_type,
+                func.count(UiLoadTimingSample.page_ready_ms).label("cnt"),
+                func.percentile_cont(0.5).within_group(
+                    UiLoadTimingSample.page_ready_ms.asc()
+                ).label("p50"),
+                func.percentile_cont(0.9).within_group(
+                    UiLoadTimingSample.page_ready_ms.asc()
+                ).label("p90"),
+            ).group_by(
+                UiLoadTimingSample.surface,
+                UiLoadTimingSample.sample_type,
+            )
+        )
+        for r in result.fetchall():
+            rows.append((r.surface, r.sample_type, r.cnt, int(r.p50), int(r.p90)))
+    else:
+        # SQLite test-harness path: SQLite has no percentile_cont, so fetch all
+        # rows and compute continuous percentiles in Python (test datasets are
+        # small, so the full scan is acceptable).
+        all_samples = (await session.execute(select(UiLoadTimingSample))).scalars().all()
+        groups: dict = defaultdict(list)
+        for s in all_samples:
+            groups[(s.surface, s.sample_type)].append(s.page_ready_ms)
+        for (surface, sample_type), vals in groups.items():
+            vals.sort()
+            n = len(vals)
+            if n == 0:
+                continue
+            # Continuous percentile matching PostgreSQL percentile_cont.
+            def _pcont(p: float) -> float:
+                rn = p * (n - 1)
+                lo = int(rn)
+                hi = min(lo + 1, n - 1)
+                frac = rn - lo
+                return vals[lo] * (1 - frac) + vals[hi] * frac
+            rows.append((surface, sample_type, n, int(_pcont(0.5)), int(_pcont(0.9))))
+
+    baselines = []
+    for surface, sample_type, cnt, p50, p90 in rows:
+        bl = UiLoadTimingBaseline(
+            surface=surface,
+            sample_type=sample_type,
+            p50=p50,
+            p90=p90,
+            count=cnt,
+            label=label,
+        )
+        session.add(bl)
+        baselines.append(bl)
+
+    await session.commit()
+
+    return {
+        "ok": True,
+        "label": label,
+        "surface_count": len(baselines),
+        "baselines": [
+            {
+                "id": str(b.id),
+                "surface": b.surface,
+                "sample_type": b.sample_type,
+                "p50": b.p50,
+                "p90": b.p90,
+                "count": b.count,
+                "label": b.label,
+                "pinned_at": b.pinned_at.isoformat() if b.pinned_at else None,
+            }
+            for b in baselines
+        ],
+    }
+
+
 @router.get("/ui-load-timing")
 async def get_ui_load_timing(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(require_admin),  # noqa: ARG001
 ) -> Dict[str, Any]:
-    """Return recent admin-UI initial-load timing samples grouped by surface.
+    """Return recent admin-UI initial-load timing samples grouped by surface,
+    plus any pinned baselines.
 
     Each surface entry is a list of {ts, page_ready_ms, sample_type} objects
-    ordered oldest-first (up to 200 per surface).  Persisted across restarts.
+    ordered oldest-first (up to 200 per surface).  The ``baselines`` array
+    carries immutable baseline snapshots (p50/p90/count) that survive the
+    per-surface FIFO cap.
     """
     rows = (
         await session.execute(
@@ -1909,4 +2013,25 @@ async def get_ui_load_timing(
         surfaces.setdefault(row.surface, []).append(
             {"ts": row.recorded_at.isoformat(), "page_ready_ms": row.page_ready_ms, "sample_type": row.sample_type}
         )
-    return {"surfaces": surfaces}
+
+    baseline_rows = (
+        await session.execute(
+            select(UiLoadTimingBaseline)
+            .order_by(UiLoadTimingBaseline.pinned_at.desc())
+        )
+    ).scalars().all()
+    baselines = [
+        {
+            "id": str(b.id),
+            "surface": b.surface,
+            "sample_type": b.sample_type,
+            "p50": b.p50,
+            "p90": b.p90,
+            "count": b.count,
+            "label": b.label,
+            "pinned_at": b.pinned_at.isoformat() if b.pinned_at else None,
+        }
+        for b in baseline_rows
+    ]
+
+    return {"surfaces": surfaces, "baselines": baselines}

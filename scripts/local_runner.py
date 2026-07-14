@@ -42,6 +42,12 @@ Optional environment variables:
     BLUEPRINT_RUNNER_MIN_DISK_BYTES   Low-disk guard: stop claiming new agent work when
                                       free space on the workspace filesystem is below this
                                       many bytes (default: 0 = disabled)
+    BLUEPRINT_RUNNER_MAX_CPU_LOAD     Host-load guard: stop claiming new agent tasks when
+                                      the 1-minute load average meets or exceeds this value
+                                      (float, default: 0 = disabled)
+    BLUEPRINT_RUNNER_MAX_GPU_UTIL_PCT Host-load guard: stop claiming new compute jobs when
+                                      max GPU utilization meets or exceeds this percentage
+                                      (int 0–100, default: 0 = disabled)
     BLUEPRINT_RUNNER_GPU_INDICES      Comma-separated GPU-index allowlist (default: all)
     BLUEPRINT_RUNNER_GPUS_PER_JOB     GPUs assigned per compute job (default: 1)
     BLUEPRINT_RUNNER_CPU_LIMIT        Best-effort CPU cap (cores) per task
@@ -57,6 +63,29 @@ Flags:
     --check   Print the preflight report and exit (claims no work). Exit code 0
               iff the orchestrator is reachable, the token is valid, and at least
               one task class is claimable.
+    --help/-h Print the RUNNER_RUNBOOK (recommended launch patterns) and exit.
+
+RUNNER_RUNBOOK — recommended launch patterns
+--------------------------------------------
+The runner self-updates: when the orchestrator advertises a newer version and
+the runner is idle, it updates and restarts. For that (and for crash recovery)
+it MUST be under a process supervisor, or wrapped so it comes back:
+
+  * systemd service (preferred) — auto-restarts on crash AND on self-update.
+    Add ``Restart=always`` to the unit; the runner exits 0 after a self-update
+    and systemd restarts the fresh binary.
+
+  * tmux / nohup / screen (manual) — no supervisor. The self-updater detects
+    this and re-execs in place (``os.execv``) so the UPDATE is not lost, but a
+    genuine CRASH still needs a restarter. Wrap the runner in a restart loop:
+
+        while true; do python3 scripts/local_runner.py; sleep 1; done
+
+    Set ``BLUEPRINT_RUNNER_SUPERVISED=1`` in that loop's environment to tell the
+    runner it IS supervised (it then exits cleanly on update instead of
+    re-exec'ing, letting the loop respawn it).
+
+``--check`` reports whether a supervisor was detected and warns if not.
 """
 
 import io
@@ -77,7 +106,7 @@ import time
 import urllib.error
 import urllib.request
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import runner_isolation as iso
 import blueprint_runner as br
@@ -210,6 +239,250 @@ def _die(reason: str, code: int = 1) -> None:
     os._exit(code)
 
 
+# PID-1 programs that actually SUPERVISE (restart) their managed children.
+# `tini` is deliberately absent: it forwards signals and reaps zombies but never
+# restarts anything, so treating it as a supervisor would be the same lie this
+# detector exists to stop telling.
+_SUPERVISING_INITS = ("supervisord", "runit", "runsv", "s6-svscan")
+
+
+def _pid1_comm() -> str:
+    """``/proc/1/comm`` (the PID-1 program name), or "" when unreadable."""
+    try:
+        with open("/proc/1/comm", "r") as fh:
+            return fh.read().strip()
+    except Exception:
+        return ""
+
+
+def _self_cgroup_text() -> str:
+    """``/proc/self/cgroup`` contents, or "" when unreadable."""
+    try:
+        with open("/proc/self/cgroup", "r") as fh:
+            return fh.read()
+    except Exception:
+        return ""
+
+
+def _cgroup_path(cgroup_text: str) -> str:
+    """First cgroup path in *cgroup_text* (``0::/user.slice/...`` → the path)."""
+    for line in cgroup_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split(":", 2)
+        return parts[2] if len(parts) == 3 else line
+    return ""
+
+
+def _systemd_service_unit(cgroup_text: str) -> str | None:
+    """Return the systemd ``*.service`` unit owning this process, else None.
+
+    This is THE discriminator between "systemd exists on this host" and "systemd
+    is actually supervising this process". A runner launched from a login shell
+    on a systemd host lives in ``/user.slice/user-1000.slice/session-3.scope`` —
+    a *scope*, which systemd tracks but NEVER restarts. Only a ``.service`` unit
+    carries a ``Restart=`` policy, so only a ``.service`` cgroup means "systemd
+    will bring this back".
+    """
+    for line in cgroup_text.splitlines():
+        parts = line.split(":", 2)
+        path = parts[2] if len(parts) == 3 else line
+        for component in reversed(path.strip().split("/")):
+            if component.endswith(".service"):
+                return component
+    return None
+
+
+def _parent_pid(pid: int) -> int | None:
+    """PPid of *pid* from ``/proc/<pid>/status``, or None when unreadable."""
+    try:
+        with open(f"/proc/{pid}/status", "r") as fh:
+            for line in fh:
+                if line.startswith("PPid:"):
+                    return int(line.split()[1])
+    except Exception:
+        return None
+    return None
+
+
+def _ancestry_reaches_pid1(max_hops: int = 64) -> bool:
+    """True iff this process's parent chain actually reaches PID 1.
+
+    A ``docker exec``-launched process inside a supervised container is NOT in
+    the init's process tree (its parent chain dead-ends at PPid 0), so the init
+    would never restart it. Walking the chain is what makes the PID-1 signal an
+    honest claim about *this* process rather than about the host.
+    """
+    pid = os.getpid()
+    for _ in range(max_hops):
+        if pid == 1:
+            return True
+        ppid = _parent_pid(pid)
+        if ppid is None or ppid <= 0:
+            return False
+        pid = ppid
+    return False
+
+
+def _detect_supervisor_state() -> dict:
+    """Report whether a supervisor will ACTUALLY restart this runner.
+
+    Returns ``{"supervisor": str | None, "supervised": bool, "evidence": str,
+    "detail": str}``. ``supervised`` is True only when a positive, process-scoped
+    signal says something will respawn this process after it exits — never merely
+    because a supervisor exists somewhere on the host.
+
+    Positive signals (any hit wins):
+      * ``INVOCATION_ID`` / ``JOURNAL_STREAM`` env → systemd launched THIS process.
+      * ``SUPERVISOR_ENABLED`` env → supervisord launched THIS process.
+      * ``BLUEPRINT_RUNNER_SUPERVISED=1`` → operator-declared restart wrapper
+        (documented in the RUNNER_RUNBOOK so a ``while true`` loop can opt in).
+      * PID 1 is systemd AND this process's cgroup is a systemd ``*.service``
+        unit AND its parent chain reaches PID 1.
+      * PID 1 is a supervising init (supervisord/runit/s6) AND this process's
+        parent chain reaches PID 1.
+
+    Explicitly NEGATIVE (the bug this replaces): PID 1 being ``systemd`` on its
+    own. Every process on a systemd host has systemd as PID 1, including a runner
+    started by hand in tmux. The old detector returned "systemd" for all of them,
+    so the self-update survival path took the "supervisor will restart me" branch,
+    ``os._exit(0)``-ed, and nothing ever came back — while ``--check`` printed a
+    healthy "systemd (auto-restart on crash/update)". Both now tell the truth.
+    """
+    if os.environ.get("INVOCATION_ID") or os.environ.get("JOURNAL_STREAM"):
+        return {
+            "supervisor": "systemd",
+            "supervised": True,
+            "evidence": "systemd unit env (INVOCATION_ID/JOURNAL_STREAM)",
+            "detail": "launched by a systemd unit — it restarts the runner if Restart= is set",
+        }
+    if os.environ.get("SUPERVISOR_ENABLED"):
+        return {
+            "supervisor": "supervisord",
+            "supervised": True,
+            "evidence": "supervisord env (SUPERVISOR_ENABLED)",
+            "detail": "launched by supervisord — it restarts the runner on exit",
+        }
+    if os.environ.get("BLUEPRINT_RUNNER_SUPERVISED") == "1":
+        return {
+            "supervisor": "declared",
+            "supervised": True,
+            "evidence": "operator-declared (BLUEPRINT_RUNNER_SUPERVISED=1)",
+            "detail": "operator declared an external restart wrapper (e.g. a `while true` loop)",
+        }
+
+    pid1 = _pid1_comm()
+    if pid1 == "systemd":
+        unit = _systemd_service_unit(_self_cgroup_text())
+        if unit and _ancestry_reaches_pid1():
+            return {
+                "supervisor": "systemd",
+                "supervised": True,
+                "evidence": f"systemd service cgroup ({unit})",
+                "detail": f"running inside systemd unit {unit} — it restarts the runner if Restart= is set",
+            }
+        cgroup = _cgroup_path(_self_cgroup_text()) or "unknown"
+        return {
+            "supervisor": None,
+            "supervised": False,
+            "evidence": f"pid1=systemd but cgroup {cgroup} is not a systemd .service unit",
+            "detail": (
+                "systemd is PID 1 on this HOST, but this runner is NOT running as a "
+                "systemd service unit (looks like a manual tmux/nohup/screen launch). "
+                "systemd will NOT restart it — a crash is permanent"
+            ),
+        }
+    if pid1 in _SUPERVISING_INITS:
+        if _ancestry_reaches_pid1():
+            return {
+                "supervisor": pid1,
+                "supervised": True,
+                "evidence": f"pid1={pid1} and this process is in its process tree",
+                "detail": f"container init {pid1} supervises this process and restarts it on exit",
+            }
+        return {
+            "supervisor": None,
+            "supervised": False,
+            "evidence": f"pid1={pid1} but this process is NOT in its process tree (docker exec?)",
+            "detail": (
+                f"{pid1} is PID 1 but this process was not started by it (parent chain "
+                "does not reach PID 1) — it will NOT be restarted"
+            ),
+        }
+    if pid1 == "tini":
+        return {
+            "supervisor": None,
+            "supervised": False,
+            "evidence": "pid1=tini (init/zombie-reaper — does not restart children)",
+            "detail": (
+                "tini forwards signals and reaps zombies but never restarts the runner. "
+                "Rely on the container restart policy and set BLUEPRINT_RUNNER_SUPERVISED=1 "
+                "to declare it"
+            ),
+        }
+    return {
+        "supervisor": None,
+        "supervised": False,
+        "evidence": f"no supervisor signal (pid1={pid1 or 'unknown'})",
+        "detail": (
+            "no process supervisor detected — a crash will NOT restart the runner"
+        ),
+    }
+
+
+def _detect_process_supervisor() -> str | None:
+    """Name of the supervisor that will ACTUALLY restart this runner, else None.
+
+    Thin wrapper over :func:`_detect_supervisor_state` — None means the runner is
+    genuinely unsupervised (manual tmux/nohup/screen launch, or a systemd host
+    that is not running the runner as a service unit), which is what makes the
+    self-update path re-exec in place instead of exiting into the void.
+    """
+    state = _detect_supervisor_state()
+    return state["supervisor"] if state.get("supervised") else None
+
+
+def _reexec_after_update() -> None:
+    """Replace the current process with the updated runner, or exit for restart.
+
+    Called after a successful auto-update. If a process supervisor is present,
+    ``os._exit(0)`` (the supervisor restarts the fresh binary). If NONE is
+    detected (manual tmux/nohup launch), ``os.execv`` re-execs in place so the
+    updated code takes over WITHOUT relying on an external restarter — the fix
+    for the silent post-update death. Any failure in the re-exec path falls back
+    to ``os._exit(0)`` so we never leave a hung, half-updated process.
+    """
+    supervisor = None
+    try:
+        supervisor = _detect_process_supervisor()
+    except Exception:
+        supervisor = None
+    if supervisor is not None:
+        print(
+            f"[runner] auto-update complete — {supervisor} supervisor detected, "
+            "exiting for restart.",
+            flush=True,
+        )
+        os._exit(0)
+    # No supervisor: re-exec in place so the update is not silently lost.
+    print(
+        "[runner] auto-update complete — NO process supervisor detected "
+        "(manual tmux/nohup/screen launch); re-exec'ing in place so the update "
+        "takes effect. Wrap the runner in systemd or a restart loop to recover "
+        "from crashes too (see --check RUNNER_RUNBOOK).",
+        flush=True,
+    )
+    try:
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+    except Exception as exc:  # pragma: no cover - defensive fallback
+        print(
+            f"[runner] re-exec failed ({exc!r}) — exiting for restart instead.",
+            flush=True,
+        )
+        os._exit(0)
+
+
 # ── Credential persistence ────────────────────────────────────────────────────
 
 def _credential_dir() -> str:
@@ -246,7 +519,7 @@ def _save_runner_token(token: str) -> None:
         finally:
             os.close(fd)
         os.chmod(tmp_path, 0o600)
-        os.rename(tmp_path, path)
+        os.replace(tmp_path, path)
     except Exception as exc:
         print(
             f"[runner] WARNING: could not persist runner token to {path}: {exc}",
@@ -317,7 +590,7 @@ def _write_status_json(
         finally:
             os.close(fd)
         os.chmod(tmp_path, 0o644)
-        os.rename(tmp_path, path)
+        os.replace(tmp_path, path)
     except Exception as exc:
         print(
             f"[runner] WARNING: could not write status.json to {path}: {exc}",
@@ -481,6 +754,48 @@ def _gpu_utilization_pct() -> int | None:
     if not vals:
         return None
     return max(0, min(100, max(vals)))
+
+
+def _gpu_memory_mib() -> tuple[list[int], list[int]] | None:
+    """Per-GPU (total, free) VRAM in MiB, best-effort/nullable.
+
+    Queries ``nvidia-smi --query-gpu=memory.total,memory.free`` so dispatch and
+    authoring can reason about VRAM fit (a ``has_gpu`` boolean cannot tell a
+    16 GiB V100 from a 46 GiB L40S). Any failure (no GPU, no nvidia-smi,
+    timeout, unparseable output) returns None and the heartbeat simply omits
+    the fields — old-runner-identical behavior.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.total,memory.free",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    totals: list[int] = []
+    frees: list[int] = []
+    for line in result.stdout.splitlines():
+        parts = [tok.strip() for tok in line.split(",")]
+        if len(parts) != 2:
+            continue
+        try:
+            total = int(float(parts[0]))
+            free = int(float(parts[1]))
+        except ValueError:
+            continue
+        totals.append(max(0, total))
+        frees.append(max(0, free))
+    if not totals:
+        return None
+    return totals, frees
 
 
 def _cpu_load_avg() -> float | None:
@@ -742,6 +1057,283 @@ def _disk_below_min(root: str | None, min_free_bytes: int) -> bool:
     return free is not None and free < min_free_bytes
 
 
+def _compute_image_keep_days() -> int:
+    """Days of LAST-USE recency that protect a Docker image from cache hygiene.
+
+    Configurable via ``BLUEPRINT_RUNNER_IMAGE_KEEP_DAYS`` (default 7). An image
+    used or pulled within this window — and any image backing a container — is
+    never pruned (see :func:`_prune_docker_images`; the window is measured
+    against last-use/pull, NOT the image's upstream creation date). The dgx-1 has
+    ~30 GB of image-layer storage, so unbounded growth of per-project compute
+    images would eventually wedge the runner; this bounds it without evicting
+    images that a recent or in-flight job still needs.
+    """
+    raw = os.environ.get("BLUEPRINT_RUNNER_IMAGE_KEEP_DAYS", "").strip()
+    if not raw:
+        return 7
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 7
+
+
+def _image_use_ledger_path() -> str:
+    """Path of the runner's image last-use ledger (``~/.blueprint/image_use.json``)."""
+    return os.path.join(_credential_dir(), "image_use.json")
+
+
+def _load_image_use_ledger() -> dict:
+    """``{image_ref: iso8601_last_used}``. Best-effort — {} on any read error."""
+    try:
+        with open(_image_use_ledger_path(), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _record_image_use(image_ref: str | None, *, _now=None) -> None:
+    """Stamp *image_ref* as used NOW in the last-use ledger (best-effort).
+
+    Docker records no last-use time for an image, so the runner keeps its own.
+    Without this, cache hygiene can only see image CREATION time — which says
+    nothing about whether a job needs the image (see :func:`_prune_docker_images`).
+    """
+    if not image_ref:
+        return
+    now = _now or datetime.now(timezone.utc)
+    try:
+        ledger = _load_image_use_ledger()
+        ledger[image_ref] = now.isoformat()
+        # Bound the ledger: drop stamps older than 90 days so it cannot grow
+        # without limit on a long-lived runner.
+        floor = now - timedelta(days=90)
+        pruned = {
+            ref: ts
+            for ref, ts in ledger.items()
+            if ref == image_ref
+            or ((_parse_docker_time(ts) or now) >= floor)
+        }
+        path = _image_use_ledger_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            json.dump(pruned, fh)
+        os.replace(tmp_path, path)
+    except Exception:
+        pass  # cache bookkeeping must never break a job
+
+
+def _parse_docker_time(raw: str | None) -> datetime | None:
+    """Parse a Docker/Go timestamp into an aware UTC datetime, else None.
+
+    Handles the three shapes docker emits across versions/fields:
+      * RFC3339 (``.Created``):            ``2026-07-01T12:34:56.789012345Z``
+      * Go ``time.Time`` (``.Metadata.LastTagTime``):
+                                           ``2026-07-01 12:34:56.789 +0000 UTC``
+      * the Go zero value (never tagged locally) → None, not year 1.
+    """
+    if not raw:
+        return None
+    text = raw.strip()
+    if not text or text.startswith("0001-01-01"):
+        return None
+    # Go time.Time default rendering ("2026-07-01 12:34:56.789 +0000 UTC"):
+    # date and time are space-separated. Rebuild it as ISO and drop the trailing
+    # zone NAME (keeping the numeric offset). NB: the zone name itself contains a
+    # "T" ("UTC"), so the separator position — not a naive "T" scan — is the test.
+    if len(text) > 10 and text[10] == " ":
+        parts = text.split()
+        if len(parts) >= 3:
+            text = f"{parts[0]}T{parts[1]}{parts[2]}"
+        elif len(parts) == 2:
+            text = f"{parts[0]}T{parts[1]}"
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    # Python's fromisoformat rejects >6 fractional digits (docker emits 9).
+    if "." in text:
+        head, _, tail = text.partition(".")
+        frac = ""
+        idx = 0
+        while idx < len(tail) and tail[idx].isdigit():
+            frac += tail[idx]
+            idx += 1
+        text = f"{head}.{frac[:6]}{tail[idx:]}"
+    # Normalize a compact UTC offset (+0000) to the ISO form (+00:00).
+    if len(text) >= 5 and text[-5] in "+-" and text[-4:].isdigit():
+        text = f"{text[:-2]}:{text[-2:]}"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _parse_repo_tags(raw: str) -> list[str]:
+    """Parse a Go-rendered RepoTags slice (``[a:1 b:2]``) into a list."""
+    text = (raw or "").strip()
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1]
+    return [t for t in text.split() if t and t != "<none>:<none>"]
+
+
+def _prune_docker_images(
+    workspace_root: str | None,
+    min_free_bytes: int,
+    *,
+    keep_days: int | None = None,
+    _run=subprocess.run,
+    _disk_below=None,
+    _now=None,
+    _ledger=None,
+    _protected=None,
+) -> dict:
+    """Best-effort: reclaim Docker image storage when disk runs low.
+
+    Runs ONLY when *workspace_root*'s free space is below *min_free_bytes* — the
+    same guard the agent-claim path uses (:func:`_disk_below_min`).
+
+    Selection keys on LAST-USE / PULL recency, never on image CREATION time.
+    ``docker image prune --filter until=<age>`` (what this used to call) keys on
+    the image's *creation* timestamp — baked into the image at BUILD time by the
+    registry. A CUDA base image published upstream months ago is "older than the
+    keep window" the instant it lands on disk, so a just-pulled, actively-needed
+    multi-GB image was deleted immediately and re-pulled by the very next job:
+    the hygiene pass thrashed the cache it exists to protect.
+
+    An image is KEPT when any of these is within the keep window:
+      * the runner's own last-use stamp (:func:`_record_image_use`) — the true
+        "a job needed this image" signal;
+      * ``Metadata.LastTagTime`` — when docker last tagged it locally, i.e. the
+        PULL time for registry images;
+      * ``.Created`` — only as a floor for locally-built images that were never
+        tagged (there, build time IS local recency).
+    It is also kept when it is the configured agent image, or when it is
+    referenced by any container (``docker image rm`` without ``-f`` refuses to
+    delete those, so in-use protection is enforced by docker itself).
+
+    Returns a status dict for logging/testing. Never raises — a missing ``docker``
+    binary or a docker error degrades to ``{"pruned": False, ...}``.
+    """
+    keep = _compute_image_keep_days() if keep_days is None else keep_days
+    disk_below = _disk_below if _disk_below is not None else _disk_below_min
+    if not disk_below(workspace_root, min_free_bytes):
+        return {"pruned": False, "reason": "disk_above_threshold"}
+
+    now = _now or datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=max(0, keep))
+    ledger = _load_image_use_ledger() if _ledger is None else dict(_ledger)
+    if _protected is None:
+        protected_refs = {
+            r for r in [(os.environ.get("BLUEPRINT_AGENT_IMAGE") or "").strip()] if r
+        }
+    else:
+        protected_refs = set(_protected)
+
+    try:
+        listing = _run(
+            ["docker", "image", "ls", "-a", "--no-trunc", "--format", "{{.ID}}"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        return {"pruned": False, "reason": f"prune_error:{type(e).__name__}"}
+    if listing.returncode != 0:
+        return {
+            "pruned": False,
+            "reason": "prune_nonzero",
+            "stderr": (listing.stderr or "")[-500:],
+        }
+    image_ids = sorted({ln.strip() for ln in (listing.stdout or "").splitlines() if ln.strip()})
+    if not image_ids:
+        return {"pruned": True, "keep_days": keep, "removed": 0, "kept": 0,
+                "removed_ids": [], "in_use_skipped": 0, "output": "no images"}
+
+    # Local recency of every image: last local tag (== pull time for registry
+    # images), with creation time only as a floor for never-tagged local builds.
+    try:
+        inspected = _run(
+            [
+                "docker", "image", "inspect", "--format",
+                "{{.Id}}\t{{.Metadata.LastTagTime}}\t{{.Created}}\t{{.RepoTags}}",
+                *image_ids,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        return {"pruned": False, "reason": f"prune_error:{type(e).__name__}"}
+    if inspected.returncode != 0:
+        return {
+            "pruned": False,
+            "reason": "prune_nonzero",
+            "stderr": (inspected.stderr or "")[-500:],
+        }
+
+    stale: list[str] = []
+    kept = 0
+    for line in (inspected.stdout or "").splitlines():
+        if not line.strip():
+            continue
+        fields = line.split("\t")
+        if len(fields) < 3:
+            continue
+        image_id = fields[0].strip()
+        tag_time = _parse_docker_time(fields[1])
+        created = _parse_docker_time(fields[2])
+        repo_tags = _parse_repo_tags(fields[3] if len(fields) > 3 else "")
+
+        if protected_refs.intersection(repo_tags):
+            kept += 1
+            continue
+
+        candidates = [t for t in (tag_time, created) if t is not None]
+        for ref in repo_tags:
+            used = _parse_docker_time(ledger.get(ref))
+            if used is not None:
+                candidates.append(used)
+        last_used = max(candidates) if candidates else None
+        # Undatable image: keep it. Never delete what we cannot age honestly.
+        if last_used is None or last_used >= cutoff:
+            kept += 1
+            continue
+        stale.append(image_id)
+
+    removed: list[str] = []
+    in_use_skipped = 0
+    for image_id in stale:
+        try:
+            # No `-f`: docker refuses to delete an image referenced by a running
+            # OR stopped container, which is exactly the protection we want.
+            rm = _run(
+                ["docker", "image", "rm", image_id],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        except (OSError, subprocess.SubprocessError):
+            in_use_skipped += 1
+            continue
+        if rm.returncode == 0:
+            removed.append(image_id)
+        else:
+            in_use_skipped += 1
+
+    return {
+        "pruned": True,
+        "keep_days": keep,
+        "removed": len(removed),
+        "removed_ids": removed,
+        "kept": kept,
+        "in_use_skipped": in_use_skipped,
+        "output": f"removed={len(removed)} kept={kept} in_use_or_error={in_use_skipped}",
+    }
+
+
 # ── HTTP helpers ─────────────────────────────────────────────────────────────
 
 def _post(url: str, token: str, body: dict, *, return_headers: bool = False):
@@ -828,10 +1420,138 @@ _REPORT_MAX_RETRIES = 4
 _REPORT_RETRY_BASE_SLEEP = 2.0
 _REPORT_RETRY_MAX_SLEEP = 30.0
 
+# Interim-progress protocol (BLUEPRINT_PROGRESS_FILE). The experiment appends
+# JSONL records like {"step": int, "metric": str, "value": float, "ts": "..."};
+# the runner tails the file between report heartbeats and attaches a bounded
+# tail to its interim (exec_status="running") compute-job reports. Everything
+# is bounded: records kept, bytes serialized per report, bytes read per poll,
+# and bytes tolerated for a single (possibly hostile) line.
+_PROGRESS_TAIL_MAX_RECORDS = 20
+_PROGRESS_TAIL_MAX_BYTES = 2048
+_PROGRESS_READ_CHUNK_BYTES = 262144
+_PROGRESS_MAX_LINE_BYTES = 8192
+_PROGRESS_METRIC_MAX_CHARS = 128
+_PROGRESS_TS_MAX_CHARS = 64
+# Interim command-log tail attached to running reports so operators see live
+# output mid-run (stamped server-side as polling_metadata["live_output"]).
+_RUNNER_LIVE_TAIL_CHARS = 4096
+
 
 def _report_retry_sleep(attempt: int) -> float:
     """Capped exponential backoff (seconds) for the terminal-report retry loop."""
     return min(_REPORT_RETRY_BASE_SLEEP * (2 ** attempt), _REPORT_RETRY_MAX_SLEEP)
+
+
+def _parse_progress_record(line: bytes) -> dict | None:
+    """Parse+validate one BLUEPRINT_PROGRESS_FILE JSONL line, or None.
+
+    The file is written by sandboxed experiment code, so every field is
+    validated before it leaves the runner: ``metric`` must be a non-empty
+    string (bounded), ``value`` a finite number; ``step`` (non-negative int)
+    and ``ts`` (bounded string) are optional. Anything else — garbage bytes,
+    non-dict JSON, NaN/inf, absurd types — is dropped, never raised.
+    """
+    text = line.strip()
+    if not text or len(text) > _PROGRESS_MAX_LINE_BYTES:
+        return None
+    try:
+        raw = json.loads(text.decode("utf-8", "replace"))
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    metric = raw.get("metric")
+    value = raw.get("value")
+    if not isinstance(metric, str) or not metric.strip():
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    numeric = float(value)
+    if numeric != numeric or numeric in (float("inf"), float("-inf")):
+        return None
+    record: dict = {"metric": metric.strip()[:_PROGRESS_METRIC_MAX_CHARS], "value": numeric}
+    step = raw.get("step")
+    if isinstance(step, int) and not isinstance(step, bool) and 0 <= step <= 10**12:
+        record["step"] = step
+    ts = raw.get("ts")
+    if isinstance(ts, str) and ts:
+        record["ts"] = ts[:_PROGRESS_TS_MAX_CHARS]
+    return record
+
+
+class _ProgressTail:
+    """Offset-tracked, bounded reader of a job's BLUEPRINT_PROGRESS_FILE.
+
+    ``poll()`` reads only the bytes appended since the previous poll (capped at
+    ``_PROGRESS_READ_CHUNK_BYTES`` per call), parses complete JSONL lines, and
+    keeps the last ``_PROGRESS_TAIL_MAX_RECORDS`` valid records plus an exact
+    running count. A partial trailing line is carried to the next poll; an
+    oversized line (> ``_PROGRESS_MAX_LINE_BYTES``, e.g. hostile output) is
+    discarded up to its next newline so the reader can never wedge or balloon.
+    A file that shrinks below the tracked offset (truncated/rewritten by the
+    job) resets the reader to the top instead of freezing at a dead offset.
+
+    ``snapshot()`` returns the report payload ``{"records": [...], "count": n}``
+    (records byte-bounded to ``_PROGRESS_TAIL_MAX_BYTES``) or None when nothing
+    valid has been observed — an absent field on the wire, so old backends see
+    byte-identical reports for progress-less jobs.
+    """
+
+    def __init__(self, path: str) -> None:
+        self._path = path
+        self._offset = 0
+        self._count = 0
+        self._records: deque = deque(maxlen=_PROGRESS_TAIL_MAX_RECORDS)
+        self._partial = b""
+        self._skip_to_newline = False
+
+    def poll(self) -> dict | None:
+        """Consume newly-appended bytes and return the current snapshot."""
+        try:
+            with open(self._path, "rb") as f:
+                size = f.seek(0, io.SEEK_END)
+                if size < self._offset:
+                    # File was truncated/rewritten under us (e.g. the job
+                    # recreates its progress file). Restart from the top —
+                    # the stale partial-line carry belongs to bytes that no
+                    # longer exist — so progress resumes instead of freezing.
+                    self._offset = 0
+                    self._partial = b""
+                    self._skip_to_newline = False
+                f.seek(self._offset)
+                chunk = f.read(_PROGRESS_READ_CHUNK_BYTES)
+        except OSError:
+            return self.snapshot()
+        if chunk:
+            self._offset += len(chunk)
+            data = self._partial + chunk
+            lines = data.split(b"\n")
+            # Last element is the (possibly empty) partial line after the final
+            # newline — carry it forward, bounded.
+            self._partial = lines.pop()
+            for line in lines:
+                if self._skip_to_newline:
+                    # This newline terminates the oversized line being skipped.
+                    self._skip_to_newline = False
+                    continue
+                record = _parse_progress_record(line)
+                if record is not None:
+                    self._count += 1
+                    self._records.append(record)
+            if len(self._partial) > _PROGRESS_MAX_LINE_BYTES:
+                # A single line larger than the cap: drop what we have and skip
+                # the remainder until its newline shows up in a later poll.
+                self._partial = b""
+                self._skip_to_newline = True
+        return self.snapshot()
+
+    def snapshot(self) -> dict | None:
+        if self._count <= 0:
+            return None
+        records = list(self._records)
+        while len(records) > 1 and len(json.dumps(records)) > _PROGRESS_TAIL_MAX_BYTES:
+            records.pop(0)
+        return {"records": records, "count": self._count}
 
 
 class _BoundedDedupLog:
@@ -1102,7 +1822,12 @@ def _release_capacity(capacity: threading.Semaphore | None) -> None:
         capacity.release()
 
 
-def _notify_decline(orchestrator_url: str, token: str, task_id: str) -> None:
+def _notify_decline(
+    orchestrator_url: str,
+    token: str,
+    task_id: str,
+    reason: str | None = None,
+) -> None:
     """Best-effort: tell the orchestrator this runner declined a claimed task.
 
     When the runner claims a task from /next-task but then declines it at the
@@ -1111,10 +1836,18 @@ def _notify_decline(orchestrator_url: str, token: str, task_id: str) -> None:
     the task strands until the stale-runner sweep fires when THIS runner goes
     offline — which may be hours or never.  This call releases the pin so the
     dispatch loop can re-pin it next cycle.
+
+    ``reason`` carries WHY we declined (the sandbox/spawn failure string we
+    already print locally).  The orchestrator records it on the task and excludes
+    this runner from re-selection, which is what stops the pin→decline loop; it
+    is optional purely so an older orchestrator still accepts the call.
     """
     try:
         url = f"{orchestrator_url}/api/runner/decline-task"
-        _post(url, token, {"task_id": task_id})
+        body = {"task_id": task_id}
+        if reason:
+            body["reason"] = reason[:500]
+        _post(url, token, body)
     except Exception:
         pass  # best-effort — the stale-runner sweep is the safety net
 
@@ -1163,9 +1896,18 @@ def _reap_loop(
                     if telemetry is not None:
                         if code == 0:
                             telemetry.record_success()
+                        elif code == 42:
+                            # Exit 42 = runtime_unavailable (missing CLI binary).
+                            # This is an infra decline, not a task failure — do NOT
+                            # increment the failure streak so the runner never trips
+                            # degraded=job_failure_streak from a missing-CLI event.
+                            pass
                         else:
                             telemetry.record_failure()
-                    print(f"[DONE] task_id={tid} exit_code={code}", flush=True)
+                    if code == 42:
+                        print(f"[DONE] task_id={tid} exit_code=42 (runtime_unavailable — not a failure)", flush=True)
+                    else:
+                        print(f"[DONE] task_id={tid} exit_code={code}", flush=True)
                     # Reap the per-task workspace so stale dirs don't accumulate
                     # and silently exhaust the runner's disk (unlike compute-job
                     # scratch dirs, these are never otherwise removed).
@@ -1228,6 +1970,231 @@ def _reap_loop(
         time.sleep(2)
 
 
+# ── Live-safe config: server-authoritative reconfiguration via heartbeat ──────
+
+class _LiveRunnerConfig:
+    """Thread-safe holder for the LIVE-SAFE runner config subset.
+
+    The heartbeat RESPONSE carries a server-authoritative ``config`` block
+    (``max_concurrent`` / ``max_concurrent_compute`` / ``task_types`` /
+    ``gpu_indices_allowed`` plus a ``config_generation`` marker). The env-var
+    startup values seed this holder as the INITIAL defaults; a server config
+    block OVERRIDES them live. The agent and compute claim loops read
+    ``max_concurrent()`` / ``max_concurrent_compute()`` each iteration, so
+    GROWING the limit lets new claims proceed on the next tick and SHRINKING it
+    simply stops NEW claims — running work is never touched. The daemon echoes
+    the applied generation + values back on the next heartbeat so the
+    orchestrator/UI can render desired-vs-applied (``config_pending``).
+    """
+
+    # Concurrency bounds the server validates (backend runner_config). A live
+    # update is clamped to this range so a bad push can never wedge the runner
+    # idle (< 1) or blow the pool past the ceiling (> 64).
+    MIN_CONCURRENT = 1
+    MAX_CONCURRENT = 64
+
+    # The live-safe keys this daemon knows how to apply mid-flight. A config
+    # block carrying an UNRECOGNIZED non-null field is treated as
+    # not-fully-applicable: the daemon leaves the new generation UNAPPLIED and
+    # keeps reporting the older one, so the server renders it as pending rather
+    # than the daemon silently dropping a field it does not understand.
+    _KNOWN_KEYS = frozenset(
+        {
+            "max_concurrent",
+            "max_concurrent_compute",
+            "task_types",
+            "gpu_indices_allowed",
+            "gpus_per_job",
+        }
+    )
+
+    # Per-job GPU-count bounds, mirroring the server projection (runner_config).
+    # A live push is clamped into this range so a bad value can never wedge the
+    # scheduler (< 1) or reserve an absurd number of devices per job.
+    MIN_GPUS_PER_JOB = 1
+    MAX_GPUS_PER_JOB = 8
+
+    def __init__(
+        self,
+        max_concurrent: int,
+        max_concurrent_compute: int,
+        task_types="all",
+        gpu_state: dict | None = None,
+        all_gpu_indices=None,
+    ) -> None:
+        self._lock = threading.Lock()
+        self._max_concurrent = self._clamp(max_concurrent)
+        self._max_concurrent_compute = self._clamp(max_concurrent_compute)
+        self._task_types = task_types  # "all" or list[str]
+        # Reported live-safe GPU allowlist value: "all" sentinel or a sorted
+        # list of indices (mirrors the server's projected representation so the
+        # echoed generation matches without recomputing the hash).
+        self._gpu_indices_allowed = "all"
+        # Shared GPU-scheduling dict; the concrete allowlist lives under
+        # ["allowed"] and is read by _assign_gpus under ["lock"]. The per-job
+        # GPU count lives under ["per_job"] and is read by _assign_gpus too, so a
+        # live update to it takes effect on the NEXT job assignment.
+        self._gpu_state = gpu_state
+        # Reported per-job GPU count, seeded from the startup gpu_state value so
+        # the echoed report matches the count the scheduler actually uses.
+        self._gpus_per_job = self._clamp_gpus_per_job(
+            (gpu_state or {}).get("per_job", self.MIN_GPUS_PER_JOB)
+        )
+        self._all_gpu_indices = list(all_gpu_indices or [])
+        # None until the first server generation is applied; the server treats a
+        # null applied generation as pending/unknown (never an error).
+        self._applied_generation: str | None = None
+
+    @classmethod
+    def _clamp(cls, value) -> int:
+        try:
+            v = int(value)
+        except (TypeError, ValueError):
+            return cls.MIN_CONCURRENT
+        return max(cls.MIN_CONCURRENT, min(cls.MAX_CONCURRENT, v))
+
+    @classmethod
+    def _clamp_gpus_per_job(cls, value) -> int:
+        try:
+            v = int(value)
+        except (TypeError, ValueError):
+            return cls.MIN_GPUS_PER_JOB
+        return max(cls.MIN_GPUS_PER_JOB, min(cls.MAX_GPUS_PER_JOB, v))
+
+    def max_concurrent(self) -> int:
+        with self._lock:
+            return self._max_concurrent
+
+    def max_concurrent_compute(self) -> int:
+        with self._lock:
+            return self._max_concurrent_compute
+
+    def report(self) -> dict:
+        """Applied-vs-pending report fields for the next HeartbeatRequest body."""
+        with self._lock:
+            return {
+                "applied_config_generation": self._applied_generation,
+                "applied_max_concurrent": self._max_concurrent,
+                "applied_max_concurrent_compute": self._max_concurrent_compute,
+                "applied_task_types": self._task_types,
+                "applied_gpu_indices_allowed": self._gpu_indices_allowed,
+                "applied_gpus_per_job": self._gpus_per_job,
+            }
+
+    def apply(self, config) -> bool:
+        """Reconcile a server config block onto the live process.
+
+        Returns True when every delivered field was applied and the generation
+        advanced; False when an unrecognized field forced the generation to stay
+        pending. Never raises — a malformed/absent block leaves live config
+        untouched and reports False.
+        """
+        if not isinstance(config, dict):
+            return False
+        generation = config.get("config_generation")
+        # Forward-compat guard: an unknown non-null field is NOT known-live-safe,
+        # so we refuse to claim the generation as applied and keep reporting the
+        # older one (the server renders it as still-pending).
+        fully_applicable = True
+        for key, value in config.items():
+            if key == "config_generation":
+                continue
+            if key not in self._KNOWN_KEYS and value is not None:
+                fully_applicable = False
+
+        with self._lock:
+            mc = config.get("max_concurrent")
+            if mc is not None:
+                self._max_concurrent = self._clamp(mc)
+            mcc = config.get("max_concurrent_compute")
+            if mcc is not None:
+                self._max_concurrent_compute = self._clamp(mcc)
+            if "task_types" in config:
+                tt = config.get("task_types")
+                if tt == "all" or tt is None:
+                    self._task_types = "all"
+                elif isinstance(tt, list):
+                    self._task_types = [str(x) for x in tt if isinstance(x, str) and x]
+            if "gpu_indices_allowed" in config:
+                self._apply_gpu_allowlist_locked(config.get("gpu_indices_allowed"))
+            if "gpus_per_job" in config:
+                self._apply_gpus_per_job_locked(config.get("gpus_per_job"))
+            if fully_applicable and isinstance(generation, str) and generation:
+                self._applied_generation = generation
+        return fully_applicable
+
+    def _apply_gpu_allowlist_locked(self, raw) -> None:
+        """Update the reported allowlist and the shared GPU-scheduling set.
+
+        ``"all"``/``None`` → no restriction (every detected GPU); a list → that
+        subset, intersected with detected GPUs so a NEW job is never assigned a
+        GPU this host does not have. Running jobs keep their already-assigned
+        GPUs (only the ``allowed`` set for FUTURE assignments changes).
+        Called with ``self._lock`` held.
+        """
+        if raw is None or raw == "all":
+            self._gpu_indices_allowed = "all"
+            concrete = list(self._all_gpu_indices)
+        elif isinstance(raw, list):
+            wanted: list[int] = []
+            seen: set[int] = set()
+            for item in raw:
+                if isinstance(item, bool):
+                    continue
+                if isinstance(item, int):
+                    value = item
+                elif isinstance(item, str) and item.strip().lstrip("+").isdecimal():
+                    value = int(item.strip())
+                else:
+                    continue
+                if value < 0 or value in seen:
+                    continue
+                seen.add(value)
+                wanted.append(value)
+            wanted.sort()
+            self._gpu_indices_allowed = wanted
+            concrete = (
+                [i for i in wanted if i in self._all_gpu_indices]
+                if self._all_gpu_indices
+                else list(wanted)
+            )
+        else:
+            return
+        if self._gpu_state is not None:
+            gpu_lock = self._gpu_state.get("lock")
+            if gpu_lock is not None:
+                with gpu_lock:
+                    self._gpu_state["allowed"] = concrete
+            else:
+                self._gpu_state["allowed"] = concrete
+
+    def _apply_gpus_per_job_locked(self, raw) -> None:
+        """Update the reported per-job GPU count and the shared scheduling state.
+
+        ``None`` keeps the current value (the server omitting the field is not a
+        request to reset it). A valid value is clamped into
+        ``[MIN_GPUS_PER_JOB, MAX_GPUS_PER_JOB]`` and written to
+        ``gpu_state["per_job"]`` so the NEXT ``_assign_gpus`` reserves that many
+        devices — running jobs keep the GPUs they were already assigned.
+        Called with ``self._lock`` held.
+        """
+        if raw is None:
+            return
+        try:
+            int(raw)
+        except (TypeError, ValueError):
+            return
+        per_job = self._clamp_gpus_per_job(raw)
+        self._gpus_per_job = per_job
+        if self._gpu_state is not None:
+            gpu_lock = self._gpu_state.get("lock")
+            if gpu_lock is not None:
+                with gpu_lock:
+                    self._gpu_state["per_job"] = per_job
+            else:
+                self._gpu_state["per_job"] = per_job
+
+
 # ── Heartbeat (background thread) ─────────────────────────────────────────────
 
 def _heartbeat_loop(
@@ -1245,6 +2212,7 @@ def _heartbeat_loop(
     max_network_failures: int = 0,
     caps: "iso.Capabilities | None" = None,
     agent_image: str | None = None,
+    live_config: "_LiveRunnerConfig | None" = None,
 ) -> None:
     url = f"{orchestrator_url}/api/runner/heartbeat"
     has_gpu = bool(gpu_capabilities.get("has_gpu"))
@@ -1281,10 +2249,15 @@ def _heartbeat_loop(
             # orchestrator stops pinning agent tasks here. When agent_image is None
             # this collapses to the prior bwrap-only behavior (no regression).
             agent_binary_present = _locate_agent_binary() is not None
+            # Probe the node runtime once and reuse it below — this is the single
+            # source of truth for both the bwrap advertisement leg and the per-leg
+            # breakdown, so the compound reason string cannot disagree with the
+            # advertisement (an earlier version re-probed inside the reason chain).
+            node_runtime_ok = _node_runtime_ok()
             bwrap_agent_ok = (
                 agent_sandbox_ok
                 and agent_binary_present
-                and _node_runtime_ok()
+                and node_runtime_ok
             )
             # A docker-only box (docker+image WITHOUT bwrap) advertises
             # agent_available=True but can run ONLY the read-only slice
@@ -1297,6 +2270,47 @@ def _heartbeat_loop(
             # a distinct runner capability, not a clobber of operator config.
             docker_agent_ok = caps is not None and _docker_agent_possible(caps, agent_image)
             agent_available = bwrap_agent_ok or docker_agent_ok
+            # Per-leg breakdown of the FOUR independent legs that gate the agent
+            # backends, so the fleet UI can render a checklist rather than parse a
+            # string. Emitted whenever the leg states are known (caps is not None);
+            # None for the old-caller path below, matching the absent-tolerant
+            # heartbeat contract. Note the docker leg does NOT require the host
+            # node/binary (the runtime lives in the prod image), while the bwrap
+            # path requires sandbox + dist + node together.
+            if caps is not None:
+                agent_unavailable_legs: dict | None = {
+                    "bwrap_sandbox": bool(agent_sandbox_ok),
+                    "agent_dist": bool(agent_binary_present),
+                    "node_runtime": bool(node_runtime_ok),
+                    "docker": bool(docker_agent_ok),
+                }
+            else:
+                agent_unavailable_legs = None
+            # Granular unavailability reason (engine's FleetRunnersPanel
+            # observability field): when NEITHER backend leg is satisfiable, say
+            # WHY so the orchestrator/operator sees the cause. Enumerate EVERY
+            # failing leg (compound, "; "-joined) rather than stopping at the first
+            # match, so the operator can tell precisely which legs failed instead of
+            # an opaque single-cause string. None when agent_available is True.
+            if agent_available:
+                agent_unavailable_reason: str | None = None
+            else:
+                # Ordered (failed-flag, phrase) pairs — a leg contributes its phrase
+                # only when it actually failed. The bwrap trio (sandbox/dist/node)
+                # and the docker leg are all independent, so a sandbox+no-docker box
+                # now surfaces BOTH causes instead of folding them into one string.
+                _leg_reasons = [
+                    (not agent_sandbox_ok, "bwrap sandbox unavailable"),
+                    (not agent_binary_present, "agent dist not built"),
+                    (not node_runtime_ok, "node runtime not functional"),
+                    (not docker_agent_ok, "docker agent unavailable"),
+                ]
+                failed_phrases = [phrase for failed, phrase in _leg_reasons if failed]
+                agent_unavailable_reason = (
+                    "; ".join(failed_phrases)
+                    if failed_phrases
+                    else "no usable agent backend (bwrap or docker)"
+                )
             # Runner-DECLARED agent capability floor. A docker-ONLY box (docker+image
             # but NO bwrap) can only run the read-only agent slice — the prod agent
             # image is read-only-parity and write/heavy types would DECLINE at claim
@@ -1325,20 +2339,45 @@ def _heartbeat_loop(
                 compute_backend = iso.decide_compute_backend(
                     caps, has_image=agent_image is not None
                 )
+                llm_clis = iso.probe_llm_clis()
             else:
                 isolation_backends = None
                 agent_backend = None
                 compute_backend = None
+                llm_clis = None
+            # Flat CLI inventory derived from the same probe: {name: version|None}.
+            # Absent binary ⇒ None; present with an unknown version ⇒ "". Probed
+            # every heartbeat, so startup AND post-self-update (the process
+            # restarts and re-probes) are both covered without extra hooks.
+            cli_inventory = (
+                {
+                    name: ((info.get("version") or "") if info.get("present") else None)
+                    for name, info in llm_clis.items()
+                    if isinstance(info, dict)
+                }
+                if isinstance(llm_clis, dict)
+                else None
+            )
+            gpu_memory = _gpu_memory_mib() if has_gpu else None
             body = {
                 "active_task_ids": task_ids,
                 "active_compute_job_ids": compute_job_ids,
+                # This is a genuine active-work report: task_ids/compute_job_ids
+                # are the live running-agents set. The orchestrator refreshes its
+                # reaper-trusted active-set snapshot + stamp only for reports
+                # flagged here (a --check preflight sets this False).
+                "active_work_report": True,
                 "agent_available": agent_available,
+                "agent_unavailable_reason": agent_unavailable_reason,
+                "agent_unavailable_legs": agent_unavailable_legs,
                 "supported_agent_task_types": supported_agent_task_types,
                 "hostname": hostname,
                 "version": version,
                 "isolation_backends": isolation_backends,
                 "agent_backend": agent_backend,
                 "compute_backend": compute_backend,
+                "llm_clis": llm_clis,
+                "cli_inventory": cli_inventory,
                 # Health telemetry consumed by the orchestrator to spot a runner
                 # that is failing every job / running low on disk / low on memory /
                 # pegged CPU.
@@ -1348,14 +2387,35 @@ def _heartbeat_loop(
                 "cpu_load_avg": _cpu_load_avg(),
                 "memory_free_bytes": _memory_free_bytes(),
                 "gpu_utilization_pct": _gpu_utilization_pct() if has_gpu else None,
+                # Free-VRAM list (read by dispatch VRAM-fit gating) derived from
+                # the superset (total, free) probe — no second nvidia-smi call.
+                "gpu_free_vram_mib": gpu_memory[1] if gpu_memory else None,
                 **gpu_capabilities,
             }
+            # Per-GPU VRAM (probe failure ⇒ fields omitted entirely, matching
+            # the schema's absent-tolerant contract for old runners).
+            if gpu_memory is not None:
+                body["gpu_memory_total_mib"], body["gpu_memory_free_mib"] = gpu_memory
+            # Applied-vs-pending config report: echo the live-safe generation +
+            # values the daemon currently has in effect so the orchestrator/UI
+            # can tell desired-vs-applied apart. Reflects what was applied on the
+            # PREVIOUS tick (the config block from THIS response is applied below
+            # and reported on the FOLLOWING heartbeat).
+            if live_config is not None:
+                body.update(live_config.report())
             status, resp_body = _post(url, token, body)
             if status in (200, 204):
                 consecutive_401 = 0
                 consecutive_network_failures = 0
                 # Parse orchestrator version hint so the runner can detect staleness.
                 if isinstance(resp_body, dict):
+                    # Apply the server-authoritative live-safe config block (if
+                    # present) onto the running process. Live-safe fields take
+                    # effect on the next claim tick without disrupting in-flight
+                    # work; the applied generation is echoed on the next
+                    # heartbeat (see body.update above).
+                    if live_config is not None:
+                        live_config.apply(resp_body.get("config"))
                     version_hint = resp_body.get("version_hint")
                     if version_hint and version:
                         runner_sha = _describe_sha(version)
@@ -1392,14 +2452,11 @@ def _heartbeat_loop(
                                     # (called inside do_update) will kill this
                                     # process via systemctl restart if a service
                                     # unit is installed. If still alive (no
-                                    # systemd), exit cleanly so any process
-                                    # supervisor restarts the updated runner.
-                                    print(
-                                        "[runner] auto-update complete — "
-                                        "exiting for restart.",
-                                        flush=True,
-                                    )
-                                    os._exit(0)
+                                    # systemd), _reexec_after_update re-execs in
+                                    # place when NO supervisor is detected (the
+                                    # manual tmux/nohup launch that otherwise
+                                    # dies silently), else exits for restart.
+                                    _reexec_after_update()
                                 else:
                                     print(
                                         f"[runner] auto-update failed "
@@ -1716,8 +2773,14 @@ def _report_compute_job(
     exit_code: int | None = None,
     result_metrics: dict | None = None,
     command_log: dict | None = None,
+    progress: dict | None = None,
+    resume_hydration: dict | None = None,
 ) -> bool:
     """POST a status report for a compute job. Returns cancel_requested.
+
+    ``progress`` is the optional bounded interim-progress tail from
+    :class:`_ProgressTail` (``{"records": [...], "count": n}``); absent when the
+    job never wrote a progress record. An old backend simply ignores the field.
 
     Terminal reports (``succeeded``/``failed``) carry the measured
     ``result_metrics`` and the job's final status, so a single transient network
@@ -1734,6 +2797,10 @@ def _report_compute_job(
         body["result_metrics"] = result_metrics
     if command_log is not None:
         body["command_log"] = command_log
+    if progress is not None:
+        body["progress"] = progress
+    if resume_hydration is not None:
+        body["resume_hydration"] = resume_hydration
 
     durable = exec_status in _REPORT_TERMINAL_STATUSES
     max_attempts = (_REPORT_MAX_RETRIES + 1) if durable else 1
@@ -1797,6 +2864,109 @@ def _build_multipart_body(
     body += file_bytes + crlf
     body += b"--" + bnd + b"--" + crlf
     return bytes(body), f"multipart/form-data; boundary={boundary}"
+
+
+# Predecessor run-status files stripped from a hydrated resume bundle so they
+# cannot contaminate THIS run's terminal detection / metric parsing. The
+# checkpoint files the resumed command actually needs (weights, optimizer state,
+# etc.) are kept — only Blueprint's own per-run status files are removed.
+_RESUME_STALE_ARTIFACT_NAMES = frozenset(
+    {"result.json", "command.log.json", "terminal.json", "live_tail.b64"}
+)
+
+
+def _safe_resume_members(tar: "tarfile.TarFile", dest_dir: str) -> list:
+    """Return tar members that extract safely under *dest_dir*.
+
+    Rejects absolute paths, ``..`` escapes, and non-regular/non-dir members
+    (symlinks, devices, fifos) so a hostile or corrupt bundle can never write
+    outside the artifact dir. The bundle is Blueprint-produced and same-project,
+    but resume runs on operator hardware — fail-closed on traversal regardless.
+    """
+    dest_abs = os.path.abspath(dest_dir)
+    safe: list = []
+    for member in tar.getmembers():
+        name = member.name
+        if not name or name.startswith("/") or os.path.isabs(name):
+            continue
+        target = os.path.abspath(os.path.join(dest_dir, name))
+        if target != dest_abs and not target.startswith(dest_abs + os.sep):
+            continue
+        if not (member.isreg() or member.isdir()):
+            continue
+        safe.append(member)
+    return safe
+
+
+def _download_input_artifact(
+    orchestrator_url: str, token: str, job_id: str, artifact_dir: str
+) -> dict:
+    """Cross-job checkpoint resume: fetch + extract the predecessor bundle.
+
+    GETs the predecessor's durable bundle from
+    ``/api/runner/compute-job/{job_id}/input-artifact`` (the server resolves the
+    validated predecessor id from the pinned job — the runner cannot request an
+    arbitrary bundle), extracts it INTO *artifact_dir* so the resumed command sees
+    the prior checkpoint already present, then strips predecessor run-status files
+    so they cannot contaminate this run.
+
+    Returns a provenance dict (``ok`` plus ``file_count`` / ``bytes`` on success,
+    or ``reason`` on failure) describing what actually happened. Best-effort by
+    contract: a failed fetch/extract returns ``ok=False`` (the command still runs,
+    from scratch) and NEVER raises — but the failure is surfaced honestly, never
+    claimed as a successful resume.
+    """
+    url = f"{orchestrator_url}/api/runner/compute-job/{job_id}/input-artifact"
+    req = urllib.request.Request(
+        url,
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/gzip"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            if resp.status not in (200, 201):
+                return {"ok": False, "reason": f"http_{resp.status}"}
+            payload = resp.read()
+    except urllib.error.HTTPError as exc:
+        return {"ok": False, "reason": f"http_{exc.code}"}
+    except Exception as exc:  # noqa: BLE001 — resume is strictly best-effort
+        return {"ok": False, "reason": f"download_error:{type(exc).__name__}"}
+
+    if not payload:
+        return {"ok": False, "reason": "empty_bundle"}
+    if len(payload) > _RUNNER_ARTIFACT_MAX_BYTES:
+        return {"ok": False, "reason": "bundle_too_large"}
+
+    try:
+        with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as tar:
+            tar.extractall(artifact_dir, members=_safe_resume_members(tar, artifact_dir))
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"extract_error:{type(exc).__name__}"}
+
+    # Strip predecessor run-status files anywhere in the extracted tree so they
+    # are not mistaken for THIS run's outputs.
+    for root, _dirs, names in os.walk(artifact_dir):
+        for name in names:
+            if name in _RESUME_STALE_ARTIFACT_NAMES:
+                try:
+                    os.remove(os.path.join(root, name))
+                except OSError:
+                    pass
+
+    file_count = 0
+    total_bytes = 0
+    for root, _dirs, names in os.walk(artifact_dir):
+        for name in names:
+            path = os.path.join(root, name)
+            if os.path.isfile(path):
+                file_count += 1
+                try:
+                    total_bytes += os.path.getsize(path)
+                except OSError:
+                    pass
+    if file_count == 0:
+        return {"ok": False, "reason": "no_files_after_extract"}
+    return {"ok": True, "file_count": file_count, "bytes": total_bytes}
 
 
 def _upload_artifact(orchestrator_url: str, token: str, job_id: str, artifact_dir: str) -> None:
@@ -1916,6 +3086,90 @@ def _upload_artifact(orchestrator_url: str, token: str, job_id: str, artifact_di
         print(f"[compute] artifact upload unexpected error for job {job_id}: {exc}", flush=True)
 
 
+def _is_safe_tar_member(name: str) -> bool:
+    """True when a tar member name is safe to extract under a destination dir.
+
+    Rejects absolute paths and any member that would escape the destination via
+    ``..`` traversal. Mirrors the orchestrator-side check in
+    ``compute_backends._is_safe_tar_member`` so runner and cloud rehydration reject
+    the same crafted-bundle shapes.
+    """
+    if not name:
+        return False
+    normalized = name.replace("\\", "/")
+    if normalized.startswith("/") or normalized.startswith("~"):
+        return False
+    if os.path.splitdrive(normalized)[0]:
+        return False
+    parts = [p for p in normalized.split("/") if p not in ("", ".")]
+    return ".." not in parts
+
+
+def _rehydrate_input_artifact(
+    orchestrator_url: str,
+    token: str,
+    job_id: str,
+    artifact_dir: str,
+) -> None:
+    """Fetch a predecessor's durable bundle and extract it into ``artifact_dir``.
+
+    Cross-job checkpoint resume: downloads the bundle streamed by
+    ``GET /api/runner/compute-job/{job_id}/input-artifact`` (scoped server-side to
+    this pinned runner + same project) and extracts it, path-traversal-safe, into
+    the job's artifact dir BEFORE the command runs so the command sees the
+    checkpoint already present in ``$BLUEPRINT_ARTIFACT_DIR``.
+
+    Raises ``RuntimeError`` on any download/extract failure so the caller fails the
+    job LOUDLY with a clear reason rather than running against an empty workspace.
+    """
+    url = f"{orchestrator_url}/api/runner/compute-job/{job_id}/input-artifact"
+    req = urllib.request.Request(
+        url,
+        headers={"Authorization": f"Bearer {token}"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            bundle = resp.read()
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(
+            f"input_artifact_rehydration_failed: HTTP {exc.code} fetching "
+            f"predecessor bundle for job {job_id}"
+        ) from exc
+    except Exception as exc:  # network/URL errors
+        raise RuntimeError(
+            f"input_artifact_rehydration_failed: error fetching predecessor "
+            f"bundle for job {job_id}: {exc}"
+        ) from exc
+
+    os.makedirs(artifact_dir, exist_ok=True)
+    try:
+        with tarfile.open(fileobj=io.BytesIO(bundle), mode="r:gz") as tar:
+            extracted = 0
+            for member in tar.getmembers():
+                if member.islnk() or member.issym():
+                    continue
+                if not _is_safe_tar_member(member.name):
+                    print(
+                        f"[compute] skipping unsafe artifact-bundle member "
+                        f"{member.name!r} during rehydration for job {job_id}",
+                        flush=True,
+                    )
+                    continue
+                tar.extract(member, path=artifact_dir)
+                extracted += 1
+    except (tarfile.TarError, OSError) as exc:
+        raise RuntimeError(
+            f"input_artifact_rehydration_failed: could not extract predecessor "
+            f"bundle for job {job_id}: {exc}"
+        ) from exc
+    print(
+        f"[compute] rehydrated {extracted} checkpoint file(s) from predecessor "
+        f"for job {job_id}",
+        flush=True,
+    )
+
+
 def _parse_result_metrics(result_file: str) -> dict | None:
     """Read numeric metrics from a job's result.json (best-effort, tolerant)."""
     try:
@@ -1964,6 +3218,14 @@ def _run_compute_job(
     cancel_requested = bool(job_body.get("cancel_requested", False))
     repo_clone = job_body.get("repo_clone") or None
     repo_token = job_body.get("repo_token") or None
+    accelerator_type = job_body.get("accelerator_type") or None
+    allow_host_fallback = bool(job_body.get("allow_host_fallback", False))
+    # No-progress watchdog timeout: when set, the runner monitors the progress file
+    # and kills the job early if no progress signal is seen within this window.
+    no_progress_timeout_seconds = job_body.get("no_progress_timeout_seconds")
+    if no_progress_timeout_seconds is not None:
+        no_progress_timeout_seconds = max(60, int(no_progress_timeout_seconds))
+    input_artifact_job_id = job_body.get("input_artifact_job_id") or None
 
     caps = capabilities if capabilities is not None else _get_capabilities()
     cpu_limit = os.environ.get("BLUEPRINT_RUNNER_CPU_LIMIT") or None
@@ -1982,8 +3244,8 @@ def _run_compute_job(
     outcome: str | None = None
     try:
         # ── Fail-closed gate: refuse anything we cannot sandbox, before any work.
-        if iso.decide_compute_backend(caps, has_image) == iso.DECLINE:
-            reason = iso.compute_decline_reason(caps, has_image) or "no isolation boundary"
+        if iso.decide_compute_backend(caps, has_image, allow_host_fallback=allow_host_fallback) == iso.DECLINE:
+            reason = iso.compute_decline_reason(caps, has_image, allow_host_fallback=allow_host_fallback) or "no isolation boundary"
             print(f"[compute] DECLINED job {job_id} (fail-closed): {reason}", flush=True)
             outcome = "failure"
             _report_compute_job(
@@ -1997,14 +3259,58 @@ def _run_compute_job(
             return
 
         if cancel_requested:
-            _report_compute_job(orchestrator_url, token, job_id,
-                                 exec_status="failed", exit_code=1)
+            _report_compute_job(
+                orchestrator_url, token, job_id,
+                exec_status="failed", exit_code=1,
+                command_log={
+                    "text": "[runner] job was cancel-requested at claim; "
+                    "command never started",
+                    "truncated": False,
+                },
+            )
             return
 
         tmpdir = tempfile.mkdtemp(prefix="bp_compute_")
         result_file = os.path.join(tmpdir, "result.json")
         artifact_dir = os.path.join(tmpdir, "artifacts")
+        # Interim-progress channel: the experiment may append JSONL records here
+        # (via $BLUEPRINT_PROGRESS_FILE); the runner tails it each heartbeat.
+        # Never pre-created — appending code creates it, absence means no progress.
+        progress_file = os.path.join(tmpdir, "progress.jsonl")
         os.makedirs(artifact_dir, exist_ok=True)
+
+        # Cross-job checkpoint resume: hydrate the predecessor's durable bundle
+        # into the artifact dir BEFORE any command runs (mirrors the repo-clone
+        # window below), so the resumed command sees the prior checkpoint already
+        # present. Best-effort + honest: provenance (success OR failure) is
+        # reported so the operator can see exactly what happened — a failed
+        # hydration is never claimed as a successful resume.
+        if input_artifact_job_id:
+            provenance = _download_input_artifact(
+                orchestrator_url, token, job_id, artifact_dir
+            )
+            provenance["resumed_from_job_id"] = str(input_artifact_job_id)
+            if provenance.get("ok"):
+                print(
+                    f"[compute] job {job_id}: resumed from {input_artifact_job_id} "
+                    f"({provenance.get('file_count')} file(s), "
+                    f"{provenance.get('bytes')} bytes hydrated)",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[compute] job {job_id}: checkpoint resume from "
+                    f"{input_artifact_job_id} FAILED "
+                    f"({provenance.get('reason')}); running from scratch",
+                    flush=True,
+                )
+            _report_compute_job(
+                orchestrator_url,
+                token,
+                job_id,
+                exec_status="running",
+                resume_hydration=provenance,
+            )
 
         # Reserve a disjoint GPU subset when the host has GPUs (16 GB V100 → 1/job).
         if caps.has_gpu:
@@ -2027,23 +3333,37 @@ def _run_compute_job(
             if not ok:
                 print(f"[compute] git clone failed for job {job_id} (exit={clone_rc})", flush=True)
                 outcome = "failure"
-                _report_compute_job(orchestrator_url, token, job_id,
-                                     exec_status="failed", exit_code=clone_rc)
+                _report_compute_job(
+                    orchestrator_url, token, job_id,
+                    exec_status="failed", exit_code=clone_rc,
+                    command_log={
+                        "text": f"[runner] git clone of {owner}/{repo}@{ref} "
+                        f"failed (exit={clone_rc}); command never started",
+                        "truncated": False,
+                    },
+                )
                 return
             if not cwd:
                 cwd = clone_dir
             print(f"[compute] cloned {owner}/{repo}@{ref} for job {job_id}", flush=True)
 
         # Registry auth for docker/podman backends only (trusted host `docker login`).
-        backend_pre = iso.decide_compute_backend(caps, has_image)
+        backend_pre = iso.decide_compute_backend(caps, has_image, allow_host_fallback=allow_host_fallback)
         if (
             backend_pre in (iso.BACKEND_DOCKER, iso.BACKEND_PODMAN)
             and container_registry_auth.get("password")
             and not _docker_login(container_registry_auth, container_image=container_image)
         ):
             outcome = "failure"
-            _report_compute_job(orchestrator_url, token, job_id,
-                                 exec_status="failed", exit_code=1)
+            _report_compute_job(
+                orchestrator_url, token, job_id,
+                exec_status="failed", exit_code=1,
+                command_log={
+                    "text": "[runner] docker login to the container registry "
+                    f"failed for image {container_image!r}; command never started",
+                    "truncated": False,
+                },
+            )
             return
 
         # Fold setup_step into the sandboxed command so it runs INSIDE the same
@@ -2063,6 +3383,7 @@ def _run_compute_job(
             workspace_host=tmpdir,
             result_file_host=result_file,
             artifact_dir_host=artifact_dir,
+            progress_file_host=progress_file,
             clone_dir_host=clone_dir,
             cwd_host=cwd,
             job_env=env_override,
@@ -2078,7 +3399,16 @@ def _run_compute_job(
             ),
             cpu_limit=cpu_limit,
             mem_limit=mem_limit,
+            allow_host_fallback=allow_host_fallback,
         )
+        # NOTE: BLUEPRINT_PROGRESS_FILE is NOT set here. plan_compute_execution
+        # already injects it into plan.env with the correct IN-SANDBOX path
+        # (translated from progress_file_host to the per-backend mount, e.g.
+        # /tmp/blueprint_out, /workspace, or SANDBOX_WORKSPACE). Overriding it
+        # with the host-absolute `progress_file` would point the command at a
+        # path that is not mounted inside the container, so the host would never
+        # observe progress writes (breaking both the progress-tail protocol and
+        # the no-progress watchdog, which stat() the host `progress_file`).
         if plan.declined:
             print(f"[compute] DECLINED job {job_id} (fail-closed): {plan.decline_reason}", flush=True)
             outcome = "failure"
@@ -2091,6 +3421,88 @@ def _run_compute_job(
                 },
             )
             return
+
+        # Cache hygiene bookkeeping: stamp this image as USED now. Docker keeps no
+        # last-use time, so without this stamp the low-disk prune could only see
+        # the image's upstream CREATION date and would evict a base image this job
+        # just pulled (see _prune_docker_images).
+        _record_image_use(container_image)
+
+        # GPU-used enforcement: run a lightweight nvidia-smi -L probe INSIDE the
+        # same sandbox before the real command, so (a) torch/TF cannot silently
+        # fall back to CPU if CUDA is not actually reachable, and (b) an image
+        # whose CUDA runtime cannot use this GPU's arch (NGC images drop older
+        # compute capabilities) is caught before the FULL RUN is burned. It does
+        # NOT save the image pull — the pull happens first, by necessity.
+        #
+        # A container image alone arms the gate: the image/GPU arch mismatch
+        # exists whenever GPUs meet a container, even with no declared
+        # accelerator. An imageless (bwrap) GPU job still probes only when an
+        # accelerator was declared, exactly as before.
+        if assigned_gpus and (accelerator_type or container_image):
+            # Pull FIRST. The probe's own `docker run` would otherwise BE the
+            # pull (docker's default policy is `missing`), pitting the probe's
+            # 30s timeout against a cold multi-GB download it cannot win — the
+            # job would then die reporting a probe timeout instead of the real
+            # reason. Best-effort: a pull failure is left for the probe / real
+            # run to surface, so there is only one authoritative failure path.
+            pull_ok, pull_detail = iso.pull_container_image(plan, container_image)
+            if not pull_ok:
+                print(
+                    f"[compute] job {job_id}: pre-probe image pull did not "
+                    f"succeed ({pull_detail}) — continuing; the probe or the run "
+                    "will surface the real error",
+                    flush=True,
+                )
+
+            probe_ok, probe_detail = iso.probe_gpu_in_sandbox(plan)
+            if not probe_ok:
+                # An arch mismatch is CONCLUSIVE: the container itself reported it
+                # cannot use this GPU, so the run can only end in "no metric".
+                # Fatal no matter what the job declared.
+                #
+                # Every OTHER probe failure (timeout, no nvidia-smi, empty device
+                # list) is INCONCLUSIVE — it says the PROBE could not run, not
+                # that the JOB cannot. Killing on those would be a false failure,
+                # and the blast radius is wide: `assigned_gpus` is populated from
+                # caps.has_gpu ALONE, so on a GPU host it covers every
+                # containerized job, CPU-only ones included. Keep the old contract
+                # — only a job that DECLARED an accelerator dies on an
+                # inconclusive probe; an image-only job warns and proceeds.
+                arch_mismatch = iso.no_usable_gpu_marker(probe_detail) is not None
+                if not arch_mismatch and not accelerator_type:
+                    print(
+                        f"[compute] job {job_id}: GPU probe inconclusive "
+                        f"({probe_detail}) — no accelerator was declared, so the "
+                        "job proceeds rather than fail on a probe it never needed",
+                        flush=True,
+                    )
+                else:
+                    declared = (
+                        f"accelerator={accelerator_type}"
+                        if accelerator_type
+                        else f"image={container_image}"
+                    )
+                    terminal_reason = (
+                        f"GPU assigned ({declared}) but unusable "
+                        f"in sandbox: {probe_detail}"
+                    )
+                    print(f"[compute] ABORT job {job_id}: {terminal_reason}", flush=True)
+                    outcome = "failure"
+                    _report_compute_job(
+                        orchestrator_url, token, job_id,
+                        exec_status="failed", exit_code=1,
+                        command_log={
+                            "text": terminal_reason,
+                            "truncated": False,
+                        },
+                    )
+                    return
+            else:
+                print(
+                    f"[compute] GPU probe OK for job {job_id}: {probe_detail.splitlines()[0]}",
+                    flush=True,
+                )
 
         # Per-job image downgrade: the job asked for a container_image but this host
         # has no container runtime, so it runs image-LESS under bwrap on the host
@@ -2134,8 +3546,14 @@ def _run_compute_job(
         except Exception as exc:
             print(f"[compute] failed to start job {job_id}: {exc}", flush=True)
             outcome = "failure"
-            _report_compute_job(orchestrator_url, token, job_id,
-                                 exec_status="failed", exit_code=1)
+            _report_compute_job(
+                orchestrator_url, token, job_id,
+                exec_status="failed", exit_code=1,
+                command_log={
+                    "text": f"[runner] failed to start command: {exc}",
+                    "truncated": False,
+                },
+            )
             return
 
         print(
@@ -2149,6 +3567,50 @@ def _run_compute_job(
         log_capture = _BoundedDedupLog(
             _RUNNER_MAX_COMMAND_LOG_BYTES, _RUNNER_COMMAND_LOG_HEAD_BYTES
         )
+
+        # Bounded tail of the job's self-reported progress records; polled each
+        # heartbeat interval and attached to interim AND terminal reports so a
+        # deadline-killed 24h run still surfaces its training trajectory.
+        progress_tail = _ProgressTail(progress_file)
+
+        def _interim_log_tail() -> dict | None:
+            # Live-output tail (~4KB) for interim running reports. The server
+            # stamps it as polling_metadata["live_output"] (same shape as the
+            # GCP live-tail path); the FULL bounded log still travels on the
+            # terminal report only. truncated=True whenever the tail is a
+            # window on a longer capture.
+            log_text, truncated = log_capture.result()
+            if not log_text:
+                return None
+            tail = log_text[-_RUNNER_LIVE_TAIL_CHARS:]
+            return {
+                "text": tail,
+                "truncated": truncated or len(tail) < len(log_text),
+            }
+
+        def _terminal_command_log(kill_note: str | None = None) -> dict | None:
+            # EVERY terminal report must carry the captured log: the deadline/
+            # cancel/shutdown kill paths previously reported failed with NO
+            # command_log, discarding the output of exactly the most expensive
+            # failures (a 24h run killed at its deadline). ``kill_note`` lands
+            # at the TAIL so a tail-truncated view still ends with WHY.
+            log_text, truncated = log_capture.result()
+            if image_downgraded:
+                log_text = (
+                    f"NOTE: container_image {container_image} requested but no "
+                    "container runtime available on this host; running "
+                    "image-less on host toolchain.\n"
+                ) + log_text
+            if kill_note:
+                sep = "" if (not log_text or log_text.endswith("\n")) else "\n"
+                log_text = f"{log_text}{sep}[runner] {kill_note}\n"
+            if not log_text and not truncated:
+                return None
+            return {
+                "text": log_text,
+                "truncated": truncated,
+                "byte_count": len(log_text.encode("utf-8")),
+            }
 
         def _read_stdout() -> None:
             try:
@@ -2186,6 +3648,10 @@ def _run_compute_job(
             if runtime_deadline_seconds is not None
             else None
         )
+        # No-progress watchdog: track the last time the progress file was touched.
+        # Initial state is "progress at start" so the window begins from launch.
+        _np_last_progress = start_time
+        _np_last_mtime: float | None = None
 
         def _teardown() -> None:
             iso.terminate_process_tree(
@@ -2209,22 +3675,76 @@ def _run_compute_job(
             if deadline is not None and now >= deadline:
                 _teardown()
                 outcome = "failure"
-                _report_compute_job(orchestrator_url, token, job_id,
-                                     exec_status="failed", exit_code=124)
+                _report_compute_job(
+                    orchestrator_url, token, job_id,
+                    exec_status="failed", exit_code=124,
+                    command_log=_terminal_command_log(
+                        "killed by runner: runtime deadline "
+                        f"({runtime_deadline_seconds}s) exceeded"
+                    ),
+                    progress=progress_tail.poll(),
+                )
                 return
+
+            # No-progress watchdog: check if the progress file has been touched
+            # since the last observation. Any mtime bump counts as progress.
+            if no_progress_timeout_seconds is not None:
+                try:
+                    _cur_mtime = os.stat(progress_file).st_mtime
+                except OSError:
+                    _cur_mtime = None
+                # Any advance counts as progress, INCLUDING the first appearance of
+                # the file (transition from "no file yet" to a valid mtime). Gating
+                # on `_np_last_mtime is not None` would miss that first write and
+                # measure the window from job start instead of from first progress.
+                if _cur_mtime is not None and (
+                    _np_last_mtime is None or _cur_mtime > _np_last_mtime
+                ):
+                    _np_last_progress = now
+                _np_last_mtime = _cur_mtime
+                if now - _np_last_progress >= no_progress_timeout_seconds:
+                    _teardown()
+                    outcome = "failure"
+                    _report_compute_job(
+                        orchestrator_url, token, job_id,
+                        exec_status="failed", exit_code=125,
+                        command_log=_terminal_command_log(
+                            "killed by runner: no-progress watchdog "
+                            f"({no_progress_timeout_seconds}s without a progress "
+                            "update) exceeded"
+                        ),
+                        progress=progress_tail.poll(),
+                    )
+                    return
 
             if _shutdown_event.is_set():
                 _teardown()
-                _report_compute_job(orchestrator_url, token, job_id,
-                                     exec_status="failed", exit_code=1)
+                _report_compute_job(
+                    orchestrator_url, token, job_id,
+                    exec_status="failed", exit_code=1,
+                    command_log=_terminal_command_log(
+                        "killed by runner: runner shutting down"
+                    ),
+                    progress=progress_tail.poll(),
+                )
                 return
 
-            cancel = _report_compute_job(orchestrator_url, token, job_id,
-                                          exec_status="running")
+            cancel = _report_compute_job(
+                orchestrator_url, token, job_id,
+                exec_status="running",
+                command_log=_interim_log_tail(),
+                progress=progress_tail.poll(),
+            )
             if cancel:
                 _teardown()
-                _report_compute_job(orchestrator_url, token, job_id,
-                                     exec_status="failed", exit_code=1)
+                _report_compute_job(
+                    orchestrator_url, token, job_id,
+                    exec_status="failed", exit_code=1,
+                    command_log=_terminal_command_log(
+                        "killed by runner: cancel requested by orchestrator"
+                    ),
+                    progress=progress_tail.poll(),
+                )
                 return
 
         # Process exited: let the reader drain, then close our read-fd so a leftover
@@ -2236,20 +3756,7 @@ def _run_compute_job(
 
         result_metrics = _parse_result_metrics(result_file)
 
-        log_text, truncated = log_capture.result()
-        if image_downgraded:
-            note = (
-                f"NOTE: container_image {container_image} requested but no container "
-                "runtime available on this host; running image-less on host toolchain.\n"
-            )
-            log_text = note + log_text
-        command_log: dict | None = None
-        if log_text or truncated or image_downgraded:
-            command_log = {
-                "text": log_text,
-                "truncated": truncated,
-                "byte_count": len(log_text.encode("utf-8")),
-            }
+        command_log = _terminal_command_log()
 
         succeeded = exit_code_val == 0
         outcome = "success" if succeeded else "failure"
@@ -2260,6 +3767,7 @@ def _run_compute_job(
             exit_code=exit_code_val,
             result_metrics=result_metrics,
             command_log=command_log,
+            progress=progress_tail.poll(),
         )
         print(f"[compute] job {job_id} {exec_status_final} (exit={exit_code_val})",
               flush=True)
@@ -2268,8 +3776,19 @@ def _run_compute_job(
         print(f"[compute] unexpected error for job {job_id}: {exc}", flush=True)
         outcome = "failure"
         try:
+            try:
+                # Salvage whatever the command printed before the runner crashed.
+                crash_log = _terminal_command_log(f"unexpected runner error: {exc}")
+            except NameError:
+                # Crashed before the log capture existed — the exception text is
+                # the only evidence there is.
+                crash_log = {
+                    "text": f"[runner] unexpected runner error: {exc}",
+                    "truncated": False,
+                }
             _report_compute_job(orchestrator_url, token, job_id,
-                                 exec_status="failed", exit_code=1)
+                                 exec_status="failed", exit_code=1,
+                                 command_log=crash_log)
         except Exception:
             pass
     finally:
@@ -2288,6 +3807,24 @@ def _run_compute_job(
         _release_capacity(capacity)
         if tmpdir:
             shutil.rmtree(tmpdir, ignore_errors=True)
+        # Cache hygiene: reclaim Docker image storage if disk is low. No-op when
+        # free space is above threshold; protects in-use and recently-used images
+        # (last-use/pull recency, not upstream image creation date).
+        try:
+            prune_result = _prune_docker_images(
+                _workspace_root(), _min_free_disk_bytes()
+            )
+            if prune_result.get("pruned"):
+                print(
+                    f"[compute] job {job_id}: Docker image hygiene (low disk) "
+                    f"keep_days={prune_result.get('keep_days')} "
+                    f"removed={prune_result.get('removed')} "
+                    f"kept={prune_result.get('kept')} "
+                    f"in_use_skipped={prune_result.get('in_use_skipped')}",
+                    flush=True,
+                )
+        except Exception:  # noqa: BLE001 — cache hygiene must never fail a job
+            pass
 
 
 def _compute_poll_loop(
@@ -2301,6 +3838,8 @@ def _compute_poll_loop(
     capabilities: "iso.Capabilities | None" = None,
     gpu_state: dict | None = None,
     telemetry: "_TelemetryState | None" = None,
+    max_gpu_util_pct: int = 0,
+    live_config: "_LiveRunnerConfig | None" = None,
 ) -> None:
     """Background thread: poll for compute jobs and spawn a worker per claimed job.
 
@@ -2316,13 +3855,34 @@ def _compute_poll_loop(
             with lock:
                 active_count = len(active_jobs)
 
-            if active_count >= max_concurrent:
+            # A live server config push can grow/shrink the compute ceiling
+            # mid-flight; read it each iteration so the gate is the source of
+            # truth (the static `max_concurrent` is only the env-var default).
+            effective_max = (
+                live_config.max_concurrent_compute()
+                if live_config is not None
+                else max_concurrent
+            )
+            if active_count >= effective_max:
                 time.sleep(poll_interval)
                 continue
 
             if not _try_acquire_capacity(capacity):
                 time.sleep(poll_interval)
                 continue
+
+            # Host-load guard: skip claiming when GPU is saturated.
+            if max_gpu_util_pct > 0:
+                util = _gpu_utilization_pct()
+                if util is not None and util >= max_gpu_util_pct:
+                    _release_capacity(capacity)
+                    print(
+                        f"[compute] gpu_utilization_pct {util} >= threshold {max_gpu_util_pct}"
+                        " — skipping compute claim",
+                        flush=True,
+                    )
+                    time.sleep(poll_interval)
+                    continue
 
             try:
                 resp = _post(url, token, {}, return_headers=True)
@@ -2610,6 +4170,90 @@ def _check_provider_credentials() -> list[str]:
     return found
 
 
+def _agent_deps_missing() -> bool:
+    """Check whether agent node dependencies are missing on this host.
+
+    Returns True when ``agent/src/index.ts`` exists on this host (agent path
+    is expected) but ``agent/node_modules/.bin/tsx`` is absent AND ``tsx`` is
+    not on the system PATH — meaning ``npm install`` / ``npm ci`` was never
+    run in the agent directory. The tsx fallback path in ``_locate_agent_binary``
+    returns a non-None argv (``["tsx", entry_ts]``) even in this state, so the
+    runner appears ready while every agent task fails at subprocess spawn.
+
+    Returns False when no agent source is found (compute-only host — not
+    actionable) or when deps are properly installed.
+    """
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    for base in [os.path.join(script_dir, ".."), os.getcwd()]:
+        agent_dir = os.path.normpath(os.path.join(base, "agent"))
+        entry_ts = os.path.join(agent_dir, "src", "index.ts")
+        if os.path.isfile(entry_ts):
+            # Agent source exists on this host — check deps.
+            tsx_in_node_modules = os.path.isfile(
+                os.path.join(agent_dir, "node_modules", ".bin", "tsx")
+            )
+            # dist/index.js means a pre-built artifact and no tsx needed.
+            dist_built = os.path.isfile(
+                os.path.join(agent_dir, "dist", "index.js")
+            )
+            if not tsx_in_node_modules and not dist_built and not shutil.which("tsx"):
+                return True
+            # Deps are fine — no warning needed.
+            return False
+    # No agent source path on this host at all — compute-only, not actionable.
+    return False
+
+
+def _gpu_sandbox_smoke(caps: "iso.Capabilities", allowlist: list) -> str:
+    """Run the preflight GPU probe in a REAL sandbox workspace; return one line.
+
+    The probe re-runs the plan's argv verbatim, and that argv binds
+    ``workspace_host`` into the sandbox — bwrap fails hard ("Can't find source
+    path") when a bind source is missing. The workspace therefore MUST still
+    exist while the probe runs: the temp dir is torn down in a ``finally`` AFTER
+    the probe, never between the plan and the probe (which made the preflight
+    smoke fail 100% of the time on a real GPU host, reporting a sandbox CUDA
+    outage that did not exist).
+    """
+    smoke_indices = list(allowlist)[:1]
+    tmpdir = None
+    try:
+        tmpdir = tempfile.mkdtemp(prefix="bp_gpu_smoke_")
+        result_file = os.path.join(tmpdir, "result.json")
+        artifact_dir = os.path.join(tmpdir, "artifacts")
+        os.makedirs(artifact_dir, exist_ok=True)
+        ldconfig = _read_ldconfig() if iso.BACKEND_BWRAP else ""
+        plan = iso.plan_compute_execution(
+            caps=caps,
+            command="nvidia-smi -L",
+            image=None,
+            registry_auth=None,
+            workspace_host=tmpdir,
+            result_file_host=result_file,
+            artifact_dir_host=artifact_dir,
+            clone_dir_host=None,
+            cwd_host=None,
+            job_env={},
+            gpu_indices=smoke_indices,
+            container_name="bp-smoke",
+            source_env=dict(os.environ),
+            ldconfig_output=ldconfig,
+        )
+        if plan.declined:
+            return f"plan declined: {plan.decline_reason}"
+        # Workspace still on disk here — the probe binds it.
+        probe_ok, probe_detail = iso.probe_gpu_in_sandbox(plan)
+        if probe_ok:
+            first_line = (probe_detail or "").splitlines()
+            return f"CUDA reachable: {first_line[0] if first_line else probe_detail}"
+        return f"WARNING — CUDA unreachable in sandbox: {probe_detail}"
+    except Exception as exc:  # noqa: BLE001 — a smoke error must not fail --check
+        return f"smoke check error: {exc}"
+    finally:
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def _preflight(
     orchestrator_url: str,
     token: str,
@@ -2671,8 +4315,15 @@ def _preflight(
             f"{orchestrator_url}/api/runner/heartbeat",
             token,
             {
+                # Preflight probe, NOT a genuine active-work report: this empty
+                # active set must NOT overwrite a live report on a box that is
+                # already running a real runner. active_work_report=False makes
+                # the orchestrator ignore the active set here, so the reaper's
+                # zombie reconcile cannot mistake this probe for "no work claimed"
+                # and reap a live task (reaper_orphan_classify).
                 "active_task_ids": [],
                 "active_compute_job_ids": [],
+                "active_work_report": False,
                 "agent_available": claimable[iso.CLASS_AGENT],
                 "supported_agent_task_types": supported_agent_task_types,
                 "hostname": hostname,
@@ -2763,23 +4414,38 @@ def _preflight(
         "gpu policy",
         f"allowlist=[{allowlist_str}]  per_job={gpu_state.get('per_job')}",
     )
+
+    # GPU sandbox smoke test: verify CUDA is actually reachable inside the bwrap
+    # sandbox that GPU compute jobs will use. Runs only when GPUs are detected and
+    # bwrap is available; a non-zero exit or empty output here means any
+    # accelerator-declared job would be aborted by the GPU probe gate.
+    if caps.has_gpu and caps.bwrap_ok and allowlist:
+        _fmt("gpu sandbox", _gpu_sandbox_smoke(caps, allowlist))
+    elif caps.has_gpu:
+        _fmt("gpu sandbox", "skipped (bwrap not usable)")
+
     for note in caps.notes:
         print(f"    note         : {note}", flush=True)
 
-    # Provider credential check. When agent work is claimable this is a HARD
-    # requirement: --check exits non-zero (setup_ok=False) so the operator
-    # catches the misconfiguration at enrollment time instead of discovering
-    # every agent task fails at PRE_CLAIM_FAILED at runtime.
+    # Provider credential check. Host env credentials are a FALLBACK only: the
+    # orchestrator ships per-task pool credentials via the /next-task claim path,
+    # so a pool-covered runner can claim and run agent work even with no host env
+    # creds. We downgrade this to a WARNING so --check passes green for pool-covered
+    # runners. Hard-fail is reserved for when we can positively confirm the
+    # orchestrator has no pool accounts at all (not implemented yet — that would
+    # require an extra API call; omitted until the pool-empty signal is available).
     provider_creds = _check_provider_credentials()
     agent_claimable = claimable[iso.CLASS_AGENT]
     if provider_creds:
         _fmt("provider creds", f"present ({len(provider_creds)} key(s))")
     elif agent_claimable:
         print(
-            "  provider creds  : FAIL — no LLM provider credential found.\n"
-            "                    Set ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN,\n"
-            "                    OPENAI_API_KEY, GEMINI_API_KEY, or similar in\n"
-            "                    the environment before claiming agent work.",
+            "  provider creds  : WARNING — no host LLM credential found.\n"
+            "                    Pool dispatch covers claims (per-task creds via\n"
+            "                    /next-task); host env is fallback only if the pool\n"
+            "                    is unconfigured or exhausted. Set ANTHROPIC_API_KEY,\n"
+            "                    CLAUDE_CODE_OAUTH_TOKEN, OPENAI_API_KEY, or similar\n"
+            "                    to enable the host-credential fallback path.",
             flush=True,
         )
     else:
@@ -2812,11 +4478,57 @@ def _preflight(
             flush=True,
         )
 
+    # Agent deps check: surface an actionable message when agent source exists
+    # on this host but node dependencies were never installed (tsx not found).
+    # The docker agent backend carries the runtime in the image, so host deps
+    # are irrelevant there — only warn for the bwrap path.
+    if caps.bwrap_ok and _agent_deps_missing():
+        print(
+            "    agent deps  : MISSING — run `cd agent && npm install` (or re-run\n"
+            "                  `blueprint-runner install`, which now bootstraps them).",
+            flush=True,
+        )
+
+    # Process-supervisor check. A runner with no supervisor that self-updates
+    # will `os._exit`/die and never come back (operator-observed dgx-1 ~45min
+    # outage). The auto-updater now re-execs in place when unsupervised, but a
+    # crash still needs a restarter — so surface the recommended launch patterns.
+    # The report prints the REAL state, including the "systemd is PID 1 but this
+    # runner is not a systemd unit" case that used to read as healthy.
+    supervisor_state = {
+        "supervisor": None,
+        "supervised": False,
+        "evidence": "supervisor detection failed",
+        "detail": "could not determine supervision state — assume unsupervised",
+    }
+    try:
+        supervisor_state = _detect_supervisor_state()
+    except Exception as exc:  # pragma: no cover - defensive
+        supervisor_state["evidence"] = f"supervisor detection error: {exc}"
+    supervisor = supervisor_state["supervisor"] if supervisor_state["supervised"] else None
+    if supervisor is not None:
+        _fmt(
+            "supervisor",
+            f"{supervisor} (auto-restart on crash/update) "
+            f"[{supervisor_state['evidence']}]",
+        )
+    else:
+        print(
+            "  supervisor      : NONE — UNSUPERVISED\n"
+            f"                    {supervisor_state['evidence']}\n"
+            f"                    {supervisor_state['detail']}.\n"
+            "                    The runner recovers from AUTO-UPDATES via in-place\n"
+            "                    re-exec, but a CRASH will NOT restart it. Run it as a\n"
+            "                    systemd service (Restart=always), under supervisord, or\n"
+            "                    in a restart loop with BLUEPRINT_RUNNER_SUPERVISED=1.\n"
+            "                    See RUNNER_RUNBOOK (--help).",
+            flush=True,
+        )
+
     setup_ok = (
         (token_valid or token_401)
         and ws_writable
         and (claimable[iso.CLASS_AGENT] or claimable[iso.CLASS_COMPUTE])
-        and (bool(provider_creds) or not agent_claimable)
     )
     return {
         "orchestrator_ok": orchestrator_ok,
@@ -2826,6 +4538,9 @@ def _preflight(
         "claimable": claimable,
         "gpu_caps": gpu_caps,
         "workspace_writable": ws_writable,
+        "supervisor": supervisor,
+        "supervised": bool(supervisor_state["supervised"]),
+        "supervisor_evidence": supervisor_state["evidence"],
         "setup_ok": setup_ok,
         "enrolled_max_concurrent": enrolled_max_concurrent,
     }
@@ -2889,8 +4604,16 @@ def _spawn_agent_task(
     lock: threading.Lock,
     llm_env: dict[str, str] | None = None,
     llm_files: list[dict[str, str]] | None = None,
+    decline_reason_out: list[str] | None = None,
 ) -> bool:
     """Plan (fail-closed) + spawn one claimed agent task; record it for reaping.
+
+    On a False (declined / could-not-spawn) return, the WHY is appended to
+    ``decline_reason_out`` when the caller supplies a list, so it can be sent to
+    ``/api/runner/decline-task`` instead of being printed and dropped — an
+    orchestrator that cannot see the reason cannot stop re-pinning the task to
+    the very runner that keeps rejecting it. An out-param (rather than a richer
+    return type) keeps the ``bool`` contract every existing caller relies on.
 
     Routes the per-task backend choice through ``iso.decide_agent_backend`` with the
     task_type + agent_image so only READ-ONLY task types get the docker backend when
@@ -2907,14 +4630,21 @@ def _spawn_agent_task(
     backend = iso.decide_agent_backend(
         caps, present, task_type=task_type, agent_image=agent_image
     )
-    if backend == iso.DECLINE:
-        # No isolation boundary for THIS task type on this host (fail-closed).
-        reason = iso.agent_decline_reason(caps, present) or "no agent sandbox"
+    def _decline(reason: str) -> bool:
+        """Print the reason locally AND hand it back to the caller (→ orchestrator)."""
         print(
             f"[runner] DECLINED agent task {task_id} (fail-closed): {reason}",
             flush=True,
         )
+        if decline_reason_out is not None:
+            decline_reason_out.append(reason)
         return False
+
+    if backend == iso.DECLINE:
+        # No isolation boundary for THIS task type on this host (fail-closed).
+        return _decline(
+            iso.agent_decline_reason(caps, present) or "no agent sandbox"
+        )
     # The bwrap backend needs the HOST agent dist; the docker backend carries the
     # agent in the image, so a missing host binary is only fatal off the docker path.
     if backend != iso.BACKEND_DOCKER and not agent_binary:
@@ -2925,6 +4655,11 @@ def _spawn_agent_task(
             "auto-detection). Compute jobs are unaffected.",
             flush=True,
         )
+        if decline_reason_out is not None:
+            decline_reason_out.append(
+                "agent binary unavailable on this runner (bwrap backend needs the "
+                "host agent dist)"
+            )
         return False
 
     # Only hand the image to the planner when THIS task's decision is docker; a
@@ -2984,11 +4719,7 @@ def _spawn_agent_task(
         agent_image=plan_image,
     )
     if plan.declined:
-        print(
-            f"[runner] DECLINED agent task {task_id} (fail-closed): {plan.decline_reason}",
-            flush=True,
-        )
-        return False
+        return _decline(plan.decline_reason or "sandbox plan declined")
 
     # Open a per-task log file to persist the agent's stdout/stderr output
     # on disk (best-effort - a write failure must never prevent the task from
@@ -3017,6 +4748,10 @@ def _spawn_agent_task(
             except Exception:
                 pass
         print(f"[runner] failed to spawn agent for task {task_id}: {exc}", flush=True)
+        if decline_reason_out is not None:
+            decline_reason_out.append(
+                f"agent process spawn failed: {type(exc).__name__}: {exc}"[:500]
+            )
         return False
 
     # Reader thread: tee the agent's stdout to both the per-task log file and
@@ -3063,6 +4798,11 @@ def _spawn_agent_task(
 
 
 def main() -> None:
+    if "--help" in sys.argv[1:] or "-h" in sys.argv[1:]:
+        # Print the module docstring (which carries the RUNNER_RUNBOOK) and exit.
+        print(__doc__ or "", flush=True)
+        return
+
     check_mode = "--check" in sys.argv[1:]
 
     signal.signal(signal.SIGTERM, _handle_signal)
@@ -3114,6 +4854,8 @@ def main() -> None:
     max_auth_failures = _env_int("BLUEPRINT_RUNNER_MAX_AUTH_FAILURES", 20, minimum=0)
     max_network_failures = _env_int("BLUEPRINT_RUNNER_MAX_NETWORK_FAILURES", 20, minimum=0)
     failure_pause_threshold = _env_int("BLUEPRINT_RUNNER_FAILURE_PAUSE_THRESHOLD", 0, minimum=0)
+    max_cpu_load = _env_float("BLUEPRINT_RUNNER_MAX_CPU_LOAD", 0.0, minimum=0.0)
+    max_gpu_util_pct = _env_int("BLUEPRINT_RUNNER_MAX_GPU_UTIL_PCT", 0, minimum=0)
 
     # Prod agent container image (agent/Dockerfile). The default agent backend is bwrap
     # (host toolchain); the docker backend is used only on an explicit opt-in:
@@ -3230,16 +4972,11 @@ def main() -> None:
         print("ERROR: initial heartbeat rejected the runner token.", file=sys.stderr)
         sys.exit(1)
 
-    enrolled_max_concurrent = result.get("enrolled_max_concurrent")
-    if enrolled_max_concurrent is not None and max_concurrent != enrolled_max_concurrent:
-        print(
-            f"[runner] WARNING: BLUEPRINT_RUNNER_MAX_CONCURRENT={max_concurrent} disagrees "
-            f"with the server-enrolled preset max_concurrent={enrolled_max_concurrent}. "
-            f"The orchestrator uses the server-side limit; set "
-            f"BLUEPRINT_RUNNER_MAX_CONCURRENT={enrolled_max_concurrent} to match the "
-            f"enrollment and avoid claiming more (or fewer) tasks than declared.",
-            flush=True,
-        )
+    # NOTE: the env-var BLUEPRINT_RUNNER_MAX_CONCURRENT is only the INITIAL
+    # default. The heartbeat RESPONSE carries a server-authoritative live-safe
+    # config block (max_concurrent / max_concurrent_compute / task_types /
+    # gpu_indices_allowed) that OVERRIDES it on the next tick — no warn-only
+    # mismatch path any more, and no SSH/restart to reconfigure a live runner.
 
     if not (agent_claimable or compute_claimable):
         print(
@@ -3260,9 +4997,28 @@ def main() -> None:
     lock = threading.Lock()
     # SEPARATE capacity pools (I5): agents and compute never contend for one
     # shared semaphore, so the advertised concurrency is honest and a saturated
-    # agent pool can't starve compute (or vice-versa).
-    agent_capacity = threading.BoundedSemaphore(max_concurrent)
-    compute_capacity = threading.BoundedSemaphore(max_concurrent_compute)
+    # agent pool can't starve compute (or vice-versa). Sized to a HARD CEILING
+    # (never below the env default or the server's 1-64 live-safe bound) so the
+    # semaphore never becomes the binding constraint when a live config push
+    # GROWS the limit — the `active_count >= live_limit` gate below is the real
+    # source of truth the claim loops read each tick.
+    agent_capacity = threading.BoundedSemaphore(
+        max(max_concurrent, _LiveRunnerConfig.MAX_CONCURRENT)
+    )
+    compute_capacity = threading.BoundedSemaphore(
+        max(max_concurrent_compute, _LiveRunnerConfig.MAX_CONCURRENT)
+    )
+    # Live-safe config holder, seeded from the env-var startup values. The
+    # heartbeat loop overwrites its live-safe fields when the server sends a
+    # config block; the agent + compute claim loops read the live limit each
+    # iteration. "all" GPU sentinel maps to every DETECTED index (caps.gpu_indices).
+    live_config = _LiveRunnerConfig(
+        max_concurrent,
+        max_concurrent_compute,
+        task_types="all",
+        gpu_state=gpu_state,
+        all_gpu_indices=list(caps.gpu_indices or []),
+    )
     telemetry = _TelemetryState()
     workspace_root = _workspace_root()
 
@@ -3303,6 +5059,9 @@ def main() -> None:
             # docker+image box even without bwrap.
             "caps": caps,
             "agent_image": agent_image,
+            # Live-safe config channel: the heartbeat loop applies the server's
+            # config block and echoes applied-vs-pending back.
+            "live_config": live_config,
         },
         daemon=True,
     )
@@ -3330,7 +5089,9 @@ def main() -> None:
                 compute_capacity,
             ),
             kwargs={"base_poll_interval": base_poll_interval, "capabilities": caps,
-                    "gpu_state": gpu_state, "telemetry": telemetry},
+                    "gpu_state": gpu_state, "telemetry": telemetry,
+                    "max_gpu_util_pct": max_gpu_util_pct,
+                    "live_config": live_config},
             daemon=True,
         )
         compute_poll.start()
@@ -3369,7 +5130,10 @@ def main() -> None:
             with lock:
                 active_count = len(active_tasks)
 
-            if active_count >= max_concurrent:
+            # A live server config push can grow/shrink the agent ceiling
+            # mid-flight; read it each iteration so the gate is the source of
+            # truth (the static `max_concurrent` is only the env-var default).
+            if active_count >= live_config.max_concurrent():
                 time.sleep(poll_interval)
                 continue
 
@@ -3389,6 +5153,19 @@ def main() -> None:
                 )
                 time.sleep(poll_interval)
                 continue
+
+            # Host-load guard: skip claiming when the machine is overloaded.
+            if max_cpu_load > 0:
+                load = _cpu_load_avg()
+                if load is not None and load >= max_cpu_load:
+                    _release_capacity(agent_capacity)
+                    print(
+                        f"[runner] cpu_load_avg {load} >= threshold {max_cpu_load}"
+                        " — skipping agent claim",
+                        flush=True,
+                    )
+                    time.sleep(poll_interval)
+                    continue
 
             # Circuit-breaker: pause claiming after N consecutive task failures.
             if failure_pause_threshold > 0:
@@ -3440,13 +5217,32 @@ def main() -> None:
                 time.sleep(poll_interval)
                 continue
 
-            if status == 503 and isinstance(body, dict) and body.get("pool_exhausted"):
+            # Any 503 means "nothing dispatchable, back off" — match on the STATUS,
+            # not on a body key, so a new orchestrator reason shape can never make
+            # this branch miss and leak the capacity permit acquired above.
+            if status == 503 and isinstance(body, dict):
                 _release_capacity(agent_capacity)
-                print(
-                    "[runner] POOL EXHAUSTED — no LLM account available; "
-                    "task stays claimable for a future poll cycle",
-                    flush=True,
-                )
+                reason = body.get("reason") or "no reason reported by orchestrator"
+                if body.get("credential_resolution_failed"):
+                    # The offending task id is nested under "error" so that no
+                    # top-level "task_id" can ever be mistaken for a dispatched
+                    # task by a runner that skipped the pool_exhausted check.
+                    err = body.get("error")
+                    err = err if isinstance(err, dict) else {}
+                    bad_task = err.get("skipped_task_id") or "unknown"
+                    print(
+                        f"[runner] CREDENTIAL RESOLUTION FAILED for task "
+                        f"{bad_task} — the orchestrator could not build "
+                        f"credentials for this task (this is a task/config problem, "
+                        f"NOT rate limiting): {reason}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[runner] POOL EXHAUSTED — no LLM account available; "
+                        f"task stays claimable for a future poll cycle: {reason}",
+                        flush=True,
+                    )
                 poll_interval = min(poll_interval * 2, 30.0)
                 time.sleep(poll_interval)
                 continue
@@ -3524,9 +5320,19 @@ def main() -> None:
             except Exception as exc:
                 print(f"[runner] failed to prepare workspace for task {task_id}: {exc}", flush=True)
                 _release_capacity(agent_capacity)
+                # Decline explicitly: without this the task stays pinned in
+                # PROVISIONING until this runner goes offline, even though we
+                # know right now that we cannot run it.
+                _notify_decline(
+                    orchestrator_url,
+                    token,
+                    task_id,
+                    reason=f"workspace preparation failed: {type(exc).__name__}: {exc}",
+                )
                 time.sleep(poll_interval)
                 continue
 
+            decline_reason: list[str] = []
             spawned = _spawn_agent_task(
                 task_id=task_id,
                 task_type=task_type,
@@ -3543,14 +5349,21 @@ def main() -> None:
                 lock=lock,
                 llm_env=llm_env,
                 llm_files=llm_files,
+                decline_reason_out=decline_reason,
             )
             if not spawned:
                 # DECLINE / spawn failure — the reaper never sees this task, so the
                 # permit must be released here.
                 _release_capacity(agent_capacity)
                 # Notify the orchestrator so the task returns to QUEUED instead of
-                # stranding in PROVISIONING until the runner goes offline.
-                _notify_decline(orchestrator_url, token, task_id)
+                # stranding in PROVISIONING until the runner goes offline — WITH the
+                # reason, so it stops re-pinning the task to this same runner.
+                _notify_decline(
+                    orchestrator_url,
+                    token,
+                    task_id,
+                    reason=decline_reason[0] if decline_reason else None,
+                )
                 time.sleep(poll_interval)
                 continue
         except Exception as exc:  # noqa: BLE001 — a transient error must not crash the runner

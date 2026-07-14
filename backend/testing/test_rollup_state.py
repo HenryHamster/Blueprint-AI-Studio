@@ -18,9 +18,9 @@ class TestClearRollupTransientState:
     def test_empty_returns_empty_dict(self):
         assert _clear_rollup_transient_state({}) == {}
 
-    def test_strips_all_thirteen_transient_keys(self):
+    def test_strips_all_fifteen_transient_keys(self):
         ctx = dict.fromkeys(_ROLLUP_TRANSIENT_CTX_KEYS, "v")
-        assert len(ctx) == 13
+        assert len(ctx) == 15
         # The escalation-latch is transient (must reset on terminal so future
         # deferral episodes can re-escalate).
         assert "_merge_escalation_attempted" in _ROLLUP_TRANSIENT_CTX_KEYS
@@ -28,6 +28,14 @@ class TestClearRollupTransientState:
         assert "rollup_pr_creating_at" in _ROLLUP_TRANSIENT_CTX_KEYS
         # The merge-queue in-flight marker is per-cycle transient as well.
         assert "_merge_queue_update_at" in _ROLLUP_TRANSIENT_CTX_KEYS
+        # The Alembic auto-reconcile in-flight stake: same shape as
+        # ``rollup_pr_creating_at`` — a per-cycle claim that a peer sweep is
+        # mid-push. A stale one left behind would block the next reconcile until
+        # its TTL expired, so it MUST be scrubbed on every terminal transition.
+        assert "_alembic_autoreconcile_inflight_at" in _ROLLUP_TRANSIENT_CTX_KEYS
+        # The scan-report exactly-once marker is scoped to ONE rollup PR; a
+        # re-entry on a NEW PR must post its own report.
+        assert "_scan_report_posted_pr" in _ROLLUP_TRANSIENT_CTX_KEYS
         assert _clear_rollup_transient_state(ctx) == {}
 
     def test_preserves_non_transient_keys(self):

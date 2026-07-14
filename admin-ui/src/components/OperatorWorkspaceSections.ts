@@ -15,7 +15,7 @@ import {
 import type { DirectionsTab } from './DirectionsPanelHeader';
 import type { SectionId } from './settingsSections';
 
-export type ProjectSection = DirectionsTab | 'manage';
+export type ProjectSection = DirectionsTab | 'manage' | 'tools';
 export type ProjectManageSection =
   | 'overview'
   | Extract<

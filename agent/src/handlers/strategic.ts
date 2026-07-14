@@ -3,12 +3,15 @@ import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sanitize, sendLog, readHandlerOutput,
   persistAndPostStatus, runClaudeCode,
-  apiPost,
+  apiGet, apiPost,
   resolveBaseBranch,
 } from '../index.js';
 import { VmConfigMissingError } from '../providers/runners.js';
 import * as indexMod from '../index.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
+import {
+  writeGitTokenFile, setupGitCredentialHelper,
+} from '../git-credential.js';
 import {
   buildContextPrefix, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper,
@@ -129,7 +132,11 @@ export function buildStagedDirectionsSection(staged: Array<Record<string, unknow
  * author GPU `compute_experiment` tasks. The backend ships this object only when
  * the project has registered a self-hosted runner OR declares the enforce-local
  * policy (require_local_runner). Shape:
- * `{ever_registered, active_total, active_gpu, require_local_runner}`.
+ * `{ever_registered, active_total, active_gpu, require_local_runner}` plus an
+ * optional bounded `devices` list (one entry per live runner: `{runner_name,
+ * gpu_count, gpu_models, gpu_vram_mib?, container_ok, gpu_in_container_ok,
+ * active_tasks, active_compute_jobs}`) rendered so the strategist can size
+ * experiments to actual VRAM/device counts and container capability.
  *
  * When no GPU runner is live the strategist should AVOID authoring GPU
  * experiments: with require_local_runner they are held then terminally fail;
@@ -167,6 +174,34 @@ export function buildLocalRunnerSection(status: unknown): string {
   } else {
     lines.push(
       '- GPU hardware is OFFLINE: a GPU `compute_experiment` authored now would FALL BACK to billable cloud GPU. Prefer to defer GPU experiments until the operator\'s runner is live, unless the cloud spend is justified.',
+    );
+  }
+  // Per-device hardware detail (backend-bounded per-runner AND in total under
+  // the experiment-authoring shared budget) so the strategist can reason about
+  // VRAM fit, device counts, and container capability when sizing experiments.
+  const devices: unknown[] = Array.isArray(s.devices) ? s.devices : [];
+  if (devices.length > 0) {
+    lines.push('- Devices (live runners — size experiments to fit this hardware):');
+    for (const entry of devices.slice(0, 8)) {
+      if (!entry || typeof entry !== 'object') continue;
+      const d = entry as Record<string, unknown>;
+      const name = typeof d.runner_name === 'string' && d.runner_name ? d.runner_name : 'runner';
+      const gpuCount = typeof d.gpu_count === 'number' ? d.gpu_count : 0;
+      const models = Array.isArray(d.gpu_models) ? d.gpu_models.filter((m) => typeof m === 'string').join(', ') : '';
+      const vramVals = Array.isArray(d.gpu_vram_mib)
+        ? (d.gpu_vram_mib as unknown[]).filter((v): v is number => typeof v === 'number' && v > 0)
+        : [];
+      const vram = vramVals.length > 0 ? `, ${Math.min(...vramVals)} MiB VRAM/GPU` : '';
+      const gpuBit = gpuCount > 0 ? `${gpuCount}x GPU${models ? ` (${models})` : ''}${vram}` : 'no GPU';
+      const containerBit = d.container_ok === true
+        ? (d.gpu_in_container_ok === true ? 'containers OK (GPU-in-container OK)' : 'containers OK (no GPU passthrough)')
+        : 'NO container runtime (container_image would be discarded)';
+      const tasks = typeof d.active_tasks === 'number' ? d.active_tasks : 0;
+      const jobs = typeof d.active_compute_jobs === 'number' ? d.active_compute_jobs : 0;
+      lines.push(`  - ${name}: ${gpuBit}; ${containerBit}; load ${tasks} task(s) + ${jobs} compute job(s)`);
+    }
+    lines.push(
+      '  When per-GPU VRAM is listed, author experiments whose model + batch fit within it (a job needing more VRAM than any device has can NEVER run locally); target `container_image` only at devices with containers OK.',
     );
   }
   return lines.join('\n');
@@ -288,6 +323,20 @@ export async function handleStrategic(
     workspace: WORKSPACE, repoUrl: cloneUrl, githubToken: ghToken,
     branch: baseBranch, baseBranch, depth: 0,
   });
+
+  // ── Git credential helper setup ──────────────────────────────────────────
+  // Write the initial token then switch the remote URL from the baked-in
+  // token-embedded form to a plain HTTPS URL backed by a credential helper that
+  // reads a refreshed token file. This prevents git operations from failing
+  // after the 60-minute GitHub App installation token TTL.
+  writeGitTokenFile(ghToken);
+  try {
+    setupGitCredentialHelper(owner, repo, WORKSPACE);
+    sendLog(ws, '[strategic] git credential helper configured (push-capable, auto-refresh)\n');
+  } catch (e) {
+    sendLog(ws, `[strategic] WARNING: git credential helper setup failed (git push may expire): ${String(e)}\n`);
+  }
+
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
   const researchMode = strVal(payload.research_mode, 'research');
@@ -478,7 +527,17 @@ export async function handleStrategic(
     // that runs fresh (no prior conversation) has no source-of-truth for the
     // purpose string and may echo a schema placeholder, exhausting retries.
     const intent = problemModel?.intent as Record<string, unknown> | undefined;
-    const currentPurpose = typeof intent?.purpose === 'string' ? intent.purpose.trim() : undefined;
+    // When intent.purpose is blank/schema-placeholder but intent.user_purpose
+    // is populated, fall back to user_purpose — the backend's
+    // _preserve_operator_intent would heal the blank from user_purpose on
+    // write-back, but the agent-side thinker validation rejects before that
+    // healing runs. Pre-applying the fallback here lets the thinker's repair
+    // prompt supply the real ground truth.
+    const rawPurpose = typeof intent?.purpose === 'string' ? intent.purpose.trim() : '';
+    const isPlaceholder = rawPurpose === '' || rawPurpose === '...' || /^<[^>]+>$/.test(rawPurpose);
+    const currentPurpose = isPlaceholder
+      ? (typeof intent?.user_purpose === 'string' ? intent.user_purpose.trim() : undefined)
+      : rawPurpose;
 
     // ── Problem-model size/health signal (soft) ──
     // Computed by the backend from the DURABLE pre-trim model (honest counts).
@@ -1125,6 +1184,17 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 #                       $BLUEPRINT_RESULT_FILE (or print it as the last stdout line)
 #                       — a run that exits 0 without it loses the metric and the
 #                       criterion fails unmeasured (compute_unmeasured_criterion).
+#                       Reliability conventions (experiments die from env drift and
+#                       lost metrics, not wrong hypotheses): PIN dependency versions
+#                       in the command (e.g. jax==0.6.2 — an unpinned brax install
+#                       once pulled an incompatible jax and killed the run); write
+#                       the metric EARLY (provisional value at first measurement)
+#                       and overwrite with the final value so a timeout still
+#                       measures; structure long training as short gated stages
+#                       (bounded first stage gates a longer follow-on) instead of
+#                       one deadline-sized run; keep the artifact dir small (~25 MiB
+#                       upload cap); prefer a repo harness/experiment entrypoint
+#                       when one exists over inlining a bespoke pipeline.
 # web_research and design are HIGH-ROI and chronically under-used: one durable
 # knowledge document de-risks every later task in the area and compounds across
 # cycles. Spawn them PROACTIVELY, not only reactively — signals that warrant one:
@@ -1276,6 +1346,21 @@ ${proposedCriteriaBlock}
 9. **Guardrails.** Ensure at least 3 active directions remain after retires.
 
 10. Done. Do not write anything else.`;
+
+    // ── Git token refresh before executor ───────────────────────────────────
+    // Refresh the token file before the executor runs so any git operations
+    // (branch creation, pushes) authenticate with a fresh credential rather
+    // than the potentially-expired role-start token.
+    try {
+      const refreshResult = await apiGet(`/api/agent/github/token?task_id=${encodeURIComponent(taskId)}&force_refresh=true`) as { data?: { token?: string } } | null;
+      const newToken = refreshResult?.data?.token;
+      if (newToken) {
+        writeGitTokenFile(newToken);
+        sendLog(ws, '[strategic] git token refreshed before executor\n');
+      }
+    } catch (e) {
+      sendLog(ws, `[strategic] git token refresh before executor failed (keeping existing token): ${String(e)}\n`);
+    }
 
     statusRef.value = 'Running strategic execution (pass 2: applying decisions)...';
     let { exitCode, allOutput, lastResultText } = await runClaudeCode(executorPrompt, ws, statusRef, model, effort, disallowedTools);

@@ -33,6 +33,7 @@ from app.message_convergence import get_message_link, resolve_message_ref
 from app.models import Project, ProjectMessage, QualificationVerdict, ReleaseVersion, Task, UiLoadTimingSample
 from app.project_message_projection import agent_fetch_message_dict
 from app.qualification_state_resolver import apply_verdict_substitution
+from app.release_scoring import blocker_execution_site as _blocker_execution_site
 from app.routers.agent import verify_agent_token
 from app.shared_state import limiter
 from app.source_ref_validation import (
@@ -65,6 +66,7 @@ def _compact_last_qualification(qual: dict[str, Any] | None) -> dict[str, Any] |
         "started_at",
         "finalized_at",
         "blocker",
+        "execution_site",
         "sub_scores",
         "ci_resolution",
         "audit_missing_reason",
@@ -564,8 +566,6 @@ async def agent_fetch_qualification(
                 "open_version_id": None,
                 "reason": "no_open_version",
                 "summary": "no open release version — nothing to qualify",
-                "coverage_total": 0,
-                "coverage_covered": 0,
             },
         }
 
@@ -652,20 +652,43 @@ async def agent_fetch_qualification(
             project_id,
         )
 
-    # Initial-qualification trigger-state signal (ADDITIVE). Answers 'why hasn't
-    # the FIRST qualification fired' — armed, or blocked because coverage is N/M,
-    # wrong phase, or already attempted. Computed via the shared classifier so the
-    # sweep and this read-surface cannot drift apart. Best-effort: a compute
-    # failure degrades to ``qualification_trigger_state: None`` without breaking
-    # the read or changing any existing key.
+    # Qualification trigger explain-surface (ADDITIVE). Answers 'why hasn't
+    # qualification fired / what will fire it next' — richer than the old
+    # initial-trigger-only signal.  Best-effort: a compute failure degrades to
+    # ``qualification_trigger_state: None`` without breaking the read.
     qualification_trigger_state: dict | None = None
     try:
-        from app.release_readiness import (  # noqa: PLC0415
-            compute_qualification_trigger_state,
+        from app import category_verdict_ledger as _cvl  # noqa: PLC0415
+        from app.qualification_triggers import explain_qualification_trigger  # noqa: PLC0415
+        from app.release_readiness import compute_requalification_readiness  # noqa: PLC0415
+        from app.runtime_config_state import (  # noqa: PLC0415
+            get_auto_qualification_triggers_mode,
         )
+        from app.time_utils import _utcnow  # noqa: PLC0415
 
-        qualification_trigger_state = await compute_qualification_trigger_state(
-            session, project_id
+        _lq = open_row.last_qualification or {}
+        _status = _lq.get("status")
+        _is_candidate_fully_met = await _cvl.is_candidate_fully_met(
+            session, open_row.id, _lq.get("candidate_sha")
+        )
+        _readiness = await compute_requalification_readiness(session, project_id)
+        qualification_trigger_state = explain_qualification_trigger(
+            phase=open_row.phase or "",
+            status=_status,
+            error_code=_lq.get("error") if _status == "error" else None,
+            qualification_attempts=open_row.qualification_attempts or 0,
+            error_redrive_count=int(_lq.get("error_redrive_count") or 0),
+            is_candidate_fully_met=_is_candidate_fully_met,
+            requalification_ready=_readiness.get("requalification_ready"),
+            candidate_sha=_lq.get("candidate_sha"),
+            automain_sha=None,  # not fetched in the read path (no GitHub I/O)
+            automain_ci_state=None,
+            blocker=_lq.get("blocker"),
+            in_flight=_status == "pending",
+            promotion_in_flight=bool(_lq.get("promotion_pending")),
+            last_attempt=_lq if _lq else None,
+            knob=get_auto_qualification_triggers_mode(),
+            evaluated_at=_utcnow().isoformat(),
         )
     except Exception:
         logger.exception(
@@ -735,6 +758,12 @@ async def agent_fetch_qualification(
             "error": lq.get("error") or None,
             "detail": lq.get("detail") or None,
             "blocker": lq.get("blocker") or None,
+            # Execution-site of the blocker so an agent reading this surface knows
+            # whether a fix on automain clears it next qualification (candidate-side)
+            # or is inert until this version itself promotes (deployed-side).
+            # Prefer the stored value; derive from the blocker for older records.
+            "execution_site": lq.get("execution_site")
+            or _blocker_execution_site(lq.get("blocker")),
             "qualify_request_blocked": lq.get("qualify_request_blocked") or None,
             "qualify_request_blocked_at": lq.get("qualify_request_blocked_at") or None,
             "source": "qualification_verdict",
@@ -1493,3 +1522,28 @@ async def agent_fetch_ui_load_timing(
             {"ts": row.recorded_at.isoformat(), "page_ready_ms": row.page_ready_ms, "sample_type": row.sample_type}
         )
     return {"status": "success", "data": {"surfaces": surfaces}}
+
+
+@router.get("/projects/{project_id}/skills")
+@limiter.limit("60/minute")
+async def agent_fetch_project_skills(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Fetch skills declared in the project's ``.blueprint/tools.json`` manifest.
+
+    Returns ``{"skills": [...]}`` where each skill entry has ``slug``,
+    ``title``, ``command``, and optionally ``description``.  An empty array
+    means no skills are declared.  Authenticated via agent JWT; cross-project
+    access returns 404.
+
+    This endpoint is the backend for the strategic resident's ``./fetch skills``
+    verb.
+    """
+    project = await _resolve_agent_project(project_id, token, session)
+    from app.routers.admin_project_tools import _discover_manifest_tools  # noqa: PLC0415
+
+    manifest = await _discover_manifest_tools(project)
+    return {"skills": manifest.get("skills", [])}

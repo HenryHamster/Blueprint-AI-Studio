@@ -154,6 +154,13 @@ async def _seed_for_finalize(
             logs=json.dumps(
                 {
                     "audit_score": 1.0,
+                    # A clean RELEASE_AUDIT_REPORT carries an explicit empty findings
+                    # list — the real agent always emits the key. A non-empty report
+                    # that OMITS it is the malformed `no_findings_key` shape that
+                    # _score_audit scores as UNMEASURED, which hard-blocks on
+                    # `audit_missing` before the merge-grade gate is ever reached —
+                    # so every test in this file would assert the wrong blocker.
+                    "findings": [],
                     "test_erosion": {
                         "deleted_test_files": [],
                         "assertion_delta": 0,

@@ -9,19 +9,40 @@ from __future__ import annotations
 import base64
 import logging
 import re
+import uuid
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger(__name__)
+
+# NOTE on matching: every charset gate below MUST be applied with `.fullmatch()`,
+# never `.match()`. Python's `$` also matches just *before* a trailing newline, so
+# `_RE.match("GOOD\n")` SUCCEEDS on all three patterns — the trailing newline is
+# never seen, and the value reaches the shell as an identifier split across two
+# lines. `fullmatch` requires the whole string to be consumed and is the only
+# correct anchor here; the `^...$` below is kept only so the pattern reads well
+# when it is interpolated into an operator-facing rejection reason.
 
 # Safe identifier charset for arm names: no shell metacharacters, no colons
 # (colon is the delimiter in the NAME:PATH aggregator spec), no slashes/dots
 # (would escape per-arm result directories).
-_ARM_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+ARM_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 # Safe charset for metric keys: allows common patterns like val/loss, top-1
 # while excluding shell metacharacters (", $, ;, backticks, spaces).
-_METRIC_KEY_RE = re.compile(r"^[A-Za-z0-9_./-]+$")
+METRIC_KEY_RE = re.compile(r"^[A-Za-z0-9_./-]+$")
+
+# Env var names must be valid shell identifiers. The GCP startup script emits
+# `export {key}=...` with the key interpolated BARE, and it runs without
+# `set -e` — so a key like "my-model" would error and the script would
+# silently continue, billing an experiment run that is missing that env var.
+# Reject at contract-validation time so a bad contract fails loud at
+# authoring instead (see also the defense-in-depth guard in
+# compute_backends._build_gcp_startup_script, which imports this pattern).
+ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 # Read and encode the aggregator script at module-load time.  The blob is then
 # embedded in generated per-arm bash wrappers so the aggregator runs on the
@@ -35,6 +56,68 @@ COMPUTE_EXPERIMENT_PREREQUISITE_MODE_CONTEXT_KEY = (
     "compute_experiment_prerequisite_mode"
 )
 COMPUTE_EXPERIMENT_PREREQUISITE_MODE_ADVISORY = "advisory_success_criterion"
+
+
+# Multi-arm wrappers are stored as `echo <blob> | base64 -d | bash`.  The
+# encoding is deliberate and stays: the wrapper nests Python inside bash inside
+# a Python string literal, and compounding escape layers is the bug class
+# CLAUDE.md explicitly warns about.  What the encoding costs is legibility — an
+# operator reading the job sees an opaque blob — so we decode on READ rather
+# than give up the escape safety.
+_GENERATED_COMMAND_RE = re.compile(
+    r"^echo\s+(?P<blob>[A-Za-z0-9+/=]+)\s*\|\s*base64\s+-d\s*\|\s*bash$"
+)
+
+# Within the decoded wrapper the aggregator is itself a base64 blob of a static
+# file (compute_arm_aggregator.py), thousands of characters long.  Expanding it
+# would bury the per-arm commands, which are the part an operator actually reads.
+#
+# The blob is matched EXACTLY, not by shape: `echo <blob> | base64 -d > <dest>`
+# is the very pattern CLAUDE.md tells authors to use for embedding a script, so
+# an arm's own command may legitimately contain one.  Eliding by shape alone
+# would relabel that arm's blob as the aggregator and destroy its contents —
+# a legibility feature that lies about what ran is worse than no feature.
+_EMBEDDED_AGGREGATOR_RE = re.compile(
+    r"^echo\s+(?P<blob>[A-Za-z0-9+/=]{64,})\s*\|\s*base64\s+-d\s*>\s*(?P<dest>\S+)$",
+    re.MULTILINE,
+)
+
+
+def decode_generated_command(
+    command: str | None, *, elide_aggregator: bool = True
+) -> str | None:
+    """Return the readable bash behind a generated ``base64 -d | bash`` command.
+
+    ``None`` means *command* is not one of our generated wrappers — single-arm
+    experiments are never encoded, and an operator-authored command is passed
+    through verbatim.  Callers fall back to showing the raw command.
+
+    Never raises: a truncated or non-UTF-8 blob yields ``None`` rather than
+    turning a read of an old job into a 500.
+    """
+    if not isinstance(command, str):
+        return None
+    match = _GENERATED_COMMAND_RE.match(command.strip())
+    if match is None:
+        return None
+    try:
+        script = base64.b64decode(match.group("blob"), validate=True).decode()
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if elide_aggregator:
+
+        def _elide(m: re.Match[str]) -> str:
+            # Only OUR aggregator blob is elided. An arm that embeds its own
+            # base64 script is left byte-for-byte intact.
+            if m.group("blob") != _AGGREGATOR_B64:
+                return m.group(0)
+            return (
+                "echo <base64 blob: compute_arm_aggregator.py> "
+                f"| base64 -d > {m.group('dest')}"
+            )
+
+        script = _EMBEDDED_AGGREGATOR_RE.sub(_elide, script)
+    return script
 
 
 def _author_compute_launch_contract(finding: dict[str, Any]) -> dict[str, Any]:
@@ -85,11 +168,52 @@ def _author_compute_launch_contract(finding: dict[str, Any]) -> dict[str, Any]:
         "setup_step",
         "container_image",
         "container_registry_auth",
+        "allow_host_fallback",
+        "spawn_followup",
+        "no_progress_timeout_seconds",
+        "input_artifact_job_id",
+        "runner_target",
+        "vram_gb",
     ):
         val = _pick(opt_key)
         if val is not None:
             contract[opt_key] = val
     return contract
+
+
+def _stamp_container_image_pin_status(
+    contract: dict[str, Any],
+    context: Any = None,
+) -> None:
+    """Record whether a contract's resolved ``container_image`` is digest-pinned.
+
+    The images-first substrate promises run-to-run reproducibility via digest
+    pinning, but ``resolve_digest_pinned_default_image`` fails open to the raw
+    mutable manifest tag whenever no matching build record exists. That leaves the
+    operator believing a run is digest-reproducible when it is not, with no signal
+    on the job itself.
+
+    When a ``container_image`` is set, stamp ``container_image_digest_pinned`` onto
+    the contract (True iff the reference is content-addressed) so the flag persists
+    on the spawned child payload and can be surfaced in the UI. A mutable default
+    additionally logs a warning. When no image is declared the flag is left absent
+    (a bare ``bash -lc`` job has no image to pin). ``context`` is any identifier
+    (e.g. a task) included in the warning for correlation.
+    """
+    from app.compute_backends import is_digest_pinned
+
+    image = contract.get("container_image")
+    if not image:
+        return
+    pinned = is_digest_pinned(image)
+    contract["container_image_digest_pinned"] = pinned
+    if not pinned:
+        logger.warning(
+            "[COMPUTE] compute_experiment (%s) defaults to MUTABLE image %r "
+            "(no @sha256: digest) — run-to-run reproducibility is NOT guaranteed",
+            context,
+            image,
+        )
 
 
 def _validate_compute_launch_contract(
@@ -129,7 +253,7 @@ def _validate_compute_launch_contract(
             arm_cmd = arm.get("command")
             if not (isinstance(arm_name, str) and arm_name.strip()):
                 return False, f"arms[{i}].name is missing or empty"
-            if not _ARM_NAME_RE.match(arm_name):
+            if not ARM_NAME_RE.fullmatch(arm_name):
                 return (
                     False,
                     f"arms[{i}].name {arm_name!r} contains invalid characters — "
@@ -143,7 +267,7 @@ def _validate_compute_launch_contract(
         declared_metric = contract.get("declared_metric")
         if not (isinstance(declared_metric, str) and declared_metric.strip()):
             return False, "declared_metric is required and must be a non-empty string when arms are specified"
-        if not _METRIC_KEY_RE.match(declared_metric):
+        if not METRIC_KEY_RE.fullmatch(declared_metric):
             return (
                 False,
                 f"declared_metric {declared_metric!r} contains invalid characters — "
@@ -204,7 +328,7 @@ def _validate_compute_launch_contract(
     if declared_metric is not None:
         if not (isinstance(declared_metric, str) and declared_metric.strip()):
             return False, "declared_metric must be a non-empty string"
-        if not _METRIC_KEY_RE.match(declared_metric):
+        if not METRIC_KEY_RE.fullmatch(declared_metric):
             return (
                 False,
                 f"declared_metric {declared_metric!r} contains invalid characters — "
@@ -229,6 +353,53 @@ def _validate_compute_launch_contract(
     if not deadline > 0:
         return False, f"deadline_seconds must be positive (got {deadline})"
 
+    no_progress_timeout = contract.get("no_progress_timeout_seconds")
+    if no_progress_timeout is not None:
+        try:
+            npt = int(no_progress_timeout)
+        except (TypeError, ValueError):
+            return (
+                False,
+                f"no_progress_timeout_seconds is not an integer "
+                f"({no_progress_timeout!r})",
+            )
+        if not npt > 0:
+            return False, (
+                f"no_progress_timeout_seconds must be positive (got {npt})"
+            )
+        if npt > deadline:
+            return False, (
+                f"no_progress_timeout_seconds ({npt}) must not exceed "
+                f"deadline_seconds ({deadline})"
+            )
+
+    input_artifact_job_id = contract.get("input_artifact_job_id")
+    if input_artifact_job_id is not None:
+        # Shape check only — the orchestrator does the authoritative same-project +
+        # bundle-exists validation at create_compute_job time (needs the DB). Here we
+        # only reject an obviously-malformed UUID so a bad reference is caught early.
+        try:
+            uuid.UUID(str(input_artifact_job_id))
+        except (ValueError, AttributeError, TypeError):
+            return (
+                False,
+                f"input_artifact_job_id must be a UUID string "
+                f"({input_artifact_job_id!r})",
+            )
+
+    env = contract.get("env")
+    if env is not None:
+        if not isinstance(env, dict):
+            return False, "env must be an object of NAME -> value pairs"
+        for env_key in env:
+            if not (isinstance(env_key, str) and ENV_KEY_RE.fullmatch(env_key)):
+                return (
+                    False,
+                    f"env key {env_key!r} is not a valid shell identifier — "
+                    "env keys must match ^[A-Za-z_][A-Za-z0-9_]*$ (the startup "
+                    "script exports them as `export KEY=value`)",
+                )
+
     container_image = contract.get("container_image")
     if container_image is not None:
         if not isinstance(container_image, str) or not container_image.strip():
@@ -241,6 +412,36 @@ def _validate_compute_launch_contract(
                 val = registry_auth.get(req_key)
                 if val is not None and not isinstance(val, str):
                     return False, f"container_registry_auth.{req_key} must be a string"
+
+    runner_target = contract.get("runner_target")
+    if runner_target is not None:
+        # Operator/agent pin of the job to a specific enrolled runner.
+        # Shape: {runner_id: uuid-string, strict: bool=false}. Enrollment
+        # (runner exists AND belongs to the launching project) is a DB check —
+        # see validate_compute_runner_target_enrollment; this validator only
+        # rejects malformed shapes.
+        if not isinstance(runner_target, dict):
+            return (
+                False,
+                "runner_target must be an object of the form "
+                "{runner_id: <uuid>, strict: <bool>}",
+            )
+        rt_runner_id = runner_target.get("runner_id")
+        if not (isinstance(rt_runner_id, str) and rt_runner_id.strip()):
+            return (
+                False,
+                "runner_target.runner_id is required and must be a non-empty string",
+            )
+        try:
+            uuid.UUID(rt_runner_id.strip())
+        except ValueError:
+            return (
+                False,
+                f"runner_target.runner_id {rt_runner_id!r} is not a valid UUID",
+            )
+        rt_strict = runner_target.get("strict")
+        if rt_strict is not None and not isinstance(rt_strict, bool):
+            return False, "runner_target.strict must be a boolean"
 
     if require_smoke:
         # Author-attested smoke is now ADVISORY ONLY.  The platform-executed
@@ -279,6 +480,52 @@ def _validate_compute_launch_contract(
             )
 
     return True, ""
+
+
+async def validate_compute_runner_target_enrollment(
+    session: AsyncSession,
+    project_id: Any,
+    runner_target: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Check a shape-valid ``runner_target`` against the project's enrolled runners.
+
+    Returns ``None`` when the pinned runner exists AND is enrolled in
+    ``project_id``, else a machine-readable 422 detail dict::
+
+        {"error": "runner_target_invalid", "reason_code": "not_found"|"not_enrolled",
+         "runner_id": "<id>", "message": "..."}
+
+    Liveness is deliberately NOT checked here — an offline-but-enrolled runner
+    is a valid authoring target (a soft pin falls through at dispatch; a strict
+    pin holds with an explicit reason until the runner comes back). Cross-project
+    runner ids are rejected at authoring time so a typo'd or stale id fails the
+    launch with a clear 422 instead of silently never dispatching.
+    """
+    from app.models import LocalRunner  # local import keeps this module neutral
+
+    runner_id = str(runner_target.get("runner_id") or "").strip()
+    runner = await session.get(LocalRunner, uuid.UUID(runner_id))
+    if runner is None:
+        return {
+            "error": "runner_target_invalid",
+            "reason_code": "not_found",
+            "runner_id": runner_id,
+            "message": (
+                f"runner_target.runner_id {runner_id} does not match any "
+                "registered runner"
+            ),
+        }
+    if runner.project_id != project_id:
+        return {
+            "error": "runner_target_invalid",
+            "reason_code": "not_enrolled",
+            "runner_id": runner_id,
+            "message": (
+                f"runner {runner_id} is not enrolled in this project — "
+                "runner_target must name one of the project's enrolled runners"
+            ),
+        }
+    return None
 
 
 def resolve_compute_spend_threshold(

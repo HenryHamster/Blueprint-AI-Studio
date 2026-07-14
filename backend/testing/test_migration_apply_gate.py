@@ -27,7 +27,10 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.migration_apply_gate import (
+    _create_database,
+    _drop_database,
     _safe_tar_extractall,
+    _validate_db_name,
     ephemeral_postgres_database,
     run_migration_apply_gate,
 )
@@ -702,3 +705,67 @@ def test_safe_tar_extractall_blocks_path_traversal():
             # Either way, the payload must not have escaped the destination.
             evil_path = os.path.abspath(os.path.join(tmp, "../../evil.txt"))
             assert not os.path.exists(evil_path)
+
+
+# --- _validate_db_name SQL injection guard tests ---------------------------
+
+
+def test_validate_db_name_accepts_valid_names():
+    """Alphanumeric names with underscores — the only valid characters for a
+    Postgres unquoted identifier — must pass validation without error."""
+    for name in ("mydb", "my_db", "db123", "a" * 63, "mig_apply_gate_a1b2c3d4e5f6"):
+        _validate_db_name(name)  # should not raise
+
+
+def test_validate_db_name_rejects_sql_metacharacters():
+    """Names containing quotes, semicolons, spaces, dashes, or other SQL
+    metacharacters must be rejected — these are the SQL injection vectors."""
+    for name in (
+        'my"db',
+        "my'db",
+        "my;db",
+        "my db",
+        "my-db",
+        "my.db",
+        "my/db",
+        "my\ndb",
+        "my\tdb",
+        "my(db)",
+        "my{db}",
+        "my[db]",
+        "my%db",
+        "my&db",
+        "my|db",
+    ):
+        with pytest.raises(ValueError, match="Invalid database name"):
+            _validate_db_name(name)
+
+
+def test_validate_db_name_rejects_empty_string():
+    """An empty string does not match the allowed character pattern and must
+    be rejected — a blank identifier cannot be a valid database name."""
+    with pytest.raises(ValueError, match="Invalid database name"):
+        _validate_db_name("")
+
+
+@pytest.mark.asyncio
+async def test_create_database_rejects_invalid_name_without_connecting():
+    """``_create_database`` must validate the name BEFORE creating any engine
+    or connection — a malicious name raises ``ValueError`` immediately,
+    without any database interaction."""
+    from sqlalchemy.engine import make_url
+
+    url = make_url("postgresql+asyncpg://u:p@localhost:5432/nope")
+    with pytest.raises(ValueError, match="Invalid database name"):
+        await _create_database(url, "my;db")
+
+@pytest.mark.asyncio
+async def test_drop_database_rejects_invalid_name_without_connecting():
+    """``_drop_database`` must validate the name BEFORE creating any engine
+    or connection — a malicious name raises ``ValueError`` immediately,
+    without any database interaction."""
+    from sqlalchemy.engine import make_url
+
+    url = make_url("postgresql+asyncpg://u:p@localhost:5432/nope")
+    with pytest.raises(ValueError, match="Invalid database name"):
+        await _drop_database(url, "my\"db")

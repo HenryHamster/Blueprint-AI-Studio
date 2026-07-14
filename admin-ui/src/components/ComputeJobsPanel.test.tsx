@@ -1,4 +1,4 @@
-import { describe, test, expect, vi, afterEach } from 'vitest';
+import { describe, test, expect, vi, afterEach, beforeEach } from 'vitest';
 import { render, waitFor, act, fireEvent } from '@testing-library/react';
 import type { ComputeJob, ComputeJobsListResponse } from '../api';
 import { ComputeJobsPanel } from './ComputeJobsPanel';
@@ -9,6 +9,8 @@ import {
   computeJobRuntimeSec,
   computeJobMargin,
   computeJobExecutionLocation,
+  computeJobEvidenceTier,
+  computeJobImagePinStatus,
   fmtCountdown,
   fmtDuration,
 } from './ComputeJobsPanel.utils';
@@ -143,6 +145,24 @@ describe('ComputeJobsPanel helpers', () => {
     expect(computeJobTerminalLabel(makeJob({ outcome: 'SUCCESS' }))).toBe('Succeeded');
   });
 
+  test('computeJobTerminalLabel returns Killed: no progress when terminal_kind is no_progress', () => {
+    expect(
+      computeJobTerminalLabel(makeJob({ outcome: 'TIMED_OUT', terminal_kind: 'no_progress' })),
+    ).toBe('Killed: no progress');
+  });
+
+  test('computeJobTerminalLabel returns Killed: deadline for TIMED_OUT with terminal_kind deadline', () => {
+    expect(
+      computeJobTerminalLabel(makeJob({ outcome: 'TIMED_OUT', terminal_kind: 'deadline' })),
+    ).toBe('Killed: deadline');
+  });
+
+  test('computeJobTerminalLabel returns Killed: deadline for TIMED_OUT with absent terminal_kind (backward compat)', () => {
+    expect(
+      computeJobTerminalLabel(makeJob({ outcome: 'TIMED_OUT' })),
+    ).toBe('Killed: deadline');
+  });
+
   test('fmtCountdown renders compact remaining time and expiry', () => {
     const now = Date.now();
     expect(fmtCountdown(new Date(now + 90_000).toISOString(), now)).toBe('1m 30s');
@@ -200,6 +220,7 @@ describe('ComputeJobsPanel helpers', () => {
   test('computeJobExecutionLocation maps known local backends to operator-hardware', () => {
     expect(computeJobExecutionLocation('local-subprocess')).toEqual({ label: 'Operator hardware', isOperatorHardware: true });
     expect(computeJobExecutionLocation('local-gpu')).toEqual({ label: 'Operator hardware · GPU', isOperatorHardware: true });
+    expect(computeJobExecutionLocation('runner-subprocess')).toEqual({ label: 'Operator hardware · Runner', isOperatorHardware: true });
   });
 
   test('computeJobExecutionLocation maps gcp to GCP cloud', () => {
@@ -209,6 +230,233 @@ describe('ComputeJobsPanel helpers', () => {
   test('computeJobExecutionLocation falls back to raw string for unknown backends', () => {
     expect(computeJobExecutionLocation('gcp_compute_engine')).toEqual({ label: 'gcp_compute_engine', isOperatorHardware: false });
     expect(computeJobExecutionLocation('unknown-backend')).toEqual({ label: 'unknown-backend', isOperatorHardware: false });
+  });
+
+  test('computeJobEvidenceTier: operator hardware + a result → covered', () => {
+    const result = { armA: { value: 1.5, met: true, cost_usd: null } };
+    expect(
+      computeJobEvidenceTier(makeJob({ backend: 'local-subprocess', per_arm_verdicts: result })),
+    ).toBe('covered');
+    expect(
+      computeJobEvidenceTier(makeJob({ backend: 'runner-subprocess', per_arm_verdicts: result })),
+    ).toBe('covered');
+    expect(
+      computeJobEvidenceTier(makeJob({ backend: 'local-gpu', per_arm_verdicts: result })),
+    ).toBe('covered');
+  });
+
+  test('computeJobEvidenceTier: operator hardware with NO result is not machine-verified', () => {
+    // `covered` renders as "Machine verified". Deriving it from the backend name
+    // alone made it a LOCATION proxy — an empty run claimed verification it never
+    // earned. Provenance is real (so not `uncovered`), but nothing was proved.
+    expect(computeJobEvidenceTier(makeJob({ backend: 'local-subprocess' }))).toBe('partial');
+    expect(computeJobEvidenceTier(makeJob({ backend: 'runner-subprocess' }))).toBe('partial');
+    expect(computeJobEvidenceTier(makeJob({ backend: 'local-gpu' }))).toBe('partial');
+  });
+
+  test('computeJobEvidenceTier: gcp → attested', () => {
+    expect(computeJobEvidenceTier(makeJob({ backend: 'gcp' }))).toBe('attested');
+    expect(computeJobEvidenceTier(makeJob({ backend: 'gcp_compute_engine' }))).toBe('attested');
+  });
+
+  test('computeJobImagePinStatus: mutable tag → mutable', () => {
+    expect(
+      computeJobImagePinStatus(makeJob({ launch_params: { container_image: 'ghcr.io/org/base:latest' } })),
+    ).toBe('mutable');
+  });
+
+  test('computeJobImagePinStatus: digest-pinned ref → pinned', () => {
+    expect(
+      computeJobImagePinStatus(
+        makeJob({ launch_params: { container_image: `ghcr.io/org/base@sha256:${'a'.repeat(64)}` } }),
+      ),
+    ).toBe('pinned');
+  });
+
+  test('computeJobImagePinStatus: no image / no launch_params → null', () => {
+    expect(computeJobImagePinStatus(makeJob({ launch_params: { command: 'python x.py' } }))).toBeNull();
+    expect(computeJobImagePinStatus(makeJob({ launch_params: undefined }))).toBeNull();
+  });
+});
+
+describe('ComputeJobsPanel evidence-tier badge rendering', () => {
+  afterEach(() => {
+    fetchComputeJobs.mockReset();
+    fetchComputeJobsAggregateSummary.mockReset();
+    fetchHeldComputeExperiments.mockReset();
+    fetchAwaitingLocalRunnerHolds.mockReset();
+    fetchComputeSweepGroups.mockReset();
+  });
+
+  test('renders evidence-tier badge on terminal operator-hardware job', async () => {
+    const job = makeJob({
+      backend: 'local-subprocess',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      // A measurable result is REQUIRED for "Machine verified" — operator hardware
+      // alone only says where it ran. Without this the job is `partial`.
+      per_arm_verdicts: { armA: { value: 0.91, met: true, cost_usd: null } },
+      accrued_cost_usd: 0,
+      final_cost_usd: 0,
+      completed_at: new Date().toISOString(),
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([job]));
+    fetchComputeJobsAggregateSummary.mockResolvedValue(null);
+    fetchHeldComputeExperiments.mockResolvedValue([]);
+    fetchAwaitingLocalRunnerHolds.mockResolvedValue([]);
+    fetchComputeSweepGroups.mockResolvedValue({ groups: [], has_more: false });
+    const { getByText } = render(
+      <ComputeJobsPanel projectId="proj-1" />
+    );
+    await waitFor(() => {
+      expect(getByText('Machine verified')).toBeTruthy();
+    });
+  });
+
+  test('active job renders no evidence-tier badge', async () => {
+    const job = makeJob({
+      backend: 'local-subprocess',
+      status: 'RUNNING',
+      outcome: null,
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([job]));
+    fetchComputeJobsAggregateSummary.mockResolvedValue(null);
+    fetchHeldComputeExperiments.mockResolvedValue([]);
+    fetchAwaitingLocalRunnerHolds.mockResolvedValue([]);
+    fetchComputeSweepGroups.mockResolvedValue({ groups: [], has_more: false });
+    const { queryByText } = render(
+      <ComputeJobsPanel projectId="proj-1" />
+    );
+    await waitFor(() => {
+      expect(queryByText('Machine verified')).toBeNull();
+    });
+  });
+
+  test('renders Mutable image badge for a job whose image lacks a digest', async () => {
+    const job = makeJob({
+      backend: 'gcp',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      completed_at: new Date().toISOString(),
+      launch_params: { container_image: 'ghcr.io/org/base:latest' },
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([job]));
+    fetchComputeJobsAggregateSummary.mockResolvedValue(null);
+    fetchHeldComputeExperiments.mockResolvedValue([]);
+    fetchAwaitingLocalRunnerHolds.mockResolvedValue([]);
+    fetchComputeSweepGroups.mockResolvedValue({ groups: [], has_more: false });
+    const { getByText } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await waitFor(() => {
+      expect(getByText('Mutable image')).toBeTruthy();
+    });
+  });
+
+  test('no Mutable image badge for a digest-pinned image', async () => {
+    const job = makeJob({
+      backend: 'gcp',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      completed_at: new Date().toISOString(),
+      launch_params: { container_image: `ghcr.io/org/base@sha256:${'a'.repeat(64)}` },
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([job]));
+    fetchComputeJobsAggregateSummary.mockResolvedValue(null);
+    fetchHeldComputeExperiments.mockResolvedValue([]);
+    fetchAwaitingLocalRunnerHolds.mockResolvedValue([]);
+    fetchComputeSweepGroups.mockResolvedValue({ groups: [], has_more: false });
+    const { queryByText, findByText } = render(<ComputeJobsPanel projectId="proj-1" />);
+    // Wait for the job row to render, then confirm no mutable-image warning.
+    await findByText('compute_experiment: sweep');
+    expect(queryByText('Mutable image')).toBeNull();
+  });
+
+  test('run surface earned-vs-claimed evidence tier never hardcodes machine-verified for cloud jobs', async () => {
+    const setupMocks = () => {
+      fetchComputeJobsAggregateSummary.mockResolvedValue(null);
+      fetchHeldComputeExperiments.mockResolvedValue([]);
+      fetchAwaitingLocalRunnerHolds.mockResolvedValue([]);
+      fetchComputeSweepGroups.mockResolvedValue({ groups: [], has_more: false });
+    };
+
+    // Cloud (gcp) job: must show 'Attested', must NOT show 'Machine verified'
+    setupMocks();
+    fetchComputeJobs.mockResolvedValue(wrapJobs([makeJob({
+      id: 'job-gcp',
+      backend: 'gcp',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      completed_at: new Date().toISOString(),
+    })]));
+    const { getByText: getGcp, queryByText: queryGcp, unmount: unmountGcp } = render(
+      <ComputeJobsPanel projectId="proj-1" />
+    );
+    await waitFor(() => {
+      expect(getGcp('Attested')).toBeTruthy();
+    });
+    expect(queryGcp('Machine verified')).toBeNull();
+    unmountGcp();
+
+    // Operator-hardware (runner-subprocess) job WITH a measurable result: must
+    // show 'Machine verified'. Post-#14597 `covered` requires BOTH operator
+    // hardware AND a produced result — a bare local run only proves WHERE it ran
+    // (see computeJobEvidenceTier), so the result is what earns the badge.
+    setupMocks();
+    fetchComputeJobs.mockResolvedValue(wrapJobs([makeJob({
+      id: 'job-runner',
+      task_title: 'compute_experiment: runner',
+      backend: 'runner-subprocess',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 0,
+      completed_at: new Date().toISOString(),
+      per_arm_verdicts: { armA: { value: 0.91, met: true, cost_usd: null } },
+    })]));
+    const { getByText: getRunner, unmount: unmountRunner } = render(
+      <ComputeJobsPanel projectId="proj-1" />
+    );
+    await waitFor(() => {
+      expect(getRunner('Machine verified')).toBeTruthy();
+    });
+    unmountRunner();
+
+    // No-backend job: must show 'Self-reported', must NOT show 'Machine verified'
+    setupMocks();
+    fetchComputeJobs.mockResolvedValue(wrapJobs([makeJob({
+      id: 'job-no-backend',
+      task_title: 'compute_experiment: no-backend',
+      backend: null as unknown as string,
+      status: 'FAILED',
+      outcome: 'FAILURE',
+      final_cost_usd: 0,
+      completed_at: new Date().toISOString(),
+    })]));
+    const { getByText: getNoBackend, queryByText: queryNoBackend, unmount: unmountNoBackend } = render(
+      <ComputeJobsPanel projectId="proj-1" />
+    );
+    await waitFor(() => {
+      expect(getNoBackend('Self-reported')).toBeTruthy();
+    });
+    expect(queryNoBackend('Machine verified')).toBeNull();
+    unmountNoBackend();
+
+    // Active cloud job: no evidence-tier badge at all
+    setupMocks();
+    fetchComputeJobs.mockResolvedValue(wrapJobs([makeJob({
+      id: 'job-active-gcp',
+      task_title: 'compute_experiment: active',
+      backend: 'gcp',
+      status: 'RUNNING',
+      outcome: null,
+    })]));
+    const { queryByText: queryActive } = render(
+      <ComputeJobsPanel projectId="proj-1" />
+    );
+    await waitFor(() => {
+      expect(queryActive('Machine verified')).toBeNull();
+      expect(queryActive('Attested')).toBeNull();
+      expect(queryActive('Self-reported')).toBeNull();
+    });
   });
 });
 
@@ -508,11 +756,12 @@ describe('ComputeJobsPanel render + kill', () => {
         compute_rpc_diagnostic: makeDiagnostic({ operation: 'cost', job_status: 'FAILED' }),
       }),
     ]));
-    const { findByTestId, findByText, findByRole } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const { findByTestId, findByRole } = render(<ComputeJobsPanel projectId="proj-1" />);
     const warning = await findByTestId('compute-rpc-diagnostic');
     expect(warning.textContent).toContain('cost');
-    // Terminal label still rendered, separate from the amber warning block.
-    await findByText('Failed');
+    // Terminal label still rendered in the jobs list, separate from the amber warning block.
+    const jobsList = await findByTestId('compute-jobs-list');
+    expect(jobsList.textContent).toContain('Failed');
     expect(warning.textContent).not.toContain('Failed');
     // Result link still present alongside the warning.
     await findByRole('link', { name: /result\.json/i });
@@ -687,14 +936,58 @@ describe('ComputeJobsPanel render + kill', () => {
     expect(queryByTestId('compute-live-output')).toBeNull();
   });
 
-  test('terminal job with exit_code in polling_metadata shows exit code chip', async () => {
+  test('renders progress series block with metric name, latest value, and sample count', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
+      makeJob({
+        status: 'RUNNING',
+        progress_series: [
+          { t: '2026-07-01T10:00:00Z', name: 'reward', value: 0.1 },
+          { t: '2026-07-01T10:01:00Z', name: 'reward', value: 0.3 },
+          { t: '2026-07-01T10:02:00Z', name: 'reward', value: 0.5 },
+        ],
+      }),
+    ]));
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const block = await findByTestId('compute-progress-series');
+    expect(block.textContent).toContain('reward');
+    expect(block.textContent).toContain('0.5');
+    expect(block.textContent).toContain('3 samples');
+  });
+
+  test('no-progress cut tag appears on stalled terminal job with terminal_kind=no_progress', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
+      makeJob({
+        status: 'TIMED_OUT',
+        outcome: 'TIMED_OUT',
+        final_cost_usd: 0.5,
+        terminal_kind: 'no_progress',
+        progress_series: [
+          { t: '2026-07-01T10:00:00Z', name: 'loss', value: 1.0 },
+          { t: '2026-07-01T10:05:00Z', name: 'loss', value: 1.0 },
+        ],
+      }),
+    ]));
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const block = await findByTestId('compute-progress-series');
+    expect(block.textContent).toContain('no-progress cut');
+    expect(block.textContent).toContain('loss');
+  });
+
+  test('absent progress_series renders no progress block', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([makeJob()]));
+    const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('compute_experiment: sweep');
+    expect(queryByTestId('compute-progress-series')).toBeNull();
+  });
+
+  test('terminal job with exit_code shows exit code chip', async () => {
     fetchComputeJobs.mockResolvedValue(wrapJobs([
       makeJob({
         status: 'FAILED',
         outcome: 'FAILURE',
         final_cost_usd: 0.5,
         terminal_reason: 'command failed',
-        polling_metadata: { exit_code: 1 },
+        exit_code: 1,
       }),
     ]));
     const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
@@ -704,7 +997,7 @@ describe('ComputeJobsPanel render + kill', () => {
 
   test('active job does not show exit code chip even if present', async () => {
     fetchComputeJobs.mockResolvedValue(wrapJobs([
-      makeJob({ polling_metadata: { exit_code: 0 } }),
+      makeJob({ exit_code: 0 }),
     ]));
     const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     await findByText('compute_experiment: sweep');
@@ -1988,10 +2281,31 @@ describe('ComputeJobsPanel render + kill', () => {
     fetchComputeJobs.mockResolvedValue(wrapJobs([
       makeJob({ external_compute_id: 'compute-job-abc-123' }),
     ]));
-    const { findByText } = render(<ComputeJobsPanel projectId="proj-1" />);
-    const subtitle = await findByText((t) => t.includes('compute-job-abc-123'));
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const subtitle = await findByTestId('compute-job-provenance');
     expect(subtitle.textContent).toContain('gcp_compute_engine');
     expect(subtitle.textContent).toContain('compute-job-abc-123');
+  });
+
+  test('shows job provenance identity', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
+      makeJob({
+        backend: 'gcp_compute_engine',
+        machine_type: 'e2-standard-2',
+        external_compute_id: 'compute-job-vm-1',
+      }),
+    ]));
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    // The provenance line is the machine-testable seam that identifies WHERE a
+    // compute result was produced: backend, machine type, and the cloud VM identity.
+    const provenance = await findByTestId('compute-job-provenance');
+    expect(provenance.textContent).toContain('gcp_compute_engine');
+    expect(provenance.textContent).toContain('e2-standard-2');
+    // The cloud VM identity is explicitly labelled so provenance reads as an
+    // identity rather than an anonymous suffix.
+    const vmIdentity = await findByTestId('compute-job-vm-identity');
+    expect(vmIdentity.textContent).toBe('VM compute-job-vm-1');
+    expect(provenance.contains(vmIdentity)).toBe(true);
   });
 
   test('renders aggregate summary header when summary has jobs', async () => {
@@ -2803,6 +3117,60 @@ describe('ComputeJobsPanel render + kill', () => {
     expect(failChip?.className).toContain('red');
   });
 
+  test('arms comparison section shows N-of-M arms met criterion rollup count', async () => {
+    const job1 = makeJob({
+      id: 'arms-rollup-1',
+      task_title: 'arms rollup run',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 2.0,
+      experiment: 'arms-rollup-test',
+      success_criterion: { metric: 'accuracy', operator: '>=' as const, threshold: 0.9 },
+      criterion_verdict: {
+        metric: 'accuracy',
+        operator: '>=',
+        threshold: 0.9,
+        value: 0.92,
+        met: true,
+        measurable: true,
+        per_arm: { 'arm-alpha': 0.95, 'arm-beta': 0.82, 'arm-gamma': 0.93 },
+      },
+      polling_metadata: {
+        result_metrics: {
+          accuracy: 0.92,
+          arms: {
+            'arm-alpha': { accuracy: 0.95 },
+            'arm-beta': { accuracy: 0.82 },
+            'arm-gamma': { accuracy: 0.93 },
+          },
+        },
+      },
+      started_at: null,
+      completed_at: null,
+    });
+    const job2 = makeJob({
+      id: 'arms-rollup-2',
+      task_title: 'other run',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      experiment: 'arms-rollup-test',
+      success_criterion: { metric: 'accuracy', operator: '>=' as const, threshold: 0.9 },
+      criterion_verdict: { metric: 'accuracy', operator: '>=', threshold: 0.9, value: 0.88, met: false, measurable: true },
+      polling_metadata: { result_metrics: { accuracy: 0.88 } },
+      started_at: null,
+      completed_at: null,
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([job1, job2]));
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const toggleBtn = await findByTestId('sweep-compare-toggle');
+    await act(async () => { toggleBtn.click(); });
+    const rollup = await findByTestId('arms-met-count');
+    expect(rollup.textContent).toBe('2/3 arms met');
+    // arm-beta failed (0.82 < 0.9), so exactly 2 out of 3 met
+    expect(rollup.textContent).not.toContain('3/3');
+  });
+
   test('per-arm pass/fail chip handles != operator correctly', async () => {
     // arm-neq-pass has value 0.5 which != 0.9 (should pass); arm-neq-fail has value 0.9 which == 0.9 (should fail)
     const job = makeJob({
@@ -3470,5 +3838,201 @@ describe('ComputeJobsPanel — draft provenance', () => {
     const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     await findByText('compute_experiment: sweep');
     expect(queryByTestId('compute-draft-provenance')).toBeNull();
+  });
+});
+describe('ComputeJobsPanel — viewable artifact gallery', () => {
+  afterEach(() => {
+    fetchComputeJobs.mockReset();
+    resolveArtifactDownloadUrl.mockReset();
+  });
+
+  const VIEWABLE = [
+    { filename: 'loss_curve.png', storage_uri: 'gs://bucket/compute-jobs/job-1/artifacts/viewable/0-loss_curve.png', content_type: 'image/png', kind: 'image' as const, size_bytes: 41233 },
+    { filename: 'rollout.mp4', storage_uri: 'gs://bucket/compute-jobs/job-1/artifacts/viewable/1-rollout.mp4', content_type: 'video/mp4', kind: 'video' as const, size_bytes: 2_400_000 },
+  ];
+
+  function makeGalleryJob(): ComputeJob {
+    return makeJob({
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      viewable_artifacts: VIEWABLE,
+    });
+  }
+
+  test('renders collapsed gallery from viewable_artifacts without resolving URLs', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([makeGalleryJob()]));
+    const { findByTestId, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const toggle = await findByTestId('compute-artifact-gallery-toggle');
+    expect(toggle.textContent).toContain('Show previews (2)');
+    // Lazy: nothing resolved and no thumbnails until the gallery is expanded.
+    expect(resolveArtifactDownloadUrl).not.toHaveBeenCalled();
+    expect(queryByTestId('compute-viewable-artifact')).toBeNull();
+  });
+
+  test('expanding the gallery resolves each storage_uri and renders image + video previews', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([makeGalleryJob()]));
+    resolveArtifactDownloadUrl.mockImplementation(async (_projectId: string, uri: string) =>
+      `https://signed.example/${uri.split('/').pop()}`);
+    const { findByTestId, findAllByTestId, container } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const toggle = await findByTestId('compute-artifact-gallery-toggle');
+    await act(async () => { toggle.click(); });
+
+    const items = await findAllByTestId('compute-viewable-artifact');
+    expect(items).toHaveLength(2);
+    expect(resolveArtifactDownloadUrl).toHaveBeenCalledTimes(2);
+    expect(resolveArtifactDownloadUrl).toHaveBeenCalledWith('proj-1', VIEWABLE[0].storage_uri);
+    expect(resolveArtifactDownloadUrl).toHaveBeenCalledWith('proj-1', VIEWABLE[1].storage_uri);
+
+    await waitFor(() => {
+      const img = container.querySelector('img[alt="loss_curve.png"]');
+      expect(img?.getAttribute('src')).toBe('https://signed.example/0-loss_curve.png');
+    });
+    const video = await findByTestId('compute-artifact-video');
+    expect(video.tagName).toBe('VIDEO');
+    expect(video.hasAttribute('controls')).toBe(true);
+    expect(video.getAttribute('src')).toBe('https://signed.example/1-rollout.mp4');
+    // Captions carry name + size.
+    const gallery = await findByTestId('compute-artifact-gallery');
+    expect(gallery.textContent).toContain('loss_curve.png · 40 KB');
+    expect(gallery.textContent).toContain('rollout.mp4 · 2.3 MB');
+  });
+
+  test('resolution failure shows a quiet placeholder that can retry', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([makeGalleryJob()]));
+    resolveArtifactDownloadUrl.mockRejectedValue(new Error('403'));
+    const { findByTestId, findAllByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const toggle = await findByTestId('compute-artifact-gallery-toggle');
+    await act(async () => { toggle.click(); });
+
+    const placeholders = await findAllByTestId('compute-artifact-placeholder');
+    expect(placeholders).toHaveLength(2);
+    expect(placeholders[0].textContent).toContain('preview unavailable');
+
+    // Retry re-resolves just the clicked artifact and swaps in the thumbnail.
+    resolveArtifactDownloadUrl.mockResolvedValue('https://signed.example/retried.png');
+    await act(async () => { placeholders[0].click(); });
+    expect(resolveArtifactDownloadUrl).toHaveBeenCalledTimes(3);
+    await waitFor(async () => {
+      const thumb = await findByTestId('compute-artifact-thumbnail');
+      expect(thumb.querySelector('img')?.getAttribute('src')).toBe('https://signed.example/retried.png');
+    });
+  });
+
+  test('no gallery section when viewable_artifacts is absent or malformed', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
+      makeJob({
+        status: 'SUCCEEDED',
+        outcome: 'SUCCESS',
+        final_cost_usd: 1.0,
+        viewable_artifacts: [{ kind: 'image' }, 'nonsense', null] as unknown as ComputeJob['viewable_artifacts'],
+      }),
+    ]));
+    const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('compute_experiment: sweep');
+    expect(queryByTestId('compute-artifact-gallery')).toBeNull();
+  });
+});
+
+describe('ComputeJobsPanel — live output expander', () => {
+  afterEach(() => {
+    fetchComputeJobs.mockReset();
+  });
+
+  test('clips active live output to 30 lines with a Show-all expander', async () => {
+    const lines = Array.from({ length: 50 }, (_, i) => `line ${i}`).join('\n');
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
+      makeJob({
+        status: 'RUNNING',
+        polling_metadata: { live_output: { text: lines, truncated: false } },
+      }),
+    ]));
+    const { findByTestId, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const showAllBtn = await findByTestId('compute-live-output-show-all');
+    expect(showAllBtn.textContent).toContain('50 lines');
+    // Only the last 30 lines visible before expanding.
+    const block = await findByTestId('compute-live-output');
+    expect(block.textContent).not.toContain('line 0');
+    expect(block.textContent).toContain('line 49');
+
+    await act(async () => { showAllBtn.click(); });
+    const expanded = await findByTestId('compute-live-output');
+    expect(expanded.textContent).toContain('line 0');
+    expect(queryByTestId('compute-live-output-show-all')).toBeNull();
+  });
+
+  test('no live-output expander when output fits within 30 lines', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
+      makeJob({
+        status: 'RUNNING',
+        polling_metadata: { live_output: { text: 'line1\nline2\n', truncated: false } },
+      }),
+    ]));
+    const { findByTestId, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByTestId('compute-live-output');
+    expect(queryByTestId('compute-live-output-show-all')).toBeNull();
+  });
+});
+
+describe('ComputeJobsPanel — runner identity on finished jobs', () => {
+  beforeEach(() => {
+    fetchComputeJobs.mockReset();
+    killComputeJob.mockReset();
+    resolveArtifactDownloadUrl.mockReset();
+  });
+
+  test('renders runner identity on finished job without claim timestamp', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
+      makeJob({
+        status: 'SUCCEEDED',
+        outcome: 'SUCCESS',
+        final_cost_usd: 1.0,
+        runner_target_id: 'runner-abc12345-dead-beef-0000-111122223333',
+        runner: { hostname: 'my-gpu-host', id: 'runner-abc12345-dead-beef-0000-111122223333', status: null },
+        runner_claimed_at: null,
+      }),
+    ]));
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const runnerEl = await findByTestId('compute-runner-claimed');
+    expect(runnerEl.textContent).toContain('my-gpu-host');
+    expect(runnerEl.textContent).not.toContain('claimed');
+  });
+
+  test('renders runner identity using truncated target id when hostname absent', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
+      makeJob({
+        status: 'SUCCEEDED',
+        outcome: 'SUCCESS',
+        final_cost_usd: 1.0,
+        runner_target_id: 'runner-abc12345-dead-beef-0000-111122223333',
+        runner: null,
+        runner_claimed_at: null,
+      }),
+    ]));
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const runnerEl = await findByTestId('compute-runner-claimed');
+    // The component truncates the target id to 8 chars (`slice(0, 8)`) — the
+    // long-standing behavior on both branches. Assert the truncated form is
+    // rendered AND that the full id is not, so this genuinely covers truncation.
+    expect(runnerEl.textContent).toContain('runner-a');
+    expect(runnerEl.textContent).not.toContain('runner-abc12345-dead-beef-0000-111122223333');
+    expect(runnerEl.textContent).not.toContain('claimed');
+  });
+
+  test('renders claimed suffix when runner_claimed_at is present', async () => {
+    const claimedAt = new Date(Date.now() - 60_000).toISOString();
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
+      makeJob({
+        status: 'RUNNING',
+        runner_target_id: 'runner-abc12345-dead-beef-0000-111122223333',
+        runner: { hostname: 'my-gpu-host', id: 'runner-abc12345-dead-beef-0000-111122223333', status: null },
+        runner_claimed_at: claimedAt,
+      }),
+    ]));
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const runnerEl = await findByTestId('compute-runner-claimed');
+    expect(runnerEl.textContent).toContain('my-gpu-host');
+    expect(runnerEl.textContent).toContain('claimed');
+    expect(runnerEl.textContent).toContain('ago');
   });
 });

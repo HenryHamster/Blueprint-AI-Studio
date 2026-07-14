@@ -40,6 +40,7 @@ from app import compute
 from app.compute_backends import (
     ComputeLaunchSpec,
     _build_gcp_startup_script,
+    _build_local_wrapper_command,
 )
 from app.compute_startup_script import (
     build_agent_startup_script,
@@ -63,6 +64,20 @@ class ShellGenerator:
     """Returns the rendered bash source as a single string."""
 
     expected_shebang: str = "#!/bin/bash"
+
+    shell: str = "bash"
+    """Dialect passed to shellcheck as ``--shell=``.
+
+    Every generator is bash today, but the flag OVERRIDES shellcheck's shebang
+    sniffing, so it cannot be a blanket constant: a future generator emitting
+    ``#!/bin/sh`` would be silently checked under bash rules and its bashisms
+    would pass. Declaring the dialect per generator keeps the override honest —
+    and ``test_shellcheck_shell_matches_shebang`` fails if the two ever disagree.
+
+    It must be stated explicitly (rather than left to sniffing) because the local
+    wrapper is handed to ``bash -lc`` and correctly carries no shebang at all,
+    which would otherwise trip SC2148.
+    """
 
 
 def _render_compute_startup_script() -> str:
@@ -90,21 +105,100 @@ def _render_pool_startup_script() -> str:
     )
 
 
-def _render_gcp_compute_startup_script() -> str:
-    """Render the GCP compute-job VM startup script with placeholder values."""
+def _make_gcp_launch_spec(**overrides) -> ComputeLaunchSpec:
+    """Minimal valid ComputeLaunchSpec; callers override optional fields to
+    force the corresponding conditional block of the startup script to render."""
     from datetime import datetime, timedelta, timezone
 
-    spec = ComputeLaunchSpec(
-        job_id=uuid.UUID("00000000-0000-0000-0000-000000000001"),
-        command="echo hello",
-        machine_type="e2-standard-2",
-        spend_cap_usd=1.0,
-        deadline_at=datetime.now(timezone.utc) + timedelta(hours=1),
-        runtime_deadline_seconds=3600,
+    defaults: dict = {
+        "job_id": uuid.UUID("00000000-0000-0000-0000-000000000001"),
+        "command": "echo hello",
+        "machine_type": "e2-standard-2",
+        "spend_cap_usd": 1.0,
+        "deadline_at": datetime.now(timezone.utc) + timedelta(hours=1),
+        "runtime_deadline_seconds": 3600,
+    }
+    defaults.update(overrides)
+    return ComputeLaunchSpec(**defaults)
+
+
+def _render_gcp_compute_startup_script() -> str:
+    """Render the GCP compute-job VM startup script with placeholder values."""
+    return _build_gcp_startup_script(
+        _make_gcp_launch_spec(),
+        artifact_upload_url="https://storage.example.com/upload?sig=placeholder",
+    )
+
+
+def _render_gcp_compute_startup_script_container() -> str:
+    """Render with container_image + registry creds set so the docker
+    login/pull block (docker_setup_block) is emitted and validated."""
+    spec = _make_gcp_launch_spec(
+        container_image="nvcr.io/nvidia/tensorflow:25.01-tf2-py3",
+        container_registry_auth={
+            "server": "nvcr.io",
+            "username": "$oauthtoken",
+            "password": "placeholder-registry-password",
+        },
+        accelerator="T4",
     )
     return _build_gcp_startup_script(
         spec,
         artifact_upload_url="https://storage.example.com/upload?sig=placeholder",
+    )
+
+
+def _render_gcp_compute_startup_script_repo_clone() -> str:
+    """Render with repo_clone + repo_token set so the clone block and its
+    clone-error classifier pipelines (repo_setup_block) are emitted and
+    validated."""
+    spec = _make_gcp_launch_spec(
+        repo_clone={"owner": "acme", "repo": "demo", "ref": "main"},
+        repo_token="ghs_placeholder_token",
+    )
+    return _build_gcp_startup_script(
+        spec,
+        artifact_upload_url="https://storage.example.com/upload?sig=placeholder",
+    )
+
+
+def _render_gcp_compute_startup_script_setup_env() -> str:
+    """Render with setup_step + env + cwd set so the setup_step_failed branch,
+    the env export block, and the cwd line are emitted and validated."""
+    spec = _make_gcp_launch_spec(
+        setup_step="pip install -r requirements.txt",
+        env={"DATASET_DIR": "/data/train", "MY_SEED": "42"},
+        cwd="/tmp",
+    )
+    return _build_gcp_startup_script(
+        spec,
+        artifact_upload_url="https://storage.example.com/upload?sig=placeholder",
+    )
+
+
+def _render_local_wrapper_command_plain() -> str:
+    """Render the local-subprocess wrapper with no optional blocks."""
+    return _build_local_wrapper_command(
+        "echo hello",
+        external_id="shell-harness-local-plain",
+    )
+
+
+def _render_local_wrapper_command_full() -> str:
+    """Render the local-subprocess wrapper with every conditional block
+    (setup_step, container login/pull, repo mount, env) emitted."""
+    return _build_local_wrapper_command(
+        "python train.py --epochs 1",
+        external_id="shell-harness-local-full",
+        setup_step="pip install -r requirements.txt",
+        container_image="nvcr.io/nvidia/tensorflow:25.01-tf2-py3",
+        container_registry_auth={
+            "server": "nvcr.io",
+            "username": "$oauthtoken",
+            "password": "placeholder-registry-password",
+        },
+        env={"DATASET_DIR": "/data/train", "MY_SEED": "42"},
+        repo_clone={"owner": "acme", "repo": "demo", "ref": "main"},
     )
 
 
@@ -120,6 +214,30 @@ GENERATORS: list[ShellGenerator] = [
     ShellGenerator(
         name="compute.gcp_startup_script",
         render=_render_gcp_compute_startup_script,
+    ),
+    ShellGenerator(
+        name="compute.gcp_startup_script.container",
+        render=_render_gcp_compute_startup_script_container,
+    ),
+    ShellGenerator(
+        name="compute.gcp_startup_script.repo_clone",
+        render=_render_gcp_compute_startup_script_repo_clone,
+    ),
+    ShellGenerator(
+        name="compute.gcp_startup_script.setup_env",
+        render=_render_gcp_compute_startup_script_setup_env,
+    ),
+    # The local wrapper is handed to `bash -lc <wrapper>` rather than written
+    # to disk as a standalone script, so it (correctly) carries no shebang.
+    ShellGenerator(
+        name="compute.local_wrapper_command",
+        render=_render_local_wrapper_command_plain,
+        expected_shebang="",
+    ),
+    ShellGenerator(
+        name="compute.local_wrapper_command.full",
+        render=_render_local_wrapper_command_full,
+        expected_shebang="",
     ),
     # Future entries: append here. Each renderer returns rendered bash.
 ]
@@ -674,6 +792,10 @@ def test_shellcheck_no_errors(
     path.write_text(gen.render(), encoding="utf-8")
     cmd = [
         "shellcheck",
+        # Per-generator dialect, NOT a blanket constant: this flag overrides
+        # shebang sniffing, so hardcoding bash would silently check a future
+        # `#!/bin/sh` generator under bash rules. See ShellGenerator.shell.
+        f"--shell={gen.shell}",
         "-S",
         "error",
         f"--exclude={','.join(_SHELLCHECK_EXCLUDES)}",
@@ -682,6 +804,26 @@ def test_shellcheck_no_errors(
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, (
         f"shellcheck errors in {gen.name}:\n{result.stdout}\n{result.stderr}"
+    )
+
+
+@pytest.mark.parametrize("gen", _PARAMS)
+def test_shellcheck_shell_matches_shebang(gen: ShellGenerator):
+    """The declared shellcheck dialect must agree with the emitted shebang.
+
+    `--shell=` overrides sniffing. This is the guard that keeps the override from
+    lying: a generator that starts emitting `#!/bin/sh` while still declaring
+    `shell="bash"` gets checked under the wrong dialect and its bashisms sail
+    through. Generators with no shebang (the `bash -lc` wrappers) are exempt —
+    there is nothing to disagree with.
+    """
+    if not gen.expected_shebang:
+        return
+    # Handles both `#!/bin/bash` and `#!/usr/bin/env bash`.
+    interpreter = gen.expected_shebang.split()[-1].rsplit("/", 1)[-1]
+    assert interpreter == gen.shell, (
+        f"{gen.name} emits {gen.expected_shebang!r} but is shellcheck'd as "
+        f"--shell={gen.shell}; the override would hide dialect errors"
     )
 
 

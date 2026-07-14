@@ -543,16 +543,20 @@ async def test_checkpoint_lane_rejects_non_owner_task(db: AsyncSession):
     lane.current_task_id = owner_id
     lane.last_checkpoint_sha = "original_sha"
     await db.commit()
+    # Snapshot the id BEFORE the rollback below: rollback expires every loaded
+    # instance, and a sync read of an expired attribute on an async session
+    # raises MissingGreenlet under real ORM expiry.
+    lane_id = lane.id
 
     stale_task_id = uuid.uuid4()
     cp = LaneCheckpointPayload(sha="stale_sha", summary="stale checkpoint attempt")
     with pytest.raises(LaneOwnerMismatchError, match=str(owner_id)):
-        await checkpoint_lane(db, lane.id, "create", stale_task_id, cp)
+        await checkpoint_lane(db, lane_id, "create", stale_task_id, cp)
 
     # Verify the lane is untouched — the DB session may have partial state,
     # so re-fetch to confirm.
     await db.rollback()
-    refreshed = await db.get(ImprovementLane, lane.id)
+    refreshed = await db.get(ImprovementLane, lane_id)
     assert refreshed.status == ImprovementLaneStatus.ACTIVE.value
     assert refreshed.current_task_id == owner_id
     assert refreshed.last_checkpoint_sha == "original_sha"
@@ -580,15 +584,18 @@ async def test_checkpoint_lane_rejects_none_owner_active_lane(db: AsyncSession):
     lane.status = ImprovementLaneStatus.ACTIVE.value
     # Deliberately leave current_task_id as None (no owner stamped yet).
     await db.commit()
+    # Snapshot the id BEFORE the rollback below (rollback expires instances;
+    # an expired sync read raises MissingGreenlet under real ORM expiry).
+    lane_id = lane.id
 
     foreign_task_id = uuid.uuid4()
     cp = LaneCheckpointPayload(sha="foreign_sha", summary="should be rejected")
     with pytest.raises(LaneOwnerMismatchError):
-        await checkpoint_lane(db, lane.id, "create", foreign_task_id, cp)
+        await checkpoint_lane(db, lane_id, "create", foreign_task_id, cp)
 
     # Lane must be untouched after the rejection.
     await db.rollback()
-    refreshed = await db.get(ImprovementLane, lane.id)
+    refreshed = await db.get(ImprovementLane, lane_id)
     assert refreshed.status == ImprovementLaneStatus.ACTIVE.value
     assert refreshed.current_task_id is None
     assert refreshed.last_checkpoint_sha is None

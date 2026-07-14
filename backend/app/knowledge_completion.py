@@ -1284,6 +1284,44 @@ def _evaluate_criterion_per_arm(
     return per_arm if per_arm else None
 
 
+def _compute_evidence_tier(
+    job: Any | None,
+    result_metrics: dict[str, Any] | None,
+) -> str:
+    """Compute the evidence tier for a compute-experiment knowledge document.
+
+    WHERE a job ran is not WHETHER it proved anything.  ``covered`` is rendered
+    to the operator as "Machine verified", so it requires BOTH facts:
+
+      1. it executed on operator hardware (a local runner, not billable cloud), AND
+      2. it produced a measurable result.
+
+    A local-runner job that reported NO metric measured nothing — it establishes
+    only its own execution location.  Grading that ``covered`` labels an empty run
+    "Machine verified", which is exactly the claimed-not-earned status this
+    version exists to eliminate; it also contradicts the compute results contract
+    (an unmeasured run is a FAILURE, not a success).  Such a run is demoted to
+    ``partial``: real execution provenance, no result to verify.
+
+    Cloud execution stays ``attested`` (we trust the platform's report of the run
+    but it is not operator-verified), and metrics without any execution record
+    stay ``backfilled``.
+    """
+    if job is None:
+        return "backfilled" if result_metrics else "uncovered"
+    backend = getattr(job, "backend", None) or ""
+    ran_on_operator_hardware = (
+        backend.startswith("local-") or backend == "runner-subprocess"
+    )
+    if ran_on_operator_hardware:
+        return "covered" if result_metrics else "partial"
+    if backend:
+        return "attested"
+    if result_metrics:
+        return "backfilled"
+    return "partial"
+
+
 def _build_compute_experiment_document(
     task: Task,
     *,
@@ -1294,6 +1332,7 @@ def _build_compute_experiment_document(
     terminal_diagnostics: dict[str, Any] | None = None,
     result_metrics: dict[str, Any] | None = None,
     arms: Any | None = None,
+    evidence_tier: str | None = None,
 ) -> dict[str, Any]:
     """Build the DETERMINISTIC compute-experiment knowledge document.
 
@@ -1382,6 +1421,14 @@ def _build_compute_experiment_document(
                 contract_parts.append(f"model={td_contract['provisioning_model']}")
             if contract_parts:
                 summary_parts.append(f"Launch contract: {', '.join(contract_parts)}.")
+        td_backend = terminal_diagnostics.get("executing_backend")
+        if td_backend:
+            summary_parts.append(f"Backend: {td_backend}.")
+        td_runner = terminal_diagnostics.get("runner_target_id")
+        if td_runner:
+            td_runner_name = terminal_diagnostics.get("runner_hostname")
+            label = f"{td_runner_name} ({td_runner})" if td_runner_name else td_runner
+            summary_parts.append(f"Runner: {label}.")
     summary = " ".join(summary_parts)
 
     body_lines = [
@@ -1408,6 +1455,9 @@ def _build_compute_experiment_document(
         td_phase = terminal_diagnostics.get("vm_phase")
         td_accel = terminal_diagnostics.get("accelerator_type")
         td_machine = terminal_diagnostics.get("machine_type")
+        td_backend = terminal_diagnostics.get("executing_backend")
+        td_runner = terminal_diagnostics.get("runner_target_id")
+        td_runner_hostname = terminal_diagnostics.get("runner_hostname")
         td_cause = terminal_diagnostics.get("provisioning_cause")
         td_contract = terminal_diagnostics.get("launch_contract")
         if td_reason:
@@ -1418,6 +1468,11 @@ def _build_compute_experiment_document(
             body_lines.append(f"- **Accelerator type:** {td_accel}")
         if td_machine:
             body_lines.append(f"- **Machine type:** {td_machine}")
+        if td_backend:
+            body_lines.append(f"- **Executing backend:** {td_backend}")
+        if td_runner:
+            runner_label = f"{td_runner_hostname} (`{td_runner}`)" if td_runner_hostname else td_runner
+            body_lines.append(f"- **Runner:** {runner_label}")
         if td_cause:
             if td_cause.get("error_type"):
                 body_lines.append(
@@ -1527,6 +1582,8 @@ def _build_compute_experiment_document(
         "criterion": criterion,
         "criterion_met": crit_met,
     }
+    if evidence_tier is not None:
+        verdict_record["evidence_tier"] = evidence_tier
     if terminal_diagnostics:
         verdict_record["terminal_diagnostics"] = terminal_diagnostics
     # Faithful, queryable home for the real numbers and any A/B arms so future
@@ -2121,6 +2178,15 @@ async def _persist_compute_knowledge_document(
     payload = task.first_payload or {}
     raw_sweep_id = payload.get("sweep_id") or None
     sweep_id_val = (str(raw_sweep_id).strip()[:128] if raw_sweep_id else None) or None
+    # Single-job arms experiments omit sweep_id from their payload, so their
+    # KnowledgeDocument lands with sweep_id=None and is excluded from the
+    # sweep-groups query (which pre-filters to sweep_id IS NOT NULL).  Synthesize
+    # a stable, task-scoped sweep_id so the existing single-doc arms path in
+    # build_compute_sweep_groups becomes reachable for these documents.
+    if sweep_id_val is None:
+        _per_arm = (document.get("verdict_record") or {}).get("per_arm_verdicts")
+        if isinstance(_per_arm, dict) and len(_per_arm) >= 2:
+            sweep_id_val = f"single-{task.id}"
     arm_label_val = derive_compute_arm_label_from_payload(payload)
 
     title = document["title"]
@@ -2291,49 +2357,61 @@ async def _persist_compute_knowledge_document(
 def _extract_job_terminal_diagnostics(job: Any) -> dict[str, Any] | None:
     """Extract attributable terminal diagnostics from a ComputeJob row.
 
-    Returns a dict with ``terminal_reason``, ``vm_phase`` (``provisioning`` when
-    the VM never started, ``runtime`` otherwise), plus ``accelerator_type`` and
-    ``machine_type`` when known.  For provisioning-phase failures also adds a
-    sanitized ``provisioning_cause`` (from ``polling_metadata["compute_rpc_diagnostic"]``)
-    and a ``launch_contract`` echo (``requested_deadline_seconds``,
-    ``provisioning_model``).  Returns ``None`` when the job has no terminal_reason.
+    Always populates execution-location fields (``executing_backend``,
+    ``runner_target_id``, ``runner_hostname``, ``accelerator_type``,
+    ``machine_type``) when present, so clean-SUCCESS runs surface provenance
+    in the run-provenance panel.  Adds ``terminal_reason``, ``vm_phase``, and
+    failure-specific fields (``provisioning_cause``, ``launch_contract``) only
+    when ``terminal_reason`` is non-empty.  Returns ``None`` only when ``job``
+    is ``None``.
     """
     if job is None:
         return None
-    reason = getattr(job, "terminal_reason", None)
-    if not reason:
-        return None
-    started_at = getattr(job, "started_at", None)
-    vm_phase = "provisioning" if started_at is None else "runtime"
-    diag: dict[str, Any] = {
-        "terminal_reason": reason,
-        "vm_phase": vm_phase,
-    }
+    diag: dict[str, Any] = {}
     accel = getattr(job, "accelerator_type", None)
     if accel:
         diag["accelerator_type"] = accel
     machine = getattr(job, "machine_type", None)
     if machine:
         diag["machine_type"] = machine
-    if vm_phase == "provisioning":
-        try:
-            meta = getattr(job, "polling_metadata", None) or {}
-            raw_diag = meta.get("compute_rpc_diagnostic")
-            cause = sanitize_rpc_diagnostic(raw_diag)
-            if cause:
-                diag["provisioning_cause"] = cause
-            deadline = meta.get("requested_deadline_seconds")
-            prov_model = meta.get("provisioning_model")
-            contract: dict[str, Any] = {}
-            if deadline is not None:
-                contract["requested_deadline_seconds"] = deadline
-            if prov_model is not None:
-                contract["provisioning_model"] = prov_model
-            if contract:
-                diag["launch_contract"] = contract
-        except Exception:
-            pass
-    return diag
+    backend = getattr(job, "backend", None)
+    if backend:
+        diag["executing_backend"] = backend
+    try:
+        meta = getattr(job, "polling_metadata", None) or {}
+        runner_target_id = meta.get("runner_target_id")
+        if runner_target_id:
+            diag["runner_target_id"] = str(runner_target_id)
+        runner_hostname = meta.get("runner_hostname")
+        if runner_hostname:
+            diag["runner_hostname"] = str(runner_hostname)
+    except Exception:
+        pass
+    reason = getattr(job, "terminal_reason", None)
+    if reason:
+        started_at = getattr(job, "started_at", None)
+        vm_phase = "provisioning" if started_at is None else "runtime"
+        diag["terminal_reason"] = reason
+        diag["vm_phase"] = vm_phase
+        if vm_phase == "provisioning":
+            try:
+                meta = getattr(job, "polling_metadata", None) or {}
+                raw_diag = meta.get("compute_rpc_diagnostic")
+                cause = sanitize_rpc_diagnostic(raw_diag)
+                if cause:
+                    diag["provisioning_cause"] = cause
+                deadline = meta.get("requested_deadline_seconds")
+                prov_model = meta.get("provisioning_model")
+                contract: dict[str, Any] = {}
+                if deadline is not None:
+                    contract["requested_deadline_seconds"] = deadline
+                if prov_model is not None:
+                    contract["provisioning_model"] = prov_model
+                if contract:
+                    diag["launch_contract"] = contract
+            except Exception:
+                pass
+    return diag if diag else None
 
 
 # Defensive bound on how many reported metric keys are captured verbatim into a
@@ -2394,6 +2472,7 @@ async def _prepare_deterministic_compute_document(
     terminal_diagnostics = _extract_job_terminal_diagnostics(job)
     result_metrics = _extract_faithful_result_metrics(job)
     arms = _extract_experiment_arms(result_metrics)
+    evidence_tier = _compute_evidence_tier(job, result_metrics)
     document = _build_compute_experiment_document(
         task,
         outcome=outcome,
@@ -2403,6 +2482,7 @@ async def _prepare_deterministic_compute_document(
         terminal_diagnostics=terminal_diagnostics,
         result_metrics=result_metrics,
         arms=arms,
+        evidence_tier=evidence_tier,
     )
     try:
         grounding_stamp = await _compute_citation_grounding_stamp(

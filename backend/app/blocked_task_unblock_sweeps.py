@@ -371,6 +371,87 @@ async def _fetch_working_capability_names(session, project_id) -> set:
     return working_capability_names(getattr(project, "problem_model", None))
 
 
+def _fold_proof_records_tier2(
+    status_by_name: dict, proof_records: object, now: object = None
+) -> dict:
+    """Upgrade an evidence_refs-derived proof map with durable proof_records.
+
+    ``record_capability_proof`` stamps a landed provider's proof into BOTH the
+    capability's ``evidence_refs`` (tier-1, read by
+    :func:`working_capability_proof_status`) AND the project-level
+    ``capability_proof_records`` column (tier-2). The evidence_refs append is
+    fail-open — if the problem_model shape blocks it, the proof survives ONLY in
+    ``capability_proof_records``. The release-qualifier and badge seams already
+    consult that tier-2 fallback (:func:`enrich_problem_model_capability_proofs`),
+    so the blocked-resume enforce gate must too — otherwise an enforce-mode
+    dependent is stranded BLOCKED on a capability the other two seams treat as
+    proven.
+
+    Only ``working`` capabilities already present in ``status_by_name`` are
+    considered (the tier-1 map is authoritative on WHICH capabilities exist and
+    are working), and a tier-2 status is applied only when it is strictly stronger
+    than the tier-1 status — so a landed proof never regresses a capability the
+    evidence_refs already classify more highly.
+
+    Freshness parity with the tier-1 gate: each proof record's ``proved_at`` is
+    carried into the synthetic ref as ``recorded_at`` and ``now`` is threaded into
+    the tiered classifier, so a stale tier-2 proof-record (older than
+    :data:`~app.evidence_primitive.PROOF_FRESHNESS_TTL`) can no longer resurrect an
+    expired capability at the enforce gate after the fail-open evidence_refs append
+    is missing. ``now`` defaults to the current UTC time when not supplied.
+
+    The rule itself now lives in
+    :func:`app.capability_registry.fold_ledger_proof_upgrades`: the spawn-time
+    resolver needs the IDENTICAL upgrade, and the two consumer seams must not grade
+    a capability differently. This thin wrapper stays as the blocked-sweep-local
+    name for it.
+    """
+    from app.capability_registry import fold_ledger_proof_upgrades
+
+    return fold_ledger_proof_upgrades(status_by_name, proof_records, now=now)
+
+
+async def _fetch_working_capability_proof_status(session, project_id) -> dict:
+    """``{canonical_name: proof_status}`` for the project's ``working`` capabilities.
+
+    The proof-aware companion of :func:`_fetch_working_capability_names`, drawn
+    from the SAME ``project.problem_model.capabilities`` registry. Its keys are
+    exactly the working-capability name set (both readers select the identical
+    alias-aware working set), so the boolean registry-satisfies check derives its
+    name set from these keys — one project fetch serves both the resolution and
+    the OBSERVE-mode proof surfacing. Cached per project across the sweep batch.
+
+    The evidence_refs-derived tier-1 map is then reconciled against the project's
+    durable ``capability_proof_records`` ledger by
+    :func:`~app.capability_registry.consumer_gate_proof_status`, which the
+    spawn-time resolver calls too, so both consumer seams (and the release
+    qualifier) grade a capability identically. That reconciliation runs BOTH ways:
+
+    * the ledger RAISES a capability whose tier-1 ``evidence_refs`` append was lost
+      to the fail-open path (see :func:`_fold_proof_records_tier2`), and
+    * SECURITY (audit finding #4) the ledger REFUSES a ``proven`` claim it does not
+      corroborate. ``problem_model.capabilities[].evidence_refs`` is AGENT-WRITABLE
+      JSONB: without this, an agent that wrote itself a
+      ``{"kind": "named_test", "proven": true}`` ref would clear this gate and resume
+      every dependent blocked on that capability with nothing machine-verified behind
+      it. Only a provenance-authorized ``proof_exempt`` clears without a ledger entry.
+    """
+    from app.capability_registry import consumer_gate_proof_status
+    from app.models import Project
+    from app.time_utils import _utcnow
+
+    # One clock for both tiers so a proof on the freshness boundary is graded
+    # identically whether it lands in evidence_refs (tier-1) or the durable
+    # capability_proof_records column (tier-2).
+    now = _utcnow()
+    project = await session.get(Project, project_id)
+    return consumer_gate_proof_status(
+        getattr(project, "problem_model", None),
+        getattr(project, "capability_proof_records", None),
+        now=now,
+    )
+
+
 async def _classify_blocker_needs(
     task,
     session,
@@ -380,6 +461,7 @@ async def _classify_blocker_needs(
     dead_cache: dict,
     knowledge_cache: dict,
     registry_cache: dict,
+    proof_gate_mode: str = "off",
 ) -> dict:
     """Classify EVERY recorded need of a blocked task against the live foundations.
 
@@ -418,7 +500,11 @@ async def _classify_blocker_needs(
         need_matched_dead_foundation,
         knowledge_substance_satisfies_need,
     )
-    from app.capability_registry import registry_satisfies_capability_need
+    from app.capability_registry import (
+        capability_need_blocked_by_proof_gate,
+        capability_need_proof_status,
+        registry_satisfies_capability_need,
+    )
 
     needs = get_blocker_needs(task)
     disp = {
@@ -430,6 +516,16 @@ async def _classify_blocker_needs(
         # The first need that matched a terminally-dead foundation, recorded so the
         # foundation-died cancel can stamp it into the unresumable marker.
         "dead_need": None,
+        # Needs that DID match a ``working`` registry capability but were held back
+        # from ``completed_needs`` by the ENFORCE proof gate (the capability is only
+        # claimed, not proven). These are a subset of ``residual``. Recorded
+        # separately so the disposition can HOLD the dependent BLOCKED
+        # deterministically rather than letting it fall through to the legacy
+        # precondition machine — where a no-dep agent-source blocker would be
+        # optimistically requeued, silently defeating the enforce gate. A gate-held
+        # need is always observable (it resumes the instant proof is recorded), so
+        # holding it never trips the never-satisfiable termination bound.
+        "proof_gate_held": [],
     }
     if not needs:
         return disp
@@ -450,14 +546,21 @@ async def _classify_blocker_needs(
     if knowledge is None:
         knowledge = await _fetch_knowledge_substance_index(session, task.project_id)
         knowledge_cache[task.project_id] = knowledge
-    # Registry working-capability set, fetched only when a capability need is
-    # actually present (the common task-kind path pays no extra query).
-    working_caps = registry_cache.get(task.project_id)
-    if working_caps is None and any(n.get("kind") == "capability" for n in needs):
-        working_caps = await _fetch_working_capability_names(session, task.project_id)
-        registry_cache[task.project_id] = working_caps
-    if working_caps is None:
-        working_caps = set()
+    # Registry working-capability proof map, fetched only when a capability need
+    # is actually present (the common task-kind path pays no extra query). The map
+    # keys ARE the working-capability name set (both readers select the identical
+    # alias-aware working set), so the boolean registry-satisfies check derives its
+    # name set from the keys — one fetch serves both the resolution and the
+    # OBSERVE-mode proof surfacing below.
+    working_proof = registry_cache.get(task.project_id)
+    if working_proof is None and any(n.get("kind") == "capability" for n in needs):
+        working_proof = await _fetch_working_capability_proof_status(
+            session, task.project_id
+        )
+        registry_cache[task.project_id] = working_proof
+    if working_proof is None:
+        working_proof = {}
+    working_caps = set(working_proof)
 
     # Stranded-parent set so a GENUINE ghost merge does NOT satisfy a completed
     # need. LANDED-IN-BASE-LINEAGE semantics: the ghost-merge exclusion fires ONLY
@@ -501,6 +604,44 @@ async def _classify_blocker_needs(
         # stale terminal provider of a still-working capability can never
         # cancel the dependent.
         if registry_satisfies_capability_need(need, working_caps):
+            _proof_status = capability_need_proof_status(need, working_proof)
+            if capability_need_blocked_by_proof_gate(
+                need, working_proof, mode=proof_gate_mode
+            ):
+                # ENFORCE mode: an unproven/partial 'working' capability does NOT
+                # satisfy the need. Leave it in ``residual`` (do NOT route to
+                # completed_needs) so the dependent stays BLOCKED — the codebase
+                # foundation is only claimed, not proven, so no edge is wired and
+                # the task does not resume.
+                logger.warning(
+                    "[BLOCKED-RESUME][capability-proof-enforce] task=%s need "
+                    "capability:%s NOT satisfied — the registry capability is "
+                    "'working' with proof_status=%s (unproven); enforce mode holds "
+                    "the dependent BLOCKED instead of resuming it",
+                    task.id,
+                    need.get("ref"),
+                    _proof_status,
+                )
+                disp["residual"].append(need)
+                # Also record it as gate-held (subset of residual) so the
+                # disposition holds the dependent BLOCKED deterministically
+                # instead of falling through to the optimistic-retry path.
+                disp["proof_gate_held"].append(need)
+                continue
+            # OBSERVE mode: surface (never gate) a blocked-resume resolution backed
+            # by a capability declared 'working' with no proven evidence. The need
+            # still routes to completed_needs below; this only makes the unproven
+            # claim visible while enforce mode is off.
+            if _proof_status is not None and _proof_status != "proven":
+                logger.warning(
+                    "[BLOCKED-RESUME][capability-proof-observe] task=%s need "
+                    "capability:%s resolved as satisfied-by-the-codebase, but the "
+                    "registry capability is 'working' with proof_status=%s — "
+                    "unproven resolution (observe mode, not gated)",
+                    task.id,
+                    need.get("ref"),
+                    _proof_status,
+                )
             disp["completed_needs"].append(need)
             continue
         if need_matched_dead_foundation(task, need, dead):
@@ -761,8 +902,9 @@ async def _apply_needs_disposition(
     Returns one of:
       ``"resumed"``   — every need accounted for; task → QUEUED (caller counts it)
       ``"cancelled"`` — a dead foundation, or the parked re-eval cap was exceeded
-      ``"held"``      — needs remain (partial / unsatisfiable / re-cut conflict);
-                        task stays BLOCKED, residual re-persisted, recheck re-armed
+      ``"held"``      — needs remain (partial / unsatisfiable / re-cut conflict /
+                        enforce-gate hold); task stays BLOCKED, residual
+                        re-persisted, recheck re-armed
       ``"escalate"``  — non-parked, residual needs remain, an edge is already wired
                         and the escalation deadline has passed; caller escalates
       ``"none"``      — non-parked, residual remains, no edge yet: caller falls
@@ -825,6 +967,14 @@ async def _apply_needs_disposition(
     residual = list(disp["residual"])
     edges = disp["edges"]
     completed_needs = disp["completed_needs"]
+    # Needs the ENFORCE proof gate held back (a subset of ``residual``). Their
+    # presence forces a deterministic HOLD below: a gate-held need matched a
+    # ``working`` registry capability, so it is NOT a genuinely-unprovided
+    # residual that may fall through to the legacy precondition machine (where a
+    # no-dep agent-source blocker would be optimistically requeued, defeating the
+    # gate). It resumes the instant proof is recorded, so holding it is bounded by
+    # that event — not the never-satisfiable termination cap.
+    gate_held = list(disp.get("proof_gate_held") or [])
 
     # 2) Verify the completed foundations are base-safe BEFORE treating them as
     #    accounted-for — on BOTH the partial- and full-resolution paths. A need
@@ -865,12 +1015,17 @@ async def _apply_needs_disposition(
 
     # 3) Unresolved needs remain → cannot fully resume this tick.
     if unresolved:
-        if progressed or recut_pending:
-            # Partial resolution (or a need mid-recut): wire the resolvable edges,
-            # drop the resolved (and base-safe-verified completed) needs, keep ONLY
-            # the unresolved set, and stay BLOCKED so the next tick re-evaluates the
-            # remainder. A recut_pending need ALWAYS holds here — it matched a
-            # foundation, so it must never fall through to the precondition machine.
+        if progressed or recut_pending or gate_held:
+            # Partial resolution (or a need mid-recut, or an enforce-gate hold):
+            # wire the resolvable edges, drop the resolved (and base-safe-verified
+            # completed) needs, keep ONLY the unresolved set, and stay BLOCKED so
+            # the next tick re-evaluates the remainder. A recut_pending need ALWAYS
+            # holds here — it matched a foundation, so it must never fall through to
+            # the precondition machine. A ``gate_held`` need holds for the same
+            # reason: it matched a ``working`` registry capability but the enforce
+            # proof gate held it, so it must stay BLOCKED here rather than fall
+            # through ("none") where a no-dep agent-source blocker would be
+            # optimistically requeued — silently defeating the gate.
             # Progress resets the parked re-eval cap — but ONLY when no sibling need
             # is still stuck mid-recut. A base-safe need's progress must not erase
             # the give-up accounting while a conflicting sibling remains unresolved.
@@ -1122,23 +1277,26 @@ async def sweep_unblock_blocked_tasks(
                 )
 
     for task_id in due_ids:
-        # Per-row FOR UPDATE SKIP LOCKED: held for exactly this one task's
-        # processing window, then released by _commit_task_row before the
-        # next iteration's GitHub call begins.  populate_existing=True forces
-        # a fresh DB read even if this id is already in the session identity map
-        # (stale after a prior iteration's commit with expire_on_commit=False).
-        task = await session.scalar(
-            select(Task)
-            .where(
-                Task.id == task_id,
-                Task.status == TaskStatus.BLOCKED,
-                (Task.recheck_after.is_(None)) | (Task.recheck_after <= now),
+        # Re-acquire a single-row FOR UPDATE SKIP LOCKED so the row lock is
+        # held ONLY during this task's processing — never across the per-task
+        # GitHub calls (_blocked_precondition_state → verify_pr_merged, up to
+        # 120s).  The per-row commit then releases it before the next task's
+        # I/O starts, keeping the locked window narrow enough that agent
+        # heartbeats are never starved.
+        task = (
+            await session.scalars(
+                select(Task)
+                .where(
+                    Task.id == task_id,
+                    Task.status == TaskStatus.BLOCKED,
+                    (Task.recheck_after.is_(None)) | (Task.recheck_after <= now),
+                )
+                .with_for_update(skip_locked=True)
+                .execution_options(populate_existing=True)
             )
-            .with_for_update(skip_locked=True)
-            .execution_options(populate_existing=True)
-        )
+        ).first()
         if task is None:
-            continue  # peer holds the lock, or task is no longer due/BLOCKED
+            continue
 
         _bc_start = len(pending_broadcasts)
         ctx = task.context or {}
@@ -1146,6 +1304,10 @@ async def sweep_unblock_blocked_tasks(
         # blocked dependent can wait on MORE THAN ONE prerequisite. Classify EVERY
         # recorded need once against the live active / completed / dead foundation
         # sets, then apply the disposition — resume only when ALL needs resolve.
+        from app.shared_state import runtime_config as _blocker_rt_config
+        _proof_gate_mode = str(
+            _blocker_rt_config.get("capability_proof_gate_mode", "off") or "off"
+        )
         disp = await _classify_blocker_needs(
             task,
             session,
@@ -1154,6 +1316,7 @@ async def sweep_unblock_blocked_tasks(
             dead_cache=dead_cache,
             knowledge_cache=knowledge_cache,
             registry_cache=registry_cache,
+            proof_gate_mode=_proof_gate_mode,
         )
 
         # Already escalated terminally — leave parked for the operator. On
@@ -1490,6 +1653,10 @@ async def _event_driven_unblock_project(
         ctx = task.context or {}
         parked = bool(ctx.get("_blocked_escalated"))
         try:
+            from app.shared_state import runtime_config as _blocker_rt_config
+            _proof_gate_mode = str(
+                _blocker_rt_config.get("capability_proof_gate_mode", "off") or "off"
+            )
             disp = await _classify_blocker_needs(
                 task,
                 session,
@@ -1498,6 +1665,7 @@ async def _event_driven_unblock_project(
                 dead_cache=dead_cache,
                 knowledge_cache=knowledge_cache,
                 registry_cache=registry_cache,
+                proof_gate_mode=_proof_gate_mode,
             )
             if not disp["had_needs"]:
                 continue

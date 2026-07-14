@@ -59,7 +59,7 @@ from app.warm_pool_maintainer import (
     sweep_idle_pool_vms,
     sweep_stranded_lanes,
 )
-from testing.conftest import TestingSessionLocal
+from testing.conftest import TestingSessionLocal, USE_POSTGRES
 
 
 class _NoCloseSession:
@@ -230,6 +230,11 @@ async def test_idle_reaper_retires_stale_image_member(db_session, warm_pool_on, 
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(
+    not USE_POSTGRES,
+    reason="the except-handler read after session.rollback() only expires (and so "
+    "raises MissingGreenlet) on asyncpg; aiosqlite no-ops InstanceState._expire.",
+)
 async def test_idle_reaper_continues_after_retire_failure(
     db_session, warm_pool_on, mocker
 ):
@@ -263,6 +268,12 @@ async def test_idle_reaper_continues_after_retire_failure(
 
     mocker.patch("app.warm_pool_maintainer.retire_and_delete_pool_vm", new=flaky_retire)
 
+    # Snapshot ids before the sweep: its internal rollback (on the simulated
+    # failure) expires the test's instances, so reading m_fail.id afterwards
+    # would itself lazy-load and raise MissingGreenlet on asyncpg.
+    m_fail_id = m_fail.id
+    m_ok_id = m_ok.id
+
     # Must not raise (no MissingGreenlet), and the healthy member is still reaped.
     retired = await sweep_idle_pool_vms(
         db_session, _utcnow(), runtime_config=_runtime_config
@@ -270,8 +281,8 @@ async def test_idle_reaper_continues_after_retire_failure(
     assert retired == 1
     # Both candidates were attempted in order — the failure did not abort the loop.
     assert attempted == ["agent-vm-fail", "agent-vm-ok"]
-    assert await db_session.get(PoolVm, m_ok.id) is None  # the OK one was deleted
-    assert await db_session.get(PoolVm, m_fail.id) is not None  # failed one survives
+    assert await db_session.get(PoolVm, m_ok_id) is None  # the OK one was deleted
+    assert await db_session.get(PoolVm, m_fail_id) is not None  # failed one survives
 
 
 @pytest.mark.asyncio
@@ -3452,11 +3463,15 @@ async def test_sweep_stranded_lanes_continues_after_non_cas_exception(
 
     call_count = 0
     real_mcm = None
+    # Snapshot the id: the sweep's rollback after the simulated error expires
+    # lane1, and reading lane1.id inside the second _patched_mcm call would
+    # itself lazy-load and raise MissingGreenlet on asyncpg.
+    lane1_id = lane1.id
 
     async def _patched_mcm(session, lane_id, **kwargs):
         nonlocal call_count, real_mcm
         call_count += 1
-        if lane_id == lane1.id:
+        if lane_id == lane1_id:
             raise RuntimeError("simulated unexpected error on lane1")
         return await real_mcm(session, lane_id, **kwargs)
 

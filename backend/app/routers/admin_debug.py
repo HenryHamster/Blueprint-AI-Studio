@@ -1866,7 +1866,12 @@ async def spawn_canary_adversarial_challenge(
 
     Returns ``{canary_task_id, grader_task_id}``.
     """
-    await _get_user_project(project_id, current_user["user_id"], session)
+    # Member+ floor, matching the sibling reset_circuit_breaker: this commits a
+    # synthetic Task and spawns a REAL agent task that executes on a VM (LLM
+    # spend + compute), which membership alone does not authorize.
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
 
     probe = {
         "title": _CANARY_PROBE_TITLE,

@@ -445,23 +445,63 @@ export interface ChangelogEntry {
 export interface CriterionCoverageEntry {
   criterion_key: string;
   text: string;
-  coverage: 'covered' | 'partial' | 'uncovered';
+  coverage: 'covered' | 'attested' | 'backfilled' | 'probed' | 'partial' | 'uncovered';
   status?: 'active' | 'retracted' | 'superseded';
   evidence_count: number;
   stuck_reason?: 'no_mapping' | 'direction_retired' | null;
+  /** ISO-8601 UTC timestamp when the operator attestation expires.
+   *  Present only when coverage='attested' and the attestation carries a
+   *  parseable attested_at timestamp. Null/absent for legacy (non-expiring)
+   *  attestations and for all non-attested coverage tiers. */
+  attestation_expires_at?: string | null;
 }
 
 export interface VersionCriterionCoverage {
   // Active criteria only; inactive criteria may still appear in criteria for audit.
   total: number;
   covered: number;
+  /** Active criteria covered ONLY by a non-expired operator attestation — a
+   *  distinct, lower-confidence tier that is NOT included in `covered`. May be
+   *  absent from older backends; treat undefined as 0. */
+  attested?: number;
+  /** Active criteria covered by backfilled evidence (merge-before-CI, no
+   *  machine-verified artifact). Distinct from attested — backfilled is
+   *  derived from task history, not operator attestation. May be absent from
+   *  older backends; treat undefined as 0. */
+  backfilled?: number;
+  /** Active criteria covered ONLY by a non-expired probe (lower-confidence,
+   *  time-bounded machine signal — an expired attestation or stale probe row).
+   *  A distinct tier that is NOT included in `covered`, `attested`, or
+   *  `backfilled`. May be absent from older backends; treat undefined as 0. */
+  probed?: number;
   partial: number;
   uncovered: number;
   retracted?: number;
   superseded?: number;
   inactive?: number;
   stuck_count?: number;
+  /** Per-reason merge-evidence gap accumulator.
+   *  Records counts per reason_key (no_criteria, verdict_not_proven, no_active_criteria,
+   *  no_open_version) and an optional list of criterion IDs that found no active row
+   *  (unmatched_criterion_ids). Null/undefined until the first gap is recorded. */
+  merge_evidence_gaps?: Record<string, number | string[]> | null;
   criteria: CriterionCoverageEntry[];
+}
+
+/** Per-dimension qualification state derived from last_qualification.
+ *  Surfaced in current_version.dimension_states and recent_versions entries. */
+export interface DimensionState {
+  /** Stable identifier: audit | test_erosion | smoketest | ci | migration_identity
+   *  | migration_apply | merge_grade | criterion_coverage | debt_pressure | goal_alignment */
+  key: string;
+  /** Human-readable name for display. */
+  label: string;
+  /** "passed" | "failed" | "unavailable" | "not_applicable" | "pending" */
+  status: string;
+  /** Numeric score in [0,1] when the dimension produces one; null otherwise. */
+  score: number | null;
+  /** Short reason string (blocker code or infra error). */
+  reason: string | null;
 }
 
 export interface CurrentVersion {
@@ -542,6 +582,41 @@ export interface CurrentVersion {
   acceptance_aggregate?: Record<string, number> | null;
   /** Version-scoped criterion coverage derived from the canonical acceptance contract. */
   criterion_coverage?: VersionCriterionCoverage | null;
+  /** Event-driven qualification trigger explain-surface (additive; nullable).
+   *  Answers 'why hasn't qualification fired / what will fire it next'. */
+  qualification_trigger_state?: QualificationTriggerState | null;
+  /** Per-dimension qualification state. Always present when a qualification has
+   *  run; empty array when no qualification data is available. Additive field —
+   *  older backends omit it. */
+  dimension_states?: DimensionState[];
+}
+
+/** Auto-trigger mode for the qualification trigger resolver. */
+export type QualificationTriggerAutoMode =
+  | 'armed'
+  | 'waiting'
+  | 'in_flight'
+  | 'capped'
+  | 'settled'
+  | 'observe'
+  | 'off';
+
+/** Output of explain_qualification_trigger — surfaced on the lifecycle endpoint
+ *  and strategic payload to answer 'why hasn't qualification fired'. */
+export interface QualificationTriggerState {
+  auto_trigger: QualificationTriggerAutoMode;
+  last_attempt: Record<string, unknown> | null;
+  next_expected_trigger: string;
+  blocking: string[];
+  attempts: { count: number; cap: number };
+  knob: 'on' | 'observe' | 'off';
+  evaluated_at: string;
+  decision?: {
+    fire: boolean;
+    trigger: string;
+    reason: string;
+    blocking: string[];
+  };
 }
 
 export interface RecentVersion {
@@ -583,6 +658,8 @@ export interface RecentVersion {
   acceptance_aggregate?: Record<string, number> | null;
   /** Version-scoped criterion coverage derived from the canonical acceptance contract. */
   criterion_coverage?: VersionCriterionCoverage | null;
+  /** Per-dimension qualification state — additive, same shape as CurrentVersion. */
+  dimension_states?: DimensionState[];
 }
 
 export interface PromotionReadinessConfidence {

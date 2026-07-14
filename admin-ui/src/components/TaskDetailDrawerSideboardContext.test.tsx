@@ -226,4 +226,99 @@ describe('TaskSideboardContextSection', () => {
     expect(screen.getByText('Pipeline')).toBeInTheDocument();
     expect(screen.getByText('Only movement detail is present.')).toBeInTheDocument();
   });
+
+  test('shows a pin badge when preferred_runner_target_id is set', () => {
+    const task = makeTask();
+    const context = task.sideboard_context!;
+    render(
+      <TaskSideboardContextSection
+        task={{
+          ...task,
+          sideboard_context: {
+            ...context,
+            task: {
+              ...context.task!,
+              runner: {
+                ...context.task!.runner,
+                preferred_runner_target_id: 'runner-9f8e7d6c-5b4a-3210-fedc-ba9876543210',
+              },
+            },
+          },
+        }}
+      />,
+    );
+
+    const badge = screen.getByTestId('runner-pin-badge');
+    expect(badge).toBeInTheDocument();
+    // Long runner ids are truncated for display but preserved in the tooltip.
+    expect(badge.textContent).toContain('pinned · runner-9f8e7d6c-5b...543210');
+    expect(badge).toHaveAttribute('title', 'Pinned to runner runner-9f8e7d6c-5b4a-3210-fedc-ba9876543210');
+    expect(screen.queryByTestId('runner-pin-hold')).not.toBeInTheDocument();
+  });
+
+  test('shows an amber hold callout with reason, detail, and runner id when runner_pin_hold is present', () => {
+    const task = makeTask();
+    const context = task.sideboard_context!;
+    render(
+      <TaskSideboardContextSection
+        task={{
+          ...task,
+          sideboard_context: {
+            ...context,
+            task: {
+              ...context.task!,
+              runner: {
+                ...context.task!.runner,
+                preferred_runner_target_id: 'runner-local-1',
+                runner_pin_hold: {
+                  runner_id: 'runner-local-1',
+                  strict: true,
+                  reason_code: 'at_capacity',
+                  detail: 'Runner iconlab has 2/2 slots in use; task waits for a free slot.',
+                },
+              },
+            },
+          },
+        }}
+      />,
+    );
+
+    const hold = screen.getByTestId('runner-pin-hold');
+    expect(hold.textContent).toContain('Runner pin hold — at capacity');
+    expect(hold.textContent).toContain('Runner iconlab has 2/2 slots in use; task waits for a free slot.');
+    expect(hold.textContent).toContain('runner runner-local-1');
+    expect(screen.getByTestId('runner-pin-badge')).toBeInTheDocument();
+  });
+
+  test('renders the Runner group when a pin hold is the only runner signal', () => {
+    const task = makeTask();
+    const context = task.sideboard_context!;
+    render(
+      <TaskSideboardContextSection
+        task={{
+          ...task,
+          sideboard_context: {
+            ...context,
+            task: {
+              ...context.task!,
+              cost: undefined,
+              runner: {
+                preferred_runner_target_id: 'runner-offline-1',
+                runner_pin_hold: {
+                  runner_id: 'runner-offline-1',
+                  strict: true,
+                  reason_code: 'offline',
+                  detail: 'No heartbeat for 12 minutes.',
+                },
+              },
+            },
+          },
+        }}
+      />,
+    );
+
+    expect(screen.getByText('Runner')).toBeInTheDocument();
+    expect(screen.getByTestId('runner-pin-badge')).toBeInTheDocument();
+    expect(screen.getByTestId('runner-pin-hold').textContent).toContain('offline');
+  });
 });

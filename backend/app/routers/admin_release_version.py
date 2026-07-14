@@ -32,6 +32,9 @@ from app.qualification_state_resolver import (
     resolve_effective_qualification_state,
     resolve_open_version_qualification_state,
     resolve_promotion_blocking_result,
+    resolve_dimension_states,
+    resolve_dimension_states_from_ledger,
+    patch_qualification_state_from_dimension_states,
 )
 from app.time_utils import _coerce_naive_utc
 from app import release_version as _release_version
@@ -230,6 +233,7 @@ async def _serialize_version_history_entry(
     qualification_state, _ = resolve_effective_qualification_state(
         version, project, serving=(aggregate, artifacts)
     )
+    # Defer dimension_states computation so we can patch qualification_state below.
 
     # Enrich each history entry with the same server-computed highlights and
     # merged counts the per-version summary endpoint produces, bounded by the
@@ -264,6 +268,17 @@ async def _serialize_version_history_entry(
                 "[VERSION_HISTORY] criterion coverage compute failed for version %s",
                 version.id,
             )
+
+    # Compute dimension_states from the ledger when possible, then patch
+    # qualification_state.sub_scores so both surfaces tell one consistent story.
+    _dim_states: list[Any] = (
+        await resolve_dimension_states_from_ledger(session, version)
+        if session is not None
+        else resolve_dimension_states(version.last_qualification)
+    )
+    qualification_state = patch_qualification_state_from_dimension_states(
+        qualification_state, _dim_states
+    )
 
     return {
         "id": str(version.id),
@@ -320,6 +335,11 @@ async def _serialize_version_history_entry(
         # Same shape as current_version. total/covered/partial/uncovered count
         # active criteria only; inactive audit rows may still appear in criteria.
         "criterion_coverage": criterion_coverage,
+        # Per-dimension qualification state — additive, same shape as current_version.
+        # When a DB session is available, prefer the QualificationDimensionResult ledger
+        # (which survives re-qualification overwrites); otherwise fall back to the
+        # mutable last_qualification blob.
+        "dimension_states": _dim_states,
     }
 
 
@@ -575,6 +595,55 @@ async def get_version_lifecycle(
                     project_id,
                 )
 
+        # Qualification trigger explain-surface (additive, read-only).  Answers
+        # 'why hasn't qualification fired' for the open version.  Best-effort: a
+        # failure computing it must never break the lifecycle read.
+        _qualification_trigger_state: Optional[Dict[str, Any]] = None
+        if open_row is not None:
+            try:
+                from app import category_verdict_ledger as _cvl  # noqa: PLC0415
+                from app.qualification_triggers import (  # noqa: PLC0415
+                    explain_qualification_trigger as _explain_trigger,
+                )
+                from app.release_readiness import (  # noqa: PLC0415
+                    compute_requalification_readiness as _compute_readiness,
+                )
+                from app.runtime_config_state import (  # noqa: PLC0415
+                    get_auto_qualification_triggers_mode as _get_trigger_mode,
+                )
+                from app.time_utils import _utcnow  # noqa: PLC0415
+
+                _lq = open_row.last_qualification or {}
+                _lq_status = _lq.get("status")
+                _is_candidate_fully_met = await _cvl.is_candidate_fully_met(
+                    session, open_row.id, _lq.get("candidate_sha")
+                )
+                _rdns = await _compute_readiness(session, project_id)
+                _qualification_trigger_state = _explain_trigger(
+                    phase=open_row.phase or "",
+                    status=_lq_status,
+                    error_code=_lq.get("error") if _lq_status == "error" else None,
+                    qualification_attempts=open_row.qualification_attempts or 0,
+                    error_redrive_count=int(_lq.get("error_redrive_count") or 0),
+                    is_candidate_fully_met=_is_candidate_fully_met,
+                    requalification_ready=_rdns.get("requalification_ready"),
+                    candidate_sha=_lq.get("candidate_sha"),
+                    automain_sha=None,  # not fetched in the read path
+                    automain_ci_state=None,
+                    blocker=_lq.get("blocker"),
+                    in_flight=_lq_status == "pending",
+                    promotion_in_flight=bool(_lq.get("promotion_pending")),
+                    last_attempt=_lq if _lq else None,
+                    knob=_get_trigger_mode(),
+                    evaluated_at=_utcnow().isoformat(),
+                )
+            except Exception:
+                logger.exception(
+                    "[VERSION_LIFECYCLE] qualification_trigger_state compute failed "
+                    "for project %s; serving lifecycle without the trigger signal",
+                    project_id,
+                )
+
         current_version_out: Optional[Dict[str, Any]] = None
         if open_row is not None:
             merged_count = await count_merged_since(
@@ -653,12 +722,19 @@ async def get_version_lifecycle(
             # it previously omitted: reuse the ``latest_audit`` already resolved above
             # for the audit-findings section, and let the helper backfill the newest
             # verdict so all four open-version surfaces agree.
+            # Resolve the ledger-backed dimension_states FIRST (also surfaced as
+            # this endpoint's own ``dimension_states`` response field below), then
+            # thread it into the seam so the shared ledger sub_score overlay is
+            # applied without a duplicate ledger query. The seam now GUARANTEES the
+            # overlay, so no separate patch call is needed here.
+            _open_dim_states = await resolve_dimension_states_from_ledger(session, open_row)
             qual_state, _ = await resolve_open_version_qualification_state(
                 session,
                 open_row,
                 project_row,
                 audit_child=latest_audit,
                 serving=(aggregate_serving, artifact_evidence),
+                dimension_states=_open_dim_states,
             )
 
             # Fetch live current_focus from the project's problem_model
@@ -777,6 +853,18 @@ async def get_version_lifecycle(
                 # Shows the latest ci.yml run state for the integration-branch HEAD
                 # so operators can see full-suite health without a promotion PR.
                 "full_suite_ci_gate": full_suite_ci_gate,
+                # Event-driven qualification trigger explain-surface (additive;
+                # nullable when compute fails). Answers 'why hasn't qualification
+                # fired / what will fire it next' per design doc efbe4182.
+                "qualification_trigger_state": _qualification_trigger_state,
+                # Per-dimension qualification state derived from last_qualification.
+                # Always a list (empty when no qualification has run); each entry
+                # has key, label, status, score, reason. Additive — never breaks
+                # older clients that ignore unknown fields.
+                # Prefers the QualificationDimensionResult ledger when populated.
+                # Already resolved above so qualification_state sub_scores could
+                # be patched to match — both surfaces share one source of truth.
+                "dimension_states": _open_dim_states,
             }
 
         history_rows = (
@@ -1364,8 +1452,12 @@ async def get_version_summary(
 
     aggregate_serving, artifacts = _version_serving_summary(version, project)
 
-    qualification_state, _ = resolve_effective_qualification_state(
-        version, project, serving=(aggregate_serving, artifacts)
+    # Route through the shared open-version seam so the returned
+    # qualification_state carries the ledger-backed per-dimension sub_score
+    # overlay rather than the mutable last_qualification blob, keeping it
+    # consistent with the dimension_states other surfaces expose.
+    qualification_state, _ = await resolve_open_version_qualification_state(
+        session, version, project, serving=(aggregate_serving, artifacts)
     )
 
     highlights = _release_version.build_version_highlights(
@@ -1722,8 +1814,12 @@ async def get_release_version_summary(
 
     aggregate_serving, artifacts = _version_serving_summary(version, project)
 
-    qualification_state, _ = resolve_effective_qualification_state(
-        version, project, serving=(aggregate_serving, artifacts)
+    # Route through the shared open-version seam so the returned
+    # qualification_state carries the ledger-backed per-dimension sub_score
+    # overlay rather than the mutable last_qualification blob, keeping it
+    # consistent with the dimension_states other surfaces expose.
+    qualification_state, _ = await resolve_open_version_qualification_state(
+        session, version, project, serving=(aggregate_serving, artifacts)
     )
 
     # Derive highlights from the data above — no extra I/O. Shared helper so the

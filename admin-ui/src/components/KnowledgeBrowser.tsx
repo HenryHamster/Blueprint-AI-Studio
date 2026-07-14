@@ -5,9 +5,12 @@ import { MarkdownContent } from './MarkdownContent';
 import { ReleaseEvidencePanel } from './ReleaseEvidence';
 import { AcceptanceGradeBadge } from './AcceptanceGradeBadge';
 import { CriterionVerdictBadge } from './CriterionVerdictBadge';
+import { EvidenceTierBadge } from './EvidenceTierBadge';
+import { computeJobExecutionLocation } from './ComputeJobsPanel.utils';
 import {
   fetchKnowledgeDocuments,
   fetchKnowledgeDocument,
+  resolveArtifactDownloadUrl,
   type KnowledgeCitation,
   type KnowledgeDocument,
   type KnowledgeForwardQualityVerdict,
@@ -349,6 +352,71 @@ function ProbeDetail({ verdict }: { verdict: KnowledgeForwardQualityVerdict | nu
   );
 }
 
+/**
+ * Execution provenance panel for compute_experiment knowledge documents.
+ * Reads terminal_diagnostics from the forward_quality_verdict (stored by the
+ * backend when the compute job has a terminal_reason) and surfaces where the
+ * run executed and the evidence tier (earned from criterion_met, not hardcoded).
+ */
+function ComputeRunProvenanceDetail({
+  doc,
+}: {
+  doc: Pick<KnowledgeDocument, 'source_kind' | 'forward_quality_verdict' | 'evidence_tier'>;
+}) {
+  if (doc.source_kind !== 'compute_experiment') return null;
+  const v = doc.forward_quality_verdict;
+  const tdRaw = v && typeof v.terminal_diagnostics === 'object' && v.terminal_diagnostics !== null
+    ? v.terminal_diagnostics as Record<string, unknown>
+    : null;
+  const backend = typeof tdRaw?.executing_backend === 'string' ? tdRaw.executing_backend : null;
+  const runnerId = typeof tdRaw?.runner_target_id === 'string' ? tdRaw.runner_target_id : null;
+  const runnerHostname = typeof tdRaw?.runner_hostname === 'string' ? tdRaw.runner_hostname : null;
+  if (!backend && !runnerId && !runnerHostname) return null;
+  const location = backend ? computeJobExecutionLocation(backend) : null;
+
+  return (
+    <div className="rounded border border-neutral-800 bg-neutral-900/40 px-2 py-1.5 text-ui-md space-y-1">
+      <div className="flex items-center gap-1.5 flex-wrap">
+        <div className="text-ui-sm uppercase tracking-wide text-neutral-500">Run provenance</div>
+        <EvidenceTierBadge tier={doc.evidence_tier} />
+      </div>
+      {location && (
+        <div className="flex items-center gap-1.5">
+          <Cpu className="w-3 h-3 shrink-0 text-neutral-400" />
+          <span className={location.isOperatorHardware ? 'text-amber-300' : 'text-sky-300'}>{location.label}</span>
+        </div>
+      )}
+      {(runnerHostname ?? runnerId) && (
+        <div className="text-neutral-400 text-ui-sm font-mono">
+          <span className="text-neutral-500">runner: </span>
+          {runnerHostname ?? (runnerId ? runnerId.slice(0, 8) + '…' : null)}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Compact chip showing execution location (operator hardware vs cloud) for compute_experiment list cards. */
+function ExecutionLocationBadge({
+  doc,
+}: {
+  doc: Pick<KnowledgeDocument, 'source_kind' | 'forward_quality_verdict'>;
+}) {
+  if (doc.source_kind !== 'compute_experiment') return null;
+  const v = doc.forward_quality_verdict;
+  const tdRaw = v && typeof v.terminal_diagnostics === 'object' && v.terminal_diagnostics !== null
+    ? v.terminal_diagnostics as Record<string, unknown>
+    : null;
+  const backend = typeof tdRaw?.executing_backend === 'string' ? tdRaw.executing_backend : null;
+  if (!backend) return null;
+  const location = computeJobExecutionLocation(backend);
+  return (
+    <span className={`text-ui-xs px-1.5 py-0.5 rounded font-medium ${location.isOperatorHardware ? 'bg-amber-950/50 text-amber-300' : 'bg-sky-950/50 text-sky-300'}`}>
+      {location.label}
+    </span>
+  );
+}
+
 function CopyableId({ id }: { id: string }) {
   const [copied, setCopied] = useState(false);
   const copy = useCallback(() => {
@@ -395,6 +463,91 @@ function ExportMarkdown({ body }: { body?: string }) {
 }
 
 const PAGE_SIZE = 50;
+
+/** File extensions we can render inline as images or videos. NO svg — an SVG
+ *  opened from a signed URL is a full document context and can execute script. */
+const VIEWABLE_IMAGE_EXTS = ['.png', '.jpg', '.jpeg', '.gif', '.webp'];
+const VIEWABLE_VIDEO_EXTS = ['.mp4', '.webm'];
+
+function viewableMediaKind(uri: string | null | undefined): 'image' | 'video' | null {
+  if (!uri) return null;
+  const lower = uri.toLowerCase();
+  if (VIEWABLE_IMAGE_EXTS.some(ext => lower.endsWith(ext))) return 'image';
+  if (VIEWABLE_VIDEO_EXTS.some(ext => lower.endsWith(ext))) return 'video';
+  return null;
+}
+
+/**
+ * Renders a single viewable-media citation (image or video) inline after
+ * resolving its `gs://` storage URI to a signed HTTPS URL. Shows a loading
+ * indicator while resolving, and falls back to a plain download link on error.
+ */
+function ViewableMediaInline({
+  projectId,
+  storageUri,
+  label,
+  kind,
+}: {
+  projectId: string;
+  storageUri: string;
+  label: string;
+  kind: 'image' | 'video';
+}) {
+  const [signedUrl, setSignedUrl] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    resolveArtifactDownloadUrl(projectId, storageUri)
+      .then(url => { if (!cancelled) setSignedUrl(url); })
+      .catch(() => { if (!cancelled) setError('Failed to load preview.'); });
+    return () => { cancelled = true; };
+  }, [projectId, storageUri]);
+
+  if (error) {
+    // Route the fallback href through the same scheme gate as the primary path:
+    // a citation ref is LLM-authored, so an unsafe scheme (e.g. javascript:) must
+    // never become a clickable link. Render plain text with the href stripped.
+    if (!isSafeUrl(storageUri)) {
+      return (
+        <span className="text-neutral-400 break-all text-ui-sm">
+          {label} — {error}
+        </span>
+      );
+    }
+    return (
+      <a
+        href={storageUri}
+        target="_blank"
+        rel="noopener noreferrer"
+        className="text-blue-400 hover:text-blue-300 break-all text-ui-sm"
+      >
+        {label} — {error} (open directly)
+      </a>
+    );
+  }
+
+  if (!signedUrl) {
+    return <div className="text-ui-sm text-neutral-600">Loading preview…</div>;
+  }
+
+  if (kind === 'video') {
+    return (
+      <video controls className="max-h-48 w-full rounded border border-neutral-800 bg-black" aria-label={label}>
+        <source src={signedUrl} />
+        Your browser does not support the video element.
+      </video>
+    );
+  }
+
+  return (
+    <img
+      src={signedUrl}
+      alt={label}
+      className="max-h-48 w-full rounded border border-neutral-800 bg-neutral-950/45 object-contain"
+    />
+  );
+}
 
 export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask, onLaunchWebResearchTask, initialDirectionId, initialDocumentId }: KnowledgeBrowserProps) {
   const routedDirectionId = initialDirectionId ?? null;
@@ -543,6 +696,7 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
                 <SourceKindBadge kind={selected.source_kind} />
                 <CriterionVerdictBadge doc={selected} />
                 <AcceptanceGradeBadge doc={selected} />
+                <EvidenceTierBadge tier={selected.evidence_tier} />
                 <OriginBadge doc={selected} />
                 <LifecycleBadge status={selected.lifecycle_status} />
                 {selected.authoring_branch && selected.head_sha && (
@@ -598,6 +752,7 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
               <ReleaseEvidencePanel evidence={selected.release_evidence} />
             )}
 
+            <ComputeRunProvenanceDetail doc={selected} />
             <VerdictBadge verdict={selected.forward_quality_verdict} />
             <ProbeDetail verdict={selected.forward_quality_verdict} />
             <OriginProvenanceDetail doc={selected} onNavigateToTask={onNavigateToTask} />
@@ -644,6 +799,36 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
                 </ul>
               </div>
             )}
+
+            {/* Inline viewable media artifacts — image/video citations rendered inline
+                instead of as click-to-download links. Grouped by kind for visual clarity. */}
+            {selectedProjectId && (selected.source_citations ?? []).length > 0 && (() => {
+              const viewableItems: Array<{ reference: string; label: string; kind: 'image' | 'video' }> = [];
+              for (const c of selected.source_citations) {
+                const { reference, label } = citationParts(c);
+                if (!reference) continue;
+                const kind = viewableMediaKind(reference);
+                if (kind) viewableItems.push({ reference, label, kind });
+              }
+              if (viewableItems.length === 0) return null;
+              return (
+                <div className="border-t border-neutral-800 pt-3">
+                  <div className="text-ui-sm uppercase tracking-wide text-neutral-500 mb-2">Artifacts</div>
+                  <div className="space-y-2">
+                    {viewableItems.map((item, i) => (
+                      <ViewableMediaInline
+                        key={i}
+                        projectId={selectedProjectId}
+                        storageUri={item.reference}
+                        label={item.label}
+                        kind={item.kind}
+                      />
+                    ))}
+                  </div>
+                </div>
+              );
+            })()}
+
           </div>
         ) : (
           /* List view */
@@ -826,6 +1011,8 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
                     <SourceKindBadge kind={doc.source_kind} />
                     <CriterionVerdictBadge doc={doc} />
                     <AcceptanceGradeBadge doc={doc} />
+                    <EvidenceTierBadge tier={doc.evidence_tier} />
+                    <ExecutionLocationBadge doc={doc} />
                     <OriginBadge doc={doc} />
                     <LifecycleBadge status={doc.lifecycle_status} />
                     {doc.direction_id && (

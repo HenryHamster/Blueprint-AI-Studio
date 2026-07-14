@@ -18,10 +18,10 @@ import { fetchTask } from './api/tasks';
 import { apiFetch, API_BASE_URL } from './api/core';
 import { loadLastSeen, loadEventPrefs, loadTemporaryMutes, fetchServerNoisePrefs, fetchServerTempMutes, resolveNoisePrefs, resolveServerTempMutes, type EventPref, type TemporaryMutes } from './components/MessagesPanel.utils';
 import { type SrInvestigationSignal } from './components/SrTrendBreakdown';
-import { TaskDetailDrawer } from './components/TaskDetailDrawer';
+const TaskDetailDrawer = lazy(() => import('./components/TaskDetailDrawer').then(m => ({ default: m.TaskDetailDrawer })));
 import { ToastContainer } from './components/Toasts';
-import { AlertsPopover } from './components/AlertsPopover';
-import { FleetDetailDrawer } from './components/FleetDetailDrawer';
+const AlertsPopover = lazy(() => import('./components/AlertsPopover').then(m => ({ default: m.AlertsPopover })));
+const FleetDetailDrawer = lazy(() => import('./components/FleetDetailDrawer').then(m => ({ default: m.FleetDetailDrawer })));
 import { WelcomeScreen } from './components/WelcomeScreen';
 import { ProjectManagementModal } from './components/ProjectManagementModal';
 import { HeaderBar, PrimaryTabNav } from './components/HeaderBar';
@@ -34,13 +34,14 @@ import { BulkActionBar } from './components/BulkActionBar';
 import type { SortBy } from './components/KanbanBoard';
 import { ACTIVE_PIPELINE_STATUSES, CANCELLABLE_STATUSES, COLUMNS, SORT_KEY, TERMINAL_STATUSES } from './appWorkbenchConstants';
 import { Pagination } from './components/Pagination';
-import { UserManagement } from './components/UserManagement';
-import { ProjectMembers } from './components/ProjectMembers';
+const UserManagement = lazy(() => import('./components/UserManagement').then(m => ({ default: m.UserManagement })));
+const ProjectMembers = lazy(() => import('./components/ProjectMembers').then(m => ({ default: m.ProjectMembers })));
 const MessagesPanel = lazy(() => import('./components/MessagesPanel').then(m => ({ default: m.MessagesPanel })));
 const ActivityFeed = lazy(() => import('./components/ActivityFeed'));
 const StrategicContextWorkspace = lazy(() => import('./components/StrategicContextWorkspace').then(m => ({ default: m.StrategicContextWorkspace })));
-import { StrategicContextRail } from './components/StrategicContextRail';
-import { StrategicSessionControl, type StrategicAccountSpendStatus, type StrategicInteractionMode } from './components/StrategicSessionControl';
+const StrategicContextRail = lazy(() => import('./components/StrategicContextRail').then(m => ({ default: m.StrategicContextRail })));
+const StrategicSessionControl = lazy(() => import('./components/StrategicSessionControl').then(m => ({ default: m.StrategicSessionControl })));
+import type { StrategicAccountSpendStatus, StrategicInteractionMode } from './components/StrategicSessionControl';
 import { CommandPaletteHost } from './components/CommandPaletteHost';
 import { KeyboardShortcutsOverlay } from './components/KeyboardShortcutsOverlay';
 import { FAILURE_CLASS_CONFIG } from './components/TaskCard';
@@ -1175,6 +1176,7 @@ export default function App() {
         sessionBusy={strategicSessionBusy}
         sessionRunners={residentStrategicSessionRunners}
         sessionSelectedRunnerId={strategicSessionSelectedRunnerId}
+        projectId={selectedProjectId}
         onSelectRunner={handleSelectStrategicRunner}
         onStartSession={residentStrategicSessionAvailable ? handleStartStrategicSession : undefined}
         onStopSession={handleStopStrategicSession}
@@ -1190,6 +1192,7 @@ export default function App() {
       {showProjectMembers && s.selectedProjectId && selectedProject && (() => {
         const projectId = s.selectedProjectId;
         return (
+        <Suspense fallback={null}>
         <ProjectMembers
           projectId={projectId}
           members={s.projectMembers}
@@ -1198,6 +1201,7 @@ export default function App() {
           onUpdateRole={(memberId, role) => s.updateProjectMemberRole(projectId, memberId, role)}
           onRemove={(memberId) => s.removeProjectMember(projectId, memberId)}
         />
+        </Suspense>
         );
       })()}
       <VersionMismatchBanner />
@@ -1224,6 +1228,7 @@ export default function App() {
       ) : (
         <WorkbenchFrame>
       {s.showUserManagement && s.userRole === 'admin' ? (
+        <Suspense fallback={null}>
         <UserManagement
           users={s.allowedUsers}
           currentUserEmail={s.user?.email || ''}
@@ -1232,12 +1237,14 @@ export default function App() {
           onRemove={s.removeAllowedUser}
           onClose={() => s.setShowUserManagement(false)}
         />
+        </Suspense>
       ) : activeTab === 'chat' ? (
         <WorkbenchSurface
           title="Strategic"
           showTitle={false}
           actions={(
             <>
+              <Suspense fallback={null}>
               <StrategicSessionControl
                 mode={normalizeStrategicInteractionMode(strategicWorkbenchState?.interaction_mode)}
                 saving={savingStrategicWorkbench}
@@ -1270,6 +1277,7 @@ export default function App() {
                 hideDetailsOnMobile
                 className="flex"
               />
+              </Suspense>
               {!chatComposerContextDescriptor && (
                 <button
                   type="button"
@@ -1316,6 +1324,7 @@ export default function App() {
               </Suspense>
             )}
             rail={(
+              <Suspense fallback={null}>
               <StrategicContextRail
                 state={strategicReadModel.data ?? null}
                 loading={strategicReadModel.loading}
@@ -1340,6 +1349,7 @@ export default function App() {
                 savingSessionRefs={savingStrategicWorkbench}
                 onUpdateSessionRefs={updateStrategicSessionRefs}
               />
+              </Suspense>
             )}
             railClassName="bg-workbench-rail"
           />
@@ -1637,6 +1647,8 @@ export default function App() {
           onRepoChange={s.handleRepoChange}
           onSubmit={s.handleCreateTask}
           onClose={() => s.setShowNewTaskModal(false)}
+          fleetRunners={s.fleetRunners}
+          fleetRunnersLoading={s.fleetRunnersLoading}
         />
         </Suspense>
       )}
@@ -1700,6 +1712,7 @@ export default function App() {
 
       {s.logTask && (
         <ErrorBoundary level="panel">
+        <Suspense fallback={null}>
         <TaskDetailDrawer
           task={s.logTask}
           tasks={s.tasks}
@@ -1735,6 +1748,7 @@ export default function App() {
             handleViewTaskById(taskId);
           }}
         />
+        </Suspense>
         </ErrorBoundary>
       )}
 
@@ -1771,6 +1785,7 @@ export default function App() {
       <ToastContainer toasts={s.toasts} onDismiss={s.dismissToast} />
 
       {s.showAlertsPopover && combinedAlerts.length > 0 && (
+        <Suspense fallback={null}>
         <AlertsPopover
           alerts={combinedAlerts}
           onDismiss={(id) => {
@@ -1787,9 +1802,11 @@ export default function App() {
           activeInvestigationTaskIds={srInvestigationTaskIds}
           onClose={() => s.setShowAlertsPopover(false)}
         />
+        </Suspense>
       )}
 
       {s.showFleetDetail && (
+        <Suspense fallback={null}>
         <FleetDetailDrawer
           onClose={() => s.setShowFleetDetail(false)}
           onViewTask={handleViewTask}
@@ -1798,6 +1815,7 @@ export default function App() {
           fleetRunnersRefreshSignal={s.fleetRunnersRefreshSignal}
           live={s.wsConnected}
         />
+        </Suspense>
       )}
 
       {s.confirmDialog && (

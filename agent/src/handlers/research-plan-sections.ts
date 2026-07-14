@@ -299,57 +299,94 @@ export const QUALIFICATION_STATE_VOCAB: ReadonlySet<string> = new Set([
 const AUDIT_IN_PROGRESS_STATES = new Set(['pending', 'qualifying']);
 
 
-function formatCriterionCoverage(versionPhase: Record<string, unknown>): string[] {
+/**
+ * Renders the version's acceptance criteria as an authored RUBRIC.
+ *
+ * This deliberately replaces the retired `formatCriterionCoverage`, which framed
+ * criteria as a coverage BURN-DOWN ("2/6 covered") and taught the strategist to
+ * treat the uncovered remainder as its release-readiness work queue — so it never
+ * cut the version. Criteria are now graded at QUALIFY (the sha-keyed per-category
+ * ledger gate); they are a judgment aid here, not a checklist to drive to zero.
+ *
+ * What IS surfaced, and why:
+ *  - key + text  — the strategist cannot retract (or aim work at) a criterion whose
+ *    key it has never seen. Rendering nothing is what made an unmeetable/orphaned
+ *    criterion a WEDGE: the qualifier blocks on `criterion_coverage_incomplete`
+ *    forever and the only autonomous exit — a retraction — was unreachable.
+ *  - stuck_reason — e.g. the sole direction that mapped it retired, so no work will
+ *    ever produce a verdict for it. That is precisely a retract-or-remap signal.
+ *  - the last grade's per-category GAPS + residual — the qualifier computes exactly
+ *    WHY each category failed and we were throwing it away at the prompt boundary,
+ *    leaving the strategist with a bare `blocker=criterion_coverage_incomplete`.
+ *
+ * What is NOT surfaced: coverage/attested/backfilled counts and evidence tallies —
+ * the burn-down framing itself.
+ */
+export function formatCriteriaRubric(versionPhase: Record<string, unknown>): string[] {
   const coverageRaw = versionPhase.criterion_coverage;
-  if (!coverageRaw || typeof coverageRaw !== 'object' || Array.isArray(coverageRaw)) return [];
+  const coverage = coverageRaw && typeof coverageRaw === 'object' && !Array.isArray(coverageRaw)
+    ? coverageRaw as Record<string, unknown>
+    : null;
+  const criteriaRaw = coverage?.criteria;
+  const criteria = Array.isArray(criteriaRaw) ? criteriaRaw : [];
 
-  const coverage = coverageRaw as Record<string, unknown>;
-  const total = typeof coverage.total === 'number' ? coverage.total : null;
-  const covered = typeof coverage.covered === 'number' ? coverage.covered : null;
-  const partial = typeof coverage.partial === 'number' ? coverage.partial : null;
-  const uncovered = typeof coverage.uncovered === 'number' ? coverage.uncovered : null;
-  if (total === null || total <= 0 || covered === null || partial === null || uncovered === null) return [];
+  const active = criteria.filter((c): c is Record<string, unknown> =>
+    !!c && typeof c === 'object' && !Array.isArray(c)
+    && (c as Record<string, unknown>).status === 'active'
+    && typeof (c as Record<string, unknown>).criterion_key === 'string');
 
-  const lines = [
-    `**Acceptance criteria coverage (canonical): ${covered}/${total} covered, ${partial} partial, ${uncovered} uncovered.**`,
-    `Canonical release-readiness path: close uncovered and partial acceptance criteria with evidence; legacy goal/proven heuristics below are secondary context only.`,
-  ];
+  const parts: string[] = [];
+  parts.push('\n### Acceptance criteria (authored rubric)');
 
-  if (Array.isArray(coverage.criteria)) {
-    const criteriaLines: string[] = [];
-    for (const item of coverage.criteria) {
-      if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
-      const criterion = item as Record<string, unknown>;
-      const criterionCoverage = typeof criterion.coverage === 'string' ? criterion.coverage.trim() : '';
-      if (criterionCoverage !== 'uncovered' && criterionCoverage !== 'partial') continue;
-
-      const status = typeof criterion.status === 'string' ? criterion.status.trim() : 'active';
-      if (status !== 'active') continue;
-
-      const key = typeof criterion.criterion_key === 'string' && criterion.criterion_key.trim()
-        ? criterion.criterion_key.trim()
-        : null;
-      const text = typeof criterion.text === 'string' && criterion.text.trim()
-        ? criterion.text.trim()
-        : null;
-      if (!key || !text) continue;
-
-      const evidenceCount = typeof criterion.evidence_count === 'number'
-        ? `, evidence=${criterion.evidence_count}`
-        : '';
-      const stuckReason = typeof criterion.stuck_reason === 'string' && criterion.stuck_reason
-        ? ` [stuck: ${criterion.stuck_reason}]`
-        : '';
-      criteriaLines.push(`  - ${key}: ${criterionCoverage}${evidenceCount}${stuckReason} — ${text}`);
-    }
-    if (criteriaLines.length > 0) {
-      lines.push(`Acceptance criteria needing evidence:`);
-      lines.push(...criteriaLines);
-    }
+  if (active.length === 0) {
+    // Must be EXPLICIT: thinker.ts §8 authors criteria only when none exist yet, so
+    // "no criteria" and "criteria not rendered" must never look the same.
+    parts.push('_None authored yet for this version._');
+    return parts;
   }
 
-  return lines;
+  parts.push(
+    'These are the categories the qualifier grades the merged diff against at qualify time. '
+    + 'They are a judgment aid, NOT a checklist to drive to zero — do not treat unmet ones as a work queue.',
+  );
+  for (const c of active) {
+    const key = c.criterion_key as string;
+    const text = typeof c.text === 'string' ? c.text : '';
+    const stuck = typeof c.stuck_reason === 'string' && c.stuck_reason ? c.stuck_reason : null;
+    parts.push(`- \`${key}\`: ${text}${stuck ? ` — **stuck: ${stuck}** (no work maps to this; retract or re-map it)` : ''}`);
+  }
+
+  // WHY the last grade failed — the qualifier computes this per category and it was
+  // being discarded here, leaving only an opaque blocker code.
+  const lastQualRaw = versionPhase.last_qualification;
+  const lastQual = lastQualRaw && typeof lastQualRaw === 'object' && !Array.isArray(lastQualRaw)
+    ? lastQualRaw as Record<string, unknown>
+    : null;
+  const verdictsRaw = lastQual?.category_verdicts;
+  const verdicts = Array.isArray(verdictsRaw) ? verdictsRaw : [];
+  const unmet = verdicts.filter((v): v is Record<string, unknown> =>
+    !!v && typeof v === 'object' && !Array.isArray(v)
+    && (v as Record<string, unknown>).status !== 'met');
+  if (unmet.length > 0) {
+    parts.push('Last grade — categories NOT met (with the grader\'s gap):');
+    for (const v of unmet) {
+      const key = typeof v.category_key === 'string' ? v.category_key : '?';
+      const status = typeof v.status === 'string' ? v.status : 'not_met';
+      const gap = typeof v.gap === 'string' && v.gap ? v.gap : 'no gap description supplied';
+      parts.push(`- \`${key}\` (${status}): ${gap}`);
+    }
+  }
+  const residual = typeof lastQual?.residual_uncaptured_gap === 'string' && lastQual.residual_uncaptured_gap
+    ? lastQual.residual_uncaptured_gap
+    : null;
+  if (residual) {
+    parts.push(
+      `Residual gap (no criterion captures this — the rubric itself is incomplete): ${residual}`,
+    );
+  }
+  return parts;
 }
+
 
 /**
  * Builds the version-phase status block for the strategic thinker prompt.
@@ -436,7 +473,6 @@ export function buildVersionPhaseSection(versionPhase: Record<string, unknown> |
   if (tasksMergedThisVersion !== null) {
     parts.push(`Tasks merged this version: ${tasksMergedThisVersion}`);
   }
-  parts.push(...formatCriterionCoverage(versionPhase));
   if (lastQualification) {
     // Compact one-line summary: status, then confidence / candidate_sha /
     // blocker when present. Keeps the prompt small while surfacing whether a
@@ -508,6 +544,13 @@ export function buildVersionPhaseSection(versionPhase: Record<string, unknown> |
     if (rvLines.length > 1) parts.push(rvLines.join('\n'));
   }
 
+  // The authored rubric (keys + text + why the last grade failed). Rendered ABOVE
+  // the phase/qualify guidance below, which explicitly refers to "the version's
+  // acceptance criteria" — without this the strategist is told to judge against a
+  // rubric it cannot see, and (per thinker.ts §8) reads every version as having no
+  // criteria authored yet.
+  parts.push(...formatCriteriaRubric(versionPhase));
+
   parts.push(`
 **Phase meanings:**
 - **build** — pursue the version's feature and improvement work at full pace. The version is actively developing; continue creating and executing directions that advance the intent.
@@ -532,7 +575,7 @@ If you decide to flip the phase, emit a \`version_phase_decision\` field in your
 If you are staying in the current phase, do NOT emit \`version_phase_decision\` — omitting it means "no change."
 
 **Requesting qualification (stabilize only):**
-When the version is in **stabilize** and you judge it ready for release — hardening is sufficient, known issues are addressed, and the canonical acceptance criteria above are covered or have a credible closure path — request qualification. Treat uncovered or partial acceptance criteria as the primary release-readiness work queue; legacy goal-alignment and drift heuristics are secondary context. The orchestrator then snapshots the integration branch and runs the automated release qualifier (CI, test-erosion, audit, smoketest). Emit a \`qualify_request\` field in your Section 6 problem_model update (a top-level JSON field alongside the model):
+When the version is in **stabilize** and you judge it ready for release — hardening is sufficient, known issues are addressed, and the version goal is substantially met — request qualification. The version's acceptance criteria are an authored RUBRIC of aspirational outcomes: use them as judgment aids for whether the goal is met, not as a coverage checklist to burn down. The qualifier grades them at qualify time (the automated release qualifier decides promotion); your job is the readiness call. The orchestrator then snapshots the integration branch and runs the automated release qualifier (CI, test-erosion, audit, smoketest). Emit a \`qualify_request\` field in your Section 6 problem_model update (a top-level JSON field alongside the model):
 \`\`\`json
 {
   "qualify_request": {

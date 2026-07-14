@@ -75,6 +75,29 @@ describe('writeDoneHelper — self-review fallback', () => {
     expect(doneScript).toContain('MISSING_REASONING=()');
   });
 
+  it('generates ./done with a zero-effective-diff guard on the PR completion path', async () => {
+    const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
+    writeCodeChangeHelpers({
+      taskId: 'test-task-123',
+      workBranch: 'blueprint/test-task-123',
+      baseBranch: 'main',
+      owner: 'test-owner',
+      repo: 'test-repo',
+      testsOnMainBranch: true,
+    });
+
+    const doneScript = capturedScripts['/tmp/workspace/done'];
+    expect(doneScript).toBeDefined();
+
+    // Reads the recorded base commit and blocks COMPLETED-with-PR when the
+    // branch nets to no effective diff, routing to the sanctioned no-op exits.
+    expect(doneScript).toContain('_BASE_COMMIT_FILE="/tmp/base_commit_test-task-123"');
+    expect(doneScript).toContain('git -C "/tmp/workspace" diff --name-only "$_BASE_COMMIT..HEAD"');
+    expect(doneScript).toContain('ZERO effective diff vs base');
+    expect(doneScript).toContain('./done --already-done');
+    expect(doneScript).toContain('./pr close --superseded-by');
+  });
+
   it('generates ./done script with PR URL shape validation', async () => {
     const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
     writeCodeChangeHelpers({
@@ -658,5 +681,94 @@ describe('writeDoneHelper — jq-free JSON payload build', () => {
     // The python3-constructed payload must round-trip fields faithfully —
     // no jq, no silent truncation.
     expect(payload?.logs).toContain('Task complete. PR:');
+  });
+});
+
+// ── writeDoneHelper — zero-effective-diff guard (execution) ────────────────────
+// A rebased/superseded branch can carry a PR URL yet net to no effective diff
+// vs base. ./done must NOT post COMPLETED-with-PR in that case; it must block
+// and point at the sanctioned no-op exits.
+describe('writeDoneHelper — zero-effective-diff guard', () => {
+  let capturedScripts: Record<string, string> = {};
+
+  beforeEach(() => {
+    capturedScripts = {};
+    vi.mocked(fs.writeFileSync).mockImplementation((...args: unknown[]) => {
+      const [path, content] = args as [string, string];
+      capturedScripts[path] = content;
+    });
+  });
+
+  it.skipIf(!SUPPORTS_EXEC_BIT)('blocks COMPLETED and does not POST when base..HEAD is empty', async () => {
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    const realOs = await vi.importActual<typeof import('node:os')>('node:os');
+    const realPath = await vi.importActual<typeof import('node:path')>('node:path');
+
+    const taskId = `done-emptydiff-${process.pid}`;
+    const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
+    writeCodeChangeHelpers({
+      taskId,
+      workBranch: `blueprint/${taskId}`,
+      baseBranch: 'main',
+      owner: 'test-owner',
+      repo: 'test-repo',
+      testsOnMainBranch: false,
+    });
+
+    const dir = realFs.mkdtempSync(realPath.join(realOs.tmpdir(), 'done-emptydiff-'));
+    const prUrlFile = `/tmp/pr_url_${taskId}`;
+    const baseCommitFile = `/tmp/base_commit_${taskId}`;
+    try {
+      const scriptPath = realPath.join(dir, 'done');
+      realFs.writeFileSync(scriptPath, capturedScripts['/tmp/workspace/done'], { mode: 0o755 });
+      realFs.writeFileSync(prUrlFile, 'https://github.com/test-owner/test-repo/pull/99');
+      realFs.writeFileSync(baseCommitFile, 'abc123');
+
+      const bin = realPath.join(dir, 'bin');
+      realFs.mkdirSync(bin);
+      const curlMarker = realPath.join(dir, 'curl-called');
+      // git stub: the base-relative diff is EMPTY (rebased/superseded branch).
+      realFs.writeFileSync(
+        realPath.join(bin, 'git'),
+        `#!/bin/bash\ncase "$*" in\n  *"diff --name-only abc123..HEAD"*) exit 0 ;;\n  *) exit 0 ;;\nesac\n`,
+        { mode: 0o755 },
+      );
+      // curl stub: records if ever invoked — the COMPLETED POST must NOT happen.
+      realFs.writeFileSync(
+        realPath.join(bin, 'curl'),
+        `#!/bin/bash\necho called > "${curlMarker}"\nprintf '200'\n`,
+        { mode: 0o755 },
+      );
+
+      const env = {
+        ...process.env,
+        PATH: `${bin}:${process.env.PATH}`,
+        ORCHESTRATOR_URL: 'http://orchestrator.test',
+        AGENT_API_TOKEN: 'test-token',
+      };
+
+      let exit = 0;
+      let stderr = '';
+      try {
+        realCp.execFileSync('bash', [scriptPath], { stdio: 'pipe', env });
+      } catch (err: unknown) {
+        const e = err as { status?: number; stderr?: Buffer };
+        exit = e.status ?? -1;
+        stderr = e.stderr?.toString() ?? '';
+      }
+
+      expect(exit).toBe(2);
+      expect(stderr).toContain('ZERO effective diff vs base');
+      expect(stderr).toContain('./done --already-done');
+      // No COMPLETED POST fired, and no done marker was written.
+      expect(realFs.existsSync(curlMarker)).toBe(false);
+      expect(realFs.existsSync(`/tmp/done_${taskId}`)).toBe(false);
+    } finally {
+      realFs.rmSync(dir, { recursive: true, force: true });
+      try { realFs.unlinkSync(prUrlFile); } catch { /* ignore */ }
+      try { realFs.unlinkSync(baseCommitFile); } catch { /* ignore */ }
+      try { realFs.unlinkSync(`/tmp/done_${taskId}`); } catch { /* ignore */ }
+    }
   });
 });

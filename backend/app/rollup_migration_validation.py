@@ -1,5 +1,6 @@
 """Alembic migration-chain validation used by rollup auto-merge."""
 
+import logging
 import os
 
 from fastapi import HTTPException
@@ -20,9 +21,11 @@ from app.migration_chain import (
 )
 from app.migration_path import is_migration_file
 from app.migration_reconciliation import (
-    AUTHORIZED_DIVERGENCES,
     AuthorizedDivergence,
+    effective_authorized_divergences,
 )
+
+logger = logging.getLogger(__name__)
 
 # Alembic versions directory, used to resolve a bare migration basename (as
 # returned by ``github.list_versions_at_ref``) back to its full repo path for a
@@ -294,7 +297,34 @@ async def _validate_rollup_migration_chain(
             f"could not list target branch '{target_branch}' migrations to "
             f"validate the combined Alembic chain: {_exc_detail(e)}",
         )
-    reason = validate_combined_migration_chain(existing_filenames, added_sources)
+    # In-place edits of migrations that ALREADY exist on the target branch are
+    # NOT new chain extensions — they keep their revision id and existing chain
+    # position (a ``modified`` PR file, not an ``added`` one). Folding them into
+    # the added-migration collision/anchor check would falsely report the
+    # revision as a duplicate ("already exists on the target branch") or as
+    # anchoring off the current head, which is exactly what made the v25 0459
+    # byte-identical RESTORE unreachable — the collision fired here before the
+    # deployed-migration restore/immutability checks below could clear it. Their
+    # immutability is enforced by those later checks (byte-identical restore
+    # passes; any real body edit still blocks).
+    existing_revisions_on_target = {
+        rev
+        for fn in existing_filenames
+        if (rev := _filename_revision_prefix(fn)) is not None
+    }
+    inplace_modified_revisions = {
+        rev
+        for f in files
+        if f.get("status") == "modified"
+        and _touches_alembic_versions(f.get("filename", ""))
+        and (rev := _filename_revision_prefix(f.get("filename", ""))) is not None
+        and rev in existing_revisions_on_target
+    }
+    reason = validate_combined_migration_chain(
+        existing_filenames,
+        added_sources,
+        inplace_modified_revisions=inplace_modified_revisions,
+    )
     if reason is not None:
         return ("block", reason)
 
@@ -361,13 +391,94 @@ async def _validate_rollup_migration_chain(
             and f["filename"].rsplit("/", 1)[-1] in promotion_basenames
         ]
         if modified_deployed:
-            return (
-                "block",
-                f"PR modifies deployed migration(s) present on promotion target "
-                f"'{promotion_target}' (deployed migrations are immutable — they "
-                f"have already been applied to the production DB and cannot be "
-                f"changed in-place): " + ", ".join(sorted(modified_deployed)),
-            )
+            # Content-aware RESTORE exemption. A "modified" deployed migration is
+            # normally a deploy-fatal in-place tamper. But the v25 migration-
+            # identity reconciliation deliberately RESTORES a candidate-branch
+            # migration back to BYTE-IDENTICAL parity with the deployed
+            # promotion-target copy (reverting an unauthorized down_revision
+            # renumber that made the candidate copy diverge from what the live DB
+            # already applied). When the PR's resulting head content for the file
+            # is EXACTLY identical to the promotion target's deployed copy, the
+            # "modification" reinstates the deployed identity and changes nothing
+            # that could corrupt a live DB — it must NOT block. Any real byte
+            # difference is still a tamper and blocks with the original message.
+            #
+            # Both sides are read as the file's ACTUAL bytes with
+            # ``get_file_text_at_ref`` (the same mechanism the content-immutability
+            # guard below uses): the deployed copy at the promotion ref and the
+            # PR's resulting content at the head commit. The patch-reconstructed
+            # post-image in ``added_sources`` is NOT used here — it drops the
+            # file's trailing newline and so cannot be compared byte-for-byte.
+            # Comparison is EXACT byte equality — no whitespace normalisation, no
+            # fuzzy matching. Any fetch failure defers (fail-safe), mirroring the
+            # other promotion-target reads.
+            try:
+                pr = await github.get_pull_request(gh_token, owner, repo, pr_number)
+            except Exception as e:
+                return (
+                    "defer",
+                    f"could not fetch PR #{pr_number} detail to check for a "
+                    f"byte-identical migration restore: {_exc_detail(e)}",
+                )
+            head_sha = (pr.get("head") or {}).get("sha") or ""
+            if not head_sha:
+                return (
+                    "defer",
+                    f"PR #{pr_number} has no head SHA — cannot check for a "
+                    f"byte-identical migration restore",
+                )
+            real_edits: list[str] = []
+            for filename in sorted(modified_deployed):
+                basename = filename.rsplit("/", 1)[-1]
+                full_path = f"{_ALEMBIC_VERSIONS_DIR}/{basename}"
+                try:
+                    deployed_text = await github.get_file_text_at_ref(
+                        full_path,
+                        token=gh_token,
+                        owner=owner,
+                        repo=repo,
+                        ref=promotion_target,
+                    )
+                    head_text = await github.get_file_text_at_ref(
+                        filename,
+                        token=gh_token,
+                        owner=owner,
+                        repo=repo,
+                        ref=head_sha,
+                    )
+                except Exception as e:
+                    return (
+                        "defer",
+                        f"could not fetch migration '{basename}' to check for a "
+                        f"byte-identical restore against promotion target "
+                        f"'{promotion_target}': {_exc_detail(e)}",
+                    )
+                if not deployed_text:
+                    return (
+                        "defer",
+                        f"empty response fetching deployed migration '{basename}' "
+                        f"from promotion target '{promotion_target}' — deferring "
+                        f"restore comparison",
+                    )
+                if not head_text:
+                    return (
+                        "defer",
+                        f"empty response fetching migration '{basename}' at the PR "
+                        f"head commit — deferring byte-identical restore comparison",
+                    )
+                # A restore requires the PR head to be an EXACT byte copy of the
+                # deployed body. Any byte difference is a real modification and
+                # still blocks with the original immutability message.
+                if head_text != deployed_text:
+                    real_edits.append(filename)
+            if real_edits:
+                return (
+                    "block",
+                    f"PR modifies deployed migration(s) present on promotion target "
+                    f"'{promotion_target}' (deployed migrations are immutable — they "
+                    f"have already been applied to the production DB and cannot be "
+                    f"changed in-place): " + ", ".join(sorted(real_edits)),
+                )
 
         # Defect class 1: pre-PR rename/renumber on the FULL integration branch.
         # The PR-diff checks above compare only the PR's added/modified files
@@ -382,8 +493,38 @@ async def _validate_rollup_migration_chain(
         # by the deploy-time reconciliation) are filtered out — they are already
         # safe and must not block new PRs on an integration branch that carries
         # the known renumber, mirroring the qual-time guard's behavior.
+        #
+        # Exception: if THIS PR itself removes or renames away the conflicting
+        # file, the post-merge integration branch will no longer carry the
+        # divergence — the PR is the FIX, not a new offender. Use effective
+        # post-merge integration filenames (current minus what the PR deletes)
+        # so such a PR is not blocked by the very conflict it resolves.
+        _pr_removed_version_basenames: set[str] = set()
+        for _f in files:
+            _fstatus = _f.get("status", "")
+            if _fstatus == "removed" and _touches_alembic_versions(
+                _f.get("filename", "")
+            ):
+                _pr_removed_version_basenames.add(
+                    _f["filename"].rsplit("/", 1)[-1]
+                )
+            elif _fstatus == "renamed" and _touches_alembic_versions(
+                _f.get("previous_filename", "")
+            ):
+                _pr_removed_version_basenames.add(
+                    _f["previous_filename"].rsplit("/", 1)[-1]
+                )
+        _effective_integration = (
+            [
+                fn
+                for fn in existing_filenames
+                if fn not in _pr_removed_version_basenames
+            ]
+            if _pr_removed_version_basenames
+            else existing_filenames
+        )
         full_branch_records = find_content_divergence_records(
-            promotion_filenames, existing_filenames
+            promotion_filenames, _effective_integration
         )
         unauthorized_full_branch = [
             r for r in full_branch_records if not _divergence_record_is_authorized(r)
@@ -504,7 +645,7 @@ async def enforce_premerge_migration_guard(
 
 def _divergence_record_is_authorized(
     record: dict,
-    authorized: tuple[AuthorizedDivergence, ...] = AUTHORIZED_DIVERGENCES,
+    authorized: tuple[AuthorizedDivergence, ...] | None = None,
 ) -> bool:
     """Is *record* an EXACT match for an authorized, already-handled divergence?
 
@@ -519,27 +660,39 @@ def _divergence_record_is_authorized(
     authorized renumber: ``reused`` matches the colliding revision + its identity
     pair; ``renumbered`` matches the deployed identity moving from the colliding
     revision to its renumbered slot.
+
+    The effective authorized list is resolved at CALL time (baked floor UNION the
+    operator-approved runtime store) unless a caller passes an explicit tuple, so
+    a newly-added runtime exemption is honored without a redeploy. When a RUNTIME
+    (non-baked) exemption is what waves a divergence through, an audit log line
+    names the revision, the operator and the reason — so the gate record shows a
+    human authorized this, not the code.
     """
+    if authorized is None:
+        authorized = effective_authorized_divergences()
     for auth in authorized:
-        if (
+        matched = (
             record["kind"] == "reused"
             and record["revision"] == auth.revision
-            and {
-                record["base_identity"],
-                record["head_identity"],
-            }
+            and {record["base_identity"], record["head_identity"]}
             == {auth.deployed_identity, auth.integration_identity}
-        ):
-            return True
-        if (
+        ) or (
             record["kind"] == "renumbered"
             and record["identity"] == auth.deployed_identity
-            and {
-                record["base_revision"],
-                record["head_revision"],
-            }
+            and {record["base_revision"], record["head_revision"]}
             == {auth.revision, auth.integration_revision}
-        ):
+        )
+        if matched:
+            if auth.is_runtime:
+                logger.warning(
+                    "[migration-guard] Alembic revision-identity divergence at "
+                    "revision %r waved through by RUNTIME exemption authorized by "
+                    "%r (added_at=%s): %s",
+                    auth.revision,
+                    auth.added_by,
+                    auth.added_at or "unknown",
+                    auth.reason,
+                )
             return True
     return False
 

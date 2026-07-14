@@ -127,6 +127,50 @@ def _infer_infra_leg(infra_error: str) -> str:
     return "audit"
 
 
+def _infer_dimension_from_infra_error(infra_error: str) -> str:
+    """Map an infra_error code to the qualification ledger dimension it belongs to.
+
+    Per-dimension failure isolation (Phase 1, design doc "From Batch Attempts to a
+    Per-Dimension Fact Ledger"): when a qualifier run holds on an infrastructure
+    failure, ONLY the failing dimension's ``(candidate_sha, dimension)`` fact is
+    marked unavailable — the dimensions that already resolved for the same
+    candidate tree are preserved.  Codes are matched by prefix because
+    ``_enrich_infra_error`` may append a sanitized agent-failure-category suffix
+    (e.g. ``"audit_task_failed_provision_failure"``).  Ordering is deliberate: the
+    ``audit_challenge*`` codes are a sub-leg of the audit but own a distinct
+    ``challenge`` dimension, so they are matched before the bare ``audit`` prefix,
+    and ``migration_identity`` / ``migration_apply`` before the bare ``migration``
+    fallback.  Unrecognized codes default to ``audit`` — the dominant,
+    always-present dimension — matching ``_infer_infra_leg``'s fallback.
+    """
+    code = (infra_error or "").lower()
+    if code.startswith("audit_challenge") or code.startswith("challenge"):
+        return "challenge"
+    if code.startswith("migration_identity"):
+        return "migration_identity"
+    if code.startswith("migration_apply"):
+        return "migration_apply"
+    if code.startswith("migration"):
+        return "migration_identity"
+    if code.startswith("smoketest"):
+        return "smoketest"
+    if code.startswith("merge_grade"):
+        return "merge_grade"
+    if code.startswith("ci"):
+        return "ci"
+    if code.startswith("test_erosion"):
+        return "test_erosion"
+    if code.startswith("audit"):
+        return "audit"
+    # Ledger-integrity codes (qualification_dimension_ledger_incomplete /
+    # qualification_dimension_ledger_empty) are not a single-dimension failure —
+    # recording them as 'audit' would overwrite a legitimately-passed audit fact.
+    # Return None so the caller skips the per-dimension upsert entirely.
+    if code.startswith("qualification_dimension_ledger"):
+        return None
+    return "audit"
+
+
 def _infra_failure_signature(
     infra_error: str, child_failures: list[dict[str, Any]]
 ) -> str:
@@ -455,13 +499,18 @@ async def _spawn_release_merge_grade_task(
     candidate_sha: str,
     version_goal: str,
     merged_pr_numbers: list[int],
+    categories: list[dict[str, Any]] | None = None,
 ) -> Task:
     """Create + queue a blind ``release_merge_grade`` task for the qualifier.
 
     The merge-grade agent grades the MERGED DIFFS of this version (the
     ``base_branch...candidate_sha`` range plus the merged-PR window) against the
-    frozen ``version_goal`` and returns ``{covers_goal, coverage_score,
-    biggest_gap}``.
+    frozen ``version_goal`` and returns the holistic ``{covers_goal,
+    coverage_score, biggest_gap}`` plus — per the goal-verification redesign — a
+    per-category verdict for each active acceptance-criterion CATEGORY in
+    ``categories`` (``{category_key, text}``) and a residual "gap no category
+    captures" answer.  The categories are the ACTIVE ``VersionAcceptanceCriterion``
+    rows; the agent keys its verdicts on the supplied ``category_key`` values.
 
     BLINDNESS CONTRACT (dir d-c0fe439f): this grade must be UNINVESTED — the
     agent sees the version goal and the merged diffs ONLY.  The strategist's
@@ -483,6 +532,11 @@ async def _spawn_release_merge_grade_task(
         # merged-PR discovery the blind merge-grade uses); the agent fetches each
         # PR's diff to grade goal coverage.
         "merged_prs": list(merged_pr_numbers),
+        # Goal-verification redesign: the ACTIVE acceptance-criterion CATEGORIES
+        # the agent grades the merged diff against (per-category met/not_met/
+        # partial + cited diff evidence + gap).  Empty list ⇒ no rubric; the agent
+        # then grades only the holistic goal coverage.
+        "categories": list(categories or []),
         # Explicitly pin to Opus — regression guard against silent downgrade
         # (mirrors release_audit / release_audit_challenge).
         "quality_tier": "opus",
@@ -848,12 +902,21 @@ async def _handle_infra_failure(
         "attempt_history": attempt_history,
     }
 
+    # Per-dimension failure isolation (Phase 1): infer WHICH dimension the infra
+    # failure belongs to so only that (candidate_sha, dimension) ledger fact is
+    # marked unavailable below — the other dimensions that already resolved for
+    # this candidate tree keep their rows.
+    failing_dimension = _infer_dimension_from_infra_error(infra_error)
+
     record: dict[str, Any] = {
         "candidate_sha": qual.get("candidate_sha"),
         "ci_green": qual.get("ci_green"),
         "smoketest_enabled": qual.get("smoketest_enabled", True),
         "status": "infra_failure",
         "error": infra_error,
+        # Which single dimension this infra failure isolated to (the other
+        # dimensions' ledger facts survive) — surfaced for operator diagnosis.
+        "failing_dimension": failing_dimension,
         "infra_failure_signature": signature,
         "previous_infra_failure_signature": previous_signature,
         "same_error_as_prior": same_error_as_prior,
@@ -881,6 +944,56 @@ async def _handle_infra_failure(
         ),
     )
     session.add(version)
+
+    # Per-dimension failure isolation (Phase 1): record ONLY the failing
+    # dimension as 'unavailable' in the per-(candidate_sha, dimension) ledger,
+    # tracking a PER-DIMENSION infra-error streak in the row's detail — so this
+    # gate's flakiness cannot burn another gate's retry budget and the other
+    # dimensions' already-resolved facts for this candidate tree are untouched.
+    # Best-effort: a ledger write failure must never break the infra-failure hold.
+    # Skip when failing_dimension is None (e.g. ledger-integrity codes) — there
+    # is no single dimension to blame and writing 'audit' would overwrite a
+    # legitimately-resolved audit fact.
+    _rq = _release_qualifier_module()
+    dimension_infra_streak = (
+        await _rq._record_infra_dimension_unavailable(
+            session,
+            version,
+            qual.get("candidate_sha"),
+            failing_dimension,
+            infra_error=infra_error,
+            signature=signature,
+        )
+        if failing_dimension is not None
+        else None
+    )
+
+    # Phase 1b read: compose already-resolved dimension facts from the per-dimension
+    # ledger into the record and verdict sub_scores, so a passed audit/CI/etc. is
+    # visible in the verdict instead of being discarded by a transient infra defer
+    # on a DIFFERENT gate.  Best-effort — any read failure leaves resolved_dimensions
+    # empty and the infra-failure hold proceeds exactly as before.
+    resolved_dimensions: dict[str, Any] = {}
+    _ledger_candidate_sha = qual.get("candidate_sha")
+    if _ledger_candidate_sha:
+        try:
+            _prior = await _rq._load_prior_dimension_results(
+                session, version, _ledger_candidate_sha
+            )
+            _resolved_statuses = _rq._LEDGER_RESOLVED_STATUSES
+            for _dim, _row in _prior.items():
+                if _row.status in _resolved_statuses:
+                    resolved_dimensions[_dim] = {
+                        "status": _row.status,
+                        "sub_score": _row.sub_score,
+                        "blocker": _row.blocker,
+                    }
+        except Exception:  # noqa: BLE001 — read is best-effort, never fatal
+            resolved_dimensions = {}
+
+    if resolved_dimensions:
+        record["resolved_dimensions"] = resolved_dimensions
+        flag_modified(version, "last_qualification")
 
     if (
         current_streak >= _MIN_INFRA_ERROR_STREAK
@@ -964,10 +1077,12 @@ async def _handle_infra_failure(
         current_streak,
     )
     promotion_enabled = resolve_project_promotion_enabled(version.project_id)
+    _verdict_sub_scores: dict[str, Any] = {"infra_failure": infra_evidence}
+    _verdict_sub_scores.update(resolved_dimensions)
     await _record_qualification_verdict(
         session,
         version,
-        {**record, "sub_scores": {"infra_failure": infra_evidence}},
+        {**record, "sub_scores": _verdict_sub_scores},
         terminal_status="infra_failure",
         would_promote=False,
         promotion_enabled=promotion_enabled,
@@ -979,6 +1094,11 @@ async def _handle_infra_failure(
         "same_error_as_prior": same_error_as_prior,
         "same_error_different_candidate": same_error_different_candidate,
         "consecutive_infra_errors": current_streak,
+        # Per-dimension isolation (Phase 1): which single dimension was marked
+        # unavailable, and that dimension's own infra-error streak (distinct from
+        # the attempt-level ``consecutive_infra_errors`` above).
+        "failing_dimension": failing_dimension,
+        "dimension_infra_streak": dimension_infra_streak,
     }
 
 

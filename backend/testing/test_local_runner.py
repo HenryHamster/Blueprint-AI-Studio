@@ -10,11 +10,12 @@ Covers the four new surfaces:
 import asyncio
 import uuid
 from datetime import datetime, timedelta
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app import alert_dispatch
@@ -38,8 +39,12 @@ from app.models import (
     _utcnow,
 )
 from app.messages_noise_prefs_store import get_messages_noise_prefs_row
-from app.routers.admin_runners import _runner_health
+from app.routers.admin_runners import (
+    _normalize_gpu_indices_allowed,
+    _runner_health,
+)
 from app.routers.runner import _parse_heartbeat_timestamp, _parse_multipart_form
+from app.runner_config import config_generation, live_safe_config
 from app.task_capabilities import STRATEGIC_TASK_TYPES
 from app.workbench_state import (
     STRATEGIC_LOCAL_CONTINUATION_KEY,
@@ -414,6 +419,72 @@ def test_parse_heartbeat_timestamp_tolerates_bad_input():
     assert _parse_heartbeat_timestamp("2026-07-02T12:00:00+02:00") == parsed
 
 
+# ── Live-safe config projection + generation hash (pure, no DB) ───────────────
+
+
+class TestLiveSafeConfigProjection:
+    def test_projects_live_safe_subset_with_compute_default(self):
+        cfg = live_safe_config(
+            {
+                "task_types": ["create", "fix"],
+                "max_concurrent": 4,
+                "has_gpu": True,  # telemetry — must NOT leak into the subset
+                "gpu_count": 2,
+            }
+        )
+        assert cfg == {
+            "max_concurrent": 4,
+            # compute ceiling defaults to max_concurrent when unset.
+            "max_concurrent_compute": 4,
+            "task_types": ["create", "fix"],
+            "gpu_indices_allowed": "all",
+            # per-job GPU count defaults to 1 when unset (backward compatible).
+            "gpus_per_job": 1,
+        }
+        assert "has_gpu" not in cfg and "gpu_count" not in cfg
+
+    def test_gpu_indices_allowed_dedup_and_sorted(self):
+        cfg = live_safe_config({"gpu_indices_allowed": [2, 0, 2, 1]})
+        assert cfg["gpu_indices_allowed"] == [0, 1, 2]
+
+    def test_generation_is_order_independent_but_value_sensitive(self):
+        base = live_safe_config(
+            {"task_types": ["a", "b"], "gpu_indices_allowed": [1, 0]}
+        )
+        reordered = live_safe_config(
+            {"gpu_indices_allowed": [0, 1], "task_types": ["a", "b"]}
+        )
+        # Same effective config → identical generation (order-independent).
+        assert config_generation(base) == config_generation(reordered)
+        # A single live-safe field change → different generation.
+        changed = live_safe_config(
+            {"task_types": ["a", "b"], "gpu_indices_allowed": [0, 1, 2]}
+        )
+        assert config_generation(changed) != config_generation(base)
+
+    def test_missing_max_concurrent_compute_defaults_but_explicit_wins(self):
+        assert live_safe_config({"max_concurrent": 3})["max_concurrent_compute"] == 3
+        assert (
+            live_safe_config({"max_concurrent": 3, "max_concurrent_compute": 1})[
+                "max_concurrent_compute"
+            ]
+            == 1
+        )
+
+
+class TestNormalizeGpuIndicesAllowed:
+    def test_accepts_all_sentinel_and_valid_list(self):
+        assert _normalize_gpu_indices_allowed("all") == "all"
+        assert _normalize_gpu_indices_allowed([3, 1, 1, 0]) == [0, 1, 3]
+        # Empty list is a deliberate "no GPUs allowed" restriction.
+        assert _normalize_gpu_indices_allowed([]) == []
+
+    def test_rejects_junk(self):
+        for bad in ["none", ["gpu0"], [1.5], [True], [-1], {"0": True}, 0]:
+            with pytest.raises(ValueError):
+                _normalize_gpu_indices_allowed(bad)
+
+
 def _snapshot(caps: dict) -> "orch.RunnerDispatchSnapshot":
     """A minimal dispatch snapshot carrying just the capabilities under test."""
     return orch.RunnerDispatchSnapshot(
@@ -462,6 +533,202 @@ def test_runner_handles_task_type_intersects_operator_policy_and_runner_floor():
     )
     assert orch._runner_handles_task_type(policy_limited, "research") is True
     assert orch._runner_handles_task_type(policy_limited, "review") is False
+
+
+def test_runner_gpu_capable_verifies_self_report_against_telemetry():
+    """`_runner_gpu_capable` disbelieves a mis-set `has_gpu` when the runner's OWN
+    GPU telemetry (gpu_count/gpu_names) contradicts the claim, but trusts the flag
+    when telemetry is absent (backward compatible with older runners)."""
+    # No claim → not GPU-capable (unchanged from the bare has_gpu filter).
+    assert orch._runner_gpu_capable(_snapshot({})) is False
+    assert orch._runner_gpu_capable(_snapshot({"has_gpu": False})) is False
+
+    # Claim CORROBORATED by telemetry → GPU-capable.
+    assert (
+        orch._runner_gpu_capable(
+            _snapshot({"has_gpu": True, "gpu_count": 1, "gpu_names": ["Tesla T4"]})
+        )
+        is True
+    )
+    # gpu_count is authoritative when present: a positive count is trusted even if
+    # names were not reported.
+    assert (
+        orch._runner_gpu_capable(_snapshot({"has_gpu": True, "gpu_count": 2}))
+        is True
+    )
+
+    # Claim CONTRADICTED by telemetry (the mis-set-flag lie) → NOT GPU-capable.
+    # gpu_count of 0 is a direct contradiction.
+    assert (
+        orch._runner_gpu_capable(_snapshot({"has_gpu": True, "gpu_count": 0}))
+        is False
+    )
+    # Empty gpu_names (with no count) is the fallback contradiction signal.
+    assert (
+        orch._runner_gpu_capable(_snapshot({"has_gpu": True, "gpu_names": []}))
+        is False
+    )
+    # gpu_count is authoritative over names: count 0 wins even if a stray name rode
+    # along, so a runner reporting an honest nvidia-smi count of 0 is disbelieved.
+    assert (
+        orch._runner_gpu_capable(
+            _snapshot({"has_gpu": True, "gpu_count": 0, "gpu_names": ["ghost"]})
+        )
+        is False
+    )
+
+    # Absence of telemetry is NOT a contradiction — an older runner that sets
+    # has_gpu but reports no count/names is still trusted (backward compatible).
+    assert orch._runner_gpu_capable(_snapshot({"has_gpu": True})) is True
+
+
+def test_select_eligible_runner_excludes_gpu_liar_prefers_honest_runner():
+    """A runner claiming `has_gpu=true` whose telemetry shows no GPU is excluded from
+    GPU-accelerator dispatch; a genuinely GPU-capable runner is selected instead."""
+    project_id = uuid.uuid4()
+    # Liar: claims a GPU but its own telemetry reports zero GPUs.
+    liar = _snapshot(
+        {"task_types": "all", "has_gpu": True, "gpu_count": 0, "gpu_names": []}
+    )
+    # Honest GPU runner: claim corroborated by telemetry.
+    honest = _snapshot(
+        {
+            "task_types": "all",
+            "has_gpu": True,
+            "gpu_count": 1,
+            "gpu_names": ["Tesla T4"],
+        }
+    )
+    cache = {project_id: [liar, honest]}
+
+    # A GPU-accelerator task must route to the honest runner, never the liar.
+    chosen = orch._select_eligible_runner(
+        cache, project_id, "compute_experiment", "T4", {}
+    )
+    assert chosen is honest
+
+    # With ONLY the liar available, a GPU task finds no eligible runner (it then
+    # holds for real hardware rather than dispatching to a box that cannot run it).
+    liar_only = {project_id: [liar]}
+    assert (
+        orch._select_eligible_runner(
+            liar_only, project_id, "compute_experiment", "T4", {}
+        )
+        is None
+    )
+    # A CPU task (no accelerator) is unaffected — the liar is a perfectly good CPU
+    # runner, so the GPU gate never touches it.
+    assert (
+        orch._select_eligible_runner(
+            liar_only, project_id, "compute_experiment", None, {}
+        )
+        is liar
+    )
+
+
+class TestRunnerHealthAgentUnavailableReason:
+    """_runner_health() surfaces agent_unavailable_reason from capabilities JSONB."""
+
+    def test_available_runner_has_null_reason(self):
+        h = _runner_health(
+            _health_runner(
+                capabilities={
+                    "task_types": "all",
+                    "max_concurrent": 2,
+                    "agent_available": True,
+                    "agent_unavailable_reason": None,
+                }
+            )
+        )
+        assert h["agent_available"] is True
+        assert h["agent_unavailable_reason"] is None
+
+    def test_unavailable_runner_surfaces_bwrap_reason(self):
+        h = _runner_health(
+            _health_runner(
+                capabilities={
+                    "task_types": "all",
+                    "max_concurrent": 2,
+                    "agent_available": False,
+                    "agent_unavailable_reason": "bwrap not available",
+                }
+            )
+        )
+        assert h["agent_available"] is False
+        assert h["agent_unavailable_reason"] == "bwrap not available"
+
+    def test_unavailable_runner_surfaces_node_reason(self):
+        h = _runner_health(
+            _health_runner(
+                capabilities={
+                    "task_types": "all",
+                    "max_concurrent": 2,
+                    "agent_available": False,
+                    "agent_unavailable_reason": "node runtime not functional",
+                }
+            )
+        )
+        assert h["agent_unavailable_reason"] == "node runtime not functional"
+
+    def test_old_runner_without_reason_field_returns_none(self):
+        # Old runners don't send agent_unavailable_reason — must not error.
+        h = _runner_health(
+            _health_runner(
+                capabilities={
+                    "task_types": "all",
+                    "max_concurrent": 2,
+                    "agent_available": False,
+                }
+            )
+        )
+        assert h["agent_available"] is False
+        assert h["agent_unavailable_reason"] is None
+
+    def test_unavailable_runner_surfaces_compound_reason_and_legs(self):
+        # The compound reason (every failing leg, "; "-joined) AND the structured
+        # per-leg map are both surfaced verbatim from capabilities JSONB, so the
+        # fleet panel can render a per-leg checklist instead of parsing a string.
+        legs = {
+            "bwrap_sandbox": False,
+            "agent_dist": True,
+            "node_runtime": False,
+            "docker": False,
+        }
+        h = _runner_health(
+            _health_runner(
+                capabilities={
+                    "task_types": "all",
+                    "max_concurrent": 2,
+                    "agent_available": False,
+                    "agent_unavailable_reason": (
+                        "bwrap sandbox unavailable; node runtime not functional; "
+                        "docker agent unavailable"
+                    ),
+                    "agent_unavailable_legs": legs,
+                }
+            )
+        )
+        assert h["agent_available"] is False
+        assert h["agent_unavailable_legs"] == legs
+        # Every failing leg is named in the compound reason.
+        assert "bwrap sandbox unavailable" in h["agent_unavailable_reason"]
+        assert "node runtime not functional" in h["agent_unavailable_reason"]
+        assert "docker agent unavailable" in h["agent_unavailable_reason"]
+
+    def test_old_runner_without_legs_field_returns_none(self):
+        # Old runners don't send agent_unavailable_legs — surfaced as None (absent
+        # in caps), never a KeyError.
+        h = _runner_health(
+            _health_runner(
+                capabilities={
+                    "task_types": "all",
+                    "max_concurrent": 2,
+                    "agent_available": False,
+                    "agent_unavailable_reason": "bwrap not available",
+                }
+            )
+        )
+        assert h["agent_unavailable_legs"] is None
 
 
 # ── Admin endpoints ──────────────────────────────────────────────────────────
@@ -893,6 +1160,497 @@ class TestAdminRunnerEndpoints:
             "released_unpulled_pins": 0,
         }
 
+    # ── Capabilities update (PATCH) ─────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_update_max_concurrent(
+        self, client: AsyncClient, db_session
+    ):
+        """Normal bump: register with max_concurrent=2, PATCH to 4 → response shows 4."""
+        project = await _make_project(db_session)
+        runner, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={"task_types": "all", "has_gpu": False, "max_concurrent": 2},
+        )
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/capabilities",
+            json={"max_concurrent": 4},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["capabilities"]["max_concurrent"] == 4
+
+        await db_session.refresh(runner)
+        assert runner.capabilities["max_concurrent"] == 4
+
+    @pytest.mark.asyncio
+    async def test_update_rejects_out_of_range(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, _ = await _make_runner(db_session, project.id)
+
+        resp_0 = await client.patch(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/capabilities",
+            json={"max_concurrent": 0},
+        )
+        assert resp_0.status_code == 422
+
+        resp_65 = await client.patch(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/capabilities",
+            json={"max_concurrent": 65},
+        )
+        assert resp_65.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_update_strategic_local_pins_max_to_one(
+        self, client: AsyncClient, db_session
+    ):
+        """A strategic_local runner clamps max_concurrent to 1 regardless of what the
+        operator sends — the same invariant enforced at registration."""
+        project = await _make_project(db_session)
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/runners/register",
+            json={
+                "hostname": "strategic-clamp",
+                "preset": "strategic_local",
+            },
+        )
+        assert resp.status_code == 200
+        runner_id = uuid.UUID(resp.json()["runner_id"])
+
+        # PATCH with max_concurrent=4 — must be clamped to 1.
+        patch = await client.patch(
+            f"/api/admin/projects/{project.id}/runners/{runner_id}/capabilities",
+            json={"max_concurrent": 4},
+        )
+        assert patch.status_code == 200
+        assert patch.json()["capabilities"]["max_concurrent"] == 1
+
+    @pytest.mark.asyncio
+    async def test_update_preserves_runner_reported_fields(
+        self, client: AsyncClient, db_session
+    ):
+        """Runner-reported hardware fields survive a capabilities PATCH."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "has_gpu": False,
+                "max_concurrent": 2,
+            },
+        )
+
+        # First, Heartbeat to populate runner-reported GPU fields.
+        hb = await client.post(
+            "/api/runner/heartbeat",
+            json={
+                "active_task_ids": [],
+                "has_gpu": True,
+                "gpu_count": 2,
+                "gpu_names": ["Tesla T4", "Tesla T4"],
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert hb.status_code == 200
+
+        # Now PATCH max_concurrent.
+        patch = await client.patch(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/capabilities",
+            json={"max_concurrent": 6},
+        )
+        assert patch.status_code == 200
+        caps = patch.json()["capabilities"]
+        assert caps["max_concurrent"] == 6
+        assert caps["has_gpu"] is True
+        assert caps["gpu_count"] == 2
+        assert caps["gpu_names"] == ["Tesla T4", "Tesla T4"]
+
+    @pytest.mark.asyncio
+    async def test_update_preserves_operator_fields_on_partial_patch(
+        self, client: AsyncClient, db_session
+    ):
+        """PATCH only max_concurrent leaves task_types untouched (and vice versa)."""
+        project = await _make_project(db_session)
+        runner, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": ["create", "fix"],
+                "has_gpu": False,
+                "max_concurrent": 2,
+            },
+        )
+
+        # PATCH only max_concurrent — task_types must survive.
+        only_max = await client.patch(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/capabilities",
+            json={"max_concurrent": 8},
+        )
+        assert only_max.status_code == 200
+        caps = only_max.json()["capabilities"]
+        assert caps["max_concurrent"] == 8
+        assert caps["task_types"] == ["create", "fix"]
+
+        # PATCH only task_types — max_concurrent must survive.
+        only_tt = await client.patch(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/capabilities",
+            json={"task_types": ["review"]},
+        )
+        assert only_tt.status_code == 200
+        caps2 = only_tt.json()["capabilities"]
+        assert caps2["task_types"] == ["review"]
+        assert caps2["max_concurrent"] == 8
+
+    @pytest.mark.asyncio
+    async def test_update_rejects_non_owner(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, _ = await _make_runner(db_session, project.id)
+
+        non_owner_project = await _make_project(
+            db_session, owner_id="other-owner", name="Member Only Runner Cap Project"
+        )
+        db_session.add(
+            ProjectMember(
+                project_id=non_owner_project.id,
+                user_id=TEST_USER_ID,
+                role="member",
+            )
+        )
+        non_owner_runner, _ = await _make_runner(
+            db_session, non_owner_project.id
+        )
+        await db_session.commit()
+
+        non_owner = await client.patch(
+            f"/api/admin/projects/{non_owner_project.id}/runners/{non_owner_runner.id}/capabilities",
+            json={"max_concurrent": 4},
+        )
+        assert non_owner.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_update_deleted_runner_404(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, _ = await _make_runner(db_session, project.id, status="deleted")
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/capabilities",
+            json={"max_concurrent": 4},
+        )
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_update_missing_runner_404(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        missing_id = uuid.uuid4()
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}/runners/{missing_id}/capabilities",
+            json={"max_concurrent": 4},
+        )
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_update_emits_workbench_refetch(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={"task_types": "all", "has_gpu": False, "max_concurrent": 2},
+        )
+
+        with patch(
+            "app.routers.admin_runners.emit_workbench_refetch",
+            new=AsyncMock(),
+        ) as emit:
+            resp = await client.patch(
+                f"/api/admin/projects/{project.id}/runners/{runner.id}/capabilities",
+                json={"max_concurrent": 4},
+            )
+
+        assert resp.status_code == 200
+        emit.assert_awaited_once()
+        assert emit.await_args.args[0] == project.id
+        assert emit.await_args.kwargs["resource"] == "local_runner"
+        assert emit.await_args.kwargs["action"] == "updated"
+        assert "strategic_session" in emit.await_args.kwargs["refetch_surfaces"]
+        assert "runtime" in emit.await_args.kwargs["refetch_surfaces"]
+        assert emit.await_args.kwargs["summary"] == {
+            "id": str(runner.id),
+            "status": runner.status,
+            "hostname": runner.hostname,
+        }
+
+
+# ── Live-safe config channel (heartbeat two-way + PATCH + view) ──────────────
+
+
+class TestRunnerConfigChannel:
+    @pytest.mark.asyncio
+    async def test_heartbeat_response_carries_config_block_and_stable_generation(
+        self, client: AsyncClient, db_session
+    ):
+        """The heartbeat response includes the live-safe config block + a stable
+        generation, and keeps the backward-compat enrolled_max_concurrent field."""
+        project = await _make_project(db_session)
+        _runner, token = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": ["create", "fix"],
+                "has_gpu": False,
+                "max_concurrent": 3,
+            },
+        )
+        resp1 = await client.post(
+            "/api/runner/heartbeat",
+            json={"active_task_ids": []},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp1.status_code == 200
+        body1 = resp1.json()
+        # Backward-compat fields preserved.
+        assert body1["enrolled_max_concurrent"] == 3
+        assert "version_hint" in body1
+        # New config block.
+        config = body1["config"]
+        assert config["max_concurrent"] == 3
+        assert config["max_concurrent_compute"] == 3  # defaults to max_concurrent
+        assert config["task_types"] == ["create", "fix"]
+        assert config["gpu_indices_allowed"] == "all"
+        gen1 = config["config_generation"]
+        assert isinstance(gen1, str) and gen1
+        assert body1["config_generation"] == gen1
+
+        # A second heartbeat with no config change yields the SAME generation.
+        resp2 = await client.post(
+            "/api/runner/heartbeat",
+            json={"active_task_ids": ["t1"]},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp2.status_code == 200
+        assert resp2.json()["config"]["config_generation"] == gen1
+
+    @pytest.mark.asyncio
+    async def test_patch_live_safe_field_changes_generation(
+        self, client: AsyncClient, db_session
+    ):
+        """A PATCH that changes a live-safe field (max_concurrent, gpu allowlist)
+        moves the config_generation surfaced on the runner view."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={"task_types": "all", "has_gpu": False, "max_concurrent": 2},
+        )
+
+        before = (await client.get(f"/api/admin/projects/{project.id}/runners")).json()[0]
+        gen_before = before["config"]["config_generation"]
+
+        # Change a live-safe field.
+        patch = await client.patch(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/capabilities",
+            json={"gpu_indices_allowed": [0, 1]},
+        )
+        assert patch.status_code == 200
+        cfg = patch.json()["config"]
+        assert cfg["gpu_indices_allowed"] == [0, 1]
+        assert cfg["config_generation"] != gen_before
+        # Newly desired but not-yet-applied → pending.
+        assert cfg["config_pending"] is True
+
+        # The heartbeat response now advertises the new generation, so the daemon
+        # can detect the drift.
+        hb = await client.post(
+            "/api/runner/heartbeat",
+            json={"active_task_ids": []},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert hb.json()["config"]["config_generation"] == cfg["config_generation"]
+
+    @pytest.mark.asyncio
+    async def test_applied_config_generation_resolves_pending(
+        self, client: AsyncClient, db_session
+    ):
+        """A heartbeat carrying applied_config_generation persists it; config_pending
+        is False only when the applied generation matches the desired one."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={"task_types": "all", "has_gpu": False, "max_concurrent": 5},
+        )
+
+        # Discover the current desired generation from the heartbeat response.
+        desired_gen = (
+            await client.post(
+                "/api/runner/heartbeat",
+                json={"active_task_ids": []},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        ).json()["config"]["config_generation"]
+
+        # Before any applied report, the view shows pending/unknown, never errors.
+        view0 = (await client.get(f"/api/admin/projects/{project.id}/runners")).json()[0]
+        assert view0["config"]["applied_config_generation"] is None
+        assert view0["config"]["config_pending"] is True
+
+        # Daemon reports it has applied a DIFFERENT (stale) generation → pending.
+        await client.post(
+            "/api/runner/heartbeat",
+            json={
+                "active_task_ids": [],
+                "applied_config_generation": "stale000deadbeef",
+                "applied_max_concurrent": 2,
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        view1 = (await client.get(f"/api/admin/projects/{project.id}/runners")).json()[0]
+        assert view1["config"]["applied_config_generation"] == "stale000deadbeef"
+        assert view1["config"]["applied"] == {"max_concurrent": 2}
+        assert view1["config"]["config_pending"] is True
+
+        # Daemon now reports the matching desired generation → NOT pending.
+        await client.post(
+            "/api/runner/heartbeat",
+            json={
+                "active_task_ids": [],
+                "applied_config_generation": desired_gen,
+                "applied_max_concurrent": 5,
+                "applied_gpu_indices_allowed": "all",
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        view2 = (await client.get(f"/api/admin/projects/{project.id}/runners")).json()[0]
+        assert view2["config"]["applied_config_generation"] == desired_gen
+        assert view2["config"]["config_pending"] is False
+
+        # Applied report must NOT clobber the operator-configured desired subset.
+        await db_session.refresh(runner)
+        assert runner.capabilities["max_concurrent"] == 5
+        assert runner.capabilities["task_types"] == "all"
+
+    @pytest.mark.asyncio
+    async def test_gpu_indices_allowed_patch_validation(
+        self, client: AsyncClient, db_session
+    ):
+        """PATCH accepts 'all' and a valid list (deduped/sorted); junk is 422."""
+        project = await _make_project(db_session)
+        runner, _ = await _make_runner(db_session, project.id)
+
+        ok_all = await client.patch(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/capabilities",
+            json={"gpu_indices_allowed": "all"},
+        )
+        assert ok_all.status_code == 200
+        assert ok_all.json()["capabilities"]["gpu_indices_allowed"] == "all"
+
+        ok_list = await client.patch(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/capabilities",
+            json={"gpu_indices_allowed": [2, 0, 0, 1]},
+        )
+        assert ok_list.status_code == 200
+        assert ok_list.json()["capabilities"]["gpu_indices_allowed"] == [0, 1, 2]
+
+        for bad in (["gpu0"], [-1], "everything", [1.5]):
+            rej = await client.patch(
+                f"/api/admin/projects/{project.id}/runners/{runner.id}/capabilities",
+                json={"gpu_indices_allowed": bad},
+            )
+            assert rej.status_code == 422, bad
+
+    @pytest.mark.asyncio
+    async def test_strategic_local_invariants_hold_with_gpu_axis(
+        self, client: AsyncClient, db_session
+    ):
+        """Adding the GPU allowlist must not relax the strategic_local clamps:
+        max_concurrent stays 1 and task_types stays the strategic set."""
+        project = await _make_project(db_session)
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/runners/register",
+            json={"hostname": "strategic-gpu", "preset": "strategic_local"},
+        )
+        assert resp.status_code == 200
+        runner_id = uuid.UUID(resp.json()["runner_id"])
+
+        patch = await client.patch(
+            f"/api/admin/projects/{project.id}/runners/{runner_id}/capabilities",
+            json={
+                "gpu_indices_allowed": [0],
+                "max_concurrent": 8,  # must still be clamped to 1
+                "task_types": "all",  # must still be clamped to strategic set
+            },
+        )
+        assert patch.status_code == 200
+        caps = patch.json()["capabilities"]
+        assert caps["gpu_indices_allowed"] == [0]
+        assert caps["max_concurrent"] == 1
+        assert caps["task_types"] == sorted(STRATEGIC_TASK_TYPES)
+        # The config block reflects the clamped values, not the requested ones.
+        assert patch.json()["config"]["desired"]["max_concurrent"] == 1
+
+    @pytest.mark.asyncio
+    async def test_gpus_per_job_pushed_via_heartbeat_and_applied_echo(
+        self, client: AsyncClient, db_session
+    ):
+        """An operator PATCH of gpus_per_job flows down the heartbeat config block,
+        and the daemon's applied_gpus_per_job echo resolves config_pending."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={"task_types": "all", "has_gpu": True, "max_concurrent": 2},
+        )
+
+        # Operator pushes a per-job GPU count of 2.
+        patch = await client.patch(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/capabilities",
+            json={"gpus_per_job": 2},
+        )
+        assert patch.status_code == 200
+        assert patch.json()["capabilities"]["gpus_per_job"] == 2
+
+        # The daemon sees it in the heartbeat response config block.
+        hb = await client.post(
+            "/api/runner/heartbeat",
+            json={"active_task_ids": []},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert hb.status_code == 200
+        config = hb.json()["config"]
+        assert config["gpus_per_job"] == 2
+        desired_gen = config["config_generation"]
+
+        # Before an applied echo, the view is pending.
+        view0 = (await client.get(f"/api/admin/projects/{project.id}/runners")).json()[0]
+        assert view0["config"]["config_pending"] is True
+
+        # Daemon echoes the applied per-job count with the matching generation.
+        await client.post(
+            "/api/runner/heartbeat",
+            json={
+                "active_task_ids": [],
+                "applied_config_generation": desired_gen,
+                "applied_max_concurrent": 2,
+                "applied_gpu_indices_allowed": "all",
+                "applied_gpus_per_job": 2,
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        view1 = (await client.get(f"/api/admin/projects/{project.id}/runners")).json()[0]
+        assert view1["config"]["applied"]["gpus_per_job"] == 2
+        assert view1["config"]["config_pending"] is False
+
 
 # ── Runner polling/heartbeat endpoints ───────────────────────────────────────
 
@@ -1153,11 +1911,15 @@ class TestRunnerEndpoints:
                 headers={"Authorization": f"Bearer {token}"},
             )
 
-        # When no LLM account is resolved, the handler returns 503
-        # with pool_exhausted=True, rolling back the dispatch marker
-        # so the task stays claimable by a future poll cycle.
+        # When no LLM account is resolved, the handler returns 503 with
+        # pool_exhausted=True and never sets the dispatch marker, so the task
+        # stays claimable by a future poll cycle. The body also carries WHY.
         assert resp.status_code == 503
-        assert resp.json() == {"pool_exhausted": True}
+        body = resp.json()
+        assert body["pool_exhausted"] is True
+        assert "reason" in body
+        # A plain no-account outcome is NOT flagged as a credential crash.
+        assert "credential_resolution_failed" not in body
 
         # Task context was NOT stamped since select_llm_runtime_for_task returned None.
         await db_session.refresh(task_instance)
@@ -1169,9 +1931,12 @@ class TestRunnerEndpoints:
         self, client: AsyncClient, db_session
     ):
         """When an unexpected exception occurs during credential resolution,
-        next-task must roll back the dispatch marker (started_at = None) and
-        return 503 with pool_exhausted=True so the task stays claimable rather
-        than being dispatched without credentials."""
+        next-task must leave the dispatch marker unset (started_at = None) and
+        503 so the task stays claimable rather than being dispatched without
+        credentials — AND must say so distinctly (credential_resolution_failed),
+        because a poisoned task that crashes _resolve_provider_materials used to
+        return the identical {"pool_exhausted": true} body as genuine rate
+        limiting, sending operators after the wrong cause."""
         project = await _make_project(db_session)
         runner, token = await _make_runner(db_session, project.id)
 
@@ -1197,17 +1962,33 @@ class TestRunnerEndpoints:
                 headers={"Authorization": f"Bearer {token}"},
             )
 
-        # Dispatch must be rolled back: 503 with pool_exhausted=True so the
-        # runner retries rather than receiving a task it can't execute.
+        # 503 so the runner backs off rather than receiving a task it can't
+        # execute — but with a DISTINCT machine-readable cause and the task id,
+        # not the same body a rate-limited pool returns.
         assert resp.status_code == 503
-        assert resp.json() == {"pool_exhausted": True}
+        body = resp.json()
+        assert body["credential_resolution_failed"] is True
+        # The offending task id is NESTED under "error", never at top level: a
+        # top-level "task_id" in a 503 body is one missed check away from an
+        # un-upgraded runner treating an error as a dispatched task.
+        assert body["error"]["code"] == "credential_resolution_failed"
+        assert body["error"]["skipped_task_id"] == str(task_instance.id)
+        assert "task_id" not in body
+        assert "pool connection lost" in body["reason"]
+        # pool_exhausted stays True for back-compat: field-deployed runners gate
+        # their back-off (and capacity-permit release) on exactly that key.
+        assert body["pool_exhausted"] is True
 
-        # Task context was NOT stamped and dispatch marker was rolled back.
+        # Task context was NOT stamped and the dispatch marker was never set.
         await db_session.refresh(task_instance)
         assert task_instance.llm_account_id is None
         assert task_instance.status == TaskStatus.PROVISIONING  # unchanged
         # started_at must be None — task is still claimable.
         assert task_instance.started_at is None
+        # The WHY is stamped on the task itself, so it shows in the admin UI.
+        assert "credential_resolution_failed" in (
+            task_instance.latest_status_message or ""
+        )
 
     @pytest.mark.asyncio
     async def test_agent_claim_after_runner_dispatch_transitions_to_in_progress(
@@ -1275,6 +2056,36 @@ class TestRunnerEndpoints:
             headers={"Authorization": "Bearer not-a-real-token"},
         )
         assert resp.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_next_task_rejects_foreign_project_pinned_task(
+        self, client: AsyncClient, db_session
+    ):
+        """A runner registered to project A must NOT see tasks from project B
+        even if those tasks are pinned to this runner's ID (defense-in-depth)."""
+        project_a = await _make_project(db_session, name="Project A")
+        project_b = await _make_project(db_session, name="Project B")
+        runner_a, token_a = await _make_runner(db_session, project_a.id)
+
+        # Create a task in project B pinned to runner_a's vm identity
+        # (simulates a misconfiguration or race where project B's task
+        # somehow targets this runner).
+        foreign_task = Task(
+            project_id=project_b.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.PROVISIONING,
+            vm_instance_id=f"runner:{runner_a.id}",
+            context={"runner_target_id": str(runner_a.id)},
+        )
+        db_session.add(foreign_task)
+        await db_session.commit()
+
+        resp = await client.post(
+            "/api/runner/next-task",
+            headers={"Authorization": f"Bearer {token_a}"},
+        )
+        # Must not claim the cross-project task — 204 (no task) expected.
+        assert resp.status_code == 204
 
     @pytest.mark.asyncio
     async def test_next_task_includes_pooled_credential_in_response(
@@ -1359,7 +2170,11 @@ class TestRunnerEndpoints:
                 headers={"Authorization": f"Bearer {token}"},
             )
             assert resp.status_code == 503
-            assert resp.json() == {"pool_exhausted": True}
+            body = resp.json()
+            assert body["pool_exhausted"] is True
+            # The 503 carries WHY the pool came up empty, so an operator does not
+            # have to reconstruct it from pool state.
+            assert body["reason"]
 
             # started_at must NOT be set — the task was not dispatched.
             await db_session.refresh(task)
@@ -1367,6 +2182,1273 @@ class TestRunnerEndpoints:
             assert task.status == TaskStatus.PROVISIONING
         finally:
             _clear_pool()
+
+    @staticmethod
+    def _pinned(project_id, runner_id, *, task_type="create", **kwargs) -> Task:
+        """A task pinned to `runner_id` and awaiting a /next-task pull."""
+        return Task(
+            project_id=project_id,
+            payloads=[{"type": task_type}],
+            status=TaskStatus.PROVISIONING,
+            vm_instance_id=f"runner:{runner_id}",
+            context={"runner_target_id": str(runner_id)},
+            **kwargs,
+        )
+
+    @staticmethod
+    def _selection(account_id: str = "acct-002"):
+        from app.max_plan_pool import LLMSelectionResult
+
+        return LLMSelectionResult(
+            provider="anthropic",
+            auth_mode="oauth",
+            model="claude-opus-4-8",
+            quality_tier="opus",
+            account={
+                "id": account_id,
+                "oauth_token": "sk-ant-test-token",
+                "runtime_secret": "sk-ant-test-token",
+                "claude_config_json": None,
+                "provider_metadata": {},
+            },
+            settings={},
+        )
+
+    @pytest.mark.asyncio
+    async def test_next_task_skips_unroutable_head_and_dispatches_next(
+        self, client: AsyncClient, db_session
+    ):
+        """An unroutable HEAD task must not starve the routable tasks behind it.
+
+        Regression for the 2026-07-11 PROVISIONING pileup: /next-task selected ONE
+        candidate and 503'd if it couldn't get an account. Routing is per-task
+        (task type / model pin / runner CLI inventory), so a single task pinned to
+        a provider in cooldown blocked every other pinned task — and the head is
+        reaper-exempt, so nothing ever cleared it. A healthy runner starved
+        indefinitely behind one bad task.
+        """
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        base = _utcnow() - timedelta(minutes=10)
+        head = self._pinned(
+            project.id, runner.id, task_type="fix", created_at=base
+        )
+        follower = self._pinned(
+            project.id,
+            runner.id,
+            task_type="review",
+            created_at=base + timedelta(minutes=1),
+        )
+        db_session.add_all([head, follower])
+        await db_session.commit()
+
+        async def _select(**kwargs):
+            if kwargs["task"].id == head.id:
+                kwargs["failure_reasons"].append(
+                    "deepseek/deepseek-v4: model in rate-limit cooldown (240s left)"
+                )
+                return None
+            return self._selection()
+
+        with patch(
+            "app.shared_state.runtime_config",
+            new={"provider_selection_mode": "exclusive"},
+        ), patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new=AsyncMock(side_effect=_select),
+        ):
+            resp = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        # The routable follower dispatches; the unroutable head is skipped, not fatal.
+        assert resp.status_code == 200
+        assert resp.json()["task_id"] == str(follower.id)
+
+        # Head is untouched and still claimable by a later poll...
+        await db_session.refresh(head)
+        assert head.started_at is None
+        assert head.llm_account_id is None
+        assert head.status == TaskStatus.PROVISIONING
+        # ...but now carries the WHY, so it isn't a silent skip.
+        assert "cooldown" in (head.latest_status_message or "")
+        assert head.context["runner_pull_skip"]["code"] == "no_eligible_account"
+
+        # Follower really was dispatched.
+        await db_session.refresh(follower)
+        assert follower.started_at is not None
+        assert follower.llm_account_id == "acct-002"
+
+    @pytest.mark.asyncio
+    async def test_next_task_503_when_every_candidate_unroutable_and_carries_reasons(
+        self, client: AsyncClient, db_session
+    ):
+        """When NO candidate can be routed, 503 — but carrying each task's reason."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        t1 = self._pinned(project.id, runner.id, task_type="fix")
+        t2 = self._pinned(project.id, runner.id, task_type="plan")
+        db_session.add_all([t1, t2])
+        await db_session.commit()
+
+        async def _select(**kwargs):
+            kwargs["failure_reasons"].append("anthropic/opus: all accounts at cap")
+            return None
+
+        with patch(
+            "app.shared_state.runtime_config",
+            new={"provider_selection_mode": "exclusive"},
+        ), patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new=AsyncMock(side_effect=_select),
+        ):
+            resp = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        assert resp.status_code == 503
+        body = resp.json()
+        assert body["pool_exhausted"] is True
+        assert "all accounts at cap" in body["reason"]
+        # Every candidate is accounted for individually, not collapsed into one bit.
+        assert {s["task_id"] for s in body["skipped"]} == {str(t1.id), str(t2.id)}
+        assert all(s["code"] == "no_eligible_account" for s in body["skipped"])
+
+        for task in (t1, t2):
+            await db_session.refresh(task)
+            assert task.started_at is None
+            assert task.status == TaskStatus.PROVISIONING
+
+    @pytest.mark.asyncio
+    async def test_next_task_honors_priority_over_created_at(
+        self, client: AsyncClient, db_session
+    ):
+        """/next-task must use the SAME ordering as every cloud dispatch path
+        (priority DESC, created_at ASC). Ordering by created_at alone made the
+        pull-based fleet ignore priority entirely: a high-priority task pinned to
+        a runner lost to any older task."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        base = _utcnow() - timedelta(minutes=10)
+        old_low = self._pinned(
+            project.id, runner.id, created_at=base, priority=10
+        )
+        new_high = self._pinned(
+            project.id,
+            runner.id,
+            created_at=base + timedelta(minutes=5),
+            priority=90,
+        )
+        db_session.add_all([old_low, new_high])
+        await db_session.commit()
+
+        with patch(
+            "app.shared_state.runtime_config",
+            new={"provider_selection_mode": "exclusive"},
+        ), patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new=AsyncMock(return_value=self._selection()),
+        ):
+            resp = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        assert resp.status_code == 200
+        # The NEWER, higher-priority task wins over the older low-priority one.
+        assert resp.json()["task_id"] == str(new_high.id)
+
+    # ── Skip escalation: a bounded scan is only safe if skips have a consumer ──
+
+    @staticmethod
+    def _with_skip_marker(task: Task, *, count: int, age_seconds: int = 600) -> Task:
+        """Pre-age a runner_pull_skip marker so the next skip re-stamps it.
+
+        ``age_seconds`` must exceed SKIP_RESTAMP_SECONDS (300) so stamp_skip_reason
+        does not throttle, and SKIP_RESOLVE_TTL_SECONDS (30) so the candidate is
+        actually re-resolved rather than short-circuited.
+        """
+        ctx = dict(task.context or {})
+        stamped = (_utcnow() - timedelta(seconds=age_seconds)).isoformat()
+        ctx["runner_pull_skip"] = {
+            "code": "no_eligible_account",
+            "reason": "all accounts at cap",
+            "at": stamped,
+            "first_at": stamped,
+            "count": count,
+        }
+        task.context = ctx
+        return task
+
+    @pytest.mark.asyncio
+    async def test_repeated_skips_raise_operator_alert(
+        self, client: AsyncClient, db_session
+    ):
+        """A skip counter with NO consumer re-creates the P0 one row further down.
+
+        Nothing unpins, fails or reaps a permanently-unroutable pinned task — the
+        head is reaper-exempt and no sweep clears it. So a bounded candidate scan
+        of N means N+1 poisoned pinned tasks starve the runner exactly as before,
+        SILENTLY. /decline-task already escalates at 3; the pull skip must too.
+        """
+        from app.models import Alert
+        from app.runner_pull_skip import SKIP_ALERT_THRESHOLD, SKIP_ALERT_TITLE
+
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        # One short of the alert threshold: this poll's skip crosses it.
+        poisoned = self._with_skip_marker(
+            self._pinned(project.id, runner.id), count=SKIP_ALERT_THRESHOLD - 1
+        )
+        db_session.add(poisoned)
+        await db_session.commit()
+
+        async def _no_account(**kwargs):
+            kwargs["failure_reasons"].append("anthropic/opus: all accounts at cap")
+            return None
+
+        with patch(
+            "app.shared_state.runtime_config",
+            new={"provider_selection_mode": "exclusive"},
+        ), patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new=AsyncMock(side_effect=_no_account),
+        ):
+            resp = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        assert resp.status_code == 503
+
+        await db_session.refresh(poisoned)
+        assert poisoned.context["runner_pull_skip"]["count"] == SKIP_ALERT_THRESHOLD
+        # Below the unpin threshold, so the task is still pinned — but the operator
+        # now KNOWS, instead of the counter incrementing into the void.
+        assert poisoned.status == TaskStatus.PROVISIONING
+
+        alerts = (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.task_id == poisoned.id, Alert.title == SKIP_ALERT_TITLE
+                )
+            )
+        ).scalars().all()
+        assert len(alerts) == 1, "repeated skips must escalate to an operator"
+        assert "all accounts at cap" in alerts[0].message
+
+    @pytest.mark.asyncio
+    async def test_skip_past_threshold_unpins_task_back_to_queued(
+        self, client: AsyncClient, db_session
+    ):
+        """Past the unpin threshold the task returns to QUEUED for re-dispatch.
+
+        This is what makes the poisoned set SELF-DRAINING. Without it, enough
+        permanently-unroutable pinned tasks permanently fill the candidate scan
+        window and the original head-of-line starvation returns — the scan bound
+        would only have MOVED the boundary, not removed it.
+        """
+        from app.runner_pull_skip import SKIP_UNPIN_THRESHOLD
+
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        poisoned = self._with_skip_marker(
+            self._pinned(project.id, runner.id), count=SKIP_UNPIN_THRESHOLD - 1
+        )
+        db_session.add(poisoned)
+        await db_session.commit()
+
+        async def _no_account(**kwargs):
+            kwargs["failure_reasons"].append("anthropic/opus: all accounts at cap")
+            return None
+
+        with patch(
+            "app.shared_state.runtime_config",
+            new={"provider_selection_mode": "exclusive"},
+        ), patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new=AsyncMock(side_effect=_no_account),
+        ):
+            resp = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        assert resp.status_code == 503
+
+        await db_session.refresh(poisoned)
+        # Back to QUEUED, pin cleared — the orchestrator will re-dispatch it
+        # (other hardware, or cloud), and it no longer occupies a scan slot.
+        assert poisoned.status == TaskStatus.QUEUED
+        assert poisoned.vm_instance_id is None
+        assert "runner_target_id" not in (poisoned.context or {})
+        # The marker is DROPPED, not zeroed: a zeroed marker would leave seen_at
+        # recent, so a re-pin to the same runner inside the TTL would short-circuit
+        # a task we specifically want re-resolved on arrival — and has_skip_marker
+        # would keep deprioritising it in the resolve order forever.
+        assert "runner_pull_skip" not in (poisoned.context or {})
+        # The audit trail survives in its own key, where it cannot make a drained
+        # task look "already examined".
+        assert poisoned.context["runner_pull_unpins"] == 1
+
+    @pytest.mark.asyncio
+    async def test_fresh_skip_marker_short_circuits_credential_resolution(
+        self, client: AsyncClient, db_session
+    ):
+        """A candidate proved unroutable seconds ago is NOT re-resolved.
+
+        Credential resolution does a Project roundtrip AND acquires the global
+        _max_plan_pool_lock. Re-running it for every pinned candidate on every
+        poll of every runner — which is exactly what a batch scan would do —
+        multiplies pool-lock traffic precisely during the pool-exhaustion storm
+        this endpoint exists to survive. The marker we already write is read back
+        to suppress the repeat work, and the cached WHY is still reported.
+        """
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        # Marker is FRESH (5s old, inside SKIP_RESOLVE_TTL_SECONDS=30).
+        fresh = self._with_skip_marker(
+            self._pinned(project.id, runner.id), count=1, age_seconds=5
+        )
+        db_session.add(fresh)
+        await db_session.commit()
+
+        select_mock = AsyncMock(return_value=None)
+        with patch(
+            "app.shared_state.runtime_config",
+            new={"provider_selection_mode": "exclusive"},
+        ), patch("app.max_plan_pool.select_llm_runtime_for_task", new=select_mock):
+            resp = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        assert resp.status_code == 503
+        select_mock.assert_not_awaited()  # the pool lock was never taken
+        # ...and the runner still learns WHY, from the cached marker.
+        body = resp.json()
+        assert body["skipped"][0]["code"] == "no_eligible_account"
+        assert "all accounts at cap" in body["reason"]
+
+    @pytest.mark.asyncio
+    async def test_abandoned_resolution_refunds_daily_quota_not_just_active_slot(
+        self, client: AsyncClient, db_session
+    ):
+        """A dispatch that never happened must not burn a unit of DAILY quota.
+
+        `select_max_plan_account` pre-increments BOTH `active_tasks` AND
+        `daily_task_count`, and `_account_at_cap` gates on
+        `daily_task_count >= daily_task_cap`. Releasing only the active slot leaves
+        the daily counter permanently incremented, so every credential-resolution
+        crash and every lost row-lock race silently eats the account's day. The
+        canonical peer (orchestrator_provision) passes revert_daily_task_count=True.
+        """
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        task = self._pinned(project.id, runner.id)
+        db_session.add(task)
+        await db_session.commit()
+
+        release_mock = AsyncMock()
+        with patch(
+            "app.shared_state.runtime_config",
+            new={"provider_selection_mode": "exclusive"},
+        ), patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new=AsyncMock(return_value=self._selection()),
+        ), patch(
+            # Materials-building blows up AFTER an account was selected (and thus
+            # after both counters were pre-incremented).
+            "app.compute_manifest._resolve_provider_materials",
+            new=MagicMock(side_effect=RuntimeError("boom")),
+        ), patch(
+            "app.max_plan_pool.release_max_plan_account", new=release_mock
+        ):
+            resp = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        assert resp.status_code == 503
+        release_mock.assert_awaited_once()
+        assert release_mock.await_args.kwargs.get("revert_daily_task_count") is True, (
+            "the reserved account was released without refunding daily_task_count — "
+            "a dispatch that never happened just burned a unit of daily quota"
+        )
+
+    @pytest.mark.asyncio
+    async def test_lost_row_lock_race_refunds_daily_quota(
+        self, client: AsyncClient, db_session
+    ):
+        """The OTHER release site: a candidate resolved but lost the winner row lock.
+
+        `test_abandoned_resolution_refunds_daily_quota...` only covers the exception
+        path inside _resolve_pool_credentials_for_dispatch. This covers
+        _release_dispatch_account — the lost-race refund — which stayed green when
+        its kwarg was reverted, i.e. it was untested and a refactor could drop it
+        silently. Both counters are pre-incremented by the selector, so a dispatch
+        that never happened must refund BOTH.
+
+        The race is forced deterministically: the account selection itself marks the
+        task dispatched (as a concurrent poll would), so the winner re-lock — which
+        re-checks `started_at IS NULL` — finds nothing.
+        """
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        task = self._pinned(project.id, runner.id)
+        db_session.add(task)
+        await db_session.commit()
+
+        async def _select_and_steal(**kwargs):
+            # A concurrent poll wins the row between our unlocked read and our
+            # re-lock: started_at is set, so the claim guard excludes it.
+            kwargs["task"].started_at = _utcnow()
+            return self._selection()
+
+        release_mock = AsyncMock()
+        with patch(
+            "app.shared_state.runtime_config",
+            new={"provider_selection_mode": "exclusive"},
+        ), patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new=AsyncMock(side_effect=_select_and_steal),
+        ), patch(
+            "app.max_plan_pool.release_max_plan_account", new=release_mock
+        ):
+            resp = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        # We resolved an account but never dispatched it — so it must be handed back.
+        assert resp.status_code == 503
+        release_mock.assert_awaited_once()
+        assert release_mock.await_args.kwargs.get("revert_daily_task_count") is True, (
+            "a candidate that lost the winner row-lock race released its active "
+            "slot but NOT its daily_task_count — every lost race permanently burns "
+            "a unit of the account's daily quota"
+        )
+
+    @pytest.mark.asyncio
+    async def test_successful_dispatch_clears_the_skip_marker(
+        self, client: AsyncClient, db_session
+    ):
+        """The marker must not outlive its episode.
+
+        Left in place it is immortal: `count` persists in task.context across
+        SEPARATE episodes, so a task that hits a transient cooldown on five
+        different occasions — days apart, each recovering on its own — accumulates
+        count=5 and is eventually UNPINNED for no reason. `has_skip_marker` would
+        also stay True forever, permanently deprioritising a healthy task.
+        """
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        # Carries a stale marker from an earlier cooldown that has since lifted.
+        task = self._with_skip_marker(
+            self._pinned(project.id, runner.id), count=2, age_seconds=600
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        with patch(
+            "app.shared_state.runtime_config",
+            new={"provider_selection_mode": "exclusive"},
+        ), patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new=AsyncMock(return_value=self._selection()),
+        ):
+            resp = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        assert resp.status_code == 200
+        await db_session.refresh(task)
+        assert "runner_pull_skip" not in (task.context or {}), (
+            "the skip marker survived a successful dispatch — its count will carry "
+            "into unrelated future episodes and eventually unpin a healthy task"
+        )
+
+    @pytest.mark.asyncio
+    async def test_skip_marker_from_another_runner_is_not_trusted(
+        self, client: AsyncClient, db_session
+    ):
+        """Routability is RUNNER-dependent, so a marker is only valid for its author.
+
+        `runner_available_clis` feeds select_llm_runtime_for_task, so runner A's
+        "unroutable" says nothing about runner B. A task unpinned from A and
+        re-pinned to B carries A's marker — and if B trusted it, B would
+        short-circuit (and refuse to run) a task it is perfectly capable of running.
+        """
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        # A FRESH marker (well inside the TTL) — but written by a different runner.
+        task = self._pinned(project.id, runner.id)
+        ctx = dict(task.context or {})
+        ctx["runner_pull_skip"] = {
+            "code": "no_eligible_account",
+            "reason": "runner A has no CLI for this provider",
+            "runner_id": str(uuid.uuid4()),  # NOT this runner
+            "seen_at": _utcnow().isoformat(),
+            "at": _utcnow().isoformat(),
+            "first_at": _utcnow().isoformat(),
+            "count": 1,
+        }
+        task.context = ctx
+        db_session.add(task)
+        await db_session.commit()
+
+        select_mock = AsyncMock(return_value=self._selection())
+        with patch(
+            "app.shared_state.runtime_config",
+            new={"provider_selection_mode": "exclusive"},
+        ), patch("app.max_plan_pool.select_llm_runtime_for_task", new=select_mock):
+            resp = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        # This runner must resolve for ITSELF, not inherit the other runner's verdict.
+        select_mock.assert_awaited_once()
+        assert resp.status_code == 200
+        assert resp.json()["task_id"] == str(task.id)
+
+    @pytest.mark.asyncio
+    async def test_second_poll_short_circuits_a_task_it_just_resolved(
+        self, client: AsyncClient, db_session
+    ):
+        """Two REAL polls: the second must not re-resolve what the first proved bad.
+
+        This is the load-bearing claim of the whole batch scan — "an examined-and-
+        failed candidate carries a fresh marker, so the next poll short-circuits it
+        and spends its budget further down the list". If it is false, the resolve
+        budget is consumed re-proving the same head candidates forever and the P0 is
+        merely re-bounded from 1 to `resolve_attempts`, not removed.
+
+        The state that breaks it is the THROTTLED re-stamp: `stamp_skip_reason` only
+        writes its timestamp when it also increments `count` (once per 300s), but
+        freshness is judged against that same timestamp on a 30s TTL — and the runner
+        backs its poll interval off to exactly 30s on every 503. So the marker is
+        stale at exactly the poll cadence and the short-circuit never fires. A test
+        that hand-writes a 5s-old marker cannot see this: that state only exists in
+        the 30s after a restamp.
+
+        Setup reproduces it: BOTH tasks already carry a marker OLDER than the resolve
+        TTL but YOUNGER than the restamp window, so the next stamp takes the
+        THROTTLED path (the one that never refreshed the timestamp). T2's model has
+        since recovered, so it is routable now. Budget is 1, so if poll 2 wastes it
+        re-resolving T1, the routable T2 is never examined and the runner starves.
+        """
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        base = _utcnow() - timedelta(minutes=10)
+        # T1: still unroutable; skipped 100s ago (> TTL=90, < restamp=300).
+        t1 = self._with_skip_marker(
+            self._pinned(project.id, runner.id, created_at=base),
+            count=1,
+            age_seconds=100,
+        )
+        # T2: skipped at the same time, but its model has since recovered — it is
+        # routable now. Same stale-marker class as T1, so ordering between them is
+        # by priority/created_at, not by examined-vs-unexamined.
+        t2 = self._with_skip_marker(
+            self._pinned(
+                project.id, runner.id, created_at=base + timedelta(seconds=1)
+            ),
+            count=1,
+            age_seconds=100,
+        )
+        db_session.add_all([t1, t2])
+        await db_session.commit()
+
+        resolved_ids: list[str] = []
+
+        async def _select(**kwargs):
+            resolved_ids.append(str(kwargs["task"].id))
+            if kwargs["task"].id == t1.id:
+                kwargs["failure_reasons"].append("anthropic/opus: all accounts at cap")
+                return None
+            return self._selection()
+
+        cfg = {
+            "provider_selection_mode": "exclusive",
+            "runner_next_task_resolve_attempts": 1,  # one resolution per poll
+        }
+
+        with patch("app.shared_state.runtime_config", new=cfg), patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new=AsyncMock(side_effect=_select),
+        ):
+            first = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            # Poll 1 spends its single attempt on T1, fails, and marks it.
+            assert first.status_code == 503
+            assert resolved_ids == [str(t1.id)]
+
+            second = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        # Poll 2 MUST short-circuit T1 on its fresh marker and spend its budget on
+        # T2 — which is routable, so the runner finally gets work. If T1 is
+        # re-resolved instead, T2 is never examined and the runner starves.
+        assert str(t1.id) not in resolved_ids[1:], (
+            "poll 2 re-resolved a task poll 1 had just proved unroutable — the "
+            "skip short-circuit is dead and the resolve budget is being burned "
+            "re-proving the same head candidates"
+        )
+        assert second.status_code == 200
+        assert second.json()["task_id"] == str(t2.id)
+
+    @pytest.mark.asyncio
+    async def test_unexamined_candidates_win_the_budget_over_stale_reprobes(
+        self, client: AsyncClient, db_session
+    ):
+        """The scan window must SLIDE, not oscillate over the head.
+
+        Even with freshness fixed, markers expire (TTL). If an expired head
+        candidate outranks a never-examined one for the resolve budget, the poll
+        cycles re-probing T1..T3 and never reaches the routable task deeper in the
+        scan — starvation returns, just at a larger bound. So a candidate with NO
+        marker (never examined) takes the budget before a candidate whose marker
+        merely went stale.
+        """
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        base = _utcnow() - timedelta(minutes=10)
+        # Two already-examined-but-STALE unroutable heads (marker older than TTL).
+        stale = [
+            self._with_skip_marker(
+                self._pinned(
+                    project.id, runner.id, created_at=base + timedelta(seconds=i)
+                ),
+                count=1,
+                age_seconds=600,
+            )
+            for i in range(2)
+        ]
+        # A never-examined routable task behind them.
+        fresh_routable = self._pinned(
+            project.id, runner.id, created_at=base + timedelta(seconds=10)
+        )
+        db_session.add_all([*stale, fresh_routable])
+        await db_session.commit()
+
+        stale_ids = {str(s.id) for s in stale}
+
+        async def _select(**kwargs):
+            if str(kwargs["task"].id) in stale_ids:
+                kwargs["failure_reasons"].append("anthropic/opus: all accounts at cap")
+                return None
+            return self._selection()
+
+        cfg = {
+            "provider_selection_mode": "exclusive",
+            "runner_next_task_resolve_attempts": 1,  # budget of ONE
+        }
+        with patch("app.shared_state.runtime_config", new=cfg), patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new=AsyncMock(side_effect=_select),
+        ):
+            resp = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        # The single attempt went to the NEVER-EXAMINED task, not to re-proving a
+        # stale head — so the runner dispatches instead of starving.
+        assert resp.status_code == 200
+        assert resp.json()["task_id"] == str(fresh_routable.id)
+
+    @pytest.mark.asyncio
+    async def test_undatable_marker_never_500s_the_dispatch_endpoint(
+        self, client: AsyncClient, db_session
+    ):
+        """A marker with no parseable `seen_at` must SORT FIRST, not crash the poll.
+
+        `skip_seen_at` is used directly as a `sorted()` key over the stale group. If
+        its "cannot date this marker" sentinel is tz-AWARE while every real marker
+        parses NAIVE (`_utcnow()` / TIMESTAMP WITHOUT TIME ZONE), then the moment one
+        undatable marker shares the stale group with one datable marker:
+
+            TypeError: can't compare offset-naive and offset-aware datetimes
+
+        — an unhandled 500 on the pull fleet's dispatch endpoint, which is NOT the
+        503 the runner knows how to back off from.
+
+        The state is explicitly legal: `skip_marker_is_fresh` falls back to `at` for
+        markers predating `seen_at`, the helper below writes exactly that shape, and
+        operators hand-PATCH `task.context` during the very incidents this endpoint
+        exists to survive. It only bites at scale — the undatable marker must survive
+        long enough to MEET a stale datable one, which needs more never-examined
+        candidates ahead of it than the resolve budget clears. So: the default scan.
+        """
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        base = _utcnow() - timedelta(minutes=30)
+        # One UNDATABLE marker (no `seen_at`, and an `at` that will not parse)...
+        undatable = self._pinned(project.id, runner.id, created_at=base)
+        undatable.context = {
+            **(undatable.context or {}),
+            "runner_pull_skip": {
+                "code": "no_eligible_account",
+                "reason": "hand-patched by an operator mid-incident",
+                "at": "not-a-timestamp",
+                "count": 1,
+            },
+        }
+        db_session.add(undatable)
+        # ...alongside enough datable candidates that the two must meet in the
+        # stale group (more than the ~9 the resolve budget clears per rotation).
+        for i in range(1, 25):
+            db_session.add(
+                self._pinned(
+                    project.id, runner.id, created_at=base + timedelta(seconds=i)
+                )
+            )
+        await db_session.commit()
+
+        async def _no_account(**kwargs):
+            kwargs["failure_reasons"].append("anthropic/opus: all accounts at cap")
+            return None
+
+        clock = {"t": _utcnow()}
+
+        def _now():
+            return clock["t"]
+
+        with patch(
+            "app.shared_state.runtime_config",
+            new={"provider_selection_mode": "exclusive"},  # DEFAULT scan/attempts
+        ), patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new=AsyncMock(side_effect=_no_account),
+        ), patch("app.routers.runner._utcnow", new=_now), patch(
+            "app.runner_pull_skip._utcnow", new=_now
+        ):
+            for _poll in range(8):
+                clock["t"] = clock["t"] + timedelta(seconds=30)
+                resp = await client.post(
+                    "/api/runner/next-task",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                assert resp.status_code == 503, (
+                    f"/next-task returned {resp.status_code}, not 503 — an undatable "
+                    "skip marker crashed the sort. A 500 is not something the runner "
+                    "can back off from; this takes the pull fleet down."
+                )
+
+    @pytest.mark.asyncio
+    async def test_steady_state_rotation_never_freezes_a_candidate(
+        self, client: AsyncClient, db_session
+    ):
+        """STEADY STATE, many polls: no candidate may be examined once and abandoned.
+
+        Unexamined-first fixes the initial SLIDE. But once every candidate carries a
+        marker, the stale group IS the whole list — and if that group is drained in
+        PRIORITY order it resonates with the TTL: exactly `attempts` markers come due
+        per poll, so the rotation locks onto the first `attempts * TTL/poll` = 9
+        candidates forever. Candidates 10+ are examined ONCE and frozen:
+
+          * never re-probed  => if one becomes routable it is NEVER dispatched;
+          * `count` frozen at 1 => never reaches the alert (3) or unpin (5) threshold
+            => never alerts, never drains, holds a candidate slot permanently.
+
+        That is verbatim the failure the escalation exists to close: N is bounded by
+        the scan (25), but the EFFECTIVE N would be 9. A 3-candidate single-poll test
+        only ever exercises the slide phase and cannot see this — so this one runs the
+        real endpoint over many polls at the runner's real 30s backoff cadence, on a
+        virtual clock, and asserts that every candidate keeps making progress.
+        """
+        from app.runner_pull_skip import skip_count
+
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        base = _utcnow() - timedelta(minutes=30)
+        tasks = [
+            self._pinned(
+                project.id, runner.id, created_at=base + timedelta(seconds=i)
+            )
+            for i in range(16)  # > the 9-candidate resonance bound
+        ]
+        db_session.add_all(tasks)
+        await db_session.commit()
+        task_ids = [t.id for t in tasks]
+
+        async def _no_account(**kwargs):
+            kwargs["failure_reasons"].append("anthropic/opus: all accounts at cap")
+            return None
+
+        cfg = {
+            "provider_selection_mode": "exclusive",
+            "runner_next_task_resolve_attempts": 3,
+            "runner_next_task_candidate_scan": 25,
+        }
+
+        # Virtual clock: the runner backs off to 30s on every 503, so that is the
+        # real steady-state cadence. 24 polls = 720s, long enough for the escalation
+        # clock (300s) to advance every candidate that is actually being re-probed,
+        # and short enough that nothing reaches the unpin threshold (5) yet.
+        clock = {"t": _utcnow()}
+
+        def _now():
+            return clock["t"]
+
+        with patch("app.shared_state.runtime_config", new=cfg), patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new=AsyncMock(side_effect=_no_account),
+        ), patch("app.routers.runner._utcnow", new=_now), patch(
+            "app.runner_pull_skip._utcnow", new=_now
+        ):
+            for poll in range(24):
+                clock["t"] = clock["t"] + timedelta(seconds=30)
+                resp = await client.post(
+                    "/api/runner/next-task",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                assert resp.status_code == 503
+
+        # Every candidate must still be making progress: re-probed often enough that
+        # its escalation counter advanced past the first sighting. A candidate stuck
+        # at count==1 after 24 polls was examined once and abandoned — it will never
+        # dispatch, never alert, and never drain.
+        frozen = []
+        for tid in task_ids:
+            row = (
+                await db_session.execute(select(Task).where(Task.id == tid))
+            ).scalars().first()
+            await db_session.refresh(row)
+            if row.status == TaskStatus.PROVISIONING and skip_count(row) <= 1:
+                frozen.append(str(tid))
+
+        assert not frozen, (
+            f"{len(frozen)} of {len(task_ids)} candidates were examined once and "
+            f"then FROZEN — never re-probed, never escalated, never drained. The "
+            f"stale-group rotation is resonating with the TTL and has locked onto "
+            f"the head of the list: {frozen}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_resolution_attempts_are_capped_per_poll(
+        self, client: AsyncClient, db_session
+    ):
+        """One poll runs at most `runner_next_task_resolve_attempts` resolutions.
+
+        The batch scan must not turn one poll into N credential resolutions (N
+        global-pool-lock acquisitions). The budget is spent, the examined
+        candidates get fresh skip markers, and the NEXT poll's budget slides down
+        the list — so work stays bounded without head-of-line blocking returning.
+        """
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        base = _utcnow() - timedelta(minutes=10)
+        for i in range(6):
+            db_session.add(
+                self._pinned(
+                    project.id, runner.id, created_at=base + timedelta(seconds=i)
+                )
+            )
+        await db_session.commit()
+
+        async def _no_account(**kwargs):
+            kwargs["failure_reasons"].append("anthropic/opus: all accounts at cap")
+            return None
+
+        select_mock = AsyncMock(side_effect=_no_account)
+        with patch(
+            "app.shared_state.runtime_config",
+            new={
+                "provider_selection_mode": "exclusive",
+                "runner_next_task_resolve_attempts": 2,
+            },
+        ), patch("app.max_plan_pool.select_llm_runtime_for_task", new=select_mock):
+            resp = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        assert resp.status_code == 503
+        # 6 candidates pinned, but only the configured budget was resolved.
+        assert select_mock.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_decline_records_reason_and_counter(
+        self, client: AsyncClient, db_session
+    ):
+        """A decline must be RECORDED (reason + per-runner counter), not just logged.
+
+        Without a record the dispatcher has nothing to exclude on, and since
+        `_select_eligible_runner`'s tiebreak (`r.id.int ^ dispatch_seed`) is stable
+        per task, it deterministically re-picks the runner that just declined —
+        pin → pull → decline, forever.
+        """
+        from app.runner_decline import recently_declined_runner_ids
+
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        task = self._pinned(project.id, runner.id, started_at=_utcnow())
+        db_session.add(task)
+        await db_session.commit()
+
+        resp = await client.post(
+            "/api/runner/decline-task",
+            json={"task_id": str(task.id), "reason": "no bwrap: fail-closed"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["decline_count"] == 1
+
+        await db_session.refresh(task)
+        # Released back to QUEUED as before...
+        assert task.status == TaskStatus.QUEUED
+        assert "runner_target_id" not in (task.context or {})
+        # ...but now the WHY and WHO are persisted.
+        record = task.context["declined_by"][str(runner.id)]
+        assert record["count"] == 1
+        assert record["reason"] == "no bwrap: fail-closed"
+        assert "no bwrap" in (task.latest_status_message or "")
+
+        # And the dispatcher will now exclude this runner for THIS task.
+        assert recently_declined_runner_ids(task) == {str(runner.id)}
+
+    @pytest.mark.asyncio
+    async def test_declining_runner_not_reselected_and_escalates(
+        self, client: AsyncClient, db_session
+    ):
+        """The declining runner is excluded from re-selection for that task, and
+        crossing the decline threshold raises an operator alert carrying the reason."""
+        from app.runner_decline import (
+            DECLINE_ESCALATION_THRESHOLD,
+            recently_declined_runner_ids,
+        )
+
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        task = self._pinned(project.id, runner.id, started_at=_utcnow())
+        db_session.add(task)
+        await db_session.commit()
+
+        for i in range(DECLINE_ESCALATION_THRESHOLD):
+            # Re-pin as the dispatch loop would, then decline again. Refresh
+            # first: the endpoint commits on its own session, so our copy is
+            # stale and re-assigning the same in-memory values would emit no
+            # UPDATE at all.
+            await db_session.refresh(task)
+            task.status = TaskStatus.PROVISIONING
+            task.vm_instance_id = f"runner:{runner.id}"
+            ctx = dict(task.context or {})
+            ctx["runner_target_id"] = str(runner.id)
+            task.context = ctx
+            flag_modified(task, "context")
+            db_session.add(task)
+            await db_session.commit()
+
+            resp = await client.post(
+                "/api/runner/decline-task",
+                json={"task_id": str(task.id), "reason": "docker is read-only"},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert resp.status_code == 200
+            assert resp.json()["decline_count"] == i + 1
+
+        await db_session.refresh(task)
+
+        # 1. The declining runner is excluded, so `_select_eligible_runner` — whose
+        #    tiebreak would otherwise re-pick it every single time — returns None
+        #    rather than looping the task straight back to the same box.
+        snap = orch.RunnerDispatchSnapshot(
+            id=runner.id, project_id=project.id, capabilities={"task_types": "all"}
+        )
+        cache = {project.id: [snap]}
+        assert (
+            orch._select_eligible_runner(
+                cache,
+                project.id,
+                "create",
+                None,
+                {},
+                dispatch_seed=task.id.int,
+                declined_runner_ids=recently_declined_runner_ids(task),
+            )
+            is None
+        )
+        # Sanity: without the exclusion the SAME runner is picked right back —
+        # this is the livelock the exclusion breaks.
+        assert (
+            orch._select_eligible_runner(
+                cache, project.id, "create", None, {}, dispatch_seed=task.id.int
+            )
+            is snap
+        )
+
+        # 2. The operator is told, with the runner's own reason — not left with a
+        #    task silently cycling forever.
+        alerts = (
+            (
+                await db_session.execute(
+                    select(Alert).where(Alert.task_id == task.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(alerts) == 1  # deduplicated across repeated declines
+        assert "docker is read-only" in alerts[0].message
+
+    def test_decline_exclusion_expires_before_strategic_hold_forces_cloud(self):
+        """The exclusion window MUST be shorter than the Strategic hold timeout.
+
+        On the single-runner Strategic fleet the decliner is the ONLY
+        Strategic-capable runner, so excluding it empties the candidate set,
+        `_select_eligible_runner` returns None, `_hold_strategic_local_runner_task`
+        parks the task — and at `strategic_local_hold_timeout_seconds` (default
+        900s) `_fail_stale_local_runner_holds` clears the local-required pin and
+        FORCES CLOUD FALLBACK.
+
+        If the exclusion outlived that timeout (it was 1800s), one transient
+        decline — a Popen spawn failure — would DETERMINISTICALLY evict a Resident
+        Strategic Agent task off local execution, defeating continuous-local mode:
+        the runner could not become eligible again until 15 min after the task had
+        already been shipped to the cloud.
+        """
+        from app.runner_decline import DECLINE_EXCLUSION_SECONDS
+
+        hold_timeout = orch._strategic_local_hold_timeout_seconds()
+        assert hold_timeout == 900  # documented default; the bound below is vs this
+        assert DECLINE_EXCLUSION_SECONDS < hold_timeout, (
+            "a decline exclusion that outlives the Strategic hold timeout evicts "
+            "the Resident Strategic Agent to cloud on a single transient decline"
+        )
+
+    def test_strategic_decline_exclusion_waived_rather_than_emptying_pool(self):
+        """A transient decline must not cost a Strategic task its local execution.
+
+        For a NORMAL task, emptying the candidate set is the graceful exit — the
+        task falls through to cloud dispatch. For a local-required Strategic task
+        it is not: an empty set parks the task and the 900s sweep evicts it to
+        cloud. So while the declines still look transient we re-pick the decliner
+        instead of emptying the pool — but ONLY while they look transient, and
+        ONLY when no other hardware exists.
+        """
+        from app.runner_decline import (
+            DECLINE_ESCALATION_THRESHOLD,
+            decline_exclusion_is_advisory,
+        )
+
+        project_id = uuid.uuid4()
+        runner_id = uuid.uuid4()
+        snap = orch.RunnerDispatchSnapshot(
+            id=runner_id, project_id=project_id, capabilities={"task_types": "all"}
+        )
+        cache = {project_id: [snap]}
+        seed = uuid.uuid4().int
+
+        def _task_with_declines(n: int) -> Task:
+            at = _utcnow().isoformat()
+            return Task(
+                project_id=project_id,
+                payloads=[{"type": "design_doc_update"}],  # a STRATEGIC task type
+                status=TaskStatus.QUEUED,
+                context={
+                    "declined_by": {
+                        str(runner_id): {"count": n, "at": at, "reason": "spawn failed"}
+                    }
+                },
+            )
+
+        # 1. ONE transient decline on a single-runner Strategic fleet: excluding
+        #    the decliner would empty the pool, so the waiver keeps it. The task
+        #    retries locally instead of being handed to the cloud.
+        transient = _task_with_declines(1)
+        assert decline_exclusion_is_advisory(transient, "design_doc_update") is True
+        assert (
+            orch._select_eligible_runner(
+                cache,
+                project_id,
+                "design_doc_update",
+                None,
+                {},
+                dispatch_seed=seed,
+                declined_runner_ids={str(runner_id)},
+                declined_exclusion_advisory=True,
+            )
+            is snap
+        )
+
+        # 2. Past the escalation threshold the decline is clearly NOT transient:
+        #    the waiver stops, the pool empties, and the ordinary hold →
+        #    cloud-fallback safety valve runs. Without this bound a persistently
+        #    incapable single-runner fleet would livelock forever.
+        persistent = _task_with_declines(DECLINE_ESCALATION_THRESHOLD)
+        assert decline_exclusion_is_advisory(persistent, "design_doc_update") is False
+        assert (
+            orch._select_eligible_runner(
+                cache,
+                project_id,
+                "design_doc_update",
+                None,
+                {},
+                dispatch_seed=seed,
+                declined_runner_ids={str(runner_id)},
+                declined_exclusion_advisory=False,
+            )
+            is None
+        )
+
+        # 3. A NON-Strategic task never gets the waiver — emptying the pool is the
+        #    correct outcome there (it falls through to cloud dispatch).
+        normal = _task_with_declines(1)
+        normal.payloads = [{"type": "create"}]
+        assert decline_exclusion_is_advisory(normal, "create") is False
+
+    def test_strategic_waiver_survives_an_ineligible_second_runner(self):
+        """The waiver must key on ELIGIBILITY, not on a runner ROW merely existing.
+
+        This is the LIVE Blueprint topology: a Strategic-capable laptop plus dgx-1,
+        which does NOT accept `design_doc_update`. If the waiver asks "did any other
+        candidate row survive the exclusion?", dgx-1 answers yes — so the exclusion
+        is applied, dgx-1 then falls out on the task-type gate, `eligible` is empty,
+        and the Resident Strategic Agent is parked and evicted to cloud by the 900s
+        hold sweep on ONE transient decline. Precisely the eviction the waiver was
+        written to prevent, defeated by a runner that could never have run the task.
+
+        A single-runner cache cannot see this bug; it needs a second runner that
+        exists but is incapable.
+        """
+        project_id = uuid.uuid4()
+        laptop = uuid.uuid4()
+        dgx = uuid.uuid4()
+        cache = {
+            project_id: [
+                orch.RunnerDispatchSnapshot(
+                    id=laptop,
+                    project_id=project_id,
+                    capabilities={"task_types": "all"},
+                ),
+                # Real dgx-1 shape: a compute box that does not take Strategic work.
+                orch.RunnerDispatchSnapshot(
+                    id=dgx,
+                    project_id=project_id,
+                    capabilities={"task_types": ["compute_experiment"]},
+                ),
+            ]
+        }
+        chosen = orch._select_eligible_runner(
+            cache,
+            project_id,
+            "design_doc_update",
+            None,
+            {},
+            dispatch_seed=uuid.uuid4().int,
+            declined_runner_ids={str(laptop)},
+            declined_exclusion_advisory=True,
+        )
+        assert chosen is not None, (
+            "the Strategic task was handed to nobody because an INELIGIBLE runner "
+            "row 'survived' the exclusion — it will now be evicted to cloud"
+        )
+        assert chosen.id == laptop
+
+    def test_strategic_waiver_survives_a_busy_second_runner(self):
+        """Same defect, other flavour: the second runner is capable but AT CAPACITY.
+
+        A merely BUSY runner must not make the exclusion bite either — it cannot
+        take the task this cycle, so the Strategic task would again be parked and
+        evicted rather than retried on the (recovered) decliner.
+        """
+        project_id = uuid.uuid4()
+        laptop = uuid.uuid4()
+        busy = uuid.uuid4()
+        cache = {
+            project_id: [
+                orch.RunnerDispatchSnapshot(
+                    id=laptop,
+                    project_id=project_id,
+                    capabilities={"task_types": "all"},
+                ),
+                orch.RunnerDispatchSnapshot(
+                    id=busy,
+                    project_id=project_id,
+                    capabilities={
+                        "task_types": "all",
+                        "max_concurrent": 1,
+                        # Authoritative per-cycle load (see _runner_active_task_count).
+                        "_active_agent_task_count": 1,
+                    },
+                ),
+            ]
+        }
+        chosen = orch._select_eligible_runner(
+            cache,
+            project_id,
+            "design_doc_update",
+            None,
+            {},
+            dispatch_seed=uuid.uuid4().int,
+            declined_runner_ids={str(laptop)},
+            declined_exclusion_advisory=True,
+        )
+        assert chosen is not None
+        assert chosen.id == laptop
+
+    def test_strategic_waiver_never_overrides_available_other_hardware(self):
+        """The waiver applies ONLY when the exclusion would empty the pool.
+
+        Whenever other hardware exists the decline exclusion is honoured
+        unconditionally — the whole point is to move the task OFF the box that
+        just said no.
+        """
+        project_id = uuid.uuid4()
+        decliner = uuid.uuid4()
+        healthy = uuid.uuid4()
+        cache = {
+            project_id: [
+                orch.RunnerDispatchSnapshot(
+                    id=decliner,
+                    project_id=project_id,
+                    capabilities={"task_types": "all"},
+                ),
+                orch.RunnerDispatchSnapshot(
+                    id=healthy,
+                    project_id=project_id,
+                    capabilities={"task_types": "all"},
+                ),
+            ]
+        }
+        chosen = orch._select_eligible_runner(
+            cache,
+            project_id,
+            "design_doc_update",
+            None,
+            {},
+            dispatch_seed=uuid.uuid4().int,
+            declined_runner_ids={str(decliner)},
+            declined_exclusion_advisory=True,  # advisory, but the set is NOT empty
+        )
+        assert chosen is not None
+        assert chosen.id == healthy
 
     @pytest.mark.asyncio
     async def test_decline_task_releases_back_to_queued(
@@ -1412,7 +3494,11 @@ class TestRunnerEndpoints:
             headers={"Authorization": f"Bearer {t1}"},
         )
         assert resp.status_code == 200
-        assert resp.json() == {"ok": True}
+        # ok:True as before; decline_count is an additive field (see the decline
+        # bookkeeping that breaks the pin -> pull -> decline livelock).
+        body = resp.json()
+        assert body["ok"] is True
+        assert body["decline_count"] == 1
 
         await db_session.refresh(task1)
         assert task1.status == TaskStatus.QUEUED
@@ -1597,6 +3683,151 @@ class TestRunnerEndpoints:
         assert "isolation_backends" not in runner.capabilities
         assert "agent_backend" not in runner.capabilities
         assert "compute_backend" not in runner.capabilities
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_persists_llm_clis(
+        self, client: AsyncClient, db_session
+    ):
+        """The heartbeat handler persists llm_clis in capabilities JSONB."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        llm_clis = {
+            "claude": {"present": True, "version": "0.2.0"},
+            "codex": {"present": False, "version": ""},
+            "gemini": {"present": False, "version": ""},
+        }
+        resp = await client.post(
+            "/api/runner/heartbeat",
+            json={
+                "llm_clis": llm_clis,
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        await db_session.refresh(runner)
+        assert runner.capabilities["llm_clis"] == llm_clis
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_tolerates_missing_llm_clis(
+        self, client: AsyncClient, db_session
+    ):
+        """An old runner that doesn't send llm_clis must not cause a heartbeat
+        failure (backward compatibility)."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        resp = await client.post(
+            "/api/runner/heartbeat",
+            json={"active_task_ids": []},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        await db_session.refresh(runner)
+        assert "llm_clis" not in runner.capabilities
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_persists_gpu_memory_and_cli_inventory(
+        self, client: AsyncClient, db_session
+    ):
+        """Per-GPU VRAM lists + flat cli_inventory persist into capabilities.
+
+        gpu_memory_total_mib is the key experiment_authoring_context's
+        build_runner_device consumes for the devices block — the names must
+        match exactly.
+        """
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        resp = await client.post(
+            "/api/runner/heartbeat",
+            json={
+                "gpu_memory_total_mib": [16384, 16384],
+                "gpu_memory_free_mib": [15021, 830],
+                "cli_inventory": {"claude": "2.1.0", "codex": None, "gemini": ""},
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        await db_session.refresh(runner)
+        assert runner.capabilities["gpu_memory_total_mib"] == [16384, 16384]
+        assert runner.capabilities["gpu_memory_free_mib"] == [15021, 830]
+        assert runner.capabilities["cli_inventory"] == {
+            "claude": "2.1.0",
+            "codex": None,
+            "gemini": "",
+        }
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_tolerates_missing_gpu_memory_and_cli_inventory(
+        self, client: AsyncClient, db_session
+    ):
+        """Old runners omit the VRAM/CLI fields — heartbeat succeeds and the
+        capability keys stay absent (never 0/empty, which would read as data)."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        resp = await client.post(
+            "/api/runner/heartbeat",
+            json={"active_task_ids": []},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        await db_session.refresh(runner)
+        assert "gpu_memory_total_mib" not in runner.capabilities
+        assert "gpu_memory_free_mib" not in runner.capabilities
+        assert "cli_inventory" not in runner.capabilities
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_bounds_gpu_memory_and_cli_inventory(
+        self, client: AsyncClient, db_session
+    ):
+        """Garbage-emitting runner: VRAM lists are length-capped and clamped
+        non-negative; cli_inventory drops non-string names/versions and is
+        entry-capped. Heartbeat still succeeds (no 500 on garbage)."""
+        from app.routers.runner import (
+            _MAX_CLI_INVENTORY_ENTRIES,
+            _MAX_GPU_LIST_ENTRIES,
+        )
+
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        resp = await client.post(
+            "/api/runner/heartbeat",
+            json={
+                "gpu_memory_total_mib": [-5] + [16384] * (_MAX_GPU_LIST_ENTRIES + 20),
+                "gpu_memory_free_mib": [1024],
+                "cli_inventory": {
+                    **{f"cli{i}": "1.0" for i in range(_MAX_CLI_INVENTORY_ENTRIES + 10)},
+                    "bad_version": 42,
+                    "": "unnamed",
+                },
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        await db_session.refresh(runner)
+        totals = runner.capabilities["gpu_memory_total_mib"]
+        assert len(totals) == _MAX_GPU_LIST_ENTRIES
+        assert totals[0] == 0  # negative clamped, not preserved
+        inventory = runner.capabilities["cli_inventory"]
+        assert len(inventory) <= _MAX_CLI_INVENTORY_ENTRIES
+        assert "bad_version" not in inventory  # non-str version dropped
+        assert "" not in inventory  # unnamed CLI dropped
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_clamps_absurd_gpu_memory_to_upper_bound(
+        self, client: AsyncClient, db_session
+    ):
+        """An absurd runner-reported VRAM integer is clamped to the 4 TiB
+        upper bound (_MAX_GPU_MEMORY_MIB) so it can never reach authoring
+        context / agent prompts, while plausible values pass through."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        resp = await client.post(
+            "/api/runner/heartbeat",
+            json={"gpu_memory_total_mib": [10**15]},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        await db_session.refresh(runner)
+        assert runner.capabilities["gpu_memory_total_mib"] == [4_194_304]
 
     @pytest.mark.asyncio
     async def test_heartbeat_tolerates_missing_trust_telemetry(
@@ -2561,6 +4792,161 @@ class TestArtifactUploadEndpoint:
         )
         assert resp.status_code == 404
 
+    # ── Terminal-status guard ────────────────────────────────────────────────
+    #
+    # _COMPUTE_JOB_TERMINAL_STATUSES promises that runner reports/uploads can no
+    # longer mutate a finalized job's evidence. /report enforced it; the artifact
+    # upload did not — so a pinned runner could POST to a SUCCEEDED/FAILED job and
+    # overwrite the durable GCS bundle a verdict had already been drawn from
+    # (store_runner_artifact writes a FIXED per-job object path).
+
+    @pytest.mark.parametrize(
+        "terminal_status",
+        [
+            ComputeJobStatus.SUCCEEDED,
+            ComputeJobStatus.FAILED,
+            ComputeJobStatus.CANCELLED,
+            ComputeJobStatus.TIMED_OUT,
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_upload_cannot_overwrite_finalized_job_artifact(
+        self, client: AsyncClient, db_session, monkeypatch, terminal_status
+    ):
+        """A second upload to a FINALIZED job is refused — evidence is immutable."""
+        project, runner, token, job = await self._make_runner_job(db_session)
+
+        # The job is finalized AND already carries its durable evidence.
+        original = {
+            "kind": "runner_artifact",
+            "uri": "gs://bucket/compute-jobs/x/artifacts/bundle.tar.gz",
+            "file_count": 7,
+            "total_bytes": 999,
+            "stored": True,
+        }
+        job.status = terminal_status
+        job.polling_metadata = {
+            **(job.polling_metadata or {}),
+            "runner_artifact": original,
+        }
+        db_session.add(job)
+        await db_session.commit()
+
+        async def fake_store(*a, **k):
+            raise AssertionError(
+                "store_runner_artifact must NOT run for a finalized job — "
+                "it would overwrite the durable GCS object"
+            )
+
+        monkeypatch.setattr(
+            compute_backends_mod, "store_runner_artifact", fake_store, raising=False
+        )
+
+        body, content_type = _build_multipart(b"\x1f\x8b\x08OVERWRITE", 1, 42)
+        resp = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact",
+            content=body,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": content_type,
+            },
+        )
+
+        assert resp.status_code == 409, resp.text
+
+        # The stamped evidence is untouched.
+        await db_session.refresh(job)
+        assert job.polling_metadata["runner_artifact"] == original
+
+    @pytest.mark.asyncio
+    async def test_first_upload_after_finalize_is_still_accepted(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """A terminal job with NO artifact yet still accepts its FIRST upload.
+
+        This is the normal race, not an attack: the runner sends its terminal
+        /report FIRST and uploads the artifact afterwards (local_runner.py does it
+        in a `finally:` block), while the monitor finalizes the job as soon as it
+        sees runner_exec_status=succeeded. Rejecting this would silently destroy
+        the artifacts of every job whose upload lost that race — so the guard must
+        bite on OVERWRITE, not on "terminal".
+        """
+        project, runner, token, job = await self._make_runner_job(db_session)
+        job.status = ComputeJobStatus.SUCCEEDED  # finalized, no artifact stamped
+        db_session.add(job)
+        await db_session.commit()
+
+        async def fake_store(session, j, archive_bytes, file_count, total_bytes):
+            return {
+                "kind": "runner_artifact",
+                "uri": "gs://bucket/compute-jobs/x/artifacts/bundle.tar.gz",
+                "file_count": file_count,
+                "total_bytes": total_bytes,
+                "stored": True,
+            }
+
+        monkeypatch.setattr(
+            compute_backends_mod, "store_runner_artifact", fake_store, raising=False
+        )
+
+        body, content_type = _build_multipart(b"\x1f\x8b\x08gz", 3, 77)
+        resp = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact",
+            content=body,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": content_type,
+            },
+        )
+
+        assert resp.status_code == 200, resp.text
+        await db_session.refresh(job)
+        assert job.polling_metadata["runner_artifact"]["file_count"] == 3
+
+    @pytest.mark.asyncio
+    async def test_upload_to_running_job_can_still_be_replaced(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """A NON-terminal job's artifact is still replaceable (retry after a blip).
+
+        The runner retries a dropped upload; the job is still RUNNING server-side,
+        so re-stamping must remain allowed. The guard is scoped to finalized jobs.
+        """
+        project, runner, token, job = await self._make_runner_job(db_session)
+        job.polling_metadata = {
+            **(job.polling_metadata or {}),
+            "runner_artifact": {"kind": "runner_artifact", "file_count": 1},
+        }
+        db_session.add(job)
+        await db_session.commit()
+
+        async def fake_store(session, j, archive_bytes, file_count, total_bytes):
+            return {
+                "kind": "runner_artifact",
+                "uri": "gs://bucket/x/bundle.tar.gz",
+                "file_count": file_count,
+                "total_bytes": total_bytes,
+                "stored": True,
+            }
+
+        monkeypatch.setattr(
+            compute_backends_mod, "store_runner_artifact", fake_store, raising=False
+        )
+
+        body, content_type = _build_multipart(b"\x1f\x8b\x08gz", 5, 88)
+        resp = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact",
+            content=body,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": content_type,
+            },
+        )
+
+        assert resp.status_code == 200, resp.text
+        await db_session.refresh(job)
+        assert job.polling_metadata["runner_artifact"]["file_count"] == 5
+
 
 # ── Orchestrator routing helpers ─────────────────────────────────────────────
 
@@ -2608,9 +4994,11 @@ class TestOrchestratorRunnerRouting:
         cache = await orch._load_active_runners_cache(db_session)
         assert {r.id for r in cache.get(project_id, [])} == {runner_id}
 
-        # Rollback does this in the live dispatch loop; expire_all reproduces the
+        # Rollback does this in the live dispatch loop; expunge_all reproduces the
         # same hazard without forcing an unrelated DB error in the test.
-        db_session.expire_all()
+        # (expire_all() is a no-op on SQLite because InstanceState._expire is
+        # globally patched in conftest.py; expunge_all() detaches without _expire.)
+        db_session.expunge_all()
 
         task = Task(
             project_id=project_id,
@@ -2825,6 +5213,9 @@ class TestOrchestratorRunnerRouting:
     async def test_active_compute_jobs_count_toward_runner_capacity(
         self, db_session
     ):
+        """Capacity is per CLASS: active compute jobs saturate the COMPUTE
+        class (a further compute_experiment is refused), while the AGENT class
+        stays dispatchable — one class must not starve the other."""
         project = await _make_project(db_session)
         runner, _ = await _make_runner(
             db_session,
@@ -2836,17 +5227,28 @@ class TestOrchestratorRunnerRouting:
                 "active_compute_job_ids": ["job-a", "job-b"],
             },
         )
-        task = Task(
+        compute_task = Task(
+            project_id=project.id,
+            payloads=[{"type": "compute_experiment"}],
+            status=TaskStatus.QUEUED,
+        )
+        agent_task = Task(
             project_id=project.id,
             payloads=[{"type": "create"}],
             status=TaskStatus.QUEUED,
         )
-        db_session.add(task)
+        db_session.add(compute_task)
+        db_session.add(agent_task)
         await db_session.commit()
 
+        # Compute class full (2 active vs max_concurrent fallback 2) → refused.
         assert await orch._try_runner_dispatch(
-            db_session, task, {project.id: [runner]}, {}
+            db_session, compute_task, {project.id: [runner]}, {}
         ) is False
+        # Agent class is independent — the same runner still takes agent work.
+        assert await orch._try_runner_dispatch(
+            db_session, agent_task, {project.id: [runner]}, {}
+        ) is True
 
     @pytest.mark.asyncio
     async def test_try_runner_dispatch_prefers_least_loaded(self, db_session):
@@ -4452,6 +6854,143 @@ class TestLocalRunnerStatusForStrategist:
         assert status["active_total"] == 2
         assert status["active_gpu"] == 1
 
+    @pytest.mark.asyncio
+    async def test_devices_absent_when_no_live_runner(self, db_session):
+        """The additive `devices` key is OMITTED when no runner is live, so the
+        load-bearing 3-key shape is preserved for existing consumers."""
+        project = await _make_project(db_session)
+        # Registered-but-stale runner → ever_registered True, no live devices.
+        await _make_runner(
+            db_session,
+            project.id,
+            status="active",
+            capabilities={"task_types": "all", "has_gpu": True, "max_concurrent": 2},
+            last_seen_at=_utcnow() - timedelta(seconds=400),
+        )
+
+        from app.strategic_spawning import _load_local_runner_status
+
+        status = await _load_local_runner_status(db_session, project.id)
+        assert status == {
+            "ever_registered": True,
+            "active_total": 0,
+            "active_gpu": 0,
+        }
+        assert "devices" not in status
+
+    @pytest.mark.asyncio
+    async def test_devices_block_for_live_gpu_runner(self, db_session):
+        """A live runner's persisted capabilities become a bounded device entry:
+        name, gpu_count, deduped models, per-GPU VRAM (when advertised),
+        container capability, and current load."""
+        project = await _make_project(db_session)
+        await _make_runner(
+            db_session,
+            project.id,
+            status="active",
+            hostname="dgx-1",
+            capabilities={
+                "task_types": "all",
+                "has_gpu": True,
+                "max_concurrent": 2,
+                "gpu_count": 8,
+                "gpu_names": ["Tesla V100-SXM2-16GB"] * 8,
+                "gpu_memory_total_mib": [16384] * 8,
+                "isolation_backends": {
+                    "bwrap_ok": True,
+                    "userns_ok": True,
+                    "docker_usable": True,
+                    "docker_cdi_gpu": True,
+                    "podman_usable": False,
+                    "apptainer_ok": False,
+                    "enroot_ok": False,
+                    "systemd_run_ok": False,
+                },
+                "active_task_ids": ["t-1"],
+                "active_compute_job_ids": [],
+            },
+            last_seen_at=_utcnow(),
+        )
+
+        from app.strategic_spawning import _load_local_runner_status
+
+        status = await _load_local_runner_status(db_session, project.id)
+        assert status["active_gpu"] == 1
+        assert status["devices"] == [
+            {
+                "runner_name": "dgx-1",
+                "gpu_count": 8,
+                "gpu_models": ["Tesla V100-SXM2-16GB"],
+                "container_ok": True,
+                "gpu_in_container_ok": True,
+                "active_tasks": 1,
+                "active_compute_jobs": 0,
+                "gpu_vram_mib": [16384] * 8,
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_devices_skip_vram_when_not_advertised(self, db_session):
+        """Older runners that do not advertise gpu_memory_total_mib get no
+        gpu_vram_mib key (never a misleading zero), and a caps dict without an
+        isolation inventory reads as no container runtime."""
+        project = await _make_project(db_session)
+        await _make_runner(
+            db_session,
+            project.id,
+            status="active",
+            hostname="old-box",
+            capabilities={
+                "task_types": "all",
+                "has_gpu": True,
+                "max_concurrent": 2,
+                "gpu_count": 1,
+                "gpu_names": ["NVIDIA GeForce RTX 3060"],
+            },
+            last_seen_at=_utcnow(),
+        )
+
+        from app.strategic_spawning import _load_local_runner_status
+
+        status = await _load_local_runner_status(db_session, project.id)
+        (device,) = status["devices"]
+        assert "gpu_vram_mib" not in device
+        assert device["container_ok"] is False
+        assert device["gpu_in_container_ok"] is False
+        assert device["active_tasks"] == 0
+        assert device["active_compute_jobs"] == 0
+
+    @pytest.mark.asyncio
+    async def test_devices_bounded_in_total_gpu_richest_first(self, db_session):
+        """The devices list is capped at DEVICES_MAX_RUNNERS total, keeping the
+        GPU-richest runners (the ones VRAM-fit reasoning needs)."""
+        from app.experiment_authoring_context import DEVICES_MAX_RUNNERS
+
+        project = await _make_project(db_session)
+        for i in range(DEVICES_MAX_RUNNERS + 2):
+            await _make_runner(
+                db_session,
+                project.id,
+                status="active",
+                hostname=f"node-{i}",
+                capabilities={
+                    "task_types": "all",
+                    "has_gpu": i % 2 == 0,
+                    "max_concurrent": 2,
+                    # Alternating 1-GPU / CPU-only so the cap has to choose.
+                    "gpu_count": 1 if i % 2 == 0 else 0,
+                },
+                last_seen_at=_utcnow(),
+            )
+
+        from app.strategic_spawning import _load_local_runner_status
+
+        status = await _load_local_runner_status(db_session, project.id)
+        devices = status["devices"]
+        assert len(devices) == DEVICES_MAX_RUNNERS
+        # GPU runners sort ahead of CPU-only runners.
+        gpu_counts = [d["gpu_count"] for d in devices]
+        assert gpu_counts == sorted(gpu_counts, reverse=True)
 
     def test_local_runner_status_registered_in_strategic_schema(self):
         """Regression guard: local_runner_status must be in _STRATEGIC_REVIEW_SCHEMA
@@ -4626,10 +7165,12 @@ class TestReportCommandLogDropsArbitraryKeys:
         # Build a result_metrics dict exceeding the key cap.
         oversized_metrics = {f"metric_{i}": i for i in range(_MAX_RUNNER_RESULT_METRICS_KEYS + 50)}
 
+        # Terminal report: command_log routes to runner_command_log (interim
+        # "running" reports route their tail to live_output instead).
         resp = await client.post(
             f"/api/runner/compute-job/{job.id}/report",
             json={
-                "exec_status": "running",
+                "exec_status": "failed",
                 "command_log": hostile_command_log,
                 "result_metrics": oversized_metrics,
             },
@@ -4676,7 +7217,7 @@ class TestReportCommandLogDropsArbitraryKeys:
         resp = await client.post(
             f"/api/runner/compute-job/{job.id}/report",
             json={
-                "exec_status": "running",
+                "exec_status": "failed",
                 "command_log": {"text": big_text, "extra_hostile": "should_drop"},
             },
             headers={"Authorization": f"Bearer {token}"},
@@ -4850,6 +7391,405 @@ class TestReportCommandLogDropsArbitraryKeys:
         assert len(result) == _MAX_RUNNER_RESULT_METRICS_KEYS, (
             f"expected exactly {_MAX_RUNNER_RESULT_METRICS_KEYS} keys, got {len(result)}"
         )
+
+
+class TestInputArtifactDownloadEndpoint:
+    """The runner-facing cross-job checkpoint-resume download endpoint.
+
+    Scoped exactly like the report/artifact endpoints (pinned runner + same
+    project), and additionally checks the predecessor belongs to the runner's
+    project before streaming its durable bundle.
+    """
+
+    async def _make_pinned_job(self, db_session, project, runner, meta):
+        job = ComputeJob(
+            project_id=project.id,
+            backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+            status=ComputeJobStatus.RUNNING,
+            polling_metadata={"runner_target_id": str(runner.id), **meta},
+        )
+        db_session.add(job)
+        await db_session.commit()
+        await db_session.refresh(job)
+        return job
+
+    @pytest.mark.asyncio
+    async def test_streams_predecessor_bundle(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        from app import storage
+
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        predecessor = await self._make_pinned_job(db_session, project, runner, {})
+        job = await self._make_pinned_job(
+            db_session, project, runner,
+            {"input_artifact_job_id": str(predecessor.id)},
+        )
+
+        async def fake_download(job_id):
+            return b"BUNDLE-BYTES" if str(job_id) == str(predecessor.id) else None
+
+        monkeypatch.setattr(
+            storage, "download_compute_job_artifact_bundle", fake_download
+        )
+
+        resp = await client.get(
+            f"/api/runner/compute-job/{job.id}/input-artifact",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.content == b"BUNDLE-BYTES"
+        assert resp.headers["content-type"] == "application/gzip"
+
+    @pytest.mark.asyncio
+    async def test_404_when_no_input_artifact_reference(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        job = await self._make_pinned_job(db_session, project, runner, {})
+
+        resp = await client.get(
+            f"/api/runner/compute-job/{job.id}/input-artifact",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_404_when_predecessor_in_other_project(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        from app import storage
+
+        project = await _make_project(db_session)
+        other = await _make_project(db_session, owner_id="other-owner")
+        runner, token = await _make_runner(db_session, project.id)
+        # Predecessor lives in a DIFFERENT project — must never be streamed.
+        foreign = ComputeJob(
+            project_id=other.id,
+            backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+            status=ComputeJobStatus.SUCCEEDED,
+            polling_metadata={},
+        )
+        db_session.add(foreign)
+        await db_session.commit()
+        await db_session.refresh(foreign)
+        job = await self._make_pinned_job(
+            db_session, project, runner,
+            {"input_artifact_job_id": str(foreign.id)},
+        )
+
+        async def fake_download(job_id):
+            return b"SHOULD-NOT-BE-SERVED"
+
+        monkeypatch.setattr(
+            storage, "download_compute_job_artifact_bundle", fake_download
+        )
+
+        resp = await client.get(
+            f"/api/runner/compute-job/{job.id}/input-artifact",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_404_when_bundle_missing(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        from app import storage
+
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        predecessor = await self._make_pinned_job(db_session, project, runner, {})
+        job = await self._make_pinned_job(
+            db_session, project, runner,
+            {"input_artifact_job_id": str(predecessor.id)},
+        )
+
+        async def fake_download(job_id):
+            return None
+
+        monkeypatch.setattr(
+            storage, "download_compute_job_artifact_bundle", fake_download
+        )
+
+        resp = await client.get(
+            f"/api/runner/compute-job/{job.id}/input-artifact",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_next_compute_job_includes_input_artifact_job_id(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        predecessor_id = str(uuid.uuid4())
+        job = ComputeJob(
+            project_id=project.id,
+            backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+            status=ComputeJobStatus.STARTING,
+            polling_metadata={
+                "runner_target_id": str(runner.id),
+                "command": "echo resume",
+                "input_artifact_job_id": predecessor_id,
+            },
+        )
+        db_session.add(job)
+        await db_session.commit()
+
+        resp = await client.post(
+            "/api/runner/next-compute-job",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["input_artifact_job_id"] == predecessor_id
+
+
+class TestReportInterimProgressAndLiveOutput:
+    """Interim-report protocol: live_output tail + self-reported progress records.
+
+    Progress records originate from SANDBOXED experiment code (the runner just
+    relays its BLUEPRINT_PROGRESS_FILE tail), so the endpoint must validate
+    every field, cap every dimension, and tolerate arbitrary garbage without a
+    500 — and interim command_log tails must land on the UI's live_output key,
+    never clobbering the terminal runner_command_log.
+    """
+
+    async def _make_running_job(self, db_session):
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        job = ComputeJob(
+            project_id=project.id,
+            backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+            status=ComputeJobStatus.RUNNING,
+            polling_metadata={"runner_target_id": str(runner.id)},
+        )
+        db_session.add(job)
+        await db_session.commit()
+        await db_session.refresh(job)
+        return project, runner, token, job
+
+    @pytest.mark.asyncio
+    async def test_running_command_log_stamps_live_output_not_runner_command_log(
+        self, client: AsyncClient, db_session
+    ):
+        _project, _runner, token, job = await self._make_running_job(db_session)
+        resp = await client.post(
+            f"/api/runner/compute-job/{job.id}/report",
+            json={
+                "exec_status": "running",
+                "command_log": {"text": "epoch 3 loss=0.42\n", "truncated": True},
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200, resp.text
+        await db_session.refresh(job)
+        meta = job.polling_metadata
+        assert meta.get("live_output") == {
+            "text": "epoch 3 loss=0.42\n",
+            "truncated": True,
+        }
+        assert "runner_command_log" not in meta, (
+            "an interim tail must never masquerade as the terminal command log"
+        )
+
+    @pytest.mark.asyncio
+    async def test_running_live_output_is_tail_truncated_at_cap(
+        self, client: AsyncClient, db_session
+    ):
+        """Oversized live tails keep the TAIL (most recent output), not the head."""
+        from app.routers.runner import _MAX_RUNNER_LIVE_OUTPUT_BYTES
+
+        _project, _runner, token, job = await self._make_running_job(db_session)
+        big = "A" * _MAX_RUNNER_LIVE_OUTPUT_BYTES + "END"
+        resp = await client.post(
+            f"/api/runner/compute-job/{job.id}/report",
+            json={"exec_status": "running", "command_log": {"text": big}},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200, resp.text
+        await db_session.refresh(job)
+        live = job.polling_metadata.get("live_output", {})
+        assert live.get("truncated") is True
+        assert live.get("text", "").endswith("END")
+        assert len(live["text"].encode("utf-8")) <= _MAX_RUNNER_LIVE_OUTPUT_BYTES
+
+    @pytest.mark.asyncio
+    async def test_progress_records_validated_and_stamped(
+        self, client: AsyncClient, db_session
+    ):
+        """Valid records land in polling_metadata['progress'] with count +
+        updated_at; invalid records (bad types, non-finite, bool value) drop."""
+        _project, _runner, token, job = await self._make_running_job(db_session)
+        resp = await client.post(
+            f"/api/runner/compute-job/{job.id}/report",
+            json={
+                "exec_status": "running",
+                "progress": {
+                    "records": [
+                        {"step": 1, "metric": "loss", "value": 2.5},
+                        {"step": 2, "metric": "loss", "value": 2.1, "ts": "2026-07-11T00:00:00Z"},
+                        {"metric": "loss", "value": True},  # bool → dropped
+                        {"metric": "", "value": 1.0},  # blank metric → dropped
+                        {"metric": "loss", "value": "NaN"},  # string → dropped
+                        "garbage",  # non-dict → dropped
+                    ],
+                    "count": 2,
+                },
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200, resp.text
+        await db_session.refresh(job)
+        progress = job.polling_metadata.get("progress")
+        assert progress is not None
+        assert progress["count"] == 2
+        assert "updated_at" in progress
+        assert progress["records"] == [
+            {"step": 1, "metric": "loss", "value": 2.5},
+            {"step": 2, "metric": "loss", "value": 2.1, "ts": "2026-07-11T00:00:00Z"},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_progress_garbage_payloads_tolerated_without_500(
+        self, client: AsyncClient, db_session
+    ):
+        """Arbitrary garbage shapes must 200 and leave no progress key."""
+        _project, _runner, token, job = await self._make_running_job(db_session)
+        for garbage in (
+            "not a dict",
+            123,
+            {"records": "nope"},
+            {"records": []},
+            {"records": [{"metric": "m"}]},  # no value
+            {"no_records_key": True},
+            {"records": [{"metric": "m", "value": 1.0}] * 500},  # wildly oversized
+        ):
+            resp = await client.post(
+                f"/api/runner/compute-job/{job.id}/report",
+                json={"exec_status": "running", "progress": garbage},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert resp.status_code == 200, f"payload {garbage!r}: {resp.text}"
+        await db_session.refresh(job)
+        assert "progress" not in (job.polling_metadata or {})
+
+    @pytest.mark.asyncio
+    async def test_progress_count_delta_merge_appends_only_new_and_caps_at_50(
+        self, client: AsyncClient, db_session
+    ):
+        """Re-sent tail overlap is not double-appended (count-delta merge) and
+        the stored list is capped at the last _MAX_PROGRESS_RECORDS_STORED."""
+        from app.routers.runner import _MAX_PROGRESS_RECORDS_STORED
+
+        _project, _runner, token, job = await self._make_running_job(db_session)
+
+        async def _send(records, count):
+            resp = await client.post(
+                f"/api/runner/compute-job/{job.id}/report",
+                json={
+                    "exec_status": "running",
+                    "progress": {"records": records, "count": count},
+                },
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert resp.status_code == 200, resp.text
+
+        def _rec(step):
+            return {"step": step, "metric": "loss", "value": 10.0 - step * 0.1}
+
+        # Report 1: steps 1-3. Report 2 re-sends 2-3 plus new 4-5 (tail overlap).
+        await _send([_rec(1), _rec(2), _rec(3)], 3)
+        await _send([_rec(2), _rec(3), _rec(4), _rec(5)], 5)
+        await db_session.refresh(job)
+        progress = job.polling_metadata["progress"]
+        assert [r["step"] for r in progress["records"]] == [1, 2, 3, 4, 5], (
+            "overlapping tail entries must not be double-appended"
+        )
+        assert progress["count"] == 5
+
+        # A re-sent identical snapshot (count unchanged) adds nothing.
+        await _send([_rec(4), _rec(5)], 5)
+        await db_session.refresh(job)
+        assert [r["step"] for r in job.polling_metadata["progress"]["records"]] == [
+            1, 2, 3, 4, 5,
+        ]
+
+        # Long run: the stored list caps at the newest 50.
+        total = 5
+        for batch_start in range(6, 106, 20):
+            batch = [_rec(s) for s in range(batch_start, batch_start + 20)]
+            total = batch_start + 19
+            await _send(batch, total)
+        await db_session.refresh(job)
+        progress = job.polling_metadata["progress"]
+        assert len(progress["records"]) == _MAX_PROGRESS_RECORDS_STORED
+        assert progress["records"][-1]["step"] == 105
+        assert progress["count"] == 105
+
+    @pytest.mark.asyncio
+    async def test_progress_retry_with_bumped_count_not_double_appended(
+        self, client: AsyncClient, db_session
+    ):
+        """Suffix-dedup backstop: a retried report whose count was BUMPED but
+        whose records are the already-stored tail verbatim adds nothing (the
+        count delta alone would falsely admit it); the next genuinely new
+        record still appends exactly once."""
+        _project, _runner, token, job = await self._make_running_job(db_session)
+
+        r1 = {"step": 1, "metric": "loss", "value": 2.5}
+        r2 = {"step": 2, "metric": "loss", "value": 2.1}
+
+        async def _send(records, count):
+            resp = await client.post(
+                f"/api/runner/compute-job/{job.id}/report",
+                json={
+                    "exec_status": "running",
+                    "progress": {"records": records, "count": count},
+                },
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert resp.status_code == 200, resp.text
+
+        await _send([r1], 1)
+        # Retry of the SAME record with a bumped count: delta says "one new"
+        # but the record equals the stored tail — must not re-append.
+        await _send([r1], 2)
+        await db_session.refresh(job)
+        assert job.polling_metadata["progress"]["records"] == [r1]
+
+        # Overlap plus one genuinely new record appends exactly the new one.
+        await _send([r1, r2], 3)
+        await db_session.refresh(job)
+        assert job.polling_metadata["progress"]["records"] == [r1, r2]
+
+    @pytest.mark.asyncio
+    async def test_progress_accepted_on_terminal_report(
+        self, client: AsyncClient, db_session
+    ):
+        """The final terminal report may carry the last progress records."""
+        _project, _runner, token, job = await self._make_running_job(db_session)
+        resp = await client.post(
+            f"/api/runner/compute-job/{job.id}/report",
+            json={
+                "exec_status": "failed",
+                "exit_code": 124,
+                "command_log": {"text": "killed at deadline", "truncated": False},
+                "progress": {
+                    "records": [{"step": 9, "metric": "reward", "value": 41.5}],
+                    "count": 9,
+                },
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200, resp.text
+        await db_session.refresh(job)
+        meta = job.polling_metadata
+        assert meta["progress"]["records"][-1]["value"] == 41.5
+        assert meta["runner_command_log"]["text"] == "killed at deadline"
 
 
 # ── Direct compute_experiment dispatch (no agent half) ───────────────────────
@@ -5151,6 +8091,726 @@ class TestDirectComputeExperimentDispatch:
         assert outcome == "failed"
         await db_session.refresh(task)
         assert task.status == TaskStatus.FAILED
+        assert await _compute_job_for_task(db_session, task.id) is None
+
+    # ── Launch-contract runner_target pin (soft + strict) ────────────────────
+
+    @pytest.mark.asyncio
+    async def test_soft_runner_pin_prefers_pinned_runner_via_payload(
+        self, db_session
+    ):
+        """runner_target (strict=false) in the launch contract wins over the
+        least-loaded rule when the pinned runner is eligible — same seam as the
+        existing context preference, but authored in the payload."""
+        project = await _make_project(db_session)
+        pinned, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "has_gpu": False,
+                "max_concurrent": 4,
+                "active_compute_job_ids": ["existing-job"],
+            },
+        )
+        idle, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "has_gpu": False,
+                "max_concurrent": 4,
+                "active_compute_job_ids": [],
+            },
+        )
+        task = Task(
+            project_id=project.id,
+            payloads=[
+                _ce_payload(
+                    runner_target={"runner_id": str(pinned.id), "strict": False}
+                )
+            ],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        outcome = await orch._dispatch_compute_experiment_directly(
+            db_session, task, {project.id: [pinned, idle]}, {}
+        )
+
+        assert outcome == "launched"
+        await db_session.refresh(task)
+        assert task.context["runner_target_id"] == str(pinned.id)
+        job = await _compute_job_for_task(db_session, task.id)
+        assert (job.polling_metadata or {}).get("runner_target_id") == str(pinned.id)
+
+    @pytest.mark.asyncio
+    async def test_soft_runner_pin_falls_through_when_pinned_ineligible(
+        self, db_session
+    ):
+        """A soft pin to an at-capacity runner falls through to normal selection
+        (the idle runner gets the job) instead of holding or wedging."""
+        project = await _make_project(db_session)
+        pinned, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "has_gpu": False,
+                "max_concurrent": 1,
+                "active_compute_job_ids": ["existing-job"],  # at capacity
+            },
+        )
+        idle, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={"task_types": "all", "has_gpu": False, "max_concurrent": 2},
+        )
+        task = Task(
+            project_id=project.id,
+            payloads=[
+                _ce_payload(
+                    runner_target={"runner_id": str(pinned.id), "strict": False}
+                )
+            ],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        outcome = await orch._dispatch_compute_experiment_directly(
+            db_session, task, {project.id: [pinned, idle]}, {}
+        )
+
+        assert outcome == "launched"
+        await db_session.refresh(task)
+        assert task.context["runner_target_id"] == str(idle.id)
+        assert "runner_pin_hold" not in (task.context or {})
+
+    @pytest.mark.asyncio
+    async def test_strict_runner_pin_dispatches_when_pinned_runner_eligible(
+        self, db_session
+    ):
+        """A strict pin dispatches to the pinned runner (even when busier than a
+        competitor) and clears a stale hold reason from a prior held cycle."""
+        project = await _make_project(db_session)
+        pinned, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "has_gpu": False,
+                "max_concurrent": 4,
+                "active_compute_job_ids": ["existing-job"],
+            },
+        )
+        idle, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={"task_types": "all", "has_gpu": False, "max_concurrent": 4},
+        )
+        task = Task(
+            project_id=project.id,
+            payloads=[
+                _ce_payload(
+                    runner_target={"runner_id": str(pinned.id), "strict": True}
+                )
+            ],
+            status=TaskStatus.QUEUED,
+            # Stale artifacts from a prior held cycle — must be cleared on launch.
+            context={
+                "awaiting_local_runner_since": _utcnow().isoformat(),
+                "runner_pin_hold": {
+                    "runner_id": str(pinned.id),
+                    "strict": True,
+                    "reason_code": "offline",
+                    "detail": "stale",
+                },
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        outcome = await orch._dispatch_compute_experiment_directly(
+            db_session, task, {project.id: [pinned, idle]}, {}
+        )
+
+        assert outcome == "launched"
+        await db_session.refresh(task)
+        assert task.context["runner_target_id"] == str(pinned.id)
+        assert "awaiting_local_runner_since" not in task.context
+        assert "runner_pin_hold" not in task.context
+        job = await _compute_job_for_task(db_session, task.id)
+        assert job.backend == RUNNER_SUBPROCESS_BACKEND_NAME
+        assert (job.polling_metadata or {}).get("runner_target_id") == str(pinned.id)
+
+    @pytest.mark.asyncio
+    async def test_strict_runner_pin_holds_when_runner_offline(self, db_session):
+        """strict=true + pinned runner not live → held with a truthful reason
+        naming the runner (never dispatched to the other eligible runner, never
+        a generic no-runner message)."""
+        project = await _make_project(db_session)
+        offline, _ = await _make_runner(
+            db_session,
+            project.id,
+            status="inactive",  # enrolled but not live → not in the cache
+        )
+        idle, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={"task_types": "all", "has_gpu": False, "max_concurrent": 2},
+        )
+        task = Task(
+            project_id=project.id,
+            payloads=[
+                _ce_payload(
+                    runner_target={"runner_id": str(offline.id), "strict": True}
+                )
+            ],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        outcome = await orch._dispatch_compute_experiment_directly(
+            db_session, task, {project.id: [idle]}, {}
+        )
+
+        assert outcome == "held"
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.QUEUED
+        assert (task.context or {}).get("awaiting_local_runner_since")
+        hold = (task.context or {}).get("runner_pin_hold")
+        assert hold is not None
+        assert hold["runner_id"] == str(offline.id)
+        assert hold["strict"] is True
+        assert hold["reason_code"] == "offline"
+        # The status message names the runner and the why — machine-checkable
+        # by the UI, truthful for the operator.
+        message = task.latest_status_message or ""
+        assert str(offline.id) in message
+        assert "offline" in message
+        assert "runner_target hold" in message
+        # Strict means strict: nothing dispatched anywhere.
+        assert await _compute_job_for_task(db_session, task.id) is None
+
+    @pytest.mark.asyncio
+    async def test_strict_runner_pin_holds_when_at_capacity(self, db_session):
+        project = await _make_project(db_session)
+        pinned, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "has_gpu": False,
+                "max_concurrent": 1,
+                "active_compute_job_ids": ["existing-job"],  # at capacity
+            },
+        )
+        task = Task(
+            project_id=project.id,
+            payloads=[
+                _ce_payload(
+                    runner_target={"runner_id": str(pinned.id), "strict": True}
+                )
+            ],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        outcome = await orch._dispatch_compute_experiment_directly(
+            db_session, task, {project.id: [pinned]}, {}
+        )
+
+        assert outcome == "held"
+        await db_session.refresh(task)
+        hold = (task.context or {}).get("runner_pin_hold")
+        assert hold is not None
+        assert hold["reason_code"] == "at_capacity"
+        assert "at_capacity" in (task.latest_status_message or "")
+        assert await _compute_job_for_task(db_session, task.id) is None
+
+    @pytest.mark.asyncio
+    async def test_strict_runner_pin_holds_when_not_enrolled(self, db_session):
+        """A strict pin to another project's runner holds with reason_code
+        not_enrolled (authoring-time 422 normally prevents this; dispatch stays
+        truthful for agent-authored payloads that slipped one through)."""
+        project = await _make_project(db_session)
+        other_project = await _make_project(db_session, name="Other Project")
+        foreign, _ = await _make_runner(db_session, other_project.id)
+        task = Task(
+            project_id=project.id,
+            payloads=[
+                _ce_payload(
+                    runner_target={"runner_id": str(foreign.id), "strict": True}
+                )
+            ],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        outcome = await orch._dispatch_compute_experiment_directly(
+            db_session, task, {}, {}
+        )
+
+        assert outcome == "held"
+        await db_session.refresh(task)
+        hold = (task.context or {}).get("runner_pin_hold")
+        assert hold is not None
+        assert hold["reason_code"] == "not_enrolled"
+        assert await _compute_job_for_task(db_session, task.id) is None
+
+    @pytest.mark.asyncio
+    async def test_strict_runner_pin_holds_when_missing_gpu(self, db_session):
+        """A strict pin to a live CPU runner for a GPU job holds with the
+        capability-specific reason, not a generic one."""
+        project = await _make_project(db_session)
+        cpu_runner, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={"task_types": "all", "has_gpu": False, "max_concurrent": 2},
+        )
+        task = Task(
+            project_id=project.id,
+            payloads=[
+                _ce_payload(
+                    accelerator="T4",
+                    runner_target={"runner_id": str(cpu_runner.id), "strict": True},
+                )
+            ],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        outcome = await orch._dispatch_compute_experiment_directly(
+            db_session, task, {project.id: [cpu_runner]}, {}
+        )
+
+        assert outcome == "held"
+        await db_session.refresh(task)
+        hold = (task.context or {}).get("runner_pin_hold")
+        assert hold is not None
+        assert hold["reason_code"] == "missing_gpu"
+        assert await _compute_job_for_task(db_session, task.id) is None
+
+    @pytest.mark.asyncio
+    async def test_strict_pin_hold_stable_reason_not_rewritten_each_cycle(
+        self, db_session
+    ):
+        """Churn gate: repeated hold cycles with the SAME reason_code but a
+        different volatile detail number (live load 3 → 4) must NOT rewrite
+        the stamped hold record or the status message (first-write values
+        retained); a genuinely DIFFERENT reason_code rewrites both."""
+        project = await _make_project(db_session)
+        caps = {
+            "task_types": "all",
+            "has_gpu": False,
+            "max_concurrent": 1,
+            "active_compute_job_ids": ["j1", "j2", "j3"],  # load 3
+        }
+        pinned, _ = await _make_runner(db_session, project.id, capabilities=caps)
+        task = Task(
+            project_id=project.id,
+            payloads=[
+                _ce_payload(
+                    runner_target={"runner_id": str(pinned.id), "strict": True}
+                )
+            ],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        outcome = await orch._dispatch_compute_experiment_directly(
+            db_session, task, {project.id: [pinned]}, {}
+        )
+        assert outcome == "held"
+        await db_session.refresh(task)
+        first_hold = dict(task.context["runner_pin_hold"])
+        first_message = task.latest_status_message
+        assert first_hold["reason_code"] == "at_capacity"
+        assert "(3 active+pinned" in first_hold["detail"]
+
+        # Cycle 2: still at_capacity, but the volatile load count moved 3 → 4.
+        pinned.capabilities = dict(
+            caps, active_compute_job_ids=["j1", "j2", "j3", "j4"]
+        )
+        db_session.add(pinned)
+        await db_session.commit()
+
+        outcome = await orch._dispatch_compute_experiment_directly(
+            db_session, task, {project.id: [pinned]}, {}
+        )
+        assert outcome == "held"
+        await db_session.refresh(task)
+        # First-write values retained: same stable hold state, no per-cycle
+        # rewrite of the held task row.
+        assert task.context["runner_pin_hold"] == first_hold
+        assert task.latest_status_message == first_message
+
+        # Cycle 3: a DIFFERENT reason_code (runner gone from the live cache →
+        # offline) rewrites both the record and the message.
+        outcome = await orch._dispatch_compute_experiment_directly(
+            db_session, task, {}, {}
+        )
+        assert outcome == "held"
+        await db_session.refresh(task)
+        hold = task.context["runner_pin_hold"]
+        assert hold["reason_code"] == "offline"
+        assert "offline" in (task.latest_status_message or "")
+        assert task.latest_status_message != first_message
+
+    # ── Transient vs terminal launch preconditions ────────────────────────────
+    # create_compute_job raises ComputeLaunchPreconditionFailed for a whole family
+    # of reasons. They are NOT all failures: the project's compute-job concurrency
+    # cap is pure back-pressure (active jobs only shrink absent new launches), so
+    # the N+1th experiment in a capped project used to be PERMANENTLY FAILED for a
+    # queueing decision the orchestrator itself made — burning the direction's
+    # failure budget and feeding the churn guardrail phantom failures.
+
+    @pytest.mark.asyncio
+    async def test_concurrency_cap_defers_and_stays_retryable(self, db_session):
+        """At the project's compute-job cap → DEFER, never terminal-FAIL."""
+        from app.shared_state import runtime_config
+
+        project = await _make_project(db_session, name="CapDeferProject")
+        # Fill the project to its cap with an active job.
+        db_session.add(
+            ComputeJob(
+                project_id=project.id,
+                command="sleep 1",
+                status=ComputeJobStatus.RUNNING,
+                spend_cap_usd=1.0,
+                deadline_seconds=300,
+                backend="local",
+            )
+        )
+        await db_session.commit()
+
+        task = Task(
+            project_id=project.id,
+            payloads=[_ce_payload()],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        orig = dict(runtime_config.get("max_concurrent_compute_jobs_by_project") or {})
+        runtime_config["max_concurrent_compute_jobs_by_project"] = {str(project.id): 1}
+        try:
+            outcome = await orch._dispatch_compute_experiment_directly(
+                db_session, task, {}, {}
+            )
+        finally:
+            runtime_config["max_concurrent_compute_jobs_by_project"] = orig
+
+        assert outcome == "deferred", f"expected 'deferred', got {outcome!r}"
+        await db_session.refresh(task)
+        # The task is RETRYABLE: still QUEUED, behind a retry_after backoff.
+        assert task.status == TaskStatus.QUEUED, (
+            "a transient cap must never leave the task FAILED — it launches "
+            "unchanged once a running job frees the cap"
+        )
+        assert task.retry_after_until is not None, (
+            "the deferral must stamp a retry_after backoff so the task re-enters "
+            "dispatch on its own"
+        )
+        ctx = task.context or {}
+        assert ctx.get("_infra_wait") is True
+        # The reason is SURFACED, not swallowed.
+        assert "cap" in (ctx.get("compute_launch_deferred_reason") or "").lower()
+        assert "cap" in (task.latest_status_message or "").lower()
+        # Crucially: no failure budget burned, and no billable job created.
+        assert "failure_category" not in ctx, (
+            "a deferral is not a failure and must not be classified as one"
+        )
+        assert await _compute_job_for_task(db_session, task.id) is None
+
+    @pytest.mark.asyncio
+    async def test_repeated_cap_deferrals_escalate_the_backoff(self, db_session):
+        """A project sitting at its cap for hours must back off, not re-probe every
+        cycle. The counter is owned by the deferral path precisely because the shared
+        `_retry_after_resets` is cleared whenever a backoff lapses."""
+        from app.shared_state import runtime_config
+
+        project = await _make_project(db_session, name="CapBackoffProject")
+        db_session.add(
+            ComputeJob(
+                project_id=project.id,
+                command="sleep 1",
+                status=ComputeJobStatus.RUNNING,
+                spend_cap_usd=1.0,
+                deadline_seconds=300,
+                backend="local",
+            )
+        )
+        await db_session.commit()
+
+        task = Task(
+            project_id=project.id,
+            payloads=[_ce_payload()],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        orig = dict(runtime_config.get("max_concurrent_compute_jobs_by_project") or {})
+        runtime_config["max_concurrent_compute_jobs_by_project"] = {str(project.id): 1}
+        try:
+            for expected_count in (1, 2, 3):
+                # Mimic the candidate scan clearing the lapsed backoff each cycle.
+                task.retry_after_until = None
+                db_session.add(task)
+                await db_session.commit()
+
+                outcome = await orch._dispatch_compute_experiment_directly(
+                    db_session, task, {}, {}
+                )
+                assert outcome == "deferred"
+                await db_session.refresh(task)
+                assert (task.context or {}).get(
+                    "compute_launch_defer_count"
+                ) == expected_count
+        finally:
+            runtime_config["max_concurrent_compute_jobs_by_project"] = orig
+
+    @pytest.mark.asyncio
+    async def test_saturated_cap_deferral_raises_one_operator_alert(self, db_session):
+        """A deferral is unbounded BY DESIGN — so a saturated one needs a surface.
+
+        Deferring instead of terminal-FAILing removed a loud (wrong) signal. Without an
+        alert it is replaced by a SILENT one: the task parks behind the 15-min ceiling
+        forever, the defer counter only resets on a successful launch, and
+        operator_attention's stale-queued sweep filters on `depends_on` being non-empty,
+        so a dep-less compute_experiment never surfaces there.
+
+        Exactly ONE alert (deduplicated), and the task keeps deferring — the alert is a
+        surface, not an outcome: no failure_category, still QUEUED, still retryable.
+        """
+        from sqlmodel import select as _select
+        from app.models import Alert, AlertSeverity
+        from app.shared_state import runtime_config
+        from app.orchestrator_runner_dispatch import (
+            _COMPUTE_CAP_DEFER_ALERT_AFTER_DEFERS,
+            _COMPUTE_CAP_DEFER_ALERT_TITLE,
+        )
+
+        project = await _make_project(db_session, name="CapAlertProject")
+        db_session.add(
+            ComputeJob(
+                project_id=project.id,
+                command="sleep 1",
+                status=ComputeJobStatus.RUNNING,
+                spend_cap_usd=1.0,
+                deadline_seconds=300,
+                backend="local",
+            )
+        )
+        await db_session.commit()
+
+        # One deferral short of the alert threshold.
+        task = Task(
+            project_id=project.id,
+            payloads=[_ce_payload()],
+            status=TaskStatus.QUEUED,
+            context={
+                "compute_launch_defer_count": (
+                    _COMPUTE_CAP_DEFER_ALERT_AFTER_DEFERS - 1
+                )
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        orig = dict(runtime_config.get("max_concurrent_compute_jobs_by_project") or {})
+        runtime_config["max_concurrent_compute_jobs_by_project"] = {str(project.id): 1}
+        try:
+            # This deferral crosses the threshold → alert.
+            assert (
+                await orch._dispatch_compute_experiment_directly(
+                    db_session, task, {}, {}
+                )
+                == "deferred"
+            )
+            # …and the NEXT one must not raise a second.
+            task.retry_after_until = None
+            db_session.add(task)
+            await db_session.commit()
+            assert (
+                await orch._dispatch_compute_experiment_directly(
+                    db_session, task, {}, {}
+                )
+                == "deferred"
+            )
+        finally:
+            runtime_config["max_concurrent_compute_jobs_by_project"] = orig
+
+        alerts = (
+            (
+                await db_session.execute(
+                    _select(Alert).where(
+                        Alert.task_id == task.id,
+                        Alert.title == _COMPUTE_CAP_DEFER_ALERT_TITLE,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(alerts) == 1, (
+            "a saturated cap deferral must raise exactly ONE operator alert, "
+            f"deduplicated across every subsequent deferral; got {len(alerts)}"
+        )
+        assert alerts[0].severity == AlertSeverity.WARNING
+
+        # The alert is a SURFACE, not an outcome — the task keeps deferring cleanly.
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.QUEUED
+        assert task.retry_after_until is not None
+        assert (task.context or {}).get("failure_category") is None
+
+        # DISMISSAL must not silence the surface forever. A deferral is unbounded by
+        # design, so a task can keep deferring long after an operator dismisses the
+        # alert — if the dedup predicate ignored dismissed_at, that task would go
+        # permanently dark. Dismissing means "seen", not "never tell me again".
+        alerts[0].dismissed_at = _utcnow()
+        db_session.add(alerts[0])
+        task.retry_after_until = None
+        db_session.add(task)
+        await db_session.commit()
+
+        runtime_config["max_concurrent_compute_jobs_by_project"] = {str(project.id): 1}
+        try:
+            assert (
+                await orch._dispatch_compute_experiment_directly(
+                    db_session, task, {}, {}
+                )
+                == "deferred"
+            )
+        finally:
+            runtime_config["max_concurrent_compute_jobs_by_project"] = orig
+
+        live = (
+            (
+                await db_session.execute(
+                    _select(Alert).where(
+                        Alert.task_id == task.id,
+                        Alert.title == _COMPUTE_CAP_DEFER_ALERT_TITLE,
+                        Alert.dismissed_at.is_(None),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(live) == 1, (
+            "after the operator DISMISSES the alert, a task that is still deferring "
+            "must be able to re-raise it — otherwise one dismissal silences an "
+            f"unbounded deferral forever; got {len(live)} live alert(s)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_long_lived_deferral_does_not_overflow_and_quarantine_the_task(
+        self, db_session
+    ):
+        """A task that has been CORRECTLY deferring for a long time must keep deferring.
+
+        The backoff is ``base_minutes * (2 ** prior_defers)``. ``float * int`` raises
+        ``OverflowError: int too large to convert to float`` once ``prior_defers >= 1024``
+        — and that raise happens inside ``_dispatch_compute_experiment_directly``, i.e.
+        inside the dispatch loop's per-task containment, so the task would start crashing
+        every cycle and be QUARANTINED as a poison task. It is reachable: a project pinned
+        at its compute cap defers every ~15 min, so the counter passes 1024 after ~10.6
+        days. Clamping the EXPONENT keeps the arithmetic finite while the backoff has long
+        since saturated at its ceiling.
+
+        Negative control: with an unclamped ``2 ** prior_defers`` this raises OverflowError.
+        """
+        from app.shared_state import runtime_config
+
+        project = await _make_project(db_session, name="CapOverflowProject")
+        db_session.add(
+            ComputeJob(
+                project_id=project.id,
+                command="sleep 1",
+                status=ComputeJobStatus.RUNNING,
+                spend_cap_usd=1.0,
+                deadline_seconds=300,
+                backend="local",
+            )
+        )
+        await db_session.commit()
+
+        # A task that has been deferring for well over a week at the 15-min ceiling.
+        task = Task(
+            project_id=project.id,
+            payloads=[_ce_payload()],
+            status=TaskStatus.QUEUED,
+            context={"compute_launch_defer_count": 5000},
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        orig = dict(runtime_config.get("max_concurrent_compute_jobs_by_project") or {})
+        runtime_config["max_concurrent_compute_jobs_by_project"] = {str(project.id): 1}
+        try:
+            outcome = await orch._dispatch_compute_experiment_directly(
+                db_session, task, {}, {}
+            )
+        finally:
+            runtime_config["max_concurrent_compute_jobs_by_project"] = orig
+
+        assert outcome == "deferred", (
+            "a long-lived deferral must keep DEFERRING, not raise out of the dispatch "
+            "path and get quarantined as a poison task"
+        )
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.QUEUED
+        assert task.retry_after_until is not None, (
+            "the task must still be stamped retryable after a saturated backoff"
+        )
+        assert (task.context or {}).get("compute_launch_defer_count") == 5001
+
+    @pytest.mark.asyncio
+    async def test_hardware_policy_violation_still_terminal_fails(self, db_session):
+        """Genuine misconfig must REMAIN terminal. A task asking for an accelerator
+        the project forbids never self-clears — deferring it would wedge it forever,
+        so it keeps burning the failure budget exactly as before."""
+        project = await _make_project(db_session, name="HwPolicyFailProject")
+        project.build_config = {
+            **(project.build_config or {}),
+            "resource_envelope": {"allowed_accelerator_types": ["T4"]},
+        }
+        db_session.add(project)
+        await db_session.commit()
+
+        task = Task(
+            project_id=project.id,
+            # A100 is not in the project's allow-list → project_hardware_policy_violated
+            payloads=[_ce_payload(accelerator="A100")],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        outcome = await orch._dispatch_compute_experiment_directly(
+            db_session, task, {}, {}
+        )
+
+        assert outcome == "failed", (
+            f"a hardware-policy violation is misconfig, not back-pressure; "
+            f"got {outcome!r}"
+        )
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.FAILED
+        assert (task.context or {}).get("failure_category") == "compute_launch_failed"
+        assert task.retry_after_until is None, (
+            "a terminal misconfig must not be stamped retryable"
+        )
         assert await _compute_job_for_task(db_session, task.id) is None
 
 

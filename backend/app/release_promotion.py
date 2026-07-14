@@ -306,7 +306,12 @@ def _recover_confidence_from_ci_unresolved(
         smoketest_enabled=smoketest_enabled,
         migration_collision=base_record.get("migration_safety") == "block",
         migration_apply_blocked=base_record.get("migration_apply_safety") == "block",
-        criterion_coverage=base_record.get("criterion_coverage"),
+        # Goal-verification redesign: re-run the SAME per-category gate on the
+        # persisted verdicts (this recompute is same-sha — CI unresolved → green —
+        # so the sha-keyed verdicts on base_record are still valid).  ``None`` when
+        # the finalize recorded no rubric / an exempt grade, matching that path.
+        category_verdicts=base_record.get("category_verdicts"),
+        residual_uncaptured_gap=base_record.get("residual_uncaptured_gap"),
         merge_grade_misses=_merge_grade_misses_armed(base_record, _policy),
         debt_pressure_score=debt_pressure_score,
     )
@@ -1058,9 +1063,23 @@ async def promote(
                 version.version_number,
             )
             await github.delete_branch(token, owner, repo, release_branch)
-            await github.create_branch(
-                token, owner, repo, release_branch, candidate_sha
+            recreated = (
+                await github.create_branch(
+                    token, owner, repo, release_branch, candidate_sha
+                )
+                or {}
             )
+            # create_branch now reports reuse explicitly. If the recreate ALSO
+            # reused a ref at a non-candidate SHA (the delete silently failed, or
+            # a peer re-cut the branch), the release PR would promote the WRONG
+            # commit — the exact hazard this whole block exists to prevent. Fail
+            # the promotion instead of shipping an unqualified SHA.
+            if recreated.get("reused") and not recreated.get("sha_matches"):
+                raise RuntimeError(
+                    f"release branch {release_branch} still points at "
+                    f"{recreated.get('existing_sha')} after delete+recreate; "
+                    f"refusing to promote a non-candidate SHA"
+                )
     except Exception as exc:  # noqa: BLE001 — a branch-creation failure blocks, never raises
         logger.warning(
             "[RELEASE_QUALIFIER] promote: failed to create release branch %s "

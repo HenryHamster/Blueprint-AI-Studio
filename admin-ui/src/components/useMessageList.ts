@@ -83,13 +83,13 @@ export function useMessageList({
   }, [messages, criticalOnly, searchQuery]);
 
   // Count new high-signal messages (created after divider time) — for visual divider only
-  const newHighSignalCount = dividerTime
+  const newHighSignalCount = useMemo(() => dividerTime
     ? openMessages.filter(m =>
         m.created_at &&
         effectiveSignal(m, eventPrefs, tempMutes) === 'high' &&
         parseTimestamp(m.created_at).getTime() > dividerTime
       ).length
-    : 0;
+    : 0, [openMessages, dividerTime, eventPrefs, tempMutes]);
 
   // Count new messages by type for the summary card (respecting mute prefs and criticalOnly)
   const newMessageCounts = useMemo<MessageSummaryCounts>(() => dividerTime

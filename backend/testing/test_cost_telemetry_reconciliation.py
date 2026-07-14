@@ -21,6 +21,7 @@ from app.cost_telemetry_reconciliation import (
 )
 from app.llm_cost_attribution import LLM_TOKEN_PRICING
 from app.models import TaskStatus, bank_task_current_attempt
+from app.routers.admin_digest import _compute_digest
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -1477,3 +1478,168 @@ async def test_reconcile_llm_cost_asdict_has_all_reconciliation_fields(db_sessio
     assert deserialized["agent_accumulated_output_tokens"] == 0
     assert deserialized["provider_reported_output_tokens"] == 0
     assert deserialized["source"] == "internal_recompute"
+
+
+# ---------------------------------------------------------------------------
+# Digest payload integration: provider-reported reconciliation in _compute_digest
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_digest_payload_includes_provider_reported_reconciliation(db_session):
+    """_compute_digest includes cost_telemetry_reconciliation_provider_reported in
+    the payload when the task window has tasks with provider_reported_usage data.
+
+    Verifies that reconcile_provider_reported_usage is wired into the live
+    digest path (not test-only), and that its result is surfaced as a top-level
+    key alongside the legacy cost_telemetry_reconciliation."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Task with both api_call_summary and provider_reported_usage — gets checked.
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        api_call_summary={
+            "total_input_tokens": 1500,
+            "total_output_tokens": 500,
+            "total_cache_creation_input_tokens": 200,
+            "total_cache_read_input_tokens": 300,
+            "llm_call_count": 5,
+        },
+        provider_reported_usage={
+            "input_tokens": 1000,
+            "output_tokens": 500,
+            "cache_creation_input_tokens": 200,
+            "cache_read_input_tokens": 300,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    result = await _compute_digest(hours=24, project_id=project.id, session=db_session)
+
+    # Top-level key must be present.
+    assert "cost_telemetry_reconciliation_provider_reported" in result, (
+        "digest payload must include cost_telemetry_reconciliation_provider_reported"
+    )
+
+    pr = result["cost_telemetry_reconciliation_provider_reported"]
+    assert pr is not None, "provider-reported reconciliation must not be None when tasks exist"
+    assert pr["source"] == "provider_reported"
+    # At least one task had provider data.
+    assert pr["task_count"] >= 1
+    # The tolerance flag must be present.
+    assert "provider_reported_within_tolerance" in pr
+    # Legacy reconciliation must also still be present.
+    assert "cost_telemetry_reconciliation" in result
+    assert result["cost_telemetry_reconciliation"] is not None
+
+
+# ---------------------------------------------------------------------------
+# Reconciliation COVERAGE: total_task_count / provider_reported_task_count /
+# coverage_fraction — distinguishes a 0%-coverage result from "nothing checked".
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_coverage_fraction_full_when_all_tasks_have_provider_probe(db_session):
+    """When every task carries a provider-reported probe, coverage_fraction == 1.0."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    t1 = _make_provider_reported_task(
+        project.id, provider="anthropic", model="claude-sonnet-4-6",
+        input_tokens=1000, output_tokens=500,
+    )
+    t2 = _make_provider_reported_task(
+        project.id, provider="anthropic", model="claude-sonnet-4-6",
+        input_tokens=2000, output_tokens=800,
+    )
+    db_session.add_all([t1, t2])
+    await db_session.commit()
+
+    result = reconcile_provider_reported_usage([t1, t2])
+
+    assert result.total_task_count == 2
+    assert result.provider_reported_task_count == 2
+    assert result.coverage_fraction == 1.0
+    # task_count (contributing tasks) stays consistent with the probed count.
+    assert result.task_count == 2
+
+
+@pytest.mark.asyncio
+async def test_coverage_fraction_partial_when_some_tasks_lack_probe(db_session):
+    """Coverage is the probed fraction of the whole input window, not 100%."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    probed = _make_provider_reported_task(
+        project.id, provider="anthropic", model="claude-sonnet-4-6",
+        input_tokens=1000, output_tokens=500,
+    )
+    # A task with api_call_summary but NO provider_reported_usage (self-reported).
+    unprobed = _make_cost_task(
+        project.id, provider="openai", model="gpt-5.5",
+        input_tokens=1000, output_tokens=500,
+    )
+    db_session.add_all([probed, unprobed])
+    await db_session.commit()
+
+    result = reconcile_provider_reported_usage([probed, unprobed])
+
+    assert result.total_task_count == 2
+    assert result.provider_reported_task_count == 1
+    assert result.coverage_fraction == 0.5
+
+
+@pytest.mark.asyncio
+async def test_coverage_fraction_zero_when_no_task_has_probe(db_session):
+    """A genuine 0%-coverage window reports coverage_fraction 0.0 (NOT None) so it
+    is distinguishable from an empty window."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    t1 = _make_cost_task(
+        project.id, provider="openai", model="gpt-5.5",
+        input_tokens=1000, output_tokens=500,
+    )
+    db_session.add(t1)
+    await db_session.commit()
+
+    result = reconcile_provider_reported_usage([t1])
+
+    assert result.total_task_count == 1
+    assert result.provider_reported_task_count == 0
+    assert result.coverage_fraction == 0.0
+
+
+def test_coverage_fraction_none_on_empty_task_list():
+    """Zero tasks → coverage_fraction is None (no window to divide by)."""
+    result = reconcile_provider_reported_usage([])
+    assert result.total_task_count == 0
+    assert result.provider_reported_task_count == 0
+    assert result.coverage_fraction is None
+
+
+def test_coverage_fields_serialize_in_asdict():
+    """The three new coverage fields are present in asdict() and JSON round-trip."""
+    import json
+
+    result = reconcile_provider_reported_usage([])
+    d = result.asdict()
+    for key in ("total_task_count", "provider_reported_task_count", "coverage_fraction"):
+        assert key in d, f"asdict() must include {key}"
+    # None survives JSON round-trip as null.
+    assert json.loads(json.dumps(d))["coverage_fraction"] is None

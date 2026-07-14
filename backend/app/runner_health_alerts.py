@@ -14,7 +14,7 @@ delivery is deferred to ``app.notification_dispatch.dispatch_external_notificati
 
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
@@ -847,6 +847,120 @@ async def _resolve_local_runner_hold_alert(
     return len(open_alerts)
 
 
+_CONTAINER_RUNNER_HOLD_ALERT_TITLE = "Compute hold: no container-capable runner"
+
+
+async def _maybe_create_container_runner_hold_alert(
+    task: "object",
+    session: AsyncSession,
+    *,
+    held_seconds: int,
+    timeout_seconds: int,
+) -> bool:
+    """Create a deduplicated WARNING alert for an aging container-runner compute hold.
+
+    Sibling of :func:`_maybe_create_local_runner_hold_alert`. Fires when a
+    ``compute_experiment`` declaring a ``container_image`` has been QUEUED longer
+    than the early-warning threshold because no live runner advertises the
+    ``docker_usable`` capability — the exact stall the project-baked-image
+    authoring default triggers on any GPU box without Docker. Distinct title so
+    the operator sees the accurate cause (missing container runtime, not an
+    offline require-local host).
+
+    Deduplicated on ``(task_id, title, dismissed_at IS NULL)`` so repeated sweep
+    passes raise exactly ONE alert per hold episode. The caller commits after this
+    returns ``True``. Returns ``False`` when the alert already exists (dedup hit).
+    """
+    existing = await session.execute(
+        select(Alert).where(
+            Alert.task_id == task.id,
+            Alert.dismissed_at.is_(None),
+            Alert.title == _CONTAINER_RUNNER_HOLD_ALERT_TITLE,
+        )
+    )
+    if existing.scalars().first() is not None:
+        return False
+    held_str = _fmt_duration_seconds(held_seconds)
+    remaining_str = _fmt_duration_seconds(timeout_seconds)
+    msg = (
+        f"A container-image compute experiment has been waiting {held_str} for a "
+        f"container-capable runner (docker_usable) with none online — the task "
+        f"will hard-fail in ~{remaining_str} if no such runner comes online. "
+        f"Enroll a Docker-capable runner or requeue the task without a "
+        f"container_image to use cloud compute."
+    )[:1000]
+    alert = Alert(
+        project_id=task.project_id,
+        severity=AlertSeverity.WARNING,
+        title=_CONTAINER_RUNNER_HOLD_ALERT_TITLE,
+        message=msg,
+        task_id=task.id,
+    )
+    session.add(alert)
+    await broadcast_to_project(
+        str(task.project_id),
+        "alert_created",
+        {"alert_id": str(alert.id), "severity": "WARNING", "title": alert.title},
+    )
+    try:
+        import asyncio as _asyncio
+        from app.notification_dispatch import dispatch_external_notification
+
+        _asyncio.ensure_future(  # noqa: RUF006
+            dispatch_external_notification(
+                task.project_id,
+                "RUNNER_CONTAINER_HOLD",
+                {
+                    "task_id": str(task.id),
+                    "task_title": task.title or str(task.id)[:8],
+                    "held_seconds": held_seconds,
+                    "held_duration": held_str,
+                    "timeout_seconds": timeout_seconds,
+                    "remaining_duration": remaining_str,
+                    "title": alert.title,
+                },
+            )
+        )
+    except Exception as _ne:
+        logger.warning("[NOTIFY] RUNNER_CONTAINER_HOLD dispatch setup failed: %s", _ne)
+    return True
+
+
+async def _resolve_container_runner_hold_alert(
+    session: AsyncSession,
+    task_id: "uuid.UUID",
+) -> int:
+    """Dismiss any open container-runner-hold alert when the held task dispatches.
+
+    Companion to :func:`_maybe_create_container_runner_hold_alert`, mirroring
+    :func:`_resolve_local_runner_hold_alert`. Idempotent no-op when no open alert
+    exists; best-effort — a resolve failure must never abort the dispatch that
+    triggered it. Returns the number of alerts dismissed.
+    """
+    result = await session.execute(
+        select(Alert).where(
+            Alert.task_id == task_id,
+            Alert.title == _CONTAINER_RUNNER_HOLD_ALERT_TITLE,
+            Alert.dismissed_at.is_(None),
+        )
+    )
+    open_alerts = result.scalars().all()
+    if not open_alerts:
+        return 0
+    now = _utcnow()
+    for alert in open_alerts:
+        alert.dismissed_at = now
+        session.add(alert)
+    await session.commit()
+    for alert in open_alerts:
+        await broadcast_to_project(
+            str(alert.project_id),
+            "alert_dismissed",
+            {"alert_id": str(alert.id), "title": alert.title},
+        )
+    return len(open_alerts)
+
+
 _FLEET_NO_HEALTHY_RUNNER_EVENT_TYPE = "runner.fleet_no_healthy"
 
 
@@ -975,75 +1089,6 @@ async def _resolve_fleet_no_healthy_runner_alert(
     return len(open_alerts)
 
 
-_RUNNER_CROSS_PROJECT_MISMATCH_EVENT_TYPE = "runner.cross_project_mismatch"
-
-
-def _runner_cross_project_mismatch_dedupe_key(
-    runner_id: "uuid.UUID | str", job_id: "uuid.UUID | str"
-) -> str:
-    return f"{_RUNNER_CROSS_PROJECT_MISMATCH_EVENT_TYPE}:{runner_id}:{job_id}"
-
-
-async def _maybe_create_runner_cross_project_mismatch_alert(
-    session: AsyncSession,
-    *,
-    project_id: "uuid.UUID",
-    runner_id: "uuid.UUID | str",
-    job_id: "uuid.UUID | str",
-    job_project_id: "uuid.UUID | str",
-    hostname: "str | None" = None,
-) -> bool:
-    """Create a deduplicated WARNING alert when a runner attempts to access a job
-    from a different project.
-
-    A self-hosted runner registered to one project should never touch compute
-    jobs belonging to another project. When this happens it almost always means
-    a misconfigured or leaked runner token. Surfaces in the operator Alerts banner
-    so the operator can investigate without grepping logs.
-
-    Deduplicated on ``runner.cross_project_mismatch:{runner_id}:{job_id}`` so
-    repeated report attempts for the SAME (runner, job) pair produce a single
-    alert row. Returns ``True`` when a NEW alert was created, else ``False``.
-    """
-    runner_label = hostname or f"runner {str(runner_id)[:8]}"
-    title = f"Runner cross-project access blocked: {runner_label}"
-    message = (
-        f"Self-hosted runner {runner_label} (id={str(runner_id)[:8]}) attempted "
-        f"to report on compute job {str(job_id)[:8]}, which belongs to a "
-        f"different project (project_id={str(job_project_id)[:8]}). Access was "
-        f"denied. This usually means a misconfigured or leaked runner token. "
-        f"Check runner registration and rotate the runner token if necessary."
-    )[:1000]
-
-    dedupe_key = _runner_cross_project_mismatch_dedupe_key(runner_id, job_id)
-    alert, created, _decision = await create_project_alert_if_allowed(
-        session,
-        project_id=project_id,
-        event_type=_RUNNER_CROSS_PROJECT_MISMATCH_EVENT_TYPE,
-        severity=AlertSeverity.WARNING,
-        title=title,
-        message=message,
-        source="runner",
-        dedupe_key=dedupe_key,
-        broadcast=False,
-    )
-    if alert is None:
-        return False
-    await session.commit()
-    if not created:
-        return False
-    await broadcast_to_project(
-        str(project_id),
-        "alert_created",
-        {
-            "alert_id": str(alert.id),
-            "severity": AlertSeverity.WARNING.value,
-            "title": title,
-        },
-    )
-    return True
-
-
 _RUNNER_LOW_DISK_EVENT_TYPE = "runner.low_disk"
 
 
@@ -1150,6 +1195,119 @@ async def _resolve_runner_low_disk_alert(
     dismissed (0 or 1 in practice).
     """
     dedupe_key = _runner_low_disk_dedupe_key(runner_id)
+    result = await session.execute(
+        select(Alert).where(
+            Alert.project_id == project_id,
+            Alert.dedupe_key == dedupe_key,
+            Alert.dismissed_at.is_(None),
+        )
+    )
+    open_alerts = result.scalars().all()
+    if not open_alerts:
+        return 0
+    now = _utcnow()
+    for alert in open_alerts:
+        alert.dismissed_at = now
+        session.add(alert)
+    await session.commit()
+    for alert in open_alerts:
+        await broadcast_to_project(
+            str(project_id),
+            "alert_dismissed",
+            {"alert_id": str(alert.id), "title": alert.title},
+        )
+    return len(open_alerts)
+
+
+_RUNNER_POST_UPDATE_SILENT_EVENT_TYPE = "runner.post_update_silent"
+
+
+def _runner_post_update_silent_dedupe_key(runner_id: "uuid.UUID | str") -> str:
+    return f"{_RUNNER_POST_UPDATE_SILENT_EVENT_TYPE}:{runner_id}"
+
+
+async def _maybe_create_runner_post_update_silent_alert(
+    session: AsyncSession,
+    *,
+    project_id: "uuid.UUID",
+    runner_id: "uuid.UUID | str",
+    hostname: "str | None" = None,
+    old_version: "str | None" = None,
+    new_version: "str | None" = None,
+    seconds_silent: "int | None" = None,
+) -> bool:
+    """Create a deduplicated WARNING alert when a runner self-updated then went silent.
+
+    Fires from the degraded-runner sweep when a runner reported a NEW version and
+    then stopped heartbeating within the post-update window — the tmux/nohup
+    auto-update failure mode where ``os._exit`` killed the process and nothing
+    restarted it (operator-observed dgx-1 ~45min outage). Deduplicated on
+    ``runner.post_update_silent:{runner_id}`` so repeated sweeps bump the
+    occurrence count. Clears via :func:`_resolve_runner_post_update_silent_alert`
+    once the runner heartbeats again. Returns ``True`` when a NEW alert was
+    created, else ``False``.
+    """
+    runner_label = hostname or f"runner {str(runner_id)[:8]}"
+    silent_for = (
+        f"{seconds_silent}s" if seconds_silent is not None else "an unknown interval"
+    )
+    version_note = (
+        f"from {old_version} to {new_version}"
+        if old_version and new_version
+        else f"to {new_version}" if new_version else ""
+    )
+    title = f"Fleet runner silent after self-update: {runner_label}"
+    message = (
+        f"Self-hosted fleet runner {runner_label} ({str(runner_id)[:8]}) reported a "
+        f"version change {version_note} and then went silent for {silent_for}. This "
+        f"is the auto-update-without-supervisor failure mode: the runner replaced "
+        f"itself and no supervisor restarted it. Check the host — if launched via "
+        f"tmux/nohup, wrap it in a restart loop or systemd service. The alert clears "
+        f"automatically when the runner heartbeats again."
+    )[:1000]
+
+    alert, created, _decision = await create_project_alert_if_allowed(
+        session,
+        project_id=project_id,
+        event_type=_RUNNER_POST_UPDATE_SILENT_EVENT_TYPE,
+        severity=AlertSeverity.WARNING,
+        title=title,
+        message=message,
+        source="orchestrator",
+        dedupe_key=_runner_post_update_silent_dedupe_key(runner_id),
+        broadcast=False,
+    )
+    if alert is None:
+        return False
+    await session.commit()
+    if not created:
+        return False
+    await broadcast_to_project(
+        str(project_id),
+        "alert_created",
+        {
+            "alert_id": str(alert.id),
+            "severity": AlertSeverity.WARNING.value,
+            "title": alert.title,
+            "domain": alert.domain,
+            "event_type": alert.event_type,
+        },
+    )
+    return True
+
+
+async def _resolve_runner_post_update_silent_alert(
+    session: AsyncSession,
+    project_id: "uuid.UUID",
+    runner_id: "uuid.UUID | str",
+) -> int:
+    """Dismiss any open post-update-silent alert once the runner is live again.
+
+    Companion to :func:`_maybe_create_runner_post_update_silent_alert`. Called
+    from the sweep when the runner has heartbeated within the liveness window.
+    Returns the number of alerts dismissed (0 or 1 in practice).
+    """
+    dedupe_key = _runner_post_update_silent_dedupe_key(runner_id)
     result = await session.execute(
         select(Alert).where(
             Alert.project_id == project_id,
@@ -1539,6 +1697,146 @@ async def _resolve_runner_low_memory_alert(
         select(Alert).where(
             Alert.project_id == project_id,
             Alert.dedupe_key == dedupe_key,
+            Alert.dismissed_at.is_(None),
+        )
+    )
+    open_alerts = result.scalars().all()
+    if not open_alerts:
+        return 0
+    now = _utcnow()
+    for alert in open_alerts:
+        alert.dismissed_at = now
+        session.add(alert)
+    await session.commit()
+    for alert in open_alerts:
+        await broadcast_to_project(
+            str(project_id),
+            "alert_dismissed",
+            {"alert_id": str(alert.id), "title": alert.title},
+        )
+    return len(open_alerts)
+
+
+# Cross-project access alert. The small process-local window deliberately
+# suppresses isolated stale-job races. It resets on restart and is not shared
+# across workers; the durable open alert itself remains in the database.
+_RUNNER_CROSS_PROJECT_ACCESS_EVENT_TYPE = "runner.cross_project_access"
+_RUNNER_CROSS_PROJECT_ACCESS_THRESHOLD = 3
+_RUNNER_CROSS_PROJECT_ACCESS_WINDOW_SECONDS = 300
+_runner_cross_project_mismatch_timestamps: dict[str, list[datetime]] = {}
+
+
+def _runner_cross_project_access_dedupe_key(runner_id: "uuid.UUID | str") -> str:
+    return f"{_RUNNER_CROSS_PROJECT_ACCESS_EVENT_TYPE}:{runner_id}"
+
+
+def _record_runner_cross_project_mismatch(
+    runner_id: "uuid.UUID | str",
+    *,
+    now: "datetime | None" = None,
+) -> tuple[bool, int]:
+    """Record a mismatch and return whether the sliding-window threshold fired."""
+    key = str(runner_id)
+    ts_now = now if now is not None else _utcnow()
+    cutoff = ts_now - timedelta(seconds=_RUNNER_CROSS_PROJECT_ACCESS_WINDOW_SECONDS)
+    timestamps = [
+        timestamp
+        for timestamp in _runner_cross_project_mismatch_timestamps.get(key, [])
+        if timestamp > cutoff
+    ]
+    timestamps.append(ts_now)
+    _runner_cross_project_mismatch_timestamps[key] = timestamps
+    return len(timestamps) >= _RUNNER_CROSS_PROJECT_ACCESS_THRESHOLD, len(timestamps)
+
+
+async def _maybe_create_runner_cross_project_access_alert(
+    session: AsyncSession,
+    *,
+    project_id: "uuid.UUID",
+    runner_id: "uuid.UUID | str",
+    hostname: "str | None" = None,
+    mismatch_count: int = 0,
+    attempt_project_id: "uuid.UUID | str | None" = None,
+) -> bool:
+    """Create one ERROR alert when a runner repeatedly crosses project boundaries."""
+    runner_label = hostname or f"runner {str(runner_id)[:8]}"
+    target_desc = (
+        f" targeting project {str(attempt_project_id)[:8]}" if attempt_project_id else ""
+    )
+    title = f"Runner cross-project access attempt: {runner_label}"
+    message = (
+        f"Self-hosted runner {runner_label} ({str(runner_id)[:8]}) has attempted "
+        f"to access jobs belonging to a different project{target_desc} "
+        f"{mismatch_count} time(s) in the last "
+        f"{_RUNNER_CROSS_PROJECT_ACCESS_WINDOW_SECONDS // 60} minutes. "
+        "This may indicate a misconfigured or compromised runner. Verify the "
+        "runner's project assignment and rotate its credentials if compromise "
+        "is suspected."
+    )[:1000]
+    alert, created, _decision = await create_project_alert_if_allowed(
+        session,
+        project_id=project_id,
+        event_type=_RUNNER_CROSS_PROJECT_ACCESS_EVENT_TYPE,
+        severity=AlertSeverity.ERROR,
+        title=title,
+        message=message,
+        source="orchestrator",
+        dedupe_key=_runner_cross_project_access_dedupe_key(runner_id),
+        broadcast=False,
+    )
+    if alert is None:
+        return False
+    await session.commit()
+    if not created:
+        return False
+    await broadcast_to_project(
+        str(project_id),
+        "alert_created",
+        {
+            "alert_id": str(alert.id),
+            "severity": AlertSeverity.ERROR.value,
+            "title": alert.title,
+            "domain": alert.domain,
+            "event_type": alert.event_type,
+        },
+    )
+    try:
+        import asyncio as _asyncio
+        from app.notification_dispatch import dispatch_external_notification
+
+        _asyncio.ensure_future(  # noqa: RUF006
+            dispatch_external_notification(
+                project_id,
+                "RUNNER_CROSS_PROJECT_ACCESS",
+                {
+                    "runner_id": str(runner_id),
+                    "runner_label": runner_label,
+                    "mismatch_count": mismatch_count,
+                    "attempt_project_id": (
+                        str(attempt_project_id) if attempt_project_id else None
+                    ),
+                    "title": alert.title,
+                },
+            )
+        )
+    except Exception as exc:
+        logger.warning(
+            "[NOTIFY] RUNNER_CROSS_PROJECT_ACCESS dispatch setup failed: %s", exc
+        )
+    return True
+
+
+async def _resolve_runner_cross_project_access_alert(
+    session: AsyncSession,
+    project_id: "uuid.UUID",
+    runner_id: "uuid.UUID | str",
+) -> int:
+    """Dismiss the runner alert and reset its process-local mismatch window."""
+    _runner_cross_project_mismatch_timestamps.pop(str(runner_id), None)
+    result = await session.execute(
+        select(Alert).where(
+            Alert.project_id == project_id,
+            Alert.dedupe_key == _runner_cross_project_access_dedupe_key(runner_id),
             Alert.dismissed_at.is_(None),
         )
     )

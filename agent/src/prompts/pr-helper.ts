@@ -342,6 +342,51 @@ if [ "$COMMITS_AHEAD" = "0" ]; then
   exit 1
 fi
 
+# Zero-effective-diff guard (primary defense for the empty-diff-at-merge
+# incident). COMMITS_AHEAD>0 only means this branch differs from base by SHA —
+# a rebased/superseded branch can be commits-ahead yet contribute ZERO effective
+# diff vs base (git diff base...HEAD is empty). Pushing + opening a PR here would
+# let a no-op branch flow to ./done and report success. Refuse and route to the
+# sanctioned no-op exits instead. Uses the three-dot (merge-base) diff so the
+# check matches what a merge actually contributes. Skip only when the base ref is
+# unresolvable (BASE_REF empty) — keep the commits-ahead-only behavior there.
+if [ -n "$BASE_REF" ]; then
+  # Capture the diff's exit STATUS separately from its output. A FAILED git diff
+  # (e.g. the merge-base commit is absent on a depth-limited/shallow clone, so
+  # "$BASE_REF...HEAD" cannot be resolved) produces empty stdout AND a non-zero
+  # exit — indistinguishable from a genuinely-empty diff if we swallow the status
+  # with "2>/dev/null || true". Conflating the two hard-blocked real work into
+  # no-op dispositions (the empty-PR / no-op-merge merge-accounting-drift class),
+  # so we must branch on the exit status, not just on emptiness of the output.
+  _EFFECTIVE_DIFF=$(git -c core.quotepath=false diff --name-only "$BASE_REF...HEAD" 2>/tmp/pr_effdiff.log)
+  _EFFECTIVE_DIFF_STATUS=$?
+  if [ "$_EFFECTIVE_DIFF_STATUS" -ne 0 ]; then
+    # Diff failed — most likely the merge-base is missing on a shallow clone.
+    # Deepen history so the merge-base becomes reachable, then retry once.
+    echo "[pr] effective-diff check: git diff vs base failed (exit $_EFFECTIVE_DIFF_STATUS) — deepening history and retrying (likely a depth-limited clone)." >&2
+    git fetch --deepen=200 origin "${cfg.baseBranch}" >/dev/null 2>&1 || true
+    git fetch --unshallow origin >/dev/null 2>&1 || true
+    _EFFECTIVE_DIFF=$(git -c core.quotepath=false diff --name-only "$BASE_REF...HEAD" 2>/tmp/pr_effdiff.log)
+    _EFFECTIVE_DIFF_STATUS=$?
+  fi
+  if [ "$_EFFECTIVE_DIFF_STATUS" -ne 0 ]; then
+    # Still failing after deepen: the check is INCONCLUSIVE, not a proven
+    # zero-diff. Do NOT hard-block genuine work on an unresolvable base ref —
+    # commits-ahead>0 already held above. Skip the guard and let the push proceed.
+    echo "[pr] effective-diff check inconclusive (git diff vs base still failing after deepen) — skipping the zero-diff guard rather than blocking real work:" >&2
+    sed 's/^/[pr]   /' /tmp/pr_effdiff.log >&2 2>/dev/null || true
+  elif [ -z "$_EFFECTIVE_DIFF" ]; then
+    echo "[pr] Branch is $COMMITS_AHEAD commit(s) ahead of ${cfg.baseBranch} but nets to ZERO effective diff vs base." >&2
+    echo "[pr] A code-change task that produced no effective diff must NOT open a PR or report success." >&2
+    echo "[pr] If a sibling PR already merged the same changes (this branch was superseded)," >&2
+    echo "[pr]   run:  ./pr close --superseded-by <winning-PR-number>" >&2
+    echo "[pr] If the deliverable already exists on ${cfg.baseBranch} and no change is needed," >&2
+    echo "[pr]   run:  ./done --already-done \\"<reason naming the artifact you verified>\\"" >&2
+    echo "[pr] Otherwise make your changes and re-run ./pr open." >&2
+    exit 1
+  fi
+fi
+
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
 _load_agent_token
 TASK="${cfg.taskId}"

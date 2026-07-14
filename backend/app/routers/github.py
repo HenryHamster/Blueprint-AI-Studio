@@ -297,6 +297,57 @@ async def github_oauth_callback(
         return RedirectResponse(url=f"{admin_url}?github_error=failed")
 
 
+async def _stamp_github_verified_changed_files(
+    pr_task: Task,
+    owner: str,
+    repo: str,
+    pr_number: int,
+    project_id: object,
+) -> None:
+    """Override the agent's self-reported changed-file list with the authoritative
+    list from GitHub's API and stamp ``_pr_changed_files_github_verified=True``.
+
+    This closes the self-declaration trust gap: agents declare what test they
+    added as acceptance evidence, but until the webhook fetches the real PR file
+    list, the gate has only the agent's word that the test was in the diff.
+
+    Fails silently (logs a warning) so that a transient GitHub API outage never
+    blocks the PR-merged signal from landing.
+    """
+    try:
+        from app.acceptance_gate import stamp_changed_files_signal
+        from app.github_auth import get_repo_installation_token
+        from app.github_pulls import get_pr_files
+
+        gh_token = await get_repo_installation_token(owner, repo)
+        if not gh_token:
+            logger.warning(
+                "[WEBHOOK] No installation token for %s/%s — "
+                "falling back to agent self-report for PR #%s",
+                owner, repo, pr_number,
+            )
+            return
+        raw_files = await get_pr_files(gh_token, owner, repo, pr_number, str(project_id))
+        file_paths = [
+            f["filename"]
+            for f in raw_files
+            if isinstance(f, dict) and isinstance(f.get("filename"), str)
+        ]
+        ctx = dict(pr_task.context or {})
+        ctx.update(stamp_changed_files_signal(file_paths, github_verified=True))
+        pr_task.context = ctx
+        logger.info(
+            "[WEBHOOK] Stamped %d GitHub-verified changed files for task %s (PR #%s)",
+            len(file_paths), pr_task.id, pr_number,
+        )
+    except Exception:
+        logger.warning(
+            "[WEBHOOK] get_pr_files failed for PR #%s; "
+            "falling back to agent self-report for acceptance gate",
+            pr_number, exc_info=True,
+        )
+
+
 @router.post("/webhook")
 @limiter.limit("120/minute")
 async def github_webhook(
@@ -439,6 +490,9 @@ async def github_webhook(
                                 source="github.pull_request.closed",
                             )
                             if record_pr_merged:
+                                await _stamp_github_verified_changed_files(
+                                    pr_task, owner, repo, pr_number, project.id
+                                )
                                 apply_merged_landed_signal(
                                     pr_task,
                                     project,

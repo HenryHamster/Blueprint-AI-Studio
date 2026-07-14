@@ -46,6 +46,7 @@ from app.models import (
     TaskHistory,
     Project,
     ProjectMember,
+    LocalRunner,
     ProjectMessage,
     Artifact,
     ArtifactType,
@@ -68,6 +69,7 @@ from app.task_capabilities import USER_LAUNCHABLE_TASK_TYPES
 from app.compute_experiment_contract import (
     _validate_compute_launch_contract,
     resolve_compute_spend_approval,
+    validate_compute_runner_target_enrollment,
 )
 from app.compute_jobs import clamp_spend_cap_usd, clamp_deadline_seconds
 from app.vm_cost_rates import (
@@ -89,6 +91,8 @@ from app.compute import _capture_serial_for_vm, get_vm_zone, get_vm_status
 from app.admin_helpers import (  # noqa: F401
     _ROLE_LEVEL,
     _user_project_ids,
+    _member_project_ids,
+    _resolve_repo_project_for_write,
     _get_user_project,
     _get_user_project_with_role,
     _get_user_task,
@@ -672,7 +676,10 @@ async def bulk_archive_tasks(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
-    user_project_ids = _user_project_ids(current_user["user_id"])
+    # Archiving is a mutation: scope to projects where the caller is member+,
+    # matching the sibling bulk-action handler. A viewer is read-only and must
+    # not be able to bulk-archive another member's tasks.
+    user_project_ids = _member_project_ids(current_user["user_id"])
     if request.task_ids is not None:
 
         def _safe_uuid(raw: str) -> uuid.UUID | None:
@@ -758,8 +765,14 @@ async def purge_archive_tasks(
     recently archived items. Up to 5000 tasks are deleted per call; callers
     should repeat until ``deleted_count`` is zero if they need to drain a large
     archive.
+
+    Scoped to projects where the caller is member+: this PERMANENTLY deletes
+    rows (the most destructive task mutation there is), so it takes the same
+    floor as the sibling bulk-action/bulk-archive handlers. A viewer is
+    read-only and must never be able to irreversibly destroy another member's
+    task history.
     """
-    user_project_ids = _user_project_ids(current_user["user_id"])
+    user_project_ids = _member_project_ids(current_user["user_id"])
 
     where_clauses = [
         Task.archived.is_(True),
@@ -1024,7 +1037,11 @@ async def bulk_action_tasks(
     # once that happens, subsequent iterations must re-fetch fresh or their reads
     # fire a sync lazy-load -> MissingGreenlet (caught, but it cascades every
     # remaining item to a spurious "error"). `_batch_dirty` flips on first rollback.
+    # Populated on first rollback: batch-fetched replacements for the expired
+    # ORM objects, avoiding per-iteration session.get (PERF finding M-P6).
     _batch_dirty = False
+    _stale_task_map: dict[uuid.UUID, Task] = {}
+    _stale_children_map: dict[uuid.UUID, list[Task]] = {}
     for raw_id in body.task_ids:
         if raw_id not in valid_map:
             continue  # already reported as invalid
@@ -1035,11 +1052,17 @@ async def bulk_action_tasks(
             )
             continue
         if _batch_dirty:
-            # Re-fetch this task fresh (populate_existing overwrites the expired
-            # instance) so the reads/mutations below run inside the async greenlet.
-            task = await session.get(
-                Task, valid_map[raw_id], populate_existing=True
-            )
+            # Batch-fetch all tasks in one query after rollback instead of
+            # N individual session.get(populate_existing=True) calls.
+            _remaining_ids = list(valid_map.values())
+            _fresh_tasks = (
+                await session.execute(
+                    select(Task).where(Task.id.in_(_remaining_ids)),
+                    execution_options={"populate_existing": True},
+                )
+            ).scalars().all()
+            _stale_task_map = {t.id: t for t in _fresh_tasks}
+            task = _stale_task_map.get(valid_map[raw_id])
             if task is None:
                 results.append(
                     {"task_id": raw_id, "status": "error", "error": "Task not found"}
@@ -1139,20 +1162,21 @@ async def bulk_action_tasks(
 
                 # Use pre-fetched children (batch query before loop, no N+1).
                 # If a prior item rolled back, the prefetch is expired — re-fetch
-                # this parent's active children fresh to avoid MissingGreenlet.
+                # fresh children in one batch query instead of per-parent queries.
                 if _batch_dirty:
-                    active_children = list(
-                        (
-                            await session.execute(
-                                select(Task).where(
-                                    Task.parent_task_id == task.id,
-                                    Task.status.in_(CANCEL_CASCADE_CHILD_STATUSES),
-                                )
+                    _parent_ids = list(valid_map.values())
+                    _fresh_children = (
+                        await session.execute(
+                            select(Task).where(
+                                Task.parent_task_id.in_(_parent_ids),
+                                Task.status.in_(CANCEL_CASCADE_CHILD_STATUSES),
                             )
                         )
-                        .scalars()
-                        .all()
-                    )
+                    ).scalars().all()
+                    _stale_children_map = _defaultdict(list)
+                    for _child in _fresh_children:
+                        _stale_children_map[_child.parent_task_id].append(_child)
+                    active_children = _stale_children_map.get(task.id, [])
                 else:
                     active_children = _cancel_children_by_parent.get(task.id, [])
 
@@ -1164,6 +1188,7 @@ async def bulk_action_tasks(
                     (
                         child.vm_instance_id,
                         (child.context or {}).get("max_plan_account_id"),
+                        str(child.project_id) if child.project_id else None,
                     )
                     for child in active_children
                 ]
@@ -1227,15 +1252,21 @@ async def bulk_action_tasks(
                 if parent_vm_id:
                     await _ensure_vm_deleted(parent_vm_id, reason="admin_bulk_cancel")
                     if parent_acct_id:
-                        await release_max_plan_account(parent_acct_id)
+                        await release_max_plan_account(
+                            parent_acct_id,
+                            project_id=str(task.project_id) if task.project_id else None,
+                        )
 
-                for child_vm_id, child_acct_id in child_vm_info:
+                for child_vm_id, child_acct_id, child_project_id in child_vm_info:
                     if child_vm_id:
                         await _ensure_vm_deleted(
                             child_vm_id, reason="parent_bulk_cancelled"
                         )
                     if child_acct_id:
-                        await release_max_plan_account(child_acct_id)
+                        await release_max_plan_account(
+                            child_acct_id,
+                            project_id=child_project_id,
+                        )
 
                 if active_children:
                     logger.info(
@@ -1414,6 +1445,18 @@ def _task_runner_sideboard_context(task: Task) -> dict[str, Any]:
     return {
         "vm_instance_id": compact_text(task.vm_instance_id, max_chars=120),
         "runner_target_id": compact_text(ctx.get("runner_target_id"), max_chars=120),
+        # Operator/agent runner pin (launch-contract runner_target) and, when a
+        # strict pin is holding the task, the machine-readable hold reason
+        # {runner_id, strict, reason_code, detail} — so the UI can show WHY
+        # nothing is dispatching instead of a silent QUEUED card.
+        "preferred_runner_target_id": compact_text(
+            ctx.get("preferred_runner_target_id"), max_chars=120
+        ),
+        "runner_pin_hold": (
+            ctx.get("runner_pin_hold")
+            if isinstance(ctx.get("runner_pin_hold"), dict)
+            else None
+        ),
         "machine_type": compact_text(task.vm_machine_type, max_chars=80),
         "spot": task.vm_spot,
         "warm_start": task.vm_warm_start,
@@ -2133,6 +2176,29 @@ class CreateTaskPayload(BaseModel):
         return self
 
 
+class ComputeRunnerTargetPayload(BaseModel):
+    """Operator pin of a compute_experiment to a specific enrolled runner.
+
+    ``strict=False`` (default) is a soft preference: dispatch prefers this
+    runner when it is live and eligible, falling through to normal selection
+    otherwise. ``strict=True`` dispatches ONLY to this runner: whenever it is
+    not currently eligible the task is held QUEUED with an explicit hold reason
+    naming the runner and why (``task.context['runner_pin_hold']``). The runner
+    must exist and be enrolled in the task's project (422 otherwise).
+    """
+
+    runner_id: str = Field(..., min_length=1, max_length=64)
+    strict: bool = False
+
+    @field_validator("runner_id")
+    @classmethod
+    def validate_runner_id(cls, v: str) -> str:
+        try:
+            return str(uuid.UUID(v.strip()))
+        except ValueError:
+            raise ValueError(f"runner_target.runner_id {v!r} is not a valid UUID")
+
+
 class ComputeExperimentTaskPayload(BaseModel):
     github_repo: str = Field(..., pattern=r"^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$")
     title: str = Field(..., min_length=1, max_length=200)
@@ -2160,15 +2226,35 @@ class ComputeExperimentTaskPayload(BaseModel):
     require_live_release: bool = False
     require_durable_artifact: bool = False
     provisioning_model: str | None = None
+    # Operator HARD runner pin (distinct from the internal soft affinity hint):
+    # a LocalRunner UUID OR a runner hostname (the operator thinks in host names
+    # like ``dgx-1``). Resolved at launch against this project's registered,
+    # non-deleted runners and stamped into task.context['forced_runner_target_id'];
+    # dispatch then runs the job ONLY on that runner, holding QUEUED (never falling
+    # back to another runner or to cloud) whenever it is offline / ineligible.
+    runner_target_id: str | None = Field(default=None, max_length=255)
     # Container-aware runner fields (parity with the research/plan authoring path):
     # required for CUDA/NGC stacks (e.g. nvcr.io images) or the command runs bare.
     # The registry password is only ever persisted for runner-subprocess jobs.
     container_image: str | None = None
     container_registry_auth: dict[str, str] | None = None
     setup_step: str | None = None
+    # No-progress watchdog window (peer of the runtime deadline). When set and
+    # positive, a stalled job that writes no progress to BLUEPRINT_PROGRESS_FILE
+    # within this many seconds is torn down early with reason `no_progress_timeout`.
+    no_progress_timeout_seconds: int | None = None
+    # Optional pin to a specific enrolled runner (soft preference by default;
+    # strict=true dispatches only to that runner and holds with an explicit
+    # reason while it is ineligible). Validated against the project's enrolled
+    # runners — a cross-project or unknown runner id is a 422.
+    runner_target: ComputeRunnerTargetPayload | None = None
     idempotency_key: str | None = Field(
         default=None, max_length=255, pattern=r"^[a-zA-Z0-9_.-]+$"
     )
+    # When False, suppresses the reason-and-ship follow-on at completion.
+    # Operator-authored tasks (created_by="USER") default to suppressed; pass
+    # spawn_followup=True to opt in. Engine-authored tasks default to spawning.
+    spawn_followup: bool | None = None
 
     @model_validator(mode="after")
     def validate_command_or_arms(self) -> "ComputeExperimentTaskPayload":
@@ -2262,15 +2348,17 @@ async def create_task_manually(
     # Parse owner/repo
     github_owner, github_repo = payload.github_repo.split("/", 1)
 
-    # Find project for this repo where user is a member (or create new)
-    stmt = select(Project).where(
-        Project.github_owner == github_owner,
-        Project.github_repo == github_repo,
-        Project.id.in_(_user_project_ids(current_user["user_id"])),
+    # Find the project for this repo the caller may WRITE to (member+), else
+    # create one. Viewers are documented read-only, so creating work on a
+    # viewer-only project is a 403 — and must NOT fall through into the
+    # auto-create branch below, which would hand the viewer a shadow project
+    # they own. See _resolve_repo_project_for_write for why the member+ lookup
+    # has to come first (duplicate projects per repo are legitimate).
+    project = await _resolve_repo_project_for_write(
+        session, current_user["user_id"], github_owner, github_repo
     )
-    project = (await session.execute(stmt)).scalars().first()
 
-    if not project:
+    if project is None:
         project = Project(
             name=payload.github_repo,
             user_id=current_user.get("user_id", "admin"),
@@ -2680,11 +2768,15 @@ def _coerce_draft(raw: dict) -> ComputeExperimentDraft:
     """Coerce and sanitize the LLM's raw dict into a valid ComputeExperimentDraft."""
     import re as _re
 
+    # fullmatch, not match: `$` also matches just before a trailing newline, so
+    # `.match()` accepts a key ending in a newline and lets it into an arm name /
+    # metric key that is later interpolated into generated bash (the same hole as
+    # the gates in compute_experiment_contract).
     _METRIC_RE = _re.compile(r"^[A-Za-z0-9_./-]+$")
     _ARM_NAME_RE = _re.compile(r"^[A-Za-z0-9_-]+$")
 
     def _safe_metric(v: object) -> str | None:
-        if isinstance(v, str) and _METRIC_RE.match(v):
+        if isinstance(v, str) and _METRIC_RE.fullmatch(v):
             return v
         return None
 
@@ -2707,7 +2799,7 @@ def _coerce_draft(raw: dict) -> ComputeExperimentDraft:
             if isinstance(arm, dict):
                 name = arm.get("name", "")
                 cmd = arm.get("command", "")
-                if isinstance(name, str) and _ARM_NAME_RE.match(name) and isinstance(cmd, str):
+                if isinstance(name, str) and _ARM_NAME_RE.fullmatch(name) and isinstance(cmd, str):
                     coerced_arms.append({"name": name, "command": cmd})
         arms = coerced_arms if coerced_arms else None
 
@@ -2941,6 +3033,78 @@ async def compute_experiment_preflight(
     }
 
 
+async def _resolve_forced_runner_target(
+    session: AsyncSession, project_id: uuid.UUID, runner_target: str
+) -> str:
+    """Resolve an operator runner target (UUID or hostname) to a LocalRunner UUID.
+
+    The operator may pass either a LocalRunner UUID or a host name (e.g. ``dgx-1``).
+    Resolution is scoped to the project's own registered, non-deleted runners. A
+    runner that is currently OFFLINE still resolves — the operator may launch ahead
+    of the box coming up; only membership (belongs to this project) and non-deletion
+    are required. Returns the resolved runner UUID string. Raises HTTP 422 with a
+    clear message when the target does not resolve to a runner owned by this project.
+    """
+    target = (runner_target or "").strip()
+    if not target:
+        raise HTTPException(
+            status_code=422,
+            detail="runner_target_id must be a non-empty runner UUID or hostname",
+        )
+    # Prefer a UUID match (operator pasted a runner id) before a hostname match.
+    parsed: uuid.UUID | None = None
+    try:
+        parsed = uuid.UUID(target)
+    except (ValueError, AttributeError, TypeError):
+        parsed = None
+    if parsed is not None:
+        runner = (
+            (
+                await session.execute(
+                    select(LocalRunner).where(
+                        LocalRunner.id == parsed,
+                        LocalRunner.project_id == project_id,
+                        LocalRunner.status != "deleted",
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if runner is not None:
+            return str(runner.id)
+    # Fall back to a hostname match; when several rows share a hostname (re-enroll),
+    # take the most recently seen so a live box wins over a stale duplicate.
+    matches = (
+        (
+            await session.execute(
+                select(LocalRunner)
+                .where(
+                    LocalRunner.project_id == project_id,
+                    LocalRunner.hostname == target,
+                    LocalRunner.status != "deleted",
+                )
+                .order_by(LocalRunner.last_seen_at.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if matches:
+        return str(matches[0].id)
+    raise HTTPException(
+        status_code=422,
+        detail={
+            "error": "forced_runner_not_found",
+            "message": (
+                f"runner_target_id {target!r} does not resolve to a registered, "
+                "non-deleted runner belonging to this project"
+            ),
+            "requested": target,
+        },
+    )
+
+
 @router.post("/tasks/compute-experiment")
 @limiter.limit("60/minute")
 async def create_compute_experiment_task(
@@ -2952,12 +3116,15 @@ async def create_compute_experiment_task(
     """Create an operator-launched compute_experiment with a full launch contract."""
     github_owner, github_repo = payload.github_repo.split("/", 1)
 
-    stmt = select(Project).where(
-        Project.github_owner == github_owner,
-        Project.github_repo == github_repo,
-        Project.id.in_(_user_project_ids(current_user["user_id"])),
+    # Same write gate as POST /tasks, and for a strictly stronger reason: this
+    # endpoint mints a compute_experiment with a full launch contract, i.e. it
+    # spends real GPU budget against the project's spend_cap_usd. Membership
+    # alone is not authorization to spend — without the member+ floor a viewer
+    # denied POST /tasks/{id}/rerun could simply launch a fresh GPU job here
+    # instead (and, via the auto-create branch, mint a project they own).
+    project = await _resolve_repo_project_for_write(
+        session, current_user["user_id"], github_owner, github_repo
     )
-    project = (await session.execute(stmt)).scalars().first()
 
     if not project:
         # Mark the auto-created project as bootstrap-complete and non-autonomous:
@@ -2987,6 +3154,15 @@ async def create_compute_experiment_task(
         await session.commit()
 
     await backfill_branch_columns(session, project_id=project.id)
+
+    # Resolve an operator HARD runner pin (UUID or hostname) against this project's
+    # own registered runners BEFORE persisting the task. A 422 here means the target
+    # is unknown/foreign — fail fast rather than create a task that can never run.
+    forced_runner_id: str | None = None
+    if payload.runner_target_id is not None and payload.runner_target_id.strip():
+        forced_runner_id = await _resolve_forced_runner_target(
+            session, project.id, payload.runner_target_id
+        )
 
     resolved_base_branch = (
         payload.base_branch or _get_project_promotion_target_for_task(project)
@@ -3024,14 +3200,28 @@ async def create_compute_experiment_task(
         "container_image",
         "container_registry_auth",
         "setup_step",
+        "no_progress_timeout_seconds",
     ):
         val = getattr(payload, opt_key)
         if val is not None:
             launch_contract[opt_key] = val
+    if payload.runner_target is not None:
+        launch_contract["runner_target"] = payload.runner_target.model_dump()
 
     ok, reason = _validate_compute_launch_contract(launch_contract, require_smoke=False)
     if not ok:
         raise HTTPException(status_code=422, detail=reason)
+
+    # A runner pin must name one of THIS project's enrolled runners — reject
+    # unknown and cross-project runner ids at authoring time with a clear 422
+    # instead of persisting a task that can never (strict) or silently won't
+    # (soft) dispatch where the operator expects.
+    if payload.runner_target is not None:
+        runner_target_error = await validate_compute_runner_target_enrollment(
+            session, project.id, launch_contract["runner_target"]
+        )
+        if runner_target_error is not None:
+            raise HTTPException(status_code=422, detail=runner_target_error)
 
     # Apply the same accelerator / machine-shape validation as compute-job
     # creation BEFORE persisting a Task, so invalid GPU launch contracts fail
@@ -3122,6 +3312,8 @@ async def create_compute_experiment_task(
                 "container_image",
                 "container_registry_auth",
                 "setup_step",
+                "no_progress_timeout_seconds",
+                "runner_target",
             )
             if launch_contract.get(k) is not None
         },
@@ -3131,6 +3323,7 @@ async def create_compute_experiment_task(
             if payload.require_durable_artifact
             else {}
         ),
+        **({"spawn_followup": payload.spawn_followup} if payload.spawn_followup is not None else {}),
     }
     try:
         task_payload = validate_task_payload(task_payload_raw)
@@ -3205,6 +3398,17 @@ async def create_compute_experiment_task(
     )
 
     vm_name = f"agent-vm-{uuid.uuid4().hex}"
+    task_context: dict[str, Any] = {}
+    if payload.runner_target is not None:
+        # Existing dispatch seam: _select_eligible_runner prefers this runner
+        # when eligible. Strictness is read from the payload's runner_target at
+        # dispatch time (orchestrator_runner_dispatch._payload_runner_target).
+        task_context["preferred_runner_target_id"] = payload.runner_target.runner_id
+    if forced_runner_id:
+        # Operator HARD pin (runner_target_id): _resolve_forced_runner_target
+        # already validated this runner belongs to the project; dispatch refuses
+        # any other runner. Distinct from the soft preferred pin above.
+        task_context["forced_runner_target_id"] = forced_runner_id
     new_task = Task(
         project_id=project.id,
         title=payload.title,
@@ -3216,6 +3420,7 @@ async def create_compute_experiment_task(
         launched_by_user_id=current_user["user_id"],
         requires_approval=requires_approval,
         idempotency_key=scoped_idempotency_key,
+        context=task_context,
     )
     session.add(new_task)
     try:
@@ -3283,6 +3488,10 @@ class RerunComputeExperimentPayload(BaseModel):
     success_criterion: ComputeSuccessCriterion | None = None
     spend_cap_usd: float | None = Field(default=None, gt=0)
     deadline_seconds: int | None = Field(default=None, gt=0)
+    # Optional forced runner pin override (UUID or hostname). When omitted the
+    # re-run INHERITS the source task's forced pin (if any); when supplied it
+    # replaces it (resolved against the project's registered runners).
+    runner_target_id: str | None = Field(default=None, max_length=255)
 
 
 @router.post("/tasks/{task_id}/rerun")
@@ -3300,7 +3509,11 @@ async def rerun_compute_experiment(
     validates the result, and creates a new QUEUED task with ``parent_task_id``
     pointing at the source so the two runs are linked.
     """
-    source = await _get_user_task(task_id, current_user["user_id"], session)
+    # Re-running a compute_experiment launches new GPU spend — member+ only
+    # (viewers are read-only).
+    source = await _get_user_task_with_role(
+        task_id, current_user["user_id"], session, "member"
+    )
 
     source_payload = _task_payload_dict(source)
     if not source_payload or source_payload.get("type") != "compute_experiment":
@@ -3347,6 +3560,20 @@ async def rerun_compute_experiment(
     if project is None:
         raise HTTPException(status_code=404, detail="Project not found")
 
+    # Forced runner pin: an explicit override resolves against the project's
+    # runners; otherwise inherit the source task's forced pin (if any).
+    if payload.runner_target_id is not None and payload.runner_target_id.strip():
+        forced_runner_id: str | None = await _resolve_forced_runner_target(
+            session, project.id, payload.runner_target_id
+        )
+    else:
+        raw_inherited = (source.context or {}).get("forced_runner_target_id")
+        forced_runner_id = (
+            str(raw_inherited).strip()
+            if isinstance(raw_inherited, str) and raw_inherited.strip()
+            else None
+        )
+
     requires_approval, _ = resolve_compute_spend_approval(
         runtime_config=_runtime_config,
         direction=None,
@@ -3365,6 +3592,9 @@ async def rerun_compute_experiment(
         launched_by_user_id=current_user["user_id"],
         requires_approval=requires_approval,
         parent_task_id=source.id,
+        context=(
+            {"forced_runner_target_id": forced_runner_id} if forced_runner_id else {}
+        ),
     )
     session.add(new_task)
     await session.commit()

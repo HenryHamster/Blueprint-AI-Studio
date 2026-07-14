@@ -1,6 +1,6 @@
-import React, { useCallback, useEffect, useState } from 'react';
-import { Cpu, Square, AlertTriangle, Clock, ExternalLink, Package, FileText, LayoutGrid, CheckCircle, XCircle, BookOpen } from 'lucide-react';
-import { analyzeComputeJob, askComputeJob, fetchAwaitingLocalRunnerHolds, fetchComputeJobsPaged, fetchComputeJobsAggregateSummary, fetchComputeSweepGroups, fetchHeldComputeExperiments, fetchKnowledgeDocument, killComputeJob, rerunComputeExperiment, type AwaitingLocalRunnerHold, type ComputeJob, type ComputeJobCommandLog, type ComputeJobLiveOutput, type ComputeJobsSummary, type ComputeSweepGroupsResponse, type ComputeSuccessOperator, type HeldComputeExperiment, type KnowledgeDocument } from '../api';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { Cpu, Square, AlertTriangle, Clock, ExternalLink, Package, FileText, LayoutGrid, CheckCircle, XCircle, BookOpen, Search, List } from 'lucide-react';
+import { analyzeComputeJob, askComputeJob, fetchAwaitingLocalRunnerHolds, fetchComputeJobsPaged, fetchComputeJobsAggregateSummary, fetchComputeSweepGroups, fetchHeldComputeExperiments, fetchKnowledgeDocument, killComputeJob, rerunComputeExperiment, resolveArtifactDownloadUrl, type AwaitingLocalRunnerHold, type ComputeJob, type ComputeJobCommandLog, type ComputeJobLiveOutput, type ComputeJobsSummary, type ComputeSweepGroupsResponse, type ComputeSuccessOperator, type HeldComputeExperiment, type KnowledgeDocument } from '../api';
 import { type ComputeExperimentForm, defaultComputeExperimentForm } from '../hooks/useTaskModal';
 import { usePersistedState } from '../hooks/usePersistedState';
 import { usePoller } from '../hooks/usePoller';
@@ -9,6 +9,7 @@ import { ConfirmDialog } from './ConfirmDialog';
 import { ReleaseEvidenceChip } from './ReleaseEvidence';
 import { asLiveReleaseEvidence } from './ReleaseEvidence.utils';
 import { AcceptanceGradeBadge } from './AcceptanceGradeBadge';
+import { EvidenceTierBadge, MutableImageBadge } from './EvidenceTierBadge';
 import { formatComputeAnalysisCauseLabel } from '../utils/computeAnalysisLabels';
 import {
   isComputeJobActive,
@@ -20,12 +21,25 @@ import {
   computeJobProjectedSpend,
   computeJobMargin,
   computeJobExecutionLocation,
+  computeJobViewableArtifacts,
+  fmtBytes,
+  computeJobEvidenceTier,
+  computeJobImagePinStatus,
   fmtUsd,
   fmtCountdown,
   fmtDuration,
 } from './ComputeJobsPanel.utils';
 
 const POLL_INTERVAL_MS = 10_000;
+
+// Signed artifact URLs expire after ~60 minutes; treat anything older than
+// 50 minutes as stale and re-resolve instead of handing out a dead link.
+const SIGNED_PREVIEW_FRESH_MS = 50 * 60 * 1000;
+
+type PreviewResolution =
+  | { state: 'resolving' }
+  | { state: 'resolved'; url: string; resolvedAt: number }
+  | { state: 'error' };
 
 const DIAGNOSTIC_KEYS = new Set(['exit_code', 'error', 'reason', 'stderr_excerpt', 'label', 'note', 'log', 'elapsed_seconds']);
 
@@ -268,10 +282,25 @@ function RunComparisonMatrix({ group }: { group: ComputeJob[] }) {
               const perArm = job.criterion_verdict?.per_arm;
               const cvOperator = job.criterion_verdict?.operator;
               const cvThreshold = job.criterion_verdict?.threshold;
+              const hasArmsVerdict = perArm != null && Object.keys(perArm).length > 0;
+              let armsMetCount = 0;
+              if (hasArmsVerdict && cvOperator && cvThreshold != null) {
+                for (const arm of arms) {
+                  const pav = perArm[arm.name];
+                  if (pav != null && criterionMet(pav, cvOperator, cvThreshold)) {
+                    armsMetCount++;
+                  }
+                }
+              }
               return (
                 <div key={job.id} className="mb-1.5">
                   <div className="text-ui-sm font-semibold text-neutral-300 font-mono mb-0.5">
                     {(job.task_title ?? job.id).slice(0, 24)}
+                    {hasArmsVerdict && (
+                      <span className="text-ui-xs text-neutral-500 font-normal ml-2" data-testid="arms-met-count">
+                        {armsMetCount}/{arms.length} arms met
+                      </span>
+                    )}
                   </div>
                   {arms.map((arm) => {
                     const armExitCode = typeof arm.metrics.exit_code === 'number' ? arm.metrics.exit_code : null;
@@ -620,7 +649,7 @@ function AwaitingLocalRunnerSection({
       <div className="flex flex-col gap-1.5">
         {holds.map((hold) => {
           const capLabel = hold.spend_cap_usd != null ? ` · $${Number(hold.spend_cap_usd).toFixed(2)}` : '';
-          const waitingMs = Date.parse(hold.awaiting_local_runner_since);
+          const waitingMs = Date.parse(hold.awaiting_local_runner_since || hold.awaiting_forced_runner_since || '');
           const waitingSec = isNaN(waitingMs) ? null : Math.max(0, Math.round((nowMs - waitingMs) / 1000));
           return (
             <div
@@ -630,7 +659,10 @@ function AwaitingLocalRunnerSection({
             >
               <div className="text-xs font-semibold text-amber-200 break-words">{hold.title ?? hold.id}{capLabel}</div>
               <div className="text-ui-sm text-amber-400 font-mono mt-0.5" data-testid="awaiting-local-runner-waiting">
-                waiting for local runner
+                {hold.forced_runner?.hostname
+                  ? <>waiting for forced runner <span className="font-semibold">{hold.forced_runner?.hostname}</span></>
+                  : 'waiting for local runner'
+                }
                 {waitingSec != null && <> since {fmtDuration(waitingSec)} ago</>}
               </div>
             </div>
@@ -651,6 +683,8 @@ function HeldExperimentsSection({
   onDismiss?: (taskId: string) => Promise<void>;
 }) {
   const [actionId, setActionId] = useState<string | null>(null);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [batchApproving, setBatchApproving] = useState(false);
 
   if (!experiments || experiments.length === 0) return null;
 
@@ -666,50 +700,123 @@ function HeldExperimentsSection({
     try { await onDismiss(id); } finally { setActionId(null); }
   };
 
+  const allSelected = experiments.length > 0 && selectedIds.size === experiments.length;
+
+  const toggleSelect = (id: string) => {
+    setSelectedIds(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  };
+
+  const toggleSelectAll = () => {
+    if (allSelected) {
+      setSelectedIds(new Set());
+    } else {
+      setSelectedIds(new Set(experiments.map(e => e.id)));
+    }
+  };
+
+  const handleBatchApprove = async () => {
+    if (!onApprove || selectedIds.size === 0) return;
+    setBatchApproving(true);
+    try {
+      await Promise.all([...selectedIds].map(id => onApprove(id)));
+      setSelectedIds(new Set());
+    } finally {
+      setBatchApproving(false);
+    }
+  };
+
+  const hasSelection = selectedIds.size > 0;
+  const busy = actionId !== null || batchApproving;
+
   return (
     <div className="mb-3" data-testid="held-experiments-section">
       <div className="text-ui-sm font-semibold text-amber-300 uppercase tracking-widest mb-1.5 flex items-center gap-1.5">
         <AlertTriangle className="w-3 h-3 shrink-0" />
         Held for approval
+        <span className="text-ui-xs text-amber-400/70 font-mono normal-case font-normal">({experiments.length})</span>
       </div>
       <div className="flex flex-col gap-1.5">
+        {/* Batch action toolbar — only when approve is wired and experiments are selectable */}
+        {onApprove && experiments.length >= 1 && (
+          <div className="flex items-center gap-2 mb-0.5">
+            <label className="flex items-center gap-1.5 text-ui-sm text-neutral-400 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={allSelected}
+                onChange={toggleSelectAll}
+                disabled={busy}
+                className="rounded border-neutral-600 bg-neutral-800 text-sky-500 focus:ring-sky-500 disabled:opacity-40"
+                data-testid="held-experiment-select-all"
+              />
+              {allSelected ? `${experiments.length} selected` : 'Select all'}
+            </label>
+            {hasSelection && (
+              <button
+                type="button"
+                onClick={() => void handleBatchApprove()}
+                disabled={batchApproving}
+                className="min-h-[28px] rounded bg-emerald-500/20 px-2.5 text-ui-sm font-semibold text-emerald-200 hover:bg-emerald-500/30 transition-colors disabled:opacity-50"
+                data-testid="held-experiment-batch-approve"
+              >
+                {batchApproving ? 'Approving…' : `Approve ${selectedIds.size}`}
+              </button>
+            )}
+          </div>
+        )}
         {experiments.map((exp) => {
           const spendCap = (exp.payloads?.[0] as Record<string, unknown> | undefined)?.spend_cap_usd;
           const capLabel = spendCap != null ? ` · $${Number(spendCap).toFixed(2)}` : '';
-          const busy = actionId === exp.id;
+          const isBusy = busy || actionId === exp.id;
+          const checked = selectedIds.has(exp.id);
           return (
             <div
               key={exp.id}
               className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 flex items-center justify-between gap-3"
               data-testid="held-experiment-row"
             >
-              <div className="min-w-0">
-                <div className="text-xs font-semibold text-amber-200 break-words">{exp.title}{capLabel}</div>
-                <div className="text-ui-sm text-amber-300/70 font-mono">spend cap requires operator approval</div>
+              <div className="flex items-center gap-3 min-w-0 flex-1">
+                {onApprove && (
+                  <input
+                    type="checkbox"
+                    checked={checked}
+                    onChange={() => toggleSelect(exp.id)}
+                    disabled={busy}
+                    className="rounded border-neutral-600 bg-neutral-800 text-sky-500 focus:ring-sky-500 shrink-0 disabled:opacity-40"
+                    data-testid="held-experiment-checkbox"
+                  />
+                )}
+                <div className="min-w-0">
+                  <div className="text-xs font-semibold text-amber-200 break-words">{exp.title}{capLabel}</div>
+                  <div className="text-ui-sm text-amber-300/70 font-mono">spend cap requires operator approval</div>
+                </div>
               </div>
               <div className="flex items-center gap-2 shrink-0">
                 {onApprove && (
                   <button
                     type="button"
                     onClick={() => void handleApprove(exp.id)}
-                    disabled={busy}
+                    disabled={isBusy}
                     className="min-h-[44px] flex items-center gap-1.5 rounded bg-emerald-500/20 px-3 text-ui-md font-semibold text-emerald-200 hover:bg-emerald-500/30 transition-colors disabled:opacity-50"
                     data-testid="held-experiment-approve"
                   >
                     <CheckCircle className="w-3 h-3" />
-                    {busy ? 'Approving…' : 'Approve'}
+                    {actionId === exp.id ? 'Approving…' : 'Approve'}
                   </button>
                 )}
                 {onDismiss && (
                   <button
                     type="button"
                     onClick={() => void handleDismiss(exp.id)}
-                    disabled={busy}
+                    disabled={isBusy}
                     className="min-h-[44px] flex items-center gap-1.5 rounded bg-red-500/20 px-3 text-ui-md font-semibold text-red-200 hover:bg-red-500/30 transition-colors disabled:opacity-50"
                     data-testid="held-experiment-dismiss"
                   >
                     <XCircle className="w-3 h-3" />
-                    {busy ? 'Dismissing…' : 'Dismiss'}
+                    {actionId === exp.id ? 'Dismissing…' : 'Dismiss'}
                   </button>
                 )}
               </div>
@@ -757,6 +864,109 @@ function buildCloneForm(job: ComputeJob): ComputeExperimentForm {
   };
 }
 
+type TableSortKey = 'name' | 'status' | 'criterion' | 'cost' | 'runtime' | 'backend';
+
+const TABLE_COL_LABELS: Record<TableSortKey, string> = {
+  name: 'Name',
+  status: 'Status',
+  criterion: 'Criterion',
+  cost: 'Cost',
+  runtime: 'Runtime',
+  backend: 'Backend',
+};
+
+function CompactJobsTable({
+  jobs,
+  sortConfig,
+  onSort,
+  onNavigateToTask,
+}: {
+  jobs: ComputeJob[];
+  sortConfig: { key: TableSortKey; dir: 'asc' | 'desc' } | null;
+  onSort: (key: TableSortKey) => void;
+  onNavigateToTask?: (taskId: string) => void;
+}) {
+  return (
+    <div className="overflow-x-auto" data-testid="compact-jobs-table">
+      <table className="w-full text-ui-sm font-mono">
+        <thead>
+          <tr className="border-b border-neutral-800">
+            {(Object.keys(TABLE_COL_LABELS) as TableSortKey[]).map((col) => (
+              <th
+                key={col}
+                className="text-left py-1.5 pr-3 text-neutral-500 font-semibold cursor-pointer hover:text-neutral-300 select-none whitespace-nowrap"
+                onClick={() => onSort(col)}
+                data-testid={`jobs-table-sort-${col}`}
+              >
+                {TABLE_COL_LABELS[col]}
+                {sortConfig?.key === col ? (sortConfig.dir === 'asc' ? ' ↑' : ' ↓') : ''}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {jobs.map((job) => {
+            const active = isComputeJobActive(job);
+            const spent = computeJobSpent(job);
+            const runtimeSec = computeJobRuntimeSec(job);
+            const { label: backendLabel } = computeJobExecutionLocation(job.backend ?? '');
+            const cv = job.criterion_verdict;
+            const sc = job.success_criterion;
+            return (
+              <tr key={job.id} className="border-t border-neutral-800/50 hover:bg-neutral-800/30 transition-colors">
+                <td className="py-1.5 pr-3 max-w-xs">
+                  {job.task_id && onNavigateToTask ? (
+                    <button
+                      onClick={() => onNavigateToTask(job.task_id as string)}
+                      className="text-sky-300 hover:underline text-left truncate max-w-full block"
+                      data-testid="compact-table-job-name"
+                    >
+                      {(job.task_title ?? job.id).slice(0, 48)}
+                    </button>
+                  ) : (
+                    <span className="text-neutral-300 truncate block" data-testid="compact-table-job-name">
+                      {(job.task_title ?? job.id).slice(0, 48)}
+                    </span>
+                  )}
+                </td>
+                <td className="py-1.5 pr-3 whitespace-nowrap">
+                  <span className={`rounded border px-1.5 py-0.5 text-ui-xs font-semibold ${statusBadgeClass(job)}`}>
+                    {active ? job.status : computeJobTerminalLabel(job)}
+                  </span>
+                </td>
+                <td className="py-1.5 pr-3">
+                  {sc ? (
+                    <span className="flex items-center gap-1.5 flex-wrap">
+                      <span className="text-neutral-400 whitespace-nowrap">{sc.metric} {sc.operator} {sc.threshold}</span>
+                      {cv && (
+                        <span
+                          className={`rounded border px-1 py-0.5 text-ui-xs font-semibold ${cv.met ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300' : !cv.measurable ? 'border-amber-500/40 bg-amber-500/15 text-amber-300' : 'border-red-500/40 bg-red-500/15 text-red-300'}`}
+                          data-testid="compact-table-criterion-chip"
+                        >
+                          {cv.met ? 'met' : !cv.measurable ? 'inconclusive' : 'unmet'}
+                        </span>
+                      )}
+                    </span>
+                  ) : <span className="text-neutral-600">—</span>}
+                </td>
+                <td className="py-1.5 pr-3 text-neutral-400 whitespace-nowrap">
+                  {spent != null ? fmtUsd(spent) : '—'}
+                </td>
+                <td className="py-1.5 pr-3 text-neutral-400 whitespace-nowrap">
+                  {runtimeSec != null ? fmtDuration(runtimeSec) : active ? 'running' : '—'}
+                </td>
+                <td className="py-1.5 text-neutral-400 max-w-xs truncate">
+                  {backendLabel}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 interface ComputeJobsPanelProps {
   projectId: string | null;
   onNavigateToTask?: (taskId: string) => void;
@@ -798,12 +1008,64 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
   const [knowledgeDocs, setKnowledgeDocs] = useState<Record<string, KnowledgeDocument>>({});
   const [sweepGroups, setSweepGroups] = useState<ComputeSweepGroupsResponse['sweep_groups']>({});
   const [expandedDocIds, setExpandedDocIds] = useState<Set<string>>(new Set());
+  // Signed preview URLs for viewable artifacts, keyed by `${jobId}:${storageUri}`.
+  // Resolved lazily on gallery expand and cached for the session; entries are
+  // re-resolved on click / media error once the signed URL goes stale.
+  const [previewUrls, setPreviewUrls] = useState<Record<string, PreviewResolution>>({});
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [askState, setAskState] = usePersistedState<Record<string, AskStateValue>>(
     `compute-ask-state:${projectId}`,
     {},
     sanitizeAskState,
   );
+  const [searchText, setSearchText] = useState('');
+  const [statusFilter, setStatusFilter] = useState<'all' | 'active' | 'completed' | 'failed'>('all');
+  const [viewMode, setViewMode] = useState<'card' | 'table'>('card');
+  const [sortConfig, setSortConfig] = useState<{ key: TableSortKey; dir: 'asc' | 'desc' } | null>(null);
+
+  const filteredJobs = useMemo(() => {
+    let result = jobs;
+    if (searchText.trim()) {
+      const q = searchText.toLowerCase();
+      result = result.filter((job) =>
+        (job.task_title ?? job.id ?? '').toLowerCase().includes(q) ||
+        (job.experiment ?? '').toLowerCase().includes(q) ||
+        (job.benchmark ?? '').toLowerCase().includes(q) ||
+        (job.hypothesis ?? '').toLowerCase().includes(q),
+      );
+    }
+    if (statusFilter === 'active') {
+      result = result.filter((job) => isComputeJobActive(job));
+    } else if (statusFilter === 'completed') {
+      result = result.filter((job) => !isComputeJobActive(job) && job.outcome === 'SUCCESS');
+    } else if (statusFilter === 'failed') {
+      result = result.filter((job) => !isComputeJobActive(job) && job.outcome !== null && job.outcome !== 'SUCCESS');
+    }
+    return result;
+  }, [jobs, searchText, statusFilter]);
+
+  const displayJobs = useMemo(() => {
+    if (!sortConfig) return filteredJobs;
+    return [...filteredJobs].sort((a, b) => {
+      let cmp = 0;
+      if (sortConfig.key === 'name') cmp = (a.task_title ?? a.id).localeCompare(b.task_title ?? b.id);
+      else if (sortConfig.key === 'status') cmp = (a.status ?? '').localeCompare(b.status ?? '');
+      else if (sortConfig.key === 'criterion') {
+        const am = a.criterion_verdict?.met ?? null;
+        const bm = b.criterion_verdict?.met ?? null;
+        cmp = am === bm ? 0 : am === true ? -1 : bm === true ? 1 : am === false ? -1 : 1;
+      } else if (sortConfig.key === 'cost') cmp = (computeJobSpent(a) ?? 0) - (computeJobSpent(b) ?? 0);
+      else if (sortConfig.key === 'runtime') cmp = (computeJobRuntimeSec(a) ?? 0) - (computeJobRuntimeSec(b) ?? 0);
+      else if (sortConfig.key === 'backend') cmp = (a.backend ?? '').localeCompare(b.backend ?? '');
+      return sortConfig.dir === 'asc' ? cmp : -cmp;
+    });
+  }, [filteredJobs, sortConfig]);
+
+  const handleTableSort = useCallback((key: TableSortKey) => {
+    setSortConfig((prev) =>
+      prev?.key === key ? { key, dir: prev.dir === 'asc' ? 'desc' : 'asc' } : { key, dir: 'asc' },
+    );
+  }, []);
 
   const toggleDocExpanded = useCallback((key: string) => {
     setExpandedDocIds((prev) => {
@@ -812,6 +1074,61 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
       return next;
     });
   }, []);
+
+  const resolvePreviewUrl = useCallback(async (key: string, storageUri: string): Promise<string | null> => {
+    if (!projectId) return null;
+    setPreviewUrls((prev) => ({ ...prev, [key]: { state: 'resolving' } }));
+    try {
+      const url = await resolveArtifactDownloadUrl(projectId, storageUri);
+      setPreviewUrls((prev) => ({ ...prev, [key]: { state: 'resolved', url, resolvedAt: Date.now() } }));
+      return url;
+    } catch {
+      setPreviewUrls((prev) => ({ ...prev, [key]: { state: 'error' } }));
+      return null;
+    }
+  }, [projectId]);
+
+  const markPreviewError = useCallback((key: string) => {
+    setPreviewUrls((prev) => ({ ...prev, [key]: { state: 'error' } }));
+  }, []);
+
+  const toggleArtifactGallery = useCallback((job: ComputeJob) => {
+    const galleryKey = `gallery-${job.id}`;
+    const wasExpanded = expandedDocIds.has(galleryKey);
+    toggleDocExpanded(galleryKey);
+    if (wasExpanded) return;
+    // Lazy resolution: sign URLs only when the operator expands this job's
+    // gallery, and only for entries without a live resolution in flight.
+    for (const art of computeJobViewableArtifacts(job)) {
+      const key = `${job.id}:${art.storage_uri}`;
+      const cached = previewUrls[key];
+      if (cached?.state === 'resolving' || cached?.state === 'resolved') continue;
+      void resolvePreviewUrl(key, art.storage_uri);
+    }
+  }, [expandedDocIds, toggleDocExpanded, previewUrls, resolvePreviewUrl]);
+
+  const openPreviewFullSize = useCallback(async (key: string, storageUri: string) => {
+    const cached = previewUrls[key];
+    if (cached?.state === 'resolved' && Date.now() - cached.resolvedAt < SIGNED_PREVIEW_FRESH_MS) {
+      window.open(cached.url, '_blank', 'noopener,noreferrer');
+      return;
+    }
+    // Stale or errored cache — re-resolve, keeping a pending tab open across
+    // the async gap so popup blockers don't eat the navigation (same pattern
+    // as ResolvedReferenceLink in TaskCard).
+    const pendingTab = window.open('', '_blank');
+    const url = await resolvePreviewUrl(key, storageUri);
+    if (!url) {
+      pendingTab?.close();
+      return;
+    }
+    if (pendingTab) {
+      pendingTab.opener = null;
+      pendingTab.location.replace(url);
+    } else {
+      window.open(url, '_blank', 'noopener,noreferrer');
+    }
+  }, [previewUrls, resolvePreviewUrl]);
 
   const load = useCallback(
     async (signal?: AbortSignal, appendOffset?: number) => {
@@ -1084,12 +1401,15 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
 
   return (
     <div className="mt-4 rounded-xl border border-neutral-800 bg-neutral-950/60 p-4" data-viewport-allow-truncation>
-      <div className="flex items-center justify-between gap-2 mb-1">
+      <div className="flex flex-wrap items-center justify-between gap-2 mb-1">
         <div className="flex items-center gap-2 text-ui-md font-bold text-neutral-400 uppercase tracking-widest">
           <Cpu className="w-3.5 h-3.5 shrink-0" />
           Compute jobs
         </div>
-        <div className="flex items-center gap-2">
+        {/* flex-wrap + min-w-0: window selector (6×44px touch targets) plus the
+            view-mode toggle exceed a 375px viewport on one line — let the
+            controls wrap under the title instead of overflowing horizontally. */}
+        <div className="flex flex-wrap items-center justify-end gap-2 min-w-0">
           {onLaunchCompute && (
             <button
               type="button"
@@ -1120,6 +1440,15 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
               All
             </button>
           </div>
+          <button
+            type="button"
+            onClick={() => setViewMode((m) => m === 'card' ? 'table' : 'card')}
+            className={`min-h-[44px] min-w-[44px] flex items-center justify-center rounded px-1.5 py-0.5 transition-colors ${viewMode === 'table' ? 'bg-neutral-700 text-neutral-100' : 'text-neutral-500 hover:text-neutral-300'}`}
+            title={viewMode === 'table' ? 'Switch to card view' : 'Switch to compact table view'}
+            data-testid="compute-view-mode-toggle"
+          >
+            <List className="w-3.5 h-3.5" />
+          </button>
         </div>
       </div>
       {!allTerminal && (
@@ -1217,8 +1546,50 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
 
       <ExperimentSweepSummary jobs={jobs} />
 
+      {(jobs.length > 0 || searchText || statusFilter !== 'all') && (
+        <div className="mb-2 flex flex-wrap items-center gap-2" data-testid="compute-jobs-filters">
+          <div className="relative flex-1 min-w-0 max-w-xs">
+            <Search className="absolute left-2 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-neutral-500 pointer-events-none" />
+            <input
+              type="text"
+              value={searchText}
+              onChange={(e) => setSearchText(e.target.value)}
+              placeholder="Search by name, experiment…"
+              className="w-full rounded border border-neutral-700 bg-neutral-900 pl-7 pr-2 py-1.5 text-ui-sm text-neutral-100 placeholder-neutral-600 focus:outline-none focus:border-sky-500/50"
+              data-testid="compute-jobs-search"
+            />
+          </div>
+          <div className="flex items-center gap-0.5" data-testid="compute-status-filter">
+            {(['all', 'active', 'completed', 'failed'] as const).map((s) => (
+              <button
+                key={s}
+                type="button"
+                onClick={() => setStatusFilter(s)}
+                className={`min-h-[44px] min-w-[44px] rounded px-1.5 py-0.5 text-ui-xs font-semibold transition-colors ${statusFilter === s ? 'bg-neutral-700 text-neutral-100' : 'text-neutral-500 hover:text-neutral-300'}`}
+                data-testid={`compute-status-${s}`}
+              >
+                {s === 'all' ? 'All' : s === 'active' ? 'Active' : s === 'completed' ? 'Completed' : 'Failed'}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
       <div className="flex flex-col gap-2" data-testid="compute-jobs-list">
-        {jobs.map((job) => {
+        {filteredJobs.length === 0 && jobs.length > 0 && (
+          <div className="rounded-lg border border-neutral-800/80 bg-neutral-900/40 px-3 py-2">
+            <div className="text-ui-sm text-neutral-500">No jobs match the current filters.</div>
+          </div>
+        )}
+        {viewMode === 'table' && filteredJobs.length > 0 && (
+          <CompactJobsTable
+            jobs={displayJobs}
+            sortConfig={sortConfig}
+            onSort={handleTableSort}
+            onNavigateToTask={onNavigateToTask}
+          />
+        )}
+        {viewMode !== 'table' && displayJobs.map((job) => {
           const active = isComputeJobActive(job);
           const cap = job.spend_cap_usd ?? 0;
           const spent = computeJobSpent(job);
@@ -1243,18 +1614,23 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                       {job.task_title ?? job.task_id ?? job.id}
                     </div>
                   )}
-                  <div className="text-ui-sm text-neutral-500 font-mono mt-0.5 break-words">
+                  <div
+                    className="text-ui-sm text-neutral-500 font-mono mt-0.5 break-words"
+                    data-testid="compute-job-provenance"
+                  >
                     {backendLabel}
                     {job.machine_type ? ` · ${job.machine_type}` : ''}
                     {job.accelerator_type ? ` · ${job.accelerator_type} x${job.accelerator_count ?? 1}` : ''}
                     {job.launch_contract?.provisioning_model ? ` · ${job.launch_contract.provisioning_model}` : ''}
-                    {job.external_compute_id ? ` · ${job.external_compute_id}` : ''}
+                    {job.external_compute_id ? (
+                      <> · <span data-testid="compute-job-vm-identity">VM {job.external_compute_id}</span></>
+                    ) : ''}
                   </div>
                   {(() => {
                     const runner = job.runner;
                     const runnerName = runner?.hostname ?? (job.runner_target_id ? job.runner_target_id.slice(0, 8) : null);
-                    if (runnerName && job.runner_claimed_at) {
-                      const claimedMs = Date.parse(job.runner_claimed_at);
+                    if (runnerName) {
+                      const claimedMs = job.runner_claimed_at ? Date.parse(job.runner_claimed_at) : NaN;
                       const elapsedSec = isNaN(claimedMs) ? null : Math.max(0, Math.round((nowMs - claimedMs) / 1000));
                       return (
                         <div className="text-ui-sm text-neutral-400 font-mono mt-0.5" data-testid="compute-runner-claimed">
@@ -1287,11 +1663,17 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                     );
                   })()}
                 </div>
-                <span
-                  className={`shrink-0 rounded border px-1.5 py-0.5 text-ui-sm font-semibold ${statusBadgeClass(job)}`}
-                >
-                  {active ? job.status : computeJobTerminalLabel(job)}
-                </span>
+                <div className="flex shrink-0 items-center gap-1.5">
+                  {computeJobImagePinStatus(job) === 'mutable' && <MutableImageBadge />}
+                  {!active && (
+                    <EvidenceTierBadge tier={computeJobEvidenceTier(job)} />
+                  )}
+                  <span
+                    className={`shrink-0 rounded border px-1.5 py-0.5 text-ui-sm font-semibold ${statusBadgeClass(job)}`}
+                  >
+                    {active ? job.status : computeJobTerminalLabel(job)}
+                  </span>
+                </div>
               </div>
 
               {isOperatorHardware ? (
@@ -1382,6 +1764,28 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
               })()}
 
               {(() => {
+                const rawCommand = job.launch_params?.command;
+                if (!rawCommand) return null;
+                const decoded = job.launch_params?.command_decoded;
+                return (
+                  <details
+                    className="mb-1.5 rounded border border-neutral-700/50 bg-neutral-800/40 px-2 py-1.5"
+                    data-testid="compute-command-disclosure"
+                  >
+                    <summary className="cursor-pointer text-ui-sm font-mono text-neutral-500 hover:text-neutral-300">
+                      Command{decoded ? ' (decoded)' : ''}
+                    </summary>
+                    <pre
+                      className="mt-1.5 overflow-x-auto whitespace-pre-wrap break-words text-ui-sm font-mono text-neutral-300"
+                      data-testid="compute-command-text"
+                    >
+                      {decoded ?? rawCommand}
+                    </pre>
+                  </details>
+                );
+              })()}
+
+              {(() => {
                 if (!active) return null;
                 const burnRate = computeJobBurnRate(job, nowMs);
                 if (burnRate == null) return null;
@@ -1458,12 +1862,12 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                   ) : (
                     <span className="break-words">{job.terminal_reason ?? '—'}</span>
                   )}
-                  {!active && typeof (job.polling_metadata?.exit_code) === 'number' && (
+                  {!active && typeof job.exit_code === 'number' && (
                     <span
                       className="shrink-0 rounded border border-neutral-700 bg-neutral-800/60 px-1 py-0.5 text-ui-xs text-neutral-400"
                       data-testid="compute-exit-code"
                     >
-                      exit {job.polling_metadata.exit_code as number}
+                      exit {job.exit_code}
                     </span>
                   )}
                 </div>
@@ -1791,6 +2195,92 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                 </div>
               )}
               {(() => {
+                const artifacts = computeJobViewableArtifacts(job);
+                if (artifacts.length === 0) return null;
+                const galleryKey = `gallery-${job.id}`;
+                const galleryExpanded = expandedDocIds.has(galleryKey);
+                return (
+                  <div className="mt-1.5" data-testid="compute-artifact-gallery">
+                    <div className="flex items-center gap-1.5 mb-0.5 text-ui-sm text-neutral-500 font-mono">
+                      <span>Artifacts</span>
+                      <button
+                        type="button"
+                        onClick={() => toggleArtifactGallery(job)}
+                        className="min-h-[44px] rounded border border-neutral-700 bg-neutral-800 px-1 py-0.5 text-ui-xs text-sky-400 hover:text-sky-300"
+                        data-testid="compute-artifact-gallery-toggle"
+                      >
+                        {galleryExpanded ? 'Hide previews' : `Show previews (${artifacts.length})`}
+                      </button>
+                    </div>
+                    {galleryExpanded && (
+                      <div className="flex flex-wrap gap-2">
+                        {artifacts.map((art) => {
+                          const key = `${job.id}:${art.storage_uri}`;
+                          const resolution = previewUrls[key];
+                          const sizeLabel = fmtBytes(art.bytes);
+                          const caption = (
+                            <div className="max-w-[10rem] truncate text-ui-xs text-neutral-500 font-mono" title={art.name}>
+                              {art.name}{sizeLabel ? ` · ${sizeLabel}` : ''}
+                            </div>
+                          );
+                          if (resolution?.state === 'resolved') {
+                            return (
+                              <div key={key} className="flex flex-col gap-0.5" data-testid="compute-viewable-artifact">
+                                {art.kind === 'video' ? (
+                                  <video
+                                    controls
+                                    preload="metadata"
+                                    src={resolution.url}
+                                    onError={() => markPreviewError(key)}
+                                    className="h-24 max-w-[16rem] rounded border border-neutral-800 bg-neutral-950"
+                                    data-testid="compute-artifact-video"
+                                  />
+                                ) : (
+                                  <button
+                                    type="button"
+                                    onClick={() => { void openPreviewFullSize(key, art.storage_uri); }}
+                                    title={`Open ${art.name} full-size in a new tab`}
+                                    className="rounded border border-neutral-800 bg-neutral-950 hover:border-sky-500/50"
+                                    data-testid="compute-artifact-thumbnail"
+                                  >
+                                    <img
+                                      src={resolution.url}
+                                      alt={art.name}
+                                      loading="lazy"
+                                      onError={() => markPreviewError(key)}
+                                      className="h-24 w-auto max-w-[16rem] rounded object-contain"
+                                    />
+                                  </button>
+                                )}
+                                {caption}
+                              </div>
+                            );
+                          }
+                          return (
+                            <div key={key} className="flex flex-col gap-0.5" data-testid="compute-viewable-artifact">
+                              <button
+                                type="button"
+                                onClick={() => { void resolvePreviewUrl(key, art.storage_uri); }}
+                                disabled={resolution?.state === 'resolving'}
+                                className="flex h-24 w-32 items-center justify-center rounded border border-neutral-800 bg-neutral-950 px-1 text-center text-ui-xs text-neutral-500 hover:border-sky-500/50 disabled:opacity-70"
+                                data-testid="compute-artifact-placeholder"
+                              >
+                                {resolution?.state === 'resolving'
+                                  ? 'resolving…'
+                                  : resolution?.state === 'error'
+                                    ? 'preview unavailable — retry'
+                                    : 'load preview'}
+                              </button>
+                              {caption}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
+              {(() => {
                 const metrics = job.polling_metadata?.result_metrics as Record<string, unknown> | undefined;
                 if (!metrics) return null;
                 const scalarEntries = Object.entries(metrics).filter(([, v]) => v === null || typeof v !== 'object');
@@ -2043,8 +2533,10 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                 const lo = job.polling_metadata?.live_output as ComputeJobLiveOutput | undefined | null;
                 if (!lo || typeof lo.text !== 'string' || !lo.text.trim()) return null;
                 const lines = lo.text.split('\n');
-                const displayLines = lines.length > 30 ? lines.slice(-30) : lines;
                 const clipped = lines.length > 30;
+                const liveKey = `liveout-${job.id}`;
+                const liveExpanded = expandedDocIds.has(liveKey);
+                const displayLines = clipped && !liveExpanded ? lines.slice(-30) : lines;
                 return (
                   <div className="mt-1.5" data-testid="compute-live-output">
                     <div className="flex items-center gap-1.5 mb-0.5 text-ui-sm text-neutral-500 font-mono">
@@ -2052,10 +2544,20 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                       <span className="rounded border border-neutral-700 bg-neutral-800 px-1 py-0.5 text-ui-xs text-neutral-500">
                         updating…
                       </span>
-                      {(lo.truncated || clipped) && (
+                      {(lo.truncated || (clipped && !liveExpanded)) && (
                         <span className="rounded border border-neutral-700 bg-neutral-800 px-1 py-0.5 text-ui-xs text-neutral-400">
                           truncated
                         </span>
+                      )}
+                      {clipped && !liveExpanded && (
+                        <button
+                          type="button"
+                          onClick={() => toggleDocExpanded(liveKey)}
+                          className="min-h-[44px] rounded border border-neutral-700 bg-neutral-800 px-1 py-0.5 text-ui-xs text-sky-400 hover:text-sky-300"
+                          data-testid="compute-live-output-show-all"
+                        >
+                          Show all ({lines.length} lines)
+                        </button>
                       )}
                     </div>
                     <pre className="rounded border border-neutral-800 bg-neutral-950 px-2 py-1.5 text-ui-xs text-neutral-300 font-mono overflow-x-auto whitespace-pre-wrap break-words max-h-32 overflow-y-auto">
@@ -2065,8 +2567,60 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                 );
               })()}
               {(() => {
+                const ps = job.progress_series;
+                if (!ps || ps.length === 0) return null;
+                const latest = ps[ps.length - 1];
+                const name = latest.name;
+                // Collect values for the same metric name (most common case), falling back to all values
+                const seriesForMetric = ps.filter((s) => s.name === name);
+                const vals = seriesForMetric.map((s) => s.value);
+                const minVal = Math.min(...vals);
+                const maxVal = Math.max(...vals);
+                const range = maxVal - minVal || 1;
+                const W = 80;
+                const H = 20;
+                const points = vals
+                  .map((v, i) => {
+                    const x = vals.length === 1 ? W / 2 : (i / (vals.length - 1)) * W;
+                    const y = H - ((v - minVal) / range) * H;
+                    return `${x.toFixed(1)},${y.toFixed(1)}`;
+                  })
+                  .join(' ');
+                const isStalled = !active && job.terminal_kind === 'no_progress';
+                return (
+                  <div className="mt-1.5" data-testid="compute-progress-series">
+                    <div className="flex items-center gap-1.5 mb-0.5 text-ui-sm text-neutral-500 font-mono">
+                      <span>{name}</span>
+                      <span className="text-neutral-300">{latest.value}</span>
+                      <span className="text-neutral-600">({ps.length} samples)</span>
+                      {isStalled && (
+                        <span className="rounded border border-amber-800 bg-amber-950 px-1 py-0.5 text-ui-xs text-amber-400">
+                          no-progress cut
+                        </span>
+                      )}
+                    </div>
+                    <svg
+                      width={W}
+                      height={H}
+                      viewBox={`0 0 ${W} ${H}`}
+                      className="overflow-visible"
+                      aria-hidden="true"
+                    >
+                      <polyline
+                        points={points}
+                        fill="none"
+                        stroke={isStalled ? '#92400e' : '#38bdf8'}
+                        strokeWidth="1.5"
+                        strokeLinejoin="round"
+                        strokeLinecap="round"
+                      />
+                    </svg>
+                  </div>
+                );
+              })()}
+              {(() => {
                 if (active) return null;
-                const cl = job.polling_metadata?.command_log as ComputeJobCommandLog | undefined | null;
+                const cl = job.command_log ?? (job.polling_metadata?.command_log as ComputeJobCommandLog | undefined | null);
                 if (!cl || typeof cl.text !== 'string' || !cl.text.trim()) return null;
                 const lines = cl.text.split('\n');
                 const clipped = lines.length > 30;

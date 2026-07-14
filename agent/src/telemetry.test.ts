@@ -695,8 +695,8 @@ describe('resident turn latency telemetry', () => {
   });
 
   it('accumulates operator turns and computes mean/max', () => {
-    recordResidentTurnLatency({ kind: 'operator', turnMs: 100, ttftMs: 50, interrupted: false, toolCallCount: 2 });
-    recordResidentTurnLatency({ kind: 'operator', turnMs: 300, ttftMs: 150, interrupted: false, toolCallCount: 1 });
+    recordResidentTurnLatency({ kind: 'operator', turnMs: 100, ttftMs: 50, interrupted: false, toolCallCount: 2, toolCallDurationMs: 30, meanInterTokenMs: 10 });
+    recordResidentTurnLatency({ kind: 'operator', turnMs: 300, ttftMs: 150, interrupted: false, toolCallCount: 1, toolCallDurationMs: 80, meanInterTokenMs: 20 });
     const tel = getResidentTurnLatencyTelemetry();
     if (!tel) throw new Error('expected non-null telemetry');
     expect(tel.operator.count).toBe(2);
@@ -705,11 +705,13 @@ describe('resident turn latency telemetry', () => {
     expect(tel.operator.mean_ttft_ms).toBe(100); // (50+150)/2
     expect(tel.operator.interrupted_count).toBe(0);
     expect(tel.operator.total_tool_calls).toBe(3);
+    expect(tel.operator.total_tool_call_duration_ms).toBe(110); // 30+80
+    expect(tel.operator.mean_inter_token_ms).toBe(15); // (10+20)/2
     expect(tel.autonomous.count).toBe(0);
   });
 
   it('accumulates autonomous turns separately', () => {
-    recordResidentTurnLatency({ kind: 'autonomous', turnMs: 200, ttftMs: null, interrupted: true, toolCallCount: 0 });
+    recordResidentTurnLatency({ kind: 'autonomous', turnMs: 200, ttftMs: null, interrupted: true, toolCallCount: 0, toolCallDurationMs: 0, meanInterTokenMs: null });
     const tel = getResidentTurnLatencyTelemetry();
     if (!tel) throw new Error('expected non-null telemetry');
     expect(tel.autonomous.count).toBe(1);
@@ -720,8 +722,8 @@ describe('resident turn latency telemetry', () => {
   });
 
   it('mean_ttft_ms denominator excludes tool-only turns with null ttft', () => {
-    recordResidentTurnLatency({ kind: 'operator', turnMs: 100, ttftMs: 40, interrupted: false, toolCallCount: 0 });
-    recordResidentTurnLatency({ kind: 'operator', turnMs: 100, ttftMs: null, interrupted: false, toolCallCount: 5 });
+    recordResidentTurnLatency({ kind: 'operator', turnMs: 100, ttftMs: 40, interrupted: false, toolCallCount: 0, toolCallDurationMs: 0, meanInterTokenMs: null });
+    recordResidentTurnLatency({ kind: 'operator', turnMs: 100, ttftMs: null, interrupted: false, toolCallCount: 5, toolCallDurationMs: 60, meanInterTokenMs: null });
     const tel = getResidentTurnLatencyTelemetry();
     if (!tel) throw new Error('expected non-null telemetry');
     // Only 1 turn had ttft; mean should be 40, not 40/2=20
@@ -730,9 +732,9 @@ describe('resident turn latency telemetry', () => {
   });
 
   it('drops non-finite and negative turnMs values', () => {
-    recordResidentTurnLatency({ kind: 'operator', turnMs: Number.NaN, ttftMs: null, interrupted: false, toolCallCount: 0 });
-    recordResidentTurnLatency({ kind: 'operator', turnMs: -50, ttftMs: null, interrupted: false, toolCallCount: 0 });
-    recordResidentTurnLatency({ kind: 'operator', turnMs: Number.POSITIVE_INFINITY, ttftMs: null, interrupted: false, toolCallCount: 0 });
+    recordResidentTurnLatency({ kind: 'operator', turnMs: Number.NaN, ttftMs: null, interrupted: false, toolCallCount: 0, toolCallDurationMs: 0, meanInterTokenMs: null });
+    recordResidentTurnLatency({ kind: 'operator', turnMs: -50, ttftMs: null, interrupted: false, toolCallCount: 0, toolCallDurationMs: 0, meanInterTokenMs: null });
+    recordResidentTurnLatency({ kind: 'operator', turnMs: Number.POSITIVE_INFINITY, ttftMs: null, interrupted: false, toolCallCount: 0, toolCallDurationMs: 0, meanInterTokenMs: null });
     const tel = getResidentTurnLatencyTelemetry();
     if (!tel) throw new Error('expected non-null telemetry');
     // count is incremented but turnMs stats are 0 since all invalid
@@ -742,8 +744,34 @@ describe('resident turn latency telemetry', () => {
   });
 
   it('resets all stats to zero', () => {
-    recordResidentTurnLatency({ kind: 'operator', turnMs: 500, ttftMs: 200, interrupted: true, toolCallCount: 3 });
+    recordResidentTurnLatency({ kind: 'operator', turnMs: 500, ttftMs: 200, interrupted: true, toolCallCount: 3, toolCallDurationMs: 100, meanInterTokenMs: 25 });
     resetResidentTurnLatencyTelemetry();
     expect(getResidentTurnLatencyTelemetry()).toBeNull();
+  });
+
+  it('accumulates pickupLagMs and reports mean_pickup_lag_ms for operator turns', () => {
+    recordResidentTurnLatency({ kind: 'operator', turnMs: 100, ttftMs: 50, interrupted: false, toolCallCount: 0, toolCallDurationMs: 0, meanInterTokenMs: null, pickupLagMs: 200 });
+    recordResidentTurnLatency({ kind: 'operator', turnMs: 200, ttftMs: 80, interrupted: false, toolCallCount: 0, toolCallDurationMs: 0, meanInterTokenMs: null, pickupLagMs: 400 });
+    const tel = getResidentTurnLatencyTelemetry();
+    if (!tel) throw new Error('expected non-null telemetry');
+    expect(tel.operator.mean_pickup_lag_ms).toBe(300); // (200+400)/2
+    expect(tel.autonomous.mean_pickup_lag_ms).toBeNull(); // none recorded
+  });
+
+  it('mean_pickup_lag_ms is null when no pickupLagMs provided', () => {
+    recordResidentTurnLatency({ kind: 'operator', turnMs: 100, ttftMs: 50, interrupted: false, toolCallCount: 0, toolCallDurationMs: 0, meanInterTokenMs: null });
+    const tel = getResidentTurnLatencyTelemetry();
+    if (!tel) throw new Error('expected non-null telemetry');
+    expect(tel.operator.mean_pickup_lag_ms).toBeNull();
+  });
+
+  it('drops null and negative pickupLagMs values from accumulation', () => {
+    recordResidentTurnLatency({ kind: 'operator', turnMs: 100, ttftMs: null, interrupted: false, toolCallCount: 0, toolCallDurationMs: 0, meanInterTokenMs: null, pickupLagMs: null });
+    recordResidentTurnLatency({ kind: 'operator', turnMs: 100, ttftMs: null, interrupted: false, toolCallCount: 0, toolCallDurationMs: 0, meanInterTokenMs: null, pickupLagMs: -5 });
+    recordResidentTurnLatency({ kind: 'operator', turnMs: 100, ttftMs: null, interrupted: false, toolCallCount: 0, toolCallDurationMs: 0, meanInterTokenMs: null, pickupLagMs: 150 });
+    const tel = getResidentTurnLatencyTelemetry();
+    if (!tel) throw new Error('expected non-null telemetry');
+    // Only the 150ms lag is valid; null and negative are skipped
+    expect(tel.operator.mean_pickup_lag_ms).toBe(150);
   });
 });

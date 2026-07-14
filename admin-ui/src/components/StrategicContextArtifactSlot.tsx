@@ -1,10 +1,11 @@
-import type { ReactNode } from 'react';
-import { AlertTriangle, ArrowUpRight, BarChart3, FileImage, FileText, Gauge, Network, Table2 } from 'lucide-react';
+import { useState, useEffect, type ReactNode } from 'react';
+import { AlertTriangle, ArrowUpRight, BarChart3, FileImage, FileText, FileVideo, Gauge, Network, Table2 } from 'lucide-react';
 import type {
   StrategicContextPackageDescriptor,
   StrategicContextPackageDrilldown,
   StrategicContextRenderableDescriptor,
 } from '../strategicStateApi';
+import { resolveArtifactDownloadUrl } from '../api';
 import { StrategicContextMap } from './StrategicContextMap';
 
 type StrategicContextTarget = StrategicContextPackageDrilldown['target'];
@@ -14,6 +15,7 @@ interface StrategicContextArtifactSlotProps {
   onOpenTarget?: (target?: StrategicContextTarget | null) => void;
   showHeader?: boolean;
   showMapDescriptor?: boolean;
+  projectId?: string | null;
 }
 
 function formatCompactNumber(value: number | string | null | undefined): string {
@@ -66,6 +68,7 @@ function descriptorIcon(kind: string): ReactNode {
   if (kind === 'metric_cards') return <Gauge className="h-3.5 w-3.5" aria-hidden="true" />;
   if (kind === 'table') return <Table2 className="h-3.5 w-3.5" aria-hidden="true" />;
   if (kind === 'image') return <FileImage className="h-3.5 w-3.5" aria-hidden="true" />;
+  if (kind === 'video') return <FileVideo className="h-3.5 w-3.5" aria-hidden="true" />;
   if (kind === 'chart' || kind === 'plot') return <BarChart3 className="h-3.5 w-3.5" aria-hidden="true" />;
   if (kind === 'unsupported') return <AlertTriangle className="h-3.5 w-3.5" aria-hidden="true" />;
   return <FileText className="h-3.5 w-3.5" aria-hidden="true" />;
@@ -79,6 +82,78 @@ function safeImageUrl(value?: string | null): string | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * Resolve the freshest usable media URL. When `projectId` and `storageUri` are
+ * present, mint a fresh signed URL from the stable `gs://` ref on mount (and
+ * whenever they change) so the preview survives baked-URL expiry on a long-idle
+ * canvas. Until that resolves — or if resolution fails, or when no ref exists —
+ * fall back to the baked URL. Returns null when nothing is renderable.
+ */
+function useFreshMediaUrl(
+  projectId: string | null | undefined,
+  storageUri: string | null | undefined,
+  bakedUrl: string | null | undefined,
+): string | null {
+  // Key the resolved URL by the ref it was minted for, so a stale resolution
+  // from a previous storage_uri is ignored once the ref changes (rather than
+  // resetting state synchronously inside the effect, which cascades renders).
+  const [resolved, setResolved] = useState<{ uri: string; url: string } | null>(null);
+
+  useEffect(() => {
+    if (!projectId || !storageUri) return;
+    const controller = new AbortController();
+    let cancelled = false;
+    resolveArtifactDownloadUrl(projectId, storageUri, controller.signal)
+      .then(url => { if (!cancelled) setResolved({ uri: storageUri, url }); })
+      .catch(() => { /* keep the baked-URL fallback below */ });
+    return () => { cancelled = true; controller.abort(); };
+  }, [projectId, storageUri]);
+
+  const fresh = resolved && storageUri && resolved.uri === storageUri ? resolved.url : null;
+  return safeImageUrl(fresh) ?? safeImageUrl(bakedUrl);
+}
+
+function ResolvedImage({
+  projectId,
+  storageUri,
+  bakedUrl,
+  alt,
+  className,
+}: {
+  projectId?: string | null;
+  storageUri?: string | null;
+  bakedUrl?: string | null;
+  alt: string;
+  className: string;
+}) {
+  const url = useFreshMediaUrl(projectId, storageUri, bakedUrl);
+  if (!url) return null;
+  return <img src={url} alt={alt} className={className} />;
+}
+
+function ResolvedVideo({
+  projectId,
+  storageUri,
+  bakedUrl,
+  ariaLabel,
+  className,
+}: {
+  projectId?: string | null;
+  storageUri?: string | null;
+  bakedUrl?: string | null;
+  ariaLabel: string;
+  className: string;
+}) {
+  const url = useFreshMediaUrl(projectId, storageUri, bakedUrl);
+  if (!url) return null;
+  return (
+    <video controls className={className} aria-label={ariaLabel}>
+      <source src={url} />
+      Your browser does not support the video element.
+    </video>
+  );
 }
 
 function MutedStatus({ children }: { children: ReactNode }) {
@@ -120,11 +195,12 @@ function DetailValue({
 function DescriptorCard({
   descriptor,
   onOpenTarget,
+  projectId,
 }: {
   descriptor: StrategicContextRenderableDescriptor;
   onOpenTarget?: (target?: StrategicContextTarget | null) => void;
+  projectId?: string | null;
 }) {
-  const imageUrl = safeImageUrl(descriptor.image?.url);
   const chartPoints = descriptor.chart?.points ?? [];
   const maxChartValue = Math.max(1, ...chartPoints.map(point => Math.abs(point.value)));
   const columns = descriptor.columns ?? [];
@@ -227,21 +303,90 @@ function DescriptorCard({
         )
       )}
 
-      {descriptor.kind === 'image' && (
-        <div className="mt-2 overflow-hidden rounded border border-neutral-800 bg-neutral-950/45">
-          {imageUrl ? (
-            <img
-              src={imageUrl}
-              alt={descriptor.image?.alt || descriptor.title}
-              className="max-h-48 w-full object-contain"
-            />
-          ) : (
-            <div className="px-2 py-2 text-xs text-neutral-500">
-              Image preview unavailable. Open the artifact for the source.
-            </div>
-          )}
-        </div>
-      )}
+      {descriptor.kind === 'image' && (() => {
+        // A preview is renderable if it has EITHER a baked URL or a stable
+        // storage_uri we can re-resolve — do not filter on url alone, or an
+        // expired baked URL would drop a still-resolvable image.
+        const listed = (descriptor.images ?? []).filter(img => img.url || img.storage_uri);
+        const fallback = descriptor.image;
+        const items: Array<{ url?: string | null; alt?: string | null; filename?: string | null; storage_uri?: string | null }> =
+          listed.length > 0
+            ? listed
+            : fallback && (fallback.url || fallback.storage_uri)
+              ? [{ url: fallback.url, alt: fallback.alt, filename: null, storage_uri: fallback.storage_uri }]
+              : [];
+        return (
+          <div className="mt-2 overflow-hidden rounded border border-neutral-800 bg-neutral-950/45">
+            {items.length > 1 ? (
+              <div className="flex gap-1 overflow-x-auto p-1 custom-scrollbar">
+                {items.map((img, i) => (
+                  <ResolvedImage
+                    key={img.storage_uri || img.url || i}
+                    projectId={projectId}
+                    storageUri={img.storage_uri}
+                    bakedUrl={img.url}
+                    alt={img.alt || img.filename || `${descriptor.title} ${i + 1}`}
+                    className="h-36 w-auto flex-shrink-0 object-contain"
+                  />
+                ))}
+              </div>
+            ) : items.length === 1 ? (
+              <ResolvedImage
+                projectId={projectId}
+                storageUri={items[0].storage_uri}
+                bakedUrl={items[0].url}
+                alt={descriptor.image?.alt || items[0].alt || descriptor.title}
+                className="max-h-48 w-full object-contain"
+              />
+            ) : (
+              <div className="px-2 py-2 text-xs text-neutral-500">
+                Image preview unavailable. Open the artifact for the source.
+              </div>
+            )}
+          </div>
+        );
+      })()}
+
+      {descriptor.kind === 'video' && (() => {
+        const listed = (descriptor.videos ?? []).filter(v => v.url || v.storage_uri);
+        const fallback = descriptor.video;
+        const items: Array<{ url?: string | null; alt?: string | null; filename?: string | null; storage_uri?: string | null }> =
+          listed.length > 0
+            ? listed
+            : fallback && (fallback.url || fallback.storage_uri)
+              ? [{ url: fallback.url, alt: fallback.alt, filename: null, storage_uri: fallback.storage_uri }]
+              : [];
+        return (
+          <div className="mt-2 overflow-hidden rounded border border-neutral-800 bg-neutral-950/45">
+            {items.length > 1 ? (
+              <div className="flex gap-1 overflow-x-auto p-1 custom-scrollbar">
+                {items.map((v, i) => (
+                  <ResolvedVideo
+                    key={v.storage_uri || v.url || i}
+                    projectId={projectId}
+                    storageUri={v.storage_uri}
+                    bakedUrl={v.url}
+                    ariaLabel={v.alt || v.filename || `${descriptor.title} ${i + 1}`}
+                    className="h-36 w-auto flex-shrink-0"
+                  />
+                ))}
+              </div>
+            ) : items.length === 1 ? (
+              <ResolvedVideo
+                projectId={projectId}
+                storageUri={items[0].storage_uri}
+                bakedUrl={items[0].url}
+                ariaLabel={descriptor.video?.alt || items[0].alt || descriptor.title}
+                className="max-h-48 w-full"
+              />
+            ) : (
+              <div className="px-2 py-2 text-xs text-neutral-500">
+                Video preview unavailable. Open the artifact for the source.
+              </div>
+            )}
+          </div>
+        );
+      })()}
 
       {(descriptor.kind === 'chart' || descriptor.kind === 'plot') && (
         <div className="mt-2 space-y-1.5 rounded border border-neutral-800 bg-neutral-950/45 p-2">
@@ -285,6 +430,7 @@ export function StrategicContextArtifactSlot({
   onOpenTarget,
   showHeader = true,
   showMapDescriptor = true,
+  projectId,
 }: StrategicContextArtifactSlotProps) {
   if (!contextPackage) return null;
 
@@ -366,6 +512,7 @@ export function StrategicContextArtifactSlot({
           key={`${descriptor.kind}:${descriptor.id}`}
           descriptor={descriptor}
           onOpenTarget={onOpenTarget}
+          projectId={projectId}
         />
       ))}
     </div>

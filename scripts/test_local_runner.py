@@ -4,11 +4,15 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tarfile
+import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -411,6 +415,489 @@ class TestLowDiskGuard(unittest.TestCase):
         # Unknown free space (None) must not falsely trip the guard.
         with patch.object(local_runner, "_disk_free_bytes", return_value=None):
             self.assertFalse(local_runner._disk_below_min("/some/root", 1000))
+
+
+# ── Host-load throttle ─────────────────────────────────────────────────────────
+
+class TestHostLoadThrottle(unittest.TestCase):
+    """_compute_poll_loop and agent poll skip claims when load thresholds are met."""
+
+    def setUp(self):
+        local_runner._shutdown_event.clear()
+
+    def tearDown(self):
+        local_runner._shutdown_event.clear()
+
+    def _make_compute_deps(self):
+        active_jobs: set = set()
+        lock = threading.Lock()
+        return active_jobs, lock
+
+    def _run_compute_poll(self, gpu_util_pct_ret, max_gpu_util_pct, post_side_effect):
+        """Run _compute_poll_loop in a thread for 0.15s, return list of posted calls."""
+        calls = []
+
+        def fake_post(url, token, body, **kwargs):
+            calls.append(url)
+            return post_side_effect(url)
+
+        active_jobs, lock = self._make_compute_deps()
+        with patch.object(local_runner, "_gpu_utilization_pct", return_value=gpu_util_pct_ret), \
+             patch.object(local_runner, "_post", side_effect=fake_post):
+            t = threading.Thread(
+                target=local_runner._compute_poll_loop,
+                args=("http://test", "tok", active_jobs, lock, 1),
+                kwargs={"max_gpu_util_pct": max_gpu_util_pct, "base_poll_interval": 0.05},
+                daemon=True,
+            )
+            t.start()
+            time.sleep(0.15)
+            local_runner._shutdown_event.set()
+            t.join(timeout=2)
+        return calls
+
+    def test_cpu_load_disabled_by_default(self):
+        """max_cpu_load=0 (default) never blocks claiming regardless of load."""
+        calls = self._run_compute_poll(
+            gpu_util_pct_ret=None,
+            max_gpu_util_pct=0,
+            post_side_effect=lambda url: (204, None, None),
+        )
+        # The poll loop should have called _post (not skipped due to load)
+        self.assertTrue(len(calls) >= 1)
+
+    def test_gpu_util_above_threshold_skips_compute_claim(self):
+        """Compute poll skips claiming when GPU utilization is at or above threshold."""
+        calls = self._run_compute_poll(
+            gpu_util_pct_ret=80,
+            max_gpu_util_pct=80,
+            post_side_effect=lambda url: (204, None, None),
+        )
+        # _post should NOT have been called — throttled
+        self.assertEqual(calls, [])
+
+    def test_gpu_util_below_threshold_allows_compute_claim(self):
+        """Compute poll proceeds when GPU utilization is below threshold."""
+        calls = self._run_compute_poll(
+            gpu_util_pct_ret=79,
+            max_gpu_util_pct=80,
+            post_side_effect=lambda url: (204, None, None),
+        )
+        self.assertTrue(len(calls) >= 1)
+
+    def test_gpu_util_none_does_not_skip(self):
+        """When GPU util can't be read (None), claiming is not blocked."""
+        calls = self._run_compute_poll(
+            gpu_util_pct_ret=None,
+            max_gpu_util_pct=80,
+            post_side_effect=lambda url: (204, None, None),
+        )
+        self.assertTrue(len(calls) >= 1)
+
+
+# ── Live-safe config applied from heartbeat response ──────────────────────────
+
+class TestLiveRunnerConfig(unittest.TestCase):
+    """Unit tests for the _LiveRunnerConfig holder: apply, clamp, report."""
+
+    def _holder(self, gpu_indices=(0, 1, 2, 3)):
+        gpu_state = _gpu_state(gpu_indices)
+        holder = local_runner._LiveRunnerConfig(
+            2, 2, task_types="all", gpu_state=gpu_state,
+            all_gpu_indices=list(gpu_indices),
+        )
+        return holder, gpu_state
+
+    def test_grow_and_shrink_concurrency(self):
+        holder, _ = self._holder()
+        self.assertEqual(holder.max_concurrent(), 2)
+        applied = holder.apply({"max_concurrent": 8, "config_generation": "g1"})
+        self.assertTrue(applied)
+        self.assertEqual(holder.max_concurrent(), 8)
+        # Shrink: the new value is the live source of truth; running work is the
+        # caller's concern (the holder never touches it).
+        holder.apply({"max_concurrent": 1, "config_generation": "g2"})
+        self.assertEqual(holder.max_concurrent(), 1)
+
+    def test_compute_limit_applied_independently(self):
+        holder, _ = self._holder()
+        holder.apply({"max_concurrent_compute": 5, "config_generation": "g"})
+        self.assertEqual(holder.max_concurrent_compute(), 5)
+        self.assertEqual(holder.max_concurrent(), 2)  # untouched
+
+    def test_clamp_out_of_range(self):
+        holder, _ = self._holder()
+        holder.apply({"max_concurrent": 999, "config_generation": "hi"})
+        self.assertEqual(holder.max_concurrent(), local_runner._LiveRunnerConfig.MAX_CONCURRENT)
+        holder.apply({"max_concurrent": 0, "config_generation": "lo"})
+        self.assertEqual(holder.max_concurrent(), local_runner._LiveRunnerConfig.MIN_CONCURRENT)
+
+    def test_null_field_keeps_current_default(self):
+        holder, _ = self._holder()
+        holder.apply({"max_concurrent": 6, "config_generation": "g1"})
+        # A subsequent block with a null max_concurrent must not clobber the value.
+        holder.apply({"max_concurrent": None, "task_types": ["fix"], "config_generation": "g2"})
+        self.assertEqual(holder.max_concurrent(), 6)
+
+    def test_task_types_allowlist_applied_and_reported(self):
+        holder, _ = self._holder()
+        holder.apply({"task_types": ["create", "fix"], "config_generation": "g"})
+        self.assertEqual(holder.report()["applied_task_types"], ["create", "fix"])
+        holder.apply({"task_types": "all", "config_generation": "g2"})
+        self.assertEqual(holder.report()["applied_task_types"], "all")
+
+    def test_gpu_allowlist_updates_scheduling_set(self):
+        holder, gpu_state = self._holder(gpu_indices=(0, 1, 2, 3))
+        holder.apply({"gpu_indices_allowed": [1, 2], "config_generation": "g"})
+        self.assertEqual(gpu_state["allowed"], [1, 2])
+        self.assertEqual(holder.report()["applied_gpu_indices_allowed"], [1, 2])
+        # "all" maps back to every DETECTED index.
+        holder.apply({"gpu_indices_allowed": "all", "config_generation": "g2"})
+        self.assertEqual(sorted(gpu_state["allowed"]), [0, 1, 2, 3])
+        self.assertEqual(holder.report()["applied_gpu_indices_allowed"], "all")
+
+    def test_gpu_allowlist_intersected_with_detected(self):
+        holder, gpu_state = self._holder(gpu_indices=(0, 1))
+        # Server asks for index 5 which this host lacks — never assign it.
+        holder.apply({"gpu_indices_allowed": [0, 5], "config_generation": "g"})
+        self.assertEqual(gpu_state["allowed"], [0])
+        # The reported value mirrors the server projection (so the echoed
+        # generation matches), even though only [0] is concretely assignable.
+        self.assertEqual(holder.report()["applied_gpu_indices_allowed"], [0, 5])
+
+    def test_gpus_per_job_applied_updates_scheduling_set(self):
+        holder, gpu_state = self._holder(gpu_indices=(0, 1, 2, 3))
+        # Seeded from gpu_state["per_job"] == 1.
+        self.assertEqual(holder.report()["applied_gpus_per_job"], 1)
+        holder.apply({"gpus_per_job": 2, "config_generation": "g"})
+        # The shared scheduling state now reserves 2 GPUs per job, and the
+        # applied value is echoed for the desired-vs-applied fleet view.
+        self.assertEqual(gpu_state["per_job"], 2)
+        self.assertEqual(holder.report()["applied_gpus_per_job"], 2)
+
+    def test_gpus_per_job_clamped_to_bounds(self):
+        holder, gpu_state = self._holder()
+        holder.apply({"gpus_per_job": 999, "config_generation": "hi"})
+        self.assertEqual(
+            gpu_state["per_job"], local_runner._LiveRunnerConfig.MAX_GPUS_PER_JOB
+        )
+        holder.apply({"gpus_per_job": 0, "config_generation": "lo"})
+        self.assertEqual(
+            gpu_state["per_job"], local_runner._LiveRunnerConfig.MIN_GPUS_PER_JOB
+        )
+
+    def test_gpus_per_job_null_keeps_current(self):
+        holder, gpu_state = self._holder()
+        holder.apply({"gpus_per_job": 3, "config_generation": "g1"})
+        self.assertEqual(gpu_state["per_job"], 3)
+        # A later block omitting/nulling the field must not reset it.
+        holder.apply({"gpus_per_job": None, "config_generation": "g2"})
+        self.assertEqual(gpu_state["per_job"], 3)
+        self.assertEqual(holder.report()["applied_gpus_per_job"], 3)
+
+    def test_gpus_per_job_seeded_from_gpu_state(self):
+        gpu_state = _gpu_state((0, 1))
+        gpu_state["per_job"] = 2
+        holder = local_runner._LiveRunnerConfig(
+            2, 2, task_types="all", gpu_state=gpu_state, all_gpu_indices=[0, 1],
+        )
+        # The reported value matches the scheduler's startup per-job count so the
+        # first heartbeat echo is not spuriously pending.
+        self.assertEqual(holder.report()["applied_gpus_per_job"], 2)
+
+    def test_gpus_per_job_unknown_field_still_blocks_generation(self):
+        # gpus_per_job is now a KNOWN key — a block carrying only it (plus known
+        # fields) is fully applicable and advances the generation.
+        holder, _ = self._holder()
+        self.assertTrue(
+            holder.apply({"gpus_per_job": 2, "config_generation": "gen-pj"})
+        )
+        self.assertEqual(holder.report()["applied_config_generation"], "gen-pj")
+
+    def test_generation_advances_only_when_fully_applicable(self):
+        holder, _ = self._holder()
+        self.assertIsNone(holder.report()["applied_config_generation"])
+        self.assertTrue(holder.apply({"max_concurrent": 4, "config_generation": "gen-A"}))
+        self.assertEqual(holder.report()["applied_config_generation"], "gen-A")
+        # A block carrying an UNRECOGNIZED non-null field is not fully applicable:
+        # the known fields still apply, but the generation stays pending (older).
+        applied = holder.apply({
+            "max_concurrent": 7,
+            "future_field": "something",
+            "config_generation": "gen-B",
+        })
+        self.assertFalse(applied)
+        self.assertEqual(holder.max_concurrent(), 7)  # known field still applied
+        self.assertEqual(holder.report()["applied_config_generation"], "gen-A")  # not advanced
+
+    def test_malformed_block_is_noop(self):
+        holder, _ = self._holder()
+        self.assertFalse(holder.apply(None))
+        self.assertFalse(holder.apply("not-a-dict"))
+        self.assertEqual(holder.max_concurrent(), 2)
+
+
+class TestComputePollLoopLiveConfig(unittest.TestCase):
+    """_compute_poll_loop gates on the LIVE compute limit, not the static arg."""
+
+    def setUp(self):
+        local_runner._shutdown_event.clear()
+
+    def tearDown(self):
+        local_runner._shutdown_event.clear()
+
+    def test_live_limit_overrides_static_max_concurrent(self):
+        """A live config that GROWS the compute limit lets a claim proceed even
+        though the static positional max_concurrent would block it."""
+        post_calls = []
+        sleep_iters = [0]
+
+        def fake_post(url, token, body, **kwargs):
+            post_calls.append(url)
+            return 204, None, None
+
+        def fake_sleep(secs):
+            sleep_iters[0] += 1
+            if sleep_iters[0] >= 2:
+                local_runner._shutdown_event.set()
+
+        # One job already running; static ceiling is 1 (would block), but the
+        # live holder was grown to 2 (should allow a claim).
+        active_jobs = {"job-a"}
+        lock = threading.Lock()
+        holder = local_runner._LiveRunnerConfig(1, 2)
+
+        with patch.object(local_runner, "_post", side_effect=fake_post), \
+             patch("time.sleep", fake_sleep):
+            local_runner._compute_poll_loop(
+                "https://api.example.com", "tok", active_jobs, lock,
+                max_concurrent=1, live_config=holder,
+            )
+        self.assertTrue(post_calls, "live-grown compute limit must allow the claim")
+
+    def test_live_limit_blocks_when_shrunk(self):
+        """A live config that SHRINKS the compute limit stops new claims even
+        though the static positional max_concurrent would allow them."""
+        post_calls = []
+        sleep_iters = [0]
+
+        def fake_post(url, token, body, **kwargs):
+            post_calls.append(url)
+            return 204, None, None
+
+        def fake_sleep(secs):
+            sleep_iters[0] += 1
+            if sleep_iters[0] >= 2:
+                local_runner._shutdown_event.set()
+
+        active_jobs = {"job-a"}
+        lock = threading.Lock()
+        holder = local_runner._LiveRunnerConfig(5, 1)  # live compute limit = 1
+
+        with patch.object(local_runner, "_post", side_effect=fake_post), \
+             patch("time.sleep", fake_sleep):
+            local_runner._compute_poll_loop(
+                "https://api.example.com", "tok", active_jobs, lock,
+                max_concurrent=5, live_config=holder,
+            )
+        self.assertEqual(post_calls, [], "live-shrunk compute limit must block the claim")
+
+
+class TestHeartbeatLiveConfig(unittest.TestCase):
+    """_heartbeat_loop applies the server config block and echoes applied-vs-pending."""
+
+    def setUp(self):
+        local_runner._shutdown_event.clear()
+
+    def tearDown(self):
+        local_runner._shutdown_event.clear()
+
+    def _drive(self, response_body, seed=(2, 2), all_gpu=(0, 1)):
+        """Run _heartbeat_loop for two ticks; return (holder, [posted bodies])."""
+        gpu_state = _gpu_state(all_gpu)
+        holder = local_runner._LiveRunnerConfig(
+            seed[0], seed[1], task_types="all", gpu_state=gpu_state,
+            all_gpu_indices=list(all_gpu),
+        )
+        bodies = []
+        calls = [0]
+
+        def fake_post(url, token, body, **kwargs):
+            bodies.append(dict(body))
+            calls[0] += 1
+            if calls[0] >= 2:
+                local_runner._shutdown_event.set()
+            return 200, response_body
+
+        active_tasks: dict = {}
+        lock = threading.Lock()
+        # An idle runner + a mismatched version_hint arms the AUTO-UPDATE path.
+        # Unstubbed, that runs a real `git fetch` (do_update) and then either
+        # os._exit()s or os.execv()s — killing the pytest process itself and
+        # silently truncating the run (exit 0, later tests never reported). These
+        # tests are about the config echo, so the update path is stubbed inert.
+        with patch.object(local_runner, "_post", side_effect=fake_post), \
+             patch.object(local_runner, "_write_status_json"), \
+             patch.object(local_runner.br, "do_update", return_value=1), \
+             patch.object(os, "_exit"), \
+             patch.object(os, "execv"), \
+             patch("time.sleep", lambda *_: None):
+            local_runner._heartbeat_loop(
+                "https://api.example.com", "tok", active_tasks, lock, {},
+                live_config=holder,
+            )
+        return holder, bodies
+
+    def test_config_block_applied_and_echoed(self):
+        response = {
+            "ok": True,
+            "config": {
+                "max_concurrent": 8,
+                "max_concurrent_compute": 4,
+                "task_types": ["create"],
+                "gpu_indices_allowed": [0, 1],
+                "config_generation": "gen-xyz",
+            },
+        }
+        holder, bodies = self._drive(response)
+        # Live values applied.
+        self.assertEqual(holder.max_concurrent(), 8)
+        self.assertEqual(holder.max_concurrent_compute(), 4)
+        # First body: nothing applied yet (generation pending / seed value).
+        self.assertIsNone(bodies[0]["applied_config_generation"])
+        self.assertEqual(bodies[0]["applied_max_concurrent"], 2)
+        # Second body: echoes the generation + applied values from the first tick.
+        self.assertEqual(bodies[1]["applied_config_generation"], "gen-xyz")
+        self.assertEqual(bodies[1]["applied_max_concurrent"], 8)
+        self.assertEqual(bodies[1]["applied_max_concurrent_compute"], 4)
+        self.assertEqual(bodies[1]["applied_task_types"], ["create"])
+        self.assertEqual(bodies[1]["applied_gpu_indices_allowed"], [0, 1])
+
+    def test_env_defaults_when_no_config_block(self):
+        """No config block in the response leaves the env-seeded defaults intact
+        and the applied generation null (server renders as pending/unknown)."""
+        holder, bodies = self._drive({"ok": True, "version_hint": "abc"}, seed=(3, 3))
+        self.assertEqual(holder.max_concurrent(), 3)
+        self.assertEqual(holder.max_concurrent_compute(), 3)
+        for body in bodies:
+            self.assertIsNone(body["applied_config_generation"])
+            self.assertEqual(body["applied_max_concurrent"], 3)
+
+
+class TestHeartbeatAgentUnavailableLegs(unittest.TestCase):
+    """_heartbeat_loop reports EVERY failing agent leg, not just the first.
+
+    The four independent legs gating the agent backends — bwrap sandbox, agent
+    dist, node runtime, docker — must each surface independently: a compound
+    ``agent_unavailable_reason`` naming every failed leg AND a structured
+    ``agent_unavailable_legs`` map of leg -> ok bool.
+    """
+
+    def setUp(self):
+        local_runner._shutdown_event.clear()
+
+    def tearDown(self):
+        local_runner._shutdown_event.clear()
+
+    def _drive_once(self, *, agent_sandbox_ok, binary_present, node_ok, docker_ok):
+        """Run one heartbeat tick with each leg's state pinned; return the body."""
+        caps = iso.Capabilities()  # truthy caps → per-leg map is emitted
+        bodies = []
+        calls = [0]
+
+        def fake_post(url, token, body, **kwargs):
+            bodies.append(dict(body))
+            calls[0] += 1
+            local_runner._shutdown_event.set()
+            return 200, {"ok": True}
+
+        binary = ["node", "/x/agent"] if binary_present else None
+        active_tasks: dict = {}
+        lock = threading.Lock()
+        with patch.object(local_runner, "_post", side_effect=fake_post), \
+             patch.object(local_runner, "_write_status_json"), \
+             patch.object(local_runner, "_locate_agent_binary", return_value=binary), \
+             patch.object(local_runner, "_node_runtime_ok", return_value=node_ok), \
+             patch.object(local_runner, "_docker_agent_possible", return_value=docker_ok), \
+             patch.object(iso, "probe_llm_clis", return_value={}), \
+             patch("time.sleep", lambda *_: None):
+            local_runner._heartbeat_loop(
+                "https://api.example.com", "tok", active_tasks, lock, {},
+                agent_sandbox_ok=agent_sandbox_ok, caps=caps, agent_image="img:latest",
+            )
+        self.assertTrue(bodies)
+        return bodies[0]
+
+    def test_multiple_failing_legs_all_named_in_reason(self):
+        """Sandbox + node + docker all failing => reason enumerates ALL, not one."""
+        body = self._drive_once(
+            agent_sandbox_ok=False, binary_present=True, node_ok=False, docker_ok=False,
+        )
+        self.assertFalse(body["agent_available"])
+        reason = body["agent_unavailable_reason"]
+        self.assertIn("bwrap sandbox unavailable", reason)
+        self.assertIn("node runtime not functional", reason)
+        self.assertIn("docker agent unavailable", reason)
+        # Compound string joins the failed legs (not a single first-match phrase).
+        self.assertEqual(reason.count(";"), 2)
+
+    def test_agent_unavailable_legs_map_reflects_each_leg(self):
+        """Every leg's ok/failed boolean is reported independently in the map."""
+        body = self._drive_once(
+            agent_sandbox_ok=False, binary_present=False, node_ok=True, docker_ok=False,
+        )
+        legs = body["agent_unavailable_legs"]
+        self.assertEqual(
+            legs,
+            {
+                "bwrap_sandbox": False,
+                "agent_dist": False,
+                "node_runtime": True,
+                "docker": False,
+            },
+        )
+        # All four failing legs relevant to unavailability are named; node ok is not.
+        reason = body["agent_unavailable_reason"]
+        self.assertIn("bwrap sandbox unavailable", reason)
+        self.assertIn("agent dist not built", reason)
+        self.assertIn("docker agent unavailable", reason)
+        self.assertNotIn("node runtime", reason)
+
+    def test_agent_available_clears_reason_and_reports_legs(self):
+        """When the bwrap trio is satisfied the agent is available: reason None,
+        legs still reported (all the legs that mattered are ok)."""
+        body = self._drive_once(
+            agent_sandbox_ok=True, binary_present=True, node_ok=True, docker_ok=False,
+        )
+        self.assertTrue(body["agent_available"])
+        self.assertIsNone(body["agent_unavailable_reason"])
+        self.assertEqual(
+            body["agent_unavailable_legs"],
+            {
+                "bwrap_sandbox": True,
+                "agent_dist": True,
+                "node_runtime": True,
+                "docker": False,
+            },
+        )
+
+    def test_docker_only_box_available_without_host_node_or_binary(self):
+        """A docker-only box (no bwrap, no host dist/node) is still available via
+        docker; the legs map shows the failed bwrap legs but reason stays None."""
+        body = self._drive_once(
+            agent_sandbox_ok=False, binary_present=False, node_ok=False, docker_ok=True,
+        )
+        self.assertTrue(body["agent_available"])
+        self.assertIsNone(body["agent_unavailable_reason"])
+        self.assertEqual(
+            body["agent_unavailable_legs"],
+            {
+                "bwrap_sandbox": False,
+                "agent_dist": False,
+                "node_runtime": False,
+                "docker": True,
+            },
+        )
 
 
 # ── Stale workspace cleanup ────────────────────────────────────────────────────
@@ -817,6 +1304,60 @@ class TestReaperLoop(unittest.TestCase):
                 self.assertFalse(os.path.exists(workspace))
 
 
+# ── Exit-code 42 (runtime_unavailable) does not increment failure streak ─────
+
+class TestExitCode42NoFailureStreak(unittest.TestCase):
+    """exit code 42 (runtime_unavailable) must NOT increment consecutive_job_failures."""
+
+    def setUp(self):
+        local_runner._shutdown_event.clear()
+
+    def tearDown(self):
+        local_runner._shutdown_event.clear()
+
+    def test_exit_code_42_does_not_increment_failure_streak(self):
+        proc = MagicMock()
+        proc.poll.return_value = 0   # poll() non-None so the reaper picks it up
+        proc.returncode = 42
+
+        active_tasks = {"task-42": proc}
+        lock = threading.Lock()
+        capacity = threading.BoundedSemaphore(1)
+        self.assertTrue(capacity.acquire(blocking=False))  # permit held by the task
+        telemetry = local_runner._TelemetryState()
+
+        def stop_sleep(_secs):
+            local_runner._shutdown_event.set()
+
+        with patch("time.sleep", stop_sleep):
+            local_runner._reap_loop(active_tasks, lock, capacity, telemetry=telemetry)
+
+        self.assertNotIn("task-42", active_tasks)
+        self.assertTrue(capacity.acquire(blocking=False))  # permit was released
+        _last_success, fails = telemetry.snapshot()
+        # Exit code 42 is a graceful infra decline — failure streak must stay 0.
+        self.assertEqual(fails, 0)
+
+    def test_nonzero_non42_exit_still_increments_failure_streak(self):
+        """Sanity-check: a normal failure (e.g. exit 1) does increment the streak."""
+        proc = MagicMock()
+        proc.poll.return_value = 0
+        proc.returncode = 1
+
+        active_tasks = {"task-fail": proc}
+        lock = threading.Lock()
+        telemetry = local_runner._TelemetryState()
+
+        def stop_sleep(_secs):
+            local_runner._shutdown_event.set()
+
+        with patch("time.sleep", stop_sleep):
+            local_runner._reap_loop(active_tasks, lock, None, telemetry=telemetry)
+
+        _last_success, fails = telemetry.snapshot()
+        self.assertEqual(fails, 1)
+
+
 # ── Graceful shutdown ─────────────────────────────────────────────────────────
 
 class TestGracefulShutdown(unittest.TestCase):
@@ -1123,7 +1664,7 @@ class TestRunComputeJob(unittest.TestCase):
         reports = []
 
         def fake_report(orch_url, token, job_id, *, exec_status, exit_code=None,
-                        result_metrics=None, command_log=None):
+                        result_metrics=None, command_log=None, progress=None):
             reports.append({"exec_status": exec_status, "exit_code": exit_code})
             return False
 
@@ -1162,7 +1703,7 @@ class TestRunComputeJob(unittest.TestCase):
         reports = []
 
         def fake_report(orch_url, token, job_id, *, exec_status, exit_code=None,
-                        result_metrics=None, command_log=None):
+                        result_metrics=None, command_log=None, progress=None):
             reports.append({
                 "exec_status": exec_status,
                 "exit_code": exit_code,
@@ -1198,7 +1739,7 @@ class TestRunComputeJob(unittest.TestCase):
         reports = []
 
         def fake_report(orch_url, token, job_id, *, exec_status, exit_code=None,
-                        result_metrics=None, command_log=None):
+                        result_metrics=None, command_log=None, progress=None):
             reports.append({"exec_status": exec_status, "exit_code": exit_code})
             return False
 
@@ -1231,7 +1772,7 @@ class TestRunComputeJob(unittest.TestCase):
         captured: dict = {}
 
         def fake_report(orch_url, token, job_id, *, exec_status, exit_code=None,
-                        result_metrics=None, command_log=None):
+                        result_metrics=None, command_log=None, progress=None):
             reports.append({"exec_status": exec_status, "exit_code": exit_code})
             return False
 
@@ -1284,7 +1825,7 @@ class TestRunComputeJob(unittest.TestCase):
         reports = []
 
         def fake_report(orch_url, token, job_id, *, exec_status, exit_code=None,
-                        result_metrics=None, command_log=None):
+                        result_metrics=None, command_log=None, progress=None):
             reports.append(exec_status)
             return False
 
@@ -1593,7 +2134,7 @@ class TestComputePollLoop(unittest.TestCase):
             }
 
         def fake_report(orch_url, token, job_id, *, exec_status, exit_code=None,
-                        result_metrics=None, command_log=None):
+                        result_metrics=None, command_log=None, progress=None):
             reports.append({
                 "job_id": job_id,
                 "exec_status": exec_status,
@@ -1820,6 +2361,9 @@ class TestGpuDetection(unittest.TestCase):
         self.assertEqual(posted_bodies[0]["active_task_ids"], ["task-1"])
         self.assertEqual(posted_bodies[0]["active_compute_job_ids"], ["job-a", "job-b"])
         self.assertFalse(posted_bodies[0]["agent_available"])
+        # The daemon loop always carries a GENUINE active-work report, so the
+        # orchestrator refreshes its reaper-trusted active set + stamp from it.
+        self.assertTrue(posted_bodies[0]["active_work_report"])
 
     def test_hostname_included_in_heartbeat_body(self):
         """Heartbeat carries the host name so the console shows a real machine name.
@@ -1938,6 +2482,86 @@ class TestGpuDetection(unittest.TestCase):
         self.assertIsNone(body["agent_backend"])
         self.assertIsNone(body["compute_backend"])
         self.assertIsNone(body["version"])
+
+    def test_llm_clis_included_in_heartbeat_body(self):
+        """Heartbeat body carries the LLM CLI inventory when caps are supplied."""
+        posted_bodies = []
+        fake_llm_clis = {
+            "claude": {"present": True, "version": "0.2.0"},
+            "codex": {"present": True, "version": "0.3.0"},
+            "gemini": {"present": True, "version": "1.0.0"},
+        }
+
+        def fake_post(url, token, body, **kwargs):
+            posted_bodies.append(body)
+            local_runner._shutdown_event.set()
+            return 200, {"ok": True}
+
+        active_tasks: dict = {}
+        lock = threading.Lock()
+        local_runner._shutdown_event.clear()
+
+        try:
+            with patch.object(local_runner, "_post", fake_post), \
+                 patch.object(local_runner, "_runner_version", return_value="v22-abc"), \
+                 patch.object(local_runner, "_locate_agent_binary", return_value=["node", "/agent/dist/index.js"]), \
+                 patch.object(local_runner, "_node_runtime_ok", return_value=True), \
+                 patch.object(iso, "probe_llm_clis", return_value=fake_llm_clis):
+                local_runner._heartbeat_loop(
+                    "https://api",
+                    "tok",
+                    active_tasks,
+                    lock,
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                    caps=_bwrap_caps(),
+                    agent_image=None,
+                )
+        finally:
+            local_runner._shutdown_event.clear()
+
+        self.assertEqual(len(posted_bodies), 1)
+        body = posted_bodies[0]
+        self.assertIsInstance(body["llm_clis"], dict)
+        self.assertEqual(body["llm_clis"], fake_llm_clis)
+        self.assertTrue(body["llm_clis"]["claude"]["present"])
+        self.assertEqual(body["llm_clis"]["claude"]["version"], "0.2.0")
+        self.assertTrue(body["llm_clis"]["codex"]["present"])
+        self.assertEqual(body["llm_clis"]["codex"]["version"], "0.3.0")
+        self.assertTrue(body["llm_clis"]["gemini"]["present"])
+        # The remaining heartbeat fields are still present.
+        self.assertIsInstance(body["isolation_backends"], dict)
+        self.assertEqual(body["version"], "v22-abc")
+
+    def test_llm_clis_none_when_caps_absent(self):
+        """caps=None (an old caller) → llm_clis serializes as None."""
+        posted_bodies = []
+
+        def fake_post(url, token, body, **kwargs):
+            posted_bodies.append(body)
+            local_runner._shutdown_event.set()
+            return 200, {"ok": True}
+
+        active_tasks: dict = {}
+        lock = threading.Lock()
+        local_runner._shutdown_event.clear()
+
+        try:
+            with patch.object(local_runner, "_post", fake_post), \
+                 patch.object(local_runner, "_runner_version", return_value=None), \
+                 patch.object(local_runner, "_locate_agent_binary", return_value=None):
+                local_runner._heartbeat_loop(
+                    "https://api",
+                    "tok",
+                    active_tasks,
+                    lock,
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                )
+        finally:
+            local_runner._shutdown_event.clear()
+
+        self.assertEqual(len(posted_bodies), 1)
+        body = posted_bodies[0]
+        self.assertIsNone(body["llm_clis"])
 
     def test_docker_only_declares_read_only_agent_slice(self):
         """A docker-only box (docker+image, NO bwrap) DECLARES the read-only agent
@@ -2832,7 +3456,7 @@ class TestComputeJobTelemetry(unittest.TestCase):
         reports = []
 
         def fake_report(orch, token, job_id, *, exec_status, exit_code=None,
-                        result_metrics=None, command_log=None):
+                        result_metrics=None, command_log=None, progress=None):
             reports.append({"exec_status": exec_status, "command_log": command_log})
             return False
 
@@ -3273,7 +3897,13 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
                  patch.object(local_runner.br, "do_update",
                               return_value=0), \
                  patch.object(os, "_exit"), \
+                 patch.object(os, "execv"), \
                  patch("builtins.print", side_effect=fake_print):
+                # BOTH exits are stubbed: after a successful update the runner
+                # either exits for its supervisor OR re-execs in place, and which
+                # branch it takes depends on the HOST running the tests. An
+                # unstubbed os.execv replaces the pytest process itself, silently
+                # truncating the run (exit 0, remaining tests never reported).
                 local_runner._heartbeat_loop(
                     "https://api", "tok", active_tasks, lock,
                     {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
@@ -3679,6 +4309,61 @@ class TestDockerAgentBackend(unittest.TestCase):
             "tok-123",
             {"task_id": "task-abc"},
         )
+
+    def test_notify_decline_sends_reason_when_known(self):
+        """The decline reason rides along so the orchestrator can record it and
+        stop re-pinning the task to the runner that keeps rejecting it. Reasons
+        used to be printed locally and dropped, leaving the dispatcher with
+        nothing to exclude on — the pin -> pull -> decline livelock."""
+        from unittest.mock import patch
+
+        with patch.object(local_runner, "_post") as post_mock:
+            local_runner._notify_decline(
+                "https://api.example.com",
+                "tok-123",
+                "task-abc",
+                reason="no bwrap: fail-closed",
+            )
+        post_mock.assert_called_once_with(
+            "https://api.example.com/api/runner/decline-task",
+            "tok-123",
+            {"task_id": "task-abc", "reason": "no bwrap: fail-closed"},
+        )
+
+    def test_spawn_agent_task_reports_decline_reason(self):
+        """_spawn_agent_task hands the fail-closed reason back to the caller
+        (which forwards it to /decline-task) instead of only printing it."""
+        from unittest.mock import patch
+
+        reasons: list[str] = []
+        with patch.object(
+            local_runner.iso,
+            "decide_agent_backend",
+            return_value=local_runner.iso.DECLINE,
+        ), patch.object(
+            local_runner.iso,
+            "agent_decline_reason",
+            return_value="docker present but image is read-only; task type needs write",
+        ):
+            spawned = local_runner._spawn_agent_task(
+                task_id="t1",
+                task_type="fix",
+                agent_token="tok",
+                vm_instance_id="runner:1",
+                orchestrator_url="https://api",
+                workspace="/tmp/ws",
+                caps=local_runner.iso.Capabilities(),
+                agent_binary=["node", "agent.js"],
+                agent_image=None,
+                active_tasks={},
+                agent_started_at={},
+                agent_teardown={},
+                lock=threading.Lock(),
+                decline_reason_out=reasons,
+            )
+
+        assert spawned is False
+        assert reasons and "read-only" in reasons[0]
 
     def test_notify_decline_swallows_exceptions(self):
         """_notify_decline is best-effort — exceptions must not propagate."""
@@ -4295,7 +4980,10 @@ class TestCredentialPersistence(unittest.TestCase):
 
 
 class TestConcurrencyPresetMismatch(unittest.TestCase):
-    """Warn when BLUEPRINT_RUNNER_MAX_CONCURRENT disagrees with server enrolled max_concurrent."""
+    """_preflight still surfaces the backward-compat enrolled_max_concurrent field,
+    but main() no longer emits a warn-only mismatch warning — a server config block
+    delivered on the heartbeat RESPONSE now OVERRIDES the env default live (see
+    TestHeartbeatLiveConfig), so the old "disagrees" advisory was removed."""
 
     def setUp(self):
         local_runner._shutdown_event.clear()
@@ -4335,8 +5023,32 @@ class TestConcurrencyPresetMismatch(unittest.TestCase):
         result = self._run_preflight(enrolled_max_concurrent=None)
         self.assertIsNone(result.get("enrolled_max_concurrent"))
 
-    def test_mismatch_warning_emitted(self):
-        """main() warns when client max_concurrent != server enrolled_max_concurrent."""
+    def test_preflight_heartbeat_flagged_as_non_report(self):
+        """The --check preflight posts active_work_report=False with an empty active
+        set, so the orchestrator IGNORES the probe rather than treating it as a real
+        report. Guards the zombie-reap hazard: a preflight on a box already running a
+        live runner must never zero out that task's claim (reaper_orphan_classify)."""
+        captured = {}
+
+        def fake_post(url, token, body, **kwargs):
+            captured["body"] = body
+            return 200, {"ok": True, "last_seen_at": "2026-01-01T00:00:00Z"}
+
+        with patch.object(local_runner, "_post", side_effect=fake_post), \
+             patch.object(local_runner, "_workspace_writable", return_value=True):
+            local_runner._preflight(
+                "https://api.example.com", "tok", None,
+                _bwrap_caps(), _gpu_state(()), 2, 2,
+            )
+
+        self.assertIn("body", captured)
+        self.assertFalse(captured["body"]["active_work_report"])
+        self.assertEqual(captured["body"]["active_task_ids"], [])
+
+    def test_no_warn_only_mismatch_path(self):
+        """main() no longer emits the warn-only "disagrees" advisory when the env
+        default differs from the server enrolled max_concurrent — that path was
+        replaced by live config application via the heartbeat response."""
         fake_body = {
             "ok": True,
             "last_seen_at": "2026-01-01T00:00:00Z",
@@ -4382,10 +5094,10 @@ class TestConcurrencyPresetMismatch(unittest.TestCase):
             except SystemExit:
                 pass
 
-        warning_lines = [line for line in output_lines if "BLUEPRINT_RUNNER_MAX_CONCURRENT" in line and "enrolled" in line.lower()]
-        self.assertTrue(
+        warning_lines = [line for line in output_lines if "disagrees" in line and "enrolled" in line.lower()]
+        self.assertFalse(
             warning_lines,
-            f"Expected mismatch warning in output. Got: {output_lines[:10]}",
+            f"Did not expect the removed warn-only mismatch advisory. Got: {warning_lines}",
         )
 
     def test_no_mismatch_warning_when_values_match(self):
@@ -4652,7 +5364,11 @@ class TestProviderCredentialCheck(unittest.TestCase):
             self.assertFalse(br._check_provider_credentials())
 
     def test_warning_printed_in_preflight_when_no_credentials(self):
-        """main() prints a WARNING when no provider credential is set (acceptance)."""
+        """main() prints a WARNING when no provider credential is set (acceptance).
+
+        Pool dispatch ships per-task credentials via /next-task so host env creds
+        are fallback-only. Missing host creds → WARNING only, not a hard fail.
+        """
         output_lines = []
 
         def capture_print(*args, **kwargs):
@@ -4670,7 +5386,7 @@ class TestProviderCredentialCheck(unittest.TestCase):
              patch("builtins.print", side_effect=capture_print), \
              patch.object(br, "_node_major", return_value=22), \
              patch.object(br.shutil, "which", return_value="/usr/bin/claude"), \
-             patch.object(br, "run_local_runner", return_value=1):
+             patch.object(br, "run_local_runner", return_value=0):
             rc = br.main(["check"])
 
         warning_lines = [line for line in output_lines if "WARNING" in line and "credential" in line.lower()]
@@ -4679,10 +5395,9 @@ class TestProviderCredentialCheck(unittest.TestCase):
             f"Expected WARNING about missing credentials in output. Got: {output_lines}",
         )
         self.assertIn("ANTHROPIC_API_KEY", warning_lines[0])
-        # Missing provider creds must make --check exit non-zero so the operator
-        # catches the misconfiguration at enrollment time instead of discovering
-        # every agent task fails at runtime.
-        self.assertEqual(rc, 1, "Missing provider creds must make blueprint-runner check exit non-zero")
+        # Missing host creds is now a warning only — pool-covered runners pass --check
+        # green. rc=0 because run_local_runner returns 0 for a pool-covered runner.
+        self.assertEqual(rc, 0, "Missing host creds is a warning only; --check should pass green")
 
 
 class TestStatusJson(unittest.TestCase):
@@ -4743,6 +5458,35 @@ class TestStatusJson(unittest.TestCase):
             active_task_ids=[],
             active_compute_job_ids=[],
         )
+        tmp_files = [f for f in os.listdir(self._tmpdir) if f.endswith(".tmp")]
+        self.assertEqual(len(tmp_files), 0, f"stale .tmp files: {tmp_files}")
+
+    def test_overwrite_existing_file_succeeds(self):
+        """Writing status.json twice must succeed: the second write replaces the first.
+        os.replace (not os.rename) is used so this works on Windows too, where
+        os.rename raises FileExistsError when the destination already exists."""
+        local_runner._write_status_json(
+            runner_id="first-box",
+            last_heartbeat_status="initial",
+            active_task_ids=[],
+            active_compute_job_ids=[],
+        )
+        path = self._status_path()
+        self.assertTrue(os.path.exists(path))
+
+        local_runner._write_status_json(
+            runner_id="second-box",
+            last_heartbeat_status="updated",
+            active_task_ids=["new-task"],
+            active_compute_job_ids=[],
+        )
+        self.assertTrue(os.path.exists(path))
+        with open(path) as f:
+            data = json.loads(f.read())
+        self.assertEqual(data["runner_id"], "second-box")
+        self.assertEqual(data["last_heartbeat_status"], "updated")
+        self.assertEqual(data["active_task_ids"], ["new-task"])
+
         tmp_files = [f for f in os.listdir(self._tmpdir) if f.endswith(".tmp")]
         self.assertEqual(len(tmp_files), 0, f"stale .tmp files: {tmp_files}")
 
@@ -4991,10 +5735,11 @@ class TestProviderCredentials(unittest.TestCase):
             )
 
         output = buf.getvalue()
-        self.assertIn("FAIL", output)
+        # Provider creds absent → WARNING (not FAIL), pool dispatch covers claims.
+        self.assertIn("WARNING", output)
         self.assertIn("provider creds", output)
-        # Failure is when agent tasks are claimable but no provider creds are set.
-        self.assertFalse(result["setup_ok"])
+        # setup_ok must be True: pool-covered runners have no host creds by design.
+        self.assertTrue(result["setup_ok"])
 
     def test_preflight_with_provider_credentials_does_not_warn(self):
         """Preflight does NOT warn when provider credentials are set."""
@@ -5028,7 +5773,208 @@ class TestProviderCredentials(unittest.TestCase):
         self.assertTrue(result["setup_ok"])
 
 
-# ── Per-task log persistence ────────────────────────────────────────────────
+# ── Agent deps bootstrap (blueprint-runner install) ──────────────────────────
+
+
+class TestBootstrapAgentDeps(unittest.TestCase):
+    """_bootstrap_agent_deps in blueprint_runner: agent npm ci at install time."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+        self._agent_dir = os.path.join(self._tmpdir, "agent")
+
+    def tearDown(self):
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def _make_agent_source(self, *, with_dist=False):
+        """Create a minimal agent source tree under self._agent_dir."""
+        os.makedirs(os.path.join(self._agent_dir, "src"))
+        Path(os.path.join(self._agent_dir, "src", "index.ts")).write_text("// test")
+        Path(os.path.join(self._agent_dir, "package.json")).write_text('{"name":"test-agent"}')
+        Path(os.path.join(self._agent_dir, "package-lock.json")).write_text("{}")
+        if with_dist:
+            os.makedirs(os.path.join(self._agent_dir, "dist"))
+            Path(os.path.join(self._agent_dir, "dist", "index.js")).write_text("// dist")
+
+    def test_bootstrap_calls_npm_ci_when_source_present(self):
+        """npm ci is called when agent source exists and dist is absent."""
+        self._make_agent_source()
+        calls = []
+        def recording_run(*args, **kwargs):
+            calls.append((args, kwargs))
+            return subprocess.CompletedProcess(args[0], 0)
+        with patch.object(br.shutil, "which", return_value="/usr/bin/npm"):
+            br._bootstrap_agent_deps(agent_dir=self._agent_dir, _run=recording_run)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("npm", calls[0][0][0])
+        self.assertEqual(calls[0][1].get("cwd"), self._agent_dir)
+
+    def test_bootstrap_skipped_with_no_agent_deps_flag(self):
+        """npm ci is NOT called when no_agent_deps=True."""
+        self._make_agent_source()
+        calls = []
+        def recording_run(*args, **kwargs):
+            calls.append((args, kwargs))
+            return subprocess.CompletedProcess(args[0], 0)
+        br._bootstrap_agent_deps(agent_dir=self._agent_dir, no_agent_deps=True, _run=recording_run)
+        self.assertEqual(len(calls), 0)
+
+    def test_bootstrap_skipped_when_dist_exists(self):
+        """npm ci is NOT called when dist/index.js already exists."""
+        self._make_agent_source(with_dist=True)
+        calls = []
+        def recording_run(*args, **kwargs):
+            calls.append((args, kwargs))
+            return subprocess.CompletedProcess(args[0], 0)
+        with patch.object(br.shutil, "which", return_value="/usr/bin/npm"):
+            br._bootstrap_agent_deps(agent_dir=self._agent_dir, _run=recording_run)
+        self.assertEqual(len(calls), 0, "npm ci should be skipped when dist is present")
+
+    def test_bootstrap_warns_when_npm_not_on_path(self):
+        """Warning is printed when npm is not on PATH, no crash."""
+        self._make_agent_source()
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), \
+             patch.object(br.shutil, "which", return_value=None):
+            br._bootstrap_agent_deps(agent_dir=self._agent_dir)
+        self.assertIn("WARNING", stderr.getvalue())
+        self.assertIn("npm", stderr.getvalue())
+
+    def test_bootstrap_noop_on_compute_only(self):
+        """No crash when agent dir does not exist (compute-only runner)."""
+        compute_dir = os.path.join(self._tmpdir, "no-agent-here")
+        br._bootstrap_agent_deps(agent_dir=compute_dir)
+
+    def test_bootstrap_handles_npm_ci_failure_nonfatally(self):
+        """npm ci non-zero exit is WARNING, not crash."""
+        self._make_agent_source()
+        stderr = io.StringIO()
+        def failing_run(*args, **kwargs):
+            return subprocess.CompletedProcess(args[0], 1)
+        with patch.object(br.shutil, "which", return_value="/usr/bin/npm"), \
+             contextlib.redirect_stderr(stderr):
+            br._bootstrap_agent_deps(agent_dir=self._agent_dir, _run=failing_run)
+        self.assertIn("WARNING", stderr.getvalue())
+
+    def test_bootstrap_noop_when_no_package_json(self):
+        """No crash when agent dir exists but no package.json."""
+        # agent dir with src/index.ts but no package.json
+        os.makedirs(os.path.join(self._agent_dir, "src"))
+        Path(os.path.join(self._agent_dir, "src", "index.ts")).write_text("// test")
+        calls = []
+        def recording_run(*args, **kwargs):
+            calls.append((args, kwargs))
+            return subprocess.CompletedProcess(args[0], 0)
+        br._bootstrap_agent_deps(agent_dir=self._agent_dir, _run=recording_run)
+        self.assertEqual(len(calls), 0)
+
+
+# ── Agent deps missing detection (preflight) ────────────────────────────────
+
+
+class TestAgentDepsMissing(unittest.TestCase):
+    """_agent_deps_missing in local_runner: preflight detection."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+        self._old_file = getattr(local_runner, "__file__", None)
+
+    def tearDown(self):
+        if self._old_file is not None:
+            local_runner.__file__ = self._old_file
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def _setup_agent(self, *, with_tsx=False, with_dist=False):
+        """Create fake scripts/../agent structure under tmpdir, redirect __file__."""
+        agent_dir = os.path.join(self._tmpdir, "agent")
+        os.makedirs(os.path.join(agent_dir, "src"))
+        Path(os.path.join(agent_dir, "src", "index.ts")).write_text("// test")
+        if with_tsx:
+            tsx_dir = os.path.join(agent_dir, "node_modules", ".bin")
+            os.makedirs(tsx_dir)
+            Path(os.path.join(tsx_dir, "tsx")).write_text("#!/usr/bin/env node")
+        if with_dist:
+            os.makedirs(os.path.join(agent_dir, "dist"))
+            Path(os.path.join(agent_dir, "dist", "index.js")).write_text("// dist")
+        # Point __file__ into this temp tree so agent is found at tmpdir/agent.
+        fake_scripts = os.path.join(self._tmpdir, "scripts")
+        os.makedirs(fake_scripts)
+        local_runner.__file__ = os.path.join(fake_scripts, "local_runner.py")
+
+    def test_true_when_agent_source_exists_but_no_tsx(self):
+        """Returns True when src/index.ts exists but tsx not installed."""
+        self._setup_agent()
+        with patch.object(local_runner.shutil, "which", return_value=None):
+            self.assertTrue(local_runner._agent_deps_missing())
+
+    def test_false_when_tsx_installed(self):
+        """Returns False when tsx is in node_modules/.bin."""
+        self._setup_agent(with_tsx=True)
+        self.assertFalse(local_runner._agent_deps_missing())
+
+    def test_false_when_dist_built(self):
+        """Returns False when dist/index.js exists (prebuilt artifact)."""
+        self._setup_agent(with_dist=True)
+        self.assertFalse(local_runner._agent_deps_missing())
+
+    def test_false_compute_only(self):
+        """Returns False when no agent source exists on this host."""
+        local_runner.__file__ = os.path.join(self._tmpdir, "scripts", "local_runner.py")
+        with patch.object(local_runner.os, "getcwd", return_value=os.path.join(self._tmpdir, "nowhere")):
+            self.assertFalse(local_runner._agent_deps_missing())
+
+
+class TestPreflightAgentDepsMessage(unittest.TestCase):
+    """Preflight prints actionable missing-deps message."""
+
+    def _run_preflight(self, deps_missing, caps=None):
+        """Run _preflight with mocked agent_binary and return captured output."""
+        if caps is None:
+            caps = _bwrap_caps()
+        gpu_state = {"allowed": [], "in_use": set(), "per_job": 1}
+
+        def fake_post(url, token, body, **kwargs):
+            return 200, {"ok": True}
+
+        buf = io.StringIO()
+        cred_env = _env(ANTHROPIC_API_KEY="sk-ant-test")
+        with patch.dict(os.environ, cred_env, clear=True), \
+             patch.object(local_runner, "_post", fake_post), \
+             patch.object(local_runner, "_detect_gpu",
+                          return_value={"has_gpu": False, "gpu_count": 0, "gpu_names": []}), \
+             patch.object(local_runner, "_workspace_writable", return_value=True), \
+             patch.object(local_runner, "_hostname", return_value="test-box"), \
+             patch.object(local_runner, "_runner_version", return_value="v1-test"), \
+             patch.object(local_runner, "_agent_deps_missing", return_value=deps_missing), \
+             contextlib.redirect_stdout(buf):
+            result = local_runner._preflight(
+                "https://api.example.com", "tok-abcdefgh-1234",
+                agent_binary=["tsx", "/agent/src/index.ts"],
+                caps=caps, gpu_state=gpu_state,
+                max_concurrent=2, max_concurrent_compute=2,
+            )
+        return buf.getvalue(), result
+
+    def test_actionable_message_when_deps_missing(self):
+        """Preflight includes 'agent deps' line when deps are missing."""
+        output, result = self._run_preflight(deps_missing=True)
+        self.assertIn("MISSING", output)
+        self.assertIn("agent deps", output)
+        self.assertIn("npm install", output)
+        self.assertTrue(result["setup_ok"])
+
+    def test_no_message_when_deps_installed(self):
+        """Preflight does NOT include the missing-deps line when deps are fine."""
+        output, result = self._run_preflight(deps_missing=False)
+        self.assertNotIn("MISSING", output)
+        self.assertNotIn("agent deps", output)
+
+    def test_no_message_when_docker_agent_only(self):
+        """Preflight does NOT warn when agent is docker-only (deps in the image)."""
+        caps = _docker_caps()
+        output, result = self._run_preflight(deps_missing=True, caps=caps)
+        # Docker-only agent doesn't have bwrap, so the check isn't relevant.
+        self.assertNotIn("agent deps", output)
 
 
 class TestTaskLogPersistence(unittest.TestCase):
@@ -5296,6 +6242,751 @@ class TestCredentialFileTraversalGuard(unittest.TestCase):
             self.assertTrue(os.path.isfile(dest),
                             "leading-slash path must be treated as relative to workspace")
             self.assertNotIn("skipping", output.lower())
+
+
+class TestInputArtifactRehydration(unittest.TestCase):
+    """Cross-job checkpoint resume: the runner rehydrates a predecessor's durable
+    bundle into the job's artifact dir before the command runs, path-traversal-safe."""
+
+    def test_is_safe_tar_member(self):
+        g = local_runner._is_safe_tar_member
+        self.assertTrue(g("a/b.txt"))
+        self.assertTrue(g("./ok.txt"))
+        self.assertFalse(g(""))
+        self.assertFalse(g("/etc/passwd"))
+        self.assertFalse(g("../up.txt"))
+        self.assertFalse(g("a/../../b.txt"))
+        self.assertFalse(g("~/secret"))
+
+    def _make_bundle(self, entries):
+        buf = io.BytesIO()
+        with __import__("tarfile").open(fileobj=buf, mode="w:gz") as tar:
+            for name, data in entries:
+                info = __import__("tarfile").TarInfo(name=name)
+                payload = data.encode()
+                info.size = len(payload)
+                tar.addfile(info, io.BytesIO(payload))
+        return buf.getvalue()
+
+    def test_rehydrate_extracts_safe_members_only(self):
+        bundle = self._make_bundle(
+            [("model.ckpt", "step-42"), ("../evil.txt", "x"), ("/abs.txt", "x")]
+        )
+
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return bundle
+
+        with tempfile.TemporaryDirectory() as dest:
+            with patch("urllib.request.urlopen", return_value=_Resp()):
+                local_runner._rehydrate_input_artifact(
+                    "http://orchestrator", "tok", "job-1", dest
+                )
+            self.assertTrue(os.path.isfile(os.path.join(dest, "model.ckpt")))
+            with open(os.path.join(dest, "model.ckpt"), encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "step-42")
+            # Traversal members never escaped the destination.
+            self.assertFalse(
+                os.path.exists(os.path.join(os.path.dirname(dest), "evil.txt"))
+            )
+
+    def test_rehydrate_raises_on_download_error(self):
+        import urllib.error
+
+        with tempfile.TemporaryDirectory() as dest:
+            with patch(
+                "urllib.request.urlopen",
+                side_effect=urllib.error.HTTPError(
+                    "http://x", 404, "not found", {}, None
+                ),
+            ):
+                with self.assertRaises(RuntimeError) as ctx:
+                    local_runner._rehydrate_input_artifact(
+                        "http://orchestrator", "tok", "job-1", dest
+                    )
+            self.assertIn("input_artifact_rehydration_failed", str(ctx.exception))
+
+
+class _FakeDocker:
+    """Scriptable ``docker`` for _prune_docker_images.
+
+    *images* is a list of dicts: ``{"id", "created", "last_tag_time", "tags",
+    "rm_fails"}``. Records every argv the prune pass invokes so a test can assert
+    on the MECHANISM (e.g. that no creation-time `until=` filter is used) and not
+    just on the outcome.
+    """
+
+    def __init__(self, images, list_rc=0, inspect_rc=0):
+        self.images = images
+        self.list_rc = list_rc
+        self.inspect_rc = inspect_rc
+        self.calls = []
+        self.removed = []
+
+    def _result(self, rc, out="", err=""):
+        class P:
+            returncode = rc
+            stdout = out
+            stderr = err
+        return P()
+
+    def __call__(self, cmd, **kw):
+        self.calls.append(list(cmd))
+        if cmd[:4] == ["docker", "image", "ls", "-a"]:
+            if self.list_rc != 0:
+                return self._result(self.list_rc, err="permission denied")
+            return self._result(0, "".join(f"{i['id']}\n" for i in self.images))
+        if cmd[:3] == ["docker", "image", "inspect"]:
+            if self.inspect_rc != 0:
+                return self._result(self.inspect_rc, err="no such image")
+            rows = []
+            for img in self.images:
+                tags = "[" + " ".join(img.get("tags") or []) + "]"
+                rows.append(
+                    f"{img['id']}\t{img.get('last_tag_time', '')}\t"
+                    f"{img.get('created', '')}\t{tags}"
+                )
+            return self._result(0, "\n".join(rows))
+        if cmd[:3] == ["docker", "image", "prune"]:
+            # The OLD, creation-time-keyed mechanism. Answered (not raised) so a
+            # regression fails on the assertions below, not on a fake's exception.
+            return self._result(0, "Total reclaimed space: 5GB")
+        if cmd[:3] == ["docker", "image", "rm"]:
+            target = cmd[3]
+            img = next((i for i in self.images if i["id"] == target), None)
+            if img is not None and img.get("rm_fails"):
+                return self._result(
+                    1, err="conflict: image is being used by stopped container"
+                )
+            self.removed.append(target)
+            return self._result(0, f"Deleted: {target}")
+        raise AssertionError(f"unexpected docker invocation: {cmd}")
+
+    @property
+    def used_until_filter(self) -> bool:
+        """True iff any invocation used docker's creation-time `until=` filter."""
+        return any(
+            any(str(arg).startswith("until=") for arg in cmd) for cmd in self.calls
+        )
+
+
+def _go_time(dt) -> str:
+    """Render *dt* the way `docker image inspect .Metadata.LastTagTime` does."""
+    return dt.strftime("%Y-%m-%d %H:%M:%S.%f000 +0000 UTC")
+
+
+def _rfc3339(dt) -> str:
+    """Render *dt* the way `docker image inspect .Created` does."""
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.%f000Z")
+
+
+class TestDockerImageCacheHygiene(unittest.TestCase):
+    """Runner Docker image cache hygiene (_prune_docker_images).
+
+    Hygiene must key on LAST-USE / PULL recency. `docker image prune --filter
+    until=<age>` keys on the image's upstream CREATION date, so a just-pulled
+    registry base image (built months ago) was evicted immediately and re-pulled
+    by the next job — the prune thrashed the cache it exists to protect.
+    """
+
+    def setUp(self):
+        self.now = datetime(2026, 7, 12, 12, 0, 0, tzinfo=timezone.utc)
+        self.tmpdir = tempfile.mkdtemp(prefix="bp_prune_test_")
+        os.environ["BLUEPRINT_CREDENTIAL_DIR"] = self.tmpdir
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+        os.environ.pop("BLUEPRINT_CREDENTIAL_DIR", None)
+
+    def _prune(self, docker, keep_days=7, ledger=None, protected=()):
+        return local_runner._prune_docker_images(
+            "/tmp",
+            1,
+            keep_days=keep_days,
+            _run=docker,
+            _disk_below=lambda root, m: True,
+            _now=self.now,
+            _ledger=ledger or {},
+            _protected=set(protected),
+        )
+
+    def test_noop_when_disk_above_threshold(self):
+        result = local_runner._prune_docker_images(
+            "/tmp", 100, keep_days=7, _disk_below=lambda root, m: False
+        )
+        self.assertFalse(result["pruned"])
+        self.assertEqual(result["reason"], "disk_above_threshold")
+
+    def test_freshly_pulled_old_base_image_is_kept(self):
+        """FINDING 7: an image BUILT 400 days ago but PULLED an hour ago stays.
+
+        This is the exact cache-thrash case: NGC/CUDA base images carry an
+        upstream creation date far older than any sane keep window, so a
+        creation-time `until=` prune deletes them the moment they land.
+        """
+        docker = _FakeDocker([
+            {
+                "id": "sha256:cuda",
+                "created": _rfc3339(self.now - timedelta(days=400)),
+                "last_tag_time": _go_time(self.now - timedelta(hours=1)),
+                "tags": ["nvcr.io/nvidia/pytorch:24.05-py3"],
+            }
+        ])
+        result = self._prune(docker, keep_days=7)
+
+        self.assertTrue(result["pruned"])
+        self.assertEqual(result["removed"], 0, result)
+        self.assertEqual(docker.removed, [])
+        self.assertEqual(result["kept"], 1)
+        # And the creation-time-keyed mechanism is gone for good.
+        self.assertFalse(
+            docker.used_until_filter,
+            "hygiene must not use docker's creation-time until= filter",
+        )
+
+    def test_ledger_last_use_protects_an_old_pull(self):
+        """An image pulled 30d ago but USED an hour ago (runner ledger) is kept."""
+        docker = _FakeDocker([
+            {
+                "id": "sha256:inuse",
+                "created": _rfc3339(self.now - timedelta(days=400)),
+                "last_tag_time": _go_time(self.now - timedelta(days=30)),
+                "tags": ["registry.example.com/proj/train:v3"],
+            }
+        ])
+        result = self._prune(
+            docker,
+            keep_days=7,
+            ledger={
+                "registry.example.com/proj/train:v3":
+                    (self.now - timedelta(hours=1)).isoformat()
+            },
+        )
+        self.assertEqual(result["removed"], 0, result)
+        self.assertEqual(docker.removed, [])
+
+    def test_stale_unused_image_is_removed(self):
+        """An image neither used nor pulled inside the window IS reclaimed."""
+        docker = _FakeDocker([
+            {
+                "id": "sha256:stale",
+                "created": _rfc3339(self.now - timedelta(days=400)),
+                "last_tag_time": _go_time(self.now - timedelta(days=90)),
+                "tags": ["old/experiment:v1"],
+            },
+            {
+                "id": "sha256:fresh",
+                "created": _rfc3339(self.now - timedelta(days=400)),
+                "last_tag_time": _go_time(self.now - timedelta(days=1)),
+                "tags": ["new/experiment:v2"],
+            },
+        ])
+        result = self._prune(docker, keep_days=7)
+        self.assertEqual(docker.removed, ["sha256:stale"])
+        self.assertEqual(result["removed"], 1)
+        self.assertEqual(result["kept"], 1)
+
+    def test_in_use_image_is_never_force_removed(self):
+        """A stale image still referenced by a container is left to docker to refuse.
+
+        The removal must not pass ``-f``: docker's own refusal ("image is being
+        used by ... container") is the in-use protection.
+        """
+        docker = _FakeDocker([
+            {
+                "id": "sha256:running",
+                "created": _rfc3339(self.now - timedelta(days=400)),
+                "last_tag_time": _go_time(self.now - timedelta(days=90)),
+                "tags": ["busy/job:v1"],
+                "rm_fails": True,
+            }
+        ])
+        result = self._prune(docker, keep_days=7)
+        self.assertEqual(result["removed"], 0)
+        self.assertEqual(result["in_use_skipped"], 1)
+        rm_calls = [c for c in docker.calls if c[:3] == ["docker", "image", "rm"]]
+        self.assertTrue(rm_calls)
+        for call in rm_calls:
+            self.assertNotIn("-f", call)
+            self.assertNotIn("--force", call)
+
+    def test_agent_image_is_protected(self):
+        """The configured agent image is never evicted, however old its build date."""
+        docker = _FakeDocker([
+            {
+                "id": "sha256:agent",
+                "created": _rfc3339(self.now - timedelta(days=400)),
+                "last_tag_time": _go_time(self.now - timedelta(days=400)),
+                "tags": ["ghcr.io/blueprint/agent:prod"],
+            }
+        ])
+        result = self._prune(
+            docker, keep_days=7, protected={"ghcr.io/blueprint/agent:prod"}
+        )
+        self.assertEqual(result["removed"], 0)
+        self.assertEqual(docker.removed, [])
+
+    def test_undatable_image_is_kept(self):
+        """No parseable timestamp anywhere → keep. Never delete what we can't age."""
+        docker = _FakeDocker([
+            {
+                "id": "sha256:unknown",
+                "created": "",
+                "last_tag_time": "0001-01-01T00:00:00Z",
+                "tags": [],
+            }
+        ])
+        result = self._prune(docker, keep_days=7)
+        self.assertEqual(result["removed"], 0)
+        self.assertEqual(result["kept"], 1)
+
+    def test_handles_docker_failure(self):
+        def fake_run(cmd, **kw):
+            raise OSError("docker not found")
+
+        result = local_runner._prune_docker_images(
+            "/tmp", 1, keep_days=7, _run=fake_run, _disk_below=lambda root, m: True
+        )
+        self.assertFalse(result["pruned"])
+        self.assertIn("prune_error", result["reason"])
+
+    def test_nonzero_exit_reported(self):
+        docker = _FakeDocker([], list_rc=1)
+        result = self._prune(docker, keep_days=7)
+        self.assertFalse(result["pruned"])
+        self.assertEqual(result["reason"], "prune_nonzero")
+
+    def test_keep_days_from_env(self):
+        with patch.dict(
+            os.environ, {"BLUEPRINT_RUNNER_IMAGE_KEEP_DAYS": "2"}
+        ):
+            self.assertEqual(local_runner._compute_image_keep_days(), 2)
+        with patch.dict(
+            os.environ, {"BLUEPRINT_RUNNER_IMAGE_KEEP_DAYS": "notanint"}
+        ):
+            self.assertEqual(local_runner._compute_image_keep_days(), 7)
+
+    def test_record_image_use_round_trips_through_ledger(self):
+        """The runner's own last-use stamp survives a write/read cycle."""
+        local_runner._record_image_use("nvcr.io/nvidia/pytorch:24.05-py3", _now=self.now)
+        ledger = local_runner._load_image_use_ledger()
+        self.assertIn("nvcr.io/nvidia/pytorch:24.05-py3", ledger)
+        parsed = local_runner._parse_docker_time(
+            ledger["nvcr.io/nvidia/pytorch:24.05-py3"]
+        )
+        self.assertEqual(parsed, self.now)
+        # And a recorded use protects the image end-to-end (no _ledger injection).
+        docker = _FakeDocker([
+            {
+                "id": "sha256:cuda",
+                "created": _rfc3339(self.now - timedelta(days=400)),
+                "last_tag_time": _go_time(self.now - timedelta(days=400)),
+                "tags": ["nvcr.io/nvidia/pytorch:24.05-py3"],
+            }
+        ])
+        result = local_runner._prune_docker_images(
+            "/tmp", 1, keep_days=7, _run=docker,
+            _disk_below=lambda root, m: True, _now=self.now, _protected=set(),
+        )
+        self.assertEqual(result["removed"], 0, result)
+
+    def test_parse_docker_time_formats(self):
+        """Docker emits RFC3339 (.Created), Go time.Time (.Metadata.LastTagTime),
+        and a Go zero value for never-tagged images."""
+        self.assertEqual(
+            local_runner._parse_docker_time("2026-07-01T12:34:56.789012345Z"),
+            datetime(2026, 7, 1, 12, 34, 56, 789012, tzinfo=timezone.utc),
+        )
+        self.assertEqual(
+            local_runner._parse_docker_time("2026-07-01 12:34:56.789012 +0000 UTC"),
+            datetime(2026, 7, 1, 12, 34, 56, 789012, tzinfo=timezone.utc),
+        )
+        self.assertIsNone(local_runner._parse_docker_time("0001-01-01T00:00:00Z"))
+        self.assertIsNone(local_runner._parse_docker_time(""))
+        self.assertIsNone(local_runner._parse_docker_time("not-a-time"))
+
+
+class _FakeResp:
+    """Minimal context-manager HTTP response for mocking urlopen."""
+
+    def __init__(self, status, body):
+        self.status = status
+        self._body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        return self._body
+
+
+def _make_bundle(members):
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for name, content in members.items():
+            info = tarfile.TarInfo(name=name)
+            info.size = len(content)
+            tar.addfile(info, io.BytesIO(content))
+    return buf.getvalue()
+
+
+class DownloadInputArtifactTests(unittest.TestCase):
+    """Cross-job checkpoint resume: runner-side bundle hydration."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="bp_resume_test_")
+        self.artifact_dir = os.path.join(self.tmpdir, "artifacts")
+        os.makedirs(self.artifact_dir, exist_ok=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_hydrates_prior_bundle_and_strips_stale(self):
+        """A successful download extracts the checkpoint into the artifact dir,
+        strips predecessor run-status files, and reports honest provenance."""
+        bundle = _make_bundle(
+            {
+                "checkpoint/model.pt": b"WEIGHTS-EPOCH-7",
+                "terminal.json": b"STALE",
+                "result.json": b"{}",
+            }
+        )
+        with patch(
+            "local_runner.urllib.request.urlopen",
+            return_value=_FakeResp(200, bundle),
+        ):
+            prov = local_runner._download_input_artifact(
+                "http://orch", "tok", "job-1", self.artifact_dir
+            )
+        self.assertTrue(prov["ok"], prov)
+        # Checkpoint present.
+        ckpt = os.path.join(self.artifact_dir, "checkpoint", "model.pt")
+        self.assertTrue(os.path.isfile(ckpt))
+        with open(ckpt, "rb") as fh:
+            self.assertEqual(fh.read(), b"WEIGHTS-EPOCH-7")
+        # Stale run-status files stripped.
+        self.assertFalse(os.path.exists(os.path.join(self.artifact_dir, "terminal.json")))
+        self.assertFalse(os.path.exists(os.path.join(self.artifact_dir, "result.json")))
+        # Provenance counts only surviving files (the single checkpoint).
+        self.assertEqual(prov["file_count"], 1)
+        self.assertEqual(prov["bytes"], len(b"WEIGHTS-EPOCH-7"))
+
+    def test_download_http_error_reports_failure_not_resume(self):
+        """A 404 from the endpoint yields ok=False (never a claimed resume)."""
+        import urllib.error
+
+        with patch(
+            "local_runner.urllib.request.urlopen",
+            side_effect=urllib.error.HTTPError("u", 404, "nf", {}, None),
+        ):
+            prov = local_runner._download_input_artifact(
+                "http://orch", "tok", "job-1", self.artifact_dir
+            )
+        self.assertFalse(prov["ok"])
+        self.assertEqual(prov["reason"], "http_404")
+        self.assertEqual(os.listdir(self.artifact_dir), [])
+
+    def test_empty_bundle_reports_failure(self):
+        with patch(
+            "local_runner.urllib.request.urlopen",
+            return_value=_FakeResp(200, b""),
+        ):
+            prov = local_runner._download_input_artifact(
+                "http://orch", "tok", "job-1", self.artifact_dir
+            )
+        self.assertFalse(prov["ok"])
+        self.assertEqual(prov["reason"], "empty_bundle")
+
+    def test_safe_members_rejects_path_traversal(self):
+        """A bundle with an absolute / .. member must not escape the dest dir."""
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            for name in ("../escape.txt", "/abs.txt", "ok.txt"):
+                info = tarfile.TarInfo(name=name)
+                info.size = 3
+                tar.addfile(info, io.BytesIO(b"xyz"))
+        with patch(
+            "local_runner.urllib.request.urlopen",
+            return_value=_FakeResp(200, buf.getvalue()),
+        ):
+            local_runner._download_input_artifact(
+                "http://orch", "tok", "job-1", self.artifact_dir
+            )
+        # Only the safe member landed; no escape above the artifact dir.
+        self.assertTrue(os.path.isfile(os.path.join(self.artifact_dir, "ok.txt")))
+        self.assertFalse(os.path.exists(os.path.join(self.tmpdir, "escape.txt")))
+
+
+class SupervisorDetectionTests(unittest.TestCase):
+    """FINDING 3: supervision must be a claim about THIS PROCESS, not the host.
+
+    The old detector returned "systemd" whenever /proc/1/comm was systemd — true
+    of EVERY process on a systemd host, including a runner started by hand in
+    tmux. The self-update path then took the "a supervisor will restart me"
+    branch, os._exit(0)-ed, and nothing came back (the dgx-1 outage), while
+    --check printed a healthy "systemd (auto-restart on crash/update)".
+    """
+
+    # A hand-started runner on a systemd host: systemd tracks the login session
+    # in a *scope*, which it never restarts.
+    SESSION_CGROUP = "0::/user.slice/user-1000.slice/session-3.scope\n"
+    # A runner running as a real systemd service unit.
+    SERVICE_CGROUP = "0::/system.slice/blueprint-runner.service\n"
+
+    def _state(self, env=None, pid1="", cgroup="", ancestry=True):
+        with patch.dict(os.environ, env or {}, clear=True), \
+             patch.object(local_runner, "_pid1_comm", return_value=pid1), \
+             patch.object(local_runner, "_self_cgroup_text", return_value=cgroup), \
+             patch.object(
+                 local_runner, "_ancestry_reaches_pid1", return_value=ancestry
+             ):
+            return local_runner._detect_supervisor_state()
+
+    def test_systemd_host_manual_launch_is_unsupervised(self):
+        """PID 1 == systemd + a session SCOPE cgroup → NOT supervised."""
+        state = self._state(pid1="systemd", cgroup=self.SESSION_CGROUP)
+        self.assertFalse(state["supervised"])
+        self.assertIsNone(state["supervisor"])
+        self.assertIn("not a systemd .service unit", state["evidence"])
+        self.assertIn("will NOT restart", state["detail"])
+        with patch.dict(os.environ, {}, clear=True), \
+             patch.object(local_runner, "_pid1_comm", return_value="systemd"), \
+             patch.object(
+                 local_runner, "_self_cgroup_text", return_value=self.SESSION_CGROUP
+             ):
+            self.assertIsNone(local_runner._detect_process_supervisor())
+
+    def test_systemd_service_unit_is_supervised(self):
+        state = self._state(pid1="systemd", cgroup=self.SERVICE_CGROUP)
+        self.assertTrue(state["supervised"])
+        self.assertEqual(state["supervisor"], "systemd")
+        self.assertIn("blueprint-runner.service", state["evidence"])
+
+    def test_service_cgroup_but_orphaned_ancestry_is_unsupervised(self):
+        """Inherited service cgroup with a parent chain that never reaches PID 1
+        (e.g. a re-parented `docker exec`) is not a supervision guarantee."""
+        state = self._state(
+            pid1="systemd", cgroup=self.SERVICE_CGROUP, ancestry=False
+        )
+        self.assertFalse(state["supervised"])
+
+    def test_systemd_unit_env_is_supervised(self):
+        state = self._state(env={"INVOCATION_ID": "abc"}, pid1="systemd")
+        self.assertTrue(state["supervised"])
+        self.assertEqual(state["supervisor"], "systemd")
+
+    def test_operator_declared_wrapper_is_supervised(self):
+        state = self._state(
+            env={"BLUEPRINT_RUNNER_SUPERVISED": "1"},
+            pid1="systemd",
+            cgroup=self.SESSION_CGROUP,
+        )
+        self.assertTrue(state["supervised"])
+        self.assertEqual(state["supervisor"], "declared")
+
+    def test_supervisord_init_in_process_tree_is_supervised(self):
+        state = self._state(pid1="supervisord", ancestry=True)
+        self.assertTrue(state["supervised"])
+        self.assertEqual(state["supervisor"], "supervisord")
+
+    def test_supervising_init_but_not_in_its_tree_is_unsupervised(self):
+        """`docker exec` into a supervised container: the init never started us."""
+        state = self._state(pid1="supervisord", ancestry=False)
+        self.assertFalse(state["supervised"])
+        self.assertIn("NOT in its process tree", state["evidence"])
+
+    def test_tini_is_not_a_supervisor(self):
+        """tini reaps zombies and forwards signals — it restarts nothing."""
+        state = self._state(pid1="tini")
+        self.assertFalse(state["supervised"])
+        self.assertIn("does not restart", state["evidence"])
+
+    def test_systemd_service_unit_parser(self):
+        self.assertEqual(
+            local_runner._systemd_service_unit(self.SERVICE_CGROUP),
+            "blueprint-runner.service",
+        )
+        # cgroup v1 multi-line form.
+        v1 = (
+            "12:pids:/system.slice/blueprint-runner.service\n"
+            "0::/system.slice/blueprint-runner.service\n"
+        )
+        self.assertEqual(
+            local_runner._systemd_service_unit(v1), "blueprint-runner.service"
+        )
+        self.assertIsNone(local_runner._systemd_service_unit(self.SESSION_CGROUP))
+        self.assertIsNone(local_runner._systemd_service_unit(""))
+
+
+@contextlib.contextmanager
+def _fake_host(pid1="", cgroup="", ancestry=True, env=None):
+    """Simulate a host's PID-1/cgroup/ancestry facts for the REAL detector."""
+    with patch.dict(os.environ, env or {}, clear=True), \
+         patch.object(local_runner, "_pid1_comm", return_value=pid1), \
+         patch.object(local_runner, "_self_cgroup_text", return_value=cgroup), \
+         patch.object(local_runner, "_ancestry_reaches_pid1", return_value=ancestry):
+        yield
+
+
+class SelfUpdateSurvivalTests(unittest.TestCase):
+    """The self-update survival path must not exit into the void on a systemd
+    host where nothing is actually supervising the runner (the dgx-1 outage).
+
+    These drive the REAL detector against simulated host facts — a detector that
+    calls every systemd host "supervised" makes the first test fail.
+    """
+
+    def test_unsupervised_systemd_host_reexecs_in_place(self):
+        with _fake_host(
+            pid1="systemd",
+            cgroup=SupervisorDetectionTests.SESSION_CGROUP,
+        ), \
+             patch.object(local_runner.os, "execv") as execv, \
+             patch.object(local_runner.os, "_exit") as exit_:
+            local_runner._reexec_after_update()
+        execv.assert_called_once()
+        exit_.assert_not_called()
+
+    def test_real_systemd_unit_exits_for_restart(self):
+        with _fake_host(
+            pid1="systemd",
+            cgroup=SupervisorDetectionTests.SERVICE_CGROUP,
+        ), \
+             patch.object(local_runner.os, "execv") as execv, \
+             patch.object(
+                 local_runner.os, "_exit", side_effect=SystemExit(0)
+             ) as exit_:
+            # os._exit is real-process-fatal; SystemExit emulates it under test.
+            with self.assertRaises(SystemExit):
+                local_runner._reexec_after_update()
+        exit_.assert_called_once_with(0)
+        execv.assert_not_called()
+
+
+class PreflightSupervisorReportTests(unittest.TestCase):
+    """--check must report the REAL supervision state — the concealment half of
+    FINDING 3 (a hand-launched runner on a systemd host read as healthy)."""
+
+    def _preflight_output(self, pid1, cgroup):
+        buf = io.StringIO()
+        with _fake_host(pid1=pid1, cgroup=cgroup), \
+             patch.object(
+                 local_runner, "_post",
+                 return_value=(200, {"ok": True, "last_seen_at": "2026-01-01T00:00:00Z"}),
+             ), \
+             patch.object(local_runner, "_workspace_writable", return_value=True), \
+             contextlib.redirect_stdout(buf):
+            result = local_runner._preflight(
+                "https://api.example.com", "tok", None,
+                _bwrap_caps(), _gpu_state(()), 2, 2,
+            )
+        return result, buf.getvalue()
+
+    def test_unsupervised_systemd_host_is_reported_as_unsupervised(self):
+        result, out = self._preflight_output(
+            "systemd", SupervisorDetectionTests.SESSION_CGROUP
+        )
+        self.assertIsNone(result["supervisor"])
+        self.assertFalse(result["supervised"])
+        self.assertIn("UNSUPERVISED", out)
+        self.assertIn("not a systemd .service unit", out)
+        # It must NOT claim an auto-restart that will never happen.
+        self.assertNotIn("auto-restart on crash/update", out)
+
+    def test_real_supervisor_is_reported_with_its_evidence(self):
+        result, out = self._preflight_output(
+            "systemd", SupervisorDetectionTests.SERVICE_CGROUP
+        )
+        self.assertEqual(result["supervisor"], "systemd")
+        self.assertTrue(result["supervised"])
+        self.assertIn("auto-restart on crash/update", out)
+        self.assertIn("blueprint-runner.service", out)
+
+
+class GpuSandboxSmokeTests(unittest.TestCase):
+    """FINDING 6: the preflight GPU smoke must probe against a LIVE workspace.
+
+    The plan's bwrap argv binds workspace_host into the sandbox, and bwrap fails
+    hard ("Can't find source path") when a bind source is missing — so deleting
+    the temp workspace between plan and probe made the smoke fail 100% of the
+    time on a real GPU host and report a CUDA outage that did not exist.
+    """
+
+    def _fake_plan(self, captured, declined=False, reason=None):
+        def plan_compute_execution(**kwargs):
+            captured["workspace"] = kwargs["workspace_host"]
+            captured["existed_at_plan"] = os.path.isdir(kwargs["workspace_host"])
+            plan = MagicMock()
+            plan.declined = declined
+            plan.decline_reason = reason
+            return plan
+        return plan_compute_execution
+
+    def _fake_probe(self, captured, raises=False):
+        def probe_gpu_in_sandbox(plan, timeout=30):
+            workspace = captured["workspace"]
+            captured["existed_at_probe"] = os.path.isdir(workspace)
+            if raises:
+                raise RuntimeError("probe blew up")
+            if not captured["existed_at_probe"]:
+                # Exactly what bwrap does with a missing bind source.
+                return False, (
+                    f"bwrap: Can't find source path {workspace}: "
+                    "No such file or directory"
+                )
+            return True, "GPU 0: Tesla V100-SXM2-32GB (UUID: GPU-abc)\n"
+        return probe_gpu_in_sandbox
+
+    def test_probe_runs_against_an_existing_workspace(self):
+        captured = {}
+        with patch.object(local_runner, "_read_ldconfig", return_value=""), \
+             patch.object(iso, "plan_compute_execution", self._fake_plan(captured)), \
+             patch.object(iso, "probe_gpu_in_sandbox", self._fake_probe(captured)):
+            line = local_runner._gpu_sandbox_smoke(_bwrap_caps((0,)), [0])
+
+        self.assertTrue(captured["existed_at_plan"])
+        self.assertTrue(
+            captured["existed_at_probe"],
+            "the smoke workspace must still exist while the probe binds it",
+        )
+        self.assertTrue(line.startswith("CUDA reachable"), line)
+        self.assertNotIn("Can't find source path", line)
+        # Cleaned up AFTER the probe — no temp-dir leak.
+        self.assertFalse(os.path.isdir(captured["workspace"]))
+
+    def test_workspace_cleaned_up_even_when_probe_raises(self):
+        captured = {}
+        with patch.object(local_runner, "_read_ldconfig", return_value=""), \
+             patch.object(iso, "plan_compute_execution", self._fake_plan(captured)), \
+             patch.object(
+                 iso, "probe_gpu_in_sandbox", self._fake_probe(captured, raises=True)
+             ):
+            line = local_runner._gpu_sandbox_smoke(_bwrap_caps((0,)), [0])
+
+        self.assertIn("smoke check error", line)
+        self.assertFalse(os.path.isdir(captured["workspace"]))
+
+    def test_declined_plan_reported_and_cleaned_up(self):
+        captured = {}
+        with patch.object(local_runner, "_read_ldconfig", return_value=""), \
+             patch.object(
+                 iso, "plan_compute_execution",
+                 self._fake_plan(captured, declined=True, reason="no sandbox"),
+             ), \
+             patch.object(iso, "probe_gpu_in_sandbox", self._fake_probe(captured)):
+            line = local_runner._gpu_sandbox_smoke(_bwrap_caps((0,)), [0])
+
+        self.assertIn("plan declined: no sandbox", line)
+        self.assertFalse(os.path.isdir(captured["workspace"]))
 
 
 if __name__ == "__main__":

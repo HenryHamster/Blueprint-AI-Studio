@@ -198,8 +198,3 @@ export function buildTaskCsv(tasks: Task[], nowMs = Date.now()): string {
     ...rows.map((row) => row.map((value) => escapeCsv(value)).join(',')),
   ].join('\n');
 }
-
-export function downloadTaskCsv(tasks: Task[], projectName?: string | null, nowMs = Date.now()) {
-  const csv = buildTaskCsv(tasks, nowMs);
-  downloadText(buildTaskCsvFilename(projectName, nowMs), 'text/csv', csv);
-}

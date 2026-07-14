@@ -16,6 +16,7 @@ from typing import Dict, Any, List, Mapping
 from sqlmodel import SQLModel, Field, Relationship
 from sqlmodel.sql.sqltypes import GUID
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     CheckConstraint,
     Column,
@@ -47,11 +48,14 @@ from app.models_base import NaiveUTCDateTime
 # (never on ``app.models``), so this import forms no cycle.
 from app.release_models import (  # noqa: F401
     AuditFindingResolution,
+    CategoryVerdict,
     CompletionDebtEntry,
     CriterionEvidence,
+    QualificationDimensionResult,
     QualificationVerdict,
     ReleaseDeployArtifact,
     ReleaseVersion,
+    ResidualVerdict,
     VersionAcceptanceCriterion,
 )
 from app.time_utils import _utcnow
@@ -956,6 +960,67 @@ class MessagesSavedViews(SQLModel, table=True):
     )
 
 
+class ProjectTool(SQLModel, table=True):
+    """A per-project custom UI tool/panel registered against a single project.
+
+    Backs the per-project custom-tools framework: a project registers entries
+    (e.g. a whiteboard/canvas panel) that the admin-ui conditionally renders in
+    that project's workspace only. Tools never leak across projects — every
+    router handler resolves the row through ``_get_user_project_with_role`` on
+    ``project_id`` first.
+
+    ``config`` holds tool-kind-specific settings (validated against the kind's
+    ``config_schema`` in ``TOOL_KINDS``). ``content`` holds the tool's mutable
+    document (e.g. whiteboard strokes); it is written through an optimistic-lock
+    path that bumps ``content_revision`` and rejects a stale ``base_revision``
+    with HTTP 409, mirroring the design-doc revision guard.
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    project_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("project.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        ),
+    )
+    kind: str
+    slug: str
+    title: str
+    enabled: bool = Field(default=True)
+    placement: str = Field(default="project_section")
+    config: Dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
+    )
+    content: Dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
+    )
+    content_revision: int = Field(default=0)
+    created_by: str | None = None
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(
+            NaiveUTCDateTime,
+            nullable=False,
+            server_default=func.now(),
+            onupdate=_utcnow,
+        ),
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id", "slug", name="uq_project_tool_project_slug"
+        ),
+    )
+
+
 class Task(SQLModel, table=True):
     """
     Extensible Task model. The 'payloads' JSONB column holds a flexible list
@@ -1123,7 +1188,7 @@ class Task(SQLModel, table=True):
             onupdate=_utcnow,
         ),
     )
-    archived: bool = Field(default=False)
+    archived: bool = Field(default=False, index=True)
 
     # VM lifecycle timing for cost tracking
     # Write-once timestamp recorded at initial dispatch (before GCE create call).
@@ -1515,11 +1580,14 @@ class Task(SQLModel, table=True):
         # that breaks SQLite-fixture tests using metadata.create_all.
         # See alembic 0063 / memory ``reference_strategic_payload_bloat.md``.
         # Partial index for auto_remediation.py queries that filter
-        # Task.auto_remediation.is_(True) — keeps the scan tight to the small
-        # fraction of tasks with auto_remediation enabled.
+        # Task.auto_remediation.is_(True) and
+        # Task.previous_error_fingerprint == fingerprint — the equality filter on
+        # previous_error_fingerprint narrows the result before the created_at range
+        # scan, avoiding a full scan of the auto_remediation rows.
         Index(
             "ix_task_auto_remediation_active",
             "project_id",
+            "previous_error_fingerprint",
             "created_at",
             postgresql_where=text("auto_remediation = true"),
             sqlite_where=text("auto_remediation = 1"),
@@ -1562,6 +1630,70 @@ class Task(SQLModel, table=True):
             "vm_stopped_at",
             postgresql_where=text("vm_stopped_at IS NOT NULL"),
             sqlite_where=text("vm_stopped_at IS NOT NULL"),
+        ),
+        # Partial index on vm_dispatched_at for warm_pool_maintainer queries
+        # that filter vm_dispatched_at >= cutoff every ~30s leader tick to
+        # detect demand. Without this, the query scans all non-QUEUED tasks
+        # across all projects. Matches the ix_task_vm_stopped_at precedent.
+        # Postgres-only via alembic 0450 CONCURRENTLY DDL.
+        Index(
+            "ix_task_vm_dispatched_at",
+            "vm_dispatched_at",
+            postgresql_where=text("vm_dispatched_at IS NOT NULL"),
+            sqlite_where=text("vm_dispatched_at IS NOT NULL"),
+        ),
+        # Partial index on (status, completed_at) for the global acceptance-gate
+        # backfill query (acceptance_gate.py:1170-1175) that scans for the 200
+        # oldest COMPLETED tasks WITHOUT a project_id filter.  The existing
+        # ix_task_project_status_composite has project_id as the leading column,
+        # so it cannot serve a project-less ORDER BY completed_at ASC scan.  This
+        # index covers status=COMPLETED + completed_at ordering directly.
+        # Postgres-only via alembic 0485 CONCURRENTLY DDL; the metadata Index
+        # registers the name + columns for
+        # test_model_indexes_covered_by_migrations.
+        Index(
+            "ix_task_status_completed_at",
+            "status",
+            "completed_at",
+            postgresql_where=text("status = 'COMPLETED'"),
+            sqlite_where=text("status = 'COMPLETED'"),
+        ),
+        # Trigram GIN indexes for the admin task-search ILIKE filter (title,
+        # description, latest_status_message).  Without these every task search
+        # triggers a full sequential table scan.  The ``postgresql_*`` kwargs are
+        # dialect-scoped — SQLite create_all emits plain indexes — so the test
+        # suite is unaffected.  See KnowledgeDocument trigram precedent above.
+        Index(
+            "ix_task_title_trgm",
+            "title",
+            postgresql_using="gin",
+            postgresql_ops={"title": "gin_trgm_ops"},
+        ),
+        Index(
+            "ix_task_description_trgm",
+            "description",
+            postgresql_using="gin",
+            postgresql_ops={"description": "gin_trgm_ops"},
+        ),
+        Index(
+            "ix_task_latest_status_message_trgm",
+            "latest_status_message",
+            postgresql_using="gin",
+            postgresql_ops={"latest_status_message": "gin_trgm_ops"},
+        ),
+        # Partial index on (updated_at) for the EVALUATING CI-monitor scan
+        # (orchestrator_ci_monitor.py:289-303) which repeatedly selects
+        # EVALUATING rows on the leader's hot cycle. The full ix_task_updated_at
+        # spans every task; this partial index over only the (small) EVALUATING
+        # subset lets the planner walk just those rows — same partial-by-status
+        # shape as ix_task_blocked_recheck. Postgres-only via alembic 0525
+        # CONCURRENTLY DDL; the metadata Index registers the name + column for
+        # test_model_indexes_covered_by_migrations.
+        Index(
+            "ix_task_evaluating_updated_at",
+            "updated_at",
+            postgresql_where=text("status = 'EVALUATING'"),
+            sqlite_where=text("status = 'EVALUATING'"),
         ),
     )
 
@@ -1957,6 +2089,53 @@ def bank_task_current_attempt(
     return snapshot
 
 
+class ProjectComputeImage(SQLModel, table=True):
+    """Durable record of a baked per-project compute image (dep_hash -> digest).
+
+    The image-build pipeline (``compute_backends.build_project_compute_image`` ->
+    ``compute_image_build.build_and_push``) content-hashes a project's declared
+    dependency files and bakes (or reuses) a digest-pinned compute image. This
+    table persists the resulting ``(dependency-hash -> pinned reference/digest)``
+    mapping so a later trigger can record and re-read what was built without
+    re-running the pipeline.
+
+    Additive and purely a record: nothing in dispatch reads it yet. Rows UPSERT
+    on ``(project_id, dep_hash)`` — repeated builds for the same dependency hash
+    update the single row in place rather than accumulating duplicates.
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    project_id: uuid.UUID = Field(foreign_key="project.id", index=True)
+    # Short image name within the registry repo (e.g. "compute-myproj").
+    image_name: str = Field()
+    # Registry repo base the image was pushed to (e.g. "ghcr.io/org/repo").
+    registry_repo: str = Field()
+    # Content hash of the project's dependency inputs — the UPSERT key.
+    dep_hash: str = Field(index=True)
+    tag: str = Field()
+    # Full reference from BuildResult: "registry/repo@sha256:..." or ":tag".
+    pinned_ref: str = Field()
+    # The "sha256:..." digest parsed out of ``pinned_ref`` when it is
+    # digest-pinned (contains ``@``); NULL when the ref is only tag-pinned.
+    digest: str | None = Field(default=None)
+    # Whether this build freshly built the image vs reused an already-present one.
+    built: bool = Field(default=False)
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False),
+    )
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, onupdate=_utcnow),
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id", "dep_hash", name="uq_projectcomputeimage_project_dep_hash"
+        ),
+    )
+
+
 class ComputeJob(SQLModel, table=True):
     """Durable compute-job record for budgeted work decoupled from ``Task``.
 
@@ -2093,10 +2272,56 @@ class ComputeJob(SQLModel, table=True):
         Index("ix_computejob_backend_external", "backend", "external_compute_id"),
         Index("ix_computejob_status_deadline", "status", "wall_clock_deadline"),
         Index("ix_computejob_next_poll", "next_poll_at"),
+        Index("ix_computejob_created_at", "created_at"),
     )
 
     project: Project = Relationship(back_populates="compute_jobs")
     task: Task | None = Relationship(back_populates="compute_jobs")
+
+
+class ComputeJobFile(SQLModel, table=True):
+    """Individually-addressable viewable file extracted from a compute job bundle.
+
+    Each row records one file (png, jpg, webp, gif, svg, mp4, webm) that was
+    extracted from the job's opaque ``bundle.tar.gz`` at completion time, so it
+    can be signed and rendered inline without downloading the full tarball.
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    compute_job_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("computejob.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        ),
+    )
+    safe_relpath: str = Field(
+        sa_column=Column(String(512), nullable=False),
+    )
+    media_type: str = Field(
+        sa_column=Column(String(16), nullable=False),
+    )
+    storage_uri: str = Field(
+        sa_column=Column(String(1024), nullable=False, unique=True),
+    )
+    content_type: str | None = Field(
+        default=None, sa_column=Column(String(128), nullable=True)
+    )
+    file_size_bytes: int | None = Field(
+        default=None, sa_column=Column(Integer, nullable=True)
+    )
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+
+    __table_args__ = (
+        Index("ix_computejobfile_job_media", "compute_job_id", "media_type"),
+        Index("ix_computejobfile_storage_uri", "storage_uri"),
+    )
+
+    compute_job: ComputeJob = Relationship()
 
 
 class PoolVm(SQLModel, table=True):
@@ -2237,6 +2462,11 @@ class PoolVm(SQLModel, table=True):
         # Reversed composite for per-project-by-state queries (warm_pool.py
         # lines 244-247, 302, 341-344) where state is the leading column.
         Index("ix_poolvm_state_project", "state", "project_id"),
+        # Composite index for the lease hot path: filters on project_id, state,
+        # AND identity columns (account_id, provider, auth_mode, model) so the
+        # query planner can do an index-only scan instead of sequential scan +
+        # in-memory filtering.
+        Index("ix_poolvm_lease_compat", "project_id", "state", "account_id", "provider", "auth_mode", "model"),
     )
 
 
@@ -2314,6 +2544,14 @@ class TaskHistory(SQLModel, table=True):
     details: Dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSONB))
 
     task: Task = Relationship(back_populates="history")
+
+    # Composite index covering the common query pattern:
+    #   WHERE task_id IN (...) ORDER BY timestamp DESC LIMIT N
+    # Without this PostgreSQL sorts all matching rows per task_id before
+    # applying LIMIT; the composite index avoids the sort.
+    __table_args__ = (
+        Index("ix_taskhistory_task_id_timestamp_desc", "task_id", text("timestamp desc")),
+    )
 
 
 # Auto-append to status_log whenever latest_status_message is set
@@ -2429,8 +2667,22 @@ def _emit_jwt_revocation_on_terminal(session, flush_context, instances):
             if not history.added:
                 continue
             new_status = history.added[0]
+            # Expiry-safe pk read: post-rollback recovery paths (e.g. the
+            # smoketest spawn retry) flush a Task whose attributes were
+            # expired by the rollback. Reading ``instance.id`` on such an
+            # instance triggers a sync lazy-load inside before_flush; the
+            # load blows up (MissingGreenlet under the async engine) AND
+            # poisons the flush's transaction, failing the whole flush the
+            # handler promises never to block. The identity key is populated
+            # for every persistent instance and needs no IO.
+            _ident = _sa_inspect(instance).identity
+            _instance_pk = (
+                _ident[0] if _ident else instance.__dict__.get("id")
+            )
+            if _instance_pk is None:
+                continue
             if task_status_releases_agent_resources(new_status):
-                emit_task_terminated_notify(session, str(instance.id))
+                emit_task_terminated_notify(session, str(_instance_pk))
             elif history.deleted and task_status_releases_agent_resources(
                 history.deleted[0]
             ):
@@ -2438,7 +2690,7 @@ def _emit_jwt_revocation_on_terminal(session, flush_context, instances):
                 # prior status was terminal and the new one is not. Broadcast so
                 # every instance evicts its stale deny-list entry. The guard on
                 # the PRIOR status keeps normal non-terminal steps silent.
-                emit_task_revived_notify(session, str(instance.id))
+                emit_task_revived_notify(session, str(_instance_pk))
     except Exception as exc:  # noqa: BLE001 — never block the flush
         logger.warning("[MODELS] before_flush NOTIFY failed: %s", exc)
 
@@ -2809,6 +3061,14 @@ class StrategicCycle(SQLModel, table=True):
             "outcome",
             "phase1_started_at",
         ),
+        # Covers the stalled-cycle reaper cross-project scan:
+        # WHERE outcome IN (...) ORDER BY phase1_started_at LIMIT N.
+        # The two project_id-led indexes above cannot serve this query.
+        Index(
+            "ix_strategiccycle_outcome_phase1_started",
+            "outcome",
+            "phase1_started_at",
+        ),
     )
 
     @property
@@ -2938,6 +3198,77 @@ class VmContact(SQLModel, table=True):
     """
 
     vm_instance_id: str = Field(sa_column=Column(String, primary_key=True))
+    last_contact_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False),
+    )
+    last_tool_use_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+
+
+class TaskContact(SQLModel, table=True):
+    """TASK-scoped twin of :class:`VmContact` — off-row liveness/progress for ONE task.
+
+    ``VmContact`` is primary-keyed on ``vm_instance_id`` — "one row per VM". That
+    identity holds for GCE agent VMs (one task per VM, so the VM row IS the task
+    row) but is FALSE for fleet runners: ``scripts/local_runner.py`` multiplexes
+    MANY concurrent tasks onto a single ``vm_instance_id='runner:<id>'``. Every
+    task on that runner therefore shares ONE ``vmcontact`` row, and the heartbeat
+    handler advances its ``last_tool_use_at`` with ``GREATEST(...)`` from ANY
+    agent's heartbeat on that runner.
+
+    The consequence was a permanent zombie class (2026-07-12): a hung-but-
+    heartbeating agent (wedged LLM call, spin loop) co-resident with ANY actively
+    working sibling is never stall-reaped, because the sibling's tool calls keep
+    the SHARED progress stamp fresh and the reaper's ``agent_stalled`` override
+    reads that shared stamp. The runner self-report fix (#14413,
+    ``_runner_report_excludes_task``) cannot help by construction: a hung-but-
+    alive process is still listed in the runner's ``active_task_ids``. With no
+    absolute IN_PROGRESS runtime ceiling anywhere, nothing else ever fires — the
+    task holds a runner slot, an account slot, and pins its parent lineage
+    forever. The same shared-row masking also survives on the heartbeat-stale
+    branch for a hung process that stops heartbeating but stays in
+    ``active_task_ids``.
+
+    This table restores the "one row per unit of work" identity that the reaper's
+    overrides actually assume, keyed on ``task_id``. The heartbeat handler
+    (``routers/agent.py::_record_vm_contact``) upserts BOTH rows on the same
+    independent session: the shared ``vmcontact`` row (unchanged — every existing
+    consumer keeps working) and this per-task row. The reaper's contact/progress
+    overrides then read THIS row for ``runner:``-prefixed vm ids, where a shared
+    row is a fleet-wide signal rather than a task signal, and keep reading
+    ``vmcontact`` for 1-task-per-VM GCE ids, where the shared row is already
+    task-scoped by construction (so GCE lock-starvation protection is preserved
+    byte-for-byte).
+
+    Rollout safety: an ABSENT row is never evidence of death — the reaper falls
+    back to the shared ``vmcontact`` row (i.e. today's behaviour) when no per-task
+    row exists yet, so a task that has not yet heartbeated under the new handler
+    cannot be false-reaped. A row is written on EVERY heartbeat (not only
+    tool-bearing ones), so a live task acquires one within a single heartbeat
+    interval (~30-60s) of deploy. Once the row exists it is authoritative for that
+    task, which is exactly what defeats the sibling mask.
+
+    Both stamps carry the same lock-starvation immunity as ``VmContact``: they are
+    written OFF the contended ``Task`` row, on a session committed independently of
+    the request session, so the rollup holding the task row FOR UPDATE can never
+    starve them. ``last_tool_use_at`` is advanced monotonically (never regressed to
+    NULL or to an older value) so a tool-less heartbeat between two tool-bearing
+    ones cannot blank a fresh progress signal.
+
+    Created on Postgres by alembic 0528 and on the SQLite test fixture by
+    ``SQLModel.metadata.create_all``.
+    """
+
+    task_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("task.id", ondelete="CASCADE"),
+            primary_key=True,
+        )
+    )
     last_contact_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False),
@@ -3193,15 +3524,16 @@ class MaxPlanAccount(SQLModel, table=True):
     )
     # Persisted rate-limit/usage headroom snapshot (latest probe data). Populated
     # by _refresh_usage_snapshot in max_plan_pool on each successful probe so
-    # the data survives orchestrator restarts even before the next probe fires.
+    # the data survives orchestrator restarts, and read back by
+    # load_max_plan_pool to re-seed the in-memory usage meter.
     # Structure: {"five_hour": {"utilization": float, "resets_at": str},
     #             "seven_day": {"utilization": float, "resets_at": str},
-    #             "unified_5h": {"remaining_tokens": int, "limit_tokens": int,
-    #                           "status": str, "resets_at": str},
-    #             "updated_at": str, "source": str}
-    # The unified_5h sub-dict is populated when Messages API response headers are
-    # captured (direct_llm_client calls); the five_hour/seven_day windows are
-    # populated by the OAuth usage probe on every probe cycle.
+    #             "updated_at": str, "source": "oauth_usage_probe"}
+    # The OAuth usage probe (anthropic OAuth accounts only) is the SOLE writer.
+    # Messages-API rate-limit headers (direct_llm_client) are NOT persisted
+    # here: inline LLM calls authenticate with the org-level ANTHROPIC_API_KEY
+    # env credential, so their headers describe the org key's limits, not any
+    # pool account's plan — attributing them to an account row would be wrong.
     rate_limit_usage: Dict[str, Any] | None = Field(
         default=None, sa_column=Column(JSONB, nullable=True)
     )
@@ -3213,6 +3545,22 @@ class MaxPlanAccount(SQLModel, table=True):
     daily_task_count_reset_at: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+    # Per-project caps: JSON dicts mapping project_id (str) → cap value.
+    # Null keys or a null dict means "no per-project cap configured" — the
+    # global daily_task_cap / max_concurrent_tasks apply to all projects.
+    # project_daily_task_cap: {project_id: int} — per-project daily cap
+    # project_max_concurrent_tasks: {project_id: int} — per-project concurrent cap
+    # project_state: {project_id: {active_tasks: int, daily_task_count: int}} —
+    #   persisted per-project counters, mirrored in the in-memory pool entry.
+    project_daily_task_cap: Dict[str, Any] | None = Field(
+        default=None, sa_column=Column(JSONB, nullable=True)
+    )
+    project_max_concurrent_tasks: Dict[str, Any] | None = Field(
+        default=None, sa_column=Column(JSONB, nullable=True)
+    )
+    project_state: Dict[str, Any] | None = Field(
+        default=None, sa_column=Column(JSONB, nullable=True)
     )
     disabled_reason: str | None = Field(default=None)
     # Set when auto-disable trips (rate-limit threshold). Persisted so
@@ -3338,7 +3686,7 @@ class ResidualRemediationCase(SQLModel, table=True):
     # without a Python-side touch.
     last_spawned_task_id: uuid.UUID | None = Field(
         default=None,
-        sa_column=Column(ForeignKey("task.id", ondelete="SET NULL"), nullable=True),
+        sa_column=Column(ForeignKey("task.id", ondelete="SET NULL"), nullable=True, index=True),
     )
     last_spawned_pr_number: int | None = Field(default=None)
     last_spawned_at: datetime | None = Field(
@@ -3433,6 +3781,7 @@ class Artifact(SQLModel, table=True):
         ),
         Index("ix_artifact_artifact_type", "artifact_type"),
         Index("ix_artifact_task_type", "task_id", "artifact_type"),
+        Index("ix_artifact_created_at", "created_at"),
     )
 
     # Git-based outputs
@@ -3783,6 +4132,7 @@ class SystemMaturity(SQLModel, table=True):
             GUID(),
             ForeignKey("task.id", ondelete="SET NULL"),
             nullable=True,
+            index=True,
         ),
     )
 
@@ -4624,6 +4974,7 @@ class EvergreenFillDecisionLog(SQLModel, table=True):
             GUID(),
             ForeignKey("evergreenbacklogitem.id", ondelete="SET NULL"),
             nullable=True,
+            index=True,
         ),
     )
     finding_key: str | None = Field(
@@ -4680,6 +5031,11 @@ class LocalRunner(SQLModel, table=True):
     #  — has_gpu et al. are overwritten at first heartbeat. gpu_utilization_pct and
     #  disk_free_bytes are display-only trust telemetry, stashed here alongside the
     #  other heartbeat-reported hardware fields rather than as dedicated columns.
+    #  Live-safe config channel (all here, no columns/migration): the operator-set
+    #  desired subset is "max_concurrent" / "max_concurrent_compute" / "task_types"
+    #  / "gpu_indices_allowed" ("all" | [int]); the daemon echoes back what it has
+    #  applied as "applied_config" (same shape) + "applied_config_generation" (the
+    #  content hash it last converged to). See app.runner_config.
     capabilities: Dict[str, Any] = Field(
         default_factory=lambda: {
             "task_types": "all",
@@ -4727,6 +5083,78 @@ class LocalRunner(SQLModel, table=True):
     )
 
 
+class RunnerHeartbeatSnapshot(SQLModel, table=True):
+    """Append-only time-series of runner heartbeat telemetry.
+
+    The ``LocalRunner.capabilities`` JSONB holds only the *latest* telemetry
+    values — each heartbeat overwrites the previous ones — so there is no
+    history to sparkline GPU/disk/memory pressure over time, and per-runner
+    outcome rollups can only be computed by scanning every ``ComputeJob`` row.
+    This table captures one row per heartbeat (fire-and-forget on the heartbeat
+    path) so the Fleet panel can show recent trends without touching the hot
+    dispatch cache. Rows are retention-trimmed (default 7 days) by a periodic
+    sweep — they are pure telemetry, never a source of truth for dispatch.
+    """
+
+    __tablename__ = "runner_heartbeat_snapshot"
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    # Deleted with the runner so snapshots never outlive their runner row.
+    # No standalone index here: the composite (runner_id, captured_at) index
+    # below already covers the FK prefix and the per-runner window query, so a
+    # second single-column index would only add write cost on this hot path.
+    runner_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("localrunner.id", ondelete="CASCADE"),
+            nullable=False,
+        ),
+    )
+    # When the telemetry was captured (heartbeat receipt time). Indexed so the
+    # per-runner recent-window query and the retention-cleanup delete are both
+    # index-driven.
+    captured_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, index=True),
+    )
+    gpu_utilization_pct: int | None = Field(
+        default=None, sa_column=Column(Integer, nullable=True)
+    )
+    disk_free_bytes: int | None = Field(
+        default=None, sa_column=Column(BigInteger, nullable=True)
+    )
+    memory_free_bytes: int | None = Field(
+        default=None, sa_column=Column(BigInteger, nullable=True)
+    )
+    cpu_load_avg: float | None = Field(
+        default=None, sa_column=Column(Float, nullable=True)
+    )
+    active_task_count: int = Field(
+        default=0, sa_column=Column(Integer, nullable=False, server_default=text("0"))
+    )
+    active_compute_job_count: int = Field(
+        default=0, sa_column=Column(Integer, nullable=False, server_default=text("0"))
+    )
+    agent_available: bool | None = Field(
+        default=None, sa_column=Column(Boolean, nullable=True)
+    )
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+
+    __table_args__ = (
+        # Retention-cleanup + per-runner recent-window scans both filter on
+        # (runner_id, captured_at). A composite index serves the panel query
+        # (one runner, last hour) and the sweep's global age filter.
+        Index(
+            "ix_runner_heartbeat_snapshot_runner_captured",
+            "runner_id",
+            "captured_at",
+        ),
+    )
+
+
 class UiLoadTimingSample(SQLModel, table=True):
     """Persisted admin-UI initial-load timing sample.
 
@@ -4742,6 +5170,30 @@ class UiLoadTimingSample(SQLModel, table=True):
     page_ready_ms: int = Field(sa_column=Column(Integer, nullable=False))
     sample_type: str = Field(default="first_commit", sa_column=Column(String(32), nullable=False))
     recorded_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+
+
+class UiLoadTimingBaseline(SQLModel, table=True):
+    """Pinned baseline snapshot of UI load timing per (surface, sample_type).
+
+    Created on-demand via POST /api/admin/ui-load-timing/pin-baseline to
+    capture a before-improvement baseline that survives the 200-sample FIFO
+    cap. Immutable once written; a new pin creates new rows rather than
+    updating existing ones.
+    """
+
+    __tablename__ = "ui_load_timing_baseline"
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    surface: str = Field(sa_column=Column(String(64), nullable=False, index=True))
+    sample_type: str = Field(sa_column=Column(String(32), nullable=False))
+    p50: int = Field(sa_column=Column(Integer, nullable=False))
+    p90: int = Field(sa_column=Column(Integer, nullable=False))
+    count: int = Field(sa_column=Column(Integer, nullable=False))
+    label: str = Field(default="", sa_column=Column(String(128), nullable=False))
+    pinned_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
     )
@@ -4783,4 +5235,16 @@ class NotificationDeadLetter(SQLModel, table=True):
     created_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+
+    # Composite index covering the common query pattern:
+    #   WHERE project_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?
+    # Without this PostgreSQL filters by project_id then sorts all
+    # matching rows in memory; the composite index avoids the sort.
+    __table_args__ = (
+        Index(
+            "ix_notification_dl_project_id_created_at_desc",
+            "project_id",
+            text("created_at desc"),
+        ),
     )

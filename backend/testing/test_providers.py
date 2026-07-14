@@ -280,7 +280,10 @@ def test_providers_expose_default_execution_mode_only():
 
 
 class TestOpenAIFlexGate:
-    @pytest.mark.parametrize("model", ["gpt-5.4", "gpt-5.4-mini"])
+    @pytest.mark.parametrize(
+        "model",
+        ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.4", "gpt-5.4-mini"],
+    )
     def test_flex_passes_through_on_supported_models(self, model):
         provider = get_provider(LLMProviderName.OPENAI)
         translation = provider.settings_to_cli(
@@ -415,7 +418,9 @@ class TestOpenAIFastGate:
 
 
 class TestOpenAITierAndEffort:
-    @pytest.mark.parametrize("effort", ["minimal", "low", "medium", "high", "xhigh"])
+    @pytest.mark.parametrize(
+        "effort", ["low", "medium", "high", "xhigh", "max", "ultra"]
+    )
     def test_reasoning_effort_passes_through(self, effort):
         """All five reasoning levels are accepted at translation; per-model
         compat gaps surface as runtime 400s (deferred to model/list)."""
@@ -433,9 +438,9 @@ class TestOpenAITierAndEffort:
 
     def test_tier_map_resolves_to_current_picker_models(self):
         provider = get_provider(LLMProviderName.OPENAI)
-        assert provider.tier_to_model("opus", {}) == "gpt-5.4"
-        assert provider.tier_to_model("sonnet", {}) == "gpt-5.3-codex"
-        assert provider.tier_to_model("haiku", {}) == "gpt-5.4-mini"
+        assert provider.tier_to_model("opus", {}) == "gpt-5.6-sol"
+        assert provider.tier_to_model("sonnet", {}) == "gpt-5.6-terra"
+        assert provider.tier_to_model("haiku", {}) == "gpt-5.6-luna"
 
 
 # ---------------------------------------------------------------------------

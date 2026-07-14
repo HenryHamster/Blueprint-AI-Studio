@@ -702,9 +702,15 @@ def do_install(
     url: str,
     dry_run: bool = False,
     resource_limits: dict[str, str] | None = None,
+    no_agent_deps: bool = False,
     _run=subprocess.run,
 ) -> int:
-    """Render, install, enable, and persist the runner service. Returns rc."""
+    """Render, install, enable, and persist the runner service. Returns rc.
+
+    On a successful install (not dry-run), also bootstraps the agent's node
+    dependencies as a best-effort, non-fatal step — the operator can skip it
+    with ``no_agent_deps=True``.
+    """
     template = _SYSTEM_SERVICE_TEMPLATE if system else _USER_SERVICE_TEMPLATE
     if not os.path.isfile(template):
         print(f"ERROR: unit template not found: {template}", file=sys.stderr)
@@ -812,6 +818,10 @@ def do_install(
         f"  Logs:   {follow}",
         flush=True,
     )
+
+    # Best-effort agent deps bootstrap (non-fatal, warn-and-continue).
+    _bootstrap_agent_deps(no_agent_deps=no_agent_deps, _run=_run)
+
     return 0
 
 
@@ -886,6 +896,83 @@ def _restart_runner_service(*, _run=subprocess.run) -> bool:
             _systemctl(["restart", SERVICE_UNIT_NAME], system=system, _run=_run)
             return True
     return False
+
+
+# ── agent deps bootstrap (install-time npm ci) ─────────────────────────────────
+#
+# `blueprint-runner install` now bootstraps the agent's node dependencies so the
+# runner can claim agent tasks immediately without the operator knowing to run
+# `cd agent && npm install` separately. Best-effort, non-fatal — a failure or
+# absent node/npm is a WARNING, not an install abort. The `--no-agent-deps` flag
+# opts out for operators who manage deps on their own cycle.
+
+
+def _bootstrap_agent_deps(
+    *,
+    agent_dir: str = _AGENT_DIR,
+    no_agent_deps: bool = False,
+    _run=subprocess.run,
+) -> None:
+    """Install agent node dependencies (npm ci) if the agent source is present.
+
+    Best-effort and NON-FATAL: a missing npm, a failed install, or a timeout
+    prints a WARNING but never aborts the caller. An operator who manages
+    dependencies on their own cycle passes ``--no-agent-deps`` to skip.
+
+    Gating (all must hold):
+      * ``no_agent_deps`` is False.
+      * ``agent_dir`` is a directory with ``package.json`` (agent project root).
+      * ``agent/src/index.ts`` exists (agent source — not a compute-only runner).
+      * ``agent/dist/index.js`` is absent (no pre-built artifact — deps needed
+        for the tsx-based dev-server path).
+    """
+    if no_agent_deps:
+        return
+
+    if not os.path.isdir(agent_dir):
+        return  # compute-only runner, nothing to do
+
+    if not os.path.isfile(os.path.join(agent_dir, "package.json")):
+        return  # not an agent project root
+
+    if not os.path.isfile(os.path.join(agent_dir, "src", "index.ts")):
+        return  # agent source absent — compute-only runner
+
+    if os.path.isfile(os.path.join(agent_dir, "dist", "index.js")):
+        return  # pre-built artifact present — deps already installed
+
+    if shutil.which("npm") is None:
+        print(
+            "[blueprint-runner] WARNING: npm not found on PATH — cannot install agent "
+            "dependencies. Agent tasks will be declined until Node.js + npm are "
+            "installed and `cd agent && npm install` has been run.",
+            file=sys.stderr, flush=True,
+        )
+        return
+
+    print(
+        f"[blueprint-runner] installing agent node dependencies (npm ci in "
+        f"{agent_dir})...",
+        flush=True,
+    )
+    try:
+        result = _run(
+            ["npm", "ci"], cwd=agent_dir, timeout=120,
+        )
+        if result.returncode != 0:
+            print(
+                f"WARNING: npm ci in {agent_dir} exited {result.returncode}. "
+                "Agent tasks may be declined until dependencies are installed "
+                "manually (`cd agent && npm install`).",
+                file=sys.stderr, flush=True,
+            )
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(
+            f"WARNING: could not run npm ci in {agent_dir}: {exc}. "
+            "Agent tasks may be declined until dependencies are installed "
+            "manually.",
+            file=sys.stderr, flush=True,
+        )
 
 
 # ── update (efficient self-update via git) ─────────────────────────────────────
@@ -1268,6 +1355,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     for _flag, _env_var, _dest, _help_text in _RESOURCE_LIMIT_VARS:
         install_parser.add_argument(_flag, dest=_dest, default=None, help=_help_text)
+    install_parser.add_argument(
+        "--no-agent-deps",
+        dest="no_agent_deps",
+        action="store_true",
+        default=False,
+        help="Skip installing agent node dependencies (npm ci) during install. "
+             "Useful when you manage agent deps on your own cycle.",
+    )
 
     uninstall_parser = sub.add_parser(
         "uninstall",
@@ -1368,6 +1463,7 @@ def main(argv: list[str] | None = None) -> int:
             url=resolve_url(getattr(args, "url", None)),
             dry_run=getattr(args, "dry_run", False),
             resource_limits=resource_limits or None,
+            no_agent_deps=getattr(args, "no_agent_deps", False),
         )
 
     token = resolve_token(getattr(args, "token", None))

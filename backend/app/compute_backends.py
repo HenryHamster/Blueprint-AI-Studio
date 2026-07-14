@@ -22,6 +22,7 @@ import json
 import logging
 import math
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -32,13 +33,14 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Protocol
+from typing import Any, Dict, Protocol, Sequence
 
 from google.cloud import storage as gcs_storage
 
 from app import compute
 from app import storage
-from app.models import ComputeJob, ComputeJobStatus
+from app.compute_experiment_contract import ENV_KEY_RE
+from app.models import ComputeJob, ComputeJobStatus, Project, ProjectComputeImage
 from app.vm_lifecycle import _ensure_vm_deleted
 
 # Scripts baked into the GCP compute-job startup script as base64 blobs.
@@ -54,6 +56,12 @@ _ARTIFACT_UPLOAD_B64 = base64.b64encode(
 _TERMINAL_RECORD_B64 = base64.b64encode(
     (_COMPUTE_SCRIPTS_DIR / "terminal_record.py").read_bytes()
 ).decode("ascii")
+_ARTIFACT_DOWNLOAD_B64 = base64.b64encode(
+    (_COMPUTE_SCRIPTS_DIR / "artifact_download.py").read_bytes()
+).decode("ascii")
+_HEARTBEAT_BODY_B64 = base64.b64encode(
+    (_COMPUTE_SCRIPTS_DIR / "heartbeat_body.py").read_bytes()
+).decode("ascii")
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +70,82 @@ def _load_result_json(result_path: str) -> Any:
     """Synchronous helper for run_preflight_smoke — offloaded via asyncio.to_thread
     so that file I/O and json.loads don't block the event loop."""
     return json.loads(Path(result_path).read_text(encoding="utf-8"))
+
+
+def _is_safe_tar_member(name: str) -> bool:
+    """True when a tar member name is safe to extract under a destination dir.
+
+    Rejects absolute paths and any member that would escape the destination via
+    ``..`` traversal (either a leading component or an embedded one). Both POSIX
+    (``/``) and Windows (``\\``) separators are normalized so a crafted bundle
+    cannot slip a traversal segment past the check.
+    """
+    if not name:
+        return False
+    normalized = name.replace("\\", "/")
+    if normalized.startswith("/") or normalized.startswith("~"):
+        return False
+    # os.path.splitdrive guards against Windows drive-absolute (``C:\\``) members.
+    if os.path.splitdrive(normalized)[0]:
+        return False
+    parts = [p for p in normalized.split("/") if p not in ("", ".")]
+    return ".." not in parts
+
+
+def _safe_extract_artifact_bundle(bundle: bytes, dest_dir: str) -> int:
+    """Extract a ``.tar.gz`` artifact bundle into ``dest_dir``, path-traversal-safe.
+
+    Members with absolute paths or ``..`` traversal are SKIPPED (never extracted),
+    so a malicious or corrupt predecessor bundle can only ever write inside
+    ``dest_dir``. Symlink / hardlink members are skipped as well — their targets
+    could point outside the destination even when the member name itself is safe.
+    Returns the count of members actually extracted.
+
+    Raises ``tarfile.TarError`` (or ``OSError``) on an unreadable/corrupt archive
+    so the caller can fail the job with a clear reason rather than proceeding
+    against a half-populated workspace.
+    """
+    os.makedirs(dest_dir, exist_ok=True)
+    extracted = 0
+    with tarfile.open(fileobj=io.BytesIO(bundle), mode="r:gz") as tar:
+        for member in tar.getmembers():
+            if member.islnk() or member.issym():
+                continue
+            if not _is_safe_tar_member(member.name):
+                logger.warning(
+                    "Skipping unsafe artifact-bundle member %r during rehydration",
+                    member.name,
+                )
+                continue
+            tar.extract(member, path=dest_dir)
+            extracted += 1
+    return extracted
+
+
+async def _rehydrate_input_artifact_bundle(
+    input_artifact_job_id: str, dest_dir: str
+) -> int:
+    """Fetch a predecessor's durable bundle and extract it into ``dest_dir``.
+
+    Raises ``RuntimeError`` when the predecessor bundle is missing or unreadable
+    so the job fails LOUDLY with a clear reason instead of silently running
+    against an empty workspace. Returns the number of files rehydrated.
+    """
+    bundle = await storage.download_compute_job_artifact_bundle(input_artifact_job_id)
+    if bundle is None:
+        raise RuntimeError(
+            "input_artifact_rehydration_failed: predecessor compute job "
+            f"{input_artifact_job_id} has no durable artifact bundle to resume from"
+        )
+    try:
+        return await asyncio.to_thread(
+            _safe_extract_artifact_bundle, bundle, dest_dir
+        )
+    except (tarfile.TarError, OSError) as exc:
+        raise RuntimeError(
+            "input_artifact_rehydration_failed: predecessor bundle for "
+            f"{input_artifact_job_id} could not be extracted: {exc}"
+        ) from exc
 
 _SERIAL_STATUS_PREFIX = "BLUEPRINT_COMPUTE_STATUS="
 _SERIAL_EXIT_PREFIX = "BLUEPRINT_COMPUTE_EXIT_CODE="
@@ -87,11 +171,19 @@ RESULT_FILE_ENV = "BLUEPRINT_RESULT_FILE"
 # disk under the job's state root, and the GCP backend uploads it to a per-job
 # durable object prefix before poweroff.
 ARTIFACT_DIR_ENV = "BLUEPRINT_ARTIFACT_DIR"
+# Well-known env var pointing the launched command at a progress file it may
+# periodically touch or write to signal liveness. Any write (mtime bump or
+# changed content) counts as progress. The no-progress watchdog polls this
+# file; when no_progress_timeout_seconds is set and the file has not advanced
+# within that window, the job is killed early with terminal reason
+# ``no_progress_timeout`` and exit code 125.
+PROGRESS_FILE_ENV = "BLUEPRINT_PROGRESS_FILE"
 # Designated result-file path the command writes; read back after it finishes.
 _GCP_RESULT_FILE_PATH = "/tmp/blueprint_compute_result.json"
 # On-VM artifact directory the GCP startup script provisions and uploads.
 _GCP_ARTIFACT_DIR_PATH = "/tmp/blueprint_compute_artifacts"
 _GCP_ARTIFACT_BUNDLE_PATH = "/tmp/blueprint_compute_artifacts.tar.gz"
+_GCP_PROGRESS_FILE_PATH = "/tmp/blueprint_compute_progress.json"
 # Durable terminal record the startup script writes into the artifact dir right
 # before poweroff. It carries the authoritative outcome (status/exit/reason +
 # the same base64 metric/log/release payloads as the serial markers) so a job
@@ -102,6 +194,16 @@ _GCP_TERMINAL_RECORD_FILENAME = "terminal.json"
 # record is small (metrics + a bounded log), so anything larger is treated as
 # absent rather than parsed.
 _MAX_TERMINAL_RECORD_DECODED_BYTES = 131072
+# Caps for the individually-persisted viewable-artifact substrate: per-file byte
+# ceiling and total object-count ceiling so a pathological run can't upload
+# unbounded per-file objects. Files over the size cap stay inside the bundle.
+_MAX_VIEWABLE_FILE_BYTES = 8 * 1024 * 1024  # 8 MiB per viewable file
+_MAX_VIEWABLE_FILE_COUNT = 25  # at most N individually-addressable objects/job
+# Transfer chunk for STREAMING a durable artifact bundle to disk. A results
+# bundle has no size bound (checkpoints, videos, logs), so it is never pulled
+# into the orchestrator's heap: peak memory during the viewable pass is bounded
+# by this chunk, not by the bundle.
+_BUNDLE_DOWNLOAD_CHUNK_BYTES = 4 * 1024 * 1024  # 4 MiB
 # Hard ceiling on the artifact upload so an oversized tree can never wedge
 # poweroff — the upload is abandoned (best-effort) once it elapses.
 _GCP_ARTIFACT_UPLOAD_TIMEOUT_SECONDS = 180
@@ -116,15 +218,103 @@ _MAX_RESULT_METRICS_DECODED_BYTES = 8192
 _MAX_COMMAND_LOG_BYTES = 32768
 _MAX_COMMAND_LOG_DECODED_BYTES = 65536
 
+class ComputeLaunchSpecError(ValueError):
+    """A launch spec is malformed in a way no retry can fix.
+
+    Raised only from code paths that run BEFORE any billable resource is
+    provisioned, so the caller can terminalize the job immediately (FAILED, with
+    this exception's message as the operator-visible terminal_reason) instead of
+    re-attempting the identical launch every monitor tick until the provisioning
+    deadline. Generic launch exceptions stay retryable — this class is the
+    explicit opt-out for deterministic, zero-cost, spec-level rejections.
+    """
+
+
 LOCAL_BACKEND_NAME = "local-subprocess"
 GCP_BACKEND_NAME = "gcp"
 LOCAL_GPU_BACKEND_NAME = "local-gpu"
 RUNNER_SUBPROCESS_BACKEND_NAME = "runner-subprocess"
 
+# Nominal per-second cost attributed to operator-hardware (self-hosted runner)
+# compute jobs. Blueprint does not pay cloud rates for a runner's box, but
+# reporting EXACTLY $0 is itself a lie: it zeroes the cost/task denominator
+# (making GPU-job spend invisible in efficiency analytics) and turns the runtime
+# spend_cap into a no-op (nothing ever accrues toward the cap, so a runaway job
+# is bounded only by the wall-clock deadline). A small non-zero amortized rate
+# keeps cost/task honest and lets the spend_cap bound runtime. Default
+# ~$0.36/hr (electricity + wear approximation); override per operator via env.
+OPERATOR_HARDWARE_NOMINAL_RATE_PER_SECOND = float(
+    os.getenv("COMPUTE_OPERATOR_HARDWARE_RATE_PER_SECOND", "0.0001")
+)
+
 
 def is_zero_cost_backend(name: str) -> bool:
     """Return True for backends that run on operator/local hardware Blueprint does not pay for."""
     return name in (LOCAL_BACKEND_NAME, LOCAL_GPU_BACKEND_NAME, RUNNER_SUBPROCESS_BACKEND_NAME)
+
+
+# Terminal statuses for a compute job — only completed jobs have a well-defined
+# elapsed window (started_at -> completed_at) to price a cloud equivalent over.
+_TERMINAL_COMPUTE_STATUSES = (
+    ComputeJobStatus.SUCCEEDED,
+    ComputeJobStatus.FAILED,
+    ComputeJobStatus.CANCELLED,
+    ComputeJobStatus.TIMED_OUT,
+)
+
+
+def cloud_equivalent_cost_usd(job: ComputeJob) -> float | None:
+    """Dollars the self-hosted fleet *avoided* by running ``job`` locally.
+
+    This is the on-demand GCP price the same job's machine/accelerator shape would
+    have accrued over its actual run window (``started_at`` -> ``completed_at``),
+    had it run on paid cloud compute instead of an operator-owned runner.
+
+    Returns ``None`` (job does not contribute to the avoided rollup) when:
+      * the backend is NOT a zero-cost/self-hosted backend (a cloud job avoided
+        nothing — Blueprint actually paid for it),
+      * the job is not terminal (no settled run window to price),
+      * ``started_at`` or ``completed_at`` is missing, or the window is negative,
+      * the machine/accelerator shape is unknown or unsupported by the rate table.
+
+    Never raises: pricing an unpriceable shape yields ``None``, not an exception,
+    so a single malformed row cannot 500 the fleet-stats endpoint.
+    """
+    # Import here to avoid a module-load cycle (vm_cost_rates is otherwise a leaf).
+    from app.vm_cost_rates import AcceleratorRejection, get_compute_rate_per_second
+
+    backend_name = getattr(job, "backend", None)
+    if not backend_name or not is_zero_cost_backend(backend_name):
+        return None
+    if getattr(job, "status", None) not in _TERMINAL_COMPUTE_STATUSES:
+        return None
+
+    started_at = getattr(job, "started_at", None)
+    completed_at = getattr(job, "completed_at", None)
+    if started_at is None or completed_at is None:
+        return None
+    elapsed_seconds = (completed_at - started_at).total_seconds()
+    if elapsed_seconds <= 0:
+        return None
+
+    accelerator = getattr(job, "accelerator_type", None)
+    count = getattr(job, "accelerator_count", None) or 1
+    try:
+        rate_per_second = get_compute_rate_per_second(
+            machine_type=getattr(job, "machine_type", None),
+            accelerator=accelerator,
+            count=count,
+            spot=False,
+        )
+    except AcceleratorRejection:
+        return None
+    except (KeyError, ValueError):
+        # Unknown machine type / unsupported shape — do not attribute a cost.
+        return None
+
+    if rate_per_second <= 0:
+        return None
+    return rate_per_second * elapsed_seconds
 
 # Fixed in-container path where the job's state directory is mounted.
 # The command writes result.json and artifacts/ here; the host-side mount makes
@@ -216,6 +406,18 @@ class ComputeLaunchSpec:
     # Registry credentials for private/gated registries.  Only {server, username}
     # survive to the persisted launch spec; password is never written to the DB.
     container_registry_auth: dict | None = None
+    # Optional no-progress watchdog timeout in seconds. When set, the execution
+    # backend monitors the progress file (BLUEPRINT_PROGRESS_FILE) and terminates
+    # the job early with exit code 125 + terminal reason ``no_progress_timeout``
+    # if the file's mtime/size has not advanced within this window. Unset/None
+    # means the watchdog is inert and the job runs to its full runtime deadline.
+    no_progress_timeout_seconds: int | None = None
+    # Optional cross-job checkpoint resume source: the id of a prior compute job
+    # whose durable artifact bundle is fetched and extracted into the artifact dir
+    # BEFORE the command runs, so a long job resumes from its predecessor's latest
+    # checkpoint instead of restarting from zero. Validated at launch time (same
+    # project, durable bundle present). Absent ⇒ no resume (existing behavior).
+    input_artifact_job_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -326,7 +528,7 @@ async def run_preflight_smoke(
                 prefix = _build_container_run_prefix(
                     container_image,
                     host_out_dir=tmpdir,  # -> result.json lands at result_path
-                    gpus=detect_local_gpu() is not None,
+                    gpus=await asyncio.to_thread(detect_local_gpu) is not None,
                 )
                 docker_parts: list[str] = []
                 auth = container_registry_auth or {}
@@ -420,7 +622,7 @@ async def run_preflight_smoke(
             ran_containerized=ran_containerized,
         )
     finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+        await asyncio.to_thread(shutil.rmtree, tmpdir, True)
 
 
 @dataclass(slots=True)
@@ -557,6 +759,17 @@ class LocalSubprocessComputeBackend:
         # Offload sync file I/O (os.makedirs, _write_local_state_text, os.remove)
         # to a thread-pool thread so the event loop is not blocked during job launch.
         await asyncio.to_thread(_launch_setup_state_dir, external_id, started_at_iso)
+        # Cross-job checkpoint resume: rehydrate the predecessor's durable bundle
+        # into the artifact dir BEFORE the wrapper command runs, so the command
+        # sees the checkpoint already present in $BLUEPRINT_ARTIFACT_DIR. The
+        # wrapper's later `mkdir -p` is idempotent and never removes these files.
+        # A missing/unreadable bundle raises (fails the job LOUDLY) rather than
+        # letting the command run against an empty workspace.
+        if spec.input_artifact_job_id is not None:
+            await _rehydrate_input_artifact_bundle(
+                spec.input_artifact_job_id,
+                _local_artifact_dir_for_external_id(external_id),
+            )
         env = {k: os.environ[k] for k in ("PATH", "HOME") if k in os.environ}
         env.update(spec.env or {})
         wrapper_command = _build_local_wrapper_command(
@@ -568,6 +781,7 @@ class LocalSubprocessComputeBackend:
             cwd=spec.cwd,
             env=spec.env,
             repo_clone=spec.repo_clone,
+            no_progress_timeout_seconds=spec.no_progress_timeout_seconds,
         )
         # Offload subprocess.Popen to a thread-pool thread — Popen itself is fast
         # but its preexec_fn / env setup can block the event loop.
@@ -703,10 +917,24 @@ class GcpComputeBackend:
                 expires_at=artifact_expiry_at,
             )
         )
+        # Cross-job checkpoint resume: mint a short-lived signed GET for the
+        # predecessor's durable bundle so the VM can pull + extract it into the
+        # artifact dir before the command runs. The resume source was validated at
+        # create_compute_job time (same project, durable bundle present).
+        input_artifact_download_url: str | None = None
+        if spec.input_artifact_job_id:
+            input_artifact_download_url = (
+                await storage.generate_compute_job_artifact_download_signed_url(
+                    spec.input_artifact_job_id,
+                    expires_at=artifact_expiry_at,
+                )
+            )
         ok = await compute.provision_ephemeral_vm(
             external_id,
             startup_script=_build_gcp_startup_script(
-                spec, artifact_upload_url=artifact_upload_url
+                spec,
+                artifact_upload_url=artifact_upload_url,
+                input_artifact_download_url=input_artifact_download_url,
             ),
             machine_type=spec.machine_type,
             provisioning_model=spec.provisioning_model,
@@ -905,12 +1133,26 @@ class RunnerSubprocessBackend:
                 if runner_exec_status == "succeeded"
                 else ComputeJobStatus.FAILED
             )
+            if cjs == ComputeJobStatus.SUCCEEDED:
+                message = "compute job succeeded"
+            elif exit_code == 125:
+                # No-progress watchdog kill on the runner. The runner /report
+                # endpoint carries only exec_status/exit_code (no reason field),
+                # so translate the reserved exit code here into a terminal reason
+                # string classify_compute_terminal_reason keys on. Without this the
+                # kill collapses to CODE_ERROR (burns retry budget, misattributes
+                # blame) instead of NO_PROGRESS_TIMEOUT — matching the GCP/local
+                # -subprocess paths which emit REASON=no_progress_timeout directly.
+                message = "no_progress_timeout"
+            else:
+                message = "compute job failed"
             return ComputeStatusResult(
                 status=cjs,
                 exit_code=exit_code if exit_code is not None else (0 if cjs == ComputeJobStatus.SUCCEEDED else None),
                 finished_at=finished_at or _utcnow(),
                 metrics=metrics,
                 command_log=command_log,
+                message=message,
             )
         # Unknown status string — treat as still running.
         return ComputeStatusResult(status=ComputeJobStatus.RUNNING)
@@ -918,7 +1160,26 @@ class RunnerSubprocessBackend:
     async def poll_cost(
         self, job: ComputeJob, *, as_of: datetime
     ) -> ComputeCostResult:
-        return ComputeCostResult(total_cost_usd=0.0, measured_at=as_of)
+        # Operator-hardware nominal accrual. Reporting a flat $0 here zeroed the
+        # cost/task denominator for every runner-subprocess (GPU) job AND made the
+        # spend_cap a no-op — the monitor terminates on ``accrued_cost_usd >=
+        # spend_cap_usd`` (compute_jobs.py), which never advanced while cost was 0.
+        # Accrue a small nominal rate over elapsed runtime so the cap bounds
+        # runtime and the job's cost is non-null. Monotonic: never below the value
+        # already persisted on the row. ``as_of`` is the authoritative stop time
+        # (the monitor passes ``finished_at`` for a terminal job), so a finished
+        # job is never billed past the moment it ended.
+        prior = float(job.accrued_cost_usd or 0.0)
+        if (
+            job.started_at is None
+            or OPERATOR_HARDWARE_NOMINAL_RATE_PER_SECOND <= 0
+        ):
+            return ComputeCostResult(total_cost_usd=prior, measured_at=as_of)
+        elapsed = max(0.0, (as_of - job.started_at).total_seconds())
+        nominal = elapsed * OPERATOR_HARDWARE_NOMINAL_RATE_PER_SECOND
+        return ComputeCostResult(
+            total_cost_usd=max(prior, nominal), measured_at=as_of
+        )
 
     async def terminate(self, job: ComputeJob, *, reason: str) -> bool:
         # The runner observes the cancel signal when it gets back cancel_requested=True
@@ -1112,6 +1373,7 @@ def _build_container_run_prefix(
     """
     result_file = f"{container_out_dir}/result.json"
     artifact_dir = f"{container_out_dir}/artifacts"
+    progress_file = f"{container_out_dir}/progress.json"
     parts = ["docker", "run", "--rm"]
     if gpus:
         parts += ["--gpus", "all"]
@@ -1119,6 +1381,7 @@ def _build_container_run_prefix(
         "-v", shlex.quote(f"{host_out_dir}:{container_out_dir}"),
         "-e", shlex.quote(f"{RESULT_FILE_ENV}={result_file}"),
         "-e", shlex.quote(f"{ARTIFACT_DIR_ENV}={artifact_dir}"),
+        "-e", shlex.quote(f"{PROGRESS_FILE_ENV}={progress_file}"),
     ]
     for host_path, container_path in extra_mounts or []:
         parts += ["-v", shlex.quote(f"{host_path}:{container_path}")]
@@ -1140,12 +1403,14 @@ def _build_local_wrapper_command(
     cwd: str | None = None,
     env: dict[str, str] | None = None,
     repo_clone: dict | None = None,
+    no_progress_timeout_seconds: int | None = None,
 ) -> str:
     state_dir = shlex.quote(_local_state_dir_for_external_id(external_id))
     pid_path = shlex.quote(_local_pid_path_for_external_id(external_id))
     terminal_path = shlex.quote(_local_terminal_path_for_external_id(external_id))
     result_path = shlex.quote(_local_result_path_for_external_id(external_id))
     artifact_dir = shlex.quote(_local_artifact_dir_for_external_id(external_id))
+    progress_file = shlex.quote(_local_progress_file_path_for_external_id(external_id))
     command_log_path = shlex.quote(
         os.path.join(
             _local_artifact_dir_for_external_id(external_id),
@@ -1246,91 +1511,103 @@ RELEASE_ECHO=
 SETUP_EOF
   exit "$SETUP_EXIT"
 fi"""
+    # The command runner is the same real, lintable file the GCP startup script
+    # ships (backend/app/_compute_scripts/command_runner.py), delivered as a
+    # base64 blob so no character has to survive an escape pass — per the
+    # "Generating Code for One Language From Another" rule, never a multi-line
+    # heredoc of another language. It is decoded into the job's private state
+    # dir (not a shared /tmp path) so concurrent local jobs cannot race on it.
+    runner_path = shlex.quote(
+        os.path.join(
+            _local_state_dir_for_external_id(external_id), "command_runner.py"
+        )
+    )
     # The artifact dir is created but NOT removed: its contents are the durable
     # output channel and must survive the subprocess (and an idempotent relaunch).
+    _no_progress_watchdog_block = ""
+    _np_watchdog_cleanup = ""
+    if no_progress_timeout_seconds is not None and no_progress_timeout_seconds > 0:
+        _np_seconds = int(no_progress_timeout_seconds)
+        _no_progress_watchdog_block = f"""# No-progress watchdog: kills the job if the progress file is untouched
+# for {_np_seconds}s. Runs in parallel with the command as a SLIDING window —
+# each interval that advances the progress mtime resets the deadline, so a job
+# that progresses then stalls is still cut on the next quiet interval (matches
+# the GCP startup-script and scripts/local_runner.py watchdogs).
+touch {progress_file} 2>/dev/null || true
+(
+  _NP_START=$(stat -c %Y {progress_file} 2>/dev/null || echo 0)
+  while true; do
+    sleep {_np_seconds}
+    _NP_NOW=$(stat -c %Y {progress_file} 2>/dev/null || echo 0)
+    if [ "$_NP_NOW" = "$_NP_START" ]; then
+      # No progress in the last window — terminal reason no_progress_timeout.
+      FINISHED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+      cat > {terminal_path} <<NP_EOF
+STATUS=FAILED
+EXIT_CODE=125
+FINISHED_AT=$FINISHED_AT
+REASON=no_progress_timeout
+METRICS=
+COMMAND_LOG=
+RELEASE_ECHO=
+NP_EOF
+      # The watchdog runs in the SAME process group it is about to signal (it is
+      # a background subshell of the job's group leader, $$). Without this trap
+      # the group SIGTERM below lands on the watchdog itself, killing it instantly
+      # — so the SIGKILL escalation two lines down was unreachable and a command
+      # that ignores/blocks SIGTERM (a trap handler, an uninterruptible
+      # docker-exec'd trainer) simply kept running, and kept billing, after the
+      # watchdog had already written the no_progress_timeout terminal record.
+      # Ignoring TERM *only here* (never in the outer wrapper) lets the watchdog
+      # outlive the TERM it sends, wait out the grace window, and then land the
+      # SIGKILL that actually reaps the group. The SIGKILL reaps this subshell
+      # too — kill(2) delivers to every member of the group before the caller
+      # dies — which is fine: its job is done by then.
+      trap '' TERM
+      kill -TERM -$$ 2>/dev/null || true
+      sleep 2
+      kill -KILL -$$ 2>/dev/null || true
+      exit 0
+    fi
+    _NP_START=$_NP_NOW
+  done
+) &
+_NP_WATCHDOG_PID=$!
+"""
+        _np_watchdog_cleanup = 'kill "$_NP_WATCHDOG_PID" 2>/dev/null || true'
+    # NOTE on the failure branch below: `EXIT_CODE=$?` MUST come before
+    # `STATUS=FAILED`. This block previously assigned STATUS first, so `$?` read
+    # the *assignment's* exit status (always 0) instead of python3's — every failing
+    # local/runner job recorded EXIT_CODE=0 and the real exit code, the only
+    # evidence of HOW the command failed, was silently lost. The GCP startup script
+    # already gets this order right; this path did not.
     return f"""mkdir -p {state_dir}
 mkdir -p {artifact_dir}
 printf '%s\\n' "$$" > {pid_path}
 rm -f {terminal_path}
 rm -f {result_path}
 rm -f {command_log_path}
+echo '{_COMMAND_RUNNER_B64}' | base64 -d > {runner_path}
 export {RESULT_FILE_ENV}={result_path}
 export {ARTIFACT_DIR_ENV}={artifact_dir}
+export {PROGRESS_FILE_ENV}={progress_file}
 {setup_step_block}
 {container_setup_block}
+{_no_progress_watchdog_block}
 EXIT_CODE=0
-if python3 - \
+if python3 {runner_path} \
   {command_literal} \
   {command_log_path} \
-  {live_tail_path_local} <<'PY'; then
-import base64, json, pathlib, subprocess, sys, threading
-
-command = sys.argv[1]
-log_path = pathlib.Path(sys.argv[2])
-live_tail_path = pathlib.Path(sys.argv[3]) if len(sys.argv) > 3 else None
-log_path.parent.mkdir(parents=True, exist_ok=True)
-proc = subprocess.Popen(
-    ["bash", "-lc", command],
-    stdout=subprocess.PIPE,
-    stderr=subprocess.STDOUT,
-)
-captured = bytearray()
-truncated = False
-_stop = threading.Event()
-
-def _flush_tail():
-    if live_tail_path is None:
-        return
-    snap = bytes(captured)
-    tail = snap[-10240:]
-    payload = json.dumps({{"text": tail.decode("utf-8", "replace"), "truncated": len(snap) > 10240 or truncated}}, ensure_ascii=False).encode()
-    try:
-        live_tail_path.write_bytes(base64.b64encode(payload))
-    except OSError:
-        pass
-
-def _tail_worker():
-    while not _stop.wait(30):
-        _flush_tail()
-
-_t = threading.Thread(target=_tail_worker, daemon=True)
-_t.start()
-assert proc.stdout is not None
-while True:
-    chunk = proc.stdout.read(8192)
-    if not chunk:
-        break
-    if len(captured) < {_MAX_COMMAND_LOG_BYTES}:
-        remaining = {_MAX_COMMAND_LOG_BYTES} - len(captured)
-        if len(chunk) <= remaining:
-            captured.extend(chunk)
-        else:
-            captured.extend(chunk[:remaining])
-            truncated = True
-    else:
-        truncated = True
-exit_code = proc.wait()
-_stop.set()
-if proc.stdout is not None:
-    proc.stdout.close()
-if captured or truncated:
-    payload = {{
-        "text": captured.decode("utf-8", "replace"),
-        "truncated": truncated,
-        "byte_count": len(captured),
-    }}
-    log_path.write_text(
-        json.dumps(payload, ensure_ascii=False, sort_keys=True),
-        encoding="utf-8",
-    )
-sys.exit(exit_code)
-PY
+  {_MAX_COMMAND_LOG_BYTES} \
+  {live_tail_path_local}; then
   STATUS=SUCCEEDED
   EXIT_CODE=0
 else
-  STATUS=FAILED
+  # Order is load-bearing: read $? before any other command runs.
   EXIT_CODE=$?
+  STATUS=FAILED
 fi
+{_np_watchdog_cleanup}
 FINISHED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 METRICS_B64=""
 if [ -f {result_path} ]; then
@@ -1409,6 +1686,14 @@ def _local_artifact_metadata(external_id: str | None) -> dict[str, str]:
     """
     path = _local_artifact_dir_for_external_id(external_id)
     return {"artifact_dir": path, "artifact_uri": f"file://{path}"}
+
+
+def _local_progress_file_path_for_external_id(external_id: str | None) -> str:
+    """Progress file path for a local job — polled by the no-progress watchdog."""
+    return os.path.join(
+        _local_state_dir_for_external_id(external_id),
+        "progress.json",
+    )
 
 
 def _read_local_live_tail(job: ComputeJob) -> dict[str, Any] | None:
@@ -1633,6 +1918,451 @@ async def store_runner_artifact(
     return reference
 
 
+@dataclass(slots=True)
+class ViewableArtifactCandidate:
+    """One viewable file selected from a terminal job's artifacts for per-file store.
+
+    ``filename`` is the sanitized object name derived from the file's path
+    *relative* to the artifact root (path-traversal safe, subdir context folded
+    to ``__`` so multi-arm same-named plots stay distinct),
+    ``content_type`` / ``kind`` come from the extension classifier, ``data`` is
+    the in-memory bytes (already size-capped), and ``size_bytes`` is ``len(data)``.
+    """
+
+    filename: str
+    content_type: str
+    kind: str
+    data: bytes
+    size_bytes: int
+
+
+def _classify_viewable_member(
+    name: str, size: int
+) -> tuple[str, str, str] | None:
+    """Return ``(sanitized_relname, content_type, kind)`` for a viewable archive
+    member, or ``None`` when it does not qualify.
+
+    The single classification rule shared by every viewable selection pass (the
+    in-memory extractor and the streaming two-pass selector): viewable extension,
+    positive size within the per-file cap, and a traversal-safe sanitized
+    *relative* path (an absolute/``..`` member path sanitizes to ``None`` and is
+    skipped).
+    """
+    classified = storage.viewable_content_type_for_filename(name)
+    if classified is None:
+        return None
+    if size <= 0 or size > _MAX_VIEWABLE_FILE_BYTES:
+        return None
+    relname = storage.sanitize_viewable_relpath(name)
+    if relname is None:
+        return None
+    content_type, kind = classified
+    return relname, content_type, kind
+
+
+def _read_capped_member(tar: tarfile.TarFile, member: tarfile.TarInfo) -> bytes | None:
+    """Read ONE archive member's bytes, refusing anything over the per-file cap."""
+    extracted = tar.extractfile(member)
+    if extracted is None:
+        return None
+    data = extracted.read(_MAX_VIEWABLE_FILE_BYTES + 1)
+    if not data or len(data) > _MAX_VIEWABLE_FILE_BYTES:
+        return None
+    return data
+
+
+def _download_artifact_bundle_to_path(job_id, dest_path: str) -> bool:
+    """STREAM a job's durable ``bundle.tar.gz`` to *dest_path* on disk.
+
+    The memory-safe counterpart of ``storage.download_compute_job_artifact_bundle``
+    (which returns the whole object as one ``bytes`` — fine for the small
+    ``terminal.json`` recovery read, an OOM risk for a multi-GB results bundle).
+    ``blob.download_to_file`` writes the object through in chunks, so the
+    orchestrator's peak memory is bounded by ``chunk_size``, not by the bundle
+    size. Returns False when the object does not exist. Raises on transport
+    errors — the caller (``_stream_viewable_candidates_from_bundle``) is the
+    fail-soft boundary.
+    """
+    client = gcs_storage.Client(project=storage.GCP_PROJECT_ID)
+    bucket = client.bucket(storage.ARTIFACT_BUCKET_NAME)
+    blob = bucket.blob(storage.compute_job_artifact_object_name(job_id))
+    if not blob.exists():
+        return False
+    blob.chunk_size = _BUNDLE_DOWNLOAD_CHUNK_BYTES
+    with open(dest_path, "wb") as handle:
+        blob.download_to_file(handle)
+    return True
+
+
+def _select_viewable_candidates_from_bundle_path(
+    path: str,
+) -> tuple[list[ViewableArtifactCandidate], int]:
+    """Select a bundle's viewable files from an ON-DISK archive, bounded memory.
+
+    Two passes over the (seekable) archive file:
+
+      1. **Metadata pass** — classify every member by name/size ONLY. No member
+         bytes are read, so an archive with thousands of images costs nothing but
+         its member headers. Yields the full qualifying set, sorted by sanitized
+         name, which is then capped at ``_MAX_VIEWABLE_FILE_COUNT``.
+      2. **Data pass** — read the bytes of ONLY the selected members.
+
+    Capping BEFORE reading is what bounds peak memory: the selected set can never
+    exceed ``_MAX_VIEWABLE_FILE_COUNT * _MAX_VIEWABLE_FILE_BYTES``, and nothing
+    else about the bundle (its total size, its non-viewable payload, its count of
+    rejected images) is ever resident. Returns ``(selected, dropped)`` with the
+    same contract as the in-memory extractor's caller.
+
+    Defensive by contract: a non-gzip/non-tar file or ANY parse error yields
+    ``([], 0)``.
+    """
+    try:
+        refs: list[tuple[str, str, str, str]] = []  # (relname, member, ctype, kind)
+        seen: set[str] = set()
+        with tarfile.open(path, mode="r:gz") as tar:
+            for member in tar:
+                if not member.isfile():
+                    continue
+                classified = _classify_viewable_member(member.name, member.size)
+                if classified is None:
+                    continue
+                relname, content_type, kind = classified
+                if relname in seen:
+                    continue
+                seen.add(relname)
+                refs.append((relname, member.name, content_type, kind))
+
+        refs.sort(key=lambda ref: ref[0])
+        selected_refs = refs[:_MAX_VIEWABLE_FILE_COUNT]
+        dropped = len(refs) - len(selected_refs)
+        if not selected_refs:
+            return [], dropped
+
+        wanted = {ref[1]: ref for ref in selected_refs}
+        out: dict[str, ViewableArtifactCandidate] = {}
+        with tarfile.open(path, mode="r:gz") as tar:
+            for member in tar:
+                if not member.isfile() or member.name not in wanted:
+                    continue
+                relname, _member_name, content_type, kind = wanted[member.name]
+                if relname in out:
+                    continue  # first occurrence wins (matches the metadata pass)
+                data = _read_capped_member(tar, member)
+                if data is None:
+                    continue
+                out[relname] = ViewableArtifactCandidate(
+                    filename=relname,
+                    content_type=content_type,
+                    kind=kind,
+                    data=data,
+                    size_bytes=len(data),
+                )
+                if len(out) == len(selected_refs):
+                    break
+    except (tarfile.TarError, OSError, EOFError, ValueError):
+        return [], 0
+    return sorted(out.values(), key=lambda c: c.filename), dropped
+
+
+async def _stream_viewable_candidates_from_bundle(
+    job_id,
+) -> tuple[list[ViewableArtifactCandidate], int]:
+    """Fetch + select a bundle-backed job's viewable files without ever holding
+    the bundle in memory.
+
+    The bundle is streamed to a temp file, selected from on disk (two-pass,
+    count-capped BEFORE any member bytes are read), and the temp file is always
+    removed. Fail-soft: a missing bundle or ANY download/parse error degrades to
+    ``([], 0)``.
+    """
+    handle, tmp_path = tempfile.mkstemp(prefix="bp-viewable-", suffix=".tar.gz")
+    os.close(handle)
+    try:
+        downloaded = await asyncio.to_thread(
+            _download_artifact_bundle_to_path, job_id, tmp_path
+        )
+        if not downloaded:
+            return [], 0
+        return await asyncio.to_thread(
+            _select_viewable_candidates_from_bundle_path, tmp_path
+        )
+    except Exception:
+        logger.warning(
+            "Failed to stream durable artifact bundle for compute job %s; "
+            "completing with no viewable manifest",
+            job_id,
+            exc_info=True,
+        )
+        return [], 0
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+def _extract_viewable_candidates_from_bundle(
+    raw: bytes,
+) -> list[ViewableArtifactCandidate]:
+    """Select viewable files from an IN-MEMORY ``.tar.gz`` bundle (no extract-to-disk).
+
+    The in-memory analogue of :func:`_select_viewable_candidates_from_bundle_path`,
+    for callers that already hold the bundle bytes. The durable-bundle backends
+    (gcp / runner-subprocess) do NOT use this — a results bundle can be
+    arbitrarily large and materializing it in the orchestrator is an OOM — they
+    go through :func:`_stream_viewable_candidates_from_bundle`.
+
+    Mirrors the safe path-matching pattern in
+    :func:`_extract_terminal_record_from_bundle`: iterate members, classify by
+    the file extension, and read each selected member's bytes directly from the
+    archive. The object name is derived from the sanitized *relative* member path
+    (via :func:`storage.sanitize_viewable_relpath`), NOT the bare basename, so a
+    multi-arm sweep whose arms each write a same-named plot
+    (``arm1/reward.png`` vs ``arm2/reward.png``) yields distinct candidates
+    instead of collapsing to one. Enforces the per-file size cap, dedupes by that
+    sanitized relpath (first occurrence wins), and classifies each as
+    ``image``/``video``. The total-count cap is NOT applied here — every
+    qualifying file is returned so the caller can sort deterministically before
+    capping; :func:`_collect_viewable_artifact_candidates` enforces the count cap
+    and reports the dropped count. A traversal/absolute member path
+    sanitizes to ``None`` and is skipped. Defensive by contract: a non-gzip/
+    non-tar blob or ANY parse error yields ``[]``.
+    """
+    if not raw:
+        return []
+    out: list[ViewableArtifactCandidate] = []
+    seen: set[str] = set()
+    try:
+        with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as tar:
+            for member in tar:
+                if not member.isfile():
+                    continue
+                classified = _classify_viewable_member(member.name, member.size)
+                if classified is None:
+                    continue
+                relname, content_type, kind = classified
+                if relname in seen:
+                    continue
+                data = _read_capped_member(tar, member)
+                if data is None:
+                    continue
+                seen.add(relname)
+                out.append(
+                    ViewableArtifactCandidate(
+                        filename=relname,
+                        content_type=content_type,
+                        kind=kind,
+                        data=data,
+                        size_bytes=len(data),
+                    )
+                )
+    except (tarfile.TarError, OSError, EOFError, ValueError):
+        return []
+    return out
+
+
+def _is_under_artifact_root(real_path: str, real_root: str) -> bool:
+    """True iff *real_path* (already realpath'd) is *real_root* or inside it."""
+    return real_path == real_root or real_path.startswith(real_root + os.sep)
+
+
+def _read_viewable_file_nofollow(path: str, artifact_root: str) -> bytes | None:
+    """Read a regular file for preview persistence, refusing to follow symlinks.
+
+    Re-checks ``islink`` + realpath containment at read time and opens with
+    ``O_NOFOLLOW`` where the platform supports it, closing the scan→read
+    TOCTOU window (an entry swapped for a symlink after the scan is refused
+    by the kernel, not just by the earlier stat). Returns ``None`` on any
+    refusal/error — callers skip the file.
+    """
+    if os.path.islink(path):
+        return None
+    if not _is_under_artifact_root(os.path.realpath(path), artifact_root):
+        return None
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(fd, "rb") as file_handle:
+            return file_handle.read(_MAX_VIEWABLE_FILE_BYTES + 1)
+    except OSError:
+        return None
+
+
+def _collect_viewable_candidates_from_dir(
+    artifact_dir: str,
+) -> list[ViewableArtifactCandidate]:
+    """Select viewable files by walking a local job's on-disk artifact dir.
+
+    The on-disk analogue of :func:`_extract_viewable_candidates_from_bundle`:
+    same viewable-extension filter, per-file size cap, and total-count cap. The
+    object name (and dedupe key) is the sanitized path *relative to*
+    ``artifact_dir`` (via :func:`storage.sanitize_viewable_relpath`), NOT the
+    bare basename, so same-named plots under different arm subdirectories
+    (``arm1/reward.png`` vs ``arm2/reward.png``) stay distinct instead of
+    collapsing to one. Returns ``[]`` for a missing/empty/unreadable dir or on
+    ANY OS error — never raises.
+
+    SECURITY — symlink exfiltration guard: the artifact dir was writable by the
+    experiment command, and this scan runs on the HOST after the run — a
+    planted symlink (e.g. ``loss_curve.png -> /etc/passwd`` or an operator
+    credentials file) must never be dereferenced and persisted as a
+    viewer-accessible preview. Symlinks are excluded at every layer:
+    ``followlinks=False`` on the walk, symlinked dirs pruned, symlinked entries
+    skipped, a realpath containment check against the artifact root, and an
+    ``O_NOFOLLOW`` read (:func:`_read_viewable_file_nofollow`) so an entry
+    swapped for a symlink between scan and read (TOCTOU) is refused by the
+    kernel, not just by the earlier stat.
+    """
+    if (
+        not artifact_dir
+        or not os.path.isdir(artifact_dir)
+        or os.path.islink(artifact_dir)
+    ):
+        return []
+    artifact_root = os.path.realpath(artifact_dir)
+    out: list[ViewableArtifactCandidate] = []
+    seen: set[str] = set()
+    try:
+        for root, dirs, files in os.walk(artifact_dir, followlinks=False):
+            dirs[:] = [
+                d for d in dirs if not os.path.islink(os.path.join(root, d))
+            ]
+            for name in sorted(files):
+                classified = storage.viewable_content_type_for_filename(name)
+                if classified is None:
+                    continue
+                path = os.path.join(root, name)
+                if os.path.islink(path) or not os.path.isfile(path):
+                    continue
+                if not _is_under_artifact_root(
+                    os.path.realpath(path), artifact_root
+                ):
+                    continue
+                relpath = os.path.relpath(path, artifact_dir)
+                relname = storage.sanitize_viewable_relpath(relpath)
+                if relname is None or relname in seen:
+                    continue
+                try:
+                    size = os.path.getsize(path)
+                except OSError:
+                    continue
+                if size <= 0 or size > _MAX_VIEWABLE_FILE_BYTES:
+                    continue
+                data = _read_viewable_file_nofollow(path, artifact_root)
+                if not data or len(data) > _MAX_VIEWABLE_FILE_BYTES:
+                    continue
+                content_type, kind = classified
+                seen.add(relname)
+                out.append(
+                    ViewableArtifactCandidate(
+                        filename=relname,
+                        content_type=content_type,
+                        kind=kind,
+                        data=data,
+                        size_bytes=len(data),
+                    )
+                )
+    except OSError:
+        return out
+    return out
+
+
+async def _collect_viewable_artifact_candidates(
+    job: ComputeJob,
+) -> tuple[list[ViewableArtifactCandidate], int]:
+    """Backend-aware selection of a terminal job's viewable files.
+
+    Local/local-gpu jobs are read from the on-disk artifact dir that survives the
+    subprocess; gcp and runner-subprocess jobs are read from the durable
+    ``bundle.tar.gz`` — STREAMED to a temp file and selected from disk, never
+    materialized in the orchestrator's heap (a results bundle has no size bound;
+    pulling one into the API process is an OOM). Returns ``([], 0)`` for an
+    unrecognised backend or a missing bundle.
+
+    Candidates are sorted by sanitized filename for deterministic selection when
+    the archive/walk order is arbitrary. Returns ``(selected, dropped)`` where
+    ``dropped`` is the count of qualifying files exceeding ``_MAX_VIEWABLE_FILE_COUNT``.
+    """
+    if job.backend in (LOCAL_BACKEND_NAME, LOCAL_GPU_BACKEND_NAME):
+        meta = job.polling_metadata or {}
+        artifact_dir = str(meta.get("artifact_dir") or "").strip()
+        if not artifact_dir:
+            artifact_dir = _local_artifact_dir_for_external_id(job.external_compute_id)
+        all_candidates = await asyncio.to_thread(
+            _collect_viewable_candidates_from_dir, artifact_dir
+        )
+    elif job.backend in (GCP_BACKEND_NAME, RUNNER_SUBPROCESS_BACKEND_NAME):
+        # Already sorted + count-capped on disk (cap applied BEFORE any member
+        # bytes are read), so it returns the final (selected, dropped) directly.
+        return await _stream_viewable_candidates_from_bundle(job.id)
+    else:
+        return [], 0
+    all_candidates.sort(key=lambda c: c.filename)
+    selected = all_candidates[:_MAX_VIEWABLE_FILE_COUNT]
+    dropped = len(all_candidates) - len(selected)
+    return selected, dropped
+
+
+async def persist_viewable_artifacts(
+    job: ComputeJob,
+) -> tuple[list[dict[str, Any]], int]:
+    """Persist a terminal job's viewable files as individually-addressable objects.
+
+    Extracts the viewable files (png/jpg/jpeg/webp/gif/mp4/webm — NO svg, which
+    can execute script when served from a signed URL) from the
+    job's artifacts, uploads each under the allowlisted per-job prefix, and
+    returns ``(manifest, dropped)`` — a list of
+    ``{filename, storage_uri, content_type, size_bytes, kind}`` for durably stored
+    files, and the count of qualifying files that exceeded ``_MAX_VIEWABLE_FILE_COUNT``
+    and were not persisted.
+
+    Fail-soft by contract: an empty/corrupt bundle, a missing dir, or ANY
+    extraction/upload error degrades to ``([], 0)`` and NEVER raises,
+    so viewable-artifact persistence can never block a job's terminal completion.
+    Individual per-file upload failures are skipped; only durably-stored files
+    appear in the returned manifest.
+    """
+    try:
+        candidates, dropped = await _collect_viewable_artifact_candidates(job)
+    except Exception:
+        logger.warning(
+            "Viewable-artifact extraction failed for compute job %s",
+            getattr(job, "id", None),
+            exc_info=True,
+        )
+        return [], 0
+    if not candidates:
+        return [], dropped
+    manifest: list[dict[str, Any]] = []
+    for candidate in candidates:
+        try:
+            uri = await storage.upload_compute_job_viewable_file(
+                job.id,
+                candidate.filename,
+                candidate.data,
+                candidate.content_type,
+            )
+        except Exception:
+            logger.warning(
+                "Viewable-artifact upload raised for compute job %s file %r",
+                getattr(job, "id", None),
+                candidate.filename,
+                exc_info=True,
+            )
+            uri = None
+        if not uri:
+            continue
+        manifest.append(
+            {
+                "filename": candidate.filename,
+                "storage_uri": uri,
+                "content_type": candidate.content_type,
+                "size_bytes": candidate.size_bytes,
+                "kind": candidate.kind,
+            }
+        )
+    return manifest, dropped
+
+
 def _count_files_in_tree(path: str) -> int:
     """Count regular files anywhere under ``path`` (0 if missing/empty/unreadable)."""
     if not path or not os.path.isdir(path):
@@ -1724,10 +2454,38 @@ def _artifact_upload_expiry(deadline_at: datetime | None) -> datetime:
 
 
 def _build_gcp_startup_script(
-    spec: ComputeLaunchSpec, *, artifact_upload_url: str
+    spec: ComputeLaunchSpec,
+    *,
+    artifact_upload_url: str,
+    input_artifact_download_url: str | None = None,
 ) -> str:
     env_lines = []
     for key, value in sorted((spec.env or {}).items()):
+        # Defense-in-depth mirror of the contract-time ENV_KEY_RE gate. The key
+        # is interpolated BARE into `export {key}=...` and this script runs
+        # WITHOUT `set -e`, so a key like "my-model" makes bash error ("not a
+        # valid identifier") and then SILENTLY CONTINUE — burning a GPU on a run
+        # that is missing that env var.
+        #
+        # fullmatch, not match: `$` also matches before a trailing newline, so
+        # `.match("GOOD\n")` would pass this guard and emit `export GOOD\n=v` —
+        # two lines, `export GOOD` (empty) then `=v` (command not found), and
+        # with no `set -e` the billed run continues without the var. That is the
+        # exact silent degradation this guard exists to stop, so it must not be
+        # reachable through the guard itself.
+        #
+        # Raise rather than skip: dropping the key would still launch the very
+        # run this guard exists to prevent (missing env var, full GPU spend),
+        # just with a warning nobody reads. This runs BEFORE provision_ephemeral_vm,
+        # so the raise costs no VM, and ComputeLaunchSpecError tells compute_jobs
+        # to terminalize the job FAILED right away with this message — which names
+        # the offending key — as the operator-visible terminal_reason.
+        if not ENV_KEY_RE.fullmatch(str(key)):
+            raise ComputeLaunchSpecError(
+                f"compute job {spec.job_id}: env key {key!r} is not a valid "
+                f"shell identifier (must match {ENV_KEY_RE.pattern}) — refusing "
+                "to launch a billed run whose `export` would fail silently"
+            )
         env_lines.append(f"export {key}={shlex.quote(value)}")
     env_block = "\n".join(env_lines)
     cwd_line = f"cd {shlex.quote(spec.cwd)}" if spec.cwd else ""
@@ -1735,6 +2493,7 @@ def _build_gcp_startup_script(
     # both reference, so assign them before repo_setup_block is built below.
     result_file = shlex.quote(_GCP_RESULT_FILE_PATH)
     artifact_dir = shlex.quote(_GCP_ARTIFACT_DIR_PATH)
+    progress_file = shlex.quote(_GCP_PROGRESS_FILE_PATH)
     # Container mode: when the contract declares a runtime image, the command runs
     # inside `docker run` instead of a bare `bash -lc`. The VM artifact dir is
     # bind-mounted into the container so result.json and artifacts written inside
@@ -1750,6 +2509,19 @@ def _build_gcp_startup_script(
             _GCP_ARTIFACT_DIR_PATH, "result.json"
         )
         result_file = shlex.quote(container_result_host_path)
+        # In container mode _build_container_run_prefix points the container's
+        # BLUEPRINT_PROGRESS_FILE at container_out_dir/progress.json. For GCP
+        # host_out_dir == container_out_dir == _GCP_ARTIFACT_DIR_PATH, so the
+        # command writes progress to _GCP_ARTIFACT_DIR_PATH/progress.json on the
+        # host — a different file from the standalone _GCP_PROGRESS_FILE_PATH the
+        # bare-mode export uses. Repoint the host-visible progress_file (which the
+        # no-progress watchdog stat's) at that same file so the watchdog observes
+        # the container's mtime advances instead of killing a live job at the
+        # first no_progress_timeout window.
+        container_progress_host_path = os.path.join(
+            _GCP_ARTIFACT_DIR_PATH, "progress.json"
+        )
+        progress_file = shlex.quote(container_progress_host_path)
         _container_extra_mounts: list[tuple[str, str]] | None = None
         _container_workdir: str | None = None
         _container_extra_env: dict[str, str] | None = None
@@ -1834,7 +2606,7 @@ def _build_gcp_startup_script(
             f"{artifact_dir} FAILED 1 repo_clone_failed:$CLONE_CLASS "
             f"{result_file} {command_log_path} >/dev/null 2>&1 || true\n"
             f"  upload_artifacts\n"
-            f'  kill "$TTL_PID" 2>/dev/null || true\n'
+            f'  kill "$TTL_PID" "$_NP_WATCHDOG_PID" 2>/dev/null || true\n'
             f"  poweroff || shutdown -h now || true\n"
             f"  exit 1\n"
             f"fi\n"
@@ -1875,7 +2647,7 @@ def _build_gcp_startup_script(
             f"{artifact_dir} FAILED 1 setup_step_failed "
             f"{result_file} {command_log_path} >/dev/null 2>&1 || true\n"
             f"  upload_artifacts\n"
-            f'  kill "$TTL_PID" 2>/dev/null || true\n'
+            f'  kill "$TTL_PID" "$_NP_WATCHDOG_PID" 2>/dev/null || true\n'
             f"  poweroff || shutdown -h now || true\n"
             f"  exit 1\n"
             f"fi"
@@ -1926,7 +2698,7 @@ def _build_gcp_startup_script(
             + f"{artifact_dir} FAILED 1 container_image_pull_failed "
             + f"{result_file} {command_log_path} >/dev/null 2>&1 || true\n"
             + "  upload_artifacts\n"
-            + '  kill "$TTL_PID" 2>/dev/null || true\n'
+            + '  kill "$TTL_PID" "$_NP_WATCHDOG_PID" 2>/dev/null || true\n'
             + "  poweroff || shutdown -h now || true\n"
             + "  exit 1\n"
             + "fi\n"
@@ -1936,15 +2708,80 @@ def _build_gcp_startup_script(
     artifact_bundle = shlex.quote(_GCP_ARTIFACT_BUNDLE_PATH)
     artifact_upload_url = shlex.quote(artifact_upload_url)
     upload_timeout = _GCP_ARTIFACT_UPLOAD_TIMEOUT_SECONDS
+    # Cross-job checkpoint resume: pull the predecessor's durable bundle from its
+    # signed GET URL and extract it into the artifact dir BEFORE the command runs,
+    # so a resumed job sees the prior checkpoint already present. Kept to
+    # single-line curl / python3 / tar invocations (no heredoc nesting) per the
+    # repo's "generating code for one language from another" guidance. Honest by
+    # design: a failed download/extract writes a `resume_hydration.failed` marker
+    # (never claims resume happened) and lets the command run from scratch; a
+    # success writes `resume_hydration.ok`. Both markers land in the uploaded
+    # bundle. Stale run-status files from the predecessor (result.json /
+    # command.log.json / terminal.json / live_tail.b64) are removed after extract
+    # so they cannot contaminate THIS run's terminal detection; the boot beacon
+    # below then re-lays a fresh terminal.json.
+    resume_block = ""
+    if input_artifact_download_url:
+        _resume_url_q = shlex.quote(input_artifact_download_url)
+        _resume_bundle_q = shlex.quote("/tmp/blueprint_resume_bundle.tar.gz")
+        _resume_ok_q = shlex.quote(
+            os.path.join(_GCP_ARTIFACT_DIR_PATH, "resume_hydration.ok")
+        )
+        _resume_fail_q = shlex.quote(
+            os.path.join(_GCP_ARTIFACT_DIR_PATH, "resume_hydration.failed")
+        )
+        _resume_stale = " ".join(
+            shlex.quote(os.path.join(_GCP_ARTIFACT_DIR_PATH, _name))
+            for _name in (
+                "result.json",
+                "command.log.json",
+                "terminal.json",
+                "live_tail.b64",
+            )
+        )
+        resume_block = (
+            f"rm -f {_resume_bundle_q}\n"
+            f"if timeout {upload_timeout} curl --fail --silent --show-error "
+            f"--location --output {_resume_bundle_q} {_resume_url_q} "
+            f">/dev/null 2>&1 || timeout {upload_timeout} python3 -c "
+            "'import urllib.request,sys; "
+            "urllib.request.urlretrieve(sys.argv[1], sys.argv[2])' "
+            f"{_resume_url_q} {_resume_bundle_q} >/dev/null 2>&1; then\n"
+            f"  RESUME_DL=1\n"
+            f"else\n"
+            f"  RESUME_DL=0\n"
+            f"fi\n"
+            f'if [ "$RESUME_DL" = 1 ] && [ -s {_resume_bundle_q} ] && '
+            f"tar -C {artifact_dir} --no-same-owner -xzf {_resume_bundle_q} "
+            f">/dev/null 2>&1; then\n"
+            f"  rm -f {_resume_stale}\n"
+            f"  echo resumed > {_resume_ok_q} 2>/dev/null || true\n"
+            f'  echo "[resume] hydrated predecessor checkpoint bundle into '
+            f'artifact dir"\n'
+            f"else\n"
+            f"  echo failed > {_resume_fail_q} 2>/dev/null || true\n"
+            f'  echo "[resume] predecessor checkpoint hydration FAILED — '
+            f'running from scratch"\n'
+            f"fi\n"
+            f"rm -f {_resume_bundle_q}"
+        )
     max_log_bytes = _MAX_COMMAND_LOG_BYTES
     command_runner_b64 = _COMMAND_RUNNER_B64
     artifact_upload_b64 = _ARTIFACT_UPLOAD_B64
     terminal_record_b64 = _TERMINAL_RECORD_B64
+    heartbeat_body_b64 = _HEARTBEAT_BODY_B64
     orchestrator_url_q = shlex.quote(compute.ORCHESTRATOR_URL)
     job_id_q = shlex.quote(str(spec.job_id))
+    np_timeout = (
+        max(60, int(spec.no_progress_timeout_seconds))
+        if spec.no_progress_timeout_seconds is not None
+        and spec.no_progress_timeout_seconds > 0
+        else 0
+    )
     return f"""#!/bin/bash
 set -u -o pipefail
 TTL_SECONDS={deadline_seconds}
+_NP_TIMEOUT_SECONDS={np_timeout}
 echo '{command_runner_b64}' | base64 -d > /tmp/blueprint_command_runner.py
 echo '{artifact_upload_b64}' | base64 -d > /tmp/blueprint_artifact_upload.py
 echo '{terminal_record_b64}' | base64 -d > /tmp/blueprint_terminal_record.py
@@ -1991,17 +2828,26 @@ trap upload_artifacts EXIT HUP INT TERM QUIT
   poweroff || shutdown -h now || true
 ) &
 TTL_PID=$!
+# The no-progress watchdog is ARMED LATER (right before the command runs), after
+# setup — repo clone, container image pull, resume hydration — completes, so slow
+# provisioning is never mistaken for a stalled job. Declared empty here so the
+# `set -u` script can reference "$_NP_WATCHDOG_PID" in the setup-failure kill
+# paths (clone/setup/pull) that run before the watchdog is armed.
+_NP_WATCHDOG_PID=
+echo '{heartbeat_body_b64}' | base64 -d > /tmp/blueprint_heartbeat_body.py
 _COMPUTE_ORCHESTRATOR_URL={orchestrator_url_q}
 _COMPUTE_JOB_ID={job_id_q}
 _compute_heartbeat() {{
-  if [ -s {live_tail_path} ]; then
-    _LT_VAL=$(cat {live_tail_path} 2>/dev/null || true)
-    if [ -n "$_LT_VAL" ]; then
-      curl -sf --max-time 5 -X POST -H "Authorization: Bearer $_COMPUTE_JOB_ID" -H "Content-Type: application/json" -d '{{"live_output_tail": "'"$_LT_VAL"'"}}' "$_COMPUTE_ORCHESTRATOR_URL/api/agent/compute-jobs/$_COMPUTE_JOB_ID/heartbeat" >/dev/null 2>&1 || true
-      return
-    fi
+  # Build the heartbeat body off-VM in a real, tested Python file (base64-baked
+  # above): it merges the live-output tail with the latest {{"metric","value"}}
+  # record from the progress file into {{"live_output_tail":..,"progress":..}}.
+  # The progress sample is what feeds the server's no-progress watchdog, so a job
+  # that keeps writing its declared metric stays distinguishable from a dead one.
+  _HB_BODY=$(python3 /tmp/blueprint_heartbeat_body.py {live_tail_path} {progress_file} 2>/dev/null || true)
+  if [ -z "$_HB_BODY" ]; then
+    _HB_BODY='{{}}'
   fi
-  curl -sf --max-time 5 -X POST -H "Authorization: Bearer $_COMPUTE_JOB_ID" "$_COMPUTE_ORCHESTRATOR_URL/api/agent/compute-jobs/$_COMPUTE_JOB_ID/heartbeat" >/dev/null 2>&1 || true
+  curl -sf --max-time 5 -X POST -H "Authorization: Bearer $_COMPUTE_JOB_ID" -H "Content-Type: application/json" -d "$_HB_BODY" "$_COMPUTE_ORCHESTRATOR_URL/api/agent/compute-jobs/$_COMPUTE_JOB_ID/heartbeat" >/dev/null 2>&1 || true
 }}
 _compute_heartbeat
 (
@@ -2015,16 +2861,47 @@ echo "{_SERIAL_STATUS_PREFIX}RUNNING"
 {env_block}
 export {RESULT_FILE_ENV}={result_file}
 export {ARTIFACT_DIR_ENV}={artifact_dir}
+export {PROGRESS_FILE_ENV}={progress_file}
 rm -f {result_file}
 rm -f {command_log_path}
 mkdir -p {artifact_dir}
+{resume_block}
 python3 /tmp/blueprint_terminal_record.py \
   {artifact_dir} FAILED 1 vm_terminated_before_completion {result_file} {command_log_path} \
   >/dev/null 2>&1 || true
 {repo_setup_block}
 {setup_step_block}
 {cwd_line}
-{docker_setup_block}EXIT_CODE=0
+{docker_setup_block}# No-progress watchdog: ARMED HERE, after all setup (repo clone, container image
+# pull, resume hydration, setup step) has completed, so slow provisioning never
+# counts as "no progress" and cannot trip a false kill. Mirrors the local
+# subprocess wrapper, which launches its watchdog after setup_step + container
+# pull. Polls the progress file's mtime; each interval that advances it resets
+# the deadline (sliding window). When _NP_TIMEOUT_SECONDS is 0 the block is inert.
+touch {progress_file} 2>/dev/null || true
+(
+  if [ "$_NP_TIMEOUT_SECONDS" -gt 0 ]; then
+    _NP_START=$(stat -c %Y {progress_file} 2>/dev/null || echo 0)
+    while true; do
+      sleep "$_NP_TIMEOUT_SECONDS"
+      _NP_NOW=$(stat -c %Y {progress_file} 2>/dev/null || echo 0)
+      if [ "$_NP_NOW" = "$_NP_START" ]; then
+        python3 /tmp/blueprint_terminal_record.py \
+          {artifact_dir} FAILED 125 no_progress_timeout {result_file} {command_log_path} \
+          >/dev/null 2>&1 || true
+        echo "{_SERIAL_REASON_PREFIX}no_progress_timeout"
+        echo "{_SERIAL_STATUS_PREFIX}FAILED"
+        echo "{_SERIAL_EXIT_PREFIX}125"
+        upload_artifacts
+        poweroff || shutdown -h now || true
+        exit 0
+      fi
+      _NP_START=$_NP_NOW
+    done
+  fi
+) &
+_NP_WATCHDOG_PID=$!
+EXIT_CODE=0
 if python3 /tmp/blueprint_command_runner.py \
   {command} \
   {command_log_path} \
@@ -2064,7 +2941,7 @@ python3 /tmp/blueprint_terminal_record.py \
   {artifact_dir} "$STATUS" "$EXIT_CODE" "$REASON" {result_file} {command_log_path} \
   >/dev/null 2>&1 || true
 upload_artifacts
-kill "$TTL_PID" "$_HEARTBEAT_PID" 2>/dev/null || true
+kill "$TTL_PID" "$_HEARTBEAT_PID" "$_NP_WATCHDOG_PID" 2>/dev/null || true
 poweroff || shutdown -h now || true
 exit "$EXIT_CODE"
 """
@@ -2373,3 +3250,463 @@ def _launch_spawn_subprocess(
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
+
+
+# ── Per-project compute image build (PRODUCE side of images-first) ───────────
+#
+# Bakes a digest-pinned container image from a project's own lockfiles. The
+# reusable, stdlib-only logic lives in :mod:`app.compute_image_build` (also the
+# home the standalone ``scripts/build_compute_image.py`` CLI loads by path). The
+# backend reads the project's manifest ``compute.image.build`` section, checks
+# out the repo, and drives the hash-gated build.
+
+from app import compute_image_build  # noqa: E402
+
+# Files, in priority order, that count as dependency inputs when the manifest
+# does not enumerate them. Any that exist in the checkout are hashed.
+_DEFAULT_DEP_FILES = (
+    "requirements.txt",
+    "requirements.lock",
+    "poetry.lock",
+    "uv.lock",
+    "Pipfile.lock",
+    "pyproject.toml",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "environment.yml",
+    "conda-lock.yml",
+)
+
+
+def resolve_project_compute_image_build(
+    manifest_compute: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Extract the buildable ``compute.image`` config from a manifest result.
+
+    *manifest_compute* is the ``compute`` dict returned by
+    ``admin_project_tools._discover_manifest_tools`` (shape
+    ``{"image": {"name": ..., "build": {...} | None}}``). Returns a dict
+    ``{"name", "dockerfile", "parent", "build_args"}`` when the project declares
+    a ``build`` section, or ``None`` when it only points at a prebuilt image
+    (or declares no compute image at all).
+    """
+    if not isinstance(manifest_compute, dict):
+        return None
+    image = manifest_compute.get("image")
+    if not isinstance(image, dict):
+        return None
+    build = image.get("build")
+    if not isinstance(build, dict):
+        return None
+    name = image.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return None
+    return {
+        "name": name.strip(),
+        "dockerfile": build.get("dockerfile") or ".blueprint/Dockerfile.compute",
+        "parent": build.get("parent"),
+        "build_args": dict(build.get("build_args") or {}),
+    }
+
+
+def _discover_dep_files(repo_dir: str) -> list[str]:
+    """Return the default dependency files that actually exist in *repo_dir*."""
+    present: list[str] = []
+    for rel in _DEFAULT_DEP_FILES:
+        if os.path.isfile(os.path.join(repo_dir, rel)):
+            present.append(rel)
+    return present
+
+
+def _git_clone_ref(clone_url: str, ref: str, dest: str) -> None:
+    """Shallow-clone *clone_url* at *ref* into *dest*. Raises on failure."""
+    proc = subprocess.run(
+        ["git", "clone", "--depth", "1", "--branch", ref, clone_url, dest],
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    if proc.returncode != 0:
+        # --branch fails for a raw SHA; fall back to full clone + checkout.
+        proc2 = subprocess.run(
+            ["git", "clone", clone_url, dest],
+            capture_output=True,
+            text=True,
+            timeout=900,
+        )
+        if proc2.returncode != 0:
+            raw = (proc.stderr or proc2.stderr or "")[-1000:]
+            # Redact any embedded credentials from the URL before surfacing in logs.
+            safe = re.sub(r"//[^@\s]+@", "//***@", raw)
+            raise RuntimeError(f"git clone failed: {safe}")
+        co = subprocess.run(
+            ["git", "-C", dest, "checkout", ref],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if co.returncode != 0:
+            raise RuntimeError(f"git checkout {ref} failed: {(co.stderr or '')[-500:]}")
+
+
+async def build_project_compute_image(
+    project: "Project",
+    *,
+    registry_repo: str,
+    build_config: dict[str, Any],
+    ref: str | None = None,
+    dep_files: Sequence[str] | None = None,
+    dry_run: bool = False,
+    _token_fn=None,
+    _clone_fn=None,
+    _build_fn=None,
+) -> Any:
+    """Bake (or reuse) the project's compute image, returning a ``BuildResult``.
+
+    Clones the project repo at *ref* into a temp dir, then delegates to
+    ``scripts/build_compute_image.build_and_push`` which content-hashes the
+    dependency inputs, no-ops if an image already exists for that hash, scans
+    for platform credentials, and otherwise builds + pushes a digest-pinned
+    image. Returns the build script's ``BuildResult`` (carries ``pinned_ref``).
+
+    *build_config* is the dict from :func:`resolve_project_compute_image_build`.
+    Hooks (``_token_fn``/``_clone_fn``/``_build_fn``) exist for tests; production
+    resolves an installation token and uses git + the real build script.
+    """
+    import tempfile as _tempfile
+
+    build_fn = _build_fn or compute_image_build.build_and_push
+
+    owner = (getattr(project, "github_owner", None) or "").strip()
+    repo = (getattr(project, "github_repo", None) or "").strip()
+    if not owner or not repo:
+        raise ValueError("project has no connected GitHub repo — cannot build image")
+
+    resolved_ref = (
+        ref or getattr(project, "promotion_target", None) or "main"
+    )
+    image_name = str(build_config["name"]).rsplit("/", 1)[-1].split(":", 1)[0].split("@", 1)[0]
+
+    with _tempfile.TemporaryDirectory(prefix="compute-image-build-") as tmp:
+        repo_dir = os.path.join(tmp, "repo")
+
+        # Resolve a short-lived read token and clone (unless a hook overrides).
+        if _clone_fn is not None:
+            await asyncio.to_thread(_clone_fn, owner, repo, resolved_ref, repo_dir)
+        else:
+            token = None
+            if _token_fn is not None:
+                token = await _token_fn(project)
+            else:
+                try:
+                    from app.branch_cleanup import _get_project_github_token
+                    from app.database import AsyncSessionLocal
+
+                    async with AsyncSessionLocal() as session:
+                        db_project = await session.get(Project, project.id)
+                        token = await _get_project_github_token(
+                            db_project or project, session
+                        )
+                except Exception as e:  # noqa: BLE001
+                    raise RuntimeError(f"could not mint repo token: {e}") from e
+            if not token:
+                raise RuntimeError("no GitHub token available for repo clone")
+            clone_url = f"https://x-access-token:{token}@github.com/{owner}/{repo}.git"
+            await asyncio.to_thread(_git_clone_ref, clone_url, resolved_ref, repo_dir)
+
+        resolved_dep_files = list(dep_files) if dep_files is not None else _discover_dep_files(repo_dir)
+
+        result = await asyncio.to_thread(
+            build_fn,
+            repo_dir=repo_dir,
+            registry_repo=registry_repo,
+            image_name=image_name,
+            dockerfile=build_config.get("dockerfile") or ".blueprint/Dockerfile.compute",
+            dep_files=resolved_dep_files,
+            parent=build_config.get("parent"),
+            build_args=dict(build_config.get("build_args") or {}),
+            dry_run=dry_run,
+        )
+    return result
+
+
+def _parse_digest_from_pinned_ref(pinned_ref: str | None) -> str | None:
+    """Extract the ``sha256:...`` digest from a pinned reference.
+
+    A digest-pinned ref looks like ``registry/repo@sha256:<hex>``; the digest is
+    the substring after the last ``@``. A tag-only ref (``registry/repo:tag``)
+    has no ``@`` and yields ``None``.
+    """
+    if not pinned_ref or "@" not in pinned_ref:
+        return None
+    return pinned_ref.rsplit("@", 1)[1] or None
+
+
+def _split_image_ref(ref: str) -> tuple[str, str, str]:
+    """Split an image reference into ``(registry_repo, image_name, tag)``.
+
+    ``us-docker.pkg.dev/proj/compute-images/my-project:v2``
+        -> ``("us-docker.pkg.dev/proj/compute-images", "my-project", "v2")``
+
+    The tag is split off the FINAL path segment only, so a registry host that
+    carries a ``:port`` (``localhost:5000/my-project:v2``) keeps its port and
+    still yields ``tag="v2"``. A ref with no registry prefix yields an empty
+    registry; a ref with no tag yields an empty tag. Any ``@digest`` suffix is
+    stripped first — callers handle already-pinned refs before this point, but
+    the parse stays total rather than depending on that.
+
+    Mirrors how :func:`build_project_compute_image` derives ``image_name`` and
+    how :func:`resolve_compute_image_registry_repo` derives the registry, so a
+    manifest ref decomposes into exactly the fields persisted on
+    :class:`ProjectComputeImage`.
+    """
+    if not ref:
+        return "", "", ""
+    base = ref.split("@", 1)[0]
+    head, sep, last = base.rpartition("/")
+    registry_repo = head if sep else ""
+    name, _, tag = last.partition(":")
+    return registry_repo, name, tag
+
+
+async def record_project_compute_image_build(
+    session: Any,
+    project_id: uuid.UUID,
+    registry_repo: str,
+    image_name: str,
+    result: Any,
+) -> ProjectComputeImage:
+    """UPSERT a :class:`ProjectComputeImage` row from a ``BuildResult``.
+
+    Keyed on ``(project_id, dep_hash)``: if a row already exists for that
+    dependency hash it is updated in place (``pinned_ref``, ``digest``, ``tag``,
+    ``built``, ``updated_at`` refreshed); otherwise a new row is inserted. The
+    ``sha256:...`` digest is parsed out of ``result.pinned_ref`` (the substring
+    after ``@``) and stored in ``digest`` — ``None`` when the ref is tag-pinned.
+
+    A REAL upsert — ``INSERT … ON CONFLICT (project_id, dep_hash) DO UPDATE``,
+    not a select-then-insert. Two concurrent build triggers for the same
+    ``(project_id, dep_hash)`` (the common case: the same dependency set built
+    from two clicks, or a click racing a CI trigger) both used to miss the
+    existence check and race to INSERT; the loser died on
+    ``uq_projectcomputeimage_project_dep_hash`` and surfaced as a 500. The
+    conflict is now resolved by the database, so the second writer updates the
+    row the first one inserted.
+
+    Callers are responsible for committing the session.
+    """
+    from sqlalchemy import select
+    from sqlalchemy.dialects.postgresql import insert as _pg_insert
+
+    pinned_ref = getattr(result, "pinned_ref", None) or ""
+    tag = getattr(result, "tag", None) or ""
+    dep_hash = getattr(result, "dep_hash", None) or ""
+    built = bool(getattr(result, "built", False))
+    digest = _parse_digest_from_pinned_ref(pinned_ref)
+    now = _utcnow()
+
+    values = {
+        "id": uuid.uuid4(),
+        "project_id": project_id,
+        "registry_repo": registry_repo,
+        "image_name": image_name,
+        "dep_hash": dep_hash,
+        "tag": tag,
+        "pinned_ref": pinned_ref,
+        "digest": digest,
+        "built": built,
+        "created_at": now,
+        "updated_at": now,
+    }
+
+    stmt = _pg_insert(ProjectComputeImage).values(**values)
+    stmt = stmt.on_conflict_do_update(
+        # The unique constraint the concurrent INSERT used to die on.
+        index_elements=[
+            ProjectComputeImage.project_id,
+            ProjectComputeImage.dep_hash,
+        ],
+        set_={
+            "registry_repo": stmt.excluded.registry_repo,
+            "image_name": stmt.excluded.image_name,
+            "tag": stmt.excluded.tag,
+            "pinned_ref": stmt.excluded.pinned_ref,
+            "digest": stmt.excluded.digest,
+            "built": stmt.excluded.built,
+            "updated_at": stmt.excluded.updated_at,
+        },
+    ).returning(ProjectComputeImage.id)
+
+    row_id = (await session.execute(stmt)).scalar_one()
+
+    # Re-read through the ORM so the caller gets a managed instance with the
+    # post-upsert values (the same contract the select-then-insert had).
+    row = (
+        await session.execute(
+            select(ProjectComputeImage)
+            .where(ProjectComputeImage.id == row_id)
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one()
+    return row
+
+
+def is_digest_pinned(ref: str | None) -> bool:
+    """True when an image reference is content-addressed (contains ``@sha256:``).
+
+    A digest-pinned reference (``registry/repo@sha256:...``) resolves to the same
+    image layers on every pull, so two runs of the same compute_experiment are
+    bit-identical over time. A mutable tag (``registry/repo:latest``) does not —
+    it is the reproducibility hazard this predicate lets callers detect. ``None``
+    / empty refs are not pinned.
+    """
+    return bool(ref) and "@sha256:" in ref
+
+
+async def resolve_digest_pinned_default_image(
+    session: Any,
+    project_id: uuid.UUID,
+    manifest_name: str | None,
+) -> str | None:
+    """Pin a project's mutable manifest compute-image tag to a content digest.
+
+    ``compute.image.name`` in a project manifest is typically a *mutable* tag
+    (e.g. ``registry/repo/my-project:latest``). Two runs of the same
+    compute_experiment days apart can therefore resolve to different image
+    layers, breaking A/B reproducibility (design gap G3). When a durable
+    :class:`ProjectComputeImage` build record exists for this project, this
+    resolves the tag to its content-addressed ``registry/repo@sha256:...``
+    reference so repeated defaulting is bit-identical over time.
+
+    Fail-open by design — the return value is a drop-in replacement for the raw
+    ``manifest_name``:
+
+    * ``None``/empty in -> ``None`` out (nothing to default).
+    * already digest-pinned (contains ``@sha256:``) -> returned unchanged.
+    * a matching ``built`` row with a non-null ``digest`` exists -> its
+      ``pinned_ref``.
+    * no such row -> the raw ``manifest_name`` unchanged (logs a debug note);
+      this preserves today's behavior rather than introducing a new failure.
+
+    **Matching is on the image's FULL identity — registry AND name — and an
+    explicitly-tagged ref resolves to THAT tag's build.** A manifest ref
+    ``registry/repo/name:tag`` names one specific image; its trailing ``name``
+    does not. Keying the lookup on ``image_name`` alone (as this did) silently
+    resolved to the wrong digest in two ordinary situations:
+
+    * **Tag rollback.** A project pins ``:v2``, hits a regression, and rolls its
+      manifest back to ``:v1``. Both builds carry the same ``image_name``, so the
+      most-recently-updated row — the ``:v2`` build — still won, and the project
+      kept running the image it had just rolled back, behind a digest-pinned ref
+      that looked authoritative. An explicit tag now resolves to the build record
+      pushed under that tag.
+    * **A foreign image with the same trailing name.** Switching to an external
+      prebuilt ``ghcr.io/vendor/my-project:latest`` matched this project's own
+      ``…/compute-images/my-project`` build record and ran THAT digest. The
+      registry is now part of the key, so a foreign image never matches a local
+      build record; it fails open to the ref the manifest actually asked for.
+
+    Resolution order for a ``registry``/``name``-matched row set:
+
+    1. A row whose ``tag`` equals the ref's tag — an explicitly-pinned tag must
+       resolve to its own build, never to a newer one.
+    2. Otherwise the most recent build for that registry+name. A FLOATING tag
+       (``:latest``, or no tag at all) is exactly the mutable-tag case this
+       function exists to pin, and the pipeline pushes content-hash tags rather
+       than ``latest``, so no per-tag row exists for it by construction — the
+       latest build IS the right answer, and the pre-existing behavior.
+    """
+    if not manifest_name:
+        return None
+    if "@sha256:" in manifest_name:
+        # Already content-addressed; nothing to pin.
+        return manifest_name
+
+    # Decompose the manifest ref into the same coordinates the build pipeline
+    # persists on ProjectComputeImage (see build_project_compute_image /
+    # record_project_compute_image_build), so the lookup keys on the image's full
+    # identity rather than on its trailing name.
+    registry_repo, image_name, ref_tag = _split_image_ref(manifest_name)
+
+    try:
+        from sqlalchemy import select
+
+        conditions = [
+            ProjectComputeImage.project_id == project_id,
+            ProjectComputeImage.image_name == image_name,
+            ProjectComputeImage.built.is_(True),
+            ProjectComputeImage.digest.is_not(None),
+        ]
+        # A bare ``name`` with no registry prefix cannot be attributed to a
+        # registry, so only the name is pinned down in that (unusual) case.
+        if registry_repo:
+            conditions.append(ProjectComputeImage.registry_repo == registry_repo)
+
+        row = None
+        if ref_tag:
+            # (1) Explicit tag → the build pushed under exactly that tag.
+            row = (
+                await session.execute(
+                    select(ProjectComputeImage)
+                    .where(*conditions, ProjectComputeImage.tag == ref_tag)
+                    .order_by(ProjectComputeImage.updated_at.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+
+        if row is None:
+            # (2) Floating/unknown tag → the latest build for this exact image.
+            row = (
+                await session.execute(
+                    select(ProjectComputeImage)
+                    .where(*conditions)
+                    .order_by(ProjectComputeImage.updated_at.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+    except Exception:  # noqa: BLE001 — fail-open to the raw tag on any DB error.
+        logger.debug(
+            "[COMPUTE] digest-pin lookup failed for project=%s image=%s; "
+            "falling back to mutable tag",
+            project_id,
+            image_name,
+        )
+        return manifest_name
+
+    if row is not None and row.pinned_ref:
+        return row.pinned_ref
+
+    # Fail-open to the mutable tag, but make it operator-VISIBLE: the images-first
+    # substrate's core promise is run-to-run reproducibility via digest pinning,
+    # and defaulting to a mutable tag silently defeats it. A warning here (not a
+    # debug note) is the signal the operator needs to know a run they believe is
+    # digest-reproducible is not. Callers additionally stamp the fact durably onto
+    # the child payload via is_digest_pinned().
+    logger.warning(
+        "[COMPUTE] no digest-pinned build record for project=%s image=%s; "
+        "defaulting to MUTABLE tag %s — run-to-run reproducibility is NOT "
+        "guaranteed for this image",
+        project_id,
+        image_name,
+        manifest_name,
+    )
+    return manifest_name
+
+
+def resolve_compute_image_registry_repo() -> str:
+    """Return the Artifact Registry repo base for compute images.
+
+    Reads ``COMPUTE_IMAGE_REGISTRY`` from the environment first; when absent,
+    derives it from ``GCP_PROJECT_ID`` and ``COMPUTE_IMAGE_REGION`` (defaulting
+    to ``"us"``) using the repo declared in ``infra/terraform/registry.tf``:
+    ``<region>-docker.pkg.dev/<project>/compute-images``.
+
+    Pure function of env/config — testable via monkeypatch.
+    """
+    explicit = os.environ.get("COMPUTE_IMAGE_REGISTRY", "").strip()
+    if explicit:
+        return explicit
+    region = os.environ.get("COMPUTE_IMAGE_REGION", "us").strip() or "us"
+    project = storage.GCP_PROJECT_ID
+    return f"{region}-docker.pkg.dev/{project}/compute-images"

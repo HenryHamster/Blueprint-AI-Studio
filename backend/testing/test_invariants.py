@@ -12,6 +12,7 @@ import os
 import re
 import subprocess
 import sys
+from functools import cache
 from pathlib import Path
 
 import pytest
@@ -314,6 +315,62 @@ def _is_admin_surface_route(route) -> bool:
     )
 
 
+def test_progression_never_gates_on_criterion_coverage():
+    """Version/direction PROGRESSION must never consult a per-criterion signal.
+
+    INVERSE invariant (replaces the two that structurally REQUIRED the retired
+    coverage gate).  The acceptance contract is enforced INSIDE qualification —
+    the sha-keyed per-category ledger gate in ``release_scoring.compute_composite``
+    — where it is actually graded.  A pre-qualification coverage precondition on
+    progression is what deadlocked v25: ``direction_owns_uncovered_criterion`` was
+    FAIL-CLOSED (True on query error) and withheld a criterion-carrying direction
+    from BOTH auto-complete routes AND strategist retire_direction, so the version
+    could never be cut — while the contract it purported to enforce went unchecked
+    (0 proven across 353 merges).
+
+    ``direction_owns_uncovered_criterion`` and ``get_version_coverage_summary``
+    still EXIST (other, non-progression consumers remain until the coverage machine
+    is deleted), which is exactly why this guard is needed: a dead-but-still-callable
+    helper is a re-wiring hazard.  If you are here because this test failed, do not
+    silence it — enforce the acceptance contract at QUALIFY, not before it.
+    """
+    forbidden = {
+        "direction_owns_uncovered_criterion",
+        "get_version_coverage_summary",
+        "compute_criterion_coverage",
+    }
+    progression_modules = [
+        "research_completion.py",
+        "research_direction_state.py",
+        "strategic_completion.py",
+        "release_readiness.py",
+        "qualification_triggers.py",
+    ]
+
+    violations: list[str] = []
+    for module_name in progression_modules:
+        path = BACKEND_ROOT / "app" / module_name
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=module_name)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    if alias.name in forbidden:
+                        violations.append(f"{module_name}: imports {alias.name}")
+            elif isinstance(node, ast.Call):
+                called = _ast_called_name(node)
+                if called in forbidden:
+                    violations.append(f"{module_name}: calls {called}()")
+
+    assert not violations, (
+        "Progression code must not gate on acceptance-criterion coverage — the "
+        "acceptance contract is graded at QUALIFY (the sha-keyed category ledger "
+        "in release_scoring.compute_composite), not as a precondition for cutting "
+        "a version or retiring a direction. A pre-qualification coverage gate is "
+        "what deadlocked v25. Violations:\n  " + "\n  ".join(violations)
+    )
+
+
 def test_all_admin_routes_require_auth():
     """Every admin-surface route must resolve an auth dependency somewhere."""
     from fastapi.routing import APIRoute
@@ -335,6 +392,14 @@ def test_all_admin_routes_require_auth():
         # (not Depends(get_current_user) / require_admin), because it is the
         # token-issuance endpoint that exchanges the shared secret for a JWT.
         "/api/admin/token": "exchanges ADMIN_API_KEY for short-lived JWT",
+        # GET /api/admin/projects/{project_id}/tools/{tool_slug}/assets/{path:path}
+        # uses JWT-based auth via a ?token query parameter (not Firebase/cookie auth)
+        # because this endpoint serves assets to opaque-origin (null) iframes that
+        # cannot send cookies. The capability JWT carries scope: "tool-asset" and is
+        # validated inline by _verify_tool_asset_token.
+        "/api/admin/projects/{project_id}/tools/{tool_slug}/assets/{path:path}": (
+            "JWT-based capability-token auth for opaque-origin iframe asset serving"
+        ),
     }
 
     # get_metrics_reader is a narrowly scoped read-only dep that accepts agent
@@ -618,6 +683,104 @@ class TestSafetyConstants:
 
 
 # ── Schema Revision Sync ───────────────────────────────────────────────────
+
+
+# CREATE/DROP [UNIQUE] INDEX ... CONCURRENTLY in a raw SQL string. Postgres
+# forbids CONCURRENTLY inside a transaction block, so a migration issuing it
+# must first escape Alembic's per-migration transaction (env.py sets
+# ``transaction_per_migration=True``) via ``op.execute("COMMIT")``.
+_CONCURRENTLY_DDL_RE = re.compile(
+    r"\b(?:CREATE|DROP)\s+(?:UNIQUE\s+)?INDEX\s+CONCURRENTLY\b",
+    re.IGNORECASE,
+)
+
+
+def _ast_literal_text(node: ast.AST) -> str:
+    """Return the static text of a string literal node.
+
+    Handles a bare ``ast.Constant`` string, adjacent-concatenated literals
+    (collapsed to one Constant by the parser), and f-strings (``ast.JoinedStr``)
+    — for f-strings only the literal segments are returned; interpolated
+    ``{...}`` placeholders are ignored (the CONCURRENTLY keyword is always in a
+    literal segment). Non-string nodes yield ``""``.
+    """
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.JoinedStr):
+        return "".join(
+            part.value
+            for part in node.values
+            if isinstance(part, ast.Constant) and isinstance(part.value, str)
+        )
+    return ""
+
+
+def _concurrently_txn_escape_violations(source: str, revision: str) -> list[str]:
+    """Return violation strings for migration source that issues CONCURRENTLY
+    index DDL without first escaping the per-migration transaction.
+
+    A CONCURRENTLY event is either:
+      * ``op.execute(...)`` whose static string contains CREATE/DROP INDEX
+        CONCURRENTLY, or
+      * ``op.create_index(...)`` / ``op.drop_index(...)`` with the alembic
+        ``postgresql_concurrently=True`` kwarg (which itself emits CONCURRENTLY).
+
+    A COMMIT event is ``.execute("COMMIT")``. Within each ``upgrade`` /
+    ``downgrade`` function, a COMMIT must lexically precede the FIRST
+    CONCURRENTLY event; otherwise the DDL runs inside Alembic's transaction and
+    fails on Postgres (while passing silently on SQLite, which ignores
+    CONCURRENTLY entirely). Only executed statements are inspected, so a
+    CONCURRENTLY mention in a docstring or comment is never flagged.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return [f"{revision}: could not parse migration source"]
+
+    violations: list[str] = []
+    for func in tree.body:
+        if not isinstance(func, ast.FunctionDef) or func.name not in (
+            "upgrade",
+            "downgrade",
+        ):
+            continue
+
+        commits: list[tuple[int, int]] = []
+        concurrentlies: list[tuple[int, int]] = []
+
+        for node in ast.walk(func):
+            if not isinstance(node, ast.Call) or not isinstance(
+                node.func, ast.Attribute
+            ):
+                continue
+            attr = node.func.attr
+            pos = (node.lineno, node.col_offset)
+
+            if attr == "execute" and node.args:
+                text = _ast_literal_text(node.args[0])
+                if text.strip().upper() == "COMMIT":
+                    commits.append(pos)
+                elif _CONCURRENTLY_DDL_RE.search(text):
+                    concurrentlies.append(pos)
+            elif attr in ("create_index", "drop_index"):
+                for kw in node.keywords:
+                    if (
+                        kw.arg == "postgresql_concurrently"
+                        and isinstance(kw.value, ast.Constant)
+                        and kw.value.value is True
+                    ):
+                        concurrentlies.append(pos)
+
+        if not concurrentlies:
+            continue
+        first_concurrently = min(concurrentlies)
+        if not any(commit < first_concurrently for commit in commits):
+            violations.append(
+                f"{revision}.{func.name}: CONCURRENTLY index DDL is not preceded "
+                "by op.execute(\"COMMIT\") to escape the per-migration transaction"
+            )
+
+    return violations
 
 
 class TestSchemaRevisionSync:
@@ -1255,17 +1418,30 @@ class TestSchemaRevisionSync:
         assert len(heads) == 1, f"Expected 1 head, got {len(heads)}: {heads}"
 
         head = heads[0]
-        max_revision = max(chain, key=int)
+
+        # Natural-order key: a revision id is a numeric prefix plus an optional
+        # lowercase letter suffix used by dedup/linearisation revisions (e.g.
+        # ``0458b`` is deliberately inserted strictly between ``0458`` and
+        # ``0459``). A bare ``int()`` sort crashes on such ids; this tuple key
+        # orders ``0458`` < ``0458b`` < ``0459`` while remaining identical to
+        # integer order for all-numeric chains.
+        def _rev_key(rev: str) -> tuple[int, str]:
+            m = re.match(r"(\d+)([a-z]*)$", rev or "")
+            if not m:
+                return (-1, rev or "")
+            return (int(m.group(1)), m.group(2))
+
+        max_revision = max(chain, key=_rev_key)
 
         # Every revision number must be greater than its down_revision's number
         # (for revisions that are part of the chain).
         violations: list[str] = []
         for rev, down_rev in chain.items():
             if down_rev is not None and down_rev in chain:
-                if int(rev) <= int(down_rev):
+                if _rev_key(rev) <= _rev_key(down_rev):
                     violations.append(
-                        f"  {rev} (numeric {int(rev)}) → down_revision {down_rev} "
-                        f"(numeric {int(down_rev)}) — revision must be numerically "
+                        f"  {rev} (key {_rev_key(rev)}) → down_revision {down_rev} "
+                        f"(key {_rev_key(down_rev)}) — revision must be numerically "
                         f"greater than its down_revision"
                     )
 
@@ -1509,9 +1685,18 @@ class TestSchemaRevisionSync:
         )
         files = sorted(globmod.glob(os.path.join(migrations_dir, "[0-9]*.py")))
 
-        # op.create_index('name', 'table', ['col', ...], ...) — handle optional op.f(...) wrapper
+        # op.create_index('name', 'table', ['col', ...], ...) — handle optional op.f(...)
+        # wrapper, AND a bare module-constant name:
+        #     _TITLE_IDX = "ix_task_title_trgm"
+        #     op.create_index(_TITLE_IDX, "task", ["title"], ...)
+        #
+        # Requiring a quoted LITERAL here silently missed every migration that binds
+        # its index name to a constant — the index IS created, but this guard reported
+        # it "missing from migrations" and demanded a create_index call that was
+        # already there. (0529 even carries a comment asserting it was covered.)
+        # Accept either form; a constant is resolved against `consts` below.
         create_idx_re = re.compile(
-            r"create_index\(\s*(?:op\.f\(\s*)?['\"](\w+)['\"]\s*\)?\s*,"
+            r"create_index\(\s*(?:op\.f\(\s*)?(?:['\"](\w+)['\"]|(\w+))\s*\)?\s*,"
             r"\s*['\"](\w+)['\"]\s*,\s*\[([^\]]+)\]",
             re.DOTALL,
         )
@@ -1519,6 +1704,38 @@ class TestSchemaRevisionSync:
         create_table_re = re.compile(r"create_table\(\s*['\"](\w+)['\"]", re.MULTILINE)
         col_start_re = re.compile(r"sa\.Column\(\s*['\"](\w+)['\"]")
         str_re = re.compile(r"['\"](\w+)['\"]")
+        # RAW-SQL index creation, e.g.
+        #   op.execute("CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_task_title_trgm "
+        #              "ON task USING gin (title gin_trgm_ops)")
+        #
+        # `op.create_index()` CANNOT emit CONCURRENTLY (it runs inside a transaction),
+        # so a concurrently-built index — the only safe way to add one to a large live
+        # table — MUST be raw SQL.  Scanning only for `op.create_index(...)` therefore
+        # reported every such index as "missing from migrations" even though the
+        # migration creates it, which pressures authors either to bypass this guard or
+        # to avoid CONCURRENTLY on a hot table.  Recognise the raw form too.
+        #
+        # Captures: index name, table, and the column list inside the trailing
+        # parenthesised expression (`gin_trgm_ops`-style operator classes and other
+        # bare identifiers are filtered out below by intersecting with real columns).
+        # `_GLUE` swallows an adjacent-string-literal break, which these migrations use:
+        #     f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {_TITLE_IDX} "
+        #     f"ON task USING gin (title gin_trgm_ops)"
+        # i.e. the raw source between tokens can contain: quote, newline, indent, f-prefix.
+        _GLUE = r"[\s\"'frb]*"
+        raw_create_idx_re = re.compile(
+            r"CREATE\s+INDEX" + _GLUE + r"\s*(?:CONCURRENTLY" + _GLUE + r"\s*)?"
+            r"(?:IF\s+NOT\s+EXISTS" + _GLUE + r"\s*)?"
+            r"\{?(\w+)\}?"                        # name, or {_PY_CONST} interpolation
+            + _GLUE + r"\s*ON\s+(\w+)"            # table
+            + _GLUE + r"\s*(?:USING\s+\w+)?"      # optional access method
+            + _GLUE + r"\s*\(([^)]*)\)",          # column expression list
+            re.IGNORECASE | re.DOTALL,
+        )
+        # Resolve `f"...{_TITLE_IDX}..."` style interpolation: migrations commonly bind
+        # the index name to a module constant.  Map constant -> literal so the raw-SQL
+        # scan can name the index it creates.
+        const_re = re.compile(r"^(_\w+)\s*=\s*['\"](\w+)['\"]", re.MULTILINE)
 
         def _matched_block(text: str, start: int) -> str:
             depth, end = 1, start
@@ -1545,12 +1762,35 @@ class TestSchemaRevisionSync:
             # where the create would otherwise overwrite the drop target in idx_by_name.
             idx_by_name_snapshot = dict(idx_by_name)
 
+            consts = dict(const_re.findall(content))
+
             for m in create_idx_re.finditer(content):
-                name, table, cols_raw = m.group(1), m.group(2), m.group(3)
+                # group 1 = quoted literal name, group 2 = bare constant name
+                raw_name = m.group(1) or m.group(2) or ""
+                name = consts.get(raw_name, raw_name)
+                table, cols_raw = m.group(3), m.group(4)
                 cols = frozenset(str_re.findall(cols_raw))
                 if cols:
                     entry = (table, cols)
                     idx_by_name[name] = entry
+                    effective.add(entry)
+
+            # Raw-SQL creates (CONCURRENTLY etc.) — see raw_create_idx_re above.
+            for m in raw_create_idx_re.finditer(content):
+                name = consts.get(m.group(1), m.group(1))
+                table, cols_raw = m.group(2), m.group(3)
+                # The expression list carries operator classes / functions alongside
+                # the columns (e.g. "title gin_trgm_ops").  Keep only tokens that are
+                # REAL columns of that table, so an opclass can never masquerade as one.
+                sa_table = SQLModel.metadata.tables.get(table)
+                if sa_table is None:
+                    continue
+                real_cols = {c.name for c in sa_table.columns}
+                cols = frozenset(t for t in str_re.findall(cols_raw) if t in real_cols)
+                if cols:
+                    entry = (table, cols)
+                    if name:
+                        idx_by_name[name] = entry
                     effective.add(entry)
 
             for ct in create_table_re.finditer(content):
@@ -1617,6 +1857,7 @@ class TestSchemaRevisionSync:
             "create_unique_constraint",
             "create_check_constraint",
             "batch_alter_table",
+            "get_bind",
         }
 
         migrations_dir = os.path.join(
@@ -1674,6 +1915,10 @@ class TestSchemaRevisionSync:
                     and isinstance(n.func.value, ast.Name)
                     and n.func.value.id == "op"
                 ]
+                # Data-only migrations: upgrade only calls data-access ops
+                # (execute, get_bind) or has no op.* calls at all (e.g.
+                # migrations using bind.execute() through helper functions
+                # for encryption/decryption).
                 if up_calls and all(
                     c.func.attr in _DATA_ONLY_OP_ATTRS for c in up_calls
                 ):
@@ -1742,6 +1987,7 @@ class TestSchemaRevisionSync:
         _KNOWN_UNGUARDED_DUPLICATES: set[tuple[str, str]] = {
             ("0045", "ix_task_post_commit_pending"),
             ("0117", "ix_task_post_commit_pending"),
+            ("0117", "ix_task_auto_remediation_active"),
             # 0138 SQLite branch uses bare op.create_index; 0141 re-asserts it
             # with guarded SQL for the back-merge reconcile (both pre-date invariant).
             ("0138", "ix_task_blocked_recheck"),
@@ -1831,6 +2077,44 @@ class TestSchemaRevisionSync:
             + "\n\nUse op.create_index(..., if_not_exists=True) or raw SQL "
             "'CREATE INDEX IF NOT EXISTS' for any migration that re-asserts "
             "an index name an earlier migration already created."
+        )
+
+    def test_concurrently_index_migrations_escape_transaction(self):
+        """Any migration issuing CREATE/DROP INDEX CONCURRENTLY (or
+        ``op.create_index(..., postgresql_concurrently=True)``) must first
+        ``op.execute("COMMIT")`` to escape Alembic's per-migration transaction.
+
+        Postgres forbids CONCURRENTLY inside a transaction block, and
+        ``env.py`` sets ``transaction_per_migration=True`` so every migration
+        runs in its own transaction. Without the COMMIT escape the DDL raises
+        on Postgres — yet SQLite (the default test backend) ignores CONCURRENTLY
+        entirely, so the fault is invisible in CI and only surfaces in
+        production. This is exactly the SQLite-masks-Postgres class that shipped
+        broken twice (#14408, #14410) and needed fix-forward commits.
+        """
+        import glob as globmod
+
+        migrations_dir = os.path.join(
+            os.path.dirname(__file__), "..", "alembic", "versions"
+        )
+        files = sorted(globmod.glob(os.path.join(migrations_dir, "[0-9]*.py")))
+        assert files, "No migration files found"
+
+        violations: list[str] = []
+        for path in files:
+            revision = os.path.basename(path).split("_")[0]
+            with open(path) as f:
+                source = f.read()
+            violations.extend(_concurrently_txn_escape_violations(source, revision))
+
+        assert not violations, (
+            "Migration(s) issue CONCURRENTLY index DDL without first escaping "
+            "the per-migration transaction — this raises on Postgres but passes "
+            "silently on SQLite:\n  "
+            + "\n  ".join(sorted(violations))
+            + "\n\nInside the `if bind.dialect.name == \"postgresql\":` branch, "
+            'emit `op.execute("COMMIT")` BEFORE the first CREATE/DROP INDEX '
+            "CONCURRENTLY statement (see alembic 0489 / 0450 for the pattern)."
         )
 
 
@@ -1983,6 +2267,76 @@ class TestChainInvariantSeedFixtures:
         errors = validate_standalone_chain(desync_sources)
         assert any("mismatch" in e for e in errors), (
             f"validate_standalone_chain did not report filename desync; got: {errors}"
+        )
+
+    def test_concurrently_escape_detector_fires_on_seeded_bad_migrations(self):
+        """Prove _concurrently_txn_escape_violations fires on unescaped CONCURRENTLY
+        DDL and stays silent on the correctly-escaped / docstring-only shapes.
+
+        The positive invariant
+        (test_concurrently_index_migrations_escape_transaction) asserts the real
+        chain is clean but never verifies the detector itself fires — so a
+        detector that silently returned [] for everything would pass forever.
+        These seeded in-memory sources (no I/O) self-certify the tooling.
+        """
+        # BAD 1: raw CREATE INDEX CONCURRENTLY with no preceding COMMIT.
+        bad_raw = (
+            "from alembic import op\n"
+            "def upgrade():\n"
+            "    op.execute('CREATE INDEX CONCURRENTLY ix_x ON task (a)')\n"
+        )
+        v = _concurrently_txn_escape_violations(bad_raw, "9001")
+        assert v and "upgrade" in v[0], (
+            f"detector did not flag unescaped raw CONCURRENTLY DDL; got: {v}"
+        )
+
+        # BAD 2: alembic postgresql_concurrently=True kwarg with no COMMIT.
+        bad_kwarg = (
+            "from alembic import op\n"
+            "def upgrade():\n"
+            "    op.create_index('ix_y', 'task', ['b'], postgresql_concurrently=True)\n"
+        )
+        v = _concurrently_txn_escape_violations(bad_kwarg, "9002")
+        assert v, (
+            f"detector did not flag postgresql_concurrently=True without COMMIT; got: {v}"
+        )
+
+        # BAD 3: DROP INDEX CONCURRENTLY in downgrade with no COMMIT.
+        bad_downgrade = (
+            "from alembic import op\n"
+            "def downgrade():\n"
+            "    op.execute('DROP INDEX CONCURRENTLY IF EXISTS ix_z')\n"
+        )
+        v = _concurrently_txn_escape_violations(bad_downgrade, "9003")
+        assert v and "downgrade" in v[0], (
+            f"detector did not flag unescaped DROP INDEX CONCURRENTLY; got: {v}"
+        )
+
+        # GOOD 1: COMMIT precedes the CONCURRENTLY DDL — no violation.
+        good = (
+            "from alembic import op\n"
+            "def upgrade():\n"
+            "    if op.get_bind().dialect.name == 'postgresql':\n"
+            "        op.execute('COMMIT')\n"
+            "        op.execute('CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_x ON task (a)')\n"
+            "    else:\n"
+            "        op.create_index('ix_x', 'task', ['a'])\n"
+        )
+        assert not _concurrently_txn_escape_violations(good, "9004"), (
+            "detector false-positived on correctly COMMIT-escaped CONCURRENTLY DDL"
+        )
+
+        # GOOD 2: CONCURRENTLY mentioned only in a docstring / comment and a plain
+        # (non-CONCURRENTLY) op.execute — the 0273 shape. Must NOT be flagged.
+        docstring_only = (
+            "from alembic import op\n"
+            "def upgrade():\n"
+            "    '''Prod already built this CREATE INDEX CONCURRENTLY in 0117.'''\n"
+            "    # DROP INDEX CONCURRENTLY handled elsewhere\n"
+            "    op.execute('CREATE INDEX IF NOT EXISTS ix_x ON task (a)')\n"
+        )
+        assert not _concurrently_txn_escape_violations(docstring_only, "9005"), (
+            "detector wrongly flagged a docstring/comment-only CONCURRENTLY mention"
         )
 
 
@@ -4670,6 +5024,7 @@ def _find_claude_md() -> str:
         os.path.join(
             os.path.dirname(__file__), "..", "..", "CLAUDE.md"
         ),  # repo root (local dev)
+        "/repo/CLAUDE.md",  # Docker agent VM: /tmp/workspace mounted at /repo
     ]
     for path in candidates:
         if os.path.isfile(path):
@@ -10538,13 +10893,17 @@ def test_get_branch_sha_live_guard_scanner_flags_injected_site():
 # String patch-target resolution invariant
 # ---------------------------------------------------------------------------
 
-def _collect_app_patch_targets(testing_dir: Path) -> dict[str, set[str]]:
-    """Return {filename: {target, ...}} for app.* string patch targets in test files.
+def _iter_app_patch_target_sites(testing_dir: Path) -> list[tuple[str, int, str]]:
+    """Return [(filename, lineno, target), ...] for app.* string patch targets.
+
+    Single source of truth for "where is an ``app.*`` symbol patched" — both the
+    resolution invariant (``test_string_patch_targets_resolve``) and the vacuous-mock
+    invariant (``test_patched_app_symbols_have_production_call_sites``) derive from it.
 
     Excludes patch() calls that carry ``create=True`` — those intentionally
     name attributes that don't exist at module level.
     """
-    result: dict[str, set[str]] = {}
+    sites: list[tuple[str, int, str]] = []
     for py_file in sorted(testing_dir.glob("*.py")):
         try:
             source = py_file.read_text(encoding="utf-8")
@@ -10552,7 +10911,6 @@ def _collect_app_patch_targets(testing_dir: Path) -> dict[str, set[str]]:
         except (SyntaxError, UnicodeDecodeError):
             continue
 
-        targets: set[str] = set()
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
@@ -10583,11 +10941,49 @@ def _collect_app_patch_targets(testing_dir: Path) -> dict[str, set[str]]:
             target = first_arg.value
             # Require at least app.<module>.<attr> (two dots minimum)
             if target.startswith("app.") and "." in target[4:]:
-                targets.add(target)
+                sites.append((py_file.name, node.lineno, target))
+    return sites
 
-        if targets:
-            result[py_file.name] = targets
+
+def _collect_app_patch_targets(testing_dir: Path) -> dict[str, set[str]]:
+    """Return {filename: {target, ...}} for app.* string patch targets in test files."""
+    result: dict[str, set[str]] = {}
+    for filename, _lineno, target in _iter_app_patch_target_sites(testing_dir):
+        result.setdefault(filename, set()).add(target)
     return result
+
+
+@cache
+def _parse_python_file(path: Path) -> "ast.Module | None":
+    """Parse a source file to an AST, memoised. None if unreadable/unparseable.
+
+    The patch-target scans below resolve ~760 targets against a few dozen modules, so an
+    uncached read+parse per target re-parses the same handful of files hundreds of times
+    (measured: 30s of pure re-parsing). Memoising makes the scan ~6.5x faster. Test files
+    do not change mid-session, so the cache is safe for the whole run.
+    """
+    try:
+        return ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    except (SyntaxError, UnicodeDecodeError, OSError):
+        return None
+
+
+@cache
+def _app_module_file(app_dir: Path, module_dotted: str) -> Path | None:
+    """Map a dotted ``app.*`` module path to its file on disk, or None.
+
+    None indicates a "nested import" pattern (e.g. app.storage.storage mapping to
+    google.cloud.storage accessed via app.storage) — not statically checkable.
+    """
+    parts = module_dotted.split(".")
+    base = app_dir.parent  # backend/
+
+    candidate = base.joinpath(*parts).with_suffix(".py")
+    if not candidate.exists():
+        candidate = base.joinpath(*parts, "__init__.py")
+        if not candidate.exists():
+            return None
+    return candidate
 
 
 def _app_module_top_level_names(app_dir: Path, module_dotted: str) -> set[str] | None:
@@ -10599,19 +10995,12 @@ def _app_module_top_level_names(app_dir: Path, module_dotted: str) -> set[str] |
     google.cloud.storage accessed via app.storage) — those are skipped rather
     than flagged.
     """
-    parts = module_dotted.split(".")
-    base = app_dir.parent  # backend/
+    candidate = _app_module_file(app_dir, module_dotted)
+    if candidate is None:
+        return None
 
-    candidate = base.joinpath(*parts).with_suffix(".py")
-    if not candidate.exists():
-        candidate = base.joinpath(*parts, "__init__.py")
-        if not candidate.exists():
-            return None
-
-    try:
-        source = candidate.read_text(encoding="utf-8")
-        tree = ast.parse(source, filename=str(candidate))
-    except (SyntaxError, UnicodeDecodeError):
+    tree = _parse_python_file(candidate)
+    if tree is None:
         return None
 
     names: set[str] = set()
@@ -10713,6 +11102,419 @@ def test_string_patch_target_scanner_self_tests():
         tmpdir_path = Path(tmpdir)
         (tmpdir_path / "test_create.py").write_text(src_create)
         assert _collect_app_patch_targets(tmpdir_path) == {}
+
+
+# ---------------------------------------------------------------------------
+# Vacuous-mock invariant: a patched app.* function production no longer calls
+# ---------------------------------------------------------------------------
+#
+# ``test_string_patch_targets_resolve`` (above) only asserts the patched attribute
+# EXISTS. It is blind to the more damaging half of the same drift: production stops
+# CALLING the symbol (renamed, or moved to a ``_checked``/``_cached`` variant) while a
+# wrapper is left behind for compatibility. The patch still resolves, so nothing errors —
+# the mock just silently does nothing and the test passes vacuously while the REAL code
+# runs, sometimes making live network calls from the test container.
+#
+# This shipped a real bug: rollup_management.py moved to
+# ``get_pull_request_reviews_checked`` while three test helpers kept patching
+# ``get_pull_request_reviews``. The stale mocks went inert, a genuinely rejected PR was
+# downgraded FAILED->CANCELLED, and the suite stayed green.
+
+
+def _app_symbol_kind(
+    app_dir: Path, module_dotted: str, attr: str, _depth: int = 0
+) -> str:
+    """Classify ``module_dotted.attr`` as seen from ``backend/app/``.
+
+    Returns one of: ``function`` | ``class`` | ``data`` | ``module`` | ``thirdparty``
+    | ``absent`` | ``unknown``.
+
+    Follows ``from .x import y`` RE-EXPORTS within ``app`` so that a symbol patched at
+    its re-export path (``app.github.get_pull_request_reviews``) is classified by its
+    real definition (``app.github_pulls``). That hop matters: the re-export is precisely
+    what keeps a stale patch target resolving.
+
+    Only ``function`` is checked for call sites. Classes are excluded (a patched class is
+    normally instantiated, and its name legitimately appears only in annotations or
+    ``isinstance`` checks); constants/data are excluded (they are read, never called).
+    """
+    if _depth > 4:  # pathological import cycle — do not flag on a guess
+        return "unknown"
+    candidate = _app_module_file(app_dir, module_dotted)
+    if candidate is None:
+        return "unknown"
+    tree = _parse_python_file(candidate)
+    if tree is None:
+        return "unknown"
+
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == attr:
+            return "function"
+        if isinstance(node, ast.ClassDef) and node.name == attr:
+            return "class"
+        if isinstance(node, ast.Assign):
+            for tgt in node.targets:
+                for n in ast.walk(tgt):
+                    if isinstance(n, ast.Name) and n.id == attr:
+                        return "data"
+        if (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == attr
+        ):
+            return "data"
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if (alias.asname or alias.name.split(".")[0]) == attr:
+                    return "module"
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if (alias.asname or alias.name) != attr:
+                    continue
+                if node.level:  # relative: resolve against the importing package
+                    pkg = module_dotted.split(".")
+                    if candidate.name != "__init__.py":
+                        pkg = pkg[:-1]
+                    up = node.level - 1
+                    if up:
+                        pkg = pkg[: len(pkg) - up] if up < len(pkg) else []
+                    source_mod = ".".join(pkg + ([node.module] if node.module else []))
+                else:
+                    source_mod = node.module or ""
+                if not source_mod.startswith("app"):
+                    return "thirdparty"  # e.g. `from httpx import AsyncClient`
+                return _app_symbol_kind(app_dir, source_mod, alias.name, _depth + 1)
+    return "absent"  # caught by test_string_patch_targets_resolve, not here
+
+
+def _referenced_symbol_names(roots: "tuple[Path, ...]") -> set[str]:
+    """The set of every symbol name REFERENCED anywhere under ``roots``.
+
+    A reference means the in-process code under test still routes through the symbol, so
+    a mock on it is live. All of these count — anything narrower makes the guard fire on
+    healthy code:
+
+      * bare call ................. ``symbol(...)``
+      * module-attribute call ..... ``_gh.symbol(...)``, ``self.symbol(...)``
+      * dynamic lookup ............ ``getattr(mod, "symbol")``
+      * function-as-value ......... ``asyncio.to_thread(symbol, ...)``,
+                                    ``background_tasks.add_task(symbol, ...)``,
+                                    ``partial(symbol, ...)``, default args, dispatch
+                                    tables, decorators, ``Depends(symbol)``
+      * attribute load ............ ``mod.symbol`` stored in a table
+
+    Deliberately NOT counted — each is exactly what leaves a stale patch target
+    resolving while nothing actually calls it:
+
+      * the ``def`` / ``class`` statement that DEFINES the symbol
+      * ``import`` / ``from ... import`` aliases — a re-export is not a call
+      * string constants (``__all__`` entries)
+
+    A SET of names, not a map to locations: a flagged symbol has zero references by
+    definition, so per-site locations could never appear in a failure message. Building
+    350k location strings nobody reads is the compute-a-reason-and-discard-it pattern
+    this repo keeps getting burned by — so we do not build them.
+
+    Keyed by bare name, not by qualified path. A same-named symbol anywhere under
+    ``roots`` suppresses the finding: this guard fails toward silence, never toward a
+    false accusation. The cost is that patching the WRONG module path
+    (``patch("app.foo.bar")`` while production calls ``app.baz.bar``) is NOT caught —
+    the name is referenced, just not there.
+    """
+    names: set[str] = set()
+    for root in roots:
+        for py_file in sorted(root.rglob("*.py")):
+            tree = _parse_python_file(py_file)
+            if tree is None:
+                continue
+            for node in ast.walk(tree):
+                # ast.walk visits a Call's `func` child, so `symbol(...)` and
+                # `mod.symbol(...)` are both captured by the Load branches below.
+                if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                    names.add(node.id)
+                elif isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load):
+                    names.add(node.attr)
+                elif (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "getattr"
+                    and len(node.args) >= 2
+                    and isinstance(node.args[1], ast.Constant)
+                    and isinstance(node.args[1].value, str)
+                ):
+                    names.add(node.args[1].value)
+    return names
+
+
+def _production_reference_roots(backend_dir: Path) -> "tuple[Path, ...]":
+    """Trees whose code a pytest mock can actually intercept — i.e. code the suite drives
+    IN-PROCESS.
+
+    ``app/`` is the obvious one. ``alembic/versions/`` and ``scripts/`` are here because
+    ``backend/testing/test_migration_*.py`` IMPORT and drive them in-process (e.g.
+    ``0472_encrypt_oauth_token.upgrade()`` calls ``app.field_encryption.encrypt_field``),
+    so a patch on a symbol they call IS live and must not be reported as vacuous.
+
+    NOT here, deliberately: ``agent/`` and the repo-root runner scripts. Those execute in
+    a SEPARATE process, so an in-process pytest patch on a symbol only they call is still
+    inert — exactly the finding this guard should surface.
+    """
+    return tuple(
+        d
+        for d in (
+            backend_dir / "app",
+            backend_dir / "alembic",
+            backend_dir / "scripts",
+        )
+        if d.is_dir()
+    )
+
+
+# app.* FUNCTIONS that are patched in backend/testing/ but have NO call site in any
+# in-process production tree — and are nonetheless legitimate. Each entry needs a REASON:
+# an escape hatch without one decays into a blanket suppression (enforced below).
+#
+# Legitimate reasons look like: the symbol is invoked only through dynamic dispatch this
+# AST scan cannot see (importlib, entry points, `getattr(mod, name_variable)`).
+#
+# NOT a legitimate reason: "the test would fail if I repointed it." That is the bug this
+# invariant exists to surface — the mock is inert and the assertions never ran against
+# the code path they name. Repoint the patch to the symbol production actually calls.
+#
+# Also not needed here: symbols called from alembic/versions/ or backend/scripts/. The
+# suite drives those IN-PROCESS, so patches on them are live and never flagged — see
+# _production_reference_roots. (A symbol called only from `agent/` or a repo-root runner
+# script IS still a finding: that code runs in another process, so the mock cannot reach
+# it. Delete the dead patch line; the symbol itself may well stay.)
+_VACUOUS_MOCK_ALLOWLIST: "dict[str, str]" = {
+    # (empty — the tree is clean as of this invariant landing; see the docstring above
+    # for what qualifies before you add anything here)
+}
+
+
+def _find_vacuous_mocks(
+    testing_dir: Path,
+    app_dir: Path,
+    reference_roots: "tuple[Path, ...]",
+    allowlist: "dict[str, str]",
+) -> list[str]:
+    """Return one formatted finding per patched app.* function nothing in-process calls.
+
+    The WHOLE body of the invariant lives here so the self-test can drive the real
+    decision path — the kind-skip, the allowlist-skip and the message — over a synthetic
+    tree. A guard whose skips are only exercised by the tree it is scanning can be
+    silently neutered (flip one comparison and it never fires again) while its self-test
+    stays green: that is precisely the bug class this invariant exists to catch, and it
+    must not be reproduced inside it.
+    """
+    sites_by_target: dict[str, list[str]] = {}
+    for filename, lineno, target in _iter_app_patch_target_sites(testing_dir):
+        sites_by_target.setdefault(target, []).append(f"{filename}:{lineno}")
+
+    referenced = _referenced_symbol_names(reference_roots)
+
+    findings: list[str] = []
+    for target, sites in sorted(sites_by_target.items()):
+        module_dotted, _, attr = target.rpartition(".")
+        if _app_symbol_kind(app_dir, module_dotted, attr) != "function":
+            continue  # classes/constants are read, never called — out of scope
+        if attr in referenced:
+            continue  # production still routes through it — the mock is live
+        if target in allowlist:
+            continue
+        findings.append(
+            f"  {target}\n"
+            f"      patched at: {', '.join(sorted(sites))}\n"
+            f"      production no longer calls this — the mock is INERT and the "
+            f"test is VACUOUS."
+        )
+    return findings
+
+
+def test_patched_app_symbols_have_production_call_sites():
+    """A patched ``app.*`` function that production never calls is an INERT mock.
+
+    The test that patches it passes vacuously: the mock is never consulted, and the real
+    code runs underneath (up to and including live network calls from the test
+    container). ``test_string_patch_targets_resolve`` cannot see this — a leftover
+    compatibility wrapper satisfies its "attribute exists" check forever.
+
+    Scope is deliberately narrow so the signal stays trustworthy: only symbols that
+    resolve to a top-level ``def``/``async def`` (following re-exports), and only when
+    the name appears NOWHERE in the in-process production trees outside its own
+    definition and import re-exports. Classes, constants, and dynamically-dispatched
+    symbols are excluded rather than guessed at.
+    """
+    testing_dir = Path(__file__).resolve().parent
+    backend_dir = Path(__file__).resolve().parents[1]
+    app_dir = backend_dir / "app"
+
+    assert all(reason.strip() for reason in _VACUOUS_MOCK_ALLOWLIST.values()), (
+        "Every _VACUOUS_MOCK_ALLOWLIST entry must carry a REASON. An escape hatch "
+        "without one decays into a blanket suppression: "
+        + ", ".join(
+            sorted(t for t, r in _VACUOUS_MOCK_ALLOWLIST.items() if not r.strip())
+        )
+    )
+
+    failures = _find_vacuous_mocks(
+        testing_dir,
+        app_dir,
+        _production_reference_roots(backend_dir),
+        _VACUOUS_MOCK_ALLOWLIST,
+    )
+
+    assert not failures, (
+        f"Vacuous mock(s): patched app.* function with ZERO call sites in production "
+        f"({len(failures)} offender(s)):\n"
+        + "\n".join(failures)
+        + "\n\nThe patch still RESOLVES (the symbol exists), so nothing errors — but "
+        "nothing production runs in-process calls it, so the mock never fires and the "
+        "real code runs underneath the assertions.\n"
+        "Fix (in order of preference):\n"
+        "  1. Repoint the patch at the symbol production actually calls — usually a "
+        "renamed or `_checked`/`_cached` variant of the same function. If the test then "
+        "FAILS, that failure is real and the inert mock was hiding it.\n"
+        "  2. If production reads that value from somewhere else entirely, delete the "
+        "dead patch line — it neutralises nothing.\n"
+        "  3. If the symbol is genuinely reached by dynamic dispatch this AST scan "
+        "cannot see, add it to _VACUOUS_MOCK_ALLOWLIST **with a reason**."
+    )
+
+
+def test_vacuous_mock_guard_scanner_self_tests():
+    """The vacuous-mock guard must flag a dead patch target and must NOT flag live ones.
+
+    Guards the guard, END-TO-END: this drives ``_find_vacuous_mocks`` — the real decision
+    path, including the kind-skip, the allowlist-skip and the message — over a synthetic
+    tree. Exercising only the helpers would leave the skips unpinned, so flipping one
+    comparison (``!= "function"`` -> ``!= "nonexistent"``) would silently neuter the guard
+    forever while this test stayed green. That is exactly the bug class this invariant
+    exists to catch; it must not be reproduced inside it.
+
+    Both directions are pinned: the true positive (zero call sites) AND every
+    false-positive shape that would otherwise get the guard disabled as noisy.
+    """
+    import tempfile
+    import textwrap
+
+    app_src = textwrap.dedent('''
+        from .other import reexported_only
+
+        CONFIG_FLAG = True
+        UNUSED_FLAG = True          # constant, referenced nowhere
+
+        class Widget:
+            pass
+
+        class Unused:               # class, referenced nowhere
+            pass
+
+        def dead_wrapper(x):
+            """Nothing in app/ calls this — the trap."""
+            return checked(x)
+
+        def checked(x):
+            return x
+
+        def via_attr(x):
+            return x
+
+        def via_getattr(x):
+            return x
+
+        def via_value(x):
+            return x
+
+        def caller():
+            _mod.via_attr(1)
+            getattr(_mod, "via_getattr")
+            asyncio.to_thread(via_value, 1)
+            reexported_only()
+            Widget()
+            return CONFIG_FLAG
+    ''')
+
+    # Patches every shape at once: the trap, the four live shapes, and an unreferenced
+    # class + constant (which must be skipped on KIND, not on reference).
+    test_src = textwrap.dedent('''
+        def test_synthetic(mocker):
+            mocker.patch("app.svc.dead_wrapper")
+            mocker.patch("app.svc.checked")
+            mocker.patch("app.svc.via_attr")
+            mocker.patch("app.svc.via_getattr")
+            mocker.patch("app.svc.via_value")
+            mocker.patch("app.svc.reexported_only")
+            mocker.patch("app.svc.Unused")
+            mocker.patch("app.svc.UNUSED_FLAG")
+    ''')
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        app_dir = root / "app"
+        app_dir.mkdir()
+        testing_dir = root / "testing"
+        testing_dir.mkdir()
+        (app_dir / "svc.py").write_text(app_src)
+        (app_dir / "other.py").write_text("def reexported_only():\n    return 1\n")
+        (testing_dir / "test_synth.py").write_text(test_src)
+
+        roots = (app_dir,)
+        findings = _find_vacuous_mocks(testing_dir, app_dir, roots, {})
+
+        # ── TRUE POSITIVE ────────────────────────────────────────────────────────────
+        # Exactly one: `dead_wrapper` is defined, re-exported, and called by nothing.
+        # `reexported_only` is patched at its RE-EXPORT path (app.svc, not app.other) and
+        # IS called — the shape of every `patch("app.github.*")` in the suite. It must
+        # resolve through the hop and stay unflagged.
+        assert len(findings) == 1, (
+            "Guard is VACUOUS or NOISY end-to-end. Expected exactly one finding "
+            f"(app.svc.dead_wrapper); got {len(findings)}:\n" + "\n".join(findings)
+        )
+        assert "app.svc.dead_wrapper" in findings[0]
+        assert "test_synth.py:3" in findings[0], (  # line 1 blank, 2 = def, 3 = patch
+            "The finding must NAME the patch site — a gate that fails without saying "
+            f"WHERE is not actionable. Got: {findings[0]}"
+        )
+        assert "INERT" in findings[0] and "VACUOUS" in findings[0]
+
+        # ── ALLOWLIST SKIP ───────────────────────────────────────────────────────────
+        assert not _find_vacuous_mocks(
+            testing_dir, app_dir, roots, {"app.svc.dead_wrapper": "documented reason"}
+        ), "An allowlisted target must be suppressed."
+
+        # ── FALSE-POSITIVE SHAPES ────────────────────────────────────────────────────
+        # None of these may appear in ANY finding: each is a live call shape, and a guard
+        # that fires on them gets disabled by the next engineer. The `len == 1` assertion
+        # above already proves it; this names them so a regression says WHICH shape broke.
+        referenced = _referenced_symbol_names(roots)
+        for symbol, shape in (
+            ("checked", "bare call"),
+            ("via_attr", "module-attribute call `_mod.via_attr(...)`"),
+            ("via_getattr", 'dynamic `getattr(_mod, "via_getattr")`'),
+            ("via_value", "function-as-value `asyncio.to_thread(via_value, ...)`"),
+        ):
+            assert symbol in referenced, (
+                f"Guard is NOISY: '{symbol}' is called in app/ via {shape} but the "
+                "reference scan missed it. This would fire on healthy code and get "
+                "the invariant disabled."
+            )
+        # An import alias must NOT count as a reference — a re-export is not a call.
+        assert "dead_wrapper" not in referenced, (
+            "Guard is vacuous: 'dead_wrapper' has no call site in app/ but the "
+            "reference scan reported one."
+        )
+
+        # ── KIND SKIP ────────────────────────────────────────────────────────────────
+        # `Unused` / `UNUSED_FLAG` are patched and referenced NOWHERE — they survive only
+        # because they are not functions. This pins the kind-skip itself: delete it and
+        # they become findings (breaking `len == 1` above).
+        assert "Unused" not in referenced and "UNUSED_FLAG" not in referenced
+        assert _app_symbol_kind(app_dir, "app.svc", "Unused") == "class"
+        assert _app_symbol_kind(app_dir, "app.svc", "UNUSED_FLAG") == "data"
+        assert _app_symbol_kind(app_dir, "app.svc", "dead_wrapper") == "function"
+        # Re-export hop: classified by its real definition, not by the import alias.
+        assert _app_symbol_kind(app_dir, "app.svc", "reexported_only") == "function"
 
 
 # Redundant ``create=True`` patches currently in the suite (target already exists
@@ -11638,329 +12440,6 @@ def test_v22_live_verification_evidence_wired_in_sweep():
         "_sweep_v22_finding_backfill in release_readiness.py. "
         "The live-verification evidence backfill is effectively disabled — "
         "restore the call site."
-    )
-
-
-def test_all_autocomplete_paths_gate_on_criterion_coverage():
-    """All direction auto-complete paths must gate on criterion coverage.
-
-    Regression guard: a direction that owns an uncovered acceptance criterion
-    must not auto-complete through any path — exhaustion (saturated / dedup
-    deadlock / already-fixed deadlock) or proven-merge (>=3 verified merges).
-    This invariant verifies structurally that every auto-complete code path in
-    research_direction_state.py checks ``direction_owns_uncovered_criterion``
-    before retiring a direction.
-
-    The module-level frozenset ``_AUTOCOMPLETE_PATHS_GATED_ON_CRITERION_COVERAGE``
-    declares the gated paths. Removing the gate from either function, or removing
-    the frozenset declaration, causes this test to fail.
-    """
-    import ast
-    from pathlib import Path
-
-    rds_path = Path(__file__).resolve().parents[1] / "app" / "research_direction_state.py"
-    source = rds_path.read_text(encoding="utf-8")
-    tree = ast.parse(source, filename=str(rds_path))
-
-    gate_func_name = "direction_owns_uncovered_criterion"
-
-    # ── 1. Verify the module-level frozenset declaration exists ───────────
-    frozenset_found = False
-    frozenset_entries: set[str] = set()
-    for stmt in ast.iter_child_nodes(tree):
-        target_name: str | None = None
-        value_node: ast.expr | None = None
-        if isinstance(stmt, ast.Assign):
-            for t in stmt.targets:
-                if isinstance(t, ast.Name) and t.id == "_AUTOCOMPLETE_PATHS_GATED_ON_CRITERION_COVERAGE":
-                    target_name = t.id
-                    value_node = stmt.value
-                    break
-        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
-            if stmt.target.id == "_AUTOCOMPLETE_PATHS_GATED_ON_CRITERION_COVERAGE":
-                target_name = stmt.target.id
-                value_node = stmt.value
-        if target_name is None:
-            continue
-        frozenset_found = True
-        # Extract the declared path names from the frozenset literal
-        if isinstance(value_node, ast.Call):
-            # frozenset({...}) or frozenset([...])
-            if isinstance(value_node.func, ast.Name) and value_node.func.id == "frozenset":
-                container = value_node.args[0] if value_node.args else None
-                if isinstance(container, (ast.Set, ast.List, ast.Tuple)):
-                    for elt in container.elts:
-                        if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
-                            frozenset_entries.add(elt.value)
-        break
-
-    assert frozenset_found, (
-        "_AUTOCOMPLETE_PATHS_GATED_ON_CRITERION_COVERAGE frozenset is missing from "
-        "research_direction_state.py. This constant declares which auto-complete paths "
-        "are criterion-gated. Restore it."
-    )
-    assert frozenset_entries >= {
-        "exhaustion",
-        "proven_merge",
-        "no_findings",
-        "strategist_retire",
-    }, (
-        f"_AUTOCOMPLETE_PATHS_GATED_ON_CRITERION_COVERAGE must contain at least "
-        f"{{'exhaustion', 'proven_merge', 'no_findings', 'strategist_retire'}}; "
-        f"found {frozenset_entries}. Restore the missing entries."
-    )
-
-    # ── 1b. Verify the criterion key constant that gates all paths ─────────
-    # This establishes that c-560ec27e is the unique criterion key whose
-    # coverage status gates every auto-complete path. Direction d-12f7d408
-    # carries this key; any direction owning an uncovered c-560ec27e criterion
-    # is blocked from retiring through any of the four gated paths.
-    _criterion_key_found = False
-    _criterion_key_value: str | None = None
-    for stmt in ast.iter_child_nodes(tree):
-        target_name: str | None = None
-        value_node: ast.expr | None = None
-        if isinstance(stmt, ast.Assign):
-            for t in stmt.targets:
-                if isinstance(t, ast.Name) and t.id == "_CRITERION_COVERAGE_GATE_KEY":
-                    target_name = t.id
-                    value_node = stmt.value
-                    break
-        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
-            if stmt.target.id == "_CRITERION_COVERAGE_GATE_KEY":
-                target_name = stmt.target.id
-                value_node = stmt.value
-        if target_name is None:
-            continue
-        _criterion_key_found = True
-        if isinstance(value_node, ast.Constant) and isinstance(value_node.value, str):
-            _criterion_key_value = value_node.value
-        break
-
-    assert _criterion_key_found, (
-        "_CRITERION_COVERAGE_GATE_KEY is missing from "
-        "research_direction_state.py. This constant declares which criterion "
-        "key gates the autocomplete paths."
-    )
-    assert _criterion_key_value == "c-560ec27e", (
-        f"_CRITERION_COVERAGE_GATE_KEY expected 'c-560ec27e', got "
-        f"{_criterion_key_value!r}"
-    )
-
-    # ── 2. Verify exhaustion path: _maybe_autocomplete_exhausted_direction ─
-    exhaustion_func: ast.AsyncFunctionDef | None = None
-    for node in ast.walk(tree):
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_maybe_autocomplete_exhausted_direction":
-            exhaustion_func = node
-            break
-
-    assert exhaustion_func is not None, (
-        "_maybe_autocomplete_exhausted_direction not found in research_direction_state.py"
-    )
-
-    exhaustion_gated = False
-    for node in ast.walk(exhaustion_func):
-        if isinstance(node, ast.Await) and isinstance(node.value, ast.Call):
-            if _ast_called_name(node.value) == gate_func_name:
-                exhaustion_gated = True
-                break
-        if isinstance(node, ast.Call) and _ast_called_name(node) == gate_func_name:
-            exhaustion_gated = True
-            break
-
-    assert exhaustion_gated, (
-        "_maybe_autocomplete_exhausted_direction does not call "
-        "direction_owns_uncovered_criterion. The exhaustion auto-complete path "
-        "(saturated / dedup-deadlock / already-fixed-deadlock) must gate on "
-        "criterion coverage before retiring a direction."
-    )
-
-    # ── 3. Verify proven-merge path: apply_post_spawn_state ───────────────
-    proven_func: ast.AsyncFunctionDef | None = None
-    for node in ast.walk(tree):
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == "apply_post_spawn_state":
-            proven_func = node
-            break
-
-    assert proven_func is not None, (
-        "apply_post_spawn_state not found in research_direction_state.py"
-    )
-
-    proven_gated = False
-    for node in ast.walk(proven_func):
-        if isinstance(node, ast.Call) and _ast_called_name(node) == gate_func_name:
-            proven_gated = True
-            break
-        if isinstance(node, ast.Await) and isinstance(node.value, ast.Call):
-            if _ast_called_name(node.value) == gate_func_name:
-                proven_gated = True
-                break
-
-    assert proven_gated, (
-        "apply_post_spawn_state does not call direction_owns_uncovered_criterion. "
-        "The proven-merge auto-complete path must gate on criterion coverage before "
-        "retiring a direction."
-    )
-
-    # ── 4. Verify research_completion.py auto-complete paths ──────────────
-    rc_path = Path(__file__).resolve().parents[1] / "app" / "research_completion.py"
-    rc_source = rc_path.read_text(encoding="utf-8")
-    rc_tree = ast.parse(rc_source, filename=str(rc_path))
-
-    # 4a. Verify the module-level frozenset declaration exists
-    rc_frozenset_found = False
-    rc_frozenset_entries: set[str] = set()
-    for stmt in ast.iter_child_nodes(rc_tree):
-        target_name: str | None = None
-        value_node: ast.expr | None = None
-        if isinstance(stmt, ast.Assign):
-            for t in stmt.targets:
-                if isinstance(t, ast.Name) and t.id == "_AUTOCOMPLETE_PATHS_GATED_ON_CRITERION_COVERAGE":
-                    target_name = t.id
-                    value_node = stmt.value
-                    break
-        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
-            if stmt.target.id == "_AUTOCOMPLETE_PATHS_GATED_ON_CRITERION_COVERAGE":
-                target_name = stmt.target.id
-                value_node = stmt.value
-        if target_name is None:
-            continue
-        rc_frozenset_found = True
-        if isinstance(value_node, ast.Call):
-            if isinstance(value_node.func, ast.Name) and value_node.func.id == "frozenset":
-                container = value_node.args[0] if value_node.args else None
-                if isinstance(container, (ast.Set, ast.List, ast.Tuple)):
-                    for elt in container.elts:
-                        if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
-                            rc_frozenset_entries.add(elt.value)
-        break
-
-    assert rc_frozenset_found, (
-        "_AUTOCOMPLETE_PATHS_GATED_ON_CRITERION_COVERAGE frozenset is missing from "
-        "research_completion.py. This constant declares which auto-complete paths "
-        "are criterion-gated in _stamp_no_findings_refractory. Restore it."
-    )
-    assert rc_frozenset_entries >= {
-        "exhaustion",
-        "proven_merge",
-        "no_findings",
-        "strategist_retire",
-    }, (
-        f"_AUTOCOMPLETE_PATHS_GATED_ON_CRITERION_COVERAGE in research_completion.py "
-        f"must contain at least "
-        f"{{'exhaustion', 'proven_merge', 'no_findings', 'strategist_retire'}}; "
-        f"found {rc_frozenset_entries}. Restore the missing entries."
-    )
-
-    # 4b. Verify _stamp_no_findings_refractory calls the gate function
-    snfr_func: ast.AsyncFunctionDef | None = None
-    for node in ast.walk(rc_tree):
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_stamp_no_findings_refractory":
-            snfr_func = node
-            break
-
-    assert snfr_func is not None, (
-        "_stamp_no_findings_refractory not found in research_completion.py"
-    )
-
-    snfr_gated = False
-    for node in ast.walk(snfr_func):
-        if isinstance(node, ast.Call) and _ast_called_name(node) == gate_func_name:
-            snfr_gated = True
-            break
-        if isinstance(node, ast.Await) and isinstance(node.value, ast.Call):
-            if _ast_called_name(node.value) == gate_func_name:
-                snfr_gated = True
-                break
-
-    assert snfr_gated, (
-        "_stamp_no_findings_refractory does not call "
-        "direction_owns_uncovered_criterion. The proven-merge and exhaustion "
-        "auto-complete paths in research_completion.py must gate on criterion "
-        "coverage before retiring a direction."
-    )
-
-    # ── 5. Verify strategist retire path: _handle_strategic_completion ──────
-    sc_path = Path(__file__).resolve().parents[1] / "app" / "strategic_completion.py"
-    sc_source = sc_path.read_text(encoding="utf-8")
-    sc_tree = ast.parse(sc_source, filename=str(sc_path))
-
-    handler_func: ast.AsyncFunctionDef | None = None
-    for node in ast.walk(sc_tree):
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_handle_strategic_completion":
-            handler_func = node
-            break
-
-    assert handler_func is not None, (
-        "_handle_strategic_completion not found in strategic_completion.py"
-    )
-
-    handler_gated = False
-    for node in ast.walk(handler_func):
-        if isinstance(node, ast.Call) and _ast_called_name(node) == gate_func_name:
-            handler_gated = True
-            break
-        if isinstance(node, ast.Await) and isinstance(node.value, ast.Call):
-            if _ast_called_name(node.value) == gate_func_name:
-                handler_gated = True
-                break
-
-    assert handler_gated, (
-        "_handle_strategic_completion does not call direction_owns_uncovered_criterion. "
-        "The strategist-authored retire_direction path must gate on criterion "
-        "coverage before retiring a direction."
-    )
-
-
-def test_retire_direction_op_gates_on_criterion_coverage():
-    """The retire_direction op in strategic_completion.py must gate on criterion coverage.
-
-    Regression guard: the retire_direction handler in
-    ``_handle_strategic_completion`` must call
-    ``direction_owns_uncovered_criterion`` before setting a direction's
-    status to ``"retired"``.  This is the strategist-authored retirement
-    path (distinct from the exhaust / proven-merge auto-complete paths
-    already covered by
-    ``test_all_autocomplete_paths_gate_on_criterion_coverage``).
-
-    Removing the gate from ``_handle_strategic_completion`` causes this
-    test to fail.
-    """
-    import ast
-    from pathlib import Path
-
-    sc_path = Path(__file__).resolve().parents[1] / "app" / "strategic_completion.py"
-    source = sc_path.read_text(encoding="utf-8")
-    tree = ast.parse(source, filename=str(sc_path))
-
-    gate_func_name = "direction_owns_uncovered_criterion"
-
-    # ── 1. Find _handle_strategic_completion ─────────────────────────────
-    handler_func: ast.AsyncFunctionDef | None = None
-    for node in ast.walk(tree):
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_handle_strategic_completion":
-            handler_func = node
-            break
-
-    assert handler_func is not None, (
-        "_handle_strategic_completion not found in strategic_completion.py"
-    )
-
-    # ── 2. Verify it calls direction_owns_uncovered_criterion ────────────
-    handler_gated = False
-    for node in ast.walk(handler_func):
-        if isinstance(node, ast.Call) and _ast_called_name(node) == gate_func_name:
-            handler_gated = True
-            break
-        if isinstance(node, ast.Await) and isinstance(node.value, ast.Call):
-            if _ast_called_name(node.value) == gate_func_name:
-                handler_gated = True
-                break
-
-    assert handler_gated, (
-        "_handle_strategic_completion does not call direction_owns_uncovered_criterion. "
-        "The retire_direction op must gate on criterion coverage before retiring a "
-        "direction."
     )
 
 

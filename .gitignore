@@ -54,3 +54,4 @@ research-*.md
 
 # Local git worktrees spawned by Claude Code — never commit as gitlinks
 .claude/worktrees/
+.claude/bin/

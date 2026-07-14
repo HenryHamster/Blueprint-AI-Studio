@@ -21,6 +21,7 @@ from app.models import (
 )
 from app import strategic_cycle
 from app.shared_state import runtime_config
+from app.strategic_constants import STATUS_LATEST_MESSAGE_MAX
 from app.strategic_resident_session import (
     RESIDENT_SESSION_REASON_CYCLE_IN_FLIGHT,
     RESIDENT_SESSION_REASON_RUNNER_OFFLINE,
@@ -120,7 +121,13 @@ def _task_summary(task: Task | None) -> Dict[str, Any] | None:
         "status": _enum_value(task.status),
         "title": task.title,
         "task_type": payload.get("type"),
-        "latest_status_message": task.latest_status_message,
+        # Enforce the declared STATUS_LATEST_MESSAGE_MAX cap on the primary
+        # status message this projection surfaces (the sibling _task_focus_item
+        # already compacts the same field; this exposure was previously
+        # unbounded).
+        "latest_status_message": _compact_text(
+            task.latest_status_message, max_chars=STATUS_LATEST_MESSAGE_MAX
+        ),
         "started_at": task.started_at.isoformat() if task.started_at else None,
         "created_at": task.created_at.isoformat() if task.created_at else None,
     }
@@ -218,6 +225,9 @@ async def _task_focus_bucket(
             select(func.count()).select_from(Task).where(*base_filters)
         )
         total = count_result.scalar() or 0
+    total = int(total)
+    if total == 0:
+        return {"total": 0, "limit": limit, "has_more": False, "items": []}
     rows_result = await session.execute(
         select(Task, task_type_expr, direction_id_expr)
         .where(*base_filters)
@@ -245,7 +255,6 @@ async def _task_focus_bucket(
         .order_by(*order_by)
         .limit(limit)
     )
-    total = int(total)
     rows = rows_result.all()
     return {
         "total": total,

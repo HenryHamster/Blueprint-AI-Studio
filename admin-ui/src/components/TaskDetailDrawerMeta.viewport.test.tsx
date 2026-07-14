@@ -17,7 +17,10 @@ vi.mock('../api', () => ({
   authGet: vi.fn(async () => new Response(JSON.stringify({ stats: {} }), { status: 200 })),
   apiFetch: vi.fn(async () => new Response(JSON.stringify({ task_id: 'task-1', fix_loop_history: {}, summary: {} }), { status: 200 })),
   API_BASE_URL: 'http://localhost:8000',
-  fetchComputeJobs: vi.fn(async () => []),
+  // fetchComputeJobs returns a ComputeJobsListResponse ({ jobs, has_more }), NOT a
+  // bare array. Mocking it as [] made `result.jobs` undefined, so the component set
+  // jobs=undefined and threw on `jobs.length` — killing the whole drawer.
+  fetchComputeJobs: vi.fn(async () => ({ jobs: [], has_more: false })),
   fetchKnowledgeDocument: vi.fn(async () => ({ id: 'doc-1', body: '# Full body\n\nDetailed markdown.' })),
   resolveArtifactDownloadUrl: vi.fn(async () => 'https://signed.example.com/tasks/task-1/result.json'),
   resolveViewportFailureDownloadUrl: vi.fn(async () => 'https://signed.example.com/viewport/screenshot.png'),

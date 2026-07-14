@@ -835,7 +835,7 @@ describe('useLogViewer strategist events', () => {
     const refreshStrategicReadModel = result.current.refreshStrategicReadModelRef.current as ReturnType<typeof vi.fn>;
     const refreshMessages = result.current.refreshMessagesRef.current as ReturnType<typeof vi.fn>;
 
-    for (const eventName of ['message_created', 'message_updated']) {
+    for (const eventName of ['message_created', 'message_updated', 'messages_superseded']) {
       refreshStrategicReadModel.mockClear();
       refreshMessages.mockClear();
 
@@ -889,6 +889,7 @@ describe('useLogViewer strategist events', () => {
       'alert_dismissed',
       'message_created',
       'message_updated',
+      'messages_superseded',
       'strategic_updated',
       'strategic_cycle_started',
       'strategic_cycle_completed',

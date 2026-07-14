@@ -526,3 +526,72 @@ def missing_demand_prompt_hint(
             f"(+{total - len(lines)} more — full list in missing_capability_demand)"
         )
     return "\n".join(parts)
+
+
+def compute_unproven_demanded_capabilities(
+    demand_result: dict[str, Any] | None,
+    problem_model: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Return demand entries whose capability is both demanded AND unproven-working.
+
+    Computes the intersection of two sets:
+
+      * **Demanded capabilities** from ``demand_result`` (the output of
+        :func:`collect_missing_capability_demand`): capability-kind demands whose
+        ``ref`` normalizes to a canonical name.
+
+      * **Unproven working capabilities** from ``problem_model``: capabilities
+        declared ``working`` whose :func:`working_capability_proof_status` returns
+        an evidence status other than ``"proven"`` (i.e. ``unproven`` / ``partial``
+        / ``unverified`` / ``contradicted``).
+
+    Each returned demand entry is enriched with the additional key
+    ``"proof_status"`` so the caller (the earning loop, the reaper sweep, or the
+    advisory hint builder) can see exactly what evidence gap remains.
+
+    Returns ``[]`` when either input is empty or absent — never raises.
+    """
+    from app.capability_registry import (
+        normalize_capability_name,
+        working_capability_proof_status,
+    )
+
+    if not demand_result:
+        return []
+    demands = demand_result.get("demands") or []
+    if not demands or not isinstance(problem_model, dict):
+        return []
+
+    # Build the proof-status map for working capabilities only.
+    proof_by_name = working_capability_proof_status(problem_model)
+    if not proof_by_name:
+        return []
+
+    # Unproven working capabilities: evidence status is anything other than
+    # "proven" (unproven / partial / unverified / contradicted).
+    unproven_working: set[str] = {
+        name
+        for name, status in proof_by_name.items()
+        if status != "proven"
+    }
+    if not unproven_working:
+        return []
+
+    result: list[dict[str, Any]] = []
+    seen_refs: set[str] = set()
+    for entry in demands:
+        kind = entry.get("kind")
+        if kind != "capability":
+            continue
+        raw_ref = entry.get("ref")
+        canonical = normalize_capability_name(raw_ref)
+        if canonical is None or canonical not in unproven_working:
+            continue
+        if canonical in seen_refs:
+            continue
+        seen_refs.add(canonical)
+        enriched = dict(entry)
+        enriched["proof_status"] = proof_by_name[canonical]
+        result.append(enriched)
+
+    return result

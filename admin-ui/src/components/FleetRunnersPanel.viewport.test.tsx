@@ -28,6 +28,16 @@ const SAMPLE_RUNNERS: FleetRunner[] = [
       agent_backend: 'bwrap',
       compute_backend: 'docker',
     },
+    // Live-config block so the per-job GPU count + task-type allowlist editors
+    // render in the acceptance-evidence capture at 1280px.
+    config: {
+      config_generation: 'gen-abc',
+      applied_config_generation: 'gen-abc',
+      config_pending: false,
+      gpu_indices_allowed: 'all',
+      gpus_per_job: 2,
+      desired: { task_types: 'all' },
+    },
     last_seen_at: new Date(Date.now() - 30_000).toISOString(),
     created_at: '2026-06-01T00:00:00Z',
   },
@@ -43,22 +53,25 @@ const SAMPLE_RUNNERS: FleetRunner[] = [
   },
 ];
 
-vi.mock('../api', () => ({
-  // FleetRunnersPanel now imports API_BASE_URL for the copy-paste runner
-  // registration snippet; the mock must provide it or the browser-mode ESM
-  // import fails with "does not provide an export named 'API_BASE_URL'".
-  // Empty string mirrors the production default (VITE_API_URL || '') so the
-  // component falls back to window.location.origin, as it does in same-origin dev.
-  API_BASE_URL: '',
-  listFleetRunners: vi.fn(async () => SAMPLE_RUNNERS),
-  registerFleetRunner: vi.fn(async () => ({ runner_id: 'runner-new', token: 'tok-secret' })),
-  revokeFleetRunner: vi.fn(async () => {}),
-  // FleetRunnersPanel also statically imports rotateFleetRunnerToken for the
-  // per-runner token-rotation action; browser-mode ESM requires the mock factory
-  // to expose it or the linker fails at import time with "does not provide an
-  // export named 'rotateFleetRunnerToken'".
-  rotateFleetRunnerToken: vi.fn(async () => ({ runner_id: 'runner-abc123', token: 'tok-rotated' })),
-}));
+// FleetRunnersPanel statically imports many named exports from '../api'
+// (registration/rotation/revocation actions, capability + status patching,
+// telemetry/stats detail loaders); browser-mode ESM requires the mock factory
+// to expose EVERY export the module graph imports or the linker fails at
+// import time with "does not provide an export named '<x>'". createApiMock
+// provides the complete, typecheck-enforced export surface so new api.ts
+// exports can't silently break this factory again. API_BASE_URL defaults to ''
+// (mirrors the production VITE_API_URL || '' fallback) so the copy-paste
+// registration snippet falls back to window.location.origin, as in
+// same-origin dev.
+vi.mock('../api', async () => {
+  const { createApiMock } = await import('../test/api-mock-complete');
+  return createApiMock({
+    listFleetRunners: vi.fn(async () => SAMPLE_RUNNERS),
+    registerFleetRunner: vi.fn(async () => ({ runner_id: 'runner-new', token: 'tok-secret' })),
+    revokeFleetRunner: vi.fn(async () => {}),
+    rotateFleetRunnerToken: vi.fn(async () => ({ runner_id: 'runner-abc123', token: 'tok-rotated' })),
+  });
+});
 
 describe('FleetRunnersPanel — viewport regression', () => {
   let root: Root | null = null;

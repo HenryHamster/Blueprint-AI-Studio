@@ -286,10 +286,24 @@ async function inspectTerminalMarkers(
     // Capture the diff so review-pipeline scope analysis, direction credit,
     // and rollup management get real changed_files instead of an empty list.
     let changedFiles: string[] = [];
+    let diffComputed = false;
     try {
       const out = git(['diff', '--name-only', `${opts.baseCommit}..HEAD`]);
       changedFiles = out.split('\n').filter(Boolean).slice(0, 50);
+      diffComputed = true;
     } catch { /* git may be in odd state — best effort */ }
+    // Zero-effective-diff guard (defense-in-depth for the empty-diff-at-merge
+    // incident). A rebased/superseded branch can carry a PR-URL marker yet net
+    // to ZERO effective diff vs base. Posting COMPLETED on Claude's behalf here
+    // would mask that no-op as a shipped success. When the diff was computed
+    // successfully and is genuinely empty, fall through to the fail-closed path
+    // instead so the task records an explicit unshipped disposition. Only trip
+    // on a confirmed-empty diff — a git error leaves diffComputed=false and
+    // preserves the prior best-effort COMPLETED behavior.
+    if (diffComputed && changedFiles.length === 0) {
+      sendLog(ws, `[wrapper] PR URL marker present (${prUrl}) but ${opts.baseCommit}..HEAD nets to ZERO effective diff${note}. Treating as task-did-not-ship (no COMPLETED post).\n`);
+      return 'unshipped';
+    }
     const selfReview = augmentSelfReview(
       readSelfReviewOutcome(taskId, opts.existingPrNumber !== undefined ? (opts.fixIteration ?? 1) : undefined),
       taskId,

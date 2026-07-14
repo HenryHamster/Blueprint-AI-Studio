@@ -72,6 +72,12 @@ export interface ResidentTurnResult {
   turnMs: number;
   /** number of tool_use calls that fired during this turn. */
   toolCallCount: number;
+  /** cumulative ms spent inside tool calls (from tool_use event to tool_result
+   *  event) during this turn. Zero when no tool calls completed. */
+  totalToolCallDurationMs: number;
+  /** mean ms between consecutive assistant text tokens (after the first) across
+   *  all streaming deltas this turn. Null when ≤1 text token arrived. */
+  meanInterTokenMs: number | null;
   /** inclusive input token count reported by this turn's top-level `result` event;
    *  zero when no usage block was reported (interrupted / pre-result child exit).
    *  The handler uses this to detect context-window pressure and trigger compaction
@@ -161,6 +167,20 @@ interface ActiveTurn {
   firstTokenAtMs: number | null;
   /** count of tool_use calls observed so far this turn. */
   toolCallCount: number;
+  /** cumulative ms spent inside tool calls (from tool_use to tool_result)
+   *  during this turn. Updated as each tool_result event arrives. */
+  totalToolCallDurationMs: number;
+  /** map from tool_use_id -> ms timestamp when the tool_use event was received.
+   *  Used to compute per-tool-call wall-clock duration at tool_result time. */
+  toolCallStartTimes: Map<string, number>;
+  /** ms timestamp of the most recently received text token delta; null until
+   *  the first text token arrives. Set on every incremental text event so
+   *  subsequent deltas can measure the inter-token gap. */
+  lastTokenAtMs: number | null;
+  /** rolling array of ms intervals between consecutive text deltas (after the
+   *  first). Each entry is the time from the PREVIOUS text delta to the current
+   *  one. Empty until at least two text tokens have arrived. */
+  interTokenIntervalsMs: number[];
   /** inclusive input token count reported by the turn's top-level `result` event;
    *  zero when no usage block was reported (interrupted / pre-result child exit). */
   inputTokens: number;
@@ -225,6 +245,10 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
   // pending stale result is swallowed exactly once before a live result settles
   // the current turn. Reset when the process dies (no more results can arrive).
   let staleResultsPending = 0;
+  // Track the last-seen cumulative numTurns from CLI result events so we only
+  // record the DELTA per turn, not the accumulating total (which would give
+  // N(N+1)/2 after N turns instead of N — see telemetry recordNumTurns).
+  let lastSeenNumTurns = 0;
   const pid = child.pid;
 
   const emit = (ev: ResidentSessionEvent): void => {
@@ -269,6 +293,11 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
     const nowMs = Date.now();
     const turnMs = nowMs - t.startedAtMs;
     const ttftMs = t.firstTokenAtMs !== null ? t.firstTokenAtMs - t.startedAtMs : null;
+    // Mean inter-token latency: average of all inter-token intervals. Only
+    // meaningful when at least two text tokens have arrived (≥1 interval).
+    const meanInterTokenMs = t.interTokenIntervalsMs.length > 0
+      ? Math.round(t.interTokenIntervalsMs.reduce((a, b) => a + b, 0) / t.interTokenIntervalsMs.length)
+      : null;
     t.resolve({
       resultText: finalText,
       interrupted: t.interrupted,
@@ -281,6 +310,8 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
       ttftMs,
       turnMs,
       toolCallCount: t.toolCallCount,
+      totalToolCallDurationMs: t.totalToolCallDurationMs,
+      meanInterTokenMs,
       inputTokens: t.inputTokens,
     });
     resolveIdleWaiters();
@@ -378,7 +409,16 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
             t.streamedText = true;
             t.sawDeltaThisMessage = true;
             t.accumulated += ev.text;
-            if (t.firstTokenAtMs === null) t.firstTokenAtMs = Date.now();
+            const now = Date.now();
+            if (t.firstTokenAtMs === null) {
+              t.firstTokenAtMs = now;
+            } else {
+              // Inter-token timing: record the gap since the last delta.
+              if (t.lastTokenAtMs !== null) {
+                t.interTokenIntervalsMs.push(now - t.lastTokenAtMs);
+              }
+            }
+            t.lastTokenAtMs = now;
           }
         }
         break;
@@ -396,6 +436,10 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
         if (t) {
           t.sawToolUse = true;
           t.toolCallCount += 1;
+          // Record the tool call start timestamp for per-tool latency tracking.
+          // When ev.toolUseId is absent (should never happen), record under a
+          // sentinel key so the tool_result handler can still compute duration.
+          t.toolCallStartTimes.set(ev.toolUseId ?? `__no_id_${t.toolCallCount}`, Date.now());
           if (isStrategicMutation(ev.command)) t.appliedStrategicOp = true;
           // A `./messages send` is only a CONFIRMED durable reply once its
           // tool_result comes back without an error — track the pending id and
@@ -416,6 +460,16 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
         if (t && ev.toolUseId && t.pendingMessageSendIds.has(ev.toolUseId)) {
           t.pendingMessageSendIds.delete(ev.toolUseId);
           if (!ev.isError) t.sentOperatorMessage = true;
+        }
+        // Per-tool-call latency: compute wall-clock duration from the tool_use
+        // event to this tool_result and add it to the running total. When the
+        // tool_use arrived before this turn started (stale), or the id is absent,
+        // skip gracefully — totalToolCallDurationMs stays at its prior value.
+        if (t && ev.toolUseId) {
+          const startedAt = t.toolCallStartTimes.get(ev.toolUseId);
+          if (startedAt !== undefined) {
+            t.totalToolCallDurationMs += Date.now() - startedAt;
+          }
         }
         // Surface a compact tool-result one-liner on the LIVE activity strip
         // (ephemeral; never persisted). Only when the parser produced a summary.
@@ -439,7 +493,11 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
           if (activeTurn) activeTurn.inputTokens = ev.usage.inputTokens;
         }
         if (ev.numTurns !== undefined) {
-          recordNumTurns(ev.numTurns);
+          // numTurns is a cumulative count across the whole CLI process;
+          // only emit the delta since the last result to avoid double-counting.
+          const delta = ev.numTurns - lastSeenNumTurns;
+          lastSeenNumTurns = ev.numTurns;
+          if (Number.isFinite(delta) && delta > 0) recordNumTurns(delta);
         }
         // Swallow a result owed by an already-force-settled turn so it cannot
         // resolve a newer turn's promise (see staleResultsPending).
@@ -543,7 +601,8 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
       return Promise.resolve({
         resultText: '', interrupted: false, timedOut: false, hardTimedOut: false,
         appliedStrategicOp: false, sawToolUse: false, sentOperatorMessage: false,
-        processGone: true, ttftMs: null, turnMs: 0, toolCallCount: 0, inputTokens: 0,
+        processGone: true, ttftMs: null, turnMs: 0, toolCallCount: 0,
+        totalToolCallDurationMs: 0, meanInterTokenMs: null, inputTokens: 0,
       });
     }
     if (activeTurn) {
@@ -566,7 +625,9 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
         interrupted: false, timedOut: false, hardTimedOut: false, sawDeltaThisMessage: false,
         stallTimeoutMs,
         stallTimer: null, forceTimer: null, hardTimer: null, interruptTimer: null,
-        startedAtMs, firstTokenAtMs: null, toolCallCount: 0, inputTokens: 0,
+        startedAtMs, firstTokenAtMs: null, toolCallCount: 0, totalToolCallDurationMs: 0,
+        toolCallStartTimes: new Map(), lastTokenAtMs: null, interTokenIntervalsMs: [],
+        inputTokens: 0,
       };
       activeTurn = turn;
       try {
@@ -583,7 +644,7 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
           resultText: '', interrupted: false, timedOut: false, hardTimedOut: false,
           appliedStrategicOp: false, sawToolUse: false, sentOperatorMessage: false,
           processGone: !alive, ttftMs: null, turnMs: Date.now() - startedAtMs, toolCallCount: 0,
-          inputTokens: 0,
+          totalToolCallDurationMs: 0, meanInterTokenMs: null, inputTokens: 0,
         });
         return;
       }

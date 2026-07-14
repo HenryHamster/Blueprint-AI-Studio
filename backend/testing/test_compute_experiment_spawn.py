@@ -113,6 +113,69 @@ def test_author_contract_tolerates_non_dict_nested():
     assert contract["command"] == "run"
 
 
+def test_author_contract_collects_input_artifact_job_id():
+    predecessor = str(uuid.uuid4())
+    finding = {
+        "command": "resume.py",
+        "spend_cap_usd": 1.0,
+        "deadline_seconds": 300,
+        "input_artifact_job_id": predecessor,
+    }
+    contract = _author_compute_launch_contract(finding)
+    assert contract["input_artifact_job_id"] == predecessor
+
+
+def test_validate_contract_accepts_valid_input_artifact_job_id():
+    ok, reason = _validate_compute_launch_contract(
+        {
+            "command": "run",
+            "spend_cap_usd": 1.0,
+            "deadline_seconds": 300,
+            "input_artifact_job_id": str(uuid.uuid4()),
+        },
+        require_smoke=False,
+    )
+    assert ok is True
+    assert reason == ""
+
+
+def test_validate_contract_rejects_malformed_input_artifact_job_id():
+    ok, reason = _validate_compute_launch_contract(
+        {
+            "command": "run",
+            "spend_cap_usd": 1.0,
+            "deadline_seconds": 300,
+            "input_artifact_job_id": "not-a-uuid",
+        },
+        require_smoke=False,
+    )
+    assert ok is False
+    assert "input_artifact_job_id" in reason
+
+
+def test_compute_experiment_payload_retains_input_artifact_job_id():
+    """The validated compute_experiment payload must keep input_artifact_job_id
+    so the orchestrator dispatch consumer can rehydrate the predecessor bundle.
+
+    Regression guard: the field was previously absent from the schema, so the
+    contract-authored/orchestrator resume reference was silently dropped at
+    validation before it could reach create_compute_job.
+    """
+    from app.payload_schemas import ComputeExperimentPayload
+
+    predecessor = str(uuid.uuid4())
+    payload = ComputeExperimentPayload.model_validate(
+        {
+            "command": "resume.py",
+            "spend_cap_usd": 1.0,
+            "deadline_seconds": 300,
+            "input_artifact_job_id": predecessor,
+        }
+    )
+    assert payload.input_artifact_job_id == predecessor
+    assert payload.model_dump().get("input_artifact_job_id") == predecessor
+
+
 def test_author_contract_forwards_accelerator():
     # GPU accelerator and provisioning_model are forwarded when flat on finding
     finding = {
@@ -268,6 +331,169 @@ def test_validate_contract_rejects_malformed(contract, needle):
     ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
     assert ok is False
     assert needle in reason
+
+
+# --- runner_target (operator/agent runner pin) -----------------------------
+
+
+def test_author_contract_forwards_runner_target():
+    # Agent authoring paths pass the pin through flat or nested, like the
+    # other optional launch fields.
+    runner_id = "0b6c9c1e-8f39-4b53-9a3e-1a2b3c4d5e6f"
+    flat = {
+        "command": "run",
+        "spend_cap_usd": 1.0,
+        "deadline_seconds": 60,
+        "runner_target": {"runner_id": runner_id, "strict": True},
+    }
+    assert _author_compute_launch_contract(flat)["runner_target"] == {
+        "runner_id": runner_id,
+        "strict": True,
+    }
+    nested = {
+        "compute_experiment": {
+            "command": "run",
+            "spend_cap_usd": 1.0,
+            "deadline_seconds": 60,
+            "runner_target": {"runner_id": runner_id},
+        }
+    }
+    assert _author_compute_launch_contract(nested)["runner_target"] == {
+        "runner_id": runner_id
+    }
+
+
+def test_validate_contract_accepts_runner_target():
+    ok, reason = _validate_compute_launch_contract(
+        {
+            "command": "run",
+            "spend_cap_usd": 1.0,
+            "deadline_seconds": 60,
+            "runner_target": {
+                "runner_id": "0b6c9c1e-8f39-4b53-9a3e-1a2b3c4d5e6f",
+                "strict": True,
+            },
+        },
+        require_smoke=False,
+    )
+    assert ok is True
+    assert reason == ""
+
+
+@pytest.mark.parametrize(
+    "runner_target, needle",
+    [
+        ("not-a-dict", "runner_target must be an object"),
+        ({}, "runner_target.runner_id is required"),
+        ({"runner_id": ""}, "runner_target.runner_id is required"),
+        ({"runner_id": 42}, "runner_target.runner_id is required"),
+        ({"runner_id": "not-a-uuid"}, "not a valid UUID"),
+        (
+            {
+                "runner_id": "0b6c9c1e-8f39-4b53-9a3e-1a2b3c4d5e6f",
+                "strict": "yes",
+            },
+            "runner_target.strict must be a boolean",
+        ),
+    ],
+)
+def test_validate_contract_rejects_malformed_runner_target(runner_target, needle):
+    ok, reason = _validate_compute_launch_contract(
+        {
+            "command": "run",
+            "spend_cap_usd": 1.0,
+            "deadline_seconds": 60,
+            "runner_target": runner_target,
+        },
+        require_smoke=False,
+    )
+    assert ok is False
+    assert needle in reason
+
+
+# --- env validation ---------------------------------------------------------
+# Env keys are interpolated BARE into `export {key}=...` in the GCP startup
+# script, which runs without `set -e` — a non-identifier key would error and
+# the script would silently continue, billing a run missing that env var.
+# The contract validator must therefore fail loud at authoring time.
+
+
+def test_validate_contract_accepts_valid_env_keys():
+    ok, reason = _validate_compute_launch_contract(
+        {
+            "command": "run",
+            "spend_cap_usd": 3.0,
+            "deadline_seconds": 300,
+            "env": {"MY_SEED": "42", "_PRIVATE": "x", "DATASET2": "/data"},
+        },
+        require_smoke=False,
+    )
+    assert ok is True
+    assert reason == ""
+
+
+@pytest.mark.parametrize(
+    "bad_key",
+    [
+        "my-model",
+        "1LEADING",
+        "A B",
+        "PATH=X",
+        "KEY;rm -rf /",
+        "$(whoami)",
+        "",
+        # Trailing newline: `re.match(r"^\w+$", "GOOD\n")` SUCCEEDS (Python's `$`
+        # also matches just before a final newline), so a `.match()` gate lets this
+        # through and the script emits `export GOOD\n=v` — bash runs `export GOOD`
+        # (empty) then `=v` (command not found) and, with no `set -e`, bills the run
+        # anyway. `bash -n` passes it too, so the shell harness cannot catch it.
+        # Only `.fullmatch()` rejects it. This case is the regression lock.
+        "GOOD\n",
+        "GOOD\nEVIL=1",
+        "\nGOOD",
+    ],
+)
+def test_validate_contract_rejects_env_keys_that_are_not_shell_identifiers(bad_key):
+    ok, reason = _validate_compute_launch_contract(
+        {
+            "command": "run",
+            "spend_cap_usd": 3.0,
+            "deadline_seconds": 300,
+            "env": {bad_key: "value"},
+        },
+        require_smoke=False,
+    )
+    assert ok is False
+    assert "env key" in reason
+    assert "shell identifier" in reason
+
+
+def test_validate_contract_rejects_non_string_env_key():
+    ok, reason = _validate_compute_launch_contract(
+        {
+            "command": "run",
+            "spend_cap_usd": 3.0,
+            "deadline_seconds": 300,
+            "env": {42: "value"},
+        },
+        require_smoke=False,
+    )
+    assert ok is False
+    assert "env key" in reason
+
+
+def test_validate_contract_rejects_non_dict_env():
+    ok, reason = _validate_compute_launch_contract(
+        {
+            "command": "run",
+            "spend_cap_usd": 3.0,
+            "deadline_seconds": 300,
+            "env": ["MY_SEED=42"],
+        },
+        require_smoke=False,
+    )
+    assert ok is False
+    assert "env must be an object" in reason
 
 
 # --- smoke_sample validation ---------------------------------------------
@@ -541,6 +767,10 @@ async def _make_compute_task(db_session, payload: dict) -> Task:
         status=TaskStatus.IN_PROGRESS,  # agent reported terminal; handler decides
         payloads=[payload],
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        # Engine-authored: the spawn_followup gate (#14223) suppresses
+        # follow-ons for created_by="USER" tasks, which is not what these
+        # autonomous-spawn tests exercise.
+        created_by="ORCHESTRATOR",
     )
     db_session.add(task)
     await db_session.commit()
@@ -824,6 +1054,173 @@ async def test_failure_followon_prompt_contains_traceback(
     assert "Traceback" in prompt
 
 
+# --- terminal-reason propagation into the follow-on ------------------------
+#
+# The COMPUTE_RESULT record carries the job's ``terminal_reason`` and the
+# readable ``command_log_text``; the follow-on must receive WHY the job ended
+# (deadline kill, spend cap, provisioning timeout, runner failure) — not just
+# that it FAILED — so iteration agents stop diagnosing blind.
+
+
+def _failed_result_record(**overrides) -> str:
+    """A terminal COMPUTE_RESULT record as build_compute_result_logs emits it."""
+    base = {
+        "job_id": str(uuid.uuid4()),
+        "outcome": "FAILURE",
+        "status": "FAILED",
+        "final_cost_usd": 0.18,
+        "accrued_cost_usd": 0.18,
+        "intentional_terminal": False,
+        "terminal_reason": "command exited with code 1",
+        "command_log_text": (
+            "Traceback (most recent call last):\n"
+            '  File "train.py", line 9, in <module>\n'
+            "RuntimeError: readable-log-marker-xyz789\n"
+        ),
+        "command_log_truncated": False,
+    }
+    base.update(overrides)
+    return json.dumps(base)
+
+
+def test_failure_prompt_surfaces_terminal_reason_and_readable_log_tail():
+    """failure_mode prompt: the terminal_reason line and the UNESCAPED
+    command_log_text tail extracted from the terminal record — plus the terminal
+    metadata — even when the caller passes compute_result={} (the gate-fail
+    spawn)."""
+    from app.task_completion import _build_act_on_verdict_prompt
+
+    task = Task(
+        project_id=uuid.uuid4(),
+        title="compute_experiment: reason-surface",
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "base_branch": "main",
+                "experiment": "reason-surface",
+            }
+        ],
+    )
+    logs = _failed_result_record(
+        terminal_reason="compute job exceeded runtime deadline"
+    )
+    prompt = _build_act_on_verdict_prompt(task, {}, logs, failure_mode=True)
+
+    # WHY, stated explicitly — not inferred from a log tail.
+    assert "Terminal reason" in prompt
+    assert "compute job exceeded runtime deadline" in prompt
+    # The log tail arrives readable (real newlines, not a JSON-escaped blob):
+    # the multi-line traceback appears verbatim as separate prompt lines.
+    assert '  File "train.py", line 9, in <module>' in prompt.splitlines()
+    assert "RuntimeError: readable-log-marker-xyz789" in prompt.splitlines()
+    # Terminal metadata survives a compute_result={} spawn (gate-fail branch).
+    assert '"outcome": "FAILURE"' in prompt
+
+
+def test_failure_prompt_falls_back_to_raw_crash_logs():
+    """Unparseable logs (raw crash traceback, legacy output) keep the existing
+    behaviour: the raw tail is shown and no reason line is fabricated."""
+    from app.task_completion import _build_act_on_verdict_prompt
+
+    task = Task(
+        project_id=uuid.uuid4(),
+        title="compute_experiment: raw-crash",
+        payloads=[{"type": "compute_experiment", "base_branch": "main"}],
+    )
+    crash = (
+        "Traceback (most recent call last):\n"
+        '  File "train.py", line 5, in <module>\n'
+        "ValueError: raw-crash-marker-456\n"
+    )
+    prompt = _build_act_on_verdict_prompt(task, {}, crash, failure_mode=True)
+
+    assert "raw-crash-marker-456" in prompt
+    assert "Terminal reason" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_gate_fail_followon_context_carries_terminal_reason(
+    db_session, _quiet_compute_io
+):
+    """A record with a terminal_reason but NO measured outcome fails the gate;
+    the diagnose-and-fix child must still receive the reason — machine-readable
+    in context AND stated in its prompt."""
+    task = await _make_compute_task(
+        db_session,
+        {
+            "type": "compute_experiment",
+            "base_branch": "main",
+            "experiment": "provisioning-timeout-surface",
+        },
+    )
+
+    logs = json.dumps(
+        {
+            "job_id": str(uuid.uuid4()),
+            "status": "TIMED_OUT",
+            "terminal_reason": "compute job timed out while provisioning",
+            "command_log_text": "",
+        }
+    )
+    await _handle_compute_experiment_completion(task, logs, db_session)
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.FAILED
+
+    children = (
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1
+    child = children[0]
+    assert (
+        child.context["compute_terminal_reason"]
+        == "compute job timed out while provisioning"
+    )
+    assert "compute job timed out while provisioning" in child.first_payload["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_measured_failure_propagates_terminal_reason_to_result_and_child(
+    db_session, _quiet_compute_io
+):
+    """A measured non-success outcome stamps terminal_reason into the durable
+    plan_output.compute_result and forwards it into the follow-on's context."""
+    task = await _make_compute_task(
+        db_session,
+        {
+            "type": "compute_experiment",
+            "base_branch": "main",
+            "experiment": "measured-failure-reason",
+        },
+    )
+    # Engine-authored: the success-path follow-on spawns by default (the
+    # spawn_followup gate suppresses operator-authored USER tasks).
+    task.created_by = "ORCHESTRATOR"
+    db_session.add(task)
+    await db_session.commit()
+
+    await _handle_compute_experiment_completion(
+        task, _failed_result_record(), db_session
+    )
+
+    await db_session.refresh(task)
+    compute_result = task.plan_output["compute_result"]
+    assert compute_result["outcome"] == "FAILURE"
+    assert compute_result["terminal_reason"] == "command exited with code 1"
+
+    children = (
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1
+    assert (
+        children[0].context["compute_terminal_reason"] == "command exited with code 1"
+    )
+
+
 @pytest.mark.asyncio
 async def test_compute_unmeasured_criterion_spawns_followon(
     db_session, _quiet_compute_io
@@ -1047,6 +1444,10 @@ async def test_concurrent_cap_suppresses_excess_spawn(db_session, _quiet_compute
                 }
             ],
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+            # Engine-authored: the spawn_followup gate (#14223) suppresses
+            # follow-ons for created_by="USER" tasks; this test exercises the
+            # CONCURRENCY cap, so the spawn must not be USER-suppressed.
+            created_by="ORCHESTRATOR",
         )
         db_session.add(t)
         await db_session.commit()
@@ -1134,6 +1535,10 @@ async def _make_sweep_arm(
             }
         ],
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        # Engine-authored: the spawn_followup gate (#14223) suppresses
+        # follow-ons for created_by="USER" tasks; sweep tests exercise the
+        # sweep-deferral/aggregate mechanics, not USER suppression.
+        created_by="ORCHESTRATOR",
     )
     db_session.add(task)
     await db_session.commit()
@@ -2019,6 +2424,106 @@ def test_arms_contract_validation_synthesizes_command():
     assert "python b.py" in decoded
 
 
+def test_decode_generated_command_round_trips_the_synthesized_wrapper():
+    """The decoder inverts the encoder: an operator can read what actually ran."""
+    from app.compute_experiment_contract import (
+        _AGGREGATOR_B64,
+        decode_generated_command,
+    )
+
+    contract = {
+        "arms": [
+            {"name": "baseline", "command": "python train.py --lr=0.1"},
+            {"name": "tuned", "command": "python train.py --lr='0.01'"},
+        ],
+        "declared_metric": "score",
+        "spend_cap_usd": 2.0,
+        "deadline_seconds": 600,
+    }
+    ok, _reason = _validate_compute_launch_contract(contract, require_smoke=False)
+    assert ok is True
+
+    decoded = decode_generated_command(contract["command"])
+    assert decoded is not None
+    # The arm commands — the part an operator actually wants to read — survive verbatim.
+    assert "python train.py --lr=0.1" in decoded
+    assert "python train.py --lr='0.01'" in decoded
+    # The static aggregator blob is elided, not expanded, so it cannot bury the arms.
+    assert "compute_arm_aggregator.py" in decoded
+    assert _AGGREGATOR_B64 not in decoded
+
+
+def test_decode_generated_command_never_elides_an_arms_own_base64_blob():
+    """An arm may legitimately embed its own base64 script — leave it INTACT.
+
+    `echo <blob> | base64 -d > <dest>` is the exact pattern CLAUDE.md tells
+    authors to use, so eliding by SHAPE would relabel an arm's blob as the
+    aggregator and destroy its contents. A legibility feature that lies about
+    what ran is worse than no feature.
+    """
+    import base64
+
+    from app.compute_experiment_contract import decode_generated_command
+
+    # Two things this test must get right or it silently proves nothing:
+    #  1. The blob must encode to >= 64 base64 chars, or _EMBEDDED_AGGREGATOR_RE
+    #     never matches it (an earlier draft used 60 and passed WITH the bug).
+    #  2. The `echo` must NOT be the arm's first line. The generator wraps line 1
+    #     as `(export BLUEPRINT_RESULT_FILE=...; <cmd>`, so a leading echo is not
+    #     at line-start and `^echo` cannot match it. A MIDDLE line is the
+    #     reachable case.
+    script_src = (
+        b"import json\n"
+        b"cfg = {'lr': 0.01, 'epochs': 30, 'arch': 'resnet50'}\n"
+        b"json.dump(cfg, open('cfg.json', 'w'))\n"
+    )
+    payload = base64.b64encode(script_src).decode()
+    assert len(payload) >= 64, "payload too short to reach the elision regex"
+    arm_cmd = (
+        "python prep.py\n"
+        f"echo {payload} | base64 -d > model_cfg.py\n"
+        "python train.py --cfg model_cfg.py"
+    )
+    contract = {
+        "arms": [{"name": "embedder", "command": arm_cmd}],
+        "declared_metric": "score",
+        "spend_cap_usd": 2.0,
+        "deadline_seconds": 600,
+    }
+    ok, _reason = _validate_compute_launch_contract(contract, require_smoke=False)
+    assert ok is True
+
+    decoded = decode_generated_command(contract["command"])
+    assert decoded is not None
+    # The arm's OWN blob survives verbatim and is not mislabelled.
+    assert payload in decoded
+    assert "base64 blob: compute_arm_aggregator.py> | base64 -d > model_cfg.py" not in decoded
+    # ...while the real aggregator blob is still elided.
+    assert "echo <base64 blob: compute_arm_aggregator.py>" in decoded
+
+
+def test_decode_generated_command_passes_through_unencoded_commands():
+    """Single-arm/operator commands are stored verbatim — nothing to decode."""
+    from app.compute_experiment_contract import decode_generated_command
+
+    assert decode_generated_command("python train.py --epochs 3") is None
+    assert decode_generated_command(None) is None
+    assert decode_generated_command("") is None
+
+
+def test_decode_generated_command_never_raises_on_a_corrupt_blob():
+    """A truncated blob must not turn a read of an old job into a 500."""
+    import base64
+
+    from app.compute_experiment_contract import decode_generated_command
+
+    # Well-formed wrapper shape, invalid base64 payload.
+    assert decode_generated_command("echo !!!notb64!!! | base64 -d | bash") is None
+    # Valid base64 that is not UTF-8 text.
+    blob = base64.b64encode(b"\xff\xfe\x00\x01").decode()
+    assert decode_generated_command(f"echo {blob} | base64 -d | bash") is None
+
+
 def test_arms_contract_validation_single_quote_safe():
     """Arms with single quotes in commands produce a safe base64-encoded command."""
     import base64
@@ -2134,6 +2639,43 @@ def test_arms_contract_validation_empty_declared_metric():
     ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
     assert ok is False
     assert "declared_metric" in reason
+
+
+@pytest.mark.parametrize("bad_name", ["bad name", "a;rm -rf /", "arm:1", "a/b", "GOOD\n"])
+def test_arms_contract_validation_rejects_arm_name_charset(bad_name):
+    """Arm names outside the safe charset are rejected — including trailing-newline.
+
+    `ARM_NAME_RE.match("GOOD\\n")` SUCCEEDS (Python's `$` matches before a final
+    newline), and the arm name is interpolated into the generated per-arm bash
+    wrapper and the NAME:PATH aggregator spec. Only `.fullmatch()` rejects it.
+    """
+    contract = {
+        "arms": [{"name": bad_name, "command": "python a.py"}],
+        "declared_metric": "score",
+        "spend_cap_usd": 2.0,
+        "deadline_seconds": 600,
+    }
+    ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
+    assert ok is False
+    assert "invalid characters" in reason
+
+
+@pytest.mark.parametrize("bad_metric", ["val loss", "$(whoami)", "a;b", "GOOD\n"])
+def test_arms_contract_validation_rejects_declared_metric_charset(bad_metric):
+    """declared_metric outside the safe charset is rejected — including trailing-newline.
+
+    Same `.match()` + `$` hole as the arm-name gate: the metric key reaches the
+    generated wrapper, so a newline must not survive validation.
+    """
+    contract = {
+        "arms": [{"name": "a", "command": "python a.py"}],
+        "declared_metric": bad_metric,
+        "spend_cap_usd": 2.0,
+        "deadline_seconds": 600,
+    }
+    ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
+    assert ok is False
+    assert "invalid characters" in reason
 
 
 def test_arms_contract_validation_empty_arms_list():

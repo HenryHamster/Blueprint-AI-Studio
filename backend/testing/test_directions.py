@@ -11427,3 +11427,101 @@ async def test_gap_staffing_reconcile_survives_concurrent_problem_model_write(
     assert direction_id in gaps["g-beta"]["active_moves"], (
         "direction must be added to g-beta active_moves after gap change"
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Role floor on the project message board.
+#
+# POST /api/admin/projects/{project_id}/messages was the LONE mutating outlier in
+# this router: every other mutating route here takes
+# _get_user_project_with_role(..., "member"), but this one took the
+# membership-only _get_user_project. It is a near-duplicate of
+# admin_notifications' POST /messages, so gating that one alone left this route
+# as a trivial bypass.
+#
+# It is not a benign write: it calls create_operator_project_message ->
+# maybe_arm_operator_refresh, which arms an OPERATOR-origin strategic refresh
+# (breaker-bypassing, cooldown-bypassing — see
+# test_operator_message_arms_strategic_refresh above) and persists the caller's
+# steering text into the project-global Project.vision column. Without the
+# member+ floor, a viewer can steer the autonomous strategist.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def _make_project_with_role(db_session, name: str, role: str):
+    """Project with test-user-123 holding the given role."""
+    from app.models import ProjectMember
+
+    project = Project(
+        name=name,
+        user_id="test-user-123",
+        vision={"purpose": "test"},
+        design_doc={"proposed_changes": []},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(
+        ProjectMember(project_id=project.id, user_id="test-user-123", role=role)
+    )
+    await db_session.commit()
+    return project
+
+
+@pytest.mark.asyncio
+async def test_create_message_viewer_forbidden(client: AsyncClient, db_session):
+    """A viewer gets 403; no message row lands and no refresh is armed."""
+    from sqlalchemy import func as sa_func
+    from app.models import ProjectMessage
+    from app.strategic_trigger import strategic_refresh_pending
+
+    project = await _make_project_with_role(db_session, "Viewer Board", "viewer")
+
+    resp = await client.post(
+        f"/api/admin/projects/{project.id}/messages",
+        json={"content": "Drop everything and rewrite auth", "message_type": "FEEDBACK"},
+    )
+
+    assert resp.status_code == 403, resp.text
+    assert "member" in resp.json()["error"]["message"].lower()
+
+    # No message persisted...
+    count = await db_session.scalar(
+        select(sa_func.count())
+        .select_from(ProjectMessage)
+        .where(ProjectMessage.project_id == project.id)
+    )
+    assert count == 0
+
+    # ...and the project-global vision carries no viewer-armed operator refresh.
+    vision = await _reload_vision(db_session, str(project.id))
+    assert strategic_refresh_pending(vision) is False
+
+
+@pytest.mark.asyncio
+async def test_create_message_member_allowed(client: AsyncClient, db_session):
+    """The floor must not over-reject: a member (not owner) can still steer."""
+    from sqlalchemy import func as sa_func
+    from app.models import ProjectMessage
+    from app.strategic_trigger import strategic_refresh_pending
+
+    project = await _make_project_with_role(db_session, "Member Board", "member")
+
+    resp = await client.post(
+        f"/api/admin/projects/{project.id}/messages",
+        json={"content": "Please refocus on the auth bug", "message_type": "FEEDBACK"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "created"
+
+    count = await db_session.scalar(
+        select(sa_func.count())
+        .select_from(ProjectMessage)
+        .where(ProjectMessage.project_id == project.id)
+    )
+    assert count == 1
+
+    vision = await _reload_vision(db_session, str(project.id))
+    assert strategic_refresh_pending(vision) is True
+    assert vision["_strategic_refresh"]["origin"] == "operator"

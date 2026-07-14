@@ -11,7 +11,7 @@ import logging
 import os
 import re
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any, Callable, Iterable
 
 from sqlalchemy import func
@@ -25,6 +25,7 @@ from app.database import resolve_dialect_name
 from app.github import post_pipeline_merge_summary_comment as post_merge_summary_comment  # noqa: F401
 from app.models import Task, TaskHistory, TaskStatus
 from app.payload_schemas import validate_internal_payload
+from app.review_fix_lane_pilot import PILOT_PROPAGATE_KEYS
 from app.shared_state import (
     runtime_config as _runtime_config,
     is_warm_continuity_suppressed,
@@ -530,18 +531,16 @@ MAX_REVIEW_FIX_ITERATIONS = 16
 # rollup chain via ``_rollup_retries`` AND the propagated ``rollup_pr_number`` +
 # ``review_loop.pr_number`` lineage (see ``_is_rollup_chain_source``), both of
 # which children DO carry, so the elevated cap still holds across iterations.
-_PROPAGATE_UNDERSCORE_KEYS = frozenset(
-    {
-        "_rollup_retries",
-        # Review-fix lane pilot: the intent-to-treat arm assignment and the
-        # chain-private lane id must survive every fix/review iteration so the
-        # chain stays bound to its arm/lane. Both are inert to dispatch (unlike
-        # ``improvement_lane_id``, which is re-derived per fix phase) — see
-        # app.review_fix_lane_pilot.
-        "_review_fix_lane_arm",
-        "_review_fix_lane_id",
-    }
-)
+# Review-fix lane pilot: the intent-to-treat arm assignment (_review_fix_lane_arm)
+# and the chain-private lane id (_review_fix_lane_id) must survive every
+# fix/review iteration so the chain stays bound to its arm/lane. Both are inert
+# to dispatch (unlike ``improvement_lane_id``, which is re-derived per fix
+# phase). Reference the canonical PILOT_PROPAGATE_KEYS frozenset that owns these
+# keys (imported at the top of this module) rather than re-typing the literals,
+# so the propagation set and the pilot module can never silently drift apart (a
+# drifted key would de-populate the trial's arm/receipt subpopulations — see
+# app.review_fix_lane_pilot).
+_PROPAGATE_UNDERSCORE_KEYS = frozenset({"_rollup_retries"}) | PILOT_PROPAGATE_KEYS
 
 
 def _is_rollup_chain_source(source_task: "Task") -> bool:
@@ -752,6 +751,110 @@ def _set_spawn_reason(task: Task, reason: str) -> None:
     ctx = dict(task.context or {})
     ctx[SPAWN_REASON_KEY] = reason
     task.context = ctx
+
+
+async def _load_vm_contact_lookup(
+    session: AsyncSession, tasks: Iterable[Task]
+) -> dict[str, datetime]:
+    """{vm_instance_id: last_contact_at} for the VMs behind ``tasks``.
+
+    R3: the uncontended liveness signal the supersede path needs. See
+    ``_is_pipeline_task_stale`` and ``VmContact`` (models.py) — a lock-starved
+    heartbeat leaves ``Task.last_heartbeat`` stale on a LIVE agent, but the
+    agent's ``VmContact`` row is written off the contended Task row and cannot
+    be starved. Batch-fetched once per spawn (mirrors reaper.py:477-496).
+    """
+    from app.models import VmContact
+
+    vm_ids = {t.vm_instance_id for t in tasks if t.vm_instance_id}
+    if not vm_ids:
+        return {}
+    rows = (
+        await session.execute(
+            select(VmContact.vm_instance_id, VmContact.last_contact_at).where(
+                VmContact.vm_instance_id.in_(vm_ids)
+            )
+        )
+    ).all()
+    return {
+        vm_id: last_contact for vm_id, last_contact in rows if last_contact is not None
+    }
+
+
+async def _load_pipeline_liveness_lookups(
+    session: AsyncSession, tasks: Iterable[Task]
+) -> tuple[dict[str, datetime], dict]:
+    """Both liveness lookups ``_is_pipeline_task_stale`` needs, in one pass.
+
+    Returns ``(vm_contact_lookup, runner_report_lookup)``:
+
+      • ``vm_contact_lookup`` — the uncontended ``VmContact.last_contact_at``
+        override that stops a lock-starved-but-LIVE agent being superseded.
+      • ``runner_report_lookup`` — the DEFEAT for that override on fleet/local
+        runners, where ``vm_instance_id='runner:<id>'`` is SHARED by every task
+        on the runner, so a live sibling's contact would otherwise mask a dead
+        reviewer forever (MAJOR 5; the shared-VmContact zombie gap #14413 closed
+        in the reaper).
+
+    Callers MUST pass both into ``_is_pipeline_task_stale`` — passing only the
+    first re-opens the zombie mask. Mirrors reaper.py:521-534, which builds the
+    same pair from the same sweep's candidate VM ids.
+    """
+    from app.reaper_orphan_classify import _build_runner_report_lookup
+
+    vm_contact_lookup = await _load_vm_contact_lookup(session, tasks)
+    vm_ids = {t.vm_instance_id for t in tasks if t.vm_instance_id}
+    if not vm_ids:
+        return vm_contact_lookup, {}
+    runner_report_lookup = await _build_runner_report_lookup(session, vm_ids)
+    return vm_contact_lookup, runner_report_lookup
+
+
+async def _relock_pipeline_task_for_cancel(
+    session: AsyncSession, task_id
+) -> Task | None:
+    """Re-SELECT a supersede/cancel candidate FOR UPDATE; None if it must be spared.
+
+    R3 (2026-07-12 concurrency audit). The supersede decision is made from a
+    plain, UNLOCKED ``SELECT ... WHERE status IN (active)`` and the cancel that
+    follows is an ORM UPDATE-by-PK with no ``WHERE status`` guard — and
+    ``version_id_col`` was deliberately dropped globally (models.py:1370, :1677),
+    so there is no optimistic-concurrency backstop either. A reviewer that
+    commits COMPLETED + APPROVE inside that window is therefore BLIND-OVERWRITTEN
+    to CANCELLED and its VM queued for deletion; worse, the write also replaces
+    the whole ``context`` blob from the stale in-memory snapshot, so the
+    just-committed APPROVE verdict is ERASED rather than merely superseded.
+
+    This closes the window: re-select the row FOR UPDATE (which serializes
+    against the agent's own terminal write, the only thing the per-PR advisory
+    lock does NOT serialize against) and re-assert the status under that lock.
+    ``populate_existing=True`` refreshes the identity-mapped instance from THIS
+    select, so the caller's subsequent ``dict(t.context or {})`` reads the FRESH
+    context, not the pre-race snapshot.
+
+    Returns None — meaning DO NOT CANCEL — when the row went terminal during the
+    window, or when it is held by a peer (``skip_locked``): a peer holding this
+    row is typically the agent's completion handler mid-commit, and the fail-safe
+    is to leave a possibly-live task alone. The lock is released by the caller's
+    eventual commit; everything between here and that commit is DB-only work.
+    """
+    locked = (
+        (
+            await session.execute(
+                select(Task)
+                .where(Task.id == task_id)
+                .with_for_update(skip_locked=True)
+                .execution_options(populate_existing=True)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if locked is None:
+        return None
+    if locked.status not in _PIPELINE_ACTIVE_STATUSES:
+        return None
+    return locked
 
 
 def _is_lock_timeout_error(exc: BaseException) -> bool:
@@ -1762,7 +1865,54 @@ async def _spawn_pipeline_task(
         acquire_pr_spawn_lock,
     )  # local import to keep top of file lean
 
-    await acquire_pr_spawn_lock(session, pr_number)
+    # ``pg_advisory_xact_lock`` BLOCKS. Under contention it waits out Postgres'
+    # bounded ``lock_timeout`` (30s — database.py:405-418) and then raises
+    # LockNotAvailableError (55P03) right here. That had NO handler: the module's
+    # ``_is_lock_timeout_error`` was only wired in around the spawn INSERT far
+    # below, so an acquire-side timeout propagated out of the pipeline and into
+    # the agent-status post-commit chain as a 500 (and left the session in
+    # pending-rollback, cascading PendingRollbackError through the rest of
+    # post-commit). Treat it exactly like the in-flight-peer deferral the INSERT
+    # path already uses: a peer IS holding this PR's spawn lock, which means a
+    # peer is already spawning for this PR — deferring is not just safe, it is
+    # the correct outcome.
+    try:
+        await acquire_pr_spawn_lock(session, pr_number)
+    except DBAPIError as _spawn_lock_exc:
+        if not _is_lock_timeout_error(_spawn_lock_exc):
+            raise
+        await session.rollback()
+        logger.warning(
+            f"[PIPELINE] {task_type} spawn for PR #{pr_number} timed out acquiring "
+            f"the per-PR spawn lock (a peer spawner holds it) — deferring to the "
+            f"next sweep: {str(_spawn_lock_exc)[:200]}"
+        )
+        # The rollback expired every loaded instance (even under
+        # expire_on_commit=False), so re-fetch the source by id before touching
+        # it — mirrors the INSERT-side lock-timeout handler.
+        #
+        # NIT 9 — SCOPE OF THIS RE-FETCH. The rollback expired EVERY instance in
+        # the session, not just ``source_task``; re-fetching the source alone does
+        # not un-expire the rest. That is sufficient HERE, and only here, because
+        # this branch is a hard early return: the sole instance touched between the
+        # rollback and ``return (None, False)`` is the re-fetched source, and the
+        # caller's post-commit chain re-reads what it needs from a fresh session.
+        # This is a property of the branch, NOT a general licence — any future code
+        # added below the rollback that touches another pre-loaded ORM instance
+        # (parent, orig, a child task) MUST re-fetch it too, or it will lazy-load
+        # outside greenlet context and raise MissingGreenlet. Same contract as
+        # review_loop_convergence._handle_cap_exhaustion; see the rollback-expiry
+        # note at the top of that function.
+        _reloaded_source = await session.get(Task, source_task_id)
+        if _reloaded_source is not None:
+            _reloaded_source.latest_status_message = (
+                f"{task_type.title()} spawn deferred for PR #{pr_number} — "
+                f"another spawner holds the PR lock; retrying next sweep"
+            )
+            _set_spawn_reason(_reloaded_source, SPAWN_REASON_DEFERRED)
+            session.add(_reloaded_source)
+            await session.commit()
+        return (None, False)
 
     # Collect VMs to delete when tasks are superseded or churn-halted.
     # VMs are deleted after the session commits to avoid holding the
@@ -1992,6 +2142,16 @@ async def _spawn_pipeline_task(
         .scalars()
         .all()
     )
+    # R3: uncontended liveness for every candidate, fetched once. The per-PR
+    # advisory lock serializes SPAWNERS only — it does not serialize against a
+    # reviewer's own terminal status write, and Task.last_heartbeat goes stale on
+    # a LIVE agent whose row write was 409-skipped under contention. Corroborate
+    # against VmContact before believing any task is dead (mirrors reaper.py:481)
+    # — AND against the runner's own active-work self-report, which defeats the
+    # shared-VmContact mask on fleet runners (MAJOR 5; mirrors reaper.py:528).
+    vm_contact_lookup, runner_report_lookup = await _load_pipeline_liveness_lookups(
+        session, active_pipeline
+    )
     for t in active_pipeline:
         if t.id == source_task.id:
             continue
@@ -2016,13 +2176,32 @@ async def _spawn_pipeline_task(
         if (
             t.status != TaskStatus.BLOCKED
             and not _task_is_actively_ci_waiting(t)
-            and _is_pipeline_task_stale(t)
+            and _is_pipeline_task_stale(
+                t,
+                vm_last_contact=vm_contact_lookup.get(t.vm_instance_id or ""),
+                runner_report_lookup=runner_report_lookup,
+            )
         ):
             from app.failure_classification import (
                 ADMIN_CANCEL,
                 persist_failure_category,
             )
             from sqlalchemy.orm.attributes import flag_modified
+
+            # R3: re-select FOR UPDATE and re-assert the status before the
+            # destructive write. Without this the CANCELLED write is an
+            # UPDATE-by-PK against a stale snapshot and blind-overwrites a
+            # reviewer that reached COMPLETED+APPROVE inside this window.
+            _locked_t = await _relock_pipeline_task_for_cancel(session, t.id)
+            if _locked_t is None:
+                logger.info(
+                    f"[PIPELINE] NOT superseding {t_type} task {t.id} for PR "
+                    f"#{pr_number} — it went terminal (or its row is held) while we "
+                    f"were deciding; it is not a corpse. Leaving it and its verdict "
+                    f"intact."
+                )
+                continue
+            t = _locked_t
 
             t_ctx = dict(t.context or {})
             t_ctx["failure_detail"] = "superseded_by_review_pipeline"
@@ -2108,6 +2287,20 @@ async def _spawn_pipeline_task(
                 persist_failure_category,
             )
             from sqlalchemy.orm.attributes import flag_modified
+
+            # R3: same guarded re-lock as the stale path. A review that has ALREADY
+            # committed COMPLETED+APPROVE is not "scoped to a pre-conflict
+            # snapshot" — it is a landed verdict, and cancelling it here would
+            # erase it (the context blob is rewritten from the stale snapshot).
+            _locked_t = await _relock_pipeline_task_for_cancel(session, t.id)
+            if _locked_t is None:
+                logger.info(
+                    f"[PIPELINE] NOT superseding review task {t.id} with a fix for PR "
+                    f"#{pr_number} — it went terminal (or its row is held) while we "
+                    f"were deciding; keeping its verdict."
+                )
+                continue
+            t = _locked_t
 
             t_ctx = dict(t.context or {})
             t_ctx["failure_detail"] = "superseded_by_review_pipeline"
@@ -2268,6 +2461,25 @@ async def _spawn_pipeline_task(
                 continue
             if not is_rollup_source and _inflight_orig != resolved_original_id:
                 continue
+            # R3 (third site, same defect class): the `status not in
+            # _PIPELINE_ACTIVE_STATUSES` check above reads the STALE in-memory
+            # snapshot from the same unlocked SELECT, so it cannot see a task that
+            # went COMPLETED after that SELECT — and the cancel below is the same
+            # unguarded UPDATE-by-PK + whole-context rewrite. Churn-halt is a
+            # deliberate kill of the loop, but killing a reviewer that has ALREADY
+            # landed its verdict is still wrong (and erases it). Re-lock and
+            # re-assert; a task that is no longer active needs no cancelling.
+            _locked_inflight = await _relock_pipeline_task_for_cancel(
+                session, _inflight.id
+            )
+            if _locked_inflight is None:
+                logger.info(
+                    f"[PIPELINE] Churn halt for PR #{pr_number}: NOT cancelling "
+                    f"{_inflight_type} task {_inflight.id} — already terminal (or its "
+                    f"row is held); leaving its result intact"
+                )
+                continue
+            _inflight = _locked_inflight
             _inflight_ctx = dict(_inflight.context or {})
             _inflight_ctx["failure_detail"] = "cancelled_by_churn_halt"
             _inflight.context = _inflight_ctx

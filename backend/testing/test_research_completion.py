@@ -4525,281 +4525,6 @@ async def test_dedup_deadlock_auto_completes_exhausted_direction(db_session):
 
 
 @_pytest.mark.asyncio
-async def test_dedup_deadlock_exhaustion_deferred_when_owns_uncovered_criterion(
-    db_session,
-):
-    """The dedup-deadlock exhaustion path (line 750 call site of
-    _maybe_autocomplete_exhausted_direction) must defer auto-complete when the
-    direction owns an uncovered acceptance criterion.
-
-    Mirrors the _stamp_no_findings_refractory exhaustion-gate test
-    (test_exhaustion_autocomplete_deferred_when_direction_owns_uncovered_criterion).
-    Without this gate, a dedup-deadlocked direction that owns uncovered criteria
-    would retire without satisfying those criteria.
-    """
-    from datetime import datetime, timedelta
-
-    from app.research_direction_state import apply_post_spawn_state
-    from test_autonomous_research import (
-        _active_direction,
-        _make_research_task,
-        _map_direction_to_criterion,
-    )
-
-    direction_id = "d-dl-uncovered-criterion"
-    old_history = [
-        {
-            "timestamp": (
-                datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=10)
-            ).isoformat(),
-            "task_id": "t-dl-crit1",
-            "tasks_created": 0,
-            "findings_produced": 0,
-            "filter_breakdown": {
-                "hash_dedup": 2,
-                "word_overlap_dedup": 0,
-                "file_overlap_dedup": 0,
-                "evidence_overlap_dedup": 0,
-                "type_filtered": 0,
-                "empty_prompt": 0,
-            },
-            "summary": "no findings",
-        },
-        {
-            "timestamp": (
-                datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=5)
-            ).isoformat(),
-            "task_id": "t-dl-crit2",
-            "tasks_created": 0,
-            "findings_produced": 0,
-            "filter_breakdown": {
-                "hash_dedup": 1,
-                "word_overlap_dedup": 1,
-                "file_overlap_dedup": 0,
-                "evidence_overlap_dedup": 0,
-                "type_filtered": 0,
-                "empty_prompt": 0,
-            },
-            "summary": "no findings",
-        },
-    ]
-    direction = {
-        **_active_direction(direction_id, "Dedup deadlock + uncovered criterion"),
-        "research_history": old_history,
-    }
-    project = _Project(
-        name="Deadlock Criterion Gate Test",
-        user_id="test-user-dlcrit",
-        autonomous_enabled=True,
-        directions=[direction],
-        vision={"purpose": "test"},
-    )
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    # Map the direction to an UNCOVERED criterion so the gate fires.
-    await _map_direction_to_criterion(
-        db_session, project, direction_id, covered=False
-    )
-
-    task = await _make_research_task(project, direction, db_session)
-    task.context = {**(task.context or {}), "direction_id": direction_id}
-    db_session.add(task)
-    await db_session.commit()
-
-    # Trigger dedup deadlock via a 3rd consecutive dedup-zero cycle.
-    await apply_post_spawn_state(
-        db_session,
-        task,
-        [],  # findings
-        [],  # child_tasks
-        [],  # deduplicated
-        [],  # insights
-        [],  # direction_notes
-        [],  # direction_proposals
-        1,  # hash_dedup_count — dedup activity
-        0,  # word_overlap_count
-        0,  # file_overlap_count
-        0,  # evidence_overlap_count
-        0,  # type_filtered_count
-        0,  # empty_prompt_count
-        "research-branch",
-        "main",
-        0,  # research_depth
-        None,  # parent_research_task_id
-    )
-    await db_session.refresh(project)
-
-    d = project.directions[0]
-    # The criterion gate defers exhaustion auto-complete; the direction falls
-    # through to the existing auto-pause path (status='paused').  The critical
-    # invariant is that it is NOT terminal-completed.
-    assert d["status"] != "completed", (
-        "dedup-deadlocked direction with uncovered criterion must NOT be "
-        f"terminal-completed (gate must defer exhaustion auto-complete), "
-        f"got status={d['status']!r}"
-    )
-    assert d.get("auto_completed") is not True, (
-        "auto_completed must NOT be set when exhaustion is gated on uncovered criteria"
-    )
-    assert d.get("_exhaustion_gated_by_criterion") is True, (
-        "_exhaustion_gated_by_criterion must be set when the criterion gate "
-        "blocks dedup-deadlock auto-completion"
-    )
-
-
-@_pytest.mark.asyncio
-async def test_already_fixed_deadlock_with_uncovered_criterion_defers_completion(
-    db_session,
-):
-    """The already-fixed-deadlock exhaustion path (line 890 call site of
-    _maybe_autocomplete_exhausted_direction) must defer auto-complete when the
-    direction owns an uncovered acceptance criterion.
-
-    Mirrors the dedup-deadlock exhaustion-gate test
-    (test_dedup_deadlock_exhaustion_deferred_when_owns_uncovered_criterion).
-    The already-fixed-deadlock variant (where spawned tasks all terminated as
-    SCOPE_EMPTY because the work was already on HEAD) is a separate code path
-    from dedup-deadlock (where cycles produce findings rejected by hash/word-overlap).
-    Both route through _maybe_autocomplete_exhausted_direction and must be gated.
-    """
-    from datetime import datetime, timedelta
-
-    from app.research_direction_state import apply_post_spawn_state
-    from test_autonomous_research import (
-        _active_direction,
-        _make_research_task,
-        _map_direction_to_criterion,
-    )
-
-    direction_id = "d-af-uncovered-criterion"
-    # Already-fixed-deadlock history: 3 consecutive research cycles whose spawned
-    # tasks all terminated as SCOPE_EMPTY (work already done on HEAD).
-    old_history = [
-        {
-            "timestamp": (
-                datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=15)
-            ).isoformat(),
-            "task_id": "t-af-crit1",
-            "tasks_created": 1,
-            "scope_empty_noop_count": 1,
-            "findings_produced": 0,
-            "filter_breakdown": {
-                "hash_dedup": 0,
-                "word_overlap_dedup": 0,
-                "file_overlap_dedup": 0,
-                "evidence_overlap_dedup": 0,
-                "type_filtered": 0,
-                "empty_prompt": 0,
-            },
-            "summary": "all tasks SCOPE_EMPTY",
-        },
-        {
-            "timestamp": (
-                datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=10)
-            ).isoformat(),
-            "task_id": "t-af-crit2",
-            "tasks_created": 2,
-            "scope_empty_noop_count": 2,
-            "findings_produced": 0,
-            "filter_breakdown": {
-                "hash_dedup": 0,
-                "word_overlap_dedup": 0,
-                "file_overlap_dedup": 0,
-                "evidence_overlap_dedup": 0,
-                "type_filtered": 0,
-                "empty_prompt": 0,
-            },
-            "summary": "all tasks SCOPE_EMPTY",
-        },
-        {
-            "timestamp": (
-                datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=5)
-            ).isoformat(),
-            "task_id": "t-af-crit3",
-            "tasks_created": 1,
-            "scope_empty_noop_count": 1,
-            "findings_produced": 0,
-            "filter_breakdown": {
-                "hash_dedup": 0,
-                "word_overlap_dedup": 0,
-                "file_overlap_dedup": 0,
-                "evidence_overlap_dedup": 0,
-                "type_filtered": 0,
-                "empty_prompt": 0,
-            },
-            "summary": "all tasks SCOPE_EMPTY",
-        },
-    ]
-    direction = {
-        **_active_direction(
-            direction_id, "Already-fixed deadlock + uncovered criterion"
-        ),
-        "research_history": old_history,
-    }
-    project = _Project(
-        name="Already-Fixed Deadlock Criterion Gate Test",
-        user_id="test-user-afcrit",
-        autonomous_enabled=True,
-        directions=[direction],
-        vision={"purpose": "test"},
-    )
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    # Map the direction to an UNCOVERED criterion so the gate fires.
-    await _map_direction_to_criterion(
-        db_session, project, direction_id, covered=False
-    )
-
-    task = await _make_research_task(project, direction, db_session)
-    task.context = {**(task.context or {}), "direction_id": direction_id}
-    db_session.add(task)
-    await db_session.commit()
-
-    # Trigger already-fixed deadlock via a 3rd consecutive scope-empty cycle.
-    await apply_post_spawn_state(
-        db_session,
-        task,
-        [],  # findings
-        [],  # child_tasks
-        [],  # deduplicated
-        [],  # insights
-        [],  # direction_notes
-        [],  # direction_proposals
-        0,  # hash_dedup_count — no dedup activity (this is already-fixed, not dedup)
-        0,  # word_overlap_count
-        0,  # file_overlap_count
-        0,  # evidence_overlap_count
-        0,  # type_filtered_count
-        0,  # empty_prompt_count
-        "research-branch",
-        "main",
-        0,  # research_depth
-        None,  # parent_research_task_id
-    )
-    await db_session.refresh(project)
-
-    d = project.directions[0]
-    # The criterion gate defers exhaustion auto-complete; the direction must NOT
-    # be terminal-completed.
-    assert d["status"] != "completed", (
-        "already-fixed-deadlocked direction with uncovered criterion must NOT be "
-        f"terminal-completed (gate must defer exhaustion auto-complete), "
-        f"got status={d['status']!r}"
-    )
-    assert d.get("auto_completed") is not True, (
-        "auto_completed must NOT be set when exhaustion is gated on uncovered criteria"
-    )
-    assert d.get("_exhaustion_gated_by_criterion") is True, (
-        "_exhaustion_gated_by_criterion must be set when the criterion gate "
-        "blocks already-fixed-deadlock auto-completion"
-    )
-
-
-@_pytest.mark.asyncio
 async def test_dedup_deadlock_populates_deadlock_filtered_titles(db_session):
     """When a dedup deadlock fires but exhaustion-completion is DECLINED (the
     direction is externally frozen), the existing auto-pause path still runs and
@@ -8020,6 +7745,372 @@ async def test_working_registry_capability_prerequisite_does_not_block(
 
 
 @_pytest.mark.asyncio
+async def test_working_registry_capability_prerequisite_blocks_under_enforce(
+    db_session, mocker
+):
+    """ACCEPTANCE EVIDENCE (finding feat:enforce-gate-blocking-on-both-consumers).
+    Spawn-time seam: under enforce mode a finding declaring a capability prerequisite
+    that the registry marks 'working' but UNPROVEN must spawn the child BLOCKED
+    with the capability need recorded — the capability exists in the codebase
+    but without machine-verified proof the dependent must not proceed."""
+    from test_autonomous_research import _make_finding, _patch_research_externals
+    from app.task_blocked import get_blocker_needs
+    from app.shared_state import runtime_config as _rc
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-prq09")
+    _project.problem_model = {
+        **(_project.problem_model or {}),
+        "capabilities": [
+            # Working but no evidence_refs → unproven
+            {"name": "Budgeted compute job substrate", "status": "working"},
+        ],
+    }
+    db_session.add(_project)
+    await db_session.commit()
+
+    finding = _make_finding(
+        title="Add compute launch entrypoint", direction_id=direction["id"]
+    )
+    finding["prerequisite"] = {
+        "kind": "capability",
+        "ref": "budgeted-compute-job-substrate",
+    }
+
+    saved_mode = _rc.get("capability_proof_gate_mode")
+    try:
+        _rc["capability_proof_gate_mode"] = "enforce"
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings", return_value=[finding]
+        )
+        await _handle_research_completion(task, "", db_session)
+    finally:
+        if saved_mode is not None:
+            _rc["capability_proof_gate_mode"] = saved_mode
+        else:
+            _rc.pop("capability_proof_gate_mode", None)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    children = [c for c in children if (c.first_payload or {}).get("type") != "memo"]
+    assert len(children) == 1
+    child = children[0]
+    assert child.status == TaskStatus.BLOCKED, (
+        "under enforce mode, a prerequisite on an unproven working capability "
+        "must park the dependent BLOCKED (spawn-time seam)"
+    )
+    needs = get_blocker_needs(child)
+    assert any(n.get("kind") == "capability" for n in needs), (
+        "BLOCKED task must record the capability need so the resume sweep can "
+        "unblock it once proof is earned"
+    )
+
+
+async def _spawn_child_under_enforce(
+    db_session,
+    mocker,
+    *,
+    direction_key: str,
+    capabilities: list[dict],
+    proof_records: dict | None,
+):
+    """Spawn one finding whose prerequisite names ``budgeted-compute-job-substrate``
+    through the REAL research-completion path with the proof gate in ENFORCE mode,
+    and return the spawned child task.
+
+    ``capabilities`` is written to ``project.problem_model`` (AGENT-WRITABLE) and
+    ``proof_records`` to ``project.capability_proof_records`` (the PLATFORM-ONLY
+    ledger) — the two sources whose disagreement finding #4 is about.
+    """
+    from test_autonomous_research import _make_finding, _patch_research_externals
+    from app.shared_state import runtime_config as _rc
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, direction_key
+    )
+    _project.problem_model = {
+        **(_project.problem_model or {}),
+        "capabilities": capabilities,
+    }
+    _project.capability_proof_records = proof_records
+    db_session.add(_project)
+    await db_session.commit()
+
+    finding = _make_finding(
+        title="Add compute launch entrypoint", direction_id=direction["id"]
+    )
+    finding["prerequisite"] = {
+        "kind": "capability",
+        "ref": "budgeted-compute-job-substrate",
+    }
+
+    saved_mode = _rc.get("capability_proof_gate_mode")
+    try:
+        _rc["capability_proof_gate_mode"] = "enforce"
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings", return_value=[finding]
+        )
+        await _handle_research_completion(task, "", db_session)
+    finally:
+        if saved_mode is not None:
+            _rc["capability_proof_gate_mode"] = saved_mode
+        else:
+            _rc.pop("capability_proof_gate_mode", None)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    children = [c for c in children if (c.first_payload or {}).get("type") != "memo"]
+    assert len(children) == 1
+    return children[0]
+
+
+def _self_declared_working_cap() -> dict:
+    """A ``working`` capability whose ONLY proof is an agent-authored evidence_ref.
+
+    Exactly what an agent can write into the JSONB ``problem_model`` with nothing
+    machine-verified behind it.
+    """
+    return {
+        "name": "Budgeted compute job substrate",
+        "status": "working",
+        "evidence_refs": [
+            {"kind": "named_test", "ref": "testing/test_x.py::test_x", "proven": True}
+        ],
+    }
+
+
+def _platform_ledger(proof_kind: str = "named_test") -> dict:
+    """One machine-verified PLATFORM proof-record (an agent cannot write this)."""
+    return {
+        "budgeted-compute-job-substrate": [
+            {
+                "task_id": "T1",
+                "proof_kind": proof_kind,
+                "proof_ref": "testing/test_x.py::test_x",
+            }
+        ]
+    }
+
+
+@_pytest.mark.asyncio
+async def test_self_declared_capability_proof_blocks_spawn_under_enforce(
+    db_session, mocker
+):
+    """SECURITY (finding #4), spawn-time seam. A prerequisite naming a ``working``
+    capability whose ``proven`` evidence_ref is a pure SELF-REPORT — no corroborating
+    entry in the platform-only ``capability_proof_records`` ledger — must NOT clear
+    the enforce gate: the dependent parks BLOCKED with the need recorded.
+
+    Before the fix the resolver graded from ``problem_model.capabilities[].evidence_refs``
+    alone (agent-writable JSONB), so this forged ref spawned the child unblocked.
+    """
+    from app.task_blocked import get_blocker_needs
+
+    child = await _spawn_child_under_enforce(
+        db_session,
+        mocker,
+        direction_key="d-prq20",
+        capabilities=[_self_declared_working_cap()],
+        proof_records={},  # empty platform ledger — nothing corroborates the claim
+    )
+
+    assert child.status == TaskStatus.BLOCKED, (
+        "a self-declared capability proof must never satisfy a prerequisite — "
+        "without a platform ledger entry the dependent must stay BLOCKED"
+    )
+    assert any(n.get("kind") == "capability" for n in get_blocker_needs(child)), (
+        "the capability need must be recorded so the resume sweep can unblock it "
+        "once real proof is earned"
+    )
+
+
+@_pytest.mark.asyncio
+async def test_ledger_corroborated_capability_clears_spawn_under_enforce(
+    db_session, mocker
+):
+    """A capability whose ``proven`` claim IS corroborated by a machine-verified
+    ``named_test`` entry in the platform ledger clears the enforce gate — the fix
+    blocks self-reports, not real proof."""
+    from app.task_blocked import get_blocker_needs
+
+    child = await _spawn_child_under_enforce(
+        db_session,
+        mocker,
+        direction_key="d-prq21",
+        capabilities=[_self_declared_working_cap()],
+        proof_records=_platform_ledger(),
+    )
+
+    assert child.status != TaskStatus.BLOCKED, (
+        "a ledger-corroborated capability must satisfy the prerequisite under enforce"
+    )
+    assert not get_blocker_needs(child)
+
+
+@_pytest.mark.asyncio
+async def test_backing_path_only_ledger_blocks_spawn_under_enforce(
+    db_session, mocker
+):
+    """A ledger holding only a structural ``backing_path`` entry grades
+    ``path_proven``, not ``proven`` — it does not corroborate a ``proven``
+    self-report, so the enforce gate still blocks the dependent."""
+    child = await _spawn_child_under_enforce(
+        db_session,
+        mocker,
+        direction_key="d-prq22",
+        capabilities=[_self_declared_working_cap()],
+        proof_records=_platform_ledger(proof_kind="backing_path"),
+    )
+
+    assert child.status == TaskStatus.BLOCKED, (
+        "a structural backing_path ledger entry is not machine-verified proof and "
+        "must not clear the gate for a self-reported 'proven' claim"
+    )
+
+
+def _platform_exemption_ledger() -> dict:
+    """The operator's PLATFORM-recorded exemption for the gating capability.
+
+    Written into ``project.capability_proof_records`` — the platform-only column no
+    agent-facing endpoint can write. It is NOT a machine proof: it is the operator's
+    standing authorization to clear the gate without one.
+    """
+    from app.capability_registry import build_operator_exemption_record
+
+    return {
+        "budgeted-compute-job-substrate": [
+            build_operator_exemption_record(
+                "budgeted-compute-job-substrate",
+                authorized_by="operator@example.com",
+                reason="external substrate, no test hook",
+            )
+        ]
+    }
+
+
+@_pytest.mark.asyncio
+async def test_platform_recorded_exemption_clears_spawn_without_proof_entry(
+    db_session, mocker
+):
+    """PRESERVED CARVE-OUT. An OPERATOR-recorded exemption (an ``operator_exemption``
+    entry in the platform-only ledger) clears the spawn-time gate with NO machine
+    proof: the earn loop deliberately never mints proof-records for an exempt
+    capability, so demanding corroboration would nullify the exemption the operator
+    granted."""
+    from app.task_blocked import get_blocker_needs
+
+    child = await _spawn_child_under_enforce(
+        db_session,
+        mocker,
+        direction_key="d-prq23",
+        capabilities=[
+            {
+                "name": "Budgeted compute job substrate",
+                "status": "working",
+                "evidence_refs": [],
+                "proof_exempt": True,
+                "source": {
+                    "type": "user_message",
+                    "ref": "operator granted exemption",
+                },
+            }
+        ],
+        # The operator's exemption record — and NO machine proof, by design.
+        proof_records=_platform_exemption_ledger(),
+    )
+
+    assert child.status != TaskStatus.BLOCKED, (
+        "an operator-recorded exemption must still clear the gate without a "
+        "machine-proof ledger entry"
+    )
+    assert not get_blocker_needs(child)
+
+
+@_pytest.mark.asyncio
+async def test_agent_fabricated_exemption_provenance_blocks_spawn_under_enforce(
+    db_session, mocker
+):
+    """SECURITY (finding #9), spawn-resolver seam. THE CORE PROPERTY OF THIS RELEASE.
+
+    ``proof_exempt: true`` + ``source: {"type": "self_reflection"}`` lives entirely in
+    the AGENT-WRITABLE ``problem_model`` JSONB — the same store the ledger-
+    corroboration pass exists to distrust. The previous fix authorized the exemption
+    off that ``source.type``, so an agent could forge one of the accepted types and
+    clear the prerequisite gate for its own dependents with nothing verified.
+
+    The exemption must now be recorded in the platform-only ledger; a fabricated
+    provenance is refused and the dependent stays BLOCKED.
+    """
+    from app.task_blocked import get_blocker_needs
+
+    for forged_type in ("self_reflection", "agent_observation", "user_message"):
+        child = await _spawn_child_under_enforce(
+            db_session,
+            mocker,
+            direction_key=f"d-prq23-forged-{forged_type}",
+            capabilities=[
+                {
+                    "name": "Budgeted compute job substrate",
+                    "status": "working",
+                    "evidence_refs": [],
+                    "proof_exempt": True,
+                    "source": {"type": forged_type, "ref": "trust me"},
+                }
+            ],
+            # Empty platform ledger — the operator granted NO exemption.
+            proof_records={},
+        )
+
+        assert child.status == TaskStatus.BLOCKED, (
+            f"an agent-fabricated exemption provenance (source.type={forged_type!r}) "
+            "must never clear the spawn-time capability gate"
+        )
+        assert any(n.get("kind") == "capability" for n in get_blocker_needs(child)), (
+            "the capability need must stay recorded so the resume sweep can unblock "
+            "it once a real proof (or a real exemption) lands"
+        )
+
+
+@_pytest.mark.asyncio
+async def test_bare_proof_exempt_blocks_spawn_under_enforce(db_session, mocker):
+    """A BARE ``proof_exempt=True`` — no cited ``source``, so no operator/strategic
+    provenance — is the silent self-report escape hatch and must still BLOCK."""
+    child = await _spawn_child_under_enforce(
+        db_session,
+        mocker,
+        direction_key="d-prq24",
+        capabilities=[
+            {
+                "name": "Budgeted compute job substrate",
+                "status": "working",
+                "evidence_refs": [],
+                "proof_exempt": True,
+            }
+        ],
+        proof_records={},
+    )
+
+    assert child.status == TaskStatus.BLOCKED, (
+        "an unattributed proof_exempt must never clear the gate"
+    )
+
+
+@_pytest.mark.asyncio
 async def test_planned_registry_capability_prerequisite_still_blocks(
     db_session, mocker
 ):
@@ -10891,6 +10982,64 @@ async def test_compute_experiment_with_gpu_or_material_spend_is_adversarially_ch
     graders = [t for t in others if (t.context or {}).get("adversarial_grader") is True]
     assert len(graders) == 1, (
         f"Exactly one adversarial grader must be spawned; got {len(graders)}"
+    )
+
+
+@_pytest.mark.asyncio
+async def test_compute_experiment_defaults_container_image_to_project_image_research(
+    db_session, mocker
+):
+    """When a project's manifest declares compute.image.name and a research finding
+    omits container_image, _handle_research_completion must default the spawned
+    compute_experiment child's container_image to the project's declared image."""
+    from test_autonomous_research import _patch_research_externals
+
+    _PROJECT_IMAGE = "us-central1-docker.pkg.dev/myproject/compute/base:sha256-abc123"
+
+    mocker.patch(
+        "app.routers.admin_project_tools._discover_manifest_tools",
+        new=AsyncMock(
+            return_value={
+                "tools": [],
+                "skills": [],
+                "compute": {"image": {"name": _PROJECT_IMAGE}},
+                "error": None,
+            }
+        ),
+    )
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-cx-img-default-01"
+    )
+
+    finding = _compute_finding(
+        direction["id"],
+        spend_cap_usd=2.0,
+        deadline_seconds=3600,
+    )
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings", return_value=[finding]
+    )
+    mocker.patch.dict(
+        "app.shared_state.runtime_config",
+        {"compute_experiment_spend_threshold_usd": 5.0},
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    children = await _children_of(db_session, task)
+    compute_children = [
+        c
+        for c in children
+        if (c.first_payload or {}).get("type") == "compute_experiment"
+    ]
+    assert len(compute_children) == 1, (
+        f"Expected 1 compute_experiment child, got {len(compute_children)}: {children}"
+    )
+    payload = compute_children[0].first_payload or {}
+    assert payload.get("container_image") == _PROJECT_IMAGE, (
+        f"Expected container_image={_PROJECT_IMAGE!r}, got {payload.get('container_image')!r}"
     )
 
 
@@ -15675,7 +15824,11 @@ async def test_adversarial_gate_uses_poolvm_provenance_after_cache_loss(
     db_session.add(grader)
     await db_session.commit()
 
-    mocker.patch("app.compute.get_vm_image", return_value=(None, None))
+    # Empty the in-memory heartbeat caches so provenance can only come from the
+    # PoolVm row — that DB fallback is what this test pins.
+    # NOTE: image identity is NOT patched here. task_lifecycle reads the image name
+    # and build_ts straight off `pool_vm` (the durable row); it never calls
+    # compute.get_vm_image, so a patch on that getter would be an INERT mock.
     mocker.patch("app.compute.get_vm_runtime_fingerprint", return_value=None)
     mocker.patch("app.compute.get_vm_source_sha", return_value=None)
 
@@ -16912,47 +17065,6 @@ class TestStampNoFindingsRefractory:
             "A budget-paused (cost_pause_evidence) direction must NOT be auto-completed"
         )
 
-    def test_exhaustion_autocomplete_deferred_when_direction_owns_uncovered_criterion(self):
-        """A genuinely-exhausted direction with an uncovered acceptance criterion
-        must NOT auto-complete via the exhaustion route — the criterion must be
-        satisfied first.
-
-        The proven-merge path (>=3 verified merges) already gates on criterion
-        coverage via direction_owns_uncovered_criterion; this guards the additive
-        exhaustion path (<3 merges, saturated/deadlocked) against the same blind
-        spot. Without this gate, a direction that owns uncovered criteria can
-        retire via dedup-deadlock, already-fixed-deadlock, or saturation-with-
-        <3-merges without satisfying those criteria.
-        """
-        from app.research_completion import _stamp_no_findings_refractory
-        from unittest.mock import patch, AsyncMock
-
-        # Saturated, genuinely exhausted history (< 3 merges)
-        already_fixed_history = [
-            {"tasks_created": 2, "scope_empty_noop_count": 2, "prs_merged": 0}
-            for _ in range(3)
-        ]
-        task = self._make_task()
-        project = self._make_exhausted_project(research_history=already_fixed_history)
-
-        with patch(
-            "app.acceptance_criteria.direction_owns_uncovered_criterion",
-            AsyncMock(return_value=True),
-        ):
-            self._run(
-                project, _stamp_no_findings_refractory(task, self._make_session())
-            )
-
-        direction = project.directions[0]
-        assert direction.get("status") != "completed", (
-            "A direction with uncovered criteria must NOT auto-complete via "
-            f"exhaustion, got status={direction.get('status')!r}"
-        )
-        assert direction.get("status") == "active", (
-            f"Direction must remain active when exhaustion is gated on uncovered "
-            f"criteria, got status={direction.get('status')!r}"
-        )
-
     def test_no_findings_auto_completion_reconciles_gap_staffing(self):
         """Auto-completing a direction via the no-findings path must reconcile
         problem-model gap staffing — pruning the direction from active_moves
@@ -17046,14 +17158,14 @@ class TestStampNoFindingsRefractory:
 
 
 # --------------------------------------------------------------------------- #
-# Proven-merge success completion is gated on owned-criterion coverage.
+# Proven-merge success completion (criterion-coverage gate RETIRED — Stage 1).
 #
-# A saturated direction with >= 3 verified merges must NOT retire declaring
-# success ("verified PRs merged") while an acceptance criterion it OWNS is still
-# uncovered. These tests exercise the real seam end-to-end against a live DB:
-# a Direction ORM row (criterion_keys), an open ReleaseVersion, a
-# VersionAcceptanceCriterion, and optional CriterionEvidence — so the
-# direction_owns_uncovered_criterion coverage query runs for real.
+# A saturated direction with >= 3 verified merges auto-completes on the
+# proven-merge route regardless of any owned acceptance criterion: the
+# pre-qualification coverage gate was removed, and the acceptance contract is
+# enforced only at qualify (the ledger gate in compute_composite). These
+# control tests confirm proven-merge completion still fires whether the
+# direction owns a covered criterion or no criteria at all.
 # --------------------------------------------------------------------------- #
 
 
@@ -17155,51 +17267,6 @@ async def _open_version_with_criterion(db_session, project, *, covered: bool):
 
 
 @_pytest.mark.asyncio
-async def test_no_findings_proven_direction_with_uncovered_criterion_stays_active(
-    db_session,
-):
-    """Site 2 (_stamp_no_findings_refractory): a saturated, >=3-merge direction
-    that OWNS an uncovered active criterion must NOT auto-complete on the
-    throughput route — it stays active to keep working toward the unmet outcome."""
-    from app.research_completion import _stamp_no_findings_refractory
-
-    direction_id = "d-cov-uncovered"
-    project, task, _ = await _setup_saturated_proven_direction(
-        db_session, direction_id=direction_id, criterion_keys=["placeholder"]
-    )
-    _version, criterion = await _open_version_with_criterion(
-        db_session, project, covered=False
-    )
-
-    # Point the direction row's criterion_keys at the real (uncovered) criterion.
-    from app.models import Direction
-
-    row = (
-        await db_session.execute(
-            _select(Direction).where(
-                Direction.project_id == project.id,
-                Direction.direction_key == direction_id,
-            )
-        )
-    ).scalar_one()
-    row.criterion_keys = [criterion.criterion_key]
-    db_session.add(row)
-    await db_session.commit()
-
-    await _stamp_no_findings_refractory(task, db_session)
-
-    await db_session.refresh(project)
-    target = next(d for d in project.directions if d.get("id") == direction_id)
-    assert target.get("status") == "active", (
-        "Direction owning an uncovered criterion must NOT auto-complete on the "
-        "proven-merge route; expected it to stay active"
-    )
-    assert target.get("auto_completed") is not True
-    # Refractory stamp is still applied even though completion was withheld.
-    assert target.get("possibly_saturated") is True
-
-
-@_pytest.mark.asyncio
 async def test_no_findings_proven_direction_with_covered_criterion_completes(
     db_session,
 ):
@@ -17242,17 +17309,16 @@ async def test_no_findings_proven_direction_with_covered_criterion_completes(
 
 @_pytest.mark.asyncio
 async def test_no_findings_proven_direction_owning_no_criteria_completes(db_session):
-    """Site 2: the gate is a no-op when the direction owns no criteria — a
-    saturated proven direction with an empty criterion_keys set still completes
-    (preserves current behavior)."""
+    """Site 2: a saturated proven direction with an empty criterion_keys set
+    still completes (proven-merge completion is criterion-independent)."""
     from app.research_completion import _stamp_no_findings_refractory
 
     direction_id = "d-cov-none"
     project, task, _ = await _setup_saturated_proven_direction(
         db_session, direction_id=direction_id, criterion_keys=[]
     )
-    # An open version with an active criterion exists, but the direction owns
-    # none of it — the gate must not block completion.
+    # An open version with an active criterion exists, but it does not affect
+    # proven-merge completion.
     await _open_version_with_criterion(db_session, project, covered=False)
 
     await _stamp_no_findings_refractory(task, db_session)
@@ -17265,473 +17331,15 @@ async def test_no_findings_proven_direction_owning_no_criteria_completes(db_sess
     assert target.get("auto_completed") is True
 
 
-@_pytest.mark.asyncio
-async def test_criterion_gate_query_error_defers_autocomplete(
-    db_session, mocker
-):
-    """Site 2 (_stamp_no_findings_refractory): when the coverage query raises,
-    the gate must fail closed — deferring retirement rather than allowing
-    auto-complete on a transient error."""
-    from app.research_completion import _stamp_no_findings_refractory
-
-    direction_id = "d-cov-failclosed"
-    project, task, _ = await _setup_saturated_proven_direction(
-        db_session, direction_id=direction_id, criterion_keys=["placeholder"]
-    )
-    _version, criterion = await _open_version_with_criterion(
-        db_session, project, covered=False
-    )
-
-    from app.models import Direction
-
-    row = (
-        await db_session.execute(
-            _select(Direction).where(
-                Direction.project_id == project.id,
-                Direction.direction_key == direction_id,
-            )
-        )
-    ).scalar_one()
-    row.criterion_keys = [criterion.criterion_key]
-    db_session.add(row)
-    await db_session.commit()
-
-    # Force the coverage resolution to raise; the helper must swallow it and
-    # return True (fail-closed), deferring retirement.
-    mocker.patch(
-        "app.release_version.current_open_version",
-        new=AsyncMock(side_effect=RuntimeError("transient DB error")),
-    )
-
-    await _stamp_no_findings_refractory(task, db_session)
-
-    await db_session.refresh(project)
-    target = next(d for d in project.directions if d.get("id") == direction_id)
-    assert target.get("status") == "active", (
-        "A coverage-query error must fail closed (defer), never auto-complete "
-        "a saturated direction on a transient failure"
-    )
-    assert target.get("auto_completed") is not True
-    # Refractory stamp still applied even though completion was withheld.
-    assert target.get("possibly_saturated") is True
-
-
-@_pytest.mark.asyncio
-async def test_criterion_gate_failure_logs_warning(db_session, mocker, caplog):
-    """When direction_owns_uncovered_criterion encounters a DB error, the
-    fail-closed block must emit a WARNING log so operators can distinguish
-    transient-query-failure blocks from legitimate uncovered-criterion defers."""
-    from app.models import Direction
-    from app.research_direction_state import apply_post_spawn_state
-
-    direction_id = "d-cov-fail-warn"
-    project, task, _direction = await _setup_saturated_proven_direction(
-        db_session, direction_id=direction_id, criterion_keys=["placeholder"]
-    )
-    _version, criterion = await _open_version_with_criterion(
-        db_session, project, covered=False
-    )
-
-    # Point the direction row's criterion_keys at the real (uncovered) criterion.
-    row = (
-        await db_session.execute(
-            _select(Direction).where(
-                Direction.project_id == project.id,
-                Direction.direction_key == direction_id,
-            )
-        )
-    ).scalar_one()
-    row.criterion_keys = [criterion.criterion_key]
-    db_session.add(row)
-    await db_session.commit()
-
-    # Ensure task context carries direction_id so apply_post_spawn_state can
-    # find the current direction for the no-findings cycle entry.
-    task.context = {**(task.context or {}), "direction_id": direction_id}
-    db_session.add(task)
-    await db_session.commit()
-
-    # Force the coverage resolution to raise; the helper must swallow it and
-    # return True (fail-closed), deferring retirement.
-    mocker.patch(
-        "app.release_version.current_open_version",
-        new=AsyncMock(side_effect=RuntimeError("transient DB error")),
-    )
-
-    with caplog.at_level(logging.WARNING, logger="app.research_direction_state"):
-        await apply_post_spawn_state(
-            db_session,
-            task,
-            [],   # findings
-            [],   # child_tasks
-            [],   # deduplicated
-            [],   # insights
-            [],   # direction_notes
-            [],   # direction_proposals
-            0,    # hash_dedup_count
-            0,    # word_overlap_count
-            0,    # file_overlap_count
-            0,    # evidence_overlap_count
-            0,    # type_filtered_count
-            0,    # empty_prompt_count
-            "research-branch",
-            "main",
-            0,    # research_depth
-            None, # parent_research_task_id
-        )
-
-    assert "Criterion-coverage gate" in caplog.text, (
-        "A criterion-gate block on DB error must emit a WARNING log "
-        "so operators can distinguish transient failures from legitimate defers"
-    )
-    # Verify the direction was NOT auto-completed (fail-closed).
-    await db_session.refresh(project)
-    target = next(d for d in project.directions if d.get("id") == direction_id)
-    assert target.get("status") == "active", (
-        "A coverage-query error must fail closed (defer), never auto-complete "
-        "a saturated direction on a transient failure"
-    )
-    assert target.get("auto_completed") is not True
-
-
-@_pytest.mark.asyncio
-async def test_no_findings_exhausted_direction_with_uncovered_criterion_stays_active(
-    db_session,
-):
-    """Site 2 (_stamp_no_findings_refractory): a saturated direction with <3
-    verified merges that owns an uncovered active criterion must NOT auto-complete
-    via the exhaustion route — it stays active to keep working toward the unmet
-    outcome."""
-    from app.models import Direction
-    from app.research_completion import _stamp_no_findings_refractory
-
-    direction_id = "d-cov-exhausted"
-
-    # Custom setup: direction has <3 verified merges (total_merged=2), is about
-    # to become saturated (2 consecutive unproductive → +1 = 3), and has no
-    # recent prs_merged entries so _direction_has_recent_merges is False —
-    # meaning the direction WOULD be flagged as "exhausted" by the deadlock
-    # predicate if the criterion gate did not block it.
-    direction_dict = {
-        "id": direction_id,
-        "text": "Exhausted direction with uncovered criterion",
-        "status": "active",
-        "history_aggregate": {},
-        "consecutive_unproductive_cycles": 2,  # +1 → saturated
-        "research_history": [
-            {"verified_prs_merged": 1},  # total_merged = 2 (< 3)
-            {"verified_prs_merged": 1},
-        ],
-    }
-    project = _Project(
-        name="Exhaustion Gate Test",
-        user_id="test-user-exhaust-gate",
-        autonomous_enabled=True,
-        directions=[direction_dict],
-        vision={"purpose": "test"},
-    )
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    # First-class Direction ORM row with placeholder criterion keys.
-    db_session.add(
-        Direction(
-            project_id=project.id,
-            direction_key=direction_id,
-            status="active",
-            data=dict(direction_dict),
-            criterion_keys=["placeholder"],
-        )
-    )
-    await db_session.commit()
-
-    # Open release version with one uncovered criterion.
-    _version, criterion = await _open_version_with_criterion(
-        db_session, project, covered=False
-    )
-
-    # Point the direction row at the real (uncovered) criterion.
-    row = (
-        await db_session.execute(
-            _select(Direction).where(
-                Direction.project_id == project.id,
-                Direction.direction_key == direction_id,
-            )
-        )
-    ).scalar_one()
-    row.criterion_keys = [criterion.criterion_key]
-    db_session.add(row)
-    await db_session.commit()
-
-    task = _Task(
-        project_id=project.id,
-        title="Research: exhausted uncovered",
-        payloads=[
-            {
-                "type": "research",
-                "directions": [direction_dict],
-                "base_branch": "main",
-                "current_direction_id": direction_id,
-            }
-        ],
-        context={"direction_id": direction_id, "research_depth": 0},
-        status=TaskStatus.IN_PROGRESS,
-        created_by="ORCHESTRATOR",
-        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
-    )
-    db_session.add(task)
-    await db_session.commit()
-    await db_session.refresh(task)
-
-    await _stamp_no_findings_refractory(task, db_session)
-
-    await db_session.refresh(project)
-    target = next(d for d in project.directions if d.get("id") == direction_id)
-    assert target.get("status") == "active", (
-        "Direction with <3 merges owning an uncovered criterion must NOT "
-        "auto-complete via the exhaustion route; expected it to stay active"
-    )
-    assert target.get("auto_completed") is not True
-    # Refractory stamp is still applied even though completion was withheld.
-    assert target.get("possibly_saturated") is True
-
-
-@_pytest.mark.asyncio
-async def test_direction_autocomplete_gate_blocks_then_records_coverage_for_owned_criterion(
-    db_session,
-):
-    """End-to-end: gate blocks auto-complete when criterion is uncovered, then
-    a proven-verdict merge records coverage, and the gate lifts.
-
-    This test proves the full lifecycle against a REAL uncovered criterion (no
-    mocks on the coverage helper):
-
-    1. A saturated, >=3-merge direction owns an uncovered acceptance criterion.
-       Auto-complete via _stamp_no_findings_refractory is DEFERRED — the
-       direction stays active.
-
-    2. A proven-verdict task merge (naming that same criterion) calls
-       record_task_merge_evidence, which records task_merge + reachability
-       evidence rows.  compute_criterion_coverage now returns 'covered'.
-
-    3. Re-driving auto-complete after the criterion is covered now SUCCEEDS —
-       the direction reaches status='completed'.
-    """
-    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
-    from app.models import Direction
-    from app.research_completion import _stamp_no_findings_refractory
-
-    direction_id = "d-e2e-gate-cover"
-    project, task, _ = await _setup_saturated_proven_direction(
-        db_session, direction_id=direction_id, criterion_keys=["placeholder"]
-    )
-    _version, criterion = await _open_version_with_criterion(
-        db_session, project, covered=False
-    )
-
-    # Point the direction row's criterion_keys at the real (uncovered) criterion.
-    row = (
-        await db_session.execute(
-            _select(Direction).where(
-                Direction.project_id == project.id,
-                Direction.direction_key == direction_id,
-            )
-        )
-    ).scalar_one()
-    row.criterion_keys = [criterion.criterion_key]
-    db_session.add(row)
-    await db_session.commit()
-
-    # ── Phase (a): uncovered criterion → gate blocks auto-complete ──────────
-    await _stamp_no_findings_refractory(task, db_session)
-
-    await db_session.refresh(project)
-    target = next(d for d in project.directions if d.get("id") == direction_id)
-    assert target.get("status") == "active", (
-        "Phase (a): direction owning an uncovered criterion must NOT auto-complete; "
-        f"expected status='active', got {target.get('status')!r}"
-    )
-    assert target.get("auto_completed") is not True, (
-        "Phase (a): auto_completed must NOT be set when gated on uncovered criterion"
-    )
-
-    # ── Phase (b): proven-verdict merge → record coverage ───────────────────
-    from app.acceptance_criteria import (
-        record_task_merge_evidence,
-        compute_criterion_coverage,
-        get_evidence_for_criterion,
-    )
-
-    # Build a proven-verdict task that carries the criterion.
-    merge_task = _Task(
-        project_id=project.id,
-        title="Proven-merge task for coverage",
-        payloads=[{"type": "create", "prompt": "record coverage"}],
-        context={
-            "direction_id": direction_id,
-            "review_loop": {"pr_number": 42},
-            CODE_ACCEPTANCE_VERDICT_KEY: {
-                "satisfied": True,
-                "proven": True,
-                "kind": "named_test",
-                "reason": "test ran green under verified merge verdict",
-                "proof_ref": (
-                    "testing/test_research_completion.py::"
-                    "test_direction_autocomplete_gate_blocks_then_records_coverage_for_owned_criterion"
-                ),
-            },
-        },
-        criterion_ids=[criterion.criterion_key],
-        status=TaskStatus.COMPLETED,
-        created_by="ORCHESTRATOR",
-    )
-    db_session.add(merge_task)
-    await db_session.commit()
-    await db_session.refresh(merge_task)
-
-    recorded = await record_task_merge_evidence(db_session, merge_task, project.id)
-    assert recorded == 2, (
-        f"Phase (b): expected 2 evidence rows (task_merge + reachability), got {recorded}"
-    )
-
-    # Verify the evidence rows exist and coverage is now 'covered'.
-    evidence = await get_evidence_for_criterion(db_session, criterion.id)
-    coverage = compute_criterion_coverage(evidence)
-    assert coverage == "covered", (
-        f"Phase (b): expected coverage='covered' after proven-verdict merge, "
-        f"got {coverage!r}. Evidence rows: {len(evidence)}"
-    )
-
-    # Confirm a proven task_merge row exists.
-    proven_merges = [
-        e for e in evidence
-        if e.source_kind == "task_merge" and (e.detail or {}).get("proven") is True
-    ]
-    assert len(proven_merges) >= 1, (
-        "Phase (b): expected at least one proven task_merge evidence row"
-    )
-
-    # ── Phase (c): criterion now covered → auto-complete succeeds ───────────
-    # Re-drive auto-complete: the gate must now allow retirement.
-    task2 = _Task(
-        project_id=project.id,
-        title="Research: retry after coverage recorded",
-        payloads=[
-            {
-                "type": "research",
-                "directions": [project.directions[0]],
-                "base_branch": "main",
-                "current_direction_id": direction_id,
-            }
-        ],
-        context={"direction_id": direction_id, "research_depth": 0},
-        status=TaskStatus.IN_PROGRESS,
-        created_by="ORCHESTRATOR",
-        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
-    )
-    db_session.add(task2)
-    await db_session.commit()
-    await db_session.refresh(task2)
-
-    await _stamp_no_findings_refractory(task2, db_session)
-
-    await db_session.refresh(project)
-    target2 = next(d for d in project.directions if d.get("id") == direction_id)
-    assert target2.get("status") == "completed", (
-        "Phase (c): direction whose criterion is now covered must auto-complete; "
-        f"expected status='completed', got {target2.get('status')!r}"
-    )
-    assert target2.get("auto_completed") is True, (
-        "Phase (c): auto_completed must be True when criterion coverage is satisfied"
-    )
-    assert "verified" in (target2.get("auto_completed_reason") or ""), (
-        "Phase (c): auto-complete reason must mention 'verified' (proven-merge route)"
-    )
-
-
 # --------------------------------------------------------------------------- #
-# Site 1 (apply_post_spawn_state): proven-route criterion-coverage gate.
+# Site 1 (apply_post_spawn_state): proven-route completion (gate RETIRED).
 #
-# The proven-merge success completion path inside apply_post_spawn_state must
-# also gate on owned-criterion coverage — identical policy to Site 2
-# (_stamp_no_findings_refractory) but exercised through the full post-spawn
-# state pipeline. A saturated direction with >= 3 verified merges must NOT
-# auto-complete when it owns an uncovered acceptance criterion.
+# The proven-merge success completion path inside apply_post_spawn_state
+# auto-completes a saturated direction with >= 3 verified merges regardless of
+# any owned acceptance criterion — the pre-qualification coverage gate is gone.
+# This control test confirms completion still fires through the full post-spawn
+# state pipeline.
 # --------------------------------------------------------------------------- #
-
-
-@_pytest.mark.asyncio
-async def test_apply_post_spawn_proven_direction_with_uncovered_criterion_stays_active(
-    db_session,
-):
-    """Site 1 (apply_post_spawn_state): a saturated, >=3-merge direction that
-    OWNS an uncovered active criterion must NOT auto-complete via the proven
-    route — it stays active to keep working toward the unmet outcome."""
-    from app.research_direction_state import apply_post_spawn_state
-
-    direction_id = "d-apply-cov-uncovered"
-    project, task, _direction = await _setup_saturated_proven_direction(
-        db_session, direction_id=direction_id, criterion_keys=["placeholder"]
-    )
-    _version, criterion = await _open_version_with_criterion(
-        db_session, project, covered=False
-    )
-
-    # Point the direction row's criterion_keys at the real (uncovered) criterion.
-    from app.models import Direction
-
-    row = (
-        await db_session.execute(
-            _select(Direction).where(
-                Direction.project_id == project.id,
-                Direction.direction_key == direction_id,
-            )
-        )
-    ).scalar_one()
-    row.criterion_keys = [criterion.criterion_key]
-    db_session.add(row)
-    await db_session.commit()
-
-    # Ensure task context carries direction_id so apply_post_spawn_state can
-    # find the current direction for the no-findings cycle entry.
-    task.context = {**(task.context or {}), "direction_id": direction_id}
-    db_session.add(task)
-    await db_session.commit()
-
-    await apply_post_spawn_state(
-        db_session,
-        task,
-        [],   # findings
-        [],   # child_tasks
-        [],   # deduplicated
-        [],   # insights
-        [],   # direction_notes
-        [],   # direction_proposals
-        0,    # hash_dedup_count
-        0,    # word_overlap_count
-        0,    # file_overlap_count
-        0,    # evidence_overlap_count
-        0,    # type_filtered_count
-        0,    # empty_prompt_count
-        "research-branch",
-        "main",
-        0,    # research_depth
-        None, # parent_research_task_id
-    )
-
-    await db_session.refresh(project)
-    target = next(d for d in project.directions if d.get("id") == direction_id)
-    assert target.get("status") == "active", (
-        "Direction owning an uncovered criterion must NOT auto-complete via "
-        "apply_post_spawn_state's proven route; expected it to stay active"
-    )
-    assert target.get("auto_completed") is not True
-    # The direction must have entered the auto-complete check (saturated).
-    assert target.get("possibly_saturated") is True, (
-        "Direction must be saturated (proving the auto-complete check ran) "
-        "but gate must have blocked completion"
-    )
 
 
 @_pytest.mark.asyncio

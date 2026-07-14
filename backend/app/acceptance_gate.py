@@ -186,7 +186,9 @@ def _changed_files(task: Task) -> list[str]:
     return [p for p in raw if isinstance(p, str) and p.strip()]
 
 
-def stamp_changed_files_signal(paths: list[str]) -> dict[str, Any]:
+def stamp_changed_files_signal(
+    paths: list[str], *, github_verified: bool = False
+) -> dict[str, Any]:
     """Non-lossy acceptance signal for a PR's changed-file paths.
 
     ``_pr_changed_files`` is truncated to 50 entries when stamped onto task
@@ -197,6 +199,12 @@ def stamp_changed_files_signal(paths: list[str]) -> dict[str, Any]:
     that fails closed. Compute the acceptance-relevant summary over the FULL list
     here (whether any test path and any production path shipped, and whether the
     stored list was truncated) so downstream classification is truncation-proof.
+
+    When ``github_verified=True``, the caller sourced the file list directly from
+    GitHub's API rather than from the agent's self-report. The
+    ``_pr_changed_files_github_verified`` sentinel is stamped alongside so the
+    ``named_test`` gate can distinguish authoritative absence (hard fail) from an
+    agent self-report truncation (soft credit).
     """
     str_paths = [p for p in paths if isinstance(p, str) and p.strip()]
     signal: dict[str, Any] = {
@@ -206,6 +214,33 @@ def stamp_changed_files_signal(paths: list[str]) -> dict[str, Any]:
     }
     if len(str_paths) > 50:
         signal["_pr_changed_files_truncated"] = True
+    if github_verified:
+        signal["_pr_changed_files_github_verified"] = True
+    return signal
+
+
+# Sentinel marking a child's ``_pr_changed_files`` as INHERITED from its rollup
+# parent's combined diff rather than sourced from the child's own PR. The
+# parent's diff is the union of every sibling's changes, so a child's declared
+# test that actually lives in a SIBLING's slice would appear "present" here — the
+# named_test gate must therefore cap parent-derived credit at the unproven
+# (inferred) tier and never mint machine ``proven`` credit from it.
+PARENT_DERIVED_CHANGED_FILES_KEY = "_pr_changed_files_from_rollup_parent"
+
+
+def stamp_parent_derived_changed_files_signal(paths: list[str]) -> dict[str, Any]:
+    """Changed-file signal for a rollup child inheriting its parent's combined diff.
+
+    Reuses :func:`stamp_changed_files_signal` for the non-lossy summary but marks
+    the list parent-derived and deliberately does NOT set the
+    ``_pr_changed_files_github_verified`` sentinel: the combined diff is a
+    superset (the union of all siblings' changes), so a child's declared test that
+    lives in a sibling's slice must not falsely earn full machine-``proven``
+    credit. Parent-derived credit is capped at the satisfied/unproven tier by
+    :func:`_evaluate_named_test`.
+    """
+    signal = stamp_changed_files_signal(paths, github_verified=False)
+    signal[PARENT_DERIVED_CHANGED_FILES_KEY] = True
     return signal
 
 
@@ -254,32 +289,61 @@ def get_cross_cutting_test_files() -> frozenset[str]:
     return _CROSS_CUTTING_TEST_FILES
 
 
+# vitest/jest test-file naming: ``<stem>.test.tsx`` / ``<stem>.spec.mts`` →
+# ``<stem>``. The recognized suffix set mirrors the JS/TS alternatives in
+# :data:`app.payload_schemas._TEST_FILE_BASENAME_RE` so test-file *detection*
+# and semantic *grounding* cannot drift apart.
+_JS_TS_TEST_BASENAME_RE = re.compile(r"^(?P<stem>.+)\.(?:test|spec)\.[cm]?[jt]sx?$")
+
+
+def _test_module_stem(test_basename: str) -> str | None:
+    """Extract the production-module stem a test file is named after.
+
+    Understands both the Python ``test_<module>.py`` convention (→ ``module``)
+    and the vitest/jest ``<module>.test.tsx`` / ``<module>.spec.ts`` conventions
+    (→ ``module``). ``test_basename`` is the file basename *including* its
+    extension.
+
+    Returns ``None`` (fail closed) for any name that follows no recognized
+    convention (e.g. ``foo_test.py``), so the caller cannot grant
+    machine-checked proof it is unable to ground.
+    """
+    js_match = _JS_TS_TEST_BASENAME_RE.match(test_basename)
+    if js_match:
+        return js_match.group("stem") or None
+    # Python: strip the file extension, then the leading ``test_`` prefix.
+    py_stem = test_basename.rsplit(".", 1)[0]
+    if py_stem.startswith("test_"):
+        module = py_stem[len("test_"):]
+        return module or None
+    return None
+
+
 def _test_semantically_grounded(
     declared_test_path: str, seam_files: list[str]
 ) -> bool:
     """Whether a declared test path semantically corresponds to a changed seam.
 
-    A heuristic that the test file's module name (its basename minus the
-    ``test_`` prefix and file extension) must match at least one changed
-    non-test file's module name exactly.  A declaration of
-    ``test_acceptance_gate.py`` must co-occur with a change to
-    ``acceptance_gate.py`` — not just any production file.
+    A heuristic that the test file's module stem must match at least one changed
+    non-test file's module name exactly. The stem is derived from either the
+    Python ``test_<module>.py`` convention or the vitest/jest
+    ``<module>.test.tsx`` / ``<module>.spec.ts`` conventions (see
+    :func:`_test_module_stem`). A declaration of ``test_acceptance_gate.py``
+    must co-occur with a change to ``acceptance_gate.py``; a declaration of
+    ``ComputeJobsPanel.test.tsx`` must co-occur with a change to
+    ``ComputeJobsPanel.tsx`` (or ``.ts``) — not just any production file.
 
-    Files that do not follow the ``test_`` prefix convention (e.g.
-    ``foo_test.py`` or non-Python files) fail closed: the heuristic cannot
-    ground them, so the gate errs on the side of not granting machine-checked
-    proof.
+    Files that follow no recognized test-naming convention (e.g.
+    ``foo_test.py``) fail closed: the heuristic cannot ground them, so the gate
+    errs on the side of not granting machine-checked proof.
     """
-    test_basename = declared_test_path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
-    if not test_basename.startswith("test_"):
-        return False
-    test_stem = test_basename[len("test_"):]
-    if not test_stem:
-        return False
-    for path in seam_files:
-        prod_basename = path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
-        if prod_basename == test_stem:
-            return True
+    test_basename = declared_test_path.rsplit("/", 1)[-1]
+    test_stem = _test_module_stem(test_basename)
+    if test_stem:
+        for path in seam_files:
+            prod_basename = path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+            if prod_basename == test_stem:
+                return True
     # Cross-cutting test files (e.g., test_invariants.py) do not map to a
     # single production module — accept them as intrinsically grounded when
     # any non-test production seam exists (already verified by the caller).
@@ -306,11 +370,37 @@ def _merge_was_test_verified(task: Task) -> bool:
     return not (isinstance(reason, str) and reason)
 
 
+# Durable signal the no-CI merge monitor stamps onto ``review_loop`` when it
+# independently ran ONLY the declared acceptance test as a targeted run and it
+# exited green (see ``orchestrator_ci_monitor`` and
+# ``ci_resolution.acceptance_test_is_green``). Read defensively so a task without
+# it (every legacy / older-agent merge) behaves exactly as today.
+ACCEPTANCE_TEST_TARGETED_GREEN_KEY = "acceptance_test_targeted_green"
+
+
+def _acceptance_test_targeted_green(task: Task) -> bool:
+    """Whether the merge gate independently ran the declared acceptance test as a
+    TARGETED run and it exited GREEN (fail-safe / defensive).
+
+    Reads ``review_loop['acceptance_test_targeted_green']`` — the durable signal
+    the no-CI monitor stamps when :func:`ci_resolution.acceptance_test_is_green`
+    held. Returns True ONLY on a literal ``True`` value; a missing / malformed /
+    non-dict review_loop, or an older agent that never emitted the signal, yields
+    False so today's behavior is preserved.
+    """
+    review_loop = (task.context or {}).get(REVIEW_LOOP_KEY)
+    if not isinstance(review_loop, dict):
+        return False
+    return review_loop.get(ACCEPTANCE_TEST_TARGETED_GREEN_KEY) is True
+
+
 def _evaluate_named_test(
     evidence: AcceptanceEvidence,
     changed: list[str],
     verified: bool,
     truncated: bool = False,
+    parent_derived: bool = False,
+    targeted_green: bool = False,
 ) -> AcceptanceGateVerdict:
     """Fail-closed gate for a ``named_test`` acceptance declaration.
 
@@ -323,6 +413,22 @@ def _evaluate_named_test(
     that shape. Trivial / placeholder test references are already rejected
     fail-closed at declaration time by ``AcceptanceEvidence`` validation.
 
+    ``targeted_green`` is the ONE relaxation of requirement (2): when the
+    full-suite merge fell open UNVERIFIED (``verified is False``) but the merge
+    gate INDEPENDENTLY executed the SPECIFIC declared acceptance test as a
+    TARGETED run and it exited green (stamped by the no-CI monitor onto
+    ``review_loop['acceptance_test_targeted_green']`` when
+    :func:`ci_resolution.acceptance_test_is_green` held), the gate does NOT fail
+    closed at the verification step — the targeted green run is honest
+    machine-checked proof of the exact claim, so it continues to the proven
+    branch and mints ``proven=True``. This does NOT require running the whole
+    suite. When BOTH ``verified`` and ``targeted_green`` are False the gate keeps
+    today's fail-closed outcome. ``targeted_green`` never overrides the
+    parent-derived soft cap or the truncation / github-verified handling — those
+    stay as-is (a parent-derived match is still capped at satisfied/unproven even
+    when the declared test ran green, because the match may live in a sibling's
+    slice of the combined diff).
+
     ``truncated`` marks that the changed-file list was capped (a >50-file PR): the
     declared test may have shipped beyond the truncation point, so its absence
     from ``changed`` is indeterminate rather than proof it was never added.
@@ -330,6 +436,25 @@ def _evaluate_named_test(
     artifact and block its merge from crediting as success, so instead the merge
     is credited soft (``satisfied=True, proven=False``) — the specific test could
     not be machine-verified from the truncated input.
+
+    Absence on a truncated list is ALWAYS inconclusive, even when the file list
+    was sourced from GitHub's API rather than an agent self-report (the
+    ``_pr_changed_files_github_verified`` sentinel). Our own
+    :func:`stamp_changed_files_signal` caps the stored list at 50 paths
+    *regardless of source*, so a GitHub-verified PR with more than 50 changed
+    files still drops every path beyond index 50. A legitimately declared test
+    lying beyond that stored prefix would read as absent and unsoundly hard-fail a
+    truthful declaration. So truncation always yields the soft (inconclusive)
+    credit above; nothing overrides it. Where the list is complete
+    (``truncated=False``), the plain hard-fail below already applies and is
+    genuinely authoritative because every changed path is stored.
+
+    ``parent_derived`` marks that the changed-file list was INHERITED from a
+    rollup parent's combined diff (the union of all siblings' changes) rather than
+    the child's own PR. Because a child's declared test could physically live in a
+    sibling's slice of that union, a parent-derived match is real enough to clear
+    ``declared_unsatisfied`` (satisfied) but must NOT mint machine ``proven``
+    credit — the final proof branch is capped at ``satisfied=True, proven=False``.
     """
     declared_path = (evidence.test_path or "").partition("::")[0].strip()
     test_present = any(_paths_match(cf, declared_path) for cf in changed)
@@ -341,7 +466,9 @@ def _evaluate_named_test(
                 evidence.kind,
                 f"declared named_test {declared_path!r} could not be confirmed "
                 "among the PR's changed files because the changed-file list was "
-                "truncated (>50 files) — crediting soft without machine proof",
+                "truncated (>50 files, only the first 50 paths are stored) — the "
+                "test may ship beyond the stored prefix, so absence is "
+                "inconclusive; crediting soft without machine proof",
             )
         return AcceptanceGateVerdict(
             True,
@@ -350,7 +477,7 @@ def _evaluate_named_test(
             f"declared named_test {declared_path!r} is not among the PR's "
             "changed files — the claimed test was not added or modified here",
         )
-    if not verified:
+    if not verified and not targeted_green:
         return AcceptanceGateVerdict(
             True,
             False,
@@ -358,6 +485,11 @@ def _evaluate_named_test(
             f"declared named_test {declared_path!r} did not run green under a "
             "real merge-test verdict (the merge fell open without verification)",
         )
+    # When ``verified`` is False but ``targeted_green`` is True, the merge gate
+    # ran ONLY the declared test as a targeted run and it exited green — honest
+    # machine-checked proof of the exact claim, so we continue past the
+    # verification step to the proven branch below rather than failing closed.
+    via_targeted = targeted_green and not verified
     seam_files = [cf for cf in changed if not _is_test_path(cf)]
     if not seam_files:
         return AcceptanceGateVerdict(
@@ -376,13 +508,39 @@ def _evaluate_named_test(
             "that does not semantically correspond to the declared test module — "
             "none of the changed production files match the test file's module name",
         )
+    if parent_derived:
+        # The changed-file list was inherited from a rollup parent's combined
+        # diff (a superset union of every sibling's changes). The declared test
+        # matches SOMEWHERE in that union, but it could be a sibling's slice, so
+        # this cannot be a machine proof. Credit soft: clears declared_unsatisfied
+        # without minting proven credit.
+        return AcceptanceGateVerdict(
+            True,
+            True,
+            evidence.kind,
+            f"declared named_test {declared_path!r} matches the rollup parent's "
+            "combined changed-file diff (inherited, not the child's own PR) — "
+            "credited soft without machine proof, as the match may live in a "
+            "sibling's slice of the union diff",
+        )
+    if via_targeted:
+        reason = (
+            f"named_test {declared_path!r} was added/modified and ran GREEN via a "
+            f"TARGETED execution of the declared test (the full-suite merge fell "
+            f"open unverified), and exercises a semantically grounded production "
+            f"seam ({len(seam_files)} non-test file(s))"
+        )
+    else:
+        reason = (
+            f"named_test {declared_path!r} was added/modified, ran green under a "
+            f"verified merge, and exercises a semantically grounded production seam "
+            f"({len(seam_files)} non-test file(s))"
+        )
     return AcceptanceGateVerdict(
         True,
         True,
         evidence.kind,
-        f"named_test {declared_path!r} was added/modified, ran green under a "
-        f"verified merge, and exercises a semantically grounded production seam "
-        f"({len(seam_files)} non-test file(s))",
+        reason,
         proven=True,
         proof_ref=evidence.test_path or declared_path or None,
     )
@@ -610,9 +768,20 @@ def evaluate_code_acceptance(task: Task) -> AcceptanceGateVerdict:
     changed = _changed_files(task)
     verified = _merge_was_test_verified(task)
     truncated = bool((task.context or {}).get("_pr_changed_files_truncated"))
+    parent_derived_files = bool(
+        (task.context or {}).get(PARENT_DERIVED_CHANGED_FILES_KEY)
+    )
+    targeted_green = _acceptance_test_targeted_green(task)
 
     if evidence.kind == "named_test":
-        return _evaluate_named_test(evidence, changed, verified, truncated)
+        return _evaluate_named_test(
+            evidence,
+            changed,
+            verified,
+            truncated,
+            parent_derived=parent_derived_files,
+            targeted_green=targeted_green,
+        )
 
     if evidence.kind == "downstream_artifact":
         return _evaluate_downstream_artifact(evidence, changed)
@@ -1161,11 +1330,12 @@ async def backfill_acceptance_verdicts(session) -> int:
         ).is_(None)
     else:
         _backfill_checked = not_(Task.context.has_key("_backfill_checked_at"))
-    # Collect IDs only — not Task objects — so a mid-loop rollback inside
-    # record_task_merge_evidence (which unconditionally expires ALL session
-    # objects regardless of expire_on_commit) cannot leave the remaining
-    # iterations' task objects stale.  Each iteration re-fetches its task
-    # fresh via session.get() at the top of the loop.
+    # Collect IDs only, then batch-fetch Task objects with a single
+    # SELECT ... WHERE id IN (...) — eliminates up to 200 individual
+    # session.get() calls (PERF finding M-P6). The initial ID-only query
+    # is safe: if a mid-loop rollback inside record_task_merge_evidence
+    # (which unconditionally expires ALL session objects on rollback)
+    # occurs, the batch is re-fetched.
     result = await session.execute(
         select(Task.id).where(
             Task.status == TaskStatus.COMPLETED,
@@ -1176,24 +1346,45 @@ async def backfill_acceptance_verdicts(session) -> int:
     )
     task_ids = list(result.scalars().all())
 
+    # Batch-fetch all task objects before the loop — single
+    # SELECT ... WHERE id IN (...) instead of up to 200 individual
+    # session.get() calls. Pass task_ids directly (they are UUID objects
+    # or strings depending on dialect; in_() handles both).
     # expire_on_commit=False prevents a commit inside record_task_merge_evidence
     # from expiring the freshly-fetched task object before its attributes are
-    # read by that function.  A ROLLBACK still expires all objects, but each
-    # iteration re-fetches its own task so the next iteration is unaffected.
+    # read by that function.  A ROLLBACK still expires all session objects, so
+    # we batch-fetch upfront and fall back to an individual re-fetch if the
+    # cached copy turns out expired (rare).
     _prior_expire = session.sync_session.expire_on_commit
     session.sync_session.expire_on_commit = False
     try:
         upgraded = 0
         marked_ids: list = []
+
+        # Batch-fetch all candidate tasks in one query (eliminates N+1).
+        _batch_result = await session.execute(
+            select(Task).where(Task.id.in_(task_ids))
+        )
+        tasks_by_id: dict = {t.id: t for t in _batch_result.scalars().all()}
+
         for task_id in task_ids:
-            # Re-fetch fresh each iteration: a rollback from record_evidence
-            # (IntegrityError on CriterionEvidence unique constraint) expires
-            # all session objects; re-fetching here avoids MissingGreenlet on
-            # the subsequent attribute access.
-            task = await session.get(Task, task_id)
+            task = tasks_by_id.get(task_id)
             if task is None:
+                marked_ids.append(task_id)
                 continue
-            verdict_data = (task.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
+
+            # If a prior rollback inside record_evidence expired this cached
+            # object, re-fetch individually (rare — IntegrityError on unique
+            # constraint).  Most iterations use the batch-fetched copy.
+            try:
+                verdict_data = (task.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
+            except Exception:
+                task = await session.get(Task, task_id)
+                if task is None:
+                    marked_ids.append(task_id)
+                    continue
+                verdict_data = (task.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
+
             if not isinstance(verdict_data, dict):
                 marked_ids.append(task_id)
                 continue
@@ -1234,6 +1425,7 @@ async def backfill_acceptance_verdicts(session) -> int:
                         getattr(task, "id", None),
                         exc_info=True,
                     )
+                    _batch_dirty = True  # rollback expired ORM objects
                 upgraded += 1
             else:
                 # Re-evaluation could not prove — stamp marker so the
@@ -1248,10 +1440,13 @@ async def backfill_acceptance_verdicts(session) -> int:
         # from ever being examined.
         if marked_ids:
             now_ts = datetime.now(timezone.utc).isoformat()
+            # Batch-fetch all marked tasks in one query (eliminates N+1).
+            _marked_result = await session.execute(
+                select(Task).where(Task.id.in_(marked_ids))
+            )
+            marked_by_id: dict = {t.id: t for t in _marked_result.scalars().all()}
             for mid in marked_ids:
-                # Re-fetch so any mid-loop rollback from a prior iteration
-                # does not leave these objects expired at stamping time.
-                t = await session.get(Task, mid)
+                t = marked_by_id.get(mid)
                 if t is None:
                     continue
                 ctx = dict(t.context or {})

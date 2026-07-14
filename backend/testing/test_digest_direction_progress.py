@@ -3023,12 +3023,15 @@ async def test_digest_direction_progress_budget_alert_stamped_in_db_and_idempote
     # Release the db_session transaction before the second request. StaticPool
     # shares a single SQLite connection; an open DEFERRED transaction on
     # db_session would deadlock writes from dedicated-session helpers inside the
-    # second request if not closed first.
+    # second request if not closed first. Snapshot the id first: the rollback
+    # expires ``project``, so a later ``project.id`` lazy-load would raise
+    # MissingGreenlet under real ORM expiry.
+    project_id = project.id
     await db_session.rollback()
 
     # Second call — _budget_alerted is now True in DB, so no re-fire.
     dispatch_mock.reset_mock()
-    response2 = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    response2 = await client.get(f"/api/admin/digest?project_id={project_id}&hours=24")
     assert response2.status_code == 200
     await _a.sleep(0)
     assert dispatch_mock.await_count == 0, (

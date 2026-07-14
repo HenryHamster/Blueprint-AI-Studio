@@ -1,5 +1,5 @@
 import { describe, test, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent } from '@testing-library/react';
+import { render, screen, fireEvent, within } from '@testing-library/react';
 import { MessageBubble } from './MessageBubble';
 import type { MessageBubbleProps, ProjectMessage } from './MessageBubble';
 
@@ -619,5 +619,95 @@ describe('MessageBubble', () => {
     const copyBtn = screen.getByTitle('Copy message ref');
     fireEvent.click(copyBtn);
     expect(screen.getByTestId('message-bubble')).toBeTruthy();
+  });
+
+  test('renders image attachment as clickable trigger that opens preview', () => {
+    render(<MessageBubble {...makeProps({
+      msg: makeMsg({
+        context: {
+          attachments: [
+            { type: 'image', mime_type: 'image/png', data: 'iVBORw0KGgo=', name: 'screenshot.png' },
+          ],
+        },
+      }),
+    })} />);
+
+    // Image thumbnail is wrapped in a clickable button
+    const trigger = screen.getByRole('button', { name: 'Preview screenshot.png' });
+    expect(trigger).toBeTruthy();
+    fireEvent.click(trigger);
+
+    // Preview modal appears with the attachment name
+    const dialog = screen.getByRole('dialog');
+    expect(dialog).toBeTruthy();
+    expect(dialog.getAttribute('aria-label')).toContain('screenshot.png');
+  });
+
+  test('PDF attachment renders clickable trigger that opens preview', () => {
+    render(<MessageBubble {...makeProps({
+      msg: makeMsg({
+        context: {
+          attachments: [
+            { type: 'document', mime_type: 'application/pdf', name: 'report.pdf', size_bytes: 12345 },
+          ],
+        },
+      }),
+    })} />);
+
+    // PDF chip is a button, not a plain div
+    const trigger = screen.getByRole('button', { name: 'Preview report.pdf' });
+    expect(trigger).toBeTruthy();
+    expect(screen.getByText('report.pdf')).toBeTruthy();
+
+    // Click opens preview modal
+    fireEvent.click(trigger);
+    const dialog = screen.getByRole('dialog');
+    expect(dialog).toBeTruthy();
+    expect(dialog.getAttribute('aria-label')).toContain('report.pdf');
+  });
+
+  test('Escape key closes preview modal', () => {
+    render(<MessageBubble {...makeProps({
+      msg: makeMsg({
+        context: {
+          attachments: [
+            { type: 'image', mime_type: 'image/png', data: 'iVBORw0KGgo=', name: 'photo.png' },
+          ],
+        },
+      }),
+    })} />);
+
+    // Open the modal
+    fireEvent.click(screen.getByRole('button', { name: 'Preview photo.png' }));
+    expect(screen.getByRole('dialog')).toBeTruthy();
+
+    // Press Escape on the dialog
+    fireEvent.keyDown(screen.getByRole('dialog'), { key: 'Escape', code: 'Escape' });
+
+    // Modal closes
+    expect(screen.queryByRole('dialog')).toBeNull();
+  });
+
+  test('non-previewable attachment type shows download option in modal', () => {
+    render(<MessageBubble {...makeProps({
+      msg: makeMsg({
+        context: {
+          attachments: [
+            { type: 'binary', mime_type: 'application/octet-stream', data: 'AAAA', name: 'data.bin' },
+          ],
+        },
+      }),
+    })} />);
+
+    // Attachment is clickable
+    const trigger = screen.getByRole('button', { name: 'Preview data.bin' });
+    expect(trigger).toBeTruthy();
+    fireEvent.click(trigger);
+
+    // Modal opens with download button for unsupported types
+    const dialog = screen.getByRole('dialog');
+    expect(dialog).toBeTruthy();
+    expect(within(dialog).getByText('Download')).toBeTruthy();
+    expect(within(dialog).getByText(/No preview available/)).toBeTruthy();
   });
 });

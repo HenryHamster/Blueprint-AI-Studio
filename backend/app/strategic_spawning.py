@@ -279,14 +279,19 @@ def _merge_finding_challenge_summary(target: dict[str, Any], source: Any) -> Non
             )
 
 
-def _strategic_recent_version_entry(version, project=None) -> dict[str, Any]:
+async def _strategic_recent_version_entry(
+    session, version, project=None
+) -> dict[str, Any]:
     from app.qualification_state_resolver import (
-        resolve_effective_qualification_state,
+        resolve_open_version_qualification_state,
     )
 
     aggregate, artifacts = _version_serving_summary(version, project)
-    qualification_state, _ = resolve_effective_qualification_state(
-        version, project, serving=(aggregate, artifacts)
+    # Route through the shared seam so this surface's qualification_state carries
+    # the ledger-backed per-dimension sub_score overlay instead of the mutable
+    # last_qualification blob, matching the dimension_states shown elsewhere.
+    qualification_state, _ = await resolve_open_version_qualification_state(
+        session, version, project, serving=(aggregate, artifacts)
     )
     return {
         "version_number": version.version_number,
@@ -2460,11 +2465,15 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # draws prerequisite / provides_capability refs from. Small and bounded; exempt.
     "available_capabilities": {"priority": "medium", "exempt": True},
     # Live local-runner availability (ever_registered, active_total, active_gpu,
-    # require_local_runner). Surfaced only when the project has ever registered a
-    # runner OR declares the enforce-local policy. Medium priority: it is small
-    # (4 scalars) and actionable — the strategist uses it to avoid authoring GPU
-    # experiments that would fall back to billable cloud GPU (or be held
-    # indefinitely when require_local_runner is set).
+    # require_local_runner, plus a bounded per-live-runner `devices` hardware
+    # list — GPU models/VRAM/container capability/load — capped per-runner and
+    # in total under the experiment-authoring shared budget, see
+    # app.experiment_authoring_context). Surfaced only when the project has
+    # ever registered a runner OR declares the enforce-local policy. Medium
+    # priority, exempt: small and bounded at build time — the strategist uses
+    # it to avoid authoring GPU experiments that would fall back to billable
+    # cloud GPU (or be held indefinitely when require_local_runner is set) and
+    # to size experiments to the fleet's actual VRAM/device counts.
     "local_runner_status": {"priority": "medium", "exempt": True},
     # Resident-session pacing knobs surfaced from _runtime_config onto the
     # resident_minimal payload so the agent's residentConfig() reads live,
@@ -6118,7 +6127,9 @@ async def _spawn_strategic_review(
                     if _version_phase_block is None:
                         _version_phase_block = {}
                     _version_phase_block["recent_versions"] = [
-                        _strategic_recent_version_entry(version, project)
+                        await _strategic_recent_version_entry(
+                            session, version, project
+                        )
                         for version in _closed
                     ]
             except Exception:
@@ -6543,7 +6554,7 @@ async def _spawn_strategic_review(
     # effort: absent when no stamped cycles exist yet or the query fails.
     _integrity_trend: dict | None = None
     try:
-        from app import strategic_cycle as _sc_trend  # noqa: PLC0415
+        from app import strategic_cycle as _sc_trend
 
         _trend_result = await _sc_trend.recent_integrity_conflict_trend(
             session, project.id, limit=10
@@ -7399,6 +7410,54 @@ async def _spawn_strategic_review(
     _local_runner_status["require_local_runner"] = resolve_project_require_local_runner(
         project
     )
+    # Experiment-authoring context: the experiment LEDGER (a bounded query over
+    # recent terminal compute_experiment tasks — what was already measured, at
+    # what cost, with what verdict) plus one-line near-duplicate advisories for
+    # pending experiments that closely match a prior entry. All experiment-
+    # authoring additions — the devices block riding inside local_runner_status
+    # above, the ledger lines, and the advisories — share ONE char budget with
+    # priority devices > ledger > advisories (module constants in
+    # app.experiment_authoring_context, no runtime-config keys), so they can
+    # never crowd out existing context. Fail-open: any error drops the block.
+    _experiment_ledger_block = ""
+    try:
+        from app.experiment_authoring_context import (
+            apply_experiment_authoring_budget,
+            build_experiment_ledger,
+            build_near_duplicate_advisories,
+            fetch_pending_experiment_specs,
+            render_experiment_ledger_lines,
+            render_experiment_ledger_prompt_block,
+        )
+
+        _ledger_entries = await build_experiment_ledger(session, project.id)
+        _ledger_lines = render_experiment_ledger_lines(_ledger_entries)
+        _dup_advisories = build_near_duplicate_advisories(
+            await fetch_pending_experiment_specs(session, project.id),
+            _ledger_entries,
+        )
+        _budgeted_devices, _ledger_lines, _dup_advisories = (
+            apply_experiment_authoring_budget(
+                _local_runner_status.get("devices"), _ledger_lines, _dup_advisories
+            )
+        )
+        if _budgeted_devices:
+            _local_runner_status["devices"] = _budgeted_devices
+        else:
+            _local_runner_status.pop("devices", None)
+        _experiment_ledger_block = render_experiment_ledger_prompt_block(
+            _ledger_lines, _dup_advisories
+        )
+    except Exception:
+        logger.exception(
+            "[STRATEGIC] experiment-authoring ledger build failed; continuing"
+        )
+    if _experiment_ledger_block:
+        prompt_suffix = (
+            f"{prompt_suffix}\n{_experiment_ledger_block}"
+            if prompt_suffix
+            else _experiment_ledger_block
+        )
     _ci_compliance_block: dict[str, Any] | None = None
     try:
         from app import ci_compliance as _ci_compliance
@@ -7436,6 +7495,7 @@ async def _spawn_strategic_review(
         session, project.id, _active_direction_ids
     )
     _cadence_exam_leads = _resident_open_found_leads(project)
+
     payload: dict = pack_under_budget(
         {
             "type": "strategic_review",

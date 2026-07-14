@@ -85,6 +85,8 @@ from app.orchestrator_filters import (
     apply_project_fairness,
     apply_project_concurrency_cap,
     reorder_by_completion_priority,
+    dispatch_window_size,
+    filter_failing_types,
     _project_fairness_weight,
     collect_dep_uuids,
 )
@@ -354,6 +356,7 @@ def _warm_pin_still_honorable(
 # ---------------------------------------------------------------------------
 
 _last_pool_refresh: datetime = _utcnow()
+_last_usage_meter_refresh: datetime = _utcnow()
 _last_zone_health_persist: datetime = _utcnow()
 _last_anomaly_state_persist: datetime = _utcnow()
 _last_anomaly_sweep: datetime = _utcnow()
@@ -417,6 +420,7 @@ from app.orchestrator_runner_dispatch import (  # noqa: F401
     _runner_active_work_count,
     _runner_agent_available,
     _runner_at_capacity,
+    _runner_gpu_capable,
     _runner_handles_task_type,
     _select_eligible_runner,
     _strategic_local_hold_timeout_seconds,
@@ -647,8 +651,12 @@ async def _project_resource_dispatch_defer_message(
         # touches it; healthy cache hits remain query-free.
         if project is not None:
             state = sa_inspect(project)
-            if "build_config" in state.expired_attributes:
-                await session.refresh(project, attribute_names=["build_config"])
+            if state.expired_attributes:
+                # A per-task rollback expires ALL scalar columns on every cached
+                # ORM instance.  Refresh the entire row so any column accessed by
+                # resolve_project_* helpers (build_config, paused, etc.) is live.
+                # Healthy cache hits remain query-free (no expired attributes).
+                await session.refresh(project)
     else:
         project = await session.get(Project, task.project_id)
         if project_cache is not None:
@@ -680,7 +688,9 @@ async def _project_resource_dispatch_defer_message(
                 project_id=task.project_id,
                 window_days=spend_window_days,
             )
-            recent_spend = spend_breakdown["total"]
+            recent_spend = spend_breakdown.get(
+                "ceiling_gate_total", spend_breakdown["total"]
+            )
             if spend_cache is not None:
                 spend_cache[task.project_id] = (
                     recent_spend,
@@ -972,6 +982,7 @@ async def orchestrator_worker():
     # Late imports to avoid circular dependency with app.main
     from app.max_plan_pool import (
         load_max_plan_pool,
+        refresh_usage_meter_snapshots,
         release_max_plan_account,
         recheck_disabled_accounts,
         _extract_task_model,
@@ -982,6 +993,8 @@ async def orchestrator_worker():
         apply_task_llm_runtime_context,
         clear_task_llm_runtime_context,
         get_task_llm_account_id,
+        reconcile_model_for_provider,
+        resolve_task_quality_tier,
         select_llm_runtime_for_task,
     )
     from app.providers.registry import get_provider
@@ -1026,7 +1039,7 @@ async def orchestrator_worker():
         _sweep_lane_baseline_backfill,
     )
 
-    global _last_pool_refresh, _orchestrator_last_cycle, _orchestrator_cycle_started
+    global _last_pool_refresh, _last_usage_meter_refresh, _orchestrator_last_cycle, _orchestrator_cycle_started
     global _orchestrator_consecutive_errors, _orchestrator_consecutive_monitoring_errors
     global \
         _last_orphan_check, \
@@ -1065,6 +1078,14 @@ async def orchestrator_worker():
             if _is_cadence_due(_last_pool_refresh, 300):
                 await load_max_plan_pool()
                 _last_pool_refresh = _utcnow()
+
+            # Periodic usage-meter refresh — keeps the admin usage meter
+            # (5h/7d plan utilization) populated independent of the
+            # default-off usage_headroom selection gate. Fire-and-forget
+            # probes; never blocks dispatch.
+            if _is_cadence_due(_last_usage_meter_refresh, 300):
+                await refresh_usage_meter_snapshots()
+                _last_usage_meter_refresh = _utcnow()
 
             # Periodic zone health persist — prevents retry storms after restart
             global _last_zone_health_persist
@@ -1255,7 +1276,9 @@ async def orchestrator_worker():
                             acct_id = get_task_llm_account_id(fresh_t)
                             if acct_id:
                                 await release_max_plan_account(
-                                    acct_id, revert_daily_task_count=True
+                                    acct_id,
+                                    revert_daily_task_count=True,
+                                    project_id=str(fresh_t.project_id) if fresh_t.project_id else None,
                                 )
                             session.add(fresh_t)
                             await _maybe_create_failure_alert(
@@ -1275,7 +1298,9 @@ async def orchestrator_worker():
                         acct_id = get_task_llm_account_id(fresh_t)
                         if acct_id:
                             await release_max_plan_account(
-                                acct_id, revert_daily_task_count=True
+                                acct_id,
+                                revert_daily_task_count=True,
+                                project_id=str(fresh_t.project_id) if fresh_t.project_id else None,
                             )
                         # Cancel any lingering coroutine reference
                         zombie = _provision_coroutines.pop(str(t.id), None)
@@ -1469,6 +1494,10 @@ async def orchestrator_worker():
                                 time.monotonic() - cycle_start, 3
                             ),
                             "tasks_dispatched": 0,
+                            # No slots ⇒ no window was scanned. Keeps the
+                            # orchestrator_cycle_complete schema identical across both
+                            # emit sites so consumers never see a missing key.
+                            "dispatch_window_scanned": 0,
                             "tasks_recovered": tasks_recovered,
                             "slots_in_use": effective_count,
                             "slots_available": 0,
@@ -2247,6 +2276,36 @@ async def orchestrator_worker():
                     eligible_ids, candidate_tasks, _dep_by_id, session
                 )
 
+                # Step 2.45: Per-type failure gate — drop candidates whose task type is
+                # currently failing BEFORE they can occupy a dispatch-window position.
+                # The gate itself is enforced inside the dispatch loop below, but that
+                # loop runs AFTER `eligible_ids[:slots_available]` has already cut the
+                # window — so a failing-type task ranked above the cutoff consumed a slot
+                # and then `continue`d without dispatching anything. With a failing type
+                # at the head of the queue that silently zeroed out the whole cycle's
+                # dispatch while capacity sat idle. These tasks provably cannot dispatch
+                # this cycle (_failing_types is computed once, above, and is not mutated
+                # by the loop), so removing them here is behaviour-preserving for every
+                # task that *can* dispatch and purely frees the slots they were wasting.
+                # Filtering is a subsequence op: relative order — and therefore the
+                # fairness / completion-priority / slot-reservation permutations applied
+                # below — is untouched.
+                # `_withheld_failing_types` keeps the all-types-blocked stall detector
+                # below honest: it reasons over the types of tasks that WANTED to
+                # dispatch, and those are no longer present in the post-filter window.
+                _before_failing_gate = len(eligible_ids)
+                eligible_ids, _withheld_failing_types = filter_failing_types(
+                    eligible_ids, candidate_tasks, _failing_types
+                )
+                if _withheld_failing_types:
+                    logger.info(
+                        "[ORCHESTRATOR] Per-type failure gate: withheld %d candidate(s) "
+                        "from the dispatch window (failing type(s): %s) — slots freed "
+                        "for healthy types",
+                        _before_failing_gate - len(eligible_ids),
+                        ", ".join(sorted(_withheld_failing_types)),
+                    )
+
                 # Step 2.5: File-conflict check — defer tasks that would conflict with in-progress work
                 # Parked BLOCKED file-conflict tasks are absent from the QUEUED
                 # candidate scan, but they still hold a seniority reservation on
@@ -2490,8 +2549,25 @@ async def orchestrator_worker():
                 elif not budget_exhausted:
                     _shared_state.monthly_budget_gate_engaged = False
 
-                # Respect slot limit after conflict filtering
-                eligible_ids = eligible_ids[:slots_available]
+                # Respect the slot limit after conflict filtering — but scan PAST it so
+                # candidates that turn out to be non-dispatchable this cycle (held /
+                # blocked / deferred / approval-gated / lost-lock) are BACKFILLED
+                # instead of silently burning a slot each. The dispatch loop below is
+                # what actually enforces `slots_available`: it stops as soon as that
+                # many REAL dispatches have occurred. Widening is strictly additive —
+                # every task that would have been in the old window is still in this
+                # one, in the same order, so the fairness / completion-priority /
+                # slot-reservation permutations above keep their exact semantics.
+                _eligible_before_window = len(eligible_ids)
+                eligible_ids = eligible_ids[: dispatch_window_size(slots_available)]
+                if _eligible_before_window > slots_available:
+                    logger.info(
+                        "[ORCHESTRATOR] Dispatch window: %d slot(s), scanning up to %d "
+                        "candidate(s) of %d eligible (backfill for held/blocked/deferred)",
+                        slots_available,
+                        len(eligible_ids),
+                        _eligible_before_window,
+                    )
 
                 # Step 3: Re-read ONLY the tasks we're about to dispatch. This
                 # scan is read-only; the row is locked with task_lock() at the
@@ -2534,6 +2610,27 @@ async def orchestrator_worker():
                     queued_tasks = list(
                         (await session.execute(dispatch_stmt)).scalars().all()
                     )
+                    # Restore the dispatch RANK. `dispatch_stmt` is an unordered
+                    # `WHERE id IN (...)` — SQL sets have no order, so Postgres
+                    # returns these rows in whatever order it likes (heap/index
+                    # order), NOT the order of `eligible_ids`. That order is the
+                    # entire output of the ranking pipeline above: health
+                    # reordering, project fairness, completion priority, the
+                    # create/research reserved-slot minimums and the pipeline cap.
+                    #
+                    # This was harmless while the window was cut at exactly
+                    # `slots_available` and the loop ATTEMPTED every member —
+                    # the dispatch SET was fully determined by the truncation, so
+                    # intra-loop order was cosmetic. It is NOT harmless now: the
+                    # window is deliberately wider (see dispatch_window_size) and
+                    # the loop stops after `slots_available` REAL dispatches, so
+                    # whoever the loop reaches FIRST wins the slot. Without this
+                    # sort the winners would be whichever rows the DB happened to
+                    # return first, silently discarding priority, fairness and the
+                    # reserved minimums — exactly under queue pressure, which is
+                    # when those transforms are the only thing that engages.
+                    _rank = {tid: i for i, tid in enumerate(eligible_ids)}
+                    queued_tasks.sort(key=lambda t: _rank.get(t.id, len(_rank)))
 
                 logger.info(
                     f"[ORCHESTRATOR] Cycle: {len(queued_tasks)} queued, {active_count} active, {slots_available} slots, pool={len(_account_by_id)} accounts"
@@ -2567,8 +2664,26 @@ async def orchestrator_worker():
                     ).scalar() or 0
                 # tasks_active_gauge already set above after active_count is computed
 
-                # Zone pre-check: skip dispatch entirely if all GCP zones are in cooldown
-                if queued_tasks and not any_zone_available():
+                # Zone pre-check: every GCP zone is in cooldown, so no COLD GCE
+                # provision can succeed this cycle. The flag is computed from zone
+                # state ALONE — never from `queued_tasks`. Two consumers:
+                #   * the all-types-blocked detector below, which must not
+                #     misattribute a zone outage to the per-type failure gate. That
+                #     detector also reasons over `_withheld_failing_types` (tasks the
+                #     pre-cutoff gate removed from `queued_tasks`); if the gate
+                #     withheld EVERY candidate, `queued_tasks` is empty while the
+                #     withheld set is not — so gating the flag on `queued_tasks`
+                #     would leave it False during a zone outage and fire exactly the
+                #     misattributed alert it was added to prevent.
+                #   * the per-task cold-provision hold in the dispatch loop below,
+                #     which is what ACTUALLY skips GCP dispatch. It is deliberately
+                #     NOT a whole-loop skip: fleet-runner pins, compute_experiment
+                #     jobs, warm-pin skip-provisions, warm-pool leases and Cloud Run
+                #     jobs consume no GCE zone capacity and must still dispatch while
+                #     the zones recover.
+                # any_zone_available() is a pure in-memory cooldown check.
+                _zones_exhausted_this_cycle = not any_zone_available()
+                if queued_tasks and _zones_exhausted_this_cycle:
                     global _last_zone_exhaustion_log
                     # _last_zone_exhaustion_log is a module-level gauge written
                     # only here; keep it naive (_utcnow) for a consistent
@@ -2581,13 +2696,22 @@ async def orchestrator_worker():
                     if _is_cadence_due(_last_zone_exhaustion_log, 60, now_check):
                         _last_zone_exhaustion_log = now_check
                         wait_sec = zone_recovery_wait_seconds()
+                        # WARNING, not INFO: this 60s-cadence line is now the only
+                        # sustained during-outage signal. Before the cold-provision
+                        # hold below existed, every held task instead burned a real
+                        # GCE insert and logged a PROVISION_FAILURE — a storm that
+                        # was the de-facto pager for "the fleet is zone-blocked".
+                        # The hold correctly silences that storm, so the ongoing
+                        # state has to carry its own weight. (Entry into the state
+                        # is separately loud: per-zone WARNINGs + a deduped operator
+                        # alert.)
                         if wait_sec is not None:
-                            logger.info(
-                                f"[ORCHESTRATOR] All zones in cooldown — skipping dispatch (recovery in {int(wait_sec)}s)"
+                            logger.warning(
+                                f"[ORCHESTRATOR] All zones in cooldown — holding cold GCE dispatch (recovery in {int(wait_sec)}s)"
                             )
                         else:
-                            logger.info(
-                                "[ORCHESTRATOR] All zones in cooldown — skipping dispatch"
+                            logger.warning(
+                                "[ORCHESTRATOR] All zones in cooldown — holding cold GCE dispatch"
                             )
                         try:
                             await ws_manager.broadcast_to_all(
@@ -2604,16 +2728,33 @@ async def orchestrator_worker():
                             logger.exception(
                                 "[ORCHESTRATOR] Failed to broadcast zone_exhaustion throttle"
                             )
-                    queued_tasks = []  # Clear so the loop below is skipped
+                    # NOTE: this does NOT skip the dispatch loop below — that loop
+                    # iterates the `_queued_task_gate_info` snapshot taken above,
+                    # not this list, so clearing it here has been a no-op for
+                    # dispatch for as long as the snapshot has existed (the comment
+                    # that used to sit on this line claimed otherwise). The real
+                    # dispatch skip is the per-task cold-provision hold below,
+                    # gated on `_zones_exhausted_this_cycle`. This clear is retained
+                    # only for the remaining reader of `queued_tasks` past this
+                    # point — the cycle's "tasks considered" metric.
+                    queued_tasks = []
 
-                # All-types-blocked detection: if every queued task's type is in _failing_types,
-                # the pipeline is silently stalled — create an operator alert.
-                if _failing_types and queued_tasks:
+                # All-types-blocked detection: if every task that wanted to dispatch is of
+                # a failing type, the pipeline is silently stalled — create an operator
+                # alert. Reason over the surviving window UNION the failing-type tasks the
+                # pre-cutoff gate (Step 2.45) withheld: those tasks are exactly the ones
+                # this detector exists to notice, and they are no longer in `queued_tasks`.
+                # Without the union this alert would never fire again.
+                if (
+                    _failing_types
+                    and not _zones_exhausted_this_cycle
+                    and (queued_tasks or _withheld_failing_types)
+                ):
                     _queued_types = {
                         t.first_payload.get("type", "")
                         for t in queued_tasks
                         if t.first_payload.get("type", "")
-                    }
+                    } | _withheld_failing_types
                     if _queued_types and _queued_types.issubset(_failing_types):
                         _blocked_summary = ", ".join(sorted(_queued_types))
                         logger.warning(
@@ -2694,6 +2835,28 @@ async def orchestrator_worker():
                 # Track per-cycle counts so a full stall on Max-plan account exhaustion
                 # fires an alert+broadcast once, rather than only per-task retry_after.
                 _cycle_accounts_blocked = 0
+                # ⚠️ _cycle_dispatched is a SAFETY INVARIANT, not a log field.
+                #
+                # It used to be purely observational: the dispatch window was cut at
+                # exactly `eligible_ids[:slots_available]`, so the slot limit was enforced
+                # STRUCTURALLY — at most slots_available tasks could ever enter the loop.
+                # The window is now deliberately WIDER than slots_available (so candidates
+                # that dispatch nothing get backfilled instead of burning a slot), and the
+                # loop's `if _cycle_dispatched >= slots_available: break` is therefore the
+                # SOLE thing keeping the fleet under max_concurrent_vms.
+                #
+                # CONSEQUENCE: any dispatch path that consumes a VM but forgets to
+                # increment this is a FREE dispatch that silently breaches the cap — and
+                # the breach scales with how many such tasks the widened window contains.
+                # So: EVERY path that leaves the loop having consumed a VM slot MUST
+                # increment it exactly once. Today that is (1) the strategic-runner pin,
+                # (2) the direct compute_experiment launch, (3) _try_runner_dispatch,
+                # (4) the warm-pool LEASE (an IDLE pool VM is subtracted from the budget;
+                # leasing it flips it to LEASED and starts charging it), and (5) the
+                # PROVISIONING commit (cold provision + Cloud Run both route through it).
+                # Paths that consume NO new VM must NOT increment: the warm-PIN
+                # skip-provision reuses an agent VM that is already charged, and every
+                # defer/hold/block/rollback path launches nothing at all.
                 _cycle_dispatched = 0
                 _cycle_earliest_recovery: datetime | None = None
                 _cycle_blockage_reasons: set[str] = set()
@@ -2742,11 +2905,24 @@ async def orchestrator_worker():
                 _spend_cache_for_dispatch: dict[uuid.UUID, tuple[float, float, int]] = {}
 
                 for _qt_id, _task_type_for_gate in _queued_task_gate_info:
+                    # Slot enforcement lives HERE, not at the window cut above: the
+                    # window is deliberately wider than slots_available so that
+                    # candidates which dispatch nothing (held / blocked / deferred /
+                    # resource-deferred / approval-gated / lock-lost) are backfilled by
+                    # the next-ranked task instead of each burning a slot. _cycle_dispatched
+                    # is incremented at exactly the four real-dispatch sites below, so it
+                    # is the honest count of slots actually consumed this cycle.
+                    if _cycle_dispatched >= slots_available:
+                        break
+
                     # Per-type failure gate: skip tasks whose type is currently failing
                     # (global 80% backstop already handled above; this skips only the bad type).
                     # Use the snapshot tuple — never read .first_payload off a session-bound
                     # object inside this loop, since _lock_task_for_mutation's rollback would
                     # expire it and trigger a sync lazy-load that crashes the cycle.
+                    # NOTE: these tasks are already withheld from eligible_ids pre-cutoff
+                    # (Step 2.45), so this is now a defence-in-depth backstop rather than
+                    # the primary gate — it no longer silently eats a dispatch slot.
                     if _task_type_for_gate and _task_type_for_gate in _failing_types:
                         logger.info(
                             f"[ORCHESTRATOR] Skipping task {_qt_id} "
@@ -2774,6 +2950,7 @@ async def orchestrator_worker():
                     # commit) or an existing early-exit path already released
                     # the slot, so the handler can never double-release.
                     _iter_preclaimed_account_id: str | None = None
+                    _iter_preclaimed_project_id: str | None = None
                     try:
                         task = await _lock_dispatchable_task_for_mutation(
                             session, _qt_id
@@ -2783,13 +2960,32 @@ async def orchestrator_worker():
                         if task.requires_approval:
                             await session.rollback()
                             continue
+                        # vm_instance_id read via __dict__ after the strategic
+                        # path call. _hold_strategic_local_runner_task's
+                        # no-change branch calls session.rollback(), which
+                        # expires ALL session-bound ORM instances even under
+                        # expire_on_commit=False. Under asyncpg reading the
+                        # expired descriptor triggers a sync lazy-load →
+                        # MissingGreenlet (the same hazard documented in the
+                        # dispatch-prep handler comments above). Reading via
+                        # __dict__ avoids the descriptor's lazy-load trap.
                         if await _try_strategic_local_required_runner_path(
                             session,
                             task,
                             _active_runners_cache,
                             _runner_pins_this_cycle,
                         ):
-                            if str(task.vm_instance_id or "").startswith("runner:"):
+                            # expire_on_commit=False preserves in-memory values
+                            # through a commit, so the runner-dispatch path has
+                            # vm_instance_id="runner:{id}" accessible. Only the
+                            # rollback path expires the instance, and that path
+                            # never writes "runner:" — so reading through __dict__
+                            # (which returns None for expired/missing keys) is
+                            # safe and avoids the lazy-load → MissingGreenlet.
+                            if str(
+                                task.__dict__.get("vm_instance_id")
+                                or ""
+                            ).startswith("runner:"):
                                 _cycle_dispatched += 1
                             continue
                         resource_defer_msg = (
@@ -3112,6 +3308,11 @@ async def orchestrator_worker():
                             task=task,
                             runtime_config=_runtime_config,
                             blacklist=_effective_blacklist,
+                            project_id=str(task.project_id) if task.project_id else None,
+                            # No runner_available_clis here: this is the cloud
+                            # pre-provision path where no concrete runner is known
+                            # yet. Cloud VMs are provisioned with all LLM CLIs
+                            # pre-installed, so CLI-based filtering is unnecessary.
                         )
                         # From here until ownership transfers, the containment
                         # handler owns releasing the slot this selection
@@ -3119,6 +3320,9 @@ async def orchestrator_worker():
                         if runtime_selection and runtime_selection.account:
                             _iter_preclaimed_account_id = runtime_selection.account.get(
                                 "id"
+                            )
+                            _iter_preclaimed_project_id = (
+                                str(task.project_id) if task.project_id else None
                             )
 
                         # Warm-pool dispatch hook (efficiency direction d-5fd69fe1):
@@ -3207,8 +3411,10 @@ async def orchestrator_worker():
                                         await release_max_plan_account(
                                             runtime_selection.account["id"],
                                             revert_daily_task_count=True,
+                                            project_id=str(task.project_id) if task.project_id else None,
                                         )
                                     _iter_preclaimed_account_id = None
+                                    _iter_preclaimed_project_id = None
                                     await session.rollback()
                                     # session.rollback() expires every session-bound
                                     # instance (independent of expire_on_commit=False),
@@ -3226,6 +3432,28 @@ async def orchestrator_worker():
                                     # warm task — the containment handler must
                                     # not release it past this point.
                                     _iter_preclaimed_account_id = None
+                                    _iter_preclaimed_project_id = None
+                                    # A warm-pool lease IS a dispatch and DOES consume a
+                                    # VM slot, so it must be counted. The pool VM was
+                                    # IDLE, and `count_idle_pool_vms` SUBTRACTS idle pool
+                                    # rows from the dispatch budget (see slots_available)
+                                    # — leasing it flips IDLE -> LEASED, so it stops being
+                                    # subtracted and starts being charged against
+                                    # max_concurrent_vms. That is a net-new slot
+                                    # consumption, unlike the warm-PIN skip-provision path
+                                    # above (which reuses an agent VM that is already
+                                    # charged, and correctly does not increment).
+                                    #
+                                    # Missing this increment silently breaches
+                                    # max_concurrent_vms now that _cycle_dispatched is the
+                                    # SOLE slot enforcement (the window is deliberately
+                                    # wider than slots_available), because every uncounted
+                                    # dispatch is a FREE one: with N idle pool VMs the
+                                    # cycle would lease all N without advancing the
+                                    # counter, then cold-provision slots_available MORE on
+                                    # top. Bounded only by pool size — i.e. by the very
+                                    # GCE quota the cap exists to respect.
+                                    _cycle_dispatched += 1
                                     record_pool_lease_hit(
                                         account=(
                                             runtime_selection.account.get("id")
@@ -3284,9 +3512,77 @@ async def orchestrator_worker():
                                 await release_max_plan_account(
                                     runtime_selection.account["id"],
                                     revert_daily_task_count=True,
+                                    project_id=str(task.project_id) if task.project_id else None,
                                 )
                             _iter_preclaimed_account_id = None
+                            _iter_preclaimed_project_id = None
                             await session.rollback()
+                            continue
+
+                        # Zone-exhaustion hold — the ONLY thing left below this
+                        # point is a COLD GCE provision, and every GCP zone is in
+                        # cooldown, so it cannot succeed. Cold-dispatching anyway
+                        # burns a Secret Manager write, a GCS payload upload and a
+                        # GCE insert attempt (which blocks in-zone for up to
+                        # ZONE_RECOVERY_WAIT_CAP_SECONDS), then requeues the task
+                        # with a 10-30 min retry_after — i.e. it DELAYS the task
+                        # well past zone recovery and banks a wasted attempt. Hold
+                        # it QUEUED instead; the next cycle dispatches it as soon
+                        # as a zone recovers.
+                        #
+                        # Deliberately scoped to the cold-GCE path only, and placed
+                        # after every non-GCE route has already had its turn
+                        # (strategic/fleet runner pin, compute_experiment, warm-pin
+                        # skip-provision, warm-pool lease) and after the Cloud Run
+                        # classification: none of those consume GCE zone capacity,
+                        # so gating them on zone cooldown would strand
+                        # locally-routable work — a worse failure than the throttle
+                        # this gate exists to apply.
+                        if _zones_exhausted_this_cycle and not _is_cloud_run_dispatch:
+                            # DEBUG, not INFO: this fires per held task per cycle —
+                            # a full dispatch window every ~5s (the idle cadence a
+                            # zero-dispatch cycle selects) for the length of the
+                            # outage, i.e. hundreds of lines/minute. The WHY is
+                            # already emitted once per 60s at cycle level (the
+                            # zone-exhaustion WARNING above, with the recovery ETA);
+                            # this line only adds which task, for when someone is
+                            # actually tracing one.
+                            logger.debug(
+                                "[ORCHESTRATOR] All GCP zones in cooldown — holding "
+                                f"cold provision of task {task.id} (stays QUEUED)"
+                            )
+                            # Release the slot pre-reserved during runtime selection
+                            # (select_max_plan_account pre-increments active_tasks),
+                            # exactly as the backlog-reuse hold above does.
+                            if runtime_selection and runtime_selection.account:
+                                await release_max_plan_account(
+                                    runtime_selection.account["id"],
+                                    revert_daily_task_count=True,
+                                    project_id=str(task.project_id) if task.project_id else None,
+                                )
+                            _iter_preclaimed_account_id = None
+                            _iter_preclaimed_project_id = None
+                            # COMMIT (not rollback) so a warm-pin clear this
+                            # iteration already decided is persisted. The pin is
+                            # genuinely dead; rolling the clear back would re-derive
+                            # it — and re-fire record_pool_claim_failure — on every
+                            # cycle of the outage, tripping the warm-pool breaker and
+                            # suppressing the pool leases this gate deliberately lets
+                            # through. On commit failure fall back to rollback: the
+                            # task simply stays QUEUED with its pin intact.
+                            try:
+                                await session.commit()
+                                if _pending_warm_pin_clear is not None:
+                                    _shared_state.record_warm_pin_clear(
+                                        *_pending_warm_pin_clear
+                                    )
+                                    _pending_warm_pin_clear = None
+                            except Exception:
+                                logger.exception(
+                                    "[ORCHESTRATOR] Failed to commit warm-pin clear while "
+                                    f"holding task {task.id} for zone recovery"
+                                )
+                                await session.rollback()
                             continue
 
                         # Ensure VM ID exists (cleared during stale PROVISIONING recovery
@@ -3535,6 +3831,44 @@ async def orchestrator_worker():
                                     _pending_warm_pin_clear = None
                                 continue
 
+                        # Cross-provider fallback model guard (EXTERNAL_API mispair
+                        # fix) — applied at the FINAL choke point where
+                        # runtime_provider / runtime_model have their settled values
+                        # from EVERY path (pool selection, account, env-credential
+                        # fallback), just before they are written to the payload,
+                        # context, and agent manifest. A task pinned to provider A's
+                        # model can be dispatched to provider B when A is unavailable;
+                        # if the model id isn't re-derived for B the runtime is handed
+                        # e.g. provider=anthropic + model=deepseek-v4-pro (selection.
+                        # model was None, so `or runtime_model` kept the task's stale
+                        # context.llm_model), and the anthropic CLI rejects the foreign
+                        # id → EXTERNAL_API failure → 3 retries burned → task FAILED
+                        # (and, in a rollup, review-fix iterations wasted). Re-derive a
+                        # model valid for the resolved provider; no-op when already
+                        # consistent or the model is operator-custom (infers to None).
+                        _reconciled_model = reconcile_model_for_provider(
+                            runtime_provider,
+                            runtime_model,
+                            (
+                                runtime_selection.quality_tier
+                                if runtime_selection
+                                else None
+                            )
+                            or resolve_task_quality_tier(task, _runtime_config),
+                            _runtime_config,
+                        )
+                        if _reconciled_model != runtime_model:
+                            logger.warning(
+                                "[ORCHESTRATOR] Cross-provider model mismatch for task "
+                                "%s: provider=%s but model=%s is foreign; re-derived "
+                                "to %s",
+                                task.id,
+                                runtime_provider,
+                                runtime_model,
+                                _reconciled_model,
+                            )
+                            runtime_model = _reconciled_model
+
                         if _sync_task_payload_runtime_fields(
                             task,
                             model=runtime_model,
@@ -3630,6 +3964,7 @@ async def orchestrator_worker():
                             # (acct_id_for_release) once the PROVISIONING commit
                             # lands — the containment handler must not release it.
                             _iter_preclaimed_account_id = None
+                            _iter_preclaimed_project_id = None
                             # active_tasks already pre-incremented in select_max_plan_account()
                             project_active_counts[task.project_id] = (
                                 project_active_counts.get(task.project_id, 0) + 1
@@ -3674,9 +4009,12 @@ async def orchestrator_worker():
                             # Release the pre-incremented slot on commit failure
                             if account_id:
                                 await release_max_plan_account(
-                                    account_id, revert_daily_task_count=True
+                                    account_id,
+                                    revert_daily_task_count=True,
+                                    project_id=str(task.project_id) if task.project_id else None,
                                 )
                             _iter_preclaimed_account_id = None
+                            _iter_preclaimed_project_id = None
                             task.context = clear_task_llm_runtime_context(task.context)
                             # Keep the promoted column in sync (D2 over-fetch fix).
                             task.llm_account_id = None
@@ -3712,6 +4050,13 @@ async def orchestrator_worker():
                             )
                         )
 
+                        # Count the slot BEFORE the broadcast: the dispatch is already
+                        # durable here (task committed PROVISIONING, provision coroutine
+                        # scheduled), so a websocket failure must not lose the count.
+                        # The dispatch loop's slot enforcement now reads this counter to
+                        # decide when to stop, so an undercount would over-provision past
+                        # max_concurrent_vms rather than merely skewing a log line.
+                        _cycle_dispatched += 1
                         await broadcast_to_project(
                             str(task.project_id),
                             "task_updated",
@@ -3720,7 +4065,6 @@ async def orchestrator_worker():
                                 "status": TaskStatus.PROVISIONING,
                             },
                         )
-                        _cycle_dispatched += 1
                     except Exception as _dispatch_prep_exc:
                         # NEVER touch the loop's `task` ORM object in here — the
                         # rollback below expires every session-bound instance
@@ -3775,6 +4119,7 @@ async def orchestrator_worker():
                                 await release_max_plan_account(
                                     _iter_preclaimed_account_id,
                                     revert_daily_task_count=True,
+                                    project_id=_iter_preclaimed_project_id,
                                 )
                             except Exception:
                                 logger.exception(
@@ -4019,7 +4364,15 @@ async def orchestrator_worker():
                 "orchestrator_cycle_complete",
                 extra={
                     "cycle_duration_seconds": round(time.monotonic() - cycle_start, 3),
-                    "tasks_dispatched": len(queued_tasks),
+                    # ACTUAL dispatches, not the window size. These used to coincide
+                    # (the window was cut at exactly slots_available and the loop
+                    # attempted every member), but the window is now deliberately WIDER
+                    # — up to dispatch_window_size(slots_available) — so len(queued_tasks)
+                    # would over-report dispatches by up to 3x on an operator-facing
+                    # field. _cycle_dispatched is the honest count (it is what enforces
+                    # the slot limit); the scanned window is reported separately below.
+                    "tasks_dispatched": _cycle_dispatched,
+                    "dispatch_window_scanned": len(queued_tasks),
                     "tasks_recovered": tasks_recovered,
                     "slots_in_use": effective_count,
                     "slots_available": slots_available,

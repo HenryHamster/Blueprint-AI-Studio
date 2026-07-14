@@ -1,8 +1,8 @@
 /* eslint-disable react-hooks/set-state-in-effect */
 import { useState, useCallback, useEffect, useRef, useMemo } from 'react';
-import { Compass, Cpu, Copy, Check, KeyRound, RefreshCw, Trash2 } from 'lucide-react';
-import { API_BASE_URL, listFleetRunners, registerFleetRunner, revokeFleetRunner, rotateFleetRunnerToken } from '../api';
-import type { FleetRunner, FleetRunnerRegistrationResult } from '../api';
+import { Compass, Cpu, Copy, Check, KeyRound, RefreshCw, Trash2, Edit2, PauseCircle, PlayCircle, Wind, Activity } from 'lucide-react';
+import { API_BASE_URL, listFleetRunners, patchRunnerStatus, registerFleetRunner, revokeFleetRunner, rotateFleetRunnerToken, updateRunnerCapabilities, fetchRunnerTelemetry, fetchRunnerStats } from '../api';
+import type { FleetRunner, FleetRunnerRegistrationResult, RunnerTelemetryResponse, RunnerStatsResponse } from '../api';
 import { ConfirmDialog } from './ConfirmDialog';
 import { timeAgo, parseTimestamp, formatAbsolute, formatDurationSec } from '../utils/time';
 import {
@@ -36,6 +36,16 @@ function deviceStatusLabel(status: string): { label: string; cls: string } {
   if (status === 'offline') return { label: 'offline', cls: 'text-neutral-500' };
   return { label: status.replace(/_/g, ' '), cls: 'text-neutral-500' };
 }
+
+// The four agent-backend legs, in the order the daemon checks them, with the
+// short labels shown on the per-leg breakdown badges when a runner's agent is
+// unavailable and the structured legs map is present.
+const AGENT_LEG_LABELS: ReadonlyArray<{ key: string; label: string }> = [
+  { key: 'bwrap_sandbox', label: 'bwrap' },
+  { key: 'agent_dist', label: 'agent dist' },
+  { key: 'node_runtime', label: 'node' },
+  { key: 'docker', label: 'docker' },
+];
 
 /** True when the runner is live (recent heartbeat) but its jobs are failing —
  *  the "connected but failing" false-green the trust telemetry exists to catch. */
@@ -85,7 +95,9 @@ function activeWorkCount(runner: FleetRunner): number {
 
 function availableSlots(runner: FleetRunner): number | null {
   if (runner.health) {
-    const health = runner.health as { available_slots?: number | null; max_concurrent?: number | null };
+    const health = runner.health;
+    // Prefer the per-class agent slot count when available (per-class gating).
+    if (typeof health.available_agent_slots === 'number') return health.available_agent_slots;
     if (typeof health.available_slots === 'number') return health.available_slots;
     if (health.available_slots === null) return null;
     if (typeof health.max_concurrent === 'number') {
@@ -96,6 +108,25 @@ function availableSlots(runner: FleetRunner): number | null {
   const max = runner.capabilities.max_concurrent;
   if (typeof max !== 'number') return null;
   return Math.max(0, max - activeWorkCount(runner));
+}
+
+function availableComputeSlots(runner: FleetRunner): number | null {
+  if (runner.health) {
+    const health = runner.health;
+    if (typeof health.available_compute_slots === 'number') return health.available_compute_slots;
+    if (typeof health.available_slots === 'number') return health.available_slots;
+    if (health.available_slots === null) return null;
+    if (typeof health.max_concurrent === 'number') {
+      return Math.max(0, health.max_concurrent - activeWorkCount(runner));
+    }
+    return null;
+  }
+  const max = runner.capabilities.max_concurrent_compute ?? runner.capabilities.max_concurrent;
+  if (typeof max !== 'number') return null;
+  const activeCompute = Array.isArray(runner.capabilities.active_compute_job_ids)
+    ? runner.capabilities.active_compute_job_ids.length
+    : 0;
+  return Math.max(0, max - activeCompute);
 }
 
 function maxSlotsForRunner(runner: FleetRunner): number | null {
@@ -119,6 +150,108 @@ function capsSummary(caps: FleetRunner['capabilities']): string {
   }
   if (typeof caps.max_concurrent === 'number') parts.push(`max ${caps.max_concurrent} concurrent`);
   return parts.join(' · ') || '—';
+}
+
+/** Desired-vs-applied config badge for a runner row. Pending = operator changed
+ *  live-safe config but the daemon has not yet echoed the matching generation
+ *  (applies on the next heartbeat); applied = the daemon's reported generation
+ *  matches. Returns null for runners that never reported a config block. */
+function configStatus(runner: FleetRunner): { label: string; cls: string; pending: boolean } | null {
+  const config = runner.config;
+  if (!config) return null;
+  if (config.config_pending) {
+    return {
+      label: 'config pending — applying on next heartbeat',
+      cls: 'border-amber-500/40 bg-amber-500/10 text-amber-300',
+      pending: true,
+    };
+  }
+  // config_pending is false only once the daemon echoed the desired generation.
+  if (config.applied_config_generation != null) {
+    return {
+      label: 'config applied',
+      cls: 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300',
+      pending: false,
+    };
+  }
+  return null;
+}
+
+/** Current GPU allowlist for a runner, from the server-authoritative desired
+ *  config. Absent / "all" means no restriction (all visible GPUs eligible). */
+function gpuAllowlistValue(runner: FleetRunner): 'all' | number[] {
+  const allow = runner.config?.gpu_indices_allowed;
+  if (Array.isArray(allow)) return allow;
+  return 'all';
+}
+
+function gpuAllowlistLabel(runner: FleetRunner): string {
+  const allow = gpuAllowlistValue(runner);
+  if (allow === 'all') return 'GPUs: all';
+  return allow.length > 0 ? `GPUs: ${allow.join(',')}` : 'GPUs: none';
+}
+
+/** Parse an operator-typed index list ("0, 1 2") into a deduped, sorted,
+ *  non-negative integer array — the shape the PATCH endpoint normalizes to. */
+function parseGpuIndexList(text: string): number[] {
+  const seen = new Set<number>();
+  const out: number[] = [];
+  for (const token of text.split(/[\s,]+/)) {
+    if (!token) continue;
+    if (!/^\d+$/.test(token)) continue;
+    const value = Number(token);
+    if (!Number.isInteger(value) || value < 0 || seen.has(value)) continue;
+    seen.add(value);
+    out.push(value);
+  }
+  return out.sort((a, b) => a - b);
+}
+
+// Per-job GPU reservation bounds. Must match backend runner_config.GPUS_PER_JOB_MIN
+// / GPUS_PER_JOB_MAX so the UI clamp agrees with the server-side clamp.
+const GPUS_PER_JOB_MIN = 1;
+const GPUS_PER_JOB_MAX = 8;
+
+/** Current per-job GPU count for a runner, from the server-authoritative config.
+ *  Absent means the default of 1 GPU per job (backward compatible). */
+function gpusPerJobValue(runner: FleetRunner): number {
+  const raw = runner.config?.gpus_per_job ?? runner.config?.desired?.gpus_per_job;
+  if (typeof raw !== 'number' || !Number.isFinite(raw)) return GPUS_PER_JOB_MIN;
+  return Math.max(GPUS_PER_JOB_MIN, Math.min(GPUS_PER_JOB_MAX, Math.trunc(raw)));
+}
+
+/** Current task-type allowlist for a runner. Prefers the server-authoritative
+ *  desired config; falls back to the runner-reported capabilities for runners
+ *  enrolled before the live-config contract (no config block). Absent / "all"
+ *  means every task type is eligible. */
+function taskTypesValue(runner: FleetRunner): 'all' | string[] {
+  const desired = runner.config?.desired?.task_types;
+  if (Array.isArray(desired)) return desired;
+  if (desired === 'all') return 'all';
+  const reported = runner.capabilities.task_types;
+  if (Array.isArray(reported)) return reported;
+  return 'all';
+}
+
+function taskTypesLabel(runner: FleetRunner): string {
+  const value = taskTypesValue(runner);
+  if (value === 'all') return 'tasks: all';
+  return value.length > 0 ? `tasks: ${value.join(', ')}` : 'tasks: none';
+}
+
+/** Parse an operator-typed task-type list ("compute_experiment, code_change")
+ *  into a deduped, trimmed, non-empty string array — the shape the PATCH
+ *  endpoint normalizes ('all' when empty is handled by the caller). */
+function parseTaskTypeList(text: string): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const token of text.split(/[\s,]+/)) {
+    const trimmed = token.trim();
+    if (!trimmed || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    out.push(trimmed);
+  }
+  return out;
 }
 
 function isStrategicRunner(runner: FleetRunner): boolean {
@@ -210,7 +343,9 @@ function runnerReadiness(runner: FleetRunner, runnerLive: boolean, slots: number
     };
   }
   if (runner.health?.agent_available === false) {
-    return { label: 'agent unavailable', detail, nextAction: 'Restart or inspect the local agent', tone: 'bad', ready: false };
+    const agentReason = runner.health?.agent_unavailable_reason;
+    const nextAction = agentReason ?? 'Restart or inspect the local agent';
+    return { label: 'agent unavailable', detail, nextAction, tone: 'bad', ready: false };
   }
   if (isRunnerDegraded(runner)) {
     // The payoff: live + heartbeating, but jobs are failing. Amber, NOT ready —
@@ -424,13 +559,17 @@ interface Props {
    *  refreshSignal and post-mutation loads instead. Absent or false keeps the
    *  poll running as a safety-net (WS down / prop not yet plumbed). */
   live?: boolean;
+  /** Navigate to a task/compute-job detail view by id. When provided, per-runner
+   *  recent-outcome rows render the task id as a keyboard-accessible link;
+   *  when absent the id degrades to plain text. */
+  onNavigateToTask?: (taskId: string) => void;
 }
 
 function tokenExpiryFromRegisterResult(result: FleetRunnerRegistrationResult): string | null {
   return result.token_expires_at ?? result.expires_at ?? result.expiresAt ?? null;
 }
 
-export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refreshSignal, live }: Props) {
+export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refreshSignal, live, onNavigateToTask }: Props) {
   const [runners, setRunners] = useState<FleetRunner[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -444,7 +583,21 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
   } | null>(null);
   const [rotating, setRotating] = useState<string | null>(null);
   const [revoking, setRevoking] = useState<string | null>(null);
+  const [editingCapabilities, setEditingCapabilities] = useState<string | null>(null);
+  const [editMaxConcurrent, setEditMaxConcurrent] = useState<number>(2);
+  const [editingGpuAllowlist, setEditingGpuAllowlist] = useState<string | null>(null);
+  const [gpuAllowlistAll, setGpuAllowlistAll] = useState<boolean>(true);
+  const [gpuAllowlistText, setGpuAllowlistText] = useState<string>('');
+  const [editingGpusPerJob, setEditingGpusPerJob] = useState<string | null>(null);
+  const [editGpusPerJob, setEditGpusPerJob] = useState<number>(GPUS_PER_JOB_MIN);
+  const [editingTaskTypes, setEditingTaskTypes] = useState<string | null>(null);
+  const [taskTypesAll, setTaskTypesAll] = useState<boolean>(true);
+  const [taskTypesText, setTaskTypesText] = useState<string>('');
+  const [updatingCapabilities, setUpdatingCapabilities] = useState<string | null>(null);
   const [pendingConfirm, setPendingConfirm] = useState<{ type: 'rotate' | 'revoke'; runner: FleetRunner } | null>(null);
+  const [updatingStatus, setUpdatingStatus] = useState<string | null>(null);
+  // Which runner's heartbeat time-series / stats detail is expanded (lazy-loaded).
+  const [expandedTelemetry, setExpandedTelemetry] = useState<string | null>(null);
   const mountedRef = useRef(true);
 
   useEffect(() => {
@@ -562,6 +715,85 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
       } finally {
         setRevoking(null);
       }
+    }
+  };
+
+  const handleUpdateCapabilities = async (runner: FleetRunner, maxConcurrent: number) => {
+    setUpdatingCapabilities(runner.id);
+    setEditingCapabilities(null);
+    try {
+      await updateRunnerCapabilities(projectId, runner.id, { max_concurrent: maxConcurrent });
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setUpdatingCapabilities(null);
+    }
+  };
+
+  const handleUpdateGpuAllowlist = async (runner: FleetRunner, gpuIndicesAllowed: 'all' | number[]) => {
+    setUpdatingCapabilities(runner.id);
+    setEditingGpuAllowlist(null);
+    try {
+      await updateRunnerCapabilities(projectId, runner.id, { gpu_indices_allowed: gpuIndicesAllowed });
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setUpdatingCapabilities(null);
+    }
+  };
+
+  const beginEditGpuAllowlist = (runner: FleetRunner) => {
+    const current = gpuAllowlistValue(runner);
+    setGpuAllowlistAll(current === 'all');
+    setGpuAllowlistText(current === 'all' ? '' : current.join(','));
+    setEditingGpuAllowlist(runner.id);
+  };
+
+  const handleUpdateGpusPerJob = async (runner: FleetRunner, gpusPerJob: number) => {
+    const clamped = Math.max(GPUS_PER_JOB_MIN, Math.min(GPUS_PER_JOB_MAX, Math.trunc(gpusPerJob)));
+    setUpdatingCapabilities(runner.id);
+    setEditingGpusPerJob(null);
+    try {
+      await updateRunnerCapabilities(projectId, runner.id, { gpus_per_job: clamped });
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setUpdatingCapabilities(null);
+    }
+  };
+
+  const handleUpdateTaskTypes = async (runner: FleetRunner, taskTypes: 'all' | string[]) => {
+    setUpdatingCapabilities(runner.id);
+    setEditingTaskTypes(null);
+    try {
+      await updateRunnerCapabilities(projectId, runner.id, { task_types: taskTypes });
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setUpdatingCapabilities(null);
+    }
+  };
+
+  const beginEditTaskTypes = (runner: FleetRunner) => {
+    const current = taskTypesValue(runner);
+    setTaskTypesAll(current === 'all');
+    setTaskTypesText(current === 'all' ? '' : current.join(', '));
+    setEditingTaskTypes(runner.id);
+  };
+
+  const handleUpdateStatus = async (runner: FleetRunner, status: 'active' | 'paused' | 'draining') => {
+    setUpdatingStatus(runner.id);
+    try {
+      await patchRunnerStatus(projectId, runner.id, status);
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setUpdatingStatus(null);
     }
   };
 
@@ -731,20 +963,30 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
             // status is authoritative (set by the backend stale-runner sweep);
             // distinct from the timestamp-derived live/stale label above.
             const isActive = runner.status === 'active';
+            const isPaused = runner.status === 'paused';
+            const isDraining = runner.status === 'draining';
             const runnerLive = isRunnerLive(runner);
             const activeCount = activeWorkCount(runner);
             const slots = runnerLive ? availableSlots(runner) : null;
+            const computeSlots = runnerLive ? availableComputeSlots(runner) : null;
+            const hasPerClassCapacity = runner.health?.max_concurrent_compute != null
+              && runner.health.max_concurrent_compute !== runner.health.max_concurrent;
             const strategicRunner = isStrategicRunner(runner);
             const readiness = runnerReadiness(runner, runnerLive, slots);
             const workday = workdayReadinessLine(readiness, strategicRunner);
             const telemetry = telemetrySummary(runner);
+            const configState = configStatus(runner);
             const backends = formatBackendInventory(runner.capabilities);
             const hasBackendInfo =
               backends.available.length > 0 || backends.agentBackend !== null || backends.computeBackend !== null;
+            const telemetryOpen = expandedTelemetry === runner.id;
             return (
               <div
                 key={runner.id}
-                className="flex items-start gap-2.5 rounded-md border border-neutral-800 bg-[#0d1218] p-2.5"
+                className="rounded-md border border-neutral-800 bg-[#0d1218]"
+              >
+              <div
+                className="flex flex-wrap items-start gap-2.5 p-2.5"
                 data-testid="fleet-runner-row"
               >
                 <div className="mt-0.5 shrink-0">
@@ -752,7 +994,11 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                     <Cpu className="h-3.5 w-3.5 text-neutral-400" />
                   </div>
                 </div>
-                <div className="flex-1 min-w-0">
+                {/* basis-[14rem] (not flex-1's basis 0) keeps the info column readable:
+                    when the per-runner action strip doesn't fit beside it (narrow
+                    viewports), the strip wraps to its own line instead of crushing
+                    the status text into a sliver that silently clips. */}
+                <div className="min-w-0 grow shrink basis-[14rem]">
                   <div className="flex flex-wrap items-center gap-1.5">
                     <span className={`shrink-0 text-sm leading-none ${livCls}`} aria-hidden="true">●</span>
                     <span className="text-sm font-medium text-neutral-200 truncate">
@@ -768,7 +1014,17 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                         Strategic capable
                       </span>
                     )}
-                    {!isActive && (
+                    {isPaused && (
+                      <span className="rounded border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 text-xs font-medium text-amber-300">
+                        paused
+                      </span>
+                    )}
+                    {isDraining && (
+                      <span className="rounded border border-blue-500/40 bg-blue-500/10 px-1.5 py-0.5 text-xs font-medium text-blue-300">
+                        draining
+                      </span>
+                    )}
+                    {!isActive && !isPaused && !isDraining && (
                       <span className="rounded border border-neutral-600/50 bg-neutral-700/40 px-1.5 py-0.5 text-xs text-neutral-300">
                         {runner.status === 'inactive' ? 'offline (deactivated)' : runner.status}
                       </span>
@@ -778,13 +1034,258 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                         {activeCount} active
                       </span>
                     )}
-                    {slots !== null && (
-                      <span className="rounded border border-neutral-700 bg-[#151c25] px-1.5 py-0.5 text-xs text-neutral-300">
-                        {slots} slots free
+                    {slots !== null && editingCapabilities === runner.id ? (
+                      <span className="inline-flex items-center gap-1 rounded border border-blue-500/30 bg-blue-500/10 px-1.5 py-0.5 text-xs text-blue-300">
+                        <input
+                          type="number"
+                          min={1}
+                          max={64}
+                          value={editMaxConcurrent}
+                          onChange={e => setEditMaxConcurrent(Math.max(1, Math.min(64, Number(e.target.value) || 1)))}
+                          className="w-10 bg-transparent text-center text-xs text-blue-300 outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+                          autoFocus
+                        />
+                        <span>/ max</span>
+                        {updatingCapabilities !== runner.id ? (
+                          <>
+                            <button
+                              onClick={() => handleUpdateCapabilities(runner, editMaxConcurrent)}
+                              className="text-emerald-400 hover:text-emerald-300 transition-colors min-h-[28px] min-w-[28px] flex items-center justify-center"
+                              title="Save"
+                              aria-label="Save max concurrent"
+                              data-viewport-allow-small-target
+                            >
+                              <Check className="w-3 h-3" />
+                            </button>
+                            <button
+                              onClick={() => setEditingCapabilities(null)}
+                              className="text-neutral-400 hover:text-neutral-200 transition-colors min-h-[28px] min-w-[28px] flex items-center justify-center"
+                              title="Cancel"
+                              aria-label="Cancel"
+                              data-viewport-allow-small-target
+                            >
+                              <span className="text-xs">✕</span>
+                            </button>
+                          </>
+                        ) : (
+                          <span className="text-blue-300 animate-pulse">saving…</span>
+                        )}
+                      </span>
+                    ) : slots !== null && (
+                      <span className="inline-flex items-center gap-1 rounded border border-neutral-700 bg-[#151c25] px-1.5 py-0.5 text-xs text-neutral-300">
+                        {hasPerClassCapacity ? `${slots} agent slots free` : `${slots} slots free`}
+                        {runner.capabilities.workload !== 'strategic' && runner.capabilities.runner_preset !== 'strategic_local' && (
+                          <button
+                            onClick={() => {
+                              setEditMaxConcurrent(runner.capabilities.max_concurrent ?? 2);
+                              setEditingCapabilities(runner.id);
+                            }}
+                            className="text-neutral-500 hover:text-neutral-200 transition-colors min-h-[20px] min-w-[20px] flex items-center justify-center"
+                            title="Edit max concurrent"
+                            aria-label="Edit max concurrent"
+                            data-viewport-allow-small-target
+                          >
+                            <Edit2 className="w-3 h-3" />
+                          </button>
+                        )}
+                      </span>
+                    )}
+                    {hasPerClassCapacity && computeSlots !== null && (
+                      <span className="inline-flex items-center gap-1 rounded border border-purple-500/30 bg-purple-500/10 px-1.5 py-0.5 text-xs text-purple-300">
+                        {computeSlots} compute slots free
                       </span>
                     )}
                     {runner.capabilities.has_gpu && (
                       <span className="rounded border border-purple-500/30 bg-purple-500/10 px-1.5 py-0.5 text-xs text-purple-300">GPU</span>
+                    )}
+                    {runner.capabilities.has_gpu && (
+                      editingGpuAllowlist === runner.id ? (
+                        <span
+                          className="inline-flex items-center gap-1 rounded border border-purple-500/30 bg-purple-500/10 px-1.5 py-0.5 text-xs text-purple-300"
+                          data-testid="fleet-runner-gpu-allowlist-editor"
+                        >
+                          <label className="inline-flex items-center gap-1">
+                            <input
+                              type="checkbox"
+                              checked={gpuAllowlistAll}
+                              onChange={e => setGpuAllowlistAll(e.target.checked)}
+                              aria-label="Allow all GPUs"
+                            />
+                            all
+                          </label>
+                          {!gpuAllowlistAll && (
+                            <input
+                              type="text"
+                              inputMode="numeric"
+                              value={gpuAllowlistText}
+                              onChange={e => setGpuAllowlistText(e.target.value)}
+                              placeholder="0,1"
+                              aria-label="GPU indices allowed"
+                              className="w-16 bg-transparent text-center text-xs text-purple-300 outline-none"
+                              autoFocus
+                            />
+                          )}
+                          {updatingCapabilities !== runner.id ? (
+                            <>
+                              <button
+                                onClick={() => handleUpdateGpuAllowlist(runner, gpuAllowlistAll ? 'all' : parseGpuIndexList(gpuAllowlistText))}
+                                className="text-emerald-400 hover:text-emerald-300 transition-colors min-h-[28px] min-w-[28px] flex items-center justify-center"
+                                title="Save GPU allowlist"
+                                aria-label="Save GPU allowlist"
+                              >
+                                <Check className="w-3 h-3" />
+                              </button>
+                              <button
+                                onClick={() => setEditingGpuAllowlist(null)}
+                                className="text-neutral-400 hover:text-neutral-200 transition-colors min-h-[28px] min-w-[28px] flex items-center justify-center"
+                                title="Cancel"
+                                aria-label="Cancel GPU allowlist"
+                              >
+                                <span className="text-xs">✕</span>
+                              </button>
+                            </>
+                          ) : (
+                            <span className="text-purple-300 animate-pulse">saving…</span>
+                          )}
+                        </span>
+                      ) : (
+                        <span className="inline-flex items-center gap-1 rounded border border-purple-500/30 bg-purple-500/10 px-1.5 py-0.5 text-xs text-purple-300">
+                          {gpuAllowlistLabel(runner)}
+                          <button
+                            onClick={() => beginEditGpuAllowlist(runner)}
+                            className="flex min-h-[44px] min-w-[44px] items-center justify-center text-purple-300/70 transition-colors hover:text-purple-200 md:min-h-5 md:min-w-5"
+                            title="Edit GPU allowlist"
+                            aria-label="Edit GPU allowlist"
+                          >
+                            <Edit2 className="w-3 h-3" />
+                          </button>
+                        </span>
+                      )
+                    )}
+                    {runner.capabilities.has_gpu && (
+                      editingGpusPerJob === runner.id ? (
+                        <span
+                          className="inline-flex items-center gap-1 rounded border border-purple-500/30 bg-purple-500/10 px-1.5 py-0.5 text-xs text-purple-300"
+                          data-testid="fleet-runner-gpus-per-job-editor"
+                        >
+                          <input
+                            type="number"
+                            min={GPUS_PER_JOB_MIN}
+                            max={GPUS_PER_JOB_MAX}
+                            value={editGpusPerJob}
+                            onChange={e => setEditGpusPerJob(
+                              Math.max(GPUS_PER_JOB_MIN, Math.min(GPUS_PER_JOB_MAX, Number(e.target.value) || GPUS_PER_JOB_MIN)),
+                            )}
+                            className="w-10 bg-transparent text-center text-xs text-purple-300 outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+                            aria-label="GPUs per job"
+                            autoFocus
+                          />
+                          <span>GPUs/job</span>
+                          {updatingCapabilities !== runner.id ? (
+                            <>
+                              <button
+                                onClick={() => handleUpdateGpusPerJob(runner, editGpusPerJob)}
+                                className="text-emerald-400 hover:text-emerald-300 transition-colors min-h-[28px] min-w-[28px] flex items-center justify-center"
+                                title="Save GPUs per job"
+                                aria-label="Save GPUs per job"
+                              >
+                                <Check className="w-3 h-3" />
+                              </button>
+                              <button
+                                onClick={() => setEditingGpusPerJob(null)}
+                                className="text-neutral-400 hover:text-neutral-200 transition-colors min-h-[28px] min-w-[28px] flex items-center justify-center"
+                                title="Cancel"
+                                aria-label="Cancel GPUs per job"
+                              >
+                                <span className="text-xs">✕</span>
+                              </button>
+                            </>
+                          ) : (
+                            <span className="text-purple-300 animate-pulse">saving…</span>
+                          )}
+                        </span>
+                      ) : (
+                        <span className="inline-flex items-center gap-1 rounded border border-purple-500/30 bg-purple-500/10 px-1.5 py-0.5 text-xs text-purple-300">
+                          {`${gpusPerJobValue(runner)} GPUs/job`}
+                          <button
+                            onClick={() => {
+                              setEditGpusPerJob(gpusPerJobValue(runner));
+                              setEditingGpusPerJob(runner.id);
+                            }}
+                            className="flex min-h-[44px] min-w-[44px] items-center justify-center text-purple-300/70 transition-colors hover:text-purple-200 md:min-h-5 md:min-w-5"
+                            title="Edit GPUs per job"
+                            aria-label="Edit GPUs per job"
+                          >
+                            <Edit2 className="w-3 h-3" />
+                          </button>
+                        </span>
+                      )
+                    )}
+                    {runner.capabilities.workload !== 'strategic' && runner.capabilities.runner_preset !== 'strategic_local' && (
+                      editingTaskTypes === runner.id ? (
+                        <span
+                          className="inline-flex items-center gap-1 rounded border border-blue-500/30 bg-blue-500/10 px-1.5 py-0.5 text-xs text-blue-300"
+                          data-testid="fleet-runner-task-types-editor"
+                        >
+                          <label className="inline-flex items-center gap-1">
+                            <input
+                              type="checkbox"
+                              checked={taskTypesAll}
+                              onChange={e => setTaskTypesAll(e.target.checked)}
+                              aria-label="Allow all task types"
+                            />
+                            all
+                          </label>
+                          {!taskTypesAll && (
+                            <input
+                              type="text"
+                              value={taskTypesText}
+                              onChange={e => setTaskTypesText(e.target.value)}
+                              placeholder="compute_experiment, code_change"
+                              aria-label="Task types allowed"
+                              className="w-40 bg-transparent text-center text-xs text-blue-300 outline-none"
+                              autoFocus
+                            />
+                          )}
+                          {updatingCapabilities !== runner.id ? (
+                            <>
+                              <button
+                                onClick={() => {
+                                  const list = parseTaskTypeList(taskTypesText);
+                                  handleUpdateTaskTypes(runner, taskTypesAll || list.length === 0 ? 'all' : list);
+                                }}
+                                className="text-emerald-400 hover:text-emerald-300 transition-colors min-h-[28px] min-w-[28px] flex items-center justify-center"
+                                title="Save task types"
+                                aria-label="Save task types"
+                              >
+                                <Check className="w-3 h-3" />
+                              </button>
+                              <button
+                                onClick={() => setEditingTaskTypes(null)}
+                                className="text-neutral-400 hover:text-neutral-200 transition-colors min-h-[28px] min-w-[28px] flex items-center justify-center"
+                                title="Cancel"
+                                aria-label="Cancel task types"
+                              >
+                                <span className="text-xs">✕</span>
+                              </button>
+                            </>
+                          ) : (
+                            <span className="text-blue-300 animate-pulse">saving…</span>
+                          )}
+                        </span>
+                      ) : (
+                        <span className="inline-flex items-center gap-1 rounded border border-blue-500/30 bg-blue-500/10 px-1.5 py-0.5 text-xs text-blue-300">
+                          {taskTypesLabel(runner)}
+                          <button
+                            onClick={() => beginEditTaskTypes(runner)}
+                            className="flex min-h-[44px] min-w-[44px] items-center justify-center text-blue-300/70 transition-colors hover:text-blue-200 md:min-h-5 md:min-w-5"
+                            title="Edit task types"
+                            aria-label="Edit task types"
+                          >
+                            <Edit2 className="w-3 h-3" />
+                          </button>
+                        </span>
+                      )
                     )}
                     {runner.health?.agent_available !== undefined && (
                       <span
@@ -793,13 +1294,55 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                             ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
                             : 'border-red-500/30 bg-red-500/10 text-red-300'
                         }`}
+                        title={!runner.health.agent_available && runner.health.agent_unavailable_reason ? runner.health.agent_unavailable_reason : undefined}
                       >
-                        {runner.health.agent_available ? 'agent ✓' : 'agent ✗'}
+                        {runner.health.agent_available
+                          ? 'agent ✓'
+                          : runner.health.agent_unavailable_reason && !runner.health.agent_unavailable_legs
+                            ? `agent ✗: ${runner.health.agent_unavailable_reason}`
+                            : 'agent ✗'}
+                      </span>
+                    )}
+                    {runner.health?.agent_available === false && runner.health.agent_unavailable_legs && (
+                      <span
+                        className="inline-flex flex-wrap items-center gap-1"
+                        data-testid="fleet-runner-agent-legs"
+                      >
+                        {AGENT_LEG_LABELS.map(({ key, label }) => {
+                          const ok = runner.health?.agent_unavailable_legs?.[key as keyof typeof runner.health.agent_unavailable_legs];
+                          if (ok === undefined) return null;
+                          return (
+                            <span
+                              key={key}
+                              data-testid={`fleet-runner-agent-leg-${key}`}
+                              data-leg-ok={ok ? 'true' : 'false'}
+                              className={`rounded border px-1.5 py-0.5 text-xs ${
+                                ok
+                                  ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
+                                  : 'border-red-500/30 bg-red-500/10 text-red-300'
+                              }`}
+                              title={ok ? `${label} ok` : `${label} failed`}
+                            >
+                              {label} {ok ? '✓' : '✗'}
+                            </span>
+                          );
+                        })}
                       </span>
                     )}
                     <span className={`rounded border px-1.5 py-0.5 text-xs font-medium ${readinessClasses(readiness.tone)}`}>
                       {readiness.label}
                     </span>
+                    {configState && (
+                      <span
+                        className={`inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-xs font-medium ${configState.cls}`}
+                        data-testid="fleet-runner-config-status"
+                      >
+                        {configState.pending
+                          ? <RefreshCw className="w-3 h-3 animate-spin" />
+                          : <Check className="w-3 h-3" />}
+                        {configState.label}
+                      </span>
+                    )}
                   </div>
                   <div
                     className={`mt-1 text-xs font-medium ${workday.ready ? 'text-emerald-300' : 'text-amber-300'}`}
@@ -847,6 +1390,49 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                     Next: {readiness.nextAction}
                   </div>
                 </div>
+                <div className="flex shrink-0 items-center gap-2.5">
+                {(isActive || isDraining) && (
+                  <button
+                    onClick={() => void handleUpdateStatus(runner, 'paused')}
+                    disabled={updatingStatus === runner.id}
+                    className="flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded-md text-neutral-500 transition-colors hover:bg-amber-500/10 hover:text-amber-300 disabled:opacity-40 md:min-h-9 md:min-w-9"
+                    aria-label={`Pause runner ${runner.hostname ?? runner.id.slice(0, 8)}`}
+                    title="Pause runner (stop new dispatch)"
+                  >
+                    <PauseCircle className="w-3.5 h-3.5" />
+                  </button>
+                )}
+                {isActive && (
+                  <button
+                    onClick={() => void handleUpdateStatus(runner, 'draining')}
+                    disabled={updatingStatus === runner.id}
+                    className="flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded-md text-neutral-500 transition-colors hover:bg-blue-500/10 hover:text-blue-300 disabled:opacity-40 md:min-h-9 md:min-w-9"
+                    aria-label={`Drain runner ${runner.hostname ?? runner.id.slice(0, 8)}`}
+                    title="Drain runner (finish existing, skip new)"
+                  >
+                    <Wind className="w-3.5 h-3.5" />
+                  </button>
+                )}
+                {(isPaused || isDraining) && (
+                  <button
+                    onClick={() => void handleUpdateStatus(runner, 'active')}
+                    disabled={updatingStatus === runner.id}
+                    className="flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded-md text-neutral-500 transition-colors hover:bg-emerald-500/10 hover:text-emerald-300 disabled:opacity-40 md:min-h-9 md:min-w-9"
+                    aria-label={`Resume runner ${runner.hostname ?? runner.id.slice(0, 8)}`}
+                    title="Resume runner (re-enable dispatch)"
+                  >
+                    <PlayCircle className="w-3.5 h-3.5" />
+                  </button>
+                )}
+                <button
+                  onClick={() => setExpandedTelemetry(telemetryOpen ? null : runner.id)}
+                  className={`flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded-md transition-colors hover:bg-sky-500/10 hover:text-sky-300 md:min-h-9 md:min-w-9 ${telemetryOpen ? 'text-sky-300' : 'text-neutral-500'}`}
+                  aria-label={`Toggle telemetry for runner ${runner.hostname ?? runner.id.slice(0, 8)}`}
+                  aria-expanded={telemetryOpen}
+                  title="Heartbeat telemetry & stats (last hour)"
+                >
+                  <Activity className="w-3.5 h-3.5" />
+                </button>
                 <button
                   onClick={() => handleRotate(runner)}
                   disabled={rotating === runner.id}
@@ -865,6 +1451,15 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                 >
                   <Trash2 className="w-3.5 h-3.5" />
                 </button>
+                </div>
+              </div>
+              {telemetryOpen && (
+                <RunnerTelemetryDetail
+                  projectId={projectId}
+                  runnerId={runner.id}
+                  onNavigateToTask={onNavigateToTask}
+                />
+              )}
               </div>
             );
           })}
@@ -894,6 +1489,242 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
           onConfirm={() => void executeConfirmedAction()}
           onCancel={() => setPendingConfirm(null)}
         />
+      )}
+    </div>
+  );
+}
+
+/** Minimal dependency-free sparkline: scales a (possibly sparse) numeric series
+ *  into an inline SVG polyline. Nulls break the line rather than plotting zero. */
+function Sparkline({
+  values,
+  width = 140,
+  height = 28,
+  color = '#38bdf8',
+  unit = '',
+}: {
+  values: (number | null)[];
+  width?: number;
+  height?: number;
+  color?: string;
+  unit?: string;
+}) {
+  const present = values.filter((v): v is number => v != null);
+  if (present.length === 0) {
+    return <span className="text-ui-md text-neutral-600">no data</span>;
+  }
+  const min = Math.min(...present);
+  const max = Math.max(...present);
+  const span = max - min || 1;
+  const stepX = values.length > 1 ? width / (values.length - 1) : 0;
+  let d = '';
+  let started = false;
+  values.forEach((v, i) => {
+    if (v == null) {
+      started = false;
+      return;
+    }
+    const x = i * stepX;
+    const y = height - ((v - min) / span) * height;
+    d += `${started ? 'L' : 'M'}${x.toFixed(1)},${y.toFixed(1)} `;
+    started = true;
+  });
+  const last = present[present.length - 1];
+  return (
+    <span className="inline-flex items-center gap-1.5">
+      <svg width={width} height={height} aria-hidden="true">
+        <path d={d.trim()} fill="none" stroke={color} strokeWidth={1.5} />
+      </svg>
+      <span className="text-ui-md tabular-nums text-neutral-400">
+        {last.toLocaleString(undefined, { maximumFractionDigits: 1 })}
+        {unit}
+      </span>
+    </span>
+  );
+}
+
+/** Expandable per-runner detail: heartbeat time-series sparklines (GPU/disk/mem
+ *  over the last hour) + compute-job rollups. Lazy-loaded when the row expands. */
+function RunnerTelemetryDetail({
+  projectId,
+  runnerId,
+  onNavigateToTask,
+}: {
+  projectId: string;
+  runnerId: string;
+  onNavigateToTask?: (taskId: string) => void;
+}) {
+  const [telemetry, setTelemetry] = useState<RunnerTelemetryResponse | null>(null);
+  const [stats, setStats] = useState<RunnerStatsResponse | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    Promise.all([
+      fetchRunnerTelemetry(projectId, runnerId, { sinceSeconds: 3600 }),
+      fetchRunnerStats(projectId, runnerId),
+    ])
+      .then(([t, s]) => {
+        if (cancelled) return;
+        setTelemetry(t);
+        setStats(s);
+      })
+      .catch((e: unknown) => {
+        if (cancelled) return;
+        setError(e instanceof Error ? e.message : 'Failed to load telemetry');
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId, runnerId]);
+
+  if (loading) {
+    return (
+      <div className="border-t border-neutral-800 px-2.5 py-2 text-ui-md text-neutral-500">
+        Loading telemetry…
+      </div>
+    );
+  }
+  if (error) {
+    return (
+      <div className="border-t border-neutral-800 px-2.5 py-2 text-ui-md text-amber-300/90">
+        {error}
+      </div>
+    );
+  }
+
+  const snaps = telemetry?.snapshots ?? [];
+  const gpu = snaps.map(s => s.gpu_utilization_pct);
+  const diskGb = snaps.map(s => (s.disk_free_bytes != null ? s.disk_free_bytes / 1e9 : null));
+  const memGb = snaps.map(s => (s.memory_free_bytes != null ? s.memory_free_bytes / 1e9 : null));
+  const successPct = stats?.jobs_success_rate != null ? Math.round(stats.jobs_success_rate * 100) : null;
+
+  return (
+    <div
+      className="space-y-2 border-t border-neutral-800 px-2.5 py-2"
+      data-testid="fleet-runner-telemetry-detail"
+    >
+      {snaps.length === 0 ? (
+        <div className="text-ui-md text-neutral-600">No heartbeat snapshots in the last hour.</div>
+      ) : (
+        <div className="grid grid-cols-[5rem_1fr] items-center gap-x-2 gap-y-1">
+          <span className="text-ui-md text-neutral-500">GPU util</span>
+          <Sparkline values={gpu} color="#38bdf8" unit="%" />
+          <span className="text-ui-md text-neutral-500">Disk free</span>
+          <Sparkline values={diskGb} color="#34d399" unit=" GB" />
+          <span className="text-ui-md text-neutral-500">Mem free</span>
+          <Sparkline values={memGb} color="#a78bfa" unit=" GB" />
+        </div>
+      )}
+      <div className="text-ui-md text-neutral-600">
+        {telemetry?.count ?? 0} snapshots · last hour
+      </div>
+      {stats && (
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-ui-md">
+          <span className="text-neutral-400">
+            Jobs run: <span className="tabular-nums text-neutral-200">{stats.jobs_run_count}</span>
+          </span>
+          <span className="text-neutral-400">
+            Success:{' '}
+            <span className="tabular-nums text-neutral-200">
+              {successPct != null ? `${successPct}%` : '—'}
+            </span>
+            {stats.jobs_terminal_count > 0 && (
+              <span className="text-neutral-600">
+                {' '}
+                ({stats.jobs_succeeded_count}/{stats.jobs_terminal_count})
+              </span>
+            )}
+          </span>
+          <span className="text-neutral-400" title="On-demand cloud VM cost these self-hosted runs avoided">
+            Cloud cost avoided:{' '}
+            <span className="tabular-nums text-emerald-300">
+              ${(stats.cloud_cost_avoided_usd ?? 0).toFixed(2)}
+            </span>
+          </span>
+        </div>
+      )}
+      {stats && stats.claim_latency_sample_count > 0 && (
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-ui-md">
+          <span className="text-neutral-400" title="Dispatch-to-claim pickup latency across completed tasks">
+            Claim latency:{' '}
+            <span className="tabular-nums text-neutral-200">
+              {stats.claim_latency_ms_p50 != null ? `${stats.claim_latency_ms_p50}ms` : '—'}
+            </span>{' '}
+            <span className="text-neutral-600">p50</span>
+          </span>
+          <span className="text-neutral-400">
+            <span className="tabular-nums text-neutral-200">
+              {stats.claim_latency_ms_p95 != null ? `${stats.claim_latency_ms_p95}ms` : '—'}
+            </span>{' '}
+            <span className="text-neutral-600">p95</span>
+          </span>
+          <span className="text-neutral-400">
+            <span className="tabular-nums text-neutral-200">
+              {stats.claim_latency_ms_p99 != null ? `${stats.claim_latency_ms_p99}ms` : '—'}
+            </span>{' '}
+            <span className="text-neutral-600">p99</span>
+          </span>
+          <span className="text-neutral-600">
+            ({stats.claim_latency_sample_count} samples)
+          </span>
+        </div>
+      )}
+      {stats && stats.last_n_outcomes.length > 0 && (
+        <div className="space-y-0.5">
+          <span className="text-ui-md text-neutral-600">Recent jobs:</span>
+          {stats.last_n_outcomes.map(o => (
+            <div key={o.job_id} className="space-y-0.5">
+              <div className="flex items-center gap-2 text-ui-md">
+                <span
+                  className={`tabular-nums ${
+                    o.status === 'SUCCEEDED'
+                      ? 'text-emerald-400/80'
+                      : o.status === 'FAILED' || o.status === 'TIMED_OUT'
+                        ? 'text-red-400/80'
+                        : 'text-neutral-400'
+                  }`}
+                >
+                  {o.status}
+                </span>
+                {(o.status === 'FAILED' || o.status === 'TIMED_OUT') &&
+                  (o.terminal_reason || o.exit_code != null) && (
+                    <span
+                      className="truncate text-red-400/70"
+                      title={o.terminal_reason ?? undefined}
+                    >
+                      {o.terminal_reason ?? ''}
+                      {o.exit_code != null ? ` (exit ${o.exit_code})` : ''}
+                    </span>
+                  )}
+                {o.task_id &&
+                  (onNavigateToTask ? (
+                    <button
+                      type="button"
+                      onClick={() => onNavigateToTask(o.task_id as string)}
+                      className="truncate text-left text-sky-300 hover:underline"
+                      data-testid="fleet-outcome-task-link"
+                    >
+                      task {o.task_id.slice(0, 8)}
+                    </button>
+                  ) : (
+                    <span className="truncate text-neutral-600">task {o.task_id.slice(0, 8)}</span>
+                  ))}
+              </div>
+              {(o.status === 'FAILED' || o.status === 'TIMED_OUT') && o.command_log_tail && (
+                <pre className="max-h-32 overflow-auto whitespace-pre-wrap break-words rounded bg-neutral-900/60 px-2 py-1 font-mono text-ui-sm text-neutral-400">
+                  {o.command_log_tail}
+                </pre>
+              )}
+            </div>
+          ))}
+        </div>
       )}
     </div>
   );

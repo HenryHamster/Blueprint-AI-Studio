@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useCallback, memo } from 'react';
 import { ChevronDown, ChevronRight, ExternalLink, Hash, BookOpen, CheckCircle, XCircle, HelpCircle } from 'lucide-react';
 import { ResolvedReferenceLink, isSafeUrl, linkifyStatusMessage } from './TaskCard';
 import { MarkdownContent } from './MarkdownContent';
@@ -6,7 +6,8 @@ import { formatAbsolute, parseTimestamp } from '../utils/time';
 import { formatVerdict, verdictToneBadgeClass } from '../utils/verdictFormatting';
 import { fetchComputeJobs, fetchKnowledgeDocument, resolveViewportFailureDownloadUrl, resolveViewportShotDownloadUrl, type ComputeJob, type LiveReleaseEvidence } from '../api';
 import { ReleaseEvidenceChip } from './ReleaseEvidence';
-import { isComputeJobActive, computeJobTerminalLabel } from './ComputeJobsPanel.utils';
+import { isComputeJobActive, computeJobTerminalLabel, computeJobExecutionLocation } from './ComputeJobsPanel.utils';
+import { AcceptanceGradeBadge } from './AcceptanceGradeBadge';
 import type { AdversarialGateDiagnostic, PanelReviewIssue, PanelReviewVerdict, Task, TaskEvaluationSummary } from '../types/task';
 import { deriveSpawnGateState } from '../types/task';
 import { formatComputeAnalysisCauseLabel } from '../utils/computeAnalysisLabels';
@@ -14,8 +15,6 @@ import { CopyableId, SectionHeader, DetailRow, Sparkline, DependencyItem } from 
 import { humanizeUnverifiedReason, labelNoTestsReason } from '../utils/unverifiedReasonLabels';
 import { parseMergeTestVerdict, deriveMergeTestOutcome, type MergeTestVerdict, type MergeTestResult } from '../utils/mergeTestVerdict';
 import { getLogEntryColor } from './TaskDetailDrawerDiagnostics';
-
-const WIDE_FINISHED_WINDOW_MINUTES = 10_080;
 
 /** Classify whether a terminal kill was intentional (budget cap / deadline /
  *  operator cancel) vs a genuine crash — drives amber vs red badge styling. */
@@ -62,29 +61,40 @@ interface MetricsSnapshot {
  *  contract (command, spend cap, deadline, success criterion) is shown above
  *  the per-job rows. Intentional kills (budget/deadline/operator) are styled
  *  amber to distinguish them from genuine crashes (red). */
-export function TaskComputeJobsSection({ task }: { task: Task }) {
+export const TaskComputeJobsSection = memo(function TaskComputeJobsSection({ task }: { task: Task }) {
   const [jobs, setJobs] = useState<ComputeJob[]>([]);
   const projectId = task.project_id;
   const taskId = task.id;
   useEffect(() => {
     if (!projectId) return;
     let cancelled = false;
-    fetchComputeJobs(projectId, undefined, WIDE_FINISHED_WINDOW_MINUTES)
+    fetchComputeJobs(projectId, undefined, undefined, 0, taskId)
       .then(result => {
-        if (!cancelled) setJobs(result.jobs.filter(j => j.task_id === taskId));
+        // Defensive: compute jobs are OPTIONAL context for this drawer. A response
+        // without a `jobs` array must degrade to "no jobs", not set state to
+        // undefined and blow up the whole TaskDetailDrawer on `jobs.length`.
+        if (!cancelled) setJobs(Array.isArray(result?.jobs) ? result.jobs : []);
       })
       .catch(() => { /* compute jobs are optional context */ });
     return () => { cancelled = true; };
   }, [projectId, taskId]);
 
   if (!projectId) return null;
-  if (jobs.length === 0) return null;
+  if (!jobs || jobs.length === 0) return null;
 
   const isComputeExperiment = (task.task_type as string) === 'compute_experiment' ||
     (task.payloads?.[0] as Record<string, unknown> | undefined)?.type === 'compute_experiment';
   const firstPayload = isComputeExperiment
     ? (task.payloads?.[0] as Record<string, unknown> | undefined)
     : undefined;
+  const planDoc = (task.plan_output as Record<string, unknown> | undefined)?.knowledge_document as {
+    source_kind?: string | null;
+    compute_acceptance_grade?: 'acceptance' | 'measured_only' | null;
+    compute_acceptance_reason?: string;
+    analysis_fallback_reason?: string | null;
+    analysis_mode?: string | null;
+    unavailable_cause?: string | null;
+  } | undefined;
   const contractCommand = firstPayload?.command as string | undefined;
   const contractSpendCap = firstPayload?.spend_cap_usd as number | undefined;
   const contractDeadline = firstPayload?.deadline_seconds as number | undefined;
@@ -141,9 +151,11 @@ export function TaskComputeJobsSection({ task }: { task: Task }) {
               : job.outcome === 'FAILURE'
                 ? 'bg-red-900/40 text-red-400'
                 : 'bg-neutral-800/60 text-neutral-400';
+        const { label: backendLabel, isOperatorHardware } = computeJobExecutionLocation(job.backend ?? '');
+        const runnerName = job.runner?.hostname ?? (job.runner_target_id ? job.runner_target_id.slice(0, 8) : null);
         return (
           <div key={job.id} className="space-y-1 mb-2">
-            <DetailRow label={job.backend}>
+            <DetailRow label={backendLabel}>
               <span className="inline-flex flex-wrap items-center gap-1.5 min-w-0">
                 <span className={`text-xs px-1.5 py-0.5 rounded ${badgeClass}`}>
                   {active ? job.status : terminalLabel}
@@ -151,8 +163,16 @@ export function TaskComputeJobsSection({ task }: { task: Task }) {
                 <span className="text-xs text-neutral-400 font-mono break-words">
                   ${spent.toFixed(2)} / ${cap.toFixed(2)}
                 </span>
+                {isOperatorHardware && !runnerName && (
+                  <span className="text-xs text-amber-400/80 font-mono">operator hw</span>
+                )}
               </span>
             </DetailRow>
+            {runnerName && (
+              <DetailRow label="Runner">
+                <span className="font-mono text-xs text-neutral-300 break-all">{job.runner?.hostname ?? runnerName}</span>
+              </DetailRow>
+            )}
             {isComputeExperiment && job.machine_type && (
               <DetailRow label="Machine">
                 <span className="font-mono text-xs text-neutral-300">{job.machine_type}</span>
@@ -211,9 +231,21 @@ export function TaskComputeJobsSection({ task }: { task: Task }) {
           </div>
         );
       })}
+      {planDoc && planDoc.compute_acceptance_grade && (
+        <DetailRow label="Evidence tier">
+          <AcceptanceGradeBadge doc={{
+            source_kind: planDoc.source_kind ?? 'compute_experiment',
+            compute_acceptance_grade: planDoc.compute_acceptance_grade,
+            compute_acceptance_reason: planDoc.compute_acceptance_reason,
+            analysis_fallback_reason: planDoc.analysis_fallback_reason,
+            analysis_mode: planDoc.analysis_mode,
+            unavailable_cause: planDoc.unavailable_cause,
+          }} />
+        </DetailRow>
+      )}
     </>
   );
-}
+});
 
 export function ResearchOriginSection({ task, tasks, onNavigateToTask }: { task: Task; tasks?: Task[]; onNavigateToTask?: (taskId: string) => void }) {
   const ctx = task.context as Record<string, unknown> | undefined;
@@ -411,7 +443,7 @@ export function BlockedNeedSection({ need, tasks, onNavigateToTask }: { need: Re
  *  tags and forward-quality verdict into plan_output.knowledge_document, so the
  *  drawer can link forward to the produced document without a second lookup —
  *  and fetch its full markdown body inline on demand. */
-export function KnowledgeDocumentSection({ task }: { task: Task }) {
+export const KnowledgeDocumentSection = memo(function KnowledgeDocumentSection({ task }: { task: Task }) {
   const doc = (task.plan_output as Record<string, unknown> | undefined)?.knowledge_document as {
     id?: string;
     title?: string;
@@ -538,7 +570,7 @@ export function KnowledgeDocumentSection({ task }: { task: Task }) {
       </div>
     </>
   );
-}
+});
 
 export function EvaluationSummarySection({ summary }: { summary: TaskEvaluationSummary }) {
   const evidence = summary.evidence ?? [];
@@ -707,7 +739,7 @@ export function PanelReviewVerdictSection({ verdict }: { verdict: PanelReviewVer
   );
 }
 
-export function AcceptanceEvidenceSection({ task }: { task: Task }) {
+export const AcceptanceEvidenceSection = memo(function AcceptanceEvidenceSection({ task }: { task: Task }) {
   const verdict = task.context?.code_acceptance_verdict;
   const [expanded, setExpanded] = useState(false);
   const [screenshotUrl, setScreenshotUrl] = useState<string | null>(null);
@@ -811,7 +843,7 @@ export function AcceptanceEvidenceSection({ task }: { task: Task }) {
       </div>
     </>
   );
-}
+});
 
 export function SystemMetricsSection({ task }: { task: Task }) {
   const metrics = (task.last_metrics_json ?? task.context?.last_metrics) as {
@@ -1808,38 +1840,45 @@ function ViewportShotPairBlock({
   );
 }
 
-export function ViewportScreenshotsPanel({ task }: { task: Task }) {
+export const ViewportScreenshotsPanel = memo(function ViewportScreenshotsPanel({ task }: { task: Task }) {
   const [expanded, setExpanded] = useState(false);
   const raw = task.context?.viewport_screenshots as ViewportShotEntry[] | undefined;
-  if (!raw || raw.length === 0) return null;
+  const toggleExpanded = useCallback(() => setExpanded(v => !v), []);
 
-  const pairsMap = new Map<string, ViewportShotPair>();
-  for (const entry of raw) {
-    let key: string;
-    let phase: 'before' | 'after' | 'diff' | null = null;
-    if (entry.name.endsWith('-before')) {
-      key = entry.name.slice(0, -'-before'.length);
-      phase = 'before';
-    } else if (entry.name.endsWith('-after')) {
-      key = entry.name.slice(0, -'-after'.length);
-      phase = 'after';
-    } else if (entry.name.endsWith('-diff')) {
-      key = entry.name.slice(0, -'-diff'.length);
-      phase = 'diff';
-    } else {
-      key = entry.name;
+  // Memoize the pairs-construction loop — each render of the parent re-creates
+  // the raw array reference, but the underlying data is stable.
+  const pairs = useMemo(() => {
+    if (!raw || raw.length === 0) return [];
+    const pairsMap = new Map<string, ViewportShotPair>();
+    for (const entry of raw) {
+      let key: string;
+      let phase: 'before' | 'after' | 'diff' | null = null;
+      if (entry.name.endsWith('-before')) {
+        key = entry.name.slice(0, -'-before'.length);
+        phase = 'before';
+      } else if (entry.name.endsWith('-after')) {
+        key = entry.name.slice(0, -'-after'.length);
+        phase = 'after';
+      } else if (entry.name.endsWith('-diff')) {
+        key = entry.name.slice(0, -'-diff'.length);
+        phase = 'diff';
+      } else {
+        key = entry.name;
+      }
+      if (!pairsMap.has(key)) pairsMap.set(key, { key });
+      const pair = pairsMap.get(key) ?? { key };
+      if (phase === 'before') pair.before = entry;
+      else if (phase === 'after') {
+        pair.after = entry;
+        if (entry.magnitude !== undefined) pair.magnitude = entry.magnitude;
+      } else if (phase === 'diff') {
+        pair.diff = entry;
+      }
     }
-    if (!pairsMap.has(key)) pairsMap.set(key, { key });
-    const pair = pairsMap.get(key) ?? { key };
-    if (phase === 'before') pair.before = entry;
-    else if (phase === 'after') {
-      pair.after = entry;
-      if (entry.magnitude !== undefined) pair.magnitude = entry.magnitude;
-    } else if (phase === 'diff') {
-      pair.diff = entry;
-    }
-  }
-  const pairs = Array.from(pairsMap.values());
+    return Array.from(pairsMap.values());
+  }, [raw]);
+
+  if (!raw || raw.length === 0) return null;
 
   return (
     <>
@@ -1848,7 +1887,7 @@ export function ViewportScreenshotsPanel({ task }: { task: Task }) {
         <button
           data-viewport-allow-small-target
           className="flex items-center gap-1 text-xs text-blue-400 hover:text-blue-300 transition-colors"
-          onClick={() => setExpanded(v => !v)}
+          onClick={toggleExpanded}
         >
           {expanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
           {expanded ? 'Hide screenshots' : `View ${raw.length} screenshot${raw.length !== 1 ? 's' : ''}`}
@@ -1864,4 +1903,4 @@ export function ViewportScreenshotsPanel({ task }: { task: Task }) {
       </div>
     </>
   );
-}
+});

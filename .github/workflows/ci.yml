@@ -59,6 +59,14 @@ jobs:
               - 'admin-ui/**'
             backend:
               - 'backend/**'
+              # The runner scripts are tested by the backend job (the scripts/
+              # suite runs there, and backend/testing invariant tests read
+              # scripts/ through the /repo mount). A PR touching ONLY scripts/
+              # would otherwise skip the backend shards entirely — so the marker
+              # parity guard, which exists precisely to catch a marker added to
+              # one copy and not the other, would not run on the very PR that
+              # introduces the drift.
+              - 'scripts/**'
             agent:
               - 'agent/**'
       - id: result
@@ -533,7 +541,13 @@ jobs:
           # failure-extraction below; we propagate the code via $pytest_status.
           set +e
           run_shard() {
+            # /repo mount + CI env: the runner-script invariant tests
+            # (backend/testing/test_local_runner_terminal_log.py etc.) resolve
+            # scripts/ via /repo and HARD-FAIL (not skip) when CI is set, so
+            # they enforce in the promotion gate instead of silently skipping.
             docker run --rm --network host -v "$PWD/backend:/app" \
+              -v "$PWD:/repo:ro" \
+              -e CI=true \
               -e DATABASE_URL=${{ env.TEST_DB_URL }} \
               -e USE_TEST_POSTGRES=true \
               -e AGENT_JWT_SECRET=ci-test-secret-padding-to-meet-32-byte-minimum \
@@ -573,6 +587,21 @@ jobs:
           fi
 
           exit $pytest_status
+
+      # The runner scripts (scripts/local_runner.py, scripts/runner_isolation.py)
+      # ship STANDALONE to runner hosts, so their tests live in scripts/ and the
+      # `pytest testing/` shards above never collect them. Without this step the
+      # GPU arch gate, the probe/real container-name isolation, and the pre-probe
+      # image pull have ZERO CI coverage — a regression there ships green.
+      # Runs once (shard 1) since it is not sharded and takes ~1s.
+      - name: Runner-script suite (scripts/)
+        if: matrix.shard == 1
+        run: |
+          docker run --rm -v "$PWD:/repo:ro" -w /repo/scripts \
+            -e CI=true \
+            ${{ steps.deps.outputs.image }} \
+            python -m pytest test_runner_isolation.py \
+              -v --tb=short --noconftest -p no:cacheprovider
 
       - name: Save test failures baseline (main only)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'

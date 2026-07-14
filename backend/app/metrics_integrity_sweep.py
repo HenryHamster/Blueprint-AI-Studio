@@ -64,7 +64,21 @@ exceeds the canonical count; the delta is the rollup double-count), and
 ``criterion_evidence_count_integrity`` (independently counts CriterionEvidence
 rows per criterion with a direct COUNT(*) and flags any criterion whose
 self-reported evidence_count from get_version_coverage_summary diverges from
-the actual row count; the delta is the silent miscount).
+the actual row count; the delta is the silent miscount), and
+``criterion_claim_reconciliation`` (grades each active acceptance criterion on
+the shared EvidenceStatus axis via criterion_evidence_status and flags those the
+open version must prove but whose evidence does not back coverage — the same
+tri-state claim_contradicts_evidence predicate the gap/capability reconciliation
+checks use, making acceptance criteria a full peer in the shared contract), and
+``capability_proof_gate_gap`` (scans each project's problem_model capabilities and
+flags per-project the count of ``working`` capabilities whose ``proof_status`` is
+not ``proven`` — these capabilities satisfy prerequisite resolution today but would
+be blocked if the proof gate were flipped to enforce, so the flag tells operators
+exactly how many capabilities need real evidence before the gate can be enabled), and
+``capability_proof_gate_auto_graduation`` (computes fleet-wide proof coverage and
+automatically advances the gate mode off→observe→enforce as coverage crosses the
+configured thresholds; disabled by default — operators must opt in via
+``capability_proof_gate_auto_graduation_enabled``).
 
 Config knobs (runtime_config, operator-settable via PATCH /api/admin/settings):
 
@@ -103,6 +117,12 @@ SWEEP_MODES = frozenset({"off", "observe", "enforce"})
 #: Provenance stamped on every metrics-integrity-enrolled ledger row, distinct
 #: from other enrollment provenances so drift findings are attributable.
 METRICS_INTEGRITY_PROVENANCE = "metrics_integrity"
+
+#: Provenance for per-capability proof-earn research obligations enrolled by the
+#: capability_proof_gate_gap check in enforce mode. Distinct from the generic
+#: drift provenance so proof-research probes are attributable and never conflated
+#: with counter-drift findings.
+CAPABILITY_PROOF_RESEARCH_PROVENANCE = "capability_proof_research"
 
 # --- Defaults (operator-overridable via runtime_config / PATCH settings) ------
 
@@ -388,6 +408,82 @@ async def _enroll_flag_finding(session, result: CheckResult) -> bool:
         title=title,
         detail=detail,
         provenance=METRICS_INTEGRITY_PROVENANCE,
+    )
+    return True
+
+
+#: Stable finding_key prefix for per-capability proof-earn research obligations.
+#: Distinct from :meth:`CheckResult.finding_key` (``metrics-integrity:<check>:<pid>``)
+#: so a research probe per unproven capability never collides with the single
+#: per-check drift finding.
+CAPABILITY_PROOF_RESEARCH_KEY_PREFIX = "metrics-integrity:capability-proof-research"
+
+
+def _capability_proof_research_finding_key(project_id: str, cap_name: str) -> str:
+    """Stable per-(project, capability) key so re-running the sweep on every tick
+    dedupes onto the same ledger row instead of spawning duplicate research."""
+    return f"{CAPABILITY_PROOF_RESEARCH_KEY_PREFIX}:{project_id}:{cap_name}"
+
+
+async def _enroll_capability_proof_research(
+    session, *, project_id, cap_name: str, candidate_paths: list[str] | None = None
+) -> bool:
+    """Enroll ONE deduped proof-earn research obligation for a working capability
+    that has no file-like backing_paths and no proof (the ``needs_backing_paths``
+    bucket). Returns True when a NEW row was created.
+
+    Idempotent via the stable per-capability finding_key: ``enroll_backlog_item``
+    dedupes on ``(project_id, finding_key)``, so repeated ticks never create
+    duplicate obligations. The enrolled item drives ``check_evergreen_fill`` ->
+    ``spawn_evergreen_probe`` to later spawn a low-priority ``type:"research"``
+    task that determines how machine-verified proof can be earned.
+
+    When automated discovery surfaced ``candidate_paths`` (source/test files at
+    HEAD whose names match the capability but which are NOT yet test-covered
+    enough to auto-record proof), they are folded into the obligation ``detail``
+    as concrete SUGGESTIONS so the downstream research task starts from a real
+    candidate list instead of nothing.
+    """
+    from app.evergreen_backlog import enroll_backlog_item
+    from app.models import EvergreenBacklogItem
+
+    finding_key = _capability_proof_research_finding_key(str(project_id), cap_name)
+    existing = (
+        await session.execute(
+            select(EvergreenBacklogItem.status).where(
+                EvergreenBacklogItem.project_id == project_id,
+                EvergreenBacklogItem.finding_key == finding_key,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is not None and existing != "retired":
+        return False
+
+    title = f"Earn machine-verified proof for capability: {cap_name}"
+    detail = (
+        f"Working capability '{cap_name}' is declared 'working' but carries no "
+        "proven evidence and no file-like backing_paths, so the always-on "
+        "backing-path self-heal cannot auto-resolve it. Determine how "
+        "machine-verified proof (a named test exercising the capability, or "
+        "verifiable file-like backing_paths that resolve at HEAD) can be earned "
+        "for this specific capability, and propose concrete backing_paths when "
+        "they can be identified. Recording that proof moves the capability out of "
+        "the capability_proof_gate gap and lets dependents rely on it."
+    )
+    if candidate_paths:
+        preview = ", ".join(candidate_paths[:5])
+        detail += (
+            " Automated discovery surfaced candidate backing path(s) whose names "
+            "match this capability and which resolve at HEAD (verify they truly "
+            f"back the capability and add test coverage): {preview}."
+        )
+    await enroll_backlog_item(
+        session,
+        project_id=project_id,
+        finding_key=finding_key,
+        title=title,
+        detail=detail,
+        provenance=CAPABILITY_PROOF_RESEARCH_PROVENANCE,
     )
     return True
 
@@ -2909,6 +3005,9 @@ async def check_capability_claim_reconciliation(
         # Eligible: working/partial capabilities with at least one file-path-shaped
         # backing_path. planned capabilities are aspirational — never flagged.
         eligible: List[dict] = []
+        # Free-claim eligible: working/partial caps with NO backing_paths whose
+        # evidence_refs alone already contradict the declared status.
+        free_claim_eligible: List[dict] = []
         for cap in capabilities:
             if not isinstance(cap, dict):
                 continue
@@ -2916,6 +3015,8 @@ async def check_capability_claim_reconciliation(
                 continue
             paths = cap.get("backing_paths")
             if not isinstance(paths, list) or not paths:
+                # No backing_paths — candidate for the free-claim path.
+                free_claim_eligible.append(cap)
                 continue
             # Keep only paths that look like repo file paths; skip logical ids.
             file_paths = [
@@ -2926,7 +3027,7 @@ async def check_capability_claim_reconciliation(
                 continue
             eligible.append({"cap": cap, "file_paths": file_paths})
 
-        if not eligible:
+        if not eligible and not free_claim_eligible:
             results.append(
                 CheckResult(
                     check="capability_claim_reconciliation",
@@ -2938,7 +3039,7 @@ async def check_capability_claim_reconciliation(
             continue
 
         any_checked = True
-        audited = len(eligible)
+        audited = len(eligible) + len(free_claim_eligible)
         flagged_caps: List[str] = []
 
         for item in eligible:
@@ -2980,6 +3081,18 @@ async def check_capability_claim_reconciliation(
                         break
                 if claim_contradicts_evidence(cap.get("status"), evidence_status):
                     flagged_caps.append(cap_name)
+
+        # Free-claim path: caps declaring working/partial with no backing_paths.
+        # Flag only when evidence_refs alone already contradict the status
+        # (e.g. working + no evidence_refs → classify_evidence returns "unproven"
+        # and claim_contradicts_evidence("working", "unproven") is True).
+        for cap in free_claim_eligible:
+            refs = cap.get("evidence_refs")
+            refs_list = refs if isinstance(refs, list) else []
+            evidence_status = classify_evidence(refs_list)
+            if claim_contradicts_evidence(cap.get("status"), evidence_status):
+                cap_name = cap.get("name") or cap.get("id") or "unknown"
+                flagged_caps.append(cap_name)
 
         if flagged_caps:
             preview = ", ".join(flagged_caps[:3])
@@ -3312,3 +3425,868 @@ async def check_criterion_evidence_count_integrity(
             )
         ]
     return results
+
+
+@register_check(
+    "criterion_claim_reconciliation",
+    "Grade each active acceptance criterion on the shared EvidenceStatus axis "
+    "(criterion_evidence_status) and flag those the open version claims it must "
+    "prove but whose recorded evidence does not back it (uncovered/partial) — "
+    "the strategist-visible '0/N covered, machine 0-for-N' signal. Flag-only.",
+)
+async def check_criterion_claim_reconciliation(
+    ctx: SweepContext,
+) -> List[CheckResult]:
+    """Ground truth: an ACTIVE acceptance criterion on the open version is a
+    standing claim the version must PROVE. Grading it via
+    :func:`app.acceptance_criteria.criterion_evidence_status` (the shared axis
+    used by gaps/capabilities) and
+    :func:`app.evidence_primitive.claim_contradicts_evidence` with the fixed
+    done-type ``proven`` claim, a criterion whose recorded evidence does not back
+    coverage (``unproven`` / ``partial`` / ``contradicted``) is flagged. This
+    makes acceptance criteria a full peer in the shared "evidence met" contract
+    (Component 4) — the same tri-state predicate the gap/capability
+    reconciliation checks use, rather than the count-only checks.
+
+    DB-only and cheap: it issues no HEAD git calls (unlike the path-backed
+    gap/capability reconciliation checks) — a ``covered/attested/backfilled/
+    partial/uncovered`` classification of already-loaded evidence rows. Flag-only
+    and side-effect-free in every mode: it NEVER mutates a criterion or its
+    evidence. Bounded to ``ctx.max_projects`` projects; SKIPPED for projects with
+    no open version or no active criteria.
+    """
+    from app.acceptance_criteria import (
+        criterion_evidence_status,
+        get_criteria_for_version,
+        get_evidence_for_criteria_batch,
+    )
+    from app.evidence_primitive import claim_contradicts_evidence
+    from app.models import Project
+    from app.release_version import current_open_version
+
+    projects = (
+        await ctx.session.execute(select(Project.id).limit(ctx.max_projects))
+    ).all()
+    if not projects:
+        return [
+            CheckResult(
+                check="criterion_claim_reconciliation",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no projects to audit",
+            )
+        ]
+
+    results: List[CheckResult] = []
+    any_checked = False
+    for (project_id,) in projects:
+        pid = str(project_id)
+        open_version = await current_open_version(ctx.session, project_id)
+        if open_version is None:
+            results.append(
+                CheckResult(
+                    check="criterion_claim_reconciliation",
+                    status=CheckStatus.SKIPPED,
+                    subject=pid,
+                    detail="no open version",
+                )
+            )
+            continue
+
+        criteria = await get_criteria_for_version(ctx.session, open_version.id)
+        active_criteria = [c for c in criteria if c.status == "active"]
+        if not active_criteria:
+            results.append(
+                CheckResult(
+                    check="criterion_claim_reconciliation",
+                    status=CheckStatus.SKIPPED,
+                    subject=pid,
+                    detail="no active criteria on open version",
+                )
+            )
+            continue
+
+        any_checked = True
+        evidence_by_cid = await get_evidence_for_criteria_batch(
+            ctx.session, [c.id for c in active_criteria]
+        )
+        flagged: List[str] = []
+        for criterion in active_criteria:
+            rows = evidence_by_cid.get(criterion.id, [])
+            evidence_status = criterion_evidence_status(rows)
+            # An active criterion is a standing "must be proven" claim; grade it
+            # with the fixed done-type claim so an uncovered/partial/contradicted
+            # criterion is flagged on the same axis as gaps/capabilities.
+            if claim_contradicts_evidence("proven", evidence_status):
+                flagged.append(f"{criterion.criterion_key}={evidence_status}")
+
+        audited = len(active_criteria)
+        if flagged:
+            preview = ", ".join(flagged[:3])
+            if len(flagged) > 3:
+                preview += f" (+{len(flagged) - 3} more)"
+            results.append(
+                CheckResult(
+                    check="criterion_claim_reconciliation",
+                    status=CheckStatus.FLAGGED,
+                    self_reported=audited,
+                    ground_truth=audited - len(flagged),
+                    delta=len(flagged),
+                    severity="warn",
+                    subject=pid,
+                    detail=(
+                        f"{len(flagged)}/{audited} active criterion(s) claim the "
+                        f"open version must prove them but evidence does not back "
+                        f"coverage: {preview}"
+                    ),
+                )
+            )
+        else:
+            results.append(
+                CheckResult(
+                    check="criterion_claim_reconciliation",
+                    status=CheckStatus.OK,
+                    self_reported=audited,
+                    ground_truth=audited,
+                    delta=0,
+                    subject=pid,
+                    detail=(
+                        f"all {audited} active criterion(s) reconciled; every "
+                        "criterion's evidence backs its coverage claim"
+                    ),
+                )
+            )
+
+    if not any_checked and not results:
+        return [
+            CheckResult(
+                check="criterion_claim_reconciliation",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no active criteria on any open version to reconcile",
+            )
+        ]
+    return results
+
+
+@register_check(
+    "capability_proof_gate_gap",
+    "Scan each project's working capabilities and flag per-project the count whose "
+    "proof_status is not 'proven'. Auto-resolves proof gaps when backing_paths are "
+    "present and verifiable; for caps with no backing_paths, auto-discovers and "
+    "proposes candidate backing paths by name (auto-resolving when a candidate set "
+    "is test-covered, else folding the proposals into the enrolled research "
+    "obligation); surfaces the remaining caps for strategist action.",
+)
+async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult]:
+    """Ground truth: a capability declared ``working`` that carries no proven
+    evidence is a claim the repo asserts without machine-backed verification.
+
+    This check auto-resolves gaps where possible:
+    - If an unproven working capability declares ``backing_paths`` and ALL resolve
+      at HEAD via :func:`_path_exists_at_head`, proof is recorded and the
+      capability moves from the gap to ``ground_truth``. Two recorded tiers, both
+      structural-only: when a convention-named test file for EVERY backing path is
+      present at HEAD and imports it (:func:`_named_tests_covering_paths`, a STATIC
+      check — the test is never executed), a ``named_test_present`` proof is
+      recorded via :func:`record_capability_named_test_proof`; otherwise a
+      ``backing_path`` proof (:func:`record_capability_backing_path_proof`) is the
+      fallback. :func:`classify_evidence_tiered` grades BOTH ``path_proven`` — NOT
+      ``proven`` — so neither raises auto-graduation coverage nor clears the
+      enforce gate (auto-graduation reads proof status through
+      :func:`working_capability_proof_status`, which grades these ``path_proven``).
+      A capability reaches ``proven`` only via a real green merge-test acceptance
+      verdict (:func:`app.capability_proof.record_capability_proof`).
+    - Caps with no file-like backing_paths trigger automated backing-path
+      DISCOVERY (:func:`_discover_candidate_backing_paths`): search tokens derived
+      from the capability name locate candidate files at HEAD. Discovered
+      candidates are held to the SAME confidence bar as declared backing_paths —
+      only a fully test-covered candidate set (:func:`_named_tests_covering_paths`)
+      auto-records a ``named_test_present`` proof and moves the cap to
+      ``ground_truth`` (still ``path_proven`` tier — see above).
+      Otherwise the candidates are surfaced as concrete SUGGESTIONS folded into
+      the enrolled research obligation (enforce mode) and the cap stays in the
+      gap — discovery never mutates the strategist-curated backing_paths and
+      never records a proof from unverified candidates.
+    - Caps with no file-like backing_paths and no usable discovery are surfaced
+      with ``needs_backing_paths`` in the detail for strategist/research discovery.
+    - Caps whose backing_paths fail verification remain in ``delta``.
+
+    After auto-resolving proofs for a project the session is committed; a failed
+    commit for one project is logged and rolled back without aborting the check.
+
+    * ``self_reported`` = total ``working`` capabilities in the project.
+    * ``ground_truth``  = caps with recorded proof (pre-existing ``proven`` plus
+      newly auto-recorded ``path_proven`` self-heal tiers); it counts recorded
+      evidence, not enforce-gate-clearing ``proven`` status specifically.
+    * ``delta``         = unresolved gap: needs_backing_paths + failed verification.
+
+    Bounded to ``ctx.max_projects`` projects.
+    """
+    import uuid as _uuid
+
+    from app.capability_proof import (
+        _discover_candidate_backing_paths,
+        _named_tests_covering_paths,
+        _read_file_at_head,
+        record_capability_backing_path_proof,
+        record_capability_named_test_proof,
+    )
+    from app.capability_registry import (
+        exempt_capability_names,
+        normalize_capability_name,
+        working_capability_proof_status,
+    )
+    from app.models import Project
+    from app.source_ref_validation import _looks_like_file_path, _path_exists_at_head
+
+    # Load full ORM objects so record_capability_backing_path_proof can flag_modified.
+    projects = (
+        await ctx.session.execute(
+            select(Project).limit(ctx.max_projects)
+        )
+    ).scalars().all()
+    if not projects:
+        return [
+            CheckResult(
+                check="capability_proof_gate_gap",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no projects to audit",
+            )
+        ]
+
+    results: List[CheckResult] = []
+    any_working = False
+    for project in projects:
+        pid = str(project.id)
+        pm = project.problem_model if isinstance(project.problem_model, dict) else {}
+        caps_list = pm.get("capabilities") if pm else None
+        if not isinstance(caps_list, list) or not caps_list:
+            results.append(
+                CheckResult(
+                    check="capability_proof_gate_gap",
+                    status=CheckStatus.SKIPPED,
+                    subject=pid,
+                    detail="no capabilities in problem_model",
+                )
+            )
+            continue
+
+        proof_by_name = working_capability_proof_status(pm)
+        exempt_set = exempt_capability_names(pm)
+        if not proof_by_name:
+            results.append(
+                CheckResult(
+                    check="capability_proof_gate_gap",
+                    status=CheckStatus.SKIPPED,
+                    subject=pid,
+                    detail="no working capabilities to audit",
+                )
+            )
+            continue
+
+        any_working = True
+        total_working = len(proof_by_name)
+        exempt_count = len(exempt_set)
+        # Exempt caps already classify as "proven" — exclude them from the
+        # unproven set and the delta so they don't inflate the gap count.
+        unproven_names = [
+            name for name, status in proof_by_name.items() if status != "proven"
+        ]
+        proven_count = total_working - len(unproven_names)
+
+        if not unproven_names:
+            _ok_detail = (
+                f"all {total_working} working capability(ies) carry proven evidence"
+            )
+            if exempt_count:
+                _ok_detail += (
+                    f" ({exempt_count} exempt: "
+                    + ", ".join(sorted(exempt_set)[:5])
+                )
+                if exempt_count > 5:
+                    _ok_detail += f" +{exempt_count - 5} more"
+                _ok_detail += ")"
+            results.append(
+                CheckResult(
+                    check="capability_proof_gate_gap",
+                    status=CheckStatus.OK,
+                    self_reported=total_working,
+                    ground_truth=proven_count,
+                    delta=0,
+                    subject=pid,
+                    detail=_ok_detail,
+                )
+            )
+            continue
+
+        # Build lookup: normalized-name → (raw_name, backing_paths) from raw caps.
+        cap_backing: dict[str, tuple[str, list]] = {}
+        for cap in caps_list:
+            if not isinstance(cap, dict):
+                continue
+            raw_name = cap.get("name")
+            if not isinstance(raw_name, str):
+                continue
+            norm = normalize_capability_name(raw_name)
+            if not norm:
+                continue
+            bp = cap.get("backing_paths")
+            cap_backing[norm] = (raw_name, bp if isinstance(bp, list) else [])
+
+        # Attempt auto-resolution for each unproven capability. The self-heal now
+        # only ever records the structural ``backing_path`` tier (finding #2 — no
+        # named_test minting from static coverage), so all auto-resolutions are
+        # backing_path-tier.
+        auto_resolved: list[str] = []
+        named_test_present_resolved: list[str] = []
+        needs_backing_paths: list[str] = []
+        still_unproven: list[str] = []
+
+        for cap_name in unproven_names:
+            raw_name, backing_paths = cap_backing.get(cap_name, (cap_name, []))
+            file_paths = [
+                p for p in backing_paths
+                if isinstance(p, str) and _looks_like_file_path(p)
+            ]
+            if not file_paths:
+                needs_backing_paths.append(cap_name)
+                continue
+
+            # Verify every file-like backing path at HEAD.
+            # Any None (indeterminate) or False (absent) prevents proof recording.
+            all_present = True
+            for p in file_paths:
+                try:
+                    exists = await _path_exists_at_head(p)
+                except Exception:  # noqa: BLE001 — verification failure is non-fatal
+                    exists = None
+                if exists is not True:
+                    all_present = False
+                    break
+
+            if all_present:
+                # When a convention-named test file for EVERY backing path is
+                # present at HEAD and imports it, record a ``named_test_present``
+                # proof. This discovery is STATIC (file exists + import regex; the
+                # test is never executed), so classify_evidence_tiered grades it
+                # ``path_proven`` — the SAME tier as the ``backing_path`` fallback,
+                # NOT ``proven``: it does NOT raise auto-graduation coverage nor
+                # clear the enforce gate. Only a real green merge-test verdict
+                # (record_capability_proof) reaches the ``proven`` named_test tier.
+                try:
+                    test_refs = await _named_tests_covering_paths(
+                        file_paths,
+                        verify_path=_path_exists_at_head,
+                        read_head=_read_file_at_head,
+                    )
+                except Exception:  # noqa: BLE001 — test discovery failure is non-fatal
+                    logger.warning(
+                        "[METRICS_INTEGRITY] capability_proof_gate_gap: "
+                        "named-test discovery failed for cap=%s pid=%s",
+                        cap_name,
+                        pid,
+                        exc_info=True,
+                    )
+                    test_refs = []
+
+                try:
+                    if test_refs:
+                        recorded = record_capability_named_test_proof(
+                            project, raw_name or cap_name, test_refs
+                        )
+                        if recorded:
+                            auto_resolved.append(cap_name)
+                            named_test_present_resolved.append(cap_name)
+                        else:
+                            # Dedup: named_test_present proof already present.
+                            still_unproven.append(cap_name)
+                    else:
+                        recorded = record_capability_backing_path_proof(
+                            project, raw_name or cap_name
+                        )
+                        if recorded:
+                            auto_resolved.append(cap_name)
+                        else:
+                            # Dedup: proof already present (path_proven tier, not
+                            # fully proven).
+                            still_unproven.append(cap_name)
+                except Exception:  # noqa: BLE001 — proof recording is non-fatal
+                    logger.warning(
+                        "[METRICS_INTEGRITY] capability_proof_gate_gap: "
+                        "proof recording failed for cap=%s pid=%s",
+                        cap_name,
+                        pid,
+                        exc_info=True,
+                    )
+                    still_unproven.append(cap_name)
+            else:
+                still_unproven.append(cap_name)
+
+        # DISCOVERY pass: for caps with no declared file-like backing_paths, try
+        # to discover candidate backing paths at HEAD by name. Apply the SAME
+        # confidence bar as the declared-backing_paths self-heal above: a fully
+        # test-covered candidate set records a ``named_test`` proof (auto-resolve,
+        # moving the cap to ground_truth); otherwise the candidates become
+        # concrete suggestions folded into the enrolled research obligation and
+        # the cap stays in the gap. This NEVER mutates the strategist-curated
+        # backing_paths and NEVER records a proof from unverified candidates.
+        # Runs before the commit below so newly-minted proofs are persisted.
+        discovery_suggestions: dict[str, list[str]] = {}
+        if needs_backing_paths:
+            remaining_needs: list[str] = []
+            for cap_name in needs_backing_paths:
+                raw_name = cap_backing.get(cap_name, (cap_name, []))[0]
+                try:
+                    candidates = await _discover_candidate_backing_paths(cap_name)
+                except Exception:  # noqa: BLE001 — discovery must not abort the check
+                    logger.warning(
+                        "[METRICS_INTEGRITY] capability_proof_gate_gap: backing-path "
+                        "discovery failed for cap=%s pid=%s",
+                        cap_name,
+                        pid,
+                        exc_info=True,
+                    )
+                    candidates = []
+                if not candidates:
+                    remaining_needs.append(cap_name)
+                    continue
+
+                # Same named_test_present confidence bar as declared backing_paths.
+                try:
+                    test_refs = await _named_tests_covering_paths(
+                        candidates,
+                        verify_path=_path_exists_at_head,
+                        read_head=_read_file_at_head,
+                    )
+                except Exception:  # noqa: BLE001 — test discovery failure is non-fatal
+                    logger.warning(
+                        "[METRICS_INTEGRITY] capability_proof_gate_gap: named-test "
+                        "discovery failed for discovered cap=%s pid=%s",
+                        cap_name,
+                        pid,
+                        exc_info=True,
+                    )
+                    test_refs = []
+
+                if test_refs:
+                    try:
+                        recorded = record_capability_named_test_proof(
+                            project, raw_name or cap_name, test_refs
+                        )
+                    except Exception:  # noqa: BLE001 — proof recording is non-fatal
+                        logger.warning(
+                            "[METRICS_INTEGRITY] capability_proof_gate_gap: proof "
+                            "recording failed for discovered cap=%s pid=%s",
+                            cap_name,
+                            pid,
+                            exc_info=True,
+                        )
+                        recorded = False
+                    if recorded:
+                        auto_resolved.append(cap_name)
+                        named_test_present_resolved.append(cap_name)
+                        continue
+                    # Dedup/failure: fall through and keep the cap as a gap, but
+                    # still surface the candidates as research suggestions.
+
+                # Candidates found but not test-covered (or record was a no-op):
+                # keep the cap in the gap and remember the suggestions so the
+                # enrolled research obligation starts from a real candidate list.
+                discovery_suggestions[cap_name] = candidates
+                remaining_needs.append(cap_name)
+            needs_backing_paths = remaining_needs
+
+        # Commit auto-resolved proofs for this project.
+        if auto_resolved:
+            try:
+                await ctx.session.commit()
+            except Exception as exc:  # noqa: BLE001 — commit failure must not abort check
+                logger.warning(
+                    "[METRICS_INTEGRITY] capability_proof_gate_gap: commit failed "
+                    "for project %s after auto-resolving %d cap(s): %s",
+                    pid,
+                    len(auto_resolved),
+                    exc,
+                )
+                with contextlib.suppress(Exception):
+                    await ctx.session.rollback()
+                # Move auto_resolved to still_unproven since the commit failed.
+                still_unproven.extend(auto_resolved)
+                auto_resolved.clear()
+
+        # ENFORCE mode only: for caps that cannot be auto-proven (no file-like
+        # backing_paths, no proof), enroll ONE deduped per-capability research
+        # obligation so the evergreen fill loop later spawns a proof-earn probe.
+        # Never crashes the check: a per-enroll failure is logged + rolled back
+        # and the sweep continues; enrolled rows are committed in their own
+        # commit (the auto-resolve proofs, if any, already committed above).
+        enrolled_research: list[str] = []
+        if ctx.mode == "enforce" and needs_backing_paths:
+            # Reconstruct the UUID from the captured pid string so we never touch
+            # a (possibly commit-expired) ORM attribute after the auto-resolve commit.
+            project_uuid = _uuid.UUID(pid)
+            for cap_name in needs_backing_paths:
+                try:
+                    if await _enroll_capability_proof_research(
+                        ctx.session,
+                        project_id=project_uuid,
+                        cap_name=cap_name,
+                        candidate_paths=discovery_suggestions.get(cap_name),
+                    ):
+                        enrolled_research.append(cap_name)
+                except Exception:  # noqa: BLE001 — enrollment must not abort the check
+                    logger.warning(
+                        "[METRICS_INTEGRITY] capability_proof_gate_gap: "
+                        "proof-research enroll failed for cap=%s pid=%s",
+                        cap_name,
+                        pid,
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await ctx.session.rollback()
+            if enrolled_research:
+                try:
+                    await ctx.session.commit()
+                except Exception as exc:  # noqa: BLE001 — commit failure must not abort check
+                    logger.warning(
+                        "[METRICS_INTEGRITY] capability_proof_gate_gap: enroll "
+                        "commit failed for project %s after enrolling %d research "
+                        "obligation(s): %s",
+                        pid,
+                        len(enrolled_research),
+                        exc,
+                    )
+                    with contextlib.suppress(Exception):
+                        await ctx.session.rollback()
+
+        new_proven = proven_count + len(auto_resolved)
+        unresolved = needs_backing_paths + still_unproven
+
+        if unresolved:
+            detail_parts: list[str] = []
+            if auto_resolved:
+                preview_ar = ", ".join(sorted(auto_resolved)[:3])
+                if len(auto_resolved) > 3:
+                    preview_ar += f" (+{len(auto_resolved) - 3} more)"
+                _tier_note = (
+                    f" ({len(named_test_present_resolved)} via named_test_present, "
+                    f"{len(auto_resolved) - len(named_test_present_resolved)} via backing_paths)"
+                    if named_test_present_resolved
+                    else " via backing_paths"
+                )
+                detail_parts.append(
+                    f"{len(auto_resolved)} auto-resolved{_tier_note}: {preview_ar}"
+                )
+            if needs_backing_paths:
+                preview_nb = ", ".join(sorted(needs_backing_paths)[:3])
+                if len(needs_backing_paths) > 3:
+                    preview_nb += f" (+{len(needs_backing_paths) - 3} more)"
+                _nb_part = (
+                    f"{len(needs_backing_paths)} need backing_paths "
+                    f"(needs_backing_paths): {preview_nb}"
+                )
+                if discovery_suggestions:
+                    _nb_part += (
+                        f" ({len(discovery_suggestions)} with discovered candidate "
+                        "path suggestion(s) folded into research obligations)"
+                    )
+                detail_parts.append(_nb_part)
+            if still_unproven:
+                preview_su = ", ".join(sorted(still_unproven)[:3])
+                if len(still_unproven) > 3:
+                    preview_su += f" (+{len(still_unproven) - 3} more)"
+                detail_parts.append(
+                    f"{len(still_unproven)} backing_paths failed verification: {preview_su}"
+                )
+            _detail = (
+                f"{len(unresolved)} working capability(ies) remain unproven "
+                "after self-heal: " + "; ".join(detail_parts)
+            )
+            if exempt_count:
+                _detail += (
+                    f"; {exempt_count} exempt (not counted in delta): "
+                    + ", ".join(sorted(exempt_set)[:5])
+                )
+                if exempt_count > 5:
+                    _detail += f" (+{exempt_count - 5} more)"
+            results.append(
+                CheckResult(
+                    check="capability_proof_gate_gap",
+                    status=CheckStatus.FLAGGED,
+                    self_reported=total_working,
+                    ground_truth=new_proven,
+                    delta=len(unresolved),
+                    severity="warn",
+                    subject=pid,
+                    detail=_detail,
+                )
+            )
+        else:
+            _ok_detail = (
+                f"all {total_working} working capability(ies) carry proven evidence"
+            )
+            if auto_resolved:
+                if named_test_present_resolved:
+                    _ok_detail += (
+                        f" ({len(auto_resolved)} auto-resolved: "
+                        f"{len(named_test_present_resolved)} via named_test_present, "
+                        f"{len(auto_resolved) - len(named_test_present_resolved)} "
+                        "via backing_paths)"
+                    )
+                else:
+                    _ok_detail += (
+                        f" ({len(auto_resolved)} auto-resolved via backing_paths)"
+                    )
+            if exempt_count:
+                _ok_detail += (
+                    f" ({exempt_count} exempt: "
+                    + ", ".join(sorted(exempt_set)[:5])
+                )
+                if exempt_count > 5:
+                    _ok_detail += f" +{exempt_count - 5} more"
+                _ok_detail += ")"
+            results.append(
+                CheckResult(
+                    check="capability_proof_gate_gap",
+                    status=CheckStatus.OK,
+                    self_reported=total_working,
+                    ground_truth=new_proven,
+                    delta=0,
+                    subject=pid,
+                    detail=_ok_detail,
+                )
+            )
+
+    if not any_working and not any(r.flagged for r in results):
+        return [
+            CheckResult(
+                check="capability_proof_gate_gap",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no projects with working capabilities found",
+            )
+        ]
+    return results
+
+
+@register_check(
+    "capability_proof_gate_auto_graduation",
+    "Compute fleet-wide capability proof coverage and automatically advance the "
+    "capability proof gate mode (off→observe→enforce) when coverage crosses the "
+    "configured thresholds. Exempt capabilities are excluded from the calculation. "
+    "Only advances, never regresses. Disabled by default — opt-in via "
+    "capability_proof_gate_auto_graduation_enabled.",
+)
+async def check_capability_proof_gate_auto_graduation(
+    ctx: SweepContext,
+) -> List[CheckResult]:
+    """Ground truth: compute proof coverage across all projects and, when the
+    auto-graduation feature is enabled, advance the capability proof gate mode
+    (off→observe→enforce) as coverage crosses the configured thresholds.
+
+    * Coverage = total proven working caps / total non-exempt working caps
+    * Exempt capabilities are excluded from both numerator and denominator
+    * Projects with zero non-exempt working caps are excluded from the aggregate
+    * Auto-graduation is disabled by default — operators must opt in
+    * Only advances (off→observe→enforce), never regresses
+    * Advances persist to the database so they survive restarts
+
+    Returns a CheckResult with coverage ratio, threshold, and whether advancement
+    occurred. Idempotent — running twice with the same coverage advances at most once.
+    """
+    from app.capability_registry import (
+        exempt_capability_names,
+        working_capability_proof_status,
+    )
+    from app.models import DeploymentState, Project
+    from app.shared_state import runtime_config as _runtime_config
+
+    # Read auto-graduation config from runtime_config.
+    auto_enabled = bool(
+        _runtime_config.get("capability_proof_gate_auto_graduation_enabled", False)
+    )
+    if not auto_enabled:
+        return [
+            CheckResult(
+                check="capability_proof_gate_auto_graduation",
+                status=CheckStatus.OK,
+                subject="global",
+                detail="auto-graduation disabled (capability_proof_gate_auto_graduation_enabled=false)",
+            )
+        ]
+
+    observe_threshold = float(
+        _runtime_config.get(
+            "capability_proof_gate_auto_graduation_observe_threshold", 0.5
+        )
+    )
+    enforce_threshold = float(
+        _runtime_config.get(
+            "capability_proof_gate_auto_graduation_enforce_threshold", 0.95
+        )
+    )
+    current_mode = str(
+        _runtime_config.get("capability_proof_gate_mode", "off") or "off"
+    ).lower()
+
+    # Already at enforce — nothing to do.
+    if current_mode == "enforce":
+        return [
+            CheckResult(
+                check="capability_proof_gate_auto_graduation",
+                status=CheckStatus.OK,
+                subject="global",
+                detail="gate already at enforce (maximum); no further advancement possible",
+            )
+        ]
+
+    # Compute fleet-wide proof coverage.
+    projects = (
+        await ctx.session.execute(
+            select(Project.id, Project.problem_model).limit(ctx.max_projects)
+        )
+    ).all()
+    if not projects:
+        return [
+            CheckResult(
+                check="capability_proof_gate_auto_graduation",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no projects to compute coverage from",
+            )
+        ]
+
+    total_non_exempt_working = 0
+    total_proven = 0
+    projects_contributing = 0
+
+    for _project_id, raw_pm in projects:
+        pm = raw_pm if isinstance(raw_pm, dict) else {}
+        proof_by_name = working_capability_proof_status(pm)
+        if not proof_by_name:
+            continue
+        exempt_set = exempt_capability_names(pm)
+        # Exclude exempt capabilities from both numerator and denominator.
+        non_exempt = {
+            name: status
+            for name, status in proof_by_name.items()
+            if name not in exempt_set
+        }
+        if not non_exempt:
+            # Project has working caps but all are exempt — exclude from aggregate.
+            continue
+        projects_contributing += 1
+        total_non_exempt_working += len(non_exempt)
+        total_proven += sum(1 for s in non_exempt.values() if s == "proven")
+
+    if total_non_exempt_working == 0:
+        return [
+            CheckResult(
+                check="capability_proof_gate_auto_graduation",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no non-exempt working capabilities across fleet; nothing to graduate on",
+            )
+        ]
+
+    coverage_ratio = total_proven / total_non_exempt_working
+
+    # Determine if advancement is warranted.
+    advance_to: str | None = None
+    if current_mode == "off" and coverage_ratio >= observe_threshold:
+        advance_to = "observe"
+    elif current_mode == "observe" and coverage_ratio >= enforce_threshold:
+        advance_to = "enforce"
+
+    if advance_to is None:
+        # Coverage below the threshold for the next step — no advancement.
+        threshold = observe_threshold if current_mode == "off" else enforce_threshold
+        return [
+            CheckResult(
+                check="capability_proof_gate_auto_graduation",
+                status=CheckStatus.OK,
+                self_reported=total_non_exempt_working,
+                ground_truth=total_proven,
+                delta=total_non_exempt_working - total_proven,
+                subject="global",
+                detail=(
+                    f"coverage={coverage_ratio:.4f} (threshold={threshold}, "
+                    f"mode={current_mode}, projects={projects_contributing}); "
+                    f"below threshold — no advancement"
+                ),
+            )
+        ]
+
+    # Advance the gate mode — update in-memory config.
+    _runtime_config["capability_proof_gate_mode"] = advance_to
+    logger.info(
+        "[METRICS-INTEGRITY] capability proof gate auto-graduated: "
+        "%s → %s (coverage=%.4f, observe_threshold=%.2f, enforce_threshold=%.2f, "
+        "projects=%d, total_non_exempt=%d, total_proven=%d)",
+        current_mode,
+        advance_to,
+        coverage_ratio,
+        observe_threshold,
+        enforce_threshold,
+        projects_contributing,
+        total_non_exempt_working,
+        total_proven,
+    )
+
+    # Persist the new gate mode to the database so it survives restarts.
+    try:
+        state = await ctx.session.get(DeploymentState, 1)
+        if state is not None:
+            config_json = getattr(state, "runtime_config_json", None)
+            if isinstance(config_json, dict):
+                config_json["capability_proof_gate_mode"] = advance_to
+            else:
+                config_json = {"capability_proof_gate_mode": advance_to}
+            state.runtime_config_json = config_json
+            ctx.session.add(state)
+            await ctx.session.commit()
+    except Exception:
+        logger.warning(
+            "[METRICS-INTEGRITY] failed to persist capability proof gate "
+            "auto-graduation to DB; in-memory value is %s",
+            advance_to,
+            exc_info=True,
+        )
+
+    # Resolve the dormant-knob debt for capability_proof_gate_mode when advancing
+    # to enforce (the knob's "off" / "observe" value meant an open obligation).
+    if advance_to == "enforce":
+        try:
+            from app.completion_debt import aresolve_completion_debt
+
+            await aresolve_completion_debt(
+                ctx.session,
+                "dormant_knob:capability_proof_gate_mode",
+                reason="graduated:auto_graduation",
+            )
+        except Exception:
+            logger.warning(
+                "[METRICS-INTEGRITY] failed to resolve dormant-knob debt for "
+                "capability_proof_gate_mode after auto-graduation to enforce",
+                exc_info=True,
+            )
+
+    return [
+        CheckResult(
+            check="capability_proof_gate_auto_graduation",
+            status=CheckStatus.FLAGGED,
+            self_reported=total_non_exempt_working,
+            ground_truth=total_proven,
+            delta=total_non_exempt_working - total_proven,
+            severity="info",
+            subject="global",
+            detail=(
+                f"auto-graduated gate from {current_mode} → {advance_to} "
+                f"(coverage={coverage_ratio:.4f}, threshold="
+                f"{observe_threshold if current_mode == 'off' else enforce_threshold}, "
+                f"projects={projects_contributing})"
+            ),
+        )
+    ]

@@ -8,6 +8,7 @@ The API surface is split into a few families:
 
 - Public project/task launch and status routes under `/api/*`
 - Agent lifecycle, warm handoff, GitHub proxy, and artifact upload routes under `/api/agent/*`
+- Self-hosted runner polling and compute-job endpoints under `/api/runner/*`
 - Admin settings, diagnostics, analytics, onboarding, and project-configuration routes under `/api/admin/*`
 - GitHub OAuth and webhook routes under `/api/github/*`
 
@@ -704,6 +705,188 @@ The user GitHub OAuth/webhook router exposes:
 - `GET /api/github/oauth/authorize`
 - `GET /api/github/oauth/callback`
 - `POST /api/github/webhook`
+
+## Runner API
+
+Self-hosted runners use these endpoints to pull tasks, report heartbeats, and execute compute jobs. Authentication uses the runner's bearer token (`Authorization: Bearer <runner_token>`), resolved via `get_current_runner` in `backend/app/auth.py`. All routes are under `/api/runner`.
+
+### `POST /api/runner/next-task`
+
+Pull the oldest task pinned to this runner (status `PROVISIONING`, `vm_instance_id = 'runner:<id>'`). Returns `204 No Content` when no task is waiting.
+
+Uses `SELECT ... FOR UPDATE SKIP LOCKED` to prevent concurrent polls from double-claiming. On a hit, `started_at` is stamped to guard against dispatch storms and a task-scoped agent JWT is minted. The task remains in `PROVISIONING` — the agent binary calls `POST /api/agent/claim` to perform the `PROVISIONING → IN_PROGRESS` transition (same contract as GCP VMs).
+
+If the LLM account pool is exhausted, returns `503 Service Unavailable` with `{"pool_exhausted": true}` and releases the dispatch marker so the task stays claimable.
+
+**Response (200):**
+```json
+{
+  "task_id": "uuid",
+  "agent_token": "jwt-string",
+  "vm_instance_id": "runner:<runner-id>",
+  "payload": [...],
+  "task_type": "create",
+  "capability_slice": [...],
+  "credentials": {
+    "env": {"PROVIDER": "...", "AUTH_MODE": "..."},
+    "files": [{"path": "...", "content": "...", "mode": "..."}]
+  }
+}
+```
+
+`credentials` is `null` when no pool account is assigned (runner falls back to host environment variables).
+
+**Status codes:** `200` task returned, `204` no task, `429` rate limited, `503` pool exhausted.
+
+---
+
+### `POST /api/runner/decline-task`
+
+Release a previously-dispatched task back to `QUEUED`. Runners call this when the isolation backend cannot sandbox the task type (e.g., no bwrap support for write tasks on a read-only docker runner). Without this, the task strands in `PROVISIONING` until the stale-runner sweep fires.
+
+**Request body:**
+```json
+{"task_id": "uuid"}
+```
+
+**Response:** `{"ok": true}`
+
+Idempotent — returns `ok` even when the task is not found or is no longer `PROVISIONING`.
+
+---
+
+### `POST /api/runner/heartbeat`
+
+Refresh the runner's `last_seen_at` and report its current load. Re-arms an inactive runner (status is set back to `active` on every authenticated heartbeat).
+
+**Request body:**
+```json
+{
+  "active_task_ids": ["uuid", ...],
+  "active_compute_job_ids": ["uuid", ...],
+  "agent_available": true,
+  "supported_agent_task_types": ["create", "review", ...],
+  "hostname": "my-machine",
+  "version": "1.2.3",
+  "isolation_backends": {"bwrap_ok": true, "docker_usable": true},
+  "agent_backend": "bwrap",
+  "compute_backend": "docker",
+  "has_gpu": false,
+  "gpu_count": 0,
+  "gpu_names": [],
+  "last_successful_job_at": "2026-07-10T12:00:00Z",
+  "consecutive_job_failures": 0,
+  "disk_free_bytes": 10737418240,
+  "cpu_load_avg": 0.5,
+  "memory_free_bytes": 4294967296,
+  "gpu_utilization_pct": 0
+}
+```
+
+All fields except `active_task_ids` and `active_compute_job_ids` are optional — older runners omit them and continue heartbeating without change.
+
+`supported_agent_task_types` is a runner-declared capability floor. The orchestrator intersects it with the operator-configured `task_types` ceiling when dispatching. This field is distinct from operator config and never overwrites `task_types`.
+
+**Response:**
+```json
+{
+  "ok": true,
+  "last_seen_at": "2026-07-10T12:00:00.000000",
+  "enrolled_max_concurrent": 2,
+  "version_hint": "git-sha"
+}
+```
+
+**Status codes:** `200` updated, `429` rate limited.
+
+---
+
+### `POST /api/runner/update-report`
+
+Report the outcome of a runner self-update. Creates an INFO alert on success and a WARNING alert on failure, broadcasting it to the operator console immediately.
+
+**Request body:**
+```json
+{
+  "status": "success",
+  "old_version": "1.0.0",
+  "new_version": "1.1.0"
+}
+```
+
+`status` must be `"success"` or `"failure"`. Version fields are optional.
+
+**Response:** `{"ok": true}`
+
+---
+
+### `POST /api/runner/next-compute-job`
+
+Pull the oldest `STARTING` runner-subprocess compute job pinned to this runner. Returns `204 No Content` when none is available. Atomically transitions the job `STARTING → RUNNING` on a hit.
+
+Scoped to the runner's project and the specific runner pin set by the orchestrator (prevents GPU experiments from being claimed by non-GPU runners).
+
+**Response (200):**
+```json
+{
+  "job_id": "uuid",
+  "command": "python3 train.py",
+  "env": {"KEY": "value"},
+  "cwd": "/workspace",
+  "setup_step": null,
+  "container_image": null,
+  "container_registry_auth": null,
+  "runtime_deadline_seconds": 3600,
+  "cancel_requested": false,
+  "repo_clone": {"owner": "org", "repo": "name", "ref": "main"},
+  "repo_token": "ghp_..."
+}
+```
+
+`repo_token` is a freshly-minted GitHub installation token (not stored in the DB); it is present only when `repo_clone` is set.
+
+**Status codes:** `200` job returned, `204` no job, `429` rate limited.
+
+---
+
+### `POST /api/runner/compute-job/{job_id}/report`
+
+Report execution status for a claimed compute job. Stamps `exec_status`, `exit_code`, `result_metrics`, and `command_log` into `polling_metadata` for the monitor's `poll_status`/finalize path. Does **not** finalize the job — the monitor owns that transition so artifact-linking and delivery run on the normal path.
+
+Idempotent: if the job is already in a terminal state (`SUCCEEDED`, `FAILED`, `CANCELLED`, `TIMED_OUT`), the update is skipped but `cancel_requested: true` is returned so the runner can observe the signal.
+
+**Request body:**
+```json
+{
+  "exec_status": "running",
+  "exit_code": null,
+  "result_metrics": {"loss": 0.42, "accuracy": 0.95},
+  "command_log": {"text": "Epoch 1/10..."}
+}
+```
+
+`exec_status` must be `"running"`, `"succeeded"`, or `"failed"`. All fields except `exec_status` are optional. `command_log.text` is truncated server-side to 64 KiB. `result_metrics` accepts numeric values; `"arms"` key may be a dict or non-empty list; strings and non-finite floats are dropped.
+
+**Response:** `{"ok": true, "cancel_requested": false}`
+
+**Status codes:** `200` stamped, `404` job not found or wrong runner, `429` rate limited.
+
+---
+
+### `POST /api/runner/compute-job/{job_id}/artifact`
+
+Upload a durable artifact tarball for a claimed compute job. The body must be `multipart/form-data` with:
+- `archive` (file field) — a `.tar.gz` archive (≤ 25 MiB)
+- `file_count` (form field) — integer count of files in the archive
+- `total_bytes` (form field) — uncompressed size in bytes
+
+The server stores the archive via `compute_backends.store_runner_artifact` and links the descriptor into `polling_metadata['runner_artifact']` for the monitor/finalize path. Scoped to the pinned runner only — runner A cannot upload to a job claimed by runner B.
+
+**Response:** `{"ok": true, "runner_artifact": {...}}`
+
+**Status codes:** `200` stored, `400` missing `archive` field, `404` job not found, `413` exceeds 25 MiB, `429` rate limited.
+
+---
 
 ## Admin API
 

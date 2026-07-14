@@ -336,6 +336,216 @@ async def test_add_issue_label_failure_raises_http_exception(mocker):
 
 
 # ---------------------------------------------------------------------------
+# get_issues — paginated and PR-free
+#
+# The request carried no per_page (GitHub defaults to 30) and no Link follow, so
+# an agent triaging a backlog saw an arbitrary truncated page. GitHub's /issues
+# also returns PULL REQUESTS (a PR is an issue with a ``pull_request`` key), and
+# they were passed through — a busy repo could fill the page with PRs and show
+# the agent no issues at all. The sole consumer is the agent proxy.
+# ---------------------------------------------------------------------------
+
+
+def _issue(n: int) -> dict:
+    return {"number": n, "title": f"issue {n}"}
+
+
+def _pr_as_issue(n: int) -> dict:
+    return {
+        "number": n,
+        "title": f"pr {n}",
+        "pull_request": {"url": f"https://api.github.com/pulls/{n}"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_get_issues_follows_pagination_beyond_first_page(mocker):
+    """>100 issues: every page is fetched (per_page=100 + page follow), not just
+    GitHub's default first 30."""
+    from app.github import get_issues
+
+    page1 = [_issue(i) for i in range(100)]
+    page2 = [_issue(100), _issue(101)]
+    mock_request = mocker.patch(
+        "app.github._github_request",
+        new=AsyncMock(side_effect=[MockResponse(200, page1), MockResponse(200, page2)]),
+    )
+
+    issues = await get_issues("token", "owner", "repo")
+
+    assert len(issues) == 102
+    assert mock_request.await_count == 2
+    first_params = mock_request.await_args_list[0].kwargs["params"]
+    assert first_params["per_page"] == 100
+    assert first_params["state"] == "open"
+    assert mock_request.await_args_list[1].kwargs["params"]["page"] == 2
+
+
+@pytest.mark.asyncio
+async def test_get_issues_filters_out_pull_requests(mocker):
+    """PRs (items carrying a ``pull_request`` key) are dropped — /issues mixes
+    them in and the agent asked for ISSUES."""
+    from app.github import get_issues
+
+    mocker.patch(
+        "app.github._github_request",
+        new=AsyncMock(
+            return_value=MockResponse(
+                200, [_issue(1), _pr_as_issue(2), _issue(3), _pr_as_issue(4)]
+            )
+        ),
+    )
+
+    issues = await get_issues("token", "owner", "repo")
+
+    assert [i["number"] for i in issues] == [1, 3]
+    assert all("pull_request" not in i for i in issues)
+
+
+@pytest.mark.asyncio
+async def test_get_issues_full_page_of_prs_still_paginates(mocker):
+    """Pagination is decided by the RAW page length, not the filtered one — a
+    full page of PRs must not be mistaken for the last page."""
+    from app.github import get_issues
+
+    all_prs = [_pr_as_issue(i) for i in range(100)]  # full page, zero issues
+    mock_request = mocker.patch(
+        "app.github._github_request",
+        new=AsyncMock(
+            side_effect=[MockResponse(200, all_prs), MockResponse(200, [_issue(999)])]
+        ),
+    )
+
+    issues = await get_issues("token", "owner", "repo")
+
+    assert mock_request.await_count == 2, (
+        "a page that filters down to zero issues still means more pages exist"
+    )
+    assert [i["number"] for i in issues] == [999]
+
+
+@pytest.mark.asyncio
+async def test_get_issues_non_200_on_first_page_raises(mocker):
+    """A GitHub failure on page 1 remains a hard 500 — there is nothing to salvage,
+    and a silently EMPTY list would look like 'this repo has no issues'."""
+    from app.github import get_issues
+
+    mocker.patch(
+        "app.github._github_request",
+        new=AsyncMock(return_value=MockResponse(500, {}, text="boom")),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await get_issues("token", "owner", "repo")
+
+    assert exc_info.value.status_code == 500
+
+
+@pytest.mark.asyncio
+async def test_get_issues_non_200_mid_pagination_returns_partial(mocker):
+    """A failure on page 2+ RETURNS the pages already fetched rather than throwing
+    away 100 successfully-fetched issues — mirroring get_open_pull_requests, which
+    this helper claims to mirror."""
+    from app.github import get_issues
+
+    page1 = [_issue(i) for i in range(100)]
+    mock_request = mocker.patch(
+        "app.github._github_request",
+        new=AsyncMock(
+            side_effect=[MockResponse(200, page1), MockResponse(502, {}, text="bad gw")]
+        ),
+    )
+
+    issues = await get_issues("token", "owner", "repo")
+
+    assert len(issues) == 100, (
+        "the 100 issues fetched on page 1 must survive a page-2 failure"
+    )
+    assert mock_request.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_get_issues_is_page_capped_to_bound_the_shared_quota(mocker):
+    """BUDGET GUARD. get_issues backs an agent endpoint rate-limited at 150 req/min
+    PER AGENT, drawing on the SHARED 5000/hr install-token bucket. Every page is a
+    x150/min multiplier, so the page cap is deliberately LOW (5, not the 30 the PR
+    list helper uses): 5 pages caps one agent at 750 GitHub calls/min; 30 would let
+    it burn 4500/min and drain the whole hourly bucket in ~70 seconds.
+
+    If someone raises _ISSUES_MAX_PAGES, they must redo that arithmetic — hence a
+    test that pins it rather than merely observing it.
+    """
+    from app import github_issues
+    from app.github import get_issues
+
+    assert github_issues._ISSUES_MAX_PAGES <= 5, (
+        "raising the issues page cap re-amplifies the shared GitHub quota this PR "
+        "exists to protect — justify it against the 150 req/min endpoint limit"
+    )
+
+    # Ten full pages available; the cap must stop us early.
+    full_page = [_issue(i) for i in range(100)]
+    mock_request = mocker.patch(
+        "app.github._github_request",
+        new=AsyncMock(return_value=MockResponse(200, full_page)),
+    )
+
+    issues = await get_issues("token", "owner", "repo")
+
+    assert mock_request.await_count == github_issues._ISSUES_MAX_PAGES
+    assert len(issues) == 100 * github_issues._ISSUES_MAX_PAGES
+
+
+@pytest.mark.asyncio
+async def test_get_issues_is_cached_so_a_polling_agent_does_not_amplify(mocker):
+    """The agent proxy is POLLED. Without a cache, pagination turns 1 GitHub call
+    into N — an amplifier, not a fix. A repeated read inside the TTL must serve from
+    cache and issue ZERO additional GitHub calls."""
+    from app.github import get_issues
+
+    mock_request = mocker.patch(
+        "app.github._github_request",
+        new=AsyncMock(return_value=MockResponse(200, [_issue(1)])),
+    )
+
+    first = await get_issues("token", "owner", "repo")
+    second = await get_issues("token", "owner", "repo")
+
+    assert first == second == [_issue(1)]
+    assert mock_request.await_count == 1, (
+        "the second read must be served from the TTL cache, not re-fetched"
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_issue_invalidates_the_issues_cache(mocker):
+    """An agent that creates an issue and immediately lists them must not read back
+    a pre-create snapshot for a whole TTL."""
+    from app.github import create_issue, get_issues
+
+    mocker.patch(
+        "app.github._github_request",
+        new=AsyncMock(return_value=MockResponse(200, [_issue(1)])),
+    )
+    await get_issues("token", "owner", "repo")  # populates the cache
+
+    mocker.patch(
+        "app.github._github_request",
+        new=AsyncMock(return_value=MockResponse(201, {"number": 2})),
+    )
+    await create_issue("token", "owner", "repo", "new", "body")
+
+    refetch = mocker.patch(
+        "app.github._github_request",
+        new=AsyncMock(return_value=MockResponse(200, [_issue(1), _issue(2)])),
+    )
+    issues = await get_issues("token", "owner", "repo")
+
+    assert refetch.await_count == 1, "the create must have dropped the cached list"
+    assert [i["number"] for i in issues] == [1, 2]
+
+
+# ---------------------------------------------------------------------------
 # enable_auto_merge — GraphQL enablePullRequestAutoMerge mutation
 # ---------------------------------------------------------------------------
 

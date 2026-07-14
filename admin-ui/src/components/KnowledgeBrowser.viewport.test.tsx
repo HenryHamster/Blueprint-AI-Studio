@@ -3,7 +3,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { fireEvent } from '@testing-library/react';
 import { KnowledgeBrowser } from './KnowledgeBrowser';
-import { fetchKnowledgeDocuments } from '../api';
+import { fetchKnowledgeDocuments, fetchKnowledgeDocument } from '../api';
 import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt } from '../test/viewport';
 
 const sampleDocs = [
@@ -58,6 +58,35 @@ const sampleDocs = [
     updated_at: '2026-05-30T00:00:00Z',
     forward_quality_verdict: { passed: false, reason: 'Insufficient citations.', strategy: 'forward_quality' },
   },
+  {
+    id: 'doc-8888-9999-aaaa-bbbb',
+    title: 'CUDA driver smoke test on L40S GPU',
+    summary: 'Raw CUDA driver validation: cuInit, device enumeration, 128MB alloc, DtoH with integrity check.',
+    topic: 'gpu-validation',
+    direction_id: 'd-compute-1',
+    tags: ['compute', 'gpu', 'cuda'],
+    source_citations: ['gs://bucket/results/cuda-smoke-result.json'],
+    source_task_id: 'task-compute-8888',
+    authoring_branch: null,
+    head_sha: null,
+    source_kind: 'compute_experiment',
+    created_at: '2026-07-01T00:00:00Z',
+    updated_at: '2026-07-01T00:00:00Z',
+    compute_acceptance_grade: 'acceptance',
+    criterion_met: true,
+    forward_quality_verdict: {
+      passed: true,
+      strategy: 'metric',
+      outcome: 'success',
+      terminal_diagnostics: {
+        executing_backend: 'local-gpu',
+        runner_target_id: 'aaaabbbb-cccc-dddd-eeee-ffff00001111',
+        runner_hostname: 'worker-host',
+        terminal_reason: 'compute job finished',
+        vm_phase: 'runtime',
+      },
+    },
+  },
 ];
 
 vi.mock('../api', () => ({
@@ -72,9 +101,10 @@ vi.mock('../api', () => ({
     }
     return Promise.resolve({ documents: sampleDocs, total: sampleDocs.length, limit: 50, offset: 0 });
   }),
-  fetchKnowledgeDocument: vi.fn(() =>
-    Promise.resolve({ ...sampleDocs[0], body: '# Heading\n\nA paragraph of markdown body text with a [link](https://example.com) and a list:\n\n- one\n- two\n' }),
-  ),
+  fetchKnowledgeDocument: vi.fn((_projectId: string, docId: string) => {
+    const doc = sampleDocs.find(d => d.id === docId) ?? sampleDocs[0];
+    return Promise.resolve({ ...doc, body: '# Heading\n\nA paragraph of markdown body text with a [link](https://example.com) and a list:\n\n- one\n- two\n' });
+  }),
   resolveArtifactDownloadUrl: vi.fn(() => Promise.resolve('https://signed.example.com/knowledge/doc-0000-1111-2222-3333')),
 }));
 
@@ -249,6 +279,101 @@ describe('KnowledgeBrowser — viewport regression', () => {
     expect((host as HTMLDivElement).textContent).toContain('Second opinion');
   });
 
+  test('compute_experiment detail view renders run provenance with execution location', async () => {
+    await renderList();
+    const docButton = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+      b => b.textContent?.includes('CUDA driver smoke test'),
+    );
+    expect(docButton).toBeTruthy();
+    if (!docButton) throw new Error('expected compute doc button');
+    await act(async () => { (docButton as HTMLElement).click(); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+    const text = (host as HTMLDivElement).textContent ?? '';
+    expect(text).toContain('Run provenance');
+    // criterion_met: true => earned "Criterion MET" verdict badge (CriterionVerdictBadge, not hardcoded)
+    expect(text).toContain('Criterion MET');
+    expect(text).toContain('Operator hardware');
+    // runner_hostname preferred over truncated runner_target_id UUID
+    expect(text).toContain('worker-host');
+    expect(text).not.toContain('aaaabbbb');
+  });
+
+  test('compute_experiment detail view shows Criterion not met badge when criterion_met is false', async () => {
+    vi.mocked(fetchKnowledgeDocuments).mockImplementationOnce(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ((_projectId: string, params?: any) => {
+        const q = typeof params?.q === 'string' ? params.q : '';
+        if (q.includes('no-match')) {
+          return Promise.resolve({ documents: [], total: 0, limit: 50, offset: 0 });
+        }
+        const docs = sampleDocs.map(d =>
+          d.id === 'doc-8888-9999-aaaa-bbbb'
+            ? { ...d, criterion_met: false as const, compute_acceptance_grade: 'measured_only' as const }
+            : d,
+        );
+        return Promise.resolve({ documents: docs, total: docs.length, limit: 50, offset: 0 });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      }) as any,
+    );
+    vi.mocked(fetchKnowledgeDocument).mockImplementationOnce((_projectId, docId) => {
+      const base = sampleDocs.find(d => d.id === docId) ?? sampleDocs[0];
+      const doc = { ...base, criterion_met: base.id === 'doc-8888-9999-aaaa-bbbb' ? false : (base as { criterion_met?: boolean | null }).criterion_met, compute_acceptance_grade: base.id === 'doc-8888-9999-aaaa-bbbb' ? ('measured_only' as const) : ('acceptance' as const), body: '# Heading\n\nBody.' };
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return Promise.resolve(doc as any);
+    });
+
+    await renderList();
+    const docButton = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+      b => b.textContent?.includes('CUDA driver smoke test'),
+    );
+    expect(docButton).toBeTruthy();
+    if (!docButton) throw new Error('expected compute doc button');
+    await act(async () => { (docButton as HTMLElement).click(); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+    const text = (host as HTMLDivElement).textContent ?? '';
+    expect(text).toContain('Run provenance');
+    expect(text).toContain('Criterion NOT MET');
+    expect(text).not.toContain('Machine-verified');
+  });
+
+  test('compute_experiment detail view shows Measured only badge when criterion_met is null', async () => {
+    vi.mocked(fetchKnowledgeDocuments).mockImplementationOnce(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ((_projectId: string, params?: any) => {
+        const q = typeof params?.q === 'string' ? params.q : '';
+        if (q.includes('no-match')) {
+          return Promise.resolve({ documents: [], total: 0, limit: 50, offset: 0 });
+        }
+        const docs = sampleDocs.map(d =>
+          d.id === 'doc-8888-9999-aaaa-bbbb'
+            ? { ...d, criterion_met: null as null, compute_acceptance_grade: 'measured_only' as const }
+            : d,
+        );
+        return Promise.resolve({ documents: docs, total: docs.length, limit: 50, offset: 0 });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      }) as any,
+    );
+    vi.mocked(fetchKnowledgeDocument).mockImplementationOnce((_projectId, docId) => {
+      const base = sampleDocs.find(d => d.id === docId) ?? sampleDocs[0];
+      const doc = { ...base, criterion_met: base.id === 'doc-8888-9999-aaaa-bbbb' ? null : (base as { criterion_met?: boolean | null }).criterion_met, compute_acceptance_grade: 'measured_only' as const, body: '# Heading\n\nBody.' };
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return Promise.resolve(doc as any);
+    });
+
+    await renderList();
+    const docButton = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+      b => b.textContent?.includes('CUDA driver smoke test'),
+    );
+    expect(docButton).toBeTruthy();
+    if (!docButton) throw new Error('expected compute doc button');
+    await act(async () => { (docButton as HTMLElement).click(); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+    const text = (host as HTMLDivElement).textContent ?? '';
+    expect(text).toContain('Run provenance');
+    expect(text).toContain('Measured only');
+    expect(text).not.toContain('Machine-verified');
+  });
+
   test('detail view renders provenance branch and sha when present', async () => {
     await renderList();
     const docButton = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
@@ -259,5 +384,60 @@ describe('KnowledgeBrowser — viewport regression', () => {
     await act(async () => { docButton.click(); });
     await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
     expect((host as HTMLDivElement).textContent).toContain('feature/knowledge-provenance@abc1234');
+  });
+
+  test('compute_experiment detail view with execution provenance renders without overflow at 800px', async () => {
+    const computeDocWithProvenance = {
+      id: 'doc-compute-provenance-vp',
+      title: 'GPU benchmark with execution provenance',
+      summary: 'Measured TFLOPS with runner metadata.',
+      topic: 'compute-performance',
+      direction_id: 'd-compute-1',
+      tags: ['gpu', 'benchmark'],
+      source_citations: [],
+      source_task_id: 'task-ce-vp',
+      authoring_branch: null,
+      head_sha: null,
+      source_kind: 'compute_experiment',
+      created_at: '2026-06-01T00:00:00Z',
+      updated_at: '2026-06-01T00:00:00Z',
+      knowledge_acceptance_evidence: true,
+      compute_acceptance_grade: 'acceptance',
+      compute_acceptance_reason: 'llm_artifact_cited',
+      criterion_met: true,
+      forward_quality_verdict: {
+        passed: true,
+        reason: 'Artifact-cited analysis passed.',
+        strategy: 'forward-quality',
+        terminal_diagnostics: {
+          executing_backend: 'local-subprocess',
+          runner_target_id: 'dd59526e-1234-5678-abcd-ef0123456789',
+        },
+      },
+    };
+    const { fetchKnowledgeDocuments: fkd, fetchKnowledgeDocument: fkdoc } = await import('../api');
+    vi.mocked(fkd).mockResolvedValueOnce({ documents: [computeDocWithProvenance] as never, total: 1, limit: 50, offset: 0 });
+    vi.mocked(fkdoc).mockResolvedValueOnce({ ...computeDocWithProvenance, body: '# GPU Results\n\nThroughput: 312 TFLOPS.' } as never);
+
+    await expectNoOverflowAt(800, async () => {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(<KnowledgeBrowser selectedProjectId="project-test" onClose={() => {}} onNavigateToTask={() => {}} />);
+      });
+      await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+      const docButton = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+        b => b.textContent?.includes('GPU benchmark with execution provenance'),
+      );
+      if (docButton) {
+        await act(async () => { (docButton as HTMLElement).click(); });
+        await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+      }
+    });
+    const text = (host as HTMLDivElement).textContent ?? '';
+    expect(text).toContain('Operator hardware');
+    expect(text).toContain('dd59526e');
   });
 });

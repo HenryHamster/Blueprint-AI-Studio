@@ -1,4 +1,45 @@
 import type { ComputeJob, ComputeRpcDiagnostic } from '../api';
+
+/** Derive the evidence tier for a compute job, mirroring backend
+ *  knowledge_completion.py::_compute_evidence_tier.
+ *
+ *  `covered` renders as "Machine verified", so it requires BOTH that the job ran
+ *  on operator hardware AND that it produced a measurable result. A local run
+ *  that reported no metric proves only WHERE it ran — labelling that
+ *  "Machine verified" is a claimed, not earned, status. It is demoted to
+ *  `partial`: real execution provenance, nothing verified. */
+export function computeJobEvidenceTier(
+  job: Pick<
+    ComputeJob,
+    'backend' | 'status' | 'outcome' | 'criterion_verdict' | 'per_arm_verdicts'
+  >,
+): 'covered' | 'attested' | 'backfilled' | 'partial' | 'uncovered' {
+  const backend = job.backend ?? '';
+  const ranOnOperatorHardware =
+    backend.startsWith('local-') || backend === 'runner-subprocess';
+  const producedResult =
+    (job.per_arm_verdicts != null && Object.keys(job.per_arm_verdicts).length > 0) ||
+    job.criterion_verdict != null;
+  if (ranOnOperatorHardware) return producedResult ? 'covered' : 'partial';
+  if (backend) return 'attested';
+  if (producedResult) return 'backfilled';
+  return 'uncovered';
+}
+/** Digest-pin status of the container image a compute job ran on, derived from
+ *  the resolved `launch_params.container_image` string.
+ *
+ *  - `null`    — no image declared (bare `bash -lc` job); nothing to pin.
+ *  - `pinned`  — content-addressed reference (`registry/repo@sha256:...`); the
+ *    same layers pull every time, so runs are bit-identical over time.
+ *  - `mutable` — a plain tag (`registry/repo:latest`); layers can drift between
+ *    runs, silently defeating A/B reproducibility. */
+export function computeJobImagePinStatus(
+  job: Pick<ComputeJob, 'launch_params'>,
+): 'pinned' | 'mutable' | null {
+  const image = job.launch_params?.container_image;
+  if (!image) return null;
+  return image.includes('@sha256:') ? 'pinned' : 'mutable';
+}
 import { parseTimestamp } from '../utils/time';
 export { formatDurationSec as fmtDuration } from '../utils/time';
 
@@ -14,13 +55,13 @@ export function isComputeJobActive(job: ComputeJob): boolean {
 }
 
 /** Human-readable terminal reason for a finished job, distinguishing the three
- *  kill paths (operator / budget / deadline) plus natural success/failure. */
+ *  kill paths (operator / budget / deadline / no-progress) plus natural success/failure. */
 export function computeJobTerminalLabel(job: ComputeJob): string {
   switch (job.outcome) {
     case 'SPEND_CAP_EXCEEDED':
       return 'Killed: budget cap';
     case 'TIMED_OUT':
-      return 'Killed: deadline';
+      return job.terminal_kind === 'no_progress' ? 'Killed: no progress' : 'Killed: deadline';
     case 'CANCELLED':
       return (job.terminal_reason || '').toLowerCase().includes('operator')
         ? 'Killed by operator'
@@ -122,11 +163,56 @@ export function computeJobExecutionLocation(backend: string): {
       return { label: 'Operator hardware', isOperatorHardware: true };
     case 'local-gpu':
       return { label: 'Operator hardware · GPU', isOperatorHardware: true };
+    case 'runner-subprocess':
+      return { label: 'Operator hardware · Runner', isOperatorHardware: true };
     case 'gcp':
       return { label: 'GCP cloud', isOperatorHardware: false };
     default:
       return { label: backend, isOperatorHardware: false };
   }
+}
+
+/** One gallery-renderable entry normalized from the job's first-class
+ *  `viewable_artifacts` manifest field. */
+export interface GalleryViewableArtifact {
+  name: string;
+  storage_uri: string;
+  kind: 'image' | 'video';
+  bytes: number;
+}
+
+/** Defensive parse of the job's first-class `viewable_artifacts` field — the
+ *  backend's normalized manifest ({filename, storage_uri, content_type,
+ *  size_bytes, kind}) of preview-able files persisted from the job's
+ *  artifacts. Entries missing a `storage_uri` or with an unknown `kind` are
+ *  dropped so a malformed manifest degrades to an empty gallery instead of a
+ *  render crash. */
+export function computeJobViewableArtifacts(job: ComputeJob): GalleryViewableArtifact[] {
+  const raw: unknown = job.viewable_artifacts;
+  if (!Array.isArray(raw)) return [];
+  const items: GalleryViewableArtifact[] = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+    const e = entry as Record<string, unknown>;
+    if (typeof e.storage_uri !== 'string' || e.storage_uri.length === 0) continue;
+    if (e.kind !== 'image' && e.kind !== 'video') continue;
+    const fallbackName = e.storage_uri.split('/').pop() || 'artifact';
+    items.push({
+      name: typeof e.filename === 'string' && e.filename.length > 0 ? e.filename : fallbackName,
+      storage_uri: e.storage_uri,
+      kind: e.kind,
+      bytes: typeof e.size_bytes === 'number' && Number.isFinite(e.size_bytes) ? e.size_bytes : 0,
+    });
+  }
+  return items;
+}
+
+/** Compact byte-count label for artifact captions. Empty string when unknown. */
+export function fmtBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 /** Calculate the margin (distance from threshold to actual value).

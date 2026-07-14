@@ -1,9 +1,9 @@
 /* eslint-disable react-hooks/refs, react-hooks/set-state-in-effect */
 import { useEffect, useState } from 'react';
 import type React from 'react';
-import { API_BASE_URL, authHeaders, authGet, fetchTaskTypeCatalog, createComputeExperiment, computeExperimentPreflight } from '../api';
+import { API_BASE_URL, authHeaders, authGet, fetchTaskTypeCatalog, createComputeExperiment, computeExperimentPreflight, listFleetRunners } from '../api';
 import { usePersistedState } from './usePersistedState';
-import type { ComputeSuccessOperator, ComputeExperimentLaunchRequest, ComputeSuccessCriterion, ComputeExperimentPreflightResponse } from '../api';
+import type { ComputeSuccessOperator, ComputeExperimentLaunchRequest, ComputeSuccessCriterion, ComputeExperimentPreflightResponse, FleetRunner } from '../api';
 import type { LaunchableTaskTypeOption, UserLaunchableTaskType } from '../taskCapabilities';
 import { USER_LAUNCHABLE_TASK_TYPE_IDS, USER_LAUNCHABLE_TASK_TYPE_OPTIONS, resolveTaskCapabilities } from '../taskCapabilities';
 import type { TaskCapabilityContract } from '../types/settings';
@@ -55,6 +55,9 @@ export interface ComputeExperimentForm {
   containerRegistryServer: string;
   containerRegistryUsername: string;
   containerRegistryPassword: string;
+  // Optional runner UUID or hostname to hard-pin this job to a specific runner.
+  // Empty string means auto-select (no forced target).
+  forcedRunnerId: string;
 }
 
 export const COMPUTE_ACCELERATOR_OPTIONS = [
@@ -94,6 +97,7 @@ export function defaultComputeExperimentForm(): ComputeExperimentForm {
     containerRegistryServer: '',
     containerRegistryUsername: '',
     containerRegistryPassword: '',
+    forcedRunnerId: '',
   };
 }
 
@@ -104,6 +108,7 @@ export function useTaskModal(
   defaultTaskBranchRef?: React.MutableRefObject<string | null>,
   selectedProjectRepoRef?: React.MutableRefObject<string | null>,
   taskCapabilityContract?: TaskCapabilityContract | null,
+  selectedProjectIdRef?: React.MutableRefObject<string | null>,
 ) {
   // Launchable set derives from the published contract (falling back to the
   // built-in table when the backend hasn't published it) so the duplicate
@@ -160,6 +165,11 @@ export function useTaskModal(
   const [branchLoading, setBranchLoading] = useState(false);
   const [branchError, setBranchError] = useState<string | null>(null);
   const [useManualBranch, setUseManualBranch] = useState(false);
+
+  // Fleet runners for the force-target picker — loaded on modal open when
+  // selectedProjectIdRef is provided. Empty when unavailable or loading.
+  const [fleetRunners, setFleetRunners] = useState<FleetRunner[]>([]);
+  const [fleetRunnersLoading, setFleetRunnersLoading] = useState(false);
 
   // Launchable task-type options, derived from the backend task-type catalog so
   // a newly registered launchable type appears in the launcher with no frontend
@@ -326,6 +336,20 @@ export function useTaskModal(
     }
   };
 
+  const fetchFleetRunnersForProject = async () => {
+    const projectId = selectedProjectIdRef?.current;
+    if (!projectId) return;
+    setFleetRunnersLoading(true);
+    try {
+      const runners = await listFleetRunners(projectId);
+      setFleetRunners(runners);
+    } catch {
+      // Runner list is optional — degrade silently
+    } finally {
+      setFleetRunnersLoading(false);
+    }
+  };
+
   const getDraftStorageKey = (suffix: string) => {
     const projectRepo = getSelectedProjectRepo();
     return projectRepo ? `blueprint-admin:draft:${projectRepo}:${suffix}` : null;
@@ -383,6 +407,7 @@ export function useTaskModal(
     restoreDraft();
     fetchRepoOptions();
     fetchLaunchableTaskTypeOptions();
+    fetchFleetRunnersForProject();
   };
 
   const handleRepoChange = (value: string) => {
@@ -543,6 +568,7 @@ export function useTaskModal(
       ...(ideaText.trim() ? { idea: ideaText.trim() } : {}),
       ...(draftNotes ? { draft_notes: draftNotes } : {}),
       ...(cameFromDraft ? { drafted_from_refinement: true } : {}),
+      ...(computeExperiment.forcedRunnerId.trim() ? { runner_target_id: computeExperiment.forcedRunnerId.trim() } : {}),
     };
     try {
       const response = await createComputeExperiment(body);
@@ -764,6 +790,9 @@ export function useTaskModal(
         })(),
         // Never prefill the registry password — it is a write-only secret.
         containerRegistryPassword: '',
+        // Forced runner target is not carried over to clones — the operator
+        // must consciously choose a target for each new launch.
+        forcedRunnerId: '',
       });
     } else {
       setComputeExperiment(defaultComputeExperimentForm());
@@ -771,6 +800,7 @@ export function useTaskModal(
 
     fetchRepoOptions();
     fetchLaunchableTaskTypeOptions();
+    fetchFleetRunnersForProject();
     if (repo) fetchBranchOptions(repo);
   };
 
@@ -786,6 +816,7 @@ export function useTaskModal(
     repoOptions, repoLoading, repoError, useManualRepo, setUseManualRepo,
     branchOptions, branchLoading, branchError, useManualBranch, setUseManualBranch, setBranchOptions,
     launchableTaskTypeOptions,
+    fleetRunners, fleetRunnersLoading,
     openNewTaskModal, openDuplicateTaskModal, openPrefilledTaskModal, openWebResearchTaskModal, handleRepoChange, handleCreateTask, getDefaultModelForType, getDefaultEffortForType,
   };
 }

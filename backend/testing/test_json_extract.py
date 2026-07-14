@@ -9,6 +9,7 @@ from app.json_extract import (
     _extract_json_object,
     _extract_last_json_array,
     async_json_loads,
+    scan_all_balanced_json_objects,
     scan_balanced_json_objects,
 )
 
@@ -115,6 +116,37 @@ def test_scan_balanced_json_objects_string_with_braces():
     assert result is not None
     assert result["verdict"] == "APPROVE"
     assert result["code"] == "if (x) { return; }"
+
+
+# ---------------------------------------------------------------------------
+# scan_all_balanced_json_objects
+# ---------------------------------------------------------------------------
+
+
+def test_scan_all_balanced_json_objects_returns_every_object_in_order():
+    text = 'prose {"a": 1} noise {"a": 2} more {"a": 3}'
+    result = scan_all_balanced_json_objects(text)
+    assert result == [{"a": 1}, {"a": 2}, {"a": 3}]
+
+
+def test_scan_all_balanced_json_objects_respects_required_key():
+    text = '{"a": 1} {"verdict": "x"} {"b": 2} {"verdict": "y"}'
+    result = scan_all_balanced_json_objects(text, required_key="verdict")
+    assert result == [{"verdict": "x"}, {"verdict": "y"}]
+
+
+def test_scan_all_balanced_json_objects_skips_malformed_and_empty():
+    assert scan_all_balanced_json_objects("") == []
+    # First span is not valid JSON; the scanner still recovers the later object.
+    assert scan_all_balanced_json_objects("{ nope } {\"a\": 1}") == [{"a": 1}]
+
+
+def test_scan_all_recovers_repeated_metric_key_ab_arms():
+    # The exact shape a single-command A/B experiment emits: the same metric key
+    # printed once per arm. Both values must be recoverable, not just the last.
+    text = '{"median_matmul_ms": 81.6}\n{"median_matmul_ms": 12.6}'
+    values = [o["median_matmul_ms"] for o in scan_all_balanced_json_objects(text)]
+    assert values == [81.6, 12.6]
 
 
 # ---------------------------------------------------------------------------

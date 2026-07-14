@@ -798,6 +798,122 @@ BLUEPRINT_RUNNER_MIN_DISK_BYTES=2147483648 blueprint-runner run
 
 ---
 
+## Crash Recovery and Process Supervision
+
+The runner self-updates when the orchestrator advertises a newer version (while
+the runner is idle). After a successful update — or after a crash — the process
+must be restarted to resume work. Blueprint handles this through process
+supervision. **Running the runner unsupervised means crashes are permanent
+outages until an operator notices.**
+
+### Why a supervisor is required
+
+Two events require an external restart:
+
+1. **Crash / unexpected exit** — any unhandled exception, OOM kill, or
+   hardware fault exits the runner process. Without a supervisor, the runner
+   stays dead.
+2. **Self-update** — when the orchestrator pushes a new runner version, the
+   runner pulls the update and then exits with code 0 (supervised mode) so the
+   supervisor can restart it with the new code. Without a supervisor the runner
+   re-execs in place (best-effort), but a crash mid-re-exec has no fallback.
+
+Background threads (the reaper, the heartbeat loop, the thread supervisor) are
+individually guarded; if one dies unexpectedly the runner calls `sys.exit`
+non-zero so the process supervisor can restart a clean copy. This design
+intentionally escalates silent degradations to recoverable restarts.
+
+### Option 1: systemd service (recommended)
+
+`blueprint-runner install` renders and installs a systemd unit with
+`Restart=always` for you. For the common shapes:
+
+```bash
+# Per-operator unit (WSL PC, second PC, single-operator lab server):
+blueprint-runner install --token <token>
+# Writes ~/.config/systemd/user/blueprint-runner.service
+# Enables linger (boot persistence without active login session)
+
+# System-wide unit (shared DGX / multi-operator server, requires sudo):
+sudo blueprint-runner install --system --token <token>
+# Writes /etc/systemd/system/blueprint-runner.service
+```
+
+The installed unit includes `Restart=always` and `RestartSec=5`. The runner
+exits 0 after a successful self-update and systemd restarts the fresh binary.
+Crashes (non-zero exit) are also restarted.
+
+To view logs: `journalctl --user -u blueprint-runner -f`  
+To restart manually: `systemctl --user restart blueprint-runner`  
+To uninstall: `blueprint-runner uninstall` (add `--system` for the system unit)
+
+### Option 2: manual restart loop (tmux / nohup / screen)
+
+When systemd is not available, wrap the runner in a shell restart loop. Set
+`BLUEPRINT_RUNNER_SUPERVISED=1` so the runner knows it is supervised and exits
+cleanly on self-update (instead of re-exec'ing in place):
+
+```bash
+# Inside a tmux pane or screen session:
+export BLUEPRINT_RUNNER_TOKEN=<token>
+export BLUEPRINT_RUNNER_SUPERVISED=1
+while true; do
+    python3 scripts/local_runner.py
+    sleep 1
+done
+```
+
+Without `BLUEPRINT_RUNNER_SUPERVISED=1`, the runner detects no supervisor and
+falls back to `os.execv` in place on self-update. That works for updates, but
+a genuine crash still exits with no restart. Always set the variable in the
+loop.
+
+### Supervisor detection (`BLUEPRINT_RUNNER_SUPERVISED`)
+
+At startup and before each self-update, the runner calls `_detect_process_supervisor()`
+to determine whether a restart is available. It checks (first match wins):
+
+| Signal | Detected supervisor |
+|---|---|
+| `INVOCATION_ID` or `JOURNAL_STREAM` env var | `systemd` |
+| `SUPERVISOR_ENABLED` env var | `supervisord` |
+| `BLUEPRINT_RUNNER_SUPERVISED=1` env var | `declared` (manual restart loop) |
+| `/proc/1/comm` is `systemd`, `supervisord`, `runit`, `runsv`, `s6-svscan`, or `tini` | container init supervisor |
+
+When a supervisor is detected, self-update exits with code 0 and lets the
+supervisor respawn. When **no** supervisor is detected, self-update falls back
+to `os.execv` in place and prints:
+
+```
+[runner] auto-update complete — NO process supervisor detected
+(manual tmux/nohup/screen launch); re-exec'ing in place so the update
+takes effect. Wrap the runner in systemd or a restart loop to recover
+from crashes too (see --check RUNNER_RUNBOOK).
+```
+
+### `--check` supervisor warning
+
+`blueprint-runner check` runs `_detect_process_supervisor()` and warns when no
+supervisor is found:
+
+```
+supervisor : [WARN] no process supervisor detected — crashes will not auto-recover.
+             Wrap the runner in systemd (blueprint-runner install) or a restart loop
+             (while true; do ...; done with BLUEPRINT_RUNNER_SUPERVISED=1).
+```
+
+When a supervisor is detected, `--check` reports it:
+
+```
+supervisor : systemd (Restart=always)
+```
+
+This warning is advisory — `--check` still exits 0 if isolation and token are
+valid. But running long-term without a supervisor is not recommended for
+production use.
+
+---
+
 ## Quick-reference: `--check` field glossary
 
 | Field | What to look for |

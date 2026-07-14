@@ -1,13 +1,27 @@
 """Tests for strategic_context_package.py read-model functions."""
 
+import json
 from datetime import datetime, timedelta
+from unittest.mock import patch
 
 import pytest
 from sqlalchemy import func
 from sqlmodel import select
 
-from app.models import KnowledgeDocument, Project, Task
-from app.strategic_context_package import load_strategic_context_evidence
+import app.strategic_context_package as scp
+from app.models import (
+    Artifact,
+    ArtifactType,
+    KnowledgeDocument,
+    Project,
+    Task,
+)
+from app.storage import ARTIFACT_BUCKET_NAME
+from app.strategic_context_package import (
+    _artifact_descriptor,
+    _artifact_renderable_kind,
+    load_strategic_context_evidence,
+)
 
 TEST_USER_ID = "test-user-123"
 
@@ -211,3 +225,683 @@ async def test_load_strategic_context_evidence_staleness_reflects_oldest_pending
     # The oldest doc was created ~72 hours ago, so the staleness should be near 72.
     assert knowledge["oldest_pending_age_hours"] >= 70
     assert knowledge["oldest_pending_age_hours"] <= 74
+
+
+# ── Viewable artifact previews (signed at the async load boundary) ───────────
+
+
+async def _make_project_task(db_session, name="PreviewTest"):
+    project = Project(name=name, user_id=TEST_USER_ID)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = Task(
+        project_id=project.id,
+        title="experiment",
+        status="completed",
+        payloads=[{"type": "research", "prompt": "test"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    return project, task
+
+
+def _fake_signer(calls=None):
+    async def fake(storage_uri, expiration_minutes=60):
+        if calls is not None:
+            calls.append((storage_uri, expiration_minutes))
+        return f"https://signed.example/{storage_uri.rsplit('/', 1)[-1]}"
+
+    return fake
+
+
+@pytest.mark.asyncio
+async def test_artifact_image_preview_signed_at_load(db_session, monkeypatch):
+    """An Artifact whose own storage_uri is an allowlisted image gets a signed,
+    transient viewable_previews entry minted inside
+    load_strategic_context_evidence, and the descriptor renders it (no more
+    unsupported_reason stub)."""
+    project, task = await _make_project_task(db_session)
+    image_uri = f"gs://{ARTIFACT_BUCKET_NAME}/tasks/{task.id}/loss_curve.png"
+    db_session.add(
+        Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.SCREENSHOT,
+            storage_uri=image_uri,
+        )
+    )
+    await db_session.commit()
+
+    calls: list = []
+    monkeypatch.setattr(scp, "generate_download_signed_url", _fake_signer(calls))
+
+    evidence = await load_strategic_context_evidence(db_session, project.id)
+    items = evidence["artifacts"]["items"]
+    assert len(items) == 1
+    item = items[0]
+    # No-leak contract (test_strategic_state.py): the raw gs:// reference must
+    # never appear in the package — only the signed, transient URL does.
+    assert "storage_uri" not in item
+    previews = item["viewable_previews"]
+    assert previews == [
+        {
+            "url": "https://signed.example/loss_curve.png",
+            "storage_uri": image_uri,
+            "kind": "image",
+            "filename": "loss_curve.png",
+        }
+    ]
+    assert calls == [(image_uri, scp._PREVIEW_SIGNED_URL_MINUTES)]
+
+    descriptor = _artifact_descriptor(item)
+    assert descriptor["kind"] == "image"
+    assert descriptor["image"]["url"] == "https://signed.example/loss_curve.png"
+    # storage_uri now rides on the descriptor sub-dict for lazy re-resolution;
+    # the no-leak contract is enforced at the item level (asserted above).
+    assert descriptor["image"]["storage_uri"] == image_uri
+    assert "unsupported_reason" not in descriptor
+
+
+@pytest.mark.asyncio
+async def test_bundle_artifact_resolves_manifest_viewable_video(
+    db_session, monkeypatch
+):
+    """A compute-job bundle Artifact resolves through its logs' viewable_files
+    manifest; entries failing the per-file ownership check are never signed,
+    and a resolved video preview promotes the descriptor kind to video."""
+    project, task = await _make_project_task(db_session, name="PreviewVideo")
+
+    own_video = (
+        f"gs://{ARTIFACT_BUCKET_NAME}/compute-jobs/"
+        "11111111-1111-1111-1111-111111111111/artifacts/viewable/rollout.mp4"
+    )
+    foreign = (
+        f"gs://{ARTIFACT_BUCKET_NAME}/compute-jobs/"
+        "00000000-0000-0000-0000-000000000001/artifacts/viewable/evil.png"
+    )
+    bundle_uri = (
+        f"gs://{ARTIFACT_BUCKET_NAME}/compute-jobs/"
+        "11111111-1111-1111-1111-111111111111/artifacts/bundle.tar.gz"
+    )
+    logs = {
+        "viewable_files": [
+            # Foreign entry listed FIRST: ownership check fails, never signed.
+            {"filename": "evil.png", "storage_uri": foreign, "kind": "image"},
+            {"filename": "rollout.mp4", "storage_uri": own_video, "kind": "video"},
+        ]
+    }
+    db_session.add(
+        Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.DEBUG_RESULT,
+            storage_uri=bundle_uri,
+            logs=json.dumps(logs),
+        )
+    )
+    await db_session.commit()
+
+    async def fake_verify(storage_uri, project_id, session):
+        if storage_uri == foreign:
+            raise Exception("ownership violation")
+
+    calls: list = []
+    monkeypatch.setattr(scp, "verify_artifact_project_ownership", fake_verify)
+    monkeypatch.setattr(scp, "generate_download_signed_url", _fake_signer(calls))
+
+    evidence = await load_strategic_context_evidence(db_session, project.id)
+    item = evidence["artifacts"]["items"][0]
+    # No-leak contract: raw gs:// never rides in the package payload; the
+    # signing-call record below proves WHICH object was resolved instead.
+    assert "storage_uri" not in item
+    previews = item["viewable_previews"]
+    assert previews == [
+        {
+            "url": "https://signed.example/rollout.mp4",
+            "storage_uri": own_video,
+            "kind": "video",
+            "filename": "rollout.mp4",
+        }
+    ]
+    # Only the owned object was ever signed — the foreign entry was skipped.
+    assert calls == [(own_video, scp._PREVIEW_SIGNED_URL_MINUTES)]
+
+    descriptor = _artifact_descriptor(item)
+    assert descriptor["kind"] == "video"
+    assert descriptor["video"]["url"] == "https://signed.example/rollout.mp4"
+    # storage_uri now rides on the descriptor sub-dict for lazy re-resolution;
+    # the no-leak contract is enforced at the item level (asserted above).
+    assert descriptor["video"]["storage_uri"] == own_video
+
+
+@pytest.mark.asyncio
+async def test_signing_failure_falls_back_to_stub(db_session, monkeypatch):
+    """Fail-soft: a signing error yields the pre-existing metadata-only stub."""
+    project, task = await _make_project_task(db_session, name="PreviewFail")
+    image_uri = f"gs://{ARTIFACT_BUCKET_NAME}/tasks/{task.id}/plot.png"
+    db_session.add(
+        Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.SCREENSHOT,
+            storage_uri=image_uri,
+            logical_key="plot.png",
+        )
+    )
+    await db_session.commit()
+
+    async def broken_signer(storage_uri, expiration_minutes=60):
+        raise RuntimeError("storage outage")
+
+    monkeypatch.setattr(scp, "generate_download_signed_url", broken_signer)
+
+    evidence = await load_strategic_context_evidence(db_session, project.id)
+    item = evidence["artifacts"]["items"][0]
+    assert "viewable_previews" not in item
+
+    descriptor = _artifact_descriptor(item)
+    assert descriptor["kind"] == "image"
+    assert descriptor["image"] == {
+        "url": None,
+        "alt": descriptor["title"],
+        "storage_uri": None,
+    }
+    assert "unsupported_reason" in descriptor
+
+
+@pytest.mark.asyncio
+async def test_svg_is_never_previewable(db_session, monkeypatch):
+    """svg is excluded from the viewable allowlist (script execution via a
+    signed URL) — no preview and no signing call, whether the svg is the
+    artifact's own storage_uri or a stamped manifest entry."""
+    project, task = await _make_project_task(db_session, name="PreviewSvg")
+    db_session.add(
+        Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.SCREENSHOT,
+            storage_uri=f"gs://{ARTIFACT_BUCKET_NAME}/tasks/{task.id}/chart.svg",
+            logs=json.dumps(
+                {
+                    "viewable_files": [
+                        {
+                            "filename": "diagram.svg",
+                            "storage_uri": f"gs://{ARTIFACT_BUCKET_NAME}/tasks/{task.id}/diagram.svg",
+                            "kind": "image",
+                        }
+                    ]
+                }
+            ),
+        )
+    )
+    await db_session.commit()
+
+    verify_calls: list = []
+
+    async def fake_verify(storage_uri, project_id, session):
+        verify_calls.append(storage_uri)
+
+    calls: list = []
+    monkeypatch.setattr(scp, "verify_artifact_project_ownership", fake_verify)
+    monkeypatch.setattr(scp, "generate_download_signed_url", _fake_signer(calls))
+
+    evidence = await load_strategic_context_evidence(db_session, project.id)
+    item = evidence["artifacts"]["items"][0]
+    assert "viewable_previews" not in item
+    assert calls == []
+    assert verify_calls == []
+
+
+def test_snapshot_sanitizer_strips_signed_preview_urls():
+    """NEVER-PERSIST invariant: the strategic-session snapshot seam
+    (message.context['strategic_session'] via sanitize_strategic_session_snapshot)
+    is a field allowlist that structurally drops image/video/preview payloads,
+    so a signed URL can never reach a durable row through it."""
+    from app.workbench_state import sanitize_strategic_session_snapshot
+
+    leaky_descriptor = {
+        "kind": "image",
+        "id": "artifact:abc",
+        "label": "Loss curve",
+        "summary": "training run",
+        "status": "ready",
+        "target": {"surface": "task", "task_id": "t-1"},
+        "image": {"url": "https://signed.example/leak.png"},
+        "video": {"url": "https://signed.example/leak.mp4"},
+        "preview": {"url": "https://signed.example/leak2.png"},
+        "viewable_previews": [
+            {
+                "url": "https://signed.example/leak3.png",
+                "kind": "image",
+                "filename": "leak3.png",
+            }
+        ],
+    }
+    snapshot = sanitize_strategic_session_snapshot(
+        {
+            "selected_ref_descriptors": [leaky_descriptor],
+            "context_package_descriptor": leaky_descriptor,
+            "context_package_id": "strategic-context:p-1",
+        }
+    )
+
+    def _assert_no_urls(obj):
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                assert key not in (
+                    "image",
+                    "video",
+                    "preview",
+                    "viewable_previews",
+                    "url",
+                ), f"signed-url field {key!r} leaked into the persisted snapshot"
+                _assert_no_urls(value)
+        elif isinstance(obj, list):
+            for value in obj:
+                _assert_no_urls(value)
+        elif isinstance(obj, str):
+            assert "signed.example" not in obj
+
+    _assert_no_urls(snapshot)
+    # The pointer fields themselves survive (the snapshot stays useful).
+    assert snapshot["selected_ref_descriptors"][0]["id"] == "artifact:abc"
+    assert snapshot["context_package_descriptor"]["id"] == "artifact:abc"
+
+
+# ── viewable-artifact preview URL tests ──────────────────────────────────
+
+
+def test_artifact_renderable_kind_image():
+    """Artifact with image tokens yields kind='image'."""
+    assert _artifact_renderable_kind({"artifact_type": "COMPUTE_RESULT", "logical_key": "plot.png"}) == "image"
+    assert _artifact_renderable_kind({"artifact_type": "image", "label": "chart"}) == "image"
+    assert _artifact_renderable_kind({"kind": "screenshot.png"}) == "image"
+
+
+def test_artifact_renderable_kind_video():
+    """Artifact with video tokens yields kind='video'."""
+    assert _artifact_renderable_kind({"artifact_type": "COMPUTE_RESULT", "logical_key": "output.mp4"}) == "video"
+    assert _artifact_renderable_kind({"artifact_type": "COMPUTE_RESULT", "logical_key": "demo.webm"}) == "video"
+    assert _artifact_renderable_kind({"kind": "video", "label": "result"}) == "video"
+    assert _artifact_renderable_kind({"kind": "recording.mov", "label": "run"}) == "video"
+
+
+def test_artifact_renderable_kind_fallback():
+    """Unknown artifact tokens fall back to resource_detail."""
+    assert _artifact_renderable_kind({"artifact_type": "UNKNOWN"}) == "resource_detail"
+    assert _artifact_renderable_kind({}) == "resource_detail"
+
+
+def test_artifact_descriptor_image_with_preview_url():
+    """Image artifact with a viewable_preview populates image.url and drops unsupported_reason."""
+    item = {
+        "id": "art-1",
+        "artifact_type": "COMPUTE_RESULT",
+        "logical_key": "plot.png",
+        "label": "Plot",
+        "task_title": "Training run",
+        "task_status": "completed",
+        "viewable_previews": [
+            {"url": "https://signed.example.com/plot.png?sig=abc", "kind": "image", "filename": "plot.png"},
+        ],
+    }
+    desc = _artifact_descriptor(item)
+    assert desc is not None
+    assert desc["kind"] == "image"
+    assert desc["image"]["url"] == "https://signed.example.com/plot.png?sig=abc"
+    assert "unsupported_reason" not in desc
+
+
+def test_artifact_descriptor_image_no_preview():
+    """Image artifact without viewable_previews keeps the existing stub."""
+    item = {
+        "id": "art-2",
+        "artifact_type": "COMPUTE_RESULT",
+        "logical_key": "plot.png",
+        "label": "Plot",
+        "task_title": "Training run",
+        "task_status": "completed",
+    }
+    desc = _artifact_descriptor(item)
+    assert desc is not None
+    assert desc["kind"] == "image"
+    assert desc["image"]["url"] is None
+    assert "unsupported_reason" in desc
+
+
+def test_artifact_descriptor_video_with_preview_url():
+    """Video artifact with a viewable_preview populates video.url and drops unsupported_reason."""
+    item = {
+        "id": "art-3",
+        "artifact_type": "COMPUTE_RESULT",
+        "logical_key": "demo.mp4",
+        "label": "Demo",
+        "task_title": "Inference run",
+        "task_status": "completed",
+        "viewable_previews": [
+            {"url": "https://signed.example.com/demo.mp4?sig=def", "kind": "video", "filename": "demo.mp4"},
+        ],
+    }
+    desc = _artifact_descriptor(item)
+    assert desc is not None
+    assert desc["kind"] == "video"
+    assert desc["video"]["url"] == "https://signed.example.com/demo.mp4?sig=def"
+    assert "unsupported_reason" not in desc
+
+
+def test_artifact_descriptor_video_no_preview():
+    """Video artifact without viewable_previews returns stub with unsupported_reason."""
+    item = {
+        "id": "art-4",
+        "artifact_type": "COMPUTE_RESULT",
+        "logical_key": "demo.mp4",
+        "label": "Demo",
+        "task_title": "Inference run",
+        "task_status": "completed",
+    }
+    desc = _artifact_descriptor(item)
+    assert desc is not None
+    assert desc["kind"] == "video"
+    assert desc["video"]["url"] is None
+    assert "unsupported_reason" in desc
+
+
+def test_artifact_descriptor_multi_image_populates_images_list():
+    """Image artifact with multiple viewable_previews populates both image (first) and images (all)."""
+    item = {
+        "id": "art-5",
+        "artifact_type": "COMPUTE_RESULT",
+        "logical_key": "results/",
+        "label": "Training Plots",
+        "task_title": "Multi-arm run",
+        "task_status": "completed",
+        "viewable_previews": [
+            {"url": "https://signed.example.com/arm0/reward.png?sig=a1", "kind": "image", "filename": "arm0/reward.png"},
+            {"url": "https://signed.example.com/arm1/reward.png?sig=a2", "kind": "image", "filename": "arm1/reward.png"},
+            {"url": "https://signed.example.com/arm2/reward.png?sig=a3", "kind": "image", "filename": "arm2/reward.png"},
+        ],
+    }
+    desc = _artifact_descriptor(item)
+    assert desc is not None
+    assert desc["kind"] == "image"
+    assert desc["image"]["url"] == "https://signed.example.com/arm0/reward.png?sig=a1"
+    assert "unsupported_reason" not in desc
+    assert len(desc["images"]) == 3
+    assert desc["images"][0]["url"] == "https://signed.example.com/arm0/reward.png?sig=a1"
+    assert desc["images"][1]["url"] == "https://signed.example.com/arm1/reward.png?sig=a2"
+    assert desc["images"][2]["url"] == "https://signed.example.com/arm2/reward.png?sig=a3"
+    assert desc["images"][0]["filename"] == "arm0/reward.png"
+
+
+def test_artifact_descriptor_single_image_also_populates_images_list():
+    """Single-image artifact also emits images list for API consistency."""
+    item = {
+        "id": "art-6",
+        "artifact_type": "COMPUTE_RESULT",
+        "logical_key": "plot.png",
+        "label": "Plot",
+        "task_title": "Run",
+        "task_status": "completed",
+        "viewable_previews": [
+            {"url": "https://signed.example.com/plot.png?sig=abc", "kind": "image", "filename": "plot.png"},
+        ],
+    }
+    desc = _artifact_descriptor(item)
+    assert desc is not None
+    assert len(desc["images"]) == 1
+    assert desc["images"][0]["url"] == "https://signed.example.com/plot.png?sig=abc"
+
+
+def test_artifact_descriptor_multi_video_populates_videos_list():
+    """Video artifact with multiple viewable_previews populates both video (first) and videos (all)."""
+    item = {
+        "id": "art-7",
+        "artifact_type": "COMPUTE_RESULT",
+        "logical_key": "clips/",
+        "label": "Training Clips",
+        "task_title": "Video run",
+        "task_status": "completed",
+        "viewable_previews": [
+            {"url": "https://signed.example.com/clip0.mp4?sig=v1", "kind": "video", "filename": "clip0.mp4"},
+            {"url": "https://signed.example.com/clip1.mp4?sig=v2", "kind": "video", "filename": "clip1.mp4"},
+        ],
+    }
+    desc = _artifact_descriptor(item)
+    assert desc is not None
+    assert desc["kind"] == "video"
+    assert desc["video"]["url"] == "https://signed.example.com/clip0.mp4?sig=v1"
+    assert "unsupported_reason" not in desc
+    assert len(desc["videos"]) == 2
+    assert desc["videos"][0]["url"] == "https://signed.example.com/clip0.mp4?sig=v1"
+    assert desc["videos"][1]["url"] == "https://signed.example.com/clip1.mp4?sig=v2"
+    assert desc["videos"][0]["filename"] == "clip0.mp4"
+
+
+def test_artifact_descriptor_image_carries_storage_uri_for_lazy_resolution():
+    """Image descriptors expose storage_uri so the frontend can re-resolve a
+    fresh signed URL when the baked (5-minute) URL expires on an idle canvas."""
+    item = {
+        "id": "art-lazy-img",
+        "artifact_type": "COMPUTE_RESULT",
+        "logical_key": "plot.png",
+        "label": "Plot",
+        "task_title": "Run",
+        "task_status": "completed",
+        "viewable_previews": [
+            {
+                "url": "https://signed.example.com/plot.png?sig=abc",
+                "kind": "image",
+                "filename": "plot.png",
+                "storage_uri": "gs://bucket/plot.png",
+            },
+        ],
+    }
+    desc = _artifact_descriptor(item)
+    assert desc is not None
+    assert desc["image"]["storage_uri"] == "gs://bucket/plot.png"
+    assert desc["images"][0]["storage_uri"] == "gs://bucket/plot.png"
+
+
+def test_artifact_descriptor_video_carries_storage_uri_for_lazy_resolution():
+    """Video descriptors expose storage_uri for the same lazy re-resolution path."""
+    item = {
+        "id": "art-lazy-vid",
+        "artifact_type": "COMPUTE_RESULT",
+        "logical_key": "demo.mp4",
+        "label": "Demo",
+        "task_title": "Run",
+        "task_status": "completed",
+        "viewable_previews": [
+            {
+                "url": "https://signed.example.com/demo.mp4?sig=def",
+                "kind": "video",
+                "filename": "demo.mp4",
+                "storage_uri": "gs://bucket/demo.mp4",
+            },
+        ],
+    }
+    desc = _artifact_descriptor(item)
+    assert desc is not None
+    assert desc["video"]["storage_uri"] == "gs://bucket/demo.mp4"
+    assert desc["videos"][0]["storage_uri"] == "gs://bucket/demo.mp4"
+
+
+def test_artifact_descriptor_image_ref_only_is_not_unsupported():
+    """A preview with only a storage_uri (no baked url) is still resolvable, so
+    the descriptor must NOT be stubbed with unsupported_reason."""
+    item = {
+        "id": "art-ref-only",
+        "artifact_type": "COMPUTE_RESULT",
+        "logical_key": "plot.png",
+        "label": "Plot",
+        "task_title": "Run",
+        "task_status": "completed",
+        "viewable_previews": [
+            {"url": None, "kind": "image", "filename": "plot.png", "storage_uri": "gs://bucket/plot.png"},
+        ],
+    }
+    desc = _artifact_descriptor(item)
+    assert desc is not None
+    assert "unsupported_reason" not in desc
+    assert desc["image"]["storage_uri"] == "gs://bucket/plot.png"
+
+
+
+
+@pytest.mark.asyncio
+async def test_load_strategic_context_evidence_artifact_viewable_files(db_session):
+    """An artifact with viewable_files in its logs yields viewable_previews with signed URLs."""
+    project = Project(name="ViewableTest", user_id=TEST_USER_ID)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="compute task",
+        status="completed",
+        payloads=[{"type": "research", "prompt": "test"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = {
+        "compute_job_id": "job-1",
+        "viewable_files": [
+            {"filename": "plot.png", "storage_uri": "gs://bucket/obj1", "kind": "image", "content_type": "image/png"},
+            {"filename": "video.mp4", "storage_uri": "gs://bucket/obj2", "kind": "video", "content_type": "video/mp4"},
+        ],
+    }
+    artifact = Artifact(
+        task_id=task.id,
+        artifact_type="COMPUTE_RESULT",
+        storage_uri="gs://bucket/result",
+        logs=json.dumps(logs),
+    )
+    db_session.add(artifact)
+    await db_session.commit()
+    await db_session.refresh(artifact)
+
+    with (
+        patch("app.strategic_context_package.verify_artifact_project_ownership") as mock_verify,
+        patch("app.strategic_context_package.generate_download_signed_url") as mock_sign,
+    ):
+        mock_verify.return_value = None  # ownership check passes
+        mock_sign.side_effect = [
+            "https://signed-url/plot.png?token=abc",
+            "https://signed-url/video.mp4?token=def",
+        ]
+        result = await load_strategic_context_evidence(db_session, project.id)
+
+    artifacts = result["artifacts"]["items"]
+    assert len(artifacts) == 1
+    item = artifacts[0]
+    # No-leak contract (test_strategic_state.py): the raw gs:// reference must
+    # never ride on the item — only the signed, transient URLs do.
+    assert "storage_uri" not in item
+    assert "viewable_previews" in item
+    assert len(item["viewable_previews"]) == 2
+    assert item["viewable_previews"][0] == {
+        "url": "https://signed-url/plot.png?token=abc",
+        "kind": "image",
+        "filename": "plot.png",
+        "storage_uri": "gs://bucket/obj1",
+    }
+    assert item["viewable_previews"][1] == {
+        "url": "https://signed-url/video.mp4?token=def",
+        "kind": "video",
+        "filename": "video.mp4",
+        "storage_uri": "gs://bucket/obj2",
+    }
+    assert mock_verify.call_count == 2
+    assert mock_sign.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_load_strategic_context_evidence_artifact_ownership_failure_skips_file(db_session):
+    """When ownership verification fails for a viewable file, that file is skipped."""
+    project = Project(name="OwnFail", user_id=TEST_USER_ID)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="compute task",
+        status="completed",
+        payloads=[{"type": "research", "prompt": "test"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = {
+        "compute_job_id": "job-2",
+        "viewable_files": [
+            {"filename": "safe.png", "storage_uri": "gs://bucket/safe", "kind": "image"},
+            {"filename": "evil.png", "storage_uri": "gs://bucket/evil", "kind": "image"},
+        ],
+    }
+    artifact = Artifact(
+        task_id=task.id,
+        artifact_type="COMPUTE_RESULT",
+        storage_uri="gs://bucket/result",
+        logs=json.dumps(logs),
+    )
+    db_session.add(artifact)
+    await db_session.commit()
+    await db_session.refresh(artifact)
+
+    with (
+        patch("app.strategic_context_package.verify_artifact_project_ownership") as mock_verify,
+        patch("app.strategic_context_package.generate_download_signed_url") as mock_sign,
+    ):
+        # First file passes, second file fails ownership
+        mock_verify.side_effect = [None, Exception("ownership violation")]
+        mock_sign.return_value = "https://signed-url/safe.png?token=abc"
+        result = await load_strategic_context_evidence(db_session, project.id)
+
+    artifacts = result["artifacts"]["items"]
+    assert len(artifacts) == 1
+    item = artifacts[0]
+    assert "viewable_previews" in item
+    assert len(item["viewable_previews"]) == 1
+    assert item["viewable_previews"][0]["filename"] == "safe.png"
+    assert mock_verify.call_count == 2
+    assert mock_sign.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_load_strategic_context_evidence_artifact_no_logs(db_session):
+    """An artifact with no logs builds the item dict without viewable_previews."""
+    project = Project(name="NoLogs", user_id=TEST_USER_ID)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="plain task",
+        status="completed",
+        payloads=[{"type": "research", "prompt": "test"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    artifact = Artifact(
+        task_id=task.id,
+        artifact_type="COMPUTE_RESULT",
+        storage_uri="gs://bucket/result",
+        logs=None,
+    )
+    db_session.add(artifact)
+    await db_session.commit()
+    await db_session.refresh(artifact)
+
+    result = await load_strategic_context_evidence(db_session, project.id)
+    artifacts = result["artifacts"]["items"]
+    assert len(artifacts) == 1
+    item = artifacts[0]
+    # No-leak contract: the raw gs:// reference never rides on the item.
+    assert "storage_uri" not in item
+    assert "viewable_previews" not in item

@@ -856,6 +856,25 @@ class TestNormalizeAgentFailureCategory:
         )
         assert classify_failure(task) == PROVISION_FAILURE
 
+    def test_runtime_unavailable_routes_to_provision_failure(self):
+        """Agent emits runtime_unavailable when a required CLI binary (e.g. codex)
+        is absent from PATH — infra decline, not a code defect.
+        Must route to PROVISION_FAILURE so it requeues without burning retry budget."""
+        task = _task("runtime_unavailable:codex")
+        assert (
+            normalize_agent_failure_category("runtime_unavailable", task)
+            == PROVISION_FAILURE
+        )
+
+    def test_runtime_unavailable_via_classify_failure_context_fast_path(self):
+        """End-to-end: classify_failure sees runtime_unavailable in context
+        and routes to PROVISION_FAILURE without falling through to text classification."""
+        task = _task(
+            "runtime_unavailable:codex",
+            {"failure_category": "runtime_unavailable"},
+        )
+        assert classify_failure(task) == PROVISION_FAILURE
+
     def test_vm_config_missing_routes_to_provision_failure(self):
         """Agent emits vm_config_missing when the provider CLI died because a
         boot/retarget-materialized config file is gone from the VM (Claude CLI

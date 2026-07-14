@@ -7,6 +7,8 @@ omits heavy fields such as knowledge bodies and artifact logs.
 
 from __future__ import annotations
 
+import json
+import logging
 import uuid
 from typing import Any, Dict, List
 
@@ -26,7 +28,14 @@ from app.models import (
     StrategicCycle,
     Task,
 )
+from app.storage import (
+    generate_download_signed_url,
+    verify_artifact_project_ownership,
+    viewable_content_type_for_filename,
+)
 from app.workbench_contracts import normalize_target
+
+logger = logging.getLogger(__name__)
 
 
 def _compact_text(value: Any, *, max_chars: int = 360) -> str | None:
@@ -630,6 +639,125 @@ def selected_ref_descriptor(
     return descriptor
 
 
+_PREVIEW_SIGNED_URL_MINUTES = 5
+
+
+async def _resolve_viewable_previews(
+    session: AsyncSession,
+    project_id,
+    artifact: Artifact,
+) -> List[Dict[str, Any]]:
+    """Mint short-lived signed preview URLs for an evidence artifact's viewables.
+
+    Two shapes resolve:
+
+    * viewable files (images/videos) recorded in the artifact's ``logs``
+      manifest (``viewable_files``, stamped at terminal compute-job linkage) —
+      each entry is independently verified for project ownership and
+      re-validated against the viewable-extension allowlist (no svg — script
+      execution via a signed URL), with a stamped ``kind`` that must match the
+      filename's classification;
+    * the Artifact's own ``storage_uri`` when it is itself an allowlisted
+      image/video object (e.g. a screenshot artifact).
+
+    The signed URLs are minted HERE — at the async evidence-load boundary — and
+    exist only in the in-flight context-package response. They are never
+    persisted: the strategic-session snapshot seam
+    (``workbench_state.sanitize_strategic_session_snapshot`` /
+    ``_sanitize_ref_descriptor``) allowlists {kind,id,label,summary,status,
+    target} and structurally drops image/video/preview payloads, and knowledge
+    evidence rules (``knowledge_completion``) already reject bare http(s)
+    citations — signed URLs stay transient helpers, never durable evidence.
+    The raw ``gs://`` object reference DOES ride along on each preview as
+    ``storage_uri`` so the frontend can lazily re-resolve a fresh signed URL
+    when a preview's short-lived signature expires; it is scrubbed from the
+    durable workbench projection at the snapshot seam
+    (``_sanitize_ref_descriptor``), so it never becomes persisted evidence.
+
+    Fail-soft everywhere: an ownership violation or signing failure skips that
+    one file, and any parse error degrades to the metadata-only stub — a
+    preview must never break the whole evidence package.
+    """
+    previews: List[Dict[str, Any]] = []
+
+    # The Artifact's own object, when directly viewable. No per-file ownership
+    # re-check needed: the artifact row itself came from the project-scoped
+    # evidence query.
+    direct = artifact.storage_uri if isinstance(artifact.storage_uri, str) else None
+    direct_classified = (
+        viewable_content_type_for_filename(direct) if direct else None
+    )
+    if direct and direct_classified is not None:
+        _content_type, direct_kind = direct_classified
+        try:
+            url = await generate_download_signed_url(
+                direct, expiration_minutes=_PREVIEW_SIGNED_URL_MINUTES
+            )
+        except Exception:  # noqa: BLE001 — fail-soft to the metadata-only stub
+            url = None
+        if url:
+            previews.append(
+                {
+                    "url": url,
+                    "storage_uri": direct,
+                    "kind": direct_kind,
+                    "filename": direct.rsplit("/", 1)[-1],
+                }
+            )
+
+    if not artifact.logs:
+        return previews
+    try:
+        logs_data = (
+            json.loads(artifact.logs)
+            if isinstance(artifact.logs, str)
+            else artifact.logs
+        )
+        viewable_files = (
+            logs_data.get("viewable_files", [])
+            if isinstance(logs_data, dict)
+            else []
+        )
+        for vf in viewable_files:
+            if not isinstance(vf, dict):
+                continue
+            vf_storage_uri = vf.get("storage_uri")
+            vf_kind = vf.get("kind", "image")
+            vf_filename = vf.get("filename", "")
+            if not vf_storage_uri or not isinstance(vf_storage_uri, str):
+                continue
+            # Defense in depth: only allowlisted-extension files whose stamped
+            # kind matches the filename's classification are ever signed — a
+            # manifest entry naming an svg (or misdeclaring its kind) is
+            # skipped even if one was somehow persisted.
+            classified = viewable_content_type_for_filename(vf_filename)
+            if classified is None or classified[1] != vf_kind:
+                continue
+            try:
+                await verify_artifact_project_ownership(
+                    vf_storage_uri, project_id, session
+                )
+                signed_url = await generate_download_signed_url(
+                    vf_storage_uri,
+                    expiration_minutes=_PREVIEW_SIGNED_URL_MINUTES,
+                )
+                previews.append(
+                    {
+                        "url": signed_url,
+                        "storage_uri": vf_storage_uri,
+                        "kind": vf_kind,
+                        "filename": vf_filename,
+                    }
+                )
+            except Exception:  # noqa: BLE001 — ownership violation or signing
+                # failure — skip this file so it degrades gracefully rather
+                # than breaking the whole evidence package.
+                continue
+    except (json.JSONDecodeError, TypeError, ValueError):
+        pass
+    return previews
+
+
 async def load_strategic_context_evidence(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -689,10 +817,13 @@ async def load_strategic_context_evidence(
                     raiseload=True,
                 )
             )
-            .where(KnowledgeDocument.project_id == project_id)
+            .where(
+                KnowledgeDocument.project_id == project_id,
+                KnowledgeDocument.lifecycle_status == "pending",
+            )
             .order_by(
-                KnowledgeDocument.updated_at.desc(),
-                KnowledgeDocument.created_at.desc(),
+                KnowledgeDocument.updated_at.asc(),
+                KnowledgeDocument.created_at.asc(),
             )
             .limit(4)
         )
@@ -734,6 +865,7 @@ async def load_strategic_context_evidence(
                     Artifact.pr_url,
                     Artifact.storage_uri,
                     Artifact.logical_key,
+                    Artifact.logs,
                     Artifact.created_at,
                     raiseload=True,
                 )
@@ -797,29 +929,41 @@ async def load_strategic_context_evidence(
             or artifact_type
             or "Artifact"
         )
-        artifact_items.append(
-            _with_target(
-                {
-                    "id": str(artifact.id),
-                    "kind": context_kind,
-                    "label": _compact_text(label, max_chars=100),
-                    "artifact_type": _compact_text(artifact_type, max_chars=80),
-                    "has_logs": bool(has_logs),
-                    "task_id": str(task_id) if task_id else None,
-                    "task_title": _compact_text(task_title, max_chars=120),
-                    "task_status": getattr(task_status, "value", task_status),
-                    "logical_key": _compact_text(artifact.logical_key, max_chars=160),
-                    "created_at": artifact.created_at.isoformat()
-                    if artifact.created_at
-                    else None,
-                },
-                {
-                    "surface": "task",
-                    "task_id": str(task_id) if task_id else None,
-                    "artifact_id": str(artifact.id),
-                },
-            )
+        item = _with_target(
+            {
+                "id": str(artifact.id),
+                "kind": context_kind,
+                "label": _compact_text(label, max_chars=100),
+                "artifact_type": _compact_text(artifact_type, max_chars=80),
+                "has_logs": bool(has_logs),
+                "task_id": str(task_id) if task_id else None,
+                "task_title": _compact_text(task_title, max_chars=120),
+                "task_status": getattr(task_status, "value", task_status),
+                "logical_key": _compact_text(artifact.logical_key, max_chars=160),
+                "created_at": artifact.created_at.isoformat()
+                if artifact.created_at
+                else None,
+            },
+            {
+                "surface": "task",
+                "task_id": str(task_id) if task_id else None,
+                "artifact_id": str(artifact.id),
+            },
         )
+        # Mint short-lived signed preview URLs for the artifact's viewable
+        # files (bounded: at most the 4 evidence rows above). The signed URLs
+        # are minted at THIS async load boundary and live only in the
+        # in-flight response — see _resolve_viewable_previews for the
+        # never-persist reasoning. Each preview also carries its raw
+        # storage_uri so the frontend can lazily re-resolve an expired signed
+        # URL; the snapshot seam scrubs it from the durable projection so it
+        # never leaks into persisted evidence (test_strategic_state.py).
+        viewable_previews = await _resolve_viewable_previews(
+            session, project_id, artifact
+        )
+        if viewable_previews:
+            item["viewable_previews"] = viewable_previews
+        artifact_items.append(item)
 
     return {
         "knowledge": {
@@ -1100,6 +1244,11 @@ def _artifact_renderable_kind(artifact: Dict[str, Any]) -> str:
         for token in ["image", ".png", ".jpg", ".jpeg", ".webp", ".gif"]
     ):
         return "image"
+    if any(
+        token in fingerprint
+        for token in ["video", ".mp4", ".webm", ".mov"]
+    ):
+        return "video"
     if any(token in fingerprint for token in ["chart", "plot", "graph"]):
         return "chart"
     if any(
@@ -1116,7 +1265,26 @@ def _artifact_descriptor(artifact: Dict[str, Any]) -> Dict[str, Any] | None:
     artifact_id = _compact_text(artifact.get("id"), max_chars=120)
     if not artifact_id:
         return None
-    kind = _artifact_renderable_kind(artifact)
+    # Resolved previews (signed URLs minted at evidence-load time — see
+    # _resolve_viewable_previews) decide the renderable kind directly, so a
+    # compute-result bundle whose manifest recorded a plot/video renders it
+    # inline; without any, fall back to the fingerprint heuristic (old
+    # behavior, incl. the image stub for image-looking artifacts with no
+    # signable object).
+    raw_previews = artifact.get("viewable_previews")
+    previews = [
+        p
+        for p in (raw_previews if isinstance(raw_previews, list) else [])
+        if isinstance(p, dict) and (p.get("url") or p.get("storage_uri"))
+    ]
+    image_url = next((p.get("url") for p in previews if p.get("kind") == "image"), None)
+    video_url = next((p.get("url") for p in previews if p.get("kind") == "video"), None)
+    if image_url:
+        kind = "image"
+    elif video_url:
+        kind = "video"
+    else:
+        kind = _artifact_renderable_kind(artifact)
     title = (
         _compact_text(artifact.get("label"), max_chars=90)
         or _compact_text(artifact.get("artifact_type"), max_chars=90)
@@ -1150,10 +1318,48 @@ def _artifact_descriptor(artifact: Dict[str, Any]) -> Dict[str, Any] | None:
         )
         descriptor["language"] = "text"
     elif kind == "image":
-        descriptor["image"] = {"url": None, "alt": title}
-        descriptor[
-            "unsupported_reason"
-        ] = "Image artifact previews require a signed preview URL."
+        # OUR filter wins: ``previews`` (top of function) is already restricted
+        # to signed-URL previews (svg/kind-mismatch dropped by
+        # _resolve_viewable_previews). Adopt engine's multi-image gallery list,
+        # built from that filtered set — emits url/alt/filename only, never a
+        # raw storage_uri.
+        image_previews = [p for p in previews if p.get("kind") == "image"] or previews
+        url = image_url or (image_previews[0].get("url") if image_previews else None)
+        primary_storage_uri = image_previews[0].get("storage_uri") if image_previews else None
+        descriptor["image"] = {"url": url, "alt": title, "storage_uri": primary_storage_uri}
+        descriptor["images"] = [
+            {
+                "url": p.get("url"),
+                "alt": p.get("filename") or title,
+                "filename": p.get("filename"),
+                "storage_uri": p.get("storage_uri"),
+            }
+            for p in image_previews
+        ]
+        if not url and not primary_storage_uri:
+            descriptor[
+                "unsupported_reason"
+            ] = "Image artifact previews require a signed preview URL."
+    elif kind == "video":
+        # OUR filtered ``previews`` (signed-URL-only) + engine's multi-video
+        # gallery list; url/alt/filename only, never a raw storage_uri.
+        video_previews = [p for p in previews if p.get("kind") == "video"] or previews
+        url = video_url or (video_previews[0].get("url") if video_previews else None)
+        primary_storage_uri = video_previews[0].get("storage_uri") if video_previews else None
+        descriptor["video"] = {"url": url, "alt": title, "storage_uri": primary_storage_uri}
+        descriptor["videos"] = [
+            {
+                "url": p.get("url"),
+                "alt": p.get("filename") or title,
+                "filename": p.get("filename"),
+                "storage_uri": p.get("storage_uri"),
+            }
+            for p in video_previews
+        ]
+        if not url and not primary_storage_uri:
+            descriptor[
+                "unsupported_reason"
+            ] = "Video artifact previews require a signed preview URL."
     elif kind == "chart":
         descriptor["chart"] = {
             "kind": "bar",

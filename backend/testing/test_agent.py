@@ -12,6 +12,7 @@ from httpx import AsyncClient
 from sqlalchemy import select
 from app.database import get_session
 from app.main import app
+from testing.conftest import USE_POSTGRES
 from app.models import (
     Artifact,
     ArtifactType,
@@ -504,6 +505,130 @@ async def test_agent_claim_omits_reservation_when_none(client: AsyncClient, db_s
 
     assert resp.status_code == 200
     assert "migration_reservation" not in resp.json()
+
+
+@pytest.mark.asyncio
+async def test_agent_claim_scoped_to_token_sub_prevents_cross_claim(
+    client: AsyncClient, db_session,
+):
+    """
+    When multiple QUEUED/PROVISIONING tasks share the same vm_instance_id
+    (e.g. local-runner concurrent tasks all pinned to "runner:<id>"), claim_task
+    must scope the primary SELECT by the token's ``sub`` (task id) so an agent
+    whose token authorizes Task A does not accidentally claim Task B. Without
+    this scoping, the vm_instance_id-only SELECT returns whichever row FOR UPDATE
+    SKIP LOCKED picks first, causing every subsequent task-scoped call to 403
+    with "Task ID mismatch" and the agent self-terminates.
+    """
+    project = Project(name="Cross-Claim Guard", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    shared_vm = "runner:test-123"
+
+    task_a = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "task_a"}],
+        vm_instance_id=shared_vm,
+        status=TaskStatus.PROVISIONING,
+    )
+    db_session.add(task_a)
+    await db_session.commit()
+    await db_session.refresh(task_a)
+
+    task_b = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "task_b"}],
+        vm_instance_id=shared_vm,
+        status=TaskStatus.PROVISIONING,
+    )
+    db_session.add(task_b)
+    await db_session.commit()
+    await db_session.refresh(task_b)
+
+    # Token scoped to task_b — claim must return task_b, not task_a
+    token = create_agent_token(str(task_b.id), shared_vm)
+    headers = {"x-agent-token": token}
+    resp = await client.post("/api/agent/claim", headers=headers)
+
+    assert resp.status_code == 200
+    claimed_id = resp.json()["task_id"]
+    assert claimed_id == str(task_b.id), (
+        f"Claim returned task {claimed_id} instead of the token's task {task_b.id}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_claim_returns_409_when_jwt_task_is_terminal(
+    client: AsyncClient, db_session
+):
+    """When the JWT's task exists but is terminal (cancelled/reaped/doomed),
+    claim must return 409 — not 404 and not a different task.
+
+    Regression: before the scoping fix, claim returned a DIFFERENT task (the
+    oldest pinned sibling). After the scoping fix, it now correctly checks only
+    the JWT's task; when that task is no longer claimable the response should be
+    409 so the agent knows to stop retrying rather than treating it as a routing
+    error.
+    """
+    project = Project(name="Claim Terminal 409", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    shared_vm = "runner:term-409-test"
+
+    # Older task pinned to the same runner — still claimable.
+    task_old = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "old"}],
+        vm_instance_id=shared_vm,
+        status=TaskStatus.PROVISIONING,
+    )
+    db_session.add(task_old)
+    await db_session.commit()
+    await db_session.refresh(task_old)
+
+    # Newer task pinned to the same runner — starts PROVISIONING, then goes terminal.
+    task_new = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "new"}],
+        vm_instance_id=shared_vm,
+        status=TaskStatus.PROVISIONING,
+    )
+    db_session.add(task_new)
+    await db_session.commit()
+    await db_session.refresh(task_new)
+
+    # JWT is scoped to the newer task.
+    token = create_agent_token(str(task_new.id), shared_vm)
+    headers = {"x-agent-token": token}
+
+    # Sanity: before the task moves off PROVISIONING, claim succeeds and returns the newer task.
+    resp = await client.post("/api/agent/claim", headers=headers)
+    assert resp.status_code == 200
+    assert resp.json()["task_id"] == str(task_new.id)
+
+    # Now move the newer task to EVALUATING (non-terminal, so verify_agent_token
+    # passes, but no longer QUEUED/PROVISIONING and outside the IN_PROGRESS
+    # idempotency window — simulates a task that was claimed and then handed to
+    # evaluation, after which the agent's retry must not grab the older sibling).
+    task_new.status = TaskStatus.EVALUATING
+    # Clear the heartbeat so the IN_PROGRESS idempotency replay window doesn't fire.
+    task_new.last_heartbeat = _utcnow() - timedelta(minutes=10)
+    db_session.add(task_new)
+    await db_session.commit()
+
+    # The JWT still has the newer task's sub. Claim must return 409, not 404
+    # (task exists but not claimable) and not 200 (must not return the older task).
+    resp2 = await client.post("/api/agent/claim", headers=headers)
+    assert resp2.status_code == 409, (
+        f"Expected 409 for non-claimable task but got {resp2.status_code}: {resp2.text}"
+    )
+    # The older pinned task must remain untouched.
+    await db_session.refresh(task_old)
+    assert task_old.status == TaskStatus.PROVISIONING
 
 
 @pytest.mark.asyncio
@@ -1402,9 +1527,10 @@ async def test_agent_claim_retry_is_idempotent(client: AsyncClient, db_session):
 @pytest.mark.asyncio
 async def test_agent_claim_idempotent_replay_expires(client: AsyncClient, db_session):
     """
-    Idempotent replay only fires within ~3 min of the original claim. Beyond
-    that window a stray claim from the same VM is a real anomaly and should
-    404, not silently re-serve a task whose agent may have long since died.
+    Idempotent replay only fires within 5 min of the original claim. Beyond
+    that window a stray claim from the same VM is a real anomaly. The task
+    exists (IN_PROGRESS) but is no longer claimable — this returns 409 (task
+    exists but not claimable), not 404 (task not found / not pinned here).
     """
     project = Project(name="Claim Replay Expiry", user_id="test-user-123")
     db_session.add(project)
@@ -1426,7 +1552,7 @@ async def test_agent_claim_idempotent_replay_expires(client: AsyncClient, db_ses
     token = create_agent_token(str(task.id), "agent-vm-stale-replay")
     headers = {"x-agent-token": token}
     resp = await client.post("/api/agent/claim", headers=headers)
-    assert resp.status_code == 404
+    assert resp.status_code == 409
 
 
 @pytest.mark.asyncio
@@ -1594,6 +1720,245 @@ async def test_agent_heartbeat_upserts_vm_contact_tool_use(
     contact3 = await db_session.get(VmContact, vm_id)
     assert contact3.last_tool_use_at is not None
     assert contact3.last_tool_use_at >= recorded
+
+
+@pytest.mark.asyncio
+async def test_agent_heartbeat_malformed_tool_trace_t_does_not_advance_progress(
+    client: AsyncClient, db_session
+):
+    """A tool_trace tail whose ``t`` is not ISO-8601 must advance NEITHER progress
+    stamp.
+
+    ``ToolTraceEntry.t`` is a free-form ``str``, so a malformed tail reaches
+    ``_parse_latest_tool_use_at``. It used to return ``_utcnow()`` there —
+    FABRICATING a tool-use "now" out of a value that proves no progress at all.
+    That stamp was written to ``Task.last_tool_use_at`` AND (monotonically, via
+    GREATEST — hence unrecoverably) to ``VmContact.last_tool_use_at``, and every
+    heartbeat re-fabricated it, so a wedged agent with a malformed trace tail
+    could NEVER be progress-stall reaped. Absent is safe; fabricated is not.
+    """
+    from app.models import VmContact
+
+    project = Project(name="Malformed Tool Trace", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    vm_id = "agent-vm-malformed-t"
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id=vm_id,
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), vm_id)
+    headers = {"x-agent-token": token}
+
+    # Tail carries a non-ISO ``t`` (the free-form-str hole).
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={
+            "task_id": str(task.id),
+            "status_message": "wedged",
+            "tool_trace": [
+                {"t": "not-a-timestamp", "tool": "Bash", "input_preview": "ls"}
+            ],
+        },
+        headers=headers,
+    )
+    # Never crash a heartbeat on a bad telemetry value.
+    assert resp.status_code == 200
+
+    # Off-row progress stamp untouched (the row exists — contact WAS recorded).
+    contact = await db_session.get(VmContact, vm_id)
+    assert contact is not None
+    assert contact.last_contact_at is not None, "liveness contact still recorded"
+    assert contact.last_tool_use_at is None, (
+        "a malformed tool_trace tail must NOT fabricate an off-row progress "
+        "stamp — the GREATEST upsert makes a poisoned value unrecoverable"
+    )
+
+    # On-row progress stamp untouched.
+    await db_session.refresh(task)
+    assert task.last_tool_use_at is None, (
+        "a malformed tool_trace tail must NOT fabricate Task.last_tool_use_at — "
+        "that blinds the reaper's progress-stall watchdog forever"
+    )
+
+    # A well-formed tail still lands (the fix is scoped to the parse failure).
+    db_session.expire(contact)
+    good = (_utcnow() - timedelta(seconds=15)).isoformat()
+    resp2 = await client.post(
+        "/api/agent/heartbeat",
+        json={
+            "task_id": str(task.id),
+            "tool_trace": [{"t": good, "tool": "Read", "input_preview": "x"}],
+        },
+        headers=headers,
+    )
+    assert resp2.status_code == 200
+    await db_session.refresh(task)
+    assert task.last_tool_use_at is not None
+    contact2 = await db_session.get(VmContact, vm_id)
+    assert contact2.last_tool_use_at is not None
+
+
+def test_parse_latest_tool_use_at_returns_none_on_malformed_tail():
+    """Unit: the parser returns None (not a fabricated _utcnow()) for an
+    unparseable tail, and still parses a valid ISO-8601 one."""
+    from app.routers.agent import _parse_latest_tool_use_at
+    from app.schemas import ToolTraceEntry
+
+    assert _parse_latest_tool_use_at(None) is None
+    assert _parse_latest_tool_use_at([]) is None
+
+    bad = [ToolTraceEntry(t="garbage", tool="Bash", input_preview="ls")]
+    assert _parse_latest_tool_use_at(bad) is None, (
+        "unparseable tail must yield None so both progress stamps stay untouched"
+    )
+    empty_t = [ToolTraceEntry(t="", tool="Bash", input_preview="ls")]
+    assert _parse_latest_tool_use_at(empty_t) is None
+
+    stamp = _utcnow().replace(microsecond=0)
+    good = [
+        ToolTraceEntry(
+            t=stamp.isoformat() + "Z", tool="Bash", input_preview="ls"
+        )
+    ]
+    parsed = _parse_latest_tool_use_at(good)
+    assert parsed == stamp, "valid ISO-8601 (incl. trailing Z) still parses to naive UTC"
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_writes_task_scoped_contact_on_multiplexed_runner(
+    client: AsyncClient, db_session
+):
+    """Multiplexed-runner zombie fix (writer side). A fleet runner pins MANY tasks
+    to ONE vm_instance_id ('runner:<id>'), so the vmcontact row is SHARED and its
+    last_tool_use_at is advanced by ANY agent on that runner (func.greatest). This
+    is what let a working sibling mask a hung agent's stall forever.
+
+    The heartbeat must therefore ALSO write a TASK-scoped taskcontact row, so the
+    two co-resident tasks end up with INDEPENDENT progress stamps: the working
+    sibling's tool calls advance the shared row and its OWN row, while the hung
+    task's row keeps a NULL/stale last_tool_use_at — which is exactly the signal
+    the reaper needs to reap it."""
+    from app.models import TaskContact, VmContact
+
+    project = Project(name="Runner Task Contact", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    runner_vm = "runner:1111-2222"
+    hung = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id=runner_vm,
+        status=TaskStatus.IN_PROGRESS,
+    )
+    working = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id=runner_vm,  # SAME vm id — the multiplexing that causes the bug
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(hung)
+    db_session.add(working)
+    await db_session.commit()
+    await db_session.refresh(hung)
+    await db_session.refresh(working)
+
+    # The hung agent heartbeats but calls NO tools (wedged LLM call / spin loop).
+    hung_headers = {"x-agent-token": create_agent_token(str(hung.id), runner_vm)}
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={"task_id": str(hung.id), "status_message": "still alive"},
+        headers=hung_headers,
+    )
+    assert resp.status_code == 200
+
+    # The healthy sibling heartbeats WITH fresh tool calls.
+    working_headers = {"x-agent-token": create_agent_token(str(working.id), runner_vm)}
+    recent = (_utcnow() - timedelta(seconds=10)).isoformat()
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={
+            "task_id": str(working.id),
+            "tool_trace": [{"t": recent, "tool": "Bash", "input_preview": "ls"}],
+        },
+        headers=working_headers,
+    )
+    assert resp.status_code == 200
+
+    # The SHARED vmcontact row is polluted by the sibling — this is the bug's
+    # mechanism, and it is preserved (other consumers still rely on this row).
+    shared = await db_session.get(VmContact, runner_vm)
+    assert shared is not None
+    assert shared.last_tool_use_at is not None, (
+        "the shared row carries the sibling's tool use — this is exactly the "
+        "signal that used to mask the hung task"
+    )
+
+    # But the TASK-scoped rows are independent, which is what breaks the mask.
+    hung_row = await db_session.get(TaskContact, hung.id)
+    working_row = await db_session.get(TaskContact, working.id)
+
+    assert hung_row is not None, (
+        "every heartbeat must write a task-scoped row (not only tool-bearing ones) "
+        "— absence would make the reaper fall back to the shared, masked row"
+    )
+    assert hung_row.last_contact_at is not None  # it IS alive and heartbeating
+    assert hung_row.last_tool_use_at is None, (
+        "the hung task made no tool calls: its OWN progress stamp must stay NULL "
+        "even though its sibling advanced the shared vmcontact row"
+    )
+
+    assert working_row is not None
+    assert working_row.last_tool_use_at is not None, (
+        "the working sibling's own progress stamp carries its tool use"
+    )
+
+
+@pytest.mark.asyncio
+async def test_task_contact_failure_does_not_lose_vm_contact_write(db_session):
+    """A taskcontact-only failure must NOT take the shared vmcontact write down.
+
+    The two upserts share one session. ``taskcontact.task_id`` REFERENCES task(id)
+    (``vmcontact`` has no FK and is immune), so a task row purged mid-flight makes
+    the taskcontact INSERT raise an FK violation — which, in one un-nested
+    transaction, poisons the whole thing and drops the vmcontact write too. That
+    would lose the lock-starvation liveness signal for that beat, i.e. this fix
+    could CAUSE a false-reap of a live agent on the very path it exists to protect.
+
+    The SAVEPOINT must scope the damage to the task-scoped row. Exercises the real
+    Postgres path with a task_id that does not exist in ``task``."""
+    import uuid as _uuid
+
+    from app.models import TaskContact, VmContact
+    from app.routers.agent import _record_vm_contact
+
+    runner_vm = "runner:savepoint-isolation"
+    ghost_task_id = _uuid.uuid4()  # never inserted → FK violation on taskcontact
+
+    # Must not raise: the whole function is best-effort.
+    await _record_vm_contact(runner_vm, None, task_id=ghost_task_id)
+
+    contact = await db_session.get(VmContact, runner_vm)
+    assert contact is not None, (
+        "the shared vmcontact row MUST still be committed even though the "
+        "task-scoped write failed — otherwise a taskcontact FK violation silently "
+        "destroys the liveness signal the reaper's false-reap guard depends on"
+    )
+    assert contact.last_contact_at is not None
+
+    assert await db_session.get(TaskContact, ghost_task_id) is None, (
+        "the failed task-scoped write must have been rolled back to the savepoint"
+    )
 
 
 @pytest.mark.asyncio
@@ -14235,7 +14600,7 @@ async def test_agent_github_check_runs_validates_commit_sha(
         "app.routers.agent.get_github_token_for_task", new=AsyncMock()
     )
     get_check_runs_mock = mocker.patch(
-        "app.routers.agent_github.get_check_runs", new=AsyncMock()
+        "app.routers.agent_github.get_check_runs_cached", new=AsyncMock()
     )
 
     token = create_agent_token(str(task.id), "agent-vm-check-runs-1")
@@ -14274,7 +14639,7 @@ async def test_agent_github_check_runs_response_omits_raw_token(
         new=AsyncMock(return_value=("secret-gh-token", "acme", "widget")),
     )
     get_check_runs_mock = mocker.patch(
-        "app.routers.agent_github.get_check_runs",
+        "app.routers.agent_github.get_check_runs_cached",
         new=AsyncMock(
             return_value={
                 "status": "completed",
@@ -14313,11 +14678,16 @@ async def test_agent_github_check_runs_response_omits_raw_token(
         ],
     }
     assert "token" not in body["data"]
+    # The proxy goes through the CACHED helper and explicitly opts OUT of the
+    # failure-log fan-out (3-10+ extra GitHub calls on a red sha, whose output this
+    # handler discards). Both are budget-load-bearing on an endpoint every agent
+    # polls, so pin them here.
     get_check_runs_mock.assert_awaited_once_with(
         token="secret-gh-token",
         owner="acme",
         repo="widget",
-        ref="deadbeef",
+        head_sha="deadbeef",
+        include_failed_logs=False,
     )
 
 
@@ -16129,19 +16499,24 @@ async def test_smoketest_plan_spawn_retries_on_transient_error(
     mocker.patch.object(_spawn_mod, "_recover_poisoned_session", _recover_and_report)
     mocker.patch.object(db_session, "flush", _patched_flush)
 
+    # Snapshot the pk before the call: the recovery path under test rolls the
+    # session back, expiring ``task`` — a ``task.id`` read afterwards would
+    # lazy-load synchronously and raise MissingGreenlet on the async engine.
+    task_pk = task.id
+
     payload = AgentStatusPayload(
-        task_id=str(task.id),
+        task_id=str(task_pk),
         status=TaskStatus.FAILED,
         artifact_type=ArtifactType.SMOKETEST_RESULT,
         logs=_json.dumps(smoketest_payload),
     )
 
-    await _spawn_mod.maybe_spawn_smoketest_fix(task, payload, db_session, str(task.id))
+    await _spawn_mod.maybe_spawn_smoketest_fix(task, payload, db_session, str(task_pk))
     await db_session.commit()
 
     # The retry should have produced exactly one plan task.
     result = await db_session.execute(
-        select(Task).where(Task.parent_task_id == task.id)
+        select(Task).where(Task.parent_task_id == task_pk)
     )
     spawned = result.scalars().all()
     assert len(spawned) == 1, (
@@ -16172,7 +16547,7 @@ async def test_smoketest_plan_spawn_retries_on_transient_error(
 
     alert_result = await db_session.execute(
         _select(Alert).where(
-            Alert.task_id == task.id,
+            Alert.task_id == task_pk,
             Alert.title.like("%spawn failed%"),
         )
     )
@@ -23850,6 +24225,9 @@ async def test_agent_status_compute_terminal_before_park_callback_finalizes_once
     db_session.add(job)
     await db_session.commit()
     await db_session.refresh(job)
+    # Snapshot before the expire_all below: reading ``job.id`` on the expired
+    # instance would lazy-load synchronously → MissingGreenlet on async engine.
+    job_pk_str = str(job.id)
 
     # No wake registration exists yet — the monitor fired nothing (lost-wakeup window).
     pre_regs = (await db_session.execute(select(TaskWakeRegistration))).scalars().all()
@@ -23895,7 +24273,7 @@ async def test_agent_status_compute_terminal_before_park_callback_finalizes_once
     )
     assert reg.fired_at is not None
     assert reg.wake_source_kind == COMPUTE_JOB_TERMINAL_WAKE_KIND
-    assert reg.wake_source_ref == str(job.id)
+    assert reg.wake_source_ref == job_pk_str
 
     # The leader sweep finalizes the parked task exactly once.
     delivered = await sweep_deliver_task_wakes(db_session, _utcnow())
@@ -26006,6 +26384,12 @@ async def test_admin_viewport_shots_download_url_firebase_user_returns_json(
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(
+    not USE_POSTGRES,
+    reason="the sibling-poisoning fault (rollback expires shared ORM rows, then "
+    "raiseload/MissingGreenlet on access) only reproduces on asyncpg; aiosqlite "
+    "no-ops InstanceState._expire so the isolation check is tautological.",
+)
 async def test_sr_analytics_sibling_isolation_after_rollback(
     client: AsyncClient, db_session, mocker
 ):

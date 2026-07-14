@@ -19,11 +19,13 @@ const {
     'NoProgressTimeoutError',
     'PROVIDER',
     'RateLimitError',
+    'RuntimeUnavailableError',
     'TASK_BRANCH_NAMESPACE_DEFAULT',
     'TASK_TYPE_BRANCH_PREFIX',
     'VmConfigMissingError',
     'WORKSPACE',
     '__resetTaskCapabilityContractLoadedForTesting',
+    '__setCommandExistsOverrideForSmoke',
     '__setRunClaudeCodeOverrideForSmoke',
     '__setWarmRetargetDepsForTesting',
     '_buildHeartbeatStatusForTesting',
@@ -284,6 +286,7 @@ import {
   readProgressArtifact,
   buildPortfolioComposition,
   buildVersionPhaseSection,
+  formatCriteriaRubric,
   buildMemoCitationsSection,
   resolveMemoHandles,
   buildEfficiencySnapshotSection,
@@ -1568,7 +1571,93 @@ describe('CAPABILITY_DECLARATION_DOC (uniform across task types)', () => {
   });
 });
 
+describe('formatCriteriaRubric', () => {
+  const withCriteria = (criteria: unknown[], lastQualification?: unknown) => ({
+    version_number: 25,
+    phase: 'stabilize',
+    criterion_coverage: { criteria },
+    ...(lastQualification ? { last_qualification: lastQualification } : {}),
+  });
+
+  it('renders active criteria as a rubric (key + text)', () => {
+    const out = formatCriteriaRubric(withCriteria([
+      { criterion_key: 'c-aaa', text: 'Evidence is machine-verified.', status: 'active' },
+      { criterion_key: 'c-bbb', text: 'Capabilities cannot self-certify.', status: 'active' },
+    ])).join('\n');
+    expect(out).toContain('c-aaa');
+    expect(out).toContain('Evidence is machine-verified.');
+    expect(out).toContain('c-bbb');
+    // The strategist must not be handed a burn-down to drive to zero.
+    expect(out).not.toMatch(/\d+\/\d+ (active )?criteria covered/);
+    expect(out).not.toContain('covered');
+  });
+
+  it('excludes retracted / superseded criteria from the rubric', () => {
+    const out = formatCriteriaRubric(withCriteria([
+      { criterion_key: 'c-live', text: 'Active one.', status: 'active' },
+      { criterion_key: 'c-dead', text: 'Retracted one.', status: 'retracted' },
+    ])).join('\n');
+    expect(out).toContain('c-live');
+    expect(out).not.toContain('c-dead');
+  });
+
+  it('makes the NO-criteria case explicit (thinker section 8 authors only when none exist)', () => {
+    // Regression guard: if "none authored" renders identically to "not rendered",
+    // the thinker re-authors the rubric every cycle.
+    const out = formatCriteriaRubric(withCriteria([])).join('\n');
+    expect(out).toContain('None authored yet');
+  });
+
+  it('surfaces the stuck_reason so an orphaned criterion can be retracted', () => {
+    // WEDGE guard: a criterion whose sole mapping direction retired can never earn a
+    // verdict; the qualifier blocks forever and retraction is the only exit — which
+    // requires the strategist to see the key.
+    const out = formatCriteriaRubric(withCriteria([
+      { criterion_key: 'c-orphan', text: 'Orphaned.', status: 'active', stuck_reason: 'direction_retired' },
+    ])).join('\n');
+    expect(out).toContain('c-orphan');
+    expect(out).toContain('direction_retired');
+    expect(out).toContain('retract');
+  });
+
+  it('surfaces WHY the last grade failed (per-category gaps + residual)', () => {
+    const out = formatCriteriaRubric(withCriteria(
+      [{ criterion_key: 'c-aaa', text: 'Some outcome.', status: 'active' }],
+      {
+        status: 'not_promoted',
+        blocker: 'criterion_coverage_incomplete',
+        category_verdicts: [
+          { category_key: 'c-aaa', status: 'not_met', gap: 'No test cites this behavior.' },
+        ],
+        residual_uncaptured_gap: 'Nothing covers the rollback path.',
+      },
+    )).join('\n');
+    expect(out).toContain('No test cites this behavior.');
+    expect(out).toContain('Nothing covers the rollback path.');
+  });
+
+  it('omits the gap block when the last grade met every category', () => {
+    const out = formatCriteriaRubric(withCriteria(
+      [{ criterion_key: 'c-aaa', text: 'Some outcome.', status: 'active' }],
+      { status: 'dry_run', category_verdicts: [{ category_key: 'c-aaa', status: 'met' }] },
+    )).join('\n');
+    expect(out).not.toContain('NOT met');
+  });
+});
+
 describe('buildVersionPhaseSection', () => {
+  it('renders the acceptance-criteria rubric inline', () => {
+    const out = buildVersionPhaseSection({
+      version_number: 25,
+      phase: 'stabilize',
+      criterion_coverage: {
+        criteria: [{ criterion_key: 'c-zzz', text: 'A real outcome.', status: 'active' }],
+      },
+    });
+    expect(out).toContain('c-zzz');
+    expect(out).toContain('A real outcome.');
+  });
+
   it('returns empty string when versionPhase is undefined', () => {
     expect(buildVersionPhaseSection(undefined)).toBe('');
   });
@@ -1956,157 +2045,6 @@ describe('buildVersionPhaseSection', () => {
     expect(result).toContain('never let the phase sit idle');
     // Explicitly does not advocate rushing.
     expect(result).toContain('Do NOT rush to qualify');
-  });
-
-  it('renders criterion coverage counts and uncovered/partial criteria as the canonical acceptance contract', () => {
-    const result = buildVersionPhaseSection({
-      version_number: 5,
-      phase: 'stabilize',
-      criterion_coverage: {
-        total: 7,
-        covered: 3,
-        partial: 2,
-        uncovered: 2,
-        criteria: [
-          {
-            criterion_key: 'AC-1',
-            text: 'Release qualifier consumes per-criterion evidence.',
-            coverage: 'covered',
-            evidence_count: 4,
-          },
-          {
-            criterion_key: 'AC-2',
-            text: 'Strategist can see uncovered acceptance criteria.',
-            coverage: 'partial',
-            evidence_count: 1,
-          },
-          {
-            criterion_key: 'AC-3',
-            text: 'Qualification blocks on missing canonical evidence.',
-            coverage: 'uncovered',
-            evidence_count: 0,
-          },
-        ],
-      },
-    });
-
-    expect(result).toContain('Acceptance criteria coverage (canonical): 3/7 covered, 2 partial, 2 uncovered');
-    expect(result).toContain('Canonical release-readiness path: close uncovered and partial acceptance criteria with evidence');
-    expect(result).toContain('Acceptance criteria needing evidence:');
-    expect(result).toContain('AC-2: partial, evidence=1 — Strategist can see uncovered acceptance criteria.');
-    expect(result).toContain('AC-3: uncovered, evidence=0 — Qualification blocks on missing canonical evidence.');
-    expect(result).not.toContain('AC-1: covered');
-  });
-
-  it('renders stuck_reason inline for uncovered criteria and omits it for covered/null', () => {
-    const result = buildVersionPhaseSection({
-      version_number: 5,
-      phase: 'stabilize',
-      criterion_coverage: {
-        total: 3,
-        covered: 1,
-        partial: 0,
-        uncovered: 2,
-        criteria: [
-          { criterion_key: 'AC-1', text: 'Covered criterion.', coverage: 'covered', evidence_count: 2, stuck_reason: null },
-          { criterion_key: 'AC-2', text: 'No direction mapped yet.', coverage: 'uncovered', evidence_count: 0, stuck_reason: 'no_mapping' },
-          { criterion_key: 'AC-3', text: 'All directions retired.', coverage: 'uncovered', evidence_count: 0, stuck_reason: 'direction_retired' },
-        ],
-      },
-    });
-
-    expect(result).toContain('AC-2: uncovered, evidence=0 [stuck: no_mapping] — No direction mapped yet.');
-    expect(result).toContain('AC-3: uncovered, evidence=0 [stuck: direction_retired] — All directions retired.');
-    // Covered criteria are not rendered; null stuck_reason does not appear
-    expect(result).not.toContain('AC-1: covered');
-    const coveredLine = result.split('\n').find((l) => l.includes('AC-1'));
-    expect(coveredLine).toBeUndefined();
-  });
-
-  it('does not surface retracted criteria as needing evidence', () => {
-    const result = buildVersionPhaseSection({
-      version_number: 5,
-      phase: 'stabilize',
-      criterion_coverage: {
-        total: 3,
-        covered: 1,
-        partial: 1,
-        uncovered: 1,
-        criteria: [
-          { criterion_key: 'AC-1', text: 'Active and uncovered.', coverage: 'uncovered', evidence_count: 0, status: 'active' },
-          { criterion_key: 'AC-2', text: 'Retracted but still uncovered.', coverage: 'uncovered', evidence_count: 0, status: 'retracted' },
-          { criterion_key: 'AC-3', text: 'Covered and superseded.', coverage: 'covered', evidence_count: 2, status: 'superseded' },
-        ],
-      },
-    });
-
-    expect(result).toContain('AC-1: uncovered, evidence=0 — Active and uncovered.');
-    expect(result).not.toContain('AC-2');
-    expect(result).not.toContain('AC-3');
-  });
-
-  it('does not surface superseded criteria as needing evidence', () => {
-    const result = buildVersionPhaseSection({
-      version_number: 5,
-      phase: 'stabilize',
-      criterion_coverage: {
-        total: 3,
-        covered: 1,
-        partial: 1,
-        uncovered: 1,
-        criteria: [
-          { criterion_key: 'AC-1', text: 'Active and partial.', coverage: 'partial', evidence_count: 1, status: 'active' },
-          { criterion_key: 'AC-2', text: 'Superseded and partial.', coverage: 'partial', evidence_count: 0, status: 'superseded' },
-        ],
-      },
-    });
-
-    expect(result).toContain('AC-1: partial, evidence=1 — Active and partial.');
-    expect(result).not.toContain('AC-2');
-  });
-
-  it('renders counts-only criterion coverage without requiring a criteria list', () => {
-    const result = buildVersionPhaseSection({
-      version_number: 5,
-      phase: 'build',
-      criterion_coverage: {
-        total: 4,
-        covered: 1,
-        partial: 1,
-        uncovered: 2,
-      },
-    });
-
-    expect(result).toContain('Acceptance criteria coverage (canonical): 1/4 covered, 1 partial, 2 uncovered');
-    expect(result).not.toContain('Acceptance criteria needing evidence:');
-  });
-
-  it('omits absent, zero-total, and malformed criterion coverage without crashing', () => {
-    const absent = buildVersionPhaseSection({ version_number: 5, phase: 'build' });
-    const zeroTotal = buildVersionPhaseSection({
-      version_number: 5,
-      phase: 'build',
-      criterion_coverage: {
-        total: 0,
-        covered: 0,
-        partial: 0,
-        uncovered: 0,
-      },
-    });
-    const malformed = buildVersionPhaseSection({
-      version_number: 5,
-      phase: 'build',
-      criterion_coverage: {
-        total: 3,
-        covered: '1',
-        partial: 1,
-        uncovered: 1,
-      },
-    });
-
-    expect(absent).not.toContain('Acceptance criteria coverage');
-    expect(zeroTotal).not.toContain('Acceptance criteria coverage');
-    expect(malformed).not.toContain('Acceptance criteria coverage');
   });
 
   it('renders enriched qualification_state and serving_status for recent_versions entries', () => {
@@ -2943,6 +2881,33 @@ describe('handlePlan / handleResearch task-specific prompt fingerprints', () => 
     const p = vi.mocked(runClaudeCode).mock.calls[0][0];
     const rubricHeadings = (p.match(/\*\*acceptance_evidence\*\*/g) || []).length;
     expect(rubricHeadings).toBe(1);
+  });
+
+  // ── prompt-cache prefix stability (research handler) ─────────────────────────
+  // Regression guard for the cache-buster fix: the stable "You are a codebase
+  // research agent" guidance body must LEAD the prompt, ahead of the
+  // task-variable context prefix (strategic intent, playbook, retry, codebase
+  // instructions). Previously those variable sections were concatenated in
+  // front of the guidance, defeating the LLM prompt-cache prefix on every turn.
+  it('handleResearch prompt leads with the stable guidance body, not the task-variable context prefix', async () => {
+    // Inject a detectable marker where the volatile context prefix renders. The
+    // reorder must place the stable guidance intro AHEAD of this task-variable
+    // content (previously it was concatenated in front, busting the cache).
+    const CTX_MARKER = 'CTX_PREFIX_MARKER_9f21';
+    vi.mocked(buildContextPrefix).mockReturnValue(CTX_MARKER);
+    await handleResearch(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    const guidanceIdx = p.indexOf('You are a codebase research agent');
+    const contextIdx = p.indexOf(CTX_MARKER);
+    // The context-prefix marker must actually be present (proves the prefix
+    // rendered and the assertion is not vacuously true)...
+    expect(contextIdx).toBeGreaterThanOrEqual(0);
+    expect(guidanceIdx).toBeGreaterThanOrEqual(0);
+    // ...and the stable guidance body must now precede it.
+    expect(guidanceIdx).toBeLessThan(contextIdx);
+    // The context prefix is relocated into the CODEBASE CONTEXT region, which
+    // itself follows the guidance intro.
+    expect(guidanceIdx).toBeLessThan(p.indexOf('# CODEBASE CONTEXT'));
   });
 
   // ── handlePlan atomic schema-change rule (no split model/migrate subtasks) ────

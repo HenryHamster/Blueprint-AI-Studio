@@ -626,13 +626,20 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
                         await _maybe_create_failure_alert(
                             ci_task, session, _pr_gone_msg
                         )
+                        # Snapshot the broadcast scalars into plain locals BEFORE
+                        # commit: session.commit() expires all ORM state, so reading
+                        # ci_task.project_id/.id/.status afterwards lazy-loads from
+                        # async context and raises MissingGreenlet on asyncpg.
+                        _bcast_project_id = str(ci_task.project_id)
+                        _bcast_task_id = str(ci_task.id)
+                        _bcast_status = ci_task.status
                         await session.commit()
                         await broadcast_to_project(
-                            str(ci_task.project_id),
+                            _bcast_project_id,
                             "task_updated",
                             {
-                                "task_id": str(ci_task.id),
-                                "status": ci_task.status,
+                                "task_id": _bcast_task_id,
+                                "status": _bcast_status,
                             },
                         )
                         continue
@@ -2197,6 +2204,38 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
                         )
                         continue
                     ci_loop["verify_tests_verdict"] = _outcome
+                    # Targeted declared-acceptance-test green signal (additive,
+                    # never changes the merge outcome). When the agent
+                    # independently ran the SPECIFIC declared acceptance test as
+                    # a TARGETED run and it exited green, stamp a durable signal
+                    # onto the ci_task's review_loop so the landing path
+                    # (mark_landed_on_integration -> record_code_acceptance_verdict)
+                    # can mint proven=True for the named_test even when the
+                    # full-suite merge fell open UNVERIFIED. This project's task
+                    # PRs target automain (relaxed CI), so the full-suite gate
+                    # legitimately falls open benign; the targeted green run is
+                    # honest machine-checked proof of the exact claim. Defensive:
+                    # an older agent that omits the ``passed`` field yields no
+                    # green signal (acceptance_test_is_green returns False) and
+                    # today's behavior is preserved. Never blocks; only records.
+                    _accept_block = ci_resolution.acceptance_test_block(_verdict)
+                    if ci_resolution.acceptance_test_is_green(_accept_block):
+                        ci_loop["acceptance_test_targeted_green"] = True
+                        _accept_desc = str(
+                            _accept_block.get("selector")
+                            or _accept_block.get("descriptor")
+                            or ""
+                        ).strip()
+                        if _accept_desc:
+                            ci_loop["acceptance_test_targeted_descriptor"] = (
+                                _accept_desc
+                            )
+                        logger.info(
+                            f"[CI] PR #{ci_pr_number} no-CI merge gate: declared "
+                            f"acceptance test ran GREEN via targeted execution "
+                            f"({_accept_desc or 'unnamed'}) — stamping proven "
+                            f"signal for the named_test acceptance gate"
+                        )
                     # Extract coverage data from the verify-tests verdict for the
                     # coverage_delta acceptance gate. The MERGE_TEST_RESULT artifact
                     # carries a ``coverage`` block with test-count fields

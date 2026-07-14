@@ -12,6 +12,7 @@ in-memory tests run under ``bash scripts/test-backend.sh --standalone``; DB
 tests (consumed artifact upgrade) run under the full test harness.
 """
 
+import os
 import uuid
 
 import pytest
@@ -52,12 +53,17 @@ from app.models import (
 from app.payload_schemas import AcceptanceEvidence
 from testing.factories import make_project
 
+USE_POSTGRES = os.getenv("USE_TEST_POSTGRES", "").lower() == "true" and os.getenv(
+    "DATABASE_URL", ""
+).startswith("postgresql")
+
 
 def _make_code_task(
     *,
     acceptance_evidence: dict | None = None,
     changed_files: list[str] | None = None,
     unverified_reason: str | None = None,
+    targeted_green: bool = False,
     task_type: str = "create",
 ) -> Task:
     payload: dict = {"type": task_type, "prompt": "do the thing"}
@@ -74,6 +80,12 @@ def _make_code_task(
     elif acceptance_evidence is not None and acceptance_evidence.get("kind") == "named_test":
         # named_test requires verification; set empty review_loop to indicate verified
         context[REVIEW_LOOP_KEY] = {}
+    # The no-CI monitor stamps this durable signal when it independently ran the
+    # declared acceptance test as a TARGETED run and it exited green. It rides on
+    # the same review_loop the merge-verification reason lives on.
+    if targeted_green:
+        rl = context.setdefault(REVIEW_LOOP_KEY, {})
+        rl["acceptance_test_targeted_green"] = True
     return Task(
         project_id=uuid.uuid4(),
         title="code task",
@@ -224,6 +236,137 @@ def test_named_test_unverified_merge_fails_closed():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# named_test — targeted-green proof under an UNVERIFIED (fell-open) merge
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_targeted_named_test_execution_earns_proven_under_unverified_merge():
+    # This project's task PRs target the ``automain`` integration branch, whose
+    # no-CI FULL-SUITE gate legitimately falls open BENIGN (stamping an
+    # unverified_merge_reason → verified=False). But the merge gate INDEPENDENTLY
+    # ran ONLY the declared acceptance test as a targeted run and it exited green,
+    # stamping ``acceptance_test_targeted_green=True``. That is honest,
+    # machine-checked proof of the exact claim, so the named_test gate must mint
+    # proven=True even though the full-suite merge fell open unverified.
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_acceptance_gate.py",
+            "test_id": "test_targeted_named_test_execution_earns_proven_under_unverified_merge",
+        },
+        changed_files=[
+            "backend/app/acceptance_gate.py",
+            "backend/testing/test_acceptance_gate.py",
+        ],
+        unverified_reason="no_detectable_test_command",  # benign fall-open
+        targeted_green=True,
+    )
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.declared is True
+    assert verdict.satisfied is True
+    assert verdict.proven is True
+    assert verdict.kind == "named_test"
+    assert "targeted" in verdict.reason.lower()
+    # proof_ref points at the specific declared test.
+    assert verdict.proof_ref == "backend/testing/test_acceptance_gate.py"
+
+    recorded = record_code_acceptance_verdict(task)
+    assert recorded is not None
+    stamped = task.context[CODE_ACCEPTANCE_VERDICT_KEY]
+    assert stamped["satisfied"] is True
+    assert stamped["proven"] is True
+    assert acceptance_is_proven(stamped) is True
+    assert acceptance_blocks_success(stamped) is False
+
+
+def test_targeted_green_but_test_absent_still_fails_closed():
+    # Even with the targeted-green signal, the declared test must be among the
+    # PR's changed files. A targeted-green flag with the test absent (never added
+    # in this PR) still fails closed — the signal relaxes ONLY the full-suite
+    # verification requirement, not the "test was actually added" requirement.
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_acceptance_gate.py",
+        },
+        changed_files=["backend/app/acceptance_gate.py"],  # test file absent
+        unverified_reason="no_detectable_test_command",
+        targeted_green=True,
+    )
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.satisfied is False
+    assert verdict.proven is False
+    assert "not among" in verdict.reason
+
+
+def test_targeted_green_test_only_diff_still_fails_closed():
+    # A targeted-green run of a test with NO changed production seam is still a
+    # test-only diff — nothing for the test to exercise. Fails closed regardless
+    # of the green signal.
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_acceptance_gate.py",
+        },
+        changed_files=["backend/testing/test_acceptance_gate.py"],
+        unverified_reason="no_detectable_test_command",
+        targeted_green=True,
+    )
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.satisfied is False
+    assert verdict.proven is False
+    assert "test-only" in verdict.reason
+
+
+def test_targeted_green_parent_derived_capped_at_soft():
+    # A rollup-child inheriting the parent's combined diff must NOT mint machine
+    # proven credit even with a targeted-green run — the matched test could live
+    # in a sibling's slice of the union diff. targeted_green never overrides the
+    # parent-derived soft cap.
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_acceptance_gate.py",
+        },
+        changed_files=[
+            "backend/app/acceptance_gate.py",
+            "backend/testing/test_acceptance_gate.py",
+        ],
+        unverified_reason="no_detectable_test_command",
+        targeted_green=True,
+    )
+    ctx = dict(task.context)
+    ctx["_pr_changed_files_from_rollup_parent"] = True
+    task.context = ctx
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.satisfied is True
+    assert verdict.proven is False
+    assert "sibling" in verdict.reason.lower()
+
+
+def test_verified_merge_ignores_absent_targeted_green_signal():
+    # A normally VERIFIED merge (no unverified_reason) does not depend on the
+    # targeted-green signal at all — it stays proven exactly as before.
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_acceptance_gate.py",
+        },
+        changed_files=[
+            "backend/app/acceptance_gate.py",
+            "backend/testing/test_acceptance_gate.py",
+        ],
+        unverified_reason=None,  # verified merge
+        targeted_green=False,
+    )
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.satisfied is True
+    assert verdict.proven is True
+    # The verified-merge reason wording (not the targeted wording).
+    assert "verified merge" in verdict.reason
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # named_test — semantic grounding
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -292,6 +435,247 @@ def test_named_test_cross_cutting_invariants_passes_semantic_grounding():
     assert verdict.satisfied is True
     assert verdict.proven is True
     assert "semantically grounded" in verdict.reason
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# named_test — frontend (vitest/jest) test files ground against a changed seam
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_named_test_frontend_vitest_grounded_proven():
+    """A frontend named_test (`ComputeJobsPanel.test.tsx`) grounds against a
+    changed production seam (`ComputeJobsPanel.tsx`) exactly like a Python
+    `test_<module>.py` does — this is the recording-seam fix that lets UI-only
+    work flip criterion coverage to covered."""
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "admin-ui/src/components/ComputeJobsPanel.test.tsx",
+        },
+        changed_files=[
+            "admin-ui/src/components/ComputeJobsPanel.tsx",
+            "admin-ui/src/components/ComputeJobsPanel.test.tsx",
+        ],
+        unverified_reason=None,
+    )
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.declared is True
+    assert verdict.satisfied is True
+    assert verdict.proven is True
+    assert "semantically grounded" in verdict.reason
+    assert verdict.proof_ref
+
+
+def test_named_test_frontend_spec_ts_grounded_proven():
+    """The `.spec.ts` (jasmine/jest) naming convention grounds too: a
+    `KnowledgeBrowser.spec.ts` grounds against a changed `KnowledgeBrowser.ts`."""
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "admin-ui/src/components/KnowledgeBrowser.spec.ts",
+        },
+        changed_files=[
+            "admin-ui/src/components/KnowledgeBrowser.ts",
+            "admin-ui/src/components/KnowledgeBrowser.spec.ts",
+        ],
+        unverified_reason=None,
+    )
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.satisfied is True
+    assert verdict.proven is True
+    assert "semantically grounded" in verdict.reason
+
+
+def test_named_test_frontend_mts_suffix_grounded_proven():
+    """The `[cm]?[jt]sx?` suffix coverage grounds `.mts`/`.cjs`-style names:
+    a `Widget.test.mts` grounds against a changed `Widget.ts`."""
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "admin-ui/src/Widget.test.mts",
+        },
+        changed_files=[
+            "admin-ui/src/Widget.ts",
+            "admin-ui/src/Widget.test.mts",
+        ],
+        unverified_reason=None,
+    )
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.satisfied is True
+    assert verdict.proven is True
+
+
+def test_named_test_frontend_stem_mismatch_fails_closed():
+    """A frontend test whose stem matches no changed production seam fails
+    closed — `ComputeJobsPanel.test.tsx` cannot be proven by a change to an
+    unrelated `KnowledgeBrowser.tsx`, even with a real merge verdict."""
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "admin-ui/src/components/ComputeJobsPanel.test.tsx",
+        },
+        changed_files=[
+            "admin-ui/src/components/KnowledgeBrowser.tsx",
+            "admin-ui/src/components/ComputeJobsPanel.test.tsx",
+        ],
+        unverified_reason=None,
+    )
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.declared is True
+    assert verdict.satisfied is False
+    assert "does not semantically correspond" in verdict.reason
+    assert verdict.proven is False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# named_test — GitHub-verified file list closes the self-declaration trust gap
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_named_test_github_verified_but_truncated_absent_is_inconclusive():
+    """A truncated (>50 files) changed-file list is INCONCLUSIVE about absence
+    even when the list came from GitHub's API (github_verified sentinel).
+
+    Our own ``stamp_changed_files_signal`` caps the stored list at 50 paths
+    regardless of source, so a >50-file PR drops every path beyond index 50. A
+    legitimately declared test lying beyond the stored prefix reads as absent from
+    the truncated window — hard-failing that truthful declaration is unsound. The
+    gate must credit soft (satisfied, unproven), not fail closed.
+    """
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_acceptance_gate.py",
+        },
+        changed_files=["backend/app/acceptance_gate.py"],  # test beyond stored prefix
+        unverified_reason=None,
+    )
+    # Simulate the webhook having stamped the GitHub-verified sentinel alongside
+    # a truncated list. Truncation makes absence inconclusive regardless of source.
+    ctx = dict(task.context or {})
+    ctx["_pr_changed_files_truncated"] = True
+    ctx["_pr_changed_files_github_verified"] = True
+    task.context = ctx
+
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.declared is True
+    assert verdict.satisfied is True, (
+        "truncated absent test must credit soft (inconclusive), not fail closed — "
+        "even when github-verified, only the first 50 paths are stored"
+    )
+    assert verdict.proven is False
+    assert "truncated" in verdict.reason
+
+
+def test_named_test_github_verified_present_still_passes():
+    """When the file list is GitHub-verified AND the declared test IS present,
+    the gate still passes (and proves) exactly as before."""
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_acceptance_gate.py",
+        },
+        changed_files=[
+            "backend/app/acceptance_gate.py",
+            "backend/testing/test_acceptance_gate.py",
+        ],
+        unverified_reason=None,
+    )
+    ctx = dict(task.context or {})
+    ctx["_pr_changed_files_github_verified"] = True
+    task.context = ctx
+
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.satisfied is True
+    assert verdict.proven is True
+
+
+def test_github_verified_sentinel_does_not_override_truncation_credit():
+    """stamp_changed_files_signal with github_verified=True sets the sentinel, but
+    the sentinel does NOT flip a truncated-absent named_test to a hard fail.
+
+    Truncation drops paths beyond index 50 in our own storage regardless of
+    source, so absence stays inconclusive and the soft credit holds both with and
+    without the GitHub-verified sentinel.
+    """
+    from app.acceptance_gate import stamp_changed_files_signal
+
+    signal = stamp_changed_files_signal(
+        ["backend/app/acceptance_gate.py"], github_verified=True
+    )
+    assert signal.get("_pr_changed_files_github_verified") is True
+
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_acceptance_gate.py",
+        },
+        changed_files=["backend/app/acceptance_gate.py"],
+        unverified_reason=None,
+    )
+    ctx = dict(task.context or {})
+    ctx["_pr_changed_files_truncated"] = True
+    task.context = ctx
+    # Without github_verified: soft credit (truncated absence is inconclusive)
+    without = evaluate_code_acceptance(task)
+    assert without.satisfied is True, "baseline: truncated absent → soft credit"
+
+    # Apply the stamp (as the webhook would) and re-evaluate — still soft credit.
+    ctx.update(signal)
+    task.context = ctx
+    with_sentinel = evaluate_code_acceptance(task)
+    assert with_sentinel.satisfied is True, (
+        "github_verified sentinel must NOT flip truncated-absent to a hard fail — "
+        "only the first 50 paths are stored so absence is inconclusive"
+    )
+    assert with_sentinel.proven is False
+
+
+def test_named_test_beyond_50_file_prefix_credits_soft_via_real_stamp():
+    """End-to-end regression for finding e8a5b79be22b056b: a >50-changed-files PR
+    (github-verified) whose declared test path lies BEYOND the stored 50-path
+    prefix must credit soft (inconclusive), not hard-fail on false absence.
+
+    Drives the real ``stamp_changed_files_signal`` truncation so the test exercises
+    exactly what the webhook stamps: the first 50 paths (none of which is the
+    declared test), ``_pr_changed_files_truncated=True``, and the github-verified
+    sentinel. Before the fix this hard-failed (``satisfied=False``) because the
+    github-verified sentinel suppressed the truncation credit even though the test
+    could not possibly be observed past index 50.
+    """
+    from app.acceptance_gate import stamp_changed_files_signal
+
+    declared_test = "backend/testing/test_acceptance_gate.py"
+    # 54 production files, then the declared test at index 54 — well beyond the
+    # 50-path stored prefix. The seam (acceptance_gate.py) sits inside the prefix so
+    # the only thing missing from the stored window is the declared test itself.
+    changed = ["backend/app/acceptance_gate.py"]
+    changed += [f"backend/app/module_{i:03d}.py" for i in range(53)]
+    changed.append(declared_test)
+    assert len(changed) > 50
+    assert declared_test not in changed[:50], "fixture: test must fall past the prefix"
+
+    signal = stamp_changed_files_signal(changed, github_verified=True)
+    assert signal["_pr_changed_files_truncated"] is True
+    assert signal["_pr_changed_files_github_verified"] is True
+    assert declared_test not in signal["_pr_changed_files"]
+
+    task = _make_code_task(
+        acceptance_evidence={"kind": "named_test", "test_path": declared_test},
+        unverified_reason=None,
+    )
+    ctx = dict(task.context or {})
+    ctx.update(signal)
+    task.context = ctx
+
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.declared is True
+    assert verdict.satisfied is True, (
+        "declared test beyond the stored 50-path prefix must credit soft, not "
+        "hard-fail on false absence"
+    )
+    assert verdict.proven is False
+    assert "truncated" in verdict.reason
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -439,6 +823,11 @@ async def test_consumed_downstream_artifact_upgrades_to_proven(db_session):
         consumer, db_session, [artifact.id]
     )
     assert len(rows) == 1
+    # Flush BEFORE refreshing: refresh() expires the instance first, which
+    # under real ORM expiry discards its still-pending context change — the
+    # explicit flush persists the helper's flag_modified updates so the
+    # refresh below genuinely round-trips them through the DB.
+    await db_session.flush()
     await db_session.refresh(producer)
     await db_session.refresh(consumer)
 
@@ -544,6 +933,8 @@ async def test_explicit_consumed_artifact_ids_ignore_undelivered_ids(db_session)
         [delivered_artifact.id, stray_artifact.id],
     )
     assert len(rows) == 1
+    # Flush before refresh — see test_consumed_downstream_artifact_upgrades_to_proven.
+    await db_session.flush()
     await db_session.refresh(producer)
     await db_session.refresh(consumer)
 
@@ -662,6 +1053,8 @@ async def test_legacy_omitted_consumed_artifact_ids_falls_back(db_session):
         consumer, db_session, None, modern_agent=False
     )
     assert len(rows) == 1
+    # Flush before refresh — see test_consumed_downstream_artifact_upgrades_to_proven.
+    await db_session.flush()
     await db_session.refresh(producer)
     await db_session.refresh(consumer)
     # Legacy fallback DID record consumption
@@ -2090,6 +2483,59 @@ async def test_backfill_acceptance_verdicts_upgrades_false_negative(db_session):
 
 
 @pytest.mark.asyncio
+async def test_backfill_acceptance_verdicts_upgrades_frontend_named_test(db_session):
+    """A pre-fix FRONTEND named_test (vitest) verdict stamped satisfied=True /
+    proven=False — because the old grounding only understood Python
+    `test_<module>.py` naming — is upgraded to proven=True by the backfill sweep
+    once JS/TS grounding lands. This is the self-healing path for rollup #14487.
+    """
+    from datetime import datetime, timezone
+
+    from testing.factories import make_project
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.flush()
+
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "admin-ui/src/components/ComputeJobsPanel.test.tsx",
+        },
+        changed_files=[
+            "admin-ui/src/components/ComputeJobsPanel.tsx",
+            "admin-ui/src/components/ComputeJobsPanel.test.tsx",
+        ],
+    )
+    task.project_id = project.id
+    task.completed_at = datetime(2026, 7, 9, 8, 0, 0, tzinfo=timezone.utc)
+    ctx = dict(task.context or {})
+    ctx[CODE_ACCEPTANCE_VERDICT_KEY] = {
+        "satisfied": True,
+        "proven": False,
+        "kind": "named_test",
+        "reason": (
+            "declared named_test "
+            "'admin-ui/src/components/ComputeJobsPanel.test.tsx' exercises a "
+            "production seam that does not semantically correspond to the "
+            "declared test module"
+        ),
+    }
+    task.context = ctx
+    db_session.add(task)
+    await db_session.flush()
+
+    result = await backfill_acceptance_verdicts(db_session)
+    assert result >= 1, "backfill should upgrade the pre-fix frontend verdict"
+
+    await db_session.refresh(task)
+    updated = (task.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
+    assert updated is not None
+    assert updated.get("proven") is True, "frontend verdict should upgrade to proven"
+    assert updated.get("backfilled") is True
+
+
+@pytest.mark.asyncio
 async def test_backfill_verdicts_no_starvation(db_session):
     """ORDER BY + NOT EXISTS ensures repeated backfill calls cover all
     >200 false-negative tasks (no starvation), and already-proven tasks
@@ -2186,6 +2632,16 @@ async def test_backfill_verdicts_no_starvation(db_session):
     assert final == 0, "No false negatives should remain after full sweep"
 
 
+@pytest.mark.skipif(
+    not USE_POSTGRES,
+    reason=(
+        "MissingGreenlet on expired task attributes is asyncpg-specific; aiosqlite "
+        "lazy-loads succeed in the async greenlet, masking the regression. "
+        "Fault injection is not practical: the rollback happens inside "
+        "record_task_merge_evidence which re-fetches the task via session.get(), "
+        "leaving no ORM object that a proxy could intercept."
+    ),
+)
 @pytest.mark.asyncio
 async def test_backfill_verdicts_resilient_to_mid_loop_rollback(db_session):
     """A rollback inside record_task_merge_evidence (e.g. IntegrityError on

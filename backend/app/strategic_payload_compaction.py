@@ -437,7 +437,7 @@ def _compact_version_phase(block: dict, *, floor: bool = False) -> dict:
     coverage = block.get("criterion_coverage")
     if isinstance(coverage, dict):
         compact_coverage: dict[str, Any] = {}
-        for key in ("total", "covered", "partial", "uncovered", "stuck_count"):
+        for key in ("total", "covered", "attested", "partial", "uncovered", "stuck_count"):
             if key in coverage:
                 compact_coverage[key] = coverage[key]
         criteria = coverage.get("criteria")

@@ -13,7 +13,7 @@ import json
 import logging
 import re
 import time
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -28,14 +28,21 @@ from app.broadcast import broadcast_to_project
 from app.shared_state import limiter
 from app.models import (
     MESSAGE_CONTENT_MAX,
+    Alert,
+    ComputeJob,
+    ComputeJobStatus,
     Direction,
+    LocalRunner,
+    MessagesNoisePrefs,
     ProjectMessage,
     MessageType,
     ReleaseVersion,
     StrategicCycle,
     Task,
     TaskStatus,
+    TaskWakeRegistration,
     Project,
+    WakeDeliveryState,
     _utcnow,
 )
 from app.auth import get_current_user
@@ -59,6 +66,10 @@ from app.strategic_context_package import (
     selected_ref_descriptor,
 )
 from app.strategic_runtime_work import build_strategic_runtime_summary
+# Canonical runner-liveness window (300s). is_live in _runner_health is purely
+# time-derived (status=='active' AND now-last_seen < this), so the broad-revision
+# fingerprint must probe it against the wall clock, not just max(last_seen_at).
+from app.routers.admin_runners import _RUNNER_LIVENESS_SECONDS
 from app.work_session_actions import build_work_session_actions
 from app.work_session_command_execution import (
     OPERATOR_COMMAND_EVENT_TYPE,
@@ -148,6 +159,23 @@ _BG_TASKS: set[asyncio.Task] = set()
 _COST_CACHE: dict[str, tuple[float, float]] = {}
 _COST_CACHE_TTL_S = 90.0
 
+# Phase-1 fingerprint constants for the broad-revision assembly-skip guard.
+# These mirror the "active" filters the Phase-2 assembly applies so a single
+# indexed count/max scalar can stand in for the expensive multi-row build when
+# nothing in a segment changed. Kept local (rather than importing the private
+# tuples from strategic_runtime_work) so the fingerprint contract is explicit
+# and testable at this seam.
+_FINGERPRINT_ACTIVE_COMPUTE_JOB_STATUSES = (
+    ComputeJobStatus.QUEUED,
+    ComputeJobStatus.STARTING,
+    ComputeJobStatus.RUNNING,
+    ComputeJobStatus.POLLING,
+)
+_FINGERPRINT_ACTIVE_WAKE_STATES = (
+    WakeDeliveryState.PENDING,
+    WakeDeliveryState.FIRED,
+)
+
 async def _currency_resolve_and_cache(
     project_id: uuid.UUID,
     last_qual: dict,
@@ -187,6 +215,53 @@ async def _currency_resolve_and_cache(
             "[STRATEGIC_STATE] background currency resolve failed for project %s",
             project_id,
         )
+
+
+def _currency_cache_fingerprint(
+    project: Project, open_version: ReleaseVersion | None
+) -> str:
+    """Fingerprint the in-memory currency-cache state that feeds sha_freshness.
+
+    sha_freshness is resolved out-of-band into ``_CURRENCY_CACHE`` (never the DB)
+    by ``_currency_resolve_and_cache``, so the DB-derived fingerprints cannot see
+    the cold→warm verdict transition: a cold-cache 200 (verdict='unknown') warms
+    the cache, and with identical DB state the next poll would otherwise match the
+    broad revision and 304 BEFORE assembly — pinning the operator's banner on
+    'unknown'. Folding this cache-state string into the broad revision makes that
+    matching-token 304 impossible across the transition, so the two-poll cold→warm
+    currency design still delivers the resolved verdict (exactly as the pre-skip
+    full-body ETag did).
+
+    Read-only: mirrors the request-path cache read below (same key + monotonic TTL
+    check) but never spawns the background resolve. Any failure degrades to a
+    constant so this segment simply falls back to pre-fingerprint behavior rather
+    than sinking the endpoint.
+    """
+    if open_version is None:
+        return "no-open-version"
+    try:
+        from app.strategic_spawning import get_project_integration_branch
+
+        _last_qual = open_version.last_qualification or {}
+        _integration_branch = get_project_integration_branch(project)
+        _candidate_sha = _last_qual.get("candidate_sha") or ""
+        _cache_key = (str(project.id), _integration_branch, _candidate_sha)
+        _cached = _CURRENCY_CACHE.get(_cache_key)
+        if _cached is None or _cached[1] <= time.monotonic():
+            # Cold / expired: assembly will serve an 'unknown' block and spawn a
+            # background resolve. When that resolve warms the cache, this string
+            # flips warm → a new revision → assembly delivers the real verdict.
+            return f"cold:{_candidate_sha}"
+        _verdict = (
+            _cached[0].get("verdict") if isinstance(_cached[0], dict) else None
+        )
+        return f"warm:{_candidate_sha}:{_verdict}"
+    except Exception:
+        logger.exception(
+            "[STRATEGIC_STATE] currency-cache fingerprint failed for project %s",
+            project.id,
+        )
+        return "error"
 
 
 def _build_work_session_summary(
@@ -857,27 +932,6 @@ async def _build_strategic_session_response(
     }
 
 
-async def _message_preview_for_session_response(
-    request: Request,
-    session: AsyncSession,
-    project_id: uuid.UUID,
-    current_user: dict,
-    message: ProjectMessage,
-) -> Dict[str, Any]:
-    state_response = await get_project_strategic_state(
-        request,
-        project_id,
-        session=session,
-        current_user=current_user,
-    )
-    return await _message_preview_for_session_state(
-        session,
-        project_id,
-        state_response,
-        message,
-    )
-
-
 async def _message_preview_for_session_state(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -1019,13 +1073,22 @@ def _compute_strategic_state_revision(
     message_counts: Dict[str, int],
     task_counts: Dict[str, int],
     attention: Dict[str, Any] | None,
+    fingerprints: Dict[str, Any] | None = None,
 ) -> str:
-    """Compute a lightweight revision token for the context package inputs.
+    """Compute a lightweight revision token for the strategic-state payload.
 
-    Only includes fields that the context package build reads directly.
-    Called AFTER cheap inputs are resolved and BEFORE the expensive
-    load_strategic_context_evidence + build_strategic_context_package_summary
-    steps, so a matching client token allows those steps to be skipped.
+    Covers both the context-package inputs and — via the optional
+    ``fingerprints`` map of cheap Phase-1 scalar/count/max-timestamp probes —
+    the segments the narrow token historically did NOT reach (runtime runners /
+    compute jobs / wakes, workbench, event feed, command jobs, integrity / open
+    version). Called AFTER the cheap inputs are resolved and BEFORE the
+    expensive Phase-2 assembly, so a matching client token lets the whole
+    assembly be skipped with an HTTP 304.
+
+    ``fingerprints`` defaults to ``None`` so the historical (context-package
+    only) signature and its callers keep working; when provided it is folded
+    into the hashed seed under a stable key, making the token change iff a
+    fingerprinted segment changed.
     """
     seed = json.dumps(
         {
@@ -1056,6 +1119,7 @@ def _compute_strategic_state_revision(
             "task_counts": task_counts,
             "attention_level": (attention or {}).get("level"),
             "attention_counts": (attention or {}).get("counts", {}),
+            "fingerprints": fingerprints or {},
         },
         sort_keys=True,
         default=str,
@@ -1063,12 +1127,313 @@ def _compute_strategic_state_revision(
     return hashlib.sha256(seed.encode()).hexdigest()[:16]
 
 
+async def _compute_strategic_state_fingerprints(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    user_id: str,
+) -> Dict[str, Any]:
+    """Cheap Phase-1 fingerprint probes for the strategic-state segments the
+    narrow context-package revision never covered.
+
+    Each probe is a single indexed scalar / count / max-timestamp — collectively
+    O(1)-ish — chosen so its value changes iff the corresponding Phase-2 segment
+    would render differently:
+
+    * ``workbench_updated_at`` — per-user workbench prefs row (MessagesNoisePrefs)
+    * ``runner_count`` / ``runner_max_seen`` / ``live_runner_count`` — enrolled
+      runners, latest heartbeat, and the count currently INSIDE the liveness
+      window (runtime local_runner + resident-session picker + availability).
+      ``live_runner_count`` is time-derived (mirrors ``_runner_health``'s
+      ``is_live``) so a runner heartbeat going stale — which does NOT move
+      ``runner_max_seen`` or ``runner_count`` — still flips the revision the
+      instant it crosses ``_RUNNER_LIVENESS_SECONDS``.
+    * ``active_compute_count`` / ``compute_max_updated`` — in-flight compute jobs
+    * ``active_wake_count`` — parked task wakes still pending/fired
+    * ``message_max_created_at`` / ``message_max_resolved_at`` — message previews,
+      event feed, and command-job feed (all ProjectMessage-derived)
+    * ``task_max_updated_at`` — event feed task rows + task focus
+    * ``alert_max_at`` — event feed alert rows
+    * ``open_version_updated_at`` — sha-freshness open version
+    * ``direction_count`` / ``direction_max_updated_at`` — Direction rows whose
+      ``criterion_keys`` / ``status`` feed model-integrity + criterion-links (these
+      live on the Direction table, NOT the project.directions blob the narrow
+      token folds in, so an integrity edit is invisible without this probe).
+
+    A DB error here would silently over-suppress (a stale probe → false 304), so
+    the caller runs this on the always-executed Phase-1 path where any failure
+    surfaces as a normal 500 rather than a wrong-but-200; we deliberately do NOT
+    swallow exceptions.
+    """
+    workbench_updated_at = await session.scalar(
+        select(func.max(MessagesNoisePrefs.updated_at)).where(
+            MessagesNoisePrefs.project_id == project_id,
+            MessagesNoisePrefs.user_id == user_id,
+        )
+    )
+    runner_row = (
+        await session.execute(
+            select(func.count(), func.max(LocalRunner.last_seen_at)).where(
+                LocalRunner.project_id == project_id,
+                LocalRunner.status != "deleted",
+            )
+        )
+    ).one()
+    # Time-derived liveness: count runners _runner_health would mark is_live=True
+    # right now (status=='active' AND heartbeat within the liveness window). When
+    # a live runner stops heartbeating, last_seen_at is frozen so runner_max_seen
+    # cannot catch the transition — this count drops from N to N-1 the moment the
+    # frozen heartbeat ages past the cutoff, flipping the revision.
+    _liveness_cutoff = _utcnow() - _dt.timedelta(seconds=_RUNNER_LIVENESS_SECONDS)
+    live_runner_count = await session.scalar(
+        select(func.count()).where(
+            LocalRunner.project_id == project_id,
+            LocalRunner.status == "active",
+            LocalRunner.last_seen_at.is_not(None),
+            LocalRunner.last_seen_at >= _liveness_cutoff,
+        )
+    )
+    direction_row = (
+        await session.execute(
+            select(func.count(), func.max(Direction.updated_at)).where(
+                Direction.project_id == project_id,
+            )
+        )
+    ).one()
+    compute_row = (
+        await session.execute(
+            select(func.count(), func.max(ComputeJob.updated_at)).where(
+                ComputeJob.project_id == project_id,
+                ComputeJob.status.in_(_FINGERPRINT_ACTIVE_COMPUTE_JOB_STATUSES),
+            )
+        )
+    ).one()
+    active_wake_count = await session.scalar(
+        select(func.count()).where(
+            TaskWakeRegistration.project_id == project_id,
+            TaskWakeRegistration.delivery_state.in_(
+                _FINGERPRINT_ACTIVE_WAKE_STATES
+            ),
+        )
+    )
+    message_row = (
+        await session.execute(
+            select(
+                func.max(ProjectMessage.created_at),
+                func.max(ProjectMessage.resolved_at),
+            ).where(ProjectMessage.project_id == project_id)
+        )
+    ).one()
+    task_max_updated_at = await session.scalar(
+        select(func.max(Task.updated_at)).where(Task.project_id == project_id)
+    )
+    alert_max_at = await session.scalar(
+        select(
+            func.max(func.coalesce(Alert.dismissed_at, Alert.created_at))
+        ).where(Alert.project_id == project_id)
+    )
+    open_version_updated_at = await session.scalar(
+        select(func.max(ReleaseVersion.updated_at)).where(
+            ReleaseVersion.project_id == project_id,
+            ReleaseVersion.status == "open",
+        )
+    )
+    return {
+        "workbench_updated_at": str(workbench_updated_at)
+        if workbench_updated_at
+        else None,
+        "runner_count": int(runner_row[0] or 0),
+        "runner_max_seen": str(runner_row[1]) if runner_row[1] else None,
+        "live_runner_count": int(live_runner_count or 0),
+        "direction_count": int(direction_row[0] or 0),
+        "direction_max_updated_at": str(direction_row[1]) if direction_row[1] else None,
+        "active_compute_count": int(compute_row[0] or 0),
+        "compute_max_updated": str(compute_row[1]) if compute_row[1] else None,
+        "active_wake_count": int(active_wake_count or 0),
+        "message_max_created_at": str(message_row[0]) if message_row[0] else None,
+        "message_max_resolved_at": str(message_row[1]) if message_row[1] else None,
+        "task_max_updated_at": str(task_max_updated_at)
+        if task_max_updated_at
+        else None,
+        "alert_max_at": str(alert_max_at) if alert_max_at else None,
+        "open_version_updated_at": str(open_version_updated_at)
+        if open_version_updated_at
+        else None,
+    }
+
+
+# Pure wall-clock stamps / derived durations that advance on every poll without
+# a real state change. They are excluded from the full-body ETag so an unchanged
+# poll yields a matching token (and thus a 304). Everything NOT listed here is
+# covered by the ETag by default, so broadening the response never risks a false
+# 304 — at worst an un-normalized noise field makes the ETag over-sensitive
+# (a redundant 200), never under-sensitive.
+_STRATEGIC_STATE_ETAG_VOLATILE_KEYS = frozenset(
+    {
+        # sha_freshness stamps: datetime.now() on every call.
+        "checked_at",
+        "generated_at",
+        # Runner health: a derived now() - last_seen_at duration. The underlying
+        # last_seen_at / is_live / device_status remain in the hash and cover the
+        # meaningful liveness transitions.
+        "seconds_since_last_seen",
+        # since_last_check_in window end is always "now"; "since" (the real last
+        # check-in time) stays in the hash.
+        "until",
+    }
+)
+
+
+def _strip_volatile_for_etag(obj: Any) -> Any:
+    """Recursively drop pure-clock noise keys so the ETag is stable across
+    unchanged polls. See ``_STRATEGIC_STATE_ETAG_VOLATILE_KEYS``."""
+    if isinstance(obj, dict):
+        return {
+            k: _strip_volatile_for_etag(v)
+            for k, v in obj.items()
+            if k not in _STRATEGIC_STATE_ETAG_VOLATILE_KEYS
+        }
+    if isinstance(obj, list):
+        return [_strip_volatile_for_etag(v) for v in obj]
+    return obj
+
+
+def _compute_strategic_state_etag(result: Dict[str, Any]) -> str:
+    """Full-body revision token used ONLY for the HTTP 304 transmission
+    short-circuit.
+
+    Hashes the ENTIRE assembled response body — so ANY change to a volatile
+    field the narrow ``state_revision`` does not cover (runtime_summary,
+    resident_runner_options, workbench_state, work_session, model_integrity,
+    sha_freshness verdict, costs, counts, …) flips the token — with two
+    deliberate exclusions:
+
+    * ``context_package`` embeds per-request signed download URLs that change
+      every poll; its meaningful inputs are already reflected in the top-level
+      strategic / problem_model / directions / message+task count / attention
+      fields (and gated by the narrow ``state_revision`` build-skip), so
+      dropping the raw block keeps the token stable without hiding real changes.
+    * pure wall-clock stamps / derived durations (see the volatile-keys set).
+
+    This is intentionally SEPARATE from ``_compute_strategic_state_revision``
+    (which stays the narrow context-package build-skip token) — do not conflate
+    them.
+    """
+    projected = {
+        k: v
+        for k, v in result.items()
+        if k not in ("context_package", "state_revision")
+    }
+    projected["work_session"] = _drop_context_derived_for_etag(
+        projected.get("work_session")
+    )
+    seed = json.dumps(
+        _strip_volatile_for_etag(projected), sort_keys=True, default=str
+    )
+    return hashlib.sha256(seed.encode()).hexdigest()
+
+
+def _drop_context_derived_for_etag(work_session: Any) -> Any:
+    """Drop the parts of ``work_session`` that MIRROR the context package.
+
+    ``context_package`` is deliberately excluded from the ETag (its signed URLs
+    change every poll), but ``work_session`` re-projects it: ``context_package_id``,
+    ``context_sources``, and the ``commands`` / ``curated_metrics`` entries tagged
+    ``provenance.surface == "context"``.  On a build-SKIPPED poll those collapse
+    (``context.items`` reports 0, a command disappears), so the ETag flipped on
+    every skip — a client's held token could never 304 and the whole body was
+    re-transmitted every time, defeating the short-circuit the ETag exists for.
+
+    Excluding the mirror is consistent with excluding the original: the context
+    package's meaningful INPUTS are already covered by the top-level strategic /
+    problem_model / directions / count / attention fields, and the narrow
+    ``state_revision`` gates the build-skip itself, so nothing real is hidden.
+
+    NOTE (separate bug, deliberately not masked here): the build-skip DEGRADES
+    ``work_session`` rather than merely omitting the raw block — a skipped poll
+    reports ``context.items = 0`` when the client's cached package holds 8. That
+    is a response-fidelity bug in the skip path, not an ETag bug; this function
+    only stops it from corrupting the ETag.
+    """
+    if not isinstance(work_session, dict):
+        return work_session
+    out = {
+        k: v
+        for k, v in work_session.items()
+        if k not in ("context_package_id", "context_sources")
+    }
+    for list_key in ("commands", "curated_metrics"):
+        items = out.get(list_key)
+        if isinstance(items, list):
+            out[list_key] = [it for it in items if not _is_context_derived_entry(it)]
+    return out
+
+
+def _is_context_derived_entry(entry: Any) -> bool:
+    """True when a work_session command/metric is a projection of the context package.
+
+    Two shapes carry that tag: an explicit ``provenance.surface == "context"``
+    (the curated metrics), and a ``context.``-namespaced id (the commands — e.g.
+    ``context.canvas.open``, which is only offered when a package was built).
+    """
+    if not isinstance(entry, dict):
+        return False
+    provenance = entry.get("provenance")
+    if isinstance(provenance, dict) and provenance.get("surface") == "context":
+        return True
+    entry_id = entry.get("id")
+    return isinstance(entry_id, str) and entry_id.startswith("context.")
+
+
+def _quote_etag(token: str) -> str:
+    """Format a raw hex token as a strong HTTP ETag header value."""
+    return f'"{token}"'
+
+
+def _if_none_match_hits(if_none_match: object | None, etag: str) -> bool:
+    """Return True when a client ``If-None-Match`` header matches the current
+    full-body ``etag``.
+
+    Tolerates the standard header shapes a proxy/browser may produce: a
+    comma-separated list, weak validators (``W/"…"``), surrounding quotes, and
+    the ``*`` wildcard.
+
+    Only a real ``str`` is a header VALUE.  ``get_project_strategic_state`` is a
+    FastAPI endpoint whose ``if_none_match`` default is a ``Header(...)`` marker
+    object, and that default is resolved to a string ONLY by dependency injection
+    on a real HTTP request.  The six INTERNAL direct callers in this module call it
+    as a plain function and omit the argument — so they received the ``Header``
+    marker itself, which is truthy, fell through to ``.split(",")`` and raised
+    ``AttributeError: 'Header' object has no attribute 'split'``, 500-ing
+    ``POST /strategic-session/messages`` (and every other internal caller).
+
+    Treat any non-``str`` as ABSENT: an internal caller has no request headers, so
+    "no If-None-Match → always return the full body" is exactly the documented
+    intent at the call sites.  Guarding here (rather than at each of the six call
+    sites) also fail-safes any future direct caller.
+    """
+    if not isinstance(if_none_match, str) or not if_none_match:
+        return False
+    for raw in if_none_match.split(","):
+        candidate = raw.strip()
+        if candidate == "*":
+            return True
+        if candidate.startswith("W/"):
+            candidate = candidate[2:].strip()
+        if len(candidate) >= 2 and candidate[0] == '"' and candidate[-1] == '"':
+            candidate = candidate[1:-1]
+        if candidate == etag:
+            return True
+    return False
+
+
 @router.get("/projects/{project_id}/strategic-state")
 @limiter.limit("30/minute")
 async def get_project_strategic_state(
     request: Request,
     project_id: uuid.UUID,
+    response: Response,
     state_revision: str | None = Query(None),
+    if_none_match: str | None = Header(None, alias="If-None-Match"),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -1082,29 +1447,66 @@ async def get_project_strategic_state(
         project_id, current_user["user_id"], session, "member"
     )
 
-    active_cycle = (
-        await session.execute(
-            select(StrategicCycle)
-            .where(
-                StrategicCycle.project_id == project.id,
-                StrategicCycle.outcome.in_(list(strategic_cycle.ACTIVE_OUTCOMES)),
-            )
-            .order_by(StrategicCycle.phase1_started_at.desc())
-            .limit(1)
+    # Sequential session.execute() calls: AsyncSession does not support
+    # concurrent coroutine-based calls (asyncpg raises InterfaceError when
+    # a second query is issued before the first completes).
+    _active_cycle_res = await session.execute(
+        select(StrategicCycle)
+        .where(
+            StrategicCycle.project_id == project.id,
+            StrategicCycle.outcome.in_(list(strategic_cycle.ACTIVE_OUTCOMES)),
         )
-    ).scalar_one_or_none()
-
-    latest_cycle = (
-        await session.execute(
-            select(StrategicCycle)
-            .where(
-                StrategicCycle.project_id == project.id,
-                ~StrategicCycle.outcome.in_(list(strategic_cycle.ACTIVE_OUTCOMES)),
-            )
-            .order_by(StrategicCycle.phase1_started_at.desc())
-            .limit(1)
+        .order_by(StrategicCycle.phase1_started_at.desc())
+        .limit(1)
+    )
+    _latest_cycle_res = await session.execute(
+        select(StrategicCycle)
+        .where(
+            StrategicCycle.project_id == project.id,
+            ~StrategicCycle.outcome.in_(list(strategic_cycle.ACTIVE_OUTCOMES)),
         )
-    ).scalar_one_or_none()
+        .order_by(StrategicCycle.phase1_started_at.desc())
+        .limit(1)
+    )
+    _task_status_rows_res = await session.execute(
+        select(Task.status, func.count())
+        .where(Task.project_id == project.id, Task.archived.is_(False))
+        .group_by(Task.status)
+    )
+    _message_rows_res = await session.execute(
+        select(ProjectMessage)
+        .where(
+            ProjectMessage.project_id == project.id,
+            ProjectMessage.status.in_([OPEN_STATUS, LINKED_STATUS]),
+        )
+        .order_by(ProjectMessage.created_at.desc())
+        .limit(12)
+    )
+    _message_count_rows_res = await session.execute(
+        select(ProjectMessage.status, func.count())
+        .where(
+            ProjectMessage.project_id == project.id,
+            ProjectMessage.status.in_([OPEN_STATUS, LINKED_STATUS]),
+        )
+        .group_by(ProjectMessage.status)
+    )
+    task_focus = await _build_task_focus(session, project.id)
+    attention = await build_operator_attention(session, project, current_user["user_id"])
+    _open_version_res = await session.execute(
+        select(ReleaseVersion)
+        .where(
+            ReleaseVersion.project_id == project.id,
+            ReleaseVersion.status == "open",
+        )
+        .order_by(ReleaseVersion.opened_at.desc())
+        .limit(1)
+    )
+    active_cycle = _active_cycle_res.scalar_one_or_none()
+    latest_cycle = _latest_cycle_res.scalar_one_or_none()
+    task_status_rows = _task_status_rows_res.all()
+    message_rows = _message_rows_res.scalars().all()
+    message_count_rows = _message_count_rows_res.all()
+    open_version = _open_version_res.scalars().first()
 
     active_task = None
     active_phase = None
@@ -1123,13 +1525,6 @@ async def get_project_strategic_state(
             else:
                 active_phase = None
 
-    task_status_rows = (
-        await session.execute(
-            select(Task.status, func.count())
-            .where(Task.project_id == project.id, Task.archived.is_(False))
-            .group_by(Task.status)
-        )
-    ).all()
     task_counts = {
         "queued": 0,
         "running": 0,
@@ -1188,48 +1583,35 @@ async def get_project_strategic_state(
             )
         ).scalar() or 0.0
         _COST_CACHE[_cost_key] = (float(cost_total), _cost_now + _COST_CACHE_TTL_S)
-    task_focus = await _build_task_focus(session, project.id)
-
-    message_rows = (
-        await session.execute(
-            select(ProjectMessage)
-            .where(
-                ProjectMessage.project_id == project.id,
-                ProjectMessage.status.in_([OPEN_STATUS, LINKED_STATUS]),
-            )
-            .order_by(ProjectMessage.created_at.desc())
-            .limit(12)
-        )
-    ).scalars().all()
-    message_count_rows = (
-        await session.execute(
-            select(ProjectMessage.status, func.count())
-            .where(
-                ProjectMessage.project_id == project.id,
-                ProjectMessage.status.in_([OPEN_STATUS, LINKED_STATUS]),
-            )
-            .group_by(ProjectMessage.status)
-        )
-    ).all()
     message_counts = {"open": 0, "linked": 0}
     for status, count in message_count_rows:
         if status in message_counts:
             message_counts[status] = int(count or 0)
 
-    async with async_timed(request, "attention"):
-        attention = await build_operator_attention(
-            session,
-            project,
-            current_user["user_id"],
-        )
     active_cycle_summary = _cycle_summary(active_cycle, active_task=active_task)
     latest_cycle_summary = _cycle_summary(latest_cycle)
     running_update_summary = _running_update_summary(project)
     problem_model_summary = _problem_model_summary(project.problem_model or {})
     directions_summary = _direction_summary(project.directions or [])
-    # State-revision skip: if the client already has a matching revision token,
-    # the context package inputs haven't changed since their last poll.
-    # Skip the expensive evidence load + package build and log the bypass.
+
+    # Broad-revision fingerprints: a handful of single-row indexed scalar/count/
+    # max-timestamp probes standing in for each Phase-2 segment the narrow token
+    # never covered. Folded into the revision hash below so the token is stable
+    # iff the visible response is stable — letting a matching poll return 304
+    # BEFORE the expensive Phase-2 assembly runs. AsyncSession is single-threaded,
+    # so these run sequentially; each is O(1)/small GROUP BY over indexed columns.
+    async with async_timed(request, "fingerprints"):
+        fingerprints = await _compute_strategic_state_fingerprints(
+            session, project.id, current_user["user_id"]
+        )
+    # sha_freshness lives in an out-of-band memory cache the DB probes above can
+    # never see; fold its cache-state so the cold→warm verdict transition flips
+    # the revision instead of being masked by an early 304 (see helper docstring).
+    fingerprints["currency"] = _currency_cache_fingerprint(project, open_version)
+
+    # Broad state-revision skip: a matching client token proves EVERY visible
+    # segment (context package + runtime + workbench + events + jobs + integrity)
+    # is unchanged, so the whole Phase-2 assembly can be skipped with an HTTP 304.
     _revision = _compute_strategic_state_revision(
         project,
         active_cycle_summary=active_cycle_summary,
@@ -1241,30 +1623,40 @@ async def get_project_strategic_state(
         message_counts=message_counts,
         task_counts=task_counts,
         attention=attention,
+        fingerprints=fingerprints,
     )
     if state_revision is not None and state_revision == _revision:
-        context_evidence: dict = {}
-        context_package: dict | None = None
+        # Assembly-skip: return 304 Not Modified with an empty body BEFORE
+        # running any Phase-2 builder. Internal direct callers never pass
+        # state_revision (it defaults to None), so this path is reachable only
+        # for a real HTTP GET carrying ?state_revision= and always yields the
+        # full dict for internal callers.
         logger.info(
-            "[STRATEGIC_STATE] skipped context package build for project %s "
-            "(state_revision unchanged)",
+            "[STRATEGIC_STATE] 304 not modified for project %s "
+            "(broad state_revision unchanged; Phase-2 assembly skipped)",
             project.id,
         )
-    else:
-        context_evidence = await load_strategic_context_evidence(session, project.id)
-        context_package = build_strategic_context_package_summary(
-            project,
-            active_cycle=active_cycle_summary,
-            active_task=active_task,
-            latest_cycle=latest_cycle,
-            running_update=running_update_summary,
-            problem_model=problem_model_summary,
-            directions=directions_summary,
-            message_counts=message_counts,
-            task_counts=task_counts,
-            attention=attention,
-            evidence=context_evidence,
-        )
+        # Empty body, no full-body ETag (never assembled). The client keys this
+        # path on ?state_revision= and keeps its held ETag untouched on a 304.
+        return Response(status_code=304)
+
+    # Revision miss (or first-load with no token): build the full context
+    # package. With the broad guard above, reaching here means a visible segment
+    # changed, so the package's inputs are (re)assembled unconditionally.
+    context_evidence = await load_strategic_context_evidence(session, project.id)
+    context_package = build_strategic_context_package_summary(
+        project,
+        active_cycle=active_cycle_summary,
+        active_task=active_task,
+        latest_cycle=latest_cycle,
+        running_update=running_update_summary,
+        problem_model=problem_model_summary,
+        directions=directions_summary,
+        message_counts=message_counts,
+        task_counts=task_counts,
+        attention=attention,
+        evidence=context_evidence,
+    )
     runtime_summary = await build_strategic_runtime_summary(
         session,
         project.id,
@@ -1341,17 +1733,6 @@ async def get_project_strategic_state(
     # SHA-aware freshness: resolve candidate vs integration HEAD, best-effort.
     # A GitHub API failure must not break the endpoint — verdict degrades to unknown.
     sha_freshness: dict | None = None
-    open_version = (
-        await session.execute(
-            select(ReleaseVersion)
-            .where(
-                ReleaseVersion.project_id == project.id,
-                ReleaseVersion.status == "open",
-            )
-            .order_by(ReleaseVersion.opened_at.desc())
-            .limit(1)
-        )
-    ).scalars().first()
     from app.strategic_spawning import (
         _build_payload_staleness_block,
         _build_unknown_freshness_block,
@@ -1454,7 +1835,7 @@ async def get_project_strategic_state(
     )
     integrity_trend = await _integrity_conflict_trend(session, project.id)
 
-    return {
+    result: Dict[str, Any] = {
         "project_id": str(project.id),
         "strategic": {
             "active_cycle": active_cycle_summary,
@@ -1522,6 +1903,25 @@ async def get_project_strategic_state(
         "strategic_memory_notes": project.strategic_memory_notes or [],
     }
 
+    # HTTP 304 transmission short-circuit. The full-body ETag covers every
+    # volatile field (unlike the narrow state_revision, which only gates the
+    # context-package build-skip above), so a matching If-None-Match proves the
+    # ENTIRE body is unchanged and we can skip re-transmitting it. Internal
+    # direct callers (get_project_strategic_session and friends) pass a throwaway
+    # Response and no If-None-Match, so they always receive the full dict — the
+    # 304 path is reachable only for a real HTTP GET carrying If-None-Match.
+    etag = _compute_strategic_state_etag(result)
+    if _if_none_match_hits(if_none_match, etag):
+        logger.info(
+            "[STRATEGIC_STATE] 304 not modified for project %s "
+            "(full-body ETag unchanged)",
+            project.id,
+        )
+        return Response(status_code=304, headers={"ETag": _quote_etag(etag)})
+    response.headers["ETag"] = _quote_etag(etag)
+    return result
+
+
 @router.get("/projects/{project_id}/strategic-session")
 @limiter.limit("30/minute")
 async def get_project_strategic_session(
@@ -1536,6 +1936,9 @@ async def get_project_strategic_session(
     state = await get_project_strategic_state(
         request,
         project_id,
+        # Internal direct call: pass a throwaway Response (headers discarded) and
+        # no If-None-Match so the full dict is always returned.
+        response=Response(),
         session=session,
         current_user=current_user,
     )
@@ -1550,7 +1953,7 @@ async def get_project_strategic_session(
 @router.get("/projects/{project_id}/strategic-conversation")
 @limiter.limit("60/minute")
 async def get_project_strategic_conversation(
-    request: Request,  # noqa: ARG001
+    request: Request,
     project_id: uuid.UUID,
     include_message_id: uuid.UUID | None = Query(None),
     session: AsyncSession = Depends(get_session),
@@ -1621,6 +2024,9 @@ async def upsert_project_strategic_session(
     state_response = await get_project_strategic_state(
         request,
         project_id,
+        # Internal direct call: pass a throwaway Response (headers discarded) and
+        # no If-None-Match so the full dict is always returned.
+        response=Response(),
         session=session,
         current_user=current_user,
     )
@@ -1660,6 +2066,9 @@ async def execute_project_strategic_session_command(
     state_response = await get_project_strategic_state(
         request,
         project_id,
+        # Internal direct call: pass a throwaway Response (headers discarded) and
+        # no If-None-Match so the full dict is always returned.
+        response=Response(),
         session=session,
         current_user=current_user,
     )
@@ -1695,6 +2104,9 @@ async def execute_project_strategic_session_command(
     refreshed_state = await get_project_strategic_state(
         request,
         project_id,
+        # Internal direct call: pass a throwaway Response (headers discarded) and
+        # no If-None-Match so the full dict is always returned.
+        response=Response(),
         session=session,
         current_user=current_user,
     )
@@ -1887,6 +2299,9 @@ async def create_project_strategic_session_check_in(
     state_response = await get_project_strategic_state(
         request,
         project_id,
+        # Internal direct call: pass a throwaway Response (headers discarded) and
+        # no If-None-Match so the full dict is always returned.
+        response=Response(),
         session=session,
         current_user=current_user,
     )
@@ -1965,6 +2380,9 @@ async def create_project_strategic_session_message(
     state_response = await get_project_strategic_state(
         request,
         project_id,
+        # Internal direct call: pass a throwaway Response (headers discarded) and
+        # no If-None-Match so the full dict is always returned.
+        response=Response(),
         session=session,
         current_user=current_user,
     )

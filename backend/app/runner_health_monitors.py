@@ -43,7 +43,6 @@ logger = logging.getLogger("blueprint")
 _RUNNER_LIVENESS_SECONDS = 300
 
 # Consecutive-failure count at which a live runner is considered degraded.
-# Mirrors admin_runners._FAILURE_STREAK_DEGRADED_THRESHOLD (both must stay in sync).
 _RUNNER_DEGRADED_FAILURE_THRESHOLD = 3
 
 # Default free-disk floor (bytes) below which a live runner is considered low-disk.
@@ -53,6 +52,162 @@ _RUNNER_LOW_DISK_THRESHOLD_BYTES_DEFAULT = 1_073_741_824  # 1 GiB
 # Default free-memory floor (bytes) below which a live runner is considered low-
 # memory.  512 MB — configurable at runtime via ``runner_low_memory_threshold_bytes``.
 _RUNNER_LOW_MEMORY_THRESHOLD_BYTES_DEFAULT = 536_870_912  # 512 MiB
+
+# Retention window (days) for RunnerHeartbeatSnapshot time-series rows. The
+# table is append-only on every heartbeat, so it must be periodically trimmed.
+# Configurable at runtime via ``runner_heartbeat_retention_days``.
+_RUNNER_HEARTBEAT_RETENTION_DAYS_DEFAULT = 7
+
+# Window (seconds) after a runner reports a NEW version within which, if it then
+# goes silent, we flag a likely post-self-update crash (no supervisor to
+# restart it). Configurable via ``runner_post_update_silence_seconds``.
+_RUNNER_POST_UPDATE_SILENCE_SECONDS_DEFAULT = 600  # 10 minutes
+
+
+async def _cleanup_stale_heartbeat_snapshots(session: AsyncSession) -> int:
+    """Delete RunnerHeartbeatSnapshot rows older than the retention window.
+
+    The snapshot table grows one row per heartbeat per runner (~every 30s), so
+    it must be trimmed or it grows without bound. Conservative default of 7 days
+    (configurable via ``runner_heartbeat_retention_days``). Index-driven delete
+    on ``captured_at``. Best-effort: a failure rolls back and returns 0 so the
+    surrounding sweep continues. Returns the number of rows deleted.
+    """
+    from sqlalchemy import delete
+
+    from app.models import RunnerHeartbeatSnapshot
+
+    retention_days = int(
+        _runtime_config.get(
+            "runner_heartbeat_retention_days",
+            _RUNNER_HEARTBEAT_RETENTION_DAYS_DEFAULT,
+        )
+    )
+    if retention_days <= 0:
+        return 0
+    cutoff = _utcnow() - timedelta(days=retention_days)
+    try:
+        result = await session.execute(
+            delete(RunnerHeartbeatSnapshot).where(
+                RunnerHeartbeatSnapshot.captured_at < cutoff
+            )
+        )
+        await session.commit()
+        return int(result.rowcount or 0)
+    except Exception:
+        logger.exception("[RUNNERS] Failed to trim stale heartbeat snapshots")
+        try:
+            await session.rollback()
+        except Exception:
+            logger.exception(
+                "[RUNNERS] rollback after heartbeat-snapshot trim failure failed"
+            )
+        return 0
+
+
+async def _check_post_update_silent_runners(session: AsyncSession) -> None:
+    """Alert when a runner self-updated and then went silent.
+
+    Detects the tmux/nohup auto-update failure mode: a runner reports a NEW
+    version (``capabilities['version_changed_at']`` stamped by the heartbeat
+    handler on a genuine version change), then goes silent because ``os._exit``
+    killed the process and no supervisor restarted it. Fires a WARNING alert
+    when all three hold within the configured window:
+      (a) a recent version change (``version_changed_at`` within the window),
+      (b) the runner has now gone silent (``last_seen_at`` past liveness), and
+      (c) it is not operator-deleted.
+    Best-effort per runner; resolves the alert once the runner heartbeats again.
+    """
+    from app.alert_dispatch import (
+        _maybe_create_runner_post_update_silent_alert,
+        _resolve_runner_post_update_silent_alert,
+    )
+
+    window = int(
+        _runtime_config.get(
+            "runner_post_update_silence_seconds",
+            _RUNNER_POST_UPDATE_SILENCE_SECONDS_DEFAULT,
+        )
+    )
+    now = _utcnow()
+    liveness_cutoff = now - timedelta(seconds=_RUNNER_LIVENESS_SECONDS)
+
+    runners = (
+        await session.execute(
+            select(LocalRunner).where(LocalRunner.status != "deleted")
+        )
+    ).scalars().all()
+
+    for runner in runners:
+        caps = runner.capabilities or {}
+        stamped = caps.get("version_changed_at")
+        changed_at = _parse_naive_iso(stamped) if stamped else None
+        # (a) a version change stamped within the silence window
+        recently_updated = (
+            changed_at is not None
+            and (now - changed_at) <= timedelta(seconds=window)
+        )
+        # (b) now silent: no heartbeat within the liveness window
+        is_silent = runner.last_seen_at is None or runner.last_seen_at < liveness_cutoff
+        if recently_updated and is_silent:
+            seconds_silent = (
+                max(0, int((now - runner.last_seen_at).total_seconds()))
+                if runner.last_seen_at is not None
+                else None
+            )
+            try:
+                await _maybe_create_runner_post_update_silent_alert(
+                    session,
+                    project_id=runner.project_id,
+                    runner_id=runner.id,
+                    hostname=runner.hostname,
+                    old_version=caps.get("previous_version"),
+                    new_version=runner.version,
+                    seconds_silent=seconds_silent,
+                )
+            except Exception:
+                logger.exception(
+                    "[RUNNERS] Failed to raise post-update-silent alert for %s",
+                    runner.id,
+                )
+                try:
+                    await session.rollback()
+                except Exception:
+                    logger.exception(
+                        "[RUNNERS] rollback after post-update-silent alert failed"
+                    )
+        elif not is_silent:
+            # Runner is live again — resolve any open post-update-silent alert.
+            try:
+                await _resolve_runner_post_update_silent_alert(
+                    session, runner.project_id, runner.id
+                )
+            except Exception:
+                logger.exception(
+                    "[RUNNERS] Failed to resolve post-update-silent alert for %s",
+                    runner.id,
+                )
+                try:
+                    await session.rollback()
+                except Exception:
+                    logger.exception(
+                        "[RUNNERS] rollback after post-update-silent resolve failed"
+                    )
+
+
+def _parse_naive_iso(raw: str) -> "object | None":
+    """Parse an ISO-8601 timestamp to naive-UTC; return None if unparseable."""
+    from datetime import datetime, timezone
+
+    if not raw or not isinstance(raw, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
 
 
 async def _sweep_runner_deactivated_escalations(session: AsyncSession) -> None:
@@ -701,6 +856,19 @@ async def _check_degraded_runners(session: AsyncSession) -> None:
         await _check_low_memory_runners(session)
     except Exception:
         logger.exception("[RUNNERS] Failed to sweep low-memory runner alerts")
+
+    # 9. Post-update silent-offline alert: runner self-updated then went dark.
+    try:
+        await _check_post_update_silent_runners(session)
+    except Exception:
+        logger.exception("[RUNNERS] Failed to sweep post-update-silent runner alerts")
+
+    # 10. Retention: trim heartbeat time-series rows past the retention window so
+    # the append-only snapshot table never grows without bound.
+    try:
+        await _cleanup_stale_heartbeat_snapshots(session)
+    except Exception:
+        logger.exception("[RUNNERS] Failed to trim stale heartbeat snapshots")
 
 
 async def _check_stale_token_runners(session: AsyncSession) -> None:

@@ -995,7 +995,7 @@ Rules:
   const enrichAuditOutput = (output: Record<string, unknown>): Record<string, unknown> => {
     const rawFindings = Array.isArray(output.findings) ? output.findings : null;
     const findings = rawFindings === null ? output.findings : rawFindings.map((raw) => {
-      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return raw;
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return raw as Record<string, unknown>;
       const finding = { ...(raw as Record<string, unknown>) };
       const path = typeof finding.file === 'string' ? finding.file.trim() : '';
       if (path) {
@@ -1033,7 +1033,7 @@ Rules:
   // handler output so it reaches release_scoring._score_audit, which retired the
   // hardcoded AUTHORIZED_TEST_DELETIONS allowlist in favour of this signal.
   const enrichedOutput = handlerOutput !== null
-    ? enrichAuditOutput(handlerOutput as Record<string, unknown>)
+    ? enrichAuditOutput(handlerOutput)
     : handlerOutput;
 
   let logs = '';

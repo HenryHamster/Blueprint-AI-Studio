@@ -273,7 +273,6 @@ function augmentCheckResultsWithFpRateHints(
   if (!categories) return;
 
   for (const [category, entry] of Object.entries(checkResults)) {
-    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
     const categoryData = categories[category];
     // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
     if (!categoryData) continue;
@@ -622,7 +621,6 @@ ${outputFormatBlock}`;
     for (const finding of reviewerFindings) {
       const cat = finding.category as string | undefined;
       if (!cat) continue;
-      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
       const categoryData = fpRateCategories[cat];
       // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
       if (!categoryData) continue;

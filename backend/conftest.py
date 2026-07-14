@@ -5,16 +5,25 @@
 #    TEXT fallback lets fixture-level schema creation succeed without touching
 #    production model code.
 #
-# 2. expire_all no-op: SQLAlchemy expires all ORM objects after each
-#    session.commit().  When production code accesses an attribute on an
-#    expired object, it issues a lazy SELECT.  In the async aiosqlite
+# 2. expire_all no-op (aiosqlite only): SQLAlchemy expires all ORM objects
+#    after each session.commit().  When production code accesses an attribute
+#    on an expired object, it issues a lazy SELECT.  In the async aiosqlite
 #    driver this lazy SELECT requires a greenlet context that is absent at
 #    the point where the production code runs (after the route's own await
 #    chain), raising MissingGreenlet.  Making expire_all a no-op keeps
 #    objects "live" in the identity map so their attributes remain readable
 #    without a round-trip.  Tests that need the post-commit DB state still
 #    call `await db_session.refresh(obj)` explicitly.
+#
+#    The no-op is ONLY installed when the test suite runs against aiosqlite.
+#    Under Postgres (USE_TEST_POSTGRES=true + postgresql DATABASE_URL), real
+#    SQLAlchemy expiry is left intact so that @pytest.mark.skipif(not
+#    USE_POSTGRES) MissingGreenlet tests genuinely reproduce the fault rather
+#    than passing tautologically with expiry suppressed.
 
+import os
+
+import pytest
 from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler
 from sqlalchemy.orm.state import InstanceState as _InstanceState
 
@@ -27,20 +36,80 @@ def _sqlite_visit_JSONB(self, type_, **kwargs):
 SQLiteTypeCompiler.visit_JSONB = _sqlite_visit_JSONB  # type: ignore[attr-defined]
 
 
-# --- Fix 2: suppress per-object expiry so lazy reloads don't raise MissingGreenlet ---
+# --- Fix 2: suppress per-object expiry on aiosqlite so lazy reloads don't raise MissingGreenlet ---
 # SQLAlchemy marks all ORM objects "expired" after session.commit() via
 # InstanceState._expire().  The next attribute access then issues a lazy SELECT.
 # In the async aiosqlite test environment that lazy SELECT requires a greenlet
 # context that is absent (outside the route's own async chain), raising
 # MissingGreenlet.  Suppressing _expire keeps each object's attribute dict
 # alive so attributes can be read from the identity map without a round-trip.
+#
+# Under the Postgres backend (USE_TEST_POSTGRES=true) this patch is NOT applied
+# so that real post-commit/rollback expiry is in effect and MissingGreenlet tests
+# guarded by @pytest.mark.skipif(not USE_POSTGRES) exercise the genuine fault.
 _orig_instance_expire = _InstanceState._expire
 
+_USE_POSTGRES_BACKEND = (
+    os.getenv("USE_TEST_POSTGRES", "").lower() == "true"
+    and os.getenv("DATABASE_URL", "").startswith("postgresql")
+)
 
-def _noop_expire(
-    self, dict_, modified_set, instance_dict=None, no_autoflush_expiry=False
-):
-    pass  # Don't expire — keep attributes readable without DB round-trip
+if not _USE_POSTGRES_BACKEND:
+    def _noop_expire(
+        self, dict_, modified_set, instance_dict=None, no_autoflush_expiry=False
+    ):
+        pass  # Don't expire — keep attributes readable without DB round-trip
+
+    _InstanceState._expire = _noop_expire  # type: ignore[assignment]
 
 
-_InstanceState._expire = _noop_expire  # type: ignore[assignment]
+@pytest.fixture
+def expire_fidelity():
+    """Restore real SQLAlchemy object expiry for one test (fidelity mode).
+
+    On the aiosqlite backend the root conftest no-ops InstanceState._expire so
+    the test environment does not raise MissingGreenlet on lazy-loads after
+    session.rollback(). This fixture temporarily restores the original _expire
+    for the duration of one test, making expired attribute access raise — the
+    same behaviour asyncpg produces in production. Use it to guard against
+    MissingGreenlet-class regressions on the cheap SQLite path.
+
+    On the Postgres backend the no-op is never installed, so this fixture is
+    effectively a no-op restore (it sets _expire to the already-real impl and
+    restores it on cleanup). It is still safe to use on Postgres.
+
+    NOTE: A bare ``session.expire(obj)`` call (without this fixture) is NOT
+    a valid MissingGreenlet fidelity mechanism on aiosqlite.  ``Session.expire()``
+    delegates to ``InstanceState._expire``, which is no-oped on the aiosqlite
+    backend, so the call silently does nothing.  The same applies to
+    ``session.expire_all()``, which calls ``InstanceState._expire`` for every
+    managed object — also a no-op on SQLite.  The fidelity scanner in
+    ``test_audit_finding_class_guards.py`` does NOT accept bare ``expire()``
+    or ``expire_all()`` as faithful.  Always pair ``session.expire()`` with
+    this fixture when the goal is to reproduce the asyncpg failure mode, or use
+    ``expunge_all()`` — which removes objects from the identity map without
+    calling ``_expire``.
+    """
+    _before = _InstanceState._expire
+    _InstanceState._expire = _orig_instance_expire  # type: ignore[assignment]
+    yield
+    _InstanceState._expire = _before  # type: ignore[assignment]
+
+
+# Pytest fixture names that guarantee MissingGreenlet test fidelity on SQLite.
+# Recognised by TestMissingGreenletTestsFaithful in test_audit_finding_class_guards.py:
+# a test that accepts one of these as a function argument is considered faithful
+# because the fixture either restores real expiry (expire_fidelity) or raises
+# MissingGreenlet directly on expired-attribute access (missing_greenlet_proxy).
+GREENLET_FIDELITY_FIXTURE_NAMES: tuple[str, ...] = (
+    "expire_fidelity",       # restores _InstanceState._expire for one test
+    "missing_greenlet_proxy",  # proxy factory that raises MissingGreenlet on poison
+)
+
+# Case-insensitive stem keyword that triggers the fidelity-docstring scan in
+# test_audit_finding_class_guards.py::_unfaithful_greenlet_tests.  Widen from
+# the literal "MissingGreenlet" to the stem "greenlet" so tests that describe
+# the identical fault class with standard alternate phrasings (greenlet_spawn,
+# "greenlet context", "greenlet-bridged DDL") are also caught.  Defined here in
+# the conftest so the fixture-manifest and scan-trigger are co-located.
+GREENLET_DOCSTRING_TRIGGER: str = "greenlet"

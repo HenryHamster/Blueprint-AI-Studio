@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.compute_jobs import (
     ComputeLaunchPreconditionFailed,
     _COMPUTE_JOB_TERMINAL_STATUSES,
+    append_progress_sample,
     create_compute_job,
     get_compute_job_for_task,
 )
@@ -58,12 +59,26 @@ class LaunchComputeJobRequest(BaseModel):
     # clone and BEFORE the main command. On failure the job fails immediately
     # with reason `setup_step_failed`; no main-command budget is consumed.
     setup_step: str | None = Field(default=None, max_length=10000)
+    # Optional no-progress watchdog window (peer of deadline_seconds). When set and
+    # positive, a job that writes no intermediate progress (BLUEPRINT_PROGRESS_FILE)
+    # within this many seconds is torn down early with reason `no_progress_timeout`.
+    # Omission = inert watchdog; create_compute_job validates/clamps the value.
+    no_progress_timeout_seconds: int | None = Field(default=None, gt=0)
     # Optional container image URI and registry auth. When container_image is set
     # the backend wraps the command in docker run. Only {server, username} are
     # accepted — password is rejected at create time (no delivery channel to the
     # backend launcher exists in the orchestrated path).
     container_image: str | None = Field(default=None, max_length=512)
     container_registry_auth: Dict[str, Any] | None = None
+    # Optional cross-job checkpoint resume: UUID of a PREDECESSOR compute job whose
+    # durable artifact bundle is rehydrated into this job's BLUEPRINT_ARTIFACT_DIR
+    # before the command runs. create_compute_job validates that the predecessor
+    # belongs to the same project and has a stored bundle. Omission = fresh workspace.
+    input_artifact_job_id: str | None = Field(default=None, max_length=64)
+    # Optional metric name the no-progress watchdog watches for a stall. When set,
+    # a still-running job whose reported metric plateaus over the watchdog window
+    # is cut early instead of burning its full deadline. Omission = no watchdog.
+    declared_metric: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 @router.post("/compute-jobs")
@@ -132,8 +147,11 @@ async def launch_compute_job(
             live_proof=req.live_proof,
             live_proof_marker=req.live_proof_marker,
             setup_step=req.setup_step,
+            no_progress_timeout_seconds=req.no_progress_timeout_seconds,
             container_image=req.container_image,
             container_registry_auth=req.container_registry_auth,
+            declared_metric=req.declared_metric,
+            input_artifact_job_id=req.input_artifact_job_id,
         )
     except ComputeLaunchPreconditionFailed as exc:
         raise HTTPException(status_code=412, detail=exc.detail) from exc
@@ -214,11 +232,24 @@ async def compute_job_vm_heartbeat(
     # ~30 s and includes it in the heartbeat body. Parse and store it so the
     # operator can see partial output while the job runs. All failures degrade
     # gracefully — a malformed or missing body never causes a non-204 response.
-    live_output = _parse_live_output_tail(await request.body())
+    body_bytes = await request.body()
+    live_output = _parse_live_output_tail(body_bytes)
     if live_output is not None:
         meta = dict(job.polling_metadata or {})
         meta["live_output"] = live_output
         job.polling_metadata = meta
+    # Optional progress sample: the runner may include {"progress": {"metric": ...,
+    # "value": ...}} in the heartbeat body. Malformed or missing fields are silently
+    # ignored — older runners that never send this keep working byte-for-byte.
+    progress_sample = _parse_progress_sample(body_bytes)
+    if progress_sample is not None:
+        metric, value = progress_sample
+        job.polling_metadata = append_progress_sample(
+            dict(job.polling_metadata or {}),
+            metric=metric,
+            value=value,
+            t=_utcnow().isoformat(),
+        )
     await session.commit()
     return Response(status_code=204)
 
@@ -252,3 +283,32 @@ def _parse_live_output_tail(body: bytes) -> dict[str, Any] | None:
         return None
     text = redact_command_log_text(text[: _LIVE_TAIL_MAX_TEXT_CHARS])
     return {"text": text, "truncated": truncated}
+
+
+def _parse_progress_sample(body: bytes) -> tuple[str, float] | None:
+    """Extract a (metric, value) progress sample from a heartbeat body, or None.
+
+    Accepts ``{"progress": {"metric": <str>, "value": <number>}}`` at the top
+    level of the JSON body.  Any missing, non-string, or non-numeric field
+    returns None so callers degrade gracefully.
+    """
+    if not body:
+        return None
+    try:
+        body_json = json.loads(body)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(body_json, dict):
+        return None
+    progress = body_json.get("progress")
+    if not isinstance(progress, dict):
+        return None
+    metric = progress.get("metric")
+    if not isinstance(metric, str) or not metric:
+        return None
+    raw_value = progress.get("value")
+    try:
+        float_val = float(raw_value)
+    except (TypeError, ValueError):
+        return None
+    return metric, float_val

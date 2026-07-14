@@ -31,8 +31,36 @@ def _github_request(*args, **kwargs):
 async def create_branch(
     token: str, owner: str, repo: str, branch_name: str, sha: str
 ) -> dict:
-    """
-    Creates a new branch (git reference) in the specified repository.
+    """Create a branch (git ref) at ``sha``, or report reuse of an existing one.
+
+    Returns the GitHub ref object on a real create (HTTP 201).
+
+    On HTTP 422 the ref already exists — the common cause is a retry after a 502
+    whose write actually landed, but it is ALSO what a crashed prior run leaves
+    behind, and that branch can be sitting at a COMPLETELY DIFFERENT SHA.  The
+    old implementation fetched the live SHA and returned a success-shaped
+    ``{"object": {"sha": existing_sha}}`` with NO comparison to the requested
+    ``sha`` — so a caller that just checks "did this raise?" silently adopted a
+    stale tip.  ``release_promotion.promote()`` already defends against this by
+    hand (compare → ``delete_branch`` → recreate), which proves the hazard is
+    real; the comparison belongs HERE so no caller can forget it.
+
+    The reuse result is therefore explicitly distinguishable::
+
+        {
+          "ref": "refs/heads/<branch>",
+          "object": {"sha": <existing_sha>},   # unchanged shape — old callers keep working
+          "reused": True,                      # NEW: this branch was NOT created by us
+          "existing_sha": <existing_sha>,      # NEW: where the pre-existing ref points
+          "requested_sha": <sha>,              # NEW: where we asked it to point
+          "sha_matches": <existing_sha == sha> # NEW: False ⇒ caller MUST decide
+        }
+
+    ``sha_matches: False`` is the load-bearing signal: the caller must either
+    force the ref to ``sha`` (delete + recreate, as ``release_promotion`` does)
+    or consciously accept the existing tip.  A real create (201) has no
+    ``reused`` key, so ``result.get("reused")`` is falsy exactly when the branch
+    is guaranteed to be at ``sha``.
     """
     headers = {
         "Authorization": f"Bearer {token}",
@@ -57,10 +85,29 @@ async def create_branch(
             existing_sha = await _gh.get_branch_sha(
                 token, owner, repo, branch_name, live=True
             )
-            logger.info(
-                f"Branch '{branch_name}' already exists (sha: {existing_sha[:8]}), reusing"
-            )
-            return {"ref": f"refs/heads/{branch_name}", "object": {"sha": existing_sha}}
+            sha_matches = bool(existing_sha) and existing_sha == sha
+            if sha_matches:
+                logger.info(
+                    f"Branch '{branch_name}' already exists at the requested sha "
+                    f"({existing_sha[:8]}) — reusing"
+                )
+            else:
+                # NOT an error on its own — but the caller is now adopting a ref
+                # that points somewhere it did not ask for. Say so loudly.
+                logger.warning(
+                    f"Branch '{branch_name}' already exists at a DIFFERENT sha "
+                    f"(existing={existing_sha[:8] if existing_sha else '?'}, "
+                    f"requested={sha[:8] if sha else '?'}) — returning reused=True "
+                    f"with sha_matches=False; the caller must reset or accept it"
+                )
+            return {
+                "ref": f"refs/heads/{branch_name}",
+                "object": {"sha": existing_sha},
+                "reused": True,
+                "existing_sha": existing_sha,
+                "requested_sha": sha,
+                "sha_matches": sha_matches,
+            }
         except Exception:  # noqa: BLE001
             logger.exception(
                 f"Branch '{branch_name}' 422 but get_branch_sha also failed; falling through"
@@ -613,6 +660,71 @@ async def agent_image_rebake_expected(
     return any(f.startswith(prefix) for f in files for prefix in AGENT_IMAGE_BAKE_PATHS)
 
 
+async def compare_ref_status(
+    token: str,
+    owner: str,
+    repo: str,
+    base_ref: str,
+    head_ref: str,
+    project_id: str | None = None,
+) -> str | None:
+    """Return GitHub's RAW compare status for ``base_ref...head_ref``.
+
+    One of the four values GitHub's compare API reports, from the perspective of
+    ``head_ref`` relative to ``base_ref``:
+
+      * ``"identical"`` — same commit.
+      * ``"ahead"``     — ``head_ref`` strictly contains ``base_ref`` plus more.
+      * ``"behind"``    — ``head_ref`` is an ANCESTOR of ``base_ref``: it has NO
+        commits of its own that ``base_ref`` lacks. Fast-forwarding ``head_ref``
+        to ``base_ref`` therefore destroys nothing.
+      * ``"diverged"``  — BOTH refs have commits the other lacks. ``head_ref``
+        carries unique work; resetting it DESTROYS that work.
+
+    ``None`` when the comparison could not be made (API error / ref not found).
+
+    Why this exists separately from :func:`is_ancestor_of`: that helper collapses
+    the four statuses onto a bool, and ``"behind"`` and ``"diverged"`` BOTH map to
+    ``False``.  For a read-only "has this landed?" question that collapse is
+    correct.  For a DESTRUCTIVE decision ("may I delete and recreate this ref?")
+    it is catastrophic — the two statuses have opposite answers, and only the raw
+    status can tell them apart.  Any caller about to delete a ref MUST use this.
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    response = await _github_request(
+        "GET",
+        f"https://api.github.com/repos/{owner}/{repo}/compare/{base_ref}...{head_ref}",
+        headers,
+        project_id=project_id,
+    )
+    if response.status_code != 200:
+        logger.warning(
+            "[GITHUB] compare_ref_status: compare %s...%s for %s/%s returned %s — "
+            "cannot determine ancestry",
+            base_ref[:8] if base_ref else base_ref,
+            head_ref,
+            owner,
+            repo,
+            response.status_code,
+        )
+        return None
+    try:
+        raw = response.json().get("status")
+    except (ValueError, TypeError) as exc:
+        logger.warning(
+            "[GITHUB] compare_ref_status: unparseable compare response for %s/%s: %s",
+            owner,
+            repo,
+            exc,
+        )
+        return None
+    return raw if isinstance(raw, str) else None
+
+
 async def is_ancestor_of(
     token: str,
     owner: str,
@@ -646,39 +758,17 @@ async def is_ancestor_of(
     comparison could not be made (API error, ref not found) so the caller can
     decide how to degrade — ``None`` deliberately is NOT coerced to a bool, so
     a transient failure never silently looks like "already merged".
+
+    NOTE the deliberate lossiness: ``"behind"`` and ``"diverged"`` BOTH return
+    ``False``.  That is correct for the reachability question this answers, but it
+    means a ``False`` here does NOT license destroying ``descendant_ref`` — a
+    diverged ref holds unique commits.  Destructive callers must use
+    :func:`compare_ref_status` and inspect the raw status.
     """
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github.v3+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-    response = await _github_request(
-        "GET",
-        f"https://api.github.com/repos/{owner}/{repo}/compare/"
-        f"{ancestor_sha}...{descendant_ref}",
-        headers,
-        project_id=project_id,
+    compare_status = await compare_ref_status(
+        token, owner, repo, ancestor_sha, descendant_ref, project_id=project_id
     )
-    if response.status_code != 200:
-        logger.warning(
-            "[GITHUB] is_ancestor_of: compare %s...%s for %s/%s returned %s — "
-            "cannot determine ancestry",
-            ancestor_sha[:8] if ancestor_sha else ancestor_sha,
-            descendant_ref,
-            owner,
-            repo,
-            response.status_code,
-        )
-        return None
-    try:
-        compare_status = response.json().get("status")
-    except (ValueError, TypeError) as exc:
-        logger.warning(
-            "[GITHUB] is_ancestor_of: unparseable compare response for %s/%s: %s",
-            owner,
-            repo,
-            exc,
-        )
+    if compare_status is None:
         return None
     # "identical" (same commit) or "ahead" (descendant strictly contains the
     # ancestor) both mean ancestor_sha is reachable from descendant_ref.

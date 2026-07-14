@@ -117,6 +117,25 @@ def invalidate_repo_installation_read_token_cache(owner: str, repo: str) -> None
         logger.info(f"[GITHUB] Invalidated cached read install token for {owner}/{repo}")
 
 
+def any_cached_installation_token() -> str | None:
+    """Return any still-valid cached installation token, or None.
+
+    Used by free/no-cost probes (e.g. ``probe_rate_limit``) that want to reuse an
+    existing token rather than spend quota minting one. Only tokens with real
+    remaining life are returned — the caches here are mint-anchored, so
+    ``time.monotonic() - minted_at`` is a true age.
+    """
+    now = time.monotonic()
+    for cache in (
+        _repo_installation_token_cache,
+        _repo_installation_read_token_cache,
+    ):
+        for token, minted_at in cache.values():
+            if token and (now - minted_at) < _INSTALLATION_TOKEN_TTL_SECONDS:
+                return token
+    return None
+
+
 async def get_repo_installation_read_token(owner: str, repo: str) -> str | None:
     """Return a read-scoped (contents:read) installation token for the repo.
 

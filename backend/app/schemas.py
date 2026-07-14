@@ -546,6 +546,12 @@ class ComputeJobResponse(BaseModel):
     artifact_id: uuid.UUID | None = None
     polling_metadata: Dict[str, Any] = Field(default_factory=dict)
     compute_rpc_diagnostic: Dict[str, Any] | None = None
+    # Cross-job checkpoint resume, promoted from polling_metadata so the operator
+    # can see (without digging into the launch bag) that a run resumed and from
+    # where. ``input_artifact_job_id`` is the declared+validated resume source;
+    # ``resume_provenance`` is what actually happened at hydration time.
+    input_artifact_job_id: str | None = None
+    resume_provenance: Dict[str, Any] | None = None
 
 
 def serialize_compute_job_response(job: object) -> Dict[str, Any]:
@@ -556,6 +562,17 @@ def serialize_compute_job_response(job: object) -> Dict[str, Any]:
         diagnostic = (data.get("polling_metadata") or {}).get("compute_rpc_diagnostic")
         if isinstance(diagnostic, dict):
             data["compute_rpc_diagnostic"] = diagnostic
+    # Promote the resume source + provenance from polling_metadata so both agent
+    # and operator surfaces expose them as first-class fields. They remain in
+    # polling_metadata too (not stripped by the _safe redactor).
+    metadata = data.get("polling_metadata")
+    if isinstance(metadata, dict):
+        source = metadata.get("input_artifact_job_id")
+        if isinstance(source, str) and source:
+            data["input_artifact_job_id"] = source
+        provenance = metadata.get("resume_provenance")
+        if isinstance(provenance, dict) and provenance:
+            data["resume_provenance"] = provenance
     return data
 
 
@@ -740,6 +757,31 @@ def serialize_compute_job_response_safe(job: object) -> Dict[str, Any]:
             contract["provisioning_model"] = prov_model
         if contract:
             data["launch_contract"] = contract
+
+    # Promote exit_code and command_log as first-class fields so callers do not
+    # need to reach into the opaque polling_metadata bag to surface them.
+    # command_log is already redacted in-place above; read from metadata so the
+    # promoted copy is consistent with the in-bag copy.
+    if isinstance(metadata, dict):
+        exit_code = metadata.get("exit_code")
+        data["exit_code"] = exit_code if isinstance(exit_code, int) else None
+        command_log = metadata.get("command_log")
+        data["command_log"] = command_log if isinstance(command_log, dict) else None
+    else:
+        data["exit_code"] = None
+        data["command_log"] = None
+
+    # Promote progress_series and terminal_kind as first-class fields so the
+    # frontend has a stable shape and does not reach into the opaque bag.
+    # Both are absent/None on legacy rows that predate these fields.
+    if isinstance(metadata, dict):
+        progress_series = metadata.get("progress_series")
+        data["progress_series"] = progress_series if isinstance(progress_series, list) else None
+        terminal_kind = metadata.get("terminal_kind")
+        data["terminal_kind"] = terminal_kind if isinstance(terminal_kind, str) else None
+    else:
+        data["progress_series"] = None
+        data["terminal_kind"] = None
 
     return data
 

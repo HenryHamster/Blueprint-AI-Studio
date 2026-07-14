@@ -1,7 +1,10 @@
 import { vi } from 'vitest';
 
 export function createStrategicStateApiMock(overrides: Record<string, unknown> = {}) {
+  const NOT_MODIFIED = { notModified: true } as const;
   const base: Record<keyof typeof import('../strategicStateApi'), unknown> = {
+    STRATEGIC_STATE_NOT_MODIFIED: NOT_MODIFIED,
+    isStrategicStateNotModified: (r: unknown) => r === NOT_MODIFIED,
     fetchStrategicState: vi.fn(),
     fetchStrategicStateWithRevision: vi.fn(),
     fetchStrategicWorkbenchState: vi.fn(),

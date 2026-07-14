@@ -14,6 +14,11 @@ vi.mock('../api', () => ({
   createComputeExperiment: vi.fn(async () => ({ id: 'compute-experiment-test' })),
   computeExperimentPreflight: vi.fn(async () => ({})),
   draftComputeExperiment: vi.fn(async () => ({ draft_available: false })),
+  // useTaskModal loads the enrolled-runner list for the operator runner-pin
+  // selector. This factory mock REPLACES the whole '../api' module, so every
+  // named export the hook imports must appear here — a missing one is a hard
+  // "does not provide an export named" SyntaxError in browser-mode ESM.
+  listFleetRunners: vi.fn(async () => []),
 }));
 
 const LAUNCHABLE_OPTIONS = [

@@ -1568,6 +1568,77 @@ async def test_sweep_groups_endpoint_omits_incomplete_planned_sweep(
 
 
 @pytest.mark.asyncio
+async def test_single_job_arms_experiment_appears_in_sweep_groups(
+    client: AsyncClient, db_session
+):
+    """A completed single-job multi-arm experiment (no sweep_id in payload) must
+    appear in sweep_groups once its KnowledgeDocument carries the synthesized
+    sweep_id ('single-{task.id}') and per_arm_verdicts with >=2 arms."""
+    project = await _make_project(db_session, name="Single-Job Arms Sweep")
+    await _add_member(db_session, project.id, "viewer")
+
+    # Single-task arms experiment: payload has no sweep_id.
+    task = Task(
+        project_id=project.id,
+        title="single-job arms experiment",
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "arms": [
+                    {"experiment": "control"},
+                    {"experiment": "treatment"},
+                ],
+            }
+        ],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # _persist_compute_knowledge_document now synthesizes this sweep_id for
+    # single-job arms experiments; we seed it directly to test the query path.
+    synthesized_sweep_id = f"single-{task.id}"
+
+    per_arm = {
+        "control": {"met": True, "value": 0.85, "cost_usd": 0.10},
+        "treatment": {"met": False, "value": 0.72, "cost_usd": 0.12},
+    }
+    doc = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=task.id,
+        source_kind=SourceKind.COMPUTE_EXPERIMENT.value,
+        title="Single-job arms result",
+        summary="Comparison of control vs treatment.",
+        body="# Arms comparison\nControl won.",
+        topic="arms-sweep",
+        sweep_id=synthesized_sweep_id,
+        forward_quality_verdict={
+            "analysis_mode": "deterministic",
+            "per_arm_verdicts": per_arm,
+        },
+    )
+    db_session.add(doc)
+    await db_session.commit()
+
+    resp = await client.get(
+        f"/api/admin/projects/{project.id}/compute-jobs/sweep-groups"
+    )
+    assert resp.status_code == 200
+    groups = resp.json()["sweep_groups"]
+    assert synthesized_sweep_id in groups, (
+        f"single-job arms sweep '{synthesized_sweep_id}' missing from sweep_groups"
+    )
+    entries = groups[synthesized_sweep_id]
+    assert len(entries) == 2
+    arm_labels = {e["arm_label"] for e in entries}
+    assert arm_labels == {"control", "treatment"}
+    criterion_map = {e["arm_label"]: e["criterion_met"] for e in entries}
+    assert criterion_map["control"] is True
+    assert criterion_map["treatment"] is False
+
+
+@pytest.mark.asyncio
 async def test_sweep_groups_endpoint_non_member_404(client: AsyncClient, db_session):
     """A user with no project membership receives 404 from the sweep-groups endpoint."""
     project = await _make_project(db_session, name="Sweep Groups No Access")
@@ -2588,3 +2659,289 @@ async def test_awaiting_local_runner_viewer_ok_non_member_404(
     )
     assert resp.status_code == 200
     assert len(resp.json()) == 1
+
+
+@pytest.mark.asyncio
+async def test_awaiting_endpoint_surfaces_forced_runner_hold(
+    client: AsyncClient, db_session
+):
+    """A compute_experiment held for its FORCED runner (awaiting_forced_runner_since,
+    no awaiting_local_runner_since) is surfaced and distinguishable, exposing the
+    forced target runner id/hostname and the forced held-since stamp."""
+    from app.models import LocalRunner
+    from app import auth as auth_mod
+
+    project = await _make_project(db_session, name="Forced Hold Project")
+    await _add_member(db_session, project.id, "viewer")
+
+    token = auth_mod.create_runner_token(uuid.uuid4())
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash=auth_mod.hash_runner_token(token),
+        hostname="dgx-1",
+        status="active",
+        capabilities={"task_types": "all", "has_gpu": True},
+    )
+    db_session.add(runner)
+    await db_session.commit()
+    await db_session.refresh(runner)
+
+    task = Task(
+        project_id=project.id,
+        title="forced-held experiment",
+        status=TaskStatus.QUEUED,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "command": "python run.py",
+                "spend_cap_usd": 4.0,
+                "deadline_seconds": 600,
+            }
+        ],
+        context={
+            "forced_runner_target_id": str(runner.id),
+            "awaiting_forced_runner_since": "2026-07-05T12:00:00+00:00",
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    resp = await client.get(
+        f"/api/admin/projects/{project.id}/compute-jobs/awaiting-local-runner"
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    ids = [e["id"] for e in body]
+    assert str(task.id) in ids, "forced hold must be surfaced by the awaiting endpoint"
+    entry = next(e for e in body if e["id"] == str(task.id))
+    # Distinguishable from a generic enforce-local hold.
+    assert entry["awaiting_local_runner_since"] is None
+    assert entry["awaiting_forced_runner_since"] == "2026-07-05T12:00:00+00:00"
+    assert entry["forced_runner_target_id"] == str(runner.id)
+    assert entry["forced_runner"] is not None
+    assert entry["forced_runner"]["hostname"] == "dgx-1"
+    assert entry["forced_runner"]["id"] == str(runner.id)
+
+
+@pytest.mark.asyncio
+async def test_failed_job_response_has_first_class_exit_code_and_command_log(
+    client: AsyncClient, db_session
+):
+    """exit_code and command_log must appear as first-class top-level fields on the
+    admin compute-job response, not only inside the opaque polling_metadata bag.
+
+    A terminal job whose polling_metadata carries exit_code (int) and command_log
+    (dict) must expose them both as first-class keys at the root of the serialized
+    job response, with the command_log already credential-redacted.  A job that
+    carries no exit_code/command_log must still expose the keys (as null) so
+    callers can rely on them being present without guarding for key absence.
+    """
+    project = await _make_project(db_session, name="First-Class Fields")
+    await _add_member(db_session, project.id, "viewer")
+
+    # Seed a failed job with exit_code and command_log in polling_metadata.
+    _task, failed_job = await _make_job_with_polling_metadata(
+        db_session,
+        project,
+        {
+            "exit_code": 1,
+            "command_log": {
+                "text": "running experiment\nANTHROPIC_API_KEY=sk-ant-api03-SECRET\nexit 1",
+                "truncated": False,
+                "byte_count": 70,
+            },
+            "result_metrics": {"accuracy": 0.42},
+        },
+    )
+    failed_job.status = ComputeJobStatus.FAILED
+    # The monitor's finalize path always stamps completed_at when a job goes
+    # terminal; the list endpoint's recently-finished filter requires it
+    # (terminal jobs with a NULL completed_at are excluded by design).
+    failed_job.completed_at = _utcnow()
+    db_session.add(failed_job)
+    await db_session.commit()
+
+    # Seed a second job with no exit_code / command_log to confirm null promotion.
+    _task2, empty_job = await _make_job_with_polling_metadata(
+        db_session,
+        project,
+        {"result_metrics": {"accuracy": 0.9}},
+    )
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
+    assert resp.status_code == 200
+    jobs_by_id = {j["id"]: j for j in resp.json()["compute_jobs"]}
+
+    # --- failed job ---
+    failed = jobs_by_id[str(failed_job.id)]
+
+    # exit_code must be a first-class integer field, not buried in polling_metadata.
+    assert "exit_code" in failed, "exit_code must be a top-level field"
+    assert failed["exit_code"] == 1
+
+    # command_log must be a first-class dict field.
+    assert "command_log" in failed, "command_log must be a top-level field"
+    assert isinstance(failed["command_log"], dict)
+    assert failed["command_log"]["truncated"] is False
+    assert failed["command_log"]["byte_count"] == 70
+
+    # The command_log text must have the credential redacted.
+    log_text = failed["command_log"]["text"]
+    assert "sk-ant-api03-SECRET" not in log_text, (
+        "command_log text must be credential-redacted before promotion"
+    )
+    assert "running experiment" in log_text
+
+    # --- job with no exit_code / command_log ---
+    empty = jobs_by_id[str(empty_job.id)]
+    assert "exit_code" in empty, "exit_code must always be present (null when absent)"
+    assert empty["exit_code"] is None
+    assert "command_log" in empty, "command_log must always be present (null when absent)"
+    assert empty["command_log"] is None
+
+
+@pytest.mark.asyncio
+async def test_gpu_contamination_audit_returns_completed_at(
+    client: AsyncClient, db_session
+):
+    """gpu-contamination-audit serializes completed_at (not ended_at) for suspect jobs.
+
+    ComputeJob has no ended_at attribute; accessing it raises AttributeError.
+    This test confirms the response carries completed_at and the endpoint
+    does not crash when at least one suspect job is present.
+    """
+    project = await _make_project(db_session, name="GPU Contamination")
+    await _add_member(db_session, project.id, "viewer")
+
+    task = Task(
+        project_id=project.id,
+        title="gpu experiment",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # A suspect job: runner-subprocess backend + accelerator_type set + started
+    # before the fix timestamp (2026-07-11 07:06:21 UTC).
+    suspect_started = datetime(2026, 7, 10, 12, 0, 0, tzinfo=timezone.utc)
+    suspect_completed = datetime(2026, 7, 10, 13, 0, 0, tzinfo=timezone.utc)
+    job = ComputeJob(
+        task_id=task.id,
+        project_id=project.id,
+        backend="runner-subprocess",
+        accelerator_type="T4",
+        status=ComputeJobStatus.SUCCEEDED,
+        machine_type="n1-standard-4",
+        spend_cap_usd=5.0,
+        accrued_cost_usd=1.0,
+        started_at=suspect_started,
+        completed_at=suspect_completed,
+        polling_metadata={},
+    )
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    resp = await client.get(
+        f"/api/admin/compute-jobs/gpu-contamination-audit?project_id={project.id}"
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["suspect_count"] == 1
+    jobs = body["jobs"]
+    assert len(jobs) == 1
+    item = jobs[0]
+    assert item["job_id"] == str(job.id)
+    assert item["accelerator_type"] == "T4"
+    # completed_at must be present (AttributeError on job.ended_at would crash here)
+    assert "completed_at" in item
+    # ComputeJob datetime columns are NaiveUTCDateTime: a tz-aware value is stored
+    # and read back as naive UTC (tz stripped), matching the codebase-wide naive-UTC
+    # convention and the canonical serializer. So the serialized value carries no
+    # offset — compare against the naive-UTC round-trip, not the aware original.
+    #
+    # Anchored to the INPUT LITERAL (`suspect_completed`), deliberately NOT to
+    # `job.completed_at.isoformat()`: the latter is a self-consistency round-trip
+    # that would still pass if the storage layer mangled the timestamp, since both
+    # sides of the comparison would shift together.
+    assert item["completed_at"] == suspect_completed.replace(tzinfo=None).isoformat()
+    assert "ended_at" not in item
+    # status must serialize to the plain enum value. job.status arrives as a str on
+    # this load path, so a bare `.value` raises AttributeError and 500s the endpoint.
+    assert item["status"] == ComputeJobStatus.SUCCEEDED.value
+
+
+@pytest.mark.asyncio
+async def test_gpu_contamination_audit_non_member_404(client: AsyncClient, db_session):
+    """The audit is project-scoped: a non-member gets 404, not a 500.
+
+    Regression guard for a malformed access-control call — the endpoint used to
+    invoke ``_get_user_project_with_role(project_id, user, session,
+    required_role=...)``, passing the user DICT instead of ``user["user_id"]``
+    and a kwarg the helper does not accept. That raised TypeError on EVERY
+    request (500), so the endpoint was unreachable and its scoping never ran.
+    A well-formed call denies the non-member with the helper's 404.
+    """
+    project = await _make_project(db_session, name="Foreign GPU Project")
+    # Deliberately NO ProjectMember row for the test user.
+
+    resp = await client.get(
+        f"/api/admin/compute-jobs/gpu-contamination-audit?project_id={project.id}"
+    )
+    assert resp.status_code == 404, resp.text
+
+
+@pytest.mark.asyncio
+async def test_list_compute_jobs_task_id_filter(client: AsyncClient, db_session):
+    """task_id query param returns only jobs for that task, not the whole project."""
+    project = await _make_project(db_session, name="TaskFilter")
+    await _add_member(db_session, project.id, "viewer")
+    task_a, job_a, _ = await _make_job(db_session, project, title="task A")
+    _task_b, job_b, _ = await _make_job(db_session, project, title="task B")
+
+    resp = await client.get(
+        f"/api/admin/projects/{project.id}/compute-jobs?task_id={task_a.id}"
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    ids = [j["id"] for j in body["compute_jobs"]]
+    assert ids == [str(job_a.id)], f"expected only job_a, got {ids}"
+    assert str(job_b.id) not in ids
+
+
+@pytest.mark.asyncio
+async def test_list_compute_jobs_task_id_bypasses_time_window(
+    client: AsyncClient, db_session
+):
+    """A task_id filter returns the task's OLD terminal jobs that the default
+    time-window query would exclude — this is what lets the task drawer drop
+    its wide (7-day) window and fetch a single task-scoped request."""
+    project = await _make_project(db_session, name="TaskFilterWindow")
+    await _add_member(db_session, project.id, "viewer")
+    task, old_job, _ = await _make_job(
+        db_session, project, status=ComputeJobStatus.SUCCEEDED, title="stale task"
+    )
+    # Completed far outside the default 6h include_finished window.
+    old_job.completed_at = _utcnow() - timedelta(days=30)
+    db_session.add(old_job)
+    await db_session.commit()
+
+    # Unfiltered listing excludes the stale terminal job (window applies)...
+    unfiltered = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
+    assert unfiltered.status_code == 200
+    unfiltered_ids = [j["id"] for j in unfiltered.json()["compute_jobs"]]
+    assert str(old_job.id) not in unfiltered_ids
+
+    # ...but the task-scoped request still returns it (window bypassed).
+    scoped = await client.get(
+        f"/api/admin/projects/{project.id}/compute-jobs?task_id={task.id}"
+    )
+    assert scoped.status_code == 200
+    scoped_body = scoped.json()
+    scoped_ids = [j["id"] for j in scoped_body["compute_jobs"]]
+    assert scoped_ids == [str(old_job.id)], f"expected stale job, got {scoped_ids}"
+    # Per-task summary counts the returned jobs (aggregate is not meaningful here).
+    assert scoped_body["summary"]["total_jobs"] == 1

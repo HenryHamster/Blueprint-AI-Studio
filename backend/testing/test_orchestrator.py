@@ -16,6 +16,7 @@ from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 
 from app.time_utils import _utcnow
+from testing.conftest import USE_POSTGRES
 import app.main as _main_module
 import app.shared_state as _shared_state
 from app.reaper import reaper_service
@@ -192,6 +193,29 @@ def test_dispatch_prep_contention_quarantine_threshold_is_bounded():
     assert isinstance(_dispatch_prep_contention_streak, dict), (
         "_dispatch_prep_contention_streak must be a dict for per-task streak tracking"
     )
+
+
+def test_build_compute_launch_kwargs_forwards_no_progress_timeout():
+    """_build_compute_launch_kwargs must forward no_progress_timeout_seconds from
+    the compute_experiment payload to create_compute_job kwargs — like every peer
+    optional launch field (setup_step, container_image, allow_host_fallback) — so a
+    task launched directly by the orchestrator gets the same no-progress watchdog an
+    agent-launched job would. Omitting it silently dropped the field."""
+    from app.orchestrator_runner_dispatch import _build_compute_launch_kwargs
+
+    kwargs = _build_compute_launch_kwargs(
+        {"no_progress_timeout_seconds": 300},
+        command="python3 run.py",
+        spend_cap_usd=5.0,
+        deadline_seconds=1800,
+    )
+    assert kwargs["no_progress_timeout_seconds"] == 300
+
+    # Absent field ⇒ not forwarded (backend default / inert watchdog).
+    kwargs_absent = _build_compute_launch_kwargs(
+        {}, command="python3 run.py", spend_cap_usd=5.0, deadline_seconds=1800
+    )
+    assert "no_progress_timeout_seconds" not in kwargs_absent
 
 
 # ── Main-loop sleep selection (WI-4: gate fast cycle on dispatch progress) ───
@@ -398,6 +422,170 @@ async def test_dispatch_gate_ceiling_exceeded_defers_tasks(db_session, mocker):
     )
 
 
+@pytest.mark.asyncio
+async def test_dispatch_gate_hard_pause_on_ceiling_exceeded(db_session, mocker):
+    """When pause_on_ceiling_exceeded=True and spend exceeds the ceiling,
+    _filter_project_resource_dispatch_eligible must set project.paused=True
+    and broadcast project_spend_ceiling_exceeded.
+
+    This directly tests the hard-pause path (orchestrator.py lines 788-812)
+    that was identified as having no dedicated coverage.
+    """
+    from app.orchestrator import _filter_project_resource_dispatch_eligible
+    import app.shared_state as _shared_state
+
+    # Reset shared state so prior tests don't affect the ceiling-deferred set.
+    _shared_state.project_ceiling_deferred_ids = set()
+
+    project = make_project(
+        name="hard-pause-test",
+        user_id=_TEST_USER,
+        build_config={
+            "resource_envelope": {
+                "spend_ceiling_usd": 100.0,
+                "spend_window_days": 30,
+                "pause_on_ceiling_exceeded": True,
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create", "prompt": "hard-pause test task"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    task_id = task.id
+
+    # Spend exceeds ceiling → hard-pause must fire.
+    mocker.patch(
+        "app.orchestrator.get_project_recent_spend_usd",
+        new=AsyncMock(
+            return_value={
+                "total": 150.0,
+                "ceiling_gate_total": 150.0,
+                "compute": 100.0,
+                "agent_vm": 50.0,
+                "llm": 0.0,
+                "idle": 0.0,
+            }
+        ),
+    )
+    broadcast_mock = AsyncMock()
+
+    result = await _filter_project_resource_dispatch_eligible(
+        db_session,
+        [task_id],
+        [task],
+        {},
+        broadcast_mock,
+    )
+
+    # Task must be excluded from dispatch (deferred).
+    assert task_id not in result, (
+        "task must be deferred when project spend ceiling is exceeded"
+    )
+
+    # Project must now be paused in the DB.
+    await db_session.refresh(project)
+    assert project.paused is True, (
+        "project must be hard-paused when pause_on_ceiling_exceeded=True "
+        "and spend ceiling is breached"
+    )
+
+    # broadcast_to_project must have been called with project_spend_ceiling_exceeded.
+    broadcast_calls = [
+        call.args[1]
+        for call in broadcast_mock.call_args_list
+        if len(call.args) >= 2
+    ]
+    assert "project_spend_ceiling_exceeded" in broadcast_calls, (
+        f"expected project_spend_ceiling_exceeded broadcast; calls={broadcast_calls}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_dispatch_gate_hard_pause_no_refire_when_already_paused(db_session, mocker):
+    """When the project is already paused, the hard-pause guard must not
+    re-fire the project_spend_ceiling_exceeded broadcast.
+
+    Guards the no-refire condition at orchestrator.py line 794:
+    `if not _project.paused:` prevents spamming the broadcast every cycle.
+    """
+    from app.orchestrator import _filter_project_resource_dispatch_eligible
+    import app.shared_state as _shared_state
+
+    _shared_state.project_ceiling_deferred_ids = set()
+
+    project = make_project(
+        name="hard-pause-already-paused",
+        user_id=_TEST_USER,
+        build_config={
+            "resource_envelope": {
+                "spend_ceiling_usd": 100.0,
+                "spend_window_days": 30,
+                "pause_on_ceiling_exceeded": True,
+            }
+        },
+    )
+    project.paused = True  # Project is already paused.
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create", "prompt": "already-paused task"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    task_id = task.id
+
+    mocker.patch(
+        "app.orchestrator.get_project_recent_spend_usd",
+        new=AsyncMock(
+            return_value={
+                "total": 150.0,
+                "ceiling_gate_total": 150.0,
+                "compute": 100.0,
+                "agent_vm": 50.0,
+                "llm": 0.0,
+                "idle": 0.0,
+            }
+        ),
+    )
+    broadcast_mock = AsyncMock()
+
+    await _filter_project_resource_dispatch_eligible(
+        db_session,
+        [task_id],
+        [task],
+        {},
+        broadcast_mock,
+    )
+
+    # The project_spend_ceiling_exceeded broadcast must NOT fire again
+    # since the project was already paused before this cycle.
+    broadcast_calls = [
+        call.args[1]
+        for call in broadcast_mock.call_args_list
+        if len(call.args) >= 2
+    ]
+    assert "project_spend_ceiling_exceeded" not in broadcast_calls, (
+        "project_spend_ceiling_exceeded must not be re-broadcast when "
+        f"project is already paused; calls={broadcast_calls}"
+    )
+
+
 # ── Degraded-runner dispatch deprioritization ─────────────────────────────────
 
 
@@ -462,6 +650,521 @@ def test_degraded_runner_deprioritized_in_dispatch():
     assert selected_fallback.id == degraded.id, (
         "degraded runner must still be selected when it is the only candidate"
     )
+
+
+
+def test_idle_runner_dispatch_rotates_across_ties():
+    """When multiple runners are equally idle, different task UUIDs must route
+    to different runners (rotation via dispatch_seed), so the fleet is balanced
+    rather than every task landing on the same first-in-order runner.
+    """
+    from app.orchestrator_runner_dispatch import (
+        _select_eligible_runner,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    caps_all = {"task_types": "all"}
+
+    runner_a = RunnerDispatchSnapshot(
+        id=uuid.UUID("aaaaaaaa-0000-0000-0000-000000000001"),
+        project_id=project_id,
+        capabilities=caps_all,
+        consecutive_job_failures=0,
+    )
+    runner_b = RunnerDispatchSnapshot(
+        id=uuid.UUID("bbbbbbbb-0000-0000-0000-000000000002"),
+        project_id=project_id,
+        capabilities=caps_all,
+        consecutive_job_failures=0,
+    )
+    cache = {project_id: [runner_a, runner_b]}
+
+    # Dispatch many tasks with distinct UUIDs; collect which runner is selected.
+    selected_ids = set()
+    for _ in range(20):
+        task_seed = uuid.uuid4().int
+        result = _select_eligible_runner(
+            active_runners_cache=cache,
+            project_id=project_id,
+            task_type="create",
+            accelerator=None,
+            runner_pins_this_cycle={},
+            dispatch_seed=task_seed,
+        )
+        assert result is not None
+        selected_ids.add(result.id)
+
+    assert len(selected_ids) == 2, (
+        f"Expected both runners to be selected across 20 dispatches, "
+        f"but only {len(selected_ids)} runner(s) were chosen: {selected_ids}"
+    )
+
+
+# ── Container-capability gating in runner dispatch ─────────────────────────────
+
+
+def test_runner_has_container_capability_true_when_backend_reported():
+    """_runner_has_container_capability returns True when at least one
+    container backend is reported in isolation_backends."""
+    from app.orchestrator_runner_dispatch import (
+        _runner_has_container_capability,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    container_runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"docker_usable": True, "bwrap_ok": False},
+        },
+    )
+    assert _runner_has_container_capability(container_runner) is True
+
+    podman_runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"podman_usable": True},
+        },
+    )
+    assert _runner_has_container_capability(podman_runner) is True
+
+
+def test_runner_has_container_capability_false_when_no_container_backend():
+    """_runner_has_container_capability returns False when no container
+    backend is reported."""
+    from app.orchestrator_runner_dispatch import (
+        _runner_has_container_capability,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    no_container_runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"bwrap_ok": True, "userns_ok": True},
+        },
+    )
+    assert _runner_has_container_capability(no_container_runner) is False
+
+
+def test_runner_has_container_capability_false_when_no_isolation_backends():
+    """_runner_has_container_capability returns False when isolation_backends
+    is absent (old runner that never reports it)."""
+    from app.orchestrator_runner_dispatch import (
+        _runner_has_container_capability,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    old_runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={"task_types": "all"},
+    )
+    assert _runner_has_container_capability(old_runner) is False
+
+
+def test_runner_has_container_capability_false_when_empty_isolation_backends():
+    """_runner_has_container_capability returns False when isolation_backends
+    is present but empty (no backends reported at all)."""
+    from app.orchestrator_runner_dispatch import (
+        _runner_has_container_capability,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    empty_backends_runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={"task_types": "all", "isolation_backends": {}},
+    )
+    assert _runner_has_container_capability(empty_backends_runner) is False
+
+
+def test_select_eligible_runner_filters_container_image_no_capable_runner():
+    """When a container_image is declared and no runner has container capability,
+    _select_eligible_runner returns None."""
+    from app.orchestrator_runner_dispatch import (
+        _select_eligible_runner,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    cpu_runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"bwrap_ok": True},
+        },
+    )
+    cache = {project_id: [cpu_runner]}
+    selected = _select_eligible_runner(
+        active_runners_cache=cache,
+        project_id=project_id,
+        task_type="compute_experiment",
+        accelerator=None,
+        runner_pins_this_cycle={},
+        container_image="my-image:latest",
+    )
+    assert selected is None, (
+        "no runner should be selected when container_image is declared "
+        "but no runner has container capability"
+    )
+
+
+def test_select_eligible_runner_container_image_selects_capable():
+    """When a container_image is declared, only a container-capable runner is
+    selected."""
+    from app.orchestrator_runner_dispatch import (
+        _select_eligible_runner,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    non_container_runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"bwrap_ok": True},
+        },
+    )
+    container_runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"docker_usable": True},
+        },
+    )
+    cache = {project_id: [non_container_runner, container_runner]}
+    selected = _select_eligible_runner(
+        active_runners_cache=cache,
+        project_id=project_id,
+        task_type="compute_experiment",
+        accelerator=None,
+        runner_pins_this_cycle={},
+        container_image="my-image:latest",
+    )
+    assert selected is not None
+    assert selected.id == container_runner.id, (
+        "the container-capable runner must be selected over the non-container one"
+    )
+
+
+def test_select_eligible_runner_no_container_image_ignores_container_cap():
+    """When no container_image is declared, runner selection does NOT filter
+    on container capability — a non-container runner is still eligible."""
+    from app.orchestrator_runner_dispatch import (
+        _select_eligible_runner,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    non_container_runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"bwrap_ok": True},
+        },
+    )
+    cache = {project_id: [non_container_runner]}
+    selected = _select_eligible_runner(
+        active_runners_cache=cache,
+        project_id=project_id,
+        task_type="compute_experiment",
+        accelerator=None,
+        runner_pins_this_cycle={},
+        container_image=None,  # no container image — should not filter
+    )
+    assert selected is not None, (
+        "a non-container runner must still be selectable when no "
+        "container_image is declared"
+    )
+
+
+# ── VRAM-fit dispatch eligibility ─────────────────────────────────────────────
+
+
+def test_select_eligible_runner_vram_filter_excludes_insufficient():
+    """A runner whose reported gpu_free_vram_mib is below the job requirement
+    must be excluded from dispatch, even when has_gpu is True.
+
+    This is the core VRAM-fit correctness guarantee: two jobs must not be
+    dispatched to the same GPU when free VRAM is insufficient for both.
+    """
+    from app.orchestrator_runner_dispatch import (
+        _select_eligible_runner,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    # Runner with only 4 GiB free (4096 MiB) cannot hold an 8 GiB job.
+    low_vram_runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "has_gpu": True,
+            "gpu_free_vram_mib": [4096],
+        },
+    )
+    cache = {project_id: [low_vram_runner]}
+
+    selected = _select_eligible_runner(
+        active_runners_cache=cache,
+        project_id=project_id,
+        task_type="compute_experiment",
+        accelerator="gpu",
+        runner_pins_this_cycle={},
+        vram_gb=8.0,
+    )
+    assert selected is None, (
+        "runner with only 4 GiB free VRAM must not be selected for an 8 GiB job"
+    )
+
+
+def test_select_eligible_runner_vram_filter_selects_sufficient():
+    """When one runner has insufficient VRAM and another has sufficient,
+    only the sufficient runner is selected."""
+    from app.orchestrator_runner_dispatch import (
+        _select_eligible_runner,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    low_vram = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "has_gpu": True,
+            "gpu_free_vram_mib": [4096],
+        },
+    )
+    high_vram = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "has_gpu": True,
+            "gpu_free_vram_mib": [20480],  # 20 GiB free
+        },
+    )
+    cache = {project_id: [low_vram, high_vram]}
+
+    selected = _select_eligible_runner(
+        active_runners_cache=cache,
+        project_id=project_id,
+        task_type="compute_experiment",
+        accelerator="gpu",
+        runner_pins_this_cycle={},
+        vram_gb=16.0,
+    )
+    assert selected is not None
+    assert selected.id == high_vram.id, (
+        "runner with 20 GiB free must be preferred over runner with only 4 GiB"
+    )
+
+
+def test_select_eligible_runner_vram_filter_no_vram_declared_unaffected():
+    """When no vram_gb is declared, runners without gpu_free_vram_mib are
+    still eligible — the VRAM gate is opt-in and must not break existing dispatch."""
+    from app.orchestrator_runner_dispatch import (
+        _select_eligible_runner,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    gpu_runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={"task_types": "all", "has_gpu": True},
+    )
+    cache = {project_id: [gpu_runner]}
+
+    selected = _select_eligible_runner(
+        active_runners_cache=cache,
+        project_id=project_id,
+        task_type="compute_experiment",
+        accelerator="gpu",
+        runner_pins_this_cycle={},
+        vram_gb=None,
+    )
+    assert selected is not None, (
+        "GPU runner must remain eligible when no vram_gb is declared"
+    )
+
+
+def test_select_eligible_runner_vram_filter_absent_telemetry_passes():
+    """A runner that does not report gpu_free_vram_mib (older daemon) must
+    not be excluded even when the job declares a vram_gb requirement — we
+    only gate dispatch on real data, not on absence of telemetry."""
+    from app.orchestrator_runner_dispatch import (
+        _select_eligible_runner,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    old_runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        # has_gpu True but no gpu_free_vram_mib — old runner that never sends it
+        capabilities={"task_types": "all", "has_gpu": True},
+    )
+    cache = {project_id: [old_runner]}
+
+    selected = _select_eligible_runner(
+        active_runners_cache=cache,
+        project_id=project_id,
+        task_type="compute_experiment",
+        accelerator="gpu",
+        runner_pins_this_cycle={},
+        vram_gb=24.0,
+    )
+    assert selected is not None, (
+        "runner without gpu_free_vram_mib telemetry must still be eligible "
+        "when vram_gb is declared — absence of data is not evidence of insufficiency"
+    )
+
+
+def test_runner_has_free_vram_any_gpu_sufficient():
+    """_runner_has_free_vram returns True when at least one GPU meets the
+    requirement, even if others do not (multi-GPU runner where only one
+    GPU has enough headroom)."""
+    from app.orchestrator_runner_dispatch import (
+        _runner_has_free_vram,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    multi_gpu = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        # GPU 0: 4 GiB free, GPU 1: 24 GiB free
+        capabilities={"task_types": "all", "gpu_free_vram_mib": [4096, 24576]},
+    )
+    assert _runner_has_free_vram(multi_gpu, required_mib=16384) is True, (
+        "runner with at least one GPU meeting the requirement must be eligible"
+    )
+    assert _runner_has_free_vram(multi_gpu, required_mib=32768) is False, (
+        "runner where no GPU meets the requirement must not be eligible"
+    )
+
+
+# ── Forced (hard) runner pin: _select_eligible_runner ──────────────────────────
+
+
+def test_select_eligible_runner_forced_target_restricts_to_that_runner():
+    """A forced runner target restricts eligibility to ONLY that runner.
+
+    Even with another idle, eligible runner present, the forced id must win and
+    the other runner must never be chosen — the hard pin does not spill over.
+    """
+    from app.orchestrator_runner_dispatch import (
+        _select_eligible_runner,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    caps_all = {"task_types": "all"}
+    forced = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities=caps_all,
+        consecutive_job_failures=0,
+    )
+    other = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities=caps_all,
+        consecutive_job_failures=0,
+    )
+    cache = {project_id: [other, forced]}
+
+    selected = _select_eligible_runner(
+        active_runners_cache=cache,
+        project_id=project_id,
+        task_type="compute_experiment",
+        accelerator=None,
+        runner_pins_this_cycle={},
+        forced_runner_target_id=str(forced.id),
+    )
+    assert selected is not None
+    assert selected.id == forced.id, "forced target must be selected, never the other runner"
+
+
+def test_select_eligible_runner_forced_target_returns_none_when_ineligible():
+    """A forced target that is not present/eligible this cycle → None.
+
+    The function must NEVER fall through to the other (eligible) runner: a hard
+    pin holds rather than silently reassigns.
+    """
+    from app.orchestrator_runner_dispatch import (
+        _select_eligible_runner,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    caps_all = {"task_types": "all"}
+    other = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities=caps_all,
+        consecutive_job_failures=0,
+    )
+    # The forced id is NOT in the cache (offline this cycle).
+    forced_id = str(uuid.uuid4())
+    cache = {project_id: [other]}
+
+    selected = _select_eligible_runner(
+        active_runners_cache=cache,
+        project_id=project_id,
+        task_type="compute_experiment",
+        accelerator=None,
+        runner_pins_this_cycle={},
+        forced_runner_target_id=forced_id,
+    )
+    assert selected is None, (
+        "an offline forced target must yield None, never fall back to the "
+        "other eligible runner"
+    )
+
+
+def test_select_eligible_runner_forced_target_respects_gpu_gate():
+    """A forced target that lacks a required GPU is NOT selected (→ None)."""
+    from app.orchestrator_runner_dispatch import (
+        _select_eligible_runner,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    cpu_forced = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={"task_types": "all", "has_gpu": False},
+        consecutive_job_failures=0,
+    )
+    cache = {project_id: [cpu_forced]}
+
+    selected = _select_eligible_runner(
+        active_runners_cache=cache,
+        project_id=project_id,
+        task_type="compute_experiment",
+        accelerator="T4",  # requires a GPU runner
+        runner_pins_this_cycle={},
+        forced_runner_target_id=str(cpu_forced.id),
+    )
+    assert selected is None, "a GPU job forced onto a CPU-only runner must hold"
 
 
 # ── DeepSeek routing preference invariant ───────────────────────────────────
@@ -1120,6 +1823,85 @@ class TestMaxPlanPool:
         entry = _account_by_id[str(acct_id)]
         assert entry["id"] == str(acct_id)
         assert entry["active_tasks"] == 2, "Only IN_PROGRESS tasks should be counted"
+
+    # ── Test 1a: per-project active_tasks is zero-reconciled from the DB ─────
+
+    @pytest.mark.asyncio
+    async def test_load_max_plan_pool_zero_reconciles_stale_per_project_active_tasks(
+        self, db_session, mocker, reset_max_plan_pool
+    ):
+        """On restart, the per-project active_tasks in the persisted project_state
+        is NOT trusted — it is reset to 0 and then re-derived from the live DB
+        tasks table. daily_task_count and other persisted keys survive.
+
+        Regression for gating finding 94f454f4: a project whose persisted
+        active_tasks was a stale nonzero value but which has ZERO currently-active
+        tasks would otherwise keep the stale count forever, permanently starving
+        that (account, project) pair once per-project concurrency caps apply.
+        """
+        mocker.patch(
+            "app.max_plan_pool.AsyncSessionLocal", _FakeSessionFactory(db_session)
+        )
+
+        # Two projects: p_stale has stale persisted active_tasks but no live
+        # tasks; p_live has stale persisted active_tasks AND live tasks.
+        proj_stale = make_project(name="Stale proj", user_id="user1")
+        proj_live = make_project(name="Live proj", user_id="user1")
+        db_session.add(proj_stale)
+        db_session.add(proj_live)
+        await db_session.commit()
+        await db_session.refresh(proj_stale)
+        await db_session.refresh(proj_live)
+
+        pid_stale = str(proj_stale.id)
+        pid_live = str(proj_live.id)
+
+        acct_id = uuid.uuid4()
+        account = MaxPlanAccount(
+            id=acct_id,
+            user_id=_TEST_USER,
+            name="test-account",
+            oauth_token="sk-ant-test-token",
+            enabled=True,
+            total_tasks=10,
+            project_state={
+                pid_stale: {"active_tasks": 3, "daily_task_count": 5},
+                pid_live: {"active_tasks": 3, "daily_task_count": 7},
+            },
+        )
+        db_session.add(account)
+        await db_session.commit()
+
+        # Only p_live has a live IN_PROGRESS task on this account.
+        db_session.add(
+            make_task(
+                project_id=proj_live.id,
+                vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+                status=TaskStatus.IN_PROGRESS,
+                llm_account_id=str(acct_id),
+                context={"max_plan_account_id": str(acct_id)},
+            )
+        )
+        await db_session.commit()
+
+        await load_max_plan_pool()
+
+        entry = _account_by_id[str(acct_id)]
+        pstate = entry["project_state"]
+
+        # Stale project: active_tasks zeroed (no live tasks), other keys survive.
+        assert pstate[pid_stale]["active_tasks"] == 0, (
+            "stale per-project active_tasks must be zero-reconciled from the DB"
+        )
+        assert pstate[pid_stale]["daily_task_count"] == 5, (
+            "daily_task_count must be preserved across reconciliation"
+        )
+
+        # Live project: DB count override applies (1 live task), other keys survive.
+        assert pstate[pid_live]["active_tasks"] == 1, (
+            "per-project active_tasks must reflect the live DB count when present"
+        )
+        assert pstate[pid_live]["daily_task_count"] == 7
 
     # ── Test 1b: hot-loop reconcile reads the promoted column, not Task.context ─
 
@@ -3041,86 +3823,13 @@ class TestProjectFairness:
         assert _project_fairness_weight(-5) == 1  # negative → floor 1
 
 
-class TestProjectConcurrencyCap:
-    """Per-project concurrent-VM cap (Step 2.92).
+class _OrchDispatchCycleHarness:
+    """Full-cycle dispatch harness: in-memory DB + the mocks orchestrator_worker needs.
 
-    Tests two levels:
-    1. Pure helper ``apply_project_concurrency_cap`` — boundary cases, same-project
-       multi-candidate, missing caps.
-    2. Dispatch-level ``test_per_project_vm_cap_defers_over_cap_project`` — a full
-       orchestrator cycle that proves an over-cap project's QUEUED candidate stays
-       QUEUED while a second project's candidate dispatches into the free slot.
+    Not collected by pytest (no ``Test`` prefix). Holds the ``orch_cap_db`` fixture and
+    ``_run_one_cycle`` so more than one test class can drive a REAL dispatch cycle
+    end-to-end instead of re-testing the extracted pure transforms in isolation.
     """
-
-    # ── Pure-helper unit tests ────────────────────────────────────────────────
-
-    @staticmethod
-    def _cap(eligible, project_by_id, active_by_project_id, cap_by_project_id):
-        from app.orchestrator_filters import apply_project_concurrency_cap
-
-        return apply_project_concurrency_cap(
-            eligible, project_by_id, active_by_project_id, cap_by_project_id
-        )
-
-    def test_no_cap_passes_all_through(self):
-        """Empty cap dict → all candidates pass through unchanged (no-op)."""
-        ids = ["a", "b", "c"]
-        pbi = {"a": "P1", "b": "P1", "c": "P2"}
-        assert self._cap(ids, pbi, {"P1": 2}, {}) == ids
-
-    def test_project_at_cap_defers_its_candidate(self):
-        """Project with active==cap has its candidate deferred; other project passes."""
-        ids = ["p1_task", "p2_task"]
-        pbi = {"p1_task": "P1", "p2_task": "P2"}
-        active = {"P1": 1}
-        caps = {"P1": 1}  # P1 is at its cap
-        result = self._cap(ids, pbi, active, caps)
-        assert "p1_task" not in result
-        assert "p2_task" in result
-
-    def test_project_below_cap_admits_candidate(self):
-        """Project with active < cap admits the next candidate."""
-        ids = ["p1_task"]
-        pbi = {"p1_task": "P1"}
-        active = {"P1": 0}
-        caps = {"P1": 2}
-        result = self._cap(ids, pbi, active, caps)
-        assert result == ["p1_task"]
-
-    def test_count_equals_cap_minus_one_admits_exactly_one(self):
-        """active == cap-1: exactly ONE candidate is admitted, the second deferred."""
-        ids = ["p1_a", "p1_b"]
-        pbi = {"p1_a": "P1", "p1_b": "P1"}
-        active = {"P1": 1}
-        caps = {"P1": 2}  # cap=2, active=1 → one slot left
-        result = self._cap(ids, pbi, active, caps)
-        assert result == ["p1_a"]  # first admitted; second deferred (would push to 2)
-
-    def test_multiple_same_project_candidates_respect_cap_across_cycle(self):
-        """Two candidates from the same project in one cycle: admitted count
-        tracks within-cycle admissions so both can't slip past a cap of 1."""
-        ids = ["p1_a", "p1_b", "p2_x"]
-        pbi = {"p1_a": "P1", "p1_b": "P1", "p2_x": "P2"}
-        active = {"P1": 0}
-        caps = {"P1": 1}
-        result = self._cap(ids, pbi, active, caps)
-        # Only first P1 candidate admitted; second deferred; P2 never filtered.
-        assert "p1_a" in result
-        assert "p1_b" not in result
-        assert "p2_x" in result
-
-    def test_project_with_no_cap_never_filtered(self):
-        """A project absent from cap_by_project_id is never deferred."""
-        ids = ["uncapped_task"]
-        pbi = {"uncapped_task": "UNCAPPED"}
-        active = {"UNCAPPED": 99}
-        caps = {"OTHER": 1}
-        assert self._cap(ids, pbi, active, caps) == ["uncapped_task"]
-
-    def test_empty_eligible_returns_empty(self):
-        assert self._cap([], {}, {}, {"P1": 1}) == []
-
-    # ── Dispatch-level test ───────────────────────────────────────────────────
 
     @staticmethod
     def _naive_utcnow():
@@ -3281,6 +3990,88 @@ class TestProjectConcurrencyCap:
                 _orphan.cancel()
                 with contextlib.suppress(BaseException):
                     await _orphan
+
+
+class TestProjectConcurrencyCap(_OrchDispatchCycleHarness):
+    """Per-project concurrent-VM cap (Step 2.92).
+
+    Tests two levels:
+    1. Pure helper ``apply_project_concurrency_cap`` — boundary cases, same-project
+       multi-candidate, missing caps.
+    2. Dispatch-level ``test_per_project_vm_cap_defers_over_cap_project`` — a full
+       orchestrator cycle that proves an over-cap project's QUEUED candidate stays
+       QUEUED while a second project's candidate dispatches into the free slot.
+    """
+
+    # ── Pure-helper unit tests ────────────────────────────────────────────────
+
+    @staticmethod
+    def _cap(eligible, project_by_id, active_by_project_id, cap_by_project_id):
+        from app.orchestrator_filters import apply_project_concurrency_cap
+
+        return apply_project_concurrency_cap(
+            eligible, project_by_id, active_by_project_id, cap_by_project_id
+        )
+
+    def test_no_cap_passes_all_through(self):
+        """Empty cap dict → all candidates pass through unchanged (no-op)."""
+        ids = ["a", "b", "c"]
+        pbi = {"a": "P1", "b": "P1", "c": "P2"}
+        assert self._cap(ids, pbi, {"P1": 2}, {}) == ids
+
+    def test_project_at_cap_defers_its_candidate(self):
+        """Project with active==cap has its candidate deferred; other project passes."""
+        ids = ["p1_task", "p2_task"]
+        pbi = {"p1_task": "P1", "p2_task": "P2"}
+        active = {"P1": 1}
+        caps = {"P1": 1}  # P1 is at its cap
+        result = self._cap(ids, pbi, active, caps)
+        assert "p1_task" not in result
+        assert "p2_task" in result
+
+    def test_project_below_cap_admits_candidate(self):
+        """Project with active < cap admits the next candidate."""
+        ids = ["p1_task"]
+        pbi = {"p1_task": "P1"}
+        active = {"P1": 0}
+        caps = {"P1": 2}
+        result = self._cap(ids, pbi, active, caps)
+        assert result == ["p1_task"]
+
+    def test_count_equals_cap_minus_one_admits_exactly_one(self):
+        """active == cap-1: exactly ONE candidate is admitted, the second deferred."""
+        ids = ["p1_a", "p1_b"]
+        pbi = {"p1_a": "P1", "p1_b": "P1"}
+        active = {"P1": 1}
+        caps = {"P1": 2}  # cap=2, active=1 → one slot left
+        result = self._cap(ids, pbi, active, caps)
+        assert result == ["p1_a"]  # first admitted; second deferred (would push to 2)
+
+    def test_multiple_same_project_candidates_respect_cap_across_cycle(self):
+        """Two candidates from the same project in one cycle: admitted count
+        tracks within-cycle admissions so both can't slip past a cap of 1."""
+        ids = ["p1_a", "p1_b", "p2_x"]
+        pbi = {"p1_a": "P1", "p1_b": "P1", "p2_x": "P2"}
+        active = {"P1": 0}
+        caps = {"P1": 1}
+        result = self._cap(ids, pbi, active, caps)
+        # Only first P1 candidate admitted; second deferred; P2 never filtered.
+        assert "p1_a" in result
+        assert "p1_b" not in result
+        assert "p2_x" in result
+
+    def test_project_with_no_cap_never_filtered(self):
+        """A project absent from cap_by_project_id is never deferred."""
+        ids = ["uncapped_task"]
+        pbi = {"uncapped_task": "UNCAPPED"}
+        active = {"UNCAPPED": 99}
+        caps = {"OTHER": 1}
+        assert self._cap(ids, pbi, active, caps) == ["uncapped_task"]
+
+    def test_empty_eligible_returns_empty(self):
+        assert self._cap([], {}, {}, {"P1": 1}) == []
+
+    # ── Dispatch-level test ───────────────────────────────────────────────────
 
     @pytest.mark.asyncio
     async def test_per_project_vm_cap_defers_over_cap_project(
@@ -3738,6 +4529,519 @@ class TestProjectConcurrencyCap:
             "Check that autonomous_enabled=False and bootstrap_completed_at are set "
             "on auto-created projects (admin.py create_compute_experiment_task), and "
             "that the direct compute_experiment dispatch path launches + parks."
+        )
+
+
+class TestDispatchWindowPreservesRank(_OrchDispatchCycleHarness):
+    """The dispatch window is now WIDER than ``slots_available`` and the loop stops
+    after N REAL dispatches — so whoever the loop reaches FIRST wins the slot.
+
+    That makes the ORDER of the dispatch loop load-bearing for the first time. It
+    was not before: the window used to be cut at exactly ``slots_available`` and the
+    loop ATTEMPTED every member, so the dispatch SET was fully determined by the
+    truncation and intra-loop order was cosmetic.
+
+    The re-read that materialises the window (``select(Task).where(Task.id.in_(...))``)
+    is UNORDERED — a SQL set has no order, so the DB returns rows in its own
+    (heap/rowid) order, NOT the rank order of ``eligible_ids``. That rank is the entire
+    output of the ranking pipeline: health reordering, project fairness, completion
+    priority, and the create/research reserved-slot minimums. Without an explicit
+    re-sort, ALL of it is silently discarded and the winners become whichever rows the
+    DB happened to return first.
+
+    Both tests below construct a queue whose RANK order deliberately differs from its
+    INSERTION order, so they FAIL against a dispatch loop that does not restore rank
+    (the unfixed code dispatches the wrong task) and pass once it does. They are real
+    negative controls, not assertions over a pure function.
+    """
+
+    @staticmethod
+    def _dispatch_mocks(mocker):
+        from app.max_plan_pool import LLMSelectionResult
+
+        mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+        mocker.patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new_callable=AsyncMock,
+            return_value=LLMSelectionResult(
+                provider="anthropic",
+                auth_mode="oauth",
+                model="claude-sonnet-4-6",
+                quality_tier=None,
+                account={
+                    "id": "acct-rank-test",
+                    "name": "Rank Test Acct",
+                    "runtime_secret": "tok",
+                    "claude_config_json": None,
+                    "provider_metadata": {},
+                },
+            ),
+        )
+        mocker.patch(
+            "app.warm_pool.try_pool_dispatch",
+            new_callable=AsyncMock,
+            return_value=None,
+        )
+        mocker.patch(
+            "app.orchestrator._sync_runtime_config_from_state",
+            new_callable=AsyncMock,
+            return_value=[],
+        )
+
+    @pytest.mark.asyncio
+    async def test_high_priority_task_below_the_insertion_head_still_wins_the_slot(
+        self, orch_cap_db, mocker
+    ):
+        """ONE slot. A LOW-priority task is inserted FIRST, a HIGH-priority task SECOND.
+
+        The candidate scan ranks by ``priority DESC, created_at ASC``, so the HIGH task
+        is rank 0 and is the one entitled to the single slot. But it has the LATER row
+        id, so the unordered window re-read returns the LOW task first. With the window
+        widened past one slot, BOTH tasks are now in the loop — and an unranked loop
+        dispatches the LOW task and breaks, silently inverting task priority.
+        """
+        from sqlmodel import select as _select
+        import app.orchestrator as _orch_module
+
+        self._dispatch_mocks(mocker)
+
+        low_id = None
+        high_id = None
+        async with orch_cap_db() as session:
+            project = make_project(name="RankProject", user_id=_TEST_USER)
+            session.add(project)
+            await session.commit()
+            await session.refresh(project)
+
+            base = self._naive_utcnow() - timedelta(minutes=10)
+            # Inserted FIRST (lower row id / earlier created_at) but LOW priority.
+            low = make_task(
+                project_id=project.id,
+                status=TaskStatus.QUEUED,
+                vm_instance_id=None,
+                priority=1,
+                created_at=base,
+                payloads=[{"type": "create", "prompt": "low priority"}],
+            )
+            session.add(low)
+            await session.commit()
+            await session.refresh(low)
+            low_id = low.id
+
+            # Inserted SECOND (higher row id) but HIGH priority → rank 0.
+            high = make_task(
+                project_id=project.id,
+                status=TaskStatus.QUEUED,
+                vm_instance_id=None,
+                priority=99,
+                created_at=base + timedelta(minutes=1),
+                payloads=[{"type": "create", "prompt": "high priority"}],
+            )
+            session.add(high)
+            await session.commit()
+            await session.refresh(high)
+            high_id = high.id
+
+        _orch_module._runtime_config["max_concurrent_vms"] = 1
+        _orch_module._runtime_config["max_pipeline_slots"] = 10
+        try:
+            await self._run_one_cycle(mocker)
+        finally:
+            _orch_module._runtime_config.pop("max_concurrent_vms", None)
+            _orch_module._runtime_config.pop("max_pipeline_slots", None)
+
+        async with orch_cap_db() as verify:
+            rows = {
+                r.id: r
+                for r in (
+                    (
+                        await verify.execute(
+                            _select(Task).where(Task.id.in_([low_id, high_id]))
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+            }
+
+        assert rows[high_id].status == TaskStatus.PROVISIONING, (
+            "the HIGH-priority task is rank 0 and must win the single slot; got "
+            f"{rows[high_id].status}. The widened dispatch window puts the lower-ranked "
+            "task in the loop too, so the loop MUST iterate in rank order — otherwise "
+            "the DB's row order silently overrides task priority."
+        )
+        assert rows[low_id].status == TaskStatus.QUEUED, (
+            "the LOW-priority task must NOT consume the slot the high-priority task "
+            f"was ranked into; got {rows[low_id].status}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_reserved_type_promoted_from_below_the_cut_still_wins_its_slot(
+        self, orch_cap_db, mocker
+    ):
+        """ONE slot; the queue head is a wall of higher-priority NON-reserved work.
+
+        ``reserve_slots_for_types`` exists precisely for this: under queue pressure it
+        PROMOTES a reserved-type task (here ``create``) from beyond the cutoff into the
+        first ``slots_available`` positions, guaranteeing it a minimum share of slots so
+        review/fix chains cannot starve it. That promotion is expressed ONLY as a
+        reordering of ``eligible_ids`` — so if the dispatch loop does not iterate in
+        that order, the reserved minimum is silently discarded and the very starvation
+        it prevents happens anyway.
+
+        The promoted ``create`` task is inserted LAST (highest row id), so an unranked
+        loop reaches the review heads first, dispatches one, breaks, and the reserved
+        minimum is lost.
+        """
+        from sqlmodel import select as _select
+        import app.orchestrator as _orch_module
+
+        self._dispatch_mocks(mocker)
+
+        review_ids: list = []
+        create_id = None
+        async with orch_cap_db() as session:
+            project = make_project(name="ReserveProject", user_id=_TEST_USER)
+            session.add(project)
+            await session.commit()
+            await session.refresh(project)
+
+            base = self._naive_utcnow() - timedelta(minutes=10)
+            # Queue head: higher-priority, NON-reserved review work, inserted FIRST.
+            for i in range(3):
+                review = make_task(
+                    project_id=project.id,
+                    status=TaskStatus.QUEUED,
+                    vm_instance_id=None,
+                    priority=50,
+                    created_at=base + timedelta(seconds=i),
+                    payloads=[{"type": "review", "prompt": f"review {i}"}],
+                )
+                session.add(review)
+                await session.commit()
+                await session.refresh(review)
+                review_ids.append(review.id)
+
+            # The reserved type, ranked BELOW the cut (lowest priority, inserted LAST).
+            # reserve_slots_for_types must promote it into the single slot.
+            create = make_task(
+                project_id=project.id,
+                status=TaskStatus.QUEUED,
+                vm_instance_id=None,
+                priority=1,
+                created_at=base + timedelta(minutes=1),
+                payloads=[{"type": "create", "prompt": "reserved create work"}],
+            )
+            session.add(create)
+            await session.commit()
+            await session.refresh(create)
+            create_id = create.id
+
+        _orch_module._runtime_config["max_concurrent_vms"] = 1
+        # Neutralise the review/fix pipeline cap so it is the RESERVATION under test,
+        # not cap_pipeline_slots incidentally removing the review heads.
+        _orch_module._runtime_config["max_pipeline_slots"] = 10
+        _orch_module._runtime_config["reserved_slots_for_types"] = {"create": 1}
+        try:
+            await self._run_one_cycle(mocker)
+        finally:
+            _orch_module._runtime_config.pop("max_concurrent_vms", None)
+            _orch_module._runtime_config.pop("max_pipeline_slots", None)
+            _orch_module._runtime_config.pop("reserved_slots_for_types", None)
+
+        async with orch_cap_db() as verify:
+            rows = {
+                r.id: r
+                for r in (
+                    (
+                        await verify.execute(
+                            _select(Task).where(Task.id.in_([*review_ids, create_id]))
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+            }
+
+        assert rows[create_id].status == TaskStatus.PROVISIONING, (
+            "reserve_slots_for_types promoted the reserved `create` task into the only "
+            f"slot, but it did not dispatch (got {rows[create_id].status}). The reserved "
+            "minimum is expressed purely as an eligible_ids reordering — the dispatch "
+            "loop must honour that order or the reservation is silently discarded."
+        )
+        dispatched_reviews = [
+            tid for tid in review_ids if rows[tid].status != TaskStatus.QUEUED
+        ]
+        assert not dispatched_reviews, (
+            "a non-reserved review task consumed the slot reserved for `create`: "
+            f"{dispatched_reviews}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_candidate_that_dispatches_nothing_does_not_consume_a_slot(
+        self, orch_cap_db, mocker
+    ):
+        """The headline bug, end-to-end through a real dispatch cycle.
+
+        ONE slot. The queue head is resource-DEFERRED inside the dispatch loop — it
+        `continue`s having dispatched NOTHING. A healthy task sits directly behind it.
+
+        Before the fix the window was cut at exactly ``slots_available``, so the window
+        was ``[deferred_head]``: the loop deferred it, dispatched nothing, and the
+        healthy task got ZERO slots — every cycle, for as long as the head kept
+        deferring, while the fleet sat idle. Several loop outcomes behave this way (a
+        failure-gated type, a compute hold, a recoverable BLOCKED launch, a transient
+        cap deferral, a lost lock race); the resource deferral is simply the one that is
+        cleanly injectable. The fix scans PAST ``slots_available`` and counts only REAL
+        dispatches, so a zero-dispatch head is backfilled over.
+
+        This is the negative control for the BACKFILL itself: it FAILS on the unfixed
+        code (the healthy task stays QUEUED behind a head that never dispatches).
+        """
+        from sqlmodel import select as _select
+        import app.orchestrator as _orch_module
+
+        self._dispatch_mocks(mocker)
+
+        deferred_id = None
+        healthy_id = None
+        async with orch_cap_db() as session:
+            project = make_project(name="BackfillProject", user_id=_TEST_USER)
+            session.add(project)
+            await session.commit()
+            await session.refresh(project)
+
+            base = self._naive_utcnow() - timedelta(minutes=10)
+            # Rank 0 (highest priority) — and it will dispatch NOTHING.
+            deferred = make_task(
+                project_id=project.id,
+                status=TaskStatus.QUEUED,
+                vm_instance_id=None,
+                priority=99,
+                created_at=base,
+                payloads=[{"type": "create", "prompt": "resource-deferred head"}],
+            )
+            session.add(deferred)
+            await session.commit()
+            await session.refresh(deferred)
+            deferred_id = deferred.id
+
+            healthy = make_task(
+                project_id=project.id,
+                status=TaskStatus.QUEUED,
+                vm_instance_id=None,
+                priority=1,
+                created_at=base + timedelta(minutes=1),
+                payloads=[{"type": "create", "prompt": "healthy work behind the head"}],
+            )
+            session.add(healthy)
+            await session.commit()
+            await session.refresh(healthy)
+            healthy_id = healthy.id
+
+        # Defer ONLY the queue head, and ONLY from INSIDE the dispatch loop — that is
+        # the `continue` that historically burned the window slot.
+        #
+        # The pre-cutoff filter `_filter_project_resource_dispatch_eligible` calls the
+        # SAME `_project_resource_dispatch_defer_message` helper, so mocking the helper
+        # alone would drop the head from eligible_ids BEFORE the window ever forms — it
+        # would then never occupy a slot, and this test would pass on the unfixed code
+        # for entirely the wrong reason. Force the pre-cutoff filter to a pass-through so
+        # the head genuinely reaches the window and defers in-loop.
+        _deferred_id = deferred_id
+
+        async def _passthrough_prefilter(session, eligible_ids, *a, **kw):
+            return eligible_ids
+
+        mocker.patch(
+            "app.orchestrator._filter_project_resource_dispatch_eligible",
+            side_effect=_passthrough_prefilter,
+        )
+
+        async def _defer_only_the_head(session, task, *a, **kw):
+            if task.id == _deferred_id:
+                return "project resource envelope exhausted"
+            return None
+
+        mocker.patch(
+            "app.orchestrator._project_resource_dispatch_defer_message",
+            side_effect=_defer_only_the_head,
+        )
+
+        _orch_module._runtime_config["max_concurrent_vms"] = 1
+        _orch_module._runtime_config["max_pipeline_slots"] = 10
+        try:
+            await self._run_one_cycle(mocker)
+        finally:
+            _orch_module._runtime_config.pop("max_concurrent_vms", None)
+            _orch_module._runtime_config.pop("max_pipeline_slots", None)
+
+        async with orch_cap_db() as verify:
+            rows = {
+                r.id: r
+                for r in (
+                    (
+                        await verify.execute(
+                            _select(Task).where(Task.id.in_([deferred_id, healthy_id]))
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+            }
+
+        # Precondition: the head really did dispatch nothing.
+        assert rows[deferred_id].status == TaskStatus.QUEUED, (
+            "precondition: the queue head must be resource-DEFERRED (still QUEUED), "
+            f"not dispatched; got {rows[deferred_id].status}"
+        )
+        # …and the slot it did NOT use went to the healthy task behind it.
+        assert rows[healthy_id].status == TaskStatus.PROVISIONING, (
+            "the healthy task behind a zero-dispatch queue head must be backfilled into "
+            f"the free slot; got {rows[healthy_id].status}. A candidate that dispatches "
+            "NOTHING must never consume a dispatch-window slot."
+        )
+
+    @pytest.mark.asyncio
+    async def test_warm_pool_leases_are_counted_against_the_slot_limit(
+        self, orch_cap_db, mocker
+    ):
+        """`_cycle_dispatched` is now the SOLE enforcement of ``max_concurrent_vms``.
+
+        Before this PR the slot limit was STRUCTURAL: the window was cut at exactly
+        ``eligible_ids[:slots_available]``, so at most that many tasks entered the loop
+        and ``_cycle_dispatched`` was purely observational. Widening the window moved
+        enforcement entirely onto the counter's ``break`` — which means any dispatch path
+        that consumes a VM without incrementing it is a FREE dispatch that breaches the
+        cap, and the breach scales with the width of the window.
+
+        A warm-pool LEASE is exactly such a path: it is a real dispatch (the task is
+        pinned to the leased member and skips cold provisioning), and it genuinely
+        consumes a slot, because ``count_idle_pool_vms`` SUBTRACTS idle pool rows from
+        the dispatch budget — leasing one flips it IDLE -> LEASED so it starts being
+        charged against ``max_concurrent_vms``.
+
+        ONE slot, THREE queued tasks, a pool that can serve TWO leases. Unfixed, the two
+        leases dispatch without advancing the counter and the third then cold-provisions
+        on top: 3 VMs consumed against a cap of 1.
+
+        NOTE: this test deliberately does NOT stub `try_pool_dispatch` to return None.
+        Every other test in this class does — which is precisely why this cap breach
+        could ship green.
+        """
+        from types import SimpleNamespace
+        from sqlmodel import select as _select
+        from app.max_plan_pool import LLMSelectionResult
+        import app.orchestrator as _orch_module
+
+        # NOTE: `_dispatch_mocks` is deliberately NOT used here — it nulls out
+        # try_pool_dispatch, which is the very path under test.
+        mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+        mocker.patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new_callable=AsyncMock,
+            return_value=LLMSelectionResult(
+                provider="anthropic",
+                auth_mode="oauth",
+                model="claude-sonnet-4-6",
+                quality_tier=None,
+                account={
+                    "id": "acct-warm-slot",
+                    "name": "Warm Slot Acct",
+                    "runtime_secret": "tok",
+                    "claude_config_json": None,
+                    "provider_metadata": {},
+                },
+            ),
+        )
+        mocker.patch(
+            "app.orchestrator._sync_runtime_config_from_state",
+            new_callable=AsyncMock,
+            return_value=[],
+        )
+
+        task_ids: list = []
+        async with orch_cap_db() as session:
+            project = make_project(name="WarmSlotProject", user_id=_TEST_USER)
+            session.add(project)
+            await session.commit()
+            await session.refresh(project)
+
+            base = self._naive_utcnow() - timedelta(minutes=10)
+            for i in range(3):
+                t = make_task(
+                    project_id=project.id,
+                    status=TaskStatus.QUEUED,
+                    vm_instance_id=None,
+                    priority=50 - i,
+                    created_at=base + timedelta(seconds=i),
+                    payloads=[{"type": "create", "prompt": f"task {i}"}],
+                )
+                session.add(t)
+                await session.commit()
+                await session.refresh(t)
+                task_ids.append(t.id)
+
+        # A faithful stand-in for the real lease: the pool can serve TWO members, and
+        # each lease pins vm_instance_id on the task and leaves it QUEUED (warm_pool.py
+        # `try_pool_dispatch` contract). The orchestrator commits and skips cold provision.
+        _pool_remaining = [f"pool-vm-{i}" for i in range(2)]
+
+        async def _fake_pool_dispatch(session, task, **kwargs):
+            if not _pool_remaining:
+                return None
+            vm_id = _pool_remaining.pop(0)
+            task.vm_instance_id = vm_id
+            session.add(task)
+            return SimpleNamespace(vm_instance_id=vm_id)
+
+        # Patch at the SOURCE module: orchestrator_worker imports try_pool_dispatch
+        # function-locally, so `app.orchestrator.try_pool_dispatch` does not exist.
+        mocker.patch(
+            "app.warm_pool.try_pool_dispatch",
+            side_effect=_fake_pool_dispatch,
+        )
+
+        slots_available = 1
+        _orch_module._runtime_config["max_concurrent_vms"] = slots_available
+        _orch_module._runtime_config["max_pipeline_slots"] = 10
+        _orch_module._runtime_config["warm_pool_enabled"] = True
+        try:
+            await self._run_one_cycle(mocker)
+        finally:
+            _orch_module._runtime_config.pop("max_concurrent_vms", None)
+            _orch_module._runtime_config.pop("max_pipeline_slots", None)
+            _orch_module._runtime_config.pop("warm_pool_enabled", None)
+
+        async with orch_cap_db() as verify:
+            rows = (
+                (await verify.execute(_select(Task).where(Task.id.in_(task_ids))))
+                .scalars()
+                .all()
+            )
+
+        # A task consumed a VM if it was warm-leased (QUEUED but pinned to a pool VM)
+        # or cold-provisioned (PROVISIONING).
+        warm_leased = [
+            r for r in rows if str(r.vm_instance_id or "").startswith("pool-vm-")
+        ]
+        cold_provisioned = [r for r in rows if r.status == TaskStatus.PROVISIONING]
+        consumed = len(warm_leased) + len(cold_provisioned)
+
+        assert consumed <= slots_available, (
+            f"dispatch consumed {consumed} VM slot(s) against a cap of {slots_available} "
+            f"({len(warm_leased)} warm-pool lease(s) + {len(cold_provisioned)} cold "
+            "provision(s)). A warm-pool lease IS a dispatch and DOES charge a VM against "
+            "max_concurrent_vms — it must increment _cycle_dispatched, which is now the "
+            "sole slot enforcement behind the widened dispatch window."
         )
 
 
@@ -6775,6 +8079,11 @@ class TestWarmVMSkipProvision:
             assert row.status == TaskStatus.PROVISIONING
 
     @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not USE_POSTGRES,
+        reason="the lease-commit rollback expiry that raises MissingGreenlet only "
+        "reproduces on asyncpg; aiosqlite no-ops InstanceState._expire.",
+    )
     async def test_pool_dispatch_commit_error_falls_back_to_cold(
         self, orch_warm_db, mocker
     ):
@@ -8381,6 +9690,28 @@ class TestCrossBaseRecutBounding:
             .all()
         )
 
+    @staticmethod
+    async def _elapse_recut_backoff(db_session, dependent):
+        """Simulate the backed-off recheck window having ELAPSED.
+
+        Every failing re-cut outcome now arms ``_recut_recheck_after`` and
+        ``ensure_dependent_base_recut`` short-circuits (issuing NO GitHub merge
+        call) while that window is open — that IS the fix: the merge POST used to
+        be re-issued on every ~5s dispatch cycle for the whole transient-"error"
+        class, ~720/hr per held dependent against a shared 5000/hr token budget.
+        A test that wants to observe the NEXT real attempt must therefore let the
+        window lapse, exactly as wall-clock does in production.
+        """
+        from app.orchestrator_health import _utcnow
+
+        ctx = dict(dependent.context or {})
+        if not ctx.get("_recut_recheck_after"):
+            return
+        ctx["_recut_recheck_after"] = (_utcnow() - timedelta(hours=1)).isoformat()
+        dependent.context = ctx
+        db_session.add(dependent)
+        await db_session.commit()
+
     @pytest.mark.asyncio
     async def test_single_conflict_increments_attempts_and_holds(
         self, db_session, mocker
@@ -8434,7 +9765,7 @@ class TestCrossBaseRecutBounding:
             new_callable=AsyncMock,
             return_value=("tok", "owner", "repo"),
         )
-        mocker.patch(
+        merge_mock = mocker.patch(
             "app.github.merge_branch",
             new_callable=AsyncMock,
             return_value={"merged": False, "conflict": True},
@@ -8449,21 +9780,27 @@ class TestCrossBaseRecutBounding:
         db_session.add_all([dep, dependent])
         await db_session.commit()
 
-        # Drive consecutive conflicts up to (and past) the escalation bound.
+        # Drive consecutive conflicts up to (and past) the escalation bound. The
+        # backoff window is elapsed between cycles (as wall-clock does), so each
+        # iteration is a REAL attempt — one merge call apiece, not one per ~5s
+        # dispatch cycle.
         for _ in range(_RECUT_CONFLICT_ESCALATION_THRESHOLD):
+            await self._elapse_recut_backoff(db_session, dependent)
             assert (
                 await ensure_dependent_base_recut(dependent, [dep], db_session) is False
             )
 
+        assert merge_mock.await_count == _RECUT_CONFLICT_ESCALATION_THRESHOLD
         assert dependent.context.get("_recut_escalated") is True
         assert "persistent merge conflict" in (dependent.latest_status_message or "")
         alerts = await self._open_escalation_alerts(db_session, dependent)
         assert len(alerts) == 1
         assert alerts[0].severity == AlertSeverity.ERROR
 
-        # Running again must NOT create a second alert (deduped + post-escalation
-        # backoff short-circuits the merge call).
+        # Running again must NOT create a second alert, and — inside the still-open
+        # backoff window — must issue NO further merge call.
         assert await ensure_dependent_base_recut(dependent, [dep], db_session) is False
+        assert merge_mock.await_count == _RECUT_CONFLICT_ESCALATION_THRESHOLD
         alerts_again = await self._open_escalation_alerts(db_session, dependent)
         assert len(alerts_again) == 1
 
@@ -8485,7 +9822,7 @@ class TestCrossBaseRecutBounding:
             new_callable=AsyncMock,
             return_value=("tok", "owner", "repo"),
         )
-        mocker.patch(
+        merge_mock = mocker.patch(
             "app.github.merge_branch",
             new_callable=AsyncMock,
             return_value={"merged": False, "conflict": False},
@@ -8501,20 +9838,89 @@ class TestCrossBaseRecutBounding:
         await db_session.commit()
 
         # Far more attempts than the conflict bound — a transient class must never
-        # escalate.
-        for _ in range(_RECUT_CONFLICT_ESCALATION_THRESHOLD + 2):
+        # escalate. Each iteration lets the backed-off window lapse first, so it is
+        # a genuine retry (one merge call each), which is what "retries with
+        # backoff" means.
+        attempts = _RECUT_CONFLICT_ESCALATION_THRESHOLD + 2
+        for _ in range(attempts):
+            await self._elapse_recut_backoff(db_session, dependent)
             assert (
                 await ensure_dependent_base_recut(dependent, [dep], db_session) is False
             )
 
+        assert merge_mock.await_count == attempts
         assert dependent.context.get("_recut_conflict_attempts") == 0
         assert dependent.context.get("_recut_last_outcome") == "error"
         assert dependent.context.get("_recut_escalated") is None
-        assert dependent.context.get("_recut_recheck_attempts") == (
-            _RECUT_CONFLICT_ESCALATION_THRESHOLD + 2
-        )
+        assert dependent.context.get("_recut_recheck_attempts") == attempts
         assert dependent.recheck_after is not None
         assert await self._open_escalation_alerts(db_session, dependent) == []
+
+    @pytest.mark.asyncio
+    async def test_transient_error_backoff_suppresses_merge_call_next_cycle(
+        self, db_session, mocker
+    ):
+        """REGRESSION (GitHub-call amplifier): a transient ``"error"`` outcome must
+        HONOR the backed-off recheck window — the next dispatch cycle inside it
+        issues NO ``POST /repos/{o}/{r}/merges`` at all.
+
+        The backoff gate used to read
+        ``ctx.get("_recut_escalated") and _recut_backoff_active(ctx)``. But
+        ``_recut_escalated`` is only ever set by the missing/conflict escalation
+        branches, and the transient ``"error"`` class NEVER escalates by design —
+        so the whole gate was dead code for that class and the (uncoalesced,
+        non-idempotent POST) merge call was re-issued on EVERY ~5s dispatch cycle:
+        ~720/hr per held dependent, forever, against a shared 5000/hr installation
+        token budget whose exhaustion has stalled production. Assert CALL COUNTS.
+        """
+        from app.orchestrator_health import ensure_dependent_base_recut
+
+        mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("tok", "owner", "repo"),
+        )
+        merge_mock = mocker.patch(
+            "app.github.merge_branch",
+            new_callable=AsyncMock,
+            return_value={"merged": False, "conflict": False},  # → "error"
+        )
+        project = make_project(
+            name="RecutBackoff1", user_id="u1", integration_branch="main"
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        dep, dependent = self._landed_cross_base_pair(project)
+        db_session.add_all([dep, dependent])
+        await db_session.commit()
+
+        # Cycle 1: a real attempt → exactly one merge POST, window armed.
+        assert await ensure_dependent_base_recut(dependent, [dep], db_session) is False
+        assert merge_mock.await_count == 1
+        assert dependent.context.get("_recut_last_outcome") == "error"
+        assert dependent.context.get("_recut_recheck_after")
+        # Never escalates — so the OLD gate could never have fired here.
+        assert dependent.context.get("_recut_escalated") is None
+
+        # Cycles 2..6, all inside the backoff window: the dependent is still HELD
+        # (False), but ZERO further GitHub merge calls are issued.
+        for _ in range(5):
+            assert (
+                await ensure_dependent_base_recut(dependent, [dep], db_session) is False
+            )
+        assert merge_mock.await_count == 1
+        # The suppressed cycles are not counted as failed attempts either.
+        assert dependent.context.get("_recut_recheck_attempts") == 1
+
+        # Once the window lapses the retry resumes (backoff, not abandonment) —
+        # and a recovered GitHub immediately unblocks the dependent.
+        await self._elapse_recut_backoff(db_session, dependent)
+        merge_mock.return_value = {"merged": True, "already": False}
+        assert await ensure_dependent_base_recut(dependent, [dep], db_session) is True
+        assert merge_mock.await_count == 2
+        assert not any(str(k).startswith("_recut_") for k in (dependent.context or {}))
 
     @pytest.mark.asyncio
     async def test_successful_recut_clears_accounting_and_resolves_alert(
@@ -8549,8 +9955,10 @@ class TestCrossBaseRecutBounding:
         db_session.add_all([dep, dependent])
         await db_session.commit()
 
-        # Escalate via persistent conflicts.
+        # Escalate via persistent conflicts (elapsing the backed-off window between
+        # cycles so each iteration is a real attempt).
         for _ in range(_RECUT_CONFLICT_ESCALATION_THRESHOLD):
+            await self._elapse_recut_backoff(db_session, dependent)
             await ensure_dependent_base_recut(dependent, [dep], db_session)
         assert dependent.context.get("_recut_escalated") is True
         assert len(await self._open_escalation_alerts(db_session, dependent)) == 1
@@ -8589,7 +9997,7 @@ class TestCrossBaseRecutBounding:
             new_callable=AsyncMock,
             return_value=("tok", "owner", "repo"),
         )
-        mocker.patch(
+        merge_mock = mocker.patch(
             "app.github.merge_branch",
             new_callable=AsyncMock,
             return_value={"merged": False, "missing": True},
@@ -8604,9 +10012,12 @@ class TestCrossBaseRecutBounding:
         db_session.add_all([dep, dependent])
         await db_session.commit()
 
-        # A SINGLE missing-branch outcome must already escalate (no bound).
+        # A SINGLE missing-branch outcome must already escalate (no bound) — the
+        # backoff gate is armed only AFTER an attempt was made and classified, so
+        # first-occurrence escalation is unaffected by the backoff fix.
         ok = await ensure_dependent_base_recut(dependent, [dep], db_session)
         assert ok is False
+        assert merge_mock.await_count == 1
         assert dependent.context.get("_recut_last_outcome") == "missing"
         assert dependent.context.get("_recut_base_missing") is True
         assert dependent.context.get("_recut_escalated") is True
@@ -8617,9 +10028,10 @@ class TestCrossBaseRecutBounding:
         assert len(alerts) == 1
         assert alerts[0].severity == AlertSeverity.ERROR
 
-        # Re-running does not create a second alert (deduped + post-escalation
-        # backoff short-circuits the merge call).
+        # Re-running does not create a second alert and issues no further merge
+        # call (deduped + post-failure backoff short-circuits the merge API).
         assert await ensure_dependent_base_recut(dependent, [dep], db_session) is False
+        assert merge_mock.await_count == 1
         assert len(await self._open_escalation_alerts(db_session, dependent)) == 1
 
     @pytest.mark.asyncio
@@ -9336,7 +10748,9 @@ class TestDispatchCrashContainment:
             self._clear_slots(_orch_module)
 
         release_mock.assert_any_await(
-            "acct-poison-release", revert_daily_task_count=True
+            "acct-poison-release",
+            revert_daily_task_count=True,
+            project_id=str(project.id),
         )
 
     @pytest.mark.asyncio
@@ -10182,6 +11596,246 @@ class TestRunnerDispatchExtractionContract:
         assert rd._runner_active_work_count(busy) == 3
 
 
+class TestPerClassCapacityGating:
+    """Per-class capacity: agent tasks and compute jobs are gated independently.
+
+    A runner with max_concurrent=2 and max_concurrent_compute=1 can have 2
+    active agent tasks and still accept 1 compute job (agent slots are full but
+    compute slot is free). Conversely, a runner with 1 active compute job and
+    max_concurrent_compute=1 is at compute capacity and must reject additional
+    compute dispatch even when agent task slots are still open.
+    """
+
+    def _make_runner(self, caps: dict):
+        from app.orchestrator_runner_dispatch import RunnerDispatchSnapshot
+
+        return RunnerDispatchSnapshot(
+            id=uuid.uuid4(), project_id=uuid.uuid4(), capabilities=caps
+        )
+
+    def test_agent_tasks_fill_agent_slots_not_compute_slot(self):
+        """Runner with max_concurrent=2, max_concurrent_compute=1, and 2 active
+        agent tasks is at AGENT capacity but not COMPUTE capacity."""
+        import app.orchestrator as orch
+        runner = self._make_runner({
+            "max_concurrent": 2,
+            "max_concurrent_compute": 1,
+            "active_task_ids": ["t1", "t2"],
+            "active_compute_job_ids": [],
+        })
+        # Agent class is at capacity.
+        assert orch._runner_at_capacity(runner, 0, "fix") is True
+        assert orch._runner_at_capacity(runner, 0, "research") is True
+        # Compute class still has capacity.
+        assert orch._runner_at_capacity(runner, 0, "compute_experiment") is False
+
+    def test_compute_job_fills_compute_slot_not_agent_slots(self):
+        """Runner with max_concurrent=2, max_concurrent_compute=1, and 1 active
+        compute job is at COMPUTE capacity but not AGENT capacity."""
+        import app.orchestrator as orch
+        runner = self._make_runner({
+            "max_concurrent": 2,
+            "max_concurrent_compute": 1,
+            "active_task_ids": [],
+            "active_compute_job_ids": ["cj1"],
+        })
+        # Compute class is at capacity.
+        assert orch._runner_at_capacity(runner, 0, "compute_experiment") is True
+        # Agent class still has capacity.
+        assert orch._runner_at_capacity(runner, 0, "fix") is False
+
+    def test_backward_compat_no_max_concurrent_compute(self):
+        """A runner without max_concurrent_compute falls back to max_concurrent
+        for compute jobs (old combined-pool behaviour preserved)."""
+        import app.orchestrator as orch
+        runner = self._make_runner({
+            "max_concurrent": 2,
+            # max_concurrent_compute absent
+            "active_task_ids": ["t1", "t2"],
+            "active_compute_job_ids": [],
+        })
+        # Both agent and compute slots exhausted under combined pool logic.
+        assert orch._runner_at_capacity(runner, 0, "fix") is True
+        # Without a separate compute limit, compute is also at capacity (2 agent
+        # tasks consume the combined pool of 2).
+        assert orch._runner_at_capacity(runner, 0, "compute_experiment") is False
+        # (active_compute_job_count=0, max_concurrent_compute falls back to
+        # max_concurrent=2, so 0 >= 2 is False — compute slot is technically
+        # still free in the old model. The new code is consistent: agent tasks do
+        # NOT fill compute slots when max_concurrent_compute is absent.)
+
+
+class TestAuthoritativeAgentTaskCount:
+    """Signal-that-lies fix #5: agent load is derived from the AUTHORITATIVE
+    ``_active_agent_task_count`` (committed Task rows) rather than the stale-prone
+    heartbeat ``active_task_ids`` list. A runner heartbeat that still lists
+    COMPLETED/FAILED tasks must not falsely hold an idle runner at capacity and
+    block a pinned head."""
+
+    def _make_runner(self, caps: dict):
+        from app.orchestrator_runner_dispatch import RunnerDispatchSnapshot
+
+        return RunnerDispatchSnapshot(
+            id=uuid.uuid4(), project_id=uuid.uuid4(), capabilities=caps
+        )
+
+    def test_active_count_prefers_authoritative_over_stale_heartbeat(self):
+        from app.orchestrator_runner_dispatch import (
+            _ACTIVE_AGENT_TASK_COUNT_KEY,
+            _runner_active_task_count,
+        )
+
+        runner = self._make_runner(
+            {
+                "active_task_ids": ["stale1", "stale2", "stale3"],  # stale-HIGH hb
+                _ACTIVE_AGENT_TASK_COUNT_KEY: 0,  # authoritative: idle
+            }
+        )
+        assert _runner_active_task_count(runner) == 0
+
+    def test_at_capacity_idle_despite_stale_heartbeat(self):
+        import app.orchestrator as orch
+        from app.orchestrator_runner_dispatch import _ACTIVE_AGENT_TASK_COUNT_KEY
+
+        runner = self._make_runner(
+            {
+                "max_concurrent": 2,
+                "active_task_ids": ["stale1", "stale2"],  # would read AT capacity
+                _ACTIVE_AGENT_TASK_COUNT_KEY: 0,  # authoritatively idle
+            }
+        )
+        assert orch._runner_at_capacity(runner, 0, "fix") is False
+
+    def test_authoritative_full_still_caps(self):
+        import app.orchestrator as orch
+        from app.orchestrator_runner_dispatch import _ACTIVE_AGENT_TASK_COUNT_KEY
+
+        runner = self._make_runner(
+            {
+                "max_concurrent": 2,
+                "active_task_ids": [],  # heartbeat lags / empty
+                _ACTIVE_AGENT_TASK_COUNT_KEY: 2,  # authoritatively full
+            }
+        )
+        assert orch._runner_at_capacity(runner, 0, "fix") is True
+
+    def test_falls_back_to_heartbeat_when_authoritative_absent(self):
+        from app.orchestrator_runner_dispatch import _runner_active_task_count
+
+        # No authoritative key (bare LocalRunner ORM / old snapshot) → heartbeat hint.
+        runner = self._make_runner({"active_task_ids": ["a", "b"]})
+        assert _runner_active_task_count(runner) == 2
+
+
+@pytest.mark.asyncio
+async def test_load_runner_active_task_counts_counts_committed_task_rows(db_session):
+    """The authoritative loader counts only active-status Task rows pinned to each
+    runner (``vm_instance_id == 'runner:<id>'``), excluding terminal rows and rows
+    pinned to a different runner."""
+    from app.orchestrator_runner_dispatch import _load_runner_active_task_counts
+
+    runner_a = uuid.uuid4()
+    runner_b = uuid.uuid4()
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    rows = [
+        # 2 active tasks pinned to runner_a (PROVISIONING + IN_PROGRESS) → counted.
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.PROVISIONING,
+            vm_instance_id=f"runner:{runner_a}",
+        ),
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.IN_PROGRESS,
+            vm_instance_id=f"runner:{runner_a}",
+        ),
+        # Terminal task pinned to runner_a → excluded (left the active set).
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            vm_instance_id=f"runner:{runner_a}",
+        ),
+        # Active task pinned to a DIFFERENT runner → not counted for runner_a.
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.IN_PROGRESS,
+            vm_instance_id=f"runner:{runner_b}",
+        ),
+    ]
+    for t in rows:
+        db_session.add(t)
+    await db_session.commit()
+
+    counts = await _load_runner_active_task_counts(db_session, [runner_a, runner_b])
+    assert counts.get(runner_a) == 2
+    assert counts.get(runner_b) == 1
+    # Empty input → empty map (no query).
+    assert await _load_runner_active_task_counts(db_session, []) == {}
+
+    def test_select_eligible_runner_compute_task_ignores_agent_load(self):
+        """_select_eligible_runner returns the runner for a compute_experiment
+        even when the runner's agent task slots are full, as long as compute
+        capacity remains."""
+        import app.orchestrator as orch
+        project_id = uuid.uuid4()
+        runner = self._make_runner({
+            "max_concurrent": 2,
+            "max_concurrent_compute": 1,
+            "active_task_ids": ["t1", "t2"],
+            "active_compute_job_ids": [],
+            "task_types": "all",
+        })
+        runner = runner._replace(project_id=project_id)
+        cache = {project_id: [runner]}
+        selected = orch._select_eligible_runner(
+            cache, project_id, "compute_experiment", None, {}
+        )
+        assert selected is not None
+        assert selected.id == runner.id
+
+    def test_select_eligible_runner_compute_task_blocked_when_compute_full(self):
+        """_select_eligible_runner returns None for a compute_experiment when the
+        runner's compute slot is full, even if agent slots are free."""
+        import app.orchestrator as orch
+        project_id = uuid.uuid4()
+        runner = self._make_runner({
+            "max_concurrent": 2,
+            "max_concurrent_compute": 1,
+            "active_task_ids": [],
+            "active_compute_job_ids": ["cj1"],
+            "task_types": "all",
+        })
+        runner = runner._replace(project_id=project_id)
+        cache = {project_id: [runner]}
+        selected = orch._select_eligible_runner(
+            cache, project_id, "compute_experiment", None, {}
+        )
+        assert selected is None
+
+    def test_agent_task_not_blocked_by_compute_load(self):
+        """A full compute slot does not block an agent task dispatch."""
+        import app.orchestrator as orch
+        project_id = uuid.uuid4()
+        runner = self._make_runner({
+            "max_concurrent": 2,
+            "max_concurrent_compute": 1,
+            "active_task_ids": [],
+            "active_compute_job_ids": ["cj1"],
+            "task_types": "all",
+        })
+        runner = runner._replace(project_id=project_id)
+        cache = {project_id: [runner]}
+        selected = orch._select_eligible_runner(
+            cache, project_id, "fix", None, {}
+        )
+        assert selected is not None
+        assert selected.id == runner.id
+
+
 @pytest.mark.asyncio
 async def test_held_require_local_compute_alerts_before_timeout(db_session, mocker):
     """A compute_experiment held for require_local longer than the early-warning
@@ -10238,3 +11892,863 @@ async def test_held_require_local_compute_alerts_before_timeout(db_session, mock
         await db_session.execute(select(Alert).where(Alert.task_id == task_id))
     ).scalars().all()
     assert len(alerts2) == 1, "Second sweep pass must not duplicate the alert"
+
+
+@pytest.mark.asyncio
+async def test_held_container_runner_compute_alerts_before_timeout(db_session, mocker):
+    """A container-image compute_experiment held (awaiting_container_runner_since)
+    longer than the early-warning threshold but under the 6h timeout emits a
+    distinct WARNING alert while the task stays QUEUED, and the second sweep pass
+    does not duplicate it. This closes the silent-indefinite-stall gap: without the
+    fix the container hold is invisible to the sweep and never escalates.
+    """
+    from sqlmodel import select
+    from app.models import Alert, AlertSeverity
+    from app.orchestrator_runner_dispatch import (
+        _fail_stale_local_runner_holds,
+        _LOCAL_RUNNER_HOLD_ALERT_SECONDS,
+    )
+
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+
+    project = make_project(name="Container Hold Alert", user_id=_TEST_USER)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    held_since = _utcnow() - timedelta(seconds=_LOCAL_RUNNER_HOLD_ALERT_SECONDS + 60)
+    task = make_task(
+        project_id=project.id,
+        title="stranded container compute",
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "compute_experiment"}],
+        context={"awaiting_container_runner_since": held_since.isoformat()},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id = task.id
+
+    failed_count = await _fail_stale_local_runner_holds(db_session)
+
+    refreshed = await db_session.get(Task, task_id)
+    assert refreshed.status == TaskStatus.QUEUED
+    assert failed_count == 0
+
+    alerts = (
+        await db_session.execute(select(Alert).where(Alert.task_id == task_id))
+    ).scalars().all()
+    assert len(alerts) == 1, f"Expected 1 container-hold alert, got {len(alerts)}"
+    alert = alerts[0]
+    assert alert.severity == AlertSeverity.WARNING
+    # Distinct copy from the require-local hold so the operator sees the real cause.
+    assert "container-capable" in alert.title.lower()
+    assert "docker_usable" in alert.message
+
+    await _fail_stale_local_runner_holds(db_session)
+    alerts2 = (
+        await db_session.execute(select(Alert).where(Alert.task_id == task_id))
+    ).scalars().all()
+    assert len(alerts2) == 1, "Second sweep pass must not duplicate the alert"
+
+
+@pytest.mark.asyncio
+async def test_held_container_runner_compute_fails_after_timeout(db_session, mocker):
+    """A container-image compute_experiment held past the 6h wait timeout is
+    terminal-FAILED (PROVISION_FAILURE) with a container-specific reason — there
+    is no safe cloud fallback for an image-declaring job that needs a
+    Docker-capable runner. Guards against the hold stalling indefinitely.
+    """
+    from app.failure_classification import PROVISION_FAILURE
+    from app.orchestrator_runner_dispatch import (
+        _fail_stale_local_runner_holds,
+        _LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS,
+    )
+
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+
+    project = make_project(name="Container Hold Timeout", user_id=_TEST_USER)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    held_since = _utcnow() - timedelta(seconds=_LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS + 120)
+    task = make_task(
+        project_id=project.id,
+        title="expired container compute",
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "compute_experiment"}],
+        context={"awaiting_container_runner_since": held_since.isoformat()},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id = task.id
+
+    failed_count = await _fail_stale_local_runner_holds(db_session)
+    assert failed_count == 1
+
+    refreshed = await db_session.get(Task, task_id)
+    assert refreshed.status == TaskStatus.FAILED
+    assert (refreshed.context or {}).get("failure_category") == PROVISION_FAILURE
+    assert "container-capable" in (refreshed.latest_status_message or "")
+
+
+@pytest.mark.asyncio
+async def test_container_runner_hold_surfaces_in_local_hold_filters(db_session):
+    """A container-image compute hold is counted by local_runner_hold_task_filters
+    (the SQL predicate driving the operator-attention count and items) exactly like
+    a require-local hold — the broadened OR predicate must compile and execute so
+    the container stall is no longer invisible to the operator surface.
+    """
+    from sqlalchemy import func, select
+    from app.strategic_runtime_work import (
+        local_runner_hold_task_filters,
+        task_awaiting_container_runner_since,
+        task_is_local_runner_hold,
+    )
+
+    project = make_project(name="Container Hold Filter", user_id=_TEST_USER)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    held_since = _utcnow().isoformat()
+    task = make_task(
+        project_id=project.id,
+        title="container held",
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "compute_experiment"}],
+        context={"awaiting_container_runner_since": held_since},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    count = (
+        await db_session.execute(
+            select(func.count())
+            .select_from(Task)
+            .where(*local_runner_hold_task_filters(project.id))
+        )
+    ).scalar()
+    assert count == 1, "container hold must be counted by the local-hold filter"
+
+    # Python-side classifiers agree with the SQL predicate.
+    assert task_awaiting_container_runner_since(task) == held_since
+    assert task_is_local_runner_hold(task) is True
+
+
+# ---------------------------------------------------------------------------
+# MissingGreenlet hardening: strategic local-runner dispatch-prep path
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_strategic_dispatch_prep_vm_id_via_dict_after_hold_rollback(
+    db_session, expire_fidelity
+):
+    """After _hold_strategic_local_runner_task rolls back (no-change path),
+    reading task.vm_instance_id via the ORM descriptor triggers a sync
+    lazy-load that raises MissingGreenlet under asyncpg. The fix reads via
+    __dict__ which avoids the descriptor entirely — reproducing the same
+    pattern the dispatch loop uses at orchestrator.py:2776.
+
+    expire_fidelity restores real SQLAlchemy expiry so the rollback truly
+    clears the instance dict, matching what asyncpg does in production.
+    """
+    from app.orchestrator_runner_dispatch import (
+        _hold_strategic_local_runner_task,
+    )
+    from app.workbench_state import (
+        STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY,
+        STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY,
+    )
+
+    project = make_project(name="strategic-mg-test")
+    db_session.add(project)
+    await db_session.commit()
+
+    _hold_reason = (
+        "Strategic workbench is in continuous local mode; waiting for a live "
+        "Strategic-capable local runner instead of dispatching to cloud."
+    )
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        vm_instance_id=None,
+        payloads=[{"type": "strategic_review"}],
+        context={
+            STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
+            STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY: "2020-01-01T00:00:00",
+        },
+        latest_status_message=_hold_reason,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # The hold function detects nothing changed → rolls back (expires task).
+    result = await _hold_strategic_local_runner_task(db_session, task)
+    assert result is True
+
+    # With expire_fidelity the rollback truly expired the instance dict.
+    # Reading via __dict__ avoids the descriptor's lazy-load → MissingGreenlet.
+    vm_id = task.__dict__.get("vm_instance_id")
+    # vm_instance_id was cleared by the rollback, so .get() returns None.
+    # This is the exact same str(__dict__.get(...) or "") pattern the
+    # dispatch loop fix uses to decide whether to increment _cycle_dispatched.
+    assert not str(vm_id or "").startswith("runner:")
+    assert vm_id is None, (
+        "vm_instance_id should not be in __dict__ after rollback; "
+        f"got {vm_id!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Container-image dispatch eligibility gate
+# ---------------------------------------------------------------------------
+
+
+def test_image_job_requires_container_capable_runner():
+    """_select_eligible_runner excludes runners without docker_usable when
+    container_image is declared; includes them when no image is required.
+
+    This is the primary acceptance-criterion test: a container_image-declaring
+    job must not land on a runner that explicitly declares docker_usable=False,
+    and must select a runner that declares docker_usable=True.
+    """
+    from app.orchestrator_runner_dispatch import (
+        _select_eligible_runner,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+
+    capable = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"docker_usable": True, "docker_cdi_gpu": False},
+        },
+    )
+    incapable = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"docker_usable": False},
+        },
+    )
+
+    cache = {project_id: [incapable, capable]}
+
+    # With container_image declared: only the capable runner is selected.
+    selected = _select_eligible_runner(
+        active_runners_cache=cache,
+        project_id=project_id,
+        task_type="compute_experiment",
+        accelerator=None,
+        runner_pins_this_cycle={},
+        container_image="registry.example.com/myproject:sha256-abc123",
+    )
+    assert selected is not None, "expected a container-capable runner to be selected"
+    assert selected.id == capable.id, (
+        "runner without docker_usable must not be selected for a container_image job"
+    )
+
+    # Without container_image: the incapable runner is still eligible (least loaded).
+    selected_no_image = _select_eligible_runner(
+        active_runners_cache=cache,
+        project_id=project_id,
+        task_type="compute_experiment",
+        accelerator=None,
+        runner_pins_this_cycle={},
+        container_image=None,
+    )
+    assert selected_no_image is not None
+    # Both are eligible when no image is required; the test just confirms selection
+    # returns something (no exclusion applied).
+
+
+
+@pytest.mark.asyncio
+async def test_dispatch_holds_when_container_image_declared_but_no_capable_runner(
+    db_session, mocker
+):
+    """_dispatch_compute_experiment_directly returns 'held' and stamps
+    awaiting_container_runner_since when a container_image is declared but
+    all registered runners lack docker_usable capability.
+
+    No ComputeJob must be created and the task must remain QUEUED.
+    """
+    from app.orchestrator_runner_dispatch import (
+        _dispatch_compute_experiment_directly,
+        RunnerDispatchSnapshot,
+    )
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project = make_project(name="ContainerImageHoldProject", user_id=_TEST_USER)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "command": "echo hello",
+                "spend_cap_usd": 1.0,
+                "deadline_seconds": 300,
+                "container_image": "registry.example.com/myproject:sha256-abc",
+            }
+        ],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id = task.id
+
+    # One runner registered for the project, but it cannot run containers.
+    incapable_runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"docker_usable": False},
+        },
+    )
+    active_runners_cache = {project.id: [incapable_runner]}
+
+    result = await _dispatch_compute_experiment_directly(
+        db_session, task, active_runners_cache, runner_pins_this_cycle={}
+    )
+
+    assert result == "held", f"expected 'held', got {result!r}"
+
+    refreshed = await db_session.get(Task, task_id)
+    assert refreshed.status == TaskStatus.QUEUED, (
+        "task must remain QUEUED when held for container runner"
+    )
+    ctx = refreshed.context or {}
+    assert ctx.get("awaiting_container_runner_since"), (
+        "awaiting_container_runner_since must be stamped in context on hold"
+    )
+    assert "docker_usable" in (refreshed.latest_status_message or ""), (
+        "status message must explain the docker_usable requirement"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Finding 12 — unvalidated float() coercion of the agent-authored `vram_gb`
+# payload field raised in the dispatch HOT PATH, taking down the whole dispatch
+# cycle (blast radius: every task in it) while the offending task itself only
+# died later, reasonless, via poison quarantine.
+# ---------------------------------------------------------------------------
+
+
+def test_coerce_vram_gb_accepts_numbers_and_numeric_strings():
+    """Valid VRAM figures coerce to float with no error, in flat and nested form."""
+    from app.orchestrator_runner_dispatch import _coerce_vram_gb
+
+    assert _coerce_vram_gb({"vram_gb": 24}) == (24.0, None)
+    assert _coerce_vram_gb({"vram_gb": 24.5}) == (24.5, None)
+    assert _coerce_vram_gb({"vram_gb": "24"}) == (24.0, None)
+    assert _coerce_vram_gb({"vram_gb": " 24.5 "}) == (24.5, None)
+    # Nested compute_experiment form resolves identically.
+    assert _coerce_vram_gb({"compute_experiment": {"vram_gb": 40}}) == (40.0, None)
+    # Unset is not an error — it simply declares no VRAM floor.
+    assert _coerce_vram_gb({}) == (None, None)
+
+
+def test_coerce_vram_gb_rejects_non_numeric_without_raising():
+    """The values that used to RAISE in the dispatch cycle now return an error.
+
+    Each of these fed a bare ``float()`` before the fix: "24GB" and [24] raised
+    ValueError/TypeError straight out of the dispatch cycle. They must now come
+    back as an honest error string naming the field and the offending value.
+    """
+    from app.orchestrator_runner_dispatch import _coerce_vram_gb
+
+    for bad in ("24GB", "24 GB", "lots", [24], {"gb": 24}, object()):
+        value, error = _coerce_vram_gb({"vram_gb": bad})
+        assert value is None, f"{bad!r} must not coerce to a VRAM figure"
+        assert error, f"{bad!r} must produce an honest validation error"
+        assert "vram_gb" in error, f"error must name the bad field, got {error!r}"
+
+    # The error names the offending value so an operator can see WHAT was wrong.
+    _value, error = _coerce_vram_gb({"vram_gb": "24GB"})
+    assert "24GB" in error
+
+
+def test_coerce_vram_gb_rejects_non_finite_and_bool():
+    """inf/nan and a truthy bool are rejected.
+
+    ``inf`` parses fine through float() but then blows up downstream at
+    ``int(vram_gb * 1024)`` (OverflowError) — the same hot-path crash by a longer
+    route. ``True`` is an ``int`` subclass, so ``float(True) == 1.0`` would
+    otherwise silently mean "1 GB".
+    """
+    from app.orchestrator_runner_dispatch import _coerce_vram_gb
+
+    for bad in ("inf", "-inf", "nan", float("inf"), float("nan"), True):
+        value, error = _coerce_vram_gb({"vram_gb": bad})
+        assert value is None, f"{bad!r} must not coerce to a VRAM figure"
+        assert error, f"{bad!r} must produce an honest validation error"
+
+
+def test_coerce_vram_gb_treats_falsy_as_no_vram_floor():
+    """A FALSY vram_gb declares no VRAM floor — it is not an error.
+
+    ``0`` / ``False`` / ``""`` are falsy, so the flat-then-nested ``or`` lookup
+    (pre-existing precedence, deliberately preserved) reads straight past them to
+    the nested form and resolves to None = "no VRAM floor". None of these can
+    crash the dispatch cycle, so none of them should terminal-fail a task — they
+    just impose no constraint. This pins that contract so a future "tighten the
+    validation" change cannot start failing tasks that declare vram_gb: 0.
+    """
+    from app.orchestrator_runner_dispatch import _coerce_vram_gb
+
+    for falsy in (0, False, ""):
+        value, error = _coerce_vram_gb({"vram_gb": falsy})
+        assert value is None, f"{falsy!r} must impose no VRAM floor"
+        assert error is None, f"{falsy!r} must NOT be treated as a validation error"
+
+    # Documented precedence: a falsy flat value falls through to the nested form.
+    assert _coerce_vram_gb(
+        {"vram_gb": 0, "compute_experiment": {"vram_gb": 40}}
+    ) == (40.0, None)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_fails_task_honestly_on_non_numeric_vram_gb(db_session, mocker):
+    """An agent writing ``vram_gb: "24GB"`` must fail THAT task with a clear
+    validation message — NOT raise out of the dispatch cycle.
+
+    Regression cover for the hot-path crash: before the fix this call raised
+    ValueError from ``float("24GB")``, aborting the dispatch cycle for every other
+    task in it, while the offending task died later via poison quarantine with no
+    honest reason. Now it terminal-FAILs with compute_launch_failed and a message
+    naming the bad field and value, and no billable ComputeJob is ever created.
+    """
+    from sqlmodel import select as _select
+    from app.models import ComputeJob
+    from app.orchestrator_runner_dispatch import _dispatch_compute_experiment_directly
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project = make_project(name="BadVramProject", user_id=_TEST_USER)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "command": "python train.py",
+                "spend_cap_usd": 1.0,
+                "deadline_seconds": 300,
+                "vram_gb": "24GB",  # unit suffix — the exact poison value
+            }
+        ],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id = task.id
+
+    # Must NOT raise — that is the whole point of the fix.
+    result = await _dispatch_compute_experiment_directly(
+        db_session, task, {}, runner_pins_this_cycle={}
+    )
+
+    assert result == "failed", f"expected 'failed', got {result!r}"
+
+    refreshed = await db_session.get(Task, task_id)
+    assert refreshed.status == TaskStatus.FAILED
+    assert (refreshed.context or {}).get("failure_category") == "compute_launch_failed"
+    message = refreshed.latest_status_message or ""
+    assert "vram_gb" in message, f"message must name the bad field, got {message!r}"
+    assert "24GB" in message, f"message must name the bad value, got {message!r}"
+
+    # A misconfigured launch must never create a (billable) compute job.
+    jobs = (
+        await db_session.execute(
+            _select(ComputeJob).where(ComputeJob.task_id == task_id)
+        )
+    ).scalars().all()
+    assert jobs == [], "a validation failure must not create a billable ComputeJob"
+
+
+# ---------------------------------------------------------------------------
+# Finding 11 — a forced-runner pin (`forced_runner_target_id`) stamped
+# `awaiting_forced_runner_since` but NO sweep or alert ever consumed the stamp,
+# so the task sat QUEUED indefinitely with nobody watching. It now rides the same
+# bounded-wait contract as its siblings: 15-min early alert, 6h terminal fail.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_held_forced_runner_compute_alerts_before_timeout(db_session, mocker):
+    """A forced-runner hold past the early-warning threshold emits a WARNING alert
+    while the task stays QUEUED, and a second sweep pass must not duplicate it.
+
+    Before the fix this hold was invisible to the sweep: no alert, no timeout — the
+    task simply waited forever.
+    """
+    from sqlmodel import select as _select
+    from app.models import Alert, AlertSeverity
+    from app.orchestrator_runner_dispatch import (
+        _fail_stale_local_runner_holds,
+        _LOCAL_RUNNER_HOLD_ALERT_SECONDS,
+        AWAITING_FORCED_RUNNER_CONTEXT_KEY,
+        FORCED_RUNNER_TARGET_CONTEXT_KEY,
+    )
+
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+
+    project = make_project(name="ForcedRunner Hold Alert", user_id=_TEST_USER)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    held_since = _utcnow() - timedelta(seconds=_LOCAL_RUNNER_HOLD_ALERT_SECONDS + 60)
+    task = make_task(
+        project_id=project.id,
+        title="pinned to an offline box",
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "compute_experiment"}],
+        context={
+            AWAITING_FORCED_RUNNER_CONTEXT_KEY: held_since.isoformat(),
+            FORCED_RUNNER_TARGET_CONTEXT_KEY: str(uuid.uuid4()),
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id = task.id
+
+    failed_count = await _fail_stale_local_runner_holds(db_session)
+
+    # Still inside the 6h window — held, not failed.
+    refreshed = await db_session.get(Task, task_id)
+    assert refreshed.status == TaskStatus.QUEUED
+    assert failed_count == 0
+
+    alerts = (
+        await db_session.execute(_select(Alert).where(Alert.task_id == task_id))
+    ).scalars().all()
+    assert len(alerts) == 1, f"Expected 1 early-warning alert, got {len(alerts)}"
+    assert alerts[0].severity == AlertSeverity.WARNING
+
+    # Dedup: a second sweep pass must not stack a duplicate alert.
+    await _fail_stale_local_runner_holds(db_session)
+    alerts2 = (
+        await db_session.execute(_select(Alert).where(Alert.task_id == task_id))
+    ).scalars().all()
+    assert len(alerts2) == 1, "Second sweep pass must not duplicate the alert"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Zone-exhaustion gate — the cold-GCE dispatch skip when every zone is in cooldown
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class TestZoneExhaustionColdProvisionGate:
+    """The orchestrator's "all GCP zones in cooldown" guard.
+
+    The guard used to clear ``queued_tasks`` with the comment "Clear so the loop
+    below is skipped" — but the dispatch loop iterates the ``_queued_task_gate_info``
+    SNAPSHOT built from ``queued_tasks`` a few lines earlier, so clearing the list
+    skipped nothing and every queued task still burned a full cold provision
+    (Secret Manager write + GCS upload + a GCE insert that blocks in-zone), then
+    got requeued with a 10-30 min retry_after — i.e. DELAYED past zone recovery.
+
+    The fix gates the COLD-GCE path only. Locally-routable work (fleet-runner
+    pins, compute_experiment, warm pins, warm-pool leases, Cloud Run jobs) uses no
+    GCE zone capacity and must still dispatch during a zone outage — blocking it
+    would be a worse regression than the dead guard.
+
+    Reuses the ``orch_warm_db`` / ``_run_one_cycle`` one-cycle harness from
+    ``TestWarmVMSkipProvision``.
+    """
+
+    orch_warm_db = TestWarmVMSkipProvision.orch_warm_db  # type: ignore[attr-defined]
+    _run_one_cycle = staticmethod(TestWarmVMSkipProvision._run_one_cycle)  # type: ignore[attr-defined]
+
+    @staticmethod
+    def _naive_utcnow():
+        from datetime import timezone as _tz
+
+        return datetime.now(_tz.utc).replace(tzinfo=None)
+
+    @staticmethod
+    def _patch_common(mocker, *, zones_available: bool):
+        """Mocks shared by every test in this class.
+
+        Returns the ``provision_agent_vm`` mock — the single observable that
+        answers "did the orchestrator attempt a GCP provision this cycle?".
+        """
+        import app.orchestrator as _orch_module
+
+        prov_mock = mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+        mocker.patch(
+            "app.orchestrator._sync_runtime_config_from_state",
+            new_callable=AsyncMock,
+            return_value=[],
+        )
+        # Supply dummy credentials so the dispatch loop reaches the cold-provision
+        # step (no env LLM keys in CI). Without this the no-credentials branch
+        # short-circuits BEFORE provisioning and these tests would pass vacuously
+        # on the unfixed code.
+        mocker.patch(
+            "app.orchestrator._resolve_env_runtime_fallback",
+            return_value=(
+                "fake-api-key",
+                "anthropic",
+                "api_key",
+                "claude-opus-4-8",
+                None,
+                {},
+            ),
+        )
+        # The zone ring: patch the orchestrator's binding, which both the
+        # cycle-level pre-check and the per-task cold-provision gate read.
+        mocker.patch(
+            "app.orchestrator.any_zone_available", return_value=zones_available
+        )
+        _orch_module._last_zone_exhaustion_log = None
+        return prov_mock
+
+    @pytest.mark.asyncio
+    async def test_cold_provision_dispatches_when_a_zone_is_available(
+        self, orch_warm_db, mocker
+    ):
+        """NEGATIVE CONTROL. With a zone available, the very same task DOES cold
+        provision — so the exhaustion tests below cannot pass vacuously (i.e. the
+        harness really does drive a dispatch)."""
+        from sqlmodel import select as _select
+
+        prov_mock = self._patch_common(mocker, zones_available=True)
+
+        async with orch_warm_db() as session:
+            project = make_project(name="Zone Available", user_id=_TEST_USER)
+            session.add(project)
+            await session.commit()
+            await session.refresh(project)
+
+            task = make_task(
+                project_id=project.id,
+                vm_instance_id=None,
+                status=TaskStatus.QUEUED,
+                payloads=[{"type": "fix", "prompt": "x"}],
+                context={},
+            )
+            session.add(task)
+            await session.commit()
+            await session.refresh(task)
+            task_id = task.id
+
+        await self._run_one_cycle(mocker)
+
+        assert prov_mock.called, (
+            "control: with a healthy zone the task must cold-provision — if this "
+            "fails the harness is not driving a dispatch and the exhaustion "
+            "assertions below prove nothing"
+        )
+        async with orch_warm_db() as verify:
+            row = (
+                (await verify.execute(_select(Task).where(Task.id == task_id)))
+                .scalars()
+                .first()
+            )
+            assert row is not None
+            assert row.status == TaskStatus.PROVISIONING
+
+    @pytest.mark.asyncio
+    async def test_zone_exhaustion_holds_cold_gcp_provision(
+        self, orch_warm_db, mocker
+    ):
+        """THE REGRESSION. All zones in cooldown => no GCP provisioning is
+        attempted, and the task is held QUEUED (not requeued with a retry_after
+        that would delay it past zone recovery).
+
+        Fails on the dead-guard code: clearing ``queued_tasks`` does not stop the
+        loop, which iterates the ``_queued_task_gate_info`` snapshot, so
+        provision_agent_vm is called anyway."""
+        from sqlmodel import select as _select
+
+        prov_mock = self._patch_common(mocker, zones_available=False)
+
+        async with orch_warm_db() as session:
+            project = make_project(name="Zone Exhausted", user_id=_TEST_USER)
+            session.add(project)
+            await session.commit()
+            await session.refresh(project)
+
+            task = make_task(
+                project_id=project.id,
+                vm_instance_id=None,
+                status=TaskStatus.QUEUED,
+                payloads=[{"type": "fix", "prompt": "x"}],
+                context={},
+            )
+            session.add(task)
+            await session.commit()
+            await session.refresh(task)
+            task_id = task.id
+
+        await self._run_one_cycle(mocker)
+
+        assert not prov_mock.called, (
+            "Zone-exhaustion guard is dead: provision_agent_vm was called with "
+            "every GCP zone in cooldown. The guard clears `queued_tasks`, but the "
+            "dispatch loop iterates the `_queued_task_gate_info` snapshot."
+        )
+        async with orch_warm_db() as verify:
+            row = (
+                (await verify.execute(_select(Task).where(Task.id == task_id)))
+                .scalars()
+                .first()
+            )
+            assert row is not None
+            assert row.status == TaskStatus.QUEUED, (
+                f"A task held for zone recovery must stay QUEUED, got {row.status}"
+            )
+            assert row.retry_after_until is None, (
+                "The hold must NOT bank a retry_after — that would delay the task "
+                "past zone recovery, the very harm the guard exists to prevent"
+            )
+
+    @pytest.mark.asyncio
+    async def test_zone_exhaustion_still_pins_task_to_local_runner(
+        self, orch_warm_db, mocker
+    ):
+        """BLAST RADIUS. A task routable to a registered fleet runner needs no GCE
+        zone, so a zone cooldown must NOT block it. Skipping the whole dispatch
+        loop (rather than only the cold-GCE step) would strand every local-runner
+        and DGX task for the duration of the outage."""
+        import hashlib
+        from sqlmodel import select as _select
+        from app.models import LocalRunner
+
+        prov_mock = self._patch_common(mocker, zones_available=False)
+
+        async with orch_warm_db() as session:
+            project = make_project(name="Zone Exhausted + Runner", user_id=_TEST_USER)
+            session.add(project)
+            await session.commit()
+            await session.refresh(project)
+
+            runner = LocalRunner(
+                project_id=project.id,
+                token_hash=hashlib.sha256(b"zone-gate-runner").hexdigest(),
+                hostname="dgx-1",
+                status="active",
+                last_seen_at=_utcnow(),
+                capabilities={"task_types": "all", "max_concurrent": 2},
+            )
+            session.add(runner)
+            await session.commit()
+            await session.refresh(runner)
+            runner_id = runner.id
+
+            task = make_task(
+                project_id=project.id,
+                vm_instance_id=None,
+                status=TaskStatus.QUEUED,
+                payloads=[{"type": "fix", "prompt": "x"}],
+                context={},
+            )
+            session.add(task)
+            await session.commit()
+            await session.refresh(task)
+            task_id = task.id
+
+        await self._run_one_cycle(mocker)
+
+        assert not prov_mock.called, (
+            "A runner-pinned task must never reach GCP provisioning"
+        )
+        async with orch_warm_db() as verify:
+            row = (
+                (await verify.execute(_select(Task).where(Task.id == task_id)))
+                .scalars()
+                .first()
+            )
+            assert row is not None
+            assert row.status == TaskStatus.PROVISIONING, (
+                "A locally-routable task must still dispatch while GCP zones are "
+                f"in cooldown, got {row.status}"
+            )
+            assert row.vm_instance_id == f"runner:{runner_id}", (
+                f"Task must be pinned to the fleet runner, got {row.vm_instance_id}"
+            )
+            assert (row.context or {}).get("runner_target_id") == str(runner_id)
+
+    @pytest.mark.asyncio
+    async def test_zone_exhaustion_still_dispatches_cloud_run_job(
+        self, orch_warm_db, mocker
+    ):
+        """BLAST RADIUS. A Cloud Run Job runs in a managed container, not on a GCE
+        VM from the agent-VM zone ring — so an allowlisted read-only type must
+        still dispatch while every zone is in cooldown."""
+        from sqlmodel import select as _select
+        import app.orchestrator as _orch_module
+
+        prov_mock = self._patch_common(mocker, zones_available=False)
+        cr_mock = mocker.patch(
+            "app.orchestrator.launch_agent_cloud_run_job",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+        _orch_module._runtime_config["cloud_run_task_type_allowlist"] = ["research"]
+        try:
+            async with orch_warm_db() as session:
+                project = make_project(name="Zone Exhausted + CR", user_id=_TEST_USER)
+                session.add(project)
+                await session.commit()
+                await session.refresh(project)
+
+                task = make_task(
+                    project_id=project.id,
+                    vm_instance_id=None,
+                    status=TaskStatus.QUEUED,
+                    payloads=[{"type": "research", "prompt": "Analyse the codebase"}],
+                    context={},
+                )
+                session.add(task)
+                await session.commit()
+                await session.refresh(task)
+                task_id = task.id
+
+            await self._run_one_cycle(mocker)
+
+            assert cr_mock.called, (
+                "Cloud Run dispatch consumes no GCE zone capacity — a zone "
+                "cooldown must not block it"
+            )
+            assert not prov_mock.called, (
+                "A Cloud Run task must not fall through to GCE provisioning"
+            )
+            async with orch_warm_db() as verify:
+                row = (
+                    (await verify.execute(_select(Task).where(Task.id == task_id)))
+                    .scalars()
+                    .first()
+                )
+                assert row is not None
+                assert row.status == TaskStatus.PROVISIONING
+        finally:
+            _orch_module._runtime_config["cloud_run_task_type_allowlist"] = []

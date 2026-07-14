@@ -9,6 +9,7 @@ needs viewer, killing needs member.
 import json
 import logging
 import uuid
+from datetime import datetime, timezone
 from datetime import timedelta
 from typing import Any, Dict
 
@@ -21,20 +22,27 @@ from sqlmodel import select
 from app.admin import _get_user_project_with_role
 from app.auth import get_current_user
 from app.compute_jobs import (
-    build_compute_result_logs,
+    build_compute_result_logs_async,
     kill_compute_job,
     list_compute_jobs,
 )
+from app.compute_experiment_contract import decode_generated_command
 from app.compute_jobs_aggregation import (
     aggregate_all_compute_jobs_summary,
     aggregate_compute_jobs_summary,
     aggregate_criterion_summary,
 )
 from app.database import get_session
-from app.models import Artifact, ComputeJob, ComputeJobStatus, LocalRunner, Task
+from app.models import (
+    Artifact,
+    ComputeJob,
+    ComputeJobStatus,
+    LocalRunner,
+    Task,
+    TaskStatus,
+)
 from app.schemas import serialize_compute_job_response_safe
 from app.strategic_runtime_work import (
-    local_runner_hold_task_filters,
     task_awaiting_local_runner_since,
 )
 from app.task_evaluators import (
@@ -115,6 +123,46 @@ def _artifact_descriptor(artifact: Artifact) -> Dict[str, Any]:
     }
 
 
+def _viewable_artifacts_descriptor(raw: Any) -> list[Dict[str, Any]]:
+    """Normalize a persisted viewable-file manifest into the operator-facing list.
+
+    Reads the ``viewable_files`` manifest stamped onto ``polling_metadata`` by
+    ``_link_terminal_artifact`` and returns a sanitized, backward-compatible list
+    of ``{filename, storage_uri, content_type, size_bytes, kind}``. A signed
+    preview URL is resolved lazily via ``/api/admin/artifacts/download-url`` from
+    ``storage_uri`` (which lives inside the allowlisted compute-job prefix), so no
+    URL is minted here. Returns ``[]`` when a job produced no viewable files or
+    the manifest is malformed (absent/empty is the common, expected case).
+    """
+    if not isinstance(raw, list):
+        return []
+    out: list[Dict[str, Any]] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        storage_uri = entry.get("storage_uri")
+        if not isinstance(storage_uri, str) or not storage_uri:
+            continue
+        filename = entry.get("filename")
+        content_type = entry.get("content_type")
+        size_bytes = entry.get("size_bytes")
+        kind = entry.get("kind")
+        out.append(
+            {
+                "filename": str(filename) if filename is not None else None,
+                "storage_uri": storage_uri,
+                "content_type": content_type
+                if isinstance(content_type, str)
+                else None,
+                "size_bytes": int(size_bytes)
+                if isinstance(size_bytes, int) and not isinstance(size_bytes, bool)
+                else None,
+                "kind": kind if kind in ("image", "video") else None,
+            }
+        )
+    return out
+
+
 async def _build_compute_job_payload(
     session: AsyncSession, jobs
 ) -> list[Dict[str, Any]]:
@@ -186,6 +234,16 @@ async def _build_compute_job_payload(
                 runner_target_ids.add(uuid.UUID(str(raw_id)))
             except (ValueError, AttributeError):
                 pass
+        # An operator's forced runner pin lives on the launching task's context,
+        # not the job row; batch its hostname in the same query so the forced
+        # target is resolvable even when the job is held (no claimed pin yet).
+        _tmeta = task_meta.get(job.task_id)
+        _forced_raw = (_tmeta[4].context or {}).get("forced_runner_target_id") if _tmeta and _tmeta[4] is not None else None
+        if _forced_raw:
+            try:
+                runner_target_ids.add(uuid.UUID(str(_forced_raw)))
+            except (ValueError, AttributeError):
+                pass
     runner_map: Dict[uuid.UUID, LocalRunner] = {}
     if runner_target_ids:
         runner_rows = (
@@ -214,7 +272,7 @@ async def _build_compute_job_payload(
             and job.status in _COMPUTE_JOB_TERMINAL_STATUSES
             and task_obj is not None
         ):
-            artifact_text = build_compute_result_logs(job)
+            artifact_text = await build_compute_result_logs_async(job)
             criterion_verdict = evaluate_compute_success_criterion(
                 task_obj, artifact_text
             )
@@ -252,8 +310,13 @@ async def _build_compute_job_payload(
             raw_provenance = fp.get("provenance")
             raw_spend = fp.get("spend_cap_usd")
             raw_deadline = fp.get("deadline_seconds")
+            raw_command = fp.get("command") or None
             launch_params = {
-                "command": fp.get("command") or None,
+                "command": raw_command,
+                # Multi-arm commands are stored base64-wrapped for escape safety;
+                # decode here so the operator can read what actually ran. None for
+                # single-arm/operator commands, which are stored verbatim.
+                "command_decoded": decode_generated_command(raw_command),
                 "arms": arms_val,
                 "declared_metric": fp.get("declared_metric") or None,
                 "metric": fp.get("metric") or None,
@@ -285,6 +348,12 @@ async def _build_compute_job_payload(
         )
         # Runner identity and wait-state fields.
         pm = job.polling_metadata or {}
+        # Additive per-file viewable-artifact manifest (empty when the job
+        # produced no viewable files) so the UI can enumerate individual
+        # image/video references alongside the opaque bundle `artifact`.
+        data["viewable_artifacts"] = _viewable_artifacts_descriptor(
+            pm.get("viewable_files")
+        )
         raw_runner_id = pm.get("runner_target_id")
         runner_target_id_str: str | None = str(raw_runner_id) if raw_runner_id else None
         data["runner_target_id"] = runner_target_id_str
@@ -305,10 +374,36 @@ async def _build_compute_job_payload(
         # awaiting_local_runner_since lives on the launching task's context, not
         # the job row. The task_obj is already loaded in the batch above.
         awaiting: str | None = None
+        forced_runner_target_id: str | None = None
+        awaiting_forced: str | None = None
+        forced_runner_descriptor: Dict[str, Any] | None = None
         if task_obj is not None:
-            raw_awaiting = (task_obj.context or {}).get("awaiting_local_runner_since")
+            tctx = task_obj.context or {}
+            raw_awaiting = tctx.get("awaiting_local_runner_since")
             awaiting = str(raw_awaiting) if raw_awaiting else None
+            # Operator HARD runner pin (and its held-since stamp) so the UI can
+            # distinguish a forced-runner hold from a generic awaiting-local hold.
+            raw_forced = tctx.get("forced_runner_target_id")
+            forced_runner_target_id = str(raw_forced) if raw_forced else None
+            raw_awaiting_forced = tctx.get("awaiting_forced_runner_since")
+            awaiting_forced = (
+                str(raw_awaiting_forced) if raw_awaiting_forced else None
+            )
+            if forced_runner_target_id:
+                try:
+                    forced_obj = runner_map.get(uuid.UUID(forced_runner_target_id))
+                    if forced_obj is not None:
+                        forced_runner_descriptor = {
+                            "id": str(forced_obj.id),
+                            "hostname": forced_obj.hostname,
+                            "status": forced_obj.status,
+                        }
+                except (ValueError, AttributeError):
+                    pass
         data["awaiting_local_runner_since"] = awaiting
+        data["forced_runner_target_id"] = forced_runner_target_id
+        data["awaiting_forced_runner_since"] = awaiting_forced
+        data["forced_runner"] = forced_runner_descriptor
         payload.append(data)
     return payload
 
@@ -320,6 +415,7 @@ async def get_project_compute_jobs(
     offset: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=200),
     all_terminal: bool = Query(False),
+    task_id: uuid.UUID | None = Query(None),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -328,6 +424,9 @@ async def get_project_compute_jobs(
     When ``all_terminal=true``, all terminal jobs are returned regardless of
     age — ``include_finished_minutes`` is accepted but ignored for the terminal
     filter, allowing deep-history browsing of past experiments.
+
+    When ``task_id`` is provided, only jobs linked to that task are returned
+    and the time-window filter is bypassed.
     """
     await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "viewer"
@@ -340,25 +439,38 @@ async def get_project_compute_jobs(
         limit=limit,
         offset=offset,
         all_terminal=all_terminal,
+        task_id=task_id,
     )
     built_payload = await _build_compute_job_payload(session, jobs)
-    agg_summary = await aggregate_compute_jobs_summary(
-        session,
-        project_id=project_id,
-        include_finished_within=window,
-        all_terminal=all_terminal,
-    )
-    criterion_stats = await aggregate_criterion_summary(
-        session,
-        project_id=project_id,
-        include_finished_within=window,
-        all_terminal=all_terminal,
-    )
-    summary = {
-        **agg_summary,
-        "criterion_met": criterion_stats["criterion_met"],
-        "criterion_measured": criterion_stats["criterion_measured"],
-    }
+    if task_id is not None:
+        # Aggregate summary is not meaningful for a single-task filter.
+        summary: dict = {
+            "total_jobs": len(jobs),
+            "active_jobs": 0,
+            "terminal_jobs": 0,
+            "total_spend_usd": 0,
+            "outcome_breakdown": {},
+            "criterion_met": 0,
+            "criterion_measured": 0,
+        }
+    else:
+        agg_summary = await aggregate_compute_jobs_summary(
+            session,
+            project_id=project_id,
+            include_finished_within=window,
+            all_terminal=all_terminal,
+        )
+        criterion_stats = await aggregate_criterion_summary(
+            session,
+            project_id=project_id,
+            include_finished_within=window,
+            all_terminal=all_terminal,
+        )
+        summary = {
+            **agg_summary,
+            "criterion_met": criterion_stats["criterion_met"],
+            "criterion_measured": criterion_stats["criterion_measured"],
+        }
     return {
         "compute_jobs": built_payload,
         "has_more": has_more,
@@ -368,17 +480,26 @@ async def get_project_compute_jobs(
     }
 
 
-def _awaiting_local_runner_entry(task: Task) -> Dict[str, Any]:
-    """Serialize a compute_experiment task held awaiting a local runner.
+def _awaiting_local_runner_entry(
+    task: Task, runner_map: Dict[uuid.UUID, LocalRunner] | None = None
+) -> Dict[str, Any]:
+    """Serialize a compute_experiment task held awaiting a runner.
 
     These tasks have NO ComputeJob row (the orchestrator holds them QUEUED
     before any job is created), so this is the only surface that exposes them.
-    The response shape is a stable contract the compute-workspace UI depends on:
+    A hold is one of two kinds, distinguishable by which ``*_since`` stamp is set:
+    a generic enforce-local hold (``awaiting_local_runner_since``) or an operator
+    HARD-pin hold (``awaiting_forced_runner_since`` + ``forced_runner_target_id``,
+    which never falls back to another runner). The response shape is a stable
+    contract the compute-workspace UI depends on:
 
         {
           "id": str,                            # task id
           "title": str | None,
-          "awaiting_local_runner_since": str,   # ISO stamp from task.context
+          "awaiting_local_runner_since": str | None,   # ISO stamp from task.context
+          "awaiting_forced_runner_since": str | None,  # ISO stamp (forced-pin hold)
+          "forced_runner_target_id": str | None,       # resolved runner UUID
+          "forced_runner": {id,hostname,status} | None,# resolved forced runner
           "created_at": str | None,             # ISO
           "requires_approval": bool,
           "spend_cap_usd": float | None,        # launch essentials from payload
@@ -393,10 +514,30 @@ def _awaiting_local_runner_entry(task: Task) -> Dict[str, Any]:
     fp = task.first_payload
     raw_spend = fp.get("spend_cap_usd")
     raw_deadline = fp.get("deadline_seconds")
+    tctx = task.context or {}
+    raw_forced = tctx.get("forced_runner_target_id")
+    forced_runner_target_id = str(raw_forced) if raw_forced else None
+    raw_awaiting_forced = tctx.get("awaiting_forced_runner_since")
+    awaiting_forced = str(raw_awaiting_forced) if raw_awaiting_forced else None
+    forced_runner_descriptor: Dict[str, Any] | None = None
+    if forced_runner_target_id and runner_map:
+        try:
+            forced_obj = runner_map.get(uuid.UUID(forced_runner_target_id))
+            if forced_obj is not None:
+                forced_runner_descriptor = {
+                    "id": str(forced_obj.id),
+                    "hostname": forced_obj.hostname,
+                    "status": forced_obj.status,
+                }
+        except (ValueError, AttributeError):
+            pass
     return {
         "id": str(task.id),
         "title": task.title,
         "awaiting_local_runner_since": task_awaiting_local_runner_since(task),
+        "awaiting_forced_runner_since": awaiting_forced,
+        "forced_runner_target_id": forced_runner_target_id,
+        "forced_runner": forced_runner_descriptor,
         "created_at": task.created_at.isoformat() if task.created_at else None,
         "requires_approval": bool(task.requires_approval),
         "spend_cap_usd": float(raw_spend) if raw_spend is not None else None,
@@ -423,20 +564,37 @@ async def get_project_awaiting_local_runner_holds(
     ComputeJob row. The regular ``/compute-jobs`` listing only surfaces ComputeJob
     rows, so these blocked experiments are otherwise invisible in the workspace.
 
-    Returns a JSON list (newest ``created_at`` first). The filter is the shared
-    ``local_runner_hold_task_filters`` predicate: QUEUED, not archived,
-    ``requires_approval`` is not True, payload type ``compute_experiment``, and a
-    non-empty awaiting stamp. Each entry's shape is documented on
+    Returns a JSON list (newest ``created_at`` first). Two hold kinds are surfaced:
+    a generic enforce-local hold (``awaiting_local_runner_since``) AND an operator
+    HARD-pin hold (``awaiting_forced_runner_since``, which never falls back to
+    another runner). The base predicate mirrors ``local_runner_hold_task_filters``
+    (QUEUED, not archived, ``requires_approval`` is not True, payload type
+    ``compute_experiment``) but the awaiting stamp is an OR over both kinds so a
+    forced-pin hold is not silently dropped. Each entry's shape is documented on
     ``_awaiting_local_runner_entry`` and is a stable contract for the UI.
     """
+    from sqlalchemy import and_, or_
+
     await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "viewer"
     )
+    awaiting_local = Task.context["awaiting_local_runner_since"].as_string()
+    awaiting_forced = Task.context["awaiting_forced_runner_since"].as_string()
     rows = (
         (
             await session.execute(
                 select(Task)
-                .where(*local_runner_hold_task_filters(project_id))
+                .where(
+                    Task.project_id == project_id,
+                    Task.archived.is_(False),
+                    Task.status == TaskStatus.QUEUED,
+                    Task.requires_approval.is_not(True),
+                    Task.payloads[0]["type"].as_string() == "compute_experiment",
+                    or_(
+                        and_(awaiting_local.is_not(None), awaiting_local != ""),
+                        and_(awaiting_forced.is_not(None), awaiting_forced != ""),
+                    ),
+                )
                 .order_by(Task.created_at.desc())
                 .limit(500)
             )
@@ -444,7 +602,29 @@ async def get_project_awaiting_local_runner_holds(
         .scalars()
         .all()
     )
-    return [_awaiting_local_runner_entry(task) for task in rows]
+    # Batch-load the forced-target runners referenced by these holds so each entry
+    # can carry the resolved hostname/status (one query for the whole page).
+    forced_ids: set[uuid.UUID] = set()
+    for task in rows:
+        raw_forced = (task.context or {}).get("forced_runner_target_id")
+        if raw_forced:
+            try:
+                forced_ids.add(uuid.UUID(str(raw_forced)))
+            except (ValueError, AttributeError):
+                pass
+    runner_map: Dict[uuid.UUID, LocalRunner] = {}
+    if forced_ids:
+        runner_rows = (
+            (
+                await session.execute(
+                    select(LocalRunner).where(LocalRunner.id.in_(forced_ids))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        runner_map = {r.id: r for r in runner_rows}
+    return [_awaiting_local_runner_entry(task, runner_map) for task in rows]
 
 
 @router.get("/projects/{project_id}/compute-jobs/summary")
@@ -464,6 +644,96 @@ async def get_project_compute_jobs_aggregate_summary(
     return await aggregate_all_compute_jobs_summary(session, project_id=project_id)
 
 
+# ── GPU contamination audit ───────────────────────────────────────────────────
+
+# Commit that introduced /sys ro-bind for bwrap GPU sandboxes (PR #14183).
+# Jobs that STARTED before this timestamp on local-runner may have been silently
+# running on CPU even when an accelerator was declared (cuInit returned rc=304).
+_GPU_SYS_FIX_UTC = datetime(2026, 7, 11, 7, 6, 21, tzinfo=timezone.utc)
+_RUNNER_SUBPROCESS_BACKEND = "runner-subprocess"
+
+
+# NOTE: this static route MUST be declared before the dynamic
+# "/compute-jobs/{job_id}" route below. FastAPI matches routes in declaration
+# order; if "{job_id}" comes first it captures "gpu-contamination-audit" as a
+# job_id and fails uuid.UUID parsing with HTTP 422.
+@router.get("/compute-jobs/gpu-contamination-audit")
+async def gpu_contamination_audit(
+    project_id: uuid.UUID = Query(...),
+    user=Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+) -> Dict[str, Any]:
+    """List accelerator-declared local-runner compute jobs started BEFORE the
+    /sys ro-bind fix (PR #14183, commit b92e368) that may have silently run on
+    CPU instead of GPU.
+
+    These jobs should be treated as suspect: CUDA likely failed inside the bwrap
+    sandbox with rc=304 CUDA_ERROR_OPERATING_SYSTEM, causing torch/TF to
+    silently fall back to CPU while reporting a successful exit code.
+
+    Returns a read-only report; no data is deleted or modified.
+    """
+    await _get_user_project_with_role(project_id, user["user_id"], session, "viewer")
+
+    from sqlalchemy import and_
+
+    result = await session.execute(
+        select(ComputeJob)
+        .where(
+            and_(
+                ComputeJob.project_id == project_id,
+                ComputeJob.backend == _RUNNER_SUBPROCESS_BACKEND,
+                ComputeJob.accelerator_type.isnot(None),
+                ComputeJob.started_at.isnot(None),
+                ComputeJob.started_at < _GPU_SYS_FIX_UTC,
+            )
+        )
+        .order_by(ComputeJob.started_at.asc())
+        .limit(500)
+    )
+    jobs = result.scalars().all()
+
+    task_ids = {j.task_id for j in jobs if j.task_id is not None}
+    task_titles: Dict[uuid.UUID, str | None] = {}
+    if task_ids:
+        task_rows = (
+            await session.execute(
+                select(Task)
+                .options(load_only(Task.id, Task.title, raiseload=True))
+                .where(Task.id.in_(task_ids))
+            )
+        ).scalars().all()
+        task_titles = {t.id: t.title for t in task_rows}
+
+    items = []
+    for job in jobs:
+        items.append({
+            "job_id": str(job.id),
+            "task_id": str(job.task_id) if job.task_id else None,
+            "task_title": task_titles.get(job.task_id) if job.task_id else None,
+            "accelerator_type": job.accelerator_type,
+            # ComputeJob.status is a String column, so it reads back from the DB
+            # as a plain str (not a ComputeJobStatus enum); getattr handles both
+            # the in-memory enum and the persisted-string case.
+            "status": getattr(job.status, "value", job.status) if job.status else None,
+            "started_at": job.started_at.isoformat() if job.started_at else None,
+            "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+            "suspect_reason": (
+                "started before /sys ro-bind fix (PR #14183); cuInit likely "
+                "returned CUDA_ERROR_OPERATING_SYSTEM (rc=304), causing silent "
+                "CPU fallback"
+            ),
+        })
+
+    return {
+        "fix_landed_at": _GPU_SYS_FIX_UTC.isoformat(),
+        "fix_pr": "#14183",
+        "fix_commit": "b92e36823",
+        "suspect_count": len(items),
+        "jobs": items,
+    }
+
+
 @router.get("/compute-jobs/{job_id}")
 async def get_compute_job_by_id(
     job_id: uuid.UUID,
@@ -475,6 +745,16 @@ async def get_compute_job_by_id(
     Returns the full job detail including its per-arm result block, task title,
     success criterion, and criterion verdict. Normalizes 403 to 404 so job
     existence is not leaked to callers without viewer access (IDOR protection).
+
+    ``polling_metadata`` may carry two runner-reported live channels:
+
+    * ``live_output``: ``{"text": str, "truncated": bool}`` — bounded live
+      command-output tail for active jobs (same shape on the GCP and
+      runner-subprocess backends).
+    * ``progress``: ``{"records": [{"metric": str, "value": float,
+      "step"?: int, "ts"?: str}, ... last ≤50], "count": int,
+      "updated_at": iso}`` — the job's self-reported interim-progress records
+      (BLUEPRINT_PROGRESS_FILE protocol), server-validated at ingest.
     """
     job = await session.get(ComputeJob, job_id)
     if job is None:

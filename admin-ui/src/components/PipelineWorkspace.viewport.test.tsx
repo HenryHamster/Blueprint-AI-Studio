@@ -174,6 +174,23 @@ describe('PipelineWorkspace viewport regression', () => {
     await act(async () => {
       r.render(<PipelineWorkspace {...props} />);
     });
+    // KanbanBoard / PipelineView are React.lazy behind <Suspense fallback={null}>,
+    // so the main region mounts empty until the chunk resolves. Wait for real
+    // content before returning — otherwise the overflow/content assertions run
+    // against an empty <main> and the outcome depends on module-cache timing
+    // (first board render historically raced and failed nondeterministically).
+    const mainTestId = section === 'board' ? 'pipeline-board-main' : 'pipeline-flow-main';
+    const deadline = Date.now() + 5000;
+    for (;;) {
+      const main = host.querySelector<HTMLElement>(`[data-testid="${mainTestId}"]`);
+      if (main && (main.textContent ?? '').trim().length > 0) break;
+      if (Date.now() > deadline) {
+        throw new Error(`Timed out waiting for lazy ${section} section content to mount`);
+      }
+      await act(async () => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 25));
+      });
+    }
   }
 
   async function expectTaskContextReachable(sideboard: HTMLElement, aside: HTMLElement) {

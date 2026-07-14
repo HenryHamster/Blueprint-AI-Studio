@@ -28,6 +28,7 @@ from sqlmodel import select
 
 from app import acceptance_criteria as ac
 from app.operator_attention import build_operator_attention
+from app.time_utils import _utcnow
 from app.models import (
     CriterionEvidence,
     Direction,
@@ -160,6 +161,51 @@ async def test_get_criteria_for_version_ordered(db_session):
     assert len(fetched) == 2
     assert fetched[0].id == c1.id
     assert fetched[1].id == c2.id
+
+
+# ---------------------------------------------------------------------------
+# get_active_criteria_rubric
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_active_criteria_rubric_returns_active_rubric_ordered(db_session):
+    """get_active_criteria_rubric returns {criterion_key, text} for ACTIVE rows,
+    ordered by created_at, excluding retracted/superseded criteria."""
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+
+    c1 = await ac.create_criterion(db_session, project.id, version.id, "First")
+    c2 = await ac.create_criterion(db_session, project.id, version.id, "Second")
+    c3 = await ac.create_criterion(db_session, project.id, version.id, "Retracted")
+
+    # Retract c3 — the rubric accessor must exclude non-active rows.
+    await ac.retract_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key=c3.criterion_key,
+        reason="stale",
+        retracted_by="test",
+    )
+
+    rubric = await ac.get_active_criteria_rubric(db_session, version.id)
+
+    # Only active criteria, in created_at order, projected to the rubric fields.
+    assert rubric == [
+        {"criterion_key": c1.criterion_key, "text": "First"},
+        {"criterion_key": c2.criterion_key, "text": "Second"},
+    ]
+    # No coverage/status/evidence keys leak into the lightweight rubric.
+    assert all(set(entry.keys()) == {"criterion_key", "text"} for entry in rubric)
+
+
+@pytest.mark.asyncio
+async def test_get_active_criteria_rubric_empty(db_session):
+    """get_active_criteria_rubric returns [] when the version has no criteria."""
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+    assert await ac.get_active_criteria_rubric(db_session, version.id) == []
 
 
 # ---------------------------------------------------------------------------
@@ -367,10 +413,18 @@ async def test_record_evidence_duplicate_is_noop(db_session):
     version = await _make_version(db_session, project)
     criterion = await ac.create_criterion(db_session, project.id, version.id, "CI green")
 
+    # Snapshot ids up front: the duplicate insert below is collapsed inside
+    # record_evidence via IntegrityError → session.rollback(), which expires
+    # every instance in the session — a post-rollback ``version.id`` lazy-load
+    # would raise MissingGreenlet under real ORM expiry.
+    version_id = version.id
+    criterion_id = criterion.id
+    project_id = project.id
+
     await ac.record_evidence(
         db_session,
-        criterion_id=criterion.id,
-        project_id=project.id,
+        criterion_id=criterion_id,
+        project_id=project_id,
         source_kind="task_merge",
         source_id="task-uuid-abc123",
         detail={"pr": 42},
@@ -378,16 +432,16 @@ async def test_record_evidence_duplicate_is_noop(db_session):
 
     await ac.record_evidence(
         db_session,
-        criterion_id=criterion.id,
-        project_id=project.id,
+        criterion_id=criterion_id,
+        project_id=project_id,
         source_kind="task_merge",
         source_id="task-uuid-abc123",
         detail={"pr": 43},
     )
 
-    assert await ac.count_criteria_for_version(db_session, version.id) == 1
+    assert await ac.count_criteria_for_version(db_session, version_id) == 1
 
-    fetched = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    fetched = await ac.get_evidence_for_criterion(db_session, criterion_id)
     assert len(fetched) == 1
     assert fetched[0].source_kind == "task_merge"
     assert fetched[0].source_id == "task-uuid-abc123"
@@ -399,14 +453,26 @@ async def test_record_evidence_duplicate_is_noop(db_session):
 # ---------------------------------------------------------------------------
 
 
-def _make_evidence(source_kind: str, detail: dict | None = None) -> CriterionEvidence:
-    return CriterionEvidence(
+_UNSET = object()
+
+
+def _make_evidence(
+    source_kind: str,
+    detail: dict | None = None,
+    recorded_at: object = _UNSET,
+) -> CriterionEvidence:
+    kwargs: dict = dict(
         id=uuid.uuid4(),
         project_id=uuid.uuid4(),
         criterion_id=uuid.uuid4(),
         source_kind=source_kind,
         detail=detail,
     )
+    # Only override recorded_at when the caller supplies one, so the model's
+    # default_factory (fresh _utcnow()) still applies for the common case.
+    if recorded_at is not _UNSET:
+        kwargs["recorded_at"] = recorded_at
+    return CriterionEvidence(**kwargs)
 
 
 def test_coverage_uncovered():
@@ -464,6 +530,156 @@ def test_unproven_or_unreachable_merge_does_not_mark_criterion_covered():
     assert ac.compute_criterion_coverage([_make_evidence("reachability")]) == "covered"
 
 
+def test_unverified_merge_backfill_reports_distinct_tier():
+    """Unverified-merge backfill evidence produces the distinct 'backfilled' tier.
+
+    ``_evidence_proves_covered`` must NOT treat ``UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND``
+    as machine-verified covering evidence — that would score it at full parity with
+    reachability / proven task_merge, even though the merge was never CI-verified
+    (only the named_test file shipping was confirmed).  The test confirms:
+      - backfill evidence alone → ``compute_criterion_coverage`` returns ``'backfilled'``
+      - backfill + proven machine evidence → ``'covered'`` (backfill doesn't regress)
+      - backfill + operator attestation → ``'attested'`` (attestation still higher)
+    """
+    # Backfill evidence alone → distinct backfilled tier (not covered)
+    backfill_ev = _make_evidence(
+        ac.UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND,
+        detail={"proven": True, "backfilled": True, "backfill_reason": "unverified_merge"},
+    )
+    assert not ac._evidence_proves_covered(backfill_ev), (
+        "UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND must NOT be treated as covering"
+    )
+    assert ac.compute_criterion_coverage([backfill_ev]) == "backfilled", (
+        "Backfill evidence alone should produce 'backfilled' coverage"
+    )
+
+    # Backfill + proven task_merge → covered (machine evidence dominates)
+    task_merge_ev = _make_evidence("task_merge", detail={"proven": True})
+    assert ac.compute_criterion_coverage([backfill_ev, task_merge_ev]) == "covered", (
+        "Backfill + proven task_merge should be 'covered'"
+    )
+
+    # Backfill + operator attestation → attested (attestation higher than backfill)
+    attest_ev = _make_evidence("operator_attestation", detail={"reason": "waiver"})
+    assert ac.compute_criterion_coverage([backfill_ev, attest_ev]) == "attested", (
+        "Backfill + operator attestation should be 'attested' (attestation > backfill)"
+    )
+
+    # Backfill evidence WITHOUT backfilled=True flag → partial (not a valid backfill record)
+    bare_backfill = _make_evidence(ac.UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND)
+    assert ac.compute_criterion_coverage([bare_backfill]) == "partial", (
+        "Bare backfill evidence without backfilled=True flag should be 'partial'"
+    )
+
+    # backfilled coverage maps onto the shared EvidenceStatus axis as "partial"
+    assert ac.criterion_coverage_to_evidence_status("backfilled") == "partial"
+
+
+def test_machine_probe_evidence_reports_distinct_probed_tier():
+    """Machine-probe evidence produces the distinct, lower-confidence 'probed' tier.
+
+    ``_evidence_proves_covered`` must NOT treat ``acceptance_window_recompute`` or
+    ``metrics_integrity_sweep`` as machine-verified covering evidence — that would
+    score a mechanism-ran signal at full parity with reachability / proven
+    task_merge, even though it only proves the sweep operated (not that the
+    criterion's own condition holds).  This confirms:
+      - a fresh probe row alone → ``compute_criterion_coverage`` returns ``'probed'``
+      - probe + proven machine evidence → ``'covered'`` (probe doesn't regress)
+      - probe + operator attestation → ``'attested'`` (attestation ranks higher)
+      - probe + backfill → ``'backfilled'`` (backfill ranks higher than probe)
+    """
+    for kind in ("acceptance_window_recompute", "metrics_integrity_sweep"):
+        probe_ev = _make_evidence(kind, detail={"ticks": 3})
+        assert not ac._evidence_proves_covered(probe_ev), (
+            f"{kind} must NOT be treated as machine-verified covering"
+        )
+        assert ac._evidence_is_probed(probe_ev) is True
+        assert ac.compute_criterion_coverage([probe_ev]) == "probed"
+
+        # Machine-verified evidence dominates a probe.
+        proven = _make_evidence("task_merge", detail={"proven": True})
+        assert ac.compute_criterion_coverage([probe_ev, proven]) == "covered"
+
+        # A non-expired operator attestation ranks above a probe.
+        attest = _make_evidence("operator_attestation", detail={"reason": "waiver"})
+        assert ac.compute_criterion_coverage([probe_ev, attest]) == "attested"
+
+        # Unverified-merge backfill ranks above a probe.
+        backfill = _make_evidence(
+            ac.UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND, detail={"backfilled": True}
+        )
+        assert ac.compute_criterion_coverage([probe_ev, backfill]) == "backfilled"
+
+    # probed coverage maps onto the shared EvidenceStatus axis as "partial",
+    # never "proven" — a mechanism-ran probe is not machine-proof.
+    assert ac.criterion_coverage_to_evidence_status("probed") == "partial"
+
+
+def test_stale_machine_probe_falls_back_to_partial():
+    """A machine-probe row older than MACHINE_PROBE_WINDOW_DAYS is no longer 'probed'.
+
+    Expiry is measured off ``recorded_at`` (these rows carry no attestation
+    timestamp), so a stale sweep decays to 'partial' until the sweep re-runs and
+    writes a fresh row.  A probe row with no ``recorded_at`` at all also fails —
+    a missing timestamp cannot grant perpetual trust.
+    """
+    stale = _make_evidence(
+        "metrics_integrity_sweep",
+        detail={"ticks": 1},
+        recorded_at=_utcnow() - timedelta(days=ac.MACHINE_PROBE_WINDOW_DAYS + 1),
+    )
+    assert ac._evidence_is_probed(stale) is False
+    assert ac.compute_criterion_coverage([stale]) == "partial"
+
+    no_ts = _make_evidence(
+        "acceptance_window_recompute", detail={"ticks": 1}, recorded_at=None
+    )
+    assert ac._evidence_is_probed(no_ts) is False
+    assert ac.compute_criterion_coverage([no_ts]) == "partial"
+
+    # A row recorded comfortably inside the window is still valid (use one day
+    # of slack so the predicate's slightly-later _utcnow() cannot tip the
+    # exact-boundary comparison and flake).
+    fresh = _make_evidence(
+        "metrics_integrity_sweep",
+        detail={"ticks": 1},
+        recorded_at=_utcnow() - timedelta(days=ac.MACHINE_PROBE_WINDOW_DAYS - 1),
+    )
+    assert ac._evidence_is_probed(fresh) is True
+    assert ac.compute_criterion_coverage([fresh]) == "probed"
+
+
+# ---------------------------------------------------------------------------
+# criterion_evidence_status (pure function, Component 1)
+# ---------------------------------------------------------------------------
+
+
+def test_criterion_evidence_status_proven_from_covered():
+    """A proven task_merge → covered → 'proven' on the shared axis."""
+    ev = _make_evidence("task_merge", detail={"proven": True})
+    assert ac.criterion_evidence_status([ev]) == "proven"
+    # reachability alone also covers → proven.
+    assert ac.criterion_evidence_status([_make_evidence("reachability")]) == "proven"
+
+
+def test_criterion_evidence_status_unproven_when_no_evidence():
+    """No evidence rows → uncovered → 'unproven'."""
+    assert ac.criterion_evidence_status([]) == "unproven"
+
+
+def test_criterion_evidence_status_partial_when_evidence_does_not_cover():
+    """Evidence present but not covering/attested/backfilled → partial."""
+    ev = _make_evidence("task_merge", detail={"proven": False})
+    assert ac.criterion_evidence_status([ev]) == "partial"
+
+
+def test_criterion_evidence_status_composes_coverage_and_axis_map():
+    """criterion_evidence_status is exactly the composition of its two parts."""
+    evs = [_make_evidence("operator"), _make_evidence("task_merge", detail={"proven": True})]
+    expected = ac.criterion_coverage_to_evidence_status(ac.compute_criterion_coverage(evs))
+    assert ac.criterion_evidence_status(evs) == expected == "proven"
+
+
 # ---------------------------------------------------------------------------
 # get_version_coverage_summary
 # ---------------------------------------------------------------------------
@@ -511,10 +727,208 @@ async def test_coverage_summary_empty(db_session):
 
     assert summary["total"] == 0
     assert summary["covered"] == 0
+    assert summary["probed"] == 0
     assert summary["partial"] == 0
     assert summary["uncovered"] == 0
     assert summary["stuck_count"] == 0
     assert summary["criteria"] == []
+
+
+@pytest.mark.asyncio
+async def test_coverage_summary_has_probed_bucket(db_session):
+    """A criterion covered only by a fresh machine probe lands in the 'probed'
+    bucket — distinct from 'covered' — and is included in ``total``."""
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Probed-only outcome"
+    )
+    db_session.add(
+        CriterionEvidence(
+            criterion_id=criterion.id,
+            project_id=project.id,
+            source_kind="acceptance_window_recompute",
+            source_id="aw-probe",
+            detail={"acceptance_window_verified": 1},
+        )
+    )
+    await db_session.commit()
+
+    summary = await ac.get_version_coverage_summary(db_session, version.id)
+
+    assert summary["probed"] == 1
+    assert summary["covered"] == 0
+    assert summary["partial"] == 0
+    assert summary["uncovered"] == 0
+    # 'probed' is counted toward total (backward-compat: total == sum of buckets).
+    assert summary["total"] == 1
+    by_key = {c["criterion_key"]: c for c in summary["criteria"]}
+    assert by_key[criterion.criterion_key]["coverage"] == "probed"
+
+
+# ---------------------------------------------------------------------------
+# phantom acceptance-criteria bookkeeping drift guard
+# ---------------------------------------------------------------------------
+
+
+def test_extract_referenced_criterion_keys_pattern():
+    """extract_referenced_criterion_keys finds c-<8hex> tokens, ignores non-keys."""
+    text = (
+        "Progress: 0/6 covered against c-bbf215e3 and c-a5940d77; "
+        "see commit deadbeefcafe (not a key) and c-ZZZ (bad hex)."
+    )
+    keys = ac.extract_referenced_criterion_keys(text)
+    assert keys == {"c-bbf215e3", "c-a5940d77"}
+    # word boundary: a longer hex run is NOT a criterion key
+    assert ac.extract_referenced_criterion_keys("c-deadbeef00") == set()
+    # defensive: non-string / empty inputs never raise
+    assert ac.extract_referenced_criterion_keys(None) == set()
+    assert ac.extract_referenced_criterion_keys("") == set()
+    assert ac.extract_referenced_criterion_keys(12345) == set()  # type: ignore[arg-type]
+
+
+def test_reconcile_flags_phantom_keys():
+    """A referenced key with no registered match is a phantom (dangling) key."""
+    report = ac.reconcile_criterion_key_references(
+        registered={"c-11111111"},
+        referenced={"c-11111111", "c-22222222"},
+    )
+    assert report["phantom_keys"] == ["c-22222222"]
+    assert report["zero_registered"] is False
+    assert report["has_drift"] is True
+
+
+def test_reconcile_flags_zero_registered_when_referenced():
+    """Keys referenced while zero criteria are registered → zero_registered drift."""
+    report = ac.reconcile_criterion_key_references(
+        registered=set(),
+        referenced={"c-33333333"},
+    )
+    assert report["zero_registered"] is True
+    assert report["phantom_keys"] == ["c-33333333"]
+    assert report["has_drift"] is True
+
+    # No drift when nothing is referenced and nothing is registered.
+    clean = ac.reconcile_criterion_key_references(registered=set(), referenced=set())
+    assert clean["has_drift"] is False
+    assert clean["zero_registered"] is False
+
+    # No drift when every referenced key is registered.
+    matched = ac.reconcile_criterion_key_references(
+        registered={"c-44444444"}, referenced={"c-44444444"}
+    )
+    assert matched["has_drift"] is False
+
+
+@pytest.mark.asyncio
+async def test_coverage_summary_includes_phantom_bookkeeping_key(db_session):
+    """get_version_coverage_summary always carries a phantom_bookkeeping report;
+    it flags drift when prose references keys not registered on the version."""
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+
+    # Register one real criterion, then reference a DIFFERENT (dangling) key in prose.
+    c1 = await ac.create_criterion(db_session, project.id, version.id, "Tests pass")
+    project.problem_model = {
+        "intent": {"current_focus": "Ship the tiering redesign for c-deadbeef"}
+    }
+    db_session.add(project)
+    await db_session.commit()
+
+    summary = await ac.get_version_coverage_summary(db_session, version.id)
+    report = summary["phantom_bookkeeping"]
+    assert report["has_drift"] is True
+    assert "c-deadbeef" in report["phantom_keys"]
+    # the registered key is NOT flagged
+    assert c1.criterion_key not in report["phantom_keys"]
+    assert report["zero_registered"] is False  # one criterion IS registered
+    assert report["registered_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_coverage_summary_no_phantom_when_prose_matches(db_session):
+    """No drift when the only referenced key is a registered active criterion."""
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+    c1 = await ac.create_criterion(db_session, project.id, version.id, "Tests pass")
+
+    # Reference the real, registered key — via a direction's success_evidence.
+    project.directions = [
+        {
+            "id": "d-1",
+            "status": "active",
+            "context": {"success_evidence": f"criterion {c1.criterion_key} covered"},
+        }
+    ]
+    db_session.add(project)
+    await db_session.commit()
+
+    summary = await ac.get_version_coverage_summary(db_session, version.id)
+    assert summary["phantom_bookkeeping"]["has_drift"] is False
+    assert summary["phantom_bookkeeping"]["phantom_keys"] == []
+
+
+@pytest.mark.asyncio
+async def test_zero_registered_criteria_and_dangling_key_flagged(db_session):
+    """End-to-end drift guard: an open version with ZERO registered criteria whose
+    focus prose / direction success_evidence still reference criterion keys reads
+    PASS at every gate today. This must instead surface a needs_operator
+    'phantom_criterion_bookkeeping' attention item so the drift fails loud.
+
+    Reproduces the v25 'phantom bookkeeping' failure: prose claimed coverage
+    against criterion keys that were never registered on the open version, while
+    live criterion_coverage read total==0.
+    """
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)  # status defaults to 'open'
+
+    # Zero registered criteria, but strategic focus AND an active direction both
+    # reference criterion keys as though they were being tracked.
+    project.problem_model = {
+        "intent": {
+            "current_focus": "Author v25 acceptance contract: 0/6 covered on c-a5940d77"
+        }
+    }
+    project.directions = [
+        {
+            "id": "d-a5940d77",
+            "status": "active",
+            "context": {"success_evidence": "attestation tiering c-bbf215e3 verified"},
+        },
+        # retired direction references are ignored (must not add drift on their own)
+        {
+            "id": "d-old",
+            "status": "retired",
+            "context": {"success_evidence": "legacy c-99999999"},
+        },
+    ]
+    db_session.add(project)
+    await db_session.commit()
+
+    # The coverage summary itself must expose the drift, sourced from BOTH prose
+    # fields, with zero_registered set (no active criteria exist).
+    summary = await ac.get_version_coverage_summary(db_session, version.id)
+    report = summary["phantom_bookkeeping"]
+    assert report["zero_registered"] is True
+    assert report["has_drift"] is True
+    assert set(report["phantom_keys"]) == {"c-a5940d77", "c-bbf215e3"}
+    # retired-direction key must NOT appear
+    assert "c-99999999" not in report["phantom_keys"]
+    assert report["registered_count"] == 0
+
+    # And it must surface as a needs_operator attention item end-to-end.
+    attention = await build_operator_attention(db_session, project, _TEST_USER_ID)
+    phantom_items = [
+        item
+        for item in attention["items"]
+        if item.get("reason") == "phantom_criterion_bookkeeping"
+    ]
+    assert len(phantom_items) == 1
+    item = phantom_items[0]
+    assert item["severity"] == "needs_operator"
+    assert item["kind"] == "version"
+    assert item["lifecycle"]["mode"] == "acceptance_criteria_lifecycle"
+    assert attention["counts"]["phantom_criterion_bookkeeping"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -722,6 +1136,133 @@ async def test_stuck_criterion_attention_item(db_session):
         retired_item["label"]
         == "Acceptance criterion points to a retired direction"
     )
+
+
+@pytest.mark.asyncio
+async def test_expired_attestation_emits_attention_item(db_session):
+    """An expired operator attestation on an active criterion emits an attestation-expiry attention item.
+
+    build_operator_attention must surface expired attestations as
+    'attestation_expired' needs_operator items so the operator knows to
+    re-attest or provide machine evidence.
+    """
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Expired-attestation criterion"
+    )
+    # Record an expired operator attestation (> ATTESTATION_WINDOW_DAYS old).
+    stale_at = (
+        _utcnow() - timedelta(days=ac.ATTESTATION_WINDOW_DAYS + 1)
+    ).isoformat()
+    await ac.record_evidence(
+        db_session,
+        criterion.id,
+        project.id,
+        source_kind="operator_attestation",
+        source_id=_TEST_USER_ID,
+        detail={"attested_at": stale_at, "reason": "was OK at the time"},
+    )
+
+    attention = await build_operator_attention(db_session, project, _TEST_USER_ID)
+
+    assert attention["level"] == "needs_operator"
+    assert attention["counts"]["attestation_expired"] == 1
+    attest_id = f"version:{version.id}:attestation_expired:{criterion.criterion_key}"
+    items_by_id = {item["id"]: item for item in attention["items"]}
+    assert attest_id in items_by_id, (
+        f"Expected attestation_expired item {attest_id} in {list(items_by_id)}"
+    )
+    item = items_by_id[attest_id]
+    assert item["reason"] == "attestation_expired"
+    assert item["label"] == "Attestation expired"
+    assert item["release_version_id"] == str(version.id)
+    assert "re-attest" in item["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_fresh_attestation_no_expiry_attention_item(db_session):
+    """A fresh (non-expired) operator attestation emits NO attestation-expiry item.
+
+    Only expired attestations should surface; a valid attestation keeps the
+    criterion in 'attested' coverage and must not trigger the expiry alert.
+    """
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Fresh-attestation criterion"
+    )
+    fresh_at = _utcnow().isoformat()
+    await ac.record_evidence(
+        db_session,
+        criterion.id,
+        project.id,
+        source_kind="operator_attestation",
+        source_id=_TEST_USER_ID,
+        detail={"attested_at": fresh_at, "reason": "still valid"},
+    )
+
+    attention = await build_operator_attention(db_session, project, _TEST_USER_ID)
+
+    assert attention["counts"]["attestation_expired"] == 0
+    attest_id = f"version:{version.id}:attestation_expired:{criterion.criterion_key}"
+    items_by_id = {item["id"]: item for item in attention["items"]}
+    assert attest_id not in items_by_id, (
+        f"Unexpected attestation_expired item {attest_id} for a fresh attestation"
+    )
+
+
+@pytest.mark.asyncio
+async def test_attestation_approaching_expiry_warns_before_lapse(db_session):
+    """A near-expiry operator attestation emits attestation_expiring_soon attention.
+
+    When the attestation is still valid (coverage='attested') but within the
+    warning window of its TTL, build_operator_attention must surface an
+    'attestation_expiring_soon' item so the operator can re-attest or provide
+    machine evidence before the criterion lapses to 'partial'.
+    """
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Near-expiry attestation criterion"
+    )
+    # Set attested_at so the attestation expires in ~1 day — well within the
+    # 2-day warning window.
+    near_expiry_at = (
+        _utcnow() - timedelta(days=ac.ATTESTATION_WINDOW_DAYS - 1)
+    ).isoformat()
+    await ac.record_evidence(
+        db_session,
+        criterion.id,
+        project.id,
+        source_kind="operator_attestation",
+        source_id=_TEST_USER_ID,
+        detail={"attested_at": near_expiry_at, "reason": "still valid but close"},
+    )
+
+    attention = await build_operator_attention(db_session, project, _TEST_USER_ID)
+
+    assert attention["counts"]["attestation_expiring"] == 1, (
+        f"Expected 1 attestation_expiring item, got "
+        f"{attention['counts'].get('attestation_expiring')}"
+    )
+    assert attention["counts"]["attestation_expired"] == 0, (
+        "A near-expiry attestation must NOT surface as already-expired"
+    )
+    expiring_id = (
+        f"version:{version.id}:attestation_expiring_soon:{criterion.criterion_key}"
+    )
+    items_by_id = {item["id"]: item for item in attention["items"]}
+    assert expiring_id in items_by_id, (
+        f"Expected attestation_expiring_soon item {expiring_id} in "
+        f"{list(items_by_id)}"
+    )
+    item = items_by_id[expiring_id]
+    assert item["reason"] == "attestation_expiring_soon"
+    assert item["label"] == "Attestation approaching expiry"
+    assert "re-attest" in item["detail"].lower()
+    assert item["release_version_id"] == str(version.id)
+    assert item["criterion_key"] == criterion.criterion_key
 
 
 # ---------------------------------------------------------------------------
@@ -1622,13 +2163,21 @@ async def test_retracted_criterion_clears_coverage_and_gate(db_session):
     assert before["covered"] == 1
     assert before["uncovered"] == 1
     assert before["retracted"] == 0
+    # Goal-verification gate: the acceptance criteria ARE the merge-grade's
+    # categories.  Before retraction the stale criterion grades not_met (no
+    # feasible evidence) → the gate hard-blocks; the covered one is met.
     before_gate = compute_composite(
         ci_green=True,
         audit_score=1.0,
         test_erosion=1.0,
         smoketest_score=1.0,
         policy={"threshold": 0.8},
-        criterion_coverage=before,
+        category_verdicts=[
+            {"category_key": covered.criterion_key, "status": "met", "tier": "judged",
+             "citations": [{"kind": "diff", "ref": "app/covered.py:1"}]},
+            {"category_key": stale.criterion_key, "status": "not_met", "tier": "judged",
+             "gap": "no feasible evidence", "citations": []},
+        ],
     )
     assert before_gate["blocker"] == "criterion_coverage_incomplete"
 
@@ -1656,13 +2205,18 @@ async def test_retracted_criterion_clears_coverage_and_gate(db_session):
     assert by_key[stale.criterion_key]["coverage"] == "uncovered"
     assert by_key[stale.criterion_key]["stuck_reason"] is None
 
+    # After retracting the stale criterion only the covered category remains
+    # active and grades met → the gate no longer fires.
     after_gate = compute_composite(
         ci_green=True,
         audit_score=1.0,
         test_erosion=1.0,
         smoketest_score=1.0,
         policy={"threshold": 0.8},
-        criterion_coverage=after,
+        category_verdicts=[
+            {"category_key": covered.criterion_key, "status": "met", "tier": "judged",
+             "citations": [{"kind": "diff", "ref": "app/covered.py:1"}]},
+        ],
     )
     assert after_gate["blocker"] is None
     assert after_gate["promote"] is True
@@ -2582,6 +3136,10 @@ async def test_spawn_task_endpoint_propagates_criterion_ids(
                 "prompt": "investigate stability regression",
                 "title": "Stability research",
                 "direction_id": direction_key,
+                "acceptance_evidence": {
+                    "kind": "named_test",
+                    "test_path": "testing/test_acceptance_criteria.py",
+                },
             },
         },
     )
@@ -2761,32 +3319,291 @@ class TestVersionLifecycleCriterionCoverage:
 # ---------------------------------------------------------------------------
 
 
-def test_operator_attestation_covers_criterion():
-    """operator_attestation source_kind must satisfy _evidence_proves_covered unconditionally.
+def test_operator_attestation_is_attested_tier_not_covered():
+    """operator_attestation is a DISTINCT lower-confidence 'attested' tier, not 'covered'.
 
-    This is the named acceptance test for the operator-attestation waiver feature.
-    It verifies that an operator_attestation evidence record flips coverage to
-    'covered' regardless of what detail it carries, mirroring the reachability
-    behaviour.  A criterion with only operator_attestation evidence must NOT
-    remain 'partial' or 'uncovered'.
+    This is the named acceptance test for the attestation-tiering feature.  An
+    operator_attestation evidence record must NOT satisfy the machine-verified
+    ``_evidence_proves_covered`` predicate; instead it yields the ``'attested'``
+    coverage tier so it scores below machine-verified evidence.  A non-expired
+    attestation still clears the criterion out of 'partial'/'uncovered'.
     """
     ev_no_detail = _make_evidence("operator_attestation")
-    assert ac._evidence_proves_covered(ev_no_detail) is True
+    # No longer machine-covered.
+    assert ac._evidence_proves_covered(ev_no_detail) is False
+    # A fresh (no attested_at) attestation falls back to recorded_at which is
+    # within the window — it is still a valid attestation.
+    assert ac._evidence_is_attested(ev_no_detail) is True
 
     ev_with_detail = _make_evidence("operator_attestation", detail={"reason": "accepted"})
-    assert ac._evidence_proves_covered(ev_with_detail) is True
+    assert ac._evidence_proves_covered(ev_with_detail) is False
+    assert ac._evidence_is_attested(ev_with_detail) is True
 
-    assert ac.compute_criterion_coverage([ev_no_detail]) == "covered"
-    assert ac.compute_criterion_coverage([ev_with_detail]) == "covered"
+    assert ac.compute_criterion_coverage([ev_no_detail]) == "attested"
+    assert ac.compute_criterion_coverage([ev_with_detail]) == "attested"
 
-    # A mix of non-covering evidence plus operator_attestation must still be covered.
+    # A mix of non-covering evidence plus operator_attestation is 'attested'
+    # (no machine-verified evidence present).
     ev_partial = _make_evidence("task_merge")  # no proven=True → not covering on its own
-    assert ac.compute_criterion_coverage([ev_partial, ev_with_detail]) == "covered"
+    assert ac.compute_criterion_coverage([ev_partial, ev_with_detail]) == "attested"
+
+
+def test_machine_verified_evidence_wins_over_attestation():
+    """Machine-verified evidence outranks an attestation → 'covered', not 'attested'."""
+    ev_attest = _make_evidence("operator_attestation", detail={"reason": "accepted"})
+    ev_proven = _make_evidence("task_merge", detail={"proven": True})
+    assert ac.compute_criterion_coverage([ev_attest, ev_proven]) == "covered"
+    # reachability also wins.
+    ev_reach = _make_evidence("reachability")
+    assert ac.compute_criterion_coverage([ev_attest, ev_reach]) == "covered"
+
+
+def test_expired_attestation_falls_back_to_partial():
+    """An operator_attestation older than the window is no longer 'attested'.
+
+    With no other evidence the criterion falls back to 'partial' (the row exists
+    but no longer counts as valid attestation coverage) until the operator
+    re-attests to refresh the timer.
+    """
+    stale_at = (
+        _utcnow() - timedelta(days=ac.ATTESTATION_WINDOW_DAYS + 1)
+    ).isoformat()
+    ev_stale = _make_evidence("operator_attestation", detail={"attested_at": stale_at})
+    assert ac._evidence_is_attested(ev_stale) is False
+    assert ac.compute_criterion_coverage([ev_stale]) == "partial"
+
+    fresh_at = _utcnow().isoformat()
+    ev_fresh = _make_evidence("operator_attestation", detail={"attested_at": fresh_at})
+    assert ac._evidence_is_attested(ev_fresh) is True
+    assert ac.compute_criterion_coverage([ev_fresh]) == "attested"
+
+
+def test_attestation_unparseable_timestamp_falls_back_to_recorded_at():
+    """An attestation with an unparseable attested_at falls back to recorded_at for expiry.
+
+    A fresh row (recorded_at defaults to now) stays valid; a stale row (recorded_at
+    older than the window) expires just like a properly-stamped stale attestation.
+    """
+    # Fresh: recorded_at defaults to _utcnow() via the model, so within the window.
+    ev_fresh = _make_evidence("operator_attestation", detail={"attested_at": "not-a-date"})
+    assert ac._evidence_is_attested(ev_fresh) is True
+    assert ac.compute_criterion_coverage([ev_fresh]) == "attested"
+
+    # Stale: recorded_at older than the window → expired, falls back to 'partial'.
+    ev_stale = _make_evidence("operator_attestation", detail={"attested_at": "not-a-date"})
+    ev_stale.recorded_at = _utcnow() - timedelta(days=ac.ATTESTATION_WINDOW_DAYS + 1)
+    assert ac._evidence_is_attested(ev_stale) is False
+    assert ac.compute_criterion_coverage([ev_stale]) == "partial"
+
+
+def test_attestation_without_detail_timestamp_expires_from_recorded_at():
+    """An operator_attestation with no attested_at in detail expires via recorded_at.
+
+    A missing attested_at must NOT grant perpetual trust — the attestation falls
+    back to recorded_at as the reference timestamp, so a stale row (recorded_at
+    older than ATTESTATION_WINDOW_DAYS) is treated as expired.
+    """
+    # Stale: no attested_at in detail, recorded_at older than the window.
+    ev_stale = _make_evidence("operator_attestation", detail={"reason": "old waiver"})
+    ev_stale.recorded_at = _utcnow() - timedelta(days=ac.ATTESTATION_WINDOW_DAYS + 1)
+    assert ac._evidence_is_attested(ev_stale) is False, (
+        "An attestation with no attested_at but a stale recorded_at must expire, "
+        "not grant perpetual trust"
+    )
+    assert ac.compute_criterion_coverage([ev_stale]) == "partial"
+
+    # Fresh: no attested_at, recorded_at within the window → still valid.
+    ev_fresh = _make_evidence("operator_attestation", detail={"reason": "recent waiver"})
+    assert ac._evidence_is_attested(ev_fresh) is True
+    assert ac.compute_criterion_coverage([ev_fresh]) == "attested"
+
+
+def test_timestampless_attestation_expires_by_recorded_at():
+    """Timestamp-less attestations expire via recorded_at when it is set.
+
+    When detail["attested_at"] is absent or unparseable, _evidence_is_attested
+    falls back to e.recorded_at as the expiry anchor and applies the same
+    ATTESTATION_WINDOW_DAYS window.  A row where recorded_at is also None has
+    NO reference timestamp and cannot be time-bounded — it does NOT count as
+    a valid attestation (a missing timestamp cannot grant perpetual trust).
+
+    Named acceptance test for the attestation-expiry-via-recorded_at fix.
+    """
+    from datetime import datetime as _dt
+
+    old = _utcnow() - timedelta(days=ac.ATTESTATION_WINDOW_DAYS + 1)
+    recent = _utcnow()
+
+    def _ev(detail, recorded_at):
+        return CriterionEvidence(
+            id=uuid.uuid4(),
+            project_id=uuid.uuid4(),
+            criterion_id=uuid.uuid4(),
+            source_kind="operator_attestation",
+            detail=detail,
+            recorded_at=recorded_at,
+        )
+
+    # No attested_at, old recorded_at → expired.
+    ev_old = _ev(None, old)
+    assert ac._evidence_is_attested(ev_old) is False
+    assert ac.compute_criterion_coverage([ev_old]) == "partial"
+
+    # No attested_at, recent recorded_at → still attested.
+    ev_recent = _ev(None, recent)
+    assert ac._evidence_is_attested(ev_recent) is True
+    assert ac.compute_criterion_coverage([ev_recent]) == "attested"
+
+    # Unparseable attested_at, old recorded_at → expired.
+    ev_bad_old = _ev({"attested_at": "not-a-date"}, old)
+    assert ac._evidence_is_attested(ev_bad_old) is False
+
+    # Unparseable attested_at, recent recorded_at → still attested.
+    ev_bad_recent = _ev({"attested_at": "not-a-date"}, recent)
+    assert ac._evidence_is_attested(ev_bad_recent) is True
+
+    # _compute_attestation_expires_at returns recorded_at + window (not None).
+    expires = ac._compute_attestation_expires_at([ev_recent])
+    assert expires is not None
+    expires_dt = _dt.fromisoformat(expires)
+    expected = recent + timedelta(days=ac.ATTESTATION_WINDOW_DAYS)
+    assert abs((expires_dt - expected).total_seconds()) < 2
+
+    # recorded_at=None → no reference point means NOT attested (not perpetual trust).
+    ev_no_rec = CriterionEvidence(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        criterion_id=uuid.uuid4(),
+        source_kind="operator_attestation",
+        detail=None,
+        recorded_at=None,
+    )
+    assert ac._evidence_is_attested(ev_no_rec) is False
+    assert ac._compute_attestation_expires_at([ev_no_rec]) is None
+
+
+def test_attestation_without_timestamps_not_perpetual():
+    """An operator_attestation with no timestamps must NOT grant perpetual trust.
+
+    When both attested_at (in detail) and recorded_at are absent, _evidence_is_attested
+    must return False — a missing timestamp cannot be treated as forever-valid.
+    This covers both the no-attested_at branch and the unparseable-attested_at branch.
+    """
+    # No attested_at in detail, no recorded_at → must NOT be treated as attested.
+    ev_no_ts = CriterionEvidence(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        criterion_id=uuid.uuid4(),
+        source_kind="operator_attestation",
+        detail=None,
+        recorded_at=None,
+    )
+    assert ac._evidence_is_attested(ev_no_ts) is False, (
+        "operator_attestation with no timestamps must not grant perpetual trust"
+    )
+    assert ac.compute_criterion_coverage([ev_no_ts]) == "partial"
+
+    # Unparseable attested_at, no recorded_at → also must NOT be attested.
+    ev_bad_ts = CriterionEvidence(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        criterion_id=uuid.uuid4(),
+        source_kind="operator_attestation",
+        detail={"attested_at": "not-a-date"},
+        recorded_at=None,
+    )
+    assert ac._evidence_is_attested(ev_bad_ts) is False, (
+        "operator_attestation with unparseable attested_at and no recorded_at must not "
+        "grant perpetual trust"
+    )
+    assert ac.compute_criterion_coverage([ev_bad_ts]) == "partial"
+
+    # _compute_attestation_expires_at returns None (no reference point).
+    assert ac._compute_attestation_expires_at([ev_no_ts]) is None
+    assert ac._compute_attestation_expires_at([ev_bad_ts]) is None
+
+
+def test_c1e3fafbf_evidence_tiering():
+    """A future-dated attested_at cannot extend or perpetuate the attestation window.
+
+    Named acceptance test for criterion c-1e3fafbf (attestation-vs-verified
+    evidence tiering). Before the fix a future ``attested_at`` made
+    ``now - attested_at`` negative — always inside the window — so the
+    attestation stayed 'valid' indefinitely and its computed expiry was pushed
+    arbitrarily far into the future, silently promoting a low-confidence
+    operator waiver to a perpetual one. The seam now rejects a meaningfully
+    future ``attested_at`` as the window anchor and falls back to
+    ``recorded_at`` (:func:`_attestation_reference_timestamp`), so the
+    lower-confidence 'attested' tier can never outrank machine-verified
+    evidence by living forever.
+    """
+    from datetime import datetime as _dt
+
+    far_future = (_utcnow() + timedelta(days=3650)).isoformat()
+
+    # (a) Future attested_at + STALE recorded_at → not attested (falls back to
+    #     the stale recorded_at, which is outside the window), coverage 'partial'.
+    ev_future_stale = _make_evidence(
+        "operator_attestation", detail={"attested_at": far_future}
+    )
+    ev_future_stale.recorded_at = _utcnow() - timedelta(
+        days=ac.ATTESTATION_WINDOW_DAYS + 1
+    )
+    assert ac._evidence_is_attested(ev_future_stale) is False, (
+        "a future attested_at must not keep a stale attestation valid"
+    )
+    assert ac.compute_criterion_coverage([ev_future_stale]) == "partial"
+    assert ac._compute_attestation_expires_at([ev_future_stale]) is None
+
+    # (b) Future attested_at + FRESH recorded_at → still attested via the fresh
+    #     recorded_at fallback, but the expiry is anchored to recorded_at (NOT
+    #     the far-future date), so the window is a normal ATTESTATION_WINDOW_DAYS.
+    fresh_recorded = _utcnow()
+    ev_future_fresh = _make_evidence(
+        "operator_attestation", detail={"attested_at": far_future}
+    )
+    ev_future_fresh.recorded_at = fresh_recorded
+    assert ac._evidence_is_attested(ev_future_fresh) is True
+    assert ac.compute_criterion_coverage([ev_future_fresh]) == "attested"
+    expires = ac._compute_attestation_expires_at([ev_future_fresh])
+    assert expires is not None
+    expires_dt = _dt.fromisoformat(expires)
+    expected = fresh_recorded + timedelta(days=ac.ATTESTATION_WINDOW_DAYS)
+    assert abs((expires_dt - expected).total_seconds()) < 2, (
+        "expiry must be anchored to recorded_at, not the far-future attested_at"
+    )
+    # The expiry must NOT be pushed near the far-future attested_at.
+    assert expires_dt < _utcnow() + timedelta(days=ac.ATTESTATION_WINDOW_DAYS + 1)
+
+    # (c) Slightly-future attested_at within the clock-skew tolerance is still
+    #     honoured as the anchor (benign client/server skew).
+    skew_future = (
+        _utcnow() + timedelta(seconds=ac.ATTESTATION_FUTURE_SKEW_SECONDS // 2)
+    ).isoformat()
+    ev_skew = _make_evidence(
+        "operator_attestation", detail={"attested_at": skew_future}
+    )
+    assert ac._evidence_is_attested(ev_skew) is True
+    assert ac.compute_criterion_coverage([ev_skew]) == "attested"
+
+    # (d) A normal, past, in-window attested_at is unaffected by the guard.
+    recent_past = (_utcnow() - timedelta(days=1)).isoformat()
+    ev_recent = _make_evidence(
+        "operator_attestation", detail={"attested_at": recent_past}
+    )
+    assert ac._evidence_is_attested(ev_recent) is True
+    ref_expires = ac._compute_attestation_expires_at([ev_recent])
+    assert ref_expires is not None
+    ref_expires_dt = _dt.fromisoformat(ref_expires)
+    expected_recent = _dt.fromisoformat(recent_past) + timedelta(
+        days=ac.ATTESTATION_WINDOW_DAYS
+    )
+    assert abs((ref_expires_dt - expected_recent).total_seconds()) < 2
 
 
 @pytest.mark.asyncio
 async def test_attest_endpoint_happy_path(client: AsyncClient, db_session):
-    """POST .../attest records operator_attestation evidence and coverage flips to 'covered'."""
+    """POST .../attest records timestamped operator_attestation evidence and coverage → 'attested'."""
     project = await _make_project_with_member(db_session, name="Attest-Happy")
     version = ReleaseVersion(project_id=project.id, version_number=1, status="open")
     db_session.add(version)
@@ -2805,26 +3622,37 @@ async def test_attest_endpoint_happy_path(client: AsyncClient, db_session):
     data = resp.json()
     assert data["status"] == "ok"
     assert data["criterion_key"] == criterion.criterion_key
-    assert data["coverage"] == "covered"
+    assert data["coverage"] == "attested"
 
-    # Verify evidence persisted with the correct source_kind and detail.
+    # Verify evidence persisted with the correct source_kind, reason, and a
+    # parseable attested_at timestamp (the expiry-timer anchor).
     evidence = await ac.get_evidence_for_criterion(db_session, criterion.id)
     assert len(evidence) == 1
     assert evidence[0].source_kind == "operator_attestation"
-    assert evidence[0].detail == {"reason": "Direction retired; operator confirms criterion is satisfied"}
+    assert evidence[0].detail["reason"] == (
+        "Direction retired; operator confirms criterion is satisfied"
+    )
+    assert "attested_at" in evidence[0].detail
+    # attested_at must be an ISO-8601 string parseable by fromisoformat.
+    from datetime import datetime as _dt
+
+    _dt.fromisoformat(evidence[0].detail["attested_at"])
     assert evidence[0].source_id == _TEST_USER_ID
 
-    # GET coverage summary must now show 'covered'.
+    # GET coverage summary must now show the distinct 'attested' tier.
     summary = await ac.get_version_coverage_summary(db_session, version.id)
     by_key = {c["criterion_key"]: c for c in summary["criteria"]}
-    assert by_key[criterion.criterion_key]["coverage"] == "covered"
-    assert summary["covered"] == 1
+    assert by_key[criterion.criterion_key]["coverage"] == "attested"
+    assert summary["attested"] == 1
+    assert summary["covered"] == 0
     assert summary["uncovered"] == 0
+    # total remains the sum of all active criteria for backward compatibility.
+    assert summary["total"] == 1
 
 
 @pytest.mark.asyncio
-async def test_attest_endpoint_get_criteria_shows_covered(client: AsyncClient, db_session):
-    """GET /acceptance-criteria returns coverage='covered' after an attestation."""
+async def test_attest_endpoint_get_criteria_shows_attested(client: AsyncClient, db_session):
+    """GET /acceptance-criteria returns coverage='attested' after an attestation."""
     project = await _make_project_with_member(db_session, name="Attest-GetCoverage")
     version = ReleaseVersion(project_id=project.id, version_number=1, status="open")
     db_session.add(version)
@@ -2841,10 +3669,11 @@ async def test_attest_endpoint_get_criteria_shows_covered(client: AsyncClient, d
     resp = await client.get(f"/api/admin/projects/{project.id}/acceptance-criteria")
     assert resp.status_code == 200, resp.text
     data = resp.json()
-    assert data["covered"] == 1
+    assert data["attested"] == 1
+    assert data["covered"] == 0
     assert data["uncovered"] == 0
     by_key = {c["criterion_key"]: c for c in data["criteria"]}
-    assert by_key[criterion.criterion_key]["coverage"] == "covered"
+    assert by_key[criterion.criterion_key]["coverage"] == "attested"
 
 
 @pytest.mark.asyncio
@@ -2931,14 +3760,13 @@ async def test_attest_endpoint_no_open_version(client: AsyncClient, db_session):
 
 
 @pytest.mark.asyncio
-async def test_attest_duplicate_attestation_is_idempotent(client: AsyncClient, db_session):
-    """Repeat attestation by the same operator on the same criterion returns 200, not 500.
+async def test_attest_duplicate_attestation_refreshes_expiry(client: AsyncClient, db_session):
+    """Repeat attestation by the same operator UPSERTS: refresh attested_at + reason, no new row.
 
-    The uq_criterionevidence_dedup index (migration 0365) covers operator attestations
-    because source_id=user_id is non-null.  A second POST .../attest by the same user
-    violates the unique constraint; the endpoint must catch IntegrityError, rollback, and
-    return the same idempotent {"status":"ok","criterion_key":...,"coverage":"covered"}
-    response instead of surfacing a 500.
+    A second POST .../attest by the same operator on the same criterion must
+    return 200 (not 500) and refresh the existing evidence row's ``attested_at``
+    timestamp (restarting the expiry timer) and ``reason`` — this is the operator
+    re-attest / renew path — while keeping exactly one evidence row.
     """
     project = await _make_project_with_member(db_session, name="Attest-Dup")
     version = ReleaseVersion(project_id=project.id, version_number=1, status="open")
@@ -2958,26 +3786,122 @@ async def test_attest_duplicate_attestation_is_idempotent(client: AsyncClient, d
     data1 = resp1.json()
     assert data1["status"] == "ok"
     assert data1["criterion_key"] == criterion.criterion_key
-    assert data1["coverage"] == "covered"
+    assert data1["coverage"] == "attested"
 
-    # Second call by the same operator: violates uq_criterionevidence_dedup.
-    # Must return 200 with the same shape — NOT 500 — because duplicates are a no-op.
-    resp2 = await client.post(url, json={"reason": "accepted again"})
+    # Read the first attestation's detail back through the real GET read path (its
+    # own request session) so we never depend on cross-session visibility of the
+    # shared SQLite test connection.
+    get1 = await client.get(f"/api/admin/projects/{project.id}/acceptance-criteria")
+    crit1 = {c["criterion_key"]: c for c in get1.json()["criteria"]}[
+        criterion.criterion_key
+    ]
+    assert len(crit1["evidence"]) == 1
+    assert crit1["evidence"][0]["detail"]["reason"] == "accepted; direction retired"
+    first_attested_at = crit1["evidence"][0]["detail"]["attested_at"]
+
+    # Second call by the same operator: UPSERT refresh (not 500, not a new row).
+    resp2 = await client.post(url, json={"reason": "re-attested; still accepted"})
     assert resp2.status_code == 200, (
-        f"Duplicate attestation must return 200 (idempotent), got {resp2.status_code}: {resp2.text}"
+        f"Re-attestation must return 200 (idempotent upsert), got {resp2.status_code}: {resp2.text}"
     )
     data2 = resp2.json()
     assert data2["status"] == "ok"
     assert data2["criterion_key"] == criterion.criterion_key
-    assert data2["coverage"] == "covered"
+    assert data2["coverage"] == "attested"
 
-    # Verify exactly one evidence row was persisted (the second was a no-op).
-    evidence = await ac.get_evidence_for_criterion(db_session, criterion.id)
-    assert len(evidence) == 1, (
-        f"Duplicate attestation must not create a second evidence row; found {len(evidence)}"
+    # Verify via the GET read path that exactly one evidence row remains, with a
+    # refreshed reason + timestamp (the renew semantics).
+    get2 = await client.get(f"/api/admin/projects/{project.id}/acceptance-criteria")
+    crit2 = {c["criterion_key"]: c for c in get2.json()["criteria"]}[
+        criterion.criterion_key
+    ]
+    assert len(crit2["evidence"]) == 1, (
+        f"Re-attestation must not create a second evidence row; found {len(crit2['evidence'])}"
     )
-    assert evidence[0].source_kind == "operator_attestation"
-    assert evidence[0].source_id == _TEST_USER_ID
+    assert crit2["coverage"] == "attested"
+    assert crit2["evidence"][0]["source_kind"] == "operator_attestation"
+    assert crit2["evidence"][0]["detail"]["reason"] == "re-attested; still accepted"
+    # attested_at is refreshed (>= the original; equal is acceptable on a fast clock).
+    assert crit2["evidence"][0]["detail"]["attested_at"] >= first_attested_at
+
+
+@pytest.mark.asyncio
+async def test_coverage_summary_carries_attestation_expiry(db_session):
+    """get_version_coverage_summary includes attestation_expires_at for attested criteria.
+
+    When a criterion is covered by a timestamped operator_attestation, the
+    per-criterion entry must carry attestation_expires_at as an ISO-8601 string
+    whose value is approximately attested_at + ATTESTATION_WINDOW_DAYS.
+    Non-attested criteria carry attestation_expires_at=None.
+    Legacy (timestamp-less) attestations carry attestation_expires_at computed
+    from recorded_at (not None) — a missing timestamp cannot grant perpetual
+    trust, so the attestation is still time-bounded via the recorded_at fallback.
+    """
+    from datetime import datetime as _dt
+
+    project = await _make_project(db_session, "AttestExpiry")
+    version = await _make_version(db_session, project)
+
+    c_attested = await ac.create_criterion(db_session, project.id, version.id, "Attested criterion")
+    c_uncovered = await ac.create_criterion(db_session, project.id, version.id, "Uncovered criterion")
+    c_legacy = await ac.create_criterion(db_session, project.id, version.id, "Legacy attestation")
+
+    # Timestamped attestation for c_attested.
+    attested_at = _utcnow()
+    await ac.record_evidence(
+        db_session,
+        criterion_id=c_attested.id,
+        project_id=project.id,
+        source_kind="operator_attestation",
+        source_id="test-user",
+        detail={"reason": "accepted", "attested_at": attested_at.isoformat()},
+    )
+
+    # Legacy (timestamp-less) attestation for c_legacy — expires via recorded_at fallback.
+    legacy_evidence = await ac.record_evidence(
+        db_session,
+        criterion_id=c_legacy.id,
+        project_id=project.id,
+        source_kind="operator_attestation",
+        source_id="test-user",
+        detail={"reason": "legacy, no timestamp"},
+    )
+
+    summary = await ac.get_version_coverage_summary(db_session, version.id)
+    by_key = {c["criterion_key"]: c for c in summary["criteria"]}
+
+    # Timestamped attestation: expiry must be present and ~attested_at + window.
+    attested_entry = by_key[c_attested.criterion_key]
+    assert attested_entry["coverage"] == "attested"
+    assert "attestation_expires_at" in attested_entry
+    expiry_str = attested_entry["attestation_expires_at"]
+    assert expiry_str is not None, "attestation_expires_at must not be None for a timestamped attestation"
+    expiry_dt = _dt.fromisoformat(expiry_str)
+    expected_expiry = attested_at + timedelta(days=ac.ATTESTATION_WINDOW_DAYS)
+    assert abs((expiry_dt - expected_expiry).total_seconds()) < 2, (
+        f"expiry {expiry_dt!r} deviates from expected {expected_expiry!r}"
+    )
+
+    # Legacy attestation: no attested_at → expires via recorded_at fallback.
+    legacy_entry = by_key[c_legacy.criterion_key]
+    assert legacy_entry["coverage"] == "attested"
+    legacy_expiry_str = legacy_entry["attestation_expires_at"]
+    assert legacy_expiry_str is not None, (
+        "Legacy (timestamp-less) attestation must carry a non-None attestation_expires_at "
+        "(recorded_at fallback keeps it time-bounded)"
+    )
+    legacy_expiry_dt = _dt.fromisoformat(legacy_expiry_str)
+    expected_legacy_expiry = legacy_evidence.recorded_at + timedelta(days=ac.ATTESTATION_WINDOW_DAYS)
+    assert abs((legacy_expiry_dt - expected_legacy_expiry).total_seconds()) < 2, (
+        f"legacy expiry {legacy_expiry_dt!r} deviates from expected {expected_legacy_expiry!r}"
+    )
+
+    # Uncovered criterion: attestation_expires_at must be None (not attested).
+    uncovered_entry = by_key[c_uncovered.criterion_key]
+    assert uncovered_entry["coverage"] == "uncovered"
+    assert uncovered_entry.get("attestation_expires_at") is None, (
+        "Non-attested criterion must carry attestation_expires_at=None"
+    )
 
 
 @pytest.mark.asyncio
@@ -3981,6 +4905,54 @@ async def test_record_task_merge_evidence_logs_verdict_not_proven(db_session, ca
 
 
 @pytest.mark.asyncio
+async def test_record_task_merge_evidence_verdict_not_proven_level_reflects_criteria(
+    db_session, caplog
+):
+    """verdict_not_proven is at WARNING level when criterion_ids are present.
+
+    The log level promotes from INFO (no criteria, expected skip) to WARNING
+    (criteria present but none recorded — a zero-evidence outcome for a
+    criteria-bearing task that operators should be able to detect).
+    """
+    import logging
+    from app.acceptance_criteria import MergeEvidenceReason
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+
+    project = await _make_project(db_session, "LogVerdictLevel")
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Level-test criterion"
+    )
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "test"}],
+        context={CODE_ACCEPTANCE_VERDICT_KEY: {"satisfied": False, "proven": False}},
+        criterion_ids=[criterion.criterion_key],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    with caplog.at_level(logging.DEBUG, logger="app.acceptance_criteria"):
+        result = await ac.record_task_merge_evidence(db_session, task, project.id)
+
+    assert result == 0
+    verdict_records = [
+        r
+        for r in caplog.records
+        if MergeEvidenceReason.verdict_not_proven in r.message
+    ]
+    assert len(verdict_records) >= 1, (
+        f"Expected verdict_not_proven in log; got: {[r.message for r in caplog.records]}"
+    )
+    assert verdict_records[0].levelno == logging.WARNING, (
+        f"Expected WARNING level, got "
+        f"{logging.getLevelName(verdict_records[0].levelno)}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_record_task_merge_evidence_logs_no_open_version_reason(db_session, caplog):
     """record_task_merge_evidence emits no_open_version when current_open_version returns None."""
     import logging
@@ -4408,14 +5380,19 @@ def _make_inferred_cochange_task(project, version, *, changed_files, seconds=1):
     )
 
 
-def test_acceptance_window_recompute_evidence_marks_covered():
-    """An ``acceptance_window_recompute`` evidence row is covering on its own."""
-    assert (
-        ac.compute_criterion_coverage(
-            [_make_evidence("acceptance_window_recompute", detail={"acceptance_window_verified": 3})]
-        )
-        == "covered"
+def test_acceptance_window_recompute_evidence_marks_probed():
+    """A fresh ``acceptance_window_recompute`` row is the lower-confidence 'probed' tier.
+
+    The sweep running (and re-scoring non-zero) proves the MECHANISM operated, not
+    that the criterion's own condition holds — so it must NOT be machine-verified
+    ``'covered'``.  It yields the distinct, time-bounded ``'probed'`` tier.
+    """
+    ev = _make_evidence(
+        "acceptance_window_recompute", detail={"acceptance_window_verified": 3}
     )
+    assert ac._evidence_proves_covered(ev) is False
+    assert ac._evidence_is_probed(ev) is True
+    assert ac.compute_criterion_coverage([ev]) == "probed"
 
 
 def test_names_acceptance_window_metric_matches_and_rejects():
@@ -4431,14 +5408,15 @@ def test_names_acceptance_window_metric_matches_and_rejects():
 @pytest.mark.asyncio
 async def test_acceptance_window_recompute_records_covering_evidence(db_session):
     """Named acceptance-evidence test: inferred_test_cochange merges flip the
-    acceptance-window criterion from uncovered to covered.
+    acceptance-window criterion from uncovered to the lower-confidence 'probed' tier.
 
     Given an open version whose merge window contains inferred_test_cochange
     merges (COMPLETED write-tasks whose PR co-changed a test AND a production
     file, CI-verified, no explicit verdict) such that the recomputed aggregate
-    scores ``verified > 0``, the recorder records ONE covering
+    scores ``verified > 0``, the recorder records ONE machine-probe
     ``acceptance_window_recompute`` row for the criterion whose text names the
-    metric and ``get_version_coverage_summary`` reports it ``covered``.
+    metric and ``get_version_coverage_summary`` reports it ``probed`` (NOT
+    machine-verified ``covered``).
     """
     from app import release_version as rv
 
@@ -4477,10 +5455,11 @@ async def test_acceptance_window_recompute_records_covering_evidence(db_session)
     # Before: no evidence, criterion uncovered.
     summary_before = await ac.get_version_coverage_summary(db_session, version.id)
     assert summary_before["covered"] == 0
+    assert summary_before["probed"] == 0
     assert summary_before["uncovered"] == 1
 
     recorded = await ac.record_acceptance_window_coverage_evidence(db_session, version)
-    assert recorded == 1, f"Expected 1 covering row for the target criterion; got {recorded}"
+    assert recorded == 1, f"Expected 1 probe row for the target criterion; got {recorded}"
 
     evidence = await ac.get_evidence_for_criterion(db_session, criterion.id)
     assert len(evidence) == 1
@@ -4497,9 +5476,11 @@ async def test_acceptance_window_recompute_records_covering_evidence(db_session)
         str(inferred_task_b.id),
     }
 
-    # After: the criterion flips to covered.
+    # After: the criterion flips to the lower-confidence 'probed' tier — the sweep
+    # ran, but that is NOT machine-verified 'covered'.
     summary_after = await ac.get_version_coverage_summary(db_session, version.id)
-    assert summary_after["covered"] == 1
+    assert summary_after["covered"] == 0
+    assert summary_after["probed"] == 1
     assert summary_after["uncovered"] == 0
 
 
@@ -4539,7 +5520,8 @@ async def test_acceptance_window_recompute_covers_via_direction_mapping(db_sessi
     recorded = await ac.record_acceptance_window_coverage_evidence(db_session, version)
     assert recorded == 1
     summary = await ac.get_version_coverage_summary(db_session, version.id)
-    assert summary["covered"] == 1
+    assert summary["covered"] == 0
+    assert summary["probed"] == 1
 
 
 @pytest.mark.asyncio
@@ -4634,7 +5616,8 @@ async def test_acceptance_window_recompute_does_not_over_cover(db_session):
         "Unrelated criterion must not receive acceptance-window evidence"
     )
     summary = await ac.get_version_coverage_summary(db_session, version.id)
-    assert summary["covered"] == 1
+    assert summary["covered"] == 0
+    assert summary["probed"] == 1
     assert summary["uncovered"] == 1
 
 
@@ -5310,6 +6293,39 @@ async def test_owns_uncovered_true_when_owned_criterion_partial(db_session):
 
 
 @pytest.mark.asyncio
+async def test_owns_uncovered_true_when_owned_criterion_probed_only(db_session):
+    """An owned criterion covered ONLY by a machine probe (probed) → True.
+
+    A direction backed solely by a mechanism-ran probe (the sweep operated but
+    the criterion's condition was not machine-verified) must NOT auto-retire as
+    "successful" — only ``'covered'`` clears the completion gate.
+    """
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Probed outcome"
+    )
+    # A fresh metrics_integrity_sweep row yields the 'probed' tier, not 'covered'.
+    db_session.add(
+        CriterionEvidence(
+            criterion_id=criterion.id,
+            project_id=project.id,
+            source_kind="metrics_integrity_sweep",
+            source_id="sweep-probe",
+            detail={"ticks": 2},
+        )
+    )
+    await db_session.commit()
+    await _make_direction_row(
+        db_session, project, "d-probe", [criterion.criterion_key]
+    )
+    assert (
+        await ac.direction_owns_uncovered_criterion(db_session, project.id, "d-probe")
+        is True
+    )
+
+
+@pytest.mark.asyncio
 async def test_owns_uncovered_false_when_all_covered(db_session):
     """All owned active criteria covered → False (do not block completion)."""
     project = await _make_project(db_session)
@@ -5543,14 +6559,17 @@ async def test_sweep_v22_finding_backfill_selects_v22_not_open_version(db_sessio
 # ---------------------------------------------------------------------------
 
 
-def test_metrics_integrity_sweep_evidence_marks_covered():
-    """A ``metrics_integrity_sweep`` evidence row is covering on its own."""
-    assert (
-        ac.compute_criterion_coverage(
-            [_make_evidence("metrics_integrity_sweep", detail={"ticks": 5})]
-        )
-        == "covered"
-    )
+def test_metrics_integrity_sweep_evidence_marks_probed():
+    """A fresh ``metrics_integrity_sweep`` row is the lower-confidence 'probed' tier.
+
+    The sweep ticking proves the MECHANISM is operating, not that the criterion's
+    own condition holds — so it yields the distinct, time-bounded ``'probed'``
+    tier rather than machine-verified ``'covered'``.
+    """
+    ev = _make_evidence("metrics_integrity_sweep", detail={"ticks": 5})
+    assert ac._evidence_proves_covered(ev) is False
+    assert ac._evidence_is_probed(ev) is True
+    assert ac.compute_criterion_coverage([ev]) == "probed"
 
 
 def test_names_metrics_integrity_sweep_matches_and_rejects():
@@ -5568,7 +6587,8 @@ def test_names_metrics_integrity_sweep_matches_and_rejects():
 @pytest.mark.asyncio
 async def test_metrics_integrity_coverage_evidence_records_when_sweep_ran(db_session):
     """When the sweep has run (ticks > 0 in observability), the recorder writes one
-    covering evidence row for the data-integrity criterion and coverage flips to covered."""
+    machine-probe evidence row for the data-integrity criterion and coverage flips
+    to the lower-confidence 'probed' tier (NOT machine-verified 'covered')."""
     import app.metrics_integrity_sweep as mis
     from app import release_version as rv
 
@@ -5607,7 +6627,7 @@ async def test_metrics_integrity_coverage_evidence_records_when_sweep_ran(db_ses
     )
 
     recorded = await ac.record_metrics_integrity_coverage_evidence(db_session, version)
-    assert recorded == 1, f"Expected 1 covering row; got {recorded}"
+    assert recorded == 1, f"Expected 1 probe row; got {recorded}"
 
     evidence = await ac.get_evidence_for_criterion(db_session, criterion.id)
     assert len(evidence) == 1
@@ -5616,9 +6636,11 @@ async def test_metrics_integrity_coverage_evidence_records_when_sweep_ran(db_ses
     assert row.detail["ticks"] == 1
     assert row.detail["mode"] == "observe"
 
-    # After: the criterion flips to covered.
+    # After: the criterion flips to the lower-confidence 'probed' tier — the sweep
+    # ticked, but that is NOT machine-verified 'covered'.
     summary_after = await ac.get_version_coverage_summary(db_session, version.id)
-    assert summary_after["covered"] == 1
+    assert summary_after["covered"] == 0
+    assert summary_after["probed"] == 1
     assert summary_after["uncovered"] == 0
 
     mis._reset_observability_for_tests()
@@ -5670,7 +6692,8 @@ async def test_metrics_integrity_coverage_evidence_via_direction_mapping(db_sess
     recorded = await ac.record_metrics_integrity_coverage_evidence(db_session, version)
     assert recorded == 1
     summary = await ac.get_version_coverage_summary(db_session, version.id)
-    assert summary["covered"] == 1
+    assert summary["covered"] == 0
+    assert summary["probed"] == 1
 
     mis._reset_observability_for_tests()
 
@@ -5874,3 +6897,2253 @@ async def test_plan_completion_propagates_criterion_ids_from_direction(db_sessio
     assert (child.context or {}).get("direction_id") == "d-plan-prop", (
         "child context must carry parent direction_id"
     )
+
+
+# ---------------------------------------------------------------------------
+# backfill_unverified_merge_evidence
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_backfill_unverified_merge_covers_unproven_verdict(db_session):
+    """Unverified-merge task whose named_test shipped SHOULD get backfill evidence.
+
+    When a task merges with unverified_merge_reason set, the acceptance verdict
+    is proven=False and record_task_merge_evidence records nothing. The backfill
+    must find such tasks, verify the test was in changed files, and record
+    unverified_merge_backfill evidence.  The criterion reaches the distinct
+    'backfilled' tier (lower-confidence than fully 'covered') rather than
+    scoring at full parity with machine-verified evidence.
+    """
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+    from app.landed_signal import REVIEW_LOOP_KEY, UNVERIFIED_MERGE_REASON_KEY
+
+    project = await _make_project(db_session, "UnverifiedMergeCoverage")
+    version = await _make_version(db_session, project)
+
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id,
+        "Unverified merge criterion",
+        created_by="strategist",
+    )
+
+    dir_row = Direction(
+        project_id=project.id,
+        direction_key="d-unver-cover",
+        data={"id": "d-unver-cover", "text": "Unverified coverage", "status": "active"},
+        status="active",
+        criterion_keys=[criterion.criterion_key],
+    )
+    db_session.add(dir_row)
+
+    # Simulate a completed task with unverified merge, where the named_test was
+    # genuinely in changed files but the merge fell open (no CI verification).
+    task = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "create",
+            "prompt": "add the test",
+            "acceptance_evidence": {
+                "kind": "named_test",
+                "test_path": "testing/test_unverified_merge.py::test_feature_x",
+            },
+        }],
+        context={
+            "direction_id": "d-unver-cover",
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            REVIEW_LOOP_KEY: {UNVERIFIED_MERGE_REASON_KEY: "verify_setup_failed"},
+            "_pr_changed_files": [
+                "testing/test_unverified_merge.py",
+                "backend/app/target_module.py",
+            ],
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": False,
+                "proven": False,
+                "kind": "named_test",
+                "reason": "declared named_test 'testing/test_unverified_merge.py::test_feature_x' "
+                          "did not run green under a real merge-test verdict "
+                          "(the merge fell open without verification)",
+                "proof_ref": "testing/test_unverified_merge.py::test_feature_x",
+            },
+        },
+        criterion_ids=[criterion.criterion_key],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    # Before backfill: the criterion has no evidence.
+    evidence_before = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    assert evidence_before == [], "No evidence before backfill"
+
+    recorded = await ac.backfill_unverified_merge_evidence(db_session, project.id)
+
+    assert recorded == 1, (
+        f"Expected 1 evidence row for 1 criterion; got {recorded}"
+    )
+    evidence_after = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    assert len(evidence_after) == 1
+    assert evidence_after[0].source_kind == ac.UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND
+    assert evidence_after[0].source_id == str(task.id)
+    assert evidence_after[0].detail is not None
+    assert evidence_after[0].detail.get("proven") is True
+    assert evidence_after[0].detail.get("backfill_reason") == "unverified_merge"
+    assert evidence_after[0].detail.get("unverified_merge_reason") == "verify_setup_failed"
+
+    coverage = ac.compute_criterion_coverage(evidence_after)
+    assert coverage == "backfilled", f"Expected 'backfilled', got '{coverage}'"
+
+
+@pytest.mark.asyncio
+async def test_backfill_unverified_merge_skips_verified_merge(db_session):
+    """Verified merges are NOT touched by the unverified-merge backfill."""
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+    from app.landed_signal import REVIEW_LOOP_KEY
+
+    project = await _make_project(db_session, "UnverifiedMergeSkipVerified")
+    version = await _make_version(db_session, project)
+
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id,
+        "Verified merge criterion",
+    )
+
+    # Task with a VERIFIED merge (review_loop exists but no unverified_merge_reason).
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "verified"}],
+        context={
+            "direction_id": "d-verified",
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            REVIEW_LOOP_KEY: {"pr_number": 1},
+            "_pr_changed_files": [
+                "testing/test_verified.py",
+                "backend/app/verified_module.py",
+            ],
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": False,
+                "proven": False,
+                "kind": "named_test",
+                "reason": "some reason",
+            },
+        },
+        criterion_ids=[criterion.criterion_key],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    recorded = await ac.backfill_unverified_merge_evidence(db_session, project.id)
+    assert recorded == 0, "Verified merge must not produce unverified-merge backfill evidence"
+
+    evidence = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    assert evidence == [], "Verified merge must not produce evidence via unverified backfill"
+
+
+@pytest.mark.asyncio
+async def test_backfill_unverified_merge_skips_test_not_in_changed(db_session):
+    """Unverified-merge task whose test WASN'T in changed files gets NO backfill."""
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+    from app.landed_signal import REVIEW_LOOP_KEY, UNVERIFIED_MERGE_REASON_KEY
+
+    project = await _make_project(db_session, "UnverifiedMergeSkipMissingTest")
+    version = await _make_version(db_session, project)
+
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id,
+        "Criterion for missing-test task",
+    )
+
+    # Task with unverified merge and a named_test that is NOT in changed files.
+    task = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "create",
+            "prompt": "add missing test",
+            "acceptance_evidence": {
+                "kind": "named_test",
+                "test_path": "testing/test_never_added.py::test_whatever",
+            },
+        }],
+        context={
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            REVIEW_LOOP_KEY: {UNVERIFIED_MERGE_REASON_KEY: "ci_setup_failed"},
+            "_pr_changed_files": [
+                "backend/app/some_module.py",
+            ],
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": False,
+                "proven": False,
+                "kind": "named_test",
+                "reason": "declared named_test 'testing/test_never_added.py::test_whatever' "
+                          "is not among the PR's changed files",
+            },
+        },
+        criterion_ids=[criterion.criterion_key],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    recorded = await ac.backfill_unverified_merge_evidence(db_session, project.id)
+    assert recorded == 0, "Task with test not in changed files must NOT get backfill evidence"
+
+    evidence = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    assert evidence == [], "No evidence expected"
+
+
+@pytest.mark.asyncio
+async def test_backfill_unverified_merge_skips_no_criterion_ids(db_session):
+    """Task with no criterion_ids gets no backfill evidence."""
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+    from app.landed_signal import REVIEW_LOOP_KEY, UNVERIFIED_MERGE_REASON_KEY
+
+    project = await _make_project(db_session, "UnverifiedMergeSkipNoCriterion")
+    version = await _make_version(db_session, project)
+
+    # Create a criterion but do NOT link it to the task.
+    await ac.create_criterion(
+        db_session, project.id, version.id,
+        "Unlinked criterion",
+    )
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "create",
+            "prompt": "no criteria",
+            "acceptance_evidence": {
+                "kind": "named_test",
+                "test_path": "testing/test_no_criteria.py::test_x",
+            },
+        }],
+        context={
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            REVIEW_LOOP_KEY: {UNVERIFIED_MERGE_REASON_KEY: "verify_setup_failed"},
+            "_pr_changed_files": [
+                "testing/test_no_criteria.py",
+                "backend/app/some_module.py",
+            ],
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": False,
+                "proven": False,
+                "kind": "named_test",
+                "reason": "unverified merge",
+            },
+        },
+        # No criterion_ids — should yield no evidence.
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    recorded = await ac.backfill_unverified_merge_evidence(db_session, project.id)
+    assert recorded == 0, "Task without criterion_ids must not produce backfill evidence"
+
+
+@pytest.mark.asyncio
+async def test_backfill_unverified_merge_idempotent(db_session):
+    """Second call to backfill_unverified_merge_evidence records 0 new rows."""
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+    from app.landed_signal import REVIEW_LOOP_KEY, UNVERIFIED_MERGE_REASON_KEY
+
+    project = await _make_project(db_session, "UnverifiedMergeIdempotent")
+    version = await _make_version(db_session, project)
+
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id,
+        "Idempotent criterion",
+    )
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "create",
+            "prompt": "idempotent test",
+            "acceptance_evidence": {
+                "kind": "named_test",
+                "test_path": "testing/test_idempotent.py::test_x",
+            },
+        }],
+        context={
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            REVIEW_LOOP_KEY: {UNVERIFIED_MERGE_REASON_KEY: "no_detectable_test_command"},
+            "_pr_changed_files": [
+                "testing/test_idempotent.py",
+                "backend/app/idempotent_module.py",
+            ],
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": False,
+                "proven": False,
+                "kind": "named_test",
+                "reason": "unverified merge",
+                "proof_ref": "testing/test_idempotent.py::test_x",
+            },
+        },
+        criterion_ids=[criterion.criterion_key],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    first = await ac.backfill_unverified_merge_evidence(db_session, project.id)
+    assert first == 1, f"First call should record 1 row; got {first}"
+
+    second = await ac.backfill_unverified_merge_evidence(db_session, project.id)
+    assert second == 0, "Second call must be idempotent (0 new rows)"
+
+    evidence = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    assert len(evidence) == 1, "Should still be exactly 1 evidence row"
+
+
+@pytest.mark.asyncio
+async def test_backfill_unverified_merge_scopes_by_direction(db_session):
+    """When direction_key is provided, only tasks in that direction are considered."""
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+    from app.landed_signal import REVIEW_LOOP_KEY, UNVERIFIED_MERGE_REASON_KEY
+
+    project = await _make_project(db_session, "UnverifiedMergeScope")
+    version = await _make_version(db_session, project)
+
+    criterion_target = await ac.create_criterion(
+        db_session, project.id, version.id,
+        "Target direction criterion",
+    )
+    criterion_other = await ac.create_criterion(
+        db_session, project.id, version.id,
+        "Other direction criterion",
+    )
+
+    for dk, crit in [("d-target-scope", criterion_target), ("d-other-scope", criterion_other)]:
+        dir_row = Direction(
+            project_id=project.id,
+            direction_key=dk,
+            data={"id": dk, "text": dk, "status": "active"},
+            status="active",
+            criterion_keys=[crit.criterion_key],
+        )
+        db_session.add(dir_row)
+
+    # Task in the OTHER direction.
+    other_task = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "create",
+            "prompt": "other",
+            "acceptance_evidence": {
+                "kind": "named_test",
+                "test_path": "testing/test_other.py::test_x",
+            },
+        }],
+        context={
+            "direction_id": "d-other-scope",
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            REVIEW_LOOP_KEY: {UNVERIFIED_MERGE_REASON_KEY: "verify_setup_failed"},
+            "_pr_changed_files": [
+                "testing/test_other.py",
+                "backend/app/other_module.py",
+            ],
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": False,
+                "proven": False,
+                "kind": "named_test",
+                "reason": "unverified merge",
+            },
+        },
+        criterion_ids=[criterion_target.criterion_key],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(other_task)
+    await db_session.commit()
+
+    # Backfill scoped to the TARGET direction — should see 0 tasks.
+    recorded = await ac.backfill_unverified_merge_evidence(
+        db_session, project.id, direction_key="d-target-scope"
+    )
+    assert recorded == 0, "No tasks in target direction should produce 0 evidence"
+
+    # Confirm no evidence was recorded.
+    ev_target = await ac.get_evidence_for_criterion(db_session, criterion_target.id)
+    assert ev_target == [], "No evidence for target criterion"
+
+
+@pytest.mark.asyncio
+async def test_backfill_unverified_merge_skips_no_seam_files(db_session):
+    """Unverified-merge task with test-only diff gets no backfill evidence.
+
+    A named_test that ships NO production seam cannot exercise the changed code,
+    so the backfill must skip it just like the original named_test gate would.
+    """
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+    from app.landed_signal import REVIEW_LOOP_KEY, UNVERIFIED_MERGE_REASON_KEY
+
+    project = await _make_project(db_session, "UnverifiedMergeNoSeam")
+    version = await _make_version(db_session, project)
+
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id,
+        "No-seam criterion",
+    )
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "create",
+            "prompt": "test-only",
+            "acceptance_evidence": {
+                "kind": "named_test",
+                "test_path": "testing/test_only.py::test_x",
+            },
+        }],
+        context={
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            REVIEW_LOOP_KEY: {UNVERIFIED_MERGE_REASON_KEY: "ci_setup_failed"},
+            "_pr_changed_files": [
+                "testing/test_only.py",
+                # No production file — test-only diff.
+            ],
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": False,
+                "proven": False,
+                "kind": "named_test",
+                "reason": "unverified merge",
+            },
+        },
+        criterion_ids=[criterion.criterion_key],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    recorded = await ac.backfill_unverified_merge_evidence(db_session, project.id)
+    assert recorded == 0, "Test-only diff must not produce backfill evidence"
+
+    evidence = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    assert evidence == [], "No evidence for test-only diff"
+
+
+# ---------------------------------------------------------------------------
+# attestation spawns corroboration task (acceptance test)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_attestation_spawns_corroboration_task(client: AsyncClient, db_session):
+    """Operator attestation spawns a QUEUED research task targeting the criterion.
+
+    When the operator attests a stuck criterion via POST .../attest, the endpoint
+    must also create a Task row with ``criterion_ids=[criterion_key]`` so the
+    existing record_task_merge_evidence machinery can later transition it from
+    ``'attested'`` to ``'covered'`` when the task merges with a proven verdict.
+    """
+    project = await _make_project_with_member(db_session, name="Attest-Corroboration")
+    version = ReleaseVersion(project_id=project.id, version_number=1, status="open")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Stuck criterion needing verification"
+    )
+
+    resp = await client.post(
+        f"/api/admin/projects/{project.id}/acceptance-criteria/{criterion.criterion_key}/attest",
+        json={"reason": "Direction retired; spawn verification task"},
+    )
+    assert resp.status_code == 200, resp.text
+
+    # A Task must have been created targeting this criterion.
+    from app.models import Task as _Task
+
+    tasks = (
+        (await db_session.execute(
+            select(_Task).where(
+                _Task.project_id == project.id,
+                _Task.created_by == "SYSTEM_AUTO_REVIEW",
+            )
+        ))
+        .scalars()
+        .all()
+    )
+    assert len(tasks) >= 1, (
+        f"Expected at least one verification task from SYSTEM_AUTO_REVIEW, "
+        f"got {len(tasks)}"
+    )
+    spawned = tasks[-1]  # most recently created
+    assert spawned.status == TaskStatus.QUEUED, (
+        f"Task should be QUEUED, got {spawned.status}"
+    )
+    assert criterion.criterion_key in spawned.criterion_ids, (
+        f"Task criterion_ids {spawned.criterion_ids} must include "
+        f"{criterion.criterion_key}"
+    )
+    assert spawned.created_by == "SYSTEM_AUTO_REVIEW", (
+        f"Expected created_by=SYSTEM_AUTO_REVIEW, got {spawned.created_by}"
+    )
+    assert "Verify: " in spawned.title, (
+        f"Task title {spawned.title!r} should start with 'Verify:'"
+    )
+
+
+@pytest.mark.asyncio
+async def test_reattest_does_not_duplicate_corroboration_task(
+    client: AsyncClient, db_session
+):
+    """Re-attestation must NOT spawn a second corroboration task.
+
+    Acceptance evidence for the dedup fix: a criterion that is attested,
+    then re-attested (renewed) by the same operator must result in exactly
+    ONE ``'Verify: {criterion_key}'`` Task row, not two.  The second POST
+    goes through the UPSERT (IntegrityError) path which also calls
+    ``spawn_corroboration_task`` — the dedup guard in that function must
+    skip the second spawn.
+    """
+    project = await _make_project_with_member(
+        db_session, name="ReAttest-No-Dup"
+    )
+    version = ReleaseVersion(
+        project_id=project.id, version_number=1, status="open"
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Criterion for re-attest dedup"
+    )
+
+    url = (
+        f"/api/admin/projects/{project.id}"
+        f"/acceptance-criteria/{criterion.criterion_key}/attest"
+    )
+
+    # First attestation — should spawn 1 corroboration task.
+    resp1 = await client.post(url, json={"reason": "First attest — spawn"})
+    assert resp1.status_code == 200, resp1.text
+
+    # Second attestation (re-attest / renewal) — should NOT spawn a
+    # second corroboration task.
+    resp2 = await client.post(
+        url, json={"reason": "Re-attest — should not duplicate"}
+    )
+    assert resp2.status_code == 200, resp2.text
+
+    # Query for corroboration tasks: there must be exactly one.
+    from app.models import Task as _Task
+
+    tasks = (
+        (
+            await db_session.execute(
+                select(_Task).where(
+                    _Task.project_id == project.id,
+                    _Task.title == f"Verify: {criterion.criterion_key}",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(tasks) == 1, (
+        f"Re-attestation must not create a duplicate corroboration task; "
+        f"expected 1, found {len(tasks)}"
+    )
+    spawned = tasks[0]
+    assert spawned.status == TaskStatus.QUEUED
+    assert spawned.criterion_ids == [criterion.criterion_key]
+    assert spawned.created_by == "SYSTEM_AUTO_REVIEW"
+
+
+# ---------------------------------------------------------------------------
+# Failed corroboration: surfaces and downgrades trust (acceptance test)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_failed_corroboration_surfaces_and_downgrades_trust(db_session):
+    """A FAILED corroboration task must both SURFACE in operator attention and
+    DOWNGRADE the attestation coverage.
+
+    When a spawned Verify: {key} task ends in FAILED or CANCELLED, the operator's
+    attestation must not remain at full 'attested' trust — coverage falls to
+    'partial' and a 'corroboration_failed' attention item appears so the operator
+    can re-attest or provide real machine evidence.
+    """
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Criterion with failed corroboration"
+    )
+
+    # Step 1: Record a valid (non-expired) operator attestation.
+    fresh_at = _utcnow().isoformat()
+    await ac.record_evidence(
+        db_session,
+        criterion.id,
+        project.id,
+        source_kind="operator_attestation",
+        source_id=_TEST_USER_ID,
+        detail={"attested_at": fresh_at, "reason": "temporarily accepted"},
+    )
+
+    # With only a fresh attestation, coverage must be 'attested'.
+    summary1 = await ac.get_version_coverage_summary(db_session, version.id)
+    crit1 = next(
+        c for c in summary1["criteria"]
+        if c["criterion_key"] == criterion.criterion_key
+    )
+    assert crit1["coverage"] == "attested", (
+        f"Expected 'attested' before failed corroboration, got {crit1['coverage']}"
+    )
+
+    # Step 2: Create a FAILED corroboration task.
+    from app.models import Task as _Task, TaskStatus as _TaskStatus
+
+    failed_task = _Task(
+        project_id=project.id,
+        title=f"Verify: {criterion.criterion_key}",
+        criterion_ids=[criterion.criterion_key],
+        context={
+            "corroboration_of": criterion.criterion_key,
+            "spawned_by": "operator_attestation",
+        },
+        payloads=[{"type": "research", "prompt": "Verify this criterion"}],
+        created_by="SYSTEM_AUTO_REVIEW",
+        status=_TaskStatus.FAILED,
+    )
+    db_session.add(failed_task)
+    await db_session.commit()
+
+    # Step 3: Coverage must now be 'partial' (downgraded from 'attested').
+    summary2 = await ac.get_version_coverage_summary(db_session, version.id)
+    assert summary2["attested"] == 0, (
+        f"Expected 0 attested after failed corroboration, got {summary2['attested']}"
+    )
+    assert summary2["partial"] >= 1, (
+        f"Expected ≥1 partial after failed corroboration, got {summary2['partial']}"
+    )
+    crit2 = next(
+        c for c in summary2["criteria"]
+        if c["criterion_key"] == criterion.criterion_key
+    )
+    assert crit2["coverage"] == "partial", (
+        f"Expected 'partial' after failed corroboration, got {crit2['coverage']}"
+    )
+
+    # Step 4: Operator attention must surface a corroboration_failed item.
+    attention = await build_operator_attention(db_session, project, _TEST_USER_ID)
+
+    assert attention["counts"]["corroboration_failed"] == 1, (
+        f"Expected corroboration_failed=1, got {attention['counts'].get('corroboration_failed')}"
+    )
+    corrob_id = (
+        f"version:{version.id}:corroboration_failed:{criterion.criterion_key}"
+    )
+    items_by_id = {item["id"]: item for item in attention["items"]}
+    assert corrob_id in items_by_id, (
+        f"Expected corroboration_failed item {corrob_id} in {list(items_by_id)}"
+    )
+    item = items_by_id[corrob_id]
+    assert item["reason"] == "corroboration_failed", (
+        f"Expected reason=corroboration_failed, got {item['reason']}"
+    )
+    assert item["label"] == "Attestation verification failed", (
+        f"Unexpected label: {item['label']}"
+    )
+    assert item["criterion_key"] == criterion.criterion_key
+    assert item["release_version_id"] == str(version.id)
+
+
+@pytest.mark.asyncio
+async def test_reattest_after_failed_corroboration_restores_attested(
+    db_session,
+):
+    """Re-attestation after a failed corroboration must restore 'attested' coverage.
+
+    When a corroboration task FAILED, the old failure alone should NOT keep the
+    criterion at 'partial' once the operator re-attests and a new QUEUED
+    corroboration task is spawned. The ``get_failed_corroboration_keys`` function
+    must exclude keys that have a newer non-terminal task.
+    """
+    project = await _make_project(db_session, "ReAttest-After-Fail")
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Criterion re-attested after fail"
+    )
+
+    fresh_at = _utcnow().isoformat()
+    await ac.record_evidence(
+        db_session,
+        criterion.id,
+        project.id,
+        source_kind="operator_attestation",
+        source_id=_TEST_USER_ID,
+        detail={"attested_at": fresh_at, "reason": "first attest"},
+    )
+
+    # Step 1: With only a fresh attestation, coverage must be 'attested'.
+    summary1 = await ac.get_version_coverage_summary(db_session, version.id)
+    crit1 = next(
+        c for c in summary1["criteria"]
+        if c["criterion_key"] == criterion.criterion_key
+    )
+    assert crit1["coverage"] == "attested", (
+        f"Expected 'attested' before failed corroboration, got {crit1['coverage']}"
+    )
+
+    # Step 2: Create a FAILED corroboration task.
+    from app.models import Task as _Task, TaskStatus as _TaskStatus
+
+    failed_task = _Task(
+        project_id=project.id,
+        title=f"Verify: {criterion.criterion_key}",
+        criterion_ids=[criterion.criterion_key],
+        context={
+            "corroboration_of": criterion.criterion_key,
+            "spawned_by": "operator_attestation",
+        },
+        payloads=[{"type": "research", "prompt": "Verify this criterion"}],
+        created_by="SYSTEM_AUTO_REVIEW",
+        status=_TaskStatus.FAILED,
+    )
+    db_session.add(failed_task)
+    await db_session.commit()
+
+    # Step 3: Coverage must now be 'partial' (downgraded from 'attested').
+    summary2 = await ac.get_version_coverage_summary(db_session, version.id)
+    crit2 = next(
+        c for c in summary2["criteria"]
+        if c["criterion_key"] == criterion.criterion_key
+    )
+    assert crit2["coverage"] == "partial", (
+        f"Expected 'partial' after failed corroboration, got {crit2['coverage']}"
+    )
+
+    # Step 4: Operator re-attests (records a new attestation, and
+    # spawn_corroboration_task would create a new QUEUED task).  Simulate
+    # the re-attestation by recording fresh evidence and adding a QUEUED
+    # corroboration task.
+    re_fresh_at = _utcnow().isoformat()
+    await ac.record_evidence(
+        db_session,
+        criterion.id,
+        project.id,
+        source_kind="operator_attestation",
+        source_id=_TEST_USER_ID,
+        detail={"attested_at": re_fresh_at, "reason": "re-attest after failure"},
+    )
+    # The re-attestation duplicates the (criterion, kind, source) evidence key,
+    # so record_evidence collapses it via IntegrityError → rollback — which
+    # expires every instance in the session. Refresh before further attribute
+    # reads (project/version/criterion are used below, and ``project`` is
+    # passed into build_operator_attention) so real ORM expiry can't raise
+    # MissingGreenlet on a sync lazy-load.
+    await db_session.refresh(project)
+    await db_session.refresh(version)
+    await db_session.refresh(criterion)
+
+    queued_task = _Task(
+        project_id=project.id,
+        title=f"Verify: {criterion.criterion_key}",
+        criterion_ids=[criterion.criterion_key],
+        context={
+            "corroboration_of": criterion.criterion_key,
+            "spawned_by": "operator_attestation",
+        },
+        payloads=[{"type": "research", "prompt": "Verify this criterion"}],
+        created_by="SYSTEM_AUTO_REVIEW",
+        status=_TaskStatus.QUEUED,
+    )
+    db_session.add(queued_task)
+    await db_session.commit()
+
+    # Step 5: Coverage must now be 'attested' again — the failed task is
+    # stale because a newer QUEUED task exists.
+    summary3 = await ac.get_version_coverage_summary(db_session, version.id)
+    assert summary3["attested"] >= 1, (
+        f"Expected ≥1 attested after re-attest + new task, "
+        f"got {summary3['attested']}"
+    )
+    crit3 = next(
+        c for c in summary3["criteria"]
+        if c["criterion_key"] == criterion.criterion_key
+    )
+    assert crit3["coverage"] == "attested", (
+        f"Expected 'attested' after re-attest + new task, got {crit3['coverage']}"
+    )
+
+    # Step 6: get_failed_corroboration_keys must NOT include this key.
+    failed_keys = await ac.get_failed_corroboration_keys(db_session, project.id)
+    assert criterion.criterion_key not in failed_keys, (
+        f"Expected criterion {criterion.criterion_key} to NOT be in failed "
+        f"corroboration keys (newer QUEUED task exists), but it was: "
+        f"{failed_keys}"
+    )
+
+    # Step 7: build_operator_attention must not surface a
+    # corroboration_failed item for this criterion.
+    attention = await build_operator_attention(db_session, project, _TEST_USER_ID)
+    corrob_id = (
+        f"version:{version.id}:corroboration_failed:{criterion.criterion_key}"
+    )
+    items_by_id = {item["id"]: item for item in attention["items"]}
+    assert corrob_id not in items_by_id, (
+        f"Expected NO corroboration_failed item for re-attested criterion, "
+        f"but found {items_by_id[corrob_id]}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_corroboration_child_inherits_criterion_ids_and_upgrades_attested_to_covered(
+    db_session, mocker
+):
+    """A child task spawned from a corroboration parent (which carries
+    criterion_ids on the Task row but has no direction_id) must inherit the
+    parent's criterion_ids, so that when the child task completes with a
+    proven acceptance verdict the criterion coverage upgrades from 'attested'
+    to 'covered'.
+
+    This is the load-bearing happy path of the attestation tier — that an
+    operator attestation is provisional until a verification task produces
+    machine-verified evidence. Without this inheritance chain the corroboration
+    flow can never actually upgrade a criterion to 'covered'.
+    """
+    from app.models import ReleaseVersion
+    from app import acceptance_criteria as _ac
+
+    project = await _make_project(db_session, "Corroboration-Upgrade")
+    version = ReleaseVersion(project_id=project.id, version_number=1, status="open")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    criterion = await _ac.create_criterion(
+        db_session, project.id, version.id,
+        "Criterion for corroboration upgrade test",
+    )
+    criterion_key = criterion.criterion_key
+
+    # Step 1: Record operator attestation evidence.
+    fresh_at = _utcnow().isoformat()
+    await _ac.record_evidence(
+        db_session, criterion.id, project.id,
+        source_kind="operator_attestation",
+        source_id=_TEST_USER_ID,
+        detail={"attested_at": fresh_at, "reason": "provisional accept"},
+    )
+
+    # Coverage must be 'attested' before corroboration.
+    summary1 = await _ac.get_version_coverage_summary(db_session, version.id)
+    crit1 = next(c for c in summary1["criteria"] if c["criterion_key"] == criterion_key)
+    assert crit1["coverage"] == "attested", (
+        f"Expected 'attested' before corroboration, got {crit1['coverage']!r}"
+    )
+
+    # Step 2: Create a research task mimicking a corroboration task:
+    # it has criterion_ids=[criterion_key] but NO direction_id in context
+    # (the exact shape spawn_corroboration_task produces).
+    corrob_task = Task(
+        project_id=project.id,
+        title=f"Verify: {criterion_key}",
+        payloads=[{"type": "research", "base_branch": "main"}],
+        context={"research_depth": 0},
+        criterion_ids=[criterion_key],
+        status=TaskStatus.IN_PROGRESS,
+        created_by="SYSTEM_AUTO_REVIEW",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(corrob_task)
+    await db_session.commit()
+    await db_session.refresh(corrob_task)
+
+    # Step 3: Run _handle_research_completion with a finding that has
+    # acceptance_evidence but no direction_id — just like a finding
+    # the corroboration task's research agent would produce.
+    from app.research_completion import _handle_research_completion
+    from test_autonomous_research import _patch_research_externals
+
+    finding = {
+        "title": "Verify criterion with automated test",
+        "description": "Write and run a test proving the criterion is met",
+        "prompt": "Implement a test that verifies this acceptance criterion",
+        "priority": "medium",
+        "scope": "small",
+        "risk": "low",
+        "type": "improvement",
+        "acceptance_evidence": {
+            "kind": "named_test",
+            "test_path": "backend/testing/test_acceptance_criteria.py",
+        },
+    }
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings", return_value=[finding]
+    )
+    mocker.patch(
+        "app.research_completion._assess_project_spawn_health",
+        return_value=(False, None),
+    )
+
+    await _handle_research_completion(corrob_task, "", db_session)
+
+    # Step 4: The spawned child must have inherited criterion_ids from
+    # the parent task (falling back from the empty direction cache to
+    # task.criterion_ids).
+    children = (
+        (await db_session.execute(
+            select(Task).where(Task.parent_task_id == corrob_task.id)
+        ))
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1, f"expected 1 spawned child, got {len(children)}"
+    child = children[0]
+    assert child.criterion_ids == [criterion_key], (
+        f"spawned child must inherit criterion_ids from parent task; "
+        f"got {child.criterion_ids!r}"
+    )
+
+    # Step 5: Simulate the child completing with a proven acceptance
+    # verdict (as a real merge-test verification would produce).
+    child.status = TaskStatus.COMPLETED
+    child.context = {
+        **(child.context or {}),
+        "code_acceptance_verdict": {
+            "satisfied": True,
+            "proven": True,
+            "kind": "named_test",
+            "reason": "CI-verified test passes",
+        },
+    }
+    await db_session.commit()
+
+    # Step 6: Record merge evidence using the child's criterion_ids.
+    recorded = await _ac.record_task_merge_evidence(
+        db_session, child, project.id
+    )
+    assert recorded >= 1, (
+        f"record_task_merge_evidence must record at least 1 evidence row "
+        f"for a child that inherited criterion_ids; got {recorded}"
+    )
+
+    # Step 7: Coverage must now be 'covered' — the task_merge evidence
+    # proves the criterion satisfied, upgrading from the provisional
+    # 'attested' tier.
+    summary2 = await _ac.get_version_coverage_summary(db_session, version.id)
+    assert summary2["covered"] >= 1, (
+        f"Expected >=1 covered after successful corroboration, "
+        f"got {summary2['covered']}"
+    )
+    assert summary2["attested"] == 0, (
+        f"Expected 0 attested after corroboration upgrade, "
+        f"got {summary2['attested']}"
+    )
+    crit2 = next(
+        c for c in summary2["criteria"] if c["criterion_key"] == criterion_key
+    )
+    assert crit2["coverage"] == "covered", (
+        f"Expected 'covered' after successful corroboration, "
+        f"got {crit2['coverage']!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# backfill corroboration loop: spawn, dedup, failed-downgrade, re-verify
+# ---------------------------------------------------------------------------
+
+
+async def _make_backfill_task(
+    db_session,
+    project,
+    criterion_key,
+    *,
+    direction_key="d-backfill-corrob",
+    test_path="testing/test_backfill_corrob.py::test_seam",
+):
+    """Create a COMPLETED unverified-merge task whose named_test shipped.
+
+    Mirrors the fixture shape used by the backfill unit tests so
+    ``backfill_unverified_merge_evidence`` records a 'backfilled' evidence row
+    for ``criterion_key``.
+    """
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+    from app.landed_signal import REVIEW_LOOP_KEY, UNVERIFIED_MERGE_REASON_KEY
+
+    dir_row = Direction(
+        project_id=project.id,
+        direction_key=direction_key,
+        data={"id": direction_key, "text": "Backfill corrob", "status": "active"},
+        status="active",
+        criterion_keys=[criterion_key],
+    )
+    db_session.add(dir_row)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "create",
+            "prompt": "add the test",
+            "acceptance_evidence": {"kind": "named_test", "test_path": test_path},
+        }],
+        context={
+            "direction_id": direction_key,
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            REVIEW_LOOP_KEY: {UNVERIFIED_MERGE_REASON_KEY: "verify_setup_failed"},
+            "_pr_changed_files": [
+                test_path.rpartition("::")[0],
+                "backend/app/target_module.py",
+            ],
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": False,
+                "proven": False,
+                "kind": "named_test",
+                "reason": "merge fell open without verification",
+                "proof_ref": test_path,
+            },
+        },
+        criterion_ids=[criterion_key],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    return task
+
+
+async def _verify_tasks_for(db_session, project, criterion_key):
+    """Return all corroboration ``Verify: {key}`` tasks for a criterion."""
+    from app.models import Task as _Task
+
+    rows = (
+        (await db_session.execute(
+            select(_Task).where(
+                _Task.project_id == project.id,
+                _Task.title == f"Verify: {criterion_key}",
+            )
+        ))
+        .scalars()
+        .all()
+    )
+    return list(rows)
+
+
+@pytest.mark.asyncio
+async def test_backfill_spawns_corroboration_task(db_session):
+    """Recording backfill evidence must spawn a corroboration task for the criterion.
+
+    Mirrors the operator-attestation earn-up loop: the lower-confidence
+    'backfilled' tier gets a ``Verify: {key}`` research task tagged
+    ``spawned_by=unverified_merge_backfill`` so it can be re-verified toward
+    real machine-verified coverage instead of staying covering indefinitely.
+    """
+    project = await _make_project(db_session, "Backfill-Spawn")
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Backfilled criterion"
+    )
+
+    await _make_backfill_task(db_session, project, criterion.criterion_key)
+
+    recorded = await ac.backfill_unverified_merge_evidence(db_session, project.id)
+    assert recorded == 1, f"Expected 1 backfill evidence row, got {recorded}"
+
+    verify_tasks = await _verify_tasks_for(db_session, project, criterion.criterion_key)
+    assert len(verify_tasks) == 1, (
+        f"Expected exactly 1 corroboration task, got {len(verify_tasks)}"
+    )
+    spawned = verify_tasks[0]
+    assert spawned.context.get("corroboration_of") == criterion.criterion_key
+    assert spawned.context.get("spawned_by") == ac.UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND, (
+        f"Expected spawned_by=unverified_merge_backfill, got "
+        f"{spawned.context.get('spawned_by')!r}"
+    )
+    assert spawned.criterion_ids == [criterion.criterion_key]
+    assert spawned.status == TaskStatus.QUEUED
+    assert spawned.created_by == "SYSTEM_AUTO_REVIEW"
+    assert "backfill" in spawned.first_payload["prompt"].lower(), (
+        "Backfill corroboration prompt must describe the backfill provenance"
+    )
+
+
+@pytest.mark.asyncio
+async def test_backfill_corroboration_task_is_deduped(db_session):
+    """A second backfill reconcile must not create a duplicate corroboration task."""
+    project = await _make_project(db_session, "Backfill-Dedup")
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Backfilled criterion"
+    )
+
+    await _make_backfill_task(db_session, project, criterion.criterion_key)
+
+    # First reconcile: records evidence and spawns one corroboration task.
+    first = await ac.backfill_unverified_merge_evidence(db_session, project.id)
+    assert first == 1
+    # Second reconcile: evidence already present (0 new rows) but the criterion
+    # is still backfilled, so the spawn path runs again — the title dedup guard
+    # must prevent a duplicate task.
+    second = await ac.backfill_unverified_merge_evidence(db_session, project.id)
+    assert second == 0, f"Second backfill must record 0 new rows, got {second}"
+
+    verify_tasks = await _verify_tasks_for(db_session, project, criterion.criterion_key)
+    assert len(verify_tasks) == 1, (
+        f"Backfill corroboration must dedup; expected 1 task, got {len(verify_tasks)}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_backfill_failed_corroboration_downgrades_coverage(db_session):
+    """A FAILED backfill corroboration task downgrades 'backfilled' to 'partial'.
+
+    Acceptance test for the backfill corroboration loop. Before this change the
+    'backfilled' tier had no re-verification path: it stayed covering forever and
+    was never caught if false. Now the spawned ``Verify: {key}`` task feeds the
+    same failed-corroboration downgrade as operator attestation — when it FAILS,
+    the backfill coverage must drop to 'partial' and no longer count as covering.
+    """
+    project = await _make_project(db_session, "Backfill-Downgrade")
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Backfilled criterion to downgrade"
+    )
+
+    await _make_backfill_task(db_session, project, criterion.criterion_key)
+    recorded = await ac.backfill_unverified_merge_evidence(db_session, project.id)
+    assert recorded == 1
+
+    # Before failure: coverage is the distinct lower-confidence 'backfilled' tier.
+    summary1 = await ac.get_version_coverage_summary(db_session, version.id)
+    assert summary1["backfilled"] == 1, (
+        f"Expected 1 backfilled before corroboration failure, got {summary1['backfilled']}"
+    )
+    crit1 = next(
+        c for c in summary1["criteria"]
+        if c["criterion_key"] == criterion.criterion_key
+    )
+    assert crit1["coverage"] == "backfilled"
+
+    # The backfill spawned a corroboration task; mark it FAILED.
+    verify_tasks = await _verify_tasks_for(db_session, project, criterion.criterion_key)
+    assert len(verify_tasks) == 1
+    verify_tasks[0].status = TaskStatus.FAILED
+    await db_session.commit()
+
+    # After failure: the backfill coverage is downgraded to 'partial'.
+    summary2 = await ac.get_version_coverage_summary(db_session, version.id)
+    assert summary2["backfilled"] == 0, (
+        f"Expected 0 backfilled after corroboration failure, got {summary2['backfilled']}"
+    )
+    assert summary2["partial"] >= 1, (
+        f"Expected >=1 partial after corroboration failure, got {summary2['partial']}"
+    )
+    crit2 = next(
+        c for c in summary2["criteria"]
+        if c["criterion_key"] == criterion.criterion_key
+    )
+    assert crit2["coverage"] == "partial", (
+        f"Expected 'partial' after failed backfill corroboration, got {crit2['coverage']}"
+    )
+    assert criterion.criterion_key in summary2["failed_corroboration_keys"]
+
+
+@pytest.mark.asyncio
+async def test_backfill_corroboration_failure_surfaces_in_operator_attention(db_session):
+    """A failed backfill corroboration surfaces a corroboration_failed attention item.
+
+    Parity with operator attestation: the operator sees that a lower-confidence
+    coverage's verification failed and can act.  (Runs against Postgres in CI —
+    build_operator_attention uses a compound SELECT SQLite cannot parse.)
+    """
+    project = await _make_project(db_session, "Backfill-Attention")
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Backfilled criterion surfacing failure"
+    )
+
+    await _make_backfill_task(db_session, project, criterion.criterion_key)
+    await ac.backfill_unverified_merge_evidence(db_session, project.id)
+
+    verify_tasks = await _verify_tasks_for(db_session, project, criterion.criterion_key)
+    verify_tasks[0].status = TaskStatus.FAILED
+    await db_session.commit()
+
+    attention = await build_operator_attention(db_session, project, _TEST_USER_ID)
+    corrob_id = (
+        f"version:{version.id}:corroboration_failed:{criterion.criterion_key}"
+    )
+    items_by_id = {item["id"]: item for item in attention["items"]}
+    assert corrob_id in items_by_id, (
+        f"Expected corroboration_failed item for backfill, got {list(items_by_id)}"
+    )
+    assert attention["counts"]["corroboration_failed"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_reattempt_after_failed_backfill_restores_backfilled(db_session):
+    """A newer non-terminal corroboration task un-stales a failed backfill downgrade.
+
+    Parity with the operator-attestation re-attest path: once a fresh
+    ``Verify: {key}`` task is in flight, the stale FAILED task no longer keeps the
+    criterion pinned at 'partial' — coverage returns to 'backfilled'.
+    """
+    project = await _make_project(db_session, "Backfill-Restore")
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Backfilled criterion re-verified"
+    )
+
+    await _make_backfill_task(db_session, project, criterion.criterion_key)
+    await ac.backfill_unverified_merge_evidence(db_session, project.id)
+
+    verify_tasks = await _verify_tasks_for(db_session, project, criterion.criterion_key)
+    verify_tasks[0].status = TaskStatus.FAILED
+    await db_session.commit()
+
+    summary_fail = await ac.get_version_coverage_summary(db_session, version.id)
+    crit_fail = next(
+        c for c in summary_fail["criteria"]
+        if c["criterion_key"] == criterion.criterion_key
+    )
+    assert crit_fail["coverage"] == "partial"
+
+    # A newer QUEUED corroboration task (a later reconcile re-spawns after the
+    # failed one is no longer non-terminal).
+    from app.models import Task as _Task
+
+    queued = _Task(
+        project_id=project.id,
+        title=f"Verify: {criterion.criterion_key}",
+        criterion_ids=[criterion.criterion_key],
+        context={
+            "corroboration_of": criterion.criterion_key,
+            "spawned_by": ac.UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND,
+        },
+        payloads=[{"type": "research", "prompt": "re-verify"}],
+        created_by="SYSTEM_AUTO_REVIEW",
+        status=TaskStatus.QUEUED,
+    )
+    db_session.add(queued)
+    await db_session.commit()
+
+    summary_ok = await ac.get_version_coverage_summary(db_session, version.id)
+    assert summary_ok["backfilled"] == 1, (
+        f"Expected backfilled restored after re-verify, got {summary_ok['backfilled']}"
+    )
+    crit_ok = next(
+        c for c in summary_ok["criteria"]
+        if c["criterion_key"] == criterion.criterion_key
+    )
+    assert crit_ok["coverage"] == "backfilled"
+    failed_keys = await ac.get_failed_corroboration_keys(db_session, project.id)
+    assert criterion.criterion_key not in failed_keys
+
+
+# ---------------------------------------------------------------------------
+# Finding #9: get_failed_corroboration_keys pushes the corroboration_of filter
+# into SQL (it ran on the qualifier finalize path pulling the FULL context JSONB
+# of every FAILED/CANCELLED task in the project, filtering only in Python).
+# The selection must be UNCHANGED by the push-down.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_failed_corroboration_keys_sql_filter_selects_same_keys(db_session):
+    """The SQL-side ``corroboration_of`` filter selects EXACTLY the keys the old
+    Python-side filter did — no more, no less.
+
+    Exercises every discriminating row shape in one project:
+      * FAILED with corroboration_of            → selected
+      * CANCELLED with corroboration_of         → selected
+      * FAILED with NO corroboration_of         → ignored (the rows the old query
+                                                  dragged the whole context JSONB
+                                                  across the wire for)
+      * FAILED with a NULL / non-string value   → ignored (never laundered into a
+                                                  key by the ``->>`` text cast)
+      * COMPLETED / IN_PROGRESS corroboration   → ignored (not a terminal failure)
+      * a FAILED corroboration in ANOTHER project → ignored (project-scoped)
+    """
+    from app.models import Task as _Task
+
+    project = await _make_project(db_session, "Corroboration-SQL-Filter")
+    other_project = await _make_project(db_session, "Corroboration-SQL-Other")
+
+    def _task(proj_id, status, context, title="Verify: x"):
+        return _Task(
+            project_id=proj_id,
+            title=title,
+            context=context,
+            payloads=[{"type": "research", "prompt": "verify"}],
+            created_by="SYSTEM_AUTO_REVIEW",
+            status=status,
+        )
+
+    db_session.add_all(
+        [
+            # --- selected -----------------------------------------------------
+            _task(
+                project.id,
+                TaskStatus.FAILED,
+                {"corroboration_of": "crit-failed", "spawned_by": "operator_attestation"},
+                title="Verify: crit-failed",
+            ),
+            _task(
+                project.id,
+                TaskStatus.CANCELLED,
+                {"corroboration_of": "crit-cancelled"},
+                title="Verify: crit-cancelled",
+            ),
+            # --- ignored: terminal, but not a corroboration task ---------------
+            _task(
+                project.id,
+                TaskStatus.FAILED,
+                {"some_other_key": "noise", "big_blob": "x" * 512},
+                title="Unrelated failed task",
+            ),
+            _task(project.id, TaskStatus.FAILED, {}, title="Empty-context failed task"),
+            # --- ignored: malformed corroboration_of values --------------------
+            _task(
+                project.id,
+                TaskStatus.FAILED,
+                {"corroboration_of": None},
+                title="Verify: null-key",
+            ),
+            _task(
+                project.id,
+                TaskStatus.FAILED,
+                {"corroboration_of": 42},
+                title="Verify: numeric-key",
+            ),
+            _task(
+                project.id,
+                TaskStatus.FAILED,
+                {"corroboration_of": {"nested": "obj"}},
+                title="Verify: object-key",
+            ),
+            # --- ignored: non-terminal / completed corroborations --------------
+            _task(
+                project.id,
+                TaskStatus.COMPLETED,
+                {"corroboration_of": "crit-completed"},
+                title="Verify: crit-completed",
+            ),
+            _task(
+                project.id,
+                TaskStatus.IN_PROGRESS,
+                {"corroboration_of": "crit-in-progress"},
+                title="Verify: crit-in-progress",
+            ),
+            # --- ignored: another project's failure ---------------------------
+            _task(
+                other_project.id,
+                TaskStatus.FAILED,
+                {"corroboration_of": "crit-other-project"},
+                title="Verify: crit-other-project",
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    failed_keys = await ac.get_failed_corroboration_keys(db_session, project.id)
+
+    assert failed_keys == {"crit-failed", "crit-cancelled"}, (
+        f"SQL-pushed filter must select exactly the FAILED/CANCELLED corroboration "
+        f"keys of THIS project, got {failed_keys}"
+    )
+    # The malformed values must not be coerced into keys by the SQL text cast.
+    assert "42" not in failed_keys and 42 not in failed_keys
+
+
+@pytest.mark.asyncio
+async def test_failed_corroboration_keys_newer_non_terminal_still_excluded(db_session):
+    """The stale-failure exclusion still works after the push-down: a key with a
+    newer non-terminal ``Verify:`` task is dropped, while a key whose only
+    corroboration attempt FAILED is still reported."""
+    from app.models import Task as _Task
+
+    project = await _make_project(db_session, "Corroboration-SQL-Stale")
+
+    def _task(status, key):
+        return _Task(
+            project_id=project.id,
+            title=f"Verify: {key}",
+            context={"corroboration_of": key},
+            payloads=[{"type": "research", "prompt": "verify"}],
+            created_by="SYSTEM_AUTO_REVIEW",
+            status=status,
+        )
+
+    db_session.add_all(
+        [
+            _task(TaskStatus.FAILED, "crit-retried"),
+            _task(TaskStatus.QUEUED, "crit-retried"),  # newer attempt in flight
+            _task(TaskStatus.FAILED, "crit-abandoned"),  # no newer attempt
+        ]
+    )
+    await db_session.commit()
+
+    failed_keys = await ac.get_failed_corroboration_keys(db_session, project.id)
+    assert failed_keys == {"crit-abandoned"}, (
+        "a key with a newer non-terminal Verify task must be excluded; a key whose "
+        f"only attempt failed must be reported. Got {failed_keys}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# MissingGreenlet fidelity: attest / re-attest with real ORM expiry
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_attest_criterion_reattest_no_missing_greenlet(
+    client: AsyncClient, db_session, expire_fidelity
+):
+    """Re-attestation must not raise MissingGreenlet when ORM expiry is active.
+
+    On the asyncpg backend, session.rollback() expires all ORM objects.
+    The attest endpoint's IntegrityError path previously read row.id and
+    row.text after the rollback, which triggered a sync lazy-load with no
+    greenlet context and raised MissingGreenlet.  The fix captures criterion_id
+    and criterion_text as plain Python values before entering the try/except,
+    so the post-rollback code never touches the expired ORM instance.
+
+    This test uses the expire_fidelity fixture to restore real SQLAlchemy expiry
+    (InstanceState._expire) on the SQLite backend, reproducing the asyncpg
+    failure mode cheaply.  Without the production fix, the second POST fails
+    with DetachedInstanceError or MissingGreenlet; with the fix it returns 200.
+    """
+    project = await _make_project_with_member(db_session, name="ReAttest-NoGreenlet")
+    version = ReleaseVersion(project_id=project.id, version_number=1, status="open")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Criterion for greenlet fidelity test"
+    )
+
+    url = (
+        f"/api/admin/projects/{project.id}"
+        f"/acceptance-criteria/{criterion.criterion_key}/attest"
+    )
+
+    # First attestation — succeeds on the INSERT path, no rollback involved.
+    resp1 = await client.post(url, json={"reason": "First attest"})
+    assert resp1.status_code == 200, resp1.text
+    data1 = resp1.json()
+    assert data1["status"] == "ok"
+    assert data1["coverage"] == "attested"
+
+    # Second attestation — triggers IntegrityError → rollback → UPDATE path.
+    # With expire_fidelity active, rollback expires row; accessing row.id or
+    # row.text after rollback would raise MissingGreenlet without the fix.
+    resp2 = await client.post(url, json={"reason": "Re-attest renewal"})
+    assert resp2.status_code == 200, resp2.text
+    data2 = resp2.json()
+    assert data2["status"] == "ok", (
+        f"Re-attestation must succeed even with real ORM expiry; got: {data2}"
+    )
+    assert data2["coverage"] == "attested"
+
+    # Verify the evidence row was updated (not duplicated) — dedup constraint held.
+    evidence = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    attest_rows = [e for e in evidence if e.source_kind == "operator_attestation"]
+    assert len(attest_rows) == 1, (
+        f"Re-attestation must UPSERT, not insert a duplicate row; "
+        f"found {len(attest_rows)} operator_attestation rows"
+    )
+    assert attest_rows[0].detail["reason"] == "Re-attest renewal", (
+        f"Evidence detail must reflect the refreshed reason; "
+        f"got {attest_rows[0].detail!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# merge_evidence_gaps persistence  (acceptance criterion: test_merge_evidence_drop_reason_surfaced)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_merge_evidence_drop_reason_surfaced(db_session):
+    """Merged tasks that fail to record evidence persist the drop reason on the open version.
+
+    Exercises the full acceptance criterion:
+      - record_task_merge_evidence with no_active_criteria persists the reason
+        on ReleaseVersion.merge_evidence_gaps.
+      - get_version_coverage_summary exposes merge_evidence_gaps so callers can
+        surface WHY merges did not produce criterion coverage.
+    """
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+    from app.acceptance_criteria import MergeEvidenceReason
+
+    project = await _make_project(db_session, "MergeGapSurfaced")
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(db_session, project.id, version.id, "Must surface gap")
+    criterion_key = criterion.criterion_key
+
+    # Retract the criterion so the merge will hit the no_active_criteria path.
+    await ac.retract_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key=criterion_key,
+        reason="Test retraction",
+        retracted_by="test",
+    )
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "merge gap test"}],
+        context={
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": True,
+                "proven": True,
+                "kind": "named_test",
+                "reason": "CI green",
+            }
+        },
+        criterion_ids=[criterion_key],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    result = await ac.record_task_merge_evidence(db_session, task, project.id)
+    assert result == 0, f"Expected 0 evidence rows for retracted criterion; got {result}"
+
+    # The drop reason must be persisted on the open version.
+    await db_session.refresh(version)
+    gaps = version.merge_evidence_gaps
+    assert gaps is not None, "merge_evidence_gaps must be set after a gap is recorded"
+    assert gaps.get(MergeEvidenceReason.no_active_criteria.value, 0) >= 1, (
+        f"Expected no_active_criteria >= 1 in merge_evidence_gaps; got {gaps}"
+    )
+    # The unmatched key must be captured.
+    assert criterion_key in gaps.get("unmatched_criterion_ids", []), (
+        f"Expected {criterion_key!r} in unmatched_criterion_ids; got {gaps}"
+    )
+
+    # get_version_coverage_summary must surface the gaps.
+    summary = await ac.get_version_coverage_summary(db_session, version.id)
+    assert "merge_evidence_gaps" in summary, (
+        "get_version_coverage_summary must include 'merge_evidence_gaps' key"
+    )
+    surfaced = summary["merge_evidence_gaps"]
+    assert surfaced is not None, "merge_evidence_gaps in summary must not be None after a gap"
+    assert surfaced.get(MergeEvidenceReason.no_active_criteria.value, 0) >= 1, (
+        f"Summary merge_evidence_gaps must reflect recorded gap; got {surfaced}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_merge_evidence_gap_no_criteria_recorded(db_session):
+    """record_task_merge_evidence with no criterion_ids increments no_criteria counter."""
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+    from app.acceptance_criteria import MergeEvidenceReason
+
+    project = await _make_project(db_session, "MergeGapNoCriteria")
+    version = await _make_version(db_session, project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "no criteria"}],
+        context={
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": True,
+                "proven": True,
+                "kind": "named_test",
+                "reason": "CI green",
+            }
+        },
+        criterion_ids=[],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    result = await ac.record_task_merge_evidence(db_session, task, project.id)
+    assert result == 0
+
+    await db_session.refresh(version)
+    gaps = version.merge_evidence_gaps
+    assert gaps is not None, "merge_evidence_gaps must be set after a no_criteria gap"
+    assert gaps.get(MergeEvidenceReason.no_criteria.value, 0) >= 1, (
+        f"Expected no_criteria >= 1; got {gaps}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_merge_evidence_gap_verdict_not_proven_recorded(db_session):
+    """record_task_merge_evidence with unproven verdict increments verdict_not_proven counter."""
+    from app.acceptance_criteria import MergeEvidenceReason
+
+    project = await _make_project(db_session, "MergeGapUnproven")
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(db_session, project.id, version.id, "Unproven crit")
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "unproven merge"}],
+        context={},  # no CODE_ACCEPTANCE_VERDICT_KEY → verdict_not_proven
+        criterion_ids=[criterion.criterion_key],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    result = await ac.record_task_merge_evidence(db_session, task, project.id)
+    assert result == 0
+
+    await db_session.refresh(version)
+    gaps = version.merge_evidence_gaps
+    assert gaps is not None, "merge_evidence_gaps must be set after a verdict_not_proven gap"
+    assert gaps.get(MergeEvidenceReason.verdict_not_proven.value, 0) >= 1, (
+        f"Expected verdict_not_proven >= 1; got {gaps}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_merge_evidence_gaps_accumulate(db_session):
+    """Multiple gap-producing merges accumulate counters, not overwrite them."""
+    from app.acceptance_criteria import MergeEvidenceReason
+
+    project = await _make_project(db_session, "MergeGapAccumulate")
+    version = await _make_version(db_session, project)
+
+    for _ in range(3):
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "no criteria"}],
+            context={},
+            criterion_ids=[],
+            status=TaskStatus.COMPLETED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await ac.record_task_merge_evidence(db_session, task, project.id)
+
+    await db_session.refresh(version)
+    gaps = version.merge_evidence_gaps
+    assert gaps is not None
+    assert gaps.get(MergeEvidenceReason.no_criteria.value, 0) >= 3, (
+        f"Expected no_criteria >= 3 after three gap-producing merges; got {gaps}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# _record_evidence_batch
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_record_evidence_batch_inserts_all(db_session):
+    """_record_evidence_batch inserts multiple evidence rows in a single commit."""
+    project = await _make_project(db_session, "BatchEvidence")
+    version = await _make_version(db_session, project)
+    c1 = await ac.create_criterion(db_session, project.id, version.id, "Batch criterion 1")
+    c2 = await ac.create_criterion(db_session, project.id, version.id, "Batch criterion 2")
+
+    batch = [
+        CriterionEvidence(
+            criterion_id=c1.id,
+            project_id=project.id,
+            source_kind="task_merge",
+            source_id="task-batch-1",
+            detail={"proven": True},
+        ),
+        CriterionEvidence(
+            criterion_id=c2.id,
+            project_id=project.id,
+            source_kind="reachability",
+            source_id="task-batch-1",
+            detail={"proven": True},
+        ),
+    ]
+    recorded = await ac._record_evidence_batch(db_session, batch)
+    assert recorded == 2
+
+    ev1 = await ac.get_evidence_for_criterion(db_session, c1.id)
+    ev2 = await ac.get_evidence_for_criterion(db_session, c2.id)
+    assert len(ev1) == 1
+    assert ev1[0].source_kind == "task_merge"
+    assert len(ev2) == 1
+    assert ev2[0].source_kind == "reachability"
+
+
+@pytest.mark.asyncio
+async def test_record_evidence_batch_empty_is_noop(db_session):
+    """_record_evidence_batch with an empty list returns 0 and does nothing."""
+    recorded = await ac._record_evidence_batch(db_session, [])
+    assert recorded == 0
+
+
+# ---------------------------------------------------------------------------
+# backfill_all_directions_merge_evidence
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_backfill_all_directions_merge_evidence_single_scan(db_session):
+    """backfill_all_directions_merge_evidence covers proven tasks across two directions."""
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+
+    project = await _make_project(db_session, "BulkDirectionBackfill")
+    version = await _make_version(db_session, project)
+
+    dk1 = "d-bulk-1"
+    dk2 = "d-bulk-2"
+
+    c1 = await ac.create_criterion(db_session, project.id, version.id, "Bulk criterion 1")
+    c2 = await ac.create_criterion(db_session, project.id, version.id, "Bulk criterion 2")
+
+    dir1 = Direction(
+        project_id=project.id,
+        direction_key=dk1,
+        data={"id": dk1, "text": "Dir 1", "status": "active"},
+        status="active",
+        criterion_keys=[c1.criterion_key],
+    )
+    dir2 = Direction(
+        project_id=project.id,
+        direction_key=dk2,
+        data={"id": dk2, "text": "Dir 2", "status": "active"},
+        status="active",
+        criterion_keys=[c2.criterion_key],
+    )
+    db_session.add(dir1)
+    db_session.add(dir2)
+
+    task1 = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "t1"}],
+        context={
+            "direction_id": dk1,
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": True,
+                "proven": True,
+                "kind": "named_test",
+                "reason": "green",
+            },
+        },
+        criterion_ids=[c1.criterion_key],
+        status=TaskStatus.COMPLETED,
+        completed_at=version.opened_at + timedelta(seconds=1),
+    )
+    task2 = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "t2"}],
+        context={
+            "direction_id": dk2,
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": True,
+                "proven": True,
+                "kind": "named_test",
+                "reason": "green",
+            },
+        },
+        criterion_ids=[c2.criterion_key],
+        status=TaskStatus.COMPLETED,
+        completed_at=version.opened_at + timedelta(seconds=2),
+    )
+    db_session.add(task1)
+    db_session.add(task2)
+    await db_session.commit()
+
+    totals = await ac.backfill_all_directions_merge_evidence(
+        db_session, project.id, [dk1, dk2]
+    )
+
+    # Each direction should have 2 evidence rows (task_merge + reachability).
+    assert totals.get(dk1, 0) == 2, f"Expected 2 for {dk1}, got {totals}"
+    assert totals.get(dk2, 0) == 2, f"Expected 2 for {dk2}, got {totals}"
+
+    ev1 = await ac.get_evidence_for_criterion(db_session, c1.id)
+    ev2 = await ac.get_evidence_for_criterion(db_session, c2.id)
+    assert {e.source_kind for e in ev1} == {"task_merge", "reachability"}
+    assert {e.source_kind for e in ev2} == {"task_merge", "reachability"}
+
+
+@pytest.mark.asyncio
+async def test_backfill_all_directions_merge_evidence_empty_list(db_session):
+    """backfill_all_directions_merge_evidence with an empty list returns {}."""
+    project = await _make_project(db_session, "BulkDirEmpty")
+    totals = await ac.backfill_all_directions_merge_evidence(db_session, project.id, [])
+    assert totals == {}
+
+
+@pytest.mark.asyncio
+async def test_backfill_all_directions_merge_evidence_ignores_other_directions(db_session):
+    """Tasks belonging to an unlisted direction are not processed."""
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+
+    project = await _make_project(db_session, "BulkDirIgnore")
+    version = await _make_version(db_session, project)
+
+    dk_target = "d-target"
+    dk_other = "d-other"
+
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Target criterion"
+    )
+    other_criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Other criterion"
+    )
+
+    dir_target = Direction(
+        project_id=project.id,
+        direction_key=dk_target,
+        data={"id": dk_target, "text": "Target", "status": "active"},
+        status="active",
+        criterion_keys=[criterion.criterion_key],
+    )
+    dir_other = Direction(
+        project_id=project.id,
+        direction_key=dk_other,
+        data={"id": dk_other, "text": "Other", "status": "active"},
+        status="active",
+        criterion_keys=[other_criterion.criterion_key],
+    )
+    db_session.add(dir_target)
+    db_session.add(dir_other)
+
+    task_target = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "x"}],
+        context={
+            "direction_id": dk_target,
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            CODE_ACCEPTANCE_VERDICT_KEY: {"satisfied": True, "proven": True, "kind": "named_test"},
+        },
+        criterion_ids=[criterion.criterion_key],
+        status=TaskStatus.COMPLETED,
+        completed_at=version.opened_at + timedelta(seconds=1),
+    )
+    task_other = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "y"}],
+        context={
+            "direction_id": dk_other,
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            CODE_ACCEPTANCE_VERDICT_KEY: {"satisfied": True, "proven": True, "kind": "named_test"},
+        },
+        criterion_ids=[other_criterion.criterion_key],
+        status=TaskStatus.COMPLETED,
+        completed_at=version.opened_at + timedelta(seconds=2),
+    )
+    db_session.add(task_target)
+    db_session.add(task_other)
+    await db_session.commit()
+
+    # Only pass dk_target — the other direction's task must not be processed.
+    totals = await ac.backfill_all_directions_merge_evidence(
+        db_session, project.id, [dk_target]
+    )
+
+    assert dk_target in totals
+    assert dk_other not in totals
+
+    other_ev = await ac.get_evidence_for_criterion(db_session, other_criterion.id)
+    assert other_ev == [], "task for unlisted direction must not have evidence"
+
+
+# ---------------------------------------------------------------------------
+# Rollup child inherits parent's changed-files context for acceptance
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_rollup_child_inherits_parent_changed_files_for_acceptance(db_session):
+    """A landed rollup child that merged via the PARENT's PR never owns a GitHub
+    PR, so it never receives its own ``_pr_changed_files`` context — its declared
+    ``named_test`` cannot be located in any diff and its acceptance verdict is
+    stuck at ``declared_unsatisfied``.
+
+    When the rollup parent lands, ``_propagate_landed_to_staging_merged_descendants``
+    must propagate the parent's changed-file context DOWN to the child (marked
+    parent-derived, NOT github-verified) and re-stamp the child's acceptance
+    verdict so the stale ``declared_unsatisfied`` flips off. Because the parent's
+    diff is the union of every sibling's changes, the credit is capped at the
+    ``satisfied_unproven`` tier — it must NOT mint machine ``proven`` credit.
+    """
+    from app.rollup_management import _propagate_landed_to_staging_merged_descendants
+    from app.acceptance_gate import (
+        PARENT_DERIVED_CHANGED_FILES_KEY,
+        classify_merged_acceptance_context,
+        record_code_acceptance_verdict,
+        stamp_changed_files_signal,
+    )
+    from app.landed_signal import REVIEW_LOOP_KEY
+
+    prod_seam = "backend/app/rollup_widget.py"
+    declared_test = "backend/testing/test_rollup_widget.py"
+
+    project = await _make_project(db_session, name="RollupInheritCF")
+
+    # Rollup PR-owning parent: carries the authoritative GitHub-verified diff
+    # (the union of all its children's changes) and has landed on integration.
+    parent_ctx = {"pr_merged": True, "landed_on_integration": True}
+    parent_ctx.update(
+        stamp_changed_files_signal([declared_test, prod_seam], github_verified=True)
+    )
+    parent = Task(
+        project_id=project.id,
+        title="rollup parent",
+        payloads=[{"type": "research", "prompt": "rollup"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context=parent_ctx,
+    )
+
+    # Child merged via the parent's PR: pr_merged=True but landed_on_integration
+    # still False (it merged to staging, not integration) and NO own
+    # _pr_changed_files. It declares the named_test as acceptance evidence.
+    child = Task(
+        project_id=project.id,
+        parent_task_id=None,  # set below after parent has an id
+        title="rollup child",
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "child",
+                "acceptance_evidence": {
+                    "kind": "named_test",
+                    "test_path": declared_test,
+                },
+            }
+        ],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+            # verified merge: review_loop present with no unverified reason.
+            REVIEW_LOOP_KEY: {},
+        },
+    )
+    db_session.add(parent)
+    await db_session.commit()
+    await db_session.refresh(parent)
+    child.parent_task_id = parent.id
+    db_session.add(child)
+    await db_session.commit()
+    await db_session.refresh(child)
+
+    # BEFORE: with no changed-file context the declared test cannot be located,
+    # so the verdict is fail-closed declared_unsatisfied.
+    before = record_code_acceptance_verdict(child)
+    assert before is not None
+    assert before.satisfied is False
+    assert (
+        classify_merged_acceptance_context(child.context)
+        == "declared_unsatisfied"
+    )
+    await db_session.commit()
+
+    # Land-time propagation from the rollup parent.
+    stamped = await _propagate_landed_to_staging_merged_descendants(
+        parent.id, db_session
+    )
+    await db_session.commit()
+    await db_session.refresh(child)
+
+    assert child.id in {t.id for t in stamped}, "child must be stamped as landed"
+
+    child_ctx = child.context or {}
+    # Parent's changed files were inherited, marked parent-derived, and NOT
+    # github-verified (the union diff must not mint a false proof).
+    assert child_ctx.get("_pr_changed_files") == [declared_test, prod_seam]
+    assert child_ctx.get(PARENT_DERIVED_CHANGED_FILES_KEY) is True
+    assert "_pr_changed_files_github_verified" not in child_ctx
+
+    # AFTER: the verdict flips off declared_unsatisfied to the soft
+    # satisfied_unproven tier — satisfied but NOT machine-proven.
+    recorded = child_ctx.get("code_acceptance_verdict")
+    assert recorded is not None
+    assert recorded["satisfied"] is True
+    assert recorded["proven"] is False
+    assert classify_merged_acceptance_context(child_ctx) == "satisfied_unproven"
+
+
+@pytest.mark.asyncio
+async def test_rollup_child_own_changed_files_not_clobbered_by_parent(db_session):
+    """setdefault semantics: a rollup child that carries its OWN self-reported
+    ``_pr_changed_files`` must keep it — the parent-derived propagation must never
+    overwrite a child's authoritative self-report."""
+    from app.rollup_management import _propagate_landed_to_staging_merged_descendants
+    from app.acceptance_gate import (
+        PARENT_DERIVED_CHANGED_FILES_KEY,
+        stamp_changed_files_signal,
+    )
+
+    project = await _make_project(db_session, name="RollupNoClobber")
+
+    parent_ctx = {"pr_merged": True, "landed_on_integration": True}
+    parent_ctx.update(
+        stamp_changed_files_signal(
+            ["backend/app/parent_seam.py", "backend/testing/test_parent_seam.py"],
+            github_verified=True,
+        )
+    )
+    parent = Task(
+        project_id=project.id,
+        title="parent",
+        payloads=[{"type": "research", "prompt": "p"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context=parent_ctx,
+    )
+    db_session.add(parent)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    own_files = ["backend/app/child_seam.py"]
+    child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        title="child-with-own-files",
+        payloads=[{"type": "create", "prompt": "c"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+            "_pr_changed_files": own_files,
+        },
+    )
+    db_session.add(child)
+    await db_session.commit()
+    await db_session.refresh(child)
+
+    await _propagate_landed_to_staging_merged_descendants(parent.id, db_session)
+    await db_session.commit()
+    await db_session.refresh(child)
+
+    child_ctx = child.context or {}
+    assert child_ctx.get("_pr_changed_files") == own_files, (
+        "child's own self-reported changed files must not be clobbered"
+    )
+    assert PARENT_DERIVED_CHANGED_FILES_KEY not in child_ctx
+
+
+@pytest.mark.asyncio
+async def test_reconcile_backfill_stamps_landed_child_changed_files_from_parent(
+    db_session,
+):
+    """Retroactive reconcile stamps a rollup parent's changed files onto
+    already-landed children, flips a stale declared_unsatisfied verdict, and lets
+    the unverified-merge backfill earn criterion evidence in the same run.
+
+    The forward-path propagation only heals NEW landings, so already-landed
+    children (stamped only on the PR-owning parent) stay without
+    ``_pr_changed_files``.  This exercises
+    :func:`ac.backfill_rollup_child_changed_files`:
+
+      1. A VERIFIED-merge child's verdict flips declared_unsatisfied ->
+         satisfied_unproven once the parent's diff is inherited (parent-derived,
+         never github-verified -> never machine-proven).
+      2. An UNVERIFIED-merge child gains the parent's changed-file context so the
+         declared named_test can be located in the diff — clearing the "not among
+         the PR's changed files" declared_unsatisfied cause — and the subsequent
+         unverified-merge backfill records criterion evidence for it.
+      3. Re-running the reconcile is a no-op (setdefault / idempotent).
+    """
+    from app.acceptance_gate import (
+        CODE_ACCEPTANCE_VERDICT_KEY,
+        PARENT_DERIVED_CHANGED_FILES_KEY,
+        classify_merged_acceptance_context,
+        record_code_acceptance_verdict,
+        stamp_changed_files_signal,
+    )
+    from app.landed_signal import REVIEW_LOOP_KEY, UNVERIFIED_MERGE_REASON_KEY
+
+    prod_seam = "backend/app/widgetflow.py"
+    declared_test = "backend/testing/test_widgetflow.py"
+
+    project = await _make_project(db_session, name="ReconcileRollupChild")
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="widgetflow named_test passes",
+        created_by="strategist",
+    )
+
+    # Parent (PR-owning rollup) landed on integration carrying the GitHub-verified
+    # combined diff (a test path + a production seam).
+    parent_ctx = {"pr_merged": True, "landed_on_integration": True}
+    parent_ctx.update(
+        stamp_changed_files_signal([prod_seam, declared_test], github_verified=True)
+    )
+    parent = Task(
+        project_id=project.id,
+        title="rollup parent",
+        payloads=[{"type": "research", "prompt": "rollup"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context=parent_ctx,
+    )
+    db_session.add(parent)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    def _child(context: dict) -> Task:
+        return Task(
+            project_id=project.id,
+            parent_task_id=parent.id,
+            title="rollup child",
+            payloads=[
+                {
+                    "type": "create",
+                    "prompt": "child",
+                    "acceptance_evidence": {
+                        "kind": "named_test",
+                        "test_path": declared_test,
+                    },
+                }
+            ],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            criterion_ids=[criterion.criterion_key],
+            context=context,
+        )
+
+    # Verified-merge child: landed, review_loop present with NO unverified reason.
+    child_verified = _child(
+        {"pr_merged": True, "landed_on_integration": True, REVIEW_LOOP_KEY: {}}
+    )
+    # Unverified-merge child: landed but the merge fell open (unverified reason set).
+    child_unverified = _child(
+        {
+            "pr_merged": True,
+            "landed_on_integration": True,
+            REVIEW_LOOP_KEY: {UNVERIFIED_MERGE_REASON_KEY: "no_detectable_test_command"},
+        }
+    )
+    db_session.add_all([child_verified, child_unverified])
+    await db_session.commit()
+
+    # BEFORE: with no changed-file context both children fail closed as
+    # declared_unsatisfied (the declared test cannot be located in any diff).
+    for c in (child_verified, child_unverified):
+        assert record_code_acceptance_verdict(c) is not None
+        assert (
+            classify_merged_acceptance_context(c.context) == "declared_unsatisfied"
+        )
+    await db_session.commit()
+
+    # Reconcile: stamp the parent's changed files onto both landed children.
+    stamped = await ac.backfill_rollup_child_changed_files(db_session, project.id)
+    assert stamped == 2, "both landed children lacking changed files must be stamped"
+
+    await db_session.refresh(child_verified)
+    await db_session.refresh(child_unverified)
+
+    # Both inherited the parent's diff as PARENT-DERIVED (never github-verified, so
+    # a union-diff match can never mint machine-proven credit).
+    for c in (child_verified, child_unverified):
+        ctx = c.context or {}
+        assert ctx.get("_pr_changed_files") == [prod_seam, declared_test]
+        assert ctx.get(PARENT_DERIVED_CHANGED_FILES_KEY) is True
+        assert "_pr_changed_files_github_verified" not in ctx
+
+    # Verified child: verdict flips off declared_unsatisfied to satisfied_unproven.
+    assert (
+        classify_merged_acceptance_context(child_verified.context)
+        == "satisfied_unproven"
+    )
+
+    # Unverified child: the declared test is now locatable in the diff, so the
+    # "not among the PR's changed files" declared_unsatisfied cause is cleared —
+    # its verdict reason now reflects the unverified merge, not a missing diff.
+    unverified_verdict = (child_unverified.context or {}).get(
+        CODE_ACCEPTANCE_VERDICT_KEY
+    )
+    assert unverified_verdict is not None
+    assert "not among the PR's changed files" not in unverified_verdict["reason"]
+    assert "did not run green" in unverified_verdict["reason"]
+
+    # The unverified-merge backfill now finds a locatable named_test + production
+    # seam and records criterion evidence — the whole point of running the
+    # reconcile BEFORE it in the same endpoint.
+    recorded = await ac.backfill_unverified_merge_evidence(db_session, project.id)
+    assert recorded >= 1, "unverified-merge backfill must credit the stamped child"
+
+    evidence = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    assert any(str(child_unverified.id) == e.source_id for e in evidence), (
+        "backfill evidence must be attributed to the stamped rollup child"
+    )
+
+    # Idempotent: a second reconcile stamps nothing new (setdefault semantics).
+    assert await ac.backfill_rollup_child_changed_files(db_session, project.id) == 0
+
+
+@pytest.mark.asyncio
+async def test_reconcile_backfill_skips_child_without_github_verified_ancestor(
+    db_session,
+):
+    """A landed child whose ancestor carries NO github-verified changed files is
+    left untouched — the reconcile must never fabricate a diff from a
+    non-authoritative parent list."""
+    from app.acceptance_gate import PARENT_DERIVED_CHANGED_FILES_KEY
+
+    project = await _make_project(db_session, name="ReconcileNoVerifiedParent")
+
+    # Parent landed but its changed files are self-reported (NOT github-verified).
+    parent = Task(
+        project_id=project.id,
+        title="parent",
+        payloads=[{"type": "research", "prompt": "rollup"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={
+            "pr_merged": True,
+            "landed_on_integration": True,
+            "_pr_changed_files": ["backend/app/foo.py"],
+        },
+    )
+    db_session.add(parent)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        title="child",
+        payloads=[{"type": "create", "prompt": "child"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={"pr_merged": True, "landed_on_integration": True},
+    )
+    db_session.add(child)
+    await db_session.commit()
+
+    assert await ac.backfill_rollup_child_changed_files(db_session, project.id) == 0
+
+    await db_session.refresh(child)
+    child_ctx = child.context or {}
+    assert "_pr_changed_files" not in child_ctx
+    assert PARENT_DERIVED_CHANGED_FILES_KEY not in child_ctx

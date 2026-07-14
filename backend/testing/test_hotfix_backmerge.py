@@ -23,6 +23,7 @@ from datetime import timedelta
 from unittest.mock import AsyncMock
 
 import pytest
+from fastapi import HTTPException
 from sqlmodel import select
 
 from app import hotfix_backmerge as hb
@@ -219,6 +220,117 @@ async def test_open_backmerge_pr_success_no_hotfix_metadata(db_session, mocker):
 
     assert result["status"] == "merged"
     assert result["pr_url"] == "http://pr/3"
+
+
+# ===========================================================================
+# ALREADY MERGED — merged=False from the merge call, but the PR really landed
+#
+# merge_pull_request collapses two outcomes onto {"merged": False}: a real block
+# AND an already-merged PR (GitHub's merge endpoint 405s once a PR is merged).
+# The second happens for real: the merge PUT lands server-side but its response
+# is lost to a 5xx, _github_request retries, and the retry gets the 405. The
+# blocked classification used to read only ``mergeable_state == "dirty"``, never
+# ``merged`` / ``merged_at`` — so a back-merge that LANDED was reported blocked,
+# with a persistent operator alert, forever.
+# ===========================================================================
+
+
+async def test_open_backmerge_pr_already_merged_pr_is_merged_not_blocked(
+    db_session, mocker
+):
+    """merged=False + PR resource says merged=True ⇒ status 'merged', no alert."""
+    project = await _make_project(db_session)
+    _patch_github(
+        mocker,
+        create_return={"number": 77, "html_url": "http://pr/77"},
+        # What a lost-5xx-then-405-retry actually returns:
+        merge_return={
+            "merged": False,
+            "conflict": False,
+            "message": "Pull Request is not mergeable",
+        },
+    )
+    # The PR resource is authoritative: it landed.
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "merged": True,
+                "merged_at": "2026-07-12T00:00:00Z",
+                "mergeable_state": "unknown",
+                "head": {"sha": "deadbeef"},
+            }
+        ),
+    )
+
+    result = await hb.open_backmerge_pr(db_session, project.id)
+    await db_session.commit()
+
+    assert result["status"] == "merged", (
+        "a back-merge that LANDED was reported blocked — the operator alert that "
+        "follows is false and persists every cycle"
+    )
+    assert result["pr_url"] == "http://pr/77"
+    # No false operator alert, no conflict/CI-fix task.
+    assert await _alerts_for(db_session, project.id) == []
+    assert await _tasks_for(db_session, project.id) == []
+
+
+async def test_open_backmerge_pr_merged_at_only_also_counts_as_merged(
+    db_session, mocker
+):
+    """``merged_at`` alone (no ``merged`` key) is equally authoritative."""
+    project = await _make_project(db_session)
+    _patch_github(
+        mocker,
+        create_return={"number": 78, "html_url": "http://pr/78"},
+        merge_return={"merged": False, "conflict": False, "message": "not mergeable"},
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "merged_at": "2026-07-12T00:00:00Z",
+                "mergeable_state": "clean",
+                "head": {"sha": "deadbeef"},
+            }
+        ),
+    )
+
+    result = await hb.open_backmerge_pr(db_session, project.id)
+    await db_session.commit()
+
+    assert result["status"] == "merged"
+    assert await _alerts_for(db_session, project.id) == []
+
+
+async def test_open_backmerge_pr_unmerged_dirty_pr_still_classified_conflict(
+    db_session, mocker
+):
+    """Regression guard: an unmerged PR that is DIRTY is still a conflict — the
+    already-merged short-circuit must not swallow the real conflict path."""
+    project = await _make_project(db_session)
+    _patch_github(
+        mocker,
+        create_return={"number": 79, "html_url": "http://pr/79"},
+        merge_return={"merged": False, "conflict": False, "message": "not mergeable"},
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "merged": False,
+                "merged_at": None,
+                "mergeable_state": "dirty",
+                "head": {"sha": "deadbeef"},
+            }
+        ),
+    )
+
+    result = await hb.open_backmerge_pr(db_session, project.id)
+    await db_session.commit()
+
+    assert result["status"] == "conflict"
 
 
 # ===========================================================================
@@ -3527,4 +3639,45 @@ async def test_module_size_check_skips_excluded_file_types(
     assert alerts == [], (
         f"Expected no alert for excluded file {filename!r} but got: "
         + ", ".join(a.title for a in alerts)
+    )
+
+
+# ===========================================================================
+# RATE-LIMITED MERGE — the 503 must be RETRYABLE, not a persistent "blocked" alert
+#
+# This is the branch that gives the 500 -> 503 reclassification its teeth. Every
+# OTHER consumer of merge_pull_request catches bare Exception and cannot tell a
+# 503 from a 500, so the status code alone changes nothing anywhere. Here it does:
+# a drained quota bucket means the merge PUT never reached GitHub's merge
+# machinery — the PR is neither merged nor blocked, it just has to be retried.
+# Raising the persistent operator alert would page a human about a transient
+# quota window, and the alert would outlive the next sweep's quiet success.
+# ===========================================================================
+
+
+async def test_rate_limited_merge_is_retryable_not_blocked(db_session, mocker):
+    """A 503 from merge_pull_request => status 'retry', and NO blocked alert."""
+    project = await _make_project(db_session)
+    _patch_github(
+        mocker,
+        create_return={"number": 91, "html_url": "http://pr/91"},
+        merge_side_effect=HTTPException(
+            status_code=503,
+            detail="Cannot merge pull request #91: the GitHub API is rate-limited.",
+            headers={"Retry-After": "42"},
+        ),
+    )
+
+    result = await hb.open_backmerge_pr(db_session, project.id)
+
+    assert result["status"] == "retry", (
+        "a rate-limited merge was never attempted upstream — it must be retried, "
+        "not reported as a hard block"
+    )
+    assert result["error"] == "rate_limited"
+
+    alerts = await _alerts_for(db_session, project.id)
+    assert alerts == [], (
+        "a transient quota exhaustion must NOT raise a persistent operator alert — "
+        "this is the whole point of the 503 reclassification"
     )

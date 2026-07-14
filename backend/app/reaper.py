@@ -44,8 +44,10 @@ from app.models import (
     ArtifactType,
     Project,
     Task,
+    TaskHistory,
     TaskStatus,
     VmContact,
+    TaskContact,
     bank_task_current_attempt,
 )
 from app.compute import (
@@ -190,6 +192,7 @@ from app.reaper_orphan_classify import (
     _select_orphans_for_cycle,
     _vm_contact_within_cutoff,  # noqa: F401
     _vm_tool_use_within_cutoff,  # noqa: F401
+    _is_multiplexed_vm_id,
     _classify_orphan,
     _HEARTBEAT_STALE_DEFAULTS,  # noqa: F401
     _HEARTBEAT_EFFORT_FLOORS,  # noqa: F401
@@ -200,6 +203,7 @@ from app.reaper_orphan_classify import (
     _progress_stale_cutoff,
     _preclaim_stale_cutoff,  # noqa: F401
     _heartbeat_stale_cutoff,
+    _build_runner_report_lookup,
     _extract_tool_trace_tail,
     _task_has_open_pr,  # noqa: F401
 )
@@ -295,7 +299,10 @@ from app.reaper_sweeps import (
     sweep_wake_delivery_stall_alerts,
     sweep_orphaned_cross_base_children,
     sweep_metrics_integrity,
+    sweep_capability_backing_proofs,
     sweep_closed_handmerge_prs,
+    sweep_protect_referenced_compute_image_digests,
+    sweep_proof_earn_loop,
     _sweep_strategic_cycle_starvation,
 )
 from app.acceptance_gate import backfill_acceptance_verdicts
@@ -339,6 +346,36 @@ async def _mark_landed_parent_dependents(parent_id, session) -> None:
         logger.warning(
             f"[REAPER] Dependent warm-claim marking failed for parent {parent_id}: {e}",
         )
+
+
+def _record_reap_reason_history(
+    session,
+    task_id,
+    *,
+    reap_reason: str,
+    reap_reason_code: str,
+    vm_instance_id: str | None = None,
+) -> None:
+    """Append a durable TaskHistory row carrying WHY the reaper acted.
+
+    ``reap_reason`` otherwise lives only in mutable channels
+    (``latest_status_message``, context meta) that the NEXT reap or status
+    update overwrites — a task reaped three times keeps only the last reason.
+    Mirrors ``compute_jobs._record_terminal_reason_history``: add-only
+    (``session.add``); the caller owns the commit alongside the reap mutation
+    itself, so an aborted iteration rolls the row back with it.
+    """
+    session.add(
+        TaskHistory(
+            task_id=task_id,
+            action="REAPED",
+            details={
+                "reap_reason": reap_reason,
+                "code": reap_reason_code,
+                "vm_instance_id": vm_instance_id,
+            },
+        )
+    )
 
 
 async def reaper_service():
@@ -490,6 +527,56 @@ async def reaper_service():
                         for vm_id, _last_contact, last_tool in contact_rows
                         if last_tool is not None
                     }
+                # Multiplexed-runner fix: the two maps above are keyed on
+                # ``vm_instance_id``, which is only one-row-per-TASK on GCE. A fleet
+                # runner multiplexes many tasks onto one ``runner:<id>`` vm id, so
+                # ANY agent's heartbeat advances the shared row and a hung agent
+                # beside a working sibling never reads as stalled (2026-07-12 zombie
+                # class). Batch-fetch the TASK-scoped ``taskcontact`` rows for the
+                # SAME candidates; _classify_orphan reads these instead of the
+                # vm-keyed maps for ``runner:`` vm ids and keeps using the vm-keyed
+                # maps for GCE. ``last_contact_at`` is NOT NULL, so presence in
+                # task_contact_lookup is the "row exists" oracle that lets an ABSENT
+                # row (pre-rollout) fall back to the old behaviour while a PRESENT
+                # row with a NULL/stale tool stamp correctly reaps.
+                task_contact_lookup: dict[str, datetime] = {}
+                task_tool_use_lookup: dict[str, datetime] = {}
+                # Only ``runner:`` tasks: _classify_orphan consults the task-scoped
+                # row solely when _is_multiplexed_vm_id(task) is True, so fetching
+                # rows for GCE tasks (1 task per VM — their vmcontact row already IS
+                # the task's row) would load rows nothing ever reads.
+                candidate_task_ids = [
+                    t.id
+                    for t in active_tasks
+                    if t.vm_instance_id and _is_multiplexed_vm_id(t)
+                ]
+                if candidate_task_ids:
+                    task_contact_rows = (
+                        await session.execute(
+                            select(
+                                TaskContact.task_id,
+                                TaskContact.last_contact_at,
+                                TaskContact.last_tool_use_at,
+                            ).where(TaskContact.task_id.in_(candidate_task_ids))
+                        )
+                    ).all()
+                    task_contact_lookup = {
+                        str(task_id): last_contact
+                        for task_id, last_contact, _last_tool in task_contact_rows
+                        if last_contact is not None
+                    }
+                    task_tool_use_lookup = {
+                        str(task_id): last_tool
+                        for task_id, _last_contact, last_tool in task_contact_rows
+                        if last_tool is not None
+                    }
+                # Fleet-runner self-reports: defeats the shared-VmContact
+                # suppression for a task whose OWN runner freshly reports it is
+                # no longer running it (zombie tasks on busy runners; see
+                # _runner_report_excludes_task). Batch-fetched once per sweep.
+                runner_report_lookup = await _build_runner_report_lookup(
+                    session, candidate_vm_ids
+                )
 
                 # State-machine invariants after the clock-separation fix:
                 #   - vm_provisioned_at: written by orchestrator when the VM is dispatched
@@ -520,6 +607,9 @@ async def reaper_service():
                         has_open_pr=has_pr,
                         vm_contact_lookup=vm_contact_lookup,
                         vm_tool_use_lookup=vm_tool_use_lookup,
+                        runner_report_lookup=runner_report_lookup,
+                        task_contact_lookup=task_contact_lookup,
+                        task_tool_use_lookup=task_tool_use_lookup,
                     ):
                         continue
                     orphaned_ids.append(task.id)
@@ -668,6 +758,47 @@ async def reaper_service():
                             for vm_id, _last_contact, last_tool in step2_contact_rows
                             if last_tool is not None
                         }
+                    # Re-fetch the TASK-scoped rows with the refreshed clock too:
+                    # a heartbeat from THIS task that landed during lock acquisition
+                    # must abort the reap, mirroring the vm_contact re-fetch above.
+                    # Without this the Step-2 re-verify would see no task-scoped row
+                    # and fall back to the shared (sibling-fed) vm row.
+                    # Same ``runner:``-only filter as the Step-1 fetch above.
+                    step2_task_ids = [
+                        t.id
+                        for t in orphaned_tasks
+                        if t.vm_instance_id and _is_multiplexed_vm_id(t)
+                    ]
+                    step2_task_contact_lookup: dict[str, datetime] = {}
+                    step2_task_tool_use_lookup: dict[str, datetime] = {}
+                    if step2_task_ids:
+                        step2_task_rows = (
+                            await session.execute(
+                                select(
+                                    TaskContact.task_id,
+                                    TaskContact.last_contact_at,
+                                    TaskContact.last_tool_use_at,
+                                ).where(TaskContact.task_id.in_(step2_task_ids))
+                            )
+                        ).all()
+                        step2_task_contact_lookup = {
+                            str(task_id): last_contact
+                            for task_id, last_contact, _last_tool in step2_task_rows
+                            if last_contact is not None
+                        }
+                        step2_task_tool_use_lookup = {
+                            str(task_id): last_tool
+                            for task_id, _last_contact, last_tool in step2_task_rows
+                            if last_tool is not None
+                        }
+                    # Re-fetch the runner self-reports with the refreshed clock
+                    # too: a runner heartbeat that landed during lock
+                    # acquisition and now INCLUDES the task (e.g. the claim
+                    # raced Step 1) must abort the reap, mirroring the
+                    # vm_contact re-fetch above.
+                    step2_runner_report_lookup = await _build_runner_report_lookup(
+                        session, step2_vm_ids
+                    )
                     verified = [
                         t
                         for t in orphaned_tasks
@@ -677,6 +808,9 @@ async def reaper_service():
                             has_open_pr=(t.id in tasks_with_pr),
                             vm_contact_lookup=step2_contact_lookup,
                             vm_tool_use_lookup=step2_tool_use_lookup,
+                            runner_report_lookup=step2_runner_report_lookup,
+                            task_contact_lookup=step2_task_contact_lookup,
+                            task_tool_use_lookup=step2_task_tool_use_lookup,
                         )
                     ]
                     orphaned_tasks = verified
@@ -1203,6 +1337,44 @@ async def reaper_service():
                             if reap_reason_code in _HEARTBEAT_STALE_REAP_CODES
                             else None
                         )
+                        # Shared-VmContact zombie mask at the relock stage: every
+                        # task on a fleet runner shares vm_instance_id
+                        # 'runner:<id>' and therefore ONE vmcontact row, so a live
+                        # sibling's heartbeat keeps last_contact_at fresh and the
+                        # relock's contact check un-reaps a dead task on EVERY
+                        # cycle — silently undoing the Step-1/Step-2
+                        # classification that #14413 taught to see through the
+                        # mask. Give the relock the same runner self-report
+                        # override. Re-fetched HERE (not reused from Step 2)
+                        # because the unlocked external-I/O window above can span
+                        # 30-120s: the report's own freshness is gated against the
+                        # liveness cutoff, so a Step-2 snapshot could read as
+                        # "stale runner" purely from I/O latency and fail-safe
+                        # back into the mask. Cheap: _build_runner_report_lookup
+                        # issues NO query for a non-'runner:' vm id.
+                        _relock_runner_report_lookup: dict = {}
+                        if (
+                            _relock_liveness_cutoff is not None
+                            and fresh_task.vm_instance_id
+                        ):
+                            try:
+                                _relock_runner_report_lookup = (
+                                    await _build_runner_report_lookup(
+                                        session, {fresh_task.vm_instance_id}
+                                    )
+                                )
+                            except Exception as _rr_exc:  # noqa: BLE001
+                                # The pre-try `{}` binding still stands (the
+                                # assignment above only binds on success), so the
+                                # relock falls back to vm_contact suppression.
+                                logger.warning(
+                                    "[REAPER] runner self-report fetch failed for "
+                                    "task %s vm=%s (non-fatal, relock falls back "
+                                    "to vm_contact suppression): %s",
+                                    task.id,
+                                    fresh_task.vm_instance_id,
+                                    _rr_exc,
+                                )
                         relocked = await _relock_orphan_task(
                             session,
                             task.id,
@@ -1210,6 +1382,7 @@ async def reaper_service():
                             pre_io_status,
                             pre_io_last_hb,
                             vm_liveness_cutoff=_relock_liveness_cutoff,
+                            runner_report_lookup=_relock_runner_report_lookup,
                         )
                         if relocked is None:
                             # Peer is finalizing this task or agent revived; skip safely.
@@ -1219,6 +1392,19 @@ async def reaper_service():
                             continue
                         task = relocked
                         fresh_task = relocked
+
+                        # Durable reason trail: the reap is now committed-to (the
+                        # relock confirmed no peer/revival), so record WHY before
+                        # any branch below (retry, requeue, PR handoff, terminal
+                        # fail) overwrites the mutable status message. Rides the
+                        # same commit as the reap mutation itself.
+                        _record_reap_reason_history(
+                            session,
+                            task.id,
+                            reap_reason=reap_reason,
+                            reap_reason_code=reap_reason_code,
+                            vm_instance_id=fresh_task.vm_instance_id,
+                        )
 
                         # Apply the in-memory account-slot release marker. Re-check
                         # the flag from the FRESH (post-relock) context to avoid a
@@ -1235,7 +1421,10 @@ async def reaper_service():
                             and not _slot_already_released
                             and not _slot_now_released
                         ):
-                            await release_max_plan_account(acct_id)
+                            await release_max_plan_account(
+                                acct_id,
+                                project_id=str(task.project_id) if task.project_id else None,
+                            )
                             task.context = {
                                 **(task.context or {}),
                                 "_slot_released": True,
@@ -2367,6 +2556,15 @@ async def reaper_service():
                                             )
                                         )
                                         _qsession.add(_qtask)
+                                        # Snapshot the branch scalar into a plain
+                                        # local BEFORE commit: _qsession.commit()
+                                        # expires _qtask, so the post-commit
+                                        # `_qtask.first_payload` read would lazy-load
+                                        # from async context and raise MissingGreenlet
+                                        # on asyncpg.
+                                        _qtask_payload_type = (
+                                            _qtask.first_payload or {}
+                                        ).get("type")
                                         await _qsession.commit()
                                         logger.exception(
                                             "[REAPER] Task %s quarantined after %d "
@@ -2380,13 +2578,16 @@ async def reaper_service():
                                         # else orig.requires_approval is stranded
                                         # forever. Runs on the same freshly-committed
                                         # _qsession; no-ops for non-safeguard tasks.
-                                        if (_qtask.first_payload or {}).get(
-                                            "type"
-                                        ) == "security_audit":
+                                        if _qtask_payload_type == "security_audit":
                                             from app.task_completion import (
                                                 _maybe_release_safeguard_gate,
                                             )
 
+                                            # Re-load the just-committed row so the
+                                            # gate helper reads live (non-expired) ORM
+                                            # state (it accesses _qtask.context)
+                                            # instead of lazy-loading post-commit.
+                                            await _qsession.refresh(_qtask)
                                             await _maybe_release_safeguard_gate(
                                                 _qtask, None, _qsession
                                             )
@@ -2905,6 +3106,56 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(
                         f"[REAPER] Backfill-acceptance-verdicts sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 22: Capability backing-proof sweep — record backing_path
+                # proof for working capabilities whose declared backing_paths all
+                # resolve at HEAD. Hourly cadence-gated. This is a PRODUCER (writes
+                # proof records), NOT an auditor — it creates evidence for capabilities
+                # that already meet the bar rather than flagging those that don't.
+                # Wrapped so it can never crash the cycle.
+                _mark_reaper_progress()
+                try:
+                    await sweep_capability_backing_proofs(session, now)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Capability backing-proof sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 22b: Proof-earn loop — commission proof for demanded unproven
+                # working capabilities.  Computes the intersection of demanded
+                # capabilities (from the missing-foundation demand signal) and unproven
+                # working capabilities, then attempts to earn proof via backing-path
+                # verification.  Shares the hourly cadence of Step 22.
+                _mark_reaper_progress()
+                try:
+                    await sweep_proof_earn_loop(session, now)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Proof-earn loop error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 22c: Compute-image GC guard — stamp durable ``inuse-`` tags
+                # on registry digests a live/recent compute job still depends on
+                # so purely time/count-based registry retention can't reclaim an
+                # image out from under a running experiment or a recent result's
+                # provenance. Hourly cadence-gated on an independent timer.
+                # Wrapped so it can never crash the cycle; registry I/O fails open.
+                _mark_reaper_progress()
+                try:
+                    await sweep_protect_referenced_compute_image_digests(session, now)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Compute-image GC guard sweep error: {e}",
                         exc_info=True,
                     )
                     with contextlib.suppress(Exception):

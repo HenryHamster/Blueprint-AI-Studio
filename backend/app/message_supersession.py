@@ -286,9 +286,6 @@ async def supersede_stale_messages_on_version_close(
         return summary
 
     # enforce: stamp each eligible message resolved.
-    from app.project_message_projection import message_updated_event_payload
-
-    broadcasts: list[tuple[str, dict]] = []
     for msg in eligible:
         msg.status = "resolved"
         msg.resolution = resolution
@@ -301,11 +298,26 @@ async def supersede_stale_messages_on_version_close(
         }
         msg.context = ctx
         session.add(msg)
-        broadcasts.append((str(msg.project_id), message_updated_event_payload(msg)))
 
     summary["acted"] = bool(eligible)
     summary["superseded"] = len(eligible)
-    summary["broadcasts"] = broadcasts
+    # Emit ONE aggregate broadcast instead of N individual message_updated events.
+    # Each individual broadcast would fire a live notification for every resolved
+    # message — with up to message_supersession_max_resolve (default 500) messages
+    # per version close, that's a broadcast storm. The frontend only needs to know
+    # that some messages changed so it can re-fetch; a single summary event suffices.
+    if eligible:
+        summary["broadcasts"] = [
+            (
+                str(project_id),
+                {
+                    "count": len(eligible),
+                    "version_number": closed_version_number,
+                    "terminal_status": terminal_status,
+                    "message_ids": [str(msg.id) for msg in eligible],
+                },
+            )
+        ]
     if eligible:
         logger.info(
             "[MSG_SUPERSEDE] enforce: auto-superseded %d open message(s) on v%d "
@@ -353,13 +365,18 @@ async def run_supersession_on_version_close(
             broadcasts = summary.get("broadcasts") or []
             if summary.get("acted"):
                 await _session.commit()
+            # broadcasts contains at most ONE aggregate entry (pid, summary_payload);
+            # emit it as messages_superseded rather than N individual message_updated
+            # events to avoid a broadcast storm on large stale backlogs.
             for pid, payload in broadcasts:
                 try:
-                    await broadcast_to_project(pid, "message_updated", payload)
+                    await broadcast_to_project(pid, "messages_superseded", payload)
                 except Exception as _bcast_err:  # noqa: BLE001, PERF203
                     logger.warning(
-                        "[MSG_SUPERSEDE] broadcast failed for message %s: %s",
-                        payload.get("message_id"),
+                        "[MSG_SUPERSEDE] aggregate broadcast failed for %d superseded "
+                        "message(s) on v%d: %s",
+                        payload.get("count", 0),
+                        closed_version_number,
                         _bcast_err,
                     )
             return summary

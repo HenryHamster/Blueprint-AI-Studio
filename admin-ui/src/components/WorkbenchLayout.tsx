@@ -158,30 +158,6 @@ export function WorkbenchPanel({
   );
 }
 
-export function WorkbenchMetric({
-  label,
-  value,
-  tone = 'neutral',
-}: {
-  label: string;
-  value: ReactNode;
-  tone?: 'neutral' | 'good' | 'warn' | 'bad' | 'info';
-}) {
-  const toneClass = {
-    neutral: 'text-neutral-100',
-    good: 'text-emerald-300',
-    warn: 'text-amber-300',
-    bad: 'text-red-300',
-    info: 'text-cyan-300',
-  }[tone];
-  return (
-    <div className="workbench-card rounded-md border px-2.5 py-1.5">
-      <div className="text-ui-md uppercase tracking-wide text-neutral-500">{label}</div>
-      <div className={`mt-1 text-lg font-semibold ${toneClass}`}>{value}</div>
-    </div>
-  );
-}
-
 export function WorkbenchStatusBar({
   left,
   right,

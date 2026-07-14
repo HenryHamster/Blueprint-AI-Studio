@@ -896,11 +896,30 @@ ${playbookKeys.length > 0 ? `Playbook entries available (use \`./playbook get <k
   // cloud normally).
   let localRunnerNote = '';
   const localRunnerStatus = payload.local_runner_status as
-    { ever_registered?: boolean; active_total?: number; active_gpu?: number } | undefined;
+    { ever_registered?: boolean; active_total?: number; active_gpu?: number; devices?: Array<Record<string, unknown>> } | undefined;
   if (localRunnerStatus && typeof localRunnerStatus === 'object' && !Array.isArray(localRunnerStatus)) {
     const activeGpu = typeof localRunnerStatus.active_gpu === 'number' ? localRunnerStatus.active_gpu : 0;
     if (activeGpu > 0) {
       localRunnerNote = `\n    Local GPU available: ${activeGpu} live GPU-capable runner(s) registered for this project. GPU compute_experiments will run on operator-owned hardware (free) rather than billable cloud GPU — prefer authoring GPU experiments now while a runner is live.`;
+      // Bounded per-device summary (when the backend advertises it) so authored
+      // experiments are sized to the hardware that will actually run them.
+      const devices: unknown[] = Array.isArray(localRunnerStatus.devices) ? localRunnerStatus.devices : [];
+      const deviceBits = devices.slice(0, 8).map((entry) => {
+        if (!entry || typeof entry !== 'object') return '';
+        const d = entry as Record<string, unknown>;
+        const name = typeof d.runner_name === 'string' && d.runner_name ? d.runner_name : 'runner';
+        const gpuCount = typeof d.gpu_count === 'number' ? d.gpu_count : 0;
+        const models = Array.isArray(d.gpu_models) ? (d.gpu_models as unknown[]).filter((m) => typeof m === 'string').join('/') : '';
+        const vramVals = Array.isArray(d.gpu_vram_mib)
+          ? (d.gpu_vram_mib as unknown[]).filter((v): v is number => typeof v === 'number' && v > 0)
+          : [];
+        const vram = vramVals.length > 0 ? ` ${Math.min(...vramVals)} MiB/GPU` : '';
+        const containers = d.container_ok === true ? 'containers OK' : 'NO container runtime';
+        return `${name}: ${gpuCount}x GPU${models ? ` (${models})` : ''}${vram}, ${containers}`;
+      }).filter((b) => b !== '');
+      if (deviceBits.length > 0) {
+        localRunnerNote += ` Devices: ${deviceBits.join('; ')}. Size any GPU experiment to fit the listed VRAM and only use container_image on a device with a container runtime.`;
+      }
     } else if (localRunnerStatus.ever_registered) {
       localRunnerNote = `\n    This project relies on operator-owned local GPU hardware which is CURRENTLY OFFLINE (0 live GPU runners). Do NOT author GPU compute_experiment findings right now — with no live runner they fall back to BILLABLE cloud GPU. Defer GPU experiments until a runner is live (or author CPU-only work).`;
     }
@@ -909,7 +928,12 @@ ${playbookKeys.length > 0 ? `Playbook entries available (use \`./playbook get <k
   const researchRetryContext = buildRetryContext(task);
   const researchFirstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
   const researchEmptyRepoGuidance = buildEmptyRepoGuidance(task);
-  const researchPrompt = `${contextPrefix}${researchPlaybookSection}${researchRetryContext}You are a codebase research agent inside an autonomous AI coding system. Your findings spawn implementing agents, get reviewed, and merge as PRs.
+  // Prompt-cache prefix stability: the stable, reusable guidance body leads so
+  // identical instruction text forms a cacheable prefix across turns. The
+  // task-variable / retry-variable sections (codebaseSummary, contextPrefix,
+  // playbook, retry) are relocated below into the CODEBASE CONTEXT region — same
+  // rendered content, order-only change — so they no longer poison the prefix.
+  const researchPrompt = `You are a codebase research agent inside an autonomous AI coding system. Your findings spawn implementing agents, get reviewed, and merge as PRs.
 
 # MISSION
 
@@ -945,7 +969,7 @@ additional structural refinement. Don't re-propose foundations that are already 
 
 # CODEBASE CONTEXT
 
-${codebaseSummary}${fileTreeSection}${gitHistorySection}
+${codebaseSummary}${contextPrefix}${researchPlaybookSection}${researchRetryContext}${fileTreeSection}${gitHistorySection}
 ${designDocHighlight}${designDocSection}${systemVerificationSection}${capabilityVerificationSection}${researchAvailableCapabilitiesSection}# DIRECTIONS
 ${userPrompt ? `Research focus: ${userPrompt}\n\n` : ''}${directionsText}${crossDirSection}
 ${priorKnowledgeSection}${pipelineScopeRatesSection}${anomalySection}
@@ -1053,6 +1077,13 @@ ALSO write /tmp/research_progress_${taskId}.md ${READ_ONLY_BASH_WRITE_NOTE} — 
     measured. Put the launch fields either flat on the finding or nested under a
     \`compute_experiment\` object. Above a configured spend threshold the launch holds for operator
     approval; below it, it runs autonomously.
+    \`dependency pinning\` (REQUIRED when \`command\` or \`setup_step\` does any package install):
+    PIN every version explicitly — e.g. \`pip install jax==0.4.28 brax==0.10.3\` — NEVER install
+    latest. Unpinned installs break on upstream drift: concrete failure — \`brax\` (unmaintained)
+    imports \`jax.device_put_replicated\`, removed in a later \`jax\` release, hard-failing at
+    import with no change to your code. This applies to every dependency. Pin the version you
+    smoke-tested; run \`pip show <pkg>\` or \`pip index versions <pkg>\` during your smoke to
+    find it if you do not know the current pinnable version.
     \`smoke_sample\` (REQUIRED on every compute_experiment finding): BEFORE writing this
     finding to the output file, smoke-test the command using Bash to confirm it works on this VM.
     Run a short/capped variant (≤30 seconds), for example:
@@ -1133,7 +1164,7 @@ implementation findings. Add metadata alongside them when relevant.
 
 **prerequisite** (optional, default null): Declare a FOUNDATION this finding depends on that is being (or was) built OUTSIDE this batch — an earlier or concurrently-in-flight cycle, or a named capability. Shape: \`{"kind": "task", "ref": "<task-id or finding-hash>"}\` to gate on a specific in-flight/queued task, or \`{"kind": "capability", "ref": "<capability-name>"}\` to gate on whichever task advertises that capability. For a capability ref, DRAW THE NAME from the AVAILABLE CAPABILITIES vocabulary above so it resolves to the registry's canonical string (the matcher is EXACT, never fuzzy). When it resolves to a real foundation the dependent is structurally gated (depends_on edge) so it does not run against a base missing the foundation or duplicate it; when it does not resolve the dependent enters a BLOCKED state with the unmet prerequisite recorded as a machine-resolvable need, and is resumed when the foundation appears or escalated to the operator after a timeout. Use ONLY for cross-cycle / cross-batch foundations or named capabilities — for ordering findings WITHIN this batch, use depends_on_indices instead (NOT prerequisite). Omit (or null) when there is no external foundation.
 
-**compute_experiment** (optional, default null): Present ONLY on a compute_experiment/measurement/benchmark finding — the launch contract for the budgeted compute job. Required keys \`command\`, \`spend_cap_usd\` (positive), \`deadline_seconds\` (positive); optional \`success_criterion\` (numeric metric/operator/threshold goal) and benchmark metadata (\`machine_type\`, \`accelerator\`, \`experiment\`, \`benchmark\`, \`metric\`, \`cwd\`, \`env\`). The \`accelerator\` field (one of \`T4\`, \`L4\`, \`V100\`) is **sufficient on its own** to request a single GPU — you do NOT need to specify \`machine_type\` when requesting a single GPU by accelerator name; the system resolves the correct GPU machine type automatically. Optional \`container_image\`: runs \`command\` INSIDE the given docker image (e.g. an NVIDIA NGC image such as \`nvcr.io/nvidia/tensorflow:25.01\`) — REQUIRED when the experiment needs a runtime the repo cannot \`pip install\` natively, e.g. a CUDA/cuDNN/framework stack; without it the command runs BARE and dies with ModuleNotFoundError. Optional \`setup_step\`: runs as bare \`bash -lc\` on the HOST, BEFORE and OUTSIDE the container — use it ONLY for host-level pre-container prep. Anything that needs the container's environment (pip installs into the experiment's interpreter, importing the container's libraries) MUST go in \`command\`, NOT \`setup_step\`. Omit entirely on non-experiment findings.
+**compute_experiment** (optional, default null): Present ONLY on a compute_experiment/measurement/benchmark finding — the launch contract for the budgeted compute job. Required keys \`command\`, \`spend_cap_usd\` (positive), \`deadline_seconds\` (positive); optional \`success_criterion\` (numeric metric/operator/threshold goal) and benchmark metadata (\`machine_type\`, \`accelerator\`, \`experiment\`, \`benchmark\`, \`metric\`, \`cwd\`, \`env\`). The \`accelerator\` field (one of \`T4\`, \`L4\`, \`V100\`) is **sufficient on its own** to request a single GPU — you do NOT need to specify \`machine_type\` when requesting a single GPU by accelerator name; the system resolves the correct GPU machine type automatically. Optional \`container_image\`: runs \`command\` INSIDE the given docker image (e.g. an NVIDIA NGC image such as \`nvcr.io/nvidia/tensorflow:25.01\`) — REQUIRED when the experiment needs a runtime the repo cannot \`pip install\` natively, e.g. a CUDA/cuDNN/framework stack; without it the command runs BARE and dies with ModuleNotFoundError. Optional \`setup_step\`: runs as bare \`bash -lc\` on the HOST, BEFORE and OUTSIDE the container — use it ONLY for host-level pre-container prep. Anything that needs the container's environment (pip installs into the experiment's interpreter, importing the container's libraries) MUST go in \`command\`, NOT \`setup_step\`. **Dependency pinning (REQUIRED):** any \`pip install\` in \`command\` or \`setup_step\` MUST pin every package version explicitly (e.g. \`pip install jax==0.4.28 brax==0.10.3\`); never install latest — upstream drift silently breaks experiments at import time (e.g. \`brax\` importing a \`jax\` symbol removed in a later release). Omit entirely on non-experiment findings.
 
 **provides_capability** (optional, default null): A short kebab-case capability name this finding's task advertises (e.g. "<feature>-core"), so a sibling finding (or another lane) declaring \`{"kind": "capability", "ref": "<feature>-core"}\` can depend on it. DRAW THE NAME from the AVAILABLE CAPABILITIES vocabulary above when one fits; propose a NEW kebab-case name (same convention) ONLY for a genuinely new capability not already listed. Omit unless another task needs to gate on this one by capability. ${CAPABILITY_DECLARATION_DOC}
 
@@ -1232,6 +1263,7 @@ export {
   buildUserPausedSection,
   QUALIFICATION_STATE_VOCAB,
   buildVersionPhaseSection,
+  formatCriteriaRubric,
   buildMemoCitationsSection,
   resolveMemoHandles,
   buildEfficiencySnapshotSection,

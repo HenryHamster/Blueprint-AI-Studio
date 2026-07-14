@@ -1283,3 +1283,331 @@ describe('KnowledgeBrowser — live proof release evidence', () => {
     expect((host as HTMLDivElement).textContent).toContain('GPU no-proof benchmark');
   });
 });
+
+describe('KnowledgeBrowser — compute run provenance detail', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+
+  afterEach(() => {
+    const r = root;
+    if (r) {
+      act(() => { r.unmount(); });
+      root = null;
+    }
+    if (host) { host.remove(); host = null; }
+    vi.resetAllMocks();
+  });
+
+  async function renderAndOpenDoc(doc: typeof computeDoc & { forward_quality_verdict?: unknown }) {
+    const { fetchKnowledgeDocuments, fetchKnowledgeDocument } = await import('../api');
+    vi.mocked(fetchKnowledgeDocuments).mockResolvedValue({ documents: [doc] as never, total: 1, limit: 50, offset: 0 });
+    vi.mocked(fetchKnowledgeDocument).mockResolvedValue({ ...doc, body: '# Body' } as never);
+
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<KnowledgeBrowser selectedProjectId="project-test" onClose={() => {}} />);
+    });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+    const docButton = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+      b => b.textContent?.includes(doc.title),
+    );
+    if (!docButton) throw new Error('expected document button');
+    await act(async () => { (docButton as HTMLElement).click(); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+  }
+
+  test('renders run provenance with operator-hardware label and truncated runner id for local-subprocess', async () => {
+    const docWithProvenance = {
+      ...computeDoc,
+      id: 'doc-provenance-1',
+      title: 'GPU benchmark with provenance',
+      evidence_tier: 'covered' as const,
+      forward_quality_verdict: {
+        ...computeDoc.forward_quality_verdict,
+        terminal_diagnostics: {
+          executing_backend: 'local-subprocess',
+          runner_target_id: 'abc12345xyz99999',
+        },
+      },
+    };
+    await renderAndOpenDoc(docWithProvenance);
+    const text = (host as HTMLDivElement).textContent ?? '';
+    expect(text).toContain('Run provenance');
+    expect(text).toContain('Machine verified');
+    expect(text).toContain('Operator hardware');
+    expect(text).toContain('abc12345');
+    expect(text).not.toContain('abc12345xyz');
+  });
+
+  test('renders GPU label for local-gpu backend', async () => {
+    const docWithGpu = {
+      ...computeDoc,
+      id: 'doc-provenance-gpu',
+      title: 'GPU experiment with gpu backend',
+      evidence_tier: 'covered' as const,
+      forward_quality_verdict: {
+        ...computeDoc.forward_quality_verdict,
+        terminal_diagnostics: {
+          executing_backend: 'local-gpu',
+          runner_target_id: 'gpu-runner-0001',
+        },
+      },
+    };
+    await renderAndOpenDoc(docWithGpu);
+    const text = (host as HTMLDivElement).textContent ?? '';
+    expect(text).toContain('Machine verified');
+    expect(text).toContain('Operator hardware · GPU');
+    expect(text).toContain('gpu-runn');
+  });
+
+  test('renders GCP label for gcp backend', async () => {
+    const docWithGcp = {
+      ...computeDoc,
+      id: 'doc-provenance-gcp',
+      title: 'Cloud experiment with gcp backend',
+      evidence_tier: 'attested' as const,
+      forward_quality_verdict: {
+        ...computeDoc.forward_quality_verdict,
+        terminal_diagnostics: {
+          executing_backend: 'gcp',
+          runner_target_id: null,
+        },
+      },
+    };
+    await renderAndOpenDoc(docWithGcp);
+    const text = (host as HTMLDivElement).textContent ?? '';
+    expect(text).toContain('Run provenance');
+    expect(text).toContain('GCP cloud');
+    expect(text).toContain('Attested');
+    expect(text).not.toContain('Machine-verified');
+    expect(text).not.toContain('Machine verified');
+  });
+
+  test('does not render duplicate Machine-verified badge when criterion_met=true and evidence_tier=attested', async () => {
+    // A cloud run where criterion_met=true but evidence_tier=attested should show
+    // "Attested" from EvidenceTierBadge — never the old hardcoded "Machine-verified" label.
+    const docCloudCriterionMet = {
+      ...computeDoc,
+      id: 'doc-provenance-cloud-criterion-met',
+      title: 'Cloud experiment criterion met but attested tier',
+      criterion_met: true,
+      evidence_tier: 'attested' as const,
+      forward_quality_verdict: {
+        ...computeDoc.forward_quality_verdict,
+        terminal_diagnostics: {
+          executing_backend: 'gcp',
+          runner_target_id: 'cloud-runner-xyz',
+        },
+      },
+    };
+    await renderAndOpenDoc(docCloudCriterionMet);
+    const text = (host as HTMLDivElement).textContent ?? '';
+    expect(text).toContain('Run provenance');
+    expect(text).toContain('Attested');
+    expect(text).not.toContain('Machine-verified');
+    expect(text).not.toContain('Machine verified');
+  });
+
+  test('renders no run provenance panel when terminal_diagnostics is absent', async () => {
+    const docWithoutProvenance = {
+      ...computeDoc,
+      id: 'doc-no-provenance',
+      title: 'GPU benchmark without provenance',
+      forward_quality_verdict: {
+        ...computeDoc.forward_quality_verdict,
+        // no terminal_diagnostics
+      },
+    };
+    await renderAndOpenDoc(docWithoutProvenance);
+    const text = (host as HTMLDivElement).textContent ?? '';
+    expect(text).not.toContain('Run provenance');
+  });
+
+  test('renders no run provenance panel when forward_quality_verdict is null', async () => {
+    const docNullVerdict = {
+      ...computeDoc,
+      id: 'doc-null-verdict',
+      title: 'GPU benchmark null verdict',
+      forward_quality_verdict: null,
+    };
+    await renderAndOpenDoc(docNullVerdict as never);
+    const text = (host as HTMLDivElement).textContent ?? '';
+    expect(text).not.toContain('Run provenance');
+  });
+});
+
+describe('KnowledgeBrowser — renders execution-location badge on compute_experiment list card', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+
+  afterEach(() => {
+    const r = root;
+    if (r) {
+      act(() => { r.unmount(); });
+      root = null;
+    }
+    if (host) { host.remove(); host = null; }
+  });
+
+  async function renderListWithDoc(doc: typeof computeDoc & { forward_quality_verdict?: unknown }) {
+    const { fetchKnowledgeDocuments } = await import('../api');
+    vi.mocked(fetchKnowledgeDocuments).mockResolvedValue({ documents: [doc] as never, total: 1, limit: 50, offset: 0 });
+
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<KnowledgeBrowser selectedProjectId="project-test" onClose={() => {}} />);
+    });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+
+    return Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+      b => b.textContent?.includes(doc.title),
+    ) as HTMLElement | undefined;
+  }
+
+  test('renders Operator hardware badge in list card for local-subprocess backend', async () => {
+    const doc = {
+      ...computeDoc,
+      id: 'doc-loc-badge-local',
+      title: 'Local subprocess execution doc',
+      forward_quality_verdict: {
+        ...computeDoc.forward_quality_verdict,
+        terminal_diagnostics: { executing_backend: 'local-subprocess' },
+      },
+    };
+    const card = await renderListWithDoc(doc);
+    expect(card).toBeTruthy();
+    expect(card?.textContent).toContain('Operator hardware');
+  });
+
+  test('renders cloud label in list card for gcp backend', async () => {
+    const doc = {
+      ...computeDoc,
+      id: 'doc-loc-badge-gcp',
+      title: 'GCP cloud execution doc',
+      forward_quality_verdict: {
+        ...computeDoc.forward_quality_verdict,
+        terminal_diagnostics: { executing_backend: 'gcp' },
+      },
+    };
+    const card = await renderListWithDoc(doc);
+    expect(card).toBeTruthy();
+    expect(card?.textContent).toContain('GCP cloud');
+  });
+
+  test('renders no location badge when executing_backend is absent', async () => {
+    const doc = {
+      ...computeDoc,
+      id: 'doc-loc-badge-absent',
+      title: 'No backend doc',
+      forward_quality_verdict: {
+        ...computeDoc.forward_quality_verdict,
+        // no terminal_diagnostics
+      },
+    };
+    const card = await renderListWithDoc(doc);
+    expect(card).toBeTruthy();
+    expect(card?.textContent).not.toContain('Operator hardware');
+    expect(card?.textContent).not.toContain('GCP cloud');
+  });
+
+  test('renders no location badge for non-compute_experiment source kind', async () => {
+    const { fetchKnowledgeDocuments } = await import('../api');
+    const nonComputeDoc = {
+      ...computeDoc,
+      id: 'doc-loc-badge-web',
+      title: 'Web research non-compute doc',
+      source_kind: 'web_research',
+      forward_quality_verdict: {
+        ...computeDoc.forward_quality_verdict,
+        terminal_diagnostics: { executing_backend: 'local-subprocess' },
+      },
+    };
+    vi.mocked(fetchKnowledgeDocuments).mockResolvedValue({ documents: [nonComputeDoc] as never, total: 1, limit: 50, offset: 0 });
+
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<KnowledgeBrowser selectedProjectId="project-test" onClose={() => {}} />);
+    });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+
+    const card = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+      b => b.textContent?.includes(nonComputeDoc.title),
+    );
+    expect(card).toBeTruthy();
+    expect(card?.textContent).not.toContain('Operator hardware');
+    expect(card?.textContent).not.toContain('GCP cloud');
+  });
+});
+
+describe('KnowledgeBrowser — viewable-media error fallback sanitizes citation hrefs', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+
+  afterEach(() => {
+    const r = root;
+    if (r) {
+      act(() => { r.unmount(); });
+      root = null;
+    }
+    if (host) { host.remove(); host = null; }
+    vi.resetAllMocks();
+  });
+
+  // A javascript: citation ref that ends in an image extension is classified as
+  // viewable media and rendered by ViewableMediaInline. When artifact resolution
+  // fails, the error fallback must NOT turn that LLM-authored javascript: URL into
+  // a clickable link — regression guard for gating finding a6ecad413d65e268.
+  test('does not render a javascript: citation ref as a clickable link in the error fallback', async () => {
+    const maliciousRef = 'javascript:alert(document.cookie)//pwn.png';
+    const { fetchKnowledgeDocument, resolveArtifactDownloadUrl } = await import('../api');
+    vi.mocked(fetchKnowledgeDocument).mockResolvedValueOnce({
+      ...webResearchDoc,
+      body: '# Body',
+      source_citations: [maliciousRef],
+    } as never);
+    // Force the ViewableMediaInline resolve path to fail so the error fallback renders.
+    vi.mocked(resolveArtifactDownloadUrl).mockRejectedValue(new Error('resolve failed'));
+
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <KnowledgeBrowser
+          selectedProjectId="project-test"
+          onClose={() => {}}
+          onNavigateToTask={() => {}}
+        />,
+      );
+    });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+    const docButton = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+      b => b.textContent?.includes('Survey of reachable web sources'),
+    );
+    if (!docButton) throw new Error('expected knowledge document button');
+    await act(async () => { (docButton as HTMLElement).click(); });
+    // Allow the rejected resolveArtifactDownloadUrl promise to settle into the error state.
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+
+    const anchors = Array.from((host as HTMLDivElement).querySelectorAll('a'));
+    // No anchor may carry a javascript: scheme href sourced from the citation ref.
+    for (const a of anchors) {
+      expect(a.getAttribute('href') ?? '').not.toContain('javascript:');
+    }
+    // The Artifacts section renders, and the failed preview appears as plain text
+    // (label + error) rather than an "open directly" link.
+    expect((host as HTMLDivElement).textContent).toContain('Failed to load preview.');
+    const openDirectlyLink = anchors.find(a => a.textContent?.includes('open directly'));
+    expect(openDirectlyLink).toBeUndefined();
+  });
+});

@@ -73,6 +73,11 @@ export interface SessionHeartbeatResponse {
    *  yet retired. Used to refresh the surface catalog between restarts so
    *  new/retired directions enter/leave the rotation mid-session. */
   active_direction_ids?: string[];
+  /** Refreshable direction grounding: id + text + status for every active
+   *  direction. The agent updates its compaction checkpoint context from this
+   *  so the resumed session sees current directions rather than session-start
+   *  snapshots. Absent on older backends — agent degrades to bootstrap data. */
+  direction_grounding?: Array<{id: string; text: string; status: string}>;
 }
 
 /**
@@ -345,6 +350,132 @@ export function compactionThreshold(
   return Math.floor(modelContextLimit(model) * COMPACTION_THRESHOLD_RATIO);
 }
 
+/**
+ * Format a compact directions section for the compaction checkpoint from
+ * heartbeat-refreshed direction_grounding data. Outputs a simple markdown
+ * list with fetch hints — the full directions_summary fields (cycles, PRs,
+ * etc.) are not available from the heartbeat, so the checkpoint shows a
+ * simpler view with a note to fetch full detail.
+ */
+export function formatDirectionGroundingText(
+  directions: Array<{id: string; text: string; status: string}> | null | undefined,
+): string {
+  if (!directions || directions.length === 0) return '';
+  const entries = directions.map(d => {
+    const statusNote = d.status !== 'active' ? ` [${d.status.toUpperCase()}]` : '';
+    const textNote = d.text ? ` — "${d.text.slice(0, 120)}"` : '';
+    return `- \`./fetch direction ${d.id}\`${textNote}${statusNote}`;
+  });
+  return `(refreshed from heartbeat)\n${entries.join('\n')}`;
+}
+
+/**
+ * Format strategic memory notes for the bootstrap / checkpoint prompt. Each
+ * entry is `{note, set_at}`; render as `- [set_at] note` so the timestamp
+ * provides ordering context. Absent, non-array, or empty degrades to an empty
+ * string. Shared by the session-start bootstrap and the compaction refresh so
+ * both paths format identically. Pure — safe to unit-test.
+ */
+export function formatStrategicMemoryNotes(raw: unknown): string {
+  if (!Array.isArray(raw) || raw.length === 0) return '';
+  return raw
+    .filter((e): e is Record<string, unknown> => e !== null && typeof e === 'object' && !Array.isArray(e))
+    .map((e) => {
+      const note = typeof e.note === 'string' ? e.note.trim() : '';
+      const setAt = typeof e.set_at === 'string' ? e.set_at.trim() : '';
+      if (!note) return '';
+      return setAt ? `- [${setAt}] ${note}` : `- ${note}`;
+    })
+    .filter(Boolean)
+    .join('\n');
+}
+
+/** Pretty-print a record-shaped value as 2-space JSON, or '' when absent/empty. */
+function formatRecordJson(value: unknown): string {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    && Object.keys(value).length > 0
+    ? JSON.stringify(value, null, 2)
+    : '';
+}
+
+/**
+ * The response of GET
+ * `/api/agent/projects/{id}/strategic-session/checkpoint-state`. Read-only
+ * mirror of the backend contract — do NOT extend without changing the endpoint.
+ */
+export interface CheckpointStateResponse {
+  problem_model?: unknown;
+  strategic_memory_notes?: unknown;
+  running_update?: unknown;
+  vision?: unknown;
+  /** Current open operator messages (same shape as the bootstrap payload's
+   *  open_messages). Present on backends that have shipped this field; absent
+   *  on older responses — caller degrades gracefully. */
+  open_messages?: unknown;
+}
+
+/** The self-model grounding fields the compaction checkpoint carries. */
+export interface CheckpointGrounding {
+  problemModelJson: string;
+  visionJson: string;
+  strategicMemoryNotesText: string;
+  runningUpdate: string;
+  /** Formatted open operator messages text (from open_messages). Absent when
+   *  not yet computed (older path) or when there are no open messages. */
+  openMessagesText?: string;
+}
+
+/**
+ * Map a checkpoint-state endpoint response into the refreshed grounding fields,
+ * formatted identically to the session-start bootstrap (problem_model / vision
+ * → pretty JSON, notes → shared formatter, running_update → string). Tolerant
+ * of missing / mistyped keys so a partial response never throws.
+ *
+ * Note: `openMessagesText` is left empty here because the formatting function
+ * (`buildOpenMessagesText`) lives in strategic-sections.ts which imports the
+ * heavy index surface. Callers in strategic-resident.ts fill this field after
+ * calling formatCheckpointState by formatting `resp.open_messages` directly.
+ */
+export function formatCheckpointState(resp: CheckpointStateResponse): CheckpointGrounding {
+  return {
+    problemModelJson: formatRecordJson(resp.problem_model),
+    visionJson: formatRecordJson(resp.vision),
+    strategicMemoryNotesText: formatStrategicMemoryNotes(resp.strategic_memory_notes),
+    runningUpdate: typeof resp.running_update === 'string' ? resp.running_update : '',
+    openMessagesText: '',
+  };
+}
+
+/**
+ * Resolve the four grounding sub-fields for the compaction checkpoint,
+ * preferring grounding refreshed at compaction time over the session-start
+ * snapshot. When `refreshed` is present (the checkpoint-state fetch succeeded)
+ * its values win entirely — even an empty field, so a mid-session clear (e.g.
+ * the operator wipes the running update) is reflected rather than reverting to
+ * the stale snapshot. When absent (fetch failed or never ran) the snapshot is
+ * used. Empty strings collapse to `undefined` so the checkpoint omits that
+ * sub-section, matching the existing `refreshedDirectionGrounding` fallback.
+ */
+export function resolveCheckpointGrounding(
+  snapshot: CheckpointGrounding,
+  refreshed: CheckpointGrounding | null | undefined,
+): {
+  problemModelJson?: string;
+  visionJson?: string;
+  strategicMemoryNotesText?: string;
+  runningUpdate?: string;
+  openMessagesText?: string;
+} {
+  const src = refreshed ?? snapshot;
+  return {
+    problemModelJson: src.problemModelJson || undefined,
+    visionJson: src.visionJson || undefined,
+    strategicMemoryNotesText: src.strategicMemoryNotesText || undefined,
+    runningUpdate: src.runningUpdate || undefined,
+    openMessagesText: src.openMessagesText || undefined,
+  };
+}
+
 export interface CompactionCheckpointContext {
   /** Condensed role identity section (from the original bootstrap). */
   roleIdentity: string;
@@ -354,6 +485,32 @@ export interface CompactionCheckpointContext {
   recentInteractions: string;
   /** Current autonomous state snapshot (agenda, focus rotation, open leads). */
   autonomousState: string;
+  // ── Durable self-model grounding (carried from the bootstrap prompt) ──────
+  // These fields deliver the same grounding the bootstrap delivers on a fresh
+  // start so the restarted session does NOT re-derive settled facts, re-read
+  // settled directions, or re-propose corrections the operator already made.
+  /** Current problem model JSON (payload.problem_model). */
+  problemModelJson?: string;
+  /** Current vision JSON (payload.vision). */
+  visionJson?: string;
+  /** Formatted standing behavioral lessons (payload.strategic_memory_notes). */
+  strategicMemoryNotesText?: string;
+  /** Formatted open operator messages text (payload.open_messages). */
+  openMessagesText?: string;
+  /** Prior session context text (ctx._session_summary). */
+  priorSessionContextText?: string;
+  /** Formatted active directions summary (payload.directions_summary). */
+  directionsText?: string;
+  /** Running update text (payload.running_update). */
+  runningUpdate?: string;
+  /** Formatted decisions register text (durable cross-tick decision memory). */
+  decisionsRegisterText?: string;
+  /**
+   * True when the self-model grounding was re-fetched from the checkpoint-state
+   * endpoint at compaction time (so it reflects current, not session-start,
+   * state). Softens the "session-start snapshot" note. Defaults to false.
+   */
+  groundingRefreshed?: boolean;
 }
 
 /**
@@ -376,8 +533,7 @@ export function buildCompactionCheckpoint(ctx: CompactionCheckpointContext): str
 
 The resident session's Claude subprocess was restarted because the context
 window approached its limit. This is a CHECKPOINT restore, not a fresh start.
-Your previous session was compacted; you retain your role, tools, and all
-durable state. Continue operating exactly where you left off.
+Your previous session was compacted. Continue operating exactly where you left off.
 
 ${ctx.roleIdentity}`);
 
@@ -399,6 +555,51 @@ ${ctx.recentInteractions.trim()}`);
   if (ctx.autonomousState.trim()) {
     sections.push(`## Current state
 ${ctx.autonomousState.trim()}`);
+  }
+
+  // (v) Durable self-model grounding — preserved from the bootstrap so the
+  // restarted session retains its identity, problem context, and operator
+  // relationship rather than re-deriving settled facts across the restart.
+  const grounding: string[] = [];
+  if (ctx.problemModelJson?.trim()) {
+    grounding.push(`### Problem model\n\`\`\`json\n${ctx.problemModelJson.trim()}\n\`\`\``);
+  }
+  if (ctx.directionsText?.trim()) {
+    grounding.push(`### Active directions\n${ctx.directionsText.trim()}`);
+  }
+  if (ctx.visionJson?.trim()) {
+    grounding.push(`### Vision\n\`\`\`json\n${ctx.visionJson.trim()}\n\`\`\``);
+  }
+  if (ctx.openMessagesText?.trim()) {
+    grounding.push(`### Open operator messages\n${ctx.openMessagesText.trim()}`);
+  }
+  if (ctx.strategicMemoryNotesText?.trim()) {
+    grounding.push(`### Standing behavioral lessons\n${ctx.strategicMemoryNotesText.trim()}`);
+  }
+  if (ctx.priorSessionContextText?.trim()) {
+    grounding.push(`### Prior session context\n${ctx.priorSessionContextText.trim()}`);
+  }
+  if (ctx.runningUpdate?.trim()) {
+    grounding.push(`### Running update\n${ctx.runningUpdate.trim()}`);
+  }
+  if (grounding.length > 0) {
+    if (ctx.groundingRefreshed) {
+      const note = `> **Refreshed note:** The data below was re-fetched from current project
+> state at compaction time. If in doubt you can still confirm via
+> \`./fetch problem-model\`, \`./fetch direction <id>\`, and \`./fetch message\`.`;
+      sections.push(`## Self-model grounding (refreshed at compaction)\n${note}\n\n${grounding.join('\n\n')}`);
+    } else {
+      const note = `> **Snapshot note:** The data below was captured when the session started
+> and may not reflect current project state. Use \`./fetch problem-model\`,
+> \`./fetch direction <id>\`, and \`./fetch message\` to retrieve
+> the latest state.`;
+      sections.push(`## Self-model grounding (session-start snapshot)\n${note}\n\n${grounding.join('\n\n')}`);
+    }
+  }
+
+  // (vi) Durable decisions register — preserved across restarts.
+  if (ctx.decisionsRegisterText?.trim()) {
+    sections.push(ctx.decisionsRegisterText.trim());
   }
 
   sections.push(`Resume from this checkpoint. Your next turn will arrive as a
@@ -552,7 +753,6 @@ function buildFileReference(att: Record<string, unknown>): string {
   const sizeStr = sizeBytes !== null ? `, ${sizeBytes} bytes` : '';
   return `[File attachment: ${name} (${mimeType}${sizeStr})]`;
 }
-
 export interface AttachmentFetchResponse {
   ok: boolean;
   status: number;
@@ -634,13 +834,13 @@ export function extractMessageTurn(msg: ResidentInboundMessage): ContentBlock[] 
                   name: attachmentName(att.name) || undefined,
                 },
               });
+              imageCount++;
             } else {
               blocks.push(attachmentUnavailableBlock(
                 { type: 'url', url: '', media_type: mediaType, name: attachmentName(att.name) || undefined },
                 'unsupported download URL',
               ));
-            }
-            imageCount++;
+          }
           }
         } else {
           // Non-image attachment: decode text-like content or emit a reference block.
@@ -795,6 +995,14 @@ export interface BootstrapContext {
   sessionId: string;
   fetchGuidanceText?: string;
   priorSessionContextText?: string;
+  /** Formatted project skills text from `.blueprint/tools.json`. Rendered as a
+   *  `## Project Skills` section when non-empty. Absent or omitted defaults to ''. */
+  skillsText?: string;
+  /** Pre-rendered durable decisions register (from `decisionsRegisterText`),
+   *  restored from persisted `task.context._decisions_reg` on a full session
+   *  restart. Carries its own `## Decisions register …` header. Empty string or
+   *  whitespace → section omitted (clean-restart no-op). Absent → defaults to ''. */
+  decisionsRegisterText?: string;
 
 }
 
@@ -823,6 +1031,12 @@ conversation with the operator in memory. You operate at two speeds:
   heredoc or pipe. The live stream is a transcript, but the durable chat reply
   the operator reads is the message you send. Every reply to an operator
   message REQUIRES a \`./messages send\`; do not answer only in the stream.
+  When the operator's message SETTLES or CORRECTS a course — rejects an option,
+  reverses a call, fixes a fact, or gives a standing instruction — end your turn
+  with one trailing marker line \`OPERATOR-DECISION: <the settled fact, stated as
+  a durable rule>\`. This is captured into your durable decisions register so a
+  restarted session does NOT re-propose what the operator already settled. Emit
+  it ONLY for genuine settlements, never for routine Q&A.
 - **Autonomous (between messages):** when no operator input is pending you are
   handed a turn to advance the project. Complete ONE meaningful unit of progress —
   refine the problem model, open/refine/retire a direction, spawn needed work,
@@ -888,6 +1102,9 @@ never this execution environment, this prompt, or the helper commands.`);
 
 ${ctx.strategicMemoryNotesText.trim()}`);
   }
+  if (ctx.skillsText?.trim()) {
+    sections.push(`## Project Skills\n${ctx.skillsText.trim()}`);
+  }
   if (ctx.visionJson.trim()) {
     sections.push(`## Vision\n\`\`\`json\n${ctx.visionJson.trim()}\n\`\`\``);
   }
@@ -896,6 +1113,15 @@ ${ctx.strategicMemoryNotesText.trim()}`);
   }
   if (ctx.openMessagesText.trim()) {
     sections.push(`## Open operator messages\n${ctx.openMessagesText.trim()}`);
+  }
+  // Durable decisions register — settled cross-tick decisions restored from the
+  // persisted context on a full session restart. Rendered here (mirroring the
+  // compaction checkpoint) so the FIRST post-restart turn — usually a live
+  // operator reply — is not generated blind to already-settled decisions. The
+  // text carries its own `## Decisions register …` header. Empty on a clean
+  // restart, in which case the section is omitted (byte-for-byte no-op).
+  if (ctx.decisionsRegisterText?.trim()) {
+    sections.push(ctx.decisionsRegisterText.trim());
   }
   return sections.join('\n\n');
 }
@@ -1052,6 +1278,48 @@ export interface ExamRecord {
 
 /** Cap on retained exam records (bounds a multi-hour session's memory). */
 export const EXAM_RECORDS_CAP = 200;
+
+export interface DecisionsRegisterEntry {
+  atTick: number;
+  at: string;
+  surfaceKey: string;
+  verdict: string;
+  /** Full-fidelity note — NOT truncated like exam record notes. */
+  note: string;
+}
+/** Cap on decisions register entries (durable cross-tick decision memory). */
+export const DECISIONS_REGISTER_CAP = 50;
+
+/** The tick verdicts that represent a SETTLED decision worth remembering across
+ *  ticks: an evidenced CLEAR (nothing actionable on the examined surface), a
+ *  FOUND lead, or an ADVANCED mutation. `interrupted` (operator preemption /
+ *  authority suspend / stall — no verdict emitted) and `unevidenced` (idle CLEAR
+ *  with no tool use, or a missing/garbled marker) are NON-decisions: they carry
+ *  no durable conclusion and must NOT occupy the fixed decisions-register window,
+ *  or they evict real decisions — worst at the autonomous<->operator boundary
+ *  where interrupts cluster. The exam ledger still records those outcomes; only
+ *  the durable register filters them out. */
+/** The verdict tag stamped on a decisions-register entry that captures a
+ *  correction/decision the operator settled in live chat (as opposed to an
+ *  autonomous tick verdict). Included in SETTLED_DECISION_VERDICTS so an
+ *  operator-settled decision is treated as durable just like an autonomous one —
+ *  this is what stops the strategist re-proposing a course the operator already
+ *  corrected after a session restart. */
+export const OPERATOR_DECISION_VERDICT = 'operator';
+
+const SETTLED_DECISION_VERDICTS: ReadonlySet<string> = new Set([
+  'advanced', 'found', 'clear', OPERATOR_DECISION_VERDICT,
+]);
+
+/**
+ * Whether a tick verdict represents a settled decision that belongs in the
+ * durable decisions register. True for `advanced` | `found` | `clear` and the
+ * operator-settled `operator` verdict; false for `unevidenced`, `interrupted`,
+ * and any unrecognized string. Pure — unit-testable in isolation.
+ */
+export function isSettledDecisionVerdict(verdict: string): boolean {
+  return SETTLED_DECISION_VERDICTS.has(verdict);
+}
 /** Default number of focus surfaces surfaced in the prompt each tick. */
 export const FOCUS_LIST_SIZE = 3;
 /** Default floor-tick interval (ms): even with no state change, review at least
@@ -1203,6 +1471,27 @@ export function parseTickVerdict(
   return null;
 }
 
+/**
+ * Parse the trailing OPERATOR-DECISION marker line from an operator-turn's
+ * result text. The resident strategist is instructed (bootstrap prompt) to end a
+ * reply with `OPERATOR-DECISION: <settled fact>` whenever the operator corrects
+ * or settles a course in live chat. Scans from the LAST line so a mid-reply
+ * mention cannot be mistaken for the marker. Returns the settled-fact note
+ * (leading dash stripped), or null when no marker is present or its note is
+ * empty. Pure — unit-testable in isolation.
+ */
+export function parseOperatorDecision(resultText: string): string | null {
+  if (typeof resultText !== 'string') return null;
+  const lines = resultText.split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const m = /^\s*OPERATOR-DECISION:\s*(.*)$/i.exec(lines[i]);
+    if (!m) continue;
+    const note = m[1].replace(/^[—–-]\s*/, '').trim();
+    return note.length > 0 ? note : null;
+  }
+  return null;
+}
+
 /** Whether a turn declared more actionable work remains (a literal AGENDA-CONTINUE
  *  line), gating an immediate re-tick in shouldRunAutonomousTurn. */
 export function parseAgendaContinue(resultText: string): boolean {
@@ -1342,6 +1631,7 @@ export function buildAutonomousPrompt(
   openFound: ExamRecord[],
   corrective: boolean,
   maxOpsPerTurn = 3,
+  decisionsRegisterText = '',
 ): string {
   const lines: string[] = [];
 
@@ -1371,6 +1661,11 @@ export function buildAutonomousPrompt(
     'Rotating examination focus (prefer the first; pick another ONLY with a concrete',
     'lead — your verdict MUST name the surface you actually examined):',
   );
+  // Durable decisions register — full-fidelity record of recent tick verdicts,
+  // rendered here so the model sees settled decisions before picking a surface.
+  if (decisionsRegisterText) {
+    lines.push('', decisionsRegisterText, '');
+  }
   for (const s of focus) lines.push(`- ${s.key} — ${s.hint}`);
 
   if (recentRecords.length > 0) {
@@ -1542,4 +1837,88 @@ export function refreshSurfaceCatalog(
   const firstNonDir = pruned.findIndex(s => s.kind !== 'direction');
   if (firstNonDir === -1) return [...pruned, ...newDirs];
   return [...pruned.slice(0, firstNonDir), ...newDirs, ...pruned.slice(firstNonDir)];
+}
+
+// ── Durable decisions register: cross-tick decision memory ──────────────────
+// Unlike the exam ledger (which truncates notes and caps retained history in
+// the prompt to 6 entries), the decisions register stores full-fidelity tick
+// verdicts and is rendered into BOTH the autonomous tick prompt and the
+// compaction checkpoint. This prevents the strategist from re-deriving
+// settled facts or re-proposing already-executed corrections tick over tick
+// and across session restarts.
+
+/**
+ * Format the decisions register for inclusion in the autonomous prompt or
+ * compaction checkpoint. Returns a markdown section header followed by one
+ * line per entry (most recent last). Returns empty string when the register
+ * is empty, so the caller can omit the section cleanly.
+ */
+export function decisionsRegisterText(
+  register: DecisionsRegisterEntry[],
+  limit = 20,
+): string {
+  if (register.length === 0) return '';
+  const slice = register.slice(-limit);
+  const lines: string[] = ['## Decisions register (durable cross-tick memory)'];
+  for (const entry of slice) {
+    const noteStr = entry.note ? ` — ${entry.note}` : '';
+    lines.push(`- tick-${entry.atTick} [${entry.verdict}] ${entry.surfaceKey || '(none)'}${noteStr} (${entry.at})`);
+  }
+  return lines.join('\n');
+}
+
+/** Max byte size for the serialized decisions register persisted in the heartbeat. */
+export const DECISIONS_REG_MAX_BYTES = 32_000;
+
+/**
+ * Serialize the decisions register for heartbeat persistence.
+ * The result is stored as ``_decisions_reg`` in task.context and restored on
+ * full session restart so the strategist retains its settled-decision memory
+ * across process death/VM recycles (not just across in-process compaction).
+ */
+export function serializeDecisionsReg(register: DecisionsRegisterEntry[]): string {
+  const trimmed = register.slice(-DECISIONS_REGISTER_CAP);
+  const candidate = JSON.stringify({ entries: trimmed });
+  if (Buffer.byteLength(candidate, 'utf8') <= DECISIONS_REG_MAX_BYTES) {
+    return candidate;
+  }
+  // Trim from the front until it fits.
+  for (let start = 1; start < trimmed.length; start++) {
+    const smaller = JSON.stringify({ entries: trimmed.slice(start) });
+    if (Buffer.byteLength(smaller, 'utf8') <= DECISIONS_REG_MAX_BYTES) {
+      return smaller;
+    }
+  }
+  return JSON.stringify({ entries: [] });
+}
+
+/**
+ * Restore the decisions register from a persisted string
+ * (``task.context._decisions_reg``). Returns null on parse error so the
+ * caller falls back to a clean empty register.
+ */
+export function restoreDecisionsReg(
+  value: string | undefined | null,
+): DecisionsRegisterEntry[] | null {
+  if (!value || typeof value !== 'string') return null;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    const p = parsed as Record<string, unknown>;
+    const rawEntries = Array.isArray(p.entries) ? p.entries : [];
+    const entries: DecisionsRegisterEntry[] = rawEntries
+      .filter((e): e is Record<string, unknown> => e !== null && typeof e === 'object' && !Array.isArray(e))
+      .filter(e => typeof e.surfaceKey === 'string')
+      .slice(0, DECISIONS_REGISTER_CAP)
+      .map(e => ({
+        atTick: typeof e.atTick === 'number' ? e.atTick : 0,
+        at: typeof e.at === 'string' ? e.at : '',
+        surfaceKey: String(e.surfaceKey),
+        verdict: typeof e.verdict === 'string' ? e.verdict : '',
+        note: typeof e.note === 'string' ? e.note : '',
+      }));
+    return entries;
+  } catch {
+    return null;
+  }
 }

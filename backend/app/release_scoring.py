@@ -21,7 +21,7 @@ from typing import Any
 from app.ci_resolution import (
     _CI_RED,
 )
-from app.migration_reconciliation import AUTHORIZED_DIVERGENCES
+from app.migration_reconciliation import effective_authorized_divergences
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +49,31 @@ MAX_COMPLETION_DEBT_WEIGHT = 0.5
 # ``completion_debt_weight_mode`` to "enforce" but left the weight unset/zero —
 # so graduation actually changes the composite instead of being a no-op.
 DEFAULT_ENFORCE_COMPLETION_DEBT_WEIGHT = 0.15
+
+# Confidence penalty applied per the goal-verification redesign.  v1 grades every
+# acceptance-criterion CATEGORY at the JUDGED tier — an uninvested LLM reading the
+# merged diff — which is a lower-confidence signal than machine/test-cited
+# evidence (the v2 "machine" tier).  When no hard gate fires (every active
+# category is ``met``), confidence is docked in proportion to the fraction of MET
+# categories still resting on the judged tier: ``JUDGED_TIER_PENALTY_WEIGHT *
+# (judged_met / met)``, applied as ``confidence *= (1 - penalty)``.  Deliberately
+# small so a healthy all-judged candidate (the whole of v1) stays promotable while
+# still scoring visibly below a machine-verified one.
+#
+# This is the ONLY confidence penalty on the acceptance axis.  It replaced the
+# retired criterion-"coverage" evidence-tier penalties (attestation / backfill),
+# which keyed off evidence accumulated per criterion rather than a graded verdict.
+JUDGED_TIER_PENALTY_WEIGHT = 0.05
+
+# Recognised per-category verdict statuses.  ``partial`` gates identically to
+# ``not_met`` (only ``met`` clears the gate); the distinction is informational.
+_CATEGORY_STATUSES: frozenset[str] = frozenset({"met", "not_met", "partial"})
+# Recognised citation kinds.  v1 emits only ``diff`` citations (the grader reads
+# the merged diff); ``test`` is reserved for the v2 machine/test-citation tier.
+_CITATION_KINDS: frozenset[str] = frozenset({"diff", "test"})
+# Caps so a runaway artifact cannot bloat the persisted verdict / payload.
+_MAX_CITATIONS = 8
+_CITATION_REF_MAX = 200
 
 
 def coerce_completion_debt_weight(weights_raw: Any) -> float:
@@ -112,9 +137,206 @@ def is_contentless_goal(goal_text: str) -> bool:
     return goal_text.strip().lower() in _CONTENTLESS_GOAL_WORDS
 
 
+def _normalize_citations(raw: Any) -> list[dict[str, str]]:
+    """Normalise a per-category citation list to ``[{kind, ref}, ...]``.
+
+    v1 accepts ``diff`` and ``test`` citation kinds (``test`` reserved for v2);
+    an unknown kind is coerced to ``diff``.  Bare strings are read as ``diff``
+    refs.  Entries without a usable ``ref`` are dropped, and the list is capped
+    at ``_MAX_CITATIONS`` so an over-eager grader cannot bloat the ledger row.
+    """
+    if not isinstance(raw, list):
+        return []
+    out: list[dict[str, str]] = []
+    for c in raw:
+        if isinstance(c, dict):
+            kind = str(c.get("kind") or "").strip().lower()
+            if kind not in _CITATION_KINDS:
+                kind = "diff"
+            ref = str(
+                c.get("ref") or c.get("path") or c.get("location") or ""
+            ).strip()
+        elif isinstance(c, str):
+            kind = "diff"
+            ref = c.strip()
+        else:
+            continue
+        if ref:
+            out.append({"kind": kind, "ref": ref[:_CITATION_REF_MAX]})
+        if len(out) >= _MAX_CITATIONS:
+            break
+    return out
+
+
+def _cited_test_is_machine_verified(
+    citations: list[dict[str, str]],
+    verified_merge_evidence: dict[str, Any] | None,
+) -> str | None:
+    """Return the validated test ref proving a category at the MACHINE tier, else None.
+
+    The grader's ``{"kind": "test", "ref": ...}`` citation is a SOFT claim ("test
+    X covers category C").  It is upgraded to the machine tier only when the cited
+    test is machine-CONFIRMED against the candidate — the same fail-closed proof
+    shape as the ``named_test`` acceptance gate, applied to the merge-grade's
+    cross-task candidate window:
+
+      1. the cited test file is among the candidate's VERIFIED-merged test files —
+         a test that shipped in a merge gated by a REAL CI/test verdict (see
+         ``landed_signal.is_verified_merge``), which is how "ran green on the
+         candidate SHA" is machine-confirmed here; AND
+      2. it semantically corresponds to a changed production seam that shipped in
+         those verified merges (reuses ``acceptance_gate._test_semantically_grounded``
+         so the test module maps to a real changed production module).
+
+    ``verified_merge_evidence`` is ``{"test_files": [...], "seam_files": [...]}``
+    gathered by the qualifier from the version window (both restricted to verified
+    merges).  When it is absent/empty — no candidate CI evidence available at grade
+    time — NO citation validates and the caller keeps ``tier="judged"``: machine
+    tier is never granted on an unvalidated claim (fail toward the lower tier).
+
+    ``ref`` is read like ``_evaluate_named_test`` reads a declared test: a pytest
+    node id (``path::test_name``) or a bare file path, split on ``::`` to the path.
+    """
+    if not verified_merge_evidence:
+        return None
+    test_files = verified_merge_evidence.get("test_files") or []
+    seam_files = verified_merge_evidence.get("seam_files") or []
+    if not test_files:
+        return None
+    # Reuse the PURE named_test proof helpers (no I/O).  Lazy import keeps this
+    # scoring module free of the heavier ``acceptance_gate`` import graph at load.
+    from app.acceptance_gate import _paths_match, _test_semantically_grounded
+
+    seam_list = [str(s) for s in seam_files]
+    for c in citations:
+        if c.get("kind") != "test":
+            continue
+        cited_path = str(c.get("ref") or "").partition("::")[0].strip()
+        if not cited_path:
+            continue
+        if not any(_paths_match(str(vf), cited_path) for vf in test_files):
+            # The cited test is NOT among the candidate's verified-merged tests —
+            # it may never have run green under real CI on this candidate.
+            continue
+        if _test_semantically_grounded(cited_path, seam_list):
+            return cited_path
+    return None
+
+
+def _normalize_category_verdicts(
+    artifact: dict[str, Any] | None,
+    active_categories: list[dict[str, Any]],
+    verified_merge_evidence: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Grade the artifact's per-category verdicts against the ACTIVE rubric.
+
+    The rubric is the set of ACTIVE ``VersionAcceptanceCriterion`` rows — each is
+    a CATEGORY the merged diff must satisfy.  v1 = JUDGED tier only: the grader
+    reads the merged diff and, per category, decides ``met`` / ``partial`` /
+    ``not_met``, CITES the diff location(s), and writes the gap.  Enforcement
+    (uncited "it's fine" → ``not_met``):
+
+      * A category the artifact never graded → ``not_met`` (it was not assessed).
+      * A category graded ``met`` with NO citations → downgraded to ``not_met``
+        (an uncited pass is not evidence).
+      * ``partial`` is preserved as an informational distinction but gates
+        identically to ``not_met`` downstream.
+      * An unknown/absent status → ``not_met``.
+
+    Tier (v2 machine/test-citation upgrade): a ``met`` category defaults to
+    ``tier="judged"`` (an LLM read the diff).  It is upgraded to ``tier="machine"``
+    ONLY when the grader attached a ``{"kind": "test", "ref": ...}`` citation whose
+    test is machine-validated against ``verified_merge_evidence`` (the candidate's
+    verified-merged test + seam files) — see :func:`_cited_test_is_machine_verified`.
+    A test citation that cannot be validated (or no evidence supplied) keeps the
+    category at ``judged`` — machine tier is never granted on an unvalidated claim.
+    ``not_met`` / ``partial`` verdicts are always ``judged``.
+
+    Returns ``(category_verdicts, residual_uncaptured_gap)`` where
+    ``residual_uncaptured_gap`` is the grader's answer to "is there a goal aspect
+    that NONE of the categories capture?" (a non-empty string hard-blocks).
+    """
+    emitted: dict[str, dict[str, Any]] = {}
+    raw_list = artifact.get("category_verdicts") if isinstance(artifact, dict) else None
+    if isinstance(raw_list, list):
+        for item in raw_list:
+            if isinstance(item, dict):
+                key = str(item.get("category_key") or item.get("key") or "").strip()
+                if key:
+                    emitted[key] = item
+
+    verdicts: list[dict[str, Any]] = []
+    for cat in active_categories:
+        key = str(cat.get("category_key") or cat.get("criterion_key") or "").strip()
+        if not key:
+            continue
+        raw = emitted.get(key)
+        if not isinstance(raw, dict):
+            verdicts.append(
+                {
+                    "category_key": key,
+                    "status": "not_met",
+                    "tier": "judged",
+                    "gap": "Not graded by the blind merge-grade against the merged diff.",
+                    "citations": [],
+                }
+            )
+            continue
+        status = str(raw.get("status") or "").strip().lower()
+        if status not in _CATEGORY_STATUSES:
+            status = "not_met"
+        citations = _normalize_citations(raw.get("citations"))
+        gap_raw = raw.get("gap")
+        gap = (
+            str(gap_raw).strip()[:_FINDING_SUMMARY_MAX]
+            if gap_raw not in (None, "")
+            else None
+        )
+        if status == "met" and not citations:
+            # v1 rule: an uncited "it's fine" is not evidence — force not_met.
+            status = "not_met"
+            gap = gap or (
+                "Marked met but cited no diff location; an uncited pass is not evidence."
+            )
+        if status in ("not_met", "partial") and not gap:
+            gap = "No gap description supplied by the grader."
+        # Tier: a MET category whose test citation is machine-validated against the
+        # candidate's verified merges earns the machine tier; everything else stays
+        # judged (fail toward the lower tier).
+        tier = "judged"
+        if status == "met" and _cited_test_is_machine_verified(
+            citations, verified_merge_evidence
+        ):
+            tier = "machine"
+        verdicts.append(
+            {
+                "category_key": key,
+                "status": status,
+                "tier": tier,
+                # ``met`` may legitimately carry no gap; not_met/partial always do.
+                "gap": gap if status != "met" else (gap or None),
+                "citations": citations,
+            }
+        )
+
+    residual_raw: Any = None
+    if isinstance(artifact, dict):
+        residual_raw = artifact.get("residual_uncaptured_gap")
+        if residual_raw in (None, ""):
+            residual_raw = artifact.get("residual")
+    residual = (
+        str(residual_raw).strip()[:_FINDING_SUMMARY_MAX]
+        if isinstance(residual_raw, str) and residual_raw.strip()
+        else None
+    )
+    return verdicts, residual
+
+
 def evaluate_merge_grade(
     goal: str | None,
     artifact: dict[str, Any] | None,
+    active_categories: list[dict[str, Any]] | None = None,
+    verified_merge_evidence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Normalise a blind merge-grade artifact into a goal-coverage verdict.
 
@@ -133,9 +355,36 @@ def evaluate_merge_grade(
         ``covers_goal`` True → ``status="pass"``, ``blocked`` False; False →
         ``status="fail"``, ``blocked`` True (the hard promotion blocker).
 
-    Returns ``{status, covers_goal, coverage, biggest_gap, blocked, detail}``.
-    ``status`` is one of ``pass`` | ``fail`` | ``not_applicable`` |
-    ``unparseable``.
+    The ``status``/``covers_goal``/``coverage``/``biggest_gap`` keys are the
+    HOLISTIC back-compat signal (still read by ``compute_goal_coverage_drift``,
+    the ``merge_grade_*`` verdict columns, and the armed ``merge_grade_misses``
+    gate).  When ``active_categories`` is supplied (the ACTIVE acceptance-criteria
+    rubric), the goal-verification redesign ADDS a per-category grade:
+    ``category_verdicts`` (a list of ``{category_key, status, tier, gap,
+    citations}`` — see :func:`_normalize_category_verdicts`) and
+    ``residual_uncaptured_gap`` (the grader's "gap no category captures" answer).
+    These drive the NEW hard gate in :func:`compute_composite`.  When
+    ``active_categories`` is absent/empty (no rubric) both are ``None`` and only
+    the holistic signal applies — preserving the pre-redesign no-criteria path.
+
+    ``verified_merge_evidence`` (v2 machine tier) — an optional
+    ``{"test_files": [...], "seam_files": [...]}`` snapshot of the candidate's
+    VERIFIED-merged test + production-seam files, gathered by the qualifier.  It
+    upgrades a ``met`` category's ``tier`` from ``judged`` to ``machine`` when the
+    grader cited a test that validates against it (see
+    :func:`_cited_test_is_machine_verified`); ``None`` leaves every met category at
+    the judged tier (v1 behaviour).
+
+    When ``active_categories`` is supplied but the artifact omits the
+    ``category_verdicts`` key ENTIRELY, the grader cannot produce per-category
+    output (a stale agent image predating the protocol) — that is NOT the same as
+    a grader that assessed the rubric and found it unmet.  Reported as
+    ``status="category_grade_unsupported"`` so the caller can HOLD with an
+    actionable reason instead of fabricating a ``not_met`` verdict per criterion.
+
+    Returns ``{status, covers_goal, coverage, biggest_gap, blocked, detail,
+    category_verdicts, residual_uncaptured_gap}``. ``status`` is one of ``pass`` |
+    ``fail`` | ``not_applicable`` | ``unparseable`` | ``category_grade_unsupported``.
     """
     goal_text = (goal or "").strip()
     if not goal_text or is_contentless_goal(goal_text):
@@ -146,6 +395,8 @@ def evaluate_merge_grade(
             "biggest_gap": None,
             "blocked": False,
             "detail": None,
+            "category_verdicts": None,
+            "residual_uncaptured_gap": None,
         }
     if not isinstance(artifact, dict):
         return {
@@ -155,6 +406,8 @@ def evaluate_merge_grade(
             "biggest_gap": None,
             "blocked": True,
             "detail": None,
+            "category_verdicts": None,
+            "residual_uncaptured_gap": None,
         }
 
     raw_covers = artifact.get("covers_goal")
@@ -176,6 +429,8 @@ def evaluate_merge_grade(
             "biggest_gap": None,
             "blocked": True,
             "detail": artifact,
+            "category_verdicts": None,
+            "residual_uncaptured_gap": None,
         }
 
     biggest_gap_raw = artifact.get("biggest_gap")
@@ -184,6 +439,44 @@ def evaluate_merge_grade(
         if biggest_gap_raw not in (None, "")
         else None
     )
+    # Per-category grade (goal-verification redesign).  Only computed when an
+    # ACTIVE rubric is supplied; otherwise the holistic signal above stands alone.
+    category_verdicts: list[dict[str, Any]] | None = None
+    residual_uncaptured_gap: str | None = None
+    if active_categories:
+        if "category_verdicts" not in artifact:
+            # The grader returned a usable HOLISTIC verdict but omitted the
+            # per-category section ENTIRELY — not one key, not an empty list.  A
+            # grader that ACTUALLY assessed the rubric always emits the key (the
+            # prompt marks it REQUIRED), so its total absence means the grader
+            # CANNOT produce per-category output: it predates the per-category
+            # protocol (a stale agent image), not that it looked and found the
+            # criteria unmet.
+            #
+            # Those two are indistinguishable downstream and must NOT be conflated.
+            # `_normalize_category_verdicts` maps "never graded" → `not_met`, so
+            # falling through here would fabricate a `not_met` verdict for EVERY
+            # active criterion, hard-block on `criterion_coverage_incomplete`, and —
+            # because the ledger is sha-KEYED and verdicts never regress — freeze
+            # that fabricated failure against this candidate forever.  It would also
+            # report a reason ("graded, not met") that is simply false.
+            #
+            # Report the real state instead.  The caller routes this to a HOLD, so
+            # it still never promotes over an ungraded acceptance contract (no
+            # fail-open) — it just says WHY, and stops lying about it.
+            return {
+                "status": "category_grade_unsupported",
+                "covers_goal": covers_goal,
+                "coverage": coverage,
+                "biggest_gap": biggest_gap,
+                "blocked": True,
+                "detail": artifact,
+                "category_verdicts": None,
+                "residual_uncaptured_gap": None,
+            }
+        category_verdicts, residual_uncaptured_gap = _normalize_category_verdicts(
+            artifact, active_categories, verified_merge_evidence
+        )
     return {
         "status": "pass" if covers_goal else "fail",
         "covers_goal": covers_goal,
@@ -191,6 +484,8 @@ def evaluate_merge_grade(
         "biggest_gap": biggest_gap,
         "blocked": not covers_goal,
         "detail": artifact,
+        "category_verdicts": category_verdicts,
+        "residual_uncaptured_gap": residual_uncaptured_gap,
     }
 
 
@@ -391,9 +686,12 @@ def compute_composite(
     ci_required: bool = True,
     migration_collision: bool = False,
     migration_apply_blocked: bool = False,
-    criterion_coverage: dict[str, Any] | None = None,
+    category_verdicts: list[dict[str, Any]] | None = None,
+    residual_uncaptured_gap: str | None = None,
     merge_grade_misses: bool = False,
+    merge_grade_exempt: bool = False,
     debt_pressure_score: float | None = None,
+    capability_proof_blocked: bool = False,
 ) -> dict[str, Any]:
     """Compute the composite promotion confidence for a release candidate.
 
@@ -428,12 +726,46 @@ def compute_composite(
         pure and only consumes the boolean.
       * ``merge_grade_misses`` is True — the required blind merge-grade ran and
         found that the candidate misses the frozen version goal
-        (``"merge_grade_misses"``).  Checked before criterion coverage so an
+        (``"merge_grade_misses"``).  Checked before the category gate so an
         empty or not-yet-mapped acceptance-criteria set cannot mask the grade.
-      * ``criterion_coverage`` reports at least one uncovered version-scoped
-        acceptance criterion (``"criterion_coverage_incomplete"``).  Versions
-        with no criteria, or callers that pass ``None`` for backward
-        compatibility, skip this gate.
+      * GOAL-VERIFICATION GATE (redesign) — ``category_verdicts`` is a per-active-
+        category grade (the acceptance criteria ARE the categories).  Blocks
+        (``"criterion_coverage_incomplete"``) when ANY active category's status
+        is not ``met`` (``partial`` gates identically to ``not_met``; the
+        distinction is informational), OR when ``residual_uncaptured_gap`` is a
+        non-empty string (the grader found a goal aspect NO category captures).
+        This REPLACES the retired coverage-count gate AND the
+        ``uncorroborated_attestation`` gate — a category resting on
+        lower-confidence evidence no longer hard-blocks; instead it is folded into
+        the judged-tier confidence penalty (below).  The blocker STRING is kept
+        (``criterion_coverage_incomplete``) so the downstream re-drive / trigger /
+        state-resolver plumbing keyed on it keeps working.  ``category_verdicts``
+        ``None`` (no rubric, or a caller passing ``None`` for back-compat) skips
+        the gate entirely — preserving the pre-redesign no-criteria path.
+        ``sub_scores["unmet_categories"]`` / ``["residual_uncaptured_gap"]``
+        record WHY for observability.
+
+        ``merge_grade_exempt`` (finding 85fa667a4d7fcae6): a merge-grade
+        exemption (``superseded_exempt`` / ``already_on_main_exempt``) exempts
+        ONLY the HOLISTIC ``merge_grade_misses`` gate — the caller clears that
+        boolean.  It does NOT exempt this per-category coverage gate: an exempt
+        candidate whose ACTIVE acceptance criteria are graded and come back
+        ``not_met`` must still block on ``criterion_coverage_incomplete``, exactly
+        as ``main``'s retired unconditional coverage block did.  Previously the
+        caller skipped grading entirely on the exempt path (passing
+        ``category_verdicts=None``), silently loosening coverage; the caller now
+        grades and passes the verdicts, and this flag is recorded in
+        ``sub_scores["merge_grade_exempt"]`` for provenance without weakening the
+        gate.
+      * ``capability_proof_blocked`` is True — the capability proof gate is in
+        ``"enforce"`` mode and at least one ``working`` capability lacks
+        ``proven`` evidence (``"capability_proof_gate_blocked"``).  Governs the
+        integrity of the capability proof gate: a promotion over unproven
+        capability claims bypasses the gate's entire purpose, so this is a hard
+        blocker.  Checked after criterion coverage so the acceptance-criteria
+        gate is not masked, and before the quality dimensions so a candidate
+        whose capability claims are unproven is rejected regardless of audit
+        quality.
       * ``smoketest_score`` is None — the smoketest never produced a usable
         score, treated as a startup-suite failure
         (``"smoketest_startup_failed"``).  ONLY checked when
@@ -531,15 +863,32 @@ def compute_composite(
     elif merge_grade_misses:
         # The armable-dark blind-grade gate: coverage_verdict == "misses" AND the
         # operator has raised merge_grade_block_threshold above 0.0.  Distinct from
-        # the canonical criterion-coverage gate so operators see the right label.
+        # the canonical goal-verification gate so operators see the right label.
         blocker = "merge_grade_misses"
-    elif (
-        criterion_coverage is not None
-        and int(criterion_coverage.get("total") or 0) > 0
-        and int(criterion_coverage.get("covered") or 0)
-        < int(criterion_coverage.get("total") or 0)
+    elif category_verdicts is not None and any(
+        (v or {}).get("status") != "met" for v in category_verdicts
     ):
+        # GOAL-VERIFICATION GATE (redesign): the acceptance criteria ARE the
+        # merge-grade's categories.  ANY active category not at ``met`` blocks
+        # (``partial`` gates identically to ``not_met`` — only ``met`` clears).
+        # This replaces the retired coverage-count arithmetic AND the
+        # uncorroborated-attestation gate; a lower-confidence (judged-tier)
+        # category no longer hard-blocks — that is folded into the confidence
+        # penalty below.  The blocker STRING is preserved so downstream re-drive /
+        # trigger / state-resolver plumbing keyed on it keeps firing.
         blocker = "criterion_coverage_incomplete"
+    elif residual_uncaptured_gap:
+        # RESIDUAL gate (redesign): the grader found a goal aspect that NONE of
+        # the categories capture — the rubric is incomplete for this candidate, so
+        # even an all-``met`` category set cannot certify the goal.  Same blocker
+        # string, distinguished for operators via sub_scores["residual_uncaptured_gap"].
+        blocker = "criterion_coverage_incomplete"
+    elif capability_proof_blocked:
+        # The capability proof gate is in ENFORCE mode and there are working
+        # capabilities whose proof status is not ``proven`` — the gate would
+        # block dependents that name them.  Block promotion until the unproven
+        # capabilities are either proven or the gate is dialled back to observe.
+        blocker = "capability_proof_gate_blocked"
     elif smoketest_enabled and smoketest_score is None:
         # Only a hard blocker when the smoketest subsystem was actually
         # enabled — a disabled subsystem legitimately produces no score.
@@ -564,6 +913,34 @@ def compute_composite(
     # only blended into confidence when completion_debt_weight > 0 in policy.
     if debt_pressure_score is not None:
         sub_scores["debt_pressure"] = _clamp01(debt_pressure_score)
+
+    # Goal-verification observability (redesign): surface the per-category grade
+    # and residual so operators see WHY the gate fired (or would fire), not just
+    # the blocker string.  Recorded whenever a per-category grade was supplied,
+    # even when a different blocker won the ordered chain.
+    if category_verdicts is not None:
+        _unmet = [
+            str((v or {}).get("category_key") or "")
+            for v in category_verdicts
+            if (v or {}).get("status") != "met"
+        ]
+        sub_scores["category_count"] = len(category_verdicts)
+        sub_scores["met_category_count"] = len(category_verdicts) - len(_unmet)
+        if _unmet:
+            sub_scores["unmet_categories"] = [k for k in _unmet if k]
+        # Fraction of MET categories still resting on the judged tier (v1 = all).
+        _met = [v for v in category_verdicts if (v or {}).get("status") == "met"]
+        if _met:
+            _judged = sum(1 for v in _met if (v or {}).get("tier", "judged") != "machine")
+            sub_scores["judged_tier_met_fraction"] = round(_judged / len(_met), 4)
+    if residual_uncaptured_gap:
+        sub_scores["residual_uncaptured_gap"] = str(residual_uncaptured_gap)
+    # Provenance (finding 85fa667a4d7fcae6): record that this candidate reached
+    # scoring on a merge-grade-exempt path so an operator can see the per-category
+    # coverage gate STILL applied (only the holistic merge_grade_misses gate was
+    # exempted).  Purely informational — the gate outcome above is unchanged.
+    if merge_grade_exempt:
+        sub_scores["merge_grade_exempt"] = True
 
     if blocker is not None:
         return {
@@ -592,6 +969,21 @@ def compute_composite(
         confidence = (1.0 - w_debt) * existing_confidence + w_debt * sub_scores["debt_pressure"]
     else:
         confidence = existing_confidence
+
+    # Judged-tier confidence penalty (goal-verification redesign): reaching here
+    # means every active category is ``met`` (the gate passed).  v1 grades every
+    # category at the JUDGED tier — an LLM reading the merged diff — a lower-
+    # confidence signal than machine/test-cited evidence (the v2 machine tier).
+    # Dock confidence in proportion to the fraction of MET categories still on the
+    # judged tier, so an all-judged candidate scores visibly below a
+    # machine-verified one WITHOUT hard-blocking.
+    if category_verdicts:
+        _met = [v for v in category_verdicts if (v or {}).get("status") == "met"]
+        if _met:
+            _judged = sum(1 for v in _met if (v or {}).get("tier", "judged") != "machine")
+            penalty = JUDGED_TIER_PENALTY_WEIGHT * (_judged / len(_met))
+            confidence *= 1.0 - penalty
+
     confidence = round(_clamp01(confidence), 4)
     return {
         "confidence": confidence,
@@ -599,6 +991,82 @@ def compute_composite(
         "sub_scores": sub_scores,
         "blocker": None,
     }
+
+
+# --- Execution-site classification of promotion blockers --------------------
+# Every hard-blocker code compute_composite() (and the qualifier's downstream
+# gates) can emit is classified by WHERE the responsible check runs, so an
+# operator or agent can tell — WITHOUT hand-diagnosing the release machinery —
+# whether a fix landing on automain will actually take effect before the very
+# promotion it is meant to unblock.
+#
+#   "deployed"  — the check runs in the DEPLOYED (main) process at the deployed
+#                 SHA and compares the candidate against the deployed promotion
+#                 target / production's recorded schema.  A fix to this check on
+#                 automain is INERT until it is itself promoted (release-machinery
+#                 self-reference): the divergence self-clears only on promotion.
+#   "candidate" — the check runs against CANDIDATE content (the merged diff, the
+#                 candidate's CI, a smoketest executing candidate code).  A fix on
+#                 automain resolves the blocker on the NEXT qualification, no
+#                 redeploy required.
+EXECUTION_SITE_DEPLOYED = "deployed"
+EXECUTION_SITE_CANDIDATE = "candidate"
+
+BLOCKER_EXECUTION_SITE: dict[str, str] = {
+    # Deployed-side: both compare the candidate against the deployed promotion
+    # target / production's live recorded schema; the divergence self-clears only
+    # once the version itself promotes, so a fix on automain is inert until then.
+    "migration_identity_collision": EXECUTION_SITE_DEPLOYED,
+    "migration_apply_drift": EXECUTION_SITE_DEPLOYED,
+    # Candidate-side: resolvable by an automain fix that lands in the next
+    # candidate tree — CI, the merged diff, or a smoketest running candidate code.
+    "ci_not_green": EXECUTION_SITE_CANDIDATE,
+    "ci_unresolved": EXECUTION_SITE_CANDIDATE,
+    "smoketest_startup_failed": EXECUTION_SITE_CANDIDATE,
+    "audit_missing": EXECUTION_SITE_CANDIDATE,
+    "test_file_deleted": EXECUTION_SITE_CANDIDATE,
+    "criterion_coverage_incomplete": EXECUTION_SITE_CANDIDATE,
+    "merge_grade_misses": EXECUTION_SITE_CANDIDATE,
+    "capability_proof_gate_blocked": EXECUTION_SITE_CANDIDATE,
+    # NOTE: ``uncorroborated_attestation`` is deliberately absent — the
+    # attestation gate it classified was replaced by the per-category
+    # goal-verification gate (which blocks as ``criterion_coverage_incomplete``),
+    # and no code path emits the code any more.  Classifying a blocker nothing
+    # emits is dead vocabulary that reads as a live gate to operators.
+}
+
+# Short operator-facing phrase per execution-site, appended to blocker labels.
+EXECUTION_SITE_LABELS: dict[str, str] = {
+    EXECUTION_SITE_DEPLOYED: (
+        "this check runs DEPLOYED-side — a fix on automain is inert until this "
+        "version itself promotes"
+    ),
+    EXECUTION_SITE_CANDIDATE: (
+        "this check runs CANDIDATE-side — a fix on automain clears it on the next "
+        "qualification"
+    ),
+}
+
+
+def blocker_execution_site(blocker: str | None) -> str | None:
+    """Classify a promotion-blocker code by where the responsible check runs.
+
+    Returns ``"deployed"`` (inert-until-promote) or ``"candidate"`` (clearable by
+    an automain fix), or ``None`` when there is no blocker or the code is not
+    classified (unknown / force-promote sentinels such as
+    ``qualification_superseded``).
+    """
+    if not blocker:
+        return None
+    return BLOCKER_EXECUTION_SITE.get(blocker)
+
+
+def blocker_execution_site_label(blocker: str | None) -> str | None:
+    """Human-readable execution-site phrase for a blocker, or None if unclassified."""
+    site = blocker_execution_site(blocker)
+    if site is None:
+        return None
+    return EXECUTION_SITE_LABELS.get(site)
 
 
 _AUDIT_DEDUCTIONS: dict[str, float] = {
@@ -701,17 +1169,27 @@ def _finding_subject_is_authorized_divergence(f: dict) -> bool:
     ).lower()
     if not text:
         return False
-    for div in AUTHORIZED_DIVERGENCES:
+    # Effective list = baked floor UNION operator-approved runtime store, resolved
+    # at call time so a newly-added runtime exemption de-dups its audit finding
+    # without a redeploy.
+    for div in effective_authorized_divergences():
         if div.revision.lower() not in text:
             continue
-        if any(p in text for p in _REVISION_IDENTITY_PHRASES):
-            return True
-        # The back-merge identity swap named explicitly (both migration
-        # identities of the reused revision) is itself the divergence concern.
-        if (
+        matched = any(p in text for p in _REVISION_IDENTITY_PHRASES) or (
+            # The back-merge identity swap named explicitly (both migration
+            # identities of the reused revision) is itself the divergence concern.
             div.deployed_identity.lower() in text
             and div.integration_identity.lower() in text
-        ):
+        )
+        if matched:
+            if div.is_runtime:
+                logger.info(
+                    "[release-audit] authorized-divergence finding de-dup for "
+                    "revision %r via RUNTIME exemption authorized by %r: %s",
+                    div.revision,
+                    div.added_by,
+                    div.reason,
+                )
             return True
     return False
 
@@ -761,9 +1239,32 @@ def _score_audit(report: dict[str, Any] | None) -> tuple[float | None, float | N
     derived = _clamp01(derived)
     missing_reason = _audit_missing_reason(report)
     audit_score: float | None = derived
-    if missing_reason == "parseable_but_unscoreable":
-        # The report parsed, but no findings entry carried a usable severity.
-        # Treat that as an unusable audit signal instead of a clean 1.0.
+    if missing_reason in (
+        "parseable_but_unscoreable",
+        "all_findings_unverified",
+        "no_findings_key",
+    ):
+        # The report parsed but yields NO trustworthy score, so returning the
+        # clean-looking ``derived`` would fail GREEN over real defects:
+        #   * ``parseable_but_unscoreable`` — no finding carried a usable severity.
+        #   * ``all_findings_unverified`` — EVERY higher-severity (critical/high/…)
+        #     finding was dropped for lacking a ≥20-char verification_note, so the
+        #     deduction loop left ``derived`` at 1.0 while unsubstantiated criticals
+        #     go unsurfaced (the false-green class this fix closes).
+        #   * ``no_findings_key`` — the artifact carries NEITHER a "findings" nor
+        #     an "issues" key, so the deduction loop never ran and ``derived``
+        #     stayed 1.0.  A report missing the findings section entirely is
+        #     MALFORMED, not clean (contrast ``empty_findings_list``, where an
+        #     explicit ``findings: []`` legitimately says the auditor found
+        #     nothing) — score it unmeasured so ``compute_composite`` routes to
+        #     the ``audit_missing`` hard blocker instead of promoting on a
+        #     phantom-clean audit.
+        # NULL the score in both cases so ``compute_composite`` routes to the
+        # ``audit_missing`` hard blocker (surface it, don't fail green) instead of
+        # promoting on a phantom-clean audit.  A report with at least ONE verified
+        # higher-severity finding is still scoreable and keeps its derived score
+        # (``all_findings_unverified`` does not fire) — correct scoring is preserved
+        # whenever verification notes are present.
         audit_score = None
     else:
         # Observability: log when the model's self-reported score diverges materially.

@@ -298,12 +298,6 @@ _PROVIDER_API_KEY_CONTEXT_MARKERS = {
 }
 
 
-def _has_provider_endpoint_context(provider: str, text: str) -> bool:
-    return any(
-        marker in text for marker in _PROVIDER_AUTH_ENDPOINT_MARKERS.get(provider, ())
-    )
-
-
 def _has_provider_api_key_context(provider: str, text: str) -> bool:
     return any(
         marker in text for marker in _PROVIDER_API_KEY_CONTEXT_MARKERS.get(provider, ())
@@ -1913,7 +1907,10 @@ async def update_agent_status(
                     _blk_acct_id = get_task_llm_account_id(task)
                     _blocked_vm_id = task.vm_instance_id
                     if _blk_acct_id and not (task.context or {}).get("_slot_released"):
-                        await release_max_plan_account(_blk_acct_id)
+                        await release_max_plan_account(
+                            _blk_acct_id,
+                            project_id=str(task.project_id) if task.project_id else None,
+                        )
                         task.context = {**(task.context or {}), "_slot_released": True}
                     enter_blocked_state(
                         task,
@@ -2025,7 +2022,10 @@ async def update_agent_status(
                     acct_id = get_task_llm_account_id(task)
                     model = _extract_task_model(task)
                     if acct_id:
-                        await release_max_plan_account(acct_id)
+                        await release_max_plan_account(
+                            acct_id,
+                            project_id=str(task.project_id) if task.project_id else None,
+                        )
                         # Mark slot as released so the fallback release (line ~6232) doesn't double-release
                         task.context = {**(task.context or {}), "_slot_released": True}
                         if failure_class == "RATE_LIMIT" and model:
@@ -2440,7 +2440,10 @@ async def update_agent_status(
                     # a code defect). The operator must re-authenticate to re-enable.
                     da_acct_id = get_task_llm_account_id(task)
                     if da_acct_id:
-                        await release_max_plan_account(da_acct_id)
+                        await release_max_plan_account(
+                            da_acct_id,
+                            project_id=str(task.project_id) if task.project_id else None,
+                        )
                         task.context = {**(task.context or {}), "_slot_released": True}
 
                     _da_pattern = (task.context or {}).get(
@@ -2618,7 +2621,10 @@ async def update_agent_status(
         # Flush immediately so _slot_released persists even if downstream processing fails.
         acct_id = get_task_llm_account_id(task)
         if acct_id and not (task.context or {}).get("_slot_released"):
-            await release_max_plan_account(acct_id)
+            await release_max_plan_account(
+                acct_id,
+                project_id=str(task.project_id) if task.project_id else None,
+            )
             task.context = {**(task.context or {}), "_slot_released": True}
             session.add(task)
             await session.flush()
@@ -2877,6 +2883,13 @@ async def update_agent_status(
                 # be unreliable under async + with_for_update(skip_locked=True)
                 # — see rollup_management._relock_parent (~line 186) and
                 # task_completion.py:1671 for the canonical pattern.
+                # Snapshot the pk BEFORE expiring: session.expire() drops every
+                # loaded attribute (including ``id``), so a ``task.id`` read in
+                # the expire→relock window triggers a sync lazy-load —
+                # MissingGreenlet under the async engine. The relock SELECT
+                # below repopulates the instance (same identity map entry), so
+                # reads after a successful relock are safe again.
+                _relock_task_pk = task.id
                 try:
                     session.expire(task)
                 except InvalidRequestError:
@@ -2885,7 +2898,7 @@ async def update_agent_status(
                     session.expire_all()
                 relock_stmt = (
                     select(Task)
-                    .where(Task.id == task.id)
+                    .where(Task.id == _relock_task_pk)
                     .with_for_update(skip_locked=True)
                     .execution_options(populate_existing=True)
                 )
@@ -2902,7 +2915,7 @@ async def update_agent_status(
                     # is added later it can grep for `_pr_state_check_pending`
                     # to find these tasks.
                     logger.info(
-                        f"[AGENT_STATUS] Task {task.id} re-lock skipped (locked elsewhere) — "
+                        f"[AGENT_STATUS] Task {_relock_task_pk} re-lock skipped (locked elsewhere) — "
                         f"tentative state persisted, returning"
                     )
                     return {"status": "accepted_pr_check_deferred"}

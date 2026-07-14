@@ -3,6 +3,9 @@ import { apiFetch } from './api';
 import {
   checkInStrategicSession,
   executeStrategicWorkSessionCommand,
+  fetchStrategicStateWithRevision,
+  isStrategicStateNotModified,
+  STRATEGIC_STATE_NOT_MODIFIED,
   updateStrategicWorkbenchState,
   type StrategicWorkbenchState,
 } from './strategicStateApi';
@@ -103,6 +106,70 @@ describe('updateStrategicWorkbenchState', () => {
     await expect(
       updateStrategicWorkbenchState('proj-1', { active_surface: 'runtime' }),
     ).rejects.toThrow('missing workbench');
+  });
+});
+
+describe('fetchStrategicStateWithRevision', () => {
+  beforeEach(() => {
+    apiFetchMock.mockReset();
+  });
+
+  test('returns the parsed state and captures the ETag header into state_etag', async () => {
+    apiFetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ project_id: 'proj-1', state_revision: 'rev-1' }), {
+        status: 200,
+        headers: { ETag: '"full-etag-1"' },
+      }),
+    );
+
+    const result = await fetchStrategicStateWithRevision('proj-1', null);
+    expect(result).not.toBe(STRATEGIC_STATE_NOT_MODIFIED);
+    if (isStrategicStateNotModified(result)) throw new Error('unreachable');
+    expect(result.project_id).toBe('proj-1');
+    expect(result.state_etag).toBe('"full-etag-1"');
+
+    // No revision and no etag → no query param, no If-None-Match header.
+    expect(apiFetchMock).toHaveBeenCalledWith(
+      '/api/admin/projects/proj-1/strategic-state',
+      undefined,
+      2,
+      30000,
+      undefined,
+      false,
+    );
+  });
+
+  test('sends the held revision as ?state_revision and the etag as If-None-Match', async () => {
+    apiFetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ project_id: 'proj-1' }), { status: 200 }),
+    );
+
+    await fetchStrategicStateWithRevision('proj-1', 'rev-9', undefined, '"held-etag"');
+
+    expect(apiFetchMock).toHaveBeenCalledWith(
+      '/api/admin/projects/proj-1/strategic-state?state_revision=rev-9',
+      { headers: { 'If-None-Match': '"held-etag"' } },
+      2,
+      30000,
+      undefined,
+      false,
+    );
+  });
+
+  test('maps a 304 response to the not-modified sentinel without parsing the body', async () => {
+    // A 304 has an empty body; json() must never be called on it.
+    apiFetchMock.mockResolvedValue(new Response(null, { status: 304 }));
+
+    const result = await fetchStrategicStateWithRevision('proj-1', 'rev-1', undefined, '"e1"');
+    expect(result).toBe(STRATEGIC_STATE_NOT_MODIFIED);
+  });
+
+  test('throws on a non-ok, non-304 response', async () => {
+    apiFetchMock.mockResolvedValue(new Response('nope', { status: 500 }));
+
+    await expect(
+      fetchStrategicStateWithRevision('proj-1', null),
+    ).rejects.toThrow('Failed to fetch strategic state: 500');
   });
 });
 

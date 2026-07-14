@@ -483,7 +483,10 @@ def validate_standalone_chain(
 
 
 def validate_combined_migration_chain(
-    existing_filenames: list[str], added_sources: dict[str, str]
+    existing_filenames: list[str],
+    added_sources: dict[str, str],
+    *,
+    inplace_modified_revisions: set[str] | None = None,
 ) -> str | None:
     """Validate a rollup's added migrations against the target branch's chain.
 
@@ -505,9 +508,28 @@ def validate_combined_migration_chain(
     or stale revision and the fix. The in-isolation checks still run first, so
     this is a strict superset of :func:`validate_added_migrations`.
 
+    ``inplace_modified_revisions`` names revision ids that this rollup edits
+    IN PLACE — a migration whose file already exists on the target branch and
+    keeps its revision id (a ``modified`` PR file, not an ``added`` one). Such a
+    file is NOT a new chain extension: it keeps its revision id and its existing
+    chain position by design, so subjecting it to the added-migration collision
+    check (a) or the head-anchor check (b) would falsely report it as a
+    duplicate revision or as anchoring off the current head. These edits are
+    exempted here and their immutability is enforced separately by the
+    deployed-migration restore/immutability checks in the pre-merge guard. This
+    is what makes the byte-identical RESTORE of an unauthorized in-place
+    down_revision renumber (v25 migration-identity reconciliation) reachable
+    instead of being hard-blocked at this earlier collision check.
+
     With no existing migrations (empty/greenfield target) it degrades exactly to
     :func:`validate_added_migrations`.
     """
+    if inplace_modified_revisions:
+        added_sources = {
+            path: src
+            for path, src in added_sources.items()
+            if _filename_revision_prefix(path) not in inplace_modified_revisions
+        }
     reason = validate_added_migrations(added_sources)
     if reason is not None:
         return reason
@@ -522,9 +544,26 @@ def validate_combined_migration_chain(
     if not existing_revisions:
         # No existing chain to combine against — in-isolation result stands.
         return None
-    existing_head = max(existing_revisions, key=int)
 
     added_chain, _duplicates, _unparseable = build_migration_chain(added_sources)
+
+    # Build the combined revision graph: the target branch's existing revisions,
+    # ordered into a linear chain by their monotonic ``NNNN`` ids (the
+    # migration-chain invariant keeps the on-disk target chain single-head and
+    # monotonic, so numeric order faithfully reconstructs its topological order),
+    # plus the revisions this rollup adds. The head is derived TOPOLOGICALLY via
+    # :func:`find_heads` over this graph rather than by numeric max — a migration
+    # renumbered or rechained to carry the largest id is exactly what let a stale
+    # head masquerade as valid under numeric-max detection (the v25 identity
+    # divergence).
+    sorted_existing = sorted(existing_revisions, key=int)
+    combined_chain: dict[str, str | None] = {}
+    prev: str | None = None
+    for rev in sorted_existing:
+        combined_chain[rev] = prev
+        prev = rev
+    existing_head = find_heads(combined_chain)[0]
+    combined_chain.update(added_chain)
 
     # (a) A revision id the rollup adds already exists on the target branch.
     collisions = sorted(set(added_chain) & existing_revisions, key=int)
@@ -532,8 +571,8 @@ def validate_combined_migration_chain(
         rev = collisions[0]
         return (
             f"Alembic revision '{rev}' already exists on the target branch; "
-            f"renumber to the next free revision and rechain onto the current "
-            f"head '{existing_head}'."
+            f"renumber your new migration to the next free revision above the "
+            f"current head '{existing_head}'."
         )
 
     # (b) The added chain's root must attach to the target's current head; a
@@ -546,7 +585,27 @@ def validate_combined_migration_chain(
         return (
             f"Alembic migration '{root_rev}' anchors to down_revision "
             f"'{anchor}', but the target branch head is '{existing_head}'; "
-            f"rechain '{root_rev}' onto '{existing_head}'."
+            f"renumber your new migration onto the current head '{existing_head}' "
+            f"(never rechain an existing migration onto a higher number — that is "
+            f"what produced the migration-identity divergence)."
+        )
+
+    # (c) Combined-result monotonicity: the merged chain must resolve to a single
+    # head that is also the numeric-max revision. An added migration correctly
+    # anchored to the head but carrying an id at or below the head (a backwards
+    # renumber) passes (a) and (b) yet leaves numeric-max pointing at a stale
+    # revision — the very masquerade numeric-max head detection cannot see.
+    combined_heads = find_heads(combined_chain)
+    numeric_max = max(combined_chain, key=int)
+    if len(combined_heads) != 1 or combined_heads[0] != numeric_max:
+        added_head = find_heads(added_chain)[0]
+        return (
+            f"Alembic migration '{added_head}' would leave the combined chain "
+            f"non-monotonic: its revision id is not the highest in the merged "
+            f"chain (numeric max is '{numeric_max}'), so numeric-max head "
+            f"detection would mis-identify the head. Renumber your new migration "
+            f"onto the current head '{existing_head}' — never rechain an existing "
+            f"migration onto a higher number."
         )
     return None
 

@@ -7,6 +7,7 @@ Tests for admin routers:
    clear-wave-deps, rollup, findings)
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -116,13 +117,17 @@ def _assert_message_event_payload(
     assert len(json.dumps(payload, default=str).encode("utf-8")) < 800
 
 
-async def _make_project(session, owner_id=TEST_USER_ID, name="Test Project"):
-    """Create a project with the given user as owner, plus the owner membership."""
+async def _make_project(session, owner_id=TEST_USER_ID, name="Test Project", role="owner"):
+    """Create a project with the given user as a member, plus the membership row.
+
+    ``role`` defaults to ``owner``; pass ``viewer``/``member`` to exercise the
+    role floor on mutating endpoints (viewer is documented read-only).
+    """
     project = Project(name=name, user_id=owner_id)
     session.add(project)
     await session.commit()
     await session.refresh(project)
-    member = ProjectMember(project_id=project.id, user_id=owner_id, role="owner")
+    member = ProjectMember(project_id=project.id, user_id=owner_id, role=role)
     session.add(member)
     await session.commit()
     return project
@@ -2255,6 +2260,10 @@ class TestDeleteProject:
         )
         await db_session.commit()
 
+        # Snapshot the id BEFORE deleting: expire_all() below expires the
+        # (now-deleted) project row, so a later ``project.id`` lazy-load would
+        # raise MissingGreenlet under real ORM expiry.
+        project_id = project.id
         resp = await client.delete(f"/api/admin/projects/{project.id}")
         assert resp.status_code == 200, resp.text
 
@@ -2268,7 +2277,7 @@ class TestDeleteProject:
             rows = (
                 (
                     await db_session.execute(
-                        _select(_model).where(_model.project_id == project.id)
+                        _select(_model).where(_model.project_id == project_id)
                     )
                 )
                 .scalars()
@@ -3050,6 +3059,133 @@ class TestPurgeArchive:
         assert surviving.parent_task_id is None
 
 
+class TestArchiveRoleFloor:
+    """bulk-archive / purge-archive are mutations → member+ only.
+
+    Both were scoped by membership alone (any role), while the sibling
+    ``POST /tasks/bulk-action`` already filtered ``role.in_(["member","owner"])``
+    — so this was an inconsistency, not a design choice. purge-archive is the
+    sharpest case: it PERMANENTLY deletes up to 5000 task rows per call, and a
+    viewer is documented read-only.
+    """
+
+    @pytest.mark.asyncio
+    async def test_purge_archive_skips_viewer_project(
+        self, client: AsyncClient, db_session
+    ):
+        """A viewer must not be able to permanently delete another member's tasks."""
+        from testing.factories import make_task
+
+        project = await _make_project(
+            db_session, name="Viewer Purge", role="viewer"
+        )
+        task = make_task(
+            project_id=project.id, status=TaskStatus.COMPLETED, archived=True
+        )
+        db_session.add(task)
+        await db_session.commit()
+        task_id = task.id
+
+        resp = await client.post("/api/admin/tasks/purge-archive", json={})
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["deleted_count"] == 0
+
+        # The archived task on the viewer-only project must still exist.
+        db_session.expunge_all()
+        row = (
+            (await db_session.execute(select(Task).where(Task.id == task_id)))
+            .scalars()
+            .first()
+        )
+        assert row is not None
+
+    @pytest.mark.asyncio
+    async def test_purge_archive_deletes_member_project_tasks(
+        self, client: AsyncClient, db_session
+    ):
+        """The floor must not over-reject: a member (not owner) can still purge."""
+        from testing.factories import make_task
+
+        project = await _make_project(
+            db_session, name="Member Purge", role="member"
+        )
+        task = make_task(
+            project_id=project.id, status=TaskStatus.COMPLETED, archived=True
+        )
+        db_session.add(task)
+        await db_session.commit()
+        task_id = task.id
+
+        resp = await client.post("/api/admin/tasks/purge-archive", json={})
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["deleted_count"] >= 1
+
+        db_session.expunge_all()
+        row = (
+            (await db_session.execute(select(Task).where(Task.id == task_id)))
+            .scalars()
+            .first()
+        )
+        assert row is None
+
+    @pytest.mark.asyncio
+    async def test_bulk_archive_skips_viewer_project(
+        self, client: AsyncClient, db_session
+    ):
+        """A viewer must not be able to bulk-archive another member's tasks."""
+        from testing.factories import make_task
+
+        project = await _make_project(
+            db_session, name="Viewer Archive", role="viewer"
+        )
+        task = make_task(
+            project_id=project.id, status=TaskStatus.COMPLETED, archived=False
+        )
+        db_session.add(task)
+        await db_session.commit()
+        task_id = task.id
+
+        resp = await client.post(
+            "/api/admin/tasks/bulk-archive", json={"task_ids": [str(task_id)]}
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["archived_count"] == 0
+
+        await db_session.refresh(task)
+        assert task.archived is False
+
+    @pytest.mark.asyncio
+    async def test_bulk_archive_archives_member_project_tasks(
+        self, client: AsyncClient, db_session
+    ):
+        """The floor must not over-reject: a member (not owner) can still archive."""
+        from testing.factories import make_task
+
+        project = await _make_project(
+            db_session, name="Member Archive", role="member"
+        )
+        task = make_task(
+            project_id=project.id, status=TaskStatus.COMPLETED, archived=False
+        )
+        db_session.add(task)
+        await db_session.commit()
+        task_id = task.id
+
+        resp = await client.post(
+            "/api/admin/tasks/bulk-archive", json={"task_ids": [str(task_id)]}
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["archived_count"] == 1
+
+        db_session.expunge_all()
+        row = (
+            (await db_session.execute(select(Task).where(Task.id == task_id)))
+            .scalars()
+            .first()
+        )
+        assert row is not None and row.archived is True
+
+
 class TestResetProjectStateHelper:
     def test_reset_project_state_clears_only_target(self):
         """reset_project_state pops one project's keys, leaves others intact."""
@@ -3088,6 +3224,51 @@ class TestAutonomousMode:
         resp = await client.post("/api/admin/autonomous/pause-all")
         assert resp.status_code == 200
         assert resp.json()["paused"] == 1
+
+    @pytest.mark.asyncio
+    async def test_pause_all_skips_viewer_projects(
+        self, client: AsyncClient, db_session
+    ):
+        """pause-all must not touch projects where the caller is only a viewer.
+
+        Viewers are read-only: disabling autonomous mode is a mutation they may
+        not perform, so the project is left running and excluded from the count.
+
+        This route takes no ``project_id``, so it is inherently the "pause
+        everything I can" bulk shape — scoping viewer-only projects out silently
+        is correct, but it must report what it left RUNNING via ``skipped_count``
+        rather than hiding it.
+        """
+        viewed = await _make_project(db_session, name="Viewed", role="viewer")
+        viewed.autonomous_enabled = True
+        db_session.add(viewed)
+        await db_session.commit()
+
+        resp = await client.post("/api/admin/autonomous/pause-all")
+        assert resp.status_code == 200
+        assert resp.json()["paused"] == 0
+        # The still-running viewer project is surfaced, not silently dropped.
+        assert resp.json()["skipped_count"] == 1
+
+        await db_session.refresh(viewed)
+        assert viewed.autonomous_enabled is True
+
+    @pytest.mark.asyncio
+    async def test_pause_all_pauses_member_projects(
+        self, client: AsyncClient, db_session
+    ):
+        """The member floor must not over-reject: a member (not owner) can pause."""
+        owned = await _make_project(db_session, name="Member Project", role="member")
+        owned.autonomous_enabled = True
+        db_session.add(owned)
+        await db_session.commit()
+
+        resp = await client.post("/api/admin/autonomous/pause-all")
+        assert resp.status_code == 200
+        assert resp.json()["paused"] == 1
+
+        await db_session.refresh(owned)
+        assert owned.autonomous_enabled is False
 
     @pytest.mark.asyncio
     async def test_toggle_autonomous_enable(self, client: AsyncClient, db_session):
@@ -4033,6 +4214,165 @@ class TestAlerts:
         assert resp.status_code == 404
 
     @pytest.mark.asyncio
+    async def test_dismiss_alert_viewer_forbidden(
+        self, client: AsyncClient, db_session
+    ):
+        """A viewer may not suppress operator escalation by dismissing an alert."""
+        project = await _make_project(db_session, name="Viewer Alerts", role="viewer")
+        alert = Alert(
+            project_id=project.id,
+            severity="ERROR",
+            title="Do not silence me",
+            message="boom",
+        )
+        db_session.add(alert)
+        await db_session.commit()
+        await db_session.refresh(alert)
+
+        resp = await client.post(f"/api/admin/alerts/{alert.id}/dismiss")
+        assert resp.status_code == 403, resp.text
+
+        await db_session.refresh(alert)
+        assert alert.dismissed_at is None
+
+    @pytest.mark.asyncio
+    async def test_acknowledge_alert_viewer_forbidden(
+        self, client: AsyncClient, db_session
+    ):
+        """A viewer may not acknowledge an alert (read-only role)."""
+        project = await _make_project(db_session, name="Viewer Ack", role="viewer")
+        alert = Alert(
+            project_id=project.id,
+            severity="ERROR",
+            title="Unacknowledged",
+            message="boom",
+        )
+        db_session.add(alert)
+        await db_session.commit()
+        await db_session.refresh(alert)
+
+        resp = await client.post(f"/api/admin/alerts/{alert.id}/acknowledge")
+        assert resp.status_code == 403, resp.text
+
+        await db_session.refresh(alert)
+        assert alert.acknowledged_at is None
+
+    @pytest.mark.asyncio
+    async def test_acknowledge_alert_member_allowed(
+        self, client: AsyncClient, db_session
+    ):
+        """The member floor must not over-reject: a member (not owner) can ack."""
+        project = await _make_project(db_session, name="Member Ack", role="member")
+        alert = Alert(
+            project_id=project.id,
+            severity="ERROR",
+            title="Acknowledge me",
+            message="boom",
+        )
+        db_session.add(alert)
+        await db_session.commit()
+        await db_session.refresh(alert)
+
+        resp = await client.post(f"/api/admin/alerts/{alert.id}/acknowledge")
+        assert resp.status_code == 200, resp.text
+
+        await db_session.refresh(alert)
+        assert alert.acknowledged_at is not None
+
+    @pytest.mark.asyncio
+    async def test_dismiss_all_skips_viewer_projects(
+        self, client: AsyncClient, db_session
+    ):
+        """dismiss-all must leave alerts on viewer-only projects untouched.
+
+        The UNFILTERED bulk shape ("dismiss everything I can") scopes silently
+        rather than 403-ing the whole call — a caller who is member on 3 projects
+        and viewer on a 4th should dismiss the 3. But it must report what it left
+        behind via ``skipped_count`` instead of hiding it.
+        """
+        project = await _make_project(db_session, name="Viewer Bulk", role="viewer")
+        alert = Alert(
+            project_id=project.id,
+            severity="ERROR",
+            title="Still open",
+            message="boom",
+        )
+        db_session.add(alert)
+        await db_session.commit()
+        await db_session.refresh(alert)
+
+        resp = await client.post("/api/admin/alerts/dismiss-all")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["dismissed_count"] == 0
+        # The no-op is surfaced, not silent.
+        assert body["skipped_count"] == 1
+
+        await db_session.refresh(alert)
+        assert alert.dismissed_at is None
+
+    @pytest.mark.asyncio
+    async def test_dismiss_all_explicit_viewer_project_id_forbidden(
+        self, client: AsyncClient, db_session
+    ):
+        """An EXPLICITLY-targeted dismiss-all on a viewer project → 403, not a silent no-op.
+
+        Silent scoping is right for the unfiltered bulk case, but when the caller
+        names a specific project they cannot write to, returning 200 /
+        ``dismissed_count: 0`` tells them nothing about why nothing happened.
+        Gates must emit WHY.
+        """
+        project = await _make_project(
+            db_session, name="Viewer Targeted", role="viewer"
+        )
+        alert = Alert(
+            project_id=project.id,
+            severity="ERROR",
+            title="Still open",
+            message="boom",
+        )
+        db_session.add(alert)
+        await db_session.commit()
+        await db_session.refresh(alert)
+
+        resp = await client.post(
+            f"/api/admin/alerts/dismiss-all?project_id={project.id}"
+        )
+        assert resp.status_code == 403, resp.text
+        assert "member" in resp.json()["error"]["message"].lower()
+
+        await db_session.refresh(alert)
+        assert alert.dismissed_at is None
+
+    @pytest.mark.asyncio
+    async def test_dismiss_all_explicit_member_project_id_allowed(
+        self, client: AsyncClient, db_session
+    ):
+        """The explicit-target 403 must not over-reject a member."""
+        project = await _make_project(
+            db_session, name="Member Targeted", role="member"
+        )
+        alert = Alert(
+            project_id=project.id,
+            severity="ERROR",
+            title="Dismiss me",
+            message="boom",
+        )
+        db_session.add(alert)
+        await db_session.commit()
+        await db_session.refresh(alert)
+
+        resp = await client.post(
+            f"/api/admin/alerts/dismiss-all?project_id={project.id}"
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["dismissed_count"] == 1
+        assert resp.json()["skipped_count"] == 0
+
+        await db_session.refresh(alert)
+        assert alert.dismissed_at is not None
+
+    @pytest.mark.asyncio
     async def test_dismiss_all_alerts(self, client: AsyncClient, db_session):
         """All undismissed alerts across user's projects are dismissed."""
         project = await _make_project(db_session)
@@ -4148,6 +4488,102 @@ class TestMessages:
         data = resp.json()
         assert data["status"] == "created"
         assert "id" in data
+
+    @pytest.mark.asyncio
+    async def test_create_message_viewer_forbidden(
+        self, client: AsyncClient, db_session
+    ):
+        """A viewer may not post to the project message board (read-only role)."""
+        project = await _make_project(db_session, name="Viewer Board", role="viewer")
+
+        resp = await client.post(
+            "/api/admin/messages",
+            json={
+                "project_id": str(project.id),
+                "message_type": "NOTE",
+                "content": "Viewers must not be able to write this.",
+            },
+        )
+        assert resp.status_code == 403, resp.text
+
+        # Nothing persisted.
+        from sqlalchemy import func as sa_func
+
+        count = (
+            await db_session.execute(
+                select(sa_func.count(ProjectMessage.id)).where(
+                    ProjectMessage.project_id == project.id
+                )
+            )
+        ).scalar_one()
+        assert count == 0
+
+    @pytest.mark.asyncio
+    async def test_create_message_member_allowed(
+        self, client: AsyncClient, db_session
+    ):
+        """The member floor must not over-reject: a member (not owner) can post."""
+        project = await _make_project(db_session, name="Member Board", role="member")
+
+        resp = await client.post(
+            "/api/admin/messages",
+            json={
+                "project_id": str(project.id),
+                "message_type": "NOTE",
+                "content": "Members can post.",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "created"
+
+    @pytest.mark.asyncio
+    async def test_resolve_message_viewer_forbidden(
+        self, client: AsyncClient, db_session
+    ):
+        """A viewer may not resolve someone else's message."""
+        project = await _make_project(db_session, name="Viewer Resolve", role="viewer")
+        msg = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.BUG_REPORT,
+            from_type="user",
+            content="Bug stays open",
+            status="open",
+        )
+        db_session.add(msg)
+        await db_session.commit()
+        await db_session.refresh(msg)
+
+        resp = await client.patch(
+            f"/api/admin/messages/{msg.id}", json={"resolution": "wontfix"}
+        )
+        assert resp.status_code == 403, resp.text
+
+        await db_session.refresh(msg)
+        assert msg.status == "open"
+
+    @pytest.mark.asyncio
+    async def test_delete_message_viewer_forbidden(
+        self, client: AsyncClient, db_session
+    ):
+        """A viewer may not delete a message off the board."""
+        project = await _make_project(db_session, name="Viewer Delete", role="viewer")
+        msg = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.BUG_REPORT,
+            from_type="user",
+            content="Must survive",
+            status="open",
+        )
+        db_session.add(msg)
+        await db_session.commit()
+        await db_session.refresh(msg)
+
+        resp = await client.delete(f"/api/admin/messages/{msg.id}")
+        assert resp.status_code == 403, resp.text
+
+        # The message must still exist.
+        still_there = await db_session.get(ProjectMessage, msg.id)
+        assert still_there is not None
 
     @pytest.mark.asyncio
     async def test_create_message_broadcasts_created_once_for_idempotent_send(
@@ -4828,7 +5264,7 @@ class TestMessages:
 
     @pytest.mark.asyncio
     async def test_canonical_message_arm_rollback_does_not_500(
-        self, client: AsyncClient, db_session
+        self, client: AsyncClient, db_session, expire_fidelity
     ):
         """Under real row contention the arm path rolls the session back to
         clear the aborted bounded-lock acquire, which EXPIRES the
@@ -7188,6 +7624,91 @@ class TestMessagesWorkbenchState:
         assert "workday mode" in marker["excerpt"]
         assert "Operator workbench" in marker["excerpt"]
 
+    # ── Role floor ────────────────────────────────────────────────────────────
+    #
+    # PUT /messages/workbench-state looks like the five sibling PUT /messages/*
+    # routes (last-seen, noise-prefs, saved-views, temp-mutes, mute-window) that
+    # ARE per-user personal UI state — each keyed by a
+    # UniqueConstraint("user_id","project_id") — and stay viewer-writable.
+    #
+    # It is not one of them. persist_strategic_workbench_update takes
+    # with_vision_locked() to read-modify-write the PROJECT-GLOBAL Project.vision
+    # column, and on a client-supplied interaction_mode transition arms a sticky,
+    # breaker-bypassing, cooldown-bypassing strategic refresh with
+    # origin=ORIGIN_OPERATOR (see test_entering_active_mode_arms_strategic_refresh
+    # directly above). Without the member+ floor, a VIEWER can steer the
+    # autonomous strategist.
+
+    @pytest.mark.asyncio
+    async def test_viewer_cannot_persist_workbench_state(
+        self, client: AsyncClient, db_session
+    ):
+        """Viewer → 403, and no operator-origin refresh armed in Project.vision."""
+        project = await _make_project(
+            db_session, name="Viewer Workbench", role="viewer"
+        )
+
+        resp = await client.put(
+            "/api/admin/messages/workbench-state",
+            json={
+                "project_id": str(project.id),
+                "workbench": {
+                    "interaction_mode": "continuous",
+                    "active_surface": "strategic",
+                    "selected_refs": [],
+                },
+            },
+        )
+
+        assert resp.status_code == 403, resp.text
+        assert "member" in resp.json()["error"]["message"].lower()
+
+        # The project-global vision column must be untouched: no viewer-supplied
+        # steering excerpt, no operator-origin refresh armed.
+        await db_session.refresh(project)
+        assert (project.vision or {}).get("_strategic_refresh") is None
+
+    @pytest.mark.asyncio
+    async def test_member_can_persist_workbench_state(
+        self, client: AsyncClient, db_session
+    ):
+        """The floor must not over-reject: a member (not owner) can still steer."""
+        project = await _make_project(
+            db_session, name="Member Workbench", role="member"
+        )
+
+        resp = await client.put(
+            "/api/admin/messages/workbench-state",
+            json={
+                "project_id": str(project.id),
+                "workbench": {
+                    "interaction_mode": "continuous",
+                    "active_surface": "strategic",
+                    "selected_refs": [],
+                },
+            },
+        )
+
+        assert resp.status_code == 200, resp.text
+        await db_session.refresh(project)
+        marker = (project.vision or {}).get("_strategic_refresh")
+        assert marker is not None
+        assert marker["origin"] == "operator"
+
+    @pytest.mark.asyncio
+    async def test_viewer_can_still_read_workbench_state(
+        self, client: AsyncClient, db_session
+    ):
+        """The GET is a read — the floor must not break viewer read access."""
+        project = await _make_project(
+            db_session, name="Viewer Workbench Read", role="viewer"
+        )
+
+        resp = await client.get(
+            f"/api/admin/messages/workbench-state?project_id={project.id}"
+        )
+        assert resp.status_code == 200, resp.text
+
     @pytest.mark.asyncio
     async def test_repeating_same_active_mode_does_not_rearm(
         self, client: AsyncClient, db_session
@@ -9499,6 +10020,8 @@ class TestNotificationConfigSettings:
             "RUNNER_FLEET_OFFLINE",
             "RUNNER_LOW_DISK",
             "RUNNER_OUTAGE_ESCALATED",
+            "RUNNER_LOCAL_HOLD",
+            "RUNNER_CONTAINER_HOLD",
         ]
         resp = await client.patch(
             "/api/admin/settings",
@@ -10422,6 +10945,91 @@ class TestNotificationConfigStartupRestore:
             await _engine.dispose()
 
     @pytest.mark.asyncio
+    async def test_notification_config_webhook_url_encrypted_in_db_and_decrypted_on_restore(
+        self, mocker
+    ):
+        """When GITHUB_PAT_ENCRYPTION_KEY is set, the webhook_url stored in
+        runtime_config_json is encrypted (ciphertext at rest) and transparently
+        decrypted when loaded back into shared_state.runtime_config on restart."""
+        from cryptography.fernet import Fernet
+        from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+        from sqlalchemy.orm import sessionmaker
+        from sqlalchemy.pool import StaticPool
+        from sqlmodel import SQLModel
+        from app import shared_state
+        from app.models import DeploymentState
+        from app.main import _init_deployment_state
+        from app.field_encryption import decrypt_field
+        from app.routers.admin_settings import _encrypt_notification_config
+
+        key = Fernet.generate_key().decode()
+        mocker.patch.dict("os.environ", {"GITHUB_PAT_ENCRYPTION_KEY": key})
+
+        _engine = create_async_engine(
+            "sqlite+aiosqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        async with _engine.begin() as conn:
+            await conn.run_sync(SQLModel.metadata.create_all)
+
+        _Session = sessionmaker(
+            bind=_engine,
+            class_=AsyncSession,
+            autocommit=False,
+            autoflush=False,
+            expire_on_commit=False,
+        )
+        mocker.patch("app.main.AsyncSessionLocal", _Session)
+
+        plaintext_url = "https://hooks.example.com/secret-bearer-token-abc123"
+        encrypted_nc = _encrypt_notification_config(
+            {
+                "webhook_url": plaintext_url,
+                "enabled_events": ["TASK_FAILED"],
+                "throttle_seconds": 60,
+            }
+        )
+
+        # Encrypted value must differ from plaintext and must be Fernet ciphertext
+        assert encrypted_nc["webhook_url"] != plaintext_url
+        assert decrypt_field(encrypted_nc["webhook_url"]) == plaintext_url
+
+        # Seed DeploymentState with the encrypted notification_config
+        async with _Session() as session:
+            state = DeploymentState(
+                id=1,
+                current_revision="r1",
+                current_sha="abc123",
+                runtime_config_json={"notification_config": encrypted_nc},
+            )
+            session.add(state)
+            await session.commit()
+
+        # Simulate restart: clear in-memory state, restore from DB
+        saved = shared_state.runtime_config.pop("notification_config", None)
+        try:
+            await _init_deployment_state()
+            restored = shared_state.runtime_config.get("notification_config")
+            assert restored is not None, (
+                "notification_config must be restored from runtime_config_json"
+            )
+            # After decryption, the webhook_url must be the original plaintext
+            assert restored["webhook_url"] == plaintext_url, (
+                f"Expected decrypted URL {plaintext_url!r}, got {restored['webhook_url']!r}"
+            )
+            assert restored["enabled_events"] == ["TASK_FAILED"]
+            assert restored["throttle_seconds"] == 60
+        finally:
+            if saved is not None:
+                shared_state.runtime_config["notification_config"] = saved
+            else:
+                shared_state.runtime_config.pop("notification_config", None)
+            async with _engine.begin() as conn:
+                await conn.run_sync(SQLModel.metadata.drop_all)
+            await _engine.dispose()
+
+    @pytest.mark.asyncio
     async def test_init_deployment_state_degrades_on_commit_lock_timeout(self, mocker):
         """A contended DeploymentState write during deploy-detection must NOT crash
         startup. Boot used to die ("Application startup failed. Exiting.") when this
@@ -10781,7 +11389,7 @@ class TestGetAllProjectsPagination:
 
     @pytest.mark.asyncio
     async def test_limit_max_enforced(self, client: AsyncClient, db_session):
-        resp = await client.get("/api/admin/projects?limit=200")
+        resp = await client.get("/api/admin/projects?limit=501")
         assert resp.status_code == 422
 
     @pytest.mark.asyncio
@@ -12826,6 +13434,8 @@ class TestAcceptanceCriteriaRouter:
             "version_number": 1,
             "total": 0,
             "covered": 0,
+            "attested": 0,
+            "backfilled": 0,
             "partial": 0,
             "uncovered": 0,
             "inactive": 0,
@@ -12833,6 +13443,20 @@ class TestAcceptanceCriteriaRouter:
             "superseded": 0,
             "stuck_count": 0,
             "criteria": [],
+            "failed_corroboration_keys": [],
+            "merge_evidence_gaps": None,
+            # Probed tier: a lower-confidence, time-bounded coverage signal.
+            "probed": 0,
+            # Phantom-bookkeeping drift signal (consumed by operator_attention):
+            # a version with no criteria registers none and references none, so
+            # there is nothing to drift.
+            "phantom_bookkeeping": {
+                "has_drift": False,
+                "phantom_keys": [],
+                "referenced_keys": [],
+                "registered_count": 0,
+                "zero_registered": False,
+            },
         }
 
         create_resp = await client.post(
@@ -21683,6 +22307,146 @@ class TestComputeExperimentTaskLaunch:
         tasks = (await db_session.execute(select(Task))).scalars().all()
         assert tasks == []
 
+    async def _enrolled_runner(self, session, project_id, hostname="dgx-1"):
+        runner = LocalRunner(
+            project_id=project_id,
+            token_hash="r" * 64,
+            hostname=hostname,
+            status="active",
+            last_seen_at=_utcnow(),
+        )
+        session.add(runner)
+        await session.commit()
+        await session.refresh(runner)
+        return runner
+
+    @pytest.mark.asyncio
+    async def test_runner_target_persists_and_stamps_preferred_runner(
+        self, client: AsyncClient, db_session
+    ):
+        """runner_target survives request → launch_contract → stored payload and
+        stamps the existing preferred_runner_target_id dispatch seam."""
+        project = await self._project_with_repo(db_session)
+        runner = await self._enrolled_runner(db_session, project.id)
+
+        resp = await client.post(
+            "/api/admin/tasks/compute-experiment",
+            json=self._valid_payload(
+                runner_target={"runner_id": str(runner.id), "strict": True}
+            ),
+        )
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        task = (
+            await db_session.execute(
+                select(Task).where(Task.id == uuid.UUID(data["id"]))
+            )
+        ).scalar_one()
+        payload = task.payloads[0]
+        assert payload["runner_target"] == {
+            "runner_id": str(runner.id),
+            "strict": True,
+        }
+        # The pin rides the existing soft-preference seam; strictness is read
+        # from the payload at dispatch time.
+        assert (task.context or {}).get("preferred_runner_target_id") == str(
+            runner.id
+        )
+
+    @pytest.mark.asyncio
+    async def test_runner_target_defaults_to_soft_pin(
+        self, client: AsyncClient, db_session
+    ):
+        project = await self._project_with_repo(db_session)
+        runner = await self._enrolled_runner(db_session, project.id)
+
+        resp = await client.post(
+            "/api/admin/tasks/compute-experiment",
+            json=self._valid_payload(runner_target={"runner_id": str(runner.id)}),
+        )
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        task = (
+            await db_session.execute(
+                select(Task).where(Task.id == uuid.UUID(data["id"]))
+            )
+        ).scalar_one()
+        assert task.payloads[0]["runner_target"] == {
+            "runner_id": str(runner.id),
+            "strict": False,
+        }
+
+    @pytest.mark.asyncio
+    async def test_runner_target_unknown_runner_rejected_422(
+        self, client: AsyncClient, db_session
+    ):
+        await self._project_with_repo(db_session)
+
+        resp = await client.post(
+            "/api/admin/tasks/compute-experiment",
+            json=self._valid_payload(
+                runner_target={"runner_id": str(uuid.uuid4()), "strict": True}
+            ),
+        )
+
+        assert resp.status_code == 422, resp.text
+        # The app-level HTTPException handler wraps the dict detail as
+        # {"error": {"code": 422, "message": <detail dict>}}.
+        detail = resp.json()["error"]["message"]
+        assert detail["error"] == "runner_target_invalid"
+        assert detail["reason_code"] == "not_found"
+        tasks = (await db_session.execute(select(Task))).scalars().all()
+        assert tasks == []
+
+    @pytest.mark.asyncio
+    async def test_runner_target_cross_project_runner_rejected_422(
+        self, client: AsyncClient, db_session
+    ):
+        """A runner enrolled in a DIFFERENT project is rejected at authoring time
+        (review-verdict requirement: validate against the task's project's
+        enrolled runners)."""
+        await self._project_with_repo(db_session)
+        other = Project(name="other/project", user_id=TEST_USER_ID)
+        db_session.add(other)
+        await db_session.commit()
+        await db_session.refresh(other)
+        foreign_runner = await self._enrolled_runner(db_session, other.id)
+
+        resp = await client.post(
+            "/api/admin/tasks/compute-experiment",
+            json=self._valid_payload(
+                runner_target={"runner_id": str(foreign_runner.id), "strict": False}
+            ),
+        )
+
+        assert resp.status_code == 422, resp.text
+        detail = resp.json()["error"]["message"]
+        assert detail["error"] == "runner_target_invalid"
+        assert detail["reason_code"] == "not_enrolled"
+        assert detail["runner_id"] == str(foreign_runner.id)
+        tasks = (await db_session.execute(select(Task))).scalars().all()
+        assert tasks == []
+
+    @pytest.mark.asyncio
+    async def test_runner_target_invalid_uuid_rejected_422(
+        self, client: AsyncClient, db_session
+    ):
+        await self._project_with_repo(db_session)
+
+        resp = await client.post(
+            "/api/admin/tasks/compute-experiment",
+            json=self._valid_payload(
+                runner_target={"runner_id": "not-a-uuid", "strict": True}
+            ),
+        )
+
+        assert resp.status_code == 422, resp.text
+        assert "not a valid UUID" in resp.text
+        tasks = (await db_session.execute(select(Task))).scalars().all()
+        assert tasks == []
+
     @pytest.mark.asyncio
     async def test_spend_above_threshold_requires_approval(
         self, client: AsyncClient, db_session
@@ -22146,11 +22910,94 @@ class TestComputeExperimentTaskLaunch:
         assert resp.status_code == 422, resp.text
         assert "command" in resp.text
 
+    # ── Role floor ────────────────────────────────────────────────────────────
+    #
+    # This endpoint mints a compute_experiment with a FULL LAUNCH CONTRACT: it
+    # spends real GPU budget against the project's spend_cap_usd. Membership
+    # alone is not authorization to spend. Without the member+ floor, a viewer
+    # denied POST /tasks/{id}/rerun could simply launch a fresh GPU job here
+    # instead — and, by falling through to the auto-create branch, mint a shadow
+    # project they own.
+
+    async def _project_with_role(self, session, role, repo="compute"):
+        project = Project(
+            name=f"acme/{repo}",
+            user_id=TEST_USER_ID,
+            github_owner="acme",
+            github_repo=repo,
+            integration_branch="automain",
+            promotion_target="automain",
+        )
+        session.add(project)
+        await session.commit()
+        await session.refresh(project)
+        session.add(
+            ProjectMember(project_id=project.id, user_id=TEST_USER_ID, role=role)
+        )
+        await session.commit()
+        return project
+
+    @pytest.mark.asyncio
+    async def test_viewer_cannot_launch_compute_experiment(
+        self, client: AsyncClient, db_session
+    ):
+        """Viewer → 403, no task enqueued, and NO shadow project auto-created."""
+        from sqlalchemy import func as sa_func
+
+        project = await self._project_with_role(db_session, "viewer")
+
+        resp = await client.post(
+            "/api/admin/tasks/compute-experiment", json=self._valid_payload()
+        )
+
+        assert resp.status_code == 403, resp.text
+        assert "member" in resp.json()["error"]["message"].lower()
+
+        # No compute_experiment task enqueued on the project...
+        count = (
+            await db_session.execute(
+                select(sa_func.count(Task.id)).where(Task.project_id == project.id)
+            )
+        ).scalar_one()
+        assert count == 0
+
+        # ...and the 403 must NOT have fallen through into the auto-create
+        # branch, which would hand the viewer a project they own outright.
+        projects = (
+            await db_session.execute(
+                select(sa_func.count(Project.id)).where(
+                    Project.github_owner == "acme", Project.github_repo == "compute"
+                )
+            )
+        ).scalar_one()
+        assert projects == 1
+
+    @pytest.mark.asyncio
+    async def test_member_can_launch_compute_experiment(
+        self, client: AsyncClient, db_session
+    ):
+        """The floor must not over-reject: a member (not owner) can still launch."""
+        from sqlalchemy import func as sa_func
+
+        project = await self._project_with_role(db_session, "member")
+
+        resp = await client.post(
+            "/api/admin/tasks/compute-experiment", json=self._valid_payload()
+        )
+
+        assert resp.status_code == 200, resp.text
+        count = (
+            await db_session.execute(
+                select(sa_func.count(Task.id)).where(Task.project_id == project.id)
+            )
+        ).scalar_one()
+        assert count == 1
+
 
 class TestRerunComputeExperiment:
     """POST /api/admin/tasks/{task_id}/rerun — re-run a compute_experiment."""
 
-    async def _project_with_task(self, session, **payload_overrides):
+    async def _project_with_task(self, session, role="owner", **payload_overrides):
         project = Project(
             name="acme/rerun",
             user_id=TEST_USER_ID,
@@ -22162,7 +23009,7 @@ class TestRerunComputeExperiment:
         session.add(project)
         await session.commit()
         await session.refresh(project)
-        session.add(ProjectMember(project_id=project.id, user_id=TEST_USER_ID, role="owner"))
+        session.add(ProjectMember(project_id=project.id, user_id=TEST_USER_ID, role=role))
         base_payload = {
             "type": "compute_experiment",
             "title": "GPU bench",
@@ -22270,6 +23117,39 @@ class TestRerunComputeExperiment:
         resp = await client.post(f"/api/admin/tasks/{task.id}/rerun", json={})
         assert resp.status_code == 422, resp.text
         assert "compute_experiment" in resp.text
+
+    @pytest.mark.asyncio
+    async def test_rerun_viewer_forbidden(self, client: AsyncClient, db_session):
+        """A viewer may not relaunch a compute_experiment — it burns GPU spend.
+
+        Membership alone is not authorization to spend: the re-run enqueues a
+        new QUEUED task against the project's spend_cap_usd, so it requires the
+        member+ floor (403), and no child task may be created.
+        """
+        _, source = await self._project_with_task(db_session, role="viewer")
+
+        resp = await client.post(f"/api/admin/tasks/{source.id}/rerun", json={})
+        assert resp.status_code == 403, resp.text
+
+        children = (
+            (
+                await db_session.execute(
+                    select(Task).where(Task.parent_task_id == source.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert children == []
+
+    @pytest.mark.asyncio
+    async def test_rerun_member_allowed(self, client: AsyncClient, db_session):
+        """The member floor must not over-reject: a member (not owner) can re-run."""
+        _, source = await self._project_with_task(db_session, role="member")
+
+        resp = await client.post(f"/api/admin/tasks/{source.id}/rerun", json={})
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["parent_task_id"] == str(source.id)
 
 
 class TestBugReportCitationGate:
@@ -23322,6 +24202,157 @@ class TestStrategistSpawnCriterionIds:
             f"got {resp3.status_code}: {resp3.text}"
         )
 
+    @pytest.mark.asyncio
+    async def test_direction_criterion_keys_require_acceptance_evidence(
+        self, client: AsyncClient, db_session
+    ):
+        """Direction-derived criterion_keys without named_test acceptance_evidence
+        is rejected (400).
+
+        When criterion_ids come from the direction row (not the explicit
+        strategist payload), the guard must still reject non-named_test
+        acceptance_evidence — otherwise the spawned task would get a proven=False
+        verdict at merge time and never record criterion evidence.
+        """
+        import uuid as _uuid
+        from app.auth import create_agent_token
+        from app.models import Direction, VersionAcceptanceCriterion
+
+        project = Project(name="DirCritKeyReqAESpawn", user_id="test-user")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        rv = await _make_open_version(db_session, project.id)
+        dir_key = f"c-dir-{_uuid.uuid4().hex[:8]}"
+        db_session.add(
+            VersionAcceptanceCriterion(
+                project_id=project.id,
+                release_version_id=rv.id,
+                criterion_key=dir_key,
+                status="active",
+                text="Direction criterion requiring evidence",
+            )
+        )
+        await db_session.commit()
+
+        direction_id_str = f"d-{_uuid.uuid4().hex[:8]}"
+        direction = Direction(
+            project_id=project.id,
+            direction_key=direction_id_str,
+            status="active",
+            text="Direction with criterion_keys",
+            data={"id": direction_id_str, "status": "active", "text": "Direction"},
+            criterion_keys=[dir_key],
+        )
+        db_session.add(direction)
+        await db_session.commit()
+
+        project.directions = [
+            {"id": direction_id_str, "status": "active", "text": "Direction"}
+        ]
+        from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+        _flag_modified(project, "directions")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        strategic_task = Task(
+            project_id=project.id,
+            title="Strategic review for dir-crit-no-evidence",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "strategic_review", "prompt": "review"}],
+            vm_instance_id="agent-vm-dir-crit-no-ae-test",
+        )
+        db_session.add(strategic_task)
+        await db_session.commit()
+        await db_session.refresh(strategic_task)
+
+        token = create_agent_token(
+            str(strategic_task.id),
+            "agent-vm-dir-crit-no-ae-test",
+            task_type="strategic_review",
+        )
+
+        # Case 1: direction_id (direction has criterion_keys) without acceptance_evidence → 400
+        resp = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(strategic_task.id),
+                "op": "spawn_task",
+                "data": {
+                    "type": "research",
+                    "title": "Research with direction criterion_keys but no evidence",
+                    "prompt": "Investigate the direction-criterion gap",
+                    "direction_id": direction_id_str,
+                },
+            },
+        )
+        assert resp.status_code == 400, (
+            f"expected 400 when direction criterion_keys lacks acceptance_evidence, "
+            f"got {resp.status_code}: {resp.text}"
+        )
+        msg = resp.json().get("detail") or resp.json().get("error", {}).get("message", "")
+        assert "acceptance_evidence" in msg, (
+            f"error must mention acceptance_evidence, got: {msg!r}"
+        )
+        assert "named_test" in msg, (
+            f"error must mention named_test, got: {msg!r}"
+        )
+
+        # Case 2: direction_id with non-named_test acceptance_evidence → 400
+        resp2 = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(strategic_task.id),
+                "op": "spawn_task",
+                "data": {
+                    "type": "research",
+                    "title": "Research with direction criterion_keys wrong evidence",
+                    "prompt": "Investigate the direction-criterion gap",
+                    "direction_id": direction_id_str,
+                    "acceptance_evidence": {
+                        "kind": "observable_behavior",
+                        "description": "the task produces a passing test",
+                    },
+                },
+            },
+        )
+        assert resp2.status_code == 400, (
+            f"expected 400 when direction criterion_keys has non-named_test evidence, "
+            f"got {resp2.status_code}: {resp2.text}"
+        )
+        msg2 = resp2.json().get("detail") or resp2.json().get("error", {}).get("message", "")
+        assert "named_test" in msg2, (
+            f"error must mention named_test, got: {msg2!r}"
+        )
+
+        # Case 3: direction_id with named_test acceptance_evidence → 200
+        resp3 = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(strategic_task.id),
+                "op": "spawn_task",
+                "data": {
+                    "type": "research",
+                    "title": "Research with direction criterion_keys and named_test",
+                    "prompt": "Investigate the direction-criterion gap",
+                    "direction_id": direction_id_str,
+                    "acceptance_evidence": {
+                        "kind": "named_test",
+                        "test_path": "testing/test_admin_routers.py",
+                    },
+                },
+            },
+        )
+        assert resp3.status_code == 200, (
+            f"expected 200 when direction criterion_keys has named_test evidence, "
+            f"got {resp3.status_code}: {resp3.text}"
+        )
+
 
 @pytest.mark.asyncio
 async def test_qa_task_receives_rejection_patterns(client: AsyncClient, db_session):
@@ -23828,6 +24859,70 @@ class TestCanaryAdversarialChallenge:
 
         assert resp.status_code == 409
         assert "already in flight" in resp.json()["error"]["message"]
+
+    @pytest.mark.asyncio
+    async def test_post_viewer_forbidden(self, client: AsyncClient, db_session):
+        """Viewer → 403: this commits a synthetic Task and spawns a REAL agent
+        task that executes on a VM (LLM spend + compute). Membership alone does
+        not authorize that — the sibling reset_circuit_breaker already takes the
+        member floor. No canary task may be persisted.
+        """
+        from unittest.mock import AsyncMock, patch
+        from sqlalchemy import func as sa_func
+
+        project = await _make_project(
+            db_session, name="Viewer Canary", role="viewer"
+        )
+
+        with patch(
+            "app.routers.admin_debug.spawn_forward_quality_grader",
+            new_callable=AsyncMock,
+        ) as spawn:
+            resp = await client.post(
+                f"/api/admin/projects/{project.id}/canary/adversarial-challenge"
+            )
+
+        assert resp.status_code == 403, resp.text
+        assert "member" in resp.json()["error"]["message"].lower()
+        # The gate must reject BEFORE any agent work is spawned.
+        spawn.assert_not_awaited()
+
+        count = (
+            await db_session.execute(
+                select(sa_func.count(Task.id)).where(Task.project_id == project.id)
+            )
+        ).scalar_one()
+        assert count == 0
+
+    @pytest.mark.asyncio
+    async def test_post_member_allowed(self, client: AsyncClient, db_session):
+        """The floor must not over-reject: a member (not owner) can run the canary."""
+        from unittest.mock import AsyncMock, patch
+
+        project = await _make_project(
+            db_session, name="Member Canary", role="member"
+        )
+        grader_id = uuid.uuid4()
+        mock_grader = Task(
+            project_id=project.id,
+            title="[GRADE] canary grader",
+            payloads=[{"type": "investigate", "scope": "small"}],
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+        )
+        mock_grader.id = grader_id
+
+        with patch(
+            "app.routers.admin_debug.spawn_forward_quality_grader",
+            new_callable=AsyncMock,
+            return_value=mock_grader,
+        ):
+            resp = await client.post(
+                f"/api/admin/projects/{project.id}/canary/adversarial-challenge"
+            )
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["grader_task_id"] == str(grader_id)
 
     @pytest.mark.asyncio
     async def test_get_returns_404_when_task_not_found(
@@ -26385,6 +27480,146 @@ class TestPoolAccountMutationsRequireAdmin:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Per-project pool consumption endpoints
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestProjectPoolUsageEndpoint:
+    """GET /api/admin/pool-accounts/project-usage and project-summary endpoints."""
+
+    @pytest.mark.asyncio
+    async def test_project_usage_requires_auth(self, override_get_session):
+        from fastapi import HTTPException
+
+        async def reject_auth():
+            raise HTTPException(status_code=401, detail="Not authenticated")
+
+        app.dependency_overrides[get_current_user] = reject_auth
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as ac:
+                resp = await ac.get(
+                    "/api/admin/pool-accounts/project-usage"
+                    "?project_id=00000000-0000-0000-0000-000000000001"
+                )
+            assert resp.status_code == 401
+        finally:
+            app.dependency_overrides.pop(get_current_user, None)
+
+    @pytest.mark.asyncio
+    async def test_project_usage_404_for_unknown_project(
+        self, client, db_session
+    ):
+        """Non-existent project or non-member → 404."""
+        import uuid as _uuid
+        from app.models import Project
+
+        pid = _uuid.uuid4()
+        project = Project(
+            id=pid,
+            name="orphan-project",
+            user_id="someone-else",
+            github_owner="other",
+            github_repo="repo",
+        )
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/pool-accounts/project-usage?project_id={pid}"
+        )
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_project_summary_returns_empty_for_user_with_no_projects(
+        self, client, db_session
+    ):
+        """When the user has no pool accounts with project state, return empty list."""
+        resp = await client.get("/api/admin/pool-accounts/project-summary")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "projects" in data
+        assert isinstance(data["projects"], list)
+        assert "generated_at" in data
+
+    @pytest.mark.asyncio
+    async def test_project_usage_response_shape(
+        self, client, db_session
+    ):
+        """Verify the response shape when the user is a member of the project."""
+        import uuid as _uuid
+        from app.models import Project, ProjectMember
+        from app.max_plan_pool import _account_by_id, _max_plan_pools
+
+        pid = _uuid.uuid4()
+        user_id = "test-user-123"
+
+        project = Project(
+            id=pid,
+            name="test-project",
+            user_id=user_id,
+            github_owner="test",
+            github_repo="repo",
+        )
+        db_session.add(project)
+        db_session.add(
+            ProjectMember(
+                project_id=pid, user_id=user_id, role="owner"
+            )
+        )
+        await db_session.commit()
+
+        _account_by_id.clear()
+        _max_plan_pools.clear()
+        try:
+            acct = {
+                "id": "acc-1",
+                "user_id": user_id,
+                "name": "Test Account",
+                "provider": "anthropic",
+                "auth_mode": "oauth",
+                "enabled": True,
+                "active_tasks": 5,
+                "daily_task_count": 20,
+                "daily_task_cap": 50,
+                "max_concurrent_tasks": 10,
+                "runtime_ready": True,
+                "oauth_token": "sk-ant-test",
+                "project_state": {
+                    str(pid): {"active_tasks": 3, "daily_task_count": 12}
+                },
+                "project_daily_task_cap": {str(pid): 40},
+                "project_max_concurrent_tasks": {str(pid): 8},
+            }
+            _account_by_id["acc-1"] = acct
+            _max_plan_pools[user_id] = [acct]
+
+            resp = await client.get(
+                f"/api/admin/pool-accounts/project-usage?project_id={pid}"
+            )
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["project_id"] == str(pid)
+            assert data["total_project_active_tasks"] == 3
+            assert data["total_project_daily_task_count"] == 12
+            assert data["total_accounts"] == 1
+            assert "accounts" in data
+            assert len(data["accounts"]) == 1
+            a = data["accounts"][0]
+            assert a["account_id"] == "acc-1"
+            assert a["project_active_tasks"] == 3
+            assert a["project_daily_task_count"] == 12
+            assert a["project_daily_task_cap"] == 40
+            assert a["project_max_concurrent_tasks"] == 8
+            assert a["at_project_cap"] is False
+            assert a["global_active_tasks"] == 5
+        finally:
+            _account_by_id.clear()
+            _max_plan_pools.clear()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Task payload secret redaction (compute_experiment launch-spec secrets)
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -28457,3 +29692,812 @@ async def test_get_message_attachment_upload_url_storage_unavailable(
         )
 
     assert resp.status_code == 503, f"Expected 503, got {resp.status_code}: {resp.text}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Runner lifecycle: pause / drain / resume (PATCH /runners/{id}/status)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestRunnerStatusPatch:
+    """Tests for PATCH /api/admin/projects/{project_id}/runners/{runner_id}/status."""
+
+    @pytest.fixture(autouse=True)
+    def _mock_workbench(self):
+        with patch("app.routers.admin_runners.emit_workbench_refetch", new_callable=AsyncMock):
+            yield
+
+    @pytest.mark.asyncio
+    async def test_active_to_paused(self, client: AsyncClient, db_session):
+        project = await _make_project(db_session)
+        runner = LocalRunner(
+            project_id=project.id, token_hash="a" * 64, hostname="host1", status="active"
+        )
+        db_session.add(runner)
+        await db_session.commit()
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/status",
+            json={"status": "paused"},
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "paused"
+        await db_session.refresh(runner)
+        assert runner.status == "paused"
+
+    @pytest.mark.asyncio
+    async def test_active_to_draining(self, client: AsyncClient, db_session):
+        project = await _make_project(db_session)
+        runner = LocalRunner(
+            project_id=project.id, token_hash="b" * 64, hostname="host2", status="active"
+        )
+        db_session.add(runner)
+        await db_session.commit()
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/status",
+            json={"status": "draining"},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "draining"
+        await db_session.refresh(runner)
+        assert runner.status == "draining"
+
+    @pytest.mark.asyncio
+    async def test_paused_to_active(self, client: AsyncClient, db_session):
+        project = await _make_project(db_session)
+        runner = LocalRunner(
+            project_id=project.id, token_hash="c" * 64, hostname="host3", status="paused"
+        )
+        db_session.add(runner)
+        await db_session.commit()
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/status",
+            json={"status": "active"},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "active"
+        await db_session.refresh(runner)
+        assert runner.status == "active"
+
+    @pytest.mark.asyncio
+    async def test_draining_to_active(self, client: AsyncClient, db_session):
+        project = await _make_project(db_session)
+        runner = LocalRunner(
+            project_id=project.id, token_hash="d" * 64, hostname="host4", status="draining"
+        )
+        db_session.add(runner)
+        await db_session.commit()
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/status",
+            json={"status": "active"},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "active"
+
+    @pytest.mark.asyncio
+    async def test_draining_to_paused(self, client: AsyncClient, db_session):
+        project = await _make_project(db_session)
+        runner = LocalRunner(
+            project_id=project.id, token_hash="e" * 64, hostname="host5", status="draining"
+        )
+        db_session.add(runner)
+        await db_session.commit()
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/status",
+            json={"status": "paused"},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "paused"
+
+    @pytest.mark.asyncio
+    async def test_invalid_transition_paused_to_draining_rejected(self, client: AsyncClient, db_session):
+        project = await _make_project(db_session)
+        runner = LocalRunner(
+            project_id=project.id, token_hash="f" * 64, hostname="host6", status="paused"
+        )
+        db_session.add(runner)
+        await db_session.commit()
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/status",
+            json={"status": "draining"},
+        )
+        assert resp.status_code == 422, resp.text
+
+    @pytest.mark.asyncio
+    async def test_deleted_runner_returns_404(self, client: AsyncClient, db_session):
+        project = await _make_project(db_session)
+        runner = LocalRunner(
+            project_id=project.id, token_hash="9" * 64, hostname="gone", status="deleted"
+        )
+        db_session.add(runner)
+        await db_session.commit()
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/status",
+            json={"status": "active"},
+        )
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_pause_releases_unpulled_pins(self, client: AsyncClient, db_session):
+        """Pausing a runner must release tasks pinned to it that haven't been pulled yet."""
+        project = await _make_project(db_session)
+        runner = LocalRunner(
+            project_id=project.id, token_hash="7" * 64, hostname="pinned", status="active"
+        )
+        db_session.add(runner)
+        await db_session.commit()
+
+        # Create a pinned task (PROVISIONING, started_at=None, vm_instance_id=runner:{id})
+        pinned_task = Task(
+            task_type="fix",
+            project_id=project.id,
+            status=TaskStatus.PROVISIONING,
+            vm_instance_id=f"runner:{runner.id}",
+            context={"runner_target_id": str(runner.id)},
+        )
+        db_session.add(pinned_task)
+        await db_session.commit()
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/status",
+            json={"status": "paused"},
+        )
+        assert resp.status_code == 200, resp.text
+
+        await db_session.refresh(pinned_task)
+        # Pin must be released: task goes back to QUEUED with no runner binding
+        assert pinned_task.status == TaskStatus.QUEUED
+        assert pinned_task.vm_instance_id is None
+        assert "runner_target_id" not in (pinned_task.context or {})
+
+    @pytest.mark.asyncio
+    async def test_idempotent_same_status(self, client: AsyncClient, db_session):
+        """Patching to the same status is a no-op (200 returned, no error)."""
+        project = await _make_project(db_session)
+        runner = LocalRunner(
+            project_id=project.id, token_hash="8" * 64, hostname="steady", status="paused"
+        )
+        db_session.add(runner)
+        await db_session.commit()
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/status",
+            json={"status": "paused"},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "paused"
+
+
+class TestRunnerStatsCloudCostAvoided:
+    """Tests for the cloud-cost-avoided rollup on
+    GET /api/admin/projects/{project_id}/runners/{runner_id}/stats.
+
+    Cloud cost avoided = the on-demand cloud VM cost that terminal compute jobs
+    run on this self-hosted runner would otherwise have incurred, priced from
+    each job's honest runtime window and (machine_type, accelerator) shape.
+    """
+
+    def _pin(self, runner_id):
+        return {"runner_target_id": str(runner_id)}
+
+    @pytest.mark.asyncio
+    async def test_cost_avoided_sums_priced_runtime_across_shapes(
+        self, client: AsyncClient, db_session
+    ):
+        from app.models import ComputeJobStatus
+        from app.vm_cost_rates import get_compute_rate_per_second
+
+        project = await _make_project(db_session, name="CostAvoided Sum")
+        runner = LocalRunner(
+            project_id=project.id, token_hash="1" * 64, hostname="cpu-gpu", status="active"
+        )
+        db_session.add(runner)
+        await db_session.commit()
+
+        now = datetime.now(timezone.utc)
+        # CPU job: 100s on the default machine type.
+        cpu_job = ComputeJob(
+            project_id=project.id,
+            backend="test",
+            status=ComputeJobStatus.SUCCEEDED,
+            started_at=now - timedelta(seconds=100),
+            completed_at=now,
+            polling_metadata=self._pin(runner.id),
+        )
+        # GPU job: 200s on an L4 accelerator (bundled G2 shape).
+        gpu_job = ComputeJob(
+            project_id=project.id,
+            backend="test",
+            status=ComputeJobStatus.SUCCEEDED,
+            accelerator_type="L4",
+            accelerator_count=1,
+            started_at=now - timedelta(seconds=200),
+            completed_at=now,
+            polling_metadata=self._pin(runner.id),
+        )
+        db_session.add_all([cpu_job, gpu_job])
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/stats"
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+
+        expected = round(
+            100 * get_compute_rate_per_second(machine_type=None, accelerator=None)
+            + 200 * get_compute_rate_per_second(accelerator="L4", count=1),
+            2,
+        )
+        assert body["cloud_cost_avoided_usd"] == pytest.approx(expected)
+        # Both jobs contribute an honest runtime window.
+        assert body["cloud_cost_avoided_basis"] == 2
+
+    @pytest.mark.asyncio
+    async def test_cost_avoided_zero_without_terminal_jobs(
+        self, client: AsyncClient, db_session
+    ):
+        from app.models import ComputeJobStatus
+
+        project = await _make_project(db_session, name="CostAvoided Empty")
+        runner = LocalRunner(
+            project_id=project.id, token_hash="2" * 64, hostname="idle", status="active"
+        )
+        db_session.add(runner)
+        await db_session.commit()
+
+        now = datetime.now(timezone.utc)
+        # A RUNNING (non-terminal) pinned job must not contribute cost.
+        running = ComputeJob(
+            project_id=project.id,
+            backend="test",
+            status=ComputeJobStatus.RUNNING,
+            started_at=now - timedelta(seconds=300),
+            polling_metadata=self._pin(runner.id),
+        )
+        db_session.add(running)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/stats"
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["cloud_cost_avoided_usd"] == 0.0
+        assert body["cloud_cost_avoided_basis"] == 0
+
+    @pytest.mark.asyncio
+    async def test_cost_avoided_excludes_other_runner_and_missing_window(
+        self, client: AsyncClient, db_session
+    ):
+        from app.models import ComputeJobStatus
+        from app.vm_cost_rates import get_compute_rate_per_second
+
+        project = await _make_project(db_session, name="CostAvoided Isolation")
+        runner = LocalRunner(
+            project_id=project.id, token_hash="3" * 64, hostname="mine", status="active"
+        )
+        other = LocalRunner(
+            project_id=project.id, token_hash="4" * 64, hostname="theirs", status="active"
+        )
+        db_session.add_all([runner, other])
+        await db_session.commit()
+
+        now = datetime.now(timezone.utc)
+        mine = ComputeJob(
+            project_id=project.id,
+            backend="test",
+            status=ComputeJobStatus.SUCCEEDED,
+            started_at=now - timedelta(seconds=50),
+            completed_at=now,
+            polling_metadata=self._pin(runner.id),
+        )
+        # Pinned to a different runner — excluded.
+        theirs = ComputeJob(
+            project_id=project.id,
+            backend="test",
+            status=ComputeJobStatus.SUCCEEDED,
+            started_at=now - timedelta(seconds=999),
+            completed_at=now,
+            polling_metadata=self._pin(other.id),
+        )
+        # Terminal but no started_at → no honest window, excluded from basis.
+        no_window = ComputeJob(
+            project_id=project.id,
+            backend="test",
+            status=ComputeJobStatus.FAILED,
+            completed_at=now,
+            polling_metadata=self._pin(runner.id),
+        )
+        db_session.add_all([mine, theirs, no_window])
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/stats"
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+
+        expected = round(
+            50 * get_compute_rate_per_second(machine_type=None, accelerator=None), 2
+        )
+        assert body["cloud_cost_avoided_usd"] == pytest.approx(expected)
+        assert body["cloud_cost_avoided_basis"] == 1
+
+
+class TestRunnerStatsClaimLatency:
+    """Tests for the per-runner claim-latency rollup on
+    GET /api/admin/projects/{project_id}/runners/{runner_id}/stats.
+
+    Claim latency = vm_cold_start_ms across terminal tasks dispatched to the
+    runner via vm_instance_id = "runner:{runner_id}". The endpoint returns
+    p50/p95/p99/max and a sample count.
+    """
+
+    @pytest.mark.asyncio
+    async def test_claim_latency_returns_percentiles(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session, name="ClaimLatency Pct")
+        runner = LocalRunner(
+            project_id=project.id, token_hash="5" * 64, hostname="latency-test", status="active"
+        )
+        other = LocalRunner(
+            project_id=project.id, token_hash="6" * 64, hostname="other", status="active"
+        )
+        db_session.add_all([runner, other])
+        await db_session.commit()
+
+        runner_prefix = f"runner:{runner.id}"
+        other_prefix = f"runner:{other.id}"
+
+        # Tasks for this runner with known cold-start latencies: [100, 200, 500, 1000, 2000]
+        # p50 = 500, p95 = 2000, p99 = 2000, max = 2000, count = 5
+        tasks = [
+            Task(
+                project_id=project.id,
+                title=f"latency-{v}",
+                status=TaskStatus.COMPLETED,
+                vm_instance_id=runner_prefix,
+                vm_cold_start_ms=v,
+                payloads=[{"type": "test", "data": {}}],
+            )
+            for v in (100, 200, 500, 1000, 2000)
+        ]
+        # Task for a different runner — excluded from this runner's stats.
+        tasks.append(
+            Task(
+                project_id=project.id,
+                title="other-runner",
+                status=TaskStatus.COMPLETED,
+                vm_instance_id=other_prefix,
+                vm_cold_start_ms=99999,
+                payloads=[{"type": "test", "data": {}}],
+            )
+        )
+        # Terminal task without vm_cold_start_ms — excluded from sample.
+        tasks.append(
+            Task(
+                project_id=project.id,
+                title="no-cold-start",
+                status=TaskStatus.FAILED,
+                vm_instance_id=runner_prefix,
+                vm_cold_start_ms=None,
+                payloads=[{"type": "test", "data": {}}],
+            )
+        )
+        # Non-terminal task (IN_PROGRESS) with vm_cold_start_ms — excluded from
+        # aggregation since TASK_OUTCOME_TERMINAL_STATUSES is the filter.
+        tasks.append(
+            Task(
+                project_id=project.id,
+                title="in-progress",
+                status=TaskStatus.IN_PROGRESS,
+                vm_instance_id=runner_prefix,
+                vm_cold_start_ms=500,
+                payloads=[{"type": "test", "data": {}}],
+            )
+        )
+        db_session.add_all(tasks)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/stats"
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+
+        assert body["claim_latency_sample_count"] == 5
+        assert body["claim_latency_ms_p50"] == 500  # median of [100, 200, 500, 1000, 2000]
+        assert body["claim_latency_ms_p95"] == 2000  # int(5 * 0.95) = 4 → index 4
+        assert body["claim_latency_ms_p99"] == 2000  # int(5 * 0.99) = 4 → index 4
+        assert body["claim_latency_ms_max"] == 2000
+
+    @pytest.mark.asyncio
+    async def test_claim_latency_no_tasks_returns_nulls(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session, name="ClaimLatency Empty")
+        runner = LocalRunner(
+            project_id=project.id, token_hash="7" * 64, hostname="empty", status="active"
+        )
+        db_session.add(runner)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/stats"
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+
+        assert body["claim_latency_sample_count"] == 0
+        assert body["claim_latency_ms_p50"] is None
+        assert body["claim_latency_ms_p95"] is None
+        assert body["claim_latency_ms_p99"] is None
+        assert body["claim_latency_ms_max"] is None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# admin_project_tools.py — compute-image build trigger
+#
+# The build runs `docker build` + `docker push` of a REAL project image (a CUDA
+# base plus a torch wheel is multi-GB, and the build can run the better part of
+# an hour) as a subprocess ON THE ORCHESTRATOR HOST. It used to be reachable by
+# any project MEMBER, with no concurrency limit, straight inside one HTTP
+# request — an unbounded docker fan-out on the API process itself.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestComputeImageBuildTrigger:
+    """Blast-radius bounds on the member-triggerable docker build."""
+
+    @staticmethod
+    def _patch_pipeline(monkeypatch, *, build_fn=None):
+        """Stub manifest discovery + the build pipeline (no docker, no network)."""
+        from app.routers import admin_project_tools as apt
+
+        async def fake_manifest(_project):
+            return {
+                "tools": [],
+                "skills": [],
+                "compute": {
+                    "image": {
+                        "name": "us-docker.pkg.dev/p/compute-images/proj:latest",
+                        "build": {"dockerfile": ".blueprint/Dockerfile.compute"},
+                    }
+                },
+                "error": None,
+            }
+
+        monkeypatch.setattr(apt, "_discover_manifest_tools", fake_manifest)
+        monkeypatch.setattr(
+            apt._cb, "resolve_compute_image_registry_repo",
+            lambda: "us-docker.pkg.dev/p/compute-images",
+        )
+
+        async def default_build(*a, **k):
+            from app.compute_image_build import BuildResult
+
+            return BuildResult(
+                pinned_ref="us-docker.pkg.dev/p/compute-images/proj@sha256:" + "a" * 64,
+                tag="deadbeef",
+                dep_hash="deadbeef",
+                already_present=False,
+                built=True,
+            )
+
+        monkeypatch.setattr(
+            apt._cb, "build_project_compute_image", build_fn or default_build
+        )
+        return apt
+
+    @pytest.mark.asyncio
+    async def test_build_succeeds_and_records_the_row(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """Happy path still works end-to-end (owner, no build in flight)."""
+        self._patch_pipeline(monkeypatch)
+        project = await _make_project(db_session, name="ImgBuild OK")
+
+        resp = await client.post(f"/api/admin/projects/{project.id}/compute-image/build")
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["digest"] == "sha256:" + "a" * 64
+        assert body["built"] is True
+
+    @pytest.mark.asyncio
+    async def test_concurrent_build_is_rejected_with_429(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """A second build while one is in flight sheds load — it does not queue.
+
+        Queuing would park an API worker (and its DB connection) behind an
+        hour-long docker build; fanning out would run N multi-GB docker builds on
+        the orchestrator host at once. Neither is acceptable, so the request is
+        refused with a Retry-After.
+        """
+        apt = self._patch_pipeline(monkeypatch)
+        project = await _make_project(db_session, name="ImgBuild Busy")
+
+        # Simulate a build already occupying the only slot.
+        await apt._compute_image_build_semaphore.acquire()
+        try:
+            resp = await client.post(
+                f"/api/admin/projects/{project.id}/compute-image/build"
+            )
+        finally:
+            apt._compute_image_build_semaphore.release()
+
+        assert resp.status_code == 429, resp.text
+        assert resp.headers.get("Retry-After")
+        # The app wraps HTTPException detail; assert on the rendered body.
+        assert "already running" in resp.text
+
+    @pytest.mark.asyncio
+    async def test_build_slot_is_released_after_a_failed_build(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """A build that raises must not leak its concurrency slot."""
+
+        async def boom(*a, **k):
+            raise RuntimeError("docker build failed (exit 1)")
+
+        apt = self._patch_pipeline(monkeypatch, build_fn=boom)
+        project = await _make_project(db_session, name="ImgBuild Boom")
+
+        resp = await client.post(f"/api/admin/projects/{project.id}/compute-image/build")
+        assert resp.status_code == 422, resp.text
+
+        # Slot is free again — a later build is not permanently 429'd.
+        assert not apt._compute_image_build_semaphore.locked()
+
+    @pytest.mark.asyncio
+    async def test_member_cannot_trigger_a_build(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """Building is OWNER-grade: it runs docker on the host and pushes to the
+        shared registry, like the other state-changing tool endpoints."""
+        self._patch_pipeline(monkeypatch)
+        project = await _make_project(db_session, name="ImgBuild Member", role="member")
+
+        resp = await client.post(f"/api/admin/projects/{project.id}/compute-image/build")
+
+        assert resp.status_code == 403, resp.text
+
+    @pytest.mark.asyncio
+    async def test_deadline_aborts_the_build_instead_of_abandoning_it(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """A 504 must STOP the build — not walk away from it.
+
+        ``asyncio.wait_for`` cancels the coroutine that is *awaiting* the build; the
+        blocking ``docker build`` in the ``asyncio.to_thread`` worker keeps running.
+        The old code then released the concurrency slot in the request's ``finally``
+        and returned 504, so:
+
+          * the abandoned build kept burning the orchestrator host,
+          * the slot was handed to the next caller while it ran (the bound stopped
+            bounding — repeated 504s fan out N concurrent multi-GB builds), and
+          * the pipeline's temp dir was torn down under the still-running build,
+            which then re-created parts of it — a disk leak.
+
+        The deadline now publishes a kill switch, kills the docker children, waits
+        for the pipeline to unwind, and only then releases the slot.
+        """
+        import tempfile
+        import threading
+        import time as _t
+
+        from app import compute_image_build as _cib
+
+        state = {
+            "control": None,
+            "tmp": None,
+            "thread_exited": threading.Event(),
+            "ran_to_completion": threading.Event(),
+        }
+
+        async def slow_build(*a, **k):
+            # Mirrors compute_backends.build_project_compute_image: a temp-dir
+            # context around a BLOCKING docker call dispatched to a worker thread.
+            state["control"] = _cib.current_build_control()
+            with tempfile.TemporaryDirectory(prefix="compute-image-build-") as tmp:
+                state["tmp"] = tmp
+
+                def blocking_docker_build():
+                    try:
+                        deadline = _t.monotonic() + 20
+                        while _t.monotonic() < deadline:
+                            control = _cib.current_build_control()
+                            if control is not None and control.aborted:
+                                raise _cib.BuildAborted("docker child killed")
+                            _t.sleep(0.02)
+                        state["ran_to_completion"].set()
+                    finally:
+                        state["thread_exited"].set()
+
+                await asyncio.to_thread(blocking_docker_build)
+            raise AssertionError("unreachable: the build should have been aborted")
+
+        apt = self._patch_pipeline(monkeypatch, build_fn=slow_build)
+        monkeypatch.setattr(apt, "_COMPUTE_IMAGE_BUILD_TIMEOUT_SECONDS", 0.5)
+        project = await _make_project(db_session, name="ImgBuild Deadline")
+
+        resp = await client.post(f"/api/admin/projects/{project.id}/compute-image/build")
+
+        assert resp.status_code == 504, resp.text
+
+        # 1. The build REALLY STOPPED. This is the finding: `wait_for` only cancels
+        #    the awaiting coroutine, so the worker thread keeps running long after
+        #    the 504 — burning the host with the slot already handed away.
+        assert state["thread_exited"].wait(5.0), (
+            "the build was still running 5s after the 504 — the deadline abandoned "
+            "it instead of aborting it"
+        )
+        assert not state["ran_to_completion"].is_set(), (
+            "the build ran to completion despite the deadline — it was abandoned, "
+            "not aborted"
+        )
+
+        # 2. It stopped because it was given a kill switch, and the switch was pulled.
+        assert state["control"] is not None, (
+            "no BuildControl reached the build — the deadline has no way to stop the "
+            "docker subprocesses and can only abandon them"
+        )
+        assert state["control"].aborted is True
+
+        # 3. Its temp dir is gone (no disk leak from a half-torn-down clone).
+        assert not os.path.exists(state["tmp"])
+
+        # 4. The slot is released only after that unwind — and it IS released, so
+        #    the bound is not permanently exhausted by repeated 504s.
+        assert not apt._compute_image_build_semaphore.locked()
+
+    @pytest.mark.asyncio
+    async def test_retrigger_with_an_empty_local_docker_store_preserves_the_digest_pin(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """Re-triggering with unchanged deps must NEVER destroy the stored digest pin.
+
+        Unchanged deps take ``build_and_push``'s already-present fast path, which
+        resolved the digest from the LOCAL docker store — empty on a fresh or pruned
+        host. It returned a tag-only ``pinned_ref``, and the UPSERT wrote
+        ``digest=NULL`` over a perfectly good pin (and flipped ``built`` back to
+        False), silently unpinning the project's compute image.
+        """
+        from app.compute_image_build import BuildResult
+        from app.models import ProjectComputeImage
+
+        project = await _make_project(db_session, name="ImgBuild Pin")
+        project_id = project.id
+
+        good_digest = "sha256:" + "a" * 64
+        registry_repo = "us-docker.pkg.dev/p/compute-images"
+        pinned = f"{registry_repo}/proj@{good_digest}"
+        db_session.add(
+            ProjectComputeImage(
+                project_id=project_id,
+                image_name="proj",
+                registry_repo=registry_repo,
+                dep_hash="deadbeef",
+                tag="deadbeef",
+                pinned_ref=pinned,
+                digest=good_digest,
+                built=True,
+            )
+        )
+        await db_session.commit()
+
+        async def already_present_on_a_fresh_host(*a, **k):
+            # Exactly what the fast path yields when neither the local store nor the
+            # registry hands back a digest: already_present, no digest, tag-only ref.
+            return BuildResult(
+                pinned_ref=f"{registry_repo}/proj:deadbeef",
+                tag="deadbeef",
+                dep_hash="deadbeef",
+                already_present=True,
+                built=False,
+                digest=None,
+            )
+
+        self._patch_pipeline(monkeypatch, build_fn=already_present_on_a_fresh_host)
+        resp = await client.post(f"/api/admin/projects/{project_id}/compute-image/build")
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["digest"] == good_digest, (
+            "the unchanged-deps re-trigger overwrote the project's digest pin with "
+            "NULL — the compute image is now unpinned"
+        )
+        assert body["pinned_ref"] == pinned
+        assert body["built"] is True
+
+        # And the DB row itself still carries the pin.
+        row = (
+            await db_session.execute(
+                select(ProjectComputeImage)
+                .where(
+                    ProjectComputeImage.project_id == project_id,
+                    ProjectComputeImage.dep_hash == "deadbeef",
+                )
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one()
+        assert row.digest == good_digest
+        assert row.pinned_ref == pinned
+        assert row.built is True
+
+    @pytest.mark.asyncio
+    async def test_a_digest_bearing_rebuild_still_updates_the_pin(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """The preserve-the-pin guard must not freeze a stale digest in place.
+
+        It only refuses to overwrite a good digest with NOTHING; a build that DOES
+        resolve a new digest still advances the pin.
+        """
+        from app.compute_image_build import BuildResult
+        from app.models import ProjectComputeImage
+
+        project = await _make_project(db_session, name="ImgBuild Repin")
+        registry_repo = "us-docker.pkg.dev/p/compute-images"
+        old_digest = "sha256:" + "a" * 64
+        new_digest = "sha256:" + "b" * 64
+        db_session.add(
+            ProjectComputeImage(
+                project_id=project.id,
+                image_name="proj",
+                registry_repo=registry_repo,
+                dep_hash="deadbeef",
+                tag="deadbeef",
+                pinned_ref=f"{registry_repo}/proj@{old_digest}",
+                digest=old_digest,
+                built=True,
+            )
+        )
+        await db_session.commit()
+
+        async def rebuilt(*a, **k):
+            return BuildResult(
+                pinned_ref=f"{registry_repo}/proj@{new_digest}",
+                tag="deadbeef",
+                dep_hash="deadbeef",
+                already_present=False,
+                built=True,
+                digest=new_digest,
+            )
+
+        self._patch_pipeline(monkeypatch, build_fn=rebuilt)
+        resp = await client.post(f"/api/admin/projects/{project.id}/compute-image/build")
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["digest"] == new_digest
+
+    @pytest.mark.asyncio
+    async def test_an_unconfined_build_network_is_surfaced_as_422(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """A build refused for network confinement is a 422, not a 500 traceback."""
+        from app import compute_image_build as _cib
+
+        async def refuses(*a, **k):
+            raise _cib.BuildNetworkError(
+                "build network 'bridge' can reach the GCP metadata server"
+            )
+
+        apt = self._patch_pipeline(monkeypatch, build_fn=refuses)
+        project = await _make_project(db_session, name="ImgBuild Net")
+
+        resp = await client.post(f"/api/admin/projects/{project.id}/compute-image/build")
+
+        assert resp.status_code == 422, resp.text
+        assert "metadata server" in resp.text
+        assert not apt._compute_image_build_semaphore.locked()

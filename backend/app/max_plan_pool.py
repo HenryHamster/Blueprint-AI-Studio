@@ -15,10 +15,11 @@ import random
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Mapping
+from typing import Any, Dict, List, Mapping, Set
 
 from app.database import AsyncSessionLocal
 from app.field_encryption import decrypt_field
+from app.max_plan_project_state import reconcile_project_state
 from app.models import LLMAuthMode, LLMProviderName
 from app.providers.base import UsageSnapshot, merge_settings
 from app.providers.registry import get_provider
@@ -232,6 +233,39 @@ def infer_quality_tier_for_model(
     return None
 
 
+def reconcile_model_for_provider(
+    provider: str | LLMProviderName | None,
+    model: str | None,
+    quality_tier: str | None,
+    runtime_config: Mapping[str, Any],
+) -> str | None:
+    """Return a model valid for ``provider``, correcting a cross-provider mispair.
+
+    A task pinned to provider A's model can be dispatched to provider B when A is
+    unavailable (cooldown / no account). If the resolved ``model`` still carries
+    A's id while ``provider`` is B, the runtime is handed e.g.
+    ``provider=anthropic`` + ``model=deepseek-v4-pro`` and the anthropic CLI
+    rejects the foreign id → EXTERNAL_API failure → retries burned → task FAILED.
+
+    When ``model`` demonstrably belongs to a DIFFERENT known provider than
+    ``provider``, re-derive the model from ``provider``'s ``quality_tier`` map so
+    the pair is consistent. Left unchanged when: no provider/model given; the
+    model already belongs to ``provider``; the model infers to None (an
+    operator-custom id absent from every tier map — never clobber an explicit
+    unknown model); or re-derivation yields nothing (no regression vs. today).
+    """
+    normalized_provider = _normalize_provider_name(provider)
+    if not normalized_provider or not model:
+        return model
+    model_provider = infer_provider_for_model(model, runtime_config)
+    if model_provider is None or model_provider == normalized_provider:
+        return model
+    rederived = get_provider(normalized_provider).tier_to_model(
+        quality_tier or DEFAULT_QUALITY_TIER, runtime_config
+    )
+    return rederived or model
+
+
 ALL_PROVIDERS: tuple[str, ...] = tuple(p.value for p in LLMProviderName)
 _VALID_SELECTION_MODES: frozenset[str] = frozenset(
     {"balanced", "preferred", "exclusive"}
@@ -245,6 +279,53 @@ def _normalize_provider_list(raw: Any) -> list[str]:
         return []
     values = [_normalize_provider_name(v) for v in raw]
     return [v for v in values if v]
+
+
+# Provider-to-CLI binary mapping for runner-side CLI inventory filtering.
+# When a runner advertises its available LLM CLI binaries via heartbeat, the
+# pool runtime selector filters providers whose required CLI is absent or
+# has present=False. This prevents dispatching a task to a runner that lacks
+# the CLI needed to execute it (e.g. codex ENOENT crash-requeues).
+_PROVIDER_REQUIRED_CLI: dict[str, str] = {
+    "anthropic": "claude",
+    "deepseek": "claude",
+    "zai": "claude",
+    "openai": "codex",
+    "gemini": "gemini",
+}
+
+
+def _filter_providers_by_cli(
+    providers: list[str],
+    runner_available_clis: dict[str, dict] | None,
+) -> list[str]:
+    """Filter *providers* to those whose required CLI is present on the runner.
+
+    When *runner_available_clis* is ``None``, no filtering is applied (backward
+    compat / cloud pre-provision path where all CLIs are installed).
+
+    When *runner_available_clis* is an empty dict (runner probed but found
+    nothing), apply the conservative fallback: assume ``claude`` is available
+    since all runners have it installed. This avoids starvation for runners
+    whose probe returned empty.
+
+    When *runner_available_clis* has entries, a provider is kept only when its
+    required CLI's ``"present"`` field is ``True``.
+    """
+    if runner_available_clis is None:
+        return providers
+    # Empty dict → conservative: assume only claude is available.
+    if not runner_available_clis:
+        return [p for p in providers if _PROVIDER_REQUIRED_CLI.get(p) == "claude"]
+    result: list[str] = []
+    for provider in providers:
+        required_cli = _PROVIDER_REQUIRED_CLI.get(provider)
+        if required_cli is None:
+            continue  # Unknown provider — can't determine requirement
+        cli_entry = runner_available_clis.get(required_cli)
+        if isinstance(cli_entry, dict) and cli_entry.get("present", False):
+            result.append(provider)
+    return result
 
 
 def _category_for_task_type(
@@ -926,11 +1007,18 @@ async def load_max_plan_pool():
     """Load Max plan accounts from database into per-user pools on startup.
     Reconciles active_tasks from DB by counting tasks currently PROVISIONING/IN_PROGRESS."""
     from sqlmodel import select as sql_select
-    from app.models import MaxPlanAccount, Task, TaskStatus
+    from app.models import MaxPlanAccount, Project, Task, TaskStatus
 
     async with AsyncSessionLocal() as session:
         result = await session.execute(sql_select(MaxPlanAccount))
         accounts = result.scalars().all()
+
+        # Projects that still exist — lets the prune evict a DELETED project's
+        # entry at once instead of waiting a daily window to zero its counters.
+        live_project_ids: Set[str] = {
+            str(p)
+            for p in (await session.execute(sql_select(Project.id))).scalars().all()
+        }
 
         # Count actually active tasks per account to reconcile after restarts
         active_tasks = (
@@ -947,11 +1035,29 @@ async def load_max_plan_pool():
             .all()
         )
         active_per_account: Dict[str, int] = {}
+        active_per_account_project: Dict[str, Dict[str, int]] = {}
         for t in active_tasks:
             acct_id = get_task_llm_account_id(t)
             if acct_id:
                 active_per_account[acct_id] = active_per_account.get(acct_id, 0) + 1
+                # Per-project reconciliation: count active tasks per (account, project).
+                pid = str(t.project_id) if t.project_id else None
+                if pid:
+                    proj_map = active_per_account_project.setdefault(acct_id, {})
+                    proj_map[pid] = proj_map.get(pid, 0) + 1
 
+        # Preserve in-memory usage-meter state across the periodic rebuild —
+        # this loader runs every ~300s from the orchestrator cycle, and the
+        # probe cache would otherwise be wiped with every refresh (the meter
+        # showed permanently-unknown in prod because of exactly that).
+        previous_usage_state: Dict[str, tuple] = {
+            aid: (
+                e.get("usage_snapshot"),
+                e.get("usage_snapshot_at"),
+                e.get("usage_probe_failed_at"),
+            )
+            for aid, e in _account_by_id.items()
+        }
         _max_plan_pools.clear()
         _account_by_id.clear()
         for acct in accounts:
@@ -974,6 +1080,16 @@ async def load_max_plan_pool():
                 if provider == LLMProviderName.ANTHROPIC
                 and auth_mode == LLMAuthMode.OAUTH
                 else None
+            )
+            # Per-project state: persisted JSONB reconciled against the live task
+            # counts, then BOUNDED (see app/max_plan_project_state.py — without
+            # the prune, one entry per project ever dispatched on this account
+            # survives forever, recopied on every rebuild and re-persisted on
+            # every cap flush).
+            reconciled_project_state = reconcile_project_state(
+                getattr(acct, "project_state", None),
+                active_per_account_project.get(acct_id, {}),
+                live_project_ids=live_project_ids,
             )
             entry = {
                 "id": acct_id,
@@ -999,12 +1115,26 @@ async def load_max_plan_pool():
                 else None,
                 "daily_task_cap": acct.daily_task_cap,
                 "max_concurrent_tasks": acct.max_concurrent_tasks,
+                # Per-project caps (persisted config — null or empty dict = unlimited).
+                "project_daily_task_cap": getattr(acct, "project_daily_task_cap", None) or {},
+                "project_max_concurrent_tasks": getattr(acct, "project_max_concurrent_tasks", None) or {},
                 "auto_disable_after_rate_limits": acct.auto_disable_after_rate_limits,
                 "daily_task_count": acct.daily_task_count,
                 "daily_task_count_reset_at": acct.daily_task_count_reset_at,
                 "disabled_reason": acct.disabled_reason,
                 "disabled_at": acct.disabled_at,
+                # Per-project runtime state (reconciled from DB on restart).
+                "project_state": reconciled_project_state,
             }
+            # Usage-meter snapshot: carry over the fresher of the previous
+            # in-memory probe result and the DB-persisted rate_limit_usage
+            # blob, so the meter survives both the periodic pool rebuild and
+            # orchestrator restarts.
+            _restore_usage_state(
+                entry,
+                previous_usage_state.get(acct_id),
+                getattr(acct, "rate_limit_usage", None),
+            )
             # Restore rate-limit state from DB (skip expired cooldowns)
             rl_state = acct.rate_limit_state or {}
             now = _utcnow()
@@ -1127,6 +1257,16 @@ def _daily_reset_if_elapsed(acct: dict, now: datetime | None = None) -> bool:
     if (now - reset_at).total_seconds() >= _DAILY_WINDOW_SECONDS:
         acct["daily_task_count"] = 0
         acct["daily_task_count_reset_at"] = now
+        # Also reset per-project daily_task_count in project_state so
+        # project_daily_task_cap is not a permanent lifetime cap.
+        pstate = acct.get("project_state")
+        if pstate:
+            for proj_entry in pstate.values():
+                if isinstance(proj_entry, dict) and "daily_task_count" in proj_entry:
+                    proj_entry["daily_task_count"] = 0
+        # Zeroed entries are COLLECTED on the next ~300s pool rebuild (which is
+        # the growth vector: it copies the map forward and re-persists it), not
+        # here on the hot dispatch path. See max_plan_project_state.
         return True
     return False
 
@@ -1143,6 +1283,35 @@ def _account_at_cap(acct: dict) -> str | None:
         concurrent_cap
     ):
         return f"concurrent cap ({concurrent_cap}) reached"
+    return None
+
+
+def _project_at_cap(acct: dict, project_id: str | None) -> str | None:
+    """Return a reason string if *project_id* is at its per-project cap on
+    *acct*, else None.
+
+    When *project_id* is None or the account has no per-project cap set for
+    that project, returns None (no per-project gating). This makes the
+    per-project layer fully backward-compatible: absent caps = no limit.
+    """
+    if project_id is None:
+        return None
+    # Check per-project daily cap.
+    project_daily_cap = acct.get("project_daily_task_cap") or {}
+    daily_cap = project_daily_cap.get(project_id)
+    if daily_cap is not None:
+        proj_state = (acct.get("project_state") or {}).get(project_id, {}) or {}
+        proj_daily = int(proj_state.get("daily_task_count", 0))
+        if proj_daily >= int(daily_cap):
+            return f"project daily cap ({daily_cap}) reached"
+    # Check per-project concurrent cap.
+    project_concurrent_cap = acct.get("project_max_concurrent_tasks") or {}
+    concurrent_cap = project_concurrent_cap.get(project_id)
+    if concurrent_cap is not None:
+        proj_state = (acct.get("project_state") or {}).get(project_id, {}) or {}
+        proj_active = int(proj_state.get("active_tasks", 0))
+        if proj_active >= int(concurrent_cap):
+            return f"project concurrent cap ({concurrent_cap}) reached"
     return None
 
 
@@ -1300,6 +1469,57 @@ def _account_state_for_model(
     return "probing"
 
 
+def _account_unavailable_reason(
+    acct: dict, model: str | None, now: datetime | None = None
+) -> str:
+    """The WHY behind an ``"unavailable"`` verdict from _account_state_for_model.
+
+    ``_account_state_for_model`` collapses five distinct causes (no token,
+    disabled, startup-failure cooldown, model-not-on-account, rate-limit
+    cooldown) into one string, so a caller that only sees "unavailable" cannot
+    tell an operator what to fix. This recomputes the cause — lazily, only for
+    accounts a selector actually skipped, so the hot path stays a single state
+    lookup.
+
+    Mirrors the branch ORDER of ``_account_state_for_model``; the two must be
+    kept in sync or the reason will name the wrong cause.
+    """
+    if not _account_runtime_ready(acct):
+        return "credentials not runtime-ready"
+    if not acct.get("enabled", True):
+        return f"account disabled ({acct.get('disabled_reason') or 'manually'})"
+    sf_cooldown_at = acct.get("startup_failure_cooldown_at")
+    if sf_cooldown_at is not None:
+        sf_elapsed = ((now or _utcnow()) - sf_cooldown_at).total_seconds()
+        if sf_elapsed < _STARTUP_FAILURE_COOLDOWN_SECONDS:
+            left = int(_STARTUP_FAILURE_COOLDOWN_SECONDS - sf_elapsed)
+            return f"startup-failure cooldown ({left}s left)"
+    if model is not None:
+        from app.account_model_availability import account_has_model
+
+        if account_has_model(acct, model) is False:
+            return f"model {model} not available on this account"
+    dm = acct.get("disabled_models") or {}
+    if not dm:
+        return "unavailable"
+    if model is None:
+        return "no concrete model requested and account has active disables"
+    # Haiku shares Opus's meter (normalized key); regression entries are keyed
+    # un-normalized — same two-step lookup as the state function.
+    info = dm.get(_normalize_rl_model(model)) or dm.get(model)
+    if info is None:
+        return "unavailable"
+    at_dt = info.get("at")
+    if at_dt is None:
+        return f"model {model} disabled (no cooldown timestamp)"
+    left = int(
+        _cooldown_seconds_for_info(info)
+        - ((now or _utcnow()) - at_dt).total_seconds()
+    )
+    kind = info.get("kind") or "rate-limit"
+    return f"model {model} in {kind} cooldown ({max(left, 0)}s left)"
+
+
 def _account_available_for_model(acct: dict, model: str | None) -> bool:
     """True if the account is either healthy OR probing for the given model.
     Probing accounts are serialized inside select_max_plan_account; outside
@@ -1308,15 +1528,24 @@ def _account_available_for_model(acct: dict, model: str | None) -> bool:
 
 
 def summarize_pool_state(
-    model: str | None, user_id: str | None = None
+    model: str | None, user_id: str | None = None, project_id: str | None = None
 ) -> Dict[str, Any]:
     """Summarize account pool state for diagnostics. Returns counts per state
     plus the earliest cooldown recovery time across rate-limited accounts.
 
     If user_id is provided, only that user's accounts are considered; otherwise
     the entire pool is summarized.
+
+    If project_id is provided, only accounts that have per-project usage for
+    that project are included in the summary.
     """
     accts = _max_plan_pools.get(user_id, []) if user_id else _all_accounts()
+    if project_id:
+        accts = [
+            a for a in accts
+            if (a.get("project_state") or {}).get(project_id, {}).get("active_tasks", 0) > 0
+            or (a.get("project_state") or {}).get(project_id, {}).get("daily_task_count", 0) > 0
+        ]
     now = _utcnow()
     healthy = probing = rate_limited = 0
     other_unavailable = 0
@@ -1356,7 +1585,7 @@ def summarize_pool_state(
 
 
 def get_all_account_health_summaries(
-    user_id: str | None = None, now: datetime | None = None
+    user_id: str | None = None, now: datetime | None = None, project_id: str | None = None
 ) -> list[dict]:
     """Return per-account health summaries for the admin dashboard.
 
@@ -1369,6 +1598,10 @@ def get_all_account_health_summaries(
     daily_task_count, daily_task_cap, max_concurrent_tasks,
     disqualify_threshold, disabled_reason, and rate_limited_models (with
     model name, kind, hits, cooldown_remaining_seconds per entry).
+
+    When *project_id* is provided, each entry also includes
+    project_active_tasks, project_daily_task_count, project_daily_task_cap,
+    and project_max_concurrent_tasks scoped to that project.
     """
     now = now or _utcnow()
     accts = _max_plan_pools.get(user_id, []) if user_id else _all_accounts()
@@ -1408,32 +1641,217 @@ def get_all_account_health_summaries(
                 entry["regression_stats"] = dict(info["regression_stats"])
             rate_limited_models.append(entry)
 
+        entry_dict = {
+            "id": acct["id"],
+            "name": acct.get("name", ""),
+            "provider": acct.get("provider", "anthropic"),
+            "auth_mode": acct.get("auth_mode", "oauth"),
+            "state": state,
+            "disabled_reason": acct.get("disabled_reason"),
+            "health_score": health_stats["health_score"],
+            "success_rate_7d": health_stats["success_rate_7d"],
+            "completions_24h": health_stats["completions_24h"],
+            "rl_events_24h": health_stats["rl_events_24h"],
+            "avg_duration_seconds": health_stats["avg_duration_seconds"],
+            "active_tasks": acct.get("active_tasks", 0),
+            "daily_task_count": acct.get("daily_task_count", 0),
+            "daily_task_cap": acct.get("daily_task_cap"),
+            "max_concurrent_tasks": acct.get("max_concurrent_tasks"),
+            "disqualify_threshold": _HEALTH_SCORE_DISQUALIFY_THRESHOLD,
+            "rate_limited_models": rate_limited_models,
+            # Additive: latest cached proactive usage-headroom snapshot
+            # (5h/7d utilization, reset times, probed_at, known/stale).
+            # "known": False covers never-probed and probe-unknown states.
+            "usage_snapshot": _usage_snapshot_summary(acct, now),
+        }
+        # Per-project fields when scoped to a specific project.
+        if project_id:
+            proj_state = (acct.get("project_state") or {}).get(project_id, {}) or {}
+            proj_daily_cap = acct.get("project_daily_task_cap") or {}
+            proj_concurrent_cap = acct.get("project_max_concurrent_tasks") or {}
+            entry_dict["proj_state"] = proj_state
+            entry_dict["project_active_tasks"] = int(proj_state.get("active_tasks", 0))
+            entry_dict["project_daily_task_count"] = int(proj_state.get("daily_task_count", 0))
+            entry_dict["project_daily_task_cap"] = proj_daily_cap.get(project_id)
+            entry_dict["project_max_concurrent_tasks"] = proj_concurrent_cap.get(project_id)
+        results.append(entry_dict)
+    return results
+
+
+def get_project_account_usage(
+    project_id: str, user_id: str
+) -> list[dict[str, Any]]:
+    """Return per-account consumption for a single project, read from the in-memory pool.
+
+    For each account in *user_id*'s pool, returns the project's active task count,
+    daily task count, configured per-project caps, and whether the project is at
+    any cap on this account. Includes global (non-project-scoped) account usage
+    for cross-project contention visibility.
+
+    Returns an empty list when the user has no pool entries or the project has
+    no recorded activity on any account.
+    """
+    accts = _max_plan_pools.get(user_id, [])
+    results: list[dict[str, Any]] = []
+    for acct in accts:
+        pstate = (acct.get("project_state") or {}).get(project_id, {})
+        pdaily_cap = (acct.get("project_daily_task_cap") or {}).get(project_id)
+        pconcurrent_cap = (acct.get("project_max_concurrent_tasks") or {}).get(
+            project_id
+        )
+        project_active = int(pstate.get("active_tasks") or 0)
+        project_daily = int(pstate.get("daily_task_count") or 0)
+
+        at_project_daily_cap = (
+            pdaily_cap is not None and project_daily >= int(pdaily_cap)
+        )
+        at_project_concurrent_cap = (
+            pconcurrent_cap is not None and project_active >= int(pconcurrent_cap)
+        )
+
         results.append(
             {
-                "id": acct["id"],
-                "name": acct.get("name", ""),
+                "account_id": acct["id"],
+                "account_name": acct.get("name", ""),
                 "provider": acct.get("provider", "anthropic"),
-                "auth_mode": acct.get("auth_mode", "oauth"),
-                "state": state,
-                "disabled_reason": acct.get("disabled_reason"),
-                "health_score": health_stats["health_score"],
-                "success_rate_7d": health_stats["success_rate_7d"],
-                "completions_24h": health_stats["completions_24h"],
-                "rl_events_24h": health_stats["rl_events_24h"],
-                "avg_duration_seconds": health_stats["avg_duration_seconds"],
-                "active_tasks": acct.get("active_tasks", 0),
-                "daily_task_count": acct.get("daily_task_count", 0),
-                "daily_task_cap": acct.get("daily_task_cap"),
-                "max_concurrent_tasks": acct.get("max_concurrent_tasks"),
-                "disqualify_threshold": _HEALTH_SCORE_DISQUALIFY_THRESHOLD,
-                "rate_limited_models": rate_limited_models,
-                # Additive: latest cached proactive usage-headroom snapshot
-                # (5h/7d utilization, reset times, probed_at, known/stale).
-                # "known": False covers never-probed and probe-unknown states.
-                "usage_snapshot": _usage_snapshot_summary(acct, now),
+                "enabled": acct.get("enabled", True),
+                "project_active_tasks": project_active,
+                "project_daily_task_count": project_daily,
+                "project_daily_task_cap": pdaily_cap,
+                "project_max_concurrent_tasks": pconcurrent_cap,
+                "at_project_daily_cap": at_project_daily_cap,
+                "at_project_concurrent_cap": at_project_concurrent_cap,
+                "at_project_cap": at_project_daily_cap or at_project_concurrent_cap,
+                "global_active_tasks": acct.get("active_tasks", 0),
+                "global_daily_task_count": acct.get("daily_task_count", 0),
+                "global_daily_task_cap": acct.get("daily_task_cap"),
+                "global_max_concurrent_tasks": acct.get("max_concurrent_tasks"),
             }
         )
     return results
+
+
+async def get_user_project_pool_summary(
+    user_id: str, session: Any
+) -> list[dict[str, Any]]:
+    """Return a per-project pool-consumption summary for all of a user's projects.
+
+    Reads from the in-memory pool for counters and caps; does a single batched
+    Project lookup for display names. Returns one entry per project the user
+    belongs to.
+
+    Each entry: project_id, project_name, total_active_tasks, total_daily_task_count,
+    accounts_at_cap (count of accounts where this project is at a per-project cap),
+    accounts_available (accounts with no per-project cap or below cap).
+    """
+    from sqlmodel import select as sql_select
+    from app.models import Project, ProjectMember
+
+    # Collect all project_ids referenced across the user's pool accounts
+    all_project_ids: set[str] = set()
+    accts = _max_plan_pools.get(user_id, [])
+    for acct in accts:
+        pstate = acct.get("project_state") or {}
+        pdaily_cap = acct.get("project_daily_task_cap") or {}
+        pconcurrent_cap = acct.get("project_max_concurrent_tasks") or {}
+        all_project_ids.update(pstate.keys())
+        all_project_ids.update(pdaily_cap.keys())
+        all_project_ids.update(pconcurrent_cap.keys())
+
+    # Also include all projects the user is a member of (even those with no
+    # pool activity yet — they show as zero-state entries).
+    member_project_ids: set[str] = set()
+    try:
+        member_rows = (
+            await session.execute(
+                sql_select(ProjectMember.project_id).where(
+                    ProjectMember.user_id == user_id
+                )
+            )
+        ).all()
+        member_project_ids = {str(pid) for (pid,) in member_rows}
+        all_project_ids.update(member_project_ids)
+    except Exception:
+        logger.debug(
+            "[POOL] get_user_project_pool_summary: failed to query ProjectMember rows"
+        )
+
+    if not all_project_ids:
+        return []
+
+    # Single batched project-name lookup
+    project_names: dict[str, str] = {}
+    try:
+        project_rows = (
+            await session.execute(
+                sql_select(Project.id, Project.name).where(
+                    Project.id.in_(
+                        [pid for pid in all_project_ids if _is_valid_uuid(pid)]
+                    )
+                )
+            )
+        ).all()
+        project_names = {str(pid): name for pid, name in project_rows}
+    except Exception:
+        logger.debug(
+            "[POOL] get_user_project_pool_summary: failed to query Project names"
+        )
+
+    results: list[dict[str, Any]] = []
+    for pid in sorted(all_project_ids):
+        total_active = 0
+        total_daily = 0
+        accounts_at_cap = 0
+        accounts_available = 0
+        caps_configured = False
+
+        for acct in accts:
+            pstate = (acct.get("project_state") or {}).get(pid, {})
+            pdaily_cap = (acct.get("project_daily_task_cap") or {}).get(pid)
+            pconcurrent_cap = (acct.get("project_max_concurrent_tasks") or {}).get(pid)
+
+            pa = int(pstate.get("active_tasks") or 0)
+            pd = int(pstate.get("daily_task_count") or 0)
+            total_active += pa
+            total_daily += pd
+
+            if pdaily_cap is not None or pconcurrent_cap is not None:
+                caps_configured = True
+
+            at_cap = False
+            if pdaily_cap is not None and pd >= int(pdaily_cap):
+                at_cap = True
+            if pconcurrent_cap is not None and pa >= int(pconcurrent_cap):
+                at_cap = True
+
+            if at_cap:
+                accounts_at_cap += 1
+            else:
+                accounts_available += 1
+
+        results.append(
+            {
+                "project_id": pid,
+                "project_name": project_names.get(pid, pid[:8]),
+                "total_active_tasks": total_active,
+                "total_daily_task_count": total_daily,
+                "accounts_at_cap": accounts_at_cap,
+                "accounts_available": accounts_available,
+                "total_accounts": len(accts),
+                "caps_configured": caps_configured,
+            }
+        )
+
+    return results
+
+
+def _is_valid_uuid(value: str) -> bool:
+    """Return True if *value* is a valid UUID string."""
+    try:
+        uuid.UUID(value)
+        return True
+    except (ValueError, AttributeError):
+        return False
 
 
 def account_in_rate_limit_cooldown(account_id: str | None) -> bool:
@@ -1571,6 +1989,7 @@ def pool_wide_rate_limit_cooldown(
     user_id: str | None = None,
     providers: list[str] | None = None,
     model: str | None = None,
+    project_id: str | None = None,
 ) -> bool:
     """Return True if every eligible account is in rate-limit cooldown.
 
@@ -1580,10 +1999,18 @@ def pool_wide_rate_limit_cooldown(
     - model: use model-specific state check; omitting falls back to the
       conservative model=None path (any disabled entry → unavailable)
 
+    When *project_id* is provided, accounts at their per-project cap for
+    that project are treated as unavailable (skipped in the check).
+
     Returns False when the eligible pool is empty or any account is healthy/probing.
     Safe to call from synchronous contexts — individual dict reads are atomic in CPython.
     """
     accts: list[dict] = _max_plan_pools.get(user_id, []) if user_id else _all_accounts()
+    # Filter out accounts at per-project cap for this project (if provided).
+    if project_id:
+        accts = [
+            a for a in accts if not _project_at_cap(a, project_id)
+        ]
     if providers:
         norm_providers = {
             _normalize_provider_name(p) or LLMProviderName.ANTHROPIC.value
@@ -2004,6 +2431,15 @@ async def _persist_rate_limit_state_best_effort(acct_id: str, reason: str) -> No
 # exactly as it did before this feature. The reactive rate-limit cooldowns
 # (disable_account_model / _account_state_for_model) remain the backstop.
 _USAGE_SNAPSHOT_TTL_SECONDS = 60
+# Cadence for the display-oriented usage-meter refresh (orchestrator calls
+# refresh_usage_meter_snapshots on this interval). Distinct from the 60s
+# selection TTL above: selection wants near-real-time data when the headroom
+# gate is enabled; the admin meter only needs minutes-fresh data.
+_USAGE_METER_REFRESH_INTERVAL_SECONDS = 300
+# A snapshot older than this renders as "stale" on the admin meter — three
+# missed meter refreshes. The 60s selection TTL is intentionally NOT used for
+# display: with a 300s refresh cadence it would flag virtually every render.
+_USAGE_METER_DISPLAY_STALE_SECONDS = 900
 # Neutral headroom rank for accounts whose snapshot is unknown — the midpoint of
 # the [0, 100] headroom scale, mirroring how sparse success-rate falls back to
 # 0.5. Keeps unprobed accounts from being either starved or unduly preferred.
@@ -2113,10 +2549,15 @@ def _usage_headroom_rank(acct: Dict[str, Any], now: datetime) -> float:
 async def _refresh_usage_snapshot(acct_id: str) -> None:
     """Probe one account's usage OUTSIDE the pool lock and cache the result.
 
-    Advisory + total: never raises. On any failure the snapshot is cached as
-    unknown with a fresh timestamp, so a broken account isn't re-probed every
-    selection for the TTL window. Writes the cache under the pool lock; the
+    Advisory + total: never raises. Writes the cache under the pool lock; the
     network probe itself runs lock-free.
+
+    Failure semantics: a failed probe never clobbers a previously KNOWN
+    snapshot — the meter keeps showing last-known values (which age into
+    ``stale``) and only ``usage_probe_failed_at`` is stamped so schedulers
+    back off instead of re-probing on every selection touch. When there is no
+    known prior, the unknown result is cached with a fresh timestamp (same
+    back-off effect through the TTL).
 
     On a SUCCESSFUL probe the snapshot is also persisted to the DB row's
     ``rate_limit_usage`` column so the data survives orchestrator restarts.
@@ -2146,8 +2587,15 @@ async def _refresh_usage_snapshot(acct_id: str) -> None:
     async with _max_plan_pool_lock:
         live = _account_by_id.get(acct_id)
         if live is not None:
-            live["usage_snapshot"] = snapshot
-            live["usage_snapshot_at"] = _utcnow()
+            prev = live.get("usage_snapshot")
+            has_known_prior = isinstance(prev, UsageSnapshot) and prev.known
+            if success or not has_known_prior:
+                live["usage_snapshot"] = snapshot
+                live["usage_snapshot_at"] = _utcnow()
+            if success:
+                live.pop("usage_probe_failed_at", None)
+            else:
+                live["usage_probe_failed_at"] = _utcnow()
             live.pop("usage_probe_inflight", None)
     # Persist to the DB row on success so the data survives restarts.
     # Best-effort: a write failure is non-fatal — the in-memory copy is the
@@ -2214,9 +2662,147 @@ def _schedule_usage_refresh(acct: Dict[str, Any]) -> None:
 
 
 def _maybe_schedule_usage_refresh(acct: Dict[str, Any], now: datetime) -> None:
-    """Schedule a refresh only when the cached snapshot is missing/stale."""
-    if _cached_usage_snapshot(acct, now) is None:
-        _schedule_usage_refresh(acct)
+    """Schedule a refresh only when the cached snapshot is missing/stale.
+
+    A recent probe FAILURE also suppresses scheduling for one TTL window —
+    failed probes preserve the last-known snapshot (see
+    ``_refresh_usage_snapshot``), so without this stamp a flaky probe would be
+    retried on every selection touch.
+    """
+    if _cached_usage_snapshot(acct, now) is not None:
+        return
+    failed_at = acct.get("usage_probe_failed_at")
+    if (
+        failed_at is not None
+        and (now - failed_at).total_seconds() < _USAGE_SNAPSHOT_TTL_SECONDS
+    ):
+        return
+    _schedule_usage_refresh(acct)
+
+
+def _snapshot_from_persisted_usage(
+    raw: Any,
+) -> tuple[UsageSnapshot, datetime] | None:
+    """Rebuild (UsageSnapshot, its wall-clock stamp) from a persisted
+    ``MaxPlanAccount.rate_limit_usage`` blob written by
+    ``_persist_rate_limit_usage_to_db``. None on any structural mismatch."""
+    if not isinstance(raw, Mapping) or raw.get("source") != "oauth_usage_probe":
+        return None
+    try:
+        updated_at = datetime.fromisoformat(raw.get("updated_at"))
+    except (TypeError, ValueError):
+        return None
+    utils: dict[str, float] = {}
+    resets: dict[str, str | None] = {}
+    for window in ("five_hour", "seven_day"):
+        entry = raw.get(window)
+        if not isinstance(entry, Mapping):
+            continue
+        util = entry.get("utilization")
+        if isinstance(util, bool) or not isinstance(util, (int, float)):
+            continue
+        utils[window] = float(util)
+        reset = entry.get("resets_at")
+        if isinstance(reset, str):
+            resets[window] = reset
+    if not utils:
+        return None
+    snapshot = UsageSnapshot(
+        known=True,
+        window_utilizations=utils,
+        resets_at=resets,
+        probed_at=updated_at.isoformat(),
+    )
+    return snapshot, updated_at
+
+
+def _restore_usage_state(
+    entry: Dict[str, Any],
+    prev_state: tuple | None,
+    persisted_raw: Any,
+) -> None:
+    """Seed a freshly-built pool entry's usage-meter state.
+
+    Takes the fresher of the previous in-memory snapshot (survives the
+    periodic pool rebuild) and the DB-persisted blob (survives restarts).
+    """
+    candidates: list[tuple[datetime, UsageSnapshot]] = []
+    if prev_state is not None:
+        prev_snap, prev_at, prev_failed_at = prev_state
+        if (
+            isinstance(prev_snap, UsageSnapshot)
+            and prev_snap.known
+            and prev_at is not None
+        ):
+            candidates.append((prev_at, prev_snap))
+        if prev_failed_at is not None:
+            entry["usage_probe_failed_at"] = prev_failed_at
+    parsed = _snapshot_from_persisted_usage(persisted_raw)
+    if parsed is not None:
+        candidates.append((parsed[1], parsed[0]))
+    if candidates:
+        best_at, best_snap = max(candidates, key=lambda c: c[0])
+        entry["usage_snapshot"] = best_snap
+        entry["usage_snapshot_at"] = best_at
+
+
+def _account_meter_eligible(acct: Dict[str, Any]) -> bool:
+    """True iff this account can produce a usage snapshot worth probing.
+
+    Only Anthropic OAuth accounts have a usage source today (every other
+    provider/auth combination resolves to ``UsageSnapshot.unknown()`` — see
+    the ``probe_usage`` implementations), so the meter loop skips the rest
+    rather than burning no-op probes.
+    """
+    provider = _normalize_provider_name(acct.get("provider"))
+    auth_mode = _normalize_auth_mode(acct.get("auth_mode"))
+    return (
+        provider == LLMProviderName.ANTHROPIC.value
+        and auth_mode == LLMAuthMode.OAUTH.value
+        and bool(acct.get("enabled", True))
+        and bool(acct.get("oauth_token") or acct.get("runtime_secret"))
+    )
+
+
+async def refresh_usage_meter_snapshots(now: datetime | None = None) -> int:
+    """Schedule usage probes for meter-eligible accounts with aging snapshots.
+
+    Called on an orchestrator cadence (every
+    ``_USAGE_METER_REFRESH_INTERVAL_SECONDS``) so the admin usage meter stays
+    populated regardless of the ``usage_headroom_gate_enabled`` selection gate
+    (default off) — previously the gate was the meter's ONLY data supply, so
+    the meter rendered permanently-unknown in any default-configured deploy.
+    Advisory and non-blocking: probes are fire-and-forget; returns the number
+    scheduled.
+    """
+    now = now or _utcnow()
+    scheduled = 0
+    async with _max_plan_pool_lock:
+        for acct in _account_by_id.values():
+            if not _account_meter_eligible(acct):
+                continue
+            snap = acct.get("usage_snapshot")
+            at = acct.get("usage_snapshot_at")
+            if (
+                isinstance(snap, UsageSnapshot)
+                and snap.known
+                and at is not None
+                and (now - at).total_seconds()
+                < _USAGE_METER_REFRESH_INTERVAL_SECONDS
+            ):
+                continue
+            failed_at = acct.get("usage_probe_failed_at")
+            if (
+                failed_at is not None
+                and (now - failed_at).total_seconds()
+                < _USAGE_METER_REFRESH_INTERVAL_SECONDS
+            ):
+                continue
+            _schedule_usage_refresh(acct)
+            scheduled += 1
+    if scheduled:
+        logger.info("[POOL] usage meter: scheduled %d usage probe(s)", scheduled)
+    return scheduled
 
 
 def _apply_usage_gate(
@@ -2247,11 +2833,17 @@ def _usage_snapshot_summary(acct: Dict[str, Any], now: datetime) -> Dict[str, An
 
     Always returns a dict (additive field). ``known=False`` covers the
     never-probed and probe-unknown states; ``stale`` flags a snapshot older
-    than the selection TTL (selection treats stale as unknown).
+    than the DISPLAY freshness window (three missed meter refreshes) — NOT
+    the 60s selection TTL, which would flag nearly every render under the
+    300s meter cadence. Selection freshness is handled separately by
+    ``_cached_usage_snapshot``.
     """
     snap = acct.get("usage_snapshot")
     at = acct.get("usage_snapshot_at")
-    stale = at is None or (now - at).total_seconds() >= _USAGE_SNAPSHOT_TTL_SECONDS
+    stale = (
+        at is None
+        or (now - at).total_seconds() >= _USAGE_METER_DISPLAY_STALE_SECONDS
+    )
     if not isinstance(snap, UsageSnapshot) or not snap.known:
         probed_at = snap.probed_at if isinstance(snap, UsageSnapshot) else None
         return {
@@ -2278,6 +2870,8 @@ async def select_max_plan_account_balanced(
     blacklist: List[str] | None = None,
     task_type: str | None = None,
     runtime_config: Mapping[str, Any] | None = None,
+    project_id: str | None = None,
+    reject_reasons: List[str] | None = None,
 ) -> tuple[Dict[str, Any], str, str | None] | None:
     """Balanced-mode selection: flatten all accounts across the given providers
     into one pool and pick the single best by (health_score, -active_tasks).
@@ -2291,7 +2885,12 @@ async def select_max_plan_account_balanced(
     eligible only when its ``active_tasks == 0`` (serialized probe). Healthy
     accounts win over probing when both are available, matching the
     single-provider selector's contract.
-    """
+
+    When *project_id* is provided, per-project cap gating is applied BEFORE
+    the global cap check. See ``_project_at_cap``.
+
+    When *reject_reasons* is provided, a short per-account reason is appended
+    for every provider-matching account that was skipped."""
     if not provider_models:
         return None
     async with _max_plan_pool_lock:
@@ -2303,6 +2902,13 @@ async def select_max_plan_account_balanced(
         now = _utcnow()
         dirty_from_reset: list[str] = []
         seen_ids: set[str] = set()
+
+        def _reject(acct: dict, provider: str, why: str) -> None:
+            if reject_reasons is not None:
+                reject_reasons.append(
+                    f"{provider}:{acct.get('name') or acct.get('id')}: {why}"
+                )
+
         for provider_name, model in provider_models:
             normalized_provider = _normalize_provider_name(provider_name)
             if not normalized_provider:
@@ -2310,25 +2916,57 @@ async def select_max_plan_account_balanced(
             for a in user_pool:
                 if a["id"] in seen_ids:
                     continue
-                if blacklist and a["id"] in blacklist:
-                    continue
                 acct_provider = (
                     _normalize_provider_name(a.get("provider"))
                     or LLMProviderName.ANTHROPIC.value
                 )
                 if acct_provider != normalized_provider:
                     continue
+                if blacklist and a["id"] in blacklist:
+                    _reject(a, normalized_provider, "blacklisted for this task")
+                    continue
                 if _daily_reset_if_elapsed(a, now):
                     dirty_from_reset.append(a["id"])
-                if _account_at_cap(a):
+                # Per-project cap check runs BEFORE global cap check.
+                proj_cap_reason = _project_at_cap(a, project_id)
+                if proj_cap_reason:
+                    _reject(a, normalized_provider, proj_cap_reason)
+                    continue
+                cap_reason = _account_at_cap(a)
+                if cap_reason:
+                    _reject(a, normalized_provider, cap_reason)
                     continue
                 state = _account_state_for_model(a, model, now)
                 if state == "healthy":
                     candidates_healthy.append((a, normalized_provider, model))
                     seen_ids.add(a["id"])
-                elif state == "probing" and a.get("active_tasks", 0) == 0:
-                    candidates_probing.append((a, normalized_provider, model))
-                    seen_ids.add(a["id"])
+                elif state == "probing":
+                    if a.get("active_tasks", 0) == 0:
+                        candidates_probing.append((a, normalized_provider, model))
+                        seen_ids.add(a["id"])
+                    else:
+                        _reject(
+                            a,
+                            normalized_provider,
+                            "cooldown elapsed, probe already in flight",
+                        )
+                else:
+                    # Guarded AT THE CALL SITE, not inside _reject: Python
+                    # evaluates arguments eagerly, so an unguarded
+                    # `_reject(a, p, _account_unavailable_reason(...))` would
+                    # build the reason (in-function import + datetime math +
+                    # f-strings) for EVERY rejected account on EVERY selection,
+                    # while this function holds the global _max_plan_pool_lock.
+                    # Cost would scale with pool size x rejected accounts and
+                    # peak during a cooldown storm — the exact incident the
+                    # reasons exist to diagnose. Every other _reject arg above
+                    # is a constant or a value the control flow already had.
+                    if reject_reasons is not None:
+                        _reject(
+                            a,
+                            normalized_provider,
+                            _account_unavailable_reason(a, model, now),
+                        )
 
         for acct_id in dirty_from_reset:
             _pending_cap_persists.add(acct_id)
@@ -2424,6 +3062,11 @@ async def select_max_plan_account_balanced(
         account, prov, model = winner
         account["active_tasks"] = account.get("active_tasks", 0) + 1
         account["daily_task_count"] = int(account.get("daily_task_count") or 0) + 1
+        # Per-project counter increment (runtime-only, best-effort).
+        if project_id:
+            proj_state = account.setdefault("project_state", {}).setdefault(project_id, {})
+            proj_state["active_tasks"] = proj_state.get("active_tasks", 0) + 1
+            proj_state["daily_task_count"] = proj_state.get("daily_task_count", 0) + 1
         _pending_cap_persists.add(account["id"])
         selected_winner = (account, prov, model)
 
@@ -2438,6 +3081,8 @@ async def select_max_plan_account(
     provider: str | LLMProviderName | None = None,
     task_type: str | None = None,
     runtime_config: Mapping[str, Any] | None = None,
+    project_id: str | None = None,
+    reject_reasons: List[str] | None = None,
 ) -> Dict[str, Any] | None:
     """Select a Max plan account for a task. Two-tier circuit-breaker selection:
 
@@ -2448,6 +3093,16 @@ async def select_max_plan_account(
        account. If the probe succeeds, the COMPLETED path clears disabled_models
        (restoring full concurrency); if it 429s, the mark path extends cooldown.
 
+    When *project_id* is provided, per-project cap gating is applied BEFORE
+    the global cap check: accounts at their per-project daily/concurrent cap
+    for this project are skipped, and per-project counters are incremented on
+    selection alongside the global counters. When *project_id* is None, no
+    per-project gating is applied (fully backward-compatible).
+
+    When *reject_reasons* is provided, a short per-account reason is appended
+    for every provider-matching account that was skipped, so callers can report
+    WHY the pool came up empty instead of a bare "pool exhausted".
+
     Pre-increments active_tasks atomically under lock."""
     async with _max_plan_pool_lock:
         user_pool = _max_plan_pools.get(user_id, [])
@@ -2456,9 +3111,13 @@ async def select_max_plan_account(
         normalized_provider = _normalize_provider_name(provider)
         now = _utcnow()
         dirty_from_reset: list[str] = []
+        provider_matched = 0
+
+        def _reject(acct: dict, why: str) -> None:
+            if reject_reasons is not None:
+                reject_reasons.append(f"{acct.get('name') or acct.get('id')}: {why}")
+
         for a in user_pool:
-            if blacklist and a["id"] in blacklist:
-                continue
             if (
                 normalized_provider
                 and (
@@ -2468,16 +3127,42 @@ async def select_max_plan_account(
                 != normalized_provider
             ):
                 continue
+            provider_matched += 1
+            if blacklist and a["id"] in blacklist:
+                _reject(a, "blacklisted for this task")
+                continue
             if _daily_reset_if_elapsed(a, now):
                 dirty_from_reset.append(a["id"])
+            # Per-project cap check runs BEFORE global cap check.
+            proj_cap_reason = _project_at_cap(a, project_id)
+            if proj_cap_reason:
+                _reject(a, proj_cap_reason)
+                continue
             cap_reason = _account_at_cap(a)
             if cap_reason:
+                _reject(a, cap_reason)
                 continue
             state = _account_state_for_model(a, model, now)
             if state == "healthy":
                 healthy.append(a)
-            elif state == "probing" and a.get("active_tasks", 0) == 0:
-                probing.append(a)
+            elif state == "probing":
+                if a.get("active_tasks", 0) == 0:
+                    probing.append(a)
+                else:
+                    _reject(a, "cooldown elapsed, probe already in flight")
+            else:
+                # Guarded at the CALL SITE — see the identical guard in
+                # select_max_plan_account_balanced. Arguments are evaluated
+                # eagerly, so the guard inside _reject does not stop
+                # _account_unavailable_reason from running under the global
+                # _max_plan_pool_lock for every rejected account.
+                if reject_reasons is not None:
+                    _reject(a, _account_unavailable_reason(a, model, now))
+
+        if provider_matched == 0 and reject_reasons is not None:
+            reject_reasons.append(
+                f"no accounts configured for provider {normalized_provider or 'any'}"
+            )
 
         for acct_id in dirty_from_reset:
             _pending_cap_persists.add(acct_id)
@@ -2549,6 +3234,11 @@ async def select_max_plan_account(
 
         account["active_tasks"] = account.get("active_tasks", 0) + 1
         account["daily_task_count"] = int(account.get("daily_task_count") or 0) + 1
+        # Per-project counter increment (runtime-only, best-effort).
+        if project_id:
+            proj_state = account.setdefault("project_state", {}).setdefault(project_id, {})
+            proj_state["active_tasks"] = proj_state.get("active_tasks", 0) + 1
+            proj_state["daily_task_count"] = proj_state.get("daily_task_count", 0) + 1
         _pending_cap_persists.add(account["id"])
         selected = account
 
@@ -2561,7 +3251,66 @@ async def select_llm_runtime_for_task(
     task: Any,
     runtime_config: Mapping[str, Any],
     blacklist: List[str] | None = None,
+    project_id: str | None = None,
+    runner_available_clis: dict[str, dict] | None = None,
+    failure_reasons: List[str] | None = None,
 ) -> LLMSelectionResult | None:
+    """Resolve the (provider, model, account) runtime for a task.
+
+    Returns None — or an account-less result when routing knows the intended
+    provider/model — when no pool account is eligible. In that case the
+    per-(provider, model) rejection reasons are logged at WARNING and, when the
+    caller passes ``failure_reasons``, copied into it: a computed-but-discarded
+    reason is how "pool exhausted" turns into an hour of debugging the wrong
+    thing.
+    """
+    # Did THIS call's caller actually ask for the WHY? Everything expensive
+    # about reason-building is gated on this.
+    #
+    # Per-account reasons are built inside select_max_plan_account{,_balanced}
+    # while they hold the global _max_plan_pool_lock. Handing those selectors a
+    # non-None reject_reasons list unconditionally would make every LLM
+    # selection system-wide — cloud dispatch included — construct a reason
+    # string for every rejected account under that lock, with the cost peaking
+    # during a cooldown storm. So the sub-lists below are None unless the
+    # caller wants them, which turns the selectors' reason work off entirely.
+    _want_reasons = failure_reasons is not None
+
+    # Coarse per-(provider, model) attempt lines. Cheap (a handful of f-strings,
+    # built OUTSIDE the pool lock) and always collected, so the no-account log
+    # line still names which routes were tried even at DEBUG.
+    _reasons: List[str] = []
+
+    def _sub_reasons() -> List[str] | None:
+        """Fresh per-account reason sink, or None when nobody asked."""
+        return [] if _want_reasons else None
+
+    def _note_attempt(
+        provider_name: str, model_name: str | None, sub: List[str] | None
+    ) -> None:
+        detail = "; ".join(sub) if sub else "no eligible accounts"
+        _reasons.append(f"{provider_name}/{model_name or 'any'}: {detail}")
+
+    def _flush_reasons(outcome: str) -> None:
+        if not _reasons:
+            _reasons.append("no provider/model attempts were possible")
+        # WARNING only when the caller asked for reasons (i.e. it will surface
+        # them to an operator). Otherwise DEBUG: a pool-exhaustion storm makes
+        # EVERY dispatch attempt fleet-wide hit this path, and a multi-KB
+        # WARNING per attempt is log amplification at the worst possible moment
+        # — the incident itself. The caller that wants the WHY (the runner pull
+        # path) still gets both the log line and the list.
+        log = logger.warning if _want_reasons else logger.debug
+        log(
+            "[LLM_SELECT] project=%s task_type=%s %s — %s",
+            _log_project_id,
+            routing_task_type,
+            outcome,
+            " | ".join(_reasons)[:1500],
+        )
+        if failure_reasons is not None:
+            failure_reasons.extend(_reasons)
+
     explicit_model = _extract_task_model(task)
     mode = provider_selection_mode(runtime_config)
     allow_fallback = mode in ("balanced", "preferred")
@@ -2574,8 +3323,15 @@ async def select_llm_runtime_for_task(
         explicit_model, runtime_config
     )
     routing_task_type = _task_type(task)
-    project_id = str(getattr(task, "project_id", None) or "unknown")
-    logger.info("[LLM_SELECT] project=%s user=%s task_type=%s", project_id, user_id, routing_task_type)
+    # Resolve project_id: explicit parameter takes precedence, then task attribute.
+    _resolved_project_id = (
+        project_id
+        if project_id is not None
+        else str(getattr(task, "project_id", None) or "")
+        or None
+    )
+    _log_project_id = _resolved_project_id or "unknown"
+    logger.info("[LLM_SELECT] project=%s user=%s task_type=%s", _log_project_id, user_id, routing_task_type)
 
     # If the inferred explicit_provider isn't allowed by the resolved
     # routing, drop the pin so category_routing wins. Catches:
@@ -2610,10 +3366,40 @@ async def select_llm_runtime_for_task(
         if provider_preference:
             provider_preference = provider_preference[:1]
 
+    # Filter providers by runner CLI inventory: when a concrete runner is
+    # known (runner claim path), remove providers whose required CLI is not
+    # present on that runner. The orchestrator pre-provision / warm-retarget
+    # paths pass runner_available_clis=None and skip this filter entirely.
+    if runner_available_clis is not None:
+        provider_preference = _filter_providers_by_cli(
+            provider_preference, runner_available_clis
+        )
+        if model_preferences:
+            model_preferences = [
+                p
+                for p in model_preferences
+                if _filter_providers_by_cli(
+                    [p.get("provider", "")], runner_available_clis
+                )
+            ]
+        if not provider_preference and not model_preferences:
+            logger.info(
+                "[LLM_SELECT] All providers filtered by runner CLI inventory "
+                "— no runtime available for runner project=%s",
+                _log_project_id,
+            )
+            if failure_reasons is not None:
+                failure_reasons.append(
+                    "all routed providers filtered out by the runner's available "
+                    "CLI inventory (runner has no CLI for any allowed provider)"
+                )
+            return None
+
     if model_preferences:
         for pref in model_preferences:
             provider_name = pref["provider"]
             model_name = pref["model"]
+            sub_reasons = _sub_reasons()
             account = await select_max_plan_account(
                 user_id=user_id,
                 model=model_name,
@@ -2621,9 +3407,13 @@ async def select_llm_runtime_for_task(
                 provider=provider_name,
                 task_type=routing_task_type,
                 runtime_config=runtime_config,
+                project_id=_resolved_project_id,
+                reject_reasons=sub_reasons,
             )
+            if not account:
+                _note_attempt(provider_name, model_name, sub_reasons)
             if account:
-                logger.info("[LLM_SELECT] project=%s account=%s provider=%s model=%s", project_id, account.get("id"), provider_name, model_name)
+                logger.info("[LLM_SELECT] project=%s account=%s provider=%s model=%s", _log_project_id, account.get("id"), provider_name, model_name)
                 return LLMSelectionResult(
                     provider=provider_name,
                     auth_mode=_normalize_auth_mode(account.get("auth_mode"))
@@ -2686,13 +3476,22 @@ async def select_llm_runtime_for_task(
                 continue
             provider_models.append((provider_name, model))
         if provider_models:
+            balanced_sub = _sub_reasons()
             balanced_result = await select_max_plan_account_balanced(
                 user_id=user_id,
                 provider_models=provider_models,
                 blacklist=blacklist,
                 task_type=routing_task_type,
                 runtime_config=runtime_config,
+                project_id=_resolved_project_id,
+                reject_reasons=balanced_sub,
             )
+            if balanced_result is None:
+                _note_attempt(
+                    "balanced[" + ",".join(p for p, _m in provider_models) + "]",
+                    None,
+                    balanced_sub,
+                )
             if balanced_result is not None:
                 account, provider_name, chosen_model = balanced_result
                 if intended_provider and provider_name != intended_provider:
@@ -2738,6 +3537,7 @@ async def select_llm_runtime_for_task(
             model = provider.tier_to_model(quality_tier, runtime_config)
         if not model:
             continue
+        sub_reasons = _sub_reasons()
         account = await select_max_plan_account(
             user_id=user_id,
             model=model,
@@ -2745,7 +3545,11 @@ async def select_llm_runtime_for_task(
             provider=provider_name,
             task_type=routing_task_type,
             runtime_config=runtime_config,
+            project_id=_resolved_project_id,
+            reject_reasons=sub_reasons,
         )
+        if not account:
+            _note_attempt(provider_name, model, sub_reasons)
         if account:
             if intended_provider and provider_name != intended_provider:
                 _record_routing_fallback(
@@ -2777,6 +3581,7 @@ async def select_llm_runtime_for_task(
         # failure mode.
         fallback = provider.fallback_model(model)
         if fallback and fallback != model:
+            sub_reasons = _sub_reasons()
             account = await select_max_plan_account(
                 user_id=user_id,
                 model=fallback,
@@ -2784,12 +3589,16 @@ async def select_llm_runtime_for_task(
                 provider=provider_name,
                 task_type=routing_task_type,
                 runtime_config=runtime_config,
+                project_id=_resolved_project_id,
+                reject_reasons=sub_reasons,
             )
+            if not account:
+                _note_attempt(provider_name, fallback, sub_reasons)
             if account:
                 logger.warning(
                     "[LLM_SELECT] project=%s No pool account has %s; falling back to GA "
                     "counterpart %s on %s.",
-                    project_id,
+                    _log_project_id,
                     model,
                     fallback,
                     provider_name,
@@ -2814,6 +3623,7 @@ async def select_llm_runtime_for_task(
                 )
 
     if explicit_provider and explicit_model:
+        _flush_reasons("no pool account (returning account-less explicit result)")
         _record_routing_fallback(
             task,
             intended_provider=intended_provider,
@@ -2834,6 +3644,7 @@ async def select_llm_runtime_for_task(
         )
 
     if provider_preference:
+        _flush_reasons("no pool account (returning account-less fallback result)")
         fallback_provider = provider_preference[0]
         provider = get_provider(fallback_provider)
         fallback_settings = resolve_task_provider_settings(
@@ -2866,6 +3677,7 @@ async def select_llm_runtime_for_task(
             settings=fallback_settings,
         )
 
+    _flush_reasons("no pool account and no routing to fall back on")
     return None
 
 
@@ -2909,14 +3721,19 @@ async def _maybe_refresh_account_secret(acct: Dict[str, Any]) -> None:
 
 
 async def release_max_plan_account(
-    account_id: str, *, revert_daily_task_count: bool = False
+    account_id: str,
+    *,
+    revert_daily_task_count: bool = False,
+    project_id: str | None = None,
 ):
     """Decrement active tasks for an account when a task finishes or aborts.
 
-    When active_tasks drops to zero and the account's credential is backed by
-    Secret Manager (secret_blob_ref starts with "projects/"), runtime_secret is
-    cleared from the in-memory dict so the resolved credential does not linger
-    indefinitely.  The next select_max_plan_account call re-fetches it.
+    When *project_id* is provided, per-project active_tasks are also
+    decremented (best-effort, floored at zero).  When active_tasks drops to zero
+    and the account's credential is backed by Secret Manager (secret_blob_ref
+    starts with "projects/"), runtime_secret is cleared from the in-memory dict
+    so the resolved credential does not linger indefinitely.  The next
+    select_max_plan_account call re-fetches it.
     """
     async with _max_plan_pool_lock:
         account = _account_by_id.get(account_id)
@@ -2926,10 +3743,29 @@ async def release_max_plan_account(
                     f"[POOL] Account {account['name']} ({account_id}) release underflow — active_tasks was {account['active_tasks']}"
                 )
             account["active_tasks"] = max(0, account["active_tasks"] - 1)
+            # Per-project active_tasks release (best-effort).
+            if project_id:
+                proj_state = account.setdefault("project_state", {}).setdefault(project_id, {})
+                current = proj_state.get("active_tasks", 0)
+                if current > 0:
+                    proj_state["active_tasks"] = current - 1
+                elif current <= 0 and account.get("active_tasks", 0) >= 0:
+                    # Non-zero underflow on per-project is unusual but not
+                    # actionable — log and floor.
+                    logger.debug(
+                        f"[POOL] Per-project release underflow for project {project_id} "
+                        f"on account {account['name']} ({account_id}) — was {current}"
+                    )
             if revert_daily_task_count:
                 account["daily_task_count"] = max(
                     0, int(account.get("daily_task_count") or 0) - 1
                 )
+                # Per-project daily_task_count revert (best-effort).
+                if project_id:
+                    proj_state = account.setdefault("project_state", {}).setdefault(project_id, {})
+                    current_daily = proj_state.get("daily_task_count", 0)
+                    if current_daily > 0:
+                        proj_state["daily_task_count"] = current_daily - 1
                 _pending_cap_persists.add(account_id)
             if account["active_tasks"] == 0:
                 secret_ref = account.get("secret_blob_ref")
@@ -3625,6 +4461,7 @@ async def recheck_disabled_accounts():
                     db_acct.disabled_reason = acct.get("disabled_reason")
                     db_acct.enabled = acct.get("enabled", True)
                     db_acct.disabled_at = acct.get("disabled_at")
+                    db_acct.project_state = acct.get("project_state")
                     cap_session.add(db_acct)
                 await cap_session.commit()
             for acct_id in flush_ids:

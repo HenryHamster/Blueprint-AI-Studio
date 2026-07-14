@@ -27,6 +27,83 @@ def _user_project_ids(user_id: str):
     return select(ProjectMember.project_id).where(ProjectMember.user_id == user_id)
 
 
+def _member_project_ids(user_id: str):
+    """Subquery returning project IDs where the user holds at least ``member``.
+
+    The mutation floor: ``viewer`` is documented read-only, so bulk-mutating
+    routes must scope to this subquery rather than :func:`_user_project_ids`.
+    """
+    return select(ProjectMember.project_id).where(
+        ProjectMember.user_id == user_id,
+        ProjectMember.role.in_(["member", "owner"]),
+    )
+
+
+async def _resolve_repo_project_for_write(
+    session: AsyncSession,
+    user_id: str,
+    github_owner: str,
+    github_repo: str,
+) -> Project | None:
+    """Resolve which project a task-creation call for ``owner/repo`` should use.
+
+    Returns the project when the caller holds member+ on one for this repo, or
+    ``None`` when the caller has no project for the repo at all — in which case
+    the caller is expected to auto-create one and become its owner.
+
+    Raises 403 when the only project(s) the caller can see for this repo are ones
+    where they are a ``viewer``: creating work there is not authorized, and
+    falling through to the auto-create branch would silently mint a shadow
+    project the viewer owns.
+
+    Ordering is load-bearing. ``ix_project_github_owner_repo`` is NOT unique and
+    the auto-create branch deliberately mints a project per (caller, repo), so
+    one repo can legitimately map to several projects — a user may be a viewer on
+    project A and the owner of project B for the same ``acme/widget``. Picking a
+    project by membership alone (any role) and only THEN checking the role would
+    turn a benign nondeterministic pick into a nondeterministic 403, randomly
+    locking a user out of creating tasks on their OWN project. So we look for a
+    member+ project FIRST, and only if none exists do we consider viewer-visible
+    ones (and refuse). The explicit ORDER BY makes the pick itself deterministic.
+    """
+    base = select(Project).where(
+        Project.github_owner == github_owner,
+        Project.github_repo == github_repo,
+    )
+
+    writable = (
+        (
+            await session.execute(
+                base.where(Project.id.in_(_member_project_ids(user_id)))
+                .order_by(Project.created_at.asc(), Project.id.asc())
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if writable is not None:
+        return writable
+
+    viewer_visible = (
+        (
+            await session.execute(
+                base.where(Project.id.in_(_user_project_ids(user_id)))
+                .order_by(Project.created_at.asc(), Project.id.asc())
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if viewer_visible is not None:
+        raise HTTPException(
+            status_code=403, detail="Requires member role on this project"
+        )
+
+    return None
+
+
 async def _get_user_project(
     project_id: uuid.UUID, user_id: str, session: AsyncSession
 ) -> Project:

@@ -418,10 +418,11 @@ async def _handle_main_branch_ci_failure_inner(
     if fingerprint:
         max_per_fingerprint = config.get("max_per_fingerprint", 3)
         fp_window_start = now - timedelta(hours=24)
-        # Audit W1 (B6/B14): previous_error_fingerprint is now an indexed
-        # column. Include QUEUED/IN_PROGRESS active spawns alongside terminal
-        # FAILED/CANCELLED so concurrent in-flight remediations count toward
-        # the cap (fixes the parallel-spawn-overshoot race).
+        # previous_error_fingerprint is indexed as part of
+        # ix_task_auto_remediation_active. Include QUEUED/IN_PROGRESS active
+        # spawns alongside terminal FAILED/CANCELLED so concurrent in-flight
+        # remediations count toward the cap (fixes the parallel-spawn-overshoot
+        # race).
         cap_states = [
             TaskStatus.FAILED,
             TaskStatus.CANCELLED,

@@ -1,6 +1,6 @@
 /* eslint-disable react-hooks/refs, react-hooks/set-state-in-effect */
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { fetchStrategicStateWithRevision, type StrategicSessionResponse, type StrategicStateResponse } from '../strategicStateApi';
+import { fetchStrategicStateWithRevision, isStrategicStateNotModified, type StrategicSessionResponse, type StrategicStateResponse } from '../strategicStateApi';
 import { DEFAULT_POLL_MS, usePoller } from './usePoller';
 
 export function useStrategicReadModel(projectId: string | null, opts?: { pollerEnabled?: boolean }) {
@@ -20,6 +20,10 @@ export function useStrategicReadModel(projectId: string | null, opts?: { pollerE
   // the server can skip the expensive context-package build when inputs are
   // unchanged. Reset when the project changes.
   const stateRevisionRef = useRef<string | null>(null);
+  // Full-body ETag from the server's ETag response header. Sent back as
+  // If-None-Match on the next poll so the server can reply 304 Not Modified
+  // (empty body) when the entire response is unchanged. Reset on project change.
+  const etagRef = useRef<string | null>(null);
 
   useEffect(() => {
     setData(null);
@@ -27,6 +31,7 @@ export function useStrategicReadModel(projectId: string | null, opts?: { pollerE
     setLoading(Boolean(projectId));
     requestGenerationRef.current += 1;
     stateRevisionRef.current = null;
+    etagRef.current = null;
   }, [projectId]);
 
   const refresh = useCallback(
@@ -36,9 +41,25 @@ export function useStrategicReadModel(projectId: string | null, opts?: { pollerE
       const requestedProjectId = projectId;
       const requestGeneration = (requestGenerationRef.current += 1);
       const revision = stateRevisionRef.current;
+      const etag = etagRef.current;
       setLoading(prev => prev || data == null);
       try {
-        const next = await fetchStrategicStateWithRevision(requestedProjectId, revision, signal);
+        const next = await fetchStrategicStateWithRevision(requestedProjectId, revision, signal, etag);
+        // 304 Not Modified: nothing changed since the token was issued. Keep the
+        // existing cached data and both revision refs untouched (do NOT clear
+        // state or advance the generation), but still honor the project/generation
+        // guards so a stale not-modified can't resurrect loading for a project the
+        // operator already switched away from.
+        if (isStrategicStateNotModified(next)) {
+          if (
+            currentProjectIdRef.current !== requestedProjectId ||
+            requestGenerationRef.current !== requestGeneration
+          ) {
+            return;
+          }
+          setError(null);
+          return;
+        }
         if (
           currentProjectIdRef.current !== requestedProjectId ||
           next.project_id !== requestedProjectId ||
@@ -47,6 +68,7 @@ export function useStrategicReadModel(projectId: string | null, opts?: { pollerE
           return;
         }
         stateRevisionRef.current = next.state_revision ?? null;
+        etagRef.current = next.state_etag ?? null;
         setData(next);
         setError(null);
       } catch (err) {

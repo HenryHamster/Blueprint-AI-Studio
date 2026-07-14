@@ -1719,3 +1719,79 @@ async def reorder_by_completion_priority(
         active_task_ids,
         rollup_parent_ids,
     )
+
+
+# ── Dispatch-window sizing + failure-gate withholding ──────────────────────────
+# Both transforms exist for one reason: a dispatch-window position must only ever
+# be spent on a task that can ACTUALLY dispatch this cycle. The window used to be
+# cut at exactly ``slots_available``, but several outcomes inside the dispatch loop
+# consume a position and dispatch nothing (a failure-gated type, a compute_experiment
+# held for a runner, a recoverable BLOCKED launch, a transient cap deferral, a
+# per-project resource deferral, a lost lock race). Those slots were never
+# backfilled, so healthy tasks ranked just below the cutoff starved for hours while
+# the fleet sat idle.
+
+#: Scan this many times ``slots_available`` (with the additive floor below) so
+#: non-dispatchable candidates are backfilled rather than each burning a slot.
+#: Bounded so a queue whose head is entirely non-dispatchable cannot turn a single
+#: cycle into an unbounded scan.
+DISPATCH_WINDOW_BACKFILL_MULTIPLIER = 3
+DISPATCH_WINDOW_BACKFILL_MIN_EXTRA = 20
+
+
+def dispatch_window_size(slots_available: int) -> int:
+    """How many candidates to SCAN for a cycle offering ``slots_available`` slots.
+
+    Strictly >= ``slots_available``, so widening never drops a task that the old
+    ``eligible_ids[:slots_available]`` cut would have included — it only appends
+    backfill candidates behind them, preserving every upstream ordering/reservation
+    permutation. The dispatch loop still enforces the real limit by stopping once
+    ``slots_available`` ACTUAL dispatches have occurred.
+    """
+    if slots_available <= 0:
+        return 0
+    return max(
+        slots_available * DISPATCH_WINDOW_BACKFILL_MULTIPLIER,
+        slots_available + DISPATCH_WINDOW_BACKFILL_MIN_EXTRA,
+    )
+
+
+def filter_failing_types(
+    eligible_ids: list,
+    candidate_tasks: list[Task],
+    failing_types: set,
+) -> tuple[list, set]:
+    """Withhold candidates whose task type is currently failure-gated.
+
+    The per-type failure gate is enforced inside the dispatch loop, but that loop
+    runs AFTER the window has been cut — so a failure-gated task ranked above the
+    cutoff consumed a slot and then skipped, dispatching nothing. With a failing type
+    at the head of the queue that silently zeroed out an entire cycle's dispatch while
+    capacity sat idle. These tasks provably cannot dispatch this cycle (``failing_types``
+    is computed once per cycle and the loop does not mutate it), so withholding them
+    here is behaviour-preserving for every task that *can* dispatch and purely frees
+    the slots they were wasting.
+
+    Filtering is a subsequence operation: the relative order of the survivors — and
+    therefore every fairness / completion-priority / slot-reservation permutation
+    applied downstream — is untouched.
+
+    Returns ``(kept_ids, withheld_types)``. ``withheld_types`` feeds the
+    all-types-blocked stall detector, which must still see the types it just
+    withheld or it would never fire again.
+    """
+    if not failing_types or not eligible_ids:
+        return eligible_ids, set()
+    types_by_id = {
+        t.id: ((t.first_payload or {}).get("type") or "") for t in candidate_tasks
+    }
+    withheld_ids = {
+        task_id
+        for task_id in eligible_ids
+        if types_by_id.get(task_id, "") in failing_types
+    }
+    if not withheld_ids:
+        return eligible_ids, set()
+    withheld_types = {types_by_id.get(task_id, "") for task_id in withheld_ids}
+    kept = [task_id for task_id in eligible_ids if task_id not in withheld_ids]
+    return kept, withheld_types

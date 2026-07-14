@@ -17,6 +17,7 @@ import random
 import re as _re
 from datetime import datetime
 from urllib.parse import quote
+from collections import OrderedDict
 
 import httpx
 import logging
@@ -47,13 +48,23 @@ _github_client: httpx.AsyncClient | None = None
 # dominant install-token-budget drain.
 _inflight_reads: dict[tuple[str, str], "asyncio.Future[httpx.Response]"] = {}
 
+# File-content cache: memoizes get_file_text_at_ref results by
+# (owner, repo, ref, path) for a short TTL.  At a fixed git ref the content is
+# immutable, so caching across calls avoids redundant GitHub API content reads
+# for the same file — the dominant cost in ci-compliance evaluation (~213 capped
+# files per new integration-branch SHA).  Bounded LRU eviction prevents unbounded
+# memory growth under sustained rollup activity.
+_FILE_CONTENT_CACHE_TTL_SECONDS = 600  # 10 minutes
+_FILE_CONTENT_CACHE_MAX_SIZE = 2000   # ~2000 entries ≈ ~3-5 MB at average file size
+_file_content_cache: "OrderedDict[tuple[str, str, str, str], tuple[str, float]]" = OrderedDict()
+
 
 def _get_client() -> httpx.AsyncClient:
     global _github_client
     if _github_client is None or _github_client.is_closed:
         _github_client = httpx.AsyncClient(
             timeout=15.0,
-            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+            limits=httpx.Limits(max_connections=50, max_keepalive_connections=25),
         )
     return _github_client
 
@@ -120,14 +131,29 @@ async def probe_rate_limit() -> bool:
     # Pull any currently-cached installation token — doesn't spend quota
     # on a refresh.  If nothing's cached, skip the probe; real activity
     # will populate the pill soon enough.
-    from app.github_token_resolver import _github_token_cache
+    #
+    # github_auth's per-repo cache is the authoritative home for App-discovery
+    # tokens (the common case). The resolver's per-project cache only holds
+    # tokens IT minted (stored-installation fallback), so check both — checking
+    # only the latter would leave the quota pill dark on most deployments.
+    from app.github_auth import any_cached_installation_token
+    from app.github_token_resolver import (
+        _github_token_cache,
+        _TOKEN_MIN_REMAINING_LIFE,
+        _remaining_life,
+    )
 
-    cached_token: str | None = None
-    for entry in _github_token_cache.values():
-        token = entry.get("token")
-        if token and token.startswith(("ghs_", "ghu_")):
-            cached_token = token
-            break
+    cached_token: str | None = any_cached_installation_token()
+    if not cached_token:
+        for entry in _github_token_cache.values():
+            token = entry.get("token")
+            if (
+                token
+                and token.startswith(("ghs_", "ghu_"))
+                and _remaining_life(entry) >= _TOKEN_MIN_REMAINING_LIFE
+            ):
+                cached_token = token
+                break
     if not cached_token:
         return False
     headers = {
@@ -852,6 +878,7 @@ async def get_file_text_at_ref(
     repo: str,
     ref: str,
     project_id: str | None = None,
+    use_content_cache: bool = True,
 ) -> str | None:
     """Fetch the decoded TEXT of *path* at ``owner/repo@ref``.
 
@@ -861,11 +888,28 @@ async def get_file_text_at_ref(
     Goes through :func:`_github_request`, so it is quota-accounted and
     rate-limit-aware like every other GitHub call.
 
+    When ``use_content_cache`` (default True), results are memoized in an
+    in-memory LRU cache keyed by ``(owner, repo, ref, path)`` with a 10-minute
+    TTL, so repeated reads of the same file at the same ref across
+    closely-spaced evaluations avoid redundant GitHub API calls.
+
     Returns the decoded UTF-8 text on HTTP 200, or ``None`` for any
     non-retrievable / non-decodable outcome (404, non-200, non-file payload,
     undecodable body, or transport error). Fail-safe like its read siblings:
     ``None`` never means "empty file", it means "could not read".
     """
+    # Check the in-memory content cache before hitting the GitHub API.
+    if use_content_cache:
+        cache_key = (owner, repo, ref, path)
+        try:
+            cached = _file_content_cache.get(cache_key)
+            if cached is not None and (time.monotonic() - cached[1]) < _FILE_CONTENT_CACHE_TTL_SECONDS:
+                import app.shared_state as _ss
+                _ss.github_cache_hits["read_content"] = _ss.github_cache_hits.get("read_content", 0) + 1
+                return cached[0]
+        except Exception:
+            pass  # Cache miss / stale — fall through to fetch.
+
     import base64
 
     headers = {
@@ -900,7 +944,21 @@ async def get_file_text_at_ref(
         content_b64 = payload.get("content")
         if not isinstance(content_b64, str):
             return None
-        return base64.b64decode(content_b64).decode()
+        text = base64.b64decode(content_b64).decode()
+
+        # Store in cache on success.
+        if use_content_cache and text is not None:
+            try:
+                cache_key = (owner, repo, ref, path)
+                _file_content_cache[cache_key] = (text, time.monotonic())
+                _file_content_cache.move_to_end(cache_key)  # LRU: most recently used
+                # Evict oldest entries over the size cap.
+                while len(_file_content_cache) > _FILE_CONTENT_CACHE_MAX_SIZE:
+                    _file_content_cache.popitem(last=False)  # Least recently used
+            except Exception:
+                pass  # Cache write failure is non-critical.
+
+        return text
     except Exception as e:  # noqa: BLE001 — never let a fetch error read as content
         logger.warning(
             "[GITHUB] Failed text fetch for %s on %s/%s@%s: %s",
@@ -909,6 +967,65 @@ async def get_file_text_at_ref(
             repo,
             ref,
             e,
+        )
+        return None
+
+
+async def get_file_bytes_at_ref(
+    path: str,
+    *,
+    token: str,
+    owner: str,
+    repo: str,
+    ref: str,
+    project_id: str | None = None,
+) -> bytes | None:
+    """Fetch the raw BYTES of *path* at ``owner/repo@ref``.
+
+    Binary-safe sibling of :func:`get_file_text_at_ref`. Returns the decoded
+    base64 content for any file (text or binary) so that image and other binary
+    asset types can be served without corruption. Goes through
+    :func:`_github_request`, so it is quota-accounted and rate-limit-aware.
+
+    Returns the raw bytes on HTTP 200, or ``None`` for any non-retrievable
+    outcome (404, non-200, non-file payload, undecodable body, or transport
+    error).
+    """
+    import base64
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    encoded_path = quote(path, safe="/")
+    encoded_ref = quote(ref, safe="")
+    url = (
+        f"https://api.github.com/repos/{owner}/{repo}/contents/"
+        f"{encoded_path}?ref={encoded_ref}"
+    )
+    try:
+        response = await _github_request(
+            "GET", url, headers, max_retries=2, project_id=project_id
+        )
+        if response.status_code != 200:
+            if response.status_code != 404:
+                logger.warning(
+                    "[GITHUB] bytes fetch for %s on %s/%s@%s: HTTP %s",
+                    path, owner, repo, ref, response.status_code,
+                )
+            return None
+        payload = response.json()
+        if not (isinstance(payload, dict) and payload.get("type") == "file"):
+            return None
+        content_b64 = payload.get("content")
+        if not isinstance(content_b64, str):
+            return None
+        return base64.b64decode(content_b64)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "[GITHUB] Failed bytes fetch for %s on %s/%s@%s: %s",
+            path, owner, repo, ref, e,
         )
         return None
 
@@ -1167,6 +1284,7 @@ from app.github_refs import (  # noqa: F401
     get_commit_date,
     list_pull_requests_for_commit,
     is_ancestor_of,
+    compare_ref_status,
     list_recent_commit_messages,
     check_squash_referenced,
     get_files_changed_between_refs,
@@ -1178,7 +1296,10 @@ from app.github_pulls import (  # noqa: F401
     pr_is_not_behind_for,
     create_pull_request,
     get_pull_request,
-    get_pull_request_reviews,
+    get_pull_request_reviews_checked,
+    REVIEWS_COMPLETE,
+    REVIEWS_TRUNCATED,
+    REVIEWS_FAILED,
     get_open_pull_requests,
     get_pull_request_diff,
     get_pull_request_commits,
@@ -1190,6 +1311,7 @@ from app.github_pulls import (  # noqa: F401
     close_pull_request,
     reopen_pull_request,
     get_pr_files,
+    pr_effective_diff_is_empty,
     _UPDATE_BRANCH_NO_NEW_COMMITS_PHRASE,
     _is_no_new_commits_message,
     _tag_not_behind_if_no_new_commits,

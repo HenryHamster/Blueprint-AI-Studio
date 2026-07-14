@@ -21,6 +21,7 @@ from app.efficiency_snapshot import (
     AXIS_LLM_COST_PER_VERIFIED_TASK,
     AXIS_MEDIAN_API_CALLS_PER_TASK,
     AXIS_MEDIAN_REVIEW_ITERATIONS,
+    AXIS_PROMPT_CACHE_READ_SHARE,
     AXIS_PROMPT_STATIC_BYTES,
     AXIS_TOTAL_COST_PER_VERIFIED_TASK,
     AXIS_REWORK_COST_SHARE,
@@ -56,9 +57,13 @@ from app.efficiency_snapshot import (
     _compute_lane_cost_per_merged_pr,
     _compute_lane_warm_resume_rate,
     _compute_cold_start_breakdown_p50,
+    _compute_job_cost_usd,
+    _compute_job_is_priced,
+    _compute_prompt_cache_read_share,
     _compute_prompt_static_bytes,
     _compute_total_cost_per_verified_task,
     _compute_verified_merge_count,
+    _load_compute_job_costs,
     _extract_ts_plain_string_length,
     _extract_ts_template_literal_length,
     _last_run_due,
@@ -76,6 +81,8 @@ from app.efficiency_snapshot import (
     write_snapshot,
 )
 from app.models import (
+    ComputeJob,
+    ComputeJobStatus,
     ImprovementLane,
     ImprovementLaneStatus,
     TaskStatus,
@@ -1541,6 +1548,363 @@ def test_total_cost_per_verified_task_in_all_axes():
     assert AXIS_TOTAL_COST_PER_VERIFIED_TASK in ALL_AXES
     assert AXIS_TOTAL_COST_PER_VERIFIED_TASK == "total_cost_per_verified_task"
     assert AXIS_TOTAL_COST_PER_VERIFIED_TASK in AXIS_CONSUMERS
+
+
+def _make_cache_task(
+    project_id,
+    *,
+    task_type: str,
+    input_tokens: int,
+    cache_read_tokens: int,
+    verified: bool,
+):
+    """A merged task carrying LLM cache tokens, bucketed under ``task_type``.
+
+    When ``verified`` is False the merge is a degraded fall-open
+    (unverified_merge_reason set), so it counts toward the token-based
+    prompt_cache_read_share but is EXCLUDED from the verified-merge denominator.
+    """
+    now = _utcnow()
+    context: dict = {"pr_merged": True}
+    if not verified:
+        context["review_loop"] = {"unverified_merge_reason": "ci_unavailable"}
+    return make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context=context,
+        payloads=[{"type": task_type}],
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        vm_provisioned_at=now - timedelta(minutes=5),
+        vm_stopped_at=now,
+        vm_spot=False,
+        api_call_summary={
+            "total_input_tokens": input_tokens,
+            "total_output_tokens": 500,
+            "total_cache_read_input_tokens": cache_read_tokens,
+            "llm_call_count": 5,
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_prompt_cache_and_verified_task_axes(db_session):
+    """Named acceptance test for the two prompt-cache cost-baseline axes.
+
+    Exercises both new seams end-to-end:
+
+    1. ``prompt_cache_read_share`` is the token-weighted rollup of the per-task-type
+       ``cache_read_share`` from ``compute_llm_cost_by_task_type`` — it counts EVERY
+       task's tokens (verified or not), and reconciles exactly with that breakdown.
+    2. ``total_cost_per_verified_task``'s denominator is the VERIFIED merge count
+       (fall-open merges excluded), and its drift_pct is suppressed while the
+       verified-merge count is below ``VERIFIED_TASK_DRIFT_MIN_COUNT``.
+    """
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Two verified merges across two task types + one degraded fall-open merge.
+    #   code_change (verified): 1000 input, 400 cache-read  -> type share 0.40
+    #   research    (verified): 1000 input, 200 cache-read  -> type share 0.20
+    #   code_change (UNVERIFIED fall-open): 2000 input, 1000 cache-read
+    # Fleet prompt_cache_read_share = (400+200+1000) / (1000+1000+2000) = 0.40
+    # Verified-merge denominator = 2 (the fall-open task is excluded).
+    tasks = [
+        _make_cache_task(
+            project.id,
+            task_type="code_change",
+            input_tokens=1000,
+            cache_read_tokens=400,
+            verified=True,
+        ),
+        _make_cache_task(
+            project.id,
+            task_type="research",
+            input_tokens=1000,
+            cache_read_tokens=200,
+            verified=True,
+        ),
+        _make_cache_task(
+            project.id,
+            task_type="code_change",
+            input_tokens=2000,
+            cache_read_tokens=1000,
+            verified=False,
+        ),
+    ]
+    for t in tasks:
+        db_session.add(t)
+    await db_session.commit()
+
+    # --- Axis 2: prompt_cache_read_share (pure-function seam) -----------------
+    share = _compute_prompt_cache_read_share(tasks)
+    assert share == 0.40
+
+    # It must reconcile with the per-task-type breakdown it rolls up.
+    rows = compute_llm_cost_by_task_type(tasks)
+    roll_input = sum(int(r["total_input_tokens"]) for r in rows)
+    roll_cache = sum(int(r["total_cache_read_input_tokens"]) for r in rows)
+    assert roll_input == 4000
+    assert round(roll_cache / roll_input, 4) == share
+
+    # --- Axis 1: verified-merge denominator excludes fall-open merges ---------
+    assert _compute_verified_merge_count(tasks) == 2
+
+    # --- Both axes flow through compute_current_axes --------------------------
+    axes = await compute_current_axes(db_session, project.id)
+    assert axes[AXIS_PROMPT_CACHE_READ_SHARE] == 0.40
+    assert axes["total_cost_per_verified_task_denominator"] == 2
+    assert axes[AXIS_TOTAL_COST_PER_VERIFIED_TASK] is not None
+
+    # --- Both axes seed the immutable baseline and flow through drift ---------
+    snap = await write_snapshot(db_session, project.id)
+    await db_session.commit()
+    assert snap[AXIS_PROMPT_CACHE_READ_SHARE] == 0.40
+
+    drift = await read_baseline_with_drift(db_session, project.id)
+    cache_axis = drift["axes"][AXIS_PROMPT_CACHE_READ_SHARE]
+    assert cache_axis["current"] == 0.40
+    assert cache_axis["baseline"] == 0.40
+    # First snapshot == baseline, so drift is defined (0.0) — proves the new axis
+    # is wired into the ALL_AXES drift loop, not silently dropped.
+    assert cache_axis["drift_pct"] == 0.0
+
+    # Verified-merge count (2) is below the floor, so its axis drift is suppressed.
+    verified_axis = drift["axes"][AXIS_TOTAL_COST_PER_VERIFIED_TASK]
+    assert verified_axis["current"] is not None
+    assert verified_axis["drift_pct"] is None, (
+        f"Expected drift_pct=None when verified_count=2 < {VERIFIED_TASK_DRIFT_MIN_COUNT}"
+    )
+
+
+def test_prompt_cache_read_share_in_all_axes():
+    """The prompt-cache axis must be registered in ALL_AXES and AXIS_CONSUMERS."""
+    assert AXIS_PROMPT_CACHE_READ_SHARE in ALL_AXES
+    assert AXIS_PROMPT_CACHE_READ_SHARE == "prompt_cache_read_share"
+    assert AXIS_PROMPT_CACHE_READ_SHARE in AXIS_CONSUMERS
+
+
+def test_prompt_cache_read_share_none_without_input_tokens():
+    """No input tokens in the window -> None (no divide-by-zero), like siblings."""
+    import uuid
+
+    project_id = uuid.uuid4()
+    empty = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+    assert _compute_prompt_cache_read_share([empty]) is None
+
+
+# ---------------------------------------------------------------------------
+# ComputeJob (GPU experiment) cost grounding
+# ---------------------------------------------------------------------------
+
+
+def _make_compute_job(project_id, **overrides):
+    """Create a ComputeJob with test defaults; pass kwargs to override."""
+    now = _utcnow()
+    defaults = {
+        "project_id": project_id,
+        "backend": "gcp",
+        "status": ComputeJobStatus.SUCCEEDED,
+        "started_at": now - timedelta(minutes=5),
+        "completed_at": now,
+        "polling_metadata": {},
+    }
+    defaults.update(overrides)
+    return ComputeJob(**defaults)
+
+
+def test_compute_job_is_priced_classification():
+    """A $0 compute job is PRICED only when it has a real rate basis (recorded
+    cost, a cloud rate stamped at launch, or the operator nominal rate for
+    runner-subprocess); otherwise it is genuinely UNPRICED, not free."""
+    import uuid
+
+    pid = uuid.uuid4()
+
+    # Recorded positive final cost → priced.
+    assert _compute_job_is_priced(
+        _make_compute_job(pid, backend="gcp", final_cost_usd=3.0)
+    )
+    # Positive cloud rate stamped at launch, $0 so far → priced.
+    assert _compute_job_is_priced(
+        _make_compute_job(
+            pid,
+            backend="gcp",
+            final_cost_usd=None,
+            accrued_cost_usd=0.0,
+            polling_metadata={"cost_rate_per_second": 0.0002},
+        )
+    )
+    # Runner-subprocess (operator hardware) with the nominal rate active → priced
+    # even at $0 (the nominal rate is the pricing basis).
+    assert _compute_job_is_priced(
+        _make_compute_job(
+            pid,
+            backend="runner-subprocess",
+            final_cost_usd=None,
+            accrued_cost_usd=0.0,
+            polling_metadata={},
+        )
+    )
+    # local-gpu ran for $0 with no rate and no operator nominal → UNPRICED.
+    assert not _compute_job_is_priced(
+        _make_compute_job(
+            pid,
+            backend="local-gpu",
+            final_cost_usd=0.0,
+            accrued_cost_usd=0.0,
+            polling_metadata={},
+        )
+    )
+    # _compute_job_cost_usd prefers settled final over accrued.
+    assert _compute_job_cost_usd(
+        _make_compute_job(pid, final_cost_usd=7.5, accrued_cost_usd=2.0)
+    ) == 7.5
+    assert _compute_job_cost_usd(
+        _make_compute_job(pid, final_cost_usd=None, accrued_cost_usd=2.0)
+    ) == 2.0
+
+
+@pytest.mark.asyncio
+async def test_compute_job_cost_included_in_total_cost_per_verified_task(db_session):
+    """ComputeJob (GPU) cost attributed to a verified-merge task must appear in
+    the total_cost_per_verified_task numerator AND the compute_cost_attribution
+    honesty block — it was previously invisible to the cost/efficiency ranking."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # A verified merge with NO VM/LLM cost so the axis reduces to compute cost.
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    # Baseline: no compute job yet → axis is 0.0 (verified=1, cost=0).
+    axes_before = await compute_current_axes(db_session, project.id)
+    assert axes_before[AXIS_TOTAL_COST_PER_VERIFIED_TASK] == 0.0
+    assert axes_before["compute_cost_attribution"]["total_compute_cost_usd"] == 0.0
+    assert axes_before["compute_cost_attribution"]["job_count"] == 0
+
+    # Attribute a priced GPU compute job costing $12.50 to that task.
+    db_session.add(
+        _make_compute_job(
+            project.id,
+            task_id=task.id,
+            machine_type="g2-standard-4",
+            accelerator_type="L4",
+            final_cost_usd=12.5,
+        )
+    )
+    await db_session.commit()
+
+    axes_after = await compute_current_axes(db_session, project.id)
+    # verified merge count is 1, so the axis equals the compute cost.
+    assert axes_after[AXIS_TOTAL_COST_PER_VERIFIED_TASK] == 12.5
+    attr = axes_after["compute_cost_attribution"]
+    assert attr["total_compute_cost_usd"] == 12.5
+    assert attr["attributed_cost_usd"] == 12.5
+    assert attr["unattributed_cost_usd"] == 0.0
+    assert attr["job_count"] == 1
+    assert attr["priced_job_count"] == 1
+    assert attr["unpriced_job_count"] == 0
+    assert attr["unpriced_coverage_fraction"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_compute_cost_attribution_surfaces_unpriced_job(db_session):
+    """A compute job that ran for $0 with no cloud/operator rate must surface as
+    UNPRICED (coverage < 1, combo recorded) so a $0 that means 'unpriced' is not
+    mistaken for 'free' in the ranking."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+    db_session.add(task)
+    # Ran (started_at set) on local-gpu, $0, no rate → genuinely unpriced.
+    db_session.add(
+        _make_compute_job(
+            project.id,
+            task_id=task.id,
+            backend="local-gpu",
+            machine_type="g2-standard-4",
+            final_cost_usd=0.0,
+            accrued_cost_usd=0.0,
+            polling_metadata={},
+        )
+    )
+    await db_session.commit()
+
+    axes = await compute_current_axes(db_session, project.id)
+    attr = axes["compute_cost_attribution"]
+    assert attr["job_count"] == 1
+    assert attr["unpriced_job_count"] == 1
+    assert attr["priced_job_count"] == 0
+    assert attr["unpriced_coverage_fraction"] == 0.0
+    assert "local-gpu:g2-standard-4" in attr["unpriced_combos"]
+    # Unpriced $0 contributes 0 to the numerator — the axis is not inflated, but
+    # the honesty block makes the $0 legible rather than silently "free".
+    assert axes[AXIS_TOTAL_COST_PER_VERIFIED_TASK] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_load_compute_job_costs_skips_not_started_zero_cost(db_session):
+    """A not-yet-started $0 job is not cost-bearing (excluded from job_count and
+    coverage); a job that ran or spent is counted."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # QUEUED, never started, $0 → skipped entirely.
+    db_session.add(
+        _make_compute_job(
+            project.id,
+            backend="gcp",
+            status=ComputeJobStatus.QUEUED,
+            started_at=None,
+            completed_at=None,
+            final_cost_usd=None,
+            accrued_cost_usd=0.0,
+        )
+    )
+    # RUNNING, started, accrued $4 → counted.
+    db_session.add(
+        _make_compute_job(
+            project.id,
+            backend="gcp",
+            status=ComputeJobStatus.RUNNING,
+            completed_at=None,
+            final_cost_usd=None,
+            accrued_cost_usd=4.0,
+            polling_metadata={"cost_rate_per_second": 0.0002},
+        )
+    )
+    await db_session.commit()
+
+    by_task, attr = await _load_compute_job_costs(db_session, project.id)
+    assert attr["job_count"] == 1
+    assert attr["priced_job_count"] == 1
+    assert attr["total_compute_cost_usd"] == 4.0
+    # Neither job carried a task_id, so nothing is attributed per-task.
+    assert by_task == {}
+    assert attr["unattributed_cost_usd"] == 4.0
 
 
 @pytest.mark.asyncio
@@ -4046,12 +4410,18 @@ async def test_payoff_transition_dedups_same_verdict(db_session, mocker):
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    # Snapshot the id: the dedup path releases its project row lock via
+    # session.rollback(), which (under real Postgres expiry) expires every
+    # loaded instance — touching project.id afterwards would lazy-load and
+    # raise MissingGreenlet. Production (lifecycle.py) likewise passes a
+    # scalar project_id and never reads the ORM instance across the call.
+    project_id = project.id
 
-    first = await maybe_alert_pool_payoff_transition(db_session, project.id)
-    second = await maybe_alert_pool_payoff_transition(db_session, project.id)
+    first = await maybe_alert_pool_payoff_transition(db_session, project_id)
+    second = await maybe_alert_pool_payoff_transition(db_session, project_id)
     assert first == POOL_PAYOFF_COST_REGRESSION
     assert second is None  # deduped on the persisted marker
-    alerts = await _payoff_alerts(db_session, project.id)
+    alerts = await _payoff_alerts(db_session, project_id)
     assert len(alerts) == 1
 
 
@@ -4304,12 +4674,16 @@ async def test_routing_verdict_dedups_same_verdict(db_session, mocker):
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    # Snapshot the id — the dedup path rollback-releases its row lock, which
+    # expires loaded instances under real Postgres expiry (see the payoff
+    # dedup test above). Mirrors production, which passes a scalar id.
+    project_id = project.id
 
-    first = await maybe_alert_provider_routing_transition(db_session, project.id)
-    second = await maybe_alert_provider_routing_transition(db_session, project.id)
+    first = await maybe_alert_provider_routing_transition(db_session, project_id)
+    second = await maybe_alert_provider_routing_transition(db_session, project_id)
     assert first == PROVIDER_ROUTING_ADOPT
     assert second is None  # deduped on the persisted marker
-    alerts = await _routing_alerts(db_session, project.id)
+    alerts = await _routing_alerts(db_session, project_id)
     assert len(alerts) == 1
 
 
@@ -5125,7 +5499,8 @@ def test_axis_llm_cost_constant_value():
     assert AXIS_LLM_COST_PER_MERGED_PR == "llm_cost_per_merged_pr"
 
 
-def test_code_change_prompt_static_bytes():
+@pytest.mark.asyncio
+async def test_code_change_prompt_static_bytes():
     """AXIS_PROMPT_STATIC_BYTES is registered in ALL_AXES and AXIS_CONSUMERS, and
     _compute_prompt_static_bytes() returns a value within a meaningful range when
     agent/src/prompt.ts is available.
@@ -5154,7 +5529,7 @@ def test_code_change_prompt_static_bytes():
         "AXIS_CONSUMERS entry for prompt_static_bytes must have a 'pending' or 'consumer' key"
     )
 
-    result = _compute_prompt_static_bytes()
+    result = await _compute_prompt_static_bytes()
     if result is None:
         pytest.skip("agent/src/prompt.ts not available in this environment")
 
@@ -5174,12 +5549,14 @@ def test_code_change_prompt_static_bytes():
 
 
 def test_playbook_guidance_trigger_bullets_condensed():
-    """PLAYBOOK_GUIDANCE must use at most 5 trigger-condition bullets.
+    """PLAYBOOK_GUIDANCE must stay condensed (no trigger-bullet re-expansion).
 
-    PR #11033 condensed the 10 original bullets to 5 by merging overlapping
-    categories (error-fixes + linting rules; workarounds + wrong-approaches;
-    build-commands + env-setup; test-setup + test-patterns; module-deps +
-    architecture). This test guards against re-expansion.
+    PR #11033 condensed the 10 original trigger bullets to 5; the guidance was
+    later condensed further into a single-paragraph "**When to save:**" form
+    (mirrored by the agent-side guard in prompt.test.ts, which caps the
+    constant under 800 bytes). This test guards against re-expansion of the
+    prompt-budget-sensitive constant from the backend side, using the same
+    template-literal extraction the prompt_static_bytes axis uses.
     """
     import os
 
@@ -5193,22 +5570,21 @@ def test_playbook_guidance_trigger_bullets_condensed():
     with open(prompt_ts, encoding="utf-8") as fh:
         src = fh.read()
 
-    # Extract the PLAYBOOK_GUIDANCE template literal body
-    marker = "**When to save (trigger conditions):**"
-    start = src.find(marker)
-    assert start != -1, (
-        "PLAYBOOK_GUIDANCE trigger conditions section not found in prompt.ts"
-    )
-    end_marker = "\n\n**What NOT to save:**"
-    end = src.find(end_marker, start)
-    assert end != -1, "'What NOT to save' section not found after trigger conditions"
+    from app.efficiency_snapshot import _extract_ts_template_literal_length
 
-    trigger_section = src[start:end]
-    bullet_count = trigger_section.count("\n- ")
-    assert bullet_count <= 5, (
-        f"PLAYBOOK_GUIDANCE has {bullet_count} trigger bullets (max 5). "
-        "Consolidate overlapping categories rather than expanding the list. "
-        "See PR #11033 for the canonical 5-bullet grouping."
+    length = _extract_ts_template_literal_length(src, "PLAYBOOK_GUIDANCE")
+    assert length is not None, (
+        "PLAYBOOK_GUIDANCE template literal not found in prompt.ts"
+    )
+    assert "**When to save:**" in src, (
+        "PLAYBOOK_GUIDANCE condensed '**When to save:**' paragraph not found "
+        "in prompt.ts — the trigger guidance was removed or restructured; "
+        "update this guard alongside it."
+    )
+    assert length < 800, (
+        f"PLAYBOOK_GUIDANCE is {length} bytes (max 800, matching the agent-side "
+        "guard in prompt.test.ts). Keep the trigger guidance condensed rather "
+        "than re-expanding it — see PR #11033 for the original consolidation."
     )
 
 
@@ -7847,6 +8223,40 @@ async def test_agent_format_compliance_snapshot_endpoint(
     assert "by_schema" in data
 
 
+@pytest.mark.asyncio
+async def test_agent_format_compliance_snapshot_rejects_tool_asset_token(
+    client: AsyncClient, db_session
+):
+    """A tool-asset-scoped JWT must be rejected (403) by the snapshot reader.
+
+    Regression for finding bbd2610e22e1779b: tool-asset tokens carry a
+    ``scope`` claim that was NOT enforced, so a token minted for tool-asset
+    access could authenticate to this unrelated read surface.
+    """
+    from app.routers.admin_project_tools import _create_tool_asset_token
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Give the reader something to return, so a 403 can only come from the
+    # scope gate (not from a missing snapshot).
+    db_session.add(
+        _make_format_compliance_typed_task(project.id, task_type="create", errors=0)
+    )
+    await db_session.commit()
+    await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    tool_asset_token = _create_tool_asset_token(str(project.id), "some-tool")
+    resp = await client.get(
+        "/api/agent/efficiency-snapshot/format-compliance",
+        headers={"x-agent-token": tool_asset_token},
+    )
+    assert resp.status_code == 403, resp.text
+
+
 # ---------------------------------------------------------------------------
 # compute_pr_rework_chain_breakdown tests
 # ---------------------------------------------------------------------------
@@ -9868,7 +10278,8 @@ def test_extract_ts_template_literal_length_unterminated_returns_none():
 # ── _compute_prompt_static_bytes tests ───────────────────────────────────────
 
 
-def test_compute_prompt_static_bytes_all_constants_present_returns_positive():
+@pytest.mark.asyncio
+async def test_compute_prompt_static_bytes_all_constants_present_returns_positive():
     """When all template-literal and plain-string constants are found the result
     is a positive integer equal to the sum of all their body lengths.
 
@@ -9912,13 +10323,14 @@ def test_compute_prompt_static_bytes_all_constants_present_returns_positive():
         patch("os.path.exists", return_value=True),
         patch("builtins.open", mock_open(read_data=synthetic_src)),
     ):
-        result = _compute_prompt_static_bytes()
+        result = await _compute_prompt_static_bytes()
 
     assert result == expected_total
     assert result > 0
 
 
-def test_compute_prompt_static_bytes_missing_constant_returns_none():
+@pytest.mark.asyncio
+async def test_compute_prompt_static_bytes_missing_constant_returns_none():
     """Returns None when any one of _PROMPT_STATIC_CONST_NAMES is absent."""
     from unittest.mock import mock_open, patch
 
@@ -9939,12 +10351,13 @@ def test_compute_prompt_static_bytes_missing_constant_returns_none():
         patch("os.path.exists", return_value=True),
         patch("builtins.open", mock_open(read_data=synthetic_src)),
     ):
-        result = _compute_prompt_static_bytes()
+        result = await _compute_prompt_static_bytes()
 
     assert result is None
 
 
-def test_compute_prompt_static_bytes_missing_plain_constant_returns_none():
+@pytest.mark.asyncio
+async def test_compute_prompt_static_bytes_missing_plain_constant_returns_none():
     """Returns None when any plain-string constant in _PROMPT_STATIC_PLAIN_CONST_NAMES
     is absent from the source."""
     from unittest.mock import mock_open, patch
@@ -9961,7 +10374,7 @@ def test_compute_prompt_static_bytes_missing_plain_constant_returns_none():
         patch("os.path.exists", return_value=True),
         patch("builtins.open", mock_open(read_data=synthetic_src)),
     ):
-        result = _compute_prompt_static_bytes()
+        result = await _compute_prompt_static_bytes()
 
     assert result is None
 
@@ -9984,19 +10397,21 @@ def test_extract_ts_plain_string_length_missing_returns_none():
     assert _extract_ts_plain_string_length(src, "MY_CONST") is None
 
 
-def test_compute_prompt_static_bytes_no_agent_src_returns_none():
+@pytest.mark.asyncio
+async def test_compute_prompt_static_bytes_no_agent_src_returns_none():
     """Returns None when _find_agent_src cannot locate the agent/src directory."""
     from unittest.mock import patch
 
     import app.efficiency_snapshot as es_mod
 
     with patch.object(es_mod, "_find_agent_src", return_value=None):
-        result = _compute_prompt_static_bytes()
+        result = await _compute_prompt_static_bytes()
 
     assert result is None
 
 
-def test_compute_prompt_static_bytes_missing_task_type_focus_file_returns_none():
+@pytest.mark.asyncio
+async def test_compute_prompt_static_bytes_missing_task_type_focus_file_returns_none():
     """Returns None when prompts/task-type-focus.ts is absent even if prompt.ts is present."""
     from unittest.mock import mock_open, patch
 
@@ -10020,12 +10435,13 @@ def test_compute_prompt_static_bytes_missing_task_type_focus_file_returns_none()
         patch("os.path.exists", side_effect=_fake_exists),
         patch("builtins.open", mock_open(read_data=prompt_src)),
     ):
-        result = _compute_prompt_static_bytes()
+        result = await _compute_prompt_static_bytes()
 
     assert result is None
 
 
-def test_compute_prompt_static_bytes_missing_task_type_focus_constant_returns_none():
+@pytest.mark.asyncio
+async def test_compute_prompt_static_bytes_missing_task_type_focus_constant_returns_none():
     """Returns None when a constant in _TASK_TYPE_FOCUS_CONST_NAMES is absent from
     prompts/task-type-focus.ts even if all prompt.ts constants are present."""
     from unittest.mock import mock_open, patch
@@ -10051,12 +10467,13 @@ def test_compute_prompt_static_bytes_missing_task_type_focus_constant_returns_no
         patch("os.path.exists", return_value=True),
         patch("builtins.open", mock_open(read_data=synthetic_src)),
     ):
-        result = _compute_prompt_static_bytes()
+        result = await _compute_prompt_static_bytes()
 
     assert result is None
 
 
-def test_compute_prompt_static_bytes_task_type_focus_additive():
+@pytest.mark.asyncio
+async def test_compute_prompt_static_bytes_task_type_focus_additive():
     """task-type-focus constants add to the total beyond prompt.ts-only constants."""
     from unittest.mock import mock_open, patch
 
@@ -10092,7 +10509,7 @@ def test_compute_prompt_static_bytes_task_type_focus_additive():
         patch("os.path.exists", return_value=True),
         patch("builtins.open", mock_open(read_data=combined_src)),
     ):
-        result = _compute_prompt_static_bytes()
+        result = await _compute_prompt_static_bytes()
 
     assert result is not None
     assert isinstance(result, int)
@@ -10103,7 +10520,8 @@ def test_compute_prompt_static_bytes_task_type_focus_additive():
     assert result == prompt_only_total + ttf_total
 
 
-def test_prompt_static_bytes_covers_task_type_focus():
+@pytest.mark.asyncio
+async def test_prompt_static_bytes_covers_task_type_focus():
     """_TASK_TYPE_FOCUS_CONST_NAMES lists the six per-task-type focus blocks and
     _compute_prompt_static_bytes() includes their byte counts in the total.
 
@@ -10125,7 +10543,7 @@ def test_prompt_static_bytes_covers_task_type_focus():
 
     import app.efficiency_snapshot as es_mod
 
-    result = _compute_prompt_static_bytes()
+    result = await _compute_prompt_static_bytes()
     if result is None:
         pytest.skip(
             "agent/src/prompt.ts or agent/src/prompts/task-type-focus.ts not "
@@ -10377,6 +10795,14 @@ async def test_self_repair_burn_share_alert_threshold(db_session, mocker):
     # Alert should not fire while below threshold
     fired3 = await maybe_alert_self_repair_burn_share(db_session, project.id)
     assert fired3 is None  # marker advanced to "healthy", no alert
+
+    # The function's contract is caller-commits (with_design_doc_locked:
+    # "Caller is responsible for committing"; the production caller in
+    # lifecycle.py commits after every maybe_alert_* call). The recovery
+    # re-arm path writes the marker but does not fire, so without this commit
+    # the write is still pending and refresh() would discard it (refresh
+    # expires the instance first) and reload the stale committed value.
+    await db_session.commit()
 
     # Verify the marker was set to "healthy"
     await db_session.refresh(project)

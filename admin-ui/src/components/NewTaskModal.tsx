@@ -3,7 +3,7 @@ import { GitBranch, X, Plus, GitFork, Microscope, CheckCircle, CheckSquare, Aler
 import type { LaunchableTaskTypeOption } from '../taskCapabilities';
 import type { ComputeExperimentForm } from '../hooks/useTaskModal';
 import { COMPUTE_ACCELERATOR_OPTIONS, COMPUTE_EXPERIMENT_TASK_TYPE, canonicalMachineTypeForAccelerator } from '../hooks/useTaskModal';
-import type { ComputeSuccessOperator, ComputeExperimentPreflightResponse, ComputeExperimentDraftResponse } from '../api';
+import type { ComputeSuccessOperator, ComputeExperimentPreflightResponse, ComputeExperimentDraftResponse, FleetRunner } from '../api';
 import { draftComputeExperiment } from '../api';
 
 const TASK_TYPE_OPTION_ICONS: Record<string, typeof Plus> = {
@@ -74,6 +74,8 @@ interface NewTaskModalProps {
   onRepoChange: (value: string) => void;
   onSubmit: (e: React.FormEvent) => Promise<void>;
   onClose: () => void;
+  fleetRunners?: FleetRunner[];
+  fleetRunnersLoading?: boolean;
 }
 
 export function NewTaskModal({
@@ -126,6 +128,8 @@ export function NewTaskModal({
   onRepoChange,
   onSubmit,
   onClose,
+  fleetRunners = [],
+  fleetRunnersLoading = false,
 }: NewTaskModalProps) {
   const [submitting, setSubmitting] = useState(false);
   const [submitAttempted, setSubmitAttempted] = useState(false);
@@ -717,6 +721,25 @@ export function NewTaskModal({
                   <option value="STANDARD">STANDARD (on-demand)</option>
                   <option value="SPOT">SPOT (preemptible, ~60–90% cheaper)</option>
                 </select>
+              </div>
+              <div className="mb-3">
+                <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Force onto runner <span className="text-neutral-600 normal-case font-normal tracking-normal">(optional — job waits for this runner instead of auto-selecting)</span></label>
+                <select
+                  value={computeExperiment.forcedRunnerId}
+                  onChange={e => updateCompute('forcedRunnerId', e.target.value)}
+                  disabled={fleetRunnersLoading}
+                  className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all appearance-none cursor-pointer disabled:opacity-50"
+                >
+                  <option value="">No preference (auto-select)</option>
+                  {fleetRunners.map(runner => (
+                    <option key={runner.id} value={runner.id}>
+                      {runner.hostname ?? runner.id}
+                    </option>
+                  ))}
+                </select>
+                {computeExperiment.forcedRunnerId && (
+                  <p className="text-ui-sm text-amber-500 mt-1">Job will stay queued until this runner is online — it will not fall back to another runner or cloud.</p>
+                )}
               </div>
               <div className="grid grid-cols-2 gap-3 mb-3">
                 <div>

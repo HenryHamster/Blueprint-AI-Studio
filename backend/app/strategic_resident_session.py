@@ -57,6 +57,7 @@ from app.models import (
 )
 from app.routers.agent import verify_agent_token
 from app.routers.agent_strategic_fetch import _resolve_agent_project
+from app.strategic_payload_summaries import _fetch_open_messages
 from app.shared_state import limiter, runtime_config
 from app.task_locking import (
     project_lock,
@@ -147,6 +148,11 @@ _ACTIVE_DIRECTION_STATUSES = ("active", "paused", "proposed")
 
 # Maximum bytes stored for the agent's serialized exam-ledger (note field).
 _EXAM_LEDGER_MAX_BYTES = 20_000
+
+# Maximum bytes stored for the agent's serialized decisions register. The TS
+# side caps serialization at 32,000 bytes (DECISIONS_REG_MAX_BYTES); this cap
+# is defense-in-depth against a malformed blob.
+_DECISIONS_REG_MAX_BYTES = 32_000
 
 # Rolling window (seconds) over which a STRATEGIC_AGENT task that reached a
 # terminal status counts toward ``work_state_summary.terminal_since`` — i.e.
@@ -670,6 +676,7 @@ async def _spawn_resident_strategic_task(
     exam_ledger: str | None = None,
     message_cursor: str | None = None,
     session_summary: str | None = None,
+    decisions_register: str | None = None,
 ) -> Task | None:
     """Spawn a fresh ``strategic_review`` task via the canonical spawn path.
 
@@ -716,7 +723,7 @@ async def _spawn_resident_strategic_task(
         runner_pin_id=str(runner_id) if runner_id else None,
         extra_context=_resident_born_context(
             session_id, runner_id, exam_ledger=exam_ledger, message_cursor=message_cursor,
-            session_summary=session_summary,
+            session_summary=session_summary, decisions_register=decisions_register,
         ),
         # Spawn MINIMALLY: skip the ~2-minute synchronous strategic-context build
         # (design-doc grounding + capability backing-path verification GitHub
@@ -892,6 +899,7 @@ def _resident_born_context(
     exam_ledger: str | None = None,
     message_cursor: str | None = None,
     session_summary: str | None = None,
+    decisions_register: str | None = None,
 ) -> dict[str, Any]:
     """Build the resident-session context flags a SPAWNED task is BORN with.
 
@@ -934,6 +942,11 @@ def _resident_born_context(
     # "Prior session context" from the previous session's set-session-summary op.
     if session_summary:
         context["_session_summary"] = session_summary
+    # Carry the decisions register forward so the new session restores the
+    # strategist's cross-tick decision memory instead of resetting to an empty
+    # array (which would cause re-derivation of settled facts).
+    if decisions_register:
+        context["_decisions_reg"] = decisions_register
     return context
 
 
@@ -945,6 +958,7 @@ def _stamp_resident_context(
     exam_ledger: str | None = None,
     message_cursor: str | None = None,
     session_summary: str | None = None,
+    decisions_register: str | None = None,
 ) -> None:
     """Stamp the shared resident-session flags + AUTHORITATIVE runner pin onto *task*.
 
@@ -992,6 +1006,10 @@ def _stamp_resident_context(
     # context" from the previous session's set-session-summary output.
     if session_summary:
         context["_session_summary"] = session_summary
+    # Carry the decisions register forward so the adopted task restores the
+    # strategist's cross-tick decision memory.
+    if decisions_register:
+        context["_decisions_reg"] = decisions_register
     if runner_id:
         context["preferred_runner_target_id"] = str(runner_id)
         # Hard local-runner intent so dispatch pins the warm session to the
@@ -1148,6 +1166,7 @@ async def start_resident_session(
     carried_exam_ledger: str | None = None
     carried_message_cursor: str | None = None
     carried_session_summary: str | None = None
+    carried_decisions_register: str | None = None
     if isinstance(existing, dict):
         _raw_ledger = existing.get("_exam_ledger")
         if isinstance(_raw_ledger, str) and 0 < len(
@@ -1164,6 +1183,16 @@ async def start_resident_session(
         _raw_summary = existing.get("_session_summary")
         if isinstance(_raw_summary, str) and _raw_summary.strip():
             carried_session_summary = _raw_summary
+        # Carry the decisions register forward so a restarted session restores
+        # the strategist's cross-tick decision memory instead of resetting to
+        # an empty array (which would cause re-derivation of settled facts).
+        # Byte-size guard: defense-in-depth against a malformed blob matching the
+        # TS-side cap (DECISIONS_REG_MAX_BYTES in strategic-resident-lib.ts).
+        _raw_decisions = existing.get("_decisions_reg")
+        if isinstance(_raw_decisions, str) and 0 < len(
+            _raw_decisions.encode()
+        ) <= _DECISIONS_REG_MAX_BYTES:
+            carried_decisions_register = _raw_decisions
     if resident_session_is_active(existing):
         task_id = existing.get("task_id")
         live = None
@@ -1286,6 +1315,10 @@ async def start_resident_session(
         # first heartbeat still carries it into the agent's bootstrap prompt.
         if carried_session_summary:
             vision[RESIDENT_SESSION_KEY]["_session_summary"] = carried_session_summary
+        # Preserve the decisions register on the new blob so a restart BEFORE
+        # the first heartbeat still restores cross-tick decision memory.
+        if carried_decisions_register:
+            vision[RESIDENT_SESSION_KEY]["_decisions_reg"] = carried_decisions_register
         decision["mode"] = "adopt" if adopt_task is not None else "spawn"
 
     await with_vision_locked(session, project.id, _claim, skip_locked=False)
@@ -1358,6 +1391,7 @@ async def start_resident_session(
                             exam_ledger=carried_exam_ledger,
                             message_cursor=carried_message_cursor,
                             session_summary=carried_session_summary,
+                            decisions_register=carried_decisions_register,
                         )
                         session.add(task)
                         workbench_state = (
@@ -1410,6 +1444,7 @@ async def start_resident_session(
                 exam_ledger=carried_exam_ledger,
                 message_cursor=carried_message_cursor,
                 session_summary=carried_session_summary,
+                decisions_register=carried_decisions_register,
             )
             if task is None:
                 raise HTTPException(
@@ -1962,6 +1997,7 @@ async def renew_resident_session_lease(
     turn_latency_summary: dict | None = None,
     compaction_count: int | None = None,
     last_compaction_at: str | None = None,
+    decisions_reg: str | None = None,
 ) -> dict[str, Any]:
     """Renew the continuation lease from a resident-agent heartbeat.
 
@@ -2046,20 +2082,23 @@ async def renew_resident_session_lease(
             pass
 
     # Cheap indexed read of live direction keys for the agent's surface-catalog
-    # refresh. Returns only non-retired directions so newly created or newly
+    # refresh AND direction_grounding (text + status) so the compaction
+    # checkpoint can show current directions rather than session-start
+    # snapshots. Returns only non-retired directions so newly created or newly
     # retired directions immediately enter/leave the rotation on the next tick.
-    active_direction_ids: list[str] = list(
-        (
-            await session.execute(
-                select(Direction.direction_key).where(
-                    Direction.project_id == project.id,
-                    Direction.status.in_(list(_ACTIVE_DIRECTION_STATUSES)),
-                )
+    _direction_rows = (
+        await session.execute(
+            select(Direction.direction_key, Direction.text, Direction.status).where(
+                Direction.project_id == project.id,
+                Direction.status.in_(list(_ACTIVE_DIRECTION_STATUSES)),
             )
         )
-        .scalars()
-        .all()
-    )
+    ).all()
+    active_direction_ids = [str(row[0]) for row in _direction_rows]
+    direction_grounding: list[dict[str, str]] = [
+        {"id": str(row[0]), "text": str(row[1] or ""), "status": str(row[2])}
+        for row in _direction_rows
+    ]
 
     # Stop-requested / ended (pre-lock snapshot): do NOT renew — let the lease
     # lapse so the cadence can reclaim, and signal the agent to wind down.
@@ -2076,6 +2115,7 @@ async def renew_resident_session_lease(
             "work_state_summary": work_state_summary,
             "exam_ledger": None,
             "active_direction_ids": active_direction_ids,
+            "direction_grounding": direction_grounding,
         }
 
     # Unattended cap: compare now against the last operator interaction, taking
@@ -2225,6 +2265,11 @@ async def renew_resident_session_lease(
         # an opaque blob the agent reads back via ``task.context`` on startup.
         if exam_ledger_str is not None:
             updated["_exam_ledger"] = exam_ledger_str
+        # Persist the decisions register so a full restart (VM recycle, process
+        # crash) can restore settled cross-tick decisions instead of falling back
+        # to empty (which re-opens the re-derivation gap the register closes).
+        if decisions_reg is not None:
+            updated["_decisions_reg"] = decisions_reg
         # Persist the advancing message cursor so a restart resumes from the
         # high-water mark rather than re-delivering already-answered messages.
         if message_cursor:
@@ -2245,7 +2290,7 @@ async def renew_resident_session_lease(
     # Mirror the exam ledger and message cursor into task.context so a runner
     # restart can read them back on startup (the agent reads task.context at pull
     # time; project.vision is not visible to the agent).
-    _need_ctx_update = exam_ledger_str is not None or bool(message_cursor)
+    _need_ctx_update = exam_ledger_str is not None or bool(message_cursor) or decisions_reg is not None
     if _need_ctx_update:
         try:
             _ledger_task_id = uuid.UUID(task_id)
@@ -2254,7 +2299,7 @@ async def renew_resident_session_lease(
         if _ledger_task_id is not None:
 
             def _mirror_ledger(ctx: dict) -> None:
-                # Only these two keys are the resident-heartbeat's durable
+                # Only these keys are the resident-heartbeat's durable
                 # restart state; every OTHER key in ``ctx`` (e.g. the
                 # strategic-API ``_strategic_api_called`` / ``_strategic_vision_set``
                 # flags) belongs to another writer and is preserved untouched.
@@ -2262,6 +2307,8 @@ async def renew_resident_session_lease(
                     ctx["_exam_ledger"] = exam_ledger_str
                 if message_cursor:
                     ctx["message_cursor"] = message_cursor
+                if decisions_reg is not None:
+                    ctx["_decisions_reg"] = decisions_reg
 
             # Re-read Task.context FRESH under FOR UPDATE (populate_existing)
             # before the read-modify-write so a concurrent strategic-API
@@ -2341,6 +2388,7 @@ async def renew_resident_session_lease(
             "work_state_summary": work_state_summary,
             "exam_ledger": None,
             "active_direction_ids": active_direction_ids,
+            "direction_grounding": direction_grounding,
         }
     if holder["capped"] or holder["lapsed"]:
         # Finding 1: the unattended cap was exceeded, or the lease genuinely
@@ -2374,6 +2422,7 @@ async def renew_resident_session_lease(
             "work_state_summary": work_state_summary,
             "exam_ledger": None,
             "active_direction_ids": active_direction_ids,
+            "direction_grounding": direction_grounding,
         }
     return {
         "authority_held": bool(cont.get("fresh"))
@@ -2386,12 +2435,51 @@ async def renew_resident_session_lease(
         "work_state_summary": work_state_summary,
         "exam_ledger": exam_ledger_str,
         "active_direction_ids": active_direction_ids,
+        "direction_grounding": direction_grounding,
     }
 
 
 # ---------------------------------------------------------------------------
 # Agent-token heartbeat endpoint
 # ---------------------------------------------------------------------------
+
+
+@router.get("/projects/{project_id}/strategic-session/checkpoint-state")
+@limiter.limit("30/minute")
+async def agent_fetch_checkpoint_state(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Return current project state for the resident agent's compaction checkpoint.
+
+    Called only at compaction time (context-window pressure). Returns the freshest
+    strategic state — problem model, memory notes, running update, and vision —
+    so the compaction checkpoint carries current data rather than the session-start
+    bootstrap snapshot, which would be stale after mid-session mutations
+    (set-problem-model, set-memory, set-running-update).
+    """
+    project = await _resolve_agent_project(project_id, token, session)
+    open_messages = await _fetch_open_messages(session, project.id)
+    # Apply the SAME agent-view trims the session bootstrap applies so the
+    # refreshed compaction grounding matches the shape the session started from.
+    # The bootstrap ships _agent_view_problem_model(project.problem_model) and
+    # _agent_visible_vision(project.vision) (strategic_spawning.py:5711-5712);
+    # returning the raw project.problem_model / project.vision here would make a
+    # successful refresh re-bloat the checkpoint with archived_gaps,
+    # rejected_agent_edits, unwindowed per-gap memory, and the internal vision
+    # continuation blob — the opposite of the coherence the refresh preserves.
+    from app.strategic_local_runner import _agent_visible_vision
+    from app.strategic_problem_view import _agent_view_problem_model
+
+    return {
+        "problem_model": _agent_view_problem_model(project.problem_model),
+        "strategic_memory_notes": project.strategic_memory_notes or [],
+        "running_update": project.running_update or "",
+        "vision": _agent_visible_vision(project.vision),
+        "open_messages": open_messages,
+    }
 
 
 class ResidentSessionHeartbeatRequest(BaseModel):
@@ -2404,6 +2492,7 @@ class ResidentSessionHeartbeatRequest(BaseModel):
     turn_latency_summary: dict | None = None
     compaction_count: int | None = None
     last_compaction_at: str | None = None
+    decisions_reg: str | None = None
 
 
 @router.post("/projects/{project_id}/strategic-session/heartbeat")
@@ -2437,4 +2526,5 @@ async def resident_session_heartbeat(
         turn_latency_summary=payload.turn_latency_summary,
         compaction_count=payload.compaction_count,
         last_compaction_at=payload.last_compaction_at,
+        decisions_reg=payload.decisions_reg,
     )

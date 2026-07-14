@@ -4,25 +4,18 @@ Extracted from ``app.github``; all symbols are re-exported from there so
 existing imports keep working.
 """
 
-import time
 from dataclasses import dataclass
 
 from fastapi import HTTPException, status
 
 from app.github import logger
-
-
-# Default backoff (seconds) advertised to the agent when we must refuse a create
-# because the pre-create idempotency lookup could not be confirmed but GitHub
-# gave us no usable reset hint. Small enough to retry promptly once a transient
-# blip clears; large enough not to hot-loop.
-_CREATE_PR_DEFAULT_RETRY_AFTER_S = 30
-
-# Upper bound on the Retry-After we advertise. A drained 5000/hr install-token
-# bucket can be up to ~1h from reset; telling the agent to sleep that long inside
-# a synchronous ``./pr`` step would starve the reaper heartbeat budget on the VM
-# and get it false-reaped. Cap it and let the agent re-poll after the window.
-_CREATE_PR_MAX_RETRY_AFTER_S = 120
+from app.github_http import (
+    clamped_retry_after,
+    is_rate_limited_response,
+    raise_rate_limited,
+    retry_after_seconds_from_response,
+    safe_json,
+)
 
 
 @dataclass
@@ -51,37 +44,17 @@ class _OpenPRLookup:
     retry_after: int | None = None
 
 
-def _retry_after_seconds_from_response(resp) -> int | None:
-    """Best-effort backoff (seconds) from a rate-limited GitHub response.
-
-    Prefers an explicit ``Retry-After`` header (integer seconds — what GitHub
-    sends for secondary limits, and what the local short-circuit synthesises from
-    ``X-RateLimit-Reset``). Falls back to ``X-RateLimit-Reset`` (epoch seconds)
-    minus now. Returns ``None`` when neither yields a positive value.
-    """
-    headers = getattr(resp, "headers", None) or {}
-    retry_after = headers.get("Retry-After")
-    if retry_after is not None:
-        try:
-            secs = int(str(retry_after).strip())
-            if secs > 0:
-                return secs
-        except (TypeError, ValueError):
-            pass
-    reset = headers.get("X-RateLimit-Reset")
-    if reset is not None:
-        try:
-            delta = int(str(reset).strip()) - int(time.time())
-            if delta > 0:
-                return delta
-        except (TypeError, ValueError):
-            pass
-    return None
+# ── Rate-limit / body-parse primitives ───────────────────────────────────────
+# Implemented once in ``app.github_http`` (shared with every other mutating
+# GitHub helper) and re-exported under their historical private names so the
+# existing call sites and tests keep working.
+_retry_after_seconds_from_response = retry_after_seconds_from_response
+_clamped_retry_after = clamped_retry_after
+_is_rate_limited_response = is_rate_limited_response
+_safe_json = safe_json
 
 
-def _raise_create_pr_retryable(
-    head: str, base: str, retry_after: int | None
-) -> None:
+def _raise_create_pr_retryable(head: str, base: str, retry_after: int | None) -> None:
     """Refuse a PR create with a retryable signal instead of failing open.
 
     Raises HTTP 503 with a ``Retry-After`` header so the agent backs off and
@@ -90,21 +63,43 @@ def _raise_create_pr_retryable(
     drained GitHub quota reset. 503 (not 500) is what keeps the agent's backoff
     loop engaged rather than treating the outcome as a hard failure.
     """
-    delay = retry_after or _CREATE_PR_DEFAULT_RETRY_AFTER_S
-    delay = max(1, min(delay, _CREATE_PR_MAX_RETRY_AFTER_S))
-    logger.warning(
-        f"[PR] Refusing to create PR for {head} -> {base}: could not confirm "
-        f"whether an open PR already exists (GitHub rate-limited/unavailable). "
-        f"Returning 503 retry-after={delay}s to avoid a duplicate PR."
-    )
-    raise HTTPException(
-        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+    raise_rate_limited(
+        log_message=(
+            f"[PR] Refusing to create PR for {head} -> {base}: could not confirm "
+            f"whether an open PR already exists (GitHub rate-limited/unavailable). "
+            f"Returning 503 to avoid a duplicate PR."
+        ),
         detail=(
             "Cannot verify whether an open pull request already exists for "
             f"{head} -> {base} because the GitHub API is rate-limited; refusing "
             "to create to avoid a duplicate PR. Retry after the window resets."
         ),
-        headers={"Retry-After": str(delay)},
+        retry_after=retry_after,
+    )
+
+
+def _raise_merge_pr_retryable(pr_number: int, retry_after: int | None) -> None:
+    """Surface a rate-limited merge as retryable (503 + Retry-After), not a 500.
+
+    The merge PUT never reached GitHub's merge machinery — the quota bucket
+    refused it — so the PR is neither merged nor blocked; the call simply has to
+    be re-attempted after the window resets.  A generic 500 is indistinguishable
+    from a real merge failure; the 503 + ``Retry-After`` is what
+    ``hotfix_backmerge`` keys on to retry rather than raise a persistent
+    "blocked" operator alert.  Mirrors :func:`_raise_create_pr_retryable`.
+    """
+    raise_rate_limited(
+        log_message=(
+            f"[PR] Merge of PR #{pr_number} refused by the GitHub rate limiter — "
+            f"the merge did NOT happen. Returning 503 so the caller backs off "
+            f"instead of treating it as a hard merge failure."
+        ),
+        detail=(
+            f"Cannot merge pull request #{pr_number}: the GitHub API is "
+            "rate-limited. The merge was not attempted; retry after the window "
+            "resets."
+        ),
+        retry_after=retry_after,
     )
 
 
@@ -410,13 +405,7 @@ async def create_pull_request(
     # synthetic 403): the create did NOT happen. Surface as a retryable 503 so
     # the agent backs off — instead of a 500 it would treat as a hard failure and
     # hot-retry, re-draining the quota and re-tripping the limiter.
-    if response.status_code == 429 or (
-        response.status_code == 403
-        and (
-            response.headers.get("X-RateLimit-Remaining") == "0"
-            or response.headers.get("Retry-After") is not None
-        )
-    ):
+    if _is_rate_limited_response(response):
         logger.warning(
             f"[PR] create POST for {head} -> {base} rate-limited "
             f"({response.status_code}) — returning retryable 503"
@@ -465,6 +454,46 @@ async def get_pull_request(
             status_code=response.status_code,
             detail=f"PR #{pr_number} not found or repo gone",
         )
+    if is_rate_limited_response(response):
+        # RATE LIMIT — surface it AS a retryable rate limit, not as a generic 500.
+        #
+        # ``_github_request`` deliberately RETURNS the raw 403/429 for a HARD rate
+        # limit instead of sleeping through it: it fast-fails a reset more than
+        # RATE_LIMIT_FAST_FAIL_THRESHOLD_S (5s) out (github.py ~:536-540) and
+        # synthesises a 403 with ZERO network for a known-empty bucket (~:471-486).
+        # Collapsing that into a 500 told every caller "GitHub broke" when the truth
+        # is "we are out of budget until the reset" — the most recoverable condition
+        # there is, reported as the least recoverable.
+        #
+        # The mislabel is load-bearing: review_loop_convergence's cap-exhaustion
+        # preservability check reads a lookup FAILURE as "PR not salvageable" and
+        # CLOSES the PR, so during an install-token-budget exhaustion window that
+        # destroyed every cap-exhausted rollup at once.
+        #
+        # Use the CANONICAL helpers (github_http, added by #14546 for exactly this
+        # problem) rather than a second, divergent discriminator:
+        #   • ``is_rate_limited_response`` — any 429 (incl. a header-less SECONDARY
+        #     limit, which a hand-rolled "429 AND headers" test would miss), or a
+        #     403 carrying rate-limit headers. Byte-identical to _github_request's
+        #     own ``is_rate_limited``.
+        #   • ``raise_rate_limited`` — a 503 + ``Retry-After``, NOT a bare 403/429.
+        #     503-with-Retry-After is what keeps a caller's backoff loop engaged:
+        #     the agent (agent/src/index.ts ~:934-946) retries 503 and 403-with-
+        #     Retry-After but deliberately FAILS FAST on a bare 403 (so genuine
+        #     auth/permission 403s don't spin), and rollup_pr_verification.py ~:331
+        #     treats 503 as its clean transient path. A bare 403 would make the
+        #     agent hard-fail a short SECONDARY limit it would otherwise have won.
+        # ``create_pull_request`` and ``merge_pull_request`` already use these; one
+        # predicate, one surface, no drift.
+        #
+        # A genuine PERMISSION 403 carries X-RateLimit-Remaining NONZERO (GitHub
+        # does send the quota headers on it) and no Retry-After, so it does NOT
+        # match and still falls through to the 500 below — unchanged, fail-fast.
+        raise_rate_limited(
+            f"[GITHUB] get PR #{pr_number} rate limited",
+            f"GitHub rate limit exhausted fetching PR #{pr_number}",
+            retry_after_seconds_from_response(response),
+        )
     if response.status_code != 200:
         logger.error(f"Failed to get PR #{pr_number}: {response.text}")
         raise HTTPException(
@@ -474,49 +503,91 @@ async def get_pull_request(
     return response.json()
 
 
-async def get_pull_request_reviews(
+# Outcome of a paginated reviews enumeration. TRUNCATED ("we know we missed some")
+# and FAILED ("we saw nothing at all") are deliberately distinct — see
+# get_pull_request_reviews_checked.
+REVIEWS_COMPLETE = "complete"
+REVIEWS_TRUNCATED = "truncated"
+REVIEWS_FAILED = "failed"
+
+
+async def get_pull_request_reviews_checked(
     token: str,
     owner: str,
     repo: str,
     pr_number: int,
     project_id: str | None = None,
-) -> list[dict]:
-    """Fetch the human/bot review submissions on a PR (state APPROVED /
-    CHANGES_REQUESTED / COMMENTED / DISMISSED).
+) -> tuple[list[dict], str]:
+    """Reviews on a PR, plus HOW the enumeration ended.
 
-    Used by the rollup PR-verify path to distinguish a genuine review rejection
-    (any submission with state == CHANGES_REQUESTED) from a non-rejection
-    cleanup/supersession close. Best-effort: returns ``[]`` on any non-200 so a
-    transient GitHub hiccup never *masks* a rejection — the caller treats an
-    empty result as "no recorded CHANGES_REQUESTED" only in combination with
-    the other non-genuine signals (bot-close / supersession), and the genuine
-    DB markers (pr_rejected / review_cap_exhausted) still force FAILED.
+    Returns ``(reviews, status)`` where status is one of:
+
+    * ``REVIEWS_COMPLETE``  — every review was enumerated.
+    * ``REVIEWS_TRUNCATED`` — we fetched at least one page successfully and KNOW
+      there are more reviews we did not see (a mid-pagination non-200 / non-list
+      body, or the 30-page cap).
+    * ``REVIEWS_FAILED``    — we could not fetch at all: page 1 itself failed, so
+      NOTHING was enumerated and we know nothing about this PR's reviews.
+
+    TRUNCATED and FAILED are NOT the same signal and must not be conflated — they
+    have OPPOSITE safe answers for a caller deciding whether a PR was rejected:
+
+    * TRUNCATED is *evidence*. GitHub serves reviews CHRONOLOGICALLY (oldest
+      first), so the reviews we are missing are precisely the NEWEST ones — exactly
+      where a late CHANGES_REQUESTED lives. "No rejection found" in a list that
+      demonstrably never reached the end is not evidence of no rejection. A caller
+      making a rejection decision MUST fail closed here.
+    * FAILED is *absence of evidence* — the same thing a 401, a timeout, or any
+      other transient GitHub hiccup produces. Fail-closing on it would let one
+      rate-limited fetch turn a routine bot cleanup-close into a terminal FAILED +
+      operator alert. Callers must degrade exactly as they do for a raised error:
+      best-effort, with their other guards still required.
+
+    Collapsing the two onto a single bool made a 502 STRICTER than a 401 (which
+    raises and is caught), which is backwards. Hence three states, not two.
+
+    (The pre-pagination implementation was silently TRUNCATED on every PR with
+    >100 reviews, while reporting itself complete.)
     """
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github.v3+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
-    response = await _github_request(
-        "GET",
-        f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/reviews",
-        headers,
-        params={"per_page": 100},
-        project_id=project_id,
+    result: list[dict] = []
+    for page in range(1, 31):
+        response = await _github_request(
+            "GET",
+            f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/reviews",
+            headers,
+            params={"per_page": 100, "page": page},
+            project_id=project_id,
+        )
+        if response.status_code == 401:
+            raise HTTPException(
+                status_code=401,
+                detail="GitHub authentication failed (401 Unauthorized) — token may be expired or revoked",
+            )
+        if response.status_code != 200:
+            # Page 1 → we enumerated NOTHING (fetch failure). Page 2+ → we hold
+            # real pages and know more exist (truncation).
+            outcome = REVIEWS_FAILED if page == 1 else REVIEWS_TRUNCATED
+            logger.warning(
+                f"Failed to list reviews for PR #{pr_number} (page {page}, "
+                f"status={response.status_code}); {len(result)} review(s) fetched "
+                f"— reporting {outcome}"
+            )
+            return result, outcome
+        batch = response.json()
+        if not isinstance(batch, list):
+            return result, (REVIEWS_FAILED if page == 1 else REVIEWS_TRUNCATED)
+        result.extend(batch)
+        if len(batch) < 100:
+            return result, REVIEWS_COMPLETE
+    logger.warning(
+        f"[PR] Reviews for PR #{pr_number} hit the 30-page cap; list is TRUNCATED"
     )
-    if response.status_code == 401:
-        raise HTTPException(
-            status_code=401,
-            detail="GitHub authentication failed (401 Unauthorized) — token may be expired or revoked",
-        )
-    if response.status_code != 200:
-        logger.warning(
-            f"Failed to list reviews for PR #{pr_number} "
-            f"(status={response.status_code}); treating as no recorded reviews"
-        )
-        return []
-    data = response.json()
-    return data if isinstance(data, list) else []
+    return result, REVIEWS_TRUNCATED
 
 
 async def get_open_pull_requests(
@@ -662,7 +733,20 @@ async def merge_pull_request(
     merge_method: str = "squash",
     project_id: str | None = None,
 ) -> dict:
-    """Merges a PR. Returns dict with 'merged' bool and 'message'. Does not raise on conflict."""
+    """Merges a PR. Returns dict with 'merged' bool and 'message'. Does not raise on conflict.
+
+    Rate limits are surfaced as a RETRYABLE 503 (+ ``Retry-After``), exactly as
+    :func:`create_pull_request` does — ``_github_request`` returns the raw
+    403/429 for a hard rate limit rather than sleeping through it, and reporting
+    that as a generic 500 made callers mistake a drained quota bucket for a hard
+    merge failure (spurious fallback-review tasks in ``task_lifecycle``, false
+    "blocked" operator alerts in ``hotfix_backmerge``).
+
+    The response body is parsed only AFTER the status is classified: an HTML 5xx
+    error page from GitHub's edge is not JSON, and the previous unconditional
+    ``response.json()`` on the raw response raised a bare ``JSONDecodeError``
+    that no caller handles.
+    """
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github.v3+json",
@@ -675,11 +759,23 @@ async def merge_pull_request(
         json={"merge_method": merge_method},
         project_id=project_id,
     )
-    data = response.json()
+
+    # Rate-limited PUT (real GitHub 403/429, or the local limiter's synthetic
+    # 403): the merge was never attempted upstream. Retryable, not a failure.
+    if _is_rate_limited_response(response):
+        _raise_merge_pr_retryable(
+            pr_number, _retry_after_seconds_from_response(response)
+        )
+
     if response.status_code == 200:
+        data = _safe_json(response)
         return {"merged": True, "message": data.get("message", "Merged")}
     if response.status_code in (405, 409):
-        # 405 = not mergeable (checks/reviews), 409 = merge conflict
+        # 405 = not mergeable (checks/reviews) OR already merged, 409 = conflict.
+        # Callers that must distinguish "blocked" from "already merged" re-read
+        # the PR resource (``get_pull_request_merge_state``) — this endpoint
+        # cannot tell them apart.
+        data = _safe_json(response)
         msg = data.get("message", "Merge failed")
         logger.warning(f"PR #{pr_number} merge blocked ({response.status_code}): {msg}")
         return {
@@ -1154,6 +1250,8 @@ async def get_pr_files(
                 "deletions": f.get("deletions", 0),
                 "changes": f.get("changes", 0),
             }
+            if "previous_filename" in f:
+                entry["previous_filename"] = f["previous_filename"]
             if include_patch and "patch" in f:
                 entry["patch"] = f["patch"]
             result.append(entry)
@@ -1164,3 +1262,43 @@ async def get_pr_files(
         if len(batch) < 100:
             break
     return result
+
+
+async def pr_effective_diff_is_empty(
+    token: str,
+    owner: str,
+    repo: str,
+    pr_number: int,
+    project_id: str | None = None,
+) -> bool | None:
+    """Return whether a PR's effective diff against its base is empty.
+
+    Built on :func:`get_pr_files`, which lists exactly the files GitHub reports
+    as changed for the PR (an empty list = no effective diff vs base). A PR can
+    reach the merge gate with a zero-file effective diff when its commits were
+    already landed on the base by a sibling merge / rebase-flat (incident
+    2026-07-12, PR #14500 / commit 683abce38 merged 'green' with an empty
+    ``git show --stat``).
+
+    Returns:
+      * ``True``  — confirmed empty (``get_pr_files`` returned ``[]``).
+      * ``False`` — confirmed non-empty (one or more changed files).
+      * ``None``  — indeterminate: the file lookup raised (transient GitHub
+                    error, auth, non-200). ``None`` is deliberately NOT coerced
+                    to a bool so a transient failure never reads as "empty"
+                    (which would wrongly no-op a real PR) — the merge-gate caller
+                    treats ``None`` as "defer, do not merge and do not no-op".
+    """
+    from app import github as _gh
+
+    try:
+        files = await _gh.get_pr_files(
+            token, owner, repo, pr_number, project_id=project_id
+        )
+    except Exception as exc:  # noqa: BLE001 — any lookup failure is INDETERMINATE, not "empty". Fail safe so we never no-op a real PR on a flaky probe.
+        logger.warning(
+            f"[PR] Effective-diff probe for PR #{pr_number} failed: {exc} — "
+            f"treating as indeterminate (merge deferred, not no-op'd)"
+        )
+        return None
+    return len(files) == 0

@@ -27,8 +27,10 @@ from sqlmodel import select
 from app.github import (
     BLUEPRINT_PR_MERGE_SUMMARY_MARKER,  # noqa: F401  (re-exported for tests / downstream)
     build_blueprint_pr_merge_summary_comment,  # noqa: F401  (re-exported for tests / downstream)
+    compare_ref_status,
     create_branch,
     create_pr_comment,
+    delete_branch,
     get_branch_sha,
     get_open_pull_requests,
     submit_pr_review,
@@ -287,6 +289,115 @@ async def _load_release_echo_for_criterion(
     return echo_sha, expected_sha
 
 
+def _summarize_progress_records(
+    progress: Any, criterion: dict | None
+) -> dict[str, Any] | None:
+    """Compact trajectory summary from a job's ``polling_metadata["progress"]``.
+
+    Returns ``{metric, count, first, last, best, best_direction}`` (each record
+    compacted to ``{value, step?, ts?}``) or None when no usable records exist.
+    The summary is scoped to the metric of the LAST record (mixed-metric files
+    summarize the most recent series). ``best`` direction comes from the
+    declared success-criterion operator when it names the same metric
+    (``<``/``<=`` ⇒ minimize); otherwise it defaults to maximize and says so
+    via ``best_direction`` — a hint, not a verdict. Records were validated at
+    the report endpoint but are re-checked here (fail-soft) since
+    polling_metadata is plain JSONB.
+    """
+    if not isinstance(progress, dict):
+        return None
+    records = progress.get("records")
+    if not isinstance(records, list):
+        return None
+
+    def _valid(rec: Any) -> bool:
+        if not isinstance(rec, dict):
+            return False
+        value = rec.get("value")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return False
+        if value != value or value in (float("inf"), float("-inf")):
+            return False
+        return isinstance(rec.get("metric"), str) and bool(rec.get("metric"))
+
+    valid = [rec for rec in records if _valid(rec)]
+    if not valid:
+        return None
+    metric = valid[-1]["metric"]
+    series = [rec for rec in valid if rec.get("metric") == metric]
+
+    minimize = False
+    if isinstance(criterion, dict) and criterion.get("metric") == metric:
+        minimize = criterion.get("operator") in ("<", "<=")
+    best = (
+        min(series, key=lambda rec: rec["value"])
+        if minimize
+        else max(series, key=lambda rec: rec["value"])
+    )
+
+    def _compact(rec: dict) -> dict[str, Any]:
+        out: dict[str, Any] = {"value": rec["value"]}
+        if isinstance(rec.get("step"), int) and not isinstance(rec.get("step"), bool):
+            out["step"] = rec["step"]
+        if isinstance(rec.get("ts"), str) and rec.get("ts"):
+            out["ts"] = rec["ts"]
+        return out
+
+    raw_count = progress.get("count")
+    count = (
+        raw_count
+        if isinstance(raw_count, int)
+        and not isinstance(raw_count, bool)
+        and raw_count >= len(valid)
+        else len(valid)
+    )
+    return {
+        "metric": metric,
+        "count": count,
+        "first": _compact(series[0]),
+        "last": _compact(series[-1]),
+        "best": _compact(best),
+        "best_direction": "min" if minimize else "max",
+    }
+
+
+async def _build_compute_progress_summary(
+    session: AsyncSession, task: Task, logs: str, criterion: dict | None
+) -> dict[str, Any] | None:
+    """Load the task's compute job and summarize its interim-progress trail.
+
+    Gives follow-on agents the trained trajectory ("loss plateaued at 2.31
+    after step 1400"), not just the terminal state. Fail-soft by contract: no
+    job, no progress records (old runner / GCP backend / job that never wrote
+    the file), or any load error returns None and the compute_result simply
+    omits ``progress_summary``.
+    """
+    try:
+        job: ComputeJob | None = None
+        job_id = _extract_compute_job_id(logs or "")
+        if job_id is not None:
+            job = await get_compute_job_for_task(
+                session, job_id=job_id, task_id=task.id
+            )
+        if job is None:
+            result = await session.execute(
+                select(ComputeJob)
+                .where(ComputeJob.task_id == task.id)
+                .order_by(ComputeJob.created_at.desc())
+            )
+            job = result.scalars().first()
+        if job is None or not isinstance(job.polling_metadata, dict):
+            return None
+        return _summarize_progress_records(
+            job.polling_metadata.get("progress"), criterion
+        )
+    except Exception:  # noqa: BLE001 — fail-soft: never block terminal completion
+        logger.warning(
+            "Progress-summary extraction failed for task %s", task.id, exc_info=True
+        )
+        return None
+
+
 def _derive_artifact_delivery_record(resource: dict) -> dict:
     """Derive artifact delivery classification from a stamped compute resource dict.
 
@@ -468,7 +579,10 @@ def _phase_runner_affinity(task: Task) -> str | None:
         runner_id = vm_instance_id.removeprefix("runner:").strip()
         return runner_id or None
     preferred_runner_target_id = ctx.get("preferred_runner_target_id")
-    if isinstance(preferred_runner_target_id, str) and preferred_runner_target_id.strip():
+    if (
+        isinstance(preferred_runner_target_id, str)
+        and preferred_runner_target_id.strip()
+    ):
         return preferred_runner_target_id.strip()
     return None
 
@@ -1231,6 +1345,110 @@ def _capture_branch_creation_snapshot(task: Task) -> dict:
     }
 
 
+class _StaleBranchError(RuntimeError):
+    """The branch we must branch FROM, or the branch we would adopt, is unverified.
+
+    Raised inside ``_ensure_branch``'s attempt loop so the attempt is retried
+    with backoff. Two cases:
+
+    * a pre-existing branch sits at a stale tip we could not reset, or
+    * the source tip itself could not be resolved (null anchor).
+
+    Distinct from a generic failure because the "does the branch exist?"
+    verify-fallback must NOT run for either — existence is precisely what is not
+    sufficient here.
+    """
+
+
+async def _reconcile_reused_branch(
+    gh_token: str,
+    owner: str,
+    repo: str,
+    branch_name: str,
+    existing_sha: str | None,
+    source_sha: str | None,
+    label: str,
+) -> bool:
+    """Decide whether a PRE-EXISTING ``branch_name`` may be adopted as the base.
+
+    Returns True when the branch is safe to use, False when it is a stale tip that
+    could not be repaired (the caller retries / eventually fails the task).
+
+    ``create_branch`` reports reuse (``reused=True``) on GitHub's 422; with
+    ``sha_matches=False`` the ref points somewhere other than the tip we asked for.
+    What to do then turns ENTIRELY on the RAW compare status of
+    ``source_sha...existing_sha`` — see :func:`app.github_refs.compare_ref_status`
+    for why a boolean ancestry test is NOT sufficient (it collapses ``"behind"``
+    and ``"diverged"``, which have OPPOSITE answers here).
+
+    DESTROY only when we have positively established there is nothing to destroy:
+
+    * ``"behind"`` — existing branch has NO commits of its own (crashed-prior-run
+      leftover cut from an older base). Reset is a FAST-FORWARD; nothing is lost.
+      This is the ONLY delete + recreate case — the same repair
+      ``release_promotion.promote()`` performs for a stale release branch.
+    * everything else (``identical`` / ``ahead`` / ``diverged`` / ``None``) — ADOPT.
+      ``"diverged"`` in particular is the ROUTINE state of an inherited staging
+      branch: ``plan_completion`` / ``research_completion`` hand us the head branch
+      of an OPEN rollup PR with CHILDREN ALREADY MERGED INTO IT, while ``parent_base``
+      (automain) keeps advancing underneath. Deleting it would close the PR and
+      destroy the merged child commits. ``None`` means a transient API error must
+      never be able to destroy a ref.
+    """
+    if not existing_sha:
+        return False
+    if not source_sha:
+        # We could not resolve the tip we were supposed to branch FROM. Adopting
+        # here would re-open the stale-tip bug on an unverified read (we have no
+        # idea whether the existing branch is current), and deleting would be
+        # destroying a ref we cannot justify destroying. Neither — signal failure
+        # so the caller RETRIES with a fresh source-sha read.
+        logger.warning(
+            f"[{label}] Branch {branch_name} exists at {existing_sha[:8]} but the "
+            f"SOURCE tip could not be resolved — refusing to adopt on an unverified "
+            f"read; retrying"
+        )
+        return False
+    if existing_sha == source_sha:
+        # Already exactly where we want it.
+        return True
+
+    compare_status = await compare_ref_status(
+        gh_token, owner, repo, source_sha, existing_sha
+    )
+    if compare_status == "behind":
+        logger.warning(
+            f"[{label}] Branch {branch_name} exists at {existing_sha[:8]}, which is "
+            f"strictly BEHIND source {source_sha[:8]} (no unique commits — stale "
+            f"branch from a crashed prior run) — resetting it to the source tip "
+            f"(fast-forward; nothing is destroyed)"
+        )
+    else:
+        # identical / ahead / diverged / None — every one of these either already
+        # contains the source tip or holds commits of its own that a delete would
+        # destroy. Adopt.
+        logger.info(
+            f"[{label}] Branch {branch_name} exists at {existing_sha[:8]} with compare "
+            f"status {compare_status!r} vs source {source_sha[:8]} — ADOPTING. It is "
+            f"not strictly behind the source tip, so it either already contains it or "
+            f"carries unique commits (e.g. children merged into an inherited staging "
+            f"branch that is the head of an open rollup PR). Deleting it here would "
+            f"destroy landed work."
+        )
+        return True
+
+    await delete_branch(gh_token, owner, repo, branch_name)
+    recreated = await create_branch(gh_token, owner, repo, branch_name, source_sha)
+    recreated = recreated or {}
+    if recreated.get("reused") and not recreated.get("sha_matches"):
+        logger.error(
+            f"[{label}] Branch {branch_name} STILL exists at "
+            f"{recreated.get('existing_sha')} after delete+recreate — not adopting"
+        )
+        return False
+    return True
+
+
 async def _ensure_branch(
     task: Task, branch_name: str, source_branch: str, label: str, session: AsyncSession
 ) -> Task | None:
@@ -1297,25 +1515,61 @@ async def _ensure_branch(
     last_err = None
     branch_created = False
     for _attempt in range(max_retries):
+        # The source tip we intend this branch to be cut from. Re-read every
+        # attempt (it can advance between retries) and reset per-iteration so the
+        # verify-fallback below never compares against a previous attempt's tip.
+        sha: str | None = None
         try:
             gh_token, owner, repo = await get_github_token_for_task(
                 parent_id_local, session, force_refresh=(_attempt > 0)
             )
             sha = await get_branch_sha(gh_token, owner, repo, source_branch, live=True)
-            await create_branch(gh_token, owner, repo, branch_name, sha)
+            if not sha:
+                # ``get_branch_sha`` is str-or-raise, but a falsy return would be
+                # far worse than a raise: ``create_branch`` would anchor on a null
+                # sha and, on the 422/reuse path, ``_reconcile_reused_branch`` has
+                # no source tip to compare against. RETRY (fresh read, fresh
+                # token) — never adopt a branch whose correctness we cannot check.
+                raise _StaleBranchError(
+                    f"could not resolve the source tip of {source_branch}; "
+                    f"refusing to create or adopt {branch_name} on a null anchor"
+                )
+            ref = await create_branch(gh_token, owner, repo, branch_name, sha) or {}
+            # create_branch reports reuse instead of silently adopting: a 422
+            # ("already exists") can be our own retried write OR a stale branch
+            # left by a crashed prior run, sitting at a completely different SHA.
+            if (
+                ref.get("reused")
+                and not ref.get("sha_matches")
+                and not await _reconcile_reused_branch(
+                    gh_token,
+                    owner,
+                    repo,
+                    branch_name,
+                    ref.get("existing_sha"),
+                    sha,
+                    label,
+                )
+            ):
+                raise _StaleBranchError(
+                    f"branch {branch_name} exists at a divergent tip that could "
+                    f"not be reset to {sha[:8] if sha else '?'}"
+                )
             logger.info(f"[{label}] Created branch {branch_name} from {source_branch}")
             branch_created = True
             break
         except Exception as e:
             last_err = e
-            if gh_token:
+            # A _StaleBranchError already PROVED the branch exists and is
+            # unusable — re-running the existence check below would only
+            # re-adopt it. Fall straight through to backoff/retry.
+            if gh_token and not isinstance(e, _StaleBranchError):
                 try:
-                    await get_branch_sha(gh_token, owner, repo, branch_name)
-                    logger.info(
-                        f"[{label}] Branch {branch_name} already exists — reusing"
+                    # live=True: this read is a decision input for adopt-vs-reset,
+                    # so it must observe the current tip, not a <=60s cached one.
+                    existing_sha = await get_branch_sha(
+                        gh_token, owner, repo, branch_name, live=True
                     )
-                    branch_created = True
-                    break
                 except HTTPException as verify_exc:
                     if verify_exc.status_code == 404:
                         # Branch genuinely doesn't exist — count against attempt budget
@@ -1329,6 +1583,22 @@ async def _ensure_branch(
                 except Exception:
                     logger.exception(
                         f"[{label}] Non-HTTP error verifying branch {branch_name}"
+                    )
+                else:
+                    # The branch exists — but "exists" is NOT "usable". Adopt it
+                    # only when it is at (or ahead of) the source tip; a divergent
+                    # stale tip gets reset first.
+                    if await _reconcile_reused_branch(
+                        gh_token, owner, repo, branch_name, existing_sha, sha, label
+                    ):
+                        logger.info(
+                            f"[{label}] Branch {branch_name} already exists — reusing"
+                        )
+                        branch_created = True
+                        break
+                    logger.warning(
+                        f"[{label}] Branch {branch_name} exists but is a stale, "
+                        f"divergent tip that could not be reset — retrying"
                     )
             if _attempt < max_retries - 1:
                 backoff = (
@@ -2640,7 +2910,7 @@ async def run_compute_wake_post_commit(session: AsyncSession, registration) -> b
     """
     from app.compute_jobs import (
         COMPUTE_JOB_TERMINAL_WAKE_KIND,
-        build_compute_result_logs,
+        build_compute_result_logs_async,
     )
     from app.models import ComputeJob
 
@@ -2699,7 +2969,7 @@ async def run_compute_wake_post_commit(session: AsyncSession, registration) -> b
             with contextlib.suppress(Exception):
                 await _clear_post_commit_marker(session, registration)
             return False
-        logs = build_compute_result_logs(job)
+        logs = await build_compute_result_logs_async(job)
         criterion = (task.context or {}).get("compute_success_criterion")
         persisted = await _persist_compute_experiment_knowledge_best_effort(
             task, logs, criterion, session
@@ -2792,6 +3062,32 @@ _ACT_ON_VERDICT_SOURCE_KEY = "act_on_verdict_source_task_id"
 _ACT_ON_VERDICT_LOG_CHARS = 16000
 
 
+def _parse_compute_result_record(logs: str) -> dict[str, Any] | None:
+    """Best-effort parse of the COMPUTE_RESULT record (``build_compute_result_logs``).
+
+    Returns the record dict — carrying ``terminal_reason`` and the readable
+    ``command_log_text`` — or ``None`` when ``logs`` is not the JSON record
+    (legacy free-form logs, raw crash output).
+    """
+    try:
+        parsed = json.loads(logs) if logs else None
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _compute_terminal_reason_of(
+    compute_result: dict[str, Any] | None, logs: str
+) -> str | None:
+    """The job's ``terminal_reason``, from the handler result or the raw record."""
+    reason = (compute_result or {}).get("terminal_reason")
+    if not (isinstance(reason, str) and reason.strip()):
+        reason = (_parse_compute_result_record(logs) or {}).get("terminal_reason")
+    if isinstance(reason, str) and reason.strip():
+        return reason.strip()
+    return None
+
+
 def _build_act_on_verdict_prompt(
     task: Task,
     compute_result: dict[str, Any],
@@ -2857,9 +3153,24 @@ def _build_act_on_verdict_prompt(
         )
     lines.append("")
     if failure_mode:
+        record = _parse_compute_result_record(logs)
+        terminal_reason = _compute_terminal_reason_of(compute_result, logs)
+        log_tail = (record or {}).get("command_log_text")
+        log_tail = (
+            log_tail.strip() if isinstance(log_tail, str) and log_tail.strip() else None
+        )
+        # Reason first: WHY the job went terminal (deadline kill, spend cap,
+        # provisioning timeout, runner failure) — not just that it FAILED.
+        if terminal_reason:
+            lines.append(f"Terminal reason (why the job ended): {terminal_reason}")
+            lines.append("")
         # The traceback/stderr tail is the key visibility fix — show it FIRST and
-        # prominently so the diagnosing agent does not have to fetch the GCS bundle.
-        raw = (logs or "").strip()
+        # prominently so the diagnosing agent does not have to fetch the GCS
+        # bundle. When ``logs`` is the structured record, its command_log_text
+        # (unescaped) IS the captured output; otherwise fall back to the raw
+        # logs (crash traceback / legacy free-form output).
+        raw = (log_tail or "") if record is not None else (logs or "")
+        raw = raw.strip()
         if raw:
             if len(raw) > _ACT_ON_VERDICT_LOG_CHARS:
                 raw = raw[-_ACT_ON_VERDICT_LOG_CHARS:]
@@ -2873,10 +3184,19 @@ def _build_act_on_verdict_prompt(
                 "No stderr/traceback was captured for this failure — the "
                 "experiment may have died before emitting any output."
             )
-        if compute_result:
+        # Merge the parsed terminal record (minus the log text shown above)
+        # under the handler-derived compute_result so gate-fail spawns — which
+        # pass compute_result={} — still forward outcome/cost/terminal metadata.
+        record_view = {
+            k: v
+            for k, v in (record or {}).items()
+            if k not in ("command_log_text", "command_log_truncated")
+        }
+        merged_record = {**record_view, **(compute_result or {})}
+        if merged_record:
             lines.append(
                 "\nPartial / terminal result record (may be incomplete):\n"
-                + json.dumps(compute_result, indent=2, default=str)
+                + json.dumps(merged_record, indent=2, default=str)
             )
         lines.append("")
         lines.append(
@@ -3007,6 +3327,13 @@ async def _spawn_act_on_verdict_followon(
     )
 
     context: dict[str, Any] = {_ACT_ON_VERDICT_SOURCE_KEY: str(task.id)}
+    # Machine-readable WHY for the follow-on: forward the job's terminal_reason
+    # (the existing vocabulary — deadline kill, spend cap, provisioning timeout,
+    # runner failure) so iteration agents and tooling read the reason without
+    # re-parsing the prompt.
+    _terminal_reason = _compute_terminal_reason_of(compute_result, logs)
+    if _terminal_reason:
+        context["compute_terminal_reason"] = _terminal_reason[:500]
     # Pillar 5 spawn-forward: when a durable COMPUTE_RESULT artifact exists, stamp
     # its canonical pointer onto the follow-on so the fresh agent can mint a signed
     # URL. Best-effort: a missing/unresolvable artifact must not block the spawn.
@@ -3423,7 +3750,9 @@ async def _handle_compute_experiment_completion(
     # the original terminal output).
     _cv_verdict_key: str | None = None
     _cv_verdict_val = (task.context or {}).get("compute_verification")
-    _grader_verdict_val = (task.context or {}).get("quality_grader")  # QUALITY_GRADER_VERDICT_KEY
+    _grader_verdict_val = (task.context or {}).get(
+        "quality_grader"
+    )  # QUALITY_GRADER_VERDICT_KEY
     _cv_spawned = (task.context or {}).get("compute_verification_spawned")
 
     if _grader_verdict_val is not None and _cv_verdict_val is None and _cv_spawned:
@@ -3553,6 +3882,21 @@ async def _handle_compute_experiment_completion(
         compute_result: dict[str, Any] = {"outcome": outcome, "final_cost_usd": cost}
         if criterion is not None:
             compute_result["criterion"] = criterion
+        # Non-success terminals carry WHY (the job's terminal_reason) so
+        # plan_output.compute_result — the durable record downstream prompts
+        # read — surfaces the reason, not just the outcome state.
+        if outcome != "SUCCESS":
+            _term_reason = _compute_terminal_reason_of(None, logs)
+            if _term_reason:
+                compute_result["terminal_reason"] = _term_reason
+        # Interim-progress trajectory (first/last/best + count) when the job
+        # self-reported progress records — follow-on agents see the CURVE, not
+        # just the terminal number.
+        _progress_summary = await _build_compute_progress_summary(
+            session, task, logs, criterion
+        )
+        if _progress_summary is not None:
+            compute_result["progress_summary"] = _progress_summary
         resource = await _stamp_compute_result_resource(session, task, logs)
         compute_result.update(resource)
         compute_result["artifact_delivery"] = _derive_artifact_delivery_record(resource)
@@ -3650,6 +3994,20 @@ async def _handle_compute_experiment_completion(
         compute_result: dict = {"outcome": outcome, "final_cost_usd": cost}
         if criterion is not None:
             compute_result["criterion"] = criterion
+        # Mirror the prerequisite path: non-success terminals carry WHY so the
+        # follow-on spawn and the sweep aggregate prompt (which read
+        # plan_output.compute_result) surface the reason, not just the state.
+        if outcome != "SUCCESS":
+            _term_reason = _compute_terminal_reason_of(None, logs)
+            if _term_reason:
+                compute_result["terminal_reason"] = _term_reason
+        # Mirror the prerequisite path: attach the self-reported progress
+        # trajectory so the act-on-verdict follow-on reads the curve too.
+        _progress_summary = await _build_compute_progress_summary(
+            session, task, logs, criterion
+        )
+        if _progress_summary is not None:
+            compute_result["progress_summary"] = _progress_summary
         resource = await _stamp_compute_result_resource(session, task, logs)
         compute_result.update(resource)
         delivery = _derive_artifact_delivery_record(resource)
@@ -3774,9 +4132,24 @@ async def _handle_compute_experiment_completion(
     # intended terminal outcomes whose experiment never produced a result to
     # reason over, so there is nothing to dispose — exactly as the failure
     # branches above exclude them. They complete clean with full capture.
+    #
+    # spawn_followup gate: operator-authored tasks (created_by="USER") suppress
+    # the follow-on by default (opt-in via spawn_followup=True in the payload).
+    # Engine-authored tasks (ORCHESTRATOR / STRATEGIC_AGENT) spawn by default
+    # unless spawn_followup=False is explicitly set. This prevents validation
+    # smokes from burning agent budget on throwaway metrics.
+    _payload_spawn_followup = (task.first_payload or {}).get("spawn_followup")
+    _should_spawn_followup = (
+        _payload_spawn_followup is True
+        if task.created_by == "USER"
+        else _payload_spawn_followup is not False
+    )
     final_status = TaskStatus.COMPLETED
     result_outcome = (plan_output.get("compute_result") or {}).get("outcome")
-    if result_outcome not in _COMPUTE_INTENTIONAL_KILL_OUTCOMES:
+    if (
+        result_outcome not in _COMPUTE_INTENTIONAL_KILL_OUTCOMES
+        and _should_spawn_followup
+    ):
         if sweep_id:
             child = await _maybe_spawn_sweep_aggregate_followon(
                 session, task, sweep_id, plan_output.get("compute_result") or {}, logs
@@ -3798,7 +4171,10 @@ async def _handle_compute_experiment_completion(
     # completes.  Advisory mode records the verdict without blocking.
     if final_status is not TaskStatus.EVALUATING:
         await _maybe_spawn_compute_verification(
-            task, criterion, logs, session,
+            task,
+            criterion,
+            logs,
+            session,
         )
         # _maybe_spawn_compute_verification may set task.context markers
         # and update final_status via the task object if a grader was spawned.
@@ -4106,8 +4482,7 @@ async def _maybe_spawn_compute_verification(
     )
     if grader is not None:
         logger.info(
-            "[COMPUTE] Spawned verification grader %s for task %s "
-            "(advisory mode)",
+            "[COMPUTE] Spawned verification grader %s for task %s (advisory mode)",
             grader.id,
             task.id,
         )
@@ -5400,10 +5775,14 @@ async def _handle_repo_bootstrap_completion(
                     build_config["bootstrap_degraded_reason"] = "overview_missing"
                     build_config["bootstrap_recovery_attempts"] = attempts
                     build_config["bootstrap_recovery_last_task_id"] = str(task.id)
-                    build_config["bootstrap_recovery_last_degraded_at"] = now.isoformat()
+                    build_config["bootstrap_recovery_last_degraded_at"] = (
+                        now.isoformat()
+                    )
                     if attempts >= BOOTSTRAP_RECOVERY_MAX_ATTEMPTS:
                         build_config["bootstrap_recovery_state"] = "exhausted"
-                        build_config["bootstrap_recovery_exhausted_at"] = now.isoformat()
+                        build_config["bootstrap_recovery_exhausted_at"] = (
+                            now.isoformat()
+                        )
                         build_config.pop("bootstrap_recovery_next_at", None)
                     else:
                         build_config["bootstrap_recovery_state"] = "backoff"

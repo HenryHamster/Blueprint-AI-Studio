@@ -389,6 +389,9 @@ async def _resolve_retarget(
         task=task,
         runtime_config=runtime_config,
         blacklist=blacklist,
+        project_id=str(task.project_id) if task.project_id else None,
+        # No runner_available_clis: warm retarget dispatches to cloud VMs that
+        # have all LLM CLIs pre-installed, so CLI-based filtering is not needed.
     )
     if selection is None:
         return None, ctx, None
@@ -450,7 +453,10 @@ async def _resolve_retarget(
     except Exception:
         from app.max_plan_pool import release_max_plan_account
 
-        await release_max_plan_account(acquired_account_id)
+        await release_max_plan_account(
+            acquired_account_id,
+            project_id=str(task.project_id) if task.project_id else None,
+        )
         raise
     # The manifest is PURELY the provider/credential payload. The authoritative,
     # TTL-gated agent JWT is the response's rotated ``agent_token``; drop the
@@ -703,7 +709,10 @@ async def _finalize_warm_claim(
         if acquired_account_id:
             from app.max_plan_pool import release_max_plan_account
 
-            await release_max_plan_account(acquired_account_id)
+            await release_max_plan_account(
+                acquired_account_id,
+                project_id=str(task.project_id) if task.project_id else None,
+            )
         await session.rollback()
         if isinstance(exc, HTTPException):
             raise

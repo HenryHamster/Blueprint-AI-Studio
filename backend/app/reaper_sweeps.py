@@ -11,6 +11,7 @@ import contextlib
 import logging
 import uuid
 from datetime import datetime, timedelta
+from typing import Any
 
 from sqlmodel import select
 
@@ -569,6 +570,253 @@ async def sweep_metrics_integrity(session, now=None) -> dict | None:
     from app.metrics_integrity_sweep import run_metrics_integrity_sweep
 
     return await run_metrics_integrity_sweep(session, now)
+
+
+# Cadence gate for the capability backing-proof sweep. Hourly to bound overall
+# reaper cycle time — the sweep iterates projects and verifies file paths via
+# git ls-files, so a slow project or deep file tree should not run every tick.
+_BACKING_PROOF_INTERVAL_SECONDS = 3600
+_last_backing_proof_sweep: datetime | None = None
+# Independent cadence timer for the proof-earn loop (Step 22b). It shares the
+# hourly interval above but MUST NOT share the timestamp global: Step 22 stamps
+# _last_backing_proof_sweep at the top of the same reaper cycle, so a shared
+# timer would report Step 22b as "not due" every cycle and permanently gate it
+# out. Splitting the timers lets both run at the same cadence on separate clocks.
+_last_proof_earn_loop_sweep: datetime | None = None
+
+
+async def sweep_capability_backing_proofs(session, now=None) -> int:
+    """Step 22: Record backing-path proof for capabilities whose backing files
+    all resolve at HEAD.
+
+    Iterates projects (bounded, default 25), finds working capabilities with
+    non-empty ``backing_paths``, verifies each path via git ls-files against
+    HEAD, and — when ALL paths are definitely present — records a bounded
+    ``backing_path`` proof entry on the project via
+    :func:`app.capability_proof.record_capability_backing_path_proof`.
+
+    Cadence-gated to hourly. Returns the number of new proof entries recorded.
+    Any path returning ``None`` (indeterminate) prevents proof recording for
+    that capability — only a definite True on every path triggers a record.
+    Wrapped so it can never crash the reaper cycle.
+    """
+    global _last_backing_proof_sweep
+    from app import source_ref_validation as _srv
+    from app.capability_proof import record_capability_backing_path_proof
+    from app.models import Project
+    from sqlalchemy.orm import load_only
+
+    _now = now or _utcnow()
+    if not _is_cadence_due(
+        _last_backing_proof_sweep, _BACKING_PROOF_INTERVAL_SECONDS, _now
+    ):
+        return 0
+    _last_backing_proof_sweep = _now
+
+    max_projects = 25
+    rows = (
+        (
+            await session.execute(
+                select(Project)
+                .options(
+                    load_only(
+                        Project.id,
+                        Project.problem_model,
+                        Project.capability_proof_records,
+                        raiseload=True,
+                    )
+                )
+                .limit(max_projects)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    if not rows:
+        return 0
+
+    total_recorded = 0
+    for project in rows:
+        project_recorded = 0
+        try:
+            pm = getattr(project, "problem_model", None)
+            if not isinstance(pm, dict):
+                continue
+            capabilities = pm.get("capabilities")
+            if not isinstance(capabilities, list):
+                continue
+
+            for cap in capabilities:
+                if not isinstance(cap, dict):
+                    continue
+                status = cap.get("status", "").strip().lower()
+                if status not in ("working", "partial"):
+                    continue
+                backing_paths = cap.get("backing_paths")
+                if not isinstance(backing_paths, list) or not backing_paths:
+                    continue
+
+                cap_name = cap.get("name")
+                if not isinstance(cap_name, str) or not cap_name:
+                    continue
+
+                # Filter to file-like paths; skip globs, logical ids, etc.
+                file_paths = [
+                    p
+                    for p in backing_paths
+                    if isinstance(p, str) and _srv._looks_like_file_path(p)
+                ]
+                if not file_paths:
+                    continue
+
+                # Check every path against HEAD. A single None (indeterminate)
+                # prevents proof recording — only definite True on ALL paths
+                # is sufficient.
+                all_present = True
+                for p in file_paths:
+                    exists = await _srv._path_exists_at_head(p)
+                    if exists is not True:
+                        all_present = False
+                        break
+
+                if all_present and file_paths:
+                    recorded = record_capability_backing_path_proof(
+                        project, cap_name
+                    )
+                    if recorded:
+                        project_recorded += 1
+
+            if project_recorded:
+                session.add(project)
+                await session.commit()
+                total_recorded += project_recorded
+
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "[REAPER] Capability backing-proof sweep failed for project %s:",
+                getattr(project, "id", "?"),
+                exc_info=True,
+            )
+            with contextlib.suppress(Exception):
+                await session.rollback()
+
+    if total_recorded:
+        logger.info(
+            "[REAPER] Step 22: recorded %d backing-path proof(s)",
+            total_recorded,
+        )
+    return total_recorded
+
+
+async def sweep_proof_earn_loop(session, now=None) -> dict[str, Any]:
+    """Step 22b: Earn proof for demanded unproven working capabilities.
+
+    Computes the intersection of demanded capabilities and unproven working
+    capabilities via :func:`commission_proof_earn_loop` and attempts to earn
+    proof by verifying backing_paths at HEAD.  For demanded capabilities that
+    have no backing_paths, the gap is surfaced in the return summary so the
+    strategist layer can act.
+
+    Cadence-gated to the same hourly interval as the backing-path sweep, but on
+    an INDEPENDENT timer (``_last_proof_earn_loop_sweep``) so Step 22 stamping
+    its own timer earlier in the same cycle cannot suppress this sweep.
+    Returns a summary dict (see ``commission_proof_earn_loop`` return doc),
+    or ``{}`` when gated.
+    """
+    global _last_proof_earn_loop_sweep
+    from app.capability_demand import collect_missing_capability_demand
+    from app.capability_proof import commission_proof_earn_loop
+    from app.models import Project
+    from sqlalchemy.orm import load_only
+
+    _now = now or _utcnow()
+    if not _is_cadence_due(
+        _last_proof_earn_loop_sweep, _BACKING_PROOF_INTERVAL_SECONDS, _now
+    ):
+        return {}
+    _last_proof_earn_loop_sweep = _now
+
+    max_projects = 25
+    rows = (
+        (
+            await session.execute(
+                select(Project)
+                .options(
+                    load_only(
+                        Project.id,
+                        Project.problem_model,
+                        Project.capability_proof_records,
+                        raiseload=True,
+                    )
+                )
+                .limit(max_projects)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    if not rows:
+        return {}
+
+    combined: dict[str, Any] = {
+        "total_demanded_unproven": 0,
+        "earned": 0,
+        "no_backing_paths": [],
+        "still_unproven": [],
+        "path_proven_stuck": [],
+    }
+
+    for project in rows:
+        try:
+            pm = getattr(project, "problem_model", None)
+            if not isinstance(pm, dict):
+                continue
+            capabilities = pm.get("capabilities")
+            if not isinstance(capabilities, list) or not capabilities:
+                continue
+
+            # Fetch demand for this project.
+            demand_result = await collect_missing_capability_demand(
+                session, project.id, now=_now
+            )
+            if not demand_result.get("demands"):
+                continue
+
+            result = await commission_proof_earn_loop(
+                project, demand_result, pm
+            )
+            if result.get("total_demanded_unproven", 0) > 0:
+                combined["total_demanded_unproven"] += result["total_demanded_unproven"]
+                combined["earned"] += result["earned"]
+                combined["no_backing_paths"].extend(result.get("no_backing_paths", []))
+                combined["still_unproven"].extend(result.get("still_unproven", []))
+                combined["path_proven_stuck"].extend(result.get("path_proven_stuck", []))
+                if result["earned"] > 0:
+                    session.add(project)
+                    await session.commit()
+
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "[REAPER] Proof-earn loop failed for project %s:",
+                getattr(project, "id", "?"),
+                exc_info=True,
+            )
+            with contextlib.suppress(Exception):
+                await session.rollback()
+
+    if combined["earned"] or combined["still_unproven"] or combined["path_proven_stuck"]:
+        logger.info(
+            "[REAPER] Step 22b: proof-earn loop: total_demanded_unproven=%d "
+            "earned=%d no_backing_paths=%d still_unproven=%d path_proven_stuck=%d",
+            combined["total_demanded_unproven"],
+            combined["earned"],
+            len(combined["no_backing_paths"]),
+            len(combined["still_unproven"]),
+            len(combined["path_proven_stuck"]),
+        )
+    return combined
 
 
 async def sweep_stuck_qualifications(session, *, session_factory) -> int:
@@ -1433,6 +1681,225 @@ async def sweep_closed_handmerge_prs(session) -> int:
     return resolved
 
 
+# Independent cadence timer for the compute-image GC guard (below). Hourly, on
+# its own clock so it can never be gated out by another sweep stamping a shared
+# global at the top of the same reaper cycle.
+_COMPUTE_IMAGE_GC_GUARD_INTERVAL_SECONDS = 3600
+# How far back a *completed* compute job still counts as depending on its image:
+# a recent result's provenance/reproducibility needs the digest to stay pullable.
+_COMPUTE_IMAGE_PROTECT_WINDOW_SECONDS = 30 * 24 * 3600
+_last_compute_image_gc_guard_sweep: datetime | None = None
+
+
+def _split_pinned_ref(ref: str) -> tuple[str, str] | None:
+    """Split a digest-pinned image ref into ``(full_repo, digest)``.
+
+    ``us-docker.pkg.dev/proj/compute-images/my-project:v2@sha256:abc``
+        -> ``("us-docker.pkg.dev/proj/compute-images/my-project", "sha256:abc")``
+
+    The digest is everything after the last ``@``; the repo is what precedes it,
+    minus an optional ``:tag`` on the FINAL path segment (a registry host may
+    legitimately carry a ``:port``, which must survive). A tag-only or malformed
+    ref yields ``None`` — it has no stable digest to protect.
+    """
+    if not ref or "@" not in ref:
+        return None
+    base, _, digest = ref.rpartition("@")
+    if not base or not digest.startswith("sha256:"):
+        return None
+    head, sep, last = base.rpartition("/")
+    if ":" in last:
+        last = last.split(":", 1)[0]
+    full_repo = f"{head}{sep}{last}" if sep else last
+    if not full_repo or not last:
+        return None
+    return full_repo, digest
+
+
+async def _referenced_compute_image_repo_digests(
+    session, *, since: datetime
+) -> set[tuple[str, str]]:
+    """``(full_repo, digest)`` pairs a live/recent compute job still depends on.
+
+    The digest-only sibling of this query lives in
+    ``compute_jobs.referenced_compute_image_digests`` and answers "which digests
+    matter". That is enough to decide what NOT to prune, but not enough to
+    PROTECT: a registry protection tag can only be applied to the repo that
+    actually holds the digest, and a job's ``container_image`` is the only place
+    that repo is recorded when the image has no ``ProjectComputeImage`` row (the
+    documented CI build path, ``scripts/build_compute_image.py``, writes none).
+
+    Reuses the same live/recent status predicate as the digest query — the status
+    constants are imported from ``compute_jobs`` so the two cannot drift — and
+    differs only in projecting the FULL ref instead of just its digest.
+    """
+    from sqlalchemy import and_, or_
+
+    from app.compute_jobs import (
+        _COMPUTE_JOB_ACTIVE_STATUSES,
+        _COMPUTE_JOB_TERMINAL_STATUSES,
+    )
+    from app.models import ComputeJob
+
+    conditions = [ComputeJob.status.in_(_COMPUTE_JOB_ACTIVE_STATUSES)]
+    if since is not None:
+        conditions.append(
+            and_(
+                ComputeJob.status.in_(list(_COMPUTE_JOB_TERMINAL_STATUSES)),
+                ComputeJob.completed_at.is_not(None),
+                ComputeJob.completed_at >= since,
+            )
+        )
+
+    rows = (
+        await session.execute(
+            select(ComputeJob.polling_metadata).where(or_(*conditions))
+        )
+    ).scalars().all()
+
+    pairs: set[tuple[str, str]] = set()
+    for meta in rows:
+        if not isinstance(meta, dict):
+            continue
+        ref = meta.get("container_image")
+        if not isinstance(ref, str):
+            continue
+        parsed = _split_pinned_ref(ref)
+        if parsed is not None:
+            pairs.add(parsed)
+    return pairs
+
+
+async def sweep_protect_referenced_compute_image_digests(
+    session,
+    now=None,
+    *,
+    _apply_tag=None,
+    _list_tags=None,
+    _delete_tag=None,
+    max_images: int = 500,
+) -> dict[str, int]:
+    """Protect registry digests a live/recent compute job still depends on.
+
+    Registry retention (Terraform ``cleanup_policy`` on the compute-images repo)
+    is purely time/count-based and cannot query the DB, so a digest a *running*
+    experiment — or a *recent* result's provenance — depends on can be GC'd out
+    from under it, breaking reproducibility. This sweep closes that gap: it
+    stamps a durable ``inuse-<shorthash>`` protection tag on every referenced
+    digest, and a matching KEEP ``cleanup_policy`` (``keep-inuse-tagged`` in
+    ``infra/terraform/registry.tf``) shields anything so tagged from deletion.
+    Protection tags whose digest is no longer referenced are pruned so ordinary
+    time-based retention can reclaim the image on a later pass.
+
+    A digest is "referenced" when it is the ``container_image`` of a live compute
+    job, of a job completed within the protection window, OR the digest of a
+    ``ProjectComputeImage`` row (re)built within that window (protect the current
+    project default even before its first job lands).
+
+    Cadence-gated to hourly on an independent timer. Returns a summary dict
+    (``applied``/``pruned``/``skipped_cadence``). The caller wraps this so it can
+    never crash the reaper cycle; the registry helpers fail open individually.
+    """
+    global _last_compute_image_gc_guard_sweep
+    from app.compute_image_build import (
+        apply_registry_protection_tag,
+        delete_registry_protection_tag,
+        list_registry_protection_tags,
+        protection_tag_for_digest,
+    )
+    from app.compute_jobs import referenced_compute_image_digests
+    from app.models import ProjectComputeImage
+
+    _now = now or _utcnow()
+    if not _is_cadence_due(
+        _last_compute_image_gc_guard_sweep,
+        _COMPUTE_IMAGE_GC_GUARD_INTERVAL_SECONDS,
+        _now,
+    ):
+        return {"applied": 0, "pruned": 0, "skipped_cadence": 1}
+    _last_compute_image_gc_guard_sweep = _now
+
+    apply_tag = _apply_tag or apply_registry_protection_tag
+    list_tags = _list_tags or list_registry_protection_tags
+    delete_tag = _delete_tag or delete_registry_protection_tag
+
+    cutoff = _now - timedelta(seconds=_COMPUTE_IMAGE_PROTECT_WINDOW_SECONDS)
+    referenced = await referenced_compute_image_digests(session, since=cutoff)
+
+    images = (
+        (
+            await session.execute(
+                select(ProjectComputeImage)
+                .where(ProjectComputeImage.digest.is_not(None))
+                .limit(max_images)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    # A freshly-(re)built image is protected even before its first job lands, so
+    # the current project default is never GC'd between bake and first use.
+    for img in images:
+        updated = getattr(img, "updated_at", None)
+        if img.digest and updated is not None and updated >= cutoff:
+            referenced.add(img.digest)
+
+    protected_tags = {protection_tag_for_digest(d) for d in referenced}
+
+    # (repo, digest) pairs to stamp. A digest can only be tagged in the repo that
+    # actually holds it, so protection needs the REPO, not just the digest.
+    #
+    # Two independent sources — and the second one is why this sweep used to lie:
+    #
+    #   * ProjectComputeImage rows — the repo comes from the row's own
+    #     registry_repo/image_name columns.
+    #   * LIVE/RECENT COMPUTE JOBS — the repo is parsed out of the job's
+    #     container_image ref. Protection used to be applied by iterating
+    #     ProjectComputeImage rows ONLY, so a digest referenced by a running job
+    #     but with NO ProjectComputeImage row (e.g. an image baked through the
+    #     documented CI path, scripts/build_compute_image.py, which writes no DB
+    #     row) was collected into `referenced`, counted as protected when pruning
+    #     — and then never actually stamped. It was GC-able out from under the
+    #     very job that was still pulling it, which is precisely the failure this
+    #     sweep's docstring promises to prevent.
+    targets: set[tuple[str, str]] = set()
+
+    for img in images:
+        if img.digest and img.digest in referenced:
+            targets.add((f"{img.registry_repo}/{img.image_name}", img.digest))
+
+    job_refs = await _referenced_compute_image_repo_digests(session, since=cutoff)
+    for full_repo, digest in job_refs:
+        if digest in referenced:
+            targets.add((full_repo, digest))
+
+    applied = 0
+    pruned = 0
+    # Every repo we know about gets its stale protection tags pruned — including
+    # repos we only learned about from a job's container_image.
+    repos: set[str] = {f"{img.registry_repo}/{img.image_name}" for img in images}
+    repos.update(repo for repo, _digest in job_refs)
+
+    for full_repo, digest in sorted(targets):
+        # Run blocking subprocess call off the event-loop thread so the
+        # sweep cannot stall API responsiveness or heartbeat processing.
+        if await asyncio.to_thread(apply_tag, full_repo, digest):
+            applied += 1
+
+    for full_repo in repos:
+        try:
+            existing = await asyncio.to_thread(list_tags, full_repo)
+        except Exception:  # noqa: BLE001 — registry helpers fail open
+            continue
+        for tag in existing:
+            if tag not in protected_tags:
+                if await asyncio.to_thread(delete_tag, full_repo, tag):
+                    pruned += 1
+
+    return {"applied": applied, "pruned": pruned, "skipped_cadence": 0}
+
+
 __all__ = [
     # Re-exported from app.blocked_task_unblock_sweeps (constants)
     "_BLOCKED_ESCALATE_AFTER",
@@ -1474,4 +1941,5 @@ __all__ = [
     "sweep_resolve_stale_open_bug_messages",
     "sweep_wake_delivery_stall_alerts",
     "sweep_closed_handmerge_prs",
+    "sweep_protect_referenced_compute_image_digests",
 ]

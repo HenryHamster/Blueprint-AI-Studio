@@ -14,12 +14,14 @@ import contextlib
 import hashlib
 import json
 import logging
+import math
 import os
+import re
 import uuid
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func
+from sqlalchemy import func, or_, and_
 from sqlalchemy.orm import selectinload
 from sqlmodel import select
 
@@ -28,13 +30,16 @@ from app.compute_backends import (
     LOCAL_GPU_BACKEND_NAME,
     RUNNER_SUBPROCESS_BACKEND_NAME,
     ComputeLaunchSpec,
+    ComputeLaunchSpecError,
     ComputeStatusResult,
     PreflightSmokeResult,
+    _parse_digest_from_pinned_ref,
     collect_terminal_artifact_reference,
     default_compute_backend_name,
     detect_local_gpu,
     get_compute_backend,
     is_zero_cost_backend,
+    persist_viewable_artifacts,
     run_preflight_smoke,
     validate_backend_name,
 )
@@ -54,22 +59,28 @@ from app.artifact_prerequisites import (
     stamp_artifact_logical_key,
 )
 from app.database import AsyncSessionLocal
-from app.json_extract import scan_balanced_json_objects
+from app.json_extract import (
+    scan_all_balanced_json_objects,
+    scan_balanced_json_objects,
+)
 from app.models import (
     Artifact,
     ArtifactType,
     ComputeJob,
+    ComputeJobFile,
     ComputeJobOutcome,
     ComputeJobStatus,
     Project,
     ReleaseVersion,
     Task,
+    TaskHistory,
     TaskStatus,
 )
 from app.compute_experiment_contract import resolve_compute_spend_approval
 from app.runtime_config_state import runtime_config as _global_runtime_config
 from app.schemas import redact_command_log_text
-from app.time_utils import _utcnow
+from app import storage
+from app.time_utils import _utcnow, exponential_backoff
 from app.vm_cost_rates import (
     get_compute_rate_per_second,
     resolve_compute_machine_type,
@@ -122,6 +133,49 @@ COMPUTE_PROVISIONING_DEADLINE_SECONDS = int(
 COMPUTE_MAX_CONSECUTIVE_POLL_FAILURES = int(
     os.getenv("COMPUTE_MAX_CONSECUTIVE_POLL_FAILURES", "20")
 )
+# Max retries for provisioning-timeout failures. When a compute job TIMED_OUT
+# during the provisioning phase (before the VM reached RUNNING), the monitor
+# retries up to this many times with backoff before going terminal. Transient
+# GCP infrastructure issues (zone quota exhaustion, image family blips) are
+# recovered without operator intervention.
+MAX_PROVISIONING_RETRY_COUNT = int(
+    os.getenv("COMPUTE_MAX_PROVISIONING_RETRY_COUNT", "2")
+)
+# Base backoff in seconds for each provisioning retry. The actual wait between
+# retries is ``exponential_backoff(retry_number, base=this, cap=600)``, yielding
+# roughly 2 min for retry 1 and 4 min for retry 2.
+PROVISIONING_RETRY_BACKOFF_BASE_SECONDS = int(
+    os.getenv("COMPUTE_PROVISIONING_RETRY_BACKOFF_SECONDS", "120")
+)
+# No-progress watchdog. A long-running compute job (e.g. multi-day RL training)
+# can burn its entire wall-clock deadline while learning nothing; the surfacing
+# half (a bounded progress-metric ring buffer in polling_metadata, written from
+# runner heartbeats via append_progress_sample) already ships. These constants
+# drive the CONSUMER that reads that trend and cuts a stalled job early.
+#
+# The watchdog is FAIL-OPEN by construction: it fires ONLY when the job declares
+# a metric to watch (polling_metadata['declared_metric']) AND enough progress
+# samples exist to prove a sustained plateau. Jobs that report no progress
+# telemetry, or declare no metric, are byte-for-byte unaffected. Setting the
+# window to 0 disables the watchdog entirely.
+COMPUTE_JOB_NO_PROGRESS_GRACE_SECONDS = float(
+    os.getenv("COMPUTE_JOB_NO_PROGRESS_GRACE_SECONDS", "1800")
+)
+# The progress ring buffer holds at most 50 samples (drop-oldest); at the ~60s
+# heartbeat cadence that is ~50 min of history, so the stall window must stay
+# comfortably under that to ever accumulate a full window of samples.
+COMPUTE_JOB_NO_PROGRESS_WINDOW_SECONDS = float(
+    os.getenv("COMPUTE_JOB_NO_PROGRESS_WINDOW_SECONDS", "1800")
+)
+COMPUTE_JOB_NO_PROGRESS_MIN_SAMPLES = int(
+    os.getenv("COMPUTE_JOB_NO_PROGRESS_MIN_SAMPLES", "4")
+)
+# Relative movement below this fraction of the metric's magnitude over the whole
+# window counts as "no progress" (direction-agnostic: a flat metric is a stall
+# whether higher or lower is better).
+COMPUTE_JOB_NO_PROGRESS_EPSILON = float(
+    os.getenv("COMPUTE_JOB_NO_PROGRESS_EPSILON", "1e-4")
+)
 _COMPUTE_RPC_DIAGNOSTIC_KEY = "compute_rpc_diagnostic"
 _COMPUTE_RPC_DIAGNOSTIC_MAX_STRING = 1000
 
@@ -158,6 +212,44 @@ _LIVE_PROOF_MARKER_KEYS = (
     "requires_live_release",
 )
 
+# Progress-metric ring buffer — bounded time-series written into polling_metadata.
+_PROGRESS_METRIC_KEY_RE = re.compile(r"^[A-Za-z0-9_./-]+$")
+_PROGRESS_SERIES_MAX_SAMPLES = 50
+
+# Stable terminal-kind label for a no-progress early-cut.  Callers that cut a
+# job for a stalled progress trend pass this as terminal_kind to
+# _finalize_terminal_job so the disposition is distinct from a wall-clock expiry.
+NO_PROGRESS_TERMINAL_REASON = "no_progress"
+
+
+def append_progress_sample(
+    meta: dict, *, metric: str, value: float, t: str
+) -> dict:
+    """Append a progress sample to the ring buffer in a polling_metadata dict.
+
+    Returns a new dict with the sample appended (drop-oldest at 50 entries).
+    Silently ignores non-finite values, bad metric keys, or any other error
+    so the caller never raises on malformed input.
+    """
+    try:
+        if not isinstance(metric, str) or not _PROGRESS_METRIC_KEY_RE.fullmatch(metric):
+            return meta
+        float_val = float(value)
+        if not math.isfinite(float_val):
+            return meta
+        if not isinstance(t, str) or not t:
+            return meta
+        meta = dict(meta)
+        series: list = list(meta.get("progress_series") or [])
+        series.append({"t": t, "name": metric, "value": float_val})
+        if len(series) > _PROGRESS_SERIES_MAX_SAMPLES:
+            series = series[-_PROGRESS_SERIES_MAX_SAMPLES:]
+        meta["progress_series"] = series
+        return meta
+    except Exception:
+        return meta
+
+
 # Wake-source kind for the task park-and-wake primitive. A compute_experiment
 # task parks on this kind with ``wake_source_ref=str(job.id)`` after launching
 # its budgeted job instead of poll-pinning its agent VM; the monitor fires the
@@ -180,6 +272,17 @@ _COMPUTE_OUTCOME_DISPOSITION: dict[ComputeJobOutcome, tuple[bool, str | None]] =
     ComputeJobOutcome.SMOKE_FAILED: (False, None),
 }
 
+# Default terminal_kind label per outcome, used when the caller does not
+# supply an explicit terminal_kind to _finalize_terminal_job.
+_OUTCOME_TO_TERMINAL_KIND: dict[ComputeJobOutcome, str | None] = {
+    ComputeJobOutcome.SUCCESS: None,
+    ComputeJobOutcome.CANCELLED: "operator",
+    ComputeJobOutcome.TIMED_OUT: "deadline",
+    ComputeJobOutcome.SPEND_CAP_EXCEEDED: "spend_cap",
+    ComputeJobOutcome.FAILURE: "failure",
+    ComputeJobOutcome.SMOKE_FAILED: "failure",
+}
+
 
 class ComputeLaunchPreconditionFailed(Exception):
     """Structured launch precondition failure safe to return to agents."""
@@ -187,6 +290,82 @@ class ComputeLaunchPreconditionFailed(Exception):
     def __init__(self, detail: dict[str, Any]):
         self.detail = detail
         super().__init__(str(detail.get("message") or detail.get("error") or detail))
+
+
+def _compute_job_has_durable_bundle(job: ComputeJob) -> bool:
+    """True when a compute job actually produced a durable artifact bundle.
+
+    A cross-job resume source must have a downloadable bundle. ``result_reference``
+    / ``artifact_id`` are stamped by ``_link_terminal_artifact`` only after a real
+    bundle is linked, and runner-subprocess jobs additionally record a
+    ``runner_artifact`` descriptor. Any of these signals means a ``bundle.tar.gz``
+    exists under the job's per-job artifact prefix.
+    """
+    if job.result_reference or job.artifact_id is not None:
+        return True
+    runner_artifact = (job.polling_metadata or {}).get("runner_artifact")
+    return isinstance(runner_artifact, dict) and bool(runner_artifact.get("uri"))
+
+
+async def _resolve_resume_source_job_id(
+    session, *, project_id, input_artifact_job_id: str
+) -> str:
+    """Validate a cross-job checkpoint-resume source and return its canonical id.
+
+    Rejects (raising :class:`ComputeLaunchPreconditionFailed`, mapped to an
+    agent-facing error) a malformed uuid, a job that does not exist, a job owned
+    by a DIFFERENT project, or a job that never produced a durable artifact
+    bundle. Fail-closed by contract: a dangling / foreign / empty resume reference
+    must never silently no-op — that would recreate the fail-open reproducibility
+    dishonesty this project is fighting.
+    """
+    raw = str(input_artifact_job_id or "").strip()
+    try:
+        parsed = uuid.UUID(raw)
+    except (ValueError, AttributeError, TypeError) as exc:
+        raise ComputeLaunchPreconditionFailed(
+            {
+                "error": "invalid_input_artifact_job_id",
+                "message": f"input_artifact_job_id is not a valid UUID: {raw!r}",
+                "input_artifact_job_id": raw,
+            }
+        ) from exc
+    source = await session.get(ComputeJob, parsed)
+    if source is None:
+        raise ComputeLaunchPreconditionFailed(
+            {
+                "error": "input_artifact_job_not_found",
+                "message": (
+                    f"input_artifact_job_id {parsed} does not reference an "
+                    "existing compute job"
+                ),
+                "input_artifact_job_id": str(parsed),
+            }
+        )
+    if source.project_id != project_id:
+        raise ComputeLaunchPreconditionFailed(
+            {
+                "error": "input_artifact_job_cross_project",
+                "message": (
+                    "input_artifact_job_id belongs to a different project — "
+                    "cross-project checkpoint resume is refused"
+                ),
+                "input_artifact_job_id": str(parsed),
+            }
+        )
+    if not _compute_job_has_durable_bundle(source):
+        raise ComputeLaunchPreconditionFailed(
+            {
+                "error": "input_artifact_job_has_no_bundle",
+                "message": (
+                    f"input_artifact_job_id {parsed} produced no durable artifact "
+                    "bundle (no result_reference / artifact / runner_artifact) — "
+                    "nothing to resume from"
+                ),
+                "input_artifact_job_id": str(parsed),
+            }
+        )
+    return str(parsed)
 
 
 def clamp_spend_cap_usd(raw_value: float) -> float:
@@ -280,6 +459,10 @@ async def create_compute_job(
     setup_step: str | None = None,
     container_image: str | None = None,
     container_registry_auth: dict | None = None,
+    allow_host_fallback: bool = False,
+    no_progress_timeout_seconds: int | None = None,
+    declared_metric: str | None = None,
+    input_artifact_job_id: str | None = None,
 ) -> ComputeJob:
     if not command.strip():
         raise ValueError("command must be non-empty")
@@ -325,6 +508,20 @@ async def create_compute_job(
     normalized_provisioning = normalize_provisioning_model(provisioning_model)
     capped_spend = clamp_spend_cap_usd(spend_cap_usd)
     capped_deadline = clamp_deadline_seconds(deadline_seconds)
+    # Validate and clamp no_progress_timeout_seconds: positive, not exceeding the
+    # runtime deadline, and never shorter than 60s (a shorter window would false-
+    # fire on normal compute startup / dependency install).
+    capped_np_timeout: int | None = None
+    if no_progress_timeout_seconds is not None:
+        raw_np = int(no_progress_timeout_seconds)
+        if raw_np < 0:
+            raise ValueError(
+                f"no_progress_timeout_seconds must be positive (got {raw_np})"
+            )
+        if raw_np == 0:
+            capped_np_timeout = None  # 0 = disable
+        else:
+            capped_np_timeout = max(60, min(raw_np, capped_deadline))
     # Persist the canonical accelerator short name (e.g. "T4") so the launch spec,
     # cost rate, and provisioning path all resolve the same supported shape.
     persisted_accelerator = accel_spec.name if accel_spec is not None else None
@@ -339,6 +536,7 @@ async def create_compute_job(
     # (the runner's GPU capability gate in _try_runner_dispatch already validated
     # that the runner can handle any GPU accelerator declared in the payload).
     runner_target_id: str | None = (locked_task.context or {}).get("runner_target_id") or None
+    runner_hostname: str | None = (locked_task.context or {}).get("runner_hostname") or None
     if runner_target_id is not None:
         normalized_backend = RUNNER_SUBPROCESS_BACKEND_NAME
     # Enforce-local policy: when a project requires its compute_experiment work to run
@@ -378,6 +576,16 @@ async def create_compute_job(
             project_id=locked_task.project_id,
             requirement=live_proof_requirement,
         )
+    # Cross-job checkpoint resume: validate the resume source BEFORE persisting the
+    # row so a bad reference is rejected at launch (agent-facing error) rather than
+    # silently no-op'ing at hydration time. Same-project + durable-bundle enforced.
+    resolved_input_artifact_job_id: str | None = None
+    if input_artifact_job_id is not None and str(input_artifact_job_id).strip():
+        resolved_input_artifact_job_id = await _resolve_resume_source_job_id(
+            session,
+            project_id=locked_task.project_id,
+            input_artifact_job_id=input_artifact_job_id,
+        )
     launch_request_fingerprint = _build_launch_request_fingerprint(
         command=command,
         machine_type=resolved_machine_type,
@@ -391,6 +599,8 @@ async def create_compute_job(
         accelerator_count=persisted_accelerator_count,
         live_proof_requirement=live_proof_requirement,
         container_image=container_image,
+        no_progress_timeout_seconds=capped_np_timeout,
+        input_artifact_job_id=resolved_input_artifact_job_id,
     )
     existing = await _get_active_compute_job_for_task(session, task_id=locked_task.id)
     if existing is not None:
@@ -467,11 +677,17 @@ async def create_compute_job(
         "cost_rate_per_second": rate,
         "requested_deadline_seconds": capped_deadline,
         "launch_request_fingerprint": launch_request_fingerprint,
-        "status_message": "queued for compute-job launch",
+        "status_message": _LAUNCH_PLACEHOLDER_STATUS_MESSAGE,
         "park_deadline_seconds": park_deadline_seconds,
     }
+    if isinstance(declared_metric, str) and declared_metric.strip():
+        # Persisted so the no-progress watchdog knows which reported metric to
+        # watch for a stall. Absent → the watchdog never fires for this job.
+        polling_metadata["declared_metric"] = declared_metric.strip()
     if setup_step is not None:
         polling_metadata["setup_step"] = setup_step
+    if capped_np_timeout is not None:
+        polling_metadata["no_progress_timeout_seconds"] = capped_np_timeout
     if container_image:
         polling_metadata["container_image"] = container_image
         if container_registry_auth and isinstance(container_registry_auth, dict):
@@ -512,6 +728,16 @@ async def create_compute_job(
         polling_metadata[_LIVE_PROOF_METADATA_KEY] = live_release_evidence
     if runner_target_id is not None:
         polling_metadata["runner_target_id"] = runner_target_id
+    if runner_hostname is not None:
+        polling_metadata["runner_hostname"] = runner_hostname
+    if allow_host_fallback:
+        polling_metadata["allow_host_fallback"] = True
+    if resolved_input_artifact_job_id is not None:
+        # Durable launch input (like command / container_image): the resume source
+        # whose checkpoint bundle is hydrated into $BLUEPRINT_ARTIFACT_DIR before
+        # the command runs. Recorded so the operator can see the run resumed and
+        # from where, and so _build_launch_spec can forward it to the backend.
+        polling_metadata["input_artifact_job_id"] = resolved_input_artifact_job_id
     job = ComputeJob(
         task_id=locked_task.id,
         project_id=locked_task.project_id,
@@ -851,6 +1077,8 @@ def _build_launch_request_fingerprint(
     accelerator_count: int | None = None,
     live_proof_requirement: dict[str, str] | None = None,
     container_image: str | None = None,
+    no_progress_timeout_seconds: int | None = None,
+    input_artifact_job_id: str | None = None,
 ) -> str:
     payload = {
         "accelerator": accelerator,
@@ -865,6 +1093,8 @@ def _build_launch_request_fingerprint(
         "provisioning_model": provisioning_model,
         "spend_cap_usd": float(spend_cap_usd),
         "live_proof_requirement": live_proof_requirement,
+        "no_progress_timeout_seconds": no_progress_timeout_seconds,
+        "input_artifact_job_id": input_artifact_job_id,
     }
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -914,6 +1144,92 @@ def _runtime_deadline_at(job: ComputeJob) -> datetime | None:
     return job.started_at + timedelta(seconds=requested)
 
 
+def _declared_progress_metric(job: ComputeJob) -> str | None:
+    """Return the contract-declared metric name to watch, or None.
+
+    Written into ``polling_metadata['declared_metric']`` at job creation from the
+    validated compute_experiment launch contract. Absent for jobs that declare no
+    metric (the watchdog then never fires for them).
+    """
+    metric = (job.polling_metadata or {}).get("declared_metric")
+    if isinstance(metric, str) and metric.strip():
+        return metric
+    return None
+
+
+def _watched_progress_samples(
+    job: ComputeJob, metric: str
+) -> list[tuple[datetime, float]]:
+    """Return time-sorted ``(t, value)`` samples for ``metric`` from the ring buffer.
+
+    Reads the bounded ``progress_series`` written by ``append_progress_sample``.
+    Malformed entries (bad timestamp, non-numeric value, wrong/absent name) are
+    silently skipped so a single bad heartbeat can never corrupt the trend.
+    """
+    series = (job.polling_metadata or {}).get("progress_series")
+    if not isinstance(series, list):
+        return []
+    out: list[tuple[datetime, float]] = []
+    for sample in series:
+        if not isinstance(sample, dict) or sample.get("name") != metric:
+            continue
+        ts = _parse_naive_iso_datetime(sample.get("t"))
+        val = _coerce_metric_number(sample.get("value"))
+        if ts is None or val is None:
+            continue
+        out.append((ts, float(val)))
+    out.sort(key=lambda pair: pair[0])
+    return out
+
+
+def _no_progress_stalled(job: ComputeJob, *, now: datetime) -> bool:
+    """True when a declared-metric job has stopped making measurable progress.
+
+    Fail-open: returns False unless ALL of the following hold, so a job that emits
+    no progress telemetry is never affected —
+
+    * the job declares a metric to watch;
+    * the job has been running longer than the grace period (never cut a job
+      before it has had a fair chance to start converging);
+    * the metric history spans at least a full window (the oldest recorded
+      sample is at least ``WINDOW`` seconds old) — so a job that has only just
+      begun reporting is never cut on a few seconds of data;
+    * at least ``COMPUTE_JOB_NO_PROGRESS_MIN_SAMPLES`` samples of that metric fall
+      inside the trailing ``[now - WINDOW, now]`` window (a stale buffer whose
+      last sample predates the window contributes nothing and cannot fire); and
+    * the spread (max - min) of the metric across that window is within a small
+      relative tolerance of the metric's magnitude — a sustained plateau.
+
+    Direction-agnostic: a flat metric is "no progress" whether higher or lower
+    is better, so the check never needs to know the metric's polarity.
+    """
+    if COMPUTE_JOB_NO_PROGRESS_WINDOW_SECONDS <= 0:
+        return False
+    metric = _declared_progress_metric(job)
+    if metric is None:
+        return False
+    if job.started_at is None:
+        return False
+    if (now - job.started_at).total_seconds() < COMPUTE_JOB_NO_PROGRESS_GRACE_SECONDS:
+        return False
+    samples = _watched_progress_samples(job, metric)
+    if len(samples) < COMPUTE_JOB_NO_PROGRESS_MIN_SAMPLES:
+        return False
+    # Enough history: the oldest recorded sample must be at least a full window
+    # old, else we have not yet observed a window's worth of the metric.
+    if (now - samples[0][0]).total_seconds() < COMPUTE_JOB_NO_PROGRESS_WINDOW_SECONDS:
+        return False
+    window_start = now - timedelta(seconds=COMPUTE_JOB_NO_PROGRESS_WINDOW_SECONDS)
+    window = [(t, v) for (t, v) in samples if t >= window_start]
+    if len(window) < COMPUTE_JOB_NO_PROGRESS_MIN_SAMPLES:
+        return False
+    values = [v for (_, v) in window]
+    spread = max(values) - min(values)
+    reference = max((abs(v) for v in values), default=0.0)
+    tolerance = COMPUTE_JOB_NO_PROGRESS_EPSILON * (reference if reference > 0 else 1.0)
+    return spread <= tolerance
+
+
 def _provisioning_timeout_seconds(job: ComputeJob, *, now: datetime) -> float | None:
     # Use the short provisioning sub-deadline stored at job creation. Fall back
     # to wall_clock_deadline for legacy rows that predate the sub-deadline field.
@@ -931,6 +1247,90 @@ def _status_is_runtime_timeout(status: ComputeStatusResult) -> bool:
     if message in {"runtime_ttl", "runtime_timeout", "command_runtime_timeout"}:
         return True
     return status.exit_code == 124
+
+
+# Fatal "no usable GPU" diagnostics printed by container entrypoints (notably
+# the NGC / ``nvcr.io/nvidia/pytorch`` images) when the host GPU predates the
+# image's minimum CUDA compute capability — e.g. a Tesla V100 (Volta, CC 7.0)
+# under a container built for Turing+. The entrypoint prints the error and can
+# still exit 0, so the backend reports SUCCEEDED even though the command never
+# had a usable GPU and produced no metric. Matching these markers lets the
+# poller reclassify the run as a FAILURE so a GPU/image mismatch is diagnosed
+# loudly instead of masquerading as a clean, metric-less success.
+_NO_USABLE_GPU_LOG_MARKERS: tuple[str, ...] = (
+    "no supported gpu(s) detected to run this container",
+    "gpu, which is not supported by this container",
+)
+_NO_USABLE_GPU_TERMINAL_REASON = (
+    "container reported no usable GPU — host GPU/image compatibility mismatch"
+)
+
+# Seeded into polling_metadata["status_message"] at job-creation time (see the
+# launch metadata builder). It is a launch-time placeholder, NOT a terminal
+# diagnostic — a terminal reason must never fall back to it, or completed and
+# failed runs alike get recorded with this misleading "still queued" string.
+_LAUNCH_PLACEHOLDER_STATUS_MESSAGE = "queued for compute-job launch"
+
+
+def _honest_terminal_default_reason(outcome: "ComputeJobOutcome | None") -> str:
+    """An honest per-outcome terminal reason for when the backend is silent.
+
+    Used when a job reaches a terminal state but the backend poll returns an
+    empty status message, so the terminal_reason still reflects how the run
+    actually ended instead of a generic/stale placeholder.
+    """
+    if outcome == ComputeJobOutcome.SUCCESS:
+        return "compute job succeeded"
+    if outcome == ComputeJobOutcome.TIMED_OUT:
+        return "compute job timed out"
+    if outcome == ComputeJobOutcome.SPEND_CAP_EXCEEDED:
+        return "compute job terminated at spend cap"
+    if outcome == ComputeJobOutcome.CANCELLED:
+        return "compute job cancelled"
+    if outcome in (ComputeJobOutcome.FAILURE, ComputeJobOutcome.SMOKE_FAILED):
+        return "compute job reported failure"
+    return "compute job finished"
+
+
+def _resolve_terminal_reason(
+    *,
+    status_message: str | None,
+    outcome: "ComputeJobOutcome | None",
+) -> str:
+    """Resolve an honest terminal reason for a job reaching a terminal state.
+
+    Precedence: the terminal poll's own status message, then an honest
+    per-outcome default. It deliberately does NOT fall back to the persisted
+    ``polling_metadata["status_message"]``: that field only ever holds a
+    launch/intermediate value — the launch-time placeholder
+    ("queued for compute-job launch"), the launch result message, or a
+    provisioning-retry message — none of which is a terminal reason. Inheriting
+    it (as the previous ``_meta_message`` fallback did) recorded completed and
+    failed runs alike with a misleading "still queued"/"launched" diagnostic
+    that then propagated verbatim into the durable knowledge/evidence record.
+    """
+    if status_message:
+        return status_message
+    return _honest_terminal_default_reason(outcome)
+
+
+def _status_reports_no_usable_gpu(status: ComputeStatusResult) -> bool:
+    """True when the command log carries a fatal no-usable-GPU diagnostic.
+
+    Some container entrypoints print a fatal "No supported GPU(s) detected" /
+    "GPU, which is not supported by this container" message when the host GPU is
+    too old for the image's CUDA build, yet may still exit 0 — in which case the
+    backend reports SUCCEEDED. Detecting the marker lets the poller reclassify
+    the run as a FAILURE instead of a silent, metric-less success.
+    """
+    command_log = status.command_log
+    if not isinstance(command_log, dict):
+        return False
+    text = command_log.get("text")
+    if not isinstance(text, str) or not text:
+        return False
+    lowered = text.lower()
+    return any(marker in lowered for marker in _NO_USABLE_GPU_LOG_MARKERS)
 
 
 async def get_compute_job_for_task(
@@ -1102,7 +1502,9 @@ async def _apply_operator_kill_result(
         now=now,
         terminate_ok=terminate_ok,
     )
+    _record_terminal_reason_history(session, live)
     await _link_terminal_artifact(session, live)
+    await persist_viewable_files_for_job(session, live)
     if live.task_id is not None:
         from app.task_lifecycle import fire_task_wakes
 
@@ -1124,6 +1526,7 @@ async def list_compute_jobs(
     limit: int = 50,
     offset: int = 0,
     all_terminal: bool = False,
+    task_id: uuid.UUID | None = None,
 ) -> tuple[list[ComputeJob], bool]:
     """Return a project's active compute jobs plus recently-finished ones.
 
@@ -1131,7 +1534,24 @@ async def list_compute_jobs(
     jobs are included regardless of age (``include_finished_within`` is ignored
     for the terminal filter). Otherwise only terminal jobs completed within
     ``include_finished_within`` are returned. Ordered newest-first.
+
+    When ``task_id`` is provided, only jobs linked to that task are returned
+    (skips the active/terminal window filter — returns all jobs for that task).
     """
+    if task_id is not None:
+        result = await session.execute(
+            select(ComputeJob)
+            .where(
+                ComputeJob.project_id == project_id,
+                ComputeJob.task_id == task_id,
+            )
+            .order_by(ComputeJob.created_at.desc(), ComputeJob.id.desc())
+            .offset(offset)
+            .limit(limit + 1)
+        )
+        jobs = list(result.scalars().all())
+        has_more = len(jobs) > limit
+        return jobs[:limit], has_more
     if all_terminal:
         terminal_filter = ComputeJob.completed_at.is_not(None)
     else:
@@ -1139,15 +1559,16 @@ async def list_compute_jobs(
         terminal_filter = ComputeJob.completed_at.is_not(None) & (
             ComputeJob.completed_at >= cutoff
         )
+    where_clauses = [
+        ComputeJob.project_id == project_id,
+        (
+            ComputeJob.status.in_(_COMPUTE_JOB_ACTIVE_STATUSES)
+            | terminal_filter
+        ),
+    ]
     result = await session.execute(
         select(ComputeJob)
-        .where(
-            ComputeJob.project_id == project_id,
-            (
-                ComputeJob.status.in_(_COMPUTE_JOB_ACTIVE_STATUSES)
-                | terminal_filter
-            ),
-        )
+        .where(*where_clauses)
         .order_by(ComputeJob.created_at.desc(), ComputeJob.id.desc())
         .offset(offset)
         .limit(limit + 1)
@@ -1241,24 +1662,107 @@ async def active_compute_job_vm_ids(session) -> set[str]:
     return {vid for vid in result.scalars().all() if vid}
 
 
-async def process_compute_jobs_once(session_factory=AsyncSessionLocal) -> None:
-    async with session_factory() as session:
-        result = await session.execute(
-            select(ComputeJob)
-            .where(ComputeJob.status.in_(_COMPUTE_JOB_ACTIVE_STATUSES))
-            .order_by(ComputeJob.created_at)
-        )
-        jobs = result.scalars().all()
+async def referenced_compute_image_digests(
+    session, *, since: datetime | None = None
+) -> set[str]:
+    """``sha256:...`` digests of compute images a live/recent job still depends on.
 
-    for job in jobs:
-        try:
-            await _process_single_compute_job(job, session_factory=session_factory)
-        except Exception as exc:  # noqa: PERF203
-            logger.exception(
-                "[COMPUTE_JOB] monitor failed for job=%s: %s",
-                job.id,
-                exc,
+    A baked compute-image digest must NOT be garbage-collected out of the
+    registry while something still references it. A digest is "referenced" when
+    it is the ``container_image`` of either:
+
+      * a non-terminal compute job (``_COMPUTE_JOB_ACTIVE_STATUSES``) — a running
+        or queued experiment that will still need to pull the image, OR
+      * a terminal compute job whose ``completed_at >= since`` — a recent result
+        whose provenance/reproducibility depends on the image staying pullable.
+        When ``since`` is ``None`` only live jobs are considered.
+
+    The image reference is stored in ``polling_metadata['container_image']`` as a
+    digest-pinned ``registry/repo@sha256:<hex>`` (contributes its digest) or a
+    tag-only ``registry/repo:tag`` (no stable digest — ignored). Returns the
+    deduplicated set of ``sha256:...`` digests; an absent/tag-only/malformed
+    reference contributes nothing.
+    """
+    conditions = [ComputeJob.status.in_(_COMPUTE_JOB_ACTIVE_STATUSES)]
+    if since is not None:
+        conditions.append(
+            and_(
+                ComputeJob.status.in_(list(_COMPUTE_JOB_TERMINAL_STATUSES)),
+                ComputeJob.completed_at.is_not(None),
+                ComputeJob.completed_at >= since,
             )
+        )
+    result = await session.execute(
+        select(ComputeJob.polling_metadata).where(or_(*conditions))
+    )
+    digests: set[str] = set()
+    for meta in result.scalars().all():
+        if not isinstance(meta, dict):
+            continue
+        ref = meta.get("container_image")
+        if not isinstance(ref, str):
+            continue
+        digest = _parse_digest_from_pinned_ref(ref)
+        if digest:
+            digests.add(digest)
+    return digests
+
+
+_COMPUTE_JOB_BATCH_SIZE = 50
+
+
+async def process_compute_jobs_once(session_factory=AsyncSessionLocal) -> None:
+    last_created_at = None
+    last_id = None
+
+    while True:
+        async with session_factory() as session:
+            stmt = (
+                select(ComputeJob)
+                .where(ComputeJob.status.in_(_COMPUTE_JOB_ACTIVE_STATUSES))
+                .order_by(ComputeJob.created_at, ComputeJob.id)
+                .limit(_COMPUTE_JOB_BATCH_SIZE)
+            )
+            if last_created_at is not None:
+                stmt = stmt.where(
+                    or_(
+                        ComputeJob.created_at > last_created_at,
+                        and_(
+                            ComputeJob.created_at == last_created_at,
+                            ComputeJob.id > last_id,
+                        ),
+                    )
+                )
+            result = await session.execute(stmt)
+            jobs = result.scalars().all()
+
+        # NOTE: the job rows above are a SNAPSHOT taken at tick start. Processing
+        # a full batch takes as long as up-to-50 backend RPCs, so by the time a
+        # late job in the batch is reached its row (and its task's row) may be
+        # minutes old. Nothing here may act on that snapshot: the authoritative
+        # rows are re-read per job in _process_single_compute_job, which is where
+        # the (irreversible) task-terminal VM kill is decided. Deliberately NOT
+        # batch-prefetching the tasks: a prefetched task snapshot would be exactly
+        # the stale input the kill must never be decided on.
+
+        if not jobs:
+            break
+
+        for job in jobs:
+            try:
+                await _process_single_compute_job(job, session_factory=session_factory)
+            except Exception as exc:  # noqa: PERF203
+                logger.exception(
+                    "[COMPUTE_JOB] monitor failed for job=%s: %s",
+                    job.id,
+                    exc,
+                )
+
+        if len(jobs) < _COMPUTE_JOB_BATCH_SIZE:
+            break
+
+        last_created_at = jobs[-1].created_at
+        last_id = jobs[-1].id
 
 
 async def compute_job_monitor_service(session_factory=AsyncSessionLocal) -> None:
@@ -1390,6 +1894,7 @@ async def _run_and_apply_preflight_smoke(
             terminal_reason=reason,
             now=now,
         )
+        _record_terminal_reason_history(session, live)
         await _link_terminal_artifact(session, live)
         if live.task_id is not None:
             from app.task_lifecycle import fire_task_wakes  # noqa: PLC0415
@@ -1407,6 +1912,72 @@ async def _run_and_apply_preflight_smoke(
     )
 
 
+async def _maybe_retry_provisioning_timeout(
+    session_factory,
+    job_id: uuid.UUID,
+) -> bool:
+    """Check if a provisioning-timeout job should be retried with backoff.
+
+    A job that TIMED_OUT during provisioning (deadline expired or launch LRO
+    timed out) can be retried up to ``MAX_PROVISIONING_RETRY_COUNT`` times
+    before going terminal, so transient GCP infrastructure issues (zone quota
+    exhaustion, image family blips, transient 503s) are recovered without
+    operator intervention.
+
+    Returns True when the job's provisioning deadline has been extended for
+    retry (the caller should return without marking the job terminal). Returns
+    False when retry budget is exhausted (caller should proceed with the
+    terminal transition).
+
+    The retry count is stored in ``polling_metadata['provisioning_retry_count']``;
+    the provisioning deadline is reset to ``<time of THIS retry> + backoff`` so
+    the next monitor tick attempts a fresh launch.
+
+    The retry clock starts NOW, never at the caller's tick-start ``now``. The
+    caller reaches this function only AFTER a slow leg it just waited out — a
+    launch LRO that ran to the full provisioning timeout (minutes), or a
+    ``backend.terminate`` RPC. Deriving the new deadline from the tick-start
+    timestamp made every retry deadline that much shorter than the backoff
+    (routinely already in the PAST when it was written): retry 1 was dead on
+    arrival, and the very next tick re-timed-it-out without ever attempting a
+    fresh launch, burning the whole retry budget in seconds.
+    """
+    async with session_factory() as session:
+        live = await _lock_compute_job(session, job_id)
+        if live is None or live.status in _COMPUTE_JOB_TERMINAL_STATUSES:
+            return True  # Already terminal — concurrent race, no-op.
+        meta = dict(live.polling_metadata or {})
+        retry_count = int(meta.get("provisioning_retry_count", 0))
+        if retry_count >= MAX_PROVISIONING_RETRY_COUNT:
+            return False  # Budget exhausted — let the caller go terminal.
+        retry_count += 1
+        backoff = exponential_backoff(
+            retry_count,
+            base=PROVISIONING_RETRY_BACKOFF_BASE_SECONDS,
+            cap=600.0,
+        )
+        # Real time AT RETRY — not the (already stale) tick-start timestamp.
+        retry_at = _utcnow()
+        new_deadline = retry_at + timedelta(seconds=backoff)
+        meta["provisioning_retry_count"] = retry_count
+        meta["provisioning_deadline_at"] = new_deadline.isoformat()
+        meta["status_message"] = (
+            f"provisioning timed out (retry {retry_count}/{MAX_PROVISIONING_RETRY_COUNT})"
+        )
+        live.polling_metadata = meta
+        live.updated_at = retry_at
+        session.add(live)
+        await session.commit()
+    logger.info(
+        "[COMPUTE_JOB] provisioning retry %d/%d for job=%s (backoff=%.0fs)",
+        retry_count,
+        MAX_PROVISIONING_RETRY_COUNT,
+        job_id,
+        backoff,
+    )
+    return True
+
+
 async def _process_single_compute_job(
     job: ComputeJob, *, session_factory=AsyncSessionLocal
 ) -> None:
@@ -1414,8 +1985,27 @@ async def _process_single_compute_job(
     backend = get_compute_backend(job.backend)
 
     task = None
-    if job.task_id:
+    if job.task_id is not None:
+        # AUTHORITATIVE RE-READ before the (irreversible) task-terminal VM kill.
+        #
+        # ``job`` is a row from the monitor's batch snapshot: the tick selects up
+        # to _COMPUTE_JOB_BATCH_SIZE jobs, then processes them one by one, each
+        # doing backend RPCs. A job late in the batch is therefore decided on data
+        # that can be many minutes old. Two ways that goes wrong, both fixed by
+        # reading the rows again HERE, at the moment of decision:
+        #   * the task was terminal at snapshot time but has since been restored
+        #     (an operator PATCHes a falsely-FAILED task back to QUEUED) — the
+        #     stale snapshot would KILL the VM of a task that is alive again;
+        #   * the task went terminal DURING the tick — the stale snapshot would
+        #     MISS the kill and keep billing the VM until the next tick.
+        # The job row is re-read in the same round trip: a peer (operator kill,
+        # another leader) may already have driven it terminal, in which case there
+        # is nothing left for this tick to do.
         async with session_factory() as session:
+            live = await session.get(ComputeJob, job.id)
+            if live is None or live.status in _COMPUTE_JOB_TERMINAL_STATUSES:
+                return
+            job = live
             task = await session.get(Task, job.task_id)
 
     if job.task_id is not None and (
@@ -1503,6 +2093,8 @@ async def _process_single_compute_job(
                     next_retry_at=None,
                     reason="provisioning",
                 )
+            if await _maybe_retry_provisioning_timeout(session_factory, job.id):
+                return
             await _apply_polled_compute_job_result(
                 session_factory,
                 job.id,
@@ -1531,7 +2123,7 @@ async def _process_single_compute_job(
         started_at = _utcnow()
         try:
             spec = await _attach_repo_clone(
-                session_factory, reserved, _build_launch_spec(reserved)
+                session_factory, reserved, _build_launch_spec(reserved), task=task
             )
             launch_coro = backend.launch(spec)
             if provisioning_timeout_seconds is not None:
@@ -1594,6 +2186,8 @@ async def _process_single_compute_job(
                     next_retry_at=None,
                     reason="provisioning",
                 )
+            if await _maybe_retry_provisioning_timeout(session_factory, job.id):
+                return
             await _apply_polled_compute_job_result(
                 session_factory,
                 job.id,
@@ -1616,6 +2210,69 @@ async def _process_single_compute_job(
                     failed_at=failed_at,
                     next_retry_at=None,
                     reason="provisioning_timeout",
+                ),
+            )
+            return
+        except ComputeLaunchSpecError as exc:
+            # A deterministic spec defect (e.g. an env key that is not a shell
+            # identifier). The generic handler below is retry-shaped: it records a
+            # diagnostic and re-polls, so this same exception is re-raised every
+            # monitor tick until provisioning_deadline_at, and the job finally
+            # finalizes TIMED_OUT with "compute job timed out while provisioning" —
+            # a terminal reason that never names the offending field. Retrying an
+            # unretryable spec buys nothing, so terminalize now and put the
+            # exception message (which names the bad key) in terminal_reason, where
+            # the operator actually reads it.
+            #
+            # On today's code the raise happens before provision_ephemeral_vm (the
+            # startup script is rendered as an ARGUMENT to it), so no billable
+            # resource exists and cost is zero. The terminate call below is NOT
+            # conditional on that holding: _reserve_compute_job_launch always
+            # assigns external_compute_id before launch, so `terminated` is always
+            # a real backend.terminate() — a belt-and-braces reap that costs one
+            # 404-ing lookup on this rare path and is the only thing that keeps a
+            # future post-provision raise from LEAKING a billed GPU VM. Deliberately
+            # kept unconditional for that reason; see
+            # test_process_compute_jobs_once_reaps_vm_when_launch_rejects_post_provision.
+            failed_at = _utcnow()
+            logger.warning(
+                "[COMPUTE_JOB] launch rejected for job=%s (unretryable launch spec): %s",
+                job.id,
+                exc,
+            )
+            terminated = True
+            if reserved.external_compute_id:
+                try:
+                    terminated = await backend.terminate(
+                        reserved, reason="launch_spec_rejected"
+                    )
+                except Exception:
+                    logger.exception(
+                        "[COMPUTE_JOB] terminate failed for rejected-spec job=%s",
+                        job.id,
+                    )
+                    terminated = False
+            await _apply_polled_compute_job_result(
+                session_factory,
+                job.id,
+                now=now,
+                poll_attempt_count=(job.poll_attempt_count or 0) + 1,
+                next_poll_at=now
+                + timedelta(seconds=COMPUTE_JOB_MONITOR_INTERVAL_SECONDS),
+                status=ComputeStatusResult(status=ComputeJobStatus.FAILED),
+                accrued_cost_usd=float(job.accrued_cost_usd or 0.0),
+                terminal_status=ComputeJobStatus.FAILED,
+                outcome=ComputeJobOutcome.FAILURE,
+                terminal_reason=str(exc),
+                terminate_ok=terminated,
+                compute_rpc_diagnostic=_build_compute_rpc_diagnostic(
+                    job,
+                    operation="launch",
+                    exc=exc,
+                    started_at=started_at,
+                    failed_at=failed_at,
+                    next_retry_at=None,
+                    reason="launch_spec_rejected",
                 ),
             )
             return
@@ -1769,15 +2426,23 @@ async def _process_single_compute_job(
             return
         accrued_cost_usd = max(float(job.accrued_cost_usd or 0.0), cost.total_cost_usd)
         timeout_like = _status_is_runtime_timeout(status)
-        outcome = (
-            ComputeJobOutcome.TIMED_OUT
-            if timeout_like
-            else (
-                ComputeJobOutcome.SUCCESS
-                if status.status == ComputeJobStatus.SUCCEEDED
-                else ComputeJobOutcome.FAILURE
-            )
+        # A backend-reported SUCCEEDED that nonetheless emitted a fatal
+        # no-usable-GPU diagnostic is not a real success — the container never
+        # had a supported GPU and could not produce its metric. Reclassify it as
+        # a FAILURE so the GPU/image mismatch surfaces loudly.
+        no_usable_gpu = (
+            not timeout_like
+            and status.status == ComputeJobStatus.SUCCEEDED
+            and _status_reports_no_usable_gpu(status)
         )
+        if timeout_like:
+            outcome = ComputeJobOutcome.TIMED_OUT
+        elif no_usable_gpu:
+            outcome = ComputeJobOutcome.FAILURE
+        elif status.status == ComputeJobStatus.SUCCEEDED:
+            outcome = ComputeJobOutcome.SUCCESS
+        else:
+            outcome = ComputeJobOutcome.FAILURE
         await _apply_polled_compute_job_result(
             session_factory,
             job.id,
@@ -1793,7 +2458,13 @@ async def _process_single_compute_job(
             terminal_reason=(
                 "compute job exceeded runtime deadline"
                 if timeout_like
-                else status.message or _meta_message(job) or "compute job finished"
+                else (
+                    _NO_USABLE_GPU_TERMINAL_REASON
+                    if no_usable_gpu
+                    else _resolve_terminal_reason(
+                        status_message=status.message, outcome=outcome
+                    )
+                )
             ),
             exit_code=status.exit_code,
         )
@@ -1906,6 +2577,55 @@ async def _process_single_compute_job(
             terminal_status=ComputeJobStatus.FAILED,
             outcome=ComputeJobOutcome.SPEND_CAP_EXCEEDED,
             terminal_reason="compute job terminated at spend cap",
+            terminate_ok=terminated,
+            compute_rpc_diagnostic=terminate_diagnostic,
+        )
+        return
+
+    # No-progress watchdog: cut a still-running job whose declared metric has
+    # plateaued so a multi-day run cannot burn its whole deadline learning
+    # nothing. Runs AFTER the deadline/budget hard limits so those always win.
+    if _no_progress_stalled(job, now=now):
+        watched_metric = _declared_progress_metric(job)
+        started_at = _utcnow()
+        terminate_diagnostic = None
+        try:
+            terminated = await backend.terminate(job, reason="no_progress")
+        except Exception as exc:
+            failed_at = _utcnow()
+            logger.exception(
+                "[COMPUTE_JOB] no-progress terminate failed for job=%s: %s",
+                job.id,
+                exc,
+            )
+            terminated = False
+            terminate_diagnostic = _build_compute_rpc_diagnostic(
+                job,
+                operation="terminate",
+                exc=exc,
+                started_at=started_at,
+                failed_at=failed_at,
+                next_retry_at=None,
+                reason="no_progress",
+            )
+        salvaged = await _salvage_poll_status(backend, job)
+        await _apply_polled_compute_job_result(
+            session_factory,
+            job.id,
+            now=now,
+            poll_attempt_count=poll_attempt_count,
+            next_poll_at=next_poll_at,
+            status=_merge_salvaged_status(status, salvaged),
+            accrued_cost_usd=accrued_cost_usd,
+            terminal_status=ComputeJobStatus.TIMED_OUT,
+            outcome=ComputeJobOutcome.TIMED_OUT,
+            terminal_reason=(
+                "compute job made no measurable progress on declared metric "
+                f"{watched_metric!r} over "
+                f"{int(COMPUTE_JOB_NO_PROGRESS_WINDOW_SECONDS)}s — "
+                "cut early to reclaim compute"
+            ),
+            terminal_kind=NO_PROGRESS_TERMINAL_REASON,
             terminate_ok=terminated,
             compute_rpc_diagnostic=terminate_diagnostic,
         )
@@ -2040,6 +2760,7 @@ async def _apply_polled_compute_job_result(
     terminal_reason: str | None = None,
     exit_code: int | None = None,
     terminate_ok: bool = True,
+    terminal_kind: str | None = None,
     compute_rpc_diagnostic: dict[str, Any] | None = None,
 ) -> bool:
     async with session_factory() as session:
@@ -2071,10 +2792,13 @@ async def _apply_polled_compute_job_result(
                 now=now,
                 exit_code=exit_code,
                 terminate_ok=terminate_ok,
+                terminal_kind=terminal_kind,
             )
+            _record_terminal_reason_history(session, live)
             if compute_rpc_diagnostic is not None:
                 _set_meta(live, compute_rpc_diagnostic=compute_rpc_diagnostic)
             await _link_terminal_artifact(session, live)
+            await persist_viewable_files_for_job(session, live)
             if live.task_id is not None:
                 from app.task_lifecycle import fire_task_wakes
 
@@ -2105,6 +2829,10 @@ async def _apply_task_terminal_cancellation(
         live = await _lock_compute_job(session, job_id)
         if live is None or live.status in _COMPUTE_JOB_TERMINAL_STATUSES:
             return False
+        # Deliberately a FRESH read under the job lock — the caller's task
+        # snapshot can be minutes stale by the end of a batch, and a task
+        # revived in that window (e.g. FAILED→QUEUED restore) must not get
+        # its running job cancelled on stale terminal status.
         live_task = await session.get(Task, live.task_id) if live.task_id else None
         if live.task_id is not None and (
             live_task is None or live_task.status not in _TASK_TERMINAL_STATUSES
@@ -2118,11 +2846,13 @@ async def _apply_task_terminal_cancellation(
             now=now,
             terminate_ok=terminate_ok,
         )
+        _record_terminal_reason_history(session, live)
         if compute_rpc_diagnostic is not None:
             _set_meta(live, compute_rpc_diagnostic=compute_rpc_diagnostic)
         else:
             _clear_compute_rpc_diagnostic(live)
         await _link_terminal_artifact(session, live)
+        await persist_viewable_files_for_job(session, live)
         if live.task_id is not None:
             from app.task_lifecycle import fire_task_wakes
 
@@ -2133,6 +2863,16 @@ async def _apply_task_terminal_cancellation(
             )
         await session.commit()
         return True
+
+
+def _coerce_uuid(value: Any) -> uuid.UUID | None:
+    """Best-effort parse of a persisted UUID string; None on any malformed value."""
+    if isinstance(value, uuid.UUID):
+        return value
+    try:
+        return uuid.UUID(str(value))
+    except (ValueError, AttributeError, TypeError):
+        return None
 
 
 def _build_launch_spec(job: ComputeJob) -> ComputeLaunchSpec:
@@ -2179,11 +2919,17 @@ def _build_launch_spec(job: ComputeJob) -> ComputeLaunchSpec:
         setup_step=meta.get("setup_step") or None,
         container_image=meta.get("container_image") or None,
         container_registry_auth=container_registry_auth,
+        no_progress_timeout_seconds=(
+            int(meta.get("no_progress_timeout_seconds"))
+            if meta.get("no_progress_timeout_seconds") is not None
+            else None
+        ),
+        input_artifact_job_id=meta.get("input_artifact_job_id") or None,
     )
 
 
 async def _attach_repo_clone(
-    session_factory, job: ComputeJob, spec: ComputeLaunchSpec
+    session_factory, job: ComputeJob, spec: ComputeLaunchSpec, *, task: Task | None = None
 ) -> ComputeLaunchSpec:
     """Best-effort: give the compute VM a checked-out clone of the project repo.
 
@@ -2212,14 +2958,16 @@ async def _attach_repo_clone(
                 return spec
             ref: str | None = None
             if job.task_id:
-                task = await session.get(Task, job.task_id)
-                if task is not None:
+                _task = task
+                if _task is None:
+                    _task = await session.get(Task, job.task_id)
+                if _task is not None:
                     payload = (
-                        task.first_payload
-                        if isinstance(task.first_payload, dict)
+                        _task.first_payload
+                        if isinstance(_task.first_payload, dict)
                         else {}
                     )
-                    ctx = task.context if isinstance(task.context, dict) else {}
+                    ctx = _task.context if isinstance(_task.context, dict) else {}
                     ref = payload.get("base_branch") or ctx.get("original_base")
             ref = ref or getattr(project, "promotion_target", None) or "main"
             # Reuses the shared, cached install-token path (50-min TTL) so launches
@@ -2499,6 +3247,7 @@ def _finalize_terminal_job(
     now,
     exit_code: int | None = None,
     terminate_ok: bool = True,
+    terminal_kind: str | None = None,
 ) -> None:
     job.status = status
     job.outcome = outcome
@@ -2507,7 +3256,8 @@ def _finalize_terminal_job(
     job.terminal_reason = terminal_reason
     job.final_cost_usd = job.accrued_cost_usd
     job.updated_at = now
-    extra: dict[str, Any] = {"terminal_status": status.value}
+    resolved_kind = terminal_kind or _OUTCOME_TO_TERMINAL_KIND.get(outcome, "failure")
+    extra: dict[str, Any] = {"terminal_status": status.value, "terminal_kind": resolved_kind}
     if exit_code is not None:
         extra["exit_code"] = exit_code
     if not terminate_ok:
@@ -2523,6 +3273,43 @@ def _finalize_terminal_job(
         auth.pop("password", None)
         meta["container_registry_auth"] = auth
         job.polling_metadata = meta
+
+
+def _record_terminal_reason_history(session, job: ComputeJob) -> None:
+    """Append a durable TaskHistory row carrying WHY the compute job ended.
+
+    ``terminal_reason`` otherwise lives only in mutable channels
+    (``latest_status_message`` / ``polling_metadata.status_message``) that the
+    next reap or status update overwrites. Every non-success terminal (deadline
+    kill, spend cap, provisioning timeout, runner-reported failure,
+    cancellation) gets a history row so operators and follow-on agents can
+    always recover the reason, not just the FAILED state. SUCCESS is skipped —
+    this is the failure-reason channel, not a completion log.
+
+    Add-only (``session.add``); the caller owns the commit alongside the
+    terminal transition itself.
+    """
+    if job.task_id is None:
+        return
+    outcome = getattr(job.outcome, "value", job.outcome)
+    if outcome == ComputeJobOutcome.SUCCESS.value:
+        return
+    details: dict[str, Any] = {
+        "compute_job_id": str(job.id),
+        "status": getattr(job.status, "value", job.status),
+        "outcome": outcome,
+        "terminal_reason": job.terminal_reason,
+    }
+    exit_code = (job.polling_metadata or {}).get("exit_code")
+    if exit_code is not None:
+        details["exit_code"] = exit_code
+    session.add(
+        TaskHistory(
+            task_id=job.task_id,
+            action="COMPUTE_TERMINATED",
+            details=details,
+        )
+    )
 
 
 def _is_durable_artifact_uri(reference: str) -> bool:
@@ -2606,7 +3393,30 @@ def _stdout_metrics_fallback(meta: dict) -> dict | None:
     if not isinstance(obj, dict):
         return None
     numeric = {k: v for k, v in obj.items() if _coerce_metric_number(v) is not None}
-    return numeric or None
+    if not numeric:
+        return None
+    # Recover repeated-metric series. An A/B experiment authored as a single
+    # command that prints the SAME metric key once per arm (e.g. fp32 then fp16
+    # both emitting {"median_matmul_ms": ...}) collapses under last-object-wins
+    # above: only the final arm's value survives, so the comparison that IS the
+    # proof becomes unrecoverable from structured data. For any recovered metric
+    # emitted more than once with differing values, attach the full ordered
+    # series under ``<metric>__series`` so both arms stay readable. The canonical
+    # ``<metric>`` value is left untouched (still the last emission), keeping
+    # last-object-wins backward compatible for single-value experiments.
+    series: dict[str, list[float | int]] = {}
+    all_objs = scan_all_balanced_json_objects(text)
+    for key in numeric:
+        values = [
+            num
+            for o in all_objs
+            if isinstance(o, dict)
+            for num in (_coerce_metric_number(o.get(key)),)
+            if num is not None
+        ]
+        if len(values) >= 2 and len(set(values)) >= 2:
+            series[f"{key}__series"] = values
+    return {**numeric, **series}
 
 
 def build_compute_result_logs(job: ComputeJob) -> str:
@@ -2688,6 +3498,25 @@ def build_compute_result_logs(job: ComputeJob) -> str:
             num = _coerce_metric_number(value)
             if num is not None:
                 result[name] = num
+            elif (
+                name.endswith("__series")
+                and isinstance(value, list)
+                and not isinstance(value, (str, bytes))
+            ):
+                # Ordered per-emission series for a metric a single-command A/B
+                # experiment printed once per arm (see _stdout_metrics_fallback).
+                # The numeric loop drops non-scalar values, so preserve the list
+                # explicitly — like the arms block below — keeping the full
+                # comparison structurally recoverable rather than reducing the
+                # proof to its final arm.
+                coerced = [
+                    num
+                    for v in value
+                    for num in (_coerce_metric_number(v),)
+                    if num is not None
+                ]
+                if len(coerced) >= 2:
+                    result[name] = coerced
         # Preserve the arms block intact so the success-criterion evaluator can
         # read per-arm metrics using best-arm semantics. The numeric loop above
         # drops non-numeric values; the arms block (a nested dict) must survive
@@ -2745,6 +3574,18 @@ def build_compute_result_logs(job: ComputeJob) -> str:
     return json.dumps(result)
 
 
+async def build_compute_result_logs_async(job: ComputeJob) -> str:
+    """Async wrapper around :func:`build_compute_result_logs`.
+
+    Offloads ``json.dumps`` to a thread-pool worker so the event loop
+    is not blocked when serializing large result payloads.  Production
+    callers that already run in an async context should use this;
+    synchronous callers (notably tests) can call
+    :func:`build_compute_result_logs` directly.
+    """
+    return await asyncio.to_thread(build_compute_result_logs, job)
+
+
 async def _link_terminal_artifact(session, job: ComputeJob) -> None:
     """Turn a terminal job's durable artifact location into a first-class result.
 
@@ -2775,6 +3616,19 @@ async def _link_terminal_artifact(session, job: ComputeJob) -> None:
         durable_file_count=reference.file_count,
         durable_payload_bytes=reference.total_size_bytes,
     )
+    # Best-effort: persist common viewable files (images/videos) as individually-
+    # addressable objects + a recorded manifest so an operator can preview them
+    # inline without untarring the bundle. Runs the SINGLE viewable pipeline
+    # (download once, sanitize once, upload once, one cap policy) and records it on
+    # both persisted surfaces — the manifest and the ComputeJobFile rows. Idempotent:
+    # when the caller already ran the pass for this job, the stamped manifest comes
+    # back with no second download/upload. Fail-soft — any error degrades to no
+    # manifest and NEVER blocks the job's terminal completion (mirrors the
+    # surrounding helpers). Stamped onto polling_metadata regardless of whether the
+    # Artifact INSERT below succeeds, so the manifest survives a linkage rollback.
+    viewable_files, viewable_files_dropped = await persist_viewable_files_for_job(
+        session, job
+    )
     task = await session.get(Task, job.task_id)
     try:
         async with session.begin_nested():
@@ -2786,6 +3640,10 @@ async def _link_terminal_artifact(session, job: ComputeJob) -> None:
                 "outcome": (job.outcome.value if job.outcome is not None else None),
                 "final_cost_usd": job.final_cost_usd,
             }
+            if viewable_files:
+                artifact_logs["viewable_files"] = viewable_files
+            if viewable_files_dropped:
+                artifact_logs["viewable_files_dropped"] = viewable_files_dropped
             command_log = (job.polling_metadata or {}).get("command_log")
             if command_log is not None:
                 if isinstance(command_log, dict) and isinstance(
@@ -2817,3 +3675,173 @@ async def _link_terminal_artifact(session, job: ComputeJob) -> None:
             job.id,
             exc_info=True,
         )
+
+
+# ---------------------------------------------------------------------------
+# Viewable-file persistence from durable artifact bundles — ONE pipeline
+# ---------------------------------------------------------------------------
+#
+# One download, one sanitizer, one cap policy, one upload.
+#
+# There used to be TWO overlapping viewable-artifact pipelines, BOTH running at
+# every terminal transition of a gcp/runner-subprocess job:
+#
+#   * ``persist_viewable_artifacts`` (app.compute_backends) — STREAMS the bundle to
+#     a temp file (never into the orchestrator's heap; a results bundle has no size
+#     bound), sanitizes member paths with ``storage.sanitize_viewable_relpath``
+#     (subdir context folded to ``__``), caps at 8 MiB/file and 25 files (applied to
+#     a deterministically SORTED candidate list, BEFORE any member bytes are read),
+#     uploads to the ``artifacts/viewable/`` prefix, and returns the
+#     ``viewable_files`` manifest.
+#   * a second extractor that lived HERE — downloaded the SAME bundle AGAIN,
+#     sanitized with a DIFFERENT sanitizer (kept ``/`` separators), capped at
+#     25 MB/file and 50 files (first-50 in arbitrary TAR ORDER), and uploaded every
+#     file a SECOND time to a DIFFERENT prefix (``artifacts/files/``).
+#
+# So the bundle was fetched twice and every viewable file was stored twice under
+# divergent rules — and because the caps and the sanitizers disagreed, the two
+# copies could disagree about WHICH files exist and under WHAT names: a 20 MB plot
+# was present under one prefix and absent from the other, and ``arm1/reward.png``
+# was ``arm1__reward.png`` in one and ``arm1/reward.png`` in the other.
+#
+# The ``artifacts/viewable/`` manifest is the CANONICAL surface. It is what the
+# admin UI renders (``viewable_artifacts``, normalized in
+# ``routers/admin_compute_jobs.py``), what the strategic context package reads, and
+# what the artifact download-URL endpoint signs. The ``artifacts/files/`` objects
+# were never handed to any client — nothing ever listed them — so they were
+# undiscoverable duplicates of the canonical ones.
+#
+# The canonical pipeline now runs ONCE and its single result is recorded on BOTH
+# persisted surfaces: the ``viewable_files`` manifest AND the ``ComputeJobFile``
+# rows (the DB-side signing allowlist read by the download-URL endpoint). The rows
+# now carry the SAME canonical ``viewable/`` URIs as the manifest, so the two
+# surfaces can no longer diverge.
+
+
+async def _record_viewable_job_files(
+    session, job: ComputeJob, manifest: list[dict[str, Any]]
+) -> int:
+    """Mirror a viewable manifest into ``ComputeJobFile`` rows (signing allowlist).
+
+    One row per durably-stored file, pointing at the SAME canonical ``viewable/``
+    URI the manifest already carries — no second upload, no second sanitizer, no
+    second cap policy. Each INSERT runs in its own SAVEPOINT so one constraint
+    violation (notably the UNIQUE ``storage_uri``, which is exactly what makes a
+    re-entry a benign no-op) or DB hiccup cannot lose the rows already written, and
+    can never roll back the job's terminal completion.
+
+    Best-effort by contract: returns the number of rows written, never raises.
+    """
+    if not manifest:
+        return 0
+    written = 0
+    for entry in manifest:
+        if not isinstance(entry, dict):
+            continue
+        storage_uri = entry.get("storage_uri")
+        filename = entry.get("filename")
+        content_type = entry.get("content_type")
+        size_bytes = entry.get("size_bytes")
+        if not isinstance(storage_uri, str) or not storage_uri:
+            continue
+        if not isinstance(filename, str) or not filename:
+            continue
+        # ``kind`` comes straight from the shared extension classifier
+        # ("image"/"video"); fall back to the MIME mapping only if it is absent.
+        media_type = entry.get("kind")
+        if not isinstance(media_type, str) or not media_type:
+            media_type = (
+                storage._media_kind_for_mime(content_type)
+                if isinstance(content_type, str)
+                else "unknown"
+            )
+        try:
+            async with session.begin_nested():
+                row = ComputeJobFile(
+                    compute_job_id=job.id,
+                    safe_relpath=filename,
+                    media_type=media_type,
+                    storage_uri=storage_uri,
+                    content_type=(
+                        content_type if isinstance(content_type, str) else None
+                    ),
+                    file_size_bytes=(
+                        size_bytes if isinstance(size_bytes, int) else None
+                    ),
+                )
+                session.add(row)
+                await session.flush()
+            written += 1
+        except Exception:  # noqa: BLE001
+            # A UNIQUE(storage_uri) hit on re-entry is the common, benign case.
+            logger.warning(
+                "[COMPUTE_JOB] ComputeJobFile insert failed for viewable file %r "
+                "in job=%s",
+                filename,
+                job.id,
+                exc_info=True,
+            )
+    return written
+
+
+async def persist_viewable_files_for_job(
+    session, job: ComputeJob
+) -> tuple[list[dict[str, Any]], int]:
+    """Persist a terminal job's viewable files — the SINGLE viewable pipeline.
+
+    Delegates selection and upload to :func:`persist_viewable_artifacts`, the
+    canonical backend-aware pass (ONE bundle download for gcp/runner-subprocess —
+    STREAMED to a temp file, never held in the orchestrator's heap — an on-disk walk
+    for local backends; ``storage.sanitize_viewable_relpath``; 8 MiB per-file and
+    25-file caps over a deterministically sorted candidate list), then records that
+    ONE result on both durable surfaces:
+
+    * ``polling_metadata['viewable_files']`` (plus ``viewable_files_dropped`` and
+      ``viewable_file_count``) — read by the admin UI (``viewable_artifacts``) and
+      the strategic context package, and used as the signing allowlist by the
+      artifact download-URL endpoint;
+    * ``ComputeJobFile`` rows — the DB-side signing allowlist for that same
+      endpoint, carrying the SAME canonical URIs.
+
+    IDEMPOTENT. ``viewable_file_count`` is stamped on every completed pass (even a
+    zero-file one), so a re-entry — the same terminal transition reaching both this
+    call site and :func:`_link_terminal_artifact` — returns the stamped manifest
+    WITHOUT re-downloading the bundle or re-uploading a byte. That guard is what
+    holds the bundle download to exactly one per job.
+
+    Fail-soft by contract: any extraction/upload/DB error degrades to no manifest
+    and NEVER raises — viewable persistence must never block terminal completion.
+    Returns ``(manifest, dropped)``.
+    """
+    meta = job.polling_metadata or {}
+    if "viewable_file_count" in meta:
+        # This job's viewable pass already ran — never re-download / re-upload.
+        stamped = meta.get("viewable_files")
+        dropped = meta.get("viewable_files_dropped")
+        return (
+            stamped if isinstance(stamped, list) else [],
+            dropped if isinstance(dropped, int) else 0,
+        )
+
+    try:
+        manifest, dropped = await persist_viewable_artifacts(job)
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[COMPUTE_JOB] viewable-artifact persistence failed for job=%s; "
+            "completing with no viewable manifest",
+            job.id,
+            exc_info=True,
+        )
+        manifest, dropped = [], 0
+
+    await _record_viewable_job_files(session, job, manifest)
+
+    # Stamped unconditionally (even at 0) — it doubles as the "pass completed"
+    # marker the idempotency guard above reads.
+    _set_meta(job, viewable_file_count=len(manifest))
+    if manifest:
+        _set_meta(job, viewable_files=manifest)
+    if dropped:
+        _set_meta(job, viewable_files_dropped=dropped)
+    session.add(job)
+    return manifest, dropped

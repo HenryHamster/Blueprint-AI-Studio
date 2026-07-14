@@ -259,9 +259,12 @@ export interface ThinkerPromptParams {
   /**
    * Live self-hosted local-runner availability note. Built from the strategic
    * payload's `local_runner_status` field ({ever_registered, active_total,
-   * active_gpu, require_local_runner}) so the strategist avoids authoring GPU
+   * active_gpu, require_local_runner}, plus an optional bounded `devices`
+   * hardware list — GPU models, per-GPU VRAM when advertised, container
+   * capability, current load) so the strategist avoids authoring GPU
    * compute_experiments while the operator's hardware is offline (they would
-   * hold then fail, or fall back to billable cloud GPU). Optional so existing
+   * hold then fail, or fall back to billable cloud GPU) and sizes experiments
+   * to the fleet's actual hardware. Optional so existing
    * constructions/tests that omit it still compile; '' renders nothing.
    */
   localRunnerSection?: string;
@@ -315,14 +318,14 @@ The append-only \`history\` / \`past_moves\` of these gaps were trimmed to only 
 
 When you reason about whether to keep pushing, refine, or retire any of these gaps, first run \`./fetch problem-model\` (or \`./fetch gap <gap_id>\`) to read its complete history and past_moves. Do not treat the shortened view as the gap's entire lifetime — a long-lived gap may have a much longer arc than the few events shown here.`
       : '';
-  return `${p.contextPrefix}You own this project's direction. Not as a task runner, not as a scheduler — as the mind responsible for where it goes.
+  return `You own this project's direction. Not as a task runner, not as a scheduler — as the mind responsible for where it goes.
 
 Each cycle you look at what's happening and decide whether it's still on the right track. If it is, keep going. If it isn't, change course. You're allowed to be wrong; you're not allowed to defer. The problem_model below is your working understanding of the project — nothing else has more authority. Update it, defend it, rewrite it when you see a better shape. The user hired you for judgment, not for audit trails or incremental polish.
 
 # Project: ${p.projectName}
 ${p.clockHeader}
 Self-repo: ${p.isSelfRepo ? 'true' : 'false'}
-${p.userStateLine}
+${p.contextPrefix}
 ${p.packerMetaSection ? `\n${p.packerMetaSection}\n` : ''}
 ${p.payloadStalenessSection ? `\n${p.payloadStalenessSection}\n` : ''}
 ${p.strategicContext ? `\n## Running Context (from prior cycles)\n${p.strategicContext}\n` : ''}
@@ -342,7 +345,7 @@ ${p.outcomeSection}${p.previousDecisionOutcomes}${p.pastRetirementCritiquesSecti
 ${p.directionPortfolioSection}
 ${p.stagedDirectionsSection ? `\n${p.stagedDirectionsSection}\n` : ''}${p.userPausedSection}${p.rejectedProposalsSection}${p.operatorOverridesSection}
 ${p.availableCapabilitiesSection ? `\n${p.availableCapabilitiesSection}` : ''}${p.modelHealthSection}${p.pruneCandidatesSection ? `\n${p.pruneCandidatesSection}\n` : ''}${p.systemMaturitySection}${p.driftSection}${p.heldDirectionsSection ? `\n${p.heldDirectionsSection}` : ''}${p.residentExamLeadsSection ? `\n${p.residentExamLeadsSection}` : ''}${p.efficiencySnapshotSection}${p.ciComplianceSection ? `\n${p.ciComplianceSection}` : ''}${p.completionDebtSection ? `\n${p.completionDebtSection}` : ''}${p.pendingFollowupsSection ? `\n${p.pendingFollowupsSection}` : ''}${p.sweepComparisonSection ? `\n${p.sweepComparisonSection}` : ''}${p.localRunnerSection ? `\n${p.localRunnerSection}\n` : ''}${p.compactionHintsSection ? `\n${p.compactionHintsSection}\n` : ''}
-${p.recentWorkSection}${p.questionSection}${p.feedbackSection}${p.threadSection}${p.versionPhaseSection}${p.memoCitationsSection}
+${p.recentWorkSection}${p.versionPhaseSection}${p.memoCitationsSection}
 # Your job
 
 You operate on a **problem model** — a structured representation of what the user wants (intent), what the project can do (capabilities), and what's between those (gaps). Directions are *moves* toward specific gaps. Friction is *obstacles* in the way.
@@ -429,8 +432,6 @@ For each existing gap: open, progressing, or closed? For each new gap you're ope
 ## 3. Moves
 Directions to retire (one-sentence reason each) and to create (name the gap_id each closes, a \`success_evidence\` string describing the observable outcome that proves the direction is done, a \`retirement_condition\` string describing the measurable trigger for retirement, and a \`dedup_reasoning\` object naming the 0–3 closest existing or retired directions you considered and a one-line justification why the new direction is distinct).
 
-**Criterion-coverage before retirement.** Before retiring a direction, verify it is not sole mapper for any criterion (\`criterion_keys\` or sole mapper = criterion-carrying — backend \`direction_owns_uncovered_criterion\` blocks orphaned criteria). If sole mapper: (a) retract via Section 8 (explain why permanently uncoverable), or (b) keep direction active. Do NOT retire criterion-carrying without addressing the criterion first.
-
 Parallel moves are fine and encouraged when non-clashing. When two directions are genuinely independent (no shared files, no logical dependency, no real conflict risk), create/dispatch BOTH now rather than staging one behind the other — dispatched work runs concurrently in the pipeline and there is no context-switching cost to you; sequence only when there is a real dependency.
 
 **Knowledge commissions.** You can also direct the Executor to spawn a \`web_research\` or \`design\` knowledge task (it has the spawn-task command). These are HIGH-ROI and chronically under-used: one durable, citation-grounded document de-risks every later task in its area and compounds across cycles. Plan one when a direction hinges on external facts nobody has documented (APIs, vendors, pricing/quotas, standards, how mature OSS solves the same problem), when an area keeps producing failed or churning implementation work (settle the structure once in a design doc instead of re-deriving it per task), or when the knowledge index is thin for a direction you are actively advancing. Name the task type, title, and what the document must answer.
@@ -439,7 +440,19 @@ Parallel moves are fine and encouraged when non-clashing. When two directions ar
 
 **Metric capture is MANDATORY.** Each command MUST emit the declared metric as JSON to \`$BLUEPRINT_RESULT_FILE\` (e.g. \`python -c "import json,os; json.dump({'<metric>':<value>},open(os.environ['BLUEPRINT_RESULT_FILE'],'w'))"\`) or as the LAST stdout line. A command exiting 0 without emitting the metric = \`success_criterion\` unmeasured → FAILS (\`compute_unmeasured_criterion\`). State this contract in your commissioned command.
 
-**Containerized / GPU runtimes.** When the experiment needs a specific runtime stack (CUDA / cuDNN / NGC), include \`container_image\` (an NGC image URI, e.g. \`nvcr.io/nvidia/tensorflow:25.01\`) so the command runs inside that image. Use \`accelerator\` (e.g. \`T4\`, \`L4\`, \`V100\`) to request a single GPU. Before authoring a GPU experiment, heed the local-runner availability note above (when present): if no GPU runner is live, hold the experiment rather than author it.
+**Containerized / GPU runtimes.** When the experiment needs a specific runtime stack (CUDA / cuDNN / NGC), include \`container_image\` (an NGC image URI, e.g. \`nvcr.io/nvidia/tensorflow:25.01\`) so the command runs inside that image. Use \`accelerator\` (e.g. \`T4\`, \`L4\`, \`V100\`) to request a single GPU. Before authoring a GPU experiment, heed the local-runner availability note above (when present): if no GPU runner is live, hold the experiment rather than author it. When the note lists per-device hardware (GPU models, per-GPU VRAM, container capability), SIZE the experiment to a device that can actually run it — model + batch must fit the listed VRAM, and \`container_image\` only works on a device with a container runtime.
+
+**Experiment reliability conventions.** Experiments most often die from environment drift and lost metrics, not wrong hypotheses. When commissioning, state these in the task:
+- **Pin dependency versions** in the command (\`pip install jax==0.6.2\`, never latest): an unpinned \`pip install brax\` once pulled a jax whose API had changed and killed the run mid-training. Every unpinned install is a future breakage.
+- **Always set \`container_image\` explicitly** for any stack beyond what the repo itself pip-installs — never rely on whatever toolchain the host happens to have.
+- **Write the metric to \`$BLUEPRINT_RESULT_FILE\` early AND final**: emit a provisional value as soon as the first real measurement exists, then overwrite with the final value — a timeout/kill then still yields a measured result instead of \`compute_unmeasured_criterion\`.
+- **Structure long training as short gated stages**: a bounded first-stage experiment (smoke / few epochs, small cap) whose measured result gates a longer follow-on — never one deadline-sized run that can only succeed wholesale.
+- **Keep the artifact dir small** (final checkpoints/plots only — artifact uploads are size-capped at ~25 MiB; a bloated dir silently loses artifacts).
+- **Prefer a repo harness entrypoint when one exists** (an experiment/eval script already in the repo) over inlining a bespoke pipeline in the command — the harness already handles env, paths, and result plumbing.
+
+Check the "Experiment ledger" section (when present) before commissioning: it lists recent measured outcomes with command fingerprints and costs — re-running a settled hypothesis without naming what changed is waste.
+
+**Dependency pinning is REQUIRED.** Any \`pip install\` (or other package manager invocation) anywhere in a commissioned experiment — the main \`command\` or any environment setup it runs first — MUST pin every package version explicitly — e.g. \`pip install jax==0.4.28 brax==0.10.3\` — never install latest. Unpinned installs silently break on upstream drift: concrete example — \`brax\` (unmaintained) imports \`jax.device_put_replicated\`, which was removed in a later \`jax\` release, hard-failing at import with no code change on your part. This applies to every dependency, not just ML libraries. Pin the version you smoke-tested; if you don't know the current version, run \`pip show <pkg>\` or \`pip index versions <pkg>\` during your smoke to find it.
 
 Name the hypothesis, the command (or arms), the metric being measured, and what the outcome changes.
 
@@ -558,8 +571,10 @@ Omit the \`new_version_goal\` key entirely if the goal is already set.
 
 ## 8. Acceptance criteria (conditional — author only when warranted)
 
+Acceptance criteria are an authored RUBRIC — a small set of aspirational, goal-derived outcomes the qualifier grades at qualify time. They are NOT a coverage checklist to burn down during build/stabilize. Author them from the version GOAL, not from any coverage count.
+
 Author criteria only when the version needs a root acceptance contract:
-- When the Version Phase section shows \`criterion_coverage.total=0\` (no criteria exist yet for this version) AND the version has a non-empty \`Goal:\` line. If the Version Phase has a non-empty \`Goal:\` but no acceptance-criteria coverage block at all, treat that as the same no-criteria case.
+- When the version has a non-empty \`Goal:\` line but no acceptance criteria have been authored yet for this version — derive the rubric from that goal. Treat a version with a non-empty \`Goal:\` and no acceptance criteria listed as this no-criteria case.
 - OR when active directions created this cycle have no criterion mappings and need to be tied to version-level outcomes.
 
 Skip entirely if criteria already exist and are reasonably mapped. Do NOT fabricate criteria when the version goal is unset — Section 7 handles that case first.
@@ -583,6 +598,12 @@ Retractions are processed before additions this cycle. Omit the \`retract\` key 
 
 Keep the total to 5-7 criteria maximum. Frame text as outcomes ("Users can X", "System handles Y"), not implementation steps ("Implement Z"). Ground every criterion in the version goal and active gap descriptions. If no criteria are needed this cycle, do not write the file at all.
 
+# Current user activity & open messages
+
+The following reflects the live wall clock (relative-time strings such as "N days ago" / message ages). It is deliberately placed AFTER the stable guidance above so those clock-derived strings do not change the cacheable prompt prefix each turn — identical underlying payloads then render an identical prefix regardless of the current time.
+
+${p.userStateLine}
+${p.questionSection}${p.feedbackSection}${p.threadSection}
 ${PLAYBOOK_GUIDANCE}
 
 ${DEFAULT_TOOL_GUIDANCE}`;
@@ -874,22 +895,62 @@ export async function runThinkerWithGate(
           const purpose = typeof intent.purpose === 'string' ? intent.purpose.trim() : '';
           const isSchemaPlaceholder = purpose === '' || purpose === '...' || /^<[^>]+>$/.test(purpose);
           if (isSchemaPlaceholder) {
-            sendLog(
-              ws,
-              `\n[ERROR] Final problem_model file has invalid intent.purpose after all retry attempts: "${purpose}"\n`,
-            );
-            try {
-              await persistAndPostStatus(taskId, {
-                task_id: taskId,
-                status: 'FAILED',
-                artifact_type: 'ERROR_LOG',
-                logs: `Problem model validation failed: intent.purpose is a schema placeholder "${purpose}"`,
-                failure_category: 'strategic_thinker_artifacts_missing',
-              });
-            } catch (e) {
-              sendLog(ws, `[ERROR] Failed to post validation failure: ${String(e)}\n`);
+            // Auto-heal: if the model carries a non-empty user_purpose (the
+            // durable operator-set backstop), restore intent.purpose from it
+            // rather than failing.  The backend's _preserve_operator_intent
+            // applies the same fallback on write-back, but the thinker gate
+            // fires BEFORE the model ever reaches the backend — the heal here
+            // lets the strategic cycle complete when the durable model has a
+            // blank purpose (agent-writable, intentionally permitted) while
+            // user_purpose still holds the operator's real text.
+            const userPurpose = typeof intent.user_purpose === 'string' ? intent.user_purpose.trim() : '';
+            if (userPurpose && userPurpose !== '...' && !/^<[^>]+>$/.test(userPurpose)) {
+              intent.purpose = userPurpose;
+              if (intent.source == null) {
+                intent.source = { type: 'user_message', excerpt: userPurpose.slice(0, 120) };
+              }
+              try {
+                fs.writeFileSync(problemModelPath, `${JSON.stringify(finalModel, null, 2)}\n`);
+                sendLog(
+                  ws,
+                  `\n[INFO] Auto-healed blank intent.purpose from user_purpose: "${userPurpose.slice(0, 80)}"\n`,
+                );
+              } catch (writeErr) {
+                sendLog(
+                  ws,
+                  `\n[WARNING] Healed intent.purpose from user_purpose but failed to write file: ${String(writeErr)}\n`,
+                );
+                try {
+                  await persistAndPostStatus(taskId, {
+                    task_id: taskId,
+                    status: 'FAILED',
+                    artifact_type: 'ERROR_LOG',
+                    logs: `Problem model validation failed: intent.purpose is a schema placeholder "${purpose}"`,
+                    failure_category: 'strategic_thinker_artifacts_missing',
+                  });
+                } catch (e) {
+                  sendLog(ws, `[ERROR] Failed to post validation failure: ${String(e)}\n`);
+                }
+                return { ok: false };
+              }
+            } else {
+              sendLog(
+                ws,
+                `\n[ERROR] Final problem_model file has invalid intent.purpose after all retry attempts: "${purpose}"\n`,
+              );
+              try {
+                await persistAndPostStatus(taskId, {
+                  task_id: taskId,
+                  status: 'FAILED',
+                  artifact_type: 'ERROR_LOG',
+                  logs: `Problem model validation failed: intent.purpose is a schema placeholder "${purpose}"`,
+                  failure_category: 'strategic_thinker_artifacts_missing',
+                });
+              } catch (e) {
+                sendLog(ws, `[ERROR] Failed to post validation failure: ${String(e)}\n`);
+              }
+              return { ok: false };
             }
-            return { ok: false };
           }
         }
       } else {

@@ -1028,6 +1028,85 @@ export function formatPlaybook(
   return `## Operational Playbook (active collective memory)\n\nThese notes are the project's living shared memory — every agent reads and writes them. Treat them as a useful starting point, not gospel: if an entry contradicts what you actually observe in the code, overwrite it with \`./playbook set\`. The playbook is only as accurate as the latest agent who looked.\n\n${lines}\n\n`;
 }
 
+// ── Skill helpers (project-declared from .blueprint/tools.json) ──────────────
+
+/**
+ * A project-declared skill entry from `.blueprint/tools.json`.
+ * Each skill describes a shell-command procedure the project's agent can invoke.
+ */
+export interface TaskSkill {
+  slug: string;
+  title: string;
+  command: string;
+  description?: string;
+}
+
+/** Slug validation: only lowercase alphanumeric + hyphens, 1-64 chars, no leading hyphen. */
+const SKILL_SLUG_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
+
+/**
+ * Render a `## Project Skills` markdown block from the task's skills array.
+ * Each skill is shown as a compact reference: title, description (if any),
+ * and how to invoke it. Returns '' when the input is undefined/empty so
+ * the prompt stays unchanged for tasks with no skills declared.
+ */
+export function formatSkills(skills: TaskSkill[] | undefined): string {
+  if (!skills || skills.length === 0) return '';
+  const lines = skills.map(skill => {
+    const slug = typeof skill.slug === 'string' ? skill.slug : '';
+    const title = typeof skill.title === 'string' ? skill.title : slug;
+    const command = typeof skill.command === 'string' ? skill.command : '';
+    const description = typeof skill.description === 'string' ? skill.description.trim() : '';
+    const parts = [`### ${title}`];
+    if (description) parts.push(description);
+    parts.push(`- Run: \`skill-${slug}\` (or directly: \`${command}\`)`);
+    return parts.join('\n\n');
+  }).join('\n\n');
+  return `## Project Skills\n\nThese are project-declared shell procedures available in this workspace as executable scripts. Use them for project-specific operations (deploy, test, lint, format, etc.).\n\n${lines}\n\n`;
+}
+
+/**
+ * Write each project skill as an executable ``skill-<slug>`` bash script in the
+ * workspace. Validates that each skill's slug is a safe shell token (alphanumeric
+ * + hyphens) before writing. Skips invalid or missing entries silently.
+ */
+export function writeSkillHelpers(
+  skills: Record<string, unknown>[] | undefined,
+  workspace: string = WORKSPACE,
+): void {
+  if (!skills || skills.length === 0) return;
+  const addedPatterns: string[] = [];
+  for (const raw of skills) {
+    const slug = typeof raw.slug === 'string' ? raw.slug : '';
+    const command = typeof raw.command === 'string' ? raw.command : '';
+    if (!slug || !SKILL_SLUG_RE.test(slug)) continue;
+    if (!command) continue;
+    const title = typeof raw.title === 'string' ? raw.title : slug;
+    const script = `#!/bin/bash\n# Project skill: ${title}\nset -e\n${command}\n`;
+    const filePath = `${workspace}/skill-${slug}`;
+    try {
+      fs.writeFileSync(filePath, script, { mode: 0o755 });
+      addedPatterns.push(`/skill-${slug}`);
+    } catch { /* skip — workspace may not be writable yet */ }
+  }
+  // Exclude all skill-* scripts from git so they don't get committed.
+  if (addedPatterns.length > 0) {
+    const excludePath = `${workspace}/.git/info/exclude`;
+    try {
+      const existing = fs.existsSync(excludePath) ? fs.readFileSync(excludePath, 'utf-8') : '';
+      const linesSet = new Set(existing.split('\n'));
+      // Also add a glob pattern so future skill scripts are auto-excluded.
+      if (!linesSet.has('/skill-*')) {
+        fs.appendFileSync(excludePath, '/skill-*\n');
+      }
+      const missing = addedPatterns.filter(p => !linesSet.has(p));
+      if (missing.length > 0) {
+        fs.appendFileSync(excludePath, missing.join('\n') + '\n');
+      }
+    } catch { /* .git/info may not exist */ }
+  }
+}
+
 // 2026-05-04: appended to every code-change task prompt (create, refactor,
 // docs, qa, deps, migrate, fix). Tells Claude about the four end-to-end
 // helpers and the *required* exit ritual. Without this, Claude has no way

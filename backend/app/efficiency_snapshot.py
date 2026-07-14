@@ -17,6 +17,7 @@ each axis as ``current_value`` / ``baseline_value`` / ``drift_pct``.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -124,6 +125,14 @@ AXIS_CHECKPOINT_LOSS_RATE = "checkpoint_loss_rate"
 AXIS_PROMPT_STATIC_BYTES = "prompt_static_bytes"
 AXIS_LLM_CACHE_HIT_RATE = "llm_cache_hit_rate"
 AXIS_TOTAL_COST_PER_VERIFIED_TASK = "total_cost_per_verified_task"
+# Prompt-cache lever's DIRECT effect signal: the fleet-level rollup of the
+# per-task-type ``cache_read_share`` already surfaced by
+# ``compute_llm_cost_by_task_type``. Kept distinct from AXIS_LLM_CACHE_HIT_RATE
+# (which is computed independently from raw attempts) so the fleet number is a
+# token-weighted aggregate that reconciles EXACTLY with the per-task-type cost
+# table operators read, giving the cost-reduction direction a baselined
+# denominator for the prompt-restructuring lever's before/after measurement.
+AXIS_PROMPT_CACHE_READ_SHARE = "prompt_cache_read_share"
 
 # Minimum verified-merge count before drift_pct is emitted for
 # AXIS_TOTAL_COST_PER_VERIFIED_TASK. Below this threshold the ratio is too noisy
@@ -170,6 +179,7 @@ ALL_AXES: tuple[str, ...] = (
     AXIS_PROMPT_STATIC_BYTES,
     AXIS_LLM_CACHE_HIT_RATE,
     AXIS_TOTAL_COST_PER_VERIFIED_TASK,
+    AXIS_PROMPT_CACHE_READ_SHARE,
     AXIS_REWORK_COST_SHARE,
     AXIS_SALVAGE_COUNT,
     AXIS_SALVAGE_MERGE_RATE,
@@ -234,6 +244,10 @@ AXIS_CONSUMERS: dict[str, dict] = {
     AXIS_TOTAL_COST_PER_VERIFIED_TASK: {
         "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
     },
+    AXIS_PROMPT_CACHE_READ_SHARE: {
+        "pending": "prompt-cache lever direct-effect axis — baselined for the v24 "
+        "cost-reduction direction; awaiting a UI consumer"
+    },
     AXIS_REWORK_COST_SHARE: {
         "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
     },
@@ -271,6 +285,10 @@ NESTED_METRIC_CONSUMERS: dict[str, dict] = {
     "effort_model_efficiency": {
         "ground_truth": "Task.first_payload[effort] + Task.provider + Task.model + Task.context.pr_merged + api_call_summary tokens priced via LLM_TOKEN_PRICING",
         "consumer": "efficiency_snapshot.write_snapshot → read_baseline_with_drift (persisted by_model efficiency breakdown for DeepSeek vs Anthropic A/B)",
+    },
+    "compute_cost_attribution": {
+        "ground_truth": "ComputeJob.final_cost_usd / accrued_cost_usd per project window; priced-vs-unpriced classified via ComputeJob.polling_metadata.cost_rate_per_second + backend + OPERATOR_HARDWARE_NOMINAL_RATE_PER_SECOND",
+        "consumer": "efficiency_snapshot.compute_current_axes → total_cost_per_verified_task numerator (cost/efficiency ranking) + unpriced-coverage honesty block",
     },
 }
 
@@ -315,10 +333,12 @@ UNPRICED_ALERT_MIN_TASKS = 3
 # Window over which "current" axes are computed for each daily snapshot.
 _AXIS_WINDOW_DAYS = 7
 
-# Cap snapshot history length (2 weeks of daily snapshots).
-# Each snapshot is ~17–21 KB; 14 entries keeps efficiency_baseline bounded at
-# roughly 300 KB while still covering a meaningful trend window.
-_SNAPSHOT_HISTORY_MAX = 14
+# Cap snapshot history length (reduced from 14 to 7 to keep the
+# efficiency_baseline blob bounded — each snapshot is ~17–21 KB, so 7
+# entries keeps it at roughly 147 KB plus baseline, leaving more room
+# in the overall design_doc row for agent-owned content.  7 is still
+# deep enough for the window-delta computation (needs 6: 3 recent + 3 prior).
+_SNAPSHOT_HISTORY_MAX = 7
 
 # Metric-definition version stamp applied to every new snapshot.  Increment
 # this whenever a metric's computation changes in a way that produces a
@@ -349,7 +369,16 @@ _SNAPSHOT_HISTORY_MAX = 14
 #      breakdown (verified_landed_rate, cost_per_merge, run counts) persisted from
 #      compute_effort_model_efficiency for retroactive A/B verification of DeepSeek
 #      vs Anthropic routing across daily snapshots.
-METRIC_DEF_VERSION = "v13"
+# v14: total_cost_per_verified_task now folds ComputeJob (GPU experiment) cost into
+#      its numerator alongside VM+LLM cost, so experiment compute is visible to the
+#      cost/efficiency ranking; a compute_cost_attribution honesty block (priced vs
+#      unpriced coverage) is added mirroring llm_cost_pricing_coverage.
+# v15: prompt_cache_read_share axis added — fleet-level token-weighted rollup of the
+#      per-task-type cache_read_share (cache_read_input_tokens / input_tokens across
+#      task-type buckets), the prompt-cache lever's direct-effect signal. Baselined
+#      on the pre-lever codebase so a later prompt-restructuring change is measured
+#      against a frozen denominator.
+METRIC_DEF_VERSION = "v15"
 
 
 async def _load_recent_tasks(
@@ -2541,26 +2570,60 @@ def _compute_llm_cache_hit_rate(tasks: list[Task]) -> float | None:
     return round(total_cache_read / total_input, 4)
 
 
+def _compute_prompt_cache_read_share(tasks: list[Task]) -> float | None:
+    """Prompt-cache lever's direct effect: fleet rollup of per-task-type cache_read_share.
 
-def _compute_total_cost_per_verified_task(tasks: list[Task]) -> float | None:
-    """Total LLM + VM cost / verified merge count (is_verified_merge, rollup parents excluded).
+    Sums ``total_cache_read_input_tokens`` and ``total_input_tokens`` across every
+    task-type bucket produced by :func:`compute_llm_cost_by_task_type` and returns
+    their token-weighted ratio. Sourcing from that rollup (rather than re-walking
+    raw attempts like :func:`_compute_llm_cache_hit_rate`) guarantees the fleet
+    number reconciles EXACTLY with the per-task-type cost table the operator reads:
+    it is the token-weighted mean of the very ``cache_read_share`` values that
+    table displays. This is the prompt-cache lever's baselined before/after signal.
+
+    Returns ``None`` when the window carries no input tokens (no divide-by-zero),
+    mirroring the ``None`` contract of the sibling cache axis.
+    """
+    total_input = 0
+    total_cache_read = 0
+    for row in compute_llm_cost_by_task_type(tasks):
+        total_input += int(row.get("total_input_tokens") or 0)
+        total_cache_read += int(row.get("total_cache_read_input_tokens") or 0)
+    if total_input <= 0:
+        return None
+    return round(total_cache_read / total_input, 4)
+
+
+def _compute_total_cost_per_verified_task(
+    tasks: list[Task],
+    compute_cost_by_task: Mapping[uuid.UUID, float] | None = None,
+) -> float | None:
+    """Total LLM + VM + ComputeJob cost / verified merge count.
 
     Mirrors the numerator aggregation of the existing cost axes (VM cost from
     :func:`get_task_total_vm_cost_usd` + LLM cost from :func:`_task_llm_cost`)
-    but divides by the VERIFIED merge count — the subset of merged completions
-    whose PR was gated by a real CI/test verdict, excluding degraded fall-open
-    merges. Rollup parents are excluded so each rollup counts as N child
-    landings, not N+1.
+    and additionally folds in each task's attributed ComputeJob (GPU experiment)
+    cost via ``compute_cost_by_task`` — a ``{task_id: compute_usd}`` map built by
+    :func:`_load_compute_job_costs`. Without it, experiment compute spend is
+    invisible to the cost/efficiency ranking (the axis this feeds). The map is
+    optional so the pure per-task VM+LLM valuation is unchanged when omitted.
+
+    Divides by the VERIFIED merge count — the subset of merged completions whose
+    PR was gated by a real CI/test verdict, excluding degraded fall-open merges.
+    Rollup parents are excluded so each rollup counts as N child landings, not
+    N+1.
 
     Returns None when no verified merges exist in the window.
     """
     total_cost = 0.0
     verified = 0
     parent_ids = _rollup_parent_ids(tasks)
+    compute_by_task = compute_cost_by_task or {}
     for t in tasks:
         total_cost += get_task_total_vm_cost_usd(t)
         llm_cost, _ = _task_llm_cost(t)
         total_cost += llm_cost
+        total_cost += float(compute_by_task.get(t.id, 0.0))
         if is_verified_merge(t) and t.id not in parent_ids:
             verified += 1
     if not verified:
@@ -2580,6 +2643,161 @@ def _compute_verified_merge_count(tasks: list[Task]) -> int:
     return sum(
         1 for t in tasks if is_verified_merge(t) and t.id not in parent_ids
     )
+
+
+# ---------------------------------------------------------------------------
+# ComputeJob (GPU experiment) cost — grounding operator/compute spend so it is
+# visible to the cost/efficiency ranking.
+# ---------------------------------------------------------------------------
+# Experiment compute runs as ComputeJob rows (own budget/cost lifecycle),
+# entirely decoupled from Task VM/LLM cost. Until now efficiency_snapshot read
+# NEITHER accrued_cost_usd NOR final_cost_usd, so GPU-job spend was invisible to
+# the per-verified-task cost aggregate the ranking consumes. These helpers close
+# that gap two ways, mirroring the LLM cost honesty pattern in
+# llm_cost_attribution.py:
+#   1. per-task compute cost feeds the total-cost-per-verified-task numerator.
+#   2. an unpriced-coverage honesty block distinguishes a $0 that means "free"
+#      (operator hardware we do not pay for, priced at the nominal rate) from a
+#      $0 that means "UNPRICED" (no cloud rate, no operator rate — a real gap),
+#      so an unpriced job is not silently read as free in the ranking.
+
+
+def _compute_job_cost_usd(job) -> float:
+    """Settled (``final_cost_usd``) cost when present, else live ``accrued_cost_usd``.
+
+    ``0.0`` when neither is recorded. Matches the precedence used by the compute
+    monitor and the spend-ceiling gate (final cost is authoritative once the job
+    is terminal; accrued cost covers in-flight jobs).
+    """
+    if job.final_cost_usd is not None:
+        return float(job.final_cost_usd)
+    return float(job.accrued_cost_usd or 0.0)
+
+
+def _compute_job_is_priced(job) -> bool:
+    """True when the job's cost rests on a real rate basis; False when its $0/None
+    cost reflects the ABSENCE of any rate (genuinely UNPRICED, not free).
+
+    A job is PRICED when any of these hold:
+      * it recorded a positive cost (final or accrued), or
+      * a positive ``cost_rate_per_second`` was stamped at launch (a cloud rate), or
+      * it is a runner-subprocess job and the operator-hardware nominal rate is
+        active (``OPERATOR_HARDWARE_NOMINAL_RATE_PER_SECOND > 0``).
+
+    Otherwise it is UNPRICED: a $0 with no cloud rate and no operator rate, which
+    must NOT be read as "free" in the cost/efficiency ranking. Mirrors the LLM
+    ``unpriced_coverage_fraction`` honesty signal.
+    """
+    from app.compute_backends import (
+        OPERATOR_HARDWARE_NOMINAL_RATE_PER_SECOND,
+        RUNNER_SUBPROCESS_BACKEND_NAME,
+    )
+
+    if _compute_job_cost_usd(job) > 0:
+        return True
+    rate = float((job.polling_metadata or {}).get("cost_rate_per_second") or 0.0)
+    if rate > 0:
+        return True
+    # Operator-hardware nominal rate covers runner-subprocess jobs even at $0.
+    return (
+        job.backend == RUNNER_SUBPROCESS_BACKEND_NAME
+        and OPERATOR_HARDWARE_NOMINAL_RATE_PER_SECOND > 0
+    )
+
+
+async def _load_compute_job_costs(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    window_days: int = _AXIS_WINDOW_DAYS,
+) -> tuple[dict[uuid.UUID, float], Dict[str, Any]]:
+    """Per-task ComputeJob cost for the window plus an unpriced-coverage honesty block.
+
+    Returns ``(by_task, attribution)``:
+
+      * ``by_task`` maps an owning ``task_id`` to the summed compute cost of its
+        jobs (:func:`_compute_job_cost_usd`). Fed into
+        :func:`_compute_total_cost_per_verified_task` so experiment compute is
+        visible to the cost/efficiency ranking. Jobs with no ``task_id`` cannot
+        be attributed and contribute only to the honesty totals.
+      * ``attribution`` mirrors the LLM ``unpriced_coverage`` pattern: total
+        compute cost, cost-bearing job count, priced/unpriced split,
+        ``unpriced_coverage_fraction`` and a capped ``unpriced_combos`` list, so
+        a $0 that means "UNPRICED" is not mistaken for "free".
+
+    A job is "cost-bearing" when it actually ran (``started_at`` set) or recorded
+    a positive cost; not-yet-started zero-cost jobs are skipped entirely (they
+    legitimately cost nothing and would dilute the coverage fraction). The window
+    is bounded on ``updated_at`` to match the task-cost numerator's window.
+    """
+    from app.models import ComputeJob
+
+    cutoff = _utcnow() - timedelta(days=window_days)
+    stmt = (
+        select(ComputeJob)
+        .where(
+            ComputeJob.project_id == project_id,
+            ComputeJob.updated_at >= cutoff,
+        )
+        .options(
+            load_only(
+                ComputeJob.id,
+                ComputeJob.task_id,
+                ComputeJob.backend,
+                ComputeJob.machine_type,
+                ComputeJob.accelerator_type,
+                ComputeJob.started_at,
+                ComputeJob.accrued_cost_usd,
+                ComputeJob.final_cost_usd,
+                ComputeJob.polling_metadata,
+                raiseload=True,
+            )
+        )
+        .limit(5000)
+    )
+    jobs = list((await session.execute(stmt)).scalars().all())
+
+    by_task: dict[uuid.UUID, float] = {}
+    total_cost = 0.0
+    attributed_cost = 0.0
+    priced_count = 0
+    unpriced_count = 0
+    unpriced_combos: list[str] = []
+    for job in jobs:
+        cost = _compute_job_cost_usd(job)
+        # Skip jobs that neither ran nor spent — not cost-bearing.
+        if job.started_at is None and cost <= 0:
+            continue
+        total_cost += cost
+        if job.task_id is not None:
+            by_task[job.task_id] = by_task.get(job.task_id, 0.0) + cost
+            attributed_cost += cost
+        if _compute_job_is_priced(job):
+            priced_count += 1
+        else:
+            unpriced_count += 1
+            combo = f"{job.backend}:{job.machine_type or job.accelerator_type or 'none'}"
+            if (
+                combo not in unpriced_combos
+                and len(unpriced_combos) < _UNPRICED_COMBOS_CAP
+            ):
+                unpriced_combos.append(combo)
+
+    cost_bearing = priced_count + unpriced_count
+    unpriced_coverage_fraction: float | None = (
+        round(priced_count / cost_bearing, 4) if cost_bearing else None
+    )
+    attribution: Dict[str, Any] = {
+        "total_compute_cost_usd": round(total_cost, 6),
+        "attributed_cost_usd": round(attributed_cost, 6),
+        "unattributed_cost_usd": round(total_cost - attributed_cost, 6),
+        "job_count": cost_bearing,
+        "priced_job_count": priced_count,
+        "unpriced_job_count": unpriced_count,
+        "unpriced_coverage_fraction": unpriced_coverage_fraction,
+        "unpriced_combos": unpriced_combos,
+    }
+    return by_task, attribution
 
 
 def _compute_rework_cost_share(tasks: list[Task]) -> float | None:
@@ -2636,7 +2854,7 @@ def _compute_cost_telemetry_reconciliation(tasks: list[Task]) -> dict | None:
     return result.asdict()
 
 
-def _compute_prompt_static_bytes() -> int | None:
+async def _compute_prompt_static_bytes() -> int | None:
     """Sum the source character lengths of all static code-change prompt sections.
 
     Reads agent/src/prompt.ts and measures the template-literal constants in
@@ -2657,8 +2875,7 @@ def _compute_prompt_static_bytes() -> int | None:
     if not os.path.exists(prompt_ts):
         return None
     try:
-        with open(prompt_ts, encoding="utf-8") as fh:
-            src = fh.read()
+        src = await asyncio.to_thread(lambda: open(prompt_ts, encoding="utf-8").read())
     except OSError:
         return None
     total = 0
@@ -2677,8 +2894,7 @@ def _compute_prompt_static_bytes() -> int | None:
     if not os.path.exists(task_type_focus_ts):
         return None
     try:
-        with open(task_type_focus_ts, encoding="utf-8") as fh:
-            ttf_src = fh.read()
+        ttf_src = await asyncio.to_thread(lambda: open(task_type_focus_ts, encoding="utf-8").read())
     except OSError:
         return None
     for name in _TASK_TYPE_FOCUS_CONST_NAMES:
@@ -2757,6 +2973,13 @@ async def compute_current_axes(
     tasks = await _load_recent_tasks(session, project_id)
     lanes = await _load_project_lanes(session, project_id)
     pool_metrics = await compute_pool_idle_cost(session, project_id)
+    # ComputeJob (GPU experiment) cost for the window: per-task map (fed into the
+    # total-cost-per-verified-task numerator) plus the unpriced-coverage honesty
+    # block so experiment compute is visible to the cost/efficiency ranking and a
+    # $0 that means "unpriced" is distinguishable from "free".
+    compute_cost_by_task, compute_cost_attribution = await _load_compute_job_costs(
+        session, project_id
+    )
 
     # Provider routing A/B verdict (direction d-cf39cb40): derive from the
     # per-model efficiency breakdown so the verdict carries BOTH cost ratio AND
@@ -2834,10 +3057,18 @@ async def compute_current_axes(
         AXIS_LANE_COST_PER_MERGED_PR: _compute_lane_cost_per_merged_pr(lanes),
         AXIS_LANE_WARM_RESUME_RATE: _compute_lane_warm_resume_rate(lanes),
         AXIS_CHECKPOINT_LOSS_RATE: _compute_checkpoint_loss_rate(lanes),
-        AXIS_PROMPT_STATIC_BYTES: _compute_prompt_static_bytes(),
+        AXIS_PROMPT_STATIC_BYTES: await _compute_prompt_static_bytes(),
         AXIS_LLM_CACHE_HIT_RATE: _compute_llm_cache_hit_rate(tasks),
-        AXIS_TOTAL_COST_PER_VERIFIED_TASK: _compute_total_cost_per_verified_task(tasks),
+        AXIS_PROMPT_CACHE_READ_SHARE: _compute_prompt_cache_read_share(tasks),
+        AXIS_TOTAL_COST_PER_VERIFIED_TASK: _compute_total_cost_per_verified_task(
+            tasks, compute_cost_by_task
+        ),
         "total_cost_per_verified_task_denominator": _compute_verified_merge_count(tasks),
+        # ComputeJob (GPU experiment) cost grounding: total compute spend folded
+        # into total_cost_per_verified_task above, plus the unpriced-coverage
+        # honesty block (mirrors llm_cost_pricing_coverage) so a genuinely
+        # UNPRICED $0 compute job is not read as free by the ranking.
+        "compute_cost_attribution": compute_cost_attribution,
         AXIS_REWORK_COST_SHARE: _compute_rework_cost_share(tasks),
         AXIS_SALVAGE_COUNT: _salvage["salvage_count"],
         AXIS_SALVAGE_MERGE_RATE: _salvage["salvage_merge_rate"],
@@ -4785,9 +5016,12 @@ async def agent_get_efficiency_snapshot_format_compliance(
     repair counts without navigating the nested blob. Returns 404 when no
     snapshot exists yet.
     """
-    from app.auth import verify_agent_jwt
+    from app.auth import reject_tool_asset_scope, verify_agent_jwt
 
     payload = verify_agent_jwt(x_agent_token)
+    # A tool-asset capability token carries scope="tool-asset" and must not be
+    # usable to read the efficiency snapshot — reject it with 403 (out of scope).
+    reject_tool_asset_scope(payload)
     task_id_str = payload.get("sub")
     project_id_str = payload.get("project_id")
 

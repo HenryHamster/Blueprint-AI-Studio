@@ -3072,6 +3072,155 @@ async def test_propagate_landed_descendants_copies_coverage_data(cleanup_db):
     )
 
 
+@pytest.mark.asyncio
+async def test_propagate_landed_descendants_inherits_changed_files(cleanup_db):
+    """The BFS sweep propagates the rollup parent's ``_pr_changed_files`` context
+    DOWN to each qualifying landed descendant that lacks its own list, marked
+    parent-derived (never github-verified), and respects setdefault: a descendant
+    that carries its own self-reported list is never clobbered.
+    """
+    from app.rollup_management import _propagate_landed_to_staging_merged_descendants
+    from app.acceptance_gate import (
+        PARENT_DERIVED_CHANGED_FILES_KEY,
+        stamp_changed_files_signal,
+    )
+
+    project = await _make_project(cleanup_db, integration_branch="main")
+
+    parent_files = [
+        "backend/app/rollup_seam.py",
+        "backend/testing/test_rollup_seam.py",
+    ]
+    parent_ctx = {"pr_merged": True, "landed_on_integration": True}
+    parent_ctx.update(stamp_changed_files_signal(parent_files, github_verified=True))
+    parent = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="research",
+        status=TaskStatus.COMPLETED,
+        context=parent_ctx,
+    )
+
+    # ── CASE 1: child with no own changed files inherits parent-derived list ──
+    child = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="create",
+        status=TaskStatus.COMPLETED,
+        parent_task_id=parent.id,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+        },
+    )
+    # ── CASE 2: grandchild (deeper descendant) also inherits via BFS ──────────
+    sub_rollup = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="research",
+        status=TaskStatus.COMPLETED,
+        parent_task_id=parent.id,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+        },
+    )
+    grandchild = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="create",
+        status=TaskStatus.COMPLETED,
+        parent_task_id=sub_rollup.id,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+        },
+    )
+    # ── CASE 3: child with OWN changed files must NOT be clobbered ────────────
+    own_files = ["backend/app/child_own_seam.py"]
+    child_own = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="create",
+        status=TaskStatus.COMPLETED,
+        parent_task_id=parent.id,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+            "_pr_changed_files": own_files,
+        },
+    )
+
+    stamped = await _propagate_landed_to_staging_merged_descendants(
+        parent.id, cleanup_db
+    )
+    await cleanup_db.commit()
+    await cleanup_db.refresh(child)
+    await cleanup_db.refresh(grandchild)
+    await cleanup_db.refresh(child_own)
+
+    stamped_ids = {t.id for t in stamped}
+    assert child.id in stamped_ids
+    assert grandchild.id in stamped_ids
+
+    for inheritor in (child, grandchild):
+        ctx = inheritor.context or {}
+        assert ctx.get("_pr_changed_files") == parent_files
+        assert ctx.get(PARENT_DERIVED_CHANGED_FILES_KEY) is True
+        # The union diff must never be marked github-verified on a child.
+        assert "_pr_changed_files_github_verified" not in ctx
+
+    own_ctx = child_own.context or {}
+    assert own_ctx.get("_pr_changed_files") == own_files, (
+        "a child's own self-reported changed files must not be clobbered"
+    )
+    assert PARENT_DERIVED_CHANGED_FILES_KEY not in own_ctx
+
+
+@pytest.mark.asyncio
+async def test_propagate_landed_descendants_no_parent_changed_files_noop(cleanup_db):
+    """When the rollup parent has no ``_pr_changed_files`` (e.g. a research/plan
+    parent with no code diff), descendants inherit nothing — the changed-files
+    propagation is a clean no-op and the landed signal still stamps."""
+    from app.rollup_management import _propagate_landed_to_staging_merged_descendants
+    from app.acceptance_gate import PARENT_DERIVED_CHANGED_FILES_KEY
+    from app.landed_signal import has_landed_signal
+
+    project = await _make_project(cleanup_db, integration_branch="main")
+    parent = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="research",
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "landed_on_integration": True},
+    )
+    child = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="create",
+        status=TaskStatus.COMPLETED,
+        parent_task_id=parent.id,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+        },
+    )
+
+    await _propagate_landed_to_staging_merged_descendants(parent.id, cleanup_db)
+    await cleanup_db.commit()
+    await cleanup_db.refresh(child)
+
+    child_ctx = child.context or {}
+    assert has_landed_signal(child)
+    assert "_pr_changed_files" not in child_ctx
+    assert PARENT_DERIVED_CHANGED_FILES_KEY not in child_ctx
+
+
 # ---------------------------------------------------------------------------
 # _do_rollup_post_merge_housekeeping: multi-direction refresh
 # ---------------------------------------------------------------------------
@@ -3647,7 +3796,10 @@ async def test_multi_child_rollup_criterion_evidence_satisfies_release_scoring_g
         f"Expected 0 uncovered criteria, got {summary['uncovered']}: {summary}"
     )
 
-    # The release-scoring gate must not fire criterion_coverage_incomplete.
+    # The release-scoring gate must not fire criterion_coverage_incomplete.  The
+    # acceptance gate is now keyed on per-category verdicts (the retired
+    # coverage-count input is gone); every active category is ``met`` with no
+    # residual uncaptured gap, mirroring the fully-covered state asserted above.
     result = compute_composite(
         ci_green=True,
         audit_score=1.0,
@@ -3657,7 +3809,21 @@ async def test_multi_child_rollup_criterion_evidence_satisfies_release_scoring_g
         smoketest_enabled=False,
         ci_state="no_checks",
         ci_required=False,
-        criterion_coverage=summary,
+        category_verdicts=[
+            {
+                "category_key": criterion_a.criterion_key,
+                "status": "met",
+                "tier": "machine",
+                "citations": [{"kind": "diff", "ref": "a.py:1"}],
+            },
+            {
+                "category_key": criterion_b.criterion_key,
+                "status": "met",
+                "tier": "machine",
+                "citations": [{"kind": "diff", "ref": "b.py:1"}],
+            },
+        ],
+        residual_uncaptured_gap=None,
     )
     assert result["blocker"] != "criterion_coverage_incomplete", (
         f"Fully-covered version must not trigger criterion_coverage_incomplete; "
@@ -3982,3 +4148,482 @@ def test_merge_credit_backfill_keyset_cursors_exist_and_advance_correctly():
     assert pid not in mcb._rollup_backfill_cursors, (
         "short page must clear cursor so the next call re-scans from the beginning"
     )
+
+
+# ── K6 / K7 lock-window regressions (2026-07-12 concurrency audit) ───────────
+#
+# K6: the Alembic auto-reconcile (PR-file plan -> main.py read -> MULTI-REQUEST
+#     GitHub PUSH) used to run with the rollup parent still held FOR UPDATE from
+#     `_relock_parent` — the code said so ("parent is locked here"). A Postgres
+#     row lock is released by TRANSACTION END, so "the parent lock is released
+#     before the push" is the assertion "there is no open transaction on the
+#     session when the push fires". That is also the assertion that the
+#     connection is not idle-in-transaction across the push (racing the 60s
+#     idle_in_transaction_session_timeout in database.py) — and it is
+#     dialect-independent, so it holds on this SQLite harness.
+#
+# K7: the scan report used to be posted UNDER the re-taken lock, and on the
+#     gates-off blocked path it was posted TWICE.
+
+
+def _collide_at_head(mocker):
+    """Target head already holds 0124, so the added 0124 collides."""
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new_callable=AsyncMock,
+        return_value=["0123_base.py", "0124_taken.py"],
+    )
+    mocker.patch(
+        "app.github.get_file_text_at_ref",
+        new_callable=AsyncMock,
+        return_value='EXPECTED_SCHEMA_REVISION = "0124"\n',
+    )
+
+
+@pytest.mark.asyncio
+async def test_alembic_push_runs_with_parent_lock_released_counter_staked_first(
+    cleanup_db, mocker
+):
+    """K6: the parent FOR UPDATE is RELEASED before the alembic push, and the
+    retry counter is STAKED (incremented + committed) BEFORE the push fires.
+
+    Staking first is load-bearing: the push is a real, irreversible side effect,
+    so if the counter were only written after the push (as it was), a
+    peer-mutation defer on re-lock would discard the increment while the push had
+    already landed — and the retry cap could be bypassed indefinitely.
+    """
+    mock_merge, mock_spawn = _mock_automerge_deps(
+        mocker,
+        pr_files=[
+            _migration_file("backend/alembic/versions/0124_a.py", "0124", "0123")
+        ],
+    )
+    _collide_at_head(mocker)
+
+    observed: dict = {}
+
+    async def _push(*_a, **_kw):
+        # (1) No open transaction => the parent row lock is NOT held across the
+        #     push, and the connection is not idle-in-transaction.
+        observed["in_transaction"] = cleanup_db.in_transaction()
+        # (2) The staked counter is already DURABLE at push time. Re-select with
+        #     populate_existing so this is a real DB read, not the identity map.
+        from sqlmodel import select as _select
+
+        fresh = (
+            (
+                await cleanup_db.execute(
+                    _select(Task)
+                    .where(Task.id == parent.id)
+                    .execution_options(populate_existing=True)
+                )
+            )
+            .scalars()
+            .first()
+        )
+        observed["ctx_at_push"] = dict(fresh.context or {})
+        return True
+
+    mock_commit = mocker.patch(
+        "app.github.commit_file_changes", new_callable=AsyncMock, side_effect=_push
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
+    child = await _make_merged_child(cleanup_db, project.id, parent.id)
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    mock_commit.assert_awaited_once()
+    assert observed["in_transaction"] is False, (
+        "the alembic auto-reconcile PUSH ran inside an open transaction — the "
+        "rollup parent is still held FOR UPDATE across a multi-request GitHub "
+        "push (GET ref, GET commit, POST blobs, POST tree, POST commit, PATCH "
+        "ref), which is the K6 idle-in-transaction defect"
+    )
+    assert observed["ctx_at_push"].get("_alembic_autoreconcile_pr") == 4242
+    assert observed["ctx_at_push"].get("_alembic_autoreconcile_count") == 1, (
+        "the retry counter was NOT staked before the push — a lost re-lock would "
+        "discard it while the push had already landed, bypassing the retry cap"
+    )
+    # End state unchanged from before the fix: deferred one sweep, not merged.
+    mock_merge.assert_not_awaited()
+    mock_spawn.assert_not_called()
+    await cleanup_db.refresh(parent)
+    assert parent.status == TaskStatus.EVALUATING
+    assert (parent.context or {}).get("_alembic_autoreconcile_count") == 1
+
+
+@pytest.mark.asyncio
+async def test_alembic_staked_counter_survives_lost_relock_after_push(
+    cleanup_db, mocker
+):
+    """K6 cap-bypass guard: when a peer mutates the parent during the unlocked
+    push window, the re-lock defers — and the staked counter MUST still be there.
+
+    This is the exact interleaving the old code lost: push lands, re-lock is
+    refused, counter never written, so the cap never advances and the mechanical
+    rewrite loops forever.
+    """
+    _mock_automerge_deps(
+        mocker,
+        pr_files=[
+            _migration_file("backend/alembic/versions/0124_a.py", "0124", "0123")
+        ],
+    )
+    _collide_at_head(mocker)
+
+    async def _push_then_peer_mutates(*_a, **_kw):
+        # The push LANDS, then a peer flips a snapshot-protected field on the
+        # parent (requires_approval), so _relock_parent detects the mutation and
+        # defers to the next cycle.
+        peer = await cleanup_db.get(Task, parent.id)
+        peer.requires_approval = True
+        cleanup_db.add(peer)
+        await cleanup_db.commit()
+        return True
+
+    mock_commit = mocker.patch(
+        "app.github.commit_file_changes",
+        new_callable=AsyncMock,
+        side_effect=_push_then_peer_mutates,
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
+    child = await _make_merged_child(cleanup_db, project.id, parent.id)
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    mock_commit.assert_awaited_once()
+    await cleanup_db.refresh(parent)
+    ctx = parent.context or {}
+    assert ctx.get("_alembic_autoreconcile_pr") == 4242
+    assert ctx.get("_alembic_autoreconcile_count") == 1, (
+        "the push landed but the retry counter was lost when the re-lock deferred "
+        "— the auto-reconcile cap can now be bypassed indefinitely"
+    )
+
+
+@pytest.mark.asyncio
+async def test_alembic_failed_push_hands_the_staked_attempt_back(cleanup_db, mocker):
+    """A transient push failure must NOT burn a retry attempt.
+
+    The counter is staked before the push (K6), so when we learn — under the
+    re-taken lock — that nothing was pushed, the stake is handed back and the cap
+    semantics stay "count successful pushes", exactly as before.
+    """
+    _mock_automerge_deps(
+        mocker,
+        pr_files=[
+            _migration_file("backend/alembic/versions/0124_a.py", "0124", "0123")
+        ],
+    )
+    _collide_at_head(mocker)
+    mock_commit = mocker.patch(
+        "app.github.commit_file_changes",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError("GitHub 502"),
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
+    child = await _make_merged_child(cleanup_db, project.id, parent.id)
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    mock_commit.assert_awaited_once()
+    await cleanup_db.refresh(parent)
+    ctx = parent.context or {}
+    assert ctx.get("_alembic_autoreconcile_count") == 0, (
+        "a failed push burned an auto-reconcile attempt; only pushes that LAND "
+        "may consume the budget"
+    )
+    # Falls through to the operator-alert / re-chain-fix path, unchanged.
+    assert parent.requires_approval is True
+
+
+@pytest.mark.asyncio
+async def test_blocked_scan_report_posted_exactly_once_and_outside_lock(
+    cleanup_db, mocker
+):
+    """K7: on the BLOCKED path the scan report is posted EXACTLY ONCE, outside
+    the parent lock window.
+
+    Before: gates-off blocked posted the report, then re-acquired the parent
+    lock, then fell through and posted the SAME report a SECOND time — under the
+    re-taken lock, behind a comment claiming "we do not mutate the parent for
+    this case" (a lock is released by transaction end, not by not-mutating).
+    """
+    from app.shared_state import runtime_config
+
+    mocker.patch.dict(runtime_config, {"require_approval_gates": False})
+
+    mock_merge, _mock_spawn = _mock_automerge_deps(mocker, pr_files=_files("app/x.py"))
+    # Blocked WITH findings triggers the double-post path.
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        new_callable=AsyncMock,
+        return_value={
+            "blocked": True,
+            "findings": [{"severity": "high", "detail": "prompt injection"}],
+            "summary": "1 high finding",
+            "report": "SCAN REPORT BODY",
+        },
+    )
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+
+    in_txn_at_post: list = []
+
+    async def _comment(*_a, **_kw):
+        in_txn_at_post.append(cleanup_db.in_transaction())
+
+    mock_comment = mocker.patch(
+        "app.github.create_pr_comment", new_callable=AsyncMock, side_effect=_comment
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
+    child = await _make_merged_child(cleanup_db, project.id, parent.id)
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    report_posts = [
+        c for c in mock_comment.await_args_list if "SCAN REPORT BODY" in repr(c)
+    ]
+    assert len(report_posts) == 1, (
+        f"the security-scan report was posted {len(report_posts)} times on the "
+        f"blocked path; it must be posted exactly once"
+    )
+    assert in_txn_at_post[0] is False, (
+        "the scan report was posted with an open transaction — the rollup parent "
+        "was still held FOR UPDATE across a GitHub write"
+    )
+    # Gates off, so it still proceeds to the merge (behaviour unchanged).
+    mock_merge.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_unblocked_findings_scan_comment_posted_outside_lock(cleanup_db, mocker):
+    """K7 path A: findings but NOT blocked (medium/low severity — "blocked" is set
+    independently of "findings"). The comment used to fire with the parent held
+    FOR UPDATE and nothing committed since the re-lock."""
+    mock_merge, _mock_spawn = _mock_automerge_deps(mocker, pr_files=_files("app/x.py"))
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        new_callable=AsyncMock,
+        return_value={
+            "blocked": False,
+            "findings": [{"severity": "medium", "detail": "suspicious string"}],
+            "summary": "1 medium finding",
+            "report": "SCAN REPORT BODY",
+        },
+    )
+    in_txn_at_post: list = []
+
+    async def _comment(*_a, **_kw):
+        in_txn_at_post.append(cleanup_db.in_transaction())
+
+    mock_comment = mocker.patch(
+        "app.github.create_pr_comment", new_callable=AsyncMock, side_effect=_comment
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
+    child = await _make_merged_child(cleanup_db, project.id, parent.id)
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    assert mock_comment.await_count == 1
+    assert in_txn_at_post == [False], (
+        "the findings-but-not-blocked scan comment ran under the parent FOR "
+        "UPDATE lock (K7)"
+    )
+    mock_merge.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_alembic_unstake_does_not_clobber_a_concurrent_peers_stake(
+    cleanup_db, mocker
+):
+    """MAJOR 3: the un-stake is a COMPARE-AND-SWAP, not an absolute write.
+
+    ``_check_and_trigger_rollup`` is driven from at least six call sites (github
+    webhook, agent_status, task_lifecycle, reaper_evaluating_sweeps,
+    reaper_post_orphan_sweep, recovery_evaluating), so two sweeps CAN be in the
+    alembic block at once — and K6 releases the parent lock across the push, so
+    ``skip_locked`` no longer defers the second one.
+
+    The interleaving that broke the headline invariant:
+
+        S1 reads count=0 → stakes 1 → its push FAILS
+        S2 reads count=1 → stakes 2 → its push SUCCEEDS
+        S1 re-locks (the counter is NOT in _capture_rollup_parent_snapshot, so
+          S2's write does NOT trip the validator) → _ar_plan is None →
+          un-stakes by writing its STALE baseline: count = 0
+
+    A landed push is now uncounted and the cap is RESET — i.e. "the cap can only
+    get stricter, never bypassed" was FALSE. Post-fix S1 hands the stake back only
+    if its OWN stake is still on top, so S2's count (and the push it landed)
+    survives.
+    """
+    _mock_automerge_deps(
+        mocker,
+        pr_files=[
+            _migration_file("backend/alembic/versions/0124_a.py", "0124", "0123")
+        ],
+    )
+    _collide_at_head(mocker)
+
+    async def _peer_stakes_then_our_push_fails(*_a, **_kw):
+        # S2 lands in the window S1 opened by releasing the parent lock: it reads
+        # S1's stake (1), stakes 2, and ITS push succeeds. Only the counter keys
+        # are touched, so _relock_parent's content snapshot (status,
+        # requires_approval, rollup_pr_number/url, pr_merged) does NOT trip —
+        # which is exactly why the stale absolute write was able to clobber it.
+        peer = await cleanup_db.get(Task, parent.id)
+        peer_ctx = dict(peer.context or {})
+        assert peer_ctx.get("_alembic_autoreconcile_count") == 1, (
+            "S1 must have staked before releasing the lock — test setup is wrong"
+        )
+        peer_ctx["_alembic_autoreconcile_count"] = 2
+        peer.context = peer_ctx
+        flag_modified(peer, "context")
+        cleanup_db.add(peer)
+        await cleanup_db.commit()
+        # ...and now S1's own push fails.
+        raise RuntimeError("GitHub 502")
+
+    mocker.patch(
+        "app.github.commit_file_changes",
+        new_callable=AsyncMock,
+        side_effect=_peer_stakes_then_our_push_fails,
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
+    child = await _make_merged_child(cleanup_db, project.id, parent.id)
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    await cleanup_db.refresh(parent)
+    ctx = parent.context or {}
+    assert ctx.get("_alembic_autoreconcile_count") == 2, (
+        "the un-stake CLOBBERED a concurrent peer's stake with a stale absolute "
+        "write: the peer's push LANDED but is no longer counted, so the "
+        "auto-reconcile retry cap has been reset and can be bypassed indefinitely"
+    )
+
+
+@pytest.mark.asyncio
+async def test_alembic_peer_inflight_stake_defers_instead_of_double_pushing(
+    cleanup_db, mocker
+):
+    """MAJOR 4: a fresh in-flight stake makes a peer sweep DEFER, not push again.
+
+    Releasing the parent lock across the push (K6) means ``skip_locked`` no longer
+    defers a second sweep, so two sweeps could both push to ``staging_branch``.
+    ``commit_file_changes`` uses ``force: False`` so the loser gets a 422 rather
+    than clobbering — but it burns GitHub calls and muddies the counter. The stake
+    written under the lock before the release doubles as a durable in-flight
+    marker; a peer that sees a fresh one defers to the next cycle.
+    """
+    from app.time_utils import _utcnow
+
+    _mock_automerge_deps(
+        mocker,
+        pr_files=[
+            _migration_file("backend/alembic/versions/0124_a.py", "0124", "0123")
+        ],
+    )
+    _collide_at_head(mocker)
+    mock_commit = mocker.patch(
+        "app.github.commit_file_changes", new_callable=AsyncMock, return_value=True
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
+    child = await _make_merged_child(cleanup_db, project.id, parent.id)
+
+    # A peer sweep is already mid-push on this PR: it staked attempt 1 and stamped
+    # the in-flight marker moments ago.
+    ctx = dict(parent.context or {})
+    ctx["_alembic_autoreconcile_pr"] = 4242
+    ctx["_alembic_autoreconcile_count"] = 1
+    ctx["_alembic_autoreconcile_inflight_at"] = _utcnow().isoformat()
+    parent.context = ctx
+    flag_modified(parent, "context")
+    cleanup_db.add(parent)
+    await cleanup_db.commit()
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    mock_commit.assert_not_awaited()
+    await cleanup_db.refresh(parent)
+    ctx = parent.context or {}
+    assert ctx.get("_alembic_autoreconcile_count") == 1, (
+        "this sweep issued a CONCURRENT SECOND push while a peer was mid-push on "
+        "the same PR (and staked another attempt for it)"
+    )
+    assert parent.status == TaskStatus.EVALUATING
+
+
+@pytest.mark.asyncio
+async def test_alembic_stale_inflight_stake_does_not_wedge_the_reconcile(
+    cleanup_db, mocker
+):
+    """The in-flight marker is TTL-bounded — a sweep that died mid-push must not
+    block the reconcile forever."""
+    from datetime import timedelta
+
+    from app.rollup_state import _ALEMBIC_AUTORECONCILE_INFLIGHT_TTL_S
+    from app.time_utils import _utcnow
+
+    _mock_automerge_deps(
+        mocker,
+        pr_files=[
+            _migration_file("backend/alembic/versions/0124_a.py", "0124", "0123")
+        ],
+    )
+    _collide_at_head(mocker)
+    mock_commit = mocker.patch(
+        "app.github.commit_file_changes", new_callable=AsyncMock, return_value=True
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
+    child = await _make_merged_child(cleanup_db, project.id, parent.id)
+
+    stale = _utcnow() - timedelta(
+        seconds=_ALEMBIC_AUTORECONCILE_INFLIGHT_TTL_S + 60
+    )
+    ctx = dict(parent.context or {})
+    ctx["_alembic_autoreconcile_pr"] = 4242
+    ctx["_alembic_autoreconcile_count"] = 0
+    ctx["_alembic_autoreconcile_inflight_at"] = stale.isoformat()
+    parent.context = ctx
+    flag_modified(parent, "context")
+    cleanup_db.add(parent)
+    await cleanup_db.commit()
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    mock_commit.assert_awaited_once()

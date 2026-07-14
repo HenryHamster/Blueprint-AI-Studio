@@ -23,6 +23,7 @@ import {
 export type SortBy = TaskSortBy;
 
 const COLLAPSED_COLUMNS_KEY = 'kanban_collapsed_columns';
+const DEFAULT_MAX_VISIBLE = 50;
 
 function loadCollapsedColumns(): Set<string> {
   try {
@@ -132,6 +133,7 @@ export function KanbanBoard({
   const [activeTask, setActiveTask] = useState<Task | null>(null);
   const [collapsedColumns, setCollapsedColumns] = useState<Set<string>>(loadCollapsedColumns);
   const [activeColumnId, setActiveColumnId] = useState<string | null>(null);
+  const [mobileShowAll, setMobileShowAll] = useState(false);
 
   // Persist order changes
   useEffect(() => {
@@ -361,6 +363,19 @@ export function KanbanBoard({
     return result;
   }, [columns, tasksByColumn]);
 
+  // Stable per-column handlers so TaskCard React.memo is not bypassed by a new
+  // function reference on every parent render. taskIdsByColumn is already memoized
+  // so the handlers only change when tasks or column membership actually changes.
+  const shiftClickHandlersByColumn = useMemo(() => {
+    if (!onShiftSelect) return {} as Record<string, (taskId: string) => void>;
+    const handlers: Record<string, (taskId: string) => void> = {};
+    for (const col of columns) {
+      const ids = taskIdsByColumn[col.id] ?? [];
+      handlers[col.id] = (taskId: string) => onShiftSelect(taskId, ids);
+    }
+    return handlers;
+  }, [onShiftSelect, taskIdsByColumn, columns]);
+
   return (
     <DndContext
       sensors={sensors}
@@ -402,14 +417,12 @@ export function KanbanBoard({
           const columnTasks = tasksByColumn[col.id] ?? [];
           const isArchivable = ARCHIVABLE_COLUMNS.includes(col.id);
           const taskIds = taskIdsByColumn[col.id] ?? [];
-          const shiftClickHandler = onShiftSelect
-            ? (taskId: string) => onShiftSelect(taskId, taskIds)
-            : undefined;
+          const shiftClickHandler = shiftClickHandlersByColumn[col.id];
 
           const mobileContent = (
               <div className={compact ? 'space-y-1.5' : 'space-y-2'}>
                 <SortableContext items={taskIds} strategy={verticalListSortingStrategy}>
-                  {columnTasks.map((task, cardIdx) => (
+                  {columnTasks.slice(0, mobileShowAll ? columnTasks.length : DEFAULT_MAX_VISIBLE).map((task, cardIdx) => (
                     <SortableCard
                       key={task.id}
                       task={task}
@@ -442,6 +455,22 @@ export function KanbanBoard({
                     />
                   ))}
                 </SortableContext>
+                {columnTasks.length > DEFAULT_MAX_VISIBLE && !mobileShowAll && (
+                  <button
+                    onClick={() => setMobileShowAll(true)}
+                    className="w-full text-xs text-neutral-500 hover:text-neutral-300 py-2 rounded-lg border border-dashed border-neutral-800 hover:border-neutral-700 transition-colors min-h-[44px]"
+                  >
+                    Show {columnTasks.length - DEFAULT_MAX_VISIBLE} more
+                  </button>
+                )}
+                {mobileShowAll && columnTasks.length > DEFAULT_MAX_VISIBLE && (
+                  <button
+                    onClick={() => setMobileShowAll(false)}
+                    className="w-full text-xs text-neutral-500 hover:text-neutral-300 py-2 rounded-lg border border-dashed border-neutral-800 hover:border-neutral-700 transition-colors min-h-[44px]"
+                  >
+                    Show less
+                  </button>
+                )}
                 {columnTasks.length === 0 && !loading && (
                   <div className="text-center text-neutral-600 text-xs py-8 border border-dashed border-neutral-800 rounded-xl bg-neutral-900/20">
                     {hasActiveFilters ? 'No tasks match filters' : 'No tasks'}

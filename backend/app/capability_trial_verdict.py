@@ -162,7 +162,11 @@ def is_lane_pilot_arm_member(context: dict[str, Any]) -> str | None:
     return None
 
 
-def evaluate_lane_pilot_verdict(aggregates: LanePilotAggregates) -> dict[str, Any]:
+def evaluate_lane_pilot_verdict(
+    aggregates: LanePilotAggregates,
+    *,
+    pilot_active: bool | None = None,
+) -> dict[str, Any]:
     """Return a KILL / ADOPT / CONTINUE verdict for the review-fix lane pilot.
 
     Kill conditions are checked in priority order before adopt.  Gate-integrity
@@ -174,6 +178,19 @@ def evaluate_lane_pilot_verdict(aggregates: LanePilotAggregates) -> dict[str, An
     aggregates:
         Per-arm aggregate statistics.  All rate fields may be None when
         not yet measurable (insufficient merges, no cost data, etc.).
+    pilot_active:
+        Tri-state enablement signal (default ``None`` preserves legacy behavior
+        exactly). When explicitly ``False`` AND both arms are empty (n_lane == 0
+        and n_control == 0), the pilot cannot accrue intent-to-treat traffic —
+        ``record_lane_arm_assignment`` writes no arm key while the pilot is off —
+        so the verdict is annotated ``awaiting_enablement`` (with an explicit
+        ``awaiting_enablement`` marker) instead of the generic ``insufficient_data``.
+        The enablement decision itself is tracked by the dormant-knob completion
+        debt, so this signal lets the debt path suppress a duplicate
+        capability-trial obligation. The branch is placed AFTER the immediate-alert
+        / contamination KILL checks (which at n=0 cannot fire, since no violation
+        counter can be non-zero without arm traffic) so it can never mask a
+        genuine KILL.
 
     Returns
     -------
@@ -255,6 +272,29 @@ def evaluate_lane_pilot_verdict(aggregates: LanePilotAggregates) -> dict[str, An
             "verdict": "KILL",
             "verdict_reason": "control_arm_warm_resume_contamination",
             "immediate_alert": True,
+        }
+
+    # Awaiting-enablement: when the pilot is explicitly disabled and NO arm
+    # traffic has accrued (both arms empty), the trial cannot make progress until
+    # an operator flips the pilot on.  Report this distinctly from the generic
+    # insufficient_data continue so the debt path can defer to the dormant-knob
+    # obligation instead of opening a duplicate, never-resolvable trial debt.
+    # Safe against masking a KILL: the immediate_alert and control-contamination
+    # KILL checks above already returned; at n_lane == 0 and n_control == 0 no
+    # violation counter can be non-zero, so no genuine KILL is possible here.
+    if (
+        pilot_active is False
+        and n_lane == 0
+        and n_control == 0
+        and gate_violations == 0
+        and control_warm_resume_count == 0
+    ):
+        return {
+            **base,
+            "verdict": "CONTINUE",
+            "verdict_reason": "awaiting_enablement",
+            "awaiting_enablement": True,
+            "immediate_alert": False,
         }
 
     if n_lane < _LANE_PILOT_MIN_N or n_control < _LANE_PILOT_MIN_N:
@@ -801,6 +841,35 @@ async def raise_capability_verdict_notice(
     )
 
 
+def is_awaiting_enablement_entry(entry: dict[str, Any]) -> bool:
+    """Return True when a verdict entry marks a trial as awaiting pilot enablement.
+
+    An awaiting-enablement continue verdict (``verdict_reason == "awaiting_enablement"``
+    or the explicit ``awaiting_enablement`` marker) means the trial cannot accrue arm
+    traffic until an operator flips the pilot on.  That enablement decision is already
+    tracked by the dormant-knob completion debt, so it must NOT also open a
+    capability-trial debt.
+    """
+    if not isinstance(entry, dict):
+        return False
+    return bool(
+        entry.get("verdict_reason") == "awaiting_enablement"
+        or entry.get("awaiting_enablement") is True
+    )
+
+
+def should_record_capability_trial_debt(entry: dict[str, Any]) -> bool:
+    """Return True when a CONTINUE verdict entry warrants a capability-trial debt.
+
+    A capability sitting in observe/trial with no decided verdict is a standing
+    obligation and normally records a completion debt.  The one exception is an
+    awaiting-enablement entry: the enablement decision is already tracked by the
+    dormant-knob debt, so recording a capability-trial debt would duplicate a
+    single operator decision as two permanent, never-resolvable obligations.
+    """
+    return not is_awaiting_enablement_entry(entry)
+
+
 async def persist_trial_verdicts_in_transaction(
     source_session: Any,
     project_id: Any,
@@ -888,7 +957,19 @@ async def persist_trial_verdicts_in_transaction(
                     )
 
                     _debt_key = f"capability_trial:{project_id}:{cap_name}"
-                    if actual_verdict in _CONTINUE_VERDICTS:
+                    if actual_verdict in _CONTINUE_VERDICTS and (
+                        not should_record_capability_trial_debt(entry)
+                    ):
+                        # Awaiting-enablement: the enablement decision is already
+                        # tracked by the dormant-knob debt, so do NOT open a
+                        # duplicate capability-trial debt.  Resolve any pre-existing
+                        # open one so the operator sees a single obligation.
+                        await aresolve_completion_debt(
+                            session,
+                            _debt_key,
+                            reason="awaiting_enablement:dormant_knob_tracks_decision",
+                        )
+                    elif actual_verdict in _CONTINUE_VERDICTS:
                         await arecord_completion_debt(
                             session,
                             dedupe_key=_debt_key,

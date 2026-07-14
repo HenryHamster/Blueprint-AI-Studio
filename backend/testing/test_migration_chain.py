@@ -411,6 +411,38 @@ def test_validate_combined_empty_added_passes():
     assert validate_combined_migration_chain(["0136_prev.py"], {}) is None
 
 
+def test_validate_combined_backwards_numbered_head_blocks():
+    """A migration correctly anchored to the head but numbered BELOW it (a
+    backwards renumber) is blocked by the combined-monotonicity check even
+    though it passes the collision and anchor checks — numeric-max head
+    detection would silently mis-identify the head here."""
+    existing_filenames = ["0525_a.py", "0526_b.py"]  # head is 0526
+    added_sources = {
+        # Anchored to the real head 0526, but its own id 0300 is below it.
+        "backend/alembic/versions/0300_new.py": _migration_src("0300", "0526"),
+    }
+    reason = validate_combined_migration_chain(existing_filenames, added_sources)
+    assert reason is not None
+    assert "0300" in reason and "0526" in reason
+    assert "non-monotonic" in reason.lower()
+    assert "renumber" in reason.lower()
+
+
+def test_validate_combined_stale_anchor_instructs_renumber_not_rechain_existing():
+    """The stale-anchor (b) message must instruct RENUMBERING the new migration
+    onto the current head, never rechaining an existing migration onto a higher
+    number — the latter is what produced the migration-identity divergence."""
+    existing_filenames = ["0135_one.py", "0136_two.py"]  # head is 0136
+    added_sources = {
+        "backend/alembic/versions/0137_new.py": _migration_src("0137", "0135"),
+    }
+    reason = validate_combined_migration_chain(existing_filenames, added_sources)
+    assert reason is not None
+    lowered = reason.lower()
+    assert "renumber your new migration onto the current head '0136'" in lowered
+    assert "never rechain an existing migration" in lowered
+
+
 # ── Async guard with target_branch ──────────────────────────────────────────
 
 

@@ -218,7 +218,9 @@ WEBSOCKET_EMITTER_INVENTORY = {
         "backend/app/routers/agent_warm_continuity.py",
         "backend/app/routers/directions.py",
         "backend/app/routers/runner.py",
+        "backend/app/runner_decline.py",
         "backend/app/runner_health_alerts.py",
+        "backend/app/runner_pull_skip.py",
         "backend/app/services.py",
         "backend/app/strategic_events.py",
         "backend/app/task_completion.py",
@@ -472,11 +474,6 @@ def _mutation(command: Mapping[str, Any]) -> Mapping[str, Any]:
 def _mutation_body(command: Mapping[str, Any]) -> Mapping[str, Any]:
     body = _mutation(command).get("body")
     return body if isinstance(body, Mapping) else {}
-
-
-def _workbench_body(command: Mapping[str, Any]) -> Mapping[str, Any]:
-    workbench = _mutation_body(command).get("workbench")
-    return workbench if isinstance(workbench, Mapping) else {}
 
 
 def _project_id_text(project_id: Any | None, target: Mapping[str, Any]) -> str | None:

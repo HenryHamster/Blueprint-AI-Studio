@@ -2198,6 +2198,97 @@ def test_acceptance_test_is_clear_failure_predicate():
     assert not ci_resolution.acceptance_test_is_clear_failure(None)
 
 
+def test_acceptance_test_block_parses_passed_defensively():
+    # ``passed`` is parsed as a defensive bool: only a literal True yields True.
+    green = ci_resolution.acceptance_test_block(
+        {
+            "acceptanceTest": {
+                "declared": True,
+                "descriptor": "seam test",
+                "present": True,
+                "ran": True,
+                "status": "ran",
+                "passed": True,
+            }
+        }
+    )
+    assert green is not None and green["passed"] is True
+    # A missing ``passed`` field (older agent) defaults to False — no green signal.
+    older = ci_resolution.acceptance_test_block(
+        {
+            "acceptanceTest": {
+                "declared": True,
+                "present": True,
+                "ran": True,
+                "status": "ran",
+            }
+        }
+    )
+    assert older is not None and older["passed"] is False
+    # A truthy-but-non-bool value ("true") is NOT green.
+    malformed = ci_resolution.acceptance_test_block(
+        {
+            "acceptanceTest": {
+                "declared": True,
+                "present": True,
+                "ran": True,
+                "status": "ran",
+                "passed": "true",
+            }
+        }
+    )
+    assert malformed is not None and malformed["passed"] is False
+
+
+def test_acceptance_test_is_green_predicate():
+    # Green ONLY when declared + ran + status=="ran" + passed is True.
+    assert ci_resolution.acceptance_test_is_green(
+        {"declared": True, "ran": True, "status": "ran", "passed": True}
+    )
+    # Ran but the targeted run failed → not green.
+    assert not ci_resolution.acceptance_test_is_green(
+        {"declared": True, "ran": True, "status": "ran", "passed": False}
+    )
+    # Skipped / absent are never green (and status must be "ran").
+    assert not ci_resolution.acceptance_test_is_green(
+        {"declared": True, "ran": False, "status": "skipped", "passed": True}
+    )
+    assert not ci_resolution.acceptance_test_is_green(
+        {"declared": True, "ran": False, "status": "absent", "passed": True}
+    )
+    # Missing ``passed`` (older agent) → not green.
+    assert not ci_resolution.acceptance_test_is_green(
+        {"declared": True, "ran": True, "status": "ran"}
+    )
+    # Non-declared / non-dict / None → not green.
+    assert not ci_resolution.acceptance_test_is_green(
+        {"declared": False, "ran": True, "status": "ran", "passed": True}
+    )
+    assert not ci_resolution.acceptance_test_is_green(None)
+    assert not ci_resolution.acceptance_test_is_green("x")
+
+
+def test_acceptance_test_is_green_end_to_end_from_verdict():
+    # A full verify-tests verdict whose acceptanceTest block ran green flows
+    # through acceptance_test_block → acceptance_test_is_green.
+    verdict = {
+        "detected": False,
+        "acceptanceTest": {
+            "declared": True,
+            "descriptor": "the seam test",
+            "selector": "testing/test_seam.py::test_x",
+            "present": True,
+            "ran": True,
+            "status": "ran",
+            "passed": True,
+        },
+    }
+    block = ci_resolution.acceptance_test_block(verdict)
+    assert ci_resolution.acceptance_test_is_green(block) is True
+    # And it is NOT a clear failure (that path is for absent/skipped).
+    assert ci_resolution.acceptance_test_is_clear_failure(block) is False
+
+
 def test_classify_verdict_absent_acceptance_test_blocks_passing_suite():
     # A green unit suite must NOT let a promised-but-missing test merge as proven.
     outcome, detail = ci_resolution.classify_merge_test_verdict(

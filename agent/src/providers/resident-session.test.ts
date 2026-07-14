@@ -287,6 +287,33 @@ describe('startResidentClaudeSession', () => {
     session.close();
   });
 
+  it('only records the delta numTurns between consecutive result events', async () => {
+    const ctl = makeControllableChild();
+    vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);
+    vi.mocked(recordNumTurns).mockClear();
+    const session = startResidentClaudeSession({});
+
+    // Turn 1: cumulative num_turns=3 → delta=3 (first result)
+    const turn1 = session.sendTurn('q1');
+    ctl.pushLine({ type: 'result', result: 'a', num_turns: 3 });
+    await turn1;
+    expect(recordNumTurns).toHaveBeenNthCalledWith(1, 3);
+
+    // Turn 2: cumulative num_turns=5 → delta=2 (the increment, not the full 5)
+    const turn2 = session.sendTurn('q2');
+    ctl.pushLine({ type: 'result', result: 'b', num_turns: 5 });
+    await turn2;
+    expect(recordNumTurns).toHaveBeenNthCalledWith(2, 2);
+
+    // Turn 3: cumulative num_turns=6 → delta=1
+    const turn3 = session.sendTurn('q3');
+    ctl.pushLine({ type: 'result', result: 'c', num_turns: 6 });
+    await turn3;
+    expect(recordNumTurns).toHaveBeenNthCalledWith(3, 1);
+
+    session.close();
+  });
+
   it('flags sentOperatorMessage only after ./messages send SUCCEEDS (tool_result, no error)', async () => {
     const ctl = makeControllableChild();
     vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);

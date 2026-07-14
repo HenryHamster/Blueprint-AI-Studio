@@ -20,6 +20,7 @@ import {
   type VersionLifecycleResponse,
   type RecentVersion,
   type QualificationState,
+  type QualificationTriggerState,
 } from '../api';
 import { timeAgo } from '../utils/time';
 import {
@@ -49,7 +50,34 @@ import {
   ServingStatusBadge,
   ArtifactEvidenceList,
   ConfidenceSparkline,
+  DimensionBreakdown,
 } from './VersionLifecyclePanelPrimitives';
+
+const TRIGGER_AUTO_LABELS: Record<string, { label: string; cls: string }> = {
+  armed:     { label: 'armed',     cls: 'text-emerald-400' },
+  waiting:   { label: 'waiting',   cls: 'text-amber-400' },
+  in_flight: { label: 'in flight', cls: 'text-sky-400' },
+  capped:    { label: 'capped',    cls: 'text-red-400' },
+  settled:   { label: 'settled',   cls: 'text-neutral-500' },
+  observe:   { label: 'observe',   cls: 'text-neutral-500' },
+  off:       { label: 'off',       cls: 'text-neutral-600' },
+};
+
+function QualificationTriggerRow({ state }: { state: QualificationTriggerState }) {
+  const { label, cls } = TRIGGER_AUTO_LABELS[state.auto_trigger] ?? { label: state.auto_trigger, cls: 'text-neutral-400' };
+  return (
+    <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 text-ui-sm" data-testid="qualification-trigger-state">
+      <span className="text-neutral-500">auto-trigger</span>
+      <span className={`font-medium ${cls}`}>{label}</span>
+      {state.blocking.length > 0 && (
+        <span className="text-neutral-600">— {state.blocking[0]}</span>
+      )}
+      {state.next_expected_trigger && state.auto_trigger === 'waiting' && (
+        <span className="text-neutral-600 italic">next: {state.next_expected_trigger.replace(/_/g, ' ')}</span>
+      )}
+    </div>
+  );
+}
 
 // Generate a client idempotency key for a version cut. Prefers the native UUID
 // generator and falls back to a timestamp+random token for older runtimes (and
@@ -818,6 +846,9 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                     ))}
                   </div>
                 )}
+                {cv.dimension_states && cv.dimension_states.length > 0 && (
+                  <DimensionBreakdown dimensions={cv.dimension_states} />
+                )}
                 {cv.last_qualification.blocker && (
                   <p className="text-ui-sm text-red-400 truncate">{cv.last_qualification.blocker}</p>
                 )}
@@ -845,6 +876,9 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                 )}
                 <DurableQualificationEvidenceRow q={cv.last_qualification} />
               </div>
+            )}
+            {cv.qualification_trigger_state && (
+              <QualificationTriggerRow state={cv.qualification_trigger_state} />
             )}
             {auditEvidenceState === 'current' && cv.latest_audit && (
               <div className="pl-2 border-l border-neutral-700/50">

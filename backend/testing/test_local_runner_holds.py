@@ -35,6 +35,10 @@ from app.models import (
     TaskStatus,
     _utcnow,
 )
+from app.orchestrator_runner_dispatch import (
+    AWAITING_FORCED_RUNNER_CONTEXT_KEY,
+    FORCED_RUNNER_TARGET_CONTEXT_KEY,
+)
 from app.workbench_state import (
     STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY,
     STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY,
@@ -85,6 +89,69 @@ async def _make_held_task(
     return task
 
 
+class TestHeldTaskClearsItsStampOnDispatch:
+    """Successful dispatch is the ONLY place a compute runner-hold stamp is cleared.
+
+    The dispatch path stamps three hold keys (local / container / forced runner) and
+    clears them in one place: the ``runner is not None`` pin block, which now iterates
+    :data:`COMPUTE_RUNNER_HOLD_CONTEXT_KEYS` rather than popping hand-listed literals.
+    That single source of truth is shared with the bounded hold-timeout sweep, and the
+    two must stay in lockstep — a key that is STAMPED but never CLEARED means the sweep
+    terminal-FAILS a task that is already running happily on a runner.
+
+    This test is the regression cover for that clear-on-dispatch loop: break it and a
+    held task that finally gets its runner keeps a stale stamp and gets reaped.
+
+    (Note: it is NOT cover for excluding holds from the dispatch candidate query —
+    that exclusion was deliberately NOT implemented, because a stamp is cleared only on
+    successful dispatch, so an excluded task could never re-enter dispatch to notice its
+    runner returning. The window BACKFILL is what stops holds from burning slots, and
+    its regression cover lives in
+    ``test_orchestrator.py::TestDispatchWindowPreservesRank``.)
+    """
+
+    @pytest.mark.asyncio
+    async def test_held_task_still_dispatches_when_its_runner_returns(self, db_session):
+        """A held task whose runner comes back must launch AND drop its hold stamp."""
+        project = await _make_project(db_session, require_local_runner=True)
+        task = await _make_held_task(db_session, project.id, held_ago_seconds=120)
+        assert (task.context or {}).get("awaiting_local_runner_since")
+
+        # The operator's runner comes back online this cycle.
+        runner = LocalRunner(
+            project_id=project.id,
+            token_hash=auth_mod.hash_runner_token(
+                auth_mod.create_runner_token(uuid.uuid4())
+            ),
+            last_seen_at=_utcnow(),
+            capabilities={"task_types": "all", "has_gpu": False, "max_concurrent": 2},
+        )
+        db_session.add(runner)
+        await db_session.commit()
+        await db_session.refresh(runner)
+
+        task.payloads = [
+            {
+                "type": "compute_experiment",
+                "command": "echo hi",
+                "spend_cap_usd": 1.0,
+                "deadline_seconds": 300,
+            }
+        ]
+        db_session.add(task)
+        await db_session.commit()
+
+        outcome = await orch._dispatch_compute_experiment_directly(
+            db_session, task, {project.id: [runner]}, {}
+        )
+
+        assert outcome == "launched"
+        await db_session.refresh(task)
+        assert "awaiting_local_runner_since" not in (task.context or {}), (
+            "the hold stamp must be cleared once the task finally dispatches"
+        )
+
+
 class TestFailStaleLocalRunnerHolds:
     @pytest.mark.asyncio
     async def test_fails_hold_older_than_timeout(self, db_session):
@@ -104,6 +171,107 @@ class TestFailStaleLocalRunnerHolds:
         assert "requeue" in (task.latest_status_message or "")
         # INFRA-class failure so it never poisons research dedup as a code error.
         assert (task.context or {}).get("failure_category") == PROVISION_FAILURE
+
+    @pytest.mark.asyncio
+    async def test_strict_pin_hold_timeout_names_pinned_runner(self, db_session):
+        """A timed-out strict runner_target hold fails with a truthful reason
+        naming the pinned runner and the last diagnosed why — never the generic
+        require_local_runner wording (which would lie about why it was held)."""
+        project = await _make_project(db_session)
+        pinned_runner_id = str(uuid.uuid4())
+        task = await _make_held_task(
+            db_session,
+            project.id,
+            held_ago_seconds=orch._LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS + 600,
+        )
+        ctx = dict(task.context or {})
+        ctx["runner_pin_hold"] = {
+            "runner_id": pinned_runner_id,
+            "strict": True,
+            "reason_code": "offline",
+            "detail": "runner (host dgx-1) is not live",
+        }
+        task.context = ctx
+        db_session.add(task)
+        await db_session.commit()
+
+        failed = await orch._fail_stale_local_runner_holds(db_session)
+
+        assert failed == 1
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.FAILED
+        message = task.latest_status_message or ""
+        assert "runner_target" in message
+        assert pinned_runner_id in message
+        assert "offline" in message
+        assert "require_local_runner" not in message
+        assert (task.context or {}).get("failure_category") == PROVISION_FAILURE
+
+    @pytest.mark.asyncio
+    async def test_forced_runner_hold_timeout_names_pinned_runner(self, db_session):
+        """A timed-out FORCED-runner pin fails with a truthful reason naming the
+        pinned runner — the bounded-wait contract its sibling pins already had.
+
+        Regression cover for the unbounded-hold gap: ``forced_runner_target_id``
+        stamped ``awaiting_forced_runner_since``, but NO sweep read that stamp, so
+        the task sat QUEUED forever with nobody watching. It must now terminal-FAIL
+        at the 6h timeout like the strict payload pin does — and the reason must
+        name the forced runner, never the generic require_local_runner wording
+        (which would lie: other runners may well have been online and idle; the pin
+        is what excluded them).
+        """
+        project = await _make_project(db_session)
+        forced_runner_id = str(uuid.uuid4())
+        task = await _make_held_task(
+            db_session,
+            project.id,
+            held_ago_seconds=orch._LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS + 600,
+            stamp=False,
+        )
+        ctx = dict(task.context or {})
+        ctx[AWAITING_FORCED_RUNNER_CONTEXT_KEY] = (
+            _utcnow() - timedelta(seconds=orch._LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS + 600)
+        ).isoformat()
+        ctx[FORCED_RUNNER_TARGET_CONTEXT_KEY] = forced_runner_id
+        task.context = ctx
+        db_session.add(task)
+        await db_session.commit()
+
+        failed = await orch._fail_stale_local_runner_holds(db_session)
+
+        assert failed == 1, "a forced-runner hold past 6h must be terminal-failed"
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.FAILED
+        message = task.latest_status_message or ""
+        assert "forced_runner_target_id" in message
+        assert forced_runner_id in message, "the reason must name the pinned runner"
+        assert "require_local_runner" not in message, (
+            "must not reuse the generic require-local wording — it would lie about "
+            "why the task was held"
+        )
+        assert (task.context or {}).get("failure_category") == PROVISION_FAILURE
+
+    @pytest.mark.asyncio
+    async def test_keeps_recent_forced_runner_hold(self, db_session):
+        """A forced-runner hold still inside the 6h window keeps waiting."""
+        project = await _make_project(db_session)
+        task = await _make_held_task(
+            db_session, project.id, held_ago_seconds=60, stamp=False
+        )
+        ctx = dict(task.context or {})
+        ctx[AWAITING_FORCED_RUNNER_CONTEXT_KEY] = (
+            _utcnow() - timedelta(seconds=60)
+        ).isoformat()
+        ctx[FORCED_RUNNER_TARGET_CONTEXT_KEY] = str(uuid.uuid4())
+        task.context = ctx
+        db_session.add(task)
+        await db_session.commit()
+
+        failed = await orch._fail_stale_local_runner_holds(db_session)
+
+        assert failed == 0
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.QUEUED
 
     @pytest.mark.asyncio
     async def test_keeps_recent_hold(self, db_session):

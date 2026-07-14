@@ -745,3 +745,97 @@ def test_resolve_project_hardware_policy_tolerates_junk_values():
     machines, accels = resolve_project_hardware_policy(project)
     assert machines is None
     assert accels is None
+
+
+# ---------------------------------------------------------------------------
+# ceiling_gate_total — non-Anthropic LLM conservatism buffer
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ceiling_gate_total_applies_conservatism_to_non_anthropic_llm(db_session):
+    """ceiling_gate_total inflates non-Anthropic LLM cost by 25%; total is unchanged."""
+    from app.models import TaskStatus
+    from app.llm_cost_attribution import LLM_TOKEN_PRICING, NON_ANTHROPIC_LLM_CONSERVATISM_MULTIPLIER
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    # Use deepseek-v4-pro: input_rate=0.435e-6, output_rate=0.87e-6
+    input_tokens = 1_000_000
+    output_tokens = 500_000
+    input_rate, output_rate = LLM_TOKEN_PRICING[("deepseek", "deepseek-v4-pro")]
+    expected_llm = input_tokens * input_rate + output_tokens * output_rate
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        provider="deepseek",
+        model="deepseek-v4-pro",
+        api_call_summary={
+            "total_input_tokens": input_tokens,
+            "total_output_tokens": output_tokens,
+            "llm_call_count": 5,
+        },
+        updated_at=now - timedelta(days=1),
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    result = await get_project_recent_spend_usd(
+        db_session, project_id=project.id, window_days=30
+    )
+
+    expected_buffer = (NON_ANTHROPIC_LLM_CONSERVATISM_MULTIPLIER - 1.0) * expected_llm
+    assert result["llm"] == pytest.approx(expected_llm, abs=1e-9)
+    assert result["total"] == pytest.approx(expected_llm, abs=1e-9)
+    assert result["ceiling_gate_total"] == pytest.approx(
+        expected_llm + expected_buffer, abs=1e-9
+    )
+    # ceiling_gate_total must be strictly greater than total when non-Anthropic LLM spend exists
+    assert result["ceiling_gate_total"] > result["total"]
+
+
+@pytest.mark.asyncio
+async def test_ceiling_gate_total_unchanged_for_anthropic_llm(db_session):
+    """ceiling_gate_total equals total when all LLM cost is Anthropic-attributed."""
+    from app.models import TaskStatus
+    from app.llm_cost_attribution import LLM_TOKEN_PRICING
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    input_tokens = 1_000_000
+    output_tokens = 500_000
+    input_rate, output_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
+    expected_llm = input_tokens * input_rate + output_tokens * output_rate
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        api_call_summary={
+            "total_input_tokens": input_tokens,
+            "total_output_tokens": output_tokens,
+            "llm_call_count": 5,
+        },
+        updated_at=now - timedelta(days=1),
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    result = await get_project_recent_spend_usd(
+        db_session, project_id=project.id, window_days=30
+    )
+
+    assert result["llm"] == pytest.approx(expected_llm, abs=1e-9)
+    assert result["total"] == pytest.approx(expected_llm, abs=1e-9)
+    # No buffer applied for Anthropic-attributed LLM cost
+    assert result["ceiling_gate_total"] == pytest.approx(result["total"], abs=1e-9)

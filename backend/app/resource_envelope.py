@@ -122,6 +122,32 @@ def resolve_project_spend_warning_fraction(project: Project) -> float:
     return 0.8
 
 
+async def get_project_spend_window_tasks(
+    session,
+    *,
+    project_id: uuid.UUID,
+    window_days: int = 30,
+):
+    """Return the project's tasks whose ``updated_at`` falls inside the rolling
+    spend window ``[now - window_days, now)``.
+
+    This is the exact task set the LLM/agent-VM spend components aggregate over,
+    exposed so trustworthiness/diagnostic callers reconcile against the SAME
+    window the ceiling gate uses.
+    """
+    from app.models import Task
+
+    now = _utcnow()
+    since = now - timedelta(days=window_days)
+    result = await session.execute(
+        select(Task).where(
+            Task.project_id == project_id,
+            Task.updated_at >= since,
+        )
+    )
+    return result.scalars().all()
+
+
 async def get_project_recent_spend_usd(
     session,
     *,
@@ -162,8 +188,11 @@ async def get_project_recent_spend_usd(
     """
     from app.compute_jobs import get_recent_terminal_compute_spend_usd
     from app.efficiency_snapshot import _compute_windowed_idle_cost
-    from app.llm_cost_attribution import _task_llm_cost
-    from app.models import Task, get_task_total_vm_cost_usd
+    from app.llm_cost_attribution import (
+        NON_ANTHROPIC_LLM_CONSERVATISM_MULTIPLIER,
+        _task_llm_cost_split,
+    )
+    from app.models import get_task_total_vm_cost_usd
 
     now = _utcnow()
     since = now - timedelta(days=window_days)
@@ -175,15 +204,20 @@ async def get_project_recent_spend_usd(
         until=None,
     )
 
-    result = await session.execute(
-        select(Task).where(
-            Task.project_id == project_id,
-            Task.updated_at >= since,
-        )
+    tasks = await get_project_spend_window_tasks(
+        session, project_id=project_id, window_days=window_days
     )
-    tasks = result.scalars().all()
     task_vm_spend = sum(get_task_total_vm_cost_usd(t) for t in tasks)
-    task_llm_spend = sum(_task_llm_cost(t)[0] for t in tasks)
+
+    task_llm_anthropic = 0.0
+    task_llm_non_anthropic = 0.0
+    any_unpriced = False
+    for t in tasks:
+        a, na, unpriced = _task_llm_cost_split(t)
+        task_llm_anthropic += a
+        task_llm_non_anthropic += na
+        any_unpriced = any_unpriced or unpriced
+    task_llm_spend = task_llm_anthropic + task_llm_non_anthropic
 
     idle_cost_result = await _compute_windowed_idle_cost(session, project_id, since)
     idle_spend = idle_cost_result["total"]
@@ -192,10 +226,158 @@ async def get_project_recent_spend_usd(
     agent_vm_f = float(task_vm_spend)
     idle_f = float(idle_spend)
     llm_f = float(task_llm_spend)
+    total = compute_f + agent_vm_f + idle_f + llm_f
+    # Non-Anthropic LLM cost cannot be independently verified (no per-call usage
+    # probe), so the ceiling gate uses a conservative total that inflates the
+    # non-Anthropic portion. Raw total and llm keys are unchanged for reporting.
+    non_anthropic_buffer = (NON_ANTHROPIC_LLM_CONSERVATISM_MULTIPLIER - 1.0) * float(
+        task_llm_non_anthropic
+    )
+    # Additive-only confidence fields (do NOT alter enforcement math): the split
+    # of LLM cost into Anthropic-verifiable vs self-reported non-Anthropic, and a
+    # coarse confidence label derived purely from that composition (no DB probe
+    # required — the independent probe / coverage_fraction is surfaced separately
+    # by ``assess_ceiling_gate_trustworthiness``).
+    non_anthropic_share = (
+        float(task_llm_non_anthropic) / llm_f if llm_f > 0 else 0.0
+    )
     return {
-        "total": compute_f + agent_vm_f + idle_f + llm_f,
+        "total": total,
         "compute": compute_f,
         "agent_vm": agent_vm_f,
         "idle": idle_f,
         "llm": llm_f,
+        "ceiling_gate_total": total + non_anthropic_buffer,
+        "llm_anthropic": float(task_llm_anthropic),
+        "llm_non_anthropic": float(task_llm_non_anthropic),
+        "llm_unpriced": bool(any_unpriced),
+        "non_anthropic_share": non_anthropic_share,
+        "confidence": spend_confidence_label(
+            non_anthropic_llm=float(task_llm_non_anthropic),
+            any_unpriced=any_unpriced,
+        ),
+    }
+
+
+def spend_confidence_label(
+    *,
+    non_anthropic_llm: float,
+    any_unpriced: bool,
+) -> str:
+    """Return a coarse confidence label for a project's weighted spend figure.
+
+    - ``"low"`` when any LLM usage is UNPRICED/unverifiable (a model/provider
+      with no pricing row): its dollar contribution is silently zero, so the
+      recorded total may under-count real spend in a way the buffer cannot cover.
+    - ``"estimated"`` when there is a priced but self-reported non-Anthropic
+      share (no per-call probe exists for these providers).
+    - ``"verified"`` otherwise — all priced LLM cost is Anthropic, the only
+      component with an independent per-call usage probe.
+
+    The label reflects only the COMPOSITION of the spend; whether the Anthropic
+    portion actually reconciles within tolerance is reported separately by
+    :func:`assess_ceiling_gate_trustworthiness`.
+    """
+    if any_unpriced:
+        return "low"
+    if non_anthropic_llm > 0:
+        return "estimated"
+    return "verified"
+
+
+def assess_ceiling_gate_trustworthiness(tasks) -> dict:
+    """Verify the weighted ceiling-gate spend figure against real recorded spend.
+
+    Given a list of real :class:`~app.models.Task` rows this returns a structured
+    verdict proving the confidence-weighted figure the dispatch gate consumes is
+    SAFE — an inaccurate cap is worse than none, so the gate must never under-count
+    real recorded spend. Pure (no DB); reusable by an operator/diagnostic against
+    real historical tasks.
+
+    Checks:
+      (a) ``ceiling_gate_total >= total`` always holds — the gate is a CONSERVATIVE
+          upper bound and can never under-count real recorded LLM spend.
+      (b) the non-Anthropic buffer equals exactly
+          ``(multiplier - 1.0) * priced-non-Anthropic cost``.
+      (c) for the Anthropic portion — the one component with an independent probe —
+          it runs :func:`reconcile_provider_reported_usage` and reports whether it
+          is within tolerance.
+      (d) it reports the self-reported (non-Anthropic) share of total LLM cost and
+          the reconciliation ``coverage_fraction``.
+    """
+    from app.cost_telemetry_reconciliation import reconcile_provider_reported_usage
+    from app.llm_cost_attribution import (
+        NON_ANTHROPIC_LLM_CONSERVATISM_MULTIPLIER,
+        _task_llm_cost_split,
+    )
+
+    task_list = list(tasks)
+    anthropic_llm = 0.0
+    non_anthropic_llm = 0.0
+    any_unpriced = False
+    for t in task_list:
+        a, na, unpriced = _task_llm_cost_split(t)
+        anthropic_llm += a
+        non_anthropic_llm += na
+        any_unpriced = any_unpriced or unpriced
+
+    total_llm = anthropic_llm + non_anthropic_llm
+    buffer = (NON_ANTHROPIC_LLM_CONSERVATISM_MULTIPLIER - 1.0) * non_anthropic_llm
+    ceiling_gate_total = total_llm + buffer
+
+    # (a) The buffer is non-negative, so this must hold by construction; assert it
+    # numerically anyway so a future change to the buffer math is caught here.
+    conservative_upper_bound = ceiling_gate_total >= total_llm - 1e-9
+
+    # (b) Buffer exactness.
+    expected_buffer = (
+        NON_ANTHROPIC_LLM_CONSERVATISM_MULTIPLIER - 1.0
+    ) * non_anthropic_llm
+    buffer_exact = abs(buffer - expected_buffer) <= 1e-9
+
+    # (c) Independent Anthropic probe reconciliation.
+    reconciliation = reconcile_provider_reported_usage(task_list)
+    provider_reported_within_tolerance = bool(
+        reconciliation.provider_reported_within_tolerance
+    )
+    coverage_fraction = reconciliation.coverage_fraction
+
+    # (d) Self-reported (non-Anthropic) share of total LLM cost.
+    non_anthropic_share = (
+        non_anthropic_llm / total_llm if total_llm > 0 else 0.0
+    )
+
+    trustworthy = (
+        conservative_upper_bound
+        and buffer_exact
+        and provider_reported_within_tolerance
+    )
+    if not conservative_upper_bound:
+        reason = "ceiling_gate_total under-counts recorded spend"
+    elif not buffer_exact:
+        reason = "non_anthropic_buffer does not match the conservatism multiplier"
+    elif not provider_reported_within_tolerance:
+        reason = "anthropic provider-reported usage failed reconciliation"
+    else:
+        reason = "weighted figure is a conservative upper bound of recorded spend"
+
+    return {
+        "trustworthy": trustworthy,
+        "reason": reason,
+        "total": total_llm,
+        "ceiling_gate_total": ceiling_gate_total,
+        "anthropic_llm_usd": anthropic_llm,
+        "non_anthropic_llm_usd": non_anthropic_llm,
+        "non_anthropic_buffer_usd": buffer,
+        "non_anthropic_share": non_anthropic_share,
+        "any_unpriced": any_unpriced,
+        "conservative_upper_bound": conservative_upper_bound,
+        "buffer_exact": buffer_exact,
+        "provider_reported_within_tolerance": provider_reported_within_tolerance,
+        "coverage_fraction": coverage_fraction,
+        "confidence": spend_confidence_label(
+            non_anthropic_llm=non_anthropic_llm,
+            any_unpriced=any_unpriced,
+        ),
+        "reconciliation": reconciliation.asdict(),
     }

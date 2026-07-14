@@ -352,23 +352,45 @@ async def _redrive_infra_failure_qualification(
         ):
             return False
         # Bounded attempts: stop re-driving a persistently broken infra path.
-        # The source of truth is the PERSISTED consecutive-infra streak that the
-        # finalize path (``_handle_infra_failure``) maintains on the infra_failure
-        # record — NOT a re-driver-local counter.  ``run_qualification`` never
-        # synchronously RETURNS status=="infra_failure" (that verdict is only ever
-        # written asynchronously at finalize, when the qualifier children
-        # terminate), so the old post-commit increment keyed on the synchronous
-        # return value was dead code and the cap never advanced (unbounded
-        # redrives).  ``consecutive_infra_errors`` is incremented on each
-        # infra_failure finalize and reset to 0 when the candidate SHA changes or a
-        # non-infra verdict lands — exactly the per-episode semantics this cap
-        # wants: a genuinely new candidate is never blocked, but a persistently
-        # broken infra path at a stable HEAD halts once the streak reaches the cap.
-        # The streak is carried forward across the spawn→finalize cycle by
-        # ``run_qualification`` (``prior_infra_streak``), so no post-commit
-        # bookkeeping is needed here.
-        consecutive_infra_errors = int(qual.get("consecutive_infra_errors") or 0)
-        if consecutive_infra_errors >= _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS:
+        # Phase 1b (per-dimension failure isolation): when the failing dimension
+        # is recorded on the infra_failure record, consult that dimension's OWN
+        # per-dimension streak from the QualificationDimensionResult ledger
+        # instead of the attempt-global ``consecutive_infra_errors`` — so a
+        # persistent migration-gate GitHub outage (migration_identity streak=3)
+        # does not exhaust the redrive budget that an audit or smoketest failure
+        # would draw on.  Falls back to the attempt-level streak when the
+        # failing dimension is absent or the ledger read fails (preserving
+        # pre-Phase-1b behaviour in those edge cases).
+        _failing_dim = qual.get("failing_dimension")
+        _dim_streak: int | None = None
+        if _failing_dim:
+            try:
+                from app.models import QualificationDimensionResult
+
+                _csha = qual.get("candidate_sha")
+                if _csha:
+                    _dim_row = (
+                        await redrive_session.execute(
+                            select(QualificationDimensionResult).where(
+                                QualificationDimensionResult.release_version_id
+                                == version.id,
+                                QualificationDimensionResult.candidate_sha == _csha,
+                                QualificationDimensionResult.dimension == _failing_dim,
+                            )
+                        )
+                    ).scalar_one_or_none()
+                    if _dim_row is not None and isinstance(_dim_row.detail, dict):
+                        _s = _dim_row.detail.get("consecutive_infra_errors")
+                        if isinstance(_s, int) and not isinstance(_s, bool):
+                            _dim_streak = _s
+            except Exception:  # noqa: BLE001 — best-effort; fall back to attempt-level
+                _dim_streak = None
+        effective_streak = (
+            _dim_streak
+            if _dim_streak is not None
+            else int(qual.get("consecutive_infra_errors") or 0)
+        )
+        if effective_streak >= _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS:
             return False
         result = await release_qualifier.run_qualification(
             redrive_session, version.project_id, version

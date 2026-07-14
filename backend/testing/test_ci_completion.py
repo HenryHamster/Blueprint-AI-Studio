@@ -3053,7 +3053,7 @@ async def test_suppress_warm_handoff_ci_failure(db_session, mocker):
 
 @pytest.mark.asyncio
 async def test_ci_failure_broadcast_uses_status_snapshot_not_post_commit_read(
-    db_session, mocker
+    db_session, expire_fidelity, mocker
 ):
     """Regression for the ci_completion.py fix-spawn broadcast MissingGreenlet.
 
@@ -5987,3 +5987,153 @@ async def test_ci_failure_general_rerun_infra_takes_priority(db_session, mocker)
     assert task.context.get("ci_rerun_consumed", 0) == 0, (
         "General rerun gate must NOT consume its budget when infra rerun fires"
     )
+
+
+# ---------------------------------------------------------------------------
+# Empty-effective-diff merge gate
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_merge_gate_blocks_empty_effective_diff_pr(db_session, mocker):
+    """A direct task PR whose effective diff went EMPTY by merge time must NOT
+    auto-merge and must NOT report COMPLETED-success — it lands an explicit
+    SCOPE_EMPTY no-op terminal (PR closed, pr_closed_empty set) instead.
+
+    Regression guard for the 2026-07-12 incident (PR #14500 / commit 683abce38:
+    a fix PR merged 'green' with an empty ``git show --stat`` yet reported
+    success).
+    """
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    # Confirmed-empty effective diff (get_pr_files returns []). This overrides
+    # the autouse _default_no_migration_pr fixture's non-empty default.
+    mocker.patch("app.github.get_pr_files", AsyncMock(return_value=[]))
+    # merge_pull_request must NEVER be called for an empty PR.
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request",
+        AsyncMock(return_value={"merged": True}),
+    )
+    close_mock = mocker.patch(
+        "app.github.close_pull_request", AsyncMock(return_value=True)
+    )
+    mocker.patch("app.github.create_pr_comment", AsyncMock(return_value=None))
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        AsyncMock(return_value=("fake-token", "owner", "repo")),
+    )
+    rec_task = mocker.patch("app.routers.agent_status.record_task_result")
+    mocker.patch(
+        "app.task_completion._record_remediation_if_terminal", new_callable=AsyncMock
+    )
+
+    project = Project(name="Empty diff block", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task(db_session, project, pr_number=14500)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is False, "Empty-diff PR must not merge"
+    merge_mock.assert_not_called()
+    close_mock.assert_awaited_once()
+
+    await db_session.refresh(task)
+    # For a direct create task the chain original is the task itself.
+    assert task.status == TaskStatus.CANCELLED, (
+        "Empty-diff task must NOT be COMPLETED-success"
+    )
+    assert task.status != TaskStatus.COMPLETED
+    ctx = task.context or {}
+    assert ctx.get("failure_detail") == "empty_effective_diff_at_merge"
+    assert ctx.get("pr_closed_empty") is True
+    assert ctx.get("failure_category") == "SCOPE_EMPTY"
+    assert ctx.get("pr_rejected") is not True, "Empty no-op is not a review rejection"
+    # The benign no-op is recorded for monitoring as SCOPE_EMPTY.
+    assert rec_task.call_args.kwargs.get("failure_class") == "SCOPE_EMPTY"
+
+
+@pytest.mark.asyncio
+async def test_indeterminate_effective_diff_defers_merge(db_session, mocker):
+    """When the effective-diff probe is INDETERMINATE (get_pr_files raises), the
+    merge is DEFERRED — not merged and not no-op'd (PR left open, task untouched
+    terminal-wise)."""
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    # First call (migration guard) succeeds with a non-migration file so the
+    # guard is 'ok'; the empty-diff probe's call then raises → indeterminate.
+    mocker.patch(
+        "app.github.get_pr_files",
+        AsyncMock(side_effect=[[{"filename": "README.md"}], RuntimeError("gh 502")]),
+    )
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request",
+        AsyncMock(return_value={"merged": True}),
+    )
+    close_mock = mocker.patch(
+        "app.github.close_pull_request", AsyncMock(return_value=True)
+    )
+
+    project = Project(name="Indeterminate diff defer", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task(db_session, project, pr_number=14501)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is False, "Indeterminate probe must defer (return False)"
+    merge_mock.assert_not_called()
+    close_mock.assert_not_called()
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.EVALUATING, (
+        "Deferred merge must leave the task EVALUATING, not terminalize it"
+    )
+
+
+@pytest.mark.asyncio
+async def test_nonempty_effective_diff_still_merges(db_session, mocker):
+    """Regression: a PR with a non-empty effective diff merges normally and the
+    task is marked COMPLETED — the empty-diff gate does not interfere."""
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
+    # Non-empty effective diff: rely on the autouse _default_no_migration_pr
+    # fixture (get_pr_files → [{"filename": "README.md"}]) so the empty-diff gate
+    # sees a non-empty diff and falls through to merge — exactly the happy path.
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request", AsyncMock(return_value={"merged": True})
+    )
+
+    project = Project(name="Nonempty diff merges", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task(db_session, project, pr_number=14502)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is True, "Non-empty PR must merge"
+    merge_mock.assert_awaited_once()
+    # The merged happy path sets COMPLETED in-memory on the relocked task
+    # instance (committed downstream by the caller / orig-session); assert the
+    # in-memory status directly, mirroring the other merge-success tests.
+    assert task.status == TaskStatus.COMPLETED

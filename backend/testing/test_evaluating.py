@@ -522,7 +522,7 @@ async def test_evaluating_hard_timeout_preserves_parked_child(eval_db, mocker):
 
 @pytest.mark.asyncio
 async def test_evaluating_hard_timeout_broadcasts_terminal_literals_when_expired(
-    eval_db, mocker
+    eval_db, expire_fidelity, mocker
 ):
     """Regression: the hard-timeout path must broadcast terminal status LITERALS
     (parent FAILED, child CANCELLED), never a post-commit task.status/child.status
@@ -545,26 +545,15 @@ async def test_evaluating_hard_timeout_broadcasts_terminal_literals_when_expired
     mocker.patch.dict(_rc, {"evaluating_fail_hours": 6})
 
     async def _expire_alert(task, session, *args, **kwargs):
-        # Mimic the prod poison/rollback: rewrite the persisted parent + children
-        # status to a non-terminal sentinel and expire the instances, so a
-        # post-commit ORM status read would lazy-load the WRONG value (an
-        # autoflush would otherwise persist the in-memory terminal status and
-        # mask the bug). The literal-based broadcast must be immune.
-        from sqlalchemy import update
-
-        kids = (
-            (await session.execute(select(Task).where(Task.parent_task_id == task.id)))
-            .scalars()
-            .all()
-        )
-        await session.execute(
-            update(Task)
-            .where((Task.id == task.id) | (Task.parent_task_id == task.id))
-            .values(status=TaskStatus.QUEUED)
-        )
-        for k in kids:
-            session.expire(k)
-        session.expire(task)
+        # Simulate a production rollback that reverts pending changes and
+        # expires all tracked instances (rollback always expires, regardless
+        # of expire_on_commit). After this, the handler's pending status
+        # mutations (task.status=FAILED, child.status=CANCELLED) are
+        # reverted in the DB, and all loaded attributes (including FK and
+        # PK) are expired. The broadcast must use FAILED/CANCELLED literals
+        # and pre-captured identifiers — not post-rollback lazy-loads that
+        # would return stale pre-timeout status or crash MissingGreenlet.
+        await session.rollback()
 
     mocker.patch(
         "app.alert_dispatch._maybe_create_failure_alert", side_effect=_expire_alert
@@ -1455,7 +1444,9 @@ async def test_rollup_concurrent_terminal_events_respawn_at_most_once(eval_db, m
     # respawn again if idempotency were broken — the respawn-count guard must
     # still prevent it.
     await eval_db.refresh(child)
-    child.updated_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=20)
+    child.updated_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(
+        minutes=20
+    )
     eval_db.add(child)
     await eval_db.commit()
     await _check_and_trigger_rollup(child, eval_db)
@@ -2130,6 +2121,79 @@ async def test_approval_gate_timeout_preserves_mergeable_rollup_pr(eval_db, mock
 
 
 @pytest.mark.asyncio
+async def test_approval_gate_timeout_rate_limited_lookup_preserves_not_fails(
+    eval_db, mocker
+):
+    """MINOR 3 (round 3): the 2nd consumer of ``_pr_is_preservable_on_cap`` must
+    honour ``_PreservabilityUnavailable`` instead of swallowing it into FAILED.
+
+    ``_PreservabilityUnavailable`` is an ``Exception``, so this sweep's generic
+    ``except Exception`` caught it, left ``_is_preservable = False``, and the task
+    landed **FAILED with a perfectly mergeable PR abandoned** — in bulk during a
+    GitHub rate-limit / install-token-exhaustion window. That falsified the very
+    invariant the exception exists to enforce ("a transient lookup failure must
+    never close a PR or fail a task") at the one call site nobody audited.
+
+    A rate-limited lookup here now PRESERVES for hand-merge; the sweep is
+    idempotent, so a later sweep re-decides once GitHub is healthy again.
+    """
+    from fastapi import HTTPException
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.services.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    # The GitHub client's synthetic 403 for a known-empty install-token bucket.
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        side_effect=HTTPException(
+            status_code=403,
+            detail="GitHub rate limit exhausted fetching PR #475 (reset at 999)",
+        ),
+    )
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    rec = mocker.patch("app.routers.agent_status.record_task_result")
+
+    project = Project(name="Rollup RateLimit", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "rollup parent"}],
+        status=TaskStatus.EVALUATING,
+        requires_approval=True,
+        context={
+            "_approval_set_at": _naive_utc_ago(hours=5).isoformat(),
+            "rollup_pr_number": 475,
+            "_is_rollup_review": True,
+        },
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(parent)
+    assert parent.status != TaskStatus.FAILED, (
+        "a GitHub RATE LIMIT made the approval-gate sweep abandon a PR it could "
+        "not even read — _PreservabilityUnavailable was swallowed into FAILED"
+    )
+    assert (parent.context or {}).get(
+        "approval_timeout_preserved_for_handmerge"
+    ) is True
+    rec.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_approval_gate_timeout_fails_non_rollup_task(eval_db, mocker):
     """RC-2 GUARDRAIL: approval-gate timeout on a non-rollup task (no rollup PR
     to preserve) keeps today's FAILED path unchanged."""
@@ -2164,6 +2228,75 @@ async def test_approval_gate_timeout_fails_non_rollup_task(eval_db, mocker):
     )
     rec.assert_called_once()
     assert rec.call_args.kwargs.get("success") is False
+
+
+@pytest.mark.asyncio
+async def test_approval_gate_timeout_reconciles_already_merged_rollup_pr(
+    eval_db, mocker
+):
+    """CREDIT-BLINDNESS: when the approval-gate timeout fires on an EVALUATING
+    parent whose rollup PR has ALREADY MERGED, the parent must be reconciled to
+    COMPLETED — never FAILED. Landed work counted as a failure costs the
+    direction its merge credit (real incident: research be331963 / PR #14342
+    merged, then FAILED 36s later). No failure result/alert must be recorded on
+    this success path."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.services.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    # Merged-PR check returns merged=True (state closed, merged, base ref set).
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "state": "closed",
+            "merged": True,
+            "number": 474,
+            "base": {"ref": "automain"},
+        },
+    )
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    rec = mocker.patch("app.routers.agent_status.record_task_result")
+
+    project = Project(name="Rollup Already Merged", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "rollup parent, PR merged"}],
+        status=TaskStatus.EVALUATING,
+        requires_approval=True,
+        context={
+            "_approval_set_at": _naive_utc_ago(hours=5).isoformat(),
+            "rollup_pr_number": 474,
+            "_is_rollup_review": True,
+        },
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(parent)
+    assert parent.status == TaskStatus.COMPLETED, (
+        f"Already-merged rollup PR must reconcile to COMPLETED, not FAILED — "
+        f"got {parent.status}: {parent.latest_status_message!r}"
+    )
+    assert "474" in (parent.latest_status_message or "")
+    assert "merged" in (parent.latest_status_message or "").lower()
+    # The approval hold is cleared — the work landed, this is terminal.
+    assert parent.requires_approval is False
+    # SUCCESS path: never counted as a task failure.
+    rec.assert_not_called()
+    alert_mock.assert_not_awaited()
 
 
 # ── Spend/budget approval holds: clean non-failure decline ────────────────────
@@ -3394,10 +3527,12 @@ def _mock_strand_github(mocker, *, pr_state, pr_merged, reviews=None):
         new_callable=AsyncMock,
         return_value={"state": pr_state, "merged": pr_merged, "user": {}},
     )
+    # rollup_management imports get_pull_request_reviews_CHECKED -> (reviews, status).
+    # Patching the list-only wrapper voids silently and leaks a live HTTP call.
     mocker.patch(
-        "app.github.get_pull_request_reviews",
+        "app.github.get_pull_request_reviews_checked",
         new_callable=AsyncMock,
-        return_value=reviews or [],
+        return_value=(reviews or [], "complete"),
     )
 
 
@@ -3799,7 +3934,8 @@ async def test_chain_active_fresh_heartbeat_defers_kill(eval_db):
     parent, _child = await _make_chain_parent_and_child(
         eval_db,
         child_status=TaskStatus.IN_PROGRESS,
-        last_heartbeat=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=30),
+        last_heartbeat=datetime.now(timezone.utc).replace(tzinfo=None)
+        - timedelta(seconds=30),
         vm_instance_id="vm-chain-alive",
     )
     assert await _chain_has_active_pipeline_work(parent, eval_db) is True
@@ -3818,14 +3954,16 @@ async def test_chain_active_vmcontact_overrides_stale_heartbeat(eval_db):
         eval_db,
         child_status=TaskStatus.IN_PROGRESS,
         # 20min-stale on-row heartbeat (past the default 600s/10min cutoff).
-        last_heartbeat=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=20),
+        last_heartbeat=datetime.now(timezone.utc).replace(tzinfo=None)
+        - timedelta(minutes=20),
         vm_instance_id="vm-chain-lockstarved",
     )
     # Fresh off-row contact (30s) within the 10min stale cutoff.
     eval_db.add(
         VmContact(
             vm_instance_id="vm-chain-lockstarved",
-            last_contact_at=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=30),
+            last_contact_at=datetime.now(timezone.utc).replace(tzinfo=None)
+            - timedelta(seconds=30),
         )
     )
     await eval_db.commit()
@@ -3844,14 +3982,16 @@ async def test_chain_active_stale_heartbeat_and_stale_vmcontact_allows_kill(eval
     parent, _child = await _make_chain_parent_and_child(
         eval_db,
         child_status=TaskStatus.IN_PROGRESS,
-        last_heartbeat=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=20),
+        last_heartbeat=datetime.now(timezone.utc).replace(tzinfo=None)
+        - timedelta(minutes=20),
         vm_instance_id="vm-chain-dead",
     )
     # Off-row contact is ALSO stale (15min, past the 10min cutoff).
     eval_db.add(
         VmContact(
             vm_instance_id="vm-chain-dead",
-            last_contact_at=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=15),
+            last_contact_at=datetime.now(timezone.utc).replace(tzinfo=None)
+            - timedelta(minutes=15),
         )
     )
     await eval_db.commit()
@@ -3867,7 +4007,8 @@ async def test_chain_active_no_vmcontact_row_allows_kill(eval_db):
     parent, _child = await _make_chain_parent_and_child(
         eval_db,
         child_status=TaskStatus.IN_PROGRESS,
-        last_heartbeat=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=20),
+        last_heartbeat=datetime.now(timezone.utc).replace(tzinfo=None)
+        - timedelta(minutes=20),
         vm_instance_id="vm-chain-no-contact-row",
     )
     assert await _chain_has_active_pipeline_work(parent, eval_db) is False
@@ -5059,9 +5200,7 @@ async def test_sweep_orphaned_provider_task_detached_not_cancelled_for_retired_d
 
 
 @pytest.mark.asyncio
-async def test_sweep_orphaned_provider_task_null_updated_at_detached(
-    eval_db, mocker
-):
+async def test_sweep_orphaned_provider_task_null_updated_at_detached(eval_db, mocker):
     """A null-updated_at EVALUATING task on a closed direction is detached.
 
     Regression: null updated_at makes a task invisible to the staleness sweep
@@ -5192,9 +5331,7 @@ async def test_sweep_orphaned_provider_task_no_direction_row_not_touched(
 
 
 @pytest.mark.asyncio
-async def test_sweep_orphaned_provider_task_with_open_pr_not_cancelled(
-    eval_db, mocker
-):
+async def test_sweep_orphaned_provider_task_with_open_pr_not_cancelled(eval_db, mocker):
     """An EVALUATING task with a retired direction but an open PR must be detached, not cancelled.
 
     When a direction expires/completes, tasks that have already opened a PR have

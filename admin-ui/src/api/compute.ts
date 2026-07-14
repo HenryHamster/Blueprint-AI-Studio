@@ -58,6 +58,10 @@ export interface ComputeExperimentLaunchRequest {
   idea?: string;
   draft_notes?: string;
   drafted_from_refinement?: boolean;
+  // Optional runner UUID or hostname to hard-pin this job to a specific runner.
+  // When set, the job stays QUEUED until that runner is available rather than
+  // falling back to another runner or cloud. Omit for auto-selection.
+  runner_target_id?: string;
 }
 
 /** Response from the dedicated compute_experiment launch endpoint — the created
@@ -729,6 +733,20 @@ export interface ComputeJobLiveOutput {
   truncated: boolean;
 }
 
+/** One directly viewable output file (plot/render/video) from a compute job's
+ *  artifacts, surfaced as the first-class `viewable_artifacts` field on the
+ *  job response (normalized server-side from the job's `viewable_files`
+ *  manifest). `storage_uri` is a durable `gs://` reference — resolve it to a
+ *  transient signed URL via `resolveArtifactDownloadUrl` before rendering;
+ *  signed URLs expire and must never be persisted. */
+export interface ViewableArtifact {
+  storage_uri: string;
+  filename: string | null;
+  content_type?: string | null;
+  size_bytes?: number | null;
+  kind: 'image' | 'video' | null;
+}
+
 export interface ComputeJob {
   id: string;
   project_id: string;
@@ -775,6 +793,10 @@ export interface ComputeJob {
     provisioning_model?: string | null;
   } | null;
   polling_metadata?: Record<string, unknown>;
+  // First-class exit_code and command_log promoted from polling_metadata.
+  // Null when not yet available or not applicable.
+  exit_code?: number | null;
+  command_log?: ComputeJobCommandLog | null;
   // Bounded RPC failure diagnostic; null/absent when no backend RPC has failed
   // (or once it resolves). Older responses may carry it under polling_metadata.
   compute_rpc_diagnostic?: ComputeRpcDiagnostic | null;
@@ -826,6 +848,10 @@ export interface ComputeJob {
   // Absent on legacy rows where the task payload predates this field.
   launch_params?: {
     command?: string | null;
+    // Multi-arm commands are stored base64-wrapped for escape safety. The
+    // backend decodes them on read; null for single-arm/operator commands,
+    // which are stored verbatim and need no decoding.
+    command_decoded?: string | null;
     arms?: Array<{ name: string; command: string }> | null;
     declared_metric?: string | null;
     metric?: string | null;
@@ -846,6 +872,20 @@ export interface ComputeJob {
       drafted_from_refinement?: boolean | null;
     } | null;
   } | null;
+  /** Per-file viewable-artifact manifest for artifacts produced by this compute
+   *  job. Present only on jobs whose backend persisted viewable files (images,
+   *  videos) as individually-addressable storage objects. Absent on legacy rows
+   *  or jobs without viewable output. */
+  viewable_artifacts?: ViewableArtifact[] | null;
+  /** Bounded time-series of intermediate progress samples emitted during the
+   *  job. Each sample has an ISO timestamp, a metric name, and a numeric value.
+   *  Absent on legacy rows or jobs that did not emit progress. */
+  progress_series?: Array<{ t: string; name: string; value: number }> | null;
+  /** Stable terminal disposition marker set when a job ends. Distinguishes a
+   *  no-progress watchdog cut ('no_progress') from a full wall-clock expiry
+   *  ('deadline'), budget cap ('spend_cap'), operator kill ('operator'), and
+   *  natural failure ('failure'). Absent on legacy rows. */
+  terminal_kind?: 'deadline' | 'no_progress' | 'spend_cap' | 'operator' | 'failure' | null;
 }
 
 export interface ComputeJobsSummary {
@@ -911,6 +951,12 @@ export interface AwaitingLocalRunnerHold {
   container_image: string | null;
   provisioning_model: string | null;
   deadline_seconds: number | null;
+  // Fields present when the job is pinned to a specific runner (forced target).
+  // Absent on holds that are waiting for any available runner. Backend returns
+  // these as top-level scalars plus a nested forced_runner descriptor.
+  forced_runner_target_id?: string | null;
+  awaiting_forced_runner_since?: string | null;
+  forced_runner?: { id: string; hostname: string | null; status: string } | null;
 }
 
 export async function fetchAwaitingLocalRunnerHolds(
@@ -934,12 +980,14 @@ export async function fetchComputeJobs(
   signal?: AbortSignal,
   includeFinishedMinutes?: number,
   offset = 0,
+  taskId?: string,
 ): Promise<ComputeJobsListResponse> {
   const query = new URLSearchParams();
   if (typeof includeFinishedMinutes === 'number') {
     query.set('include_finished_minutes', String(includeFinishedMinutes));
   }
   if (offset > 0) query.set('offset', String(offset));
+  if (taskId) query.set('task_id', taskId);
   const suffix = query.toString() ? `?${query.toString()}` : '';
   const res = await apiFetch(
     `/api/admin/projects/${encodeURIComponent(projectId)}/compute-jobs${suffix}`,
@@ -1278,6 +1326,11 @@ export interface KnowledgeDocument {
   /** Criterion verdict (True/False/None) from the success criterion evaluation for compute_experiment
    *  documents. None = unmeasured/not evaluable. Distinct from compute_acceptance_grade. */
   criterion_met?: boolean | null;
+  /** Proof-strength tier for compute_experiment documents: 'covered' (local hw execution),
+   *  'attested' (cloud execution), 'backfilled' (metrics without direct run evidence),
+   *  'partial' (attempted but incomplete), 'uncovered' (no execution evidence). Null for
+   *  non-compute documents and older docs persisted before the field existed. */
+  evidence_tier?: 'covered' | 'attested' | 'backfilled' | 'partial' | 'uncovered' | null;
   /** Lifecycle tracking for the strategist follow-up workflow. */
   lifecycle_status?: 'pending' | 'consumed' | 'dismissed' | string;
   consumed_at?: string | null;
@@ -1606,6 +1659,32 @@ export async function patchMetricsIntegritySettings(patch: { metrics_integrity_s
   }
 }
 
+export type CapabilityProofGateMode = 'off' | 'observe' | 'enforce';
+
+export interface CapabilityProofGateSettings {
+  capability_proof_gate_mode: CapabilityProofGateMode;
+  capability_proof_gate_auto_graduation_enabled: boolean;
+  capability_proof_gate_auto_graduation_observe_threshold: number;
+  capability_proof_gate_auto_graduation_enforce_threshold: number;
+}
+
+// PATCHes any partial of the four capability-proof-gate config keys. The backend
+// validates the mode enum, the boolean, and clamps thresholds to 0.0–1.0; only
+// the keys the operator changed should be sent.
+export async function patchCapabilityProofGateSettings(
+  patch: Partial<CapabilityProofGateSettings>,
+): Promise<void> {
+  const res = await apiFetch('/api/admin/settings', {
+    method: 'PATCH',
+    body: JSON.stringify(patch),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || `Failed to update capability proof gate settings: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to update capability proof gate settings: ${res.status}`);
+  }
+}
+
 
 export interface FleetRunner {
   id: string;
@@ -1616,6 +1695,7 @@ export interface FleetRunner {
     task_types?: string | string[];
     has_gpu?: boolean;
     max_concurrent?: number;
+    max_concurrent_compute?: number;
     // Task ids the runner reported as currently executing in its last heartbeat.
     active_task_ids?: string[];
     active_compute_job_ids?: string[];
@@ -1654,9 +1734,22 @@ export interface FleetRunner {
     active_compute_job_count?: number;
     active_work_count?: number;
     max_concurrent: number | null;
+    max_concurrent_compute?: number | null;
     available_slots: number | null;
+    available_agent_slots?: number | null;
+    available_compute_slots?: number | null;
     stale_reason: string | null;
     agent_available?: boolean | null;
+    agent_unavailable_reason?: string | null;
+    // Per-leg ok/failed breakdown of the four agent-backend legs so the fleet
+    // panel can render a checklist instead of parsing one folded reason string.
+    // null/absent when the runner (older build) never reported it.
+    agent_unavailable_legs?: {
+      bwrap_sandbox?: boolean;
+      agent_dist?: boolean;
+      node_runtime?: boolean;
+      docker?: boolean;
+    } | null;
     liveness_window_seconds: number;
     // Trust telemetry surfaced from the backend health computation.
     last_successful_job_at?: string | null;
@@ -1666,6 +1759,30 @@ export interface FleetRunner {
     disk_low?: boolean;
     gpu_utilization_pct?: number | null;
     failure_streak_threshold?: number;
+  };
+  // Server-authoritative live-safe config the daemon converges to on heartbeat,
+  // plus the desired-vs-applied generation markers. Optional: runners enrolled
+  // before this contract, or that have not yet reported an applied generation,
+  // omit it (or report applied_config_generation=null → config_pending=true).
+  config?: {
+    desired?: {
+      max_concurrent?: number | null;
+      max_concurrent_compute?: number | null;
+      task_types?: string | string[];
+      gpu_indices_allowed?: 'all' | number[];
+      gpus_per_job?: number;
+    };
+    config_generation?: string;
+    applied?: Record<string, unknown> | null;
+    applied_config_generation?: string | null;
+    // True whenever the operator changed config but the daemon has not yet
+    // echoed the matching generation (includes the never-reported case).
+    config_pending?: boolean;
+    gpu_indices_allowed?: 'all' | number[];
+    // Number of GPUs the runner reserves per compute job (server-authoritative,
+    // mirrored top-level for the fleet editor). Absent on runners enrolled before
+    // this contract; defaults to 1 GPU per job.
+    gpus_per_job?: number;
   };
   last_seen_at: string | null;
   created_at: string | null;
@@ -1738,6 +1855,148 @@ export async function revokeFleetRunner(projectId: string, runnerId: string): Pr
     const msg = data?.detail || `Failed to revoke runner: ${res.status}`;
     throw new Error(typeof msg === 'string' ? msg : `Failed to revoke runner: ${res.status}`);
   }
+}
+
+/** Update a runner's operator-configured capabilities in-place (partial merge).
+ * Only provided fields are updated; runner-reported hardware fields are preserved.
+ * Returns the updated runner view. */
+export async function updateRunnerCapabilities(
+  projectId: string,
+  runnerId: string,
+  capabilities: {
+    max_concurrent?: number;
+    task_types?: string | string[];
+    max_concurrent_compute?: number;
+    gpu_indices_allowed?: 'all' | number[];
+    gpus_per_job?: number;
+  },
+): Promise<FleetRunner> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/runners/${encodeURIComponent(runnerId)}/capabilities`,
+    { method: 'PATCH', body: JSON.stringify(capabilities) },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || `Failed to update runner capabilities: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to update runner capabilities: ${res.status}`);
+  }
+  return res.json();
+}
+
+/** Update a runner's lifecycle status (pause / drain / resume).
+ * Valid transitions: active→paused, active→draining, paused→active, draining→active, draining→paused.
+ * Returns the updated runner view. */
+export async function patchRunnerStatus(
+  projectId: string,
+  runnerId: string,
+  status: 'active' | 'paused' | 'draining',
+): Promise<FleetRunner> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/runners/${encodeURIComponent(runnerId)}/status`,
+    { method: 'PATCH', body: JSON.stringify({ status }) },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || `Failed to update runner status: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to update runner status: ${res.status}`);
+  }
+  return res.json();
+}
+
+/** One heartbeat time-series snapshot for a runner (from RunnerHeartbeatSnapshot). */
+export interface RunnerTelemetrySnapshot {
+  captured_at: string | null;
+  gpu_utilization_pct: number | null;
+  disk_free_bytes: number | null;
+  memory_free_bytes: number | null;
+  cpu_load_avg: number | null;
+  active_task_count: number;
+  active_compute_job_count: number;
+  agent_available: boolean | null;
+}
+
+export interface RunnerTelemetryResponse {
+  runner_id: string;
+  since_seconds: number;
+  count: number;
+  /** Oldest-first, ready to plot left-to-right. */
+  snapshots: RunnerTelemetrySnapshot[];
+}
+
+/** Fetch recent heartbeat time-series snapshots for one runner (default last hour). */
+export async function fetchRunnerTelemetry(
+  projectId: string,
+  runnerId: string,
+  opts?: { sinceSeconds?: number; limit?: number },
+): Promise<RunnerTelemetryResponse> {
+  const params = new URLSearchParams();
+  if (opts?.sinceSeconds != null) params.set('since', String(opts.sinceSeconds));
+  if (opts?.limit != null) params.set('limit', String(opts.limit));
+  const qs = params.toString();
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/runners/${encodeURIComponent(runnerId)}/telemetry${qs ? `?${qs}` : ''}`,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch runner telemetry: ${res.status}`);
+  return res.json();
+}
+
+export interface RunnerOutcome {
+  job_id: string;
+  task_id: string | null;
+  status: string;
+  outcome: string | null;
+  created_at: string | null;
+  completed_at: string | null;
+  /** Terminal diagnostic reason for a failed/timed-out job; null on success/legacy rows. */
+  terminal_reason?: string | null;
+  /** Process exit code for a failed job; null when not an int / absent. */
+  exit_code?: number | null;
+  /**
+   * Server-side redacted + truncated tail of the job's command log, surfaced
+   * inline on failed/timed-out rows. null on success/legacy rows or when no
+   * log was captured.
+   */
+  command_log_tail?: string | null;
+}
+
+export interface RunnerStatsResponse {
+  runner_id: string;
+  jobs_run_count: number;
+  jobs_terminal_count: number;
+  jobs_succeeded_count: number;
+  /** succeeded / terminal, or null when no terminal jobs yet. */
+  jobs_success_rate: number | null;
+  /** On-demand cloud VM cost the runner's terminal jobs would have incurred. */
+  cloud_cost_avoided_usd: number;
+  /** Number of terminal jobs with an honest runtime window backing the total. */
+  cloud_cost_avoided_basis: number;
+  /** Median claim latency (vm_cold_start_ms) across terminal tasks, ms. */
+  claim_latency_ms_p50: number | null;
+  /** 95th percentile claim latency, ms. */
+  claim_latency_ms_p95: number | null;
+  /** 99th percentile claim latency, ms. */
+  claim_latency_ms_p99: number | null;
+  /** Maximum claim latency, ms. */
+  claim_latency_ms_max: number | null;
+  /** Number of tasks with vm_cold_start_ms in the sample. */
+  claim_latency_sample_count: number;
+  last_n_outcomes: RunnerOutcome[];
+}
+
+/** Fetch per-runner compute-job rollups: total, success rate, recent outcomes. */
+export async function fetchRunnerStats(
+  projectId: string,
+  runnerId: string,
+  opts?: { recentLimit?: number },
+): Promise<RunnerStatsResponse> {
+  const params = new URLSearchParams();
+  if (opts?.recentLimit != null) params.set('recent_limit', String(opts.recentLimit));
+  const qs = params.toString();
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/runners/${encodeURIComponent(runnerId)}/stats${qs ? `?${qs}` : ''}`,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch runner stats: ${res.status}`);
+  return res.json();
 }
 
 /** Reset the review-fix iteration cap for a PR-linked task. Archives FAILED

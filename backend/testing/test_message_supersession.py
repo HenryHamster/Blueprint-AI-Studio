@@ -162,9 +162,14 @@ async def test_message_from_promoted_version_is_auto_resolved(db):
     assert audit is not None
     assert audit["version_number"] == 2
     assert audit["terminal_status"] == "promoted"
-    # A message_updated broadcast is queued for the caller to emit.
+    # ONE aggregate messages_superseded broadcast is queued (not one per message).
     assert len(summary["broadcasts"]) == 1
-    assert summary["broadcasts"][0][1]["message_id"] == str(msg.id)
+    pid, payload = summary["broadcasts"][0]
+    assert pid == str(project.id)
+    assert payload["count"] == 1
+    assert str(msg.id) in payload["message_ids"]
+    assert payload["version_number"] == 2
+    assert payload["terminal_status"] == "promoted"
 
 
 @pytest.mark.asyncio
@@ -382,3 +387,42 @@ async def test_open_rows_remaining_after_enforce(db):
         .all()
     )
     assert [r.id for r in open_rows] == [survivor.id]
+
+
+@pytest.mark.asyncio
+async def test_enforce_mode_emits_one_broadcast_for_many_messages(db):
+    """Batch supersession must emit ONE aggregate broadcast, not one per message.
+
+    This is the core regression guard for the broadcast-storm fix: up to
+    message_supersession_max_resolve (default 500) messages may be eligible in a
+    single version-close, but the caller must fire at most one live-update event.
+    """
+    _rc["message_supersession_max_resolve"] = 100
+    project = await _project(db)
+    await _version(db, project, 1, V1_OPENED)
+    await _version(db, project, 2, V2_OPENED)
+
+    # Create 10 eligible messages (all in v1's window, older than 14d).
+    n = 10
+    msgs = [
+        await _message(db, project, created_at=MSG_IN_V1 - timedelta(seconds=i))
+        for i in range(n)
+    ]
+
+    summary = await _close_v2(db, project)
+    await db.commit()
+
+    assert summary["superseded"] == n
+    # Exactly ONE broadcast entry regardless of how many messages were resolved.
+    assert len(summary["broadcasts"]) == 1, (
+        f"Expected 1 aggregate broadcast but got {len(summary['broadcasts'])} "
+        f"(one per message would be a broadcast storm)."
+    )
+    pid, payload = summary["broadcasts"][0]
+    assert pid == str(project.id)
+    assert payload["count"] == n
+    assert payload["version_number"] == 2
+    assert len(payload["message_ids"]) == n
+    # All resolved message IDs are included in the aggregate payload.
+    resolved_ids = {str(m.id) for m in msgs}
+    assert set(payload["message_ids"]) == resolved_ids

@@ -22,9 +22,10 @@ keeps working for existing callers and tests.
 
 import asyncio
 import logging
+import math
+import re
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import NamedTuple
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
@@ -38,6 +39,11 @@ from app.models import (
     TaskStatus,
 )
 from app.resource_envelope import resolve_project_require_local_runner
+from app.runner_decline import (
+    decline_exclusion_is_advisory,
+    decline_record_for_runner,
+    recently_declined_runner_ids,
+)
 from app.runner_health_monitors import (  # noqa: F401
     _RUNNER_DEGRADED_FAILURE_THRESHOLD,
     _RUNNER_LIVENESS_SECONDS,
@@ -62,6 +68,10 @@ from app.workbench_events import (
     SURFACE_STRATEGIC_SESSION,
     emit_workbench_refetch,
 )
+from app.strategic_runtime_work import (
+    CONTAINER_RUNNER_HOLD_CONTEXT_KEY,
+    LOCAL_RUNNER_HOLD_CONTEXT_KEY,
+)
 from app.workbench_state import (
     STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY,
     STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY,
@@ -69,6 +79,77 @@ from app.workbench_state import (
 )
 
 logger = logging.getLogger("blueprint")
+
+
+# task.context key holding an operator's HARD runner pin for a compute_experiment.
+# Kept deliberately SEPARATE from the soft ``preferred_runner_target_id`` affinity
+# hint: a forced target NEVER silently falls back to a different runner or to
+# cloud — when it is not eligible this cycle the task is HELD QUEUED. The soft
+# preferred hint keeps its fallback behaviour untouched.
+FORCED_RUNNER_TARGET_CONTEXT_KEY = "forced_runner_target_id"
+
+# task.context marker stamped (ISO-8601) the first cycle a forced-pin
+# compute_experiment is held waiting for its target runner to become eligible —
+# the honest, operator-legible "waiting for dgx-1" signal, mirroring the
+# ``awaiting_local_runner_since`` / ``awaiting_container_runner_since`` holds.
+AWAITING_FORCED_RUNNER_CONTEXT_KEY = "awaiting_forced_runner_since"
+
+# Every task.context key that marks a compute_experiment HELD QUEUED at dispatch
+# because no runner could take it this cycle. This is the set the dispatch path STAMPS,
+# and the set it CLEARS on successful dispatch (the only place a stamp is cleared).
+#
+# COMPOSED from the canonical per-key constants rather than re-typing their string
+# literals: a third independent copy of "awaiting_local_runner_since" et al. is the
+# exact drift this aggregate exists to prevent.
+#
+# It IS in lockstep with the bounded hold-timeout sweep: every key below is both
+# STAMPED here and SWEPT by ``_fail_stale_local_runner_holds`` (15-min early operator
+# alert, then 6h terminal PROVISION_FAILURE), upholding the invariant:
+#
+#   a key that is stamped but never swept is an unbounded hold, and a key that dispatch
+#   stops stamping but the sweep still reads is dead code.
+#
+# AWAITING_FORCED_RUNNER_CONTEXT_KEY was previously stamped but NEVER swept — a
+# forced-pin hold whose target runner never came back waited QUEUED indefinitely with
+# nothing watching it. The sweep now covers it on the same bounded-wait contract as its
+# siblings, with a forced-pin-specific terminal reason naming the pinned runner.
+COMPUTE_RUNNER_HOLD_CONTEXT_KEYS: tuple[str, ...] = (
+    LOCAL_RUNNER_HOLD_CONTEXT_KEY,
+    CONTAINER_RUNNER_HOLD_CONTEXT_KEY,
+    AWAITING_FORCED_RUNNER_CONTEXT_KEY,
+)
+
+# task.context marker stamped when a compute_experiment launch is deferred by a
+# TRANSIENT precondition (currently: the project's active-ComputeJob concurrency
+# cap). Distinct from the hold markers above — nothing is "awaited" here, the task
+# is simply re-queued behind a retry_after backoff and will launch unchanged once a
+# running job finishes and frees cap. Carries the human-readable reason so the
+# deferral is legible instead of looking like an idle QUEUED task.
+COMPUTE_LAUNCH_DEFERRED_REASON_CONTEXT_KEY = "compute_launch_deferred_reason"
+
+# Consecutive-deferral counter driving the backoff escalation below. Deliberately
+# NOT the shared ``_retry_after_resets``: the candidate scan clears that counter the
+# moment a backoff lapses, so escalation built on it would flatten to the base delay
+# forever. This key is owned by the deferral path and cleared only once the task
+# actually launches.
+COMPUTE_LAUNCH_DEFER_COUNT_CONTEXT_KEY = "compute_launch_defer_count"
+
+# Backoff bounds (minutes) for the transient-cap deferral above. Escalates per
+# consecutive deferral so a project sitting at its cap for hours (long GPU jobs)
+# re-checks cheaply instead of re-probing every dispatch cycle. Both are well inside
+# set_retry_after's own [0, 30] clamp.
+_COMPUTE_CAP_DEFER_BASE_MINUTES = 2.0
+_COMPUTE_CAP_DEFER_MAX_MINUTES = 15.0
+
+# Raise ONE operator alert once a task has deferred this many consecutive times. The
+# backoff saturates at _COMPUTE_CAP_DEFER_MAX_MINUTES from the 3rd deferral, so by the
+# 8th the task has been waiting on a full compute-job cap for well over an hour with no
+# sign of it clearing. A deferral is correct and unbounded BY DESIGN (it self-clears
+# whenever a running job goes terminal) — which is exactly why a saturated one needs a
+# surface: nothing else will ever mention it.
+_COMPUTE_CAP_DEFER_ALERT_AFTER_DEFERS = 8
+
+_COMPUTE_CAP_DEFER_ALERT_TITLE = "Compute experiment stalled at project job cap"
 
 
 # A compute_experiment held for a require-local project is failed if no runner
@@ -83,124 +164,83 @@ _LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS = 6 * 3600
 _LOCAL_RUNNER_HOLD_ALERT_SECONDS = 15 * 60  # 15 minutes
 
 
-class RunnerDispatchSnapshot(NamedTuple):
-    """Session-independent view of a live local runner used during dispatch."""
+def _coerce_vram_gb(payload: dict) -> tuple[float | None, str | None]:
+    """Resolve the agent-authored ``vram_gb`` hint to a float, or an honest error.
 
-    id: uuid.UUID
-    project_id: uuid.UUID
-    capabilities: dict
-    consecutive_job_failures: int = 0
+    ``vram_gb`` is AGENT-AUTHORED free-form payload data read in the dispatch hot
+    path, so it must be treated as untrusted. A bare ``float(raw)`` raises on the
+    values agents actually write — ``"24GB"`` (unit suffix), ``[24]``, ``{}`` —
+    and that exception propagates out of the dispatch cycle, taking down dispatch
+    for EVERY task in the cycle (blast radius: the whole fleet) while the offending
+    task itself only dies later, reasonless, via poison quarantine.
 
+    So: coerce defensively and return ``(value, None)`` on success or
+    ``(None, error)`` on a value that cannot be a VRAM figure — the caller
+    fails THAT task with a message naming the bad field and value, and the cycle
+    survives. ``None`` (unset) is not an error: it simply declares no VRAM floor.
 
-def _runner_handles_task_type(
-    runner: LocalRunner | RunnerDispatchSnapshot, task_type: str
-) -> bool:
-    """Whether a runner covers this task type, honoring BOTH policy and capability.
-
-    Two independent gates, intersected:
-
-    * **Operator policy (ceiling)** — ``capabilities['task_types']`` is
-      operator-configured (``"all"`` or an allowlist). It is the maximum set the
-      operator permits this runner to serve.
-    * **Runner-declared capability (floor)** — ``capabilities['supported_agent_task_types']``
-      is advertised by the runner itself over the heartbeat: a docker-only box
-      (docker+image, no bwrap) declares the read-only agent slice it can actually
-      run. When present (not None), an AGENT task type must also appear in it, so
-      the orchestrator never pins a write/heavy type this box would decline after
-      dispatch. Absent/None → no extra restriction (backward compatible with
-      runners that never advertise it).
-
-    ``compute_experiment`` is a COMPUTE-class task fulfilled by a different backend
-    (the runner's ``decide_compute_backend``, not the agent path), so the
-    agent-only floor never applies to it — a docker-only runner still handles
-    compute jobs. This mirrors the ``task_type == "compute_experiment"`` carve-out
-    the caller already applies to ``_runner_agent_available``.
+    Non-finite values are rejected too, not just non-numeric ones: ``inf`` parses
+    fine but blows up downstream at ``int(vram_gb * 1024)`` (OverflowError) in
+    :func:`_select_eligible_runner`, which is the same hot-path crash by a longer
+    route. ``bool`` is rejected explicitly — it is an ``int`` subclass, so
+    ``float(True) == 1.0`` would otherwise silently mean "1 GB".
     """
-    caps = runner.capabilities or {}
-    task_types = caps.get("task_types", "all")
-    if task_types == "all":
-        policy_ok = True
-    elif isinstance(task_types, (list, tuple, set)):
-        policy_ok = task_type in task_types
-    else:
-        # Malformed capability shape — be conservative and treat as no-cover.
-        policy_ok = False
-    if not policy_ok:
-        return False
-
-    # Runner-declared agent-capability floor. Only constrains AGENT task types;
-    # compute_experiment is exempt (handled by the compute backend, not the agent).
-    supported_agent = caps.get("supported_agent_task_types")
-    if (
-        supported_agent is not None
-        and task_type != "compute_experiment"
-        and isinstance(supported_agent, (list, tuple, set))
-    ):
-        return task_type in supported_agent
-    return True
-
-
-def _runner_active_task_count(runner: LocalRunner | RunnerDispatchSnapshot) -> int:
-    """Best-effort current load, from the heartbeat-reported active task ids."""
-    active = (runner.capabilities or {}).get("active_task_ids") or []
-    try:
-        return len(active)
-    except TypeError:
-        return 0
-
-
-def _runner_active_compute_job_count(
-    runner: LocalRunner | RunnerDispatchSnapshot,
-) -> int:
-    """Best-effort compute-job load, from heartbeat-reported active job ids."""
-    active = (runner.capabilities or {}).get("active_compute_job_ids") or []
-    try:
-        return len(active)
-    except TypeError:
-        return 0
-
-
-def _runner_active_work_count(runner: LocalRunner | RunnerDispatchSnapshot) -> int:
-    return _runner_active_task_count(runner) + _runner_active_compute_job_count(runner)
-
-
-def _runner_agent_available(runner: LocalRunner | RunnerDispatchSnapshot) -> bool:
-    """Old runners omit the field, which remains backward-compatible."""
-    available = (runner.capabilities or {}).get("agent_available")
-    return available is not False
-
-
-def _runner_at_capacity(
-    runner: LocalRunner | RunnerDispatchSnapshot, pins_this_cycle: int = 0
-) -> bool:
-    """True when the runner's EFFECTIVE load has reached its declared max_concurrent.
-
-    Effective load = heartbeat-reported active count (tasks the runner has already
-    pulled and reported) PLUS ``pins_this_cycle`` (tasks pinned to this runner
-    earlier in the SAME dispatch pass but not yet pulled/reported). The
-    heartbeat-reported ``active_task_ids`` lags pins by at least one heartbeat, so
-    without counting same-cycle pins a burst of N QUEUED tasks would all pin to a
-    single idle runner (it reads as load 0 on every iteration) and the surplus —
-    beyond what the runner can actually pull (max_concurrent) — would sit
-    PROVISIONING until falsely reaped. Counting the in-cycle pins caps NEW work
-    per cycle at the runner's real pull capacity.
-    """
-    caps = runner.capabilities or {}
-    raw_max_concurrent = caps.get("max_concurrent")
-    if isinstance(raw_max_concurrent, bool):
-        max_concurrent = None
-    elif isinstance(raw_max_concurrent, float):
-        max_concurrent = (
-            int(raw_max_concurrent) if raw_max_concurrent.is_integer() else None
+    raw = payload.get("vram_gb") or (payload.get("compute_experiment") or {}).get(
+        "vram_gb"
+    )
+    if raw is None:
+        return None, None
+    if isinstance(raw, bool):
+        return None, (
+            f"vram_gb must be a number of gigabytes (e.g. 24 or 24.5); "
+            f"got boolean {raw!r}"
         )
-    else:
+    if isinstance(raw, (int, float)):
+        value = float(raw)
+    elif isinstance(raw, str):
         try:
-            max_concurrent = int(raw_max_concurrent)
-        except (TypeError, ValueError):
-            max_concurrent = None
-    if max_concurrent is None:
-        return False
-    return _runner_active_work_count(runner) + pins_this_cycle >= max_concurrent
+            value = float(raw.strip())
+        except (ValueError, TypeError):
+            return None, (
+                f"vram_gb must be a number of gigabytes (e.g. 24 or 24.5); got "
+                f"{raw!r} — drop the unit suffix and requeue"
+            )
+    else:
+        return None, (
+            f"vram_gb must be a number of gigabytes (e.g. 24 or 24.5); got "
+            f"{type(raw).__name__} {raw!r}"
+        )
+    if not math.isfinite(value):
+        return None, (
+            f"vram_gb must be a finite number of gigabytes (e.g. 24 or 24.5); "
+            f"got {raw!r}"
+        )
+    return value, None
+
+
+# ── Runner eligibility predicates ────────────────────────────────────────────
+# Moved to app/runner_eligibility.py. This module is a chronic size-limit
+# offender (decomposition required; cap bumps are forbidden by
+# app.size_limit_policy), and the capability predicates were the one large,
+# perfectly self-contained unit here: pure functions over a runner snapshot, no
+# session, no I/O. Re-exported so every existing `orch._runner_*` reference and
+# import path keeps working unchanged.
+from app.runner_eligibility import (  # noqa: F401
+    _ACTIVE_AGENT_TASK_COUNT_KEY,
+    RunnerDispatchSnapshot,
+    _coerce_max_concurrent,
+    _runner_active_compute_job_count,
+    _runner_active_task_count,
+    _runner_active_work_count,
+    _runner_agent_available,
+    _runner_at_capacity,
+    _runner_at_compute_capacity,
+    _runner_gpu_capable,
+    _runner_handles_task_type,
+    _runner_has_container_capability,
+    _runner_has_free_vram,
+    _runner_max_concurrent_compute,
+)
 
 
 async def _load_active_runners_cache(
@@ -228,6 +268,7 @@ async def _load_active_runners_cache(
                     LocalRunner.project_id,
                     LocalRunner.capabilities,
                     LocalRunner.consecutive_job_failures,
+                    LocalRunner.hostname,
                 ).where(
                     LocalRunner.status == "active",
                     LocalRunner.last_seen_at.is_not(None),
@@ -238,12 +279,29 @@ async def _load_active_runners_cache(
     except Exception:
         logger.exception("[RUNNERS] Failed to load active-runner cache")
         return {}
+    runner_ids_for_load = [
+        runner_id for runner_id, _project_id, _capabilities, _failures, _hostname in rows
+    ]
     outstanding_compute_by_runner = await _load_runner_compute_job_assignments(
-        session, [runner_id for runner_id, _project_id, _capabilities, _failures in rows]
+        session, runner_ids_for_load
+    )
+    # Authoritative per-runner agent-task load from Task rows (heartbeat-independent).
+    active_task_count_by_runner = await _load_runner_active_task_counts(
+        session, runner_ids_for_load
     )
     by_project: dict[uuid.UUID, list[RunnerDispatchSnapshot]] = {}
-    for runner_id, project_id, capabilities, consecutive_job_failures in rows:
+    for runner_id, project_id, capabilities, consecutive_job_failures, hostname in rows:
         caps = dict(capabilities or {})
+        # Inject the authoritative active agent-task count so _runner_active_task_count
+        # / _runner_at_capacity size AGENT capacity off committed Task rows rather than
+        # the stale-prone heartbeat ``active_task_ids`` list (which can over-report and
+        # falsely pin-block an idle runner).  Inject ONLY when the count query
+        # succeeded: on success the loader returns an entry for EVERY runner id (0
+        # for idle), so a missing id means the query FAILED — in which case we leave
+        # the key absent and _runner_active_task_count falls back to the heartbeat
+        # hint instead of reading a false 0 that would let a loaded runner over-pin.
+        if runner_id in active_task_count_by_runner:
+            caps[_ACTIVE_AGENT_TASK_COUNT_KEY] = active_task_count_by_runner[runner_id]
         heartbeat_jobs = caps.get("active_compute_job_ids") or []
         merged_job_ids: list[str] = []
         seen_job_ids: set[str] = set()
@@ -261,6 +319,7 @@ async def _load_active_runners_cache(
             project_id=project_id,
             capabilities=caps,
             consecutive_job_failures=consecutive_job_failures or 0,
+            hostname=hostname,
         )
         by_project.setdefault(project_id, []).append(snapshot)
     return by_project
@@ -319,6 +378,61 @@ async def _load_runner_compute_job_assignments(
     return by_runner
 
 
+async def _load_runner_active_task_counts(
+    session: AsyncSession,
+    runner_ids: list[uuid.UUID],
+) -> dict[uuid.UUID, int]:
+    """Return the AUTHORITATIVE active agent-task count per runner id.
+
+    Counts committed Task rows pinned to each runner (``vm_instance_id ==
+    'runner:<id>'``) that are still in an active status (PROVISIONING or
+    IN_PROGRESS). This is the source of truth for a runner's agent load: unlike the
+    heartbeat-reported ``active_task_ids`` list — which can go stale-HIGH by still
+    listing tasks that already COMPLETED/FAILED and thus falsely trip
+    ``_runner_at_capacity`` — a Task row leaves the active set the instant it
+    reaches a terminal status. In-cycle pins made after this snapshot are covered
+    separately by the caller's ``runner_pins_this_cycle`` counter.
+
+    Returns ``{runner_id: count}`` with an entry for EVERY passed runner id (0 for
+    an idle runner with no active tasks) on a successful query, so a populated dict
+    unambiguously reflects the query result. Best-effort: on a query error returns
+    an EMPTY dict — distinguishable from "all idle" precisely because success seeds
+    every id — which the caller treats as "query failed, do not inject the
+    authoritative count", so ``_runner_active_task_count`` falls back to the
+    heartbeat ``active_task_ids`` hint instead of reading a false 0.
+    """
+    if not runner_ids:
+        return {}
+    vm_id_by_runner = {f"runner:{runner_id}": runner_id for runner_id in runner_ids}
+    try:
+        rows = (
+            await session.execute(
+                select(Task.vm_instance_id)
+                .where(
+                    Task.vm_instance_id.in_(list(vm_id_by_runner.keys())),
+                    Task.status.in_(
+                        [TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]
+                    ),
+                )
+            )
+        ).all()
+    except Exception:
+        logger.exception("[RUNNERS] Failed to load runner active-task counts")
+        return {}
+
+    # Seed every known runner at 0 so a SUCCESSFUL query returns an entry for each
+    # runner id. This makes an empty return dict mean UNAMBIGUOUSLY "query failed"
+    # (see the except above), rather than being indistinguishable from "all idle" —
+    # the ambiguity that made a partial DB failure inject a false 0 everywhere.
+    by_runner: dict[uuid.UUID, int] = dict.fromkeys(runner_ids, 0)
+    for (vm_instance_id,) in rows:
+        runner_id = vm_id_by_runner.get(vm_instance_id)
+        if runner_id is None:
+            continue
+        by_runner[runner_id] = by_runner.get(runner_id, 0) + 1
+    return by_runner
+
+
 async def _try_runner_dispatch(
     session: AsyncSession,
     task: Task,
@@ -357,6 +471,25 @@ async def _try_runner_dispatch(
     accelerator = payload.get("accelerator") or (
         payload.get("compute_experiment") or {}
     ).get("accelerator")
+    # A declared container_image restricts eligibility to runners with a
+    # container isolation backend. Read flat and nested, mirroring accelerator.
+    container_image = payload.get("container_image") or (
+        payload.get("compute_experiment") or {}
+    ).get("container_image")
+    # A declared vram_gb restricts eligibility to runners with sufficient free VRAM.
+    # Coerced defensively: this is agent-authored payload data, and a raw float()
+    # here would raise INSIDE the dispatch cycle on e.g. "24GB". Decline to pin
+    # (return False) rather than crash the cycle — the task falls through to the
+    # compute-experiment dispatch path, which fails IT with an honest validation
+    # message naming the bad field (see _dispatch_compute_experiment_task).
+    vram_gb, vram_error = _coerce_vram_gb(payload)
+    if vram_error is not None:
+        logger.warning(
+            "[RUNNERS] Not pinning task %s to a runner: invalid vram_gb — %s",
+            task.id,
+            vram_error,
+        )
+        return False
     runner = _select_eligible_runner(
         active_runners_cache,
         task.project_id,
@@ -364,17 +497,32 @@ async def _try_runner_dispatch(
         accelerator,
         runner_pins_this_cycle,
         preferred_runner_target_id=ctx.get("preferred_runner_target_id"),
+        dispatch_seed=task.id.int,
+        container_image=container_image,
+        vram_gb=vram_gb,
+        # Runners that recently declined THIS task are excluded — otherwise the
+        # per-task-stable tiebreak re-pins it to the same runner that just said
+        # no, and the pin→pull→decline loop never terminates.
+        declined_runner_ids=recently_declined_runner_ids(task),
+        # ...but never at the cost of a local-required Strategic task's local
+        # execution: on a single-runner Strategic fleet an exclusion empties the
+        # pool, and the 900s hold sweep then evicts the task to cloud. While the
+        # declines still look transient, re-pick the decliner instead.
+        declined_exclusion_advisory=decline_exclusion_is_advisory(task, task_type),
     )
     if runner is None:
         return False
 
     new_ctx = dict(ctx)
     new_ctx["runner_target_id"] = str(runner.id)
+    new_ctx["runner_hostname"] = runner.hostname
     # A task that was held (enforce-local) and is now pinned must not carry the
     # stale wait stamp — otherwise the bounded-timeout sweep could fail it after
     # it has already been claimed by a runner.
-    new_ctx.pop("awaiting_local_runner_since", None)
+    new_ctx.pop(LOCAL_RUNNER_HOLD_CONTEXT_KEY, None)
+    new_ctx.pop(CONTAINER_RUNNER_HOLD_CONTEXT_KEY, None)
     new_ctx.pop(STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY, None)
+    new_ctx.pop("runner_pin_hold", None)
     task.context = new_ctx
     task.vm_instance_id = f"runner:{runner.id}"
     task.status = TaskStatus.PROVISIONING
@@ -395,6 +543,20 @@ async def _try_runner_dispatch(
             "[RUNNERS] Failed to commit runner pin for task %s", task.id
         )
         await session.rollback()
+        # The rollback expired every session-bound ORM instance (independent of
+        # expire_on_commit=False). A subsequent attribute read on ``task`` in
+        # the dispatch loop (e.g. ``_hold_strategic_local_runner_task`` at
+        # orchestrator.py:2842) would then fire a sync lazy-load from async
+        # context and raise MissingGreenlet, quarantining a healthy task.
+        # Re-pickling from the DB is async-safe because ``refresh()`` goes
+        # through the session's async API, and the rollback has already opened
+        # a new implicit transaction for the read.
+        try:
+            await session.refresh(task)
+        except Exception:
+            logger.exception(
+                "[RUNNERS] Failed to refresh task %s after rollback", task.id
+            )
         return False
     # Only charge the in-cycle pin slot once the pin is durably committed — a
     # rolled-back pin above must not consume the runner's per-cycle capacity.
@@ -409,9 +571,13 @@ async def _try_runner_dispatch(
     # flagged the stall is now stale — dismiss it. Best-effort: a resolve
     # failure must never abort a successful dispatch.
     try:
-        from app.alert_dispatch import _resolve_local_runner_hold_alert
+        from app.alert_dispatch import (
+            _resolve_container_runner_hold_alert,
+            _resolve_local_runner_hold_alert,
+        )
 
         await _resolve_local_runner_hold_alert(session, task.id)
+        await _resolve_container_runner_hold_alert(session, task.id)
     except Exception:
         logger.exception(
             "[RUNNERS] Failed to dismiss hold alert for task %s (non-fatal)", task.id
@@ -544,6 +710,186 @@ def _num_or_none(value) -> float | None:
     return f
 
 
+def _payload_runner_target(payload: dict) -> tuple[str | None, bool]:
+    """Extract a launch-contract runner pin as ``(runner_id, strict)``.
+
+    Reads ``runner_target: {runner_id, strict}`` flat or nested under
+    ``compute_experiment`` (mirroring the accelerator / container_image reads).
+    Returns ``(None, False)`` when absent or malformed — dispatch treats a
+    malformed pin as no pin (the authoring contract validator rejects malformed
+    shapes for operator launches; agent-authored payloads degrade soft).
+    """
+    target = payload.get("runner_target") or (
+        payload.get("compute_experiment") or {}
+    ).get("runner_target")
+    if not isinstance(target, dict):
+        return None, False
+    runner_id = target.get("runner_id")
+    if not (isinstance(runner_id, str) and runner_id.strip()):
+        return None, False
+    return runner_id.strip(), bool(target.get("strict"))
+
+
+_PIN_HOLD_DIGITS_RE = re.compile(r"\d+")
+
+
+def _pin_hold_stable_key(record) -> tuple | None:
+    """Change-comparison key for ``context['runner_pin_hold']`` records.
+
+    The human-readable ``detail`` embeds per-cycle-mutable values (live load
+    counts, heartbeat timestamps), so full-record equality would flip every
+    dispatch cycle while a pinned runner flaps — rewriting the held task row
+    each cycle and defeating the change-gated commit. The key keeps what
+    identifies the hold STATE — runner id + reason code — plus the detail with
+    digit runs collapsed, so a genuinely different hold (another gate, other
+    wording) still rewrites while volatile numbers do not. Returns ``None``
+    for a missing/malformed record so the first stamp always writes.
+    """
+    if not isinstance(record, dict):
+        return None
+    detail = record.get("detail")
+    coarse_detail = (
+        _PIN_HOLD_DIGITS_RE.sub("#", detail) if isinstance(detail, str) else None
+    )
+    return (record.get("runner_id"), record.get("reason_code"), coarse_detail)
+
+
+async def _diagnose_strict_runner_pin_hold(
+    session: AsyncSession,
+    active_runners_cache: dict[uuid.UUID, list[LocalRunner | RunnerDispatchSnapshot]],
+    project_id: uuid.UUID,
+    pinned_runner_id: str,
+    task_type: str,
+    accelerator: str | None,
+    container_image: str | None,
+    runner_pins_this_cycle: dict[uuid.UUID, int],
+    declined_record: dict | None = None,
+) -> tuple[str, str]:
+    """Explain why a strict-pinned runner cannot take this job RIGHT NOW.
+
+    Returns ``(reason_code, detail)``. The reason must be truthful and specific
+    (runner id + why), never a generic no-runner message: reason codes are
+    ``declined_recently`` / ``at_capacity`` / ``task_type_not_allowed`` /
+    ``missing_gpu`` / ``missing_container_runtime`` / ``not_eligible`` (live but
+    failed another gate) for runners in the live cache, and ``not_found`` /
+    ``not_enrolled`` / ``offline`` for runners that are not live. The pair is
+    stamped into ``task.context['runner_pin_hold']`` and the hold status message
+    so the admin UI can show exactly why nothing is dispatching.
+    """
+    # Checked FIRST, mirroring _select_eligible_runner: the decline exclusion is
+    # applied to the candidate pool BEFORE any eligibility filter, so a runner it
+    # dropped never reaches the capacity/task-type/GPU gates below. Reporting one
+    # of those instead would be a lie, and reporting the generic "not_eligible"
+    # would leave the operator with no idea the runner had said no — and no
+    # sight of the reason the runner itself gave.
+    if declined_record is not None:
+        count = declined_record.get("count") or 1
+        why = declined_record.get("reason") or "unspecified"
+        left = declined_record.get("seconds_left")
+        left_txt = f"; excluded for another {left}s" if left is not None else ""
+        return (
+            "declined_recently",
+            f"runner declined this task {count}x (most recent reason: {why})"
+            f"{left_txt}",
+        )
+
+    candidates = active_runners_cache.get(project_id) or []
+    snapshot = next(
+        (r for r in candidates if str(r.id) == pinned_runner_id), None
+    )
+    if snapshot is not None:
+        if not _runner_handles_task_type(snapshot, task_type):
+            return (
+                "task_type_not_allowed",
+                f"runner does not accept task type {task_type!r} "
+                "(operator task_types policy)",
+            )
+        pins = runner_pins_this_cycle.get(snapshot.id, 0)
+        # Mirror _select_eligible_runner exactly: capacity is per CLASS
+        # (compute_experiment checks the compute-job class, agent tasks the
+        # agent class), so the diagnosed reason matches why selection skipped
+        # this runner.
+        if _runner_at_capacity(snapshot, pins, task_type):
+            caps = snapshot.capabilities or {}
+            if task_type == "compute_experiment":
+                load = _runner_active_compute_job_count(snapshot) + pins
+                limit = _runner_max_concurrent_compute(snapshot)
+                limit_label = f"max_concurrent_compute={limit}"
+            else:
+                load = _runner_active_task_count(snapshot) + pins
+                limit_label = f"max_concurrent={caps.get('max_concurrent')}"
+            return (
+                "at_capacity",
+                f"runner is at capacity ({load} active+pinned vs {limit_label})",
+            )
+        if accelerator and not (snapshot.capabilities or {}).get("has_gpu"):
+            return (
+                "missing_gpu",
+                f"job declares accelerator {accelerator!r} but the runner does "
+                "not advertise has_gpu",
+            )
+        if container_image and not _runner_has_container_capability(snapshot):
+            return (
+                "missing_container_runtime",
+                f"job declares container_image {container_image!r} but the "
+                "runner advertises no container isolation backend",
+            )
+        return ("not_eligible", "runner failed dispatch eligibility this cycle")
+
+    # Not in the live cache — distinguish unknown / cross-project / offline via
+    # the runner row. This path runs only while a strict pin is holding (rare,
+    # once per dispatch cycle for the held task), so the extra read is cheap.
+    try:
+        runner_uuid = uuid.UUID(pinned_runner_id)
+    except ValueError:
+        return ("not_found", "runner_target.runner_id is not a valid runner id")
+    row = await session.get(LocalRunner, runner_uuid)
+    if row is None:
+        return ("not_found", "no runner with this id is registered")
+    if row.project_id != project_id:
+        return (
+            "not_enrolled",
+            "runner is enrolled in a different project — a pin must name one "
+            "of this project's runners",
+        )
+    last_seen = (
+        row.last_seen_at.isoformat() if row.last_seen_at is not None else "never"
+    )
+    return (
+        "offline",
+        f"runner (host {row.hostname or 'unknown'}) is not live — "
+        f"status={row.status!r}, last heartbeat {last_seen}; it must be active "
+        f"and heartbeating within {_RUNNER_LIVENESS_SECONDS}s to claim work",
+    )
+
+
+async def _lookup_runner_hostname(
+    session: AsyncSession, project_id: uuid.UUID, runner_id: str | None
+) -> str | None:
+    """Best-effort hostname for a runner id owned by ``project_id`` (else None).
+
+    Used only to build an operator-legible "waiting for <host>" hold message — a
+    lookup miss (offline/deleted/unknown/unparseable id) degrades to the raw id,
+    never raising, so a display concern can never abort a dispatch commit.
+    """
+    if not runner_id:
+        return None
+    try:
+        parsed = uuid.UUID(str(runner_id).strip())
+    except (ValueError, TypeError, AttributeError):
+        return None
+    try:
+        runner = await session.get(LocalRunner, parsed)
+    except Exception:
+        logger.exception(
+            "[RUNNERS] hostname lookup failed for runner %s", runner_id
+        )
+        return None
+    if runner is None or runner.project_id != project_id:
+        return None
+    return runner.hostname
+
+
 def _select_eligible_runner(
     active_runners_cache: dict[uuid.UUID, list[LocalRunner | RunnerDispatchSnapshot]],
     project_id: uuid.UUID,
@@ -551,31 +897,121 @@ def _select_eligible_runner(
     accelerator: str | None,
     runner_pins_this_cycle: dict[uuid.UUID, int],
     preferred_runner_target_id: str | None = None,
+    dispatch_seed: int = 0,
+    container_image: str | None = None,
+    forced_runner_target_id: str | None = None,
+    vram_gb: float | None = None,
+    declined_runner_ids: set[str] | None = None,
+    declined_exclusion_advisory: bool = False,
 ) -> "LocalRunner | RunnerDispatchSnapshot | None":
     """Pick the least-loaded eligible runner for a task/job, or None.
 
     Eligibility: the runner handles ``task_type`` (its advertised allowlist) and is
     not at its per-cycle pull capacity; when an ``accelerator`` is declared it must
-    also advertise ``has_gpu`` (a CPU runner cannot provide a GPU). A preferred
-    runner wins only after those eligibility checks pass; otherwise selection
-    prefers the least EFFECTIVE load — heartbeat-reported active count plus pins
-    already made to the runner this cycle — so a same-cycle burst spreads across
-    a fleet instead of stacking onto one runner.
+    be VERIFIED GPU-capable via :func:`_runner_gpu_capable` — the self-reported
+    ``has_gpu`` bool cross-checked against the runner's own GPU telemetry, so a
+    mis-set flag cannot silently defeat the GPU capability gate (a CPU runner, or one
+    whose telemetry contradicts its ``has_gpu`` claim, cannot provide a GPU).  When a
+    ``container_image`` is declared the runner must advertise a container isolation
+    backend (docker, podman, etc.) — the orchestrator will not route a
+    container-image-dependent job to a runner whose isolation support is unknown.
+    A preferred runner wins only after those eligibility checks pass; otherwise
+    selection prefers the least EFFECTIVE load — heartbeat-reported active count
+    plus pins already made to the runner this cycle — so a same-cycle burst spreads
+    across a fleet instead of stacking onto one runner.
+
+    ``forced_runner_target_id`` is an operator HARD pin (distinct from the soft
+    ``preferred_runner_target_id`` hint): when set, candidate eligibility is
+    restricted to ONLY that runner id and the function returns ``None`` if that one
+    runner is not eligible this cycle — it NEVER falls through to the least-loaded
+    selection or to a different runner. The caller (``_dispatch_compute_experiment_directly``)
+    then HOLDS the task QUEUED rather than dispatching it elsewhere.
+
+    When multiple runners are equally loaded, ``dispatch_seed`` (derived from the
+    dispatched task/job UUID) breaks ties deterministically so repeated dispatch
+    bursts rotate across the fleet rather than always landing on the same runner.
+
+    ``declined_runner_ids`` are runners that recently DECLINED this specific task
+    (see :mod:`app.runner_decline`). They are removed from the candidate pool
+    because that same stable per-task tiebreak would otherwise re-pick the runner
+    that just declined — pin → pull → decline → pin, forever. Excluding them is
+    what makes the loop terminate: the task moves to other hardware, or to no
+    runner at all, which correctly falls through to cloud dispatch.
+
+    ``declined_exclusion_advisory`` waives that exclusion when honouring it would
+    empty the candidate set (see ``runner_decline.decline_exclusion_is_advisory``,
+    which sets it only for a Strategic task whose declines still look transient).
+    For a normal task an empty set IS the graceful exit — cloud dispatch. For a
+    local-required Strategic task it is not: the task parks and the 900s hold
+    sweep evicts it to cloud, defeating continuous-local mode. So rather than
+    empty the pool we re-pick the decliner and let the retry try again; the
+    decline counter and operator alert still escalate, and the waiver stops at
+    ``DECLINE_ESCALATION_THRESHOLD`` so a genuinely incapable single-runner fleet
+    still reaches the hold → cloud-fallback safety valve instead of livelocking.
+    Whenever other hardware exists the exclusion is honoured unconditionally.
 
     Shared by agent-task dispatch (:func:`_try_runner_dispatch`) and direct
     compute-job dispatch (:func:`_dispatch_compute_experiment_directly`) so both use
     a single eligibility / least-loaded rule.
     """
     candidates = active_runners_cache.get(project_id) or []
-    eligible = [
-        r
-        for r in candidates
-        if _runner_handles_task_type(r, task_type)
-        and (task_type == "compute_experiment" or _runner_agent_available(r))
-        and not _runner_at_capacity(r, runner_pins_this_cycle.get(r.id, 0))
-    ]
-    if accelerator:
-        eligible = [r for r in eligible if (r.capabilities or {}).get("has_gpu")]
+    # Operator HARD pin: restrict the candidate pool to ONLY the forced runner id
+    # BEFORE any eligibility check. If that runner is offline / at capacity / the
+    # wrong task-type / lacks a required GPU it simply falls out of ``eligible``
+    # below and the function returns None — it never spills over to another runner.
+    if forced_runner_target_id:
+        forced_id = str(forced_runner_target_id).strip()
+        candidates = [r for r in candidates if str(r.id) == forced_id]
+
+    pins = runner_pins_this_cycle
+
+    def _eligible(pool: list) -> list:
+        """Runners in ``pool`` that can actually take this task THIS cycle."""
+        out = [
+            r
+            for r in pool
+            if _runner_handles_task_type(r, task_type)
+            and (task_type == "compute_experiment" or _runner_agent_available(r))
+            and not _runner_at_capacity(r, pins.get(r.id, 0), task_type)
+        ]
+        if accelerator:
+            # Trust VERIFIED GPU capability, not the bare self-reported has_gpu bool:
+            # a mis-set flag would silently defeat this gate and win GPU jobs the
+            # runner cannot run. _runner_gpu_capable cross-checks has_gpu against the
+            # runner's own nvidia-smi telemetry (gpu_count/gpu_names) and disbelieves
+            # a claim its telemetry contradicts. Fail-safe: a runner that cannot be
+            # verified GPU-capable falls out of `eligible` and the task holds for
+            # real hardware.
+            out = [r for r in out if _runner_gpu_capable(r)]
+        if container_image:
+            out = [r for r in out if _runner_has_container_capability(r)]
+        if vram_gb is not None and vram_gb > 0:
+            required_mib = int(vram_gb * 1024)
+            out = [r for r in out if _runner_has_free_vram(r, required_mib)]
+        return out
+
+    if declined_runner_ids and not forced_runner_target_id:
+        # Not applied under a forced pin: an operator hard-pin is an explicit
+        # instruction to use that runner and nothing else, so it out-ranks the
+        # decline heuristic (the hold + decline alert still surface the problem).
+        eligible = _eligible(
+            [r for r in candidates if str(r.id) not in declined_runner_ids]
+        )
+        # The waiver is decided on ELIGIBILITY, not on whether some other runner
+        # ROW merely exists. Deciding it on the raw candidate list made the waiver
+        # inert on every multi-runner fleet — including the live one: with a
+        # Strategic laptop + a dgx-1, excluding the laptop leaves dgx-1 "surviving",
+        # so the exclusion was applied — and dgx-1 then fails the task-type /
+        # capacity gate, `eligible` is empty, and the Strategic task is parked and
+        # evicted to cloud by the hold sweep. Exactly what the waiver exists to
+        # prevent, defeated by a runner that could never have taken the task.
+        #
+        # So: fall back to the decliner only when no ELIGIBLE runner survives.
+        if not eligible and declined_exclusion_advisory:
+            eligible = _eligible(candidates)
+    else:
+        eligible = _eligible(candidates)
+
     if not eligible:
         return None
     if preferred_runner_target_id:
@@ -589,10 +1025,22 @@ def _select_eligible_runner(
     # Deprioritize degraded runners (consecutive_job_failures at threshold) so
     # healthy runners are always preferred; degraded runners remain eligible as
     # a fallback so they can receive a job and reset their failure streak.
+    # Sort by per-class load so compute tasks sort by compute load and agent tasks
+    # sort by agent load — preventing one class from starving the other.
+    # Among equally-loaded runners the XOR of the runner id with the dispatch
+    # seed (task UUID int) acts as a stable per-task offset so different tasks
+    # route to different runners instead of always picking the same first entry.
+    is_compute = task_type == "compute_experiment"
+
     def _dispatch_sort_key(r: "LocalRunner | RunnerDispatchSnapshot") -> tuple:
         failures = getattr(r, "consecutive_job_failures", 0) or 0
         is_degraded = int(failures >= _RUNNER_DEGRADED_FAILURE_THRESHOLD)
-        return (is_degraded, _runner_active_work_count(r) + runner_pins_this_cycle.get(r.id, 0))
+        if is_compute:
+            load = _runner_active_compute_job_count(r) + pins.get(r.id, 0)
+        else:
+            load = _runner_active_task_count(r) + pins.get(r.id, 0)
+        tiebreak = r.id.int ^ dispatch_seed
+        return (is_degraded, load, tiebreak)
 
     return min(eligible, key=_dispatch_sort_key)
 
@@ -659,6 +1107,30 @@ def _build_compute_launch_kwargs(
         kwargs["container_image"] = payload["container_image"]
     if isinstance(payload.get("container_registry_auth"), dict):
         kwargs["container_registry_auth"] = payload["container_registry_auth"]
+    if payload.get("allow_host_fallback"):
+        kwargs["allow_host_fallback"] = bool(payload["allow_host_fallback"])
+    # No-progress watchdog window (peer of runtime deadline). Forwarded when set so
+    # a stalled job is cut early; create_compute_job validates/clamps it. Integer
+    # field, so it uses a plain presence check rather than the string `_present`.
+    if payload.get("no_progress_timeout_seconds") is not None:
+        kwargs["no_progress_timeout_seconds"] = payload["no_progress_timeout_seconds"]
+    # Cross-job checkpoint resume: forward the optional predecessor reference so the
+    # new job rehydrates that job's durable bundle before its command runs.
+    # create_compute_job does the authoritative same-project + bundle-exists check.
+    input_artifact_job_id = payload.get("input_artifact_job_id") or (
+        payload.get("compute_experiment") or {}
+    ).get("input_artifact_job_id")
+    if _present(input_artifact_job_id):
+        kwargs["input_artifact_job_id"] = input_artifact_job_id
+    # declared_metric names the contract metric the no-progress watchdog watches
+    # for a stall. Accept the nested compute_experiment form too, mirroring how the
+    # accelerator is read above. (The multi-arm command is still synthesized at task
+    # creation; this only forwards the label so the watchdog has a metric to track.)
+    declared_metric = payload.get("declared_metric") or (
+        payload.get("compute_experiment") or {}
+    ).get("declared_metric")
+    if _present(declared_metric):
+        kwargs["declared_metric"] = declared_metric
     return kwargs
 
 
@@ -721,6 +1193,193 @@ async def _fail_compute_experiment_task(
     return "failed"
 
 
+async def _defer_compute_experiment_task(
+    session: AsyncSession, task: Task, message: str
+) -> str:
+    """DEFER a ``compute_experiment`` whose launch hit a TRANSIENT precondition.
+
+    The project's compute-job concurrency cap is not a failure — it is back-pressure.
+    Active jobs are a strictly shrinking set absent new launches, so the very same
+    task launches unchanged once a running job reaches a terminal state. Terminal-
+    FAILing it (the old behaviour for every non-live-release precondition) burned the
+    direction's failure budget for a queueing decision the orchestrator itself made,
+    and fed the churn guardrail with phantom failures.
+
+    So: keep the task QUEUED and stamp the established ``retry_after_until`` backoff
+    (``set_retry_after`` + ``_infra_wait``) — the same convention the provisioner uses
+    for infrastructure back-pressure. The candidate scan at the top of the dispatch
+    cycle skips a task whose ``retry_after_until`` is in the future and clears the
+    marker once it lapses, so the task re-enters dispatch on its own with no sweep and
+    no retry-budget burn. Backoff escalates per consecutive deferral (2 → 15 min).
+
+    Deliberately does NOT call ``record_task_result`` — a deferral is not an outcome,
+    and recording one would recreate the exact failure-budget pollution this fixes.
+
+    Returns ``"deferred"``.
+    """
+    from app.broadcast import broadcast_to_project
+    from app.time_utils import set_retry_after
+
+    ctx = dict(task.context or {})
+    # _infra_wait marks this as back-pressure, not a rate-limit hold: it stops the
+    # candidate scan from releasing the backoff early on LLM-account recovery (an
+    # available account does nothing for a full compute-job cap).
+    ctx["_infra_wait"] = True
+    ctx[COMPUTE_LAUNCH_DEFERRED_REASON_CONTEXT_KEY] = message[:500]
+    try:
+        _prior_defers = int(ctx.get(COMPUTE_LAUNCH_DEFER_COUNT_CONTEXT_KEY) or 0)
+    except (TypeError, ValueError):
+        _prior_defers = 0
+    ctx[COMPUTE_LAUNCH_DEFER_COUNT_CONTEXT_KEY] = _prior_defers + 1
+    task.context = ctx
+    # Clamp the EXPONENT, not just the product. `float * (2**n)` raises
+    # OverflowError("int too large to convert to float") once n >= 1024 — and the
+    # raise happens inside _dispatch_compute_experiment_directly, i.e. inside the
+    # dispatch loop's per-task containment, so a task that was CORRECTLY deferring
+    # would start crashing every cycle and get QUARANTINED as a poison task. That is
+    # reachable: a project pinned at its compute cap defers every ~15 min, so the
+    # counter passes 1024 after ~10.6 days. The backoff is already saturated at
+    # _COMPUTE_CAP_DEFER_MAX_MINUTES long before n=8, so clamping there is
+    # value-identical for every n and merely keeps the arithmetic finite.
+    backoff_minutes = min(
+        _COMPUTE_CAP_DEFER_BASE_MINUTES * (2 ** min(_prior_defers, 8)),
+        _COMPUTE_CAP_DEFER_MAX_MINUTES,
+    )
+    # set_retry_after rewrites task.context off the dict above, so the keys just set
+    # survive; it owns retry_after_until + the shared _retry_after_resets counter.
+    set_retry_after(task, backoff_minutes)
+    task.status = TaskStatus.QUEUED  # explicit: a deferral never leaves QUEUED
+    task.latest_status_message = message[:500]
+    session.add(task)
+    # Operator surface for a deferral that is never going to clear on its own.
+    #
+    # Deferring instead of terminal-FAILing removed a LOUD (but wrong) signal; without
+    # this it would be replaced by a SILENT one — the task parks behind a saturated
+    # 15-min backoff forever, and nothing surfaces it: the counter only resets on a
+    # successful launch, and operator_attention's stale-queued sweep filters on
+    # `jsonb_array_length(depends_on) > 0`, so a dep-less compute_experiment never
+    # appears there. Past the saturation point the cap is no longer transient
+    # back-pressure in any useful sense — it is a standing condition an operator
+    # should see. Staged BEFORE the commit below so it costs no extra transaction.
+    if _prior_defers + 1 >= _COMPUTE_CAP_DEFER_ALERT_AFTER_DEFERS:
+        try:
+            await _maybe_alert_saturated_compute_cap_defer(
+                task, session, message, _prior_defers + 1
+            )
+        except Exception:
+            # An alerting failure must never turn a correct deferral into a crash
+            # (which the dispatch loop's containment would quarantine).
+            logger.exception(
+                "[ORCHESTRATOR] failed to stage saturated compute-cap defer alert "
+                "for task %s",
+                task.id,
+            )
+    # Snapshot broadcast scalars BEFORE commit — commit expires ORM state and a
+    # post-commit task.id/.project_id read lazy-loads from async context
+    # (MissingGreenlet on asyncpg), which would quarantine a correctly-deferred task.
+    _deferred_project_id = str(task.project_id)
+    _deferred_task_id = str(task.id)
+    await session.commit()
+    try:
+        await broadcast_to_project(
+            _deferred_project_id,
+            "task_updated",
+            {
+                "task_id": _deferred_task_id,
+                "status": TaskStatus.QUEUED,
+                "message": message[:200],
+            },
+        )
+    except Exception:
+        logger.exception(
+            "[ORCHESTRATOR] task_updated broadcast failed for deferred "
+            "compute_experiment %s",
+            _deferred_task_id,
+        )
+    logger.info(
+        "[ORCHESTRATOR] compute_experiment %s DEFERRED on transient launch "
+        "precondition (retry in %.1f min, still QUEUED): %s",
+        _deferred_task_id,
+        backoff_minutes,
+        message[:200],
+    )
+    return "deferred"
+
+
+async def _maybe_alert_saturated_compute_cap_defer(
+    task: Task,
+    session: AsyncSession,
+    message: str,
+    defer_count: int,
+) -> None:
+    """Stage ONE deduplicated WARNING alert for a compute_experiment stuck at the cap.
+
+    Deduplicates on (task, stable title) so the alert is raised once and does not
+    re-fire on each subsequent deferral. WARNING (not ERROR): the task is healthy and
+    correctly queued — the *project* is saturated, and that is an operator/capacity
+    decision (raise ``max_concurrent_compute_jobs_by_project``, or wait for the running
+    jobs). Never records a task result: a deferral is still not an outcome.
+
+    The dedup predicate excludes DISMISSED alerts (matching the sibling
+    retry_after "task stuck" alert). Without that, an operator dismissing this once
+    would silence it FOREVER for that task — and since a deferral is unbounded by
+    design, the task could keep deferring indefinitely with the operator's only
+    surface permanently suppressed. Dismissing means "I have seen this", not "never
+    tell me again"; if the condition persists past a dismissal it is allowed to
+    re-raise.
+
+    Mirrors ``_create_strategic_local_cloud_fallback_alert``: stages the row and
+    broadcasts; the CALLER owns the commit.
+    """
+    from app.models import Alert, AlertSeverity
+
+    existing = await session.execute(
+        select(Alert).where(
+            Alert.task_id == task.id,
+            Alert.title == _COMPUTE_CAP_DEFER_ALERT_TITLE,
+            Alert.dismissed_at.is_(None),
+        )
+    )
+    if existing.scalars().first() is not None:
+        return
+    alert = Alert(
+        project_id=task.project_id,
+        severity=AlertSeverity.WARNING,
+        title=_COMPUTE_CAP_DEFER_ALERT_TITLE,
+        message=(
+            f"compute_experiment has been deferred {defer_count}x on the project's "
+            f"compute-job concurrency cap and is now at the maximum "
+            f"{_COMPUTE_CAP_DEFER_MAX_MINUTES:.0f}-minute backoff. It is still QUEUED "
+            "and will launch on its own as soon as a running job finishes — no action "
+            "is required if the current jobs are expected to complete. If they are "
+            "long-running or stuck, raise the project's compute-job cap "
+            "(max_concurrent_compute_jobs_by_project) or cancel a running job. "
+            f"Launch precondition: {message[:200]}"
+        ),
+        task_id=task.id,
+    )
+    session.add(alert)
+    _alert_project_id = str(task.project_id)
+    try:
+        from app.broadcast import broadcast_to_project
+
+        await broadcast_to_project(
+            _alert_project_id,
+            "alert_created",
+            {
+                "alert_id": str(alert.id),
+                "severity": "WARNING",
+                "title": alert.title,
+            },
+        )
+    except Exception:
+        logger.exception(
+            "[ORCHESTRATOR] alert_created broadcast failed for saturated compute-cap "
+            "defer on task %s",
+            task.id,
+        )
+
+
 async def _dispatch_compute_experiment_directly(
     session: AsyncSession,
     task: Task,
@@ -744,18 +1403,27 @@ async def _dispatch_compute_experiment_directly(
     GCP/local backend as before.
 
     Returns:
-        ``"launched"`` — ComputeJob created, task PARKED on the job-terminal wake.
-        ``"failed"``   — launch misconfigured / non-recoverable precondition; task
-                         terminal-FAILED.
-        ``"blocked"``  — a recoverable live-release precondition (release not yet
-                         serving-confirmed); task BLOCKED, auto-unblock sweep re-queues
-                         it once the deploy confirms (not a failure, no retry burn).
-        ``"held"``     — ``require_local_runner`` set and no live runner; held QUEUED
-                         (``awaiting_local_runner_since`` stamped; the existing bounded
-                         sweep terminal-fails a hold that outlives the wait window).
-    Only ``"launched"`` and ``"failed"`` count as a dispatch; ``"blocked"``/``"held"``
-    leave the task waiting. The caller owns the dispatch loop; this function commits
-    its own outcome.
+        ``"launched"``  — ComputeJob created, task PARKED on the job-terminal wake.
+        ``"failed"``    — launch misconfigured / non-recoverable precondition; task
+                          terminal-FAILED.
+        ``"blocked"``   — a recoverable live-release precondition (release not yet
+                          serving-confirmed); task BLOCKED, auto-unblock sweep re-queues
+                          it once the deploy confirms (not a failure, no retry burn).
+        ``"held"``      — held QUEUED (``awaiting_local_runner_since`` stamped; the
+                          existing bounded sweep terminal-fails a hold that outlives
+                          the wait window). Two hold causes: ``require_local_runner``
+                          set and no live runner, or a strict ``runner_target`` pin
+                          whose runner is not currently eligible (the latter also
+                          stamps ``context['runner_pin_hold']`` with the
+                          machine-readable reason).
+        ``"deferred"``  — a TRANSIENT launch precondition (the project's compute-job
+                          concurrency cap); task stays QUEUED behind a ``retry_after``
+                          backoff and re-enters dispatch on its own once the cap frees.
+                          NOT a failure — no failure budget burned.
+    Only ``"launched"`` and ``"failed"`` count as a dispatch; ``"blocked"`` / ``"held"``
+    / ``"deferred"`` leave the task waiting and must NOT consume a dispatch-window slot
+    (see the backfill in the orchestrator's dispatch loop). The caller owns the dispatch
+    loop; this function commits its own outcome.
     """
     from app.broadcast import broadcast_to_project
     from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
@@ -798,6 +1466,36 @@ async def _dispatch_compute_experiment_directly(
     accelerator = payload.get("accelerator") or (
         payload.get("compute_experiment") or {}
     ).get("accelerator")
+    # Container-image (flat or nested) gates runner eligibility on container
+    # isolation backend capability.
+    container_image = payload.get("container_image") or (
+        payload.get("compute_experiment") or {}
+    ).get("container_image")
+    # vram_gb (flat or nested) gates runner eligibility on free GPU memory. It is
+    # AGENT-AUTHORED, so a bad value ("24GB") must fail THIS task with an honest
+    # validation message — never raise in the dispatch hot path, which would abort
+    # the cycle for every other task and leave this one to die reasonless in poison
+    # quarantine. Same terminal-fail contract as the config_errors check above.
+    vram_gb, vram_error = _coerce_vram_gb(payload)
+    if vram_error is not None:
+        return await _fail_compute_experiment_task(
+            session,
+            task,
+            "compute_launch_failed",
+            "Compute experiment misconfigured: " + vram_error,
+        )
+
+    # Launch-contract runner pin (operator or agent authored). The pin id feeds
+    # the existing preferred-runner seam; ``strict`` additionally forbids any
+    # other runner (hold-with-reason below instead of falling through).
+    pin_runner_id, pin_strict = _payload_runner_target(payload)
+
+    # Operator HARD pin (distinct from the soft preferred hint): this job may run
+    # ONLY on this runner id. A forced target that is offline/ineligible HOLDS the
+    # task — it never falls back to another runner or to cloud (handled below).
+    forced_runner_target_id = (task.context or {}).get(
+        FORCED_RUNNER_TARGET_CONTEXT_KEY
+    )
 
     # ── Select an eligible runner (shared rule with _try_runner_dispatch) ──────
     runner = _select_eligible_runner(
@@ -806,10 +1504,130 @@ async def _dispatch_compute_experiment_directly(
         "compute_experiment",
         accelerator,
         runner_pins_this_cycle,
-        preferred_runner_target_id=(task.context or {}).get(
-            "preferred_runner_target_id"
+        preferred_runner_target_id=pin_runner_id
+        or (task.context or {}).get("preferred_runner_target_id"),
+        dispatch_seed=task.id.int,
+        container_image=container_image,
+        forced_runner_target_id=forced_runner_target_id,
+        vram_gb=vram_gb,
+        declined_runner_ids=recently_declined_runner_ids(task),
+        declined_exclusion_advisory=decline_exclusion_is_advisory(
+            task, "compute_experiment"
         ),
     )
+
+    # ── Strict runner pin: ONLY the pinned runner may take this job ────────────
+    # When the pinned runner is not currently eligible, hold QUEUED with a
+    # truthful, machine-readable reason (runner id + why) — never dispatch to
+    # another runner or the cloud, and never reuse the generic require-local
+    # wording. The ``awaiting_local_runner_since`` stamp reuses the existing
+    # bounded-wait sweep (15-min operator alert, 6h terminal fail), whose
+    # timeout message is pin-aware (see _fail_stale_local_runner_holds).
+    if (
+        pin_strict
+        and pin_runner_id
+        and (runner is None or str(runner.id) != pin_runner_id)
+    ):
+        reason_code, detail = await _diagnose_strict_runner_pin_hold(
+            session,
+            active_runners_cache,
+            task.project_id,
+            pin_runner_id,
+            "compute_experiment",
+            accelerator,
+            container_image,
+            runner_pins_this_cycle,
+            # A strict `runner_target` pin is passed to _select_eligible_runner as
+            # a SOFT preference, so the decline exclusion DOES drop the pinned
+            # runner from the candidate pool (unlike an operator hard pin, which
+            # short-circuits it). Without this the diagnosis would blame a generic
+            # "not_eligible" for a runner that is perfectly healthy and simply
+            # declined the task — the exact observability hole this campaign is
+            # closing. Not consulted under a forced hard pin, mirroring selection.
+            declined_record=(
+                None
+                if forced_runner_target_id
+                else decline_record_for_runner(task, pin_runner_id)
+            ),
+        )
+        message = (
+            f"runner_target hold: strict pin to runner {pin_runner_id} cannot "
+            f"dispatch — {reason_code}: {detail}"
+        )[:500]
+        ctx = dict(task.context or {})
+        changed = ctx.pop("runner_target_id", None) is not None  # drop stale pin
+        if not ctx.get(LOCAL_RUNNER_HOLD_CONTEXT_KEY):
+            ctx[LOCAL_RUNNER_HOLD_CONTEXT_KEY] = _utcnow().isoformat()
+            changed = True
+        hold_record = {
+            "runner_id": pin_runner_id,
+            "strict": True,
+            "reason_code": reason_code,
+            "detail": detail,
+        }
+        # Change-gate on the STABLE key only (runner id + reason code + detail
+        # with volatile numbers stripped): the raw detail carries per-cycle
+        # values (live load counts, heartbeat timestamps), so full-record
+        # comparison would rewrite the task row every cycle for a flapping
+        # pinned runner. The stamped record and status message keep the
+        # volatile detail from the first write of each stable hold state.
+        if _pin_hold_stable_key(ctx.get("runner_pin_hold")) != _pin_hold_stable_key(
+            hold_record
+        ):
+            ctx["runner_pin_hold"] = hold_record
+            task.latest_status_message = message
+            changed = True
+        if changed:
+            task.context = ctx
+            session.add(task)
+            await session.commit()
+        logger.info(
+            "[RUNNERS] Holding compute_experiment %s: strict runner_target pin "
+            "to %s not dispatchable (%s: %s)",
+            task.id,
+            pin_runner_id,
+            reason_code,
+            detail,
+        )
+        return "held"
+
+    # ── Forced-runner hold: operator hard-pinned this job to a specific runner ──
+    # When that runner is not eligible this cycle (offline / at capacity / wrong
+    # task-type / lacks a required GPU) HOLD QUEUED with an honest, host-named
+    # reason — NEVER fall back to a different runner or to cloud, and independent
+    # of the project's enforce-local / container-image policy (checked first so a
+    # forced offline target holds regardless of those). The forced pin itself is
+    # preserved in context; only a stale CLAIMED ``runner_target_id`` is dropped.
+    if runner is None and forced_runner_target_id:
+        forced_id = str(forced_runner_target_id).strip()
+        forced_hostname = await _lookup_runner_hostname(
+            session, task.project_id, forced_id
+        )
+        target_label = forced_hostname or forced_id
+        hold_msg = (
+            f"Waiting for forced runner {target_label}: this compute experiment is "
+            "hard-pinned to that runner and will not run on any other runner or in "
+            "the cloud until it is live and eligible."
+        )
+        ctx = dict(task.context or {})
+        changed = ctx.pop("runner_target_id", None) is not None
+        if not ctx.get(AWAITING_FORCED_RUNNER_CONTEXT_KEY):
+            ctx[AWAITING_FORCED_RUNNER_CONTEXT_KEY] = _utcnow().isoformat()
+            changed = True
+        if task.latest_status_message != hold_msg:
+            task.latest_status_message = hold_msg
+            changed = True
+        if changed:
+            task.context = ctx
+            session.add(task)
+            await session.commit()
+        logger.info(
+            "[RUNNERS] Holding compute_experiment %s: forced runner %s not eligible "
+            "this cycle (offline/at-capacity/ineligible) — not dispatching elsewhere",
+            task.id,
+            target_label,
+        )
+        return "held"
 
     project = await session.get(Project, task.project_id)
     require_local = bool(
@@ -820,8 +1638,8 @@ async def _dispatch_compute_experiment_directly(
     if runner is None and require_local:
         ctx = dict(task.context or {})
         changed = ctx.pop("runner_target_id", None) is not None  # drop any stale pin
-        if not ctx.get("awaiting_local_runner_since"):
-            ctx["awaiting_local_runner_since"] = _utcnow().isoformat()
+        if not ctx.get(LOCAL_RUNNER_HOLD_CONTEXT_KEY):
+            ctx[LOCAL_RUNNER_HOLD_CONTEXT_KEY] = _utcnow().isoformat()
             changed = True
         if changed:
             task.context = ctx
@@ -834,11 +1652,54 @@ async def _dispatch_compute_experiment_directly(
         )
         return "held"
 
+    # ── Container-image hold: image declared + registered runners but none
+    # container-capable → keep QUEUED with an honest reason, never cloud-dispatch.
+    # Only fires when the project has at least one live runner (runners exist but
+    # lack the runtime); when no runners are registered at all we fall through to
+    # the cloud backend so the job is not silently wedged.
+    if runner is None and container_image:
+        project_runners = active_runners_cache.get(task.project_id) or []
+        if project_runners:
+            hold_msg = (
+                "Waiting for a container-capable runner: job declares "
+                f"container_image={container_image!r} but no live runner "
+                "has docker_usable capability."
+            )
+            ctx = dict(task.context or {})
+            changed = ctx.pop("runner_target_id", None) is not None
+            if not ctx.get(CONTAINER_RUNNER_HOLD_CONTEXT_KEY):
+                ctx[CONTAINER_RUNNER_HOLD_CONTEXT_KEY] = _utcnow().isoformat()
+                changed = True
+            if task.latest_status_message != hold_msg:
+                task.latest_status_message = hold_msg
+                changed = True
+            if changed:
+                task.context = ctx
+                session.add(task)
+                await session.commit()
+            logger.info(
+                "[RUNNERS] Holding compute_experiment %s: container_image declared "
+                "(%r) but no container-capable runner available",
+                task.id,
+                container_image,
+            )
+            return "held"
+
     # ── Pin to the chosen runner; the job inherits it via task.context ─────────
     if runner is not None:
         ctx = dict(task.context or {})
         ctx["runner_target_id"] = str(runner.id)
-        ctx.pop("awaiting_local_runner_since", None)
+        ctx["runner_hostname"] = runner.hostname
+        # Successful dispatch is the ONLY place a compute runner-hold stamp clears.
+        # Clear every key in the aggregate so a task that was held under one hold
+        # class and dispatches under another cannot carry a stale stamp into the
+        # bounded hold-timeout sweep (which would terminal-fail a task that is
+        # already running on a runner).
+        for _hold_key in COMPUTE_RUNNER_HOLD_CONTEXT_KEYS:
+            ctx.pop(_hold_key, None)
+        # A strict-pin hold that is now dispatching must drop its stale hold
+        # reason — the pinned runner became eligible.
+        ctx.pop("runner_pin_hold", None)
         task.context = ctx
         session.add(task)
     elif (task.context or {}).get("runner_target_id"):
@@ -901,33 +1762,76 @@ async def _dispatch_compute_experiment_directly(
                 source="agent",
             )
             session.add(task)
+            # Snapshot the broadcast/log scalars into plain locals BEFORE commit:
+            # session.commit() expires all ORM state, so reading task.project_id/.id
+            # afterwards lazy-loads from async context and raises MissingGreenlet on
+            # asyncpg, quarantining a task that was correctly BLOCKED.
+            _blocked_project_id = str(task.project_id)
+            _blocked_task_id = str(task.id)
             await session.commit()
             try:
                 await broadcast_to_project(
-                    str(task.project_id),
+                    _blocked_project_id,
                     "task_updated",
-                    {"task_id": str(task.id), "status": TaskStatus.BLOCKED},
+                    {"task_id": _blocked_task_id, "status": TaskStatus.BLOCKED},
                 )
             except Exception:
                 logger.exception(
                     "[ORCHESTRATOR] task_updated broadcast failed for blocked "
                     "compute_experiment %s",
-                    task.id,
+                    _blocked_task_id,
                 )
             logger.info(
                 "[ORCHESTRATOR] compute_experiment %s BLOCKED on live-release "
                 "precondition (recoverable): %s",
-                task.id,
+                _blocked_task_id,
                 msg[:200],
             )
             return "blocked"
-        # Non-live-release preconditions (spend ceiling, hardware policy,
-        # concurrency, local_runner_required) are genuine launch failures, not
-        # recoverable blocks — label them ``compute_launch_failed`` exactly as the
-        # agent path did. Using ``BLOCKED_PRECONDITION`` on a terminal FAILED task
-        # would make a parent waiting on this child mis-read it as still in flight
-        # (blocked_task_unblock_sweeps treats failure_category BLOCKED_PRECONDITION
-        # as "waiting") and wedge.
+        # The project's compute-job concurrency cap is TRANSIENT back-pressure, not a
+        # launch failure: active jobs only shrink absent new launches, so this exact
+        # task launches unchanged once a running job goes terminal. Nothing upstream
+        # defers it (the cap is enforced nowhere else in dispatch — the task-level
+        # per-project cap counts active Tasks, and compute_experiments PARK after
+        # launch rather than staying active), so the N+1th experiment in a capped
+        # project reliably reached create_compute_job and was PERMANENTLY FAILED —
+        # burning the direction's failure budget on the orchestrator's own queueing
+        # decision and feeding the churn guardrail phantom failures. Defer instead.
+        if detail.get("error") == "compute_job_concurrency_limit_exceeded":
+            return await _defer_compute_experiment_task(session, task, msg)
+        # require_local_runner with no runner-pinned backend is an infrastructure
+        # AVAILABILITY condition, not misconfig — and this same function already HOLDS
+        # for exactly that condition above (the runner-is-None + require_local branch),
+        # so terminal-failing it here would contradict the established contract. Reached
+        # only if that pre-check and this chokepoint disagree (e.g. the selected runner
+        # lost its pin under the re-lock). Take the hold: the bounded 6h sweep
+        # (_fail_stale_local_runner_holds) still terminal-fails a hold nothing resolves,
+        # so this cannot wedge.
+        if detail.get("error") == "local_runner_required":
+            ctx = dict(task.context or {})
+            if not ctx.get(LOCAL_RUNNER_HOLD_CONTEXT_KEY):
+                ctx[LOCAL_RUNNER_HOLD_CONTEXT_KEY] = _utcnow().isoformat()
+            ctx.pop("runner_target_id", None)
+            task.context = ctx
+            task.latest_status_message = msg[:500]
+            session.add(task)
+            _held_task_id = str(task.id)
+            await session.commit()
+            logger.info(
+                "[ORCHESTRATOR] compute_experiment %s HELD on require-local launch "
+                "chokepoint (no runner-pinned backend): %s",
+                _held_task_id,
+                msg[:200],
+            )
+            return "held"
+        # Everything else is a genuine, non-self-clearing launch failure — spend
+        # ceiling (needs an operator to raise the budget; the rolling window only
+        # decays over DAYS, not dispatch cycles), spend-approval gate, hardware-policy
+        # violation, bad checkpoint-resume reference. Label them ``compute_launch_failed``
+        # exactly as the agent path did. Using ``BLOCKED_PRECONDITION`` on a terminal
+        # FAILED task would make a parent waiting on this child mis-read it as still in
+        # flight (blocked_task_unblock_sweeps treats failure_category
+        # BLOCKED_PRECONDITION as "waiting") and wedge.
         return await _fail_compute_experiment_task(
             session, task, "compute_launch_failed", msg
         )
@@ -946,13 +1850,31 @@ async def _dispatch_compute_experiment_directly(
     # flagged the stall is now stale — dismiss it. Best-effort: a resolve
     # failure must never abort a successful dispatch.
     try:
-        from app.alert_dispatch import _resolve_local_runner_hold_alert
+        from app.alert_dispatch import (
+            _resolve_container_runner_hold_alert,
+            _resolve_local_runner_hold_alert,
+        )
 
         await _resolve_local_runner_hold_alert(session, task.id)
+        await _resolve_container_runner_hold_alert(session, task.id)
     except Exception:
         logger.exception(
             "[RUNNERS] Failed to dismiss hold alert for task %s (non-fatal)", task.id
         )
+
+    # The launch succeeded, so any transient-deferral breadcrumbs from earlier cycles
+    # are now stale — drop them (including the escalation counter, so a LATER cap hit
+    # on this task restarts the backoff at the base delay rather than inheriting a
+    # maxed-out one). Rides the park_task commit below; `retry_after_until` itself was
+    # already cleared by the candidate scan when the backoff lapsed.
+    if (task.context or {}).get(COMPUTE_LAUNCH_DEFERRED_REASON_CONTEXT_KEY) or (
+        task.context or {}
+    ).get(COMPUTE_LAUNCH_DEFER_COUNT_CONTEXT_KEY):
+        _launched_ctx = dict(task.context or {})
+        _launched_ctx.pop(COMPUTE_LAUNCH_DEFERRED_REASON_CONTEXT_KEY, None)
+        _launched_ctx.pop(COMPUTE_LAUNCH_DEFER_COUNT_CONTEXT_KEY, None)
+        task.context = _launched_ctx
+        session.add(task)
 
     # ── Park the task on the job-terminal wake (releases its slot now) ─────────
     meta = job.polling_metadata or {}
@@ -1236,11 +2158,17 @@ async def _fail_stale_local_runner_holds(session: AsyncSession) -> int:
 
     Two hold classes share the bounded-wait contract but resolve DIFFERENTLY:
 
-    * **compute_experiment** (``context['awaiting_local_runner_since']``): held
-      QUEUED instead of cloud-provisioned when no live self-hosted runner claimed
-      it. A hold older than ``_LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS`` (6h) is marked
-      terminal-FAILED (PROVISION_FAILURE) — a require-local compute run has no
-      safe cloud fallback (it needs the operator's GPU), so failing is correct.
+    * **compute_experiment** (``context['awaiting_local_runner_since']``,
+      ``context['awaiting_container_runner_since']`` or
+      ``context['awaiting_forced_runner_since']``): held QUEUED instead of
+      cloud-provisioned when no live self-hosted runner claimed it (require-local),
+      no runner advertises ``docker_usable`` for an image-declaring job
+      (container hold), or the operator's HARD ``forced_runner_target_id`` pin is
+      not eligible (forced hold). A hold older than
+      ``_LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS`` (6h) is marked terminal-FAILED
+      (PROVISION_FAILURE) — no variant has a safe cloud fallback (each needs
+      specific operator hardware/runtime/host), so failing is correct. All three
+      emit an early-warning alert first.
 
     * **continuous local Strategic** (``context['awaiting_strategic_local_runner_since']``
       + ``context['strategic_local_runner_required']``): SAFETY self-heal. A hold
@@ -1281,9 +2209,39 @@ async def _fail_stale_local_runner_holds(session: AsyncSession) -> int:
         ctx = task.context or {}
         task_type = str((task.first_payload or {}).get("type") or "")
         compute_stamp = ctx.get("awaiting_local_runner_since")
+        container_stamp = ctx.get("awaiting_container_runner_since")
+        forced_stamp = ctx.get(AWAITING_FORCED_RUNNER_CONTEXT_KEY)
         strategic_stamp = ctx.get(STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY)
         is_compute_hold = (
             bool(compute_stamp)
+            and task_type == "compute_experiment"
+            and not task.archived
+            and task.requires_approval is not True
+        )
+        # Container-image hold: an image-declaring job parked because no live
+        # runner advertises docker_usable. Same bounded-wait contract as the
+        # require-local compute hold (early-warning alert, then 6h terminal FAIL —
+        # no safe cloud fallback), but distinct alert copy + failure reason so the
+        # operator sees the accurate cause. Require-local takes precedence if a
+        # stale local stamp somehow coexists.
+        is_container_hold = (
+            bool(container_stamp)
+            and not is_compute_hold
+            and task_type == "compute_experiment"
+            and not task.archived
+            and task.requires_approval is not True
+        )
+        # Forced-runner hold: an operator HARD pin (forced_runner_target_id) whose
+        # target runner is not eligible. Same bounded-wait contract as its siblings
+        # above — it has no cloud fallback BY DESIGN (the whole point of the pin is
+        # "this host or nothing"), which is exactly why it must be bounded: without
+        # this branch the stamp was written and never read, so the task waited QUEUED
+        # forever with no timeout and no alert. Lowest precedence: a coexisting
+        # require-local / container stamp names a more specific blocker.
+        is_forced_runner_hold = (
+            bool(forced_stamp)
+            and not is_compute_hold
+            and not is_container_hold
             and task_type == "compute_experiment"
             and not task.archived
             and task.requires_approval is not True
@@ -1295,10 +2253,22 @@ async def _fail_stale_local_runner_holds(session: AsyncSession) -> int:
             and not task.archived
             and task.requires_approval is not True
         )
-        if not is_compute_hold and not is_strategic_hold:
+        if (
+            not is_compute_hold
+            and not is_container_hold
+            and not is_forced_runner_hold
+            and not is_strategic_hold
+        ):
             continue
 
-        stamped = strategic_stamp if is_strategic_hold else compute_stamp
+        if is_strategic_hold:
+            stamped = strategic_stamp
+        elif is_container_hold:
+            stamped = container_stamp
+        elif is_forced_runner_hold:
+            stamped = forced_stamp
+        else:
+            stamped = compute_stamp
         stamped_at = _parse_local_runner_hold_timestamp(stamped)
         if stamped_at is None:
             continue
@@ -1307,22 +2277,36 @@ async def _fail_stale_local_runner_holds(session: AsyncSession) -> int:
             # Within the full wait window — keep holding. For compute holds, emit a
             # proactive early-warning alert once the hold passes the shorter threshold
             # so the operator learns the hardware is offline in minutes, not 6h.
-            if is_compute_hold:
+            if is_compute_hold or is_container_hold or is_forced_runner_hold:
                 alert_cutoff = now - timedelta(seconds=_LOCAL_RUNNER_HOLD_ALERT_SECONDS)
                 if stamped_at <= alert_cutoff:
-                    from app.alert_dispatch import _maybe_create_local_runner_hold_alert
-
                     held_secs = int((now - stamped_at).total_seconds())
                     remaining_secs = max(
                         0, _LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS - held_secs
                     )
                     try:
-                        created = await _maybe_create_local_runner_hold_alert(
-                            task,
-                            session,
-                            held_seconds=held_secs,
-                            timeout_seconds=remaining_secs,
-                        )
+                        if is_container_hold:
+                            from app.alert_dispatch import (
+                                _maybe_create_container_runner_hold_alert,
+                            )
+
+                            created = await _maybe_create_container_runner_hold_alert(
+                                task,
+                                session,
+                                held_seconds=held_secs,
+                                timeout_seconds=remaining_secs,
+                            )
+                        else:
+                            from app.alert_dispatch import (
+                                _maybe_create_local_runner_hold_alert,
+                            )
+
+                            created = await _maybe_create_local_runner_hold_alert(
+                                task,
+                                session,
+                                held_seconds=held_secs,
+                                timeout_seconds=remaining_secs,
+                            )
                         if created:
                             await session.commit()
                     except Exception:
@@ -1380,12 +2364,53 @@ async def _fail_stale_local_runner_holds(session: AsyncSession) -> int:
             continue
 
         # compute_experiment hold — terminal FAIL (no safe cloud fallback).
+        # A strict runner_target pin gets a truthful, pin-specific reason
+        # (runner id + why it never dispatched) instead of the generic
+        # require-local wording, which would lie about why the task was held.
         hours = _LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS // 3600
-        reason = (
-            f"require_local_runner: no self-hosted runner became available "
-            f"within {hours}h — operator hardware offline; bring a runner "
-            f"online and requeue"
-        )
+        # Most-specific cause wins. A strict runner_target pin gets a truthful,
+        # pin-specific reason (runner id + why it never dispatched) even when the
+        # job also declares a container image — the pin diagnosis already names
+        # the concrete blocker (e.g. that runner has no docker), which is strictly
+        # more actionable than the generic container-capability wording.
+        pin_hold = ctx.get("runner_pin_hold")
+        if isinstance(pin_hold, dict) and pin_hold.get("runner_id"):
+            reason = (
+                f"runner_target: strict-pinned runner {pin_hold.get('runner_id')} "
+                f"did not become eligible within {hours}h "
+                f"(last: {pin_hold.get('reason_code') or 'unknown'}: "
+                f"{pin_hold.get('detail') or 'no detail'}) — bring that runner "
+                f"online / free its capacity, or relaunch without the strict "
+                f"pin, then requeue"
+            )
+        elif is_forced_runner_hold:
+            # Name the host the operator actually pinned — "forced runner dgx-1"
+            # is actionable; "no self-hosted runner" would be a lie (other runners
+            # may well have been online and idle; the pin is what excluded them).
+            forced_id = str(ctx.get(FORCED_RUNNER_TARGET_CONTEXT_KEY) or "").strip()
+            forced_hostname = await _lookup_runner_hostname(
+                session, task.project_id, forced_id
+            )
+            target_label = forced_hostname or forced_id or "unknown"
+            reason = (
+                f"forced_runner_target_id: hard-pinned runner {target_label} did "
+                f"not become eligible within {hours}h — a forced pin never falls "
+                f"back to another runner or to cloud. Bring that runner online / "
+                f"free its capacity, or relaunch without the forced pin, then "
+                f"requeue"
+            )
+        elif is_container_hold:
+            reason = (
+                f"container_image: no container-capable runner (docker_usable) "
+                f"became available within {hours}h — enroll a Docker-capable "
+                f"runner and requeue, or requeue without a container_image"
+            )
+        else:
+            reason = (
+                f"require_local_runner: no self-hosted runner became available "
+                f"within {hours}h — operator hardware offline; bring a runner "
+                f"online and requeue"
+            )
         task.status = TaskStatus.FAILED
         task.latest_status_message = reason[:500]
         persist_failure_category(task, PROVISION_FAILURE)

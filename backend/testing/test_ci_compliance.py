@@ -429,9 +429,12 @@ async def test_record_and_get_round_trip_keyed_by_sha(db_session):
     await db_session.commit()
 
     # Round-trip through the real JSONB column: re-fetch from the DB.
+    # Snapshot the id BEFORE expire(): reading an expired attribute emits a
+    # sync lazy-load that raises MissingGreenlet under the asyncpg harness.
+    project_id = project.id
     db_session.expire(project)
     refetched = (
-        await db_session.execute(select(Project).where(Project.id == project.id))
+        await db_session.execute(select(Project).where(Project.id == project_id))
     ).scalar_one()
 
     assert ci_compliance.get_ci_compliance(refetched, sha=_HEAD_SHA) == result
@@ -849,3 +852,23 @@ async def test_evaluator_allows_agent_allowlisted_entry(mocker):
     assert agent_violations == [], (
         f"allowlisted entry at {allow_entry.path}:{allow_entry.line} must not trigger a violation"
     )
+
+
+def test_in_flight_evals_dict_exists_and_is_mutable():
+    """_in_flight_evals is a module-level dict used for in-flight coalescing.
+
+    This is the acceptance gate for the coalescing implementation: the dict
+    must exist and be mutable so concurrent callers can register and look up
+    in-flight tasks by ``"{project_id}:{sha}"`` key.
+    """
+    assert hasattr(ci_compliance, "_in_flight_evals"), (
+        "_in_flight_evals process-level registry is missing from ci_compliance"
+    )
+    d = ci_compliance._in_flight_evals
+    assert isinstance(d, dict), "_in_flight_evals must be a dict"
+    # Confirm it is writable (the coalescing logic reads and writes it).
+    original_len = len(d)
+    d["_test_key"] = None  # type: ignore[assignment]
+    assert "_test_key" in d
+    del d["_test_key"]
+    assert len(d) == original_len

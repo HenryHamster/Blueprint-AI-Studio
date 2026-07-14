@@ -1835,6 +1835,59 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     onOpenStrategicContextCommands,
   ]);
 
+  // Stable callbacks for MessagesPanelHeader and MessagesComposer props —
+  // extracted into useCallback so that memo-wrapped children (MessagesPanelHeader
+  // and MessagesComposer) can skip re-renders when only these callback identities change.
+  const handleResetAllPrefs = useCallback(() => {
+    setEventPrefs({});
+    saveEventPrefs(auth.currentUser?.email, selectedProjectId, {});
+    if (selectedProjectId) void saveServerNoisePrefs(selectedProjectId, {});
+  }, [selectedProjectId]);
+
+  const handleToggleSort = useCallback(() => {
+    setSortMode(m => m === 'importance' ? 'recent' : 'importance');
+  }, []);
+
+  const handleToggleCriticalOnly = useCallback(() => {
+    setCriticalOnly(v => !v);
+  }, []);
+
+  const handleToggleShowOnlyNew = useCallback(() => {
+    setShowOnlyNew(v => !v);
+  }, []);
+
+  const handleToggleSelectMode = useCallback(() => {
+    if (selectMode) { setSelectMode(false); setSelectedIds(new Set()); }
+    else { setSelectMode(true); setSelectedIds(new Set(openFeedbackMessages.map(m => m.id))); }
+  }, [selectMode, openFeedbackMessages]);
+
+  const handleOpenMutedPrefs = useCallback(() => {
+    setShowPrefsPanel(true);
+  }, []);
+
+  const handleChangeType = useCallback((value: string) => {
+    setNewType(value);
+    setLastArming(null);
+    if (newContent) saveComposerDraft(auth.currentUser?.email, selectedProjectId, { type: value, content: newContent });
+  }, [newContent, selectedProjectId]);
+
+  const handleChangeContent = useCallback((value: string) => {
+    setNewContent(value);
+    if (value) {
+      saveComposerDraft(auth.currentUser?.email, selectedProjectId, { type: effectiveNewType, content: value });
+    } else {
+      clearComposerDraft(auth.currentUser?.email, selectedProjectId);
+    }
+  }, [effectiveNewType, selectedProjectId]);
+
+  const handleCancelReply = useCallback(() => setReplyTo(null), []);
+
+  const handlePickStarterPrompt = useCallback((value: string) => {
+    setNewContent(value);
+    saveComposerDraft(auth.currentUser?.email, selectedProjectId, { type: effectiveNewType, content: value });
+    focusComposerTextarea();
+  }, [effectiveNewType, selectedProjectId, focusComposerTextarea]);
+
   return (
     <div className="flex-1 overflow-hidden flex flex-col min-h-0">
       {/* Header */}
@@ -1859,7 +1912,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         messages={messages}
         eventPrefs={eventPrefs}
         onUpdatePref={updatePref}
-        onResetAllPrefs={() => { setEventPrefs({}); saveEventPrefs(auth.currentUser?.email, selectedProjectId, {}); if (selectedProjectId) void saveServerNoisePrefs(selectedProjectId, {}); }}
+        onResetAllPrefs={handleResetAllPrefs}
         searchQuery={searchQuery}
         onSearchChange={setSearchQuery}
         onOpenSaveDialog={openSaveDialog}
@@ -1873,14 +1926,11 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         onApplyView={applyView}
         onRenameView={openRenameDialog}
         onDeleteView={deleteView}
-        onToggleSort={() => setSortMode(m => m === 'importance' ? 'recent' : 'importance')}
-        onToggleCriticalOnly={() => setCriticalOnly(v => !v)}
-        onToggleShowOnlyNew={() => setShowOnlyNew(v => !v)}
-        onToggleSelectMode={() => {
-          if (selectMode) { setSelectMode(false); setSelectedIds(new Set()); }
-          else { setSelectMode(true); setSelectedIds(new Set(openFeedbackMessages.map(m => m.id))); }
-        }}
-        onOpenMutedPrefs={() => setShowPrefsPanel(true)}
+        onToggleSort={handleToggleSort}
+        onToggleCriticalOnly={handleToggleCriticalOnly}
+        onToggleShowOnlyNew={handleToggleShowOnlyNew}
+        onToggleSelectMode={handleToggleSelectMode}
+        onOpenMutedPrefs={handleOpenMutedPrefs}
         onClose={onClose}
         showCloseButton={resolvedShowCloseButton}
         filterChrome={resolvedFilterChrome}
@@ -2161,13 +2211,13 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         uploading={uploading}
         onAddAttachment={handleAddAttachment}
         onRemoveAttachment={handleRemoveAttachment}
-        onChangeType={(value) => { setNewType(value); setLastArming(null); if (newContent) saveComposerDraft(auth.currentUser?.email, selectedProjectId, { type: value, content: newContent }); }}
-        onChangeContent={(value) => { setNewContent(value); if (value) { saveComposerDraft(auth.currentUser?.email, selectedProjectId, { type: effectiveNewType, content: value }); } else { clearComposerDraft(auth.currentUser?.email, selectedProjectId); } }}
-        onCancelReply={() => setReplyTo(null)}
+        onChangeType={handleChangeType}
+        onChangeContent={handleChangeContent}
+        onCancelReply={handleCancelReply}
         onSubmit={handleSubmit}
         starterPrompts={starterPrompts ?? undefined}
         capabilityHint={starterPrompts ? WORKDAY_CAPABILITY_HINT : undefined}
-        onPickStarterPrompt={(value) => { setNewContent(value); saveComposerDraft(auth.currentUser?.email, selectedProjectId, { type: effectiveNewType, content: value }); focusComposerTextarea(); }}
+        onPickStarterPrompt={handlePickStarterPrompt}
         chrome={conversationMode ? 'minimal' : 'full'}
         strategicContext={strategicComposerContext}
         onOpenStrategicContext={conversationMode ? (onOpenStrategicContextWorkspace ?? onOpenStrategicContextCommands) : undefined}

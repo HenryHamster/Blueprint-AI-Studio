@@ -308,6 +308,9 @@ def classify_compute_terminal_reason(
       they somehow reach a failure branch the class must be AGENT_TIMEOUT, not
       CODE_ERROR)
     - reason contains "cancelled" or "operator" → ADMIN_CANCEL
+    - reason contains "no_progress_timeout" → NO_PROGRESS_TIMEOUT
+      (job was cut early by the no-progress watchdog — a configurable platform
+      kill, not a code defect)
     - default → CODE_ERROR (genuine command/work defect)
     """
     if vm_phase == "provisioning":
@@ -320,6 +323,8 @@ def classify_compute_terminal_reason(
             return AGENT_TIMEOUT
         if "cancelled" in lower or "operator" in lower:
             return ADMIN_CANCEL
+        if "no_progress_timeout" in lower:
+            return NO_PROGRESS_TIMEOUT
     return CODE_ERROR
 
 # Administrative cancellation — orchestrator or operator terminated the task before
@@ -762,14 +767,6 @@ def classify_failure_taxonomy(task: "Task") -> str:
 _INVESTIGATION_EXCLUDED_TYPES: frozenset[str] = frozenset({"investigate", "smoketest"})
 
 
-# Minimum number of review-quality failures (in the recent sliding window on a
-# direction) before the frequency-based review-quality investigation trigger
-# fires. Individual review-quality failures are retried in-place; the trigger
-# only fires once a pattern has formed (3+ in the window) suggesting a
-# systemic issue.
-REVIEW_QUALITY_STREAK_THRESHOLD = 3
-
-
 def should_trigger_review_quality_investigation(task: "Task") -> bool:
     """Return True if a failed task is a candidate for a review-quality pattern
     investigation (gating only — streak check is performed at the spawn site
@@ -900,6 +897,12 @@ _AGENT_CATEGORY_TO_CLASS: dict[str, str] = {
     # or fix. Similar to SCOPE_EMPTY (task had no work to do), routed to that
     # class so it doesn't consume retry budget or penalize direction health.
     "pr_branch_deleted": SCOPE_EMPTY,
+    # ``runtime_unavailable`` — agent detected a required CLI binary (e.g.
+    # ``codex``) is not installed on the runner BEFORE spawning. The agent exits
+    # with code 42 so the runner skips the failure-streak increment. Routes to
+    # PROVISION_FAILURE (INFRA class) so it requeues without burning retry budget
+    # and the orchestrator can blacklist the unavailable runtime for this runner.
+    "runtime_unavailable": PROVISION_FAILURE,
     # ``reassigned`` — agent self-terminated gracefully because the task is no
     # longer assigned to its VM (non-transient heartbeat 4xx = reassignment/
     # deauth, or cancel/supersede during startup). Posted synchronously from the

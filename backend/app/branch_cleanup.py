@@ -154,6 +154,11 @@ async def _get_project_github_token(project, session, *, integration=None):
     pattern was silently draining the ~60/hr App-JWT bucket even with zero
     agents running.
 
+    Freshness is delegated to the resolver's helpers, which check a token's TRUE
+    (mint-anchored) expiry rather than how long ago it happened to be cached —
+    this function previously duplicated the buggy ``fetched_at`` TTL check and so
+    could return a token that had already expired.
+
     Pass a pre-loaded ``integration`` to skip the per-project DB query (used
     by ``_run_stale_branch_cleanup`` which batch-loads all integrations upfront).
     """
@@ -164,22 +169,20 @@ async def _get_project_github_token(project, session, *, integration=None):
         get_repo_installation_token,
     )
     from app.secrets_manager import get_user_secret
-    from app.routers.agent import (
-        _github_token_cache,
+    from app.github_token_resolver import (
         _github_token_cache_lock,
-        _GITHUB_TOKEN_TTL,
+        cache_project_token,
+        get_cached_project_token,
+        remember_project_repo,
     )
 
     project_id_str = str(project.id)
 
-    # Cache check — installation tokens are good for 60min; we treat them as
-    # valid for 50min (3000s) to leave safety margin for clock skew.
+    # Only self-minted tokens are cached here, and only served while they still
+    # have a real margin of life left.
     async with _github_token_cache_lock:
-        cached = _github_token_cache.get(project_id_str)
-        if (
-            cached
-            and (_utcnow() - cached["fetched_at"]).total_seconds() < _GITHUB_TOKEN_TTL
-        ):
+        cached = get_cached_project_token(project_id_str)
+        if cached:
             return cached["token"]
 
     if integration is None:
@@ -196,29 +199,39 @@ async def _get_project_github_token(project, session, *, integration=None):
         )
 
     token: str | None = None
+    self_minted = False
     if integration and integration.github_installation_id:
         token = await generate_installation_access_token(
             integration.github_installation_id,
             repositories=[project.github_repo],
         )
+        self_minted = True
     elif integration and integration.github_pat:
         # PATs are long-lived — caching isn't necessary but is harmless and
         # keeps every code path symmetric.
         decrypted_pat_ref = decrypt_field(integration.github_pat)
         token = await get_user_secret(decrypted_pat_ref)
+        self_minted = True
     else:
+        # github_auth owns a mint-anchored, single-flighted cache for this one —
+        # it is warm ~100% of the time and costs zero GitHub calls. Caching a
+        # COPY of it here (anchored at our insert time, not its mint time) is the
+        # bug this change removes, so we only record the resolution.
         token = await get_repo_installation_token(
             project.github_owner, project.github_repo
         )
 
     if token and project.github_owner and project.github_repo:
         async with _github_token_cache_lock:
-            _github_token_cache[project_id_str] = {
-                "token": token,
-                "owner": project.github_owner,
-                "repo": project.github_repo,
-                "fetched_at": _utcnow(),
-            }
+            if self_minted:
+                # Minted just now, so insert time == mint time — expires_at is sound.
+                cache_project_token(
+                    project_id_str, token, project.github_owner, project.github_repo
+                )
+            else:
+                remember_project_repo(
+                    project_id_str, project.github_owner, project.github_repo
+                )
     return token
 
 

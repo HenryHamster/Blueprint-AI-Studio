@@ -7059,6 +7059,11 @@ async def test_ci_unresolved_guard_restores_managed_check_wait_for_migration_pr(
     assert result is not None
     assert result.get("managed_check_wait") is True
 
+    # The guard leaves its restored promotion_pending write pending for the
+    # caller's commit (in prod _finalize_locked_version commits after it);
+    # commit here before refresh so the refresh reads the persisted state
+    # instead of discarding the pending write under real ORM expiry.
+    await db_session.commit()
     await db_session.refresh(version)
     pending = version.last_qualification["promotion_pending"]
     assert pending.get("managed_check_wait") is True
@@ -7126,6 +7131,9 @@ async def test_ci_unresolved_guard_does_not_set_managed_check_wait_for_non_migra
     assert result is not None
     assert not result.get("managed_check_wait")
 
+    # Commit before refresh — the guard's promotion_pending write rides the
+    # caller's commit (see the migration-PR variant above).
+    await db_session.commit()
     await db_session.refresh(version)
     pending = version.last_qualification["promotion_pending"]
     assert not pending.get("managed_check_wait")

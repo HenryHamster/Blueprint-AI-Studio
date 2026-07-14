@@ -32,6 +32,15 @@ const SAMPLE_RUNNERS: FleetRunner[] = [
 // so heartbeats POSTed to the UI origin silently vanish (SPA HTML 200).
 const API_BASE_URL_FIXTURE = 'https://blueprint-orchestrator-xyz.a.run.app';
 
+// React tracks controlled-input values via a native value setter, so assigning
+// `input.value` directly is invisible to onChange. Drive it through the prototype
+// setter, then dispatch the 'input' event React binds to for text inputs.
+function typeInto(input: HTMLInputElement, value: string) {
+  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+  setter?.call(input, value);
+  input.dispatchEvent(new Event('input', { bubbles: true }));
+}
+
 vi.mock('../api', async () => {
   const { createApiMock } = await import('../test/api-mock-complete');
   return createApiMock({
@@ -40,10 +49,11 @@ vi.mock('../api', async () => {
     registerFleetRunner: vi.fn(async () => ({ runner_id: 'runner-new', token: 'tok-secret-xyz' })),
     rotateFleetRunnerToken: vi.fn(async () => ({ runner_id: 'runner-abc123', token: 'tok-rotated-xyz' })),
     revokeFleetRunner: vi.fn(async () => {}),
+    updateRunnerCapabilities: vi.fn(async () => SAMPLE_RUNNERS[0]),
   });
 });
 
-import { listFleetRunners, registerFleetRunner, revokeFleetRunner, rotateFleetRunnerToken } from '../api';
+import { listFleetRunners, registerFleetRunner, revokeFleetRunner, rotateFleetRunnerToken, updateRunnerCapabilities, fetchRunnerStats, fetchRunnerTelemetry } from '../api';
 
 describe('FleetRunnersPanel — behavioral', () => {
   let root: Root | null = null;
@@ -59,13 +69,18 @@ describe('FleetRunnersPanel — behavioral', () => {
     if (host) { host.remove(); host = null; }
   });
 
-  async function mount(projectId = 'proj-test') {
+  async function mount(
+    projectId = 'proj-test',
+    opts: { onNavigateToTask?: (taskId: string) => void } = {},
+  ) {
     host = document.createElement('div');
     document.body.appendChild(host);
     const r = createRoot(host);
     root = r;
     await act(async () => {
-      r.render(<FleetRunnersPanel projectId={projectId} />);
+      r.render(
+        <FleetRunnersPanel projectId={projectId} onNavigateToTask={opts.onNavigateToTask} />,
+      );
     });
     await act(async () => {});
     return host as HTMLDivElement;
@@ -588,6 +603,100 @@ describe('FleetRunnersPanel — behavioral', () => {
     expect(el.textContent).toContain('2 slots free');
   });
 
+  test('renders per-leg agent-unavailable breakdown when the structured legs map is present', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([
+      {
+        ...SAMPLE_RUNNERS[0],
+        capabilities: { task_types: ['compute_experiment'], has_gpu: true, max_concurrent: 2 },
+        health: {
+          device_status: 'connected',
+          device_status_reason: null,
+          is_live: true,
+          seconds_since_last_seen: 8,
+          active_task_count: 0,
+          active_compute_job_count: 0,
+          active_work_count: 0,
+          max_concurrent: 2,
+          available_slots: 2,
+          stale_reason: null,
+          agent_available: false,
+          agent_unavailable_reason: 'bwrap sandbox missing; node runtime missing',
+          agent_unavailable_legs: {
+            bwrap_sandbox: false,
+            agent_dist: true,
+            node_runtime: false,
+            docker: true,
+          },
+          liveness_window_seconds: 300,
+        },
+      },
+    ]);
+    const el = await mount();
+
+    const legsRow = el.querySelector('[data-testid="fleet-runner-agent-legs"]');
+    expect(legsRow).not.toBeNull();
+
+    // All four legs are shown, each labelled.
+    const bwrap = el.querySelector('[data-testid="fleet-runner-agent-leg-bwrap_sandbox"]');
+    const dist = el.querySelector('[data-testid="fleet-runner-agent-leg-agent_dist"]');
+    const node = el.querySelector('[data-testid="fleet-runner-agent-leg-node_runtime"]');
+    const docker = el.querySelector('[data-testid="fleet-runner-agent-leg-docker"]');
+    expect(bwrap?.textContent).toContain('bwrap');
+    expect(dist?.textContent).toContain('agent dist');
+    expect(node?.textContent).toContain('node');
+    expect(docker?.textContent).toContain('docker');
+
+    // Failing legs are distinguishable from passing ones (state + red styling).
+    expect(bwrap?.getAttribute('data-leg-ok')).toBe('false');
+    expect(node?.getAttribute('data-leg-ok')).toBe('false');
+    expect(dist?.getAttribute('data-leg-ok')).toBe('true');
+    expect(docker?.getAttribute('data-leg-ok')).toBe('true');
+    expect(bwrap?.textContent).toContain('✗');
+    expect(node?.textContent).toContain('✗');
+    expect(dist?.textContent).toContain('✓');
+    expect(docker?.textContent).toContain('✓');
+    expect(bwrap?.className).toContain('border-red-500/30');
+    expect(dist?.className).toContain('border-emerald-500/30');
+
+    // With the structured map present, the pill is the bare 'agent ✗' (the folded
+    // string is not repeated), but the full reason stays available as its tooltip.
+    const agentPill = Array.from(el.querySelectorAll('span')).find(
+      s => s.textContent === 'agent ✗',
+    );
+    expect(agentPill).toBeTruthy();
+    expect(agentPill?.getAttribute('title')).toBe('bwrap sandbox missing; node runtime missing');
+    expect(el.textContent).not.toContain('agent ✗: bwrap sandbox missing');
+  });
+
+  test('falls back to the folded agent_unavailable_reason string when no legs map is present', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([
+      {
+        ...SAMPLE_RUNNERS[0],
+        capabilities: { task_types: ['compute_experiment'], has_gpu: true, max_concurrent: 2 },
+        health: {
+          device_status: 'connected',
+          device_status_reason: null,
+          is_live: true,
+          seconds_since_last_seen: 8,
+          active_task_count: 0,
+          active_compute_job_count: 0,
+          active_work_count: 0,
+          max_concurrent: 2,
+          available_slots: 2,
+          stale_reason: null,
+          agent_available: false,
+          agent_unavailable_reason: 'bwrap sandbox missing; docker unavailable',
+          liveness_window_seconds: 300,
+        },
+      },
+    ]);
+    const el = await mount();
+
+    // Older runner without the structured map: no per-leg row, folded string shown.
+    expect(el.querySelector('[data-testid="fleet-runner-agent-legs"]')).toBeNull();
+    expect(el.textContent).toContain('agent ✗: bwrap sandbox missing; docker unavailable');
+  });
+
   test('distinguishes unknown runner slots from full capacity', async () => {
     vi.mocked(listFleetRunners).mockResolvedValueOnce([
       {
@@ -861,6 +970,7 @@ describe('FleetRunnersPanel — behavioral', () => {
           active_task_count: 1,
           active_compute_job_count: 1,
           max_concurrent: 3,
+          available_slots: 1,
           stale_reason: null,
           agent_available: true,
           liveness_window_seconds: 300,
@@ -1164,5 +1274,623 @@ describe('FleetRunnersPanel — behavioral', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  // ── Live config: applied-vs-pending badge + GPU allowlist editor ─────────────
+
+  test('renders config-pending badge when config_pending is true', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([
+      {
+        ...SAMPLE_RUNNERS[0],
+        config: {
+          config_generation: 'gen-new',
+          applied_config_generation: 'gen-old',
+          config_pending: true,
+          gpu_indices_allowed: [0, 1],
+        },
+      },
+    ]);
+    const el = await mount();
+
+    const badge = el.querySelector('[data-testid="fleet-runner-config-status"]');
+    expect(badge).not.toBeNull();
+    expect(badge?.textContent).toContain('config pending — applying on next heartbeat');
+    // Pending state is amber, distinct from the applied emerald.
+    expect(badge?.className).toContain('text-amber-300');
+    expect(badge?.textContent).not.toContain('config applied');
+  });
+
+  test('renders config-applied badge when applied matches desired', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([
+      {
+        ...SAMPLE_RUNNERS[0],
+        config: {
+          config_generation: 'gen-abc',
+          applied_config_generation: 'gen-abc',
+          config_pending: false,
+          gpu_indices_allowed: 'all',
+        },
+      },
+    ]);
+    const el = await mount();
+
+    const badge = el.querySelector('[data-testid="fleet-runner-config-status"]');
+    expect(badge).not.toBeNull();
+    expect(badge?.textContent).toContain('config applied');
+    expect(badge?.className).toContain('text-emerald-300');
+    expect(badge?.textContent).not.toContain('config pending');
+  });
+
+  test('renders no config badge for a runner without a config block', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([SAMPLE_RUNNERS[0]]);
+    const el = await mount();
+    expect(el.querySelector('[data-testid="fleet-runner-config-status"]')).toBeNull();
+  });
+
+  test('editing the GPU allowlist to an index list calls updateRunnerCapabilities with gpu_indices_allowed', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([
+      {
+        ...SAMPLE_RUNNERS[0],
+        capabilities: { task_types: 'all', has_gpu: true, max_concurrent: 2 },
+        config: {
+          config_generation: 'gen-abc',
+          applied_config_generation: 'gen-abc',
+          config_pending: false,
+          gpu_indices_allowed: 'all',
+        },
+      },
+    ]);
+    const el = await mount();
+
+    // Currently "all" — open the editor.
+    expect(el.textContent).toContain('GPUs: all');
+    const editBtn = el.querySelector('button[aria-label="Edit GPU allowlist"]');
+    expect(editBtn).not.toBeNull();
+    await act(async () => { (editBtn as HTMLButtonElement).click(); });
+
+    // Uncheck "all" to reveal the index input.
+    const allToggle = el.querySelector('input[aria-label="Allow all GPUs"]') as HTMLInputElement;
+    expect(allToggle).not.toBeNull();
+    expect(allToggle.checked).toBe(true);
+    // Native click toggles the checkbox and fires the 'click' event React binds
+    // its onChange to for checkboxes (a dispatched 'input' event is unreliable).
+    await act(async () => { allToggle.click(); });
+
+    const indexInput = el.querySelector('input[aria-label="GPU indices allowed"]') as HTMLInputElement;
+    expect(indexInput).not.toBeNull();
+    await act(async () => { typeInto(indexInput, '2, 0, 2'); });
+
+    const saveBtn = el.querySelector('button[aria-label="Save GPU allowlist"]');
+    expect(saveBtn).not.toBeNull();
+    await act(async () => { (saveBtn as HTMLButtonElement).click(); });
+    await act(async () => {});
+
+    // Parsed to a deduped, sorted, non-negative integer array.
+    expect(updateRunnerCapabilities).toHaveBeenCalledWith('proj-test', 'runner-abc123', {
+      gpu_indices_allowed: [0, 2],
+    });
+  });
+
+  test('saving the GPU allowlist while "all" is checked sends the "all" sentinel', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([
+      {
+        ...SAMPLE_RUNNERS[0],
+        capabilities: { task_types: 'all', has_gpu: true, max_concurrent: 2 },
+        config: {
+          config_generation: 'gen-abc',
+          applied_config_generation: 'gen-abc',
+          config_pending: false,
+          gpu_indices_allowed: [0, 1],
+        },
+      },
+    ]);
+    const el = await mount();
+
+    // Currently restricted — open the editor and re-check "all".
+    expect(el.textContent).toContain('GPUs: 0,1');
+    const editBtn = el.querySelector('button[aria-label="Edit GPU allowlist"]');
+    await act(async () => { (editBtn as HTMLButtonElement).click(); });
+
+    const allToggle = el.querySelector('input[aria-label="Allow all GPUs"]') as HTMLInputElement;
+    // Opened from a restricted list → starts unchecked.
+    expect(allToggle.checked).toBe(false);
+    await act(async () => { allToggle.click(); });
+
+    const saveBtn = el.querySelector('button[aria-label="Save GPU allowlist"]');
+    await act(async () => { (saveBtn as HTMLButtonElement).click(); });
+    await act(async () => {});
+
+    expect(updateRunnerCapabilities).toHaveBeenCalledWith('proj-test', 'runner-abc123', {
+      gpu_indices_allowed: 'all',
+    });
+  });
+
+  test('the GPU allowlist editor is absent for non-GPU runners', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([
+      {
+        ...SAMPLE_RUNNERS[0],
+        capabilities: { task_types: 'all', has_gpu: false, max_concurrent: 2 },
+        config: {
+          config_generation: 'gen-abc',
+          applied_config_generation: 'gen-abc',
+          config_pending: false,
+          gpu_indices_allowed: 'all',
+        },
+      },
+    ]);
+    const el = await mount();
+    expect(el.querySelector('button[aria-label="Edit GPU allowlist"]')).toBeNull();
+  });
+
+  // ── Live config: per-job GPU count + task-type allowlist editors ─────────────
+
+  test('editing gpus_per_job calls updateRunnerCapabilities with the new count', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([
+      {
+        ...SAMPLE_RUNNERS[0],
+        capabilities: { task_types: 'all', has_gpu: true, max_concurrent: 2 },
+        config: {
+          config_generation: 'gen-abc',
+          applied_config_generation: 'gen-abc',
+          config_pending: false,
+          gpu_indices_allowed: 'all',
+          gpus_per_job: 1,
+        },
+      },
+    ]);
+    const el = await mount();
+
+    // Current value is surfaced, editor closed.
+    expect(el.textContent).toContain('1 GPUs/job');
+    const editBtn = el.querySelector('button[aria-label="Edit GPUs per job"]');
+    expect(editBtn).not.toBeNull();
+    await act(async () => { (editBtn as HTMLButtonElement).click(); });
+
+    const input = el.querySelector('input[aria-label="GPUs per job"]') as HTMLInputElement;
+    expect(input).not.toBeNull();
+    await act(async () => { typeInto(input, '4'); });
+
+    const saveBtn = el.querySelector('button[aria-label="Save GPUs per job"]');
+    expect(saveBtn).not.toBeNull();
+    await act(async () => { (saveBtn as HTMLButtonElement).click(); });
+    await act(async () => {});
+
+    expect(updateRunnerCapabilities).toHaveBeenCalledWith('proj-test', 'runner-abc123', {
+      gpus_per_job: 4,
+    });
+  });
+
+  test('the gpus_per_job input clamps out-of-range values to 1–8', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([
+      {
+        ...SAMPLE_RUNNERS[0],
+        capabilities: { task_types: 'all', has_gpu: true, max_concurrent: 2 },
+        config: {
+          config_generation: 'gen-abc',
+          applied_config_generation: 'gen-abc',
+          config_pending: false,
+          gpu_indices_allowed: 'all',
+          gpus_per_job: 2,
+        },
+      },
+    ]);
+    const el = await mount();
+
+    const editBtn = el.querySelector('button[aria-label="Edit GPUs per job"]');
+    await act(async () => { (editBtn as HTMLButtonElement).click(); });
+
+    const input = el.querySelector('input[aria-label="GPUs per job"]') as HTMLInputElement;
+    // Above the max clamps to 8.
+    await act(async () => { typeInto(input, '99'); });
+    const saveBtn = el.querySelector('button[aria-label="Save GPUs per job"]');
+    await act(async () => { (saveBtn as HTMLButtonElement).click(); });
+    await act(async () => {});
+
+    expect(updateRunnerCapabilities).toHaveBeenCalledWith('proj-test', 'runner-abc123', {
+      gpus_per_job: 8,
+    });
+  });
+
+  test('the gpus_per_job editor is absent for non-GPU runners', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([
+      {
+        ...SAMPLE_RUNNERS[0],
+        capabilities: { task_types: 'all', has_gpu: false, max_concurrent: 2 },
+        config: {
+          config_generation: 'gen-abc',
+          applied_config_generation: 'gen-abc',
+          config_pending: false,
+          gpu_indices_allowed: 'all',
+          gpus_per_job: 1,
+        },
+      },
+    ]);
+    const el = await mount();
+    expect(el.querySelector('button[aria-label="Edit GPUs per job"]')).toBeNull();
+  });
+
+  test('editing task_types to a list calls updateRunnerCapabilities with the parsed array', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([
+      {
+        ...SAMPLE_RUNNERS[0],
+        capabilities: { task_types: 'all', has_gpu: false, max_concurrent: 2 },
+        config: {
+          config_generation: 'gen-abc',
+          applied_config_generation: 'gen-abc',
+          config_pending: false,
+          gpu_indices_allowed: 'all',
+          desired: { task_types: 'all' },
+        },
+      },
+    ]);
+    const el = await mount();
+
+    expect(el.textContent).toContain('tasks: all');
+    const editBtn = el.querySelector('button[aria-label="Edit task types"]');
+    expect(editBtn).not.toBeNull();
+    await act(async () => { (editBtn as HTMLButtonElement).click(); });
+
+    const allToggle = el.querySelector('input[aria-label="Allow all task types"]') as HTMLInputElement;
+    expect(allToggle).not.toBeNull();
+    expect(allToggle.checked).toBe(true);
+    await act(async () => { allToggle.click(); });
+
+    const listInput = el.querySelector('input[aria-label="Task types allowed"]') as HTMLInputElement;
+    expect(listInput).not.toBeNull();
+    await act(async () => { typeInto(listInput, 'compute_experiment, code_change, compute_experiment'); });
+
+    const saveBtn = el.querySelector('button[aria-label="Save task types"]');
+    await act(async () => { (saveBtn as HTMLButtonElement).click(); });
+    await act(async () => {});
+
+    // Deduped, trimmed list preserving input order.
+    expect(updateRunnerCapabilities).toHaveBeenCalledWith('proj-test', 'runner-abc123', {
+      task_types: ['compute_experiment', 'code_change'],
+    });
+  });
+
+  test('saving task_types with "all" checked sends the "all" sentinel', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([
+      {
+        ...SAMPLE_RUNNERS[0],
+        capabilities: { task_types: ['compute_experiment'], has_gpu: false, max_concurrent: 2 },
+        config: {
+          config_generation: 'gen-abc',
+          applied_config_generation: 'gen-abc',
+          config_pending: false,
+          gpu_indices_allowed: 'all',
+          desired: { task_types: ['compute_experiment'] },
+        },
+      },
+    ]);
+    const el = await mount();
+
+    expect(el.textContent).toContain('tasks: compute_experiment');
+    const editBtn = el.querySelector('button[aria-label="Edit task types"]');
+    await act(async () => { (editBtn as HTMLButtonElement).click(); });
+
+    const allToggle = el.querySelector('input[aria-label="Allow all task types"]') as HTMLInputElement;
+    // Opened from a restricted list → starts unchecked.
+    expect(allToggle.checked).toBe(false);
+    await act(async () => { allToggle.click(); });
+
+    const saveBtn = el.querySelector('button[aria-label="Save task types"]');
+    await act(async () => { (saveBtn as HTMLButtonElement).click(); });
+    await act(async () => {});
+
+    expect(updateRunnerCapabilities).toHaveBeenCalledWith('proj-test', 'runner-abc123', {
+      task_types: 'all',
+    });
+  });
+
+  test('the task_types editor is suppressed for strategic runners', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([
+      {
+        ...SAMPLE_RUNNERS[0],
+        capabilities: {
+          task_types: ['design_doc_update', 'strategic_review'],
+          has_gpu: false,
+          max_concurrent: 1,
+          runner_preset: 'strategic_local',
+          workload: 'strategic',
+        },
+        config: {
+          config_generation: 'gen-abc',
+          applied_config_generation: 'gen-abc',
+          config_pending: false,
+          gpu_indices_allowed: 'all',
+          desired: { task_types: ['design_doc_update', 'strategic_review'] },
+        },
+      },
+    ]);
+    const el = await mount();
+    expect(el.querySelector('button[aria-label="Edit task types"]')).toBeNull();
+  });
+
+  // ── Cloud-cost-avoided rollup in the telemetry detail ────────────────────────
+
+  async function openTelemetry(el: HTMLDivElement) {
+    const toggle = [...el.querySelectorAll('button')].find(b =>
+      b.getAttribute('aria-label')?.startsWith('Toggle telemetry for runner'),
+    );
+    await act(async () => { (toggle as HTMLButtonElement).click(); });
+    await act(async () => {});
+  }
+
+  test('telemetry detail renders the cloud-cost-avoided and claim-latency lines when the backend reports them', async () => {
+    vi.mocked(fetchRunnerTelemetry).mockResolvedValue({
+      runner_id: 'runner-abc123',
+      since_seconds: 3600,
+      count: 0,
+      snapshots: [],
+    });
+    vi.mocked(fetchRunnerStats).mockResolvedValue({
+      runner_id: 'runner-abc123',
+      jobs_run_count: 4,
+      jobs_terminal_count: 3,
+      jobs_succeeded_count: 3,
+      jobs_success_rate: 1,
+      cloud_cost_avoided_usd: 12.5,
+      cloud_cost_avoided_basis: 2,
+      claim_latency_ms_p50: 1200,
+      claim_latency_ms_p95: 3400,
+      claim_latency_ms_p99: 5600,
+      claim_latency_ms_max: 6000,
+      claim_latency_sample_count: 3,
+      last_n_outcomes: [],
+    });
+
+    const el = await mount();
+    await openTelemetry(el);
+
+    const detail = el.querySelector('[data-testid="fleet-runner-telemetry-detail"]');
+    expect(detail).not.toBeNull();
+    const text = detail?.textContent ?? '';
+    expect(text).toContain('Cloud cost avoided:');
+    expect(text).toContain('$12.50');
+    expect(text).toContain('Claim latency:');
+    expect(text).toContain('1200ms');
+    expect(text).toContain('3 samples');
+  });
+
+  test('telemetry detail omits the claim-latency line when there is no cold-start sample', async () => {
+    vi.mocked(fetchRunnerTelemetry).mockResolvedValue({
+      runner_id: 'runner-abc123',
+      since_seconds: 3600,
+      count: 0,
+      snapshots: [],
+    });
+    vi.mocked(fetchRunnerStats).mockResolvedValue({
+      runner_id: 'runner-abc123',
+      jobs_run_count: 1,
+      jobs_terminal_count: 1,
+      jobs_succeeded_count: 1,
+      jobs_success_rate: 1,
+      cloud_cost_avoided_usd: 0,
+      cloud_cost_avoided_basis: 0,
+      claim_latency_ms_p50: null,
+      claim_latency_ms_p95: null,
+      claim_latency_ms_p99: null,
+      claim_latency_ms_max: null,
+      claim_latency_sample_count: 0,
+      last_n_outcomes: [],
+    });
+
+    const el = await mount();
+    await openTelemetry(el);
+
+    const detail = el.querySelector('[data-testid="fleet-runner-telemetry-detail"]');
+    expect(detail).not.toBeNull();
+    const text = detail?.textContent ?? '';
+    // Cloud-cost line always renders (defaults to $0.00); claim-latency block is gated.
+    expect(text).toContain('Cloud cost avoided:');
+    expect(text).not.toContain('Claim latency:');
+  });
+
+  test('telemetry recent-jobs rows show terminal_reason and exit_code for a failed job', async () => {
+    vi.mocked(fetchRunnerTelemetry).mockResolvedValue({
+      runner_id: 'runner-abc123',
+      since_seconds: 3600,
+      count: 0,
+      snapshots: [],
+    });
+    vi.mocked(fetchRunnerStats).mockResolvedValue({
+      runner_id: 'runner-abc123',
+      jobs_run_count: 2,
+      jobs_terminal_count: 2,
+      jobs_succeeded_count: 1,
+      jobs_success_rate: 0.5,
+      cloud_cost_avoided_usd: 0,
+      cloud_cost_avoided_basis: 0,
+      claim_latency_ms_p50: null,
+      claim_latency_ms_p95: null,
+      claim_latency_ms_p99: null,
+      claim_latency_ms_max: null,
+      claim_latency_sample_count: 0,
+      last_n_outcomes: [
+        {
+          job_id: 'job-failed',
+          task_id: 'task-1234abcd',
+          status: 'FAILED',
+          outcome: null,
+          created_at: null,
+          completed_at: null,
+          terminal_reason: 'process exited non-zero',
+          exit_code: 137,
+        },
+        {
+          job_id: 'job-ok',
+          task_id: null,
+          status: 'SUCCEEDED',
+          outcome: null,
+          created_at: null,
+          completed_at: null,
+          terminal_reason: null,
+          exit_code: null,
+        },
+      ],
+    });
+
+    const el = await mount();
+    await openTelemetry(el);
+
+    const detail = el.querySelector('[data-testid="fleet-runner-telemetry-detail"]');
+    expect(detail).not.toBeNull();
+    const text = detail?.textContent ?? '';
+    // The failed row surfaces the reason and exit code inline.
+    expect(text).toContain('process exited non-zero');
+    expect(text).toContain('(exit 137)');
+  });
+
+  test('telemetry recent-jobs rows show command_log_tail for a failed job only', async () => {
+    vi.mocked(fetchRunnerTelemetry).mockResolvedValue({
+      runner_id: 'runner-abc123',
+      since_seconds: 3600,
+      count: 0,
+      snapshots: [],
+    });
+    vi.mocked(fetchRunnerStats).mockResolvedValue({
+      runner_id: 'runner-abc123',
+      jobs_run_count: 2,
+      jobs_terminal_count: 2,
+      jobs_succeeded_count: 1,
+      jobs_success_rate: 0.5,
+      cloud_cost_avoided_usd: 0,
+      cloud_cost_avoided_basis: 0,
+      claim_latency_ms_p50: null,
+      claim_latency_ms_p95: null,
+      claim_latency_ms_p99: null,
+      claim_latency_ms_max: null,
+      claim_latency_sample_count: 0,
+      last_n_outcomes: [
+        {
+          job_id: 'job-failed',
+          task_id: 'task-1234abcd',
+          status: 'FAILED',
+          outcome: null,
+          created_at: null,
+          completed_at: null,
+          terminal_reason: 'process exited non-zero',
+          exit_code: 137,
+          command_log_tail: 'Traceback (most recent call last):\n  RuntimeError: boom',
+        },
+        {
+          job_id: 'job-ok',
+          task_id: null,
+          status: 'SUCCEEDED',
+          outcome: null,
+          created_at: null,
+          completed_at: null,
+          terminal_reason: null,
+          exit_code: null,
+          command_log_tail: 'this should never render',
+        },
+      ],
+    });
+
+    const el = await mount();
+    await openTelemetry(el);
+
+    const detail = el.querySelector('[data-testid="fleet-runner-telemetry-detail"]');
+    expect(detail).not.toBeNull();
+    const text = detail?.textContent ?? '';
+    // The failed row surfaces its command-log tail inline.
+    expect(text).toContain('RuntimeError: boom');
+    // A success row's tail (defensive) is never rendered.
+    expect(text).not.toContain('this should never render');
+  });
+
+  test('recent-outcome task id is a keyboard-accessible link that fires onNavigateToTask', async () => {
+    vi.mocked(fetchRunnerTelemetry).mockResolvedValue({
+      runner_id: 'runner-abc123',
+      since_seconds: 3600,
+      count: 0,
+      snapshots: [],
+    });
+    vi.mocked(fetchRunnerStats).mockResolvedValue({
+      runner_id: 'runner-abc123',
+      jobs_run_count: 1,
+      jobs_terminal_count: 1,
+      jobs_succeeded_count: 0,
+      jobs_success_rate: 0,
+      cloud_cost_avoided_usd: 0,
+      cloud_cost_avoided_basis: 0,
+      claim_latency_ms_p50: null,
+      claim_latency_ms_p95: null,
+      claim_latency_ms_p99: null,
+      claim_latency_ms_max: null,
+      claim_latency_sample_count: 0,
+      last_n_outcomes: [
+        {
+          job_id: 'job-failed',
+          task_id: 'task-1234abcd',
+          status: 'FAILED',
+          outcome: null,
+          created_at: null,
+          completed_at: null,
+          terminal_reason: 'process exited non-zero',
+          exit_code: 137,
+        },
+      ],
+    });
+
+    const onNavigateToTask = vi.fn();
+    const el = await mount('proj-test', { onNavigateToTask });
+    await openTelemetry(el);
+
+    const link = el.querySelector<HTMLButtonElement>(
+      '[data-testid="fleet-outcome-task-link"]',
+    );
+    expect(link).not.toBeNull();
+    // Rendered as a real <button> so it is focusable/keyboard-activatable.
+    expect(link?.tagName).toBe('BUTTON');
+    expect(link?.textContent).toContain('task task-123');
+
+    await act(async () => { (link as HTMLButtonElement).click(); });
+    expect(onNavigateToTask).toHaveBeenCalledTimes(1);
+    expect(onNavigateToTask).toHaveBeenCalledWith('task-1234abcd');
+  });
+
+  test('recent-outcome task id degrades to plain text when no navigator is provided', async () => {
+    vi.mocked(fetchRunnerTelemetry).mockResolvedValue({
+      runner_id: 'runner-abc123',
+      since_seconds: 3600,
+      count: 0,
+      snapshots: [],
+    });
+    vi.mocked(fetchRunnerStats).mockResolvedValue({
+      runner_id: 'runner-abc123',
+      jobs_run_count: 1,
+      jobs_terminal_count: 1,
+      jobs_succeeded_count: 0,
+      jobs_success_rate: 0,
+      cloud_cost_avoided_usd: 0,
+      cloud_cost_avoided_basis: 0,
+      claim_latency_ms_p50: null,
+      claim_latency_ms_p95: null,
+      claim_latency_ms_p99: null,
+      claim_latency_ms_max: null,
+      claim_latency_sample_count: 0,
+      last_n_outcomes: [
+        {
+          job_id: 'job-failed',
+          task_id: 'task-1234abcd',
+          status: 'FAILED',
+          outcome: null,
+          created_at: null,
+          completed_at: null,
+          terminal_reason: 'process exited non-zero',
+          exit_code: 137,
+        },
+      ],
+    });
+
+    const el = await mount();
+    await openTelemetry(el);
+
+    // No callback → no clickable link, but the id is still shown as plain text.
+    expect(el.querySelector('[data-testid="fleet-outcome-task-link"]')).toBeNull();
+    const detail = el.querySelector('[data-testid="fleet-runner-telemetry-detail"]');
+    expect(detail?.textContent).toContain('task task-123');
   });
 });

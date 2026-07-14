@@ -134,8 +134,8 @@ export function DashboardHome({ tasks, selectedProjectId, projects, globalActive
   }
 
   // Compute task counts from props before hook calls — used by useDashboardDigest for sparkline
-  const pageActiveCount = tasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING').length;
-  const pageQueuedCount = tasks.filter(t => t.status === 'QUEUED').length;
+  const pageActiveCount = useMemo(() => tasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING').length, [tasks]);
+  const pageQueuedCount = useMemo(() => tasks.filter(t => t.status === 'QUEUED').length, [tasks]);
   const activeCount = selectedProjectId && scopedActiveCount != null
     ? scopedActiveCount
     : (globalActiveCount ?? pageActiveCount);
@@ -164,7 +164,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, globalActive
     agentServingShas,
   } = useProjectMetrics(selectedProjectId, windowHours, selectedSrCategory);
 
-  const selectedProject = projects?.find(p => p.id === selectedProjectId);
+  const selectedProject = useMemo(() => projects?.find(p => p.id === selectedProjectId), [projects, selectedProjectId]);
   const srCatchRateTargets = selectedProject?.sr_catch_rate_targets;
 
   const handleCategoryClick = useCallback((category: string) => {

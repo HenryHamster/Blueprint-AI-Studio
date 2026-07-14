@@ -26,7 +26,7 @@ import {
   buildWroteNewOutput,
   discoverDocumentedCommands, runnerFromCommand, MAX_DOCUMENTED_COMMANDS,
   discoverNewlyDisabledTests, MAX_DISABLED_TEST_MARKERS,
-  buildAcceptanceTestRunner, classifyAcceptanceTestRun, matchesEnvironmentFailureSignature,
+  buildAcceptanceTestRunner, classifyAcceptanceTestRun, acceptanceTestRunPassed, matchesEnvironmentFailureSignature,
   type BuildConfig, type TestRunner, type AcceptanceProbe, type DocumentedCommand,
   type DeclaredAcceptanceTest,
 } from '../utils/test-runners.js';
@@ -198,6 +198,13 @@ interface VerifyTestsResult {
     // The declared test actually executed (true ONLY for ``ran``).
     ran: boolean;
     status: 'ran' | 'skipped' | 'absent' | 'could_not_run';
+    // The targeted run was GREEN — true ONLY when the runner exited zero AND the
+    // classified status is ``ran``. Because the run targets ONLY the declared
+    // test, an exit-zero ``ran`` proves the declared test is passing; any thrown/
+    // non-zero exit (a failing test), or a ``skipped``/``absent``/``could_not_run``
+    // status, yields false. Additive: a backend that does not read it is
+    // unaffected; the sibling backend change consumes it to mint ``proven``.
+    passed: boolean;
   };
 }
 
@@ -745,15 +752,20 @@ async function attachAcceptanceTestProbe(
     const note = `Declared acceptance test \`${label}\` could not be targeted (no runnable suite to execute it) — cannot confirm it ran; falling open as degraded.`;
     return {
       ...base,
-      acceptanceTest: { ...blockBase, present: false, ran: false, status: 'could_not_run' },
+      acceptanceTest: { ...blockBase, present: false, ran: false, status: 'could_not_run', passed: false },
       output: [base.output, note].filter(Boolean).join('\n'),
     };
   }
 
   let output = '';
   let status: 'ran' | 'skipped' | 'absent' | 'could_not_run';
+  // Whether the targeted runner invocation completed WITHOUT throwing (exit 0).
+  // A thrown/non-zero exit (a failing test, or an environment failure) leaves
+  // this false, so the pass determination can never be minted from a red run.
+  let cleanExit = false;
   try {
     output = await execFileAsync(runner.cmd, runner.args, { cwd: runner.cwd, timeoutMs: TEST_RUNNER_TIMEOUT });
+    cleanExit = true;
     status = classifyAcceptanceTestRun(output);
   } catch (err: unknown) {
     const e = err as Error & { stdout?: string; stderr?: string };
@@ -766,6 +778,10 @@ async function attachAcceptanceTestProbe(
       : classifyAcceptanceTestRun(output);
   }
   const ran = status === 'ran';
+  // Because the run targets ONLY the declared test, an exit-zero run classified
+  // ``ran`` means the declared test is GREEN. Any thrown/non-zero exit or a
+  // non-``ran`` status yields false (see acceptanceTestRunPassed).
+  const passed = acceptanceTestRunPassed(cleanExit, status);
   const present = status !== 'absent';
   sendLog(ws, `Declared acceptance test [${label}]: ${status}\n`);
   let note: string;
@@ -780,7 +796,7 @@ async function attachAcceptanceTestProbe(
   }
   return {
     ...base,
-    acceptanceTest: { ...blockBase, present, ran, status },
+    acceptanceTest: { ...blockBase, present, ran, status, passed },
     output: [base.output, note].filter(Boolean).join('\n'),
   };
 }

@@ -2,6 +2,17 @@ import { useState, type JSX } from 'react';
 import type { ChangelogEntry, VersionCriterionCoverage, CriterionCoverageEntry } from '../api';
 import { isSafeUrl } from './TaskCard';
 
+function formatExpiresIn(expiresAt: string): string {
+  try {
+    const diffMs = new Date(expiresAt).getTime() - Date.now();
+    if (diffMs <= 0) return 'expired';
+    const diffDays = Math.ceil(diffMs / (1000 * 60 * 60 * 24));
+    return `expires ${diffDays}d`;
+  } catch {
+    return '';
+  }
+}
+
 // Group changelog entries by task_type, preserving newest-first order within each group.
 function groupByType(entries: ChangelogEntry[]): Map<string, ChangelogEntry[]> {
   const groups = new Map<string, ChangelogEntry[]>();
@@ -106,6 +117,46 @@ function TypeCountBadge({ taskType, count }: { taskType: string; count: number }
   );
 }
 
+const GAP_REASON_LABELS: Record<string, string> = {
+  no_criteria: 'no criteria',
+  verdict_not_proven: 'verdict not proven',
+  no_active_criteria: 'no active criteria',
+  no_open_version: 'no open version',
+};
+
+function MergeEvidenceGapBreakdown({ gaps }: { gaps: Record<string, number | string[]> | null | undefined }): JSX.Element | null {
+  if (gaps == null) return null;
+  const entries = Object.entries(gaps)
+    .filter(([key, val]) => key !== 'unmatched_criterion_ids' && typeof val === 'number' && val > 0)
+    .map(([key, val]) => ({
+      key,
+      count: val as number,
+      label: GAP_REASON_LABELS[key] ?? key.replace(/_/g, ' '),
+    }));
+  if (entries.length === 0) return null;
+
+  const unmatchedIds: string[] = (Array.isArray(gaps.unmatched_criterion_ids) ? gaps.unmatched_criterion_ids : []) as string[];
+
+  return (
+    <span className="flex flex-wrap items-center gap-x-2 gap-y-0.5" data-testid="merge-evidence-gap-breakdown">
+      {entries.map(e => (
+        <span key={e.key} className="text-ui-sm text-amber-400/70" data-testid={`gap-reason-${e.key}`}>
+          {e.count} {e.label}
+        </span>
+      ))}
+      {unmatchedIds.length > 0 && (
+        <span
+          className="text-ui-sm text-amber-400/50 cursor-default"
+          data-testid="gap-unmatched-ids"
+          title={`Unmatched criterion IDs: ${unmatchedIds.join(', ')}`}
+        >
+          {unmatchedIds.length} unmatched
+        </span>
+      )}
+    </span>
+  );
+}
+
 const BUCKET_META: Record<string, { label: string; className: string }> = {
   undeclared:                { label: 'no criteria',    className: 'text-amber-400' },
   declared_unsatisfied:      { label: 'criteria failed', className: 'text-red-400' },
@@ -116,6 +167,9 @@ const BUCKET_META: Record<string, { label: string; className: string }> = {
 
 const COVERAGE_BADGE: Record<CriterionCoverageEntry['coverage'], { label: string; className: string }> = {
   covered:   { label: 'covered',   className: 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30' },
+  attested:  { label: 'attested',  className: 'bg-amber-600/20 text-amber-400 border border-amber-600/40' },
+  backfilled:{ label: 'backfilled',className: 'bg-slate-600/40 text-slate-300 border border-slate-500/40' },
+  probed:    { label: 'probed',    className: 'bg-sky-600/20 text-sky-300 border border-sky-600/40' },
   partial:   { label: 'partial',   className: 'bg-amber-500/20 text-amber-400 border border-amber-500/30' },
   uncovered: { label: 'uncovered', className: 'bg-slate-700/60 text-slate-400 border border-slate-600/40' },
 };
@@ -132,6 +186,7 @@ function CriterionCoveragePanel({ coverage, onReinstate, onAttest, onLinkDirecti
       <div className="mb-3" data-testid="criterion-coverage-panel">
         <div className="text-ui-sm font-semibold uppercase tracking-wide text-slate-500 mb-1">Version acceptance criteria</div>
         <div className="text-ui-sm text-slate-500 italic">No acceptance criteria defined for this version.</div>
+        <MergeEvidenceGapBreakdown gaps={coverage.merge_evidence_gaps} />
       </div>
     );
   }
@@ -140,14 +195,33 @@ function CriterionCoveragePanel({ coverage, onReinstate, onAttest, onLinkDirecti
   const inactiveCount = coverage.inactive ?? rowInactiveCount;
   const retractedCount = coverage.retracted ?? coverage.criteria.filter((c) => c.status === 'retracted').length;
   const supersededCount = coverage.superseded ?? coverage.criteria.filter((c) => c.status === 'superseded').length;
+  // Attested criteria are a distinct, lower-confidence tier (operator's word,
+  // not machine-verified) and are NOT part of `covered`. Older backends omit
+  // the field entirely — treat undefined as 0.
+  const attestedCount = coverage.attested ?? 0;
 
   return (
     <div className="mb-3" data-testid="criterion-coverage-panel">
       <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 mb-1">
         <span className="text-ui-sm font-semibold uppercase tracking-wide text-slate-500">Version acceptance criteria</span>
-        <span className="text-ui-sm text-slate-400 font-medium">
-          {coverage.total === 0 ? '0 active criteria' : `${coverage.covered}/${coverage.total} active covered`}
+        <span className="text-ui-sm text-slate-400 font-medium" data-testid="criterion-coverage-fraction">
+          {coverage.total === 0
+            ? '0 active criteria'
+            : attestedCount > 0
+              ? `${coverage.covered} verified + ${attestedCount} attested / ${coverage.total}`
+              : `${coverage.covered}/${coverage.total} active covered`}
         </span>
+        {attestedCount > 0 && (
+          <span
+            className="text-ui-sm text-amber-400"
+            data-testid="attested-count-badge"
+            title="Covered only by operator attestation (not machine-verified) — lower confidence and expiring"
+          >
+            {attestedCount} attested
+          </span>
+        )}
+        {(coverage.backfilled ?? 0) > 0 && <span className="text-ui-sm text-slate-500" data-testid="backfilled-count-badge">{coverage.backfilled} backfilled</span>}
+        {(coverage.probed ?? 0) > 0 && <span className="text-ui-sm text-sky-300" data-testid="probed-count-badge">{coverage.probed} probed</span>}
         {coverage.partial > 0 && <span className="text-ui-sm text-amber-400">{coverage.partial} partial</span>}
         {coverage.uncovered > 0 && <span className="text-ui-sm text-slate-500">{coverage.uncovered} uncovered</span>}
         {inactiveCount > 0 && (
@@ -161,6 +235,7 @@ function CriterionCoveragePanel({ coverage, onReinstate, onAttest, onLinkDirecti
           </span>
         )}
       </div>
+      <MergeEvidenceGapBreakdown gaps={coverage.merge_evidence_gaps} />
       <ul className="space-y-1">
         {coverage.criteria.map((c) => {
           const badge = COVERAGE_BADGE[c.coverage];
@@ -198,6 +273,15 @@ function CriterionCoveragePanel({ coverage, onReinstate, onAttest, onLinkDirecti
               {isInProgress && (
                 <span className="shrink-0 text-ui-sm text-slate-400 ml-1" data-testid={`in-progress-${c.criterion_key}`} title="Active direction is working on this criterion">
                   in progress
+                </span>
+              )}
+              {c.coverage === 'attested' && c.attestation_expires_at != null && (
+                <span
+                  className="shrink-0 text-ui-sm text-amber-500 ml-1"
+                  data-testid={`attestation-expiry-${c.criterion_key}`}
+                  title={`Attestation expires at ${c.attestation_expires_at}`}
+                >
+                  {formatExpiresIn(c.attestation_expires_at)}
                 </span>
               )}
               {c.evidence_count > 0 && (

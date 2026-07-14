@@ -6,6 +6,10 @@ import { MessagesPanel, type MessagesPanelProps } from './MessagesPanel';
 import type { ProjectMessage } from './MessageBubble';
 import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt, stressStrings } from '../test/viewport';
 import type { StrategicStateResponse } from '../strategicStateApi';
+// Preload MarkdownContentInner so React.lazy in MarkdownContent resolves immediately
+// in the browser viewport environment, preventing the Suspense fallback from hiding
+// the message content during DOM queries.
+import './MarkdownContentInner';
 
 // React patches the input `value` setter on its prototype to track controlled-input
 // state. Assigning `input.value = 'x'` then dispatching an event won't trigger React's

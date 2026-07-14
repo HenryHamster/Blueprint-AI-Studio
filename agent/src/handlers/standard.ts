@@ -1,4 +1,4 @@
-import { execFileSync } from 'child_process';
+import { execFileSync, spawn } from 'child_process';
 import fs from 'fs';
 /**
  * Standard task handlers — core code-change operations.
@@ -43,6 +43,7 @@ import {
   buildAnalysisPrompt, parseAnalysisPlanFiles, parseAnalysisPlanTestFiles, parseAnalysisPlanVerifyFiles, extractModuleInterfaces,
   discoverAffectedConsumers, type PlaybookEntry, computePromptFingerprint,
   formatProvenanceWarnings, formatAcceptanceEvidence,
+  formatSkills, writeSkillHelpers, type TaskSkill,
 } from '../prompt.js';
 import { providerAutoInjectsClaudeMd } from '../providers/runners.js';
 import { writeFetchHelper, buildFetchGuidance, PLAN_FETCH_VERBS } from './strategic-helpers.js';
@@ -187,7 +188,12 @@ type CapabilityHoldbackName = 'module_interfaces' | 'related_tests' | 'affected_
 
 function holdbackFraction(meta: Record<string, unknown> | undefined, capability: CapabilityHoldbackName): number {
   const value = meta?.[`${capability}_holdback_fraction`];
-  return typeof value === 'number' ? value : 0.0;
+  // Default-OFF: absent an explicit per-project runtime_config holdback fraction,
+  // these context blocks were evaluated no_effect at the futility bound (2026-07-10)
+  // and are suppressed by default (holdback fraction 1.0 => holdback arm). A project
+  // can re-enable a section by setting its `<capability>_holdback_fraction` to a
+  // value < 1.0 (0.0 = always-treatment/opt-in).
+  return typeof value === 'number' ? value : 1.0;
 }
 
 /**
@@ -309,6 +315,88 @@ export function resolveVisualAcceptance(
   return { component, width };
 }
 
+/**
+ * Section strings for a standard-handler prompt, split by cache-stability.
+ * See {@link assembleStandardPrompt}.
+ */
+export interface StandardPromptSections {
+  // ── Stable prefix (deterministic literal/config guidance) ──────────────────
+  /** ## Codebase Instructions block (CLAUDE.md), or '' when the provider auto-injects it. */
+  claudeMdPrefix: string;
+  /** Whether this is a retry (toggles a retry-specific failure-guidance block; still stable for identical payload). */
+  isRetry: boolean;
+  /** ./check + ./pr + ./done + ./fail helper guidance. */
+  codeChangeHelperGuidance: string;
+  /** Task-type focus block (constant per task type). */
+  taskTypeFocusBlock: string;
+  /** Task-type hint (constant per task type + base branch). */
+  taskTypeHint: string;
+  /** First-task-on-repo guidance, or ''. */
+  firstTaskSection: string;
+  /** Read-only ./fetch verb guidance, or '' when no project_id. */
+  fetchGuidance: string;
+  // ── Variable tail (task-payload / project-aggregate content) ────────────────
+  acceptanceEvidenceNotice: string;
+  playbookSection: string;
+  skillsSection: string;
+  retryContext: string;
+  provenanceNotice: string;
+  /** buildPrompt() output — carries contextPrefix + rawPrompt (the per-task core). */
+  corePrompt: string;
+  reservedRevisionGuidance: string;
+  /** Self-review feedback + execution-evidence blocks (project-aggregate, slow-moving). */
+  srFeedbackBlock: string;
+  promptSuffix: string;
+  prTitlePrefixNote: string;
+}
+
+/**
+ * Assemble a standard-handler prompt so the automatically-cacheable prefix is
+ * maximized: ALL stable literal/config guidance forms one contiguous leading
+ * prefix, and ALL task-variable content forms a contiguous trailing tail.
+ *
+ * This is a byte-ORDER change only — every section that was sent before is
+ * still sent; only its position changes. Anthropic prefix caching bills a
+ * cache read at ~10% of base input, so a variable byte appearing early would
+ * bust the automatic prefix match for everything after it. Keeping the stable
+ * guidance first means two builds of the same handler for an identical payload
+ * but different wall-clock / git HEAD produce a BYTE-IDENTICAL stable prefix
+ * (none of the prefix sections read the clock or HEAD).
+ *
+ * Returns the leading `stablePrefix`, the trailing `variableBody`, and their
+ * concatenation `finalPrompt` (fileTree/repoMap/analysis are appended by the
+ * caller, after the tail).
+ */
+export function assembleStandardPrompt(s: StandardPromptSections): {
+  stablePrefix: string;
+  variableBody: string;
+  finalPrompt: string;
+} {
+  const stablePrefix =
+    s.claudeMdPrefix
+    + PLAYBOOK_GUIDANCE
+    + `\nNote: If lint or test fixes required non-obvious steps, save them to the playbook (e.g., ./playbook set "lint-gotcha" "description").\n`
+    + assembleFailureGuidanceBlocks(s.isRetry)
+    + VIEWPORT_INFRA_SKIP_GUIDANCE
+    + s.codeChangeHelperGuidance
+    + s.taskTypeFocusBlock
+    + s.taskTypeHint
+    + s.firstTaskSection
+    + `\n\n${s.fetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
+  const variableBody =
+    s.acceptanceEvidenceNotice
+    + s.playbookSection
+    + s.skillsSection
+    + s.retryContext
+    + s.provenanceNotice
+    + s.corePrompt
+    + s.reservedRevisionGuidance
+    + s.srFeedbackBlock
+    + s.promptSuffix
+    + s.prTitlePrefixNote;
+  return { stablePrefix, variableBody, finalPrompt: stablePrefix + variableBody };
+}
+
 async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   const {
     taskId, payload, task, ghToken, owner, repo, ws, statusRef,
@@ -364,6 +452,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   const claudeMd = readClaudeMd();
   const claudeMdPrefix = (claudeMd && !providerAutoInjectsClaudeMd()) ? `## Codebase Instructions\n${claudeMd}\n\n` : '';
   const playbookSection = formatPlaybook(task.playbook as Record<string, PlaybookEntry | string> | undefined);
+  const skillsSection = formatSkills(task.skills as TaskSkill[] | undefined);
   const retryContext = buildRetryContext(task);
   const firstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
   const taskTypeFocusBlock = getTaskTypeFocusBlock(taskTypeKey);
@@ -408,11 +497,45 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   // fired, so the prompt is byte-unchanged for non-finding-derived tasks.
   const provenanceNotice = formatProvenanceWarnings(ctx);
   const isRetry = !!retryContext;
-  const finalPrompt = claudeMdPrefix + acceptanceEvidenceNotice + playbookSection + retryContext + provenanceNotice + buildPrompt({ contextPrefix, parentCtx, rawPrompt }) + reservedRevisionGuidance + taskTypeHint + firstTaskSection + buildCodeChangeHelperGuidance({ buildConfig, owner, repo }) + taskTypeFocusBlock + loosenHintSection + coFailurePairsSection + severityCalibrationHintSection + precisionRecallQuadrantHintSection + executionEvidenceSection + PLAYBOOK_GUIDANCE + `\nNote: If lint or test fixes required non-obvious steps, save them to the playbook (e.g., ./playbook set "lint-gotcha" "description").\n` + assembleFailureGuidanceBlocks(isRetry) + VIEWPORT_INFRA_SKIP_GUIDANCE + `\n\n${stdFetchGuidance}${DEFAULT_TOOL_GUIDANCE}` + promptSuffix + prTitlePrefixNote;
+  // ── Cache-optimized prompt assembly ────────────────────────────────────────
+  // Stable literal/config guidance forms one contiguous leading prefix; all
+  // task-variable content forms a contiguous trailing tail. This maximizes the
+  // automatically-cacheable prefix for Anthropic prefix caching (cache reads
+  // billed at ~10% of base input) across a dispatch burst. See
+  // assembleStandardPrompt. Section groups below are also reused for the
+  // prompt-size telemetry further down, so they are computed exactly once.
+  const codeChangeHelperGuidance = buildCodeChangeHelperGuidance({ buildConfig, owner, repo });
+  const corePromptBody = buildPrompt({ contextPrefix, parentCtx, rawPrompt });
+  const srFeedbackBlock =
+    loosenHintSection
+    + coFailurePairsSection
+    + severityCalibrationHintSection
+    + precisionRecallQuadrantHintSection
+    + executionEvidenceSection;
+  const { finalPrompt } = assembleStandardPrompt({
+    claudeMdPrefix,
+    isRetry,
+    codeChangeHelperGuidance,
+    taskTypeFocusBlock,
+    taskTypeHint,
+    firstTaskSection,
+    fetchGuidance: stdFetchGuidance,
+    acceptanceEvidenceNotice,
+    playbookSection,
+    skillsSection,
+    retryContext,
+    provenanceNotice,
+    corePrompt: corePromptBody,
+    reservedRevisionGuidance,
+    srFeedbackBlock,
+    promptSuffix,
+    prTitlePrefixNote,
+  });
 
   const { workBranch } = await setupWorkspace(owner, repo, ghToken, baseBranch, branchPrefix, taskId, ws, statusRef, resolveTaskBranchNamespace(task), buildConfig);
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
+  writeSkillHelpers(task.skills as Record<string, unknown>[] | undefined);
   if (isBlueprintSelfRepo(owner, repo)) {
     writeViewportSnapshotHelper(taskId);
     writeViewportLiveHelper(taskId);
@@ -421,16 +544,24 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   // Build ctags symbol index for language-aware navigation (./symbols helper).
   // Graceful fallback: if ctags is unavailable or indexing fails, agents still
   // work normally and ./symbols reports "index not available".
-  try {
-    try { execFileSync('ctags', ['--version'], { stdio: 'ignore', timeout: 5000 }); } catch {
-      execFileSync('sudo', ['apt-get', 'install', '-y', '-q', 'universal-ctags'], { stdio: 'ignore', timeout: 60000 });
-    }
-    execFileSync('ctags', ['-R', '--output-format=json', '-f', `/tmp/symbols_${taskId}.json`, '.'], {
-      cwd: WORKSPACE,
-      stdio: 'ignore',
-      timeout: 120000,
-    });
-  } catch { /* ctags unavailable or indexing failed — continue without symbol index */ }
+  // Runs asynchronously so the event loop stays free for heartbeats and WS I/O.
+  void (async () => {
+    const spawnWithTimeout = (file: string, args: string[], timeoutMs: number, opts?: { cwd?: string }) =>
+      new Promise<void>((resolve, reject) => {
+        const child = spawn(file, args, { stdio: 'ignore', ...(opts?.cwd ? { cwd: opts.cwd } : {}) });
+        const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error(`timed out after ${timeoutMs}ms: ${file} ${args.join(' ')}`)); }, timeoutMs);
+        child.on('exit', (code) => { clearTimeout(timer); if (code === 0) resolve(); else reject(new Error(`exit ${code}: ${file} ${args.join(' ')}`)); });
+        child.on('error', (err) => { clearTimeout(timer); reject(err); });
+      });
+    try {
+      try {
+        await spawnWithTimeout('ctags', ['--version'], 5000);
+      } catch {
+        await spawnWithTimeout('sudo', ['apt-get', 'install', '-y', '-q', 'universal-ctags'], 60000);
+      }
+      await spawnWithTimeout('ctags', ['-R', '--output-format=json', '-f', `/tmp/symbols_${taskId}.json`, '.'], 120000, { cwd: WORKSPACE });
+    } catch { /* ctags unavailable or indexing failed — continue without symbol index */ }
+  })();
   if (stdProjectId) writeFetchHelper(taskId, stdProjectId, WORKSPACE, { verbs: PLAN_FETCH_VERBS });
   const disallowedTools = configureAgentPermissions(taskTypeKey);
 
@@ -503,7 +634,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     const baselineFailures = await captureTestBaseline(ws, statusRef, buildConfig, relatedFiles);
     if (baselineFailures !== null) {
       try {
-        fs.writeFileSync(
+        await fs.promises.writeFile(
           `/tmp/test_baseline_${taskId}.json`,
           JSON.stringify(Array.from(baselineFailures)),
           { mode: 0o644 },
@@ -522,7 +653,6 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     ((task.context as Record<string, unknown> | undefined)?.related_files as string[] | undefined) ||
     []
   );
-  let repoMap = buildRepoMap(ws, { taskPrompt: rawPrompt, relatedFiles: repoMapRelatedFiles });
   const providerRunner = getProviderRunner();
 
   // ── Deterministic repo-map holdback arm ──────────────────────────────────
@@ -532,25 +662,35 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   // independent of whether buildRepoMap returns content. This ensures intent-to-treat
   // analysis can use the assignment signal rather than the receipt boolean.
   // repoMapArm=true → treatment (map injected); false → holdback; null → no trial.
+  //
+  // Default-OFF (2026-07-10 futility bound: repo_map evaluated no_effect): absent an
+  // explicit project fraction, the default is 1.0 (holdback), so buildRepoMap is NOT
+  // called and no repo map is injected — saving both tokens and the discovery compute.
+  // A project re-enables by setting repo_map_holdback_fraction < 1.0 (0.0 = always-on).
   const projectMetaForHoldback = task.project_metadata as Record<string, unknown> | undefined;
   const holdbackFraction = typeof projectMetaForHoldback?.repo_map_holdback_fraction === 'number'
     ? projectMetaForHoldback.repo_map_holdback_fraction
-    : 0.0;
+    : 1.0;
   let repoMapArm: boolean | null = null;
   if (holdbackFraction > 0) {
     repoMapArm = assignCapabilityHoldbackArm(taskId, 'repo_map', holdbackFraction) ?? true;
-    if (!repoMapArm) {
-      sendLog(ws, `[RepoMap] holdback arm for task ${taskId} (fraction=${holdbackFraction}) — suppressing repo map\n`);
-      repoMap = '';
-    }
+  }
+  let repoMap = '';
+  if (repoMapArm === false) {
+    sendLog(ws, `[RepoMap] holdback arm for task ${taskId} (fraction=${holdbackFraction}) — suppressing repo map\n`);
+  } else {
+    repoMap = buildRepoMap(ws, { taskPrompt: rawPrompt, relatedFiles: repoMapRelatedFiles });
   }
 
   // ── Deterministic diagnostics-after-edit holdback arm ───────────────────
   // Claude-Code-only, Blueprint self-repo-only trial. Codex/foreign repos are
   // capability-not-applicable and intentionally receive no arm or receipt keys.
+  // Default-OFF (2026-07-10 futility bound: diagnostics_after_edit evaluated no_effect):
+  // absent an explicit project fraction, default to 1.0 (holdback) so the post-edit
+  // diagnostics hook is not materialized. Re-enable via a fraction < 1.0.
   const diagnosticsHoldbackFraction = typeof projectMetaForHoldback?.diagnostics_after_edit_holdback_fraction === 'number'
     ? projectMetaForHoldback.diagnostics_after_edit_holdback_fraction
-    : 0.0;
+    : 1.0;
   const diagnosticsEnabled = projectMetaForHoldback?.diagnostics_after_edit_enabled === true;
   const diagnosticsEligible = providerRunner.provider === 'anthropic' && isBlueprintSelfRepo(owner, repo);
   let diagnosticsAfterEditArm: boolean | null = null;
@@ -818,12 +958,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   // getLlmTelemetry() reports prompt bulk for standard-handler runs the same
   // way it already does for plan/research. Group logically distinct sections;
   // the builder caps output at 3 largest, so fine granularity is harmless.
-  const corePromptBody = buildPrompt({ contextPrefix, parentCtx, rawPrompt });
-  const srFeedbackBlock = loosenHintSection
-    + coFailurePairsSection
-    + severityCalibrationHintSection
-    + precisionRecallQuadrantHintSection
-    + executionEvidenceSection;
+  // corePromptBody and srFeedbackBlock are computed once at assembly time above.
   const guidanceFooter = PLAYBOOK_GUIDANCE
     + `\nNote: If lint or test fixes required non-obvious steps, save them to the playbook (e.g., ./playbook set "lint-gotcha" "description").\n`
     + assembleFailureGuidanceBlocks(isRetry)
@@ -840,7 +975,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     ['core_prompt', corePromptBody],
     ['reserved_revision', reservedRevisionGuidance],
     ['task_guidance', taskGuidance],
-    ['code_change_helper', buildCodeChangeHelperGuidance({ buildConfig, owner, repo })],
+    ['code_change_helper', codeChangeHelperGuidance],
     ['sr_feedback', srFeedbackBlock],
     ['guidance_footer', guidanceFooter],
     ['fetch_tool_guidance', fetchToolBlock],
@@ -988,7 +1123,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     const srRecoveryPath = `/tmp/self_review_${taskId}.json`;
     let srRecovery: Record<string, unknown> = {};
     try {
-      const raw = fs.readFileSync(srRecoveryPath, 'utf-8');
+      const raw = await fs.promises.readFile(srRecoveryPath, 'utf-8');
       if (raw) srRecovery = JSON.parse(raw) as Record<string, unknown>;
     } catch { /* may not exist */ }
     const srCategories = Array.isArray(srRecovery.categories) ? srRecovery.categories as string[] : [];
@@ -1130,7 +1265,7 @@ export async function handleCreate(
     try { git(['fetch', 'origin', `+refs/heads/${prBaseBranch}:refs/remotes/origin/${prBaseBranch}`, '--depth', String(DEFAULT_CLONE_DEPTH)]); } catch { /* ok */ }
     try {
       const mergeBase = git(['merge-base', 'HEAD', `origin/${prBaseBranch}`]).trim();
-      if (mergeBase) fs.writeFileSync(`/tmp/base_commit_${taskId}`, mergeBase);
+      if (mergeBase) await fs.promises.writeFile(`/tmp/base_commit_${taskId}`, mergeBase);
     } catch { /* ok */ }
     const title = strVal(task.title) || 'Operator-requested fresh review';
     await runFreshReviewerPass(taskId, title, rawPrompt || '', relatedFiles, ws, statusRef, model, task.project_context as Record<string, unknown> | undefined, false, false, true, operatorReviewFor, sensitivePathsFromMetadata(task.project_metadata as Record<string, unknown> | undefined));

@@ -1632,7 +1632,7 @@ async def _delete_local(vm_instance_id: str):
         if local_root.exists():
             import shutil
 
-            shutil.rmtree(local_root, ignore_errors=True)
+            await asyncio.to_thread(shutil.rmtree, local_root, True)
     except Exception:
         logger.warning(f"[LOCAL] Failed to clean manifest files for {vm_instance_id}")
     _clear_vm_heartbeat_state(vm_instance_id)
@@ -2374,11 +2374,7 @@ async def _provision_gcp(
                 logger.warning(
                     f"All zones in cooldown — waiting {soonest_wait:.0f}s for {wait_zone} to exit cooldown"
                 )
-                import time as _time
-
-                _time.sleep(
-                    max(0, soonest_wait) + 1
-                )  # Safe to block — runs in a thread via asyncio.to_thread(_insert_instance)
+                time.sleep(max(0, soonest_wait) + 1)
                 # Retry the soonest zone
                 try:
                     instance_config.machine_type = (

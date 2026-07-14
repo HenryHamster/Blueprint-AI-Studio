@@ -370,13 +370,19 @@ async def _reconcile_if_criterion_coverage_now_complete(
                 return False
 
             # Live coverage gate: mirror release_scoring — the gate fires when
-            # ``total > 0 and covered < total``, so it is CLEAR when no active
-            # criteria remain or every active one is covered.
+            # genuinely uncovered criteria remain (``total - covered - attested > 0``).
+            # Criteria covered only by a (non-expired) operator attestation are NOT
+            # genuinely uncovered — they clear the hard blocker and let the re-drive
+            # proceed even though they will incur a confidence penalty at score time.
             coverage = await get_version_coverage_summary(session, version.id)
             total = int(coverage.get("total") or 0)
             covered = int(coverage.get("covered") or 0)
+            attested = int(coverage.get("attested") or 0)
+            backfilled = int(coverage.get("backfilled") or 0)
 
-            if total > 0 and covered < total:
+            # Mirror release_scoring.compute_composite: 'backfilled' clears the
+            # coverage gate alongside covered/attested.
+            if total > 0 and (total - covered - attested - backfilled) > 0:
                 # Before giving up, attempt to backfill merge evidence for any
                 # uncovered criteria that have an active direction mapping.  Tasks
                 # that merged before the criterion-direction mapping was created
@@ -415,14 +421,18 @@ async def _reconcile_if_criterion_coverage_now_complete(
                         )
                         total = int(coverage.get("total") or 0)
                         covered = int(coverage.get("covered") or 0)
+                        attested = int(coverage.get("attested") or 0)
+                        backfilled = int(coverage.get("backfilled") or 0)
                         logger.info(
                             "[RELEASE_QUALIFIER] reconcile criterion_coverage_now_complete: "
                             "backfilled evidence for %d direction(s) on v%d "
-                            "(total=%d covered=%d after backfill)",
+                            "(total=%d covered=%d attested=%d backfilled=%d after backfill)",
                             len(keys_to_backfill),
                             version.version_number,
                             total,
                             covered,
+                            attested,
+                            backfilled,
                         )
 
                 # Re-score the acceptance-window metric and, when the window is
@@ -437,14 +447,18 @@ async def _reconcile_if_criterion_coverage_now_complete(
                     coverage = await get_version_coverage_summary(session, version.id)
                     total = int(coverage.get("total") or 0)
                     covered = int(coverage.get("covered") or 0)
+                    attested = int(coverage.get("attested") or 0)
+                    backfilled = int(coverage.get("backfilled") or 0)
                     logger.info(
                         "[RELEASE_QUALIFIER] reconcile criterion_coverage_now_complete: "
                         "recorded %d acceptance-window recompute evidence row(s) on v%d "
-                        "(total=%d covered=%d after recompute)",
+                        "(total=%d covered=%d attested=%d backfilled=%d after recompute)",
                         window_recorded,
                         version.version_number,
                         total,
                         covered,
+                        attested,
+                        backfilled,
                     )
 
                 # Record covering evidence for the data-integrity criterion when
@@ -459,17 +473,40 @@ async def _reconcile_if_criterion_coverage_now_complete(
                     coverage = await get_version_coverage_summary(session, version.id)
                     total = int(coverage.get("total") or 0)
                     covered = int(coverage.get("covered") or 0)
+                    attested = int(coverage.get("attested") or 0)
+                    backfilled = int(coverage.get("backfilled") or 0)
                     logger.info(
                         "[RELEASE_QUALIFIER] reconcile criterion_coverage_now_complete: "
                         "recorded %d metrics-integrity sweep evidence row(s) on v%d "
-                        "(total=%d covered=%d after mis-sweep evidence)",
+                        "(total=%d covered=%d attested=%d backfilled=%d after mis-sweep evidence)",
                         mis_recorded,
                         version.version_number,
                         total,
                         covered,
+                        attested,
+                        backfilled,
                     )
 
-            if not (total == 0 or covered >= total):
+            # Goal-verification redesign — LOCKSTEP with run_qualification's
+            # ``criterion_coverage_recovered_same_sha`` guard (they are a matched
+            # pair: this is the scheduled trigger, that is the on-entry gate).  The
+            # coverage-count arithmetic (``covered + attested + backfilled >=
+            # total``) is retired; the gate now clears iff the sha-keyed ledger
+            # reports the candidate FULLY MET — every active category ``met`` AND
+            # the residual clean.  The evidence-recording machinery above is now
+            # vestigial (a criterion retraction/supersession or a merge-grade
+            # re-grade is what flips a ledger verdict), but is left in place as a
+            # no-op for the integrator to prune.  When the sibling ledger module is
+            # absent in this checkout, stay cached (safe: never a wrong re-drive).
+            try:
+                from app import category_verdict_ledger as _cvl
+            except Exception:  # noqa: BLE001 — sibling ledger not yet landed
+                _cvl = None
+            if _cvl is None:
+                return False
+            if not await _cvl.is_candidate_fully_met(
+                session, version.id, candidate_sha
+            ):
                 return False
 
             project = await session.get(Project, version.project_id)
@@ -508,11 +545,12 @@ async def _reconcile_if_criterion_coverage_now_complete(
             logger.info(
                 "[RELEASE_QUALIFIER] reconcile criterion_coverage_now_complete: "
                 "coverage cleared for candidate %s of v%d on unchanged automain "
-                "(total=%d covered=%d) — spawning fresh qualification",
+                "(total=%d covered=%d attested=%d) — spawning fresh qualification",
                 candidate_sha[:8],
                 version.version_number,
                 total,
                 covered,
+                attested,
             )
             result = await release_qualifier.run_qualification(
                 session, version.project_id, version
@@ -613,12 +651,10 @@ async def _fire_initial_qualification_if_coverage_complete(
 
             logger.info(
                 "[RELEASE_QUALIFIER] fire_initial_qualification: "
-                "coverage complete for v%d on %s (total=%d covered=%d) "
-                "— spawning initial qualification",
+                "initial trigger armed for v%d on %s — spawning initial "
+                "qualification (acceptance contract graded inside qualification)",
                 version.version_number,
                 automain_sha[:8],
-                trigger.get("coverage_total", 0),
-                trigger.get("coverage_covered", 0),
             )
             result = await release_qualifier.run_qualification(
                 session, version.project_id, version
@@ -1119,6 +1155,339 @@ async def _check_full_suite_drift_sentinel(
                     "[DRIFT_SENTINEL] rollback failed for version %s", version_id
                 )
             return False
+
+
+async def _run_auto_qualification_trigger_sweep(
+    open_versions: list,
+    session: AsyncSession,
+    *,
+    session_factory=None,
+) -> None:
+    """Observe-mode event-driven qualification trigger sweep.
+
+    For each open version: gather qualification inputs, call
+    ``resolve_qualification_trigger``, and either log the decision (observe mode)
+    or call ``run_qualification`` (on mode).  This never replaces the bespoke
+    re-driver loops above — it runs in addition, providing a unified log surface
+    and a path to eventual consolidation.
+
+    Controlled by the ``auto_qualification_triggers`` runtime-config knob:
+      "off"     — skip entirely
+      "observe" — log decisions, spawn nothing (default Phase 0)
+      "on"      — call run_qualification for fire=True decisions
+    """
+    from app.runtime_config_state import get_auto_qualification_triggers_mode
+
+    mode = get_auto_qualification_triggers_mode()
+    if mode == "off":
+        return
+
+    from app import release_qualifier
+    from app.qualification_triggers import resolve_qualification_trigger
+    from app.release_readiness import compute_requalification_readiness
+
+    _factory = session_factory or AsyncSessionLocal
+
+    for version in open_versions:
+        try:
+            await _run_auto_qualification_trigger_for_version(
+                version,
+                session,
+                mode=mode,
+                release_qualifier=release_qualifier,
+                resolve_qualification_trigger=resolve_qualification_trigger,
+                compute_requalification_readiness=compute_requalification_readiness,
+                session_factory=_factory,
+            )
+        except Exception:
+            logger.exception(
+                "[AUTO_QUAL_TRIGGER] sweep failed for version %s", version.id
+            )
+
+
+async def _run_auto_qualification_trigger_for_version(
+    version,
+    session: AsyncSession,
+    *,
+    mode: str,
+    release_qualifier,
+    resolve_qualification_trigger,
+    compute_requalification_readiness,
+    session_factory,
+) -> None:
+    """Run the trigger resolver for one open version and act per mode."""
+    from app import github
+
+    qual = version.last_qualification or {}
+    status = qual.get("status") if qual else None
+    error_code = qual.get("error") if status == "error" else None
+    blocker = qual.get("blocker") if qual else None
+    candidate_sha = qual.get("candidate_sha") if qual else None
+    qualification_attempts = version.qualification_attempts or 0
+    # PER-ERROR-EPISODE counter (not the lifetime column) — see the T2 cap in
+    # qualification_triggers: capping on the lifetime count strands a version at
+    # status=error forever.
+    error_redrive_count = int(qual.get("error_redrive_count") or 0) if qual else 0
+
+    # Determine in-flight and promotion-in-flight guards cheaply from stored state.
+    in_flight = status == "pending"
+    promotion_in_flight = bool(qual.get("promotion_pending")) if qual else False
+
+    # Gather the sha-keyed acceptance-ledger verdict for the last-evaluated
+    # candidate (DB-only, cheap). Only the not_promoted/criterion_coverage
+    # redrive leg consults it; the initial/error fire ignores it. Fail-closed to
+    # False (not fully met) so a ledger-fetch error never spuriously redrives.
+    is_candidate_fully_met = False
+    try:
+        from app import category_verdict_ledger as _cvl
+
+        is_candidate_fully_met = await _cvl.is_candidate_fully_met(
+            session, version.id, candidate_sha
+        )
+    except Exception:
+        logger.warning(
+            "[AUTO_QUAL_TRIGGER] ledger fetch failed for version %s — treating "
+            "candidate as not fully met",
+            version.id,
+        )
+        is_candidate_fully_met = False
+
+    # Gather requalification_ready (DB-only, cheap).
+    requalification_ready: bool | None = None
+    try:
+        readiness = await compute_requalification_readiness(
+            session, version.project_id
+        )
+        requalification_ready = readiness.get("requalification_ready")
+    except Exception:
+        logger.warning(
+            "[AUTO_QUAL_TRIGGER] readiness fetch failed for version %s — using None",
+            version.id,
+        )
+
+    # Candidate-advancement paths need the integration-branch HEAD + its CI state.
+    # This is the only path that requires GitHub I/O in the sweep.
+    #
+    # BOTH advancement legs need it, not just T3:
+    #   * T3  — dry_run superseded by a new automain HEAD.
+    #   * T1  — a ``not_promoted`` version blocked on the acceptance grade. Its
+    #           CategoryVerdict rows are SHA-KEYED and nothing re-grades a PAST
+    #           candidate, so the not-met verdict is frozen; only a NEW candidate
+    #           can change it. Without automain_sha here that leg could never fire
+    #           (candidate_superseded would be permanently False) — i.e. the escape
+    #           would be dead code and the version would sit blocked.
+    automain_sha: str | None = None
+    automain_ci_state: str | None = None
+    if status in ("dry_run", "not_promoted") and candidate_sha:
+        project = (
+            (
+                await session.execute(
+                    select(Project).where(Project.id == version.project_id)
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if project is not None:
+            resolved = await release_qualifier._resolve_github_with_session(
+                session, project
+            )
+            if resolved is not None:
+                token, owner, repo = resolved
+                integration_branch, _ = release_qualifier._lts_branch_names(project)
+                try:
+                    automain_sha = await github.get_branch_sha(
+                        token, owner, repo, integration_branch
+                    )
+                except Exception:
+                    logger.warning(
+                        "[AUTO_QUAL_TRIGGER] could not resolve %s HEAD for version %s",
+                        integration_branch,
+                        version.id,
+                    )
+                # Only check CI state when the SHA has actually advanced.
+                if automain_sha and automain_sha != candidate_sha:
+                    # ``_resolve_candidate_ci`` — the qualifier-scoped STRICT CI
+                    # resolver — is defined in ``release_qualifier``, NOT in
+                    # ``app.ci_resolution`` (which holds the shared merge-path
+                    # helpers).  Bind it from the injected module, and bind it
+                    # OUTSIDE the try below: a missing symbol is a WIRING BUG,
+                    # and swallowing it as a benign "CI fetch failed" warning is
+                    # exactly how the CI-red suppression underneath this call
+                    # stayed dead code (every sweep raised ImportError, left
+                    # automain_ci_state None, and the red candidate auto-fired).
+                    # Only genuine GitHub I/O failure may degrade to "unknown".
+                    _resolve_candidate_ci = release_qualifier._resolve_candidate_ci
+                    try:
+                        ci_result = await _resolve_candidate_ci(
+                            token, owner, repo, automain_sha
+                        )
+                    except Exception:
+                        logger.warning(
+                            "[AUTO_QUAL_TRIGGER] CI state fetch failed for %s "
+                            "(version %s) — treating as unknown",
+                            automain_sha[:8] if automain_sha else "?",
+                            version.id,
+                        )
+                    else:
+                        automain_ci_state = ci_result.get("state")
+
+    decision = resolve_qualification_trigger(
+        phase=version.phase or "",
+        status=status,
+        error_code=error_code,
+        qualification_attempts=qualification_attempts,
+        error_redrive_count=error_redrive_count,
+        is_candidate_fully_met=is_candidate_fully_met,
+        requalification_ready=requalification_ready,
+        candidate_sha=candidate_sha,
+        automain_sha=automain_sha,
+        automain_ci_state=automain_ci_state,
+        blocker=blocker,
+        in_flight=in_flight,
+        promotion_in_flight=promotion_in_flight,
+    )
+
+    if decision.fire:
+        if mode == "observe":
+            logger.info(
+                "[AUTO_QUAL_TRIGGER] observe: would fire '%s' for version %s "
+                "(v%d, status=%s, trigger=%s)",
+                decision.trigger,
+                version.id,
+                version.version_number,
+                status,
+                decision.trigger,
+            )
+        else:  # mode == "on"
+            logger.info(
+                "[AUTO_QUAL_TRIGGER] firing '%s' for version %s "
+                "(v%d, status=%s)",
+                decision.trigger,
+                version.id,
+                version.version_number,
+                status,
+            )
+            async with session_factory() as fire_session:
+                try:
+                    locked_v = (
+                        (
+                            await fire_session.execute(
+                                select(release_version.ReleaseVersion).where(
+                                    release_version.ReleaseVersion.id == version.id
+                                )
+                            )
+                        )
+                        .scalars()
+                        .first()
+                    )
+                    if locked_v is None:
+                        return
+                    result = await release_qualifier.run_qualification(
+                        fire_session, locked_v.project_id, locked_v
+                    )
+                    if result and result.get("status") == "spawned":
+                        await fire_session.commit()
+                        logger.info(
+                            "[AUTO_QUAL_TRIGGER] spawned qualification for version %s "
+                            "(trigger=%s)",
+                            version.id,
+                            decision.trigger,
+                        )
+                    else:
+                        await fire_session.rollback()
+                        logger.info(
+                            "[AUTO_QUAL_TRIGGER] run_qualification returned '%s' "
+                            "for version %s (trigger=%s) — no spawn",
+                            (result or {}).get("status"),
+                            version.id,
+                            decision.trigger,
+                        )
+                except Exception:
+                    logger.exception(
+                        "[AUTO_QUAL_TRIGGER] run_qualification failed for version %s",
+                        version.id,
+                    )
+                    try:
+                        await fire_session.rollback()
+                    except Exception:
+                        pass
+    else:
+        logger.debug(
+            "[AUTO_QUAL_TRIGGER] %s: hold for version %s (v%d, reason=%s, blocking=%s)",
+            mode,
+            version.id,
+            version.version_number,
+            decision.reason,
+            decision.blocking,
+        )
+
+
+async def _run_lifecycle_stall_alerts(
+    open_versions,
+    *,
+    session_factory=None,
+) -> None:
+    """Run the per-version lifecycle-stall alert checks on fresh row state.
+
+    For each open version this opens its OWN dedicated session and RE-SELECTs the
+    version row inside that transaction rather than merging the sweep-START
+    snapshot.  The stall checks that mutate ``last_qualification``
+    (``_check_version_auto_merge_stall`` / ``_check_version_managed_check_wait_stall``)
+    rebuild the verdict from ``version.last_qualification``; if that value is the
+    stale sweep-start snapshot (as it was under the old ``merge(load=False)`` of
+    the outer-scan object), the rebuilt verdict clobbers a ``last_qualification``
+    that another writer committed between sweep start and now — the re-driver
+    loops in ``sweep_stuck_qualifications`` (finalize, initial-fire, auto-trigger)
+    and out-of-band completion handlers all write that column on this same row in
+    their own sessions.  Re-selecting fresh makes every check operate on current
+    state, so a concurrently committed verdict is never overwritten.
+
+    A messaging failure on one version is logged and cannot affect another (each
+    version is fully isolated in its own session/transaction).
+    """
+    factory = session_factory or AsyncSessionLocal
+    for version in open_versions:
+        try:
+            async with factory() as alert_session:
+                v = (
+                    await alert_session.execute(
+                        select(release_version.ReleaseVersion).where(
+                            release_version.ReleaseVersion.id == version.id
+                        )
+                    )
+                ).scalar_one_or_none()
+                # The row could have been deleted between the outer scan and now;
+                # nothing to alert on if it is gone.
+                if v is None:
+                    continue
+                alerted = await _check_version_calcification(alert_session, v)
+                alerted = (
+                    await _check_version_ci_unresolved_stall(alert_session, v)
+                    or alerted
+                )
+                alerted = await _check_version_build_stall(alert_session, v) or alerted
+                alerted = (
+                    await _check_version_stabilize_stall(alert_session, v) or alerted
+                )
+                alerted = (
+                    await _check_version_promotion_readiness(alert_session, v)
+                    or alerted
+                )
+                alerted = (
+                    await _check_version_auto_merge_stall(alert_session, v) or alerted
+                )
+                alerted = (
+                    await _check_version_managed_check_wait_stall(alert_session, v)
+                    or alerted
+                )
+                if alerted:
+                    await alert_session.commit()
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] lifecycle-stall check failed for version %s",
+                version.id,
+            )
 
 
 async def sweep_stuck_qualifications(
@@ -1905,46 +2274,25 @@ async def sweep_stuck_qualifications(
                 version_id,
             )
 
+    # Event-driven qualification trigger resolver (Phase 0 — observe mode).
+    # For each open version: gather inputs, call resolve_qualification_trigger,
+    # and in "observe" mode log the would-fire decision without actually spawning.
+    # In "on" mode, call run_qualification for matched versions.
+    # This loop runs LAST so all re-driver paths above have already handled any
+    # version that transitioned state during this sweep cycle.
+    await _run_auto_qualification_trigger_sweep(
+        open_versions,
+        session,
+        session_factory=session_factory,
+    )
+
     # Lifecycle-stall checks: alert when an open version is stuck at either end
     # of the lifecycle — calcifying in stabilize (repeated hard-blocker
-    # failures) or stalled in build (sitting too long without advancing).  The
-    # two checks are mutually exclusive per version (each early-returns on the
-    # wrong phase) but both run so whichever applies fires.  Each version gets
-    # its own dedicated session (same isolation pattern as the finalize loop
-    # above) so a messaging failure on one version can't affect another.
-    factory = session_factory or AsyncSessionLocal
-    for version in open_versions:
-        try:
-            async with factory() as alert_session:
-                v = await alert_session.get(release_version.ReleaseVersion, version.id)
-                if v is None:
-                    continue
-                alerted = await _check_version_calcification(alert_session, v)
-                alerted = (
-                    await _check_version_ci_unresolved_stall(alert_session, v)
-                    or alerted
-                )
-                alerted = await _check_version_build_stall(alert_session, v) or alerted
-                alerted = (
-                    await _check_version_stabilize_stall(alert_session, v) or alerted
-                )
-                alerted = (
-                    await _check_version_promotion_readiness(alert_session, v)
-                    or alerted
-                )
-                alerted = (
-                    await _check_version_auto_merge_stall(alert_session, v) or alerted
-                )
-                alerted = (
-                    await _check_version_managed_check_wait_stall(alert_session, v)
-                    or alerted
-                )
-                if alerted:
-                    await alert_session.commit()
-        except Exception:
-            logger.exception(
-                "[RELEASE_QUALIFIER] lifecycle-stall check failed for version %s",
-                version.id,
-            )
+    # failures) or stalled in build (sitting too long without advancing).  Each
+    # version gets its own dedicated session (same isolation pattern as the
+    # finalize loop above) so a messaging failure on one version can't affect
+    # another.  Extracted to a helper so the fresh-per-version re-read is
+    # independently testable.
+    await _run_lifecycle_stall_alerts(open_versions, session_factory=session_factory)
 
     return finalized

@@ -158,6 +158,10 @@ async def run_post_orphan_sweep(
                         select(Task).where(Task.id.in_(post_reap_task_ids))
                     )
                     _rollup_task_batch = {t.id: t for t in _rows.scalars().all()}
+                    # Re-assign task to the fresh object so landed_cb does not
+                    # access parent_task_id on an expired instance (MissingGreenlet
+                    # on asyncpg for any attribute access after session.rollback()).
+                    task = _rollup_task_batch.get(_post_reap_task_id) or task
                 # Completion-side warm-reuse: if that landing
                 # completed the parent rollup, stamp the
                 # _deps_satisfied marker on the dependents it just
@@ -183,6 +187,18 @@ async def run_post_orphan_sweep(
                     select(Task).where(Task.id.in_(post_reap_task_ids))
                 )
                 _rollup_task_batch = {t.id: t for t in _rows.scalars().all()}
+
+    # Re-fetch post_reap_tasks: per-iteration rollbacks inside the rollup loop
+    # above expire every ORM object regardless of expire_on_commit, including
+    # the post_reap_tasks list that the safeguard and dead-PR loops below read
+    # directly. A sync attribute access on an expired AsyncSession object raises
+    # MissingGreenlet on asyncpg. Re-fetch once so the downstream loops get
+    # fresh (non-expired) objects without needing their own per-loop re-fetches.
+    if post_reap_task_ids:
+        _rows = await session.execute(
+            select(Task).where(Task.id.in_(post_reap_task_ids))
+        )
+        post_reap_tasks = list(_rows.scalars().all())
 
     # Immediately unblock dependents of terminally failed tasks
     # Batch-fetch ALL tasks once before the loop so we read from a local

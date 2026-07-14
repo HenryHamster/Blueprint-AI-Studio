@@ -639,3 +639,58 @@ async def closing_session():
         yield session
     finally:
         await _safe_close(session)
+
+
+# ---------------------------------------------------------------------------
+# Rollback-safe read patterns — documented for the AST-based regression guard
+# in test_audit_finding_class_guards.py::TestRollbackSafetyRegressionCheck.
+# ---------------------------------------------------------------------------
+
+# Recognised safe-read patterns that a function containing session.rollback()
+# must use in its body to safely avoid MissingGreenlet on asyncpg.
+# The test scanner checks for these patterns via AST analysis of backend/app/
+# production code.  This constant lets the test exercise production code and
+# also serves as canonical documentation of what constitutes a safe rollback.
+ROLLBACK_SAFE_PATTERNS: frozenset[str] = frozenset({
+    "session.refresh",       # explicit re-load from DB
+    "db_session.refresh",    # explicit re-load via db_session
+    "session.get",           # re-fetch via primary key
+    "db.get",                # re-fetch via db.get
+    "session.execute",       # re-fetch via query
+    "db_session.execute",    # re-fetch via db_session
+    "expunge_all",           # remove all objects from identity map
+    "expire_all",            # expire all objects (no-op on SQLite, real on asyncpg)
+    "__dict__",              # bypass expiry by reading from instance dict
+    "return",                # exit function immediately after rollback
+    "raise",                 # propagate exception after rollback
+    "continue",              # continue loop iteration (no ORM read in this iteration)
+    "break",                 # break out of loop (no ORM read in this iteration)
+    "logger.exception",      # log and exit (typically followed by return/raise)
+    "logger.warning",        # log and fall through or return
+    "expired",               # .expired attribute access (self-aware check)
+    "unloaded",              # sa_inspect(obj).unloaded deferred-column check
+})
+
+# Subset of ROLLBACK_SAFE_PATTERNS that are unconditionally safe regardless of
+# where they appear relative to the rollback call.  A session.refresh() or
+# session.execute() anywhere after rollback genuinely re-loads ORM state —
+# BUT ONLY for the object actually passed to refresh(), or the rows returned
+# by execute().  A co-located refetch does NOT make a same-expression ORM
+# attribute read safe when that attribute belongs to a DIFFERENT, unrelated
+# object that the refetch does not reload (e.g. reading ``row.id`` as an
+# argument to ``session.execute(sa_update(...).where(... == row.id))``).
+# Control-flow tokens (return/raise/break/continue) are only safe when they
+# appear IN THE SAME BLOCK as the rollback, after it — a return at function
+# level after an ORM attribute read does NOT make the read safe.  The flow-aware
+# scanner in test_audit_finding_class_guards.py uses this constant to distinguish
+# the two categories; this definition serves as canonical documentation.
+ROLLBACK_SAFE_REFETCH_PATTERNS: frozenset[str] = frozenset({
+    "session.refresh",
+    "db_session.refresh",
+    "session.get",
+    "db.get",
+    "session.execute",
+    "db_session.execute",
+    "expunge_all",
+    "expire_all",
+})

@@ -28,7 +28,20 @@ import pytest
 from httpx import AsyncClient
 
 from app.models import StrategicCycle, TaskStatus
+from testing.conftest import USE_POSTGRES
 from testing.factories import make_membership, make_project, make_task, _utcnow
+
+# The deferred-column MissingGreenlet fault these endpoint walks reproduce only
+# fires on asyncpg: the root conftest globally no-ops InstanceState._expire, so on
+# the default aiosqlite backend the lazy-load never happens and every test here
+# would pass tautologically regardless of the projection fix. Each test is marked
+# Postgres-only with an inline @pytest.mark.skipif(not USE_POSTGRES, ...) so it
+# exercises the real failure mode instead of masking it (the fidelity guard in
+# test_audit_finding_class_guards.py only recognises the inline skipif form).
+_POSTGRES_ONLY_REASON = (
+    "MissingGreenlet deferred-column fault only reproduces on asyncpg; SQLite "
+    "no-ops InstanceState._expire so the walk passes tautologically."
+)
 
 
 def _seed_non_code_portfolio(project_id, now):
@@ -70,6 +83,7 @@ def _seed_non_code_portfolio(project_id, now):
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(not USE_POSTGRES, reason=_POSTGRES_ONLY_REASON)
 async def test_outer_loop_convergence_walks_non_code_outcomes_without_lazy_load(
     client: AsyncClient, db_session
 ):
@@ -237,6 +251,7 @@ async def test_fetch_outer_loop_tasks_lookback_cutoff_widens_created_at_scan(
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(not USE_POSTGRES, reason=_POSTGRES_ONLY_REASON)
 async def test_lane_diag_walks_hydrated_original_without_lazy_load(
     client: AsyncClient, db_session
 ):
@@ -308,6 +323,7 @@ async def test_lane_diag_walks_hydrated_original_without_lazy_load(
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(not USE_POSTGRES, reason=_POSTGRES_ONLY_REASON)
 async def test_outer_loop_convergence_trend_walks_non_code_outcomes(
     client: AsyncClient, db_session
 ):
@@ -332,6 +348,7 @@ async def test_outer_loop_convergence_trend_walks_non_code_outcomes(
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(not USE_POSTGRES, reason=_POSTGRES_ONLY_REASON)
 async def test_digest_survives_trend_window_exceeding_digest_lookback(
     client: AsyncClient, db_session
 ):
@@ -446,6 +463,7 @@ async def test_research_actionability_walks_cancelled_and_non_code_followons(
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(not USE_POSTGRES, reason=_POSTGRES_ONLY_REASON)
 async def test_evaluate_task_outcome_over_fixed_projection_fetch(db_session):
     """Focused unit walk: evaluate_task_outcome over Tasks fetched with the
     fixed outer-loop projection in a FRESH async session (empty identity map —

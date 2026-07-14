@@ -51,6 +51,7 @@ interface StrategicContextWorkspaceProps {
   sessionBusy?: boolean;
   sessionRunners?: StrategicResidentRunnerOption[] | null;
   sessionSelectedRunnerId?: string | null;
+  projectId?: string | null;
   onSelectRunner?: (runnerId: string | null) => void;
   onStartSession?: () => void;
   onStopSession?: () => void;
@@ -594,6 +595,7 @@ export function StrategicContextWorkspace({
   sessionBusy = false,
   sessionRunners = null,
   sessionSelectedRunnerId = null,
+  projectId,
   onSelectRunner,
   onStartSession,
   onStopSession,
@@ -1086,6 +1088,7 @@ export function StrategicContextWorkspace({
                   onOpenTarget={handleOpenTarget}
                   showHeader={false}
                   showMapDescriptor={showDescriptorOnlyContextMap}
+                  projectId={projectId}
                 />
               </Section>
             )}

@@ -20,6 +20,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.task_capabilities import ALL_TASK_TYPES, TaskType
+from app.viewport_evidence import VIEWPORT_WIDTH_MAX, VIEWPORT_WIDTH_MIN
 
 logger = logging.getLogger(__name__)
 
@@ -315,9 +316,13 @@ class AcceptanceEvidence(BaseModel):
     description: str | None = None
     # downstream_artifact
     artifact_id: str | None = None
-    # visual — width bounds mirror the upload endpoint (Field(ge=1, le=4096))
+    # visual — width bounds mirror the upload endpoint (Field(ge=1, le=4096)).
+    # Sourced from the canonical VIEWPORT_WIDTH_* constants in viewport_evidence
+    # so this declaration-time bound and the upload-endpoint bound cannot drift.
     component: str | None = None
-    viewport_width: int | None = Field(default=None, ge=1, le=4096)
+    viewport_width: int | None = Field(
+        default=None, ge=VIEWPORT_WIDTH_MIN, le=VIEWPORT_WIDTH_MAX
+    )
     assertion_type: str | None = None
     # coverage_delta — minimum coverage percentage (0-100)
     threshold: float | None = Field(default=None, ge=0, le=100)
@@ -370,7 +375,7 @@ class AcceptanceEvidence(BaseModel):
             if self.viewport_width is None:
                 raise ValueError(
                     "visual acceptance_evidence requires viewport_width to be set "
-                    "(must be an integer in 1–4096)"
+                    f"(must be an integer in {VIEWPORT_WIDTH_MIN}–{VIEWPORT_WIDTH_MAX})"
                 )
         elif self.kind == "coverage_delta":
             if self.threshold is None:
@@ -1040,10 +1045,27 @@ class ComputeExperimentPayload(_AcceptanceEvidenceMixin, _SystemPopulated):
     # budget is consumed by the main command. Use to install dependencies that are
     # absent from the base VM image (e.g. `pip install -r requirements.txt`).
     setup_step: str | None = None
+    # Optional no-progress watchdog window (peer of runtime deadline). When set and
+    # positive, a job that writes no intermediate progress to BLUEPRINT_PROGRESS_FILE
+    # within this many seconds is torn down early with reason `no_progress_timeout`.
+    # Absent/None ⇒ inert watchdog; the job runs to its runtime deadline unchanged.
+    no_progress_timeout_seconds: int | None = None
+    # Optional cross-job checkpoint resume reference. When set to a prior compute
+    # job's id, that job's durable artifact bundle is rehydrated into this job's
+    # workspace before the command runs (see compute_jobs.create_compute_job /
+    # compute_backends._rehydrate_input_artifact_bundle). Absent ⇒ fresh workspace,
+    # unchanged. Validated as a UUID string at create time; a missing/foreign/
+    # bundle-less reference fails loud rather than silently running empty.
+    input_artifact_job_id: str | None = None
     # Optional container image URI. When set the compute backend wraps the command
     # in ``docker run`` with the result-file directory volume-mounted. Absent ⇒
     # existing bare bash -lc path, unchanged. General — no image hardcoding.
     container_image: str | None = None
+    # Reproducibility signal — set by the spawn path (plan/research completion)
+    # when ``container_image`` resolves. True iff the reference is digest-pinned
+    # (``@sha256:``); False for a mutable tag whose layers can drift between runs,
+    # silently defeating A/B reproducibility. Absent ⇒ no image declared.
+    container_image_digest_pinned: bool | None = None
     # Optional registry credentials for private/gated registries.
     # Shape: {server, username}. The 'password' field is NOT supported in the
     # orchestrated path — there is no delivery channel from create time to the

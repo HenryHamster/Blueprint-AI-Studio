@@ -134,7 +134,7 @@ async def _collect_gcp_cleanup_active_vm_ids(session) -> set[str]:
         await session.execute(
             select(Task.vm_instance_id).where(
                 Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS])
-            )
+            ).limit(5000)
         )
     ).scalars().all()
     active_vm_ids = {vid for vid in active_vm_ids if vid}
@@ -404,7 +404,7 @@ async def secret_reconciliation_service():
             async with AsyncSessionLocal() as session:
                 stmt = select(Task.vm_instance_id).where(
                     Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS])
-                )
+                ).limit(5000)
                 active_vm_ids = (await session.execute(stmt)).scalars().all()
                 active_vm_ids = {vid for vid in active_vm_ids if vid}
                 # Spare the pre-staged secrets of live warm-pool members — their

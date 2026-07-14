@@ -33,6 +33,12 @@ ALLOWLIST: set[str] = {
     # (not Depends(get_current_user) / require_admin), because it is the
     # token-issuance endpoint that exchanges the shared secret for a JWT.
     "/api/admin/token",
+    # GET /api/admin/projects/{project_id}/tools/{tool_slug}/assets/{path:path}
+    # uses JWT-based auth via a ?token query parameter (not Firebase/cookie auth)
+    # because this endpoint serves assets to opaque-origin (null) iframes that
+    # cannot send cookies. The capability JWT carries scope: "tool-asset" and is
+    # validated inline by _verify_tool_asset_token.
+    "/api/admin/projects/{project_id}/tools/{tool_slug}/assets/{path:path}",
 }
 
 # get_metrics_reader is a narrowly scoped read-only auth dep that accepts

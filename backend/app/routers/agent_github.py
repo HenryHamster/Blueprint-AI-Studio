@@ -21,7 +21,7 @@ from app.github import (
     create_pr_comment,
     create_pr_review_comment,
     create_pull_request,
-    get_check_runs,
+    get_check_runs_cached,
     get_issues,
     get_pull_request,
     submit_pr_review,
@@ -91,8 +91,22 @@ async def agent_github_get_check_runs(
     gh_token, owner, repo = await _agent_router.get_github_token_for_task(
         task_id, session
     )
-    result = await get_check_runs(
-        token=gh_token, owner=owner, repo=repo, ref=commit_sha
+    # Budget: this endpoint is POLLED by every agent waiting on CI, and it
+    # returns only status/conclusion/details — ``failed_logs`` is discarded.
+    #   * get_check_runs_cached (30s TTL, the same wrapper auto_remediation /
+    #     ci_resolution / hotfix_backmerge / orchestrator_ci_monitor use)
+    #     collapses sibling agents polling the same sha into one fetch;
+    #   * include_failed_logs=False skips the RED-sha failure fan-out (workflow
+    #     runs + per-run jobs + per-failed-check job logs + annotations — 3-10+
+    #     calls) whose output this handler throws away.
+    # Both draw on the SHARED 5000/hr installation-token bucket whose exhaustion
+    # has stalled production twice.
+    result = await get_check_runs_cached(
+        token=gh_token,
+        owner=owner,
+        repo=repo,
+        head_sha=commit_sha,
+        include_failed_logs=False,
     )
     return {
         "status": "success",
@@ -264,6 +278,21 @@ async def agent_github_create_branch(
     result = await create_branch(
         token=gh_token, owner=owner, repo=repo, branch_name=req.branch_name, sha=req.sha
     )
+    # create_branch reports reuse of a pre-existing ref instead of silently
+    # adopting it. The proxy still returns success (the branch the agent asked
+    # for does exist), but the discriminating fields are passed through in
+    # ``data`` (reused / existing_sha / requested_sha / sha_matches) and a
+    # sha-mismatch is logged — an agent branching off a stale tip left by a
+    # crashed prior run is otherwise invisible.
+    if (
+        isinstance(result, dict)
+        and result.get("reused")
+        and not result.get("sha_matches")
+    ):
+        logger.warning(
+            f"[BRANCH] Task {req.task_id}: branch {req.branch_name!r} already existed at "
+            f"{result.get('existing_sha')} — NOT the requested {req.sha}"
+        )
     return {"status": "success", "data": result}
 
 

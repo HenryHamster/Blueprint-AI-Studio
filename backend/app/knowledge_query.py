@@ -342,6 +342,11 @@ def serialize_knowledge_document(doc: KnowledgeDocument, *, include_body: bool) 
             if doc.source_kind == SourceKind.COMPUTE_EXPERIMENT.value
             else None
         ),
+        "evidence_tier": (
+            verdict.get("evidence_tier")
+            if doc.source_kind == SourceKind.COMPUTE_EXPERIMENT.value
+            else None
+        ),
         "authoring_branch": doc.authoring_branch,
         "head_sha": doc.head_sha,
         "sweep_id": doc.sweep_id,
@@ -667,10 +672,11 @@ async def build_pending_followups(
     """Return compact entries for knowledge docs that need strategist follow-up.
 
     Only design and web_research docs participate in this lifecycle. Returns
-    pending (not yet consumed/dismissed) entries, newest-first. Each entry
-    carries id, title, summary (truncated), topic, source_kind, direction_id,
-    created_at, and tags — enough for the strategist to decide whether to
-    consume, dismiss, or spawn a direction.
+    pending (not yet consumed/dismissed) entries, oldest-first, so stale
+    items surface before newer ones. Each entry carries id, title, summary
+    (truncated), topic, source_kind, direction_id, created_at, and tags —
+    enough for the strategist to decide whether to consume, dismiss, or
+    spawn a direction.
     """
     stmt = (
         select(KnowledgeDocument)
@@ -681,7 +687,7 @@ async def build_pending_followups(
             ),
             KnowledgeDocument.lifecycle_status == "pending",
         )
-        .order_by(KnowledgeDocument.created_at.desc())
+        .order_by(KnowledgeDocument.created_at.asc())
         .limit(limit)
     )
     rows = (await session.execute(stmt)).scalars().all()

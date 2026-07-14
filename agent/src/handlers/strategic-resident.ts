@@ -1,3 +1,4 @@
+import fs from 'fs';
 import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sanitize, sendLog, sendWsFrame,
@@ -7,7 +8,7 @@ import {
 import { prepareWorkspaceForRole, listWorkspaceTopDirs } from '../workspacePrep.js';
 import {
   buildContextPrefix, configureResidentAgentPermissions,
-  writePlaybookHelper, writeMessagesHelper,
+  writePlaybookHelper, writeMessagesHelper, writeSkillHelpers,
 } from '../prompt.js';
 import { writeStrategicHelpers } from './strategic-helpers.js';
 import { provisionAmbientHelpers } from '../providers/runners.js';
@@ -29,13 +30,17 @@ import {
   nextAuthorityHeld, autonomousActive, FrameCoalescer,
   MESSAGE_POLL_LIMIT, MAX_POLL_PAGES,
   buildPriorDecisionsText, buildRetiredContextText, buildStagedDirectionsText,
-  buildSurfaceCatalog, nextFocus, classifyTickOutcome, openFoundLeads,
+  buildSurfaceCatalog, nextFocus, classifyTickOutcome, openFoundLeads, parseTickVerdict,
   shouldRunAutonomousTurn, EXAM_RECORDS_CAP, FOCUS_LIST_SIZE,
   serializeLedger, restoreLedger, refreshSurfaceCatalog,
-  compactionThreshold, buildCompactionCheckpoint,
+  compactionThreshold, formatDirectionGroundingText, buildCompactionCheckpoint,
+  decisionsRegisterText, DECISIONS_REGISTER_CAP, isSettledDecisionVerdict,
+  serializeDecisionsReg, restoreDecisionsReg, parseOperatorDecision, OPERATOR_DECISION_VERDICT,
+  formatStrategicMemoryNotes, formatCheckpointState, resolveCheckpointGrounding,
   type MessagesPollResponse, type SessionHeartbeatResponse, type ResidentInboundMessage,
   type StreamFrameKind, type StreamFrameStatus, type ExamRecord, type ContentBlock,
-  type CompactionCheckpointContext,
+  type CompactionCheckpointContext, type DecisionsRegisterEntry,
+  type CheckpointGrounding, type CheckpointStateResponse,
 } from './strategic-resident-lib.js';
 import { buildFetchGuidance, STRATEGIC_FETCH_VERBS } from './strategic-helpers.js';
 
@@ -218,6 +223,96 @@ type WatchOutcome =
  * authority lease and is the stop channel. Terminal status is posted only once
  * the session actually stops.
  */
+/**
+ * Refresh the resident's ambient git credential with a READ-SCOPED token.
+ *
+ * SECURITY (audit finding #10). The resident is the longest-lived process in the
+ * fleet, so whatever token sits in its credential file is AMBIENT — reachable by
+ * anything the strategist runs, for as long as the session lives. This refresh
+ * therefore mints from `/api/agent/git-read-token` (a `contents:read` installation
+ * token) and NOT from the push-capable `/api/agent/github/token`. Refreshing from
+ * the latter kept a standing, freshly-minted PUSH-capable installation token in
+ * that file every 8 minutes for the whole session — a standing privilege
+ * escalation.
+ *
+ * The resident does not need push: it only runs `git fetch origin` (automain
+ * verification). Push credentials are per-task and short-lived by design. A
+ * strategic op that genuinely needs to push must mint a push-capable token AT THE
+ * MOMENT OF USE and must not park it in this ambient file.
+ *
+ * Exported so the read-scoping is a directly testable property rather than an
+ * incidental detail of a background timer.
+ *
+ * Never throws: a failed refresh keeps the existing token (the credential is
+ * still valid until the 60-minute installation-token TTL expires).
+ */
+export async function refreshResidentGitReadToken(ws: WebSocket | null): Promise<void> {
+  try {
+    const result = await apiGet('/api/agent/git-read-token') as { token?: string } | null;
+    if (result?.token) {
+      writeGitTokenFile(result.token);
+      sendLog(ws, '[resident] git read token refreshed (read-scoped)\n');
+    } else {
+      sendLog(ws, '[resident] git read token refresh: empty response (keeping existing token)\n');
+    }
+  } catch (e) {
+    sendLog(ws, `[resident] git read token refresh failed (keeping existing token): ${String(e)}\n`);
+  }
+}
+
+/**
+ * Re-clone the resident workspace after it vanished mid-session (OOM-kill, /tmp
+ * cleaner), restoring it to EXACTLY the state the initial setup leaves it in.
+ *
+ * SECURITY + CORRECTNESS (audit finding, this PR). The guard used to re-clone with
+ * the `cloneUrl` / `ghToken` captured at session START, which is wrong twice over:
+ *
+ *  * STALE. A GitHub App installation token lives 60 minutes; the resident is a
+ *    multi-hour "workday". Any re-clone after the first hour authenticated with an
+ *    EXPIRED token — the clone throws, the throw escapes the turn loop, and the
+ *    whole resident session dies. The guard was least likely to work exactly when
+ *    it was most needed (deep into a long session).
+ *  * WRONG-SCOPED. `ghToken` is the PUSH-capable per-task token. Re-cloning with it
+ *    re-embedded a push-capable credential in the workspace remote and re-wrote it
+ *    into the ambient credential file — silently undoing the read-scoping the
+ *    8-minute background refresh exists to maintain (the resident never pushes).
+ *    The re-clone also dropped the credential helper, so the remote reverted to the
+ *    token-embedded form and stopped consulting the refreshed token file at all —
+ *    re-breaking `git fetch` at the next TTL boundary.
+ *
+ * So: mint a FRESH READ-SCOPED token at the moment of use, clone with it, then
+ * re-establish the credential helper (plain HTTPS remote + refreshable token file)
+ * exactly as `handleStrategicResident` does at startup. Consistent with the refresh
+ * loop, and correct at any point in the session.
+ *
+ * Throws when no read token can be minted — a re-clone with no valid credential
+ * cannot succeed anyway, and failing loudly beats silently re-parking a
+ * push-capable token in the ambient file.
+ */
+export async function recloneResidentWorkspace(
+  ws: WebSocket | null, owner: string, repo: string, baseBranch: string,
+): Promise<void> {
+  const result = await apiGet('/api/agent/git-read-token') as { token?: string } | null;
+  const token = result?.token;
+  if (!token) {
+    throw new Error(
+      'resident workspace re-clone failed: /api/agent/git-read-token returned no token',
+    );
+  }
+  sendLog(ws, '[resident] re-clone: minted a fresh read-scoped git token\n');
+  await prepareWorkspaceForRole({
+    workspace: WORKSPACE,
+    repoUrl: `https://x-access-token:${token}@github.com/${owner}/${repo}.git`,
+    githubToken: token,
+    branch: baseBranch, baseBranch, depth: 0,
+  });
+  // Restore the refreshable credential: plain HTTPS remote + helper reading the
+  // token file. Without this the re-cloned workspace keeps a token-embedded remote
+  // that the background refresh cannot update, so fetches break at the next TTL.
+  writeGitTokenFile(token);
+  setupGitCredentialHelper(owner, repo, WORKSPACE);
+}
+
 export async function handleStrategicResident(
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
   ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
@@ -249,6 +344,7 @@ export async function handleStrategicResident(
 
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
+  writeSkillHelpers(task.skills as Record<string, unknown>[] | undefined);
   const disallowedTools = configureResidentAgentPermissions(_RESIDENT_STRATEGIC_TASK_TYPE);
   const contextPrefix = buildContextPrefix(task);
 
@@ -304,21 +400,42 @@ export async function handleStrategicResident(
 
   // Format strategic memory notes for the bootstrap prompt. Each entry is
   // {note, set_at}; render as "- [set_at] note" so the timestamp provides
-  // ordering context. Absent or non-array degrades to empty string.
-  const strategicMemoryNotesText = ((): string => {
-    const raw = payload.strategic_memory_notes;
+  // ordering context. Absent or non-array degrades to empty string. Shared with
+  // the compaction-refresh path so both format identically.
+  const strategicMemoryNotesText = formatStrategicMemoryNotes(payload.strategic_memory_notes);
+
+  // Format project skills for the bootstrap context.
+  const skillsText = ((): string => {
+    const raw = task.skills;
     if (!Array.isArray(raw) || raw.length === 0) return '';
     return raw
       .filter((e): e is Record<string, unknown> => e !== null && typeof e === 'object' && !Array.isArray(e))
       .map((e) => {
-        const note = typeof e.note === 'string' ? e.note.trim() : '';
-        const setAt = typeof e.set_at === 'string' ? e.set_at.trim() : '';
-        if (!note) return '';
-        return setAt ? `- [${setAt}] ${note}` : `- ${note}`;
+        const slug = strVal(e.slug);
+        const title = strVal(e.title) || slug;
+        const command = strVal(e.command);
+        const description = strVal(e.description).trim();
+        const parts = [`- **${title}** (\`skill-${slug}\`) — \`${command}\``];
+        if (description) parts.push(`  ${description}`);
+        return parts.join('\n');
       })
       .filter(Boolean)
       .join('\n');
   })();
+
+  // ── Durable decisions register ──────────────────────────────────────────
+  // Full-fidelity cross-tick memory of settled decisions, preserved across
+  // compaction AND full session restarts (VM recycles, process crashes) so
+  // the strategist stops re-deriving settled facts and re-proposing
+  // corrections tick over tick. Restored from task.context._decisions_reg
+  // (written by the heartbeat round-trip, same pattern as the exam ledger).
+  // Restored HERE — above the bootstrap assembly — so the register can be
+  // rendered into the bootstrap prompt: on a full restart the first turn is
+  // usually a live operator reply, and it must not be generated blind to
+  // settled decisions (compaction restart already carries it via the checkpoint).
+  const decisionsReg: DecisionsRegisterEntry[] = restoreDecisionsReg(
+    typeof ctx._decisions_reg === 'string' ? ctx._decisions_reg : undefined,
+  ) ?? [];
 
   const bootstrapPrompt = buildBootstrapPrompt({
     contextPrefix,
@@ -335,6 +452,8 @@ export async function handleStrategicResident(
     sessionId,
     fetchGuidanceText: buildFetchGuidance(STRATEGIC_FETCH_VERBS),
     priorSessionContextText,
+    skillsText,
+    decisionsRegisterText: decisionsRegisterText(decisionsReg, DECISIONS_REGISTER_CAP),
   });
 
   const cfg = residentConfig(payload);
@@ -373,6 +492,20 @@ export async function handleStrategicResident(
   let lastCompactionAt = 0;
   const projectName = strVal(payload.project_name, 'this project');
 
+  // Refreshable direction grounding from the heartbeat. Initialized as null
+  // (degrading to the bootstrap directionsSummary) and updated on every
+  // heartbeat that returns direction_grounding; the compaction checkpoint
+  // uses this so it shows live directions rather than session-start snapshots.
+  let refreshedDirectionGrounding: Array<{id: string; text: string; status: string}> | null = null;
+
+  // Refreshable self-model grounding (problem model, vision, memory notes,
+  // running update) fetched from the checkpoint-state endpoint at compaction
+  // time. Initialized null (degrading to the session-start snapshots) and set
+  // just before a compaction checkpoint is built so the checkpoint carries
+  // current state rather than stale bootstrap data. Mirrors the direction
+  // refresh above. See maybeCompact / buildCheckpointContext.
+  let refreshedGrounding: CheckpointGrounding | null = null;
+
   /** Build the compaction checkpoint context from current handler state. */
   const buildCheckpointContext = (): CompactionCheckpointContext => {
     const roleIdentity = [
@@ -401,7 +534,39 @@ export async function handleStrategicResident(
       `Compaction count: ${compactionCount + 1}`,
     ].filter(Boolean).join('\n');
 
-    return { roleIdentity, examLedgerJson, recentInteractions, autonomousState };
+    // Durable self-model grounding — carried from the bootstrap across compaction
+    // so the resumed session does NOT re-derive settled facts, re-read settled
+    // directions, or re-propose corrections the operator already made. Prefer
+    // grounding refreshed at compaction time (refreshedGrounding, fetched from
+    // the checkpoint-state endpoint) over the session-start snapshot.
+    // Pass the bootstrap open messages text in the snapshot so
+    // resolveCheckpointGrounding can fall back to it when the checkpoint-state
+    // fetch fails, but let a refreshed empty feed WIN (operator resolved all
+    // messages mid-session) rather than reverting to the stale bootstrap text.
+    const grounding = resolveCheckpointGrounding(
+      {
+        problemModelJson,
+        visionJson,
+        strategicMemoryNotesText,
+        runningUpdate: strVal(payload.running_update),
+        openMessagesText: buildOpenMessagesText(openMessages),
+      },
+      refreshedGrounding,
+    );
+    return {
+      roleIdentity, examLedgerJson, recentInteractions, autonomousState,
+      problemModelJson: grounding.problemModelJson,
+      visionJson: grounding.visionJson,
+      strategicMemoryNotesText: grounding.strategicMemoryNotesText,
+      openMessagesText: grounding.openMessagesText,
+      priorSessionContextText: priorSessionContextText || undefined,
+      directionsText: refreshedDirectionGrounding
+        ? formatDirectionGroundingText(refreshedDirectionGrounding) || undefined
+        : buildDirSummaryText(directionsSummary, authoritativeActive) || undefined,
+      runningUpdate: grounding.runningUpdate,
+      decisionsRegisterText: decisionsRegisterText(decisionsReg, DECISIONS_REGISTER_CAP),
+      groundingRefreshed: refreshedGrounding !== null,
+    };
   };
   // An operator turn just completed → run an autonomous turn to act on it.
   let operatorTurnJustCompleted = false;
@@ -475,7 +640,7 @@ export async function handleStrategicResident(
     return result;
   }
 
-  const runTurn = async (content: string | ContentBlock[], operator: boolean): Promise<ResidentTurnResult> => {
+  const runTurn = async (content: string | ContentBlock[], operator: boolean, pickupLagMs?: number | null): Promise<ResidentTurnResult> => {
     const full: string | ContentBlock[] = typeof content === 'string'
       ? (firstTurnSent ? content : `${bootstrapPrompt}\n\n---\n\n${content}`)
       : (firstTurnSent ? content : [{ type: 'text', text: `${bootstrapPrompt}\n\n---\n\n` }, ...content]);
@@ -504,6 +669,9 @@ export async function handleStrategicResident(
       ttftMs: r.ttftMs,
       interrupted: r.interrupted,
       toolCallCount: r.toolCallCount,
+      toolCallDurationMs: r.totalToolCallDurationMs,
+      meanInterTokenMs: r.meanInterTokenMs,
+      pickupLagMs: pickupLagMs ?? null,
     });
     return r;
   };
@@ -543,6 +711,31 @@ export async function handleStrategicResident(
     }
     sendLog(ws, `[resident] context-window pressure detected (${r.inputTokens} input tokens >= ${threshold} threshold) — compacting session\n`);
     streamer.status('session compacting — context reset to preserve signal');
+
+    // Refresh the self-model grounding from CURRENT project state before building
+    // the checkpoint, so a session that compacts after mid-session mutations
+    // (set-problem-model, set-memory, set-running-update) carries fresh data
+    // rather than the stale session-start snapshot. NON-FATAL: any failure
+    // degrades to the snapshot so compaction still proceeds — same degrade
+    // pattern as the heartbeat/poll paths.
+    try {
+      const state = await apiGet(
+        `/api/agent/projects/${projectId}/strategic-session/checkpoint-state`,
+      ) as CheckpointStateResponse | null;
+      if (state) {
+        refreshedGrounding = formatCheckpointState(state);
+        // Format the refreshed open messages using the same function as the
+        // bootstrap. buildOpenMessagesText lives in strategic-sections.ts
+        // (imports ../index.js), so it cannot be called from the pure lib.
+        const refreshedOpenMsgs = Array.isArray(state.open_messages)
+          ? state.open_messages as Array<Record<string, unknown>>
+          : [];
+        refreshedGrounding.openMessagesText = buildOpenMessagesText(refreshedOpenMsgs);
+        sendLog(ws, '[resident] compaction grounding refreshed from checkpoint-state endpoint\n');
+      }
+    } catch (e) {
+      sendLog(ws, `[resident] checkpoint-state refresh failed (non-fatal, using session-start snapshot): ${String(e)}\n`);
+    }
 
     // Build the checkpoint prompt from current handler state.
     const checkpoint = buildCompactionCheckpoint(buildCheckpointContext());
@@ -599,6 +792,31 @@ export async function handleStrategicResident(
     }
   };
 
+  // Capture an operator-settled correction into the durable decisions register.
+  // Operator turns (fast path + interrupt path) never emit a TICK-VERDICT, so
+  // the autonomous decisions-register push at the bottom of the loop never sees
+  // them; without this, a correction the operator makes in live chat drops out of
+  // open_messages once handled and survives nowhere durable — so a restarted
+  // session re-proposes exactly what the operator already settled. The strategist
+  // is instructed (bootstrap prompt) to end such a turn with an OPERATOR-DECISION
+  // marker; when present we record it here BEFORE the operator-turn heartbeat so
+  // it is serialized into task.context._decisions_reg on that same heartbeat.
+  const recordOperatorDecision = (r: ResidentTurnResult): void => {
+    const note = parseOperatorDecision(r.resultText);
+    if (!note) return;
+    decisionsReg.push({
+      atTick: examTick,
+      at: new Date().toISOString(),
+      surfaceKey: 'operator:message',
+      verdict: OPERATOR_DECISION_VERDICT,
+      note,
+    });
+    if (decisionsReg.length > DECISIONS_REGISTER_CAP) {
+      decisionsReg.splice(0, decisionsReg.length - DECISIONS_REGISTER_CAP);
+    }
+    streamer.status('operator correction recorded to durable decisions register');
+  };
+
   const pollMessages = async (): Promise<ResidentInboundMessage[]> => {
     const collected: ResidentInboundMessage[] = [];
     try {
@@ -652,6 +870,9 @@ export async function handleStrategicResident(
       // blob — surfaced in the snapshot for operator visibility.
       compaction_count: compactionCount,
       last_compaction_at: lastCompactionAt > 0 ? new Date(lastCompactionAt).toISOString() : null,
+      // Persist the decisions register so a full restart (VM recycle, process
+      // crash) can restore settled decisions from task.context._decisions_reg.
+      decisions_reg: decisionsReg.length > 0 ? serializeDecisionsReg(decisionsReg) : null,
     };
     if (handledIds && handledIds.length > 0) {
       body.handled_message_ids = handledIds;
@@ -671,6 +892,12 @@ export async function handleStrategicResident(
       // newly created or retired directions enter/leave the rotation mid-session.
       if (Array.isArray(resp.active_direction_ids)) {
         surfaceCatalog = refreshSurfaceCatalog(surfaceCatalog, resp.active_direction_ids, payload);
+      }
+      // Refresh direction grounding from the heartbeat so compaction
+      // checkpoints receive live direction text/status rather than the
+      // session-start snapshot baked into directionsSummary.
+      if (Array.isArray(resp.direction_grounding)) {
+        refreshedDirectionGrounding = resp.direction_grounding;
       }
       return resp;
     } catch (e) {
@@ -724,25 +951,40 @@ export async function handleStrategicResident(
     }
   };
 
-  // ── Git read-token background refresh ────────────────────────────────────────
+  // ── Git READ-token background refresh ────────────────────────────────────────
   // Periodically calls /api/agent/git-read-token and updates the credential
   // helper's token file so `git fetch origin` keeps working beyond the 60-minute
-  // GitHub App installation token TTL. Self-scheduling named function expression
-  // so the timer reference is always non-null and cleared cleanly in the finally.
+  // GitHub App installation token TTL.
+  //
+  // SECURITY (audit finding #10) — this MUST stay the read-scoped endpoint.
+  // The resident is a long-lived session (a multi-hour "workday"), so whatever
+  // token sits in its credential file is AMBIENT: reachable by anything the
+  // strategist runs, for as long as the session lives. Refreshing from the
+  // push-capable /api/agent/github/token?force_refresh=true instead kept a
+  // standing, freshly-minted push-capable installation token in that file every
+  // 8 minutes for the life of the session — a standing privilege escalation in
+  // the longest-lived process in the fleet.
+  //
+  // The resident does not need it: it only ever runs `git fetch origin` (automain
+  // verification) and never pushes — push credentials are per-task and
+  // short-lived, by design (see the endpoint docstring on agent_git_read_token).
+  // Reading read-scoped here also means the push-capable ghToken written at clone
+  // time (writeGitTokenFile above, which the clone itself needs) is REPLACED by a
+  // read-scoped one on the first tick: the ambient credential DECAYS to read-only
+  // within GIT_TOKEN_REFRESH_MS instead of being re-minted push-capable forever.
+  //
+  // If a strategic op ever genuinely needs to push, it must mint a push-capable
+  // token AT THE MOMENT OF USE and must not park it in the ambient credential
+  // file. (Dropping force_refresh also stops re-minting an installation token
+  // every 8 minutes against the shared 5000/hr GitHub App budget; the read-token
+  // endpoint is cache-backed.)
+  //
+  // Self-scheduling named function expression so the timer reference is always
+  // non-null and cleared cleanly in the finally.
   let gitTokenRefreshTimer: ReturnType<typeof setTimeout>;
   function gitReadTokenRefreshTick(): void {
     void (async () => {
-      try {
-        const result = await apiGet('/api/agent/git-read-token') as { token?: string } | null;
-        if (result?.token) {
-          writeGitTokenFile(result.token);
-          sendLog(ws, '[resident] git read token refreshed\n');
-        } else {
-          sendLog(ws, '[resident] git read token refresh: empty response (keeping existing token)\n');
-        }
-      } catch (e) {
-        sendLog(ws, `[resident] git read token refresh failed (keeping existing token): ${String(e)}\n`);
-      }
+      await refreshResidentGitReadToken(ws);
       gitTokenRefreshTimer = setTimeout(gitReadTokenRefreshTick, GIT_TOKEN_REFRESH_MS);
     })();
   }
@@ -751,6 +993,21 @@ export async function handleStrategicResident(
   // ── Two-speed loop ──────────────────────────────────────────────────────────
   try {
     for (;;) {
+      // Guard: verify the workspace is still present before each turn. An
+      // external event (OOM-kill, /tmp cleaner) can delete it mid-session.
+      //
+      // The re-clone mints a FRESH READ-SCOPED token at the moment of use rather
+      // than reusing the session-start `cloneUrl`/`ghToken`: that token is push-
+      // capable (which the resident must not hold ambiently) and expires after 60
+      // minutes (so a re-clone deep into a multi-hour session would just throw).
+      // See recloneResidentWorkspace.
+      if (!fs.existsSync(`${WORKSPACE}/.git`)) {
+        sendLog(ws, '[resident] workspace vanished — re-cloning before next turn\n');
+        streamer.status('workspace vanished — re-cloning');
+        await recloneResidentWorkspace(ws, owner, repo, baseBranch);
+        sendLog(ws, '[resident] workspace restored\n');
+      }
+
       if (!session.isAlive()) {
         stopReason = 'session_process_exited';
         break;
@@ -760,18 +1017,42 @@ export async function handleStrategicResident(
       const msgs = await pollMessages();
       if (msgs.length > 0) {
         streamer.status('operator message received — responding');
-        const r = await runTurn(combineOperatorMessages(msgs), true);
+        // Measure pickup lag: time from when the MOST RECENT operator message
+        // was created (server-side) to now. Uses server-absolute created_at
+        // timestamps so agent-VM / backend clock drift doesn't inflate the lag.
+        const pickupLagMs = (() => {
+          const now = Date.now();
+          let maxCreatedMs = 0;
+          for (const m of msgs) {
+            if (typeof m.created_at === 'string') {
+              const t = new Date(m.created_at).getTime();
+              if (Number.isFinite(t) && t > maxCreatedMs) maxCreatedMs = t;
+            }
+          }
+          if (maxCreatedMs <= 0) return null;
+          const lag = now - maxCreatedMs;
+          return lag >= 0 ? lag : null;
+        })();
+        const r = await runTurn(combineOperatorMessages(msgs), true, pickupLagMs);
         if (turnWedgedSession(r)) break;
         await persistReply(r);
-        // Check context-window pressure after the turn: compact if needed.
-        if (await maybeCompact(r)) break;
         // Collect the ids of the messages we just consumed so the backend can
         // mark them handled — they stop counting as open backlog and won't be
         // re-delivered to a restarted session.
         const consumedIds = msgs.map(m => m.id).filter((id): id is string => typeof id === 'string' && id.length > 0);
+        // Capture any operator-settled correction into the durable register
+        // BEFORE the heartbeat so it is serialized in this same round-trip.
+        recordOperatorDecision(r);
         const hb = await heartbeat(true, consumedIds); // operator interaction always renews the lease
         if (hb?.stop_requested) break;
         if (r.processGone) { stopReason = 'session_process_exited'; break; }
+        // Check context-window pressure AFTER the decision is registered and the
+        // handled-marking heartbeat has landed. Compacting earlier would build the
+        // checkpoint from decisionsReg before this turn's OPERATOR-DECISION is
+        // pushed AND fetch checkpoint-state open_messages before the backend marks
+        // the just-answered message handled — priming the fresh session blind to
+        // the settled decision and re-surfacing the answered message as still-open.
+        if (await maybeCompact(r)) break;
         // A just-finished operator turn arms one autonomous follow-through tick.
         operatorTurnJustCompleted = true;
         continue;
@@ -847,7 +1128,7 @@ export async function handleStrategicResident(
       const openFound = openFoundLeads(examRecords);
       const corrective = correctiveNextTick;
       lastAutonomousTurnAt = Date.now();
-      const turnPromise = runTurn(buildAutonomousPrompt(focus, recentRecords, openFound, corrective, cfg.maxOpsPerTurn), false);
+      const turnPromise = runTurn(buildAutonomousPrompt(focus, recentRecords, openFound, corrective, cfg.maxOpsPerTurn, decisionsRegisterText(decisionsReg)), false);
       const watch = await watchTurn(turnPromise);
       if (watch.kind !== 'done') session.interrupt();
 
@@ -887,6 +1168,26 @@ export async function handleStrategicResident(
       if (examRecords.length > EXAM_RECORDS_CAP) {
         examRecords.splice(0, examRecords.length - EXAM_RECORDS_CAP);
       }
+      // Build and push to the durable decisions register (full-fidelity notes),
+      // but ONLY for SETTLED decisions (advanced/found/clear). Interrupted turns
+      // (operator preemption / authority suspend / stall) and unevidenced idle
+      // CLEARs carry no durable conclusion; recording them here would crowd the
+      // fixed register window and evict real decisions — worst at the
+      // autonomous<->operator boundary where interrupts cluster. They remain in
+      // the exam ledger (examRecords) above; only the durable register skips them.
+      if (isSettledDecisionVerdict(upd.record.verdict)) {
+        const fullTickVerdict = parseTickVerdict(r.resultText);
+        decisionsReg.push({
+          atTick: upd.record.atTick,
+          at: upd.record.at,
+          surfaceKey: upd.record.surfaceKey,
+          verdict: upd.record.verdict,
+          note: fullTickVerdict?.note ?? upd.record.note,
+        });
+        if (decisionsReg.length > DECISIONS_REGISTER_CAP) {
+          decisionsReg.splice(0, decisionsReg.length - DECISIONS_REGISTER_CAP);
+        }
+      }
       correctiveNextTick = upd.corrective;
       previousTurnAgendaContinue = upd.agendaContinue;
       if (upd.statusNote) streamer.status(upd.statusNote);
@@ -900,14 +1201,20 @@ export async function handleStrategicResident(
         const or = await runTurn(combineOperatorMessages(watch.messages), true);
         if (turnWedgedSession(or)) break;
         await persistReply(or);
-        // Check context-window pressure after the turn: compact if needed.
-        if (await maybeCompact(or)) break;
         // Extract the ids of the messages we just consumed so the backend can mark
         // them handled — same as the fast-path operator-message pre-emption above.
         const consumedIds = watch.messages.map(m => m.id).filter((id): id is string => typeof id === 'string' && id.length > 0);
+        // Capture any operator-settled correction into the durable register
+        // BEFORE the heartbeat so it is serialized in this same round-trip.
+        recordOperatorDecision(or);
         const hb2 = await heartbeat(true, consumedIds);
         if (hb2?.stop_requested) break;
         if (or.processGone) { stopReason = 'session_process_exited'; break; }
+        // Compact only AFTER the decision is registered and the handled-marking
+        // heartbeat has landed — identical ordering invariant as the fast path
+        // above, so a compaction on this interrupt turn primes the fresh session
+        // WITH the settled decision and WITHOUT the just-answered message.
+        if (await maybeCompact(or)) break;
         operatorTurnJustCompleted = true;
         continue;
       }

@@ -184,6 +184,10 @@ vi.mock('fs', () => {
     mkdirSync: vi.fn(),
     readdirSync: vi.fn().mockReturnValue([]),
     unlinkSync: vi.fn(),
+    promises: {
+      writeFile: vi.fn().mockResolvedValue(undefined),
+      readFile: vi.fn().mockResolvedValue(''),
+    },
   };
   return { ...stub, default: stub };
 });
@@ -211,8 +215,10 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports under test ────────────────────────────────────────────────────────
-import { handleCreate, handleRefactor, handleDocs, handleQA, handleDeps, handleSalvageBundle, extractSelfReviewJson, needsMigrationGeneration, buildSmallScopeCallerNote, runFreshReviewerPass, SR_SKIP_REASONS, computeRegressionRiskHeuristic, loneCheckerCategoriesForTask, pickFreshReviewerEffort, sensitivePathsFromMetadata, assignCapabilityHoldbackArm, resolveVisualAcceptance } from './standard.js';
-import { setupWorkspace, runClaudeCode, sendHeartbeatSync, getProviderRunner } from '../index.js';
+import { handleCreate, handleRefactor, handleDocs, handleQA, handleDeps, handleSalvageBundle, extractSelfReviewJson, needsMigrationGeneration, buildSmallScopeCallerNote, runFreshReviewerPass, SR_SKIP_REASONS, computeRegressionRiskHeuristic, loneCheckerCategoriesForTask, pickFreshReviewerEffort, sensitivePathsFromMetadata, assignCapabilityHoldbackArm, resolveVisualAcceptance, assembleStandardPrompt, type StandardPromptSections } from './standard.js';
+import { setupWorkspace, runClaudeCode, sendHeartbeatSync, getProviderRunner, git } from '../index.js';
+import { PLAYBOOK_GUIDANCE, DEFAULT_TOOL_GUIDANCE } from '../prompt.js';
+import { VIEWPORT_INFRA_SKIP_GUIDANCE } from './fresh-reviewer.js';
 import { resetLlmTelemetry, getLlmTelemetry, buildPromptSizeTelemetry, setPromptSizeTelemetry } from '../telemetry.js';
 import { captureTestBaseline } from '../utils/test-fix-loop.js';
 import { readClaudeMd, extractModuleInterfaces, discoverRelatedTests, discoverAffectedConsumers, parseAnalysisPlanFiles, parseAnalysisPlanTestFiles, parseAnalysisPlanVerifyFiles, buildAnalysisPrompt, buildRepoMap } from '../prompt.js';
@@ -659,8 +665,23 @@ describe('module interface extraction', () => {
     vi.mocked(extractModuleInterfaces).mockReturnValue('## Module Interfaces\nfoo\n\n');
   });
 
-  it('calls extractModuleInterfaces for handleCreate with scope=medium', async () => {
+  // Default-OFF (2026-07-10 futility bound): absent an explicit project holdback
+  // fraction, module_interfaces is suppressed even at medium scope — the discovery
+  // function is NOT invoked and the section is absent from the prompt.
+  it('does not call extractModuleInterfaces for handleCreate with scope=medium and no holdback config (default-off)', async () => {
     const task = { title: 'Task', description: '', context: { scope: 'medium' } };
+    await handleCreate(TASK_ID, { prompt: 'Do it', related_files: ['src/foo.ts'] }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(extractModuleInterfaces)).not.toHaveBeenCalled();
+    expect(capturedPrompt()).not.toContain('## Module Interfaces');
+  });
+
+  // Opt-in: an explicit holdback fraction < 1.0 (0.0 = always-treatment) re-enables
+  // the section — the discovery function is invoked and the section is injected.
+  it('calls extractModuleInterfaces for handleCreate with scope=medium when explicitly opted in (fraction 0.0)', async () => {
+    const task = {
+      title: 'Task', description: '', context: { scope: 'medium' },
+      project_metadata: { module_interfaces_holdback_fraction: 0.0 },
+    };
     await handleCreate(TASK_ID, { prompt: 'Do it', related_files: ['src/foo.ts'] }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expectCalledWith(extractModuleInterfaces, WS, ['src/foo.ts']);
     expect(capturedPrompt()).toContain('## Module Interfaces');
@@ -678,8 +699,18 @@ describe('module interface extraction', () => {
     expect(vi.mocked(extractModuleInterfaces)).not.toHaveBeenCalled();
   });
 
-  it('calls extractModuleInterfaces for handleRefactor with scope=medium', async () => {
+  it('does not call extractModuleInterfaces for handleRefactor with scope=medium and no holdback config (default-off)', async () => {
     const task = { title: 'Refactor', description: '', context: { scope: 'medium' } };
+    await handleRefactor(TASK_ID, { prompt: 'Improve it', related_files: ['src/utils.ts'] }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(extractModuleInterfaces)).not.toHaveBeenCalled();
+    expect(capturedPrompt()).not.toContain('## Module Interfaces');
+  });
+
+  it('calls extractModuleInterfaces for handleRefactor with scope=medium when explicitly opted in (fraction 0.0)', async () => {
+    const task = {
+      title: 'Refactor', description: '', context: { scope: 'medium' },
+      project_metadata: { module_interfaces_holdback_fraction: 0.0 },
+    };
     await handleRefactor(TASK_ID, { prompt: 'Improve it', related_files: ['src/utils.ts'] }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expectCalledWith(extractModuleInterfaces, WS, ['src/utils.ts']);
     expect(capturedPrompt()).toContain('## Module Interfaces');
@@ -699,8 +730,19 @@ describe('affected consumer discovery', () => {
     vi.mocked(discoverAffectedConsumers).mockReturnValue('## Affected Consumers\nbar\n\n');
   });
 
-  it('calls discoverAffectedConsumers for handleCreate with scope=medium', async () => {
+  // Default-OFF (2026-07-10 futility bound): suppressed by default at medium scope.
+  it('does not call discoverAffectedConsumers for handleCreate with scope=medium and no holdback config (default-off)', async () => {
     const task = { title: 'Task', description: '', context: { scope: 'medium' } };
+    await handleCreate(TASK_ID, { prompt: 'Do it', related_files: ['src/foo.ts'] }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(discoverAffectedConsumers)).not.toHaveBeenCalled();
+    expect(capturedPrompt()).not.toContain('## Affected Consumers');
+  });
+
+  it('calls discoverAffectedConsumers for handleCreate with scope=medium when explicitly opted in (fraction 0.0)', async () => {
+    const task = {
+      title: 'Task', description: '', context: { scope: 'medium' },
+      project_metadata: { affected_consumers_holdback_fraction: 0.0 },
+    };
     await handleCreate(TASK_ID, { prompt: 'Do it', related_files: ['src/foo.ts'] }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expectCalledWith(discoverAffectedConsumers, WS, ['src/foo.ts']);
     expect(capturedPrompt()).toContain('## Affected Consumers');
@@ -718,8 +760,18 @@ describe('affected consumer discovery', () => {
     expect(vi.mocked(discoverAffectedConsumers)).not.toHaveBeenCalled();
   });
 
-  it('calls discoverAffectedConsumers for handleRefactor with scope=medium', async () => {
+  it('does not call discoverAffectedConsumers for handleRefactor with scope=medium and no holdback config (default-off)', async () => {
     const task = { title: 'Refactor', description: '', context: { scope: 'medium' } };
+    await handleRefactor(TASK_ID, { prompt: 'Improve it', related_files: ['src/utils.ts'] }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(discoverAffectedConsumers)).not.toHaveBeenCalled();
+    expect(capturedPrompt()).not.toContain('## Affected Consumers');
+  });
+
+  it('calls discoverAffectedConsumers for handleRefactor with scope=medium when explicitly opted in (fraction 0.0)', async () => {
+    const task = {
+      title: 'Refactor', description: '', context: { scope: 'medium' },
+      project_metadata: { affected_consumers_holdback_fraction: 0.0 },
+    };
     await handleRefactor(TASK_ID, { prompt: 'Improve it', related_files: ['src/utils.ts'] }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expectCalledWith(discoverAffectedConsumers, WS, ['src/utils.ts']);
     expect(capturedPrompt()).toContain('## Affected Consumers');
@@ -1010,6 +1062,142 @@ describe('code-change helper guidance is in prompt', () => {
   });
 });
 
+// ── Cache-optimized prompt prefix ─────────────────────────────────────────────
+// The v24 cost lever: the automatically-cacheable prompt prefix (Anthropic
+// prefix caching bills a cache read at ~10% of base input) is maximized by
+// placing ALL stable literal/config guidance in one contiguous leading prefix
+// and ALL task-variable content in a contiguous trailing tail. Two builds of
+// the same handler for an identical payload but different wall-clock / git HEAD
+// must produce a BYTE-IDENTICAL stable prefix. This is a byte-ORDER change:
+// every section still ships, only its position moves.
+describe('stable prompt prefix is byte-identical across wall-clock and HEAD', () => {
+  const STABLE_SECTIONS = {
+    claudeMdPrefix: '## Codebase Instructions\nBE CONSISTENT\n\n',
+    isRetry: false,
+    codeChangeHelperGuidance: '\n\n## Helpers\n./check ./pr open ./done ./fail\n',
+    taskTypeFocusBlock: '\n\n## Focus\nfocus-block-text\n',
+    taskTypeHint: '\n\nHint: task-type-hint-text\n',
+    firstTaskSection: '',
+    fetchGuidance: '## MID-RUN FETCH\nfetch-verbs\n',
+  } as const;
+
+  function sections(variable: Partial<StandardPromptSections>): StandardPromptSections {
+    return {
+      ...STABLE_SECTIONS,
+      acceptanceEvidenceNotice: '',
+      playbookSection: '',
+      skillsSection: '',
+      retryContext: '',
+      provenanceNotice: '',
+      corePrompt: 'CORE_TASK_PROMPT',
+      reservedRevisionGuidance: '',
+      srFeedbackBlock: '',
+      promptSuffix: '',
+      prTitlePrefixNote: '',
+      ...variable,
+    };
+  }
+
+  it('yields an identical stable prefix when only task-variable content changes (wall-clock/HEAD proxy)', () => {
+    // Wall-clock- and HEAD-derived text (relative-day strings, live SHAs) only
+    // ever lands in task-variable sections. Two builds differing ONLY in those
+    // sections must share a byte-identical stable prefix while the tail differs.
+    const build1 = assembleStandardPrompt(sections({
+      corePrompt: 'implement X — updated 2 days ago — HEAD abc1234',
+      provenanceNotice: '',
+    }));
+    const build2 = assembleStandardPrompt(sections({
+      corePrompt: 'implement X — updated 9 days ago — HEAD def5678',
+      provenanceNotice: 'PROVENANCE_DELTA',
+    }));
+    expect(build1.stablePrefix).toBe(build2.stablePrefix);
+    expect(build1.stablePrefix.length).toBeGreaterThan(0);
+    expect(build1.variableBody).not.toBe(build2.variableBody);
+  });
+
+  it('places every stable guidance constant strictly before any task-variable section', () => {
+    const { finalPrompt } = assembleStandardPrompt(sections({
+      corePrompt: 'UNIQUE_TASK_VARIABLE_MARKER',
+      acceptanceEvidenceNotice: 'ACCEPTANCE_MARKER',
+      retryContext: 'RETRY_MARKER',
+      srFeedbackBlock: 'SR_FEEDBACK_MARKER',
+    }));
+    const firstVariableIdx = Math.min(
+      ...['UNIQUE_TASK_VARIABLE_MARKER', 'ACCEPTANCE_MARKER', 'RETRY_MARKER', 'SR_FEEDBACK_MARKER']
+        .map((m) => finalPrompt.indexOf(m))
+        .filter((i) => i >= 0),
+    );
+    for (const stable of [
+      STABLE_SECTIONS.claudeMdPrefix,
+      PLAYBOOK_GUIDANCE,
+      DEFAULT_TOOL_GUIDANCE,
+      VIEWPORT_INFRA_SKIP_GUIDANCE,
+      STABLE_SECTIONS.codeChangeHelperGuidance,
+      STABLE_SECTIONS.taskTypeFocusBlock,
+    ]) {
+      const idx = finalPrompt.indexOf(stable);
+      expect(idx).toBeGreaterThanOrEqual(0);
+      expect(idx).toBeLessThan(firstVariableIdx);
+    }
+  });
+
+  it('preserves every sent section (byte-order change only, nothing dropped)', () => {
+    const s = sections({
+      corePrompt: 'CORE',
+      acceptanceEvidenceNotice: 'AE',
+      playbookSection: 'PB',
+      skillsSection: 'SK',
+      srFeedbackBlock: 'SR',
+      reservedRevisionGuidance: 'RR',
+      promptSuffix: 'PS',
+      prTitlePrefixNote: 'PT',
+    });
+    const { finalPrompt } = assembleStandardPrompt(s);
+    for (const piece of [
+      s.claudeMdPrefix, s.codeChangeHelperGuidance, s.taskTypeFocusBlock, s.taskTypeHint,
+      'CORE', 'AE', 'PB', 'SK', 'SR', 'RR', 'PS', 'PT',
+      PLAYBOOK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, VIEWPORT_INFRA_SKIP_GUIDANCE,
+    ]) {
+      expect(finalPrompt).toContain(piece);
+    }
+  });
+
+  it('handleCreate leads with stable guidance and is byte-identical across wall-clock and HEAD', async () => {
+    vi.clearAllMocks();
+    const MARKER = 'END_TO_END_TASK_VARIABLE_MARKER_9f3a';
+    const task = { title: 'T', description: '', context: {}, project_context: {} };
+
+    // Build 1 — git HEAD "aaaaaaaa", wall-clock T0.
+    vi.mocked(git).mockReturnValue('aaaaaaaa');
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000);
+    await handleCreate(TASK_ID, { prompt: MARKER }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt1 = capturedPrompt();
+
+    // Build 2 — different git HEAD, wall-clock advanced 30 days.
+    vi.mocked(runCodeChangeTask).mockClear();
+    vi.mocked(git).mockReturnValue('bbbbbbbb');
+    nowSpy.mockReturnValue(1_700_000_000_000 + 30 * 86_400_000);
+    await handleCreate(TASK_ID, { prompt: MARKER }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt2 = capturedPrompt();
+    nowSpy.mockRestore();
+
+    // The reorder: stable guidance constants precede the task-variable marker.
+    const markerIdx1 = prompt1.indexOf(MARKER);
+    expect(markerIdx1).toBeGreaterThan(0);
+    expect(prompt1.indexOf(PLAYBOOK_GUIDANCE)).toBeGreaterThanOrEqual(0);
+    expect(prompt1.indexOf(PLAYBOOK_GUIDANCE)).toBeLessThan(markerIdx1);
+    expect(prompt1.indexOf(DEFAULT_TOOL_GUIDANCE)).toBeLessThan(markerIdx1);
+    expect(prompt1.indexOf(VIEWPORT_INFRA_SKIP_GUIDANCE)).toBeLessThan(markerIdx1);
+
+    // The stable prefix (everything up to the first task-variable byte) is
+    // byte-identical across the two builds despite different wall-clock/HEAD.
+    const prefix1 = prompt1.slice(0, markerIdx1);
+    const prefix2 = prompt2.slice(0, prompt2.indexOf(MARKER));
+    expect(prefix1.length).toBeGreaterThan(0);
+    expect(prefix1).toBe(prefix2);
+  });
+});
+
 // ── Test baseline capture ─────────────────────────────────────────────────────
 // Baseline still gates on baseBranch === 'main' && captureBaseline && runTestFix
 // && !auto_remediation. handleCreate sets captureBaseline + runTestFix true;
@@ -1071,23 +1259,23 @@ describe('test baseline capture', () => {
   });
 
   it('writes test_baseline file when captureTestBaseline returns a non-null set', async () => {
-    const { writeFileSync } = await import('fs');
+    const { default: fs } = await import('fs');
     vi.mocked(captureTestBaseline).mockResolvedValue(new Set(['test A', 'test B']));
     const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    const baselineCalls = vi.mocked(writeFileSync).mock.calls.filter(c => String(c[0]).includes('test_baseline_'));
+    const baselineCalls = vi.mocked(fs.promises.writeFile).mock.calls.filter(c => (c[0] as string).includes('test_baseline_'));
     expect(baselineCalls).toHaveLength(1);
     expect(baselineCalls[0][0]).toBe(`/tmp/test_baseline_${TASK_ID}.json`);
-    expect(baselineCalls[0][1]).toContain('test A');
+    expect(baselineCalls[0][1] as string).toContain('test A');
   });
 
   it('does not write test_baseline file when captureTestBaseline returns null', async () => {
-    const { writeFileSync } = await import('fs');
-    vi.mocked(writeFileSync).mockClear();
+    const { default: fs } = await import('fs');
+    vi.mocked(fs.promises.writeFile).mockClear();
     vi.mocked(captureTestBaseline).mockResolvedValue(null);
     const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    const baselineCalls = vi.mocked(writeFileSync).mock.calls.filter(c => String(c[0]).includes('test_baseline_'));
+    const baselineCalls = vi.mocked(fs.promises.writeFile).mock.calls.filter(c => (c[0] as string).includes('test_baseline_'));
     expect(baselineCalls).toHaveLength(0);
   });
 });
@@ -3443,11 +3631,11 @@ describe('runStandardHandler incomplete_review auto-trigger', () => {
     const { default: fs } = await import('fs');
     const idx = await import('../index.js');
     vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
-    vi.mocked(fs.readFileSync).mockImplementation((p: unknown) => {
+    vi.mocked(fs.promises.readFile).mockImplementation((p: unknown) => {
       if (typeof p === 'string' && p.includes('self_review_')) {
-        return JSON.stringify({ verdict: 'pass', categories: ['incomplete_review'] });
+        return Promise.resolve(JSON.stringify({ verdict: 'pass', categories: ['incomplete_review'] }));
       }
-      return '';
+      return Promise.resolve('');
     });
     vi.mocked(idx.runClaudeCode).mockResolvedValue({
       exitCode: 0,
@@ -3468,15 +3656,15 @@ describe('runStandardHandler incomplete_review auto-trigger', () => {
     const { default: fs } = await import('fs');
     const idx = await import('../index.js');
     vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
-    vi.mocked(fs.readFileSync).mockImplementation((p: unknown) => {
+    vi.mocked(fs.promises.readFile).mockImplementation((p: unknown) => {
       if (typeof p === 'string' && p.includes('self_review_')) {
-        return JSON.stringify({
+        return Promise.resolve(JSON.stringify({
           verdict: 'pass',
           categories: ['incomplete_review'],
           reviewer_findings: [{ category: 'correctness', severity: 'HIGH', description: 'prior finding' }],
-        });
+        }));
       }
-      return '';
+      return Promise.resolve('');
     });
 
     await handleCreate(TASK_ID, PAYLOAD, TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
@@ -4498,12 +4686,20 @@ describe('receipt-only capability trial arm assignment', () => {
   });
 
   it('suppresses held-back refactor sections before prompt assembly', async () => {
+    // related_tests explicitly held back (1.0); module_interfaces + affected_consumers
+    // explicitly opted back in (0.0) — proves the arm is per-capability, only the
+    // held-back section is suppressed. (Under default-off, the other two must be
+    // explicitly opted in to remain injected.)
     const task = {
       title: 'Task',
       description: '',
       context: { scope: 'medium' },
       project_context: {},
-      project_metadata: { related_tests_holdback_fraction: 1.0 },
+      project_metadata: {
+        related_tests_holdback_fraction: 1.0,
+        module_interfaces_holdback_fraction: 0.0,
+        affected_consumers_holdback_fraction: 0.0,
+      },
     };
 
     await handleRefactor(TASK_ID, { prompt: 'Refactor this' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
@@ -4581,6 +4777,69 @@ describe('receipt-only capability trial arm assignment', () => {
     expect(refactorOpts?.affected_consumers_arm).toBeUndefined();
     expect(refactorOpts?.had_related_tests).toBe(true);
     expect(refactorOpts?.related_tests_arm).toBe(true);
+  });
+});
+
+// ── Default-OFF: all five futility-proven context blocks suppressed absent config ─
+// (2026-07-10 futility bound: repo_map, related_tests, module_interfaces,
+// affected_consumers, diagnostics_after_edit all evaluated no_effect.) With no
+// project holdback config, none of the five discovery functions is invoked (saving
+// compute) and every section is absent (saving tokens), while the heartbeat honestly
+// reports the suppression: had_*=false and *_arm=false.
+describe('futility-proven context blocks default-off (no project holdback config)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(getProviderRunner).mockReturnValue({ displayName: 'Claude Code', provider: 'anthropic' } as ReturnType<typeof getProviderRunner>);
+    vi.mocked(writeDiagnosticsAfterEditHook).mockReturnValue(true);
+    // Non-empty discovery results so any accidental invocation would surface as
+    // injected sections / had_*=true — the test proves they are NOT called.
+    vi.mocked(buildRepoMap).mockReturnValue('REPO_MAP_CONTENT');
+    vi.mocked(extractModuleInterfaces).mockReturnValue('MODULE_INTERFACE_CONTEXT');
+    vi.mocked(discoverRelatedTests).mockReturnValue('RELATED_TEST_CONTEXT');
+    vi.mocked(discoverAffectedConsumers).mockReturnValue('AFFECTED_CONSUMERS_CONTEXT');
+  });
+
+  it('suppresses all five sections and skips their discovery functions for a medium-scope Blueprint self-repo create task', async () => {
+    // scope=medium → module_interfaces/affected_consumers are scope-eligible;
+    // anthropic + Blueprint self-repo → diagnostics_after_edit is capability-eligible.
+    // No *_holdback_fraction keys → every capability falls to the default-off (1.0) arm.
+    const task = {
+      title: 'Task',
+      description: '',
+      context: { scope: 'medium' },
+      project_context: {},
+      project_metadata: { diagnostics_after_edit_enabled: true },
+    };
+
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, 'HenryHamster', 'BlueprintAIStudio', WS, STATUS_REF());
+
+    // Discovery functions are not invoked (compute saved).
+    expect(vi.mocked(buildRepoMap)).not.toHaveBeenCalled();
+    expect(vi.mocked(extractModuleInterfaces)).not.toHaveBeenCalled();
+    expect(vi.mocked(discoverRelatedTests)).not.toHaveBeenCalled();
+    expect(vi.mocked(discoverAffectedConsumers)).not.toHaveBeenCalled();
+    expect(vi.mocked(writeDiagnosticsAfterEditHook)).not.toHaveBeenCalled();
+
+    // No section content is injected into the prompt (tokens saved).
+    const prompt = capturedPrompt();
+    expect(prompt).not.toContain('REPO_MAP_CONTENT');
+    expect(prompt).not.toContain('MODULE_INTERFACE_CONTEXT');
+    expect(prompt).not.toContain('RELATED_TEST_CONTEXT');
+    expect(prompt).not.toContain('AFFECTED_CONSUMERS_CONTEXT');
+
+    // Heartbeat honestly reflects suppression: arm=false, receipt (had_*)=false.
+    const opts = capturedRepoMapHeartbeatOpts();
+    expect(opts).toBeDefined();
+    expect(opts?.had_repo_map).toBe(false);
+    expect(opts?.repo_map_arm).toBe(false);
+    expect(opts?.had_module_interfaces).toBe(false);
+    expect(opts?.module_interfaces_arm).toBe(false);
+    expect(opts?.had_related_tests).toBe(false);
+    expect(opts?.related_tests_arm).toBe(false);
+    expect(opts?.had_affected_consumers).toBe(false);
+    expect(opts?.affected_consumers_arm).toBe(false);
+    expect(opts?.diagnostics_after_edit_arm).toBe(false);
+    expect(opts?.had_diagnostics_after_edit).toBeUndefined();
   });
 });
 

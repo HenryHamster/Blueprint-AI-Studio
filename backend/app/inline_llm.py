@@ -94,14 +94,6 @@ class InlineLLMTarget:
     base_url: str | None
 
 
-def _default_base_url(provider: str) -> str | None:
-    if provider == "deepseek":
-        return DEFAULT_DEEPSEEK_ANTHROPIC_BASE_URL
-    if provider == "zai":
-        return DEFAULT_ZAI_ANTHROPIC_BASE_URL
-    return None
-
-
 def _default_model(provider: str) -> str:
     if provider == "deepseek":
         return "deepseek-v4-flash"
@@ -417,6 +409,10 @@ async def call_inline_llm_json(
 
     for attempt in range(2):
         try:
+            # The discarded second element is Messages-API rate-limit header
+            # data for the ORG-LEVEL env credential these inline calls use —
+            # it cannot be attributed to any MaxPlanAccount, so the account
+            # usage meter is fed by the OAuth probe instead (max_plan_pool).
             raw, _ = await call_direct_llm(
                 target.api_key,
                 messages=payload_messages,

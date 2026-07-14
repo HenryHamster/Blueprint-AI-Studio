@@ -9,22 +9,45 @@ ever stored — the plaintext is returned exactly once, at registration.
 
 import logging
 import uuid
+from datetime import timedelta
 from typing import Any, Dict, List, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.admin import _get_user_project_with_role
 from app.auth import create_runner_token, hash_runner_token, get_current_user, require_admin
 from app.database import get_session
-from app.models import LocalRunner, Task, TaskStatus, _utcnow
+from app.models import (
+    ComputeJob,
+    ComputeJobStatus,
+    LocalRunner,
+    RunnerHeartbeatSnapshot,
+    Task,
+    TASK_OUTCOME_TERMINAL_STATUSES,
+    TaskStatus,
+    _utcnow,
+)
+from app.runner_config import (
+    GPU_INDICES_ALL,
+    GPUS_PER_JOB_MAX,
+    GPUS_PER_JOB_MIN,
+    config_generation,
+    live_safe_config,
+)
+from app.schemas import redact_command_log_text
 from app.task_capabilities import STRATEGIC_TASK_TYPES, TaskType
+from app.vm_cost_rates import AcceleratorRejection, get_compute_rate_per_second
 from app.workbench_events import (
     SURFACE_RUNTIME,
     SURFACE_STRATEGIC_SESSION,
     emit_workbench_refetch,
+)
+from app.runner_health_monitors import (
+    _RUNNER_DEGRADED_FAILURE_THRESHOLD,
+    _RUNNER_LIVENESS_SECONDS,
 )
 from app.workbench_state import clear_preferred_runner_references
 
@@ -44,18 +67,6 @@ _DEFAULT_CAPABILITIES: Dict[str, Any] = {
     "has_gpu": False,
     "max_concurrent": 2,
 }
-
-_RUNNER_LIVENESS_SECONDS = 300
-# Trust-telemetry thresholds for the "connected but failing" (degraded) state.
-# A runner can heartbeat perfectly while every job it is handed fails — the
-# false-green these guard against. A live runner is degraded when either:
-#   * it has failed >= _FAILURE_STREAK_DEGRADED_THRESHOLD jobs in a row, or
-#   * it currently carries active work, has recorded at least one failure, and
-#     has no recent success (last_successful_job_at stale beyond
-#     _SUCCESS_STALE_SECONDS or never set) — "working but not succeeding".
-# The second branch requires >= 1 recorded failure so a freshly-enrolled runner
-# legitimately churning on its first job is never mislabelled as failing.
-_FAILURE_STREAK_DEGRADED_THRESHOLD = 3
 _SUCCESS_STALE_SECONDS = 1800  # 30 min
 # Advisory low-disk flag (does not by itself degrade a runner).
 _LOW_DISK_FREE_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
@@ -63,6 +74,34 @@ _LOW_DISK_FREE_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
 _LOW_MEMORY_FREE_BYTES = 512 * 1024 * 1024  # 512 MiB
 _STRATEGIC_LOCAL_TASK_TYPES = sorted(STRATEGIC_TASK_TYPES)
 _KNOWN_TASK_TYPES = {task_type.value for task_type in TaskType}
+# Max chars of command-log tail surfaced inline on a failed recent-outcome row.
+# Kept small so the per-runner stats payload stays lean — operators wanting the
+# full log open ComputeJobsPanel. The text is redacted before truncation.
+_COMMAND_LOG_TAIL_MAX_CHARS = 2000
+
+
+def _command_log_tail(polling_metadata: Dict[str, Any] | None) -> str | None:
+    """Extract a bounded, credential-redacted tail of a job's command log.
+
+    Reads ``polling_metadata["command_log"]["text"]`` (the runner-captured
+    stdout/stderr marker), applies the shared credential redactor, and returns
+    the last ``_COMMAND_LOG_TAIL_MAX_CHARS`` characters. Returns ``None`` when
+    the log is absent, malformed, or empty so success/legacy rows stay lean.
+    """
+    if not isinstance(polling_metadata, dict):
+        return None
+    command_log = polling_metadata.get("command_log")
+    if not isinstance(command_log, dict):
+        return None
+    text = command_log.get("text")
+    if not isinstance(text, str):
+        return None
+    redacted = redact_command_log_text(text).strip()
+    if not redacted:
+        return None
+    if len(redacted) <= _COMMAND_LOG_TAIL_MAX_CHARS:
+        return redacted
+    return redacted[-_COMMAND_LOG_TAIL_MAX_CHARS:]
 
 RunnerPreset = Literal["default", "strategic", "strategic_local"]
 
@@ -72,6 +111,40 @@ class RunnerRegisterRequest(BaseModel):
     version: str | None = None
     capabilities: Dict[str, Any] | None = None
     preset: RunnerPreset | None = None
+
+
+class RunnerUpdateCapabilitiesRequest(BaseModel):
+    """Request body for PATCH /projects/../runners/../capabilities.
+
+    All fields are optional — only the provided fields are updated.
+    """
+    max_concurrent: int | None = None
+    task_types: str | list[str] | None = None
+    max_concurrent_compute: int | None = None
+    # GPU-index allowlist: "all" (no restriction) or a list of non-negative GPU
+    # indices the runner may schedule onto. Part of the LIVE-SAFE config subset
+    # pushed to the daemon via the heartbeat response.
+    gpu_indices_allowed: str | list[int] | None = None
+    # Per-job GPU count: how many GPUs each compute job reserves on this runner.
+    # Part of the LIVE-SAFE config subset pushed to the daemon via the heartbeat
+    # response, so an operator can retune a mixed multi-GPU box without SSH.
+    gpus_per_job: int | None = None
+
+
+class RunnerStatusUpdateRequest(BaseModel):
+    """Request body for PATCH /projects/../runners/../status."""
+    status: Literal["active", "paused", "draining"]
+
+
+# Valid operator-initiated status transitions.
+# Rows are (from_status, to_status) pairs that are allowed.
+_VALID_STATUS_TRANSITIONS: set[tuple[str, str]] = {
+    ("active", "paused"),
+    ("active", "draining"),
+    ("paused", "active"),
+    ("draining", "active"),
+    ("draining", "paused"),
+}
 
 
 def _normalize_capabilities(
@@ -142,6 +215,76 @@ def _normalize_max_concurrent(raw: Any) -> int:
     return value
 
 
+def _normalize_gpu_indices_allowed(raw: Any) -> str | list[int]:
+    """Validate the GPU-index allowlist: the ``"all"`` sentinel or a list of
+    non-negative ints. Deduplicated and sorted so storage (and therefore the
+    live-safe config generation hash) is order-independent. An empty list is
+    accepted and means "no GPU indices allowed" (a deliberate restriction).
+    """
+    if raw == GPU_INDICES_ALL:
+        return GPU_INDICES_ALL
+    if not isinstance(raw, list):
+        raise ValueError(
+            "capabilities.gpu_indices_allowed must be 'all' or a list of "
+            "non-negative integers"
+        )
+    normalized: list[int] = []
+    seen: set[int] = set()
+    for item in raw:
+        if isinstance(item, bool):
+            raise ValueError(
+                "capabilities.gpu_indices_allowed entries must be non-negative integers"
+            )
+        if isinstance(item, int):
+            value = item
+        elif isinstance(item, float) and item.is_integer():
+            value = int(item)
+        elif isinstance(item, str) and item.strip().isdecimal():
+            value = int(item.strip())
+        else:
+            raise ValueError(
+                "capabilities.gpu_indices_allowed entries must be non-negative integers"
+            )
+        if value < 0:
+            raise ValueError(
+                "capabilities.gpu_indices_allowed entries must be non-negative integers"
+            )
+        if value not in seen:
+            normalized.append(value)
+            seen.add(value)
+    return sorted(normalized)
+
+
+def _normalize_gpus_per_job(raw: Any) -> int:
+    """Validate the per-job GPU count: a positive int within the fleet bounds.
+
+    Rejects bools and non-integer junk outright (an operator typo should 422,
+    not silently coerce), then requires a value in
+    ``[GPUS_PER_JOB_MIN, GPUS_PER_JOB_MAX]``.
+    """
+    if isinstance(raw, bool):
+        raise ValueError("capabilities.gpus_per_job must be a positive integer")
+    if isinstance(raw, int):
+        value = raw
+    elif isinstance(raw, float):
+        if not raw.is_integer():
+            raise ValueError("capabilities.gpus_per_job must be a positive integer")
+        value = int(raw)
+    elif isinstance(raw, str):
+        stripped = raw.strip()
+        if not stripped.isdecimal():
+            raise ValueError("capabilities.gpus_per_job must be a positive integer")
+        value = int(stripped)
+    else:
+        raise ValueError("capabilities.gpus_per_job must be a positive integer")
+    if value < GPUS_PER_JOB_MIN or value > GPUS_PER_JOB_MAX:
+        raise ValueError(
+            f"capabilities.gpus_per_job must be between {GPUS_PER_JOB_MIN} "
+            f"and {GPUS_PER_JOB_MAX}"
+        )
+    return value
+
+
 def _runner_active_task_count(capabilities: Dict[str, Any] | None) -> int:
     active = (capabilities or {}).get("active_task_ids") or []
     return len(active) if isinstance(active, list) else 0
@@ -204,6 +347,26 @@ def _runner_max_concurrent(capabilities: Dict[str, Any] | None) -> int | None:
     return None
 
 
+def _runner_max_concurrent_compute(capabilities: Dict[str, Any] | None) -> int | None:
+    """Max concurrent compute jobs, defaulting to max_concurrent when absent."""
+    raw = (capabilities or {}).get("max_concurrent_compute")
+    if raw is not None:
+        if isinstance(raw, bool):
+            pass  # fall through to default
+        elif isinstance(raw, int) and raw > 0:
+            return raw
+        elif isinstance(raw, float) and raw.is_integer() and raw > 0:
+            return int(raw)
+        elif isinstance(raw, str):
+            try:
+                parsed = int(raw)
+                if parsed > 0:
+                    return parsed
+            except ValueError:
+                pass
+    return _runner_max_concurrent(capabilities)
+
+
 def _runner_health(runner: LocalRunner) -> Dict[str, Any]:
     """Return the dispatch-relevant health shape used by the operator UI."""
     now = _utcnow()
@@ -217,9 +380,20 @@ def _runner_health(runner: LocalRunner) -> Dict[str, Any]:
     active_compute_job_count = _runner_active_compute_job_count(runner.capabilities)
     active_work_count = active_task_count + active_compute_job_count
     max_concurrent = _runner_max_concurrent(runner.capabilities)
+    max_concurrent_compute = _runner_max_concurrent_compute(runner.capabilities)
     available_slots = (
         max(0, max_concurrent - active_work_count)
         if max_concurrent is not None
+        else None
+    )
+    available_agent_slots = (
+        max(0, max_concurrent - active_task_count)
+        if max_concurrent is not None
+        else None
+    )
+    available_compute_slots = (
+        max(0, max_concurrent_compute - active_compute_job_count)
+        if max_concurrent_compute is not None
         else None
     )
     is_live = (
@@ -248,7 +422,7 @@ def _runner_health(runner: LocalRunner) -> Dict[str, Any]:
         or seconds_since_last_success >= _SUCCESS_STALE_SECONDS
     )
     failure_streak_degraded = (
-        consecutive_job_failures >= _FAILURE_STREAK_DEGRADED_THRESHOLD
+        consecutive_job_failures >= _RUNNER_DEGRADED_FAILURE_THRESHOLD
     )
     success_stale_while_working = (
         active_work_count > 0
@@ -303,9 +477,17 @@ def _runner_health(runner: LocalRunner) -> Dict[str, Any]:
         "active_compute_job_count": active_compute_job_count,
         "active_work_count": active_work_count,
         "max_concurrent": max_concurrent,
+        "max_concurrent_compute": max_concurrent_compute,
         "available_slots": available_slots,
+        "available_agent_slots": available_agent_slots,
+        "available_compute_slots": available_compute_slots,
         "stale_reason": stale_reason,
         "agent_available": (runner.capabilities or {}).get("agent_available"),
+        "agent_unavailable_reason": (runner.capabilities or {}).get("agent_unavailable_reason"),
+        # Per-leg ok/failed breakdown ({bwrap_sandbox, agent_dist, node_runtime,
+        # docker} -> bool) so the fleet panel can render a checklist. None when the
+        # runner (old build) never reported it.
+        "agent_unavailable_legs": (runner.capabilities or {}).get("agent_unavailable_legs"),
         "liveness_window_seconds": _RUNNER_LIVENESS_SECONDS,
         # Trust telemetry surfaced to the panel.
         "last_successful_job_at": (
@@ -321,7 +503,33 @@ def _runner_health(runner: LocalRunner) -> Dict[str, Any]:
         "memory_low": memory_low,
         "cpu_load_avg": cpu_load_avg,
         "gpu_utilization_pct": gpu_utilization_pct,
-        "failure_streak_threshold": _FAILURE_STREAK_DEGRADED_THRESHOLD,
+        "failure_streak_threshold": _RUNNER_DEGRADED_FAILURE_THRESHOLD,
+    }
+
+
+def _runner_config_view(capabilities: Dict[str, Any] | None) -> Dict[str, Any]:
+    """Desired-vs-applied LIVE-SAFE config for the Fleet UI.
+
+    ``desired`` is the server-authoritative subset the daemon should converge to;
+    ``config_generation`` is its deterministic marker. ``applied_config_generation``
+    is what the daemon last reported having in effect (None until it reports).
+    ``config_pending`` is True whenever the two generations differ — including the
+    "never reported" case, so an old/silent daemon reads as pending, not applied.
+    """
+    caps = capabilities or {}
+    desired = live_safe_config(caps)
+    desired_generation = config_generation(desired)
+    applied_generation = caps.get("applied_config_generation")
+    if not isinstance(applied_generation, str):
+        applied_generation = None
+    return {
+        "desired": desired,
+        "config_generation": desired_generation,
+        "applied": caps.get("applied_config"),
+        "applied_config_generation": applied_generation,
+        "config_pending": applied_generation != desired_generation,
+        "gpu_indices_allowed": desired["gpu_indices_allowed"],
+        "gpus_per_job": desired["gpus_per_job"],
     }
 
 
@@ -339,6 +547,7 @@ def _runner_view(runner: LocalRunner) -> Dict[str, Any]:
         "status": runner.status,
         "capabilities": runner.capabilities,
         "health": _runner_health(runner),
+        "config": _runner_config_view(runner.capabilities),
         "last_seen_at": (
             runner.last_seen_at.isoformat() if runner.last_seen_at else None
         ),
@@ -365,7 +574,7 @@ async def register_runner(
     try:
         capabilities = _normalize_capabilities(payload.capabilities, payload.preset)
     except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc))
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     runner = LocalRunner(
         project_id=project_id,
@@ -404,6 +613,181 @@ async def register_runner(
     return {"runner_id": str(runner.id), "token": token}
 
 
+@router.patch("/projects/{project_id}/runners/{runner_id}/capabilities")
+async def update_runner_capabilities(
+    project_id: uuid.UUID,
+    runner_id: uuid.UUID,
+    payload: RunnerUpdateCapabilitiesRequest,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Update an existing runner's operator-configured capabilities in-place.
+
+    Only the fields provided in the request body are updated; all other
+    capabilities (including runner-reported hardware telemetry) are preserved.
+    The ``strategic_local`` preset invariant is enforced: ``max_concurrent``
+    is clamped to 1 and ``task_types`` is clamped to the strategic task set.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+    result = await session.execute(
+        select(LocalRunner)
+        .where(
+            LocalRunner.id == runner_id,
+            LocalRunner.project_id == project_id,
+        )
+        .with_for_update()
+    )
+    runner = result.scalars().first()
+    if runner is None or runner.status == "deleted":
+        raise HTTPException(status_code=404, detail="Runner not found")
+
+    # Start from existing capabilities so runner-reported fields survive.
+    caps = dict(runner.capabilities or {})
+
+    # Detect strategic workload: strategic preset or workload pins concurrency.
+    is_strategic = caps.get("runner_preset") in (
+        "strategic_local",
+    ) or caps.get("workload") == "strategic"
+
+    try:
+        if payload.max_concurrent is not None:
+            mc = _normalize_max_concurrent(payload.max_concurrent)
+            if is_strategic:
+                mc = 1  # strategic runners are pinned to single concurrency
+            caps["max_concurrent"] = mc
+
+        if payload.task_types is not None:
+            tt = _normalize_task_types(payload.task_types)
+            if is_strategic:
+                tt = list(_STRATEGIC_LOCAL_TASK_TYPES)
+            caps["task_types"] = tt
+
+        if payload.max_concurrent_compute is not None:
+            mcc = _normalize_max_concurrent(payload.max_concurrent_compute)
+            caps["max_concurrent_compute"] = mcc
+
+        # GPU-index allowlist is orthogonal to the strategic_local invariants
+        # (which pin concurrency/task_types) — it applies to every runner and
+        # never relaxes those clamps.
+        if payload.gpu_indices_allowed is not None:
+            caps["gpu_indices_allowed"] = _normalize_gpu_indices_allowed(
+                payload.gpu_indices_allowed
+            )
+
+        # Per-job GPU count is likewise orthogonal to the strategic clamps — it
+        # governs compute-job GPU reservation, not agent-task concurrency.
+        if payload.gpus_per_job is not None:
+            caps["gpus_per_job"] = _normalize_gpus_per_job(payload.gpus_per_job)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    runner.capabilities = caps
+    session.add(runner)
+    await session.commit()
+
+    logger.info(
+        "[RUNNERS] Updated capabilities for runner %s on project %s",
+        runner_id,
+        project_id,
+    )
+    await emit_workbench_refetch(
+        project_id,
+        resource="local_runner",
+        action="updated",
+        refetch_surfaces=(SURFACE_STRATEGIC_SESSION, SURFACE_RUNTIME),
+        summary_key="runner",
+        summary={
+            "id": str(runner_id),
+            "status": runner.status,
+            "hostname": runner.hostname,
+        },
+    )
+    return _runner_view(runner)
+
+
+@router.patch("/projects/{project_id}/runners/{runner_id}/status")
+async def update_runner_status(
+    project_id: uuid.UUID,
+    runner_id: uuid.UUID,
+    payload: RunnerStatusUpdateRequest,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Pause, drain, or resume a runner.
+
+    Valid transitions:
+      active  → paused   (stop new dispatch immediately)
+      active  → draining (stop new dispatch, let existing tasks finish)
+      paused  → active   (resume)
+      draining → active  (resume)
+      draining → paused  (force-pause a draining runner)
+
+    On pause or drain, any tasks pinned but not yet pulled by this runner are
+    released back to QUEUED so another runner can claim them.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+    result = await session.execute(
+        select(LocalRunner)
+        .where(
+            LocalRunner.id == runner_id,
+            LocalRunner.project_id == project_id,
+        )
+        .with_for_update()
+    )
+    runner = result.scalars().first()
+    if runner is None or runner.status == "deleted":
+        raise HTTPException(status_code=404, detail="Runner not found")
+
+    current = runner.status
+    target = payload.status
+    if current == target:
+        # Already in the requested state — idempotent, no-op.
+        return _runner_view(runner)
+
+    if (current, target) not in _VALID_STATUS_TRANSITIONS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid status transition: {current!r} → {target!r}",
+        )
+
+    runner.status = target
+    session.add(runner)
+
+    released_pins = 0
+    if target in ("paused", "draining"):
+        released_pins = await _release_unpulled_runner_pins(session, runner_id)
+
+    await session.commit()
+    await session.refresh(runner)
+
+    logger.info(
+        "[RUNNERS] Status %s → %s for runner %s on project %s (released_pins=%s)",
+        current,
+        target,
+        runner_id,
+        project_id,
+        released_pins,
+    )
+    await emit_workbench_refetch(
+        project_id,
+        resource="local_runner",
+        action="status_updated",
+        refetch_surfaces=(SURFACE_STRATEGIC_SESSION, SURFACE_RUNTIME),
+        summary_key="runner",
+        summary={
+            "id": str(runner_id),
+            "status": target,
+            "hostname": runner.hostname,
+            "released_unpulled_pins": released_pins,
+        },
+    )
+    return _runner_view(runner)
+
+
 @router.get("/projects/{project_id}/runners")
 async def list_runners(
     project_id: uuid.UUID,
@@ -427,6 +811,283 @@ async def list_runners(
     query = query.limit(limit).offset(offset)
     result = await session.execute(query)
     return [_runner_view(r) for r in result.scalars().all()]
+
+
+def _snapshot_view(snap: RunnerHeartbeatSnapshot) -> Dict[str, Any]:
+    return {
+        "captured_at": snap.captured_at.isoformat() if snap.captured_at else None,
+        "gpu_utilization_pct": snap.gpu_utilization_pct,
+        "disk_free_bytes": snap.disk_free_bytes,
+        "memory_free_bytes": snap.memory_free_bytes,
+        "cpu_load_avg": snap.cpu_load_avg,
+        "active_task_count": snap.active_task_count,
+        "active_compute_job_count": snap.active_compute_job_count,
+        "agent_available": snap.agent_available,
+    }
+
+
+@router.get("/projects/{project_id}/runners/{runner_id}/telemetry")
+async def runner_telemetry(
+    project_id: uuid.UUID,
+    runner_id: uuid.UUID,
+    since: int = Query(
+        default=3600, ge=60, le=604800, description="Look-back window in seconds"
+    ),
+    limit: int = Query(default=240, ge=1, le=2000),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Return recent heartbeat time-series snapshots for one runner.
+
+    Defaults to the last hour (``since=3600``), newest first, capped at ``limit``
+    rows. Powers the Fleet panel's GPU/disk/memory sparklines. Read-only; a
+    viewer role suffices.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "viewer"
+    )
+    # 404 on a runner that is not this project's, so telemetry can't be read
+    # cross-project even though snapshots carry no project_id of their own.
+    runner = (
+        await session.execute(
+            select(LocalRunner).where(
+                LocalRunner.id == runner_id,
+                LocalRunner.project_id == project_id,
+            )
+        )
+    ).scalars().first()
+    if runner is None or runner.status == "deleted":
+        raise HTTPException(status_code=404, detail="Runner not found")
+
+    cutoff = _utcnow() - timedelta(seconds=since)
+    rows = (
+        await session.execute(
+            select(RunnerHeartbeatSnapshot)
+            .where(
+                RunnerHeartbeatSnapshot.runner_id == runner_id,
+                RunnerHeartbeatSnapshot.captured_at >= cutoff,
+            )
+            .order_by(RunnerHeartbeatSnapshot.captured_at.desc())
+            .limit(limit)
+        )
+    ).scalars().all()
+    return {
+        "runner_id": str(runner_id),
+        "since_seconds": since,
+        "count": len(rows),
+        # Newest-first from the query; return oldest-first so the UI can plot
+        # left-to-right without reversing.
+        "snapshots": [_snapshot_view(s) for s in reversed(rows)],
+    }
+
+
+@router.get("/projects/{project_id}/runners/{runner_id}/stats")
+async def runner_stats(
+    project_id: uuid.UUID,
+    runner_id: uuid.UUID,
+    recent_limit: int = Query(default=8, ge=1, le=50),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Per-runner compute-job rollups: total jobs, success rate, recent outcomes.
+
+    Compute jobs are pinned to a runner via
+    ``polling_metadata['runner_target_id']`` (there is no ComputeJob.runner_id
+    column), so both the count and the recent-outcomes list filter on that key.
+    Success rate is succeeded / terminal (terminal = succeeded|failed|cancelled|
+    timed_out); non-terminal jobs are excluded from the denominator. Read-only.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "viewer"
+    )
+    runner = (
+        await session.execute(
+            select(LocalRunner).where(
+                LocalRunner.id == runner_id,
+                LocalRunner.project_id == project_id,
+            )
+        )
+    ).scalars().first()
+    if runner is None or runner.status == "deleted":
+        raise HTTPException(status_code=404, detail="Runner not found")
+
+    terminal_statuses = {
+        ComputeJobStatus.SUCCEEDED,
+        ComputeJobStatus.FAILED,
+        ComputeJobStatus.CANCELLED,
+        ComputeJobStatus.TIMED_OUT,
+    }
+
+    runner_id_str = str(runner_id)
+    pin_condition = ComputeJob.polling_metadata["runner_target_id"].as_string() == runner_id_str
+    base_filter = [ComputeJob.project_id == project_id, pin_condition]
+
+    # Aggregate counts via SQL — avoids loading every row into Python memory
+    total_result = await session.execute(
+        select(func.count(ComputeJob.id)).where(*base_filter)
+    )
+    jobs_run_count = total_result.scalar() or 0
+
+    terminal_result = await session.execute(
+        select(func.count(ComputeJob.id)).where(
+            *base_filter,
+            ComputeJob.status.in_(terminal_statuses),
+        )
+    )
+    jobs_terminal_count = terminal_result.scalar() or 0
+
+    succeeded_result = await session.execute(
+        select(func.count(ComputeJob.id)).where(
+            *base_filter,
+            ComputeJob.status == ComputeJobStatus.SUCCEEDED,
+        )
+    )
+    jobs_succeeded_count = succeeded_result.scalar() or 0
+
+    success_rate = (
+        (jobs_succeeded_count / jobs_terminal_count)
+        if jobs_terminal_count > 0
+        else None
+    )
+
+    # Cloud cost avoided — the on-demand cloud VM cost that terminal jobs run on
+    # this self-hosted runner *would* have incurred. We only have honest wall
+    # clock for jobs with both started_at and completed_at, so those are the
+    # basis. Runtime seconds are summed per (machine_type, accelerator) group and
+    # priced at the on-demand (non-spot) rate; unpriceable groups (unsupported
+    # accelerator names) contribute nothing rather than failing the whole read.
+    cost_rows = (
+        await session.execute(
+            select(
+                ComputeJob.machine_type,
+                ComputeJob.accelerator_type,
+                ComputeJob.accelerator_count,
+                ComputeJob.started_at,
+                ComputeJob.completed_at,
+            ).where(
+                *base_filter,
+                ComputeJob.status.in_(terminal_statuses),
+                ComputeJob.started_at.is_not(None),
+                ComputeJob.completed_at.is_not(None),
+            )
+        )
+    ).all()
+
+    # (machine_type, accelerator_type, accelerator_count) -> summed runtime secs
+    seconds_by_group: Dict[tuple, float] = {}
+    cloud_cost_avoided_basis = 0
+    for machine_type, accel_type, accel_count, started_at, completed_at in cost_rows:
+        runtime_secs = (completed_at - started_at).total_seconds()
+        if runtime_secs <= 0:
+            # Clock skew or zero-length window — no honest cost basis.
+            continue
+        key = (machine_type, accel_type, accel_count)
+        seconds_by_group[key] = seconds_by_group.get(key, 0.0) + runtime_secs
+        cloud_cost_avoided_basis += 1
+
+    cloud_cost_avoided_usd = 0.0
+    for (machine_type, accel_type, accel_count), total_secs in seconds_by_group.items():
+        try:
+            rate_per_second = get_compute_rate_per_second(
+                machine_type=machine_type,
+                accelerator=accel_type,
+                count=accel_count or 1,
+                spot=False,
+            )
+        except AcceleratorRejection:
+            # Unsupported/unknown accelerator shape — cannot price it, so it
+            # does not contribute to the avoided-cost total.
+            continue
+        cloud_cost_avoided_usd += total_secs * rate_per_second
+    cloud_cost_avoided_usd = round(cloud_cost_avoided_usd, 2)
+
+    # Claim-latency rollup from task-level cold-start telemetry.
+    # Tasks dispatched to this runner have vm_instance_id = "runner:{runner_id}".
+    # We query terminal tasks with a recorded vm_cold_start_ms to compute
+    # per-runner pickup-lag percentiles.
+    claim_latency_ms_values = (
+        (
+            await session.execute(
+                select(Task.vm_cold_start_ms).where(
+                    Task.vm_instance_id == f"runner:{runner_id_str}",
+                    Task.vm_cold_start_ms.is_not(None),
+                    Task.status.in_(TASK_OUTCOME_TERMINAL_STATUSES),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    claim_latency_ms_p50: int | None = None
+    claim_latency_ms_p95: int | None = None
+    claim_latency_ms_p99: int | None = None
+    claim_latency_ms_max: int | None = None
+    claim_latency_sample_count = len(claim_latency_ms_values)
+
+    if claim_latency_ms_values:
+        sorted_vals = sorted(claim_latency_ms_values)
+        n = len(sorted_vals)
+        claim_latency_ms_max = sorted_vals[-1]
+        claim_latency_ms_p50 = sorted_vals[min(int(n * 0.5), n - 1)]
+        claim_latency_ms_p95 = sorted_vals[min(int(n * 0.95), n - 1)]
+        claim_latency_ms_p99 = sorted_vals[min(int(n * 0.99), n - 1)]
+
+    # Recent outcomes — bounded fetch
+    recent_jobs = (
+        await session.execute(
+            select(ComputeJob)
+            .where(*base_filter)
+            .order_by(ComputeJob.created_at.desc())
+            .limit(recent_limit)
+        )
+    ).scalars().all()
+
+    last_outcomes = [
+        {
+            "job_id": str(j.id),
+            "task_id": str(j.task_id) if j.task_id else None,
+            "status": j.status.value if hasattr(j.status, "value") else str(j.status),
+            "outcome": (
+                j.outcome.value if getattr(j, "outcome", None) is not None else None
+            ),
+            "created_at": j.created_at.isoformat() if j.created_at else None,
+            "completed_at": j.completed_at.isoformat() if j.completed_at else None,
+            "terminal_reason": j.terminal_reason,
+            "exit_code": (
+                exit_code
+                if isinstance(
+                    (exit_code := (j.polling_metadata or {}).get("exit_code")), int
+                )
+                else None
+            ),
+            # Command-log tail only on failed/timed-out rows — success rows keep
+            # the payload lean (operators triage failures, not successes).
+            "command_log_tail": (
+                _command_log_tail(j.polling_metadata)
+                if (j.status.value if hasattr(j.status, "value") else str(j.status))
+                in ("FAILED", "TIMED_OUT")
+                else None
+            ),
+        }
+        for j in recent_jobs
+    ]
+
+    return {
+        "runner_id": str(runner_id),
+        "jobs_run_count": jobs_run_count,
+        "jobs_terminal_count": jobs_terminal_count,
+        "jobs_succeeded_count": jobs_succeeded_count,
+        "jobs_success_rate": success_rate,
+        "cloud_cost_avoided_usd": cloud_cost_avoided_usd,
+        "cloud_cost_avoided_basis": cloud_cost_avoided_basis,
+        "claim_latency_ms_p50": claim_latency_ms_p50,
+        "claim_latency_ms_p95": claim_latency_ms_p95,
+        "claim_latency_ms_p99": claim_latency_ms_p99,
+        "claim_latency_ms_max": claim_latency_ms_max,
+        "claim_latency_sample_count": claim_latency_sample_count,
+        "last_n_outcomes": last_outcomes,
+    }
 
 
 @router.post("/projects/{project_id}/runners/{runner_id}/rotate-token")

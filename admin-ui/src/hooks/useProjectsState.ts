@@ -20,7 +20,7 @@ export function useProjectsState(
 
   const fetchProjects = async (silent = false) => {
     try {
-      const PAGE_LIMIT = 50;
+      const PAGE_LIMIT = 500;
       const allItems: unknown[] = [];
       let offset = 0;
       let hasMore = true;

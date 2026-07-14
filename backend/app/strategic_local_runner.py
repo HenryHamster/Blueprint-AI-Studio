@@ -17,6 +17,7 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
+from app.experiment_authoring_context import build_runner_devices
 from app.models import LocalRunner, Project
 from app.time_utils import _utcnow
 from app.workbench_state import (
@@ -55,6 +56,16 @@ async def _load_local_runner_status(
     * ``active_gpu`` — subset of ``active_total`` whose ``capabilities.has_gpu`` is
       truthy.
 
+    ADDITIVE: when at least one runner is live, a ``devices`` key carries a
+    bounded per-runner hardware list (name, gpu_count, gpu_models, per-GPU
+    VRAM when advertised, container capability, current load) built by
+    :func:`app.experiment_authoring_context.build_runner_devices` — so
+    authoring agents can reason about VRAM fit and device counts. The key is
+    OMITTED when no runner is live, keeping the exact 3-key shape above for
+    its existing consumers and tests (the shape is load-bearing:
+    ``strategic_spawning`` merges ``require_local_runner`` at the call site
+    and agent-side renderers read the three counters by name).
+
     One query (non-deleted runners for the project — a small set); the liveness
     + GPU filtering is done in Python to stay dialect-agnostic over the JSONB
     ``capabilities`` column.
@@ -70,17 +81,24 @@ async def _load_local_runner_status(
     cutoff = _utcnow() - timedelta(seconds=_RUNNER_LIVENESS_SECONDS)
     active_total = 0
     active_gpu = 0
+    live_runners: list[LocalRunner] = []
     for runner in rows:
         last_seen = runner.last_seen_at
         if runner.status == "active" and last_seen is not None and last_seen > cutoff:
             active_total += 1
+            live_runners.append(runner)
             if (runner.capabilities or {}).get("has_gpu"):
                 active_gpu += 1
-    return {
+    status: dict[str, Any] = {
         "ever_registered": len(rows) > 0,
         "active_total": active_total,
         "active_gpu": active_gpu,
     }
+    if live_runners:
+        devices = build_runner_devices(live_runners)
+        if devices:
+            status["devices"] = devices
+    return status
 
 
 def _agent_visible_vision(vision: dict[str, Any] | None) -> dict[str, Any]:

@@ -86,14 +86,31 @@ from app.failure_classification import (
 from app.acceptance_gate import (
     ACCEPTANCE_AGGREGATE_BUCKETS,
     _UNDECLARED_REASON_KEYS,
+    _is_test_path,
     classify_merged_acceptance_context,
     classify_undeclared_reason,
 )
-from app.acceptance_criteria import get_version_coverage_summary
-from app.landed_signal import landed_signal_predicate
+from app.acceptance_criteria import (
+    get_active_criteria_rubric,
+    get_version_coverage_summary,
+)
+
+# Per-(sha, category) goal-verdict ledger (goal-verification redesign).  A SIBLING
+# module owns this file; it may not be present in every checkout during the
+# staged rollout of the redesign, so the import is guarded exactly like the
+# best-effort ``app.completion_debt`` snapshot below.  When absent, the qualifier
+# falls back to the pre-redesign path (no per-category gate, holistic merge-grade
+# only) rather than failing to import.  The integrator's tree carries the module.
+try:  # pragma: no cover - exercised once the sibling ledger module lands
+    from app import category_verdict_ledger as _category_ledger
+except Exception:  # noqa: BLE001 - sibling module not yet landed in this checkout
+    _category_ledger = None  # type: ignore[assignment]
+
+from app.landed_signal import is_verified_merge, landed_signal_predicate
 from app.models import (
     ArtifactType,
     Project,
+    QualificationDimensionResult,
     Task,
     TaskStatus,
 )
@@ -182,7 +199,9 @@ from app.release_scoring import (
     _audit_finding_key,  # noqa: F401 — re-exported for callers/tests
     _audit_findings_carry_meta,
     _audit_missing_reason,
-    compute_enforce_confidence_preview,  # noqa: F401 — re-exported for callers/tests
+    blocker_execution_site,
+    blocker_execution_site_label,
+    compute_enforce_confidence_preview,
     DEFAULT_ENFORCE_COMPLETION_DEBT_WEIGHT,
     MAX_COMPLETION_DEBT_WEIGHT,
     _clamp01,  # noqa: F401
@@ -284,6 +303,81 @@ _CONCLUSIVE_VERDICT_STATUSES: frozenset[str] = frozenset(
 )
 
 
+_NEVER_GRADED_GAP = (
+    "No merge-grade verdict exists for this candidate — the acceptance contract "
+    "was never graded (a merge-grade runs only for a version with a usable, "
+    "non-contentless goal)."
+)
+
+
+def _never_graded_category_verdicts(active_keys: set[str]) -> list[dict[str, Any]]:
+    """Fail-CLOSED verdicts for a candidate that was NEVER graded.
+
+    ``compute_composite`` SKIPS the per-category gate when ``category_verdicts`` is
+    ``None`` — that is deliberate (it preserves the no-criteria path).  But a version
+    that HAS active acceptance criteria and simply never produced a merge-grade for
+    this candidate would hit the same ``None`` and thus promote over an acceptance
+    contract that was never checked at all.  That is reachable whenever no merge-grade
+    ran — most notably a version whose ``goal`` is empty/contentless (see
+    ``_merge_grade_goal_usable``), which spawns no merge-grade child.
+
+    Synthesising ``not_met`` for every active key mirrors
+    ``category_verdict_ledger.is_candidate_fully_met`` (an ACTIVE criterion with no
+    verdict → NOT met), so the gate and the sweep can never disagree, and it carries
+    the reason in ``gap`` rather than failing silently.
+    """
+    return [
+        {
+            "category_key": key,
+            "status": "not_met",
+            "tier": "judged",
+            "gap": _NEVER_GRADED_GAP,
+            "citations": [],
+        }
+        for key in sorted(k for k in active_keys if k)
+    ]
+
+
+def _coerce_ledger_category_verdict(v: Any) -> dict[str, Any]:
+    """Coerce a category-verdict row read back from the ledger into a plain dict.
+
+    ``compute_composite``'s goal-verification gate reads ``status``/``tier`` via
+    ``dict.get``; the sibling ledger may hand back either dicts or ORM rows, so
+    this normalises both to ``{category_key, status, tier}`` (the only fields the
+    gate consumes).  Keeps the gate pure and shape-agnostic to the ledger's
+    internal representation.
+    """
+    if isinstance(v, dict):
+        return v
+    return {
+        "category_key": getattr(v, "category_key", None),
+        "status": getattr(v, "status", None),
+        "tier": getattr(v, "tier", "judged"),
+        "gap": getattr(v, "gap", None),
+    }
+
+
+def _fail_closed_category_verdicts(
+    active_keys: set[str | None],
+) -> list[dict[str, Any]] | None:
+    """Build a fail-CLOSED per-category gate input from the active criterion keys.
+
+    ``compute_composite``'s goal-verification gate BLOCKS when any category's
+    ``status`` is not ``"met"`` and SKIPS entirely when handed ``None``.  When the
+    per-category verdicts cannot be read back (ledger read raised, or returned no
+    row for any active criterion), returning ``None`` would silently SKIP the gate
+    and let an unverified candidate promote — the fail-open this closes.  Instead,
+    synthesise one ``"unverified"`` verdict per active criterion so the gate blocks
+    with ``criterion_coverage_incomplete`` (unverified != verified).  Returns
+    ``None`` only when there are genuinely no active criterion keys to gate on.
+    """
+    verdicts = [
+        {"category_key": k, "status": "unverified", "tier": "unverified"}
+        for k in sorted(k for k in active_keys if k)
+    ]
+    return verdicts or None
+
+
 def _is_audited_surface_path(path: str) -> bool:
     """True when a file is part of the code surface a release audit judges.
 
@@ -305,9 +399,7 @@ def _is_audited_surface_path(path: str) -> bool:
         return False
     if p.endswith(".test_durations"):
         return False
-    if p.endswith(".md"):
-        return False
-    return True
+    return not p.endswith(".md")
 
 
 def compute_audited_surface_hash(tree_entries: list[dict] | None) -> str | None:
@@ -492,7 +584,7 @@ _MIN_AUDIT_WEIGHT = 0.2
 _AUDIT_VETO_MARGIN = 0.05
 
 
-def _policy_from_build_config(project: "Project | None") -> dict[str, Any] | None:
+def _policy_from_build_config(project: Project | None) -> dict[str, Any] | None:
     """Resolve a per-project promotion rubric from ``Project.build_config``.
 
     A project may LEGITIMATELY promote at a different bar than the fleet default
@@ -547,7 +639,7 @@ def _policy_from_build_config(project: "Project | None") -> dict[str, Any] | Non
         # (audit_weight=0.2, threshold=0.5) a candidate with a PRESENT-but-terrible
         # audit (score 0.0 — no audit_missing hard block) still promotes
         # (0.2·0 + test_erosion + smoketest = 0.8 ≥ 0.5).  A zero-audit candidate
-        # scores at most (1 − audit_weight), so CLAMP the threshold up to strictly
+        # scores at most (1 - audit_weight), so CLAMP the threshold up to strictly
         # exceed that — the audit dimension can then ALWAYS veto a promotion, for
         # any per-project weights.  (Clamping up rather than rejecting keeps the
         # override usable; it only ever makes the gate stricter.)
@@ -624,7 +716,7 @@ def _apply_completion_debt_weight_mode(policy: dict[str, Any]) -> dict[str, Any]
 
 
 def _resolve_policy_with_provenance(
-    project: "Project | None" = None,
+    project: Project | None = None,
 ) -> tuple[dict[str, Any], str, str | None]:
     """Resolve the promotion rubric and return its active source + fallback reason.
 
@@ -724,7 +816,7 @@ def _resolve_fleet_policy_with_provenance() -> tuple[dict[str, Any], str, str | 
         )
 
 
-def _load_policy(project: "Project | None" = None) -> dict[str, Any]:
+def _load_policy(project: Project | None = None) -> dict[str, Any]:
     """Resolve the promotion rubric: project build_config → runtime_config → YAML → defaults.
 
     Resolution order:
@@ -758,7 +850,7 @@ def _load_policy(project: "Project | None" = None) -> dict[str, Any]:
 
 
 def _resolve_configured_completion_debt_weight(
-    project: "Project | None" = None,
+    project: Project | None = None,
 ) -> float:
     """Resolve the completion_debt blend weight through the SAME provenance chain
     the enforce blend reads (build_config > runtime_config > yaml), BEFORE the
@@ -874,10 +966,8 @@ async def _qualification_in_flight(
         # A child row is not (yet) persisted — the spawning run is still
         # in progress; treat as in flight.
         return True
-    if any(r.status not in _TERMINAL_STATUSES for r in rows):
-        return True
     # status == "pending" but every child already terminated → not in flight.
-    return False
+    return any(r.status not in _TERMINAL_STATUSES for r in rows)
 
 
 def _promotion_in_flight_result(
@@ -2049,39 +2139,43 @@ async def run_qualification(
         and prior_qual.get("candidate_sha") == candidate_sha
         and ci_green
     )
-    # Criterion-coverage recovery — the acceptance-contract safety valve.  A
-    # same-SHA not_promoted verdict whose blocker was
-    # ``criterion_coverage_incomplete`` (set in release_scoring when active
-    # criteria are uncovered) may re-run once the LIVE coverage summary shows the
-    # gate would no longer fire: every active criterion covered, or ZERO active
-    # criteria remain after a retraction/supersession cleared an uncoverable one.
-    # This is the deadlock this direction exists to break — retracting an
-    # uncoverable criterion must let the qualifier re-audit and clear the gate
-    # WITHOUT a SHA change or operator action.  Mirrors the ``ci_unresolved``
-    # narrow exception exactly: it relaxes caching for THIS blocker only and
-    # only on the SAME SHA (a different SHA already re-runs via the normal cache
-    # miss), and every downstream gate still applies to the fresh re-audit.
+    # Goal-verification recovery — the acceptance-contract safety valve, updated
+    # in LOCKSTEP with the redesigned gate.  A same-SHA not_promoted verdict whose
+    # blocker was ``criterion_coverage_incomplete`` (now set in release_scoring
+    # when any active CATEGORY is not ``met`` OR the residual gap is non-empty) may
+    # re-run once the ledger shows the candidate is FULLY MET again: every active
+    # category met AND the residual clean.  This is the deadlock this valve exists
+    # to break — retracting/superseding an uncoverable criterion, or a re-grade
+    # flipping a category to ``met``, must let the qualifier re-audit and clear the
+    # gate WITHOUT a SHA change or operator action.  ``is_candidate_fully_met``
+    # subsumes the old ``total - covered - attested - backfilled <= 0`` arithmetic
+    # AND the residual leg in one sha-keyed read.  Mirrors the ``ci_unresolved``
+    # narrow exception: relaxes caching for THIS blocker, on the SAME SHA only.
     criterion_coverage_recovered_same_sha = False
     if (
         prior_status == "not_promoted"
         and prior_qual.get("blocker") == "criterion_coverage_incomplete"
         and prior_qual.get("candidate_sha") == candidate_sha
     ):
-        try:
-            _coverage = await get_version_coverage_summary(session, version.id)
-            _total = int(_coverage.get("total") or 0)
-            _covered = int(_coverage.get("covered") or 0)
-            # Mirror the release_scoring gate exactly: it fires when
-            # ``total > 0 and covered < total``, so the gate is CLEAR when no
-            # active criteria remain (total == 0) or every active one is covered.
-            criterion_coverage_recovered_same_sha = _total == 0 or _covered >= _total
-        except Exception:  # noqa: BLE001 — a coverage lookup failure stays cached (safe: no wrong re-run)
-            logger.warning(
-                "[RELEASE_QUALIFIER] run_qualification: coverage-recovery check "
-                "failed for v%d — leaving the not_promoted verdict cached",
-                version.version_number,
-            )
+        if _category_ledger is None:
+            # Sibling ledger not present in this checkout — cannot re-evaluate the
+            # per-category gate, so leave the verdict cached (safe: no wrong re-run).
             criterion_coverage_recovered_same_sha = False
+        else:
+            try:
+                criterion_coverage_recovered_same_sha = (
+                    await _category_ledger.is_candidate_fully_met(
+                        session, version.id, candidate_sha
+                    )
+                )
+            except Exception:  # noqa: BLE001 — a ledger lookup failure stays cached (safe: no wrong re-run)
+                logger.warning(
+                    "[RELEASE_QUALIFIER] run_qualification: goal-verification "
+                    "recovery check failed for v%d — leaving the not_promoted "
+                    "verdict cached",
+                    version.version_number,
+                )
+                criterion_coverage_recovered_same_sha = False
     # Content-hash reuse: a newer commit whose AUDITED SURFACE is byte-identical
     # to the prior conclusive candidate (differs only in excluded CI/fixture/
     # config files) carries the same verdict — reuse it instead of re-rolling the
@@ -2211,20 +2305,125 @@ async def run_qualification(
     # _finalize_qualification).  Contentless == empty for this purpose.
     version_goal = (version.goal or "").strip()
     _merge_grade_goal_usable = bool(version_goal) and not is_contentless_goal(version_goal)
-    try:
-        audit_task = await _spawn_release_audit_task(
-            session,
-            project_id,
-            version_id=version.id,
-            base_branch=promotion_target,
-            diff_range=diff_range,
-            candidate_sha=candidate_sha,
-            audit_base_sha=_incremental_audit_base_sha(prior_qual, candidate_sha),
-            version_goal=version.goal,
+    # Consult the per-dimension fact ledger before spawning children (Phase 1
+    # ledger reuse).  On a re-drive at the same candidate_sha, dimensions that
+    # already resolved (passed/failed/blocked) in a prior finalize are carried
+    # forward from the ledger — their child tasks are NOT re-spawned, and only
+    # the dimensions still unavailable/pending are re-run.  This is the piece
+    # that flattens the "attempt 12→13" re-audit cost when a single gate
+    # (e.g. merge-grade) hit a transient infra failure.
+    prior_dim_results = await _load_prior_dimension_results(
+        session, version, candidate_sha
+    )
+    resolved_dims: dict[str, dict[str, Any]] = {}
+    for dim, row in prior_dim_results.items():
+        if row.status in _LEDGER_RESOLVED_STATUSES:
+            resolved_dims[dim] = {
+                "status": row.status,
+                "sub_score": row.sub_score,
+                "blocker": row.blocker,
+                "detail": row.detail,
+            }
+    # Audit-challenge parity on reuse: a stored audit fact with status "failed"
+    # carries a finding-driven DEDUCTION that is only trustworthy once the
+    # audit-challenge gate CONFIRMED the underlying findings.  The audit
+    # dimension is upserted to the ledger EARLY (before the challenge gate runs
+    # in _finalize_qualification), so a prior attempt that HELD on a
+    # missing/uncertain/SHA-mismatched challenge leaves audit="failed" while the
+    # "challenge" dimension is never written "passed" (its dual-write is only
+    # reached on a terminal finalize).  Reusing that audit verbatim would
+    # compose an unconfirmed deduction and silently drop the challenge gate the
+    # fresh-run path enforces.  Force a fresh audit+challenge re-measurement
+    # instead — drop audit+test_erosion from the reuse set so BOTH the spawn
+    # decision below AND the finalize composition route through the same gate.
+    #
+    # A stored audit fact with status "blocked" (sub_score None == the
+    # ``audit_missing`` hard-blocker sentinel) is the SECOND way a reused audit
+    # fact composes an un-re-measurable verdict, and it is strictly worse: the
+    # dimension carries NO usable report at all, so reusing it verbatim replays
+    # the identical ``audit_missing`` block on every permitted same-sha re-drive
+    # while ``_audit_needed`` stays False — the audit child is never re-spawned,
+    # so nothing can ever produce the report that would clear it.  That is a
+    # fail-closed wedge with no recovery valve short of new work landing (which
+    # moves the sha and abandons the ledger row).  A re-drive is only reached
+    # when some caller judged the candidate worth re-measuring, so the ONLY
+    # useful thing to do with a blocked audit fact is re-measure it.  Drop it
+    # from the reuse set for the same reason, and by the same mechanism, as the
+    # unconfirmed-deduction case above.
+    _reused_audit_status = resolved_dims.get("audit", {}).get("status")
+    _force_fresh_audit_reason: str | None = None
+    if (
+        _reused_audit_status == "failed"
+        and resolved_dims.get("challenge", {}).get("status") != "passed"
+    ):
+        _force_fresh_audit_reason = (
+            "reused a 'failed' audit whose challenge gate never resolved "
+            "'passed' — composing the unconfirmed deduction would silently drop "
+            "the challenge gate the fresh-run path enforces"
         )
-        audit_task_id = str(audit_task.id)
-        if _merge_grade_goal_usable:
+    elif _reused_audit_status == "blocked":
+        _force_fresh_audit_reason = (
+            "reused a 'blocked' audit fact (no usable report) — replaying it "
+            "would re-block on audit_missing forever, since the audit child is "
+            "not re-spawned while the fact is reused"
+        )
+    if _force_fresh_audit_reason:
+        logger.info(
+            "[RELEASE_QUALIFIER] v%d candidate %s %s — forcing a fresh "
+            "audit+challenge re-measurement",
+            version.version_number,
+            candidate_sha[:8],
+            _force_fresh_audit_reason,
+        )
+        resolved_dims.pop("audit", None)
+        resolved_dims.pop("test_erosion", None)
+    # A child task is needed only when NOT ALL of its produced dimensions are
+    # already resolved.  audit task → {audit, test_erosion}; smoketest task →
+    # {smoketest}; merge_grade task → {merge_grade}.
+    _audit_needed = not (
+        "audit" in resolved_dims and "test_erosion" in resolved_dims
+    )
+    _smoketest_needed = smoketest_enabled and "smoketest" not in resolved_dims
+    _merge_grade_needed = (
+        _merge_grade_goal_usable and "merge_grade" not in resolved_dims
+    )
+    if resolved_dims:
+        logger.info(
+            "[RELEASE_QUALIFIER] run_qualification: v%d candidate %s has %d "
+            "already-resolved dimension(s) from a prior finalize — "
+            "audit_needed=%s smoketest_needed=%s merge_grade_needed=%s",
+            version.version_number,
+            candidate_sha[:8],
+            len(resolved_dims),
+            _audit_needed,
+            _smoketest_needed,
+            _merge_grade_needed,
+        )
+    try:
+        if _audit_needed:
+            audit_task = await _spawn_release_audit_task(
+                session,
+                project_id,
+                version_id=version.id,
+                base_branch=promotion_target,
+                diff_range=diff_range,
+                candidate_sha=candidate_sha,
+                audit_base_sha=_incremental_audit_base_sha(prior_qual, candidate_sha),
+                version_goal=version.goal,
+            )
+            audit_task_id = str(audit_task.id)
+        if _merge_grade_needed:
             merged_pr_numbers = await _merged_pr_numbers_for_version(session, version)
+            # Goal-verification redesign: the merge-grade agent grades the merged
+            # diff per ACTIVE acceptance-criterion CATEGORY, so pass the rubric
+            # (stable ``criterion_key`` + text) into the payload.  The agent keys
+            # its per-category verdicts back on these keys.
+            _mg_criteria = await get_active_criteria_rubric(session, version.id)
+            _mg_categories = [
+                {"category_key": c.get("criterion_key"), "text": c.get("text")}
+                for c in _mg_criteria
+                if c.get("criterion_key")
+            ]
             merge_grade_task = await _spawn_release_merge_grade_task(
                 session,
                 project_id,
@@ -2234,9 +2433,10 @@ async def run_qualification(
                 candidate_sha=candidate_sha,
                 version_goal=version_goal,
                 merged_pr_numbers=merged_pr_numbers,
+                categories=_mg_categories,
             )
             merge_grade_task_id = str(merge_grade_task.id)
-        if smoketest_enabled:
+        if _smoketest_needed:
             smoketest_task = await _spawn_qualifier_smoketest_task(
                 session,
                 project_id,
@@ -2271,6 +2471,8 @@ async def run_qualification(
         session.add(version)
         return {"status": "spawn_failed"}
 
+    audit_challenge_spawn_pending = _audit_needed
+
     # 6. Stamp the pending qualification record.  smoketest_task_id is None
     #    when the smoketest subsystem is disabled — maybe_finalize_qualification
     #    and the reaper sweep both treat a None smoketest id as "no smoketest
@@ -2301,6 +2503,11 @@ async def run_qualification(
         "keyless_requalification_consumed_at": prior_qual.get(
             "keyless_requalification_consumed_at"
         ),
+        # Dimensions already resolved (passed/failed/blocked) for this
+        # candidate_sha from a prior finalize — carried forward from the
+        # per-dimension ledger so _finalize_qualification can compose from
+        # them without re-running their gates.
+        "resolved_dimensions": resolved_dims if resolved_dims else None,
     }
     # Read-modify-write is safe here (unlike the no_credentials / sha_error
     # early returns, which run pre-lock and use the atomic
@@ -2381,14 +2588,22 @@ _BLOCKER_LABELS: dict[str, str] = {
         "production's recorded schema state (deploy-fatal drift)"
     ),
     "criterion_coverage_incomplete": (
-        "one or more version acceptance criteria remain uncovered; stuck "
-        "criteria (no direction mapping, or all mapped directions retired) need "
-        "direction remapping or operator attestation to clear"
+        "the blind merge-grade found the merged diff does not yet satisfy the "
+        "version goal: at least one active acceptance-criterion CATEGORY is not "
+        "met (or is only partially met), or the grader named a goal aspect that "
+        "no category captures (residual gap) — the categories must all grade "
+        "'met' with cited diff evidence, and the residual must be clean, to clear"
     ),
     "merge_grade_misses": (
         "the merged diffs 'misses' the version goal per the blind merge-grade "
         "and the merge_grade_block_threshold is armed"
     ),
+    # NOTE: ``uncorroborated_attestation`` was retired with the attestation gate
+    # it labeled (replaced by the per-category goal-verification gate, whose
+    # block surfaces as ``criterion_coverage_incomplete``).  It has no emitter
+    # anywhere in the backend; a label for a blocker nothing can emit is dead
+    # operator-facing vocabulary, so it is intentionally absent here.  Do not
+    # re-add a label without an emitter — see test_blocker_labels_have_emitters.
 }
 
 
@@ -2849,6 +3064,57 @@ async def _compute_acceptance_window_aggregate(
     }
 
 
+async def _collect_verified_merge_test_evidence(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+) -> dict[str, list[str]]:
+    """Gather the candidate's VERIFIED-merged test + production-seam file paths.
+
+    Feeds the v2 machine-tier upgrade in ``evaluate_merge_grade``: a merge-grade
+    ``{"kind": "test"}`` citation earns the machine tier only when the cited test
+    is among these ``test_files`` (a test that shipped in a merge gated by a REAL
+    CI/test verdict — ``landed_signal.is_verified_merge``) AND semantically maps to
+    one of these ``seam_files``.  Restricting to verified merges is how "ran green
+    on the candidate SHA" is machine-confirmed without re-running any test at grade
+    time: the qualifier has no live test-runner, and a verified merge is the
+    standing machine evidence that the shipped test ran green under real CI.
+
+    Scans the SAME version window as ``_compute_acceptance_window_aggregate`` — all
+    COMPLETED, landed tasks that completed at/after ``version.opened_at`` — and, for
+    those whose merge is ``verified``, splits each task's ``_pr_changed_files`` into
+    test vs non-test (production seam) paths.  Returns
+    ``{"test_files": [...], "seam_files": [...]}`` (deduplicated, sorted).
+    """
+    since = version.opened_at
+    stmt = select(Task).where(
+        Task.project_id == version.project_id,
+        Task.status == TaskStatus.COMPLETED,
+        landed_signal_predicate(session),
+        Task.updated_at >= since,
+    )
+    rows = [
+        task
+        for task in (await session.execute(stmt)).scalars().all()
+        if release_version._task_completed_at(task) >= since
+    ]
+    test_files: set[str] = set()
+    seam_files: set[str] = set()
+    for task in rows:
+        if not is_verified_merge(task):
+            continue
+        changed = (task.context or {}).get("_pr_changed_files")
+        if not isinstance(changed, list):
+            continue
+        for p in changed:
+            if not isinstance(p, str) or not p.strip():
+                continue
+            if _is_test_path(p):
+                test_files.add(p.strip())
+            else:
+                seam_files.add(p.strip())
+    return {"test_files": sorted(test_files), "seam_files": sorted(seam_files)}
+
+
 async def _guard_ci_unresolved_promotion_in_flight(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
@@ -3112,7 +3378,7 @@ async def _count_project_actionable_open_completion_debt(
     """Count open completion-debt rows owned by the qualified project only."""
     if project_id is None:
         return 0
-    from app.models import CompletionDebtEntry  # noqa: PLC0415
+    from app.models import CompletionDebtEntry
 
     stmt = (
         select(sa_func.count())
@@ -3123,6 +3389,558 @@ async def _count_project_actionable_open_completion_debt(
         )
     )
     return int((await session.execute(stmt)).scalar_one() or 0)
+
+
+async def _upsert_dimension_result(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+    candidate_sha: str | None,
+    dimension: str,
+    *,
+    status: str,
+    sub_score: float | None = None,
+    blocker: str | None = None,
+    detail: Any | None = None,
+    producing_task_id: Any | None = None,
+    audited_surface_hash: str | None = None,
+) -> None:
+    """Best-effort UPSERT of ONE per-(candidate_sha, dimension) qualification fact.
+
+    Phase 1 dual-write (design doc "From Batch Attempts to a Per-Dimension Fact
+    Ledger", section 3).  SELECT-then-INSERT/UPDATE on the unique
+    ``(release_version_id, candidate_sha, dimension)`` key so a later re-check of
+    a single gate re-records ONLY its own fact (latest write wins) without
+    touching the other dimensions that already passed for the same candidate
+    tree.  SELECT-then-write (not a dialect-specific ON CONFLICT upsert) keeps
+    the helper portable across the SQLite test gate and the Postgres runtime.
+
+    CRITICAL: recording must NEVER break or roll back a qualification/promotion
+    (mirrors ``_record_qualification_verdict``).  The read+write runs inside a
+    SAVEPOINT (``begin_nested``) wrapped in try/except; any failure — a malformed
+    row, or (until the sibling migration lands) a missing table — is rolled back
+    to the savepoint leaving the OUTER transaction intact, logged, and swallowed.
+    Purely additive: no existing write or decision is affected.  The caller is
+    expected to have flushed its own staged mutations into the outer transaction
+    first, so this savepoint isolates only the ledger write.
+    """
+    # A per-tree fact is only meaningful with a candidate SHA (the upsert key
+    # relies on it).  Skip silently otherwise — additive, best-effort.
+    if not candidate_sha:
+        return
+
+    _producing_uuid: uuid.UUID | None = None
+    if producing_task_id:
+        try:
+            _producing_uuid = uuid.UUID(str(producing_task_id))
+        except (ValueError, TypeError, AttributeError):
+            _producing_uuid = None
+
+    _sub_score: float | None = None
+    if isinstance(sub_score, (int, float)) and not isinstance(sub_score, bool):
+        _sub_score = float(sub_score)
+
+    try:
+        async with session.begin_nested():
+            existing = (
+                await session.execute(
+                    select(QualificationDimensionResult).where(
+                        QualificationDimensionResult.release_version_id == version.id,
+                        QualificationDimensionResult.candidate_sha == candidate_sha,
+                        QualificationDimensionResult.dimension == dimension,
+                    )
+                )
+            ).scalar_one_or_none()
+            if existing is not None:
+                # Never downgrade a resolved fact (passed/failed/blocked) to a
+                # non-resolved status (e.g. "unavailable" from an infra failure
+                # in a different gate or a failed _load_prior_dimension_results).
+                # _record_infra_dimension_unavailable has a matching guard at its
+                # call site; this primitive-level guard is defense-in-depth.
+                if (
+                    existing.status in _LEDGER_RESOLVED_STATUSES
+                    and status not in _LEDGER_RESOLVED_STATUSES
+                ):
+                    logger.debug(
+                        "[RELEASE_QUALIFIER] skipping downgrade of resolved dimension "
+                        "'%s' on v%s/%s from '%s' to '%s'",
+                        dimension,
+                        getattr(version, "version_number", "?"),
+                        candidate_sha[:8] if candidate_sha else "?",
+                        existing.status,
+                        status,
+                    )
+                    return
+                existing.status = status
+                existing.sub_score = _sub_score
+                existing.blocker = blocker
+                existing.audited_surface_hash = audited_surface_hash
+                existing.detail = detail
+                existing.producing_task_id = _producing_uuid
+                existing.computed_at = _utcnow()
+                session.add(existing)
+            else:
+                session.add(
+                    QualificationDimensionResult(
+                        project_id=version.project_id,
+                        release_version_id=version.id,
+                        candidate_sha=candidate_sha,
+                        dimension=dimension,
+                        status=status,
+                        sub_score=_sub_score,
+                        blocker=blocker,
+                        audited_surface_hash=audited_surface_hash,
+                        detail=detail,
+                        producing_task_id=_producing_uuid,
+                    )
+                )
+            await session.flush()
+    except Exception as exc:  # noqa: BLE001 — recording is best-effort, never fatal
+        logger.warning(
+            "[RELEASE_QUALIFIER] failed to upsert dimension result '%s' for v%s "
+            "(non-fatal — additive ledger only): %s",
+            dimension,
+            getattr(version, "version_number", "?"),
+            exc,
+        )
+
+
+# Per-dimension ledger status vocabulary (design doc "From Batch Attempts to a
+# Per-Dimension Fact Ledger", section 3).  A dimension is RESOLVED when its gate
+# reached a real pass/fail/blocked outcome; it is TERMINAL (for the same-tree
+# promotion invariant) when it additionally reached a legitimate not-applicable
+# 'unavailable' (e.g. smoketest disabled, merge-grade exempt).  'pending' and a
+# missing row are neither.  An infra failure records 'unavailable' — RESOLVED is
+# deliberately narrower than TERMINAL so a re-finalize RE-RUNS an infra-held
+# dimension while REUSING the ones that already truly passed/failed/blocked.
+_LEDGER_RESOLVED_STATUSES: frozenset[str] = frozenset({"passed", "failed", "blocked"})
+_LEDGER_TERMINAL_STATUSES: frozenset[str] = frozenset(
+    {"passed", "failed", "blocked", "unavailable"}
+)
+
+# Gates that must every one have a terminal fact at the SAME candidate_sha before
+# a promotion may compose from the ledger — the informational dimensions
+# (challenge / acceptance_window / debt_pressure) never gate promotion and are
+# excluded.  smoketest is required only when the run had it enabled (audit H3).
+_PROMOTION_REQUIRED_DIMENSIONS: tuple[str, ...] = (
+    "ci",
+    "audit",
+    "test_erosion",
+    "migration_identity",
+    "migration_apply",
+    "merge_grade",
+)
+
+
+async def _load_prior_dimension_results(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+    candidate_sha: str | None,
+) -> dict[str, QualificationDimensionResult]:
+    """Return the per-dimension ledger rows already recorded for this candidate.
+
+    Read side of the per-dimension fact ledger (Phase 1).  Keyed by dimension,
+    scoped to ``(release_version_id, candidate_sha)`` so facts from a DIFFERENT
+    candidate tree are never mixed in — preserving the batch model's "everything
+    scored the same tree" guarantee.  Best-effort: any read failure (including a
+    missing table before the sibling migration lands) degrades to an empty map so
+    finalize continues exactly as before.
+    """
+    if not candidate_sha:
+        return {}
+    try:
+        rows = (
+            (
+                await session.execute(
+                    select(QualificationDimensionResult).where(
+                        QualificationDimensionResult.release_version_id == version.id,
+                        QualificationDimensionResult.candidate_sha == candidate_sha,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    except Exception as exc:  # noqa: BLE001 — read is best-effort, never fatal
+        logger.warning(
+            "[RELEASE_QUALIFIER] failed to load prior dimension ledger for v%s "
+            "(non-fatal — composing from live gates): %s",
+            getattr(version, "version_number", "?"),
+            exc,
+        )
+        return {}
+    return {r.dimension: r for r in rows}
+
+
+async def _record_infra_dimension_unavailable(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+    candidate_sha: str | None,
+    dimension: str,
+    *,
+    infra_error: str,
+    signature: str | None = None,
+) -> int:
+    """Mark ONE dimension 'unavailable' in the ledger on an infrastructure failure.
+
+    Per-dimension failure isolation (Phase 1): an infra failure in a single gate
+    records ONLY that ``(candidate_sha, dimension)`` fact as unavailable — the
+    other dimensions that already resolved for the same candidate tree keep their
+    rows untouched (the upsert only ever writes this one dimension's row).  The
+    consecutive-infra-error streak is tracked PER-DIMENSION in the row's ``detail``
+    JSONB, so one gate's flakiness cannot burn another gate's retry budget.
+
+    Best-effort — mirrors ``_upsert_dimension_result`` and never breaks finalize.
+    Returns the new per-dimension streak (0 when the write is skipped, e.g. no
+    candidate SHA).
+    """
+    if not candidate_sha:
+        return 0
+    prior_streak = 0
+    try:
+        existing = (
+            await session.execute(
+                select(QualificationDimensionResult).where(
+                    QualificationDimensionResult.release_version_id == version.id,
+                    QualificationDimensionResult.candidate_sha == candidate_sha,
+                    QualificationDimensionResult.dimension == dimension,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is not None and existing.status in _LEDGER_RESOLVED_STATUSES:
+            # Already resolved (passed/failed/blocked) — an infra failure in a
+            # different gate must never downgrade a fact that truly settled.
+            logger.debug(
+                "[RELEASE_QUALIFIER] skipping infra-unavailable write for dimension "
+                "'%s' on v%s/%s — already resolved as '%s'",
+                dimension,
+                getattr(version, "version_number", "?"),
+                candidate_sha[:8] if candidate_sha else "?",
+                existing.status,
+            )
+            return 0
+        if existing is not None and isinstance(existing.detail, dict):
+            prior = existing.detail.get("consecutive_infra_errors")
+            if isinstance(prior, int) and not isinstance(prior, bool):
+                prior_streak = prior
+    except Exception as exc:  # noqa: BLE001 — best-effort read of the prior streak
+        logger.warning(
+            "[RELEASE_QUALIFIER] failed to read prior infra streak for dimension "
+            "'%s' on v%s (non-fatal): %s",
+            dimension,
+            getattr(version, "version_number", "?"),
+            exc,
+        )
+        prior_streak = 0
+    new_streak = prior_streak + 1
+    await _upsert_dimension_result(
+        session,
+        version,
+        candidate_sha,
+        dimension,
+        status="unavailable",
+        blocker=None,
+        detail={
+            "infra_error": infra_error,
+            "infra_failure_signature": signature,
+            "consecutive_infra_errors": new_streak,
+        },
+    )
+    return new_streak
+
+
+async def _promotion_dimension_ledger_complete(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+    candidate_sha: str | None,
+    *,
+    smoketest_enabled: bool = True,
+) -> tuple[bool, list[str]]:
+    """Is there a full set of terminal dimension facts at ONE candidate_sha?
+
+    The batch model's invariant — every gate scored the SAME candidate tree —
+    carried onto the per-dimension ledger: a promotion may only compose from the
+    ledger when every required gating dimension has a TERMINAL row (not pending,
+    not missing) at ``candidate_sha``.  A required dimension whose only fact is at
+    a DIFFERENT candidate_sha does not count (``_load_prior_dimension_results`` is
+    already sha-scoped).  Returns ``(complete, missing_dimensions)``.
+    """
+    required = list(_PROMOTION_REQUIRED_DIMENSIONS)
+    if smoketest_enabled:
+        required.append("smoketest")
+    prior = await _load_prior_dimension_results(session, version, candidate_sha)
+    missing = [
+        dim
+        for dim in required
+        if dim not in prior or prior[dim].status not in _LEDGER_TERMINAL_STATUSES
+    ]
+    return (not missing, missing)
+
+
+async def _dual_write_dimension_results(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+    base_record: dict[str, Any],
+    composite: dict[str, Any],
+) -> None:
+    """Dual-write every resolved qualification dimension as its own ledger row.
+
+    Phase 1 of the per-dimension fact ledger (design doc "From Batch Attempts to
+    a Per-Dimension Fact Ledger").  Called from ``_finalize_qualification`` once
+    the composite ``base_record`` is fully assembled — i.e. after EVERY gate /
+    dimension has resolved (CI, audit, test-erosion, smoketest, challenge, both
+    migration gates, merge-grade, acceptance-window, debt-pressure,
+    capability-proof).  Deriving
+    the per-dimension facts from the already-assembled ``base_record`` +
+    ``composite`` keeps the write in ONE additive place that cannot alter control
+    flow, rather than threading a mutation through the ~1300-line finalize body
+    (all three terminal paths — not_promoted / dry_run / promote — flow through
+    this single point).
+
+    ADDITIVE to the composite / ``last_qualification`` / ``QualificationVerdict``
+    writes — it changes no decision.  READ-SIDE COMPOSITION (Phase 1): a
+    dimension that already reached a RESOLVED (passed/failed/blocked) fact at this
+    same ``candidate_sha`` in an earlier finalize is REUSED verbatim — its stored
+    row is left untouched rather than overwritten with the freshly recomputed
+    value.  So a finalize re-run after a transient infra failure re-records ONLY
+    the dimensions that were still unavailable, and the gates that already passed
+    for this candidate tree are neither re-run into the ledger nor discarded.
+    Each written row goes through best-effort ``_upsert_dimension_result``.
+    """
+    candidate_sha = base_record.get("candidate_sha")
+    if not candidate_sha:
+        # No candidate tree → no meaningful per-tree fact; skip the whole block.
+        return
+
+    # Read side: dimensions already RESOLVED for this candidate tree are reused
+    # verbatim (skip re-recording), isolating a re-check to the still-unresolved
+    # gates.  Best-effort — an empty map degrades to "write every dimension".
+    prior_resolved = {
+        dim: row
+        for dim, row in (
+            await _load_prior_dimension_results(session, version, candidate_sha)
+        ).items()
+        if row.status in _LEDGER_RESOLVED_STATUSES
+    }
+
+    sub_scores = base_record.get("sub_scores") or {}
+    blocker = composite.get("blocker")
+    ci_green = bool(base_record.get("ci_green"))
+    smoketest_enabled = bool(base_record.get("smoketest_enabled", True))
+
+    def _score(key: str) -> float | None:
+        v = sub_scores.get(key)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return float(v)
+        return None
+
+    def _own_blocker(codes: set[str]) -> str | None:
+        return blocker if blocker in codes else None
+
+    def _mig_status(verdict: Any) -> str:
+        if verdict == "block":
+            return "blocked"
+        if verdict == "defer":
+            return "unavailable"
+        if verdict in ("ok", "pass"):
+            return "passed"
+        return "unavailable"
+
+    audit_score = _score("audit")
+    if blocker == "audit_missing":
+        audit_status = "blocked"
+    elif audit_score is not None and audit_score < 1.0:
+        audit_status = "failed"
+    else:
+        audit_status = "passed"
+
+    if not smoketest_enabled:
+        smoketest_status = "unavailable"
+    elif blocker == "smoketest_startup_failed":
+        smoketest_status = "blocked"
+    else:
+        smoketest_status = "passed"
+
+    mg_status_raw = base_record.get("merge_grade_status")
+    if mg_status_raw == "pass":
+        merge_grade_status = "passed"
+    elif mg_status_raw in ("fail", "misses"):
+        merge_grade_status = "failed"
+    else:
+        merge_grade_status = "unavailable"
+    mg_coverage = base_record.get("merge_grade_coverage")
+
+    challenge_verdicts = base_record.get("challenge_verdicts")
+    acc_fraction = sub_scores.get("acceptance_window_fraction")
+    debt_score = _score("debt_pressure")
+
+    # Capability-proof gate ledger status: OFF → unavailable (gate not active),
+    # OBSERVE → passed (watching), ENFORCE → same as the composite blocker.
+    _cp_detail = base_record.get("capability_proof_detail") or {}
+    _cp_mode = _cp_detail.get("mode", "off")
+    if _cp_mode == "off":
+        _cp_status = "unavailable"
+    elif _cp_mode == "observe":
+        _cp_status = "passed"
+    else:  # enforce
+        _cp_status = "blocked" if blocker == "capability_proof_gate_blocked" else "passed"
+
+    specs: list[dict[str, Any]] = [
+        {
+            "dimension": "ci",
+            "status": "passed" if ci_green else "blocked",
+            "sub_score": None,
+            "blocker": _own_blocker({"ci_not_green", "ci_unresolved"}),
+            "detail": base_record.get("ci_resolution"),
+            "producing_task_id": None,
+        },
+        {
+            "dimension": "audit",
+            "status": audit_status,
+            "sub_score": audit_score,
+            "blocker": _own_blocker({"audit_missing"}),
+            "audited_surface_hash": base_record.get("candidate_diff_hash"),
+            "detail": {
+                "audit_missing_reason": base_record.get("audit_missing_reason"),
+                "audit_findings_total": base_record.get("audit_findings_total"),
+                "excluded_audit_findings_total": base_record.get("excluded_audit_findings_total"),
+            },
+            "producing_task_id": base_record.get("audit_task_id"),
+        },
+        {
+            "dimension": "test_erosion",
+            "status": "blocked" if blocker == "test_file_deleted" else "passed",
+            "sub_score": _score("test_erosion"),
+            "blocker": _own_blocker({"test_file_deleted"}),
+            "detail": base_record.get("test_erosion_detail"),
+            "producing_task_id": base_record.get("audit_task_id"),
+        },
+        {
+            "dimension": "smoketest",
+            "status": smoketest_status,
+            "sub_score": _score("smoketest") if smoketest_enabled else None,
+            "blocker": _own_blocker({"smoketest_startup_failed"}),
+            "detail": base_record.get("smoketest_detail"),
+            "producing_task_id": base_record.get("smoketest_task_id"),
+        },
+        {
+            "dimension": "challenge",
+            "status": "passed" if challenge_verdicts else "unavailable",
+            "sub_score": None,
+            "blocker": None,
+            "detail": {
+                "verdicts": challenge_verdicts,
+                "challenger_refuted_audit_findings": base_record.get("challenger_refuted_audit_findings"),
+            },
+            "producing_task_id": base_record.get("audit_challenge_task_id"),
+        },
+        {
+            "dimension": "migration_identity",
+            "status": _mig_status(base_record.get("migration_safety")),
+            "sub_score": None,
+            "blocker": _own_blocker({"migration_identity_collision"}),
+            "detail": {
+                "verdict": base_record.get("migration_safety"),
+                "detail": base_record.get("migration_safety_detail"),
+            },
+            "producing_task_id": None,
+        },
+        {
+            "dimension": "migration_apply",
+            "status": _mig_status(base_record.get("migration_apply_safety")),
+            "sub_score": None,
+            "blocker": _own_blocker({"migration_apply_drift"}),
+            "detail": {
+                "verdict": base_record.get("migration_apply_safety"),
+                "detail": base_record.get("migration_apply_safety_detail"),
+            },
+            "producing_task_id": None,
+        },
+        {
+            "dimension": "merge_grade",
+            "status": merge_grade_status,
+            "sub_score": (
+                float(mg_coverage)
+                if isinstance(mg_coverage, (int, float)) and not isinstance(mg_coverage, bool)
+                else None
+            ),
+            "blocker": _own_blocker({"merge_grade_misses"}),
+            "detail": base_record.get("merge_grade"),
+            "producing_task_id": base_record.get("merge_grade_task_id"),
+        },
+        {
+            "dimension": "acceptance_window",
+            "status": "passed" if acc_fraction is not None else "unavailable",
+            "sub_score": (
+                float(acc_fraction)
+                if isinstance(acc_fraction, (int, float)) and not isinstance(acc_fraction, bool)
+                else None
+            ),
+            "blocker": None,
+            "detail": {
+                k: v for k, v in sub_scores.items() if str(k).startswith("acceptance_window")
+            },
+            "producing_task_id": None,
+        },
+        {
+            "dimension": "debt_pressure",
+            "status": "passed" if debt_score is not None else "unavailable",
+            "sub_score": debt_score,
+            "blocker": None,
+            "detail": base_record.get("completion_debt"),
+            "producing_task_id": None,
+        },
+        {
+            "dimension": "capability_proof",
+            "status": _cp_status,
+            "sub_score": None,
+            "blocker": _own_blocker({"capability_proof_gate_blocked"}),
+            "detail": _cp_detail,
+            "producing_task_id": None,
+        },
+    ]
+
+    try:
+        await session.flush()
+    except Exception as exc:  # noqa: BLE001 — best-effort; never break finalize
+        logger.warning(
+            "[RELEASE_QUALIFIER] v%s dimension-ledger pre-flush failed (%s); "
+            "skipping additive dual-write",
+            getattr(version, "version_number", "?"),
+            exc,
+        )
+        return
+
+    for spec in specs:
+        if spec["dimension"] in prior_resolved:
+            # Already resolved (passed/failed/blocked) for this candidate tree in
+            # an earlier finalize — reuse the stored fact, do NOT re-record or
+            # overwrite it.  This is the read-side composition: a re-check after a
+            # transient failure re-runs ONLY the still-unavailable dimensions and
+            # never discards the ones that already passed for the same tree.
+            continue
+        _detail = spec["detail"]
+        # Tag a blocked dimension's fact with WHERE its check runs (deployed-side
+        # inert-until-promote vs candidate-side clearable by an automain fix), so
+        # the per-dimension ledger view carries the same execution-site signal as
+        # last_qualification.  Wrap non-dict details so we never clobber them.
+        _spec_site = blocker_execution_site(spec["blocker"])
+        if _spec_site is not None:
+            if isinstance(_detail, dict):
+                _detail = {**_detail, "execution_site": _spec_site}
+            else:
+                _detail = {"execution_site": _spec_site, "detail": _detail}
+        await _upsert_dimension_result(
+            session,
+            version,
+            candidate_sha,
+            spec["dimension"],
+            status=spec["status"],
+            sub_score=spec["sub_score"],
+            blocker=spec["blocker"],
+            detail=_detail,
+            producing_task_id=spec["producing_task_id"],
+            audited_surface_hash=spec.get("audited_surface_hash"),
+        )
 
 
 async def _finalize_qualification(
@@ -3171,6 +3989,12 @@ async def _finalize_qualification(
     # must match the children that actually ran.  Legacy records that predate
     # the flag default to True (the old always-spawn behaviour).
     smoketest_enabled = bool(qual.get("smoketest_enabled", True))
+    # Dimensions already resolved (passed/failed/blocked) for this candidate_sha
+    # from a prior finalize, carried forward by run_qualification from the
+    # per-dimension ledger.  When a dimension is present here its gate evaluation
+    # is composed from the ledger rather than re-run, and its child task may not
+    # have been spawned (the spawn coordinator skipped it).
+    resolved_dims: dict[str, dict[str, Any]] = qual.get("resolved_dimensions") or {}
 
     # Re-resolve CI for the candidate commit NOW rather than reusing the
     # boolean frozen at spawn — a candidate whose checks were merely pending
@@ -3188,6 +4012,15 @@ async def _finalize_qualification(
     else:
         ci_green, ci_resolution = await _resolve_ci_at_finalize(
             session, version, candidate_sha
+        )
+
+    # Eager-write CI dimension so this fact survives a later gate's infra failure
+    # that returns before _dual_write_dimension_results (line 5065).
+    if candidate_sha:
+        await _upsert_dimension_result(
+            session, version, candidate_sha, "ci",
+            status="passed" if ci_green else "blocked",
+            detail=ci_resolution if isinstance(ci_resolution, dict) else None,
         )
 
     _policy_project = await session.get(Project, version.project_id)
@@ -3415,109 +4248,196 @@ async def _finalize_qualification(
             )
 
     # --- Read the release_audit report -------------------------------------
-    audit_report: dict[str, Any] | None = None
-    if audit_task_id:
-        try:
-            audit_report = await _latest_artifact_logs(
-                session,
-                uuid.UUID(str(audit_task_id)),
-                ArtifactType.RELEASE_AUDIT_REPORT,
-            )
-        except (ValueError, TypeError):
-            logger.warning(
-                "[RELEASE_QUALIFIER] invalid audit_task_id %s on version v%d",
-                audit_task_id,
-                version.version_number,
-            )
-    # Defense-in-depth: a COMPLETED audit task whose RELEASE_AUDIT_REPORT
-    # artifact is absent or unparseable is an infrastructure failure — the
-    # agent ran but produced no usable output.  Route to _handle_infra_failure
-    # so the operator notification is "release_infra_failure" (not
-    # "release_blocked / audit_missing"), and no QualificationVerdict row is
-    # written.
-    if (
-        audit_report is None
-        and audit_task_id
-        and _audit_task_obj is not None
-        and _audit_task_obj.status == TaskStatus.COMPLETED
-    ):
-        return await _handle_infra_failure(
-            session, version, qual, "audit_report_missing"
-        )
-
-    audit_score, test_erosion_score = _score_audit(audit_report)
-    # Carry the findings (not just the score) into last_qualification so the
-    # strategic agent can target them — otherwise the audit sub-score, usually
-    # the binding constraint, is opaque to the loop.
-    audit_findings = _extract_audit_findings(audit_report)
-    # Carry the higher-severity findings the verification gate EXCLUDED from
-    # scoring — for display only, marked unverified — so an audit whose
-    # sub-score was inflated by dropped findings is rendered honestly instead of
-    # reading as clean. Never confirmed blockers.  Use original report (the
-    # unverified-primary gap is independent of the challenge reconciliation).
-    excluded_audit_findings = _extract_excluded_audit_findings(audit_report)
-    # Carry the specific test-erosion detail (deleted files / negative deltas)
-    # so the agent can target it when test-erosion is the binding constraint,
-    # the same way it sees audit_findings.
-    test_erosion_detail = _extract_test_erosion_detail(audit_report)
-    audit_missing_reason = _audit_missing_reason(audit_report)
-    if audit_missing_reason == "parseable_but_unscoreable":
-        return await _handle_infra_failure(
-            session, version, qual, "audit_report_parseable_but_unscoreable"
-        )
-    # An empty artifact dict has no scoring signal at all — _score_audit()
-    # returns a silent clean 1.0 because no deductions ever apply.
-    if isinstance(audit_report, dict) and not audit_report:
-        return await _handle_infra_failure(
-            session, version, qual, "audit_report_empty_dict"
-        )
-    # A "findings" key whose value is not a list is a malformed artifact shape.
-    # _score_audit() falls through to the "issues" fallback; if that is also
-    # absent or not a list, derived=1.0 with no deductions — treat as infra_failure.
-    if isinstance(audit_report, dict):
-        _findings_raw = audit_report.get("findings")
+    # When both audit and test_erosion dimensions are already resolved from a
+    # prior finalize at this candidate_sha (carried forward from the ledger),
+    # compose from the durable facts rather than reading artifacts — the audit
+    # child was not re-spawned for this re-drive.
+    _audit_and_erosion_resolved = (
+        "audit" in resolved_dims and "test_erosion" in resolved_dims
+    )
+    if _audit_and_erosion_resolved:
+        audit_report = None
+        audit_score = resolved_dims["audit"].get("sub_score")
+        test_erosion_score = resolved_dims["test_erosion"].get("sub_score")
+        # A resolved test_erosion fact with status "blocked" carries the
+        # hard-blocker sentinel (sub_score None == test_file_deleted); it must
+        # propagate as None so compute_composite re-raises the block, never
+        # coerce to a clean 1.0 (the same-SHA ledger-reuse fail-open).  Only a
+        # non-blocked reuse whose score is genuinely absent falls back to the
+        # neutral 1.0.
         if (
-            _findings_raw is not None
-            and not isinstance(_findings_raw, list)
-            and not isinstance(audit_report.get("issues"), list)
+            test_erosion_score is None
+            and resolved_dims["test_erosion"].get("status") != "blocked"
+        ):
+            test_erosion_score = 1.0
+        audit_findings: list[dict[str, Any]] = []
+        excluded_audit_findings: list[dict[str, Any]] = []
+        test_erosion_detail: dict[str, Any] = {}
+        audit_missing_reason: str | None = None
+    else:
+        audit_report: dict[str, Any] | None = None
+        if audit_task_id:
+            try:
+                audit_report = await _latest_artifact_logs(
+                    session,
+                    uuid.UUID(str(audit_task_id)),
+                    ArtifactType.RELEASE_AUDIT_REPORT,
+                )
+            except (ValueError, TypeError):
+                logger.warning(
+                    "[RELEASE_QUALIFIER] invalid audit_task_id %s on version v%d",
+                    audit_task_id,
+                    version.version_number,
+                )
+        # Defense-in-depth: a COMPLETED audit task whose RELEASE_AUDIT_REPORT
+        # artifact is absent or unparseable is an infrastructure failure — the
+        # agent ran but produced no usable output.  Route to _handle_infra_failure
+        # so the operator notification is "release_infra_failure" (not
+        # "release_blocked / audit_missing"), and no QualificationVerdict row is
+        # written.
+        if (
+            audit_report is None
+            and audit_task_id
+            and _audit_task_obj is not None
+            and _audit_task_obj.status == TaskStatus.COMPLETED
         ):
             return await _handle_infra_failure(
-                session, version, qual, "audit_report_findings_wrong_type"
+                session, version, qual, "audit_report_missing"
             )
+
+        audit_score, test_erosion_score = _score_audit(audit_report)
+        # Carry the findings (not just the score) into last_qualification so the
+        # strategic agent can target them — otherwise the audit sub-score, usually
+        # the binding constraint, is opaque to the loop.
+        audit_findings = _extract_audit_findings(audit_report)
+        # Carry the higher-severity findings the verification gate EXCLUDED from
+        # scoring — for display only, marked unverified — so an audit whose
+        # sub-score was inflated by dropped findings is rendered honestly instead of
+        # reading as clean. Never confirmed blockers.  Use original report (the
+        # unverified-primary gap is independent of the challenge reconciliation).
+        excluded_audit_findings = _extract_excluded_audit_findings(audit_report)
+        # Carry the specific test-erosion detail (deleted files / negative deltas)
+        # so the agent can target it when test-erosion is the binding constraint,
+        # the same way it sees audit_findings.
+        test_erosion_detail = _extract_test_erosion_detail(audit_report)
+        audit_missing_reason = _audit_missing_reason(audit_report)
+        if audit_missing_reason == "parseable_but_unscoreable":
+            return await _handle_infra_failure(
+                session, version, qual, "audit_report_parseable_but_unscoreable"
+            )
+        # An empty artifact dict has no scoring signal at all — _score_audit()
+        # returns a silent clean 1.0 because no deductions ever apply.
+        if isinstance(audit_report, dict) and not audit_report:
+            return await _handle_infra_failure(
+                session, version, qual, "audit_report_empty_dict"
+            )
+        # A "findings" key whose value is not a list is a malformed artifact shape.
+        # _score_audit() falls through to the "issues" fallback; if that is also
+        # absent or not a list, derived=1.0 with no deductions — treat as infra_failure.
+        if isinstance(audit_report, dict):
+            _findings_raw = audit_report.get("findings")
+            if (
+                _findings_raw is not None
+                and not isinstance(_findings_raw, list)
+                and not isinstance(audit_report.get("issues"), list)
+            ):
+                return await _handle_infra_failure(
+                    session, version, qual, "audit_report_findings_wrong_type"
+                )
+
+    # Persist audit and test_erosion to the per-dimension ledger immediately
+    # since both have now been resolved (from the ledger or live).  An infra
+    # failure in a later gate must not discard them — otherwise the re-drive
+    # re-spawns the audit child (~15 min) even though its results are intact.
+    # _upsert_dimension_result handles a None candidate_sha with a silent no-op.
+    if audit_score is None:
+        _audit_status = "blocked"
+    elif audit_score < 1.0:
+        _audit_status = "failed"
+    else:
+        _audit_status = "passed"
+    await _upsert_dimension_result(
+        session, version, candidate_sha, "audit",
+        status=_audit_status,
+        sub_score=audit_score,
+        producing_task_id=audit_task_id,
+    )
+    _te_status = "blocked" if test_erosion_score is None else "passed"
+    await _upsert_dimension_result(
+        session, version, candidate_sha, "test_erosion",
+        status=_te_status,
+        sub_score=test_erosion_score,
+        producing_task_id=audit_task_id,
+    )
 
     # --- Read the smoketest result -----------------------------------------
     # Audit H3: only when the smoketest subsystem was enabled — a disabled run
     # spawned no qualifier-smoketest child, so there is no SMOKETEST_RESULT to
     # read and smoketest_score stays None (compute_composite drops the
-    # dimension rather than hard-blocking on it).
-    smoketest_result: dict[str, Any] | None = None
-    if smoketest_enabled and smoketest_task_id:
-        try:
-            smoketest_result = await _latest_artifact_logs(
-                session,
-                uuid.UUID(str(smoketest_task_id)),
-                ArtifactType.SMOKETEST_RESULT,
+    # dimension rather than hard-blocking on it).  When the smoketest dimension
+    # is already resolved from a prior finalize at this candidate_sha, compose
+    # from the ledger (the smoketest child was not re-spawned).
+    if "smoketest" in resolved_dims:
+        smoketest_result = None
+        _smoke_score = resolved_dims["smoketest"].get("sub_score")
+        # A resolved smoketest fact with status "blocked" carries the
+        # hard-blocker sentinel (sub_score None == startup-suite failure); it
+        # must propagate as None so compute_composite re-raises the block,
+        # never coerce to a clean 1.0 (the same-SHA ledger-reuse fail-open).
+        # A non-blocked reuse with an absent score falls back to neutral 1.0.
+        if (
+            _smoke_score is None
+            and resolved_dims["smoketest"].get("status") == "blocked"
+        ):
+            smoketest_score = None
+        else:
+            smoketest_score = _smoke_score if _smoke_score is not None else 1.0
+        smoketest_detail = resolved_dims["smoketest"].get("detail") or {}
+    else:
+        smoketest_result: dict[str, Any] | None = None
+        if smoketest_enabled and smoketest_task_id:
+            try:
+                smoketest_result = await _latest_artifact_logs(
+                    session,
+                    uuid.UUID(str(smoketest_task_id)),
+                    ArtifactType.SMOKETEST_RESULT,
+                )
+            except (ValueError, TypeError):
+                logger.warning(
+                    "[RELEASE_QUALIFIER] invalid smoketest_task_id %s on version v%d",
+                    smoketest_task_id,
+                    version.version_number,
+                )
+        if (
+            smoketest_enabled
+            and smoketest_task_id
+            and _smoke_task_obj is not None
+            and _smoke_task_obj.status == TaskStatus.COMPLETED
+            and smoketest_result is None
+        ):
+            return await _handle_infra_failure(
+                session, version, qual, "smoketest_report_missing"
             )
-        except (ValueError, TypeError):
-            logger.warning(
-                "[RELEASE_QUALIFIER] invalid smoketest_task_id %s on version v%d",
-                smoketest_task_id,
-                version.version_number,
-            )
-    if (
-        smoketest_enabled
-        and smoketest_task_id
-        and _smoke_task_obj is not None
-        and _smoke_task_obj.status == TaskStatus.COMPLETED
-        and smoketest_result is None
-    ):
-        return await _handle_infra_failure(
-            session, version, qual, "smoketest_report_missing"
-        )
-    smoketest_score = _score_smoketest(smoketest_result)
-    # Carry the specific smoketest-failure detail (failed suite / named tests)
-    # so the agent can target it when smoketest is the binding constraint.
-    smoketest_detail = _extract_smoketest_detail(smoketest_result)
+        smoketest_score = _score_smoketest(smoketest_result)
+        # Carry the specific smoketest-failure detail (failed suite / named tests)
+        # so the agent can target it when smoketest is the binding constraint.
+        smoketest_detail = _extract_smoketest_detail(smoketest_result)
+
+    # Persist smoketest to the per-dimension ledger immediately so it
+    # survives a later-gate infra failure before _dual_write_dimension_results.
+    # _upsert_dimension_result handles a None candidate_sha with a silent no-op.
+    if not smoketest_enabled:
+        _smoke_status = "unavailable"
+    elif smoketest_score is None:
+        _smoke_status = "blocked"
+    else:
+        _smoke_status = "passed"
+    await _upsert_dimension_result(
+        session, version, candidate_sha, "smoketest",
+        status=_smoke_status,
+        sub_score=smoketest_score,
+        producing_task_id=smoketest_task_id,
+    )
     primary_findings = _primary_findings_for_challenge_retry(audit_report)
 
     # If the qualifying run intentionally deferred the challenge spawn, do the
@@ -3525,10 +4445,10 @@ async def _finalize_qualification(
     # where the initial release_audit_challenge finally has the audit findings
     # needed to copy primary summaries verbatim into the prompt.
     if (
-        bool(qual.get("audit_challenge_spawn_pending"))
-        and not challenge_task_id
-        and _audit_task_matches_candidate(_audit_task_obj, candidate_sha)
-    ):
+            bool(qual.get("audit_challenge_spawn_pending"))
+            and not challenge_task_id
+            and _audit_task_matches_candidate(_audit_task_obj, candidate_sha)
+        ):
         audit_payload = (
             _audit_task_obj.first_payload if _audit_task_obj is not None else {}
         )
@@ -4001,72 +4921,114 @@ async def _finalize_qualification(
                 )
             return await _handle_infra_failure(session, version, qual, _challenge_hold)
 
-    # Score using the reconciled report (refuted findings removed when challenge ran).
-    audit_score, test_erosion_score = _score_audit(_audit_report_scored)
-    # Carry the confirmed (actionable) findings into last_qualification so the
-    # strategic agent can target them.  Use reconciled report when available so
-    # refuted findings are not surfaced as actionable blockers.
-    audit_findings = _extract_audit_findings(_audit_report_scored)
-    # Pre-cap totals + truncation flags for both carried lists. Verified meta is
-    # computed on the reconciled report (matches audit_findings just above);
-    # excluded meta on the original report (matches excluded_audit_findings,
-    # which is derived from audit_report — the unverified-primary gap is
-    # independent of challenge reconciliation).
-    _verified_findings_meta = _audit_findings_carry_meta(_audit_report_scored)
-    _excluded_findings_meta = _audit_findings_carry_meta(audit_report)
-    # Build the reconciliation record on the RECONCILED report so
-    # findings_derived_score agrees with the applied audit_score.  The challenge
-    # synthesis is derived from the binding verdict artifact (new gate) — kept
-    # separate from excluded_findings_count (verification-gate drops) so they
-    # are never double-counted.
-    audit_reconciliation = {
-        **_compute_audit_reconciliation(_audit_report_scored),
-        "audit_challenge": _compute_challenge_synthesis_from_binding_verdicts(
-            audit_report,
-            challenge_verdicts,
+    # Score using the reconciled report (refuted findings removed when challenge
+    # ran).  When audit+test_erosion are already resolved from a prior finalize
+    # at this candidate_sha, skip re-scoring — the carried-forward scores and
+    # empty findings lists from the ledger are authoritative, and re-scoring
+    # against a None report would overwrite them with a default 1.0.
+    if not _audit_and_erosion_resolved:
+        audit_score, test_erosion_score = _score_audit(_audit_report_scored)
+        # Carry the confirmed (actionable) findings into last_qualification so the
+        # strategic agent can target them.  Use reconciled report when available so
+        # refuted findings are not surfaced as actionable blockers.
+        audit_findings = _extract_audit_findings(_audit_report_scored)
+        # Pre-cap totals + truncation flags for both carried lists. Verified meta is
+        # computed on the reconciled report (matches audit_findings just above);
+        # excluded meta on the original report (matches excluded_audit_findings,
+        # which is derived from audit_report — the unverified-primary gap is
+        # independent of challenge reconciliation).
+        _verified_findings_meta = _audit_findings_carry_meta(_audit_report_scored)
+        _excluded_findings_meta = _audit_findings_carry_meta(audit_report)
+        # Build the reconciliation record on the RECONCILED report so
+        # findings_derived_score agrees with the applied audit_score.  The challenge
+        # synthesis is derived from the binding verdict artifact (new gate) — kept
+        # separate from excluded_findings_count (verification-gate drops) so they
+        # are never double-counted.
+        audit_reconciliation = {
+            **_compute_audit_reconciliation(_audit_report_scored),
+            "audit_challenge": _compute_challenge_synthesis_from_binding_verdicts(
+                audit_report,
+                challenge_verdicts,
+                candidate_sha=candidate_sha,
+                challenge_reason=None,
+            ),
+            "challenge_excluded_findings_count": len(challenger_refuted_audit_findings),
+            "challenge_binding_record": _challenge_binding_record,
+        }
+        audit_challenge = audit_reconciliation.get("audit_challenge")
+        audit_task_candidate_sha = None
+        if _audit_task_obj is not None:
+            audit_task_candidate_sha = (
+                str(
+                    (_audit_task_obj.context or {}).get("candidate_sha")
+                    or (_audit_task_obj.first_payload or {}).get("candidate_sha")
+                    or ""
+                ).strip()
+                or None
+            )
+        audit_reconciliation["audit_leg_proof"] = _build_audit_leg_proof(
             candidate_sha=candidate_sha,
-            challenge_reason=None,
-        ),
-        "challenge_excluded_findings_count": len(challenger_refuted_audit_findings),
-        "challenge_binding_record": _challenge_binding_record,
-    }
-    audit_challenge = audit_reconciliation.get("audit_challenge")
-    audit_task_candidate_sha = None
-    if _audit_task_obj is not None:
-        audit_task_candidate_sha = (
-            str(
-                (_audit_task_obj.context or {}).get("candidate_sha")
-                or (_audit_task_obj.first_payload or {}).get("candidate_sha")
-                or ""
-            ).strip()
-            or None
+            audit_task_id=str(audit_task_id) if audit_task_id else None,
+            audit_task_candidate_sha=audit_task_candidate_sha,
+            challenge_task_id=str(challenge_task_id) if challenge_task_id else None,
+            challenged_candidate_sha=(
+                str(audit_challenge.get("challenged_candidate_sha") or "").strip() or None
+                if isinstance(audit_challenge, dict)
+                else None
+            ),
+            binding_expected_count=len(primary_findings),
+            binding_record_count=len(_challenge_binding_record),
+            reconciliation_status=(
+                str(audit_challenge.get("status") or "").strip() or None
+                if isinstance(audit_challenge, dict)
+                else None
+            ),
+            reconciliation_reason=(
+                str(audit_challenge.get("reason") or "").strip() or None
+                if isinstance(audit_challenge, dict)
+                else None
+            ),
+            legacy_advisory_only=bool(audit_challenge_task_id)
+            and not bool(challenge_task_id),
         )
-    audit_reconciliation["audit_leg_proof"] = _build_audit_leg_proof(
-        candidate_sha=candidate_sha,
-        audit_task_id=str(audit_task_id) if audit_task_id else None,
-        audit_task_candidate_sha=audit_task_candidate_sha,
-        challenge_task_id=str(challenge_task_id) if challenge_task_id else None,
-        challenged_candidate_sha=(
-            str(audit_challenge.get("challenged_candidate_sha") or "").strip() or None
-            if isinstance(audit_challenge, dict)
-            else None
-        ),
-        binding_expected_count=len(primary_findings),
-        binding_record_count=len(_challenge_binding_record),
-        reconciliation_status=(
-            str(audit_challenge.get("status") or "").strip() or None
-            if isinstance(audit_challenge, dict)
-            else None
-        ),
-        reconciliation_reason=(
-            str(audit_challenge.get("reason") or "").strip() or None
-            if isinstance(audit_challenge, dict)
-            else None
-        ),
-        legacy_advisory_only=bool(audit_challenge_task_id)
-        and not bool(challenge_task_id),
-    )
-
+        # Refresh the per-dimension audit ledger row with the POST-challenge-
+        # reconciliation score (finding 7c6c3428ff6afee2).  The eager upsert
+        # earlier in finalize ran BEFORE the challenge gate and therefore stored
+        # the PRE-reconciliation audit_score; reconciliation has now dropped
+        # challenger-refuted findings and re-scored the report, so overwrite that
+        # stale fact.  Without this the ledger permanently freezes the
+        # pre-reconciliation value (the later _dual_write_dimension_results skips
+        # audit because its row is already RESOLVED), and the read-side
+        # sub_scores overlay — patch_qualification_state_from_dimension_states —
+        # then clobbers the reconciled sub_scores.audit with that stale value.
+        # Both statuses are RESOLVED, so the primitive's downgrade guard permits
+        # this update.
+        if audit_score is None:
+            _reconciled_audit_status = "blocked"
+        elif audit_score < 1.0:
+            _reconciled_audit_status = "failed"
+        else:
+            _reconciled_audit_status = "passed"
+        await _upsert_dimension_result(
+            session, version, candidate_sha, "audit",
+            status=_reconciled_audit_status,
+            sub_score=audit_score,
+            producing_task_id=audit_task_id,
+        )
+    else:
+        # audit+test_erosion resolved from ledger — reconciliation fields are
+        # not meaningful (no challenge ran, no audit report exists).
+        _verified_findings_meta = {
+            "audit_findings_total": 0,
+            "audit_findings_truncated": False,
+        }
+        _excluded_findings_meta = {
+            "excluded_audit_findings_total": 0,
+            "excluded_audit_findings_truncated": False,
+        }
+        audit_reconciliation: dict[str, Any] = {}
+        challenger_refuted_audit_findings = []
+        _challenge_binding_record = []
     # --- Deterministic Alembic revision-identity safety gate ----------------
     # A revision-identity collision between the candidate and the deployed
     # promotion target (the back-merge renumber class, prod incident
@@ -4125,6 +5087,18 @@ async def _finalize_qualification(
         )
     migration_apply_blocked = apply_verdict == "block"
 
+    # Acceptance-criteria coverage summary + the ACTIVE-criteria rubric.  Computed
+    # once here (before the merge-grade block) so the rubric can be threaded into
+    # the per-category grade below.  ``criterion_coverage`` is still persisted for
+    # observability / back-compat; ``active_categories`` are the CATEGORIES the
+    # goal-verification redesign grades the merged diff against.
+    criterion_coverage = await get_version_coverage_summary(session, version.id)
+    active_categories: list[dict[str, Any]] = [
+        {"category_key": c.get("criterion_key"), "text": c.get("text")}
+        for c in (criterion_coverage.get("criteria") or [])
+        if c.get("status") == "active" and c.get("criterion_key")
+    ]
+
     # --- Blind merge-grade artifact validation (dir d-c0fe439f) -------------
     # An uninvested release_merge_grade agent graded the merged diffs against the
     # frozen version.goal (blind to running_update).  Since ae0664174 the grade
@@ -4137,15 +5111,33 @@ async def _finalize_qualification(
     #     against); no child was spawned, merge_grade_task_id is None.
     #   * goal non-empty but the required grade is MISSING / UNPARSEABLE → HOLD
     #     (infra_failure): required artifacts cannot be skipped or waved through.
-    merge_grade_cert: dict[str, Any] = {
-        "status": "not_applicable",
-        "covers_goal": None,
-        "coverage": None,
-        "biggest_gap": None,
-        "blocked": False,
-        "detail": None,
-    }
-    if merge_grade_task_id:
+    #   * merge_grade dimension already resolved from a prior finalize at this
+    #     candidate_sha → compose from the ledger (the child was not re-spawned).
+    if "merge_grade" in resolved_dims:
+        _mg_resolved = resolved_dims["merge_grade"]
+        _mg_status = _mg_resolved["status"]
+        merge_grade_cert = {
+            "status": (
+                "pass" if _mg_status == "passed" else (
+                    "fail" if _mg_status == "failed" else _mg_status
+                )
+            ),
+            "covers_goal": None,
+            "coverage": _mg_resolved.get("sub_score"),
+            "biggest_gap": None,
+            "blocked": _mg_status == "failed",
+            "detail": None,
+        }
+    else:
+        merge_grade_cert: dict[str, Any] = {
+            "status": "not_applicable",
+            "covers_goal": None,
+            "coverage": None,
+            "biggest_gap": None,
+            "blocked": False,
+            "detail": None,
+        }
+    if merge_grade_task_id and "merge_grade" not in resolved_dims:
         merge_grade_artifact: dict[str, Any] | None = None
         try:
             merge_grade_artifact = await _latest_artifact_logs(
@@ -4159,7 +5151,20 @@ async def _finalize_qualification(
                 merge_grade_task_id,
                 version.version_number,
             )
-        merge_grade_cert = evaluate_merge_grade(version.goal, merge_grade_artifact)
+        # v2 machine tier: only gather the (bounded) verified-merge test evidence
+        # when there is an ACTIVE rubric to grade categories against — otherwise
+        # the per-category grade (and thus the tier) is never computed.
+        _verified_merge_evidence = (
+            await _collect_verified_merge_test_evidence(session, version)
+            if active_categories
+            else None
+        )
+        merge_grade_cert = evaluate_merge_grade(
+            version.goal,
+            merge_grade_artifact,
+            active_categories or None,
+            _verified_merge_evidence,
+        )
         if qual.get("prior_superseded") and merge_grade_cert["status"] == "fail":
             merge_grade_cert = {
                 **merge_grade_cert,
@@ -4178,6 +5183,30 @@ async def _finalize_qualification(
                 else "merge_grade_report_unparseable"
             )
             return await _handle_infra_failure(session, version, qual, label)
+        # The grader produced a usable holistic verdict but CANNOT emit the
+        # per-category section (stale agent image predating the per-category
+        # protocol).  HOLD — never promote over an ungraded acceptance contract —
+        # but do NOT fabricate a ``not_met`` verdict for every active criterion:
+        # that would report a false reason ("graded, not met" when nothing was
+        # graded) and, because the ledger is sha-KEYED, freeze the fabricated
+        # failure against this candidate permanently.  Holding leaves the ledger
+        # clean, so the SAME candidate re-qualifies honestly the moment a grader
+        # that supports the protocol reaches the fleet.
+        if merge_grade_cert["status"] == "category_grade_unsupported":
+            logger.warning(
+                "[RELEASE_QUALIFIER] v%d candidate %s: the merge-grade agent "
+                "returned no `category_verdicts` section while %d acceptance "
+                "criteria are ACTIVE — the grader predates the per-category "
+                "protocol. HOLDING (not fabricating not_met verdicts). Rebake the "
+                "agent image from a ref carrying agent/src/handlers/merge-grade.ts "
+                "per-category output.",
+                version.version_number,
+                (candidate_sha or "")[:8],
+                len(active_categories or []),
+            )
+            return await _handle_infra_failure(
+                session, version, qual, "merge_grade_grader_lacks_category_verdicts"
+            )
 
     ci_state = ci_resolution.get("state", _CI_RED)
     ci_required = True
@@ -4186,7 +5215,6 @@ async def _finalize_qualification(
     elif ci_state == _CI_NO_CHECKS:
         _proj_for_ci_gate = await session.get(Project, version.project_id)
         ci_required = _ci_required_for_finalize(_proj_for_ci_gate, ci_resolution)
-    criterion_coverage = await get_version_coverage_summary(session, version.id)
     merge_grade_misses = _merge_grade_misses_armed(
         {
             "merge_grade_status": merge_grade_cert["status"],
@@ -4221,6 +5249,236 @@ async def _finalize_qualification(
             "status": "already_on_main_exempt",
             "blocked": False,
         }
+    # Eagerly persist merge_grade to the per-dimension ledger so a later-gate
+    # infra failure does not discard the result before _dual_write_dimension_results.
+    if merge_grade_task_id or "merge_grade" in resolved_dims:
+        _mg_cert_status = merge_grade_cert.get("status", "not_applicable")
+        if _mg_cert_status == "pass":
+            _mg_ledger_status = "passed"
+        elif _mg_cert_status in ("fail", "misses"):
+            _mg_ledger_status = "failed"
+        elif _mg_cert_status in ("superseded_exempt", "already_on_main_exempt"):
+            _mg_ledger_status = "passed"
+        else:
+            _mg_ledger_status = "unavailable"
+        _mg_coverage = merge_grade_cert.get("coverage")
+        await _upsert_dimension_result(
+            session, version, candidate_sha, "merge_grade",
+            status=_mg_ledger_status,
+            sub_score=_mg_coverage if isinstance(_mg_coverage, (int, float)) and not isinstance(_mg_coverage, bool) else None,
+            producing_task_id=merge_grade_task_id,
+        )
+
+    # --- Goal-verification per-category ledger (redesign) -------------------
+    # The acceptance criteria ARE the merge-grade's categories.  Persist this
+    # candidate's per-category verdicts + residual into the sha-keyed ledger (the
+    # verdict cache), then read the gate inputs back FROM the ledger so the gate
+    # is a pure read that survives a re-drive (on a re-drive the merge_grade child
+    # is not re-spawned; its verdicts are already in the ledger).
+    #
+    # Finding 85fa667a4d7fcae6 — merge-grade EXEMPTIONS (superseded_exempt /
+    # already_on_main_exempt) exempt ONLY the HOLISTIC merge_grade_misses gate
+    # (cleared above).  They do NOT exempt this per-category coverage gate: a
+    # candidate whose ACTIVE acceptance criteria grade ``not_met`` must still
+    # block on ``criterion_coverage_incomplete``, exactly as main's retired
+    # unconditional coverage block did.  Skipping grading on the exempt path
+    # (the prior ``not _merge_grade_exempt`` guard) silently loosened coverage —
+    # a not_met candidate promoted just because its release was superseded or it
+    # had already landed on the promotion target.  We now grade + persist + gate
+    # on the SAME exempt candidates.  When the sibling ledger module is absent,
+    # or there is no active rubric, the gate is still skipped (fallback to the
+    # pre-redesign holistic-only path).
+    _merge_grade_exempt = merge_grade_cert.get("status") in (
+        "superseded_exempt",
+        "already_on_main_exempt",
+    )
+    _gate_category_verdicts: list[dict[str, Any]] | None = None
+    _gate_residual: str | None = None
+    if _category_ledger is not None and active_categories:
+        # The CURRENTLY-ACTIVE criterion keys.  A retracted / superseded criterion
+        # keeps its (possibly ``not_met``) CategoryVerdict row in the ledger — the
+        # row is never cleared — but it is no longer part of the acceptance
+        # contract, so it must NOT gate.  Both the ledger read-back (FIX 1) and the
+        # fail-closed in-memory fallback (FIX 2) below filter to this set, mirroring
+        # ``category_verdict_ledger.is_candidate_fully_met`` (the sweep / reuse
+        # guard) so the gate and the sweep never disagree.
+        _active_keys = {
+            c.get("category_key")
+            for c in active_categories
+            if c.get("category_key")
+        }
+        # The goal-verification gate only APPLIES when a merge-grade grade exists
+        # for this candidate (fresh child this finalize, or a grade reused from
+        # the per-dimension ledger on a re-drive).  When no merge-grade ran (e.g.
+        # the version has no gradeable goal), the per-category verdicts are
+        # legitimately absent and the gate stays inert — criteria are governed by
+        # the evidence-coverage path, not this gate — so an empty/unreadable
+        # read-back falls back to None (skip) rather than fail-closed.  Fail-closed
+        # only guards the case where a grade DID run but its verdicts cannot be
+        # trusted (absent for active keys, or the read raised).
+        _merge_grade_ran = bool(merge_grade_task_id) or ("merge_grade" in resolved_dims)
+        _fresh_category_verdicts = merge_grade_cert.get("category_verdicts")
+        _ledger_write_failed = False
+        if _fresh_category_verdicts is not None:
+            # Fresh grade this finalize: write each category verdict + the residual.
+            try:
+                for _v in _fresh_category_verdicts:
+                    await _category_ledger.upsert_category_verdict(
+                        session,
+                        version_id=version.id,
+                        candidate_sha=candidate_sha,
+                        category_key=_v.get("category_key"),
+                        status=_v.get("status"),
+                        tier=_v.get("tier", "judged"),
+                        gap=_v.get("gap"),
+                        citations=_v.get("citations") or [],
+                        grader_run_id=merge_grade_task_id,
+                    )
+                await _category_ledger.upsert_residual(
+                    session,
+                    version.id,
+                    candidate_sha,
+                    merge_grade_cert.get("residual_uncaptured_gap"),
+                )
+            except Exception:  # noqa: BLE001 — ledger write failure must not crash finalize
+                _ledger_write_failed = True
+                logger.warning(
+                    "[RELEASE_QUALIFIER] v%d failed to persist per-category "
+                    "goal-verification verdicts to the ledger — gating on the "
+                    "freshly-computed in-memory verdicts (fail-closed) for this "
+                    "finalize",
+                    version.version_number,
+                )
+        if _ledger_write_failed:
+            # FIX 2 — fail CLOSED.  Persistence hiccupped, so a ledger read-back
+            # would see stale/absent rows and (via a None gate input) SKIP the
+            # category gate entirely, letting a ``not_met`` candidate promote.  The
+            # freshly-computed in-memory grade is authoritative: feed it to the gate
+            # directly (filtered to the active keys, exactly like the read-back).
+            # Fail-open state 1/3: the write failed AND the freshly-computed
+            # verdicts do not cover any currently-active criterion (e.g. the
+            # grader only graded now-retracted categories).  Absent evidence for
+            # every active category is UNVERIFIED, not clean — fail closed rather
+            # than skip the gate (None).
+            _gate_category_verdicts = [
+                cv
+                for cv in (
+                    _coerce_ledger_category_verdict(_v)
+                    for _v in (_fresh_category_verdicts or [])
+                )
+                if cv.get("category_key") in _active_keys
+            ] or _fail_closed_category_verdicts(_active_keys)
+            _gate_residual = merge_grade_cert.get("residual_uncaptured_gap")
+        else:
+            # Read the gate inputs back FROM the ledger (canonical source; covers
+            # the re-drive path where no fresh artifact was re-evaluated).
+            try:
+                _ledger_verdicts = await _category_ledger.get_category_verdicts(
+                    session, version.id, candidate_sha
+                )
+                # FIX 1 — filter to the CURRENTLY-ACTIVE criterion keys.  The ledger
+                # returns EVERY row for the (version, sha) pair, including a
+                # retracted criterion's stale ``not_met`` row, which would otherwise
+                # permanently re-block this gate even though the sweep's
+                # ``is_candidate_fully_met`` (which filters the same way) reports the
+                # candidate FULLY MET — a permanent finalize wedge + re-qual loop.
+                # Fail-open state 2/3: the read-back succeeded but returned NO
+                # row for any currently-active criterion.  When a merge-grade
+                # grade ran for this candidate, that means active criteria were
+                # never graded into the ledger — UNVERIFIED, not clean — so fail
+                # closed rather than skip the gate (None).  When no grade ran the
+                # gate is inert (evidence-coverage path governs), so skip.
+                _gate_category_verdicts = [
+                    cv
+                    for cv in (
+                        _coerce_ledger_category_verdict(_v)
+                        for _v in (_ledger_verdicts or [])
+                    )
+                    if cv.get("category_key") in _active_keys
+                ] or (
+                    _fail_closed_category_verdicts(_active_keys)
+                    if _merge_grade_ran
+                    else None
+                )
+                _gate_residual = await _category_ledger.get_residual(
+                    session, version.id, candidate_sha
+                )
+            except Exception:  # noqa: BLE001 — a read failure fails CLOSED (below)
+                # Fail-open state 3/3: the ledger read itself raised, so the
+                # verdicts are UNREADABLE.  When a grade ran for this candidate,
+                # skipping the gate (None) would let a candidate promote on a
+                # transient DB error masking the goal-verification result — fail
+                # closed so an unreadable gate input blocks instead of promotes.
+                # (No grade ran → gate inert → skip, matching the no-goal path.)
+                logger.warning(
+                    "[RELEASE_QUALIFIER] v%d failed to read per-category verdicts back "
+                    "from the ledger — %s the goal-verification gate",
+                    version.version_number,
+                    "failing closed on" if _merge_grade_ran else "skipping (no grade ran)",
+                )
+                _gate_category_verdicts = (
+                    _fail_closed_category_verdicts(_active_keys)
+                    if _merge_grade_ran
+                    else None
+                )
+                _gate_residual = None
+
+        if _gate_category_verdicts is None:
+            # FIX 3 — fail CLOSED on a NEVER-GRADED candidate.  We are inside the
+            # guard, so this version HAS active acceptance criteria and is not
+            # merge-grade exempt — yet not one active category carries a verdict for
+            # this candidate.  A ``None`` gate input SKIPS the category gate, so
+            # leaving it would promote over an acceptance contract that was never
+            # graded at all.
+            #
+            # This is reachable whenever no merge-grade ran for the candidate — most
+            # notably a version whose ``goal`` is empty/contentless (see
+            # ``_merge_grade_goal_usable``), which spawns no merge-grade child and so
+            # produces no verdicts.  Blanking the goal is a real operator lever, and
+            # before the coverage gate was retired the pre-qualification coverage
+            # precondition happened to hold such a version back; it no longer does.
+            #
+            # Fail closed, mirroring ``category_verdict_ledger.is_candidate_fully_met``
+            # (an ACTIVE criterion with no verdict → NOT met), so the gate and the
+            # sweep cannot disagree.  The gap text carries WHY.
+            _gate_category_verdicts = _never_graded_category_verdicts(_active_keys) or None
+            if _gate_category_verdicts:
+                logger.warning(
+                    "[RELEASE_QUALIFIER] v%d has %d ACTIVE acceptance criteria but no "
+                    "merge-grade verdict for candidate %s — failing the category gate "
+                    "CLOSED rather than promoting over an ungraded acceptance contract",
+                    version.version_number,
+                    len(_gate_category_verdicts),
+                    (candidate_sha or "?")[:8],
+                )
+
+    # --- Capability-proof gate dimension (informational in OFF/OBSERVE, gating in ENFORCE) ---
+    # Reflects whether the capability proof gate is active and — in ENFORCE
+    # mode — whether all working capabilities carry machine-verified proof.
+    # The dimension is always recorded in the ledger, but only blocks promotion
+    # in ENFORCE mode when unproven capabilities exist.
+    # Delegate to the shared IO-free primitive so this release-qualification
+    # enforcement point derives from the SAME tiered proof map and exemption set
+    # the spawn-time resolver and blocked-resume sweep use — one source of truth
+    # for "unproven working capability blocks promotion" instead of an inline
+    # re-implementation that can drift.
+    from app.capability_registry import (
+        capability_proof_gate_release_status as _cp_release_status,
+    )
+
+    _capability_proof_mode = str(
+        _runtime_config.get("capability_proof_gate_mode", "off") or "off"
+    ).strip().lower()
+    capability_proof_blocked, capability_proof_detail = _cp_release_status(
+        getattr(_policy_project, "problem_model", None),
+        _capability_proof_mode,
+        # Finding #1: pass the durable, platform-only proof ledger so the enforce
+        # gate corroborates each "cleared" capability against machine-verified
+        # evidence instead of trusting agent-writable problem_model evidence_refs
+        # / proof_exempt claims.
+        getattr(_policy_project, "capability_proof_records", None),
+    )
+
     # --- Completion-debt snapshot (additive, informational, best-effort) ------
     # Fetched before compute_composite so the pressure score can be passed in as
     # an observe-mode sub-score signal.  Never a blocker.  Best-effort: if the
@@ -4228,7 +5486,7 @@ async def _finalize_qualification(
     # with completion_debt=None (pressure score = None → omitted from sub_scores).
     _completion_debt: dict[str, Any] | None = None
     try:
-        from importlib import import_module  # noqa: PLC0415
+        from importlib import import_module
 
         _cd_mod = import_module("app.completion_debt")
         _completion_debt = await _cd_mod.get_open_completion_debt(
@@ -4292,9 +5550,16 @@ async def _finalize_qualification(
         ci_required=ci_required,
         migration_collision=migration_collision,
         migration_apply_blocked=migration_apply_blocked,
-        criterion_coverage=criterion_coverage,
+        # Goal-verification redesign: the per-category verdicts + residual (read
+        # from the sha-keyed ledger) drive the gate INSTEAD of the coverage-count
+        # summary.  Both are None when there is no active rubric / the ledger is
+        # absent / the grade was exempted — preserving the holistic-only path.
+        category_verdicts=_gate_category_verdicts,
+        residual_uncaptured_gap=_gate_residual,
         merge_grade_misses=merge_grade_misses,
+        merge_grade_exempt=_merge_grade_exempt,
         debt_pressure_score=_debt_pressure_score,
+        capability_proof_blocked=capability_proof_blocked,
     )
 
     # --- Acceptance-window counts (additive evidence, no score impact) -----
@@ -4305,6 +5570,12 @@ async def _finalize_qualification(
     acceptance_window = await _compute_acceptance_window_aggregate(session, version)
     extended_sub_scores = dict(composite["sub_scores"])
     extended_sub_scores.update(acceptance_window)
+
+    # --- Dual-write handled by _dual_write_dimension_results after base_record
+    # is fully assembled (below), where all dimensions including challenge are
+    # derived from the assembled composite.  The Phase 1a block that wrote
+    # mid-finalize variables as raw rows was subsumed by the comprehensive
+    # per-dimension write at the end of this function.
 
     finalized_at = _utcnow().isoformat()
     base_record: dict[str, Any] = {
@@ -4319,6 +5590,11 @@ async def _finalize_qualification(
         "confidence": composite["confidence"],
         "sub_scores": extended_sub_scores,
         "blocker": composite["blocker"],
+        # Execution-site of the responsible check (dir: tag promotion blockers
+        # inert-until-promote). "deployed" = a fix on automain is inert until this
+        # version itself promotes; "candidate" = an automain fix clears it next
+        # qualification; None when there is no blocker or it is unclassified.
+        "execution_site": blocker_execution_site(composite["blocker"]),
         "threshold": policy.get("threshold"),
         "started_at": qual.get("started_at"),
         "finalized_at": finalized_at,
@@ -4369,6 +5645,12 @@ async def _finalize_qualification(
         "migration_apply_safety": apply_verdict,
         "migration_apply_safety_detail": apply_detail,
         "criterion_coverage": criterion_coverage,
+        # Goal-verification redesign: the per-category verdicts + residual that
+        # drove the gate this finalize (sha-keyed; None when no rubric / ledger
+        # absent / exempt).  Persisted so the CI-unresolved-recovery recompute in
+        # release_promotion can re-run the SAME gate without a DB round-trip.
+        "category_verdicts": _gate_category_verdicts,
+        "residual_uncaptured_gap": _gate_residual,
         # Blind merge-grade goal-coverage verdict (dir d-c0fe439f). Mirrored into
         # last_qualification AND persisted on QualificationVerdict so an operator
         # can see the single biggest gap toward the goal.
@@ -4385,6 +5667,10 @@ async def _finalize_qualification(
         # Open completion-debt snapshot at qualification time (additive, informational).
         # None when the ledger module is not yet available or returned no data.
         "completion_debt": _completion_debt,
+        # Capability-proof gate dimension (informational in OFF/OBSERVE,
+        # gating in ENFORCE).  Recorded in the per-dimension fact ledger.
+        "capability_proof_blocked": capability_proof_blocked,
+        "capability_proof_detail": capability_proof_detail,
     }
 
     # Enforce-mode confidence preview — only in observe/off mode, only when no
@@ -4427,6 +5713,16 @@ async def _finalize_qualification(
         composite["sub_scores"],
         promotion_enabled,
     )
+
+    # --- Per-dimension fact ledger dual-write (Phase 1, purely additive) -----
+    # Every gate/dimension has now resolved into base_record + composite.  Write
+    # each as its own (candidate_sha, dimension) ledger row ALONGSIDE the
+    # existing last_qualification / QualificationVerdict writes so a later
+    # single-gate re-check can re-record only its own fact without discarding the
+    # dimensions that already passed for this tree.  Best-effort — never breaks
+    # or rolls back the qualification.  Runs before the decision branch so all
+    # three terminal paths (not_promoted / dry_run / promote) are covered once.
+    await _dual_write_dimension_results(session, version, base_record, composite)
 
     # --- Decide -------------------------------------------------------------
     if not composite["promote"]:
@@ -4503,6 +5799,12 @@ async def _finalize_qualification(
             # would fail to create, not just the generic blocker label.
             if composite["blocker"] == "migration_apply_drift" and apply_detail:
                 blocker_label = f"{blocker_label} — {apply_detail}"
+            # Tag the blocker with WHERE its check runs so the operator sees
+            # whether a fix on automain takes effect pre-promotion (candidate-side)
+            # or is inert until this version itself promotes (deployed-side).
+            _site_phrase = blocker_execution_site_label(composite["blocker"])
+            if _site_phrase:
+                blocker_label = f"{blocker_label} ({_site_phrase})"
             notify_event = "release_blocked"
             notify_summary = (
                 f"v{version.version_number} blocked from promotion — "
@@ -4526,12 +5828,14 @@ async def _finalize_qualification(
                 "threshold": policy.get("threshold"),
                 "sub_scores": composite["sub_scores"],
                 "blocker": composite["blocker"],
+                "execution_site": blocker_execution_site(composite["blocker"]),
             },
         )
         return {
             "status": "not_promoted",
             "confidence": composite["confidence"],
             "blocker": composite["blocker"],
+            "execution_site": blocker_execution_site(composite["blocker"]),
         }
 
     if not promotion_enabled:
@@ -4602,6 +5906,62 @@ async def _finalize_qualification(
         )
         return {"status": "error", "error": "missing_candidate_sha"}
 
+    # Same-tree promotion invariant (Phase 1): a promotion composes from the
+    # per-dimension ledger only when every required gating dimension has a
+    # TERMINAL fact at THIS candidate_sha — the batch model's "everything scored
+    # the same tree" guarantee carried onto the ledger.  The dual-write above
+    # populated exactly these rows for the candidate moments ago, so the common
+    # path is complete; a populated-but-incomplete ledger (a required dimension
+    # missing or stranded at a different sha) means the facts do NOT agree on one
+    # tree, so HOLD as an infra failure rather than promote on a split verdict.
+    # Fail OPEN when the ledger is entirely empty for this candidate (the
+    # best-effort dual-write did not land) so a transient ledger-write failure
+    # never blocks an otherwise-qualified promotion.
+    _ledger_complete, _missing_dims = await _promotion_dimension_ledger_complete(
+        session, version, candidate_sha, smoketest_enabled=smoketest_enabled
+    )
+    if not _ledger_complete:
+        _prior_any = await _load_prior_dimension_results(
+            session, version, candidate_sha
+        )
+        if _prior_any:
+            logger.warning(
+                "[RELEASE_QUALIFIER] v%d ledger incomplete at promote "
+                "(candidate=%s missing/split dimensions=%s) — holding rather than "
+                "promoting on facts that do not agree on one tree",
+                version.version_number,
+                (candidate_sha or "")[:8],
+                _missing_dims,
+            )
+            return await _handle_infra_failure(
+                session, version, qual, "qualification_dimension_ledger_incomplete"
+            )
+        # Completely empty ledger.  Distinguish first qualification from a re-drive
+        # using qualification_attempts: on a re-drive (attempts > 1) the ledger was
+        # populated on a prior successful finalize but is now empty — the current
+        # _dual_write_dimension_results silently failed (SAVEPOINT swallowed the
+        # write).  Hold rather than fail-open so the same-tree invariant is not
+        # silently bypassed on a re-check.
+        if (version.qualification_attempts or 0) > 1:
+            logger.warning(
+                "[RELEASE_QUALIFIER] v%d per-dimension ledger empty at promote "
+                "(candidate=%s, attempts=%d) — dual-write silently failed; "
+                "holding rather than promoting on the live composite",
+                version.version_number,
+                (candidate_sha or "")[:8],
+                version.qualification_attempts,
+            )
+            return await _handle_infra_failure(
+                session, version, qual, "qualification_dimension_ledger_empty"
+            )
+        logger.warning(
+            "[RELEASE_QUALIFIER] v%d per-dimension ledger empty at promote "
+            "(candidate=%s) — best-effort dual-write did not land; promoting on "
+            "the live composite (fail-open)",
+            version.version_number,
+            (candidate_sha or "")[:8],
+        )
+
     # Delegate to promote().  Credentials are NOT pre-resolved here on purpose
     # (concern 2): credential resolution is GitHub I/O, and at this point the
     # dedicated session still holds the ReleaseVersion FOR UPDATE lock.
@@ -4633,8 +5993,22 @@ async def _required_children_terminal(
     default to "required".  Returns False (not ready) when a required child id
     is missing/unparseable, the row is not yet persisted, or any required child
     is still non-terminal — i.e. a conservative "not ready to finalize" answer.
+
+    When one or more dimensions are already resolved via the per-dimension
+    ledger (``resolved_dimensions``), their corresponding child task was not
+    spawned — the function skips the terminal check for those dimensions since
+    the ledger carries the durable fact forward from the prior finalize.
     """
     qual = version.last_qualification or {}
+
+    # Dimensions already resolved via the per-dimension ledger, carried forward
+    # from a prior finalize at this candidate_sha.  When present, the
+    # corresponding child task was NOT re-spawned, so skip requiring it.
+    resolved_dims: dict[str, dict[str, Any]] = qual.get("resolved_dimensions") or {}
+    audit_resolved = "audit" in resolved_dims and "test_erosion" in resolved_dims
+    smoketest_resolved = "smoketest" in resolved_dims
+    merge_grade_resolved = "merge_grade" in resolved_dims
+
     smoketest_required = bool(qual.get("smoketest_enabled", True))
     audit_task_id_raw = qual.get("audit_task_id")
     challenge_task_id_raw = qual.get("challenge_task_id")
@@ -4644,20 +6018,34 @@ async def _required_children_terminal(
     merge_grade_task_id_raw = qual.get("merge_grade_task_id")
     merge_grade_required = bool(merge_grade_task_id_raw)
 
-    if not audit_task_id_raw or (smoketest_required and not smoketest_task_id_raw):
+    # When a dimension is already resolved via the ledger, its child task id
+    # is legitimately None (the spawn coordinator skipped it).  Skip requiring
+    # it rather than returning False for a "missing" task id.
+    if (not audit_task_id_raw and not audit_resolved) or (
+        smoketest_required
+        and not smoketest_task_id_raw
+        and not smoketest_resolved
+    ):
         logger.warning(
             "[RELEASE_QUALIFIER] finalize-gate: version v%d has pending "
             "qualification but missing required child task ids "
-            "(audit=%r smoke=%r smoketest_required=%s) — not ready",
+            "(audit=%r smoke=%r smoketest_required=%s audit_resolved=%s "
+            "smoketest_resolved=%s) — not ready",
             version.version_number,
             audit_task_id_raw,
             smoketest_task_id_raw,
             smoketest_required,
+            audit_resolved,
+            smoketest_resolved,
         )
         return False
 
     try:
-        audit_task_id = uuid.UUID(str(audit_task_id_raw))
+        audit_task_id = (
+            uuid.UUID(str(audit_task_id_raw))
+            if audit_task_id_raw is not None
+            else None
+        )
         smoketest_task_id = (
             uuid.UUID(str(smoketest_task_id_raw))
             if smoketest_required and smoketest_task_id_raw
@@ -4682,7 +6070,11 @@ async def _required_children_terminal(
         )
         return False
 
-    audit_task: Task | None = await session.get(Task, audit_task_id)
+    audit_task: Task | None = (
+        await session.get(Task, audit_task_id)
+        if audit_task_id is not None
+        else None
+    )
     smoketest_task: Task | None = (
         await session.get(Task, smoketest_task_id)
         if smoketest_task_id is not None
@@ -4700,10 +6092,10 @@ async def _required_children_terminal(
     )
 
     if (
-        audit_task is None
-        or (smoketest_required and smoketest_task is None)
+        (not audit_resolved and audit_task is None)
+        or (smoketest_required and not smoketest_resolved and smoketest_task is None)
         or (challenge_required and challenge_task is None)
-        or (merge_grade_required and merge_grade_task is None)
+        or (merge_grade_required and not merge_grade_resolved and merge_grade_task is None)
     ):
         logger.debug(
             "[RELEASE_QUALIFIER] finalize-gate: version v%d required child "
@@ -4713,9 +6105,10 @@ async def _required_children_terminal(
         return False
 
     if (
-        audit_task.status not in _TERMINAL_STATUSES
+        (not audit_resolved and audit_task is not None and audit_task.status not in _TERMINAL_STATUSES)
         or (
             smoketest_required
+            and not smoketest_resolved
             and smoketest_task is not None
             and smoketest_task.status not in _TERMINAL_STATUSES
         )
@@ -4726,6 +6119,7 @@ async def _required_children_terminal(
         )
         or (
             merge_grade_required
+            and not merge_grade_resolved
             and merge_grade_task is not None
             and merge_grade_task.status not in _TERMINAL_STATUSES
         )
@@ -4737,8 +6131,8 @@ async def _required_children_terminal(
         "[RELEASE_QUALIFIER] finalize-gate: required children terminal for "
         "version v%d (audit=%s/%s smoke=%s challenge=%s)",
         version.version_number,
-        audit_task.id,
-        audit_task.status,
+        audit_task.id if audit_task is not None else "resolved",
+        audit_task.status if audit_task is not None else "N/A",
         f"{smoketest_task.id}/{smoketest_task.status}"
         if smoketest_task is not None
         else "disabled",

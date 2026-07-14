@@ -2,8 +2,17 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
-import 'katex/dist/katex.min.css';
 import type { Components } from 'react-markdown';
+
+// Lazy KaTeX CSS: only import when content contains math delimiters ($ or $$).
+// KaTeX CSS is ~30KB; eagerly loading it on every view inflates the initial
+// bundle on routes that never render math.
+let _katexCssLoaded = false;
+function ensureKaTexCss(): void {
+  if (_katexCssLoaded) return;
+  _katexCssLoaded = true;
+  import('katex/dist/katex.min.css').catch(() => { /* CSS import failure is non-fatal */ });
+}
 
 const mdComponents: Components = {
   h1: ({ children, ...props }) => <h1 className="text-base font-bold text-neutral-100 mt-4 mb-2" {...props}>{children}</h1>,
@@ -29,6 +38,11 @@ const mdComponents: Components = {
 };
 
 export default function MarkdownContentInner({ content }: { content: string }) {
+  // Lazily load KaTeX CSS only when the content contains math delimiters.
+  // Checking for $ / $$ is cheap and avoids the redundant import on non-math views.
+  const hasMath = typeof content === 'string' && /(?<!\$)\${1,2}(?!\$)/.test(content);
+  if (hasMath) ensureKaTexCss();
+
   return (
     <ReactMarkdown
       remarkPlugins={[remarkGfm, remarkMath]}

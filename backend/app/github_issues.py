@@ -4,6 +4,7 @@ Extracted from ``app.github``; all symbols are re-exported from there so
 existing imports keep working.
 """
 
+import time
 from typing import Any, Dict
 
 from fastapi import HTTPException, status
@@ -290,33 +291,131 @@ async def create_issue(
             detail="Failed to create issue on GitHub.",
         )
 
+    # The issue list this repo serves is now stale. Drop every cached state for
+    # it so an agent that creates an issue and immediately lists them does not
+    # read back a pre-create snapshot for up to a TTL.
+    invalidate_issues_cache(owner, repo)
     return response.json()
 
 
+# Page cap for ``get_issues``. DELIBERATELY LOW (not the 30 that
+# ``get_open_pull_requests`` uses). The sole caller is the agent-facing
+# ``/api/agent/github/issues`` proxy, which is rate-limited at 150 req/min PER
+# AGENT — so every page here is a x150/min multiplier against the SHARED 5000/hr
+# installation-token bucket whose exhaustion has stalled production twice. At 5
+# pages an agent can burn 750 GitHub calls/min; at 30 it could burn 4500/min and
+# drain the whole hourly bucket in ~70 seconds. 5 pages x 100 = 500 issues is far
+# more backlog than any agent triages in one task, and the truncation is now
+# explicit in the log rather than silent at 30 items.
+_ISSUES_MAX_PAGES = 5
+
+# Cached because the proxy is POLLED and the underlying list moves slowly. Keyed
+# by (owner, repo, state); a 60s TTL collapses a burst of sibling agents (and one
+# agent's repeated reads) onto a single fetch, so the steady-state cost is
+# <=_ISSUES_MAX_PAGES calls per repo per minute regardless of caller volume.
+_ISSUES_CACHE_TTL_S = 60
+_ISSUES_CACHE_MAX = 200
+_issues_cache: dict[tuple[str, str, str], tuple[list, float]] = {}
+
+
+def invalidate_issues_cache(owner: str, repo: str) -> None:
+    """Drop every cached issue list for ``owner/repo`` (all ``state`` variants).
+
+    Called after a write that changes the list (``create_issue``). Safe to call
+    when nothing is cached.
+    """
+    for key in [k for k in _issues_cache if k[0] == owner and k[1] == repo]:
+        _issues_cache.pop(key, None)
+
+
 async def get_issues(token: str, owner: str, repo: str, state: str = "open") -> list:
+    """Retrieve the repository's ISSUES (never pull requests), paginated + cached.
+
+    Two long-standing distortions, both of which an agent triaging a backlog
+    silently inherits:
+
+    * **Truncation.** The request carried no ``per_page``, so GitHub's default
+      of 30 applied and there was no Link-pagination follow — a repo with more
+      open issues than that returned an arbitrary first page while looking like
+      the complete set. Now ``per_page=100`` + pagination to ``_ISSUES_MAX_PAGES``.
+    * **PR pollution.** ``GET /issues`` returns pull requests as well as issues
+      (GitHub models a PR as an issue); PR entries are identified by a
+      ``pull_request`` key. They were passed through unfiltered, so a busy repo
+      could fill the entire page with PRs and show the agent no issues at all.
+      Entries carrying ``pull_request`` are now dropped.
+
+    BUDGET: pagination turns 1 GitHub call into up to ``_ISSUES_MAX_PAGES``. On an
+    endpoint an agent may hit 150x/minute that is an amplifier, not a fix — so the
+    page cap is low (5, not 30) AND the result is served from a 60s TTL cache.
+    Both are load-bearing; do not raise the cap without re-doing the arithmetic in
+    the ``_ISSUES_MAX_PAGES`` comment.
+
+    A non-200 on page 2+ RETURNS the issues already fetched (mirroring
+    :func:`app.github_pulls.get_open_pull_requests`) rather than discarding them:
+    a partial backlog is strictly more useful than none, and the alternative
+    threw away up to 400 successfully-fetched issues. A failure on page 1 — where
+    there is nothing to salvage — still raises.
     """
-    Retrieves a list of issues for the specified repository.
-    """
+    key = (owner, repo, state)
+    now = time.time()
+    cached = _issues_cache.get(key)
+    if cached is not None and (now - cached[1]) < _ISSUES_CACHE_TTL_S:
+        return list(cached[0])
+
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github.v3+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
 
-    response = await _github_request(
-        "GET",
-        f"https://api.github.com/repos/{owner}/{repo}/issues?state={state}",
-        headers,
-    )
-
-    if response.status_code != 200:
-        logger.error(f"Failed to get issues: {response.text}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to retrieve issues from GitHub.",
+    issues: list = []
+    for page in range(1, _ISSUES_MAX_PAGES + 1):
+        response = await _github_request(
+            "GET",
+            f"https://api.github.com/repos/{owner}/{repo}/issues",
+            headers,
+            params={"state": state, "per_page": 100, "page": page},
         )
 
-    return response.json()
+        if response.status_code != 200:
+            logger.error(f"Failed to get issues (page {page}): {response.text}")
+            if page == 1:
+                # Nothing salvageable — the caller gets no list at all.
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Failed to retrieve issues from GitHub.",
+                )
+            logger.warning(
+                f"[GITHUB] get_issues: page {page} failed; returning the "
+                f"{len(issues)} issue(s) fetched so far (partial)"
+            )
+            return issues
+
+        batch = response.json()
+        if not isinstance(batch, list):
+            break
+        # Drop pull requests: /issues mixes them in, and every consumer of this
+        # helper wants issues.
+        issues.extend(
+            item
+            for item in batch
+            if isinstance(item, dict) and "pull_request" not in item
+        )
+        # A short page is the last page (the filter above must NOT be used to
+        # decide this — a full page of PRs still means more pages exist).
+        if len(batch) < 100:
+            break
+    else:
+        logger.warning(
+            f"[GITHUB] get_issues: hit the {_ISSUES_MAX_PAGES}-page cap for "
+            f"{owner}/{repo} (state={state}); the list is TRUNCATED at "
+            f"{len(issues)} issue(s)"
+        )
+
+    if len(_issues_cache) >= _ISSUES_CACHE_MAX:
+        _issues_cache.clear()
+    _issues_cache[key] = (list(issues), now)
+    return issues
 
 
 async def get_single_issue(
@@ -410,5 +509,3 @@ async def create_issue_comment(
         )
 
     return response.json()
-
-

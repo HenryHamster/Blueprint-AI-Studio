@@ -1,10 +1,11 @@
-import { useEffect, useState, memo, type ComponentProps, type ReactNode } from 'react';
+import { useEffect, useState, memo, lazy, Suspense, type ComponentProps, type ReactNode } from 'react';
 import { ChevronDown, ChevronRight, Star } from 'lucide-react';
-import ArchiveView from './ArchiveView';
 import { ErrorBoundary } from './ErrorBoundary';
-import { KanbanBoard } from './KanbanBoard';
 import type { KanbanColumn, SortBy } from './KanbanBoard';
-import { PipelineView } from './PipelineView';
+
+const ArchiveView = lazy(() => import('./ArchiveView'));
+const KanbanBoard = lazy(() => import('./KanbanBoard').then(m => ({ default: m.KanbanBoard })));
+const PipelineView = lazy(() => import('./PipelineView').then(m => ({ default: m.PipelineView })));
 import { TaskContextRail, type AttentionTaskInput } from './TaskContextRail';
 import TaskStreamPanel, { type TaskStreamPanelProps } from './TaskStreamPanel';
 import type { Task } from './TaskCard';
@@ -614,16 +615,18 @@ export const PipelineWorkspace = memo(function PipelineWorkspace({
       flush
     >
       {surface.pipelineSection === 'archive' ? (
-        <ArchiveView
-          {...archive}
-          setShowArchive={(show) => {
-            surface.setShowArchive(show);
-            if (!show) {
-              surface.onPipelineSectionChange('flow');
-              surface.setViewMode('pipeline');
-            }
-          }}
-        />
+        <Suspense fallback={null}>
+          <ArchiveView
+            {...archive}
+            setShowArchive={(show) => {
+              surface.setShowArchive(show);
+              if (!show) {
+                surface.onPipelineSectionChange('flow');
+                surface.setViewMode('pipeline');
+              }
+            }}
+          />
+        </Suspense>
       ) : surface.pipelineSection === 'flow' ? (
         <div className="flex h-full min-h-0 flex-col">
           {chrome.filterStrip}
@@ -639,16 +642,18 @@ export const PipelineWorkspace = memo(function PipelineWorkspace({
             </aside>
             <ErrorBoundary level="panel">
               <main data-testid="pipeline-flow-main" className="flex min-h-0 min-w-0 flex-col overflow-hidden px-3 py-2.5 md:px-4 lg:col-start-1 lg:row-start-1 lg:py-3">
-                <PipelineView
-                  tasks={flow.tasks}
-                  loading={flow.loading}
-                  hasActiveFilters={flow.hasActiveFilters}
-                  onViewLogs={flow.onViewLogs}
-                  onNavigateToParent={flow.onNavigateToParent}
-                  onClearWaveDeps={flow.onClearWaveDeps}
-                  onArchiveGroup={flow.onArchiveGroup}
-                  onUnarchiveTask={flow.onUnarchiveTask}
-                />
+                <Suspense fallback={null}>
+                  <PipelineView
+                    tasks={flow.tasks}
+                    loading={flow.loading}
+                    hasActiveFilters={flow.hasActiveFilters}
+                    onViewLogs={flow.onViewLogs}
+                    onNavigateToParent={flow.onNavigateToParent}
+                    onClearWaveDeps={flow.onClearWaveDeps}
+                    onArchiveGroup={flow.onArchiveGroup}
+                    onUnarchiveTask={flow.onUnarchiveTask}
+                  />
+                </Suspense>
               </main>
             </ErrorBoundary>
           </div>
@@ -669,36 +674,38 @@ export const PipelineWorkspace = memo(function PipelineWorkspace({
             </aside>
             <ErrorBoundary level="panel">
               <main data-testid="pipeline-board-main" className="min-h-0 min-w-0 overflow-hidden px-3 py-3 md:px-4 lg:col-start-1 lg:row-start-1">
-                <KanbanBoard
-                  tasks={board.tasks}
-                  columns={board.columns}
-                  loading={board.loading}
-                  maxRetries={board.maxRetries}
-                  actionLoadingMap={board.actionLoadingMap}
-                  compact={board.compact}
-                  sortBy={board.sortBy}
-                  selectionMode={board.selectionMode}
-                  selectedTaskIds={board.selectedTaskIds}
-                  onToggleTaskSelection={board.onToggleTaskSelection}
-                  onCtrlClick={board.onCtrlClick}
-                  onBulkToggle={board.onBulkToggle}
-                  onShiftSelect={board.onShiftSelect}
-                  hasActiveFilters={board.hasActiveFilters}
-                  onArchiveColumn={board.onArchiveColumn}
-                  onApprove={board.onApprove}
-                  onRequestChanges={board.onRequestChanges}
-                  onCancel={board.onCancel}
-                  onRetry={board.onRetry}
-                  onEditPrompt={board.onEditPrompt}
-                  onDismiss={board.onDismiss}
-                  onArchive={board.onArchive}
-                  onViewLogs={board.onViewLogs}
-                  onTrack={board.onTrack}
-                  trackedTaskIds={board.trackedTaskIds}
-                  onDuplicate={board.onDuplicate}
-                  searchQuery={board.searchQuery}
-                  onDirectionClick={board.onDirectionClick}
-                />
+                <Suspense fallback={null}>
+                  <KanbanBoard
+                    tasks={board.tasks}
+                    columns={board.columns}
+                    loading={board.loading}
+                    maxRetries={board.maxRetries}
+                    actionLoadingMap={board.actionLoadingMap}
+                    compact={board.compact}
+                    sortBy={board.sortBy}
+                    selectionMode={board.selectionMode}
+                    selectedTaskIds={board.selectedTaskIds}
+                    onToggleTaskSelection={board.onToggleTaskSelection}
+                    onCtrlClick={board.onCtrlClick}
+                    onBulkToggle={board.onBulkToggle}
+                    onShiftSelect={board.onShiftSelect}
+                    hasActiveFilters={board.hasActiveFilters}
+                    onArchiveColumn={board.onArchiveColumn}
+                    onApprove={board.onApprove}
+                    onRequestChanges={board.onRequestChanges}
+                    onCancel={board.onCancel}
+                    onRetry={board.onRetry}
+                    onEditPrompt={board.onEditPrompt}
+                    onDismiss={board.onDismiss}
+                    onArchive={board.onArchive}
+                    onViewLogs={board.onViewLogs}
+                    onTrack={board.onTrack}
+                    trackedTaskIds={board.trackedTaskIds}
+                    onDuplicate={board.onDuplicate}
+                    searchQuery={board.searchQuery}
+                    onDirectionClick={board.onDirectionClick}
+                  />
+                </Suspense>
               </main>
             </ErrorBoundary>
           </div>

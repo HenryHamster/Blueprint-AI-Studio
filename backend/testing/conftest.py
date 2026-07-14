@@ -318,19 +318,23 @@ def reset_runtime_config():
 def reset_github_module_caches():
     """Clear module-level GitHub API caches between tests.
 
-    ``_list_prs_for_commit_cache`` (github_refs) and ``_check_runs_cache``
-    (github_checks) are module-level dicts that persist across tests.  Without
-    this fixture a successful call in test A populates the cache, and test B
-    with the same SHA receives the stale cached result instead of making its own
-    mocked HTTP call — breaking non-200 and non-list-body error-path tests.
+    ``_list_prs_for_commit_cache`` (github_refs), ``_check_runs_cache``
+    (github_checks) and ``_issues_cache`` (github_issues) are module-level dicts
+    that persist across tests.  Without this fixture a successful call in test A
+    populates the cache, and test B with the same key receives the stale cached
+    result instead of making its own mocked HTTP call — breaking non-200 and
+    non-list-body error-path tests.  (Every github test uses the same
+    owner/repo/sha placeholders, so collisions are the norm, not the exception.)
     """
-    from app import github_refs, github_checks
+    from app import github_refs, github_checks, github_issues
 
     github_refs._list_prs_for_commit_cache.clear()
     github_checks._check_runs_cache.clear()
+    github_issues._issues_cache.clear()
     yield
     github_refs._list_prs_for_commit_cache.clear()
     github_checks._check_runs_cache.clear()
+    github_issues._issues_cache.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -391,6 +395,22 @@ def reset_rate_limiter():
 _TEST_CSRF_TOKEN = "test-csrf-token-for-client-fixture"
 
 
+@pytest.fixture(autouse=True)
+def _allow_plaintext_credentials_for_tests(monkeypatch):
+    """Allow encryption pass-through for tests without GITHUB_PAT_ENCRYPTION_KEY.
+
+    Most tests do not configure an encryption key and should not need to.
+    This fixture sets ``ALLOW_PLAINTEXT_CREDENTIALS=true`` so that
+    :func:`~app.field_encryption.encrypt_field` and
+    :func:`~app.field_encryption.decrypt_field` pass through values unchanged
+    instead of raising ``RuntimeError``.
+
+    Tests that specifically verify the error path when neither the key nor the
+    opt-in is set can remove the variable with their own ``monkeypatch.delenv``.
+    """
+    monkeypatch.setenv("ALLOW_PLAINTEXT_CREDENTIALS", "true")
+
+
 @pytest_asyncio.fixture(scope="function")
 async def client(override_get_session, override_get_current_user):
     """
@@ -423,6 +443,50 @@ async def unauthenticated_client(override_get_session):
         transport=ASGITransport(app=app), base_url="http://test"
     ) as ac:
         yield ac
+
+
+@pytest.fixture
+def missing_greenlet_proxy():
+    """Factory: wrap an object so that accessing ``poison_attr`` after
+    ``.poison()`` is called raises ``MissingGreenlet`` — mimicking asyncpg's
+    behaviour when production code lazy-reads an expired ORM attribute in an
+    async context after a session rollback.
+
+    Usage::
+
+        proxy = missing_greenlet_proxy(project, poison_attr="id")
+        # ... trigger rollback in production code ...
+        proxy.poison()   # arm the proxy
+        # any read of proxy.id now raises MissingGreenlet
+
+    This fixture generalises the ad-hoc ``_ProjectIdPoisonAfterRollback`` proxy
+    used in ``test_sync_resident_snapshots_project_id_before_rollback`` so that
+    future MissingGreenlet regression tests can reach for a shared, reusable
+    helper instead of reinventing the proxy each time.
+    """
+    from sqlalchemy.exc import MissingGreenlet as _MG
+
+    class _Proxy:
+        def __init__(self, real_obj: object, poison_attr: str) -> None:
+            object.__setattr__(self, "_real", real_obj)
+            object.__setattr__(self, "_attr", poison_attr)
+            object.__setattr__(self, "_poisoned", False)
+
+        def poison(self) -> None:
+            object.__setattr__(self, "_poisoned", True)
+
+        def __getattr__(self, name: str) -> object:
+            if object.__getattribute__(self, "_poisoned") and name == object.__getattribute__(self, "_attr"):
+                raise _MG(
+                    "simulated post-rollback lazy-load of expired attribute "
+                    "(missing_greenlet_proxy fixture)"
+                )
+            return getattr(object.__getattribute__(self, "_real"), name)
+
+    def _factory(real_obj: object, *, poison_attr: str) -> _Proxy:
+        return _Proxy(real_obj, poison_attr)
+
+    return _factory
 
 
 @pytest.fixture

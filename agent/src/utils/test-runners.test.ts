@@ -20,7 +20,7 @@ import {
   isSafeDocumentedCommand, isAllowlistedRunnerShape, discoverDocumentedCommands,
   MAX_DOCUMENTED_COMMANDS,
   discoverNewlyDisabledTests, isTestFilePath, MAX_DISABLED_TEST_MARKERS,
-  buildAcceptanceTestRunner, classifyAcceptanceTestRun,
+  buildAcceptanceTestRunner, classifyAcceptanceTestRun, acceptanceTestRunPassed,
   effectiveTestCmd, effectiveBuildCmd, effectiveInstallCmd,
 } from './test-runners.js';
 import type { BuildConfig, TestRunner, DirectoryConfig } from './test-runners.js';
@@ -3745,5 +3745,24 @@ describe('classifyAcceptanceTestRun — ran / skipped / absent', () => {
   it('maps a zero-collection / not-found run to absent', () => {
     expect(classifyAcceptanceTestRun('no tests ran in 0.01s')).toBe('absent');
     expect(classifyAcceptanceTestRun('collected 0 items')).toBe('absent');
+  });
+});
+
+describe('acceptanceTestRunPassed — exit-zero + ran is the only green', () => {
+  it('is true ONLY for a clean (exit-zero) run classified ran', () => {
+    expect(acceptanceTestRunPassed(true, 'ran')).toBe(true);
+  });
+
+  it('is false for a non-zero exit even when classified ran (a failing test)', () => {
+    expect(acceptanceTestRunPassed(false, 'ran')).toBe(false);
+  });
+
+  it('is false for skipped / absent / could_not_run regardless of exit', () => {
+    expect(acceptanceTestRunPassed(true, 'skipped')).toBe(false);
+    expect(acceptanceTestRunPassed(true, 'absent')).toBe(false);
+    expect(acceptanceTestRunPassed(true, 'could_not_run')).toBe(false);
+    expect(acceptanceTestRunPassed(false, 'skipped')).toBe(false);
+    expect(acceptanceTestRunPassed(false, 'absent')).toBe(false);
+    expect(acceptanceTestRunPassed(false, 'could_not_run')).toBe(false);
   });
 });

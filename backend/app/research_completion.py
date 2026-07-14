@@ -40,6 +40,7 @@ from app.cochange_decomposition import (
 )
 from app.compute_experiment_contract import (
     _author_compute_launch_contract,
+    _stamp_container_image_pin_status,
     _validate_compute_launch_contract,
     resolve_compute_spend_approval,
     resolve_compute_spend_threshold,
@@ -95,6 +96,7 @@ from app.task_evaluators import (
 from app.capability_registry import (
     annotate_capability_proof_status,
     off_registry_capability_refs,
+    registry_capability_evidence_refs_map,
     registry_capability_names,
     registry_capability_vocabulary,
 )
@@ -287,20 +289,6 @@ _SPAWN_GATE_REASONS_SAMPLE_CAP = 5
 _SPAWN_GATE_REASON_MAX_LEN = 200
 _ADVERSARIAL_WHOLESALE_RETRY_KEY = "_adversarial_wholesale_retry_count"
 _ADVERSARIAL_WHOLESALE_RETRY_LIMIT = 1
-# Declares which auto-complete code paths inside _stamp_no_findings_refractory
-# gate on criterion coverage before retiring a direction, plus the
-# strategist-authored retire_direction path in strategic_completion.py.
-# This frozenset MUST match the one in research_direction_state.py.
-# test_all_autocomplete_paths_gate_on_criterion_coverage in test_invariants.py
-# verifies structurally that all declared paths contain the gate call.
-_AUTOCOMPLETE_PATHS_GATED_ON_CRITERION_COVERAGE: frozenset[str] = frozenset(
-    {
-        "exhaustion",  # _stamp_no_findings_refractory exhaustion complete (L840)
-        "proven_merge",  # _stamp_no_findings_refractory >=3-merge completion (L824)
-        "no_findings",  # _stamp_no_findings_refractory overall site (research_completion.py)
-        "strategist_retire",  # _handle_strategic_completion retire_direction op (strategic_completion.py)
-    }
-)
 # Targeted retry: used when the non-response cause is time-based (timeout/stall).
 # A reduced-manifest grader is spawned BEFORE falling back to the wholesale retry,
 # so the total grader budget is: initial + at most one targeted + at most one wholesale.
@@ -565,6 +553,62 @@ def _parse_research_findings(text: str) -> List[Dict[str, Any]] | None:
     return None
 
 
+def _cap_findings_by_priority(
+    findings: List[Dict[str, Any]], effective_cap: int
+) -> tuple[List[Dict[str, Any]], int, List[Dict[str, Any]]]:
+    """Cap findings to effective_cap, preserving high-priority items first.
+
+    Returns (capped_findings, batch_cap_applied_count, batch_cap_deferred).
+    Synchronous helper for asyncio.to_thread() offloading.
+    """
+    _BATCH_PRIORITY_ORDER = {"high": 0, "medium": 1, "low": 2}
+    batch_cap_applied_count = max(0, len(findings) - effective_cap)
+    _batch_cap_deferred: list[dict] = []
+    if len(findings) > effective_cap:
+        _ranked = sorted(
+            enumerate(findings),
+            key=lambda pair: _BATCH_PRIORITY_ORDER.get(
+                pair[1].get("priority", "medium"), 1
+            ),
+        )
+        _kept_set = {i for i, _ in _ranked[:effective_cap]}
+        # Co-defer any kept finding whose depends_on_indices points at a finding
+        # the cap dropped. Without this, the index remap below silently DROPS
+        # that edge (the target index is not in _old_to_new), and the dependent
+        # spawns as an ordinary child with no edge and no blocking need --
+        # dispatching against a foundation that does not exist yet. Mirror the
+        # same-cycle prerequisite co-deferral: shelve the dependent alongside its
+        # deferred foundation so the pair re-surfaces together next cycle.
+        # Iterate to a fixpoint so an entire dependent chain co-defers, never
+        # just the leaf.
+        while True:
+            _co_defer = {
+                i
+                for i in _kept_set
+                if any(
+                    0 <= d < len(findings) and d not in _kept_set
+                    for d in (findings[i].get("depends_on_indices") or [])
+                )
+            }
+            if not _co_defer:
+                break
+            _kept_set -= _co_defer
+        _kept_orig_indices = sorted(_kept_set)
+        _batch_cap_deferred = [
+            f for i, f in enumerate(findings) if i not in _kept_set
+        ]
+        _old_to_new = {old: new for new, old in enumerate(_kept_orig_indices)}
+        findings_capped = [findings[i] for i in _kept_orig_indices]
+        for _f in findings_capped:
+            _deps = _f.get("depends_on_indices")
+            if _deps:
+                _f["depends_on_indices"] = [
+                    _old_to_new[d] for d in _deps if d in _old_to_new
+                ]
+        return findings_capped, batch_cap_applied_count, _batch_cap_deferred
+    return findings, batch_cap_applied_count, _batch_cap_deferred
+
+
 def _annotate_capability_declarations(
     findings: List[Dict[str, Any]], registry_names: List[str]
 ) -> None:
@@ -765,22 +809,6 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
 
     _auto_complete_info: list[dict] = []
 
-    # Gate the PROVEN-merge SUCCESS route on outcome coverage (same policy as
-    # apply_post_spawn_state). The coverage query is async, but the completion
-    # decision runs inside the SYNCHRONOUS with_directions_locked closure below,
-    # so we resolve the verdict here (outside the lock) and thread the boolean
-    # in. Fail-closed: the helper returns True on query errors (blocking
-    # completion until resolved) and False only when the direction owns no keys,
-    # no open version, no active owned criteria, or all owned active criteria
-    # are covered.
-    from app.acceptance_criteria import (  # noqa: PLC0415
-        direction_owns_uncovered_criterion,
-    )
-
-    _owns_uncovered = await direction_owns_uncovered_criterion(
-        session, task.project_id, direction_id
-    )
-
     def _apply_no_findings_refractory(dirs: list) -> None:
         target = next((d for d in dirs if d.get("id") == direction_id), None)
         if not target:
@@ -823,14 +851,12 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
                 ) - int(agg.get("total_stranded_prs_merged", 0) or 0),
             )
             total_cycles = len(history) + (agg.get("total_cycles") or 0)
-            # Gated: a direction (regardless of merge count) whose owned
-            # acceptance outcome is still uncovered is withheld from BOTH the
-            # SUCCESS route AND the exhaustion route — a criterion-carrying
-            # direction with an unmet outcome is neither proven NOR deadlocked;
-            # it stays active. The exhaustion route declares deadlock, which a
-            # productive-but-unmet direction is not.
-            _proven_gated = _owns_uncovered
-            if total_merged >= 3 and not _owns_uncovered:
+            # Direction completion falls back to its own proven-merge and
+            # exhaustion logic. The acceptance contract is enforced only at
+            # qualify (the ledger gate in compute_composite), so a direction
+            # retiring while a criterion is unmet still cannot promote an unmet
+            # version — there is no pre-qualification coverage precondition here.
+            if total_merged >= 3:
                 target["status"] = "completed"
                 target["completed_at"] = now_iso
                 target["auto_completed"] = True
@@ -846,7 +872,7 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
                         "total_cycles": total_cycles,
                     }
                 )
-            elif not _proven_gated and not _owns_uncovered and _should_autocomplete_exhausted(target):
+            elif _should_autocomplete_exhausted(target):
                 reason = _exhaustion_complete_reason(target)
                 target["status"] = "completed"
                 target["completed_at"] = now_iso
@@ -1050,6 +1076,16 @@ def _compute_direction_productivity(
     current direction.  Crediting verification-only cycles prevents live-verification
     sweeps and concluded design/research cycles from incurring the longer unproductive
     refractory window.
+
+    Scope note: this flag drives the COOLDOWN cadence only (``direction_refractory``
+    picks the fast productive window when ``last_cycle_productive`` is True). It is a
+    spawn-/notes-level signal and deliberately does NOT mean the direction LANDED
+    work, so it must NOT be treated on its own as a merge-rate pause shield: a
+    direction that spawns every cycle but never merges is still spawn-productive here
+    yet is churn for pause purposes. The still-productive pause shield
+    (``strategic_completion._direction_still_productive``) therefore additionally
+    requires a real landing / no-op-completion signal from the direction's history —
+    see that function.
     """
     if tasks_by_dir.get(direction_id, 0) > 0:
         return True
@@ -1595,7 +1631,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         )
         return
 
-    findings = _parse_research_findings(logs)
+    findings = await asyncio.to_thread(_parse_research_findings, logs)
     insights = await _parse_research_insights(str(task.id))
     # Agent JSON sometimes contains non-dict entries (bare strings, nulls).
     # The downstream .get() loop would AttributeError and the handler-failed
@@ -1898,6 +1934,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     _registry_vocab = annotate_capability_proof_status(
         registry_capability_vocabulary(getattr(project_obj, "problem_model", None)),
         getattr(project_obj, "capability_proof_records", None),
+        registry_capability_evidence_refs_map(getattr(project_obj, "problem_model", None)),
     )
     _annotate_capability_declarations(findings, _registry_names)
 
@@ -1926,7 +1963,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         and _runtime_config.get("research_quality_grader_enabled", False)
         and _research_findings_would_spawn(findings)
     ):
-        grader = await spawn_forward_quality_grader(task, json.dumps(findings), session)
+        findings_json = await asyncio.to_thread(json.dumps, findings)
+        grader = await spawn_forward_quality_grader(task, findings_json, session)
         if grader is not None:
             logger.info(
                 "[RESEARCH] Task %s parked awaiting forward-quality grade "
@@ -2837,51 +2875,17 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # each surviving finding's depends_on_indices to the compacted positions
     # so _validate_plan_dependencies doesn't see spurious self-cycles and
     # UUID resolution wires deps to the correct child tasks.
-    _BATCH_PRIORITY_ORDER = {"high": 0, "medium": 1, "low": 2}
 
     # Cap findings to prevent runaway task creation and backlog build-up.
     # Excess findings are deferred to the next cycle (via task.context['deferred_findings'])
     # rather than discarded, so capacity-constrained cycles don't permanently lose work.
-    batch_cap_applied_count = max(0, len(findings) - _effective_cap)
-    _batch_cap_deferred: list[dict] = []
-    if len(findings) > _effective_cap:
-        _ranked = sorted(
-            enumerate(findings),
-            key=lambda pair: _BATCH_PRIORITY_ORDER.get(
-                pair[1].get("priority", "medium"), 1
-            ),
-        )
-        _kept_set = {i for i, _ in _ranked[:_effective_cap]}
-        # Co-defer any kept finding whose depends_on_indices points at a finding the
-        # cap dropped. Without this, the index remap below silently DROPS that edge
-        # (the target index is not in _old_to_new), and the dependent spawns as an
-        # ordinary child with no edge and no blocking need — dispatching against a
-        # foundation that does not exist yet. Mirror the same-cycle prerequisite
-        # co-deferral: shelve the dependent alongside its deferred foundation so the
-        # pair re-surfaces together next cycle. Iterate to a fixpoint so an entire
-        # dependent chain co-defers, never just the leaf.
-        while True:
-            _co_defer = {
-                i
-                for i in _kept_set
-                if any(
-                    0 <= d < len(findings) and d not in _kept_set
-                    for d in (findings[i].get("depends_on_indices") or [])
-                )
-            }
-            if not _co_defer:
-                break
-            _kept_set -= _co_defer
-        _kept_orig_indices = sorted(_kept_set)
-        _batch_cap_deferred = [f for i, f in enumerate(findings) if i not in _kept_set]
-        _old_to_new = {old: new for new, old in enumerate(_kept_orig_indices)}
-        findings = [findings[i] for i in _kept_orig_indices]
-        for _f in findings:
-            _deps = _f.get("depends_on_indices")
-            if _deps:
-                _f["depends_on_indices"] = [
-                    _old_to_new[d] for d in _deps if d in _old_to_new
-                ]
+    # Offloaded to thread via asyncio.to_thread since the sort + fixpoint loop is CPU-bound.
+    (
+        findings,
+        batch_cap_applied_count,
+        _batch_cap_deferred,
+    ) = await asyncio.to_thread(_cap_findings_by_priority, findings, _effective_cap)
+    if _batch_cap_deferred:
         logger.info(
             "[RESEARCH] Batch cap (%d) exceeded — deferring %d lower-priority finding(s) to next cycle",
             _effective_cap,
@@ -3510,6 +3514,25 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
 
     # Pre-load project for scope calibration (SQLAlchemy identity map — no extra query if already loaded)
     _scope_cal_project = await session.get(Project, task.project_id)
+
+    _project_default_container_image: str | None = None
+    if _scope_cal_project:
+        try:
+            from app.routers.admin_project_tools import _discover_manifest_tools as _dmt
+            _manifest = await _dmt(_scope_cal_project)
+            _ci = ((_manifest.get("compute") or {}).get("image") or {})
+            if isinstance(_ci, dict):
+                _project_default_container_image = _ci.get("name") or None
+            if _project_default_container_image:
+                # Pin the mutable manifest tag to a content-addressed digest so
+                # repeated defaulting is bit-identical over time (design gap G3).
+                from app.compute_backends import resolve_digest_pinned_default_image
+                _project_default_container_image = await resolve_digest_pinned_default_image(
+                    session, _scope_cal_project.id, _project_default_container_image
+                )
+        except Exception:
+            logger.debug("[RESEARCH] manifest fetch for compute image default failed")
+
     _directions_by_id: dict = {}
     if _scope_cal_project:
         for _d in _scope_cal_project.directions or []:
@@ -4087,6 +4110,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         _compute_threshold = 0.0
         if task_type == "compute_experiment":
             _compute_contract = _author_compute_launch_contract(finding)
+            if not _compute_contract.get("container_image") and _project_default_container_image:
+                _compute_contract["container_image"] = _project_default_container_image
+            _stamp_container_image_pin_status(_compute_contract, task)
             _cc_ok, _cc_reason = _validate_compute_launch_contract(_compute_contract)
             if not _cc_ok:
                 _compute_contract_deferred.append(finding)
@@ -4725,7 +4751,10 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                             "require_durable_artifact",
                             "sweep_id",
                             "setup_step",
+                            "no_progress_timeout_seconds",
+                            "input_artifact_job_id",
                             "container_image",
+                            "container_image_digest_pinned",
                             "container_registry_auth",
                             "declared_metric",
                             "arms",
@@ -4802,6 +4831,14 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         _spawn_criterion_ids = _direction_criterion_cache.get(
             _spawn_effective_dir_id or "", []
         )
+        # Fall back to the parent task's own criterion_ids when the direction
+        # cache has no entry (e.g. corroboration tasks that carry criterion_ids
+        # directly on the Task row but have no direction_id). Without this
+        # fallback, research children spawned from a corroboration task would
+        # inherit empty criterion_ids and record_task_merge_evidence would
+        # produce no evidence, defeating the attestation->covered upgrade.
+        if not _spawn_criterion_ids and task.criterion_ids:
+            _spawn_criterion_ids = list(task.criterion_ids)
         new_task = Task(
             project_id=task.project_id,
             title=title,
@@ -5563,6 +5600,36 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         session, task, stage="child-task spawn"
     ):
         return
+    # The self-claim recovery path inside _commit_or_handle_duplicate_spawn
+    # rolls the session back before re-committing, which expires EVERY loaded
+    # ORM instance (rollback expires even with expire_on_commit=False). The
+    # helper re-populates ``task`` itself, but the other instances this
+    # function keeps reading below (project_obj, the dedup scans) would
+    # otherwise lazy-load synchronously on the next attribute access —
+    # MissingGreenlet under the async engine. Detect the rollback via the
+    # ``expired`` flag (no IO) and batch re-populate in place;
+    # ``populate_existing`` refreshes the SAME identity-map instances, so
+    # every existing reference becomes live again.
+    from sqlalchemy import inspect as _sa_inspect
+
+    with session.no_autoflush:
+        if project_obj is not None and _sa_inspect(project_obj).expired:
+            await session.execute(
+                select(Project)
+                .where(Project.id == _sa_inspect(project_obj).identity[0])
+                .execution_options(populate_existing=True)
+            )
+        _stale_scan_ids = [
+            _sa_inspect(t).identity[0]
+            for t in (*existing_tasks, *recent_tasks_for_dedup)
+            if _sa_inspect(t).expired
+        ]
+        if _stale_scan_ids:
+            await session.execute(
+                select(Task)
+                .where(Task.id.in_(_stale_scan_ids))
+                .execution_options(populate_existing=True)
+            )
     # Batch-reload all child tasks (N+1 guard: commit above expired the
     # session; one batch SELECT + identity-map lookups replaces N individual
     # session.refresh calls). Build a fresh map so the downstream code that
@@ -5607,9 +5674,13 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # the structural source rather than deferred to the dispatch-time cycle breaker.
     from app.blocked_need_resolution import _would_create_cycle
     from app.capability_registry import (
+        capability_need_blocked_by_proof_gate,
+        capability_need_proof_status,
+        consumer_gate_proof_status,
         registry_satisfies_capability_need,
         working_capability_names,
     )
+    from app.shared_state import runtime_config as _rc
     from app.task_blocked import build_need, enter_blocked_state
 
     _prereq_candidates = list(existing_tasks) + list(child_tasks)
@@ -5622,6 +5693,26 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # and lands on the operator — for work that was runnable all along.
     _working_registry_caps = working_capability_names(
         getattr(project_obj, "problem_model", None)
+    )
+    # Proof-status companion of the working-capability set, built from the SAME
+    # registry so an unproven "declared working with zero evidence" resolution can
+    # be surfaced.  In OBSERVE mode this map drives a WARNING log below and does
+    # NOT change which needs resolve; in ENFORCE mode (checked below via
+    # capability_need_blocked_by_proof_gate) an unproven capability need DOES
+    # block the dependent — the enforce gate is implemented and active.
+    #
+    # SECURITY (audit finding #4): graded through consumer_gate_proof_status, NOT
+    # from working_capability_proof_status alone. The latter reads only
+    # problem_model.capabilities[].evidence_refs / proof_exempt — AGENT-WRITABLE
+    # JSONB — so a task could write itself a {"kind":"named_test","proven":true}
+    # ref and clear this gate for its own dependents with nothing verified. The
+    # shared grader corroborates every ``proven`` claim against
+    # project.capability_proof_records (the platform-only ledger), exactly as the
+    # release-qualifier seam does; only a provenance-authorized proof_exempt clears
+    # without a ledger entry.
+    _working_registry_proof = consumer_gate_proof_status(
+        getattr(project_obj, "problem_model", None),
+        getattr(project_obj, "capability_proof_records", None),
     )
     # Prerequisites already satisfied by SHIPPED prior-cycle work or a durable
     # knowledge document are resolved at spawn time too — the completed-foundation
@@ -5909,13 +6000,53 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 if prereq_need and registry_satisfies_capability_need(
                     prereq_need, _working_registry_caps
                 ):
-                    logger.info(
-                        "[RESEARCH] Finding '%s' prerequisite capability:%s is "
-                        "already 'working' per the problem_model registry — "
-                        "satisfied by the codebase, no gate",
-                        finding_title,
-                        prereq.get("ref"),
+                    _proof_status = capability_need_proof_status(
+                        prereq_need, _working_registry_proof
                     )
+                    if capability_need_blocked_by_proof_gate(
+                        prereq_need,
+                        _working_registry_proof,
+                        mode=str(_rc.get("capability_proof_gate_mode", "off") or "off"),
+                    ):
+                        # ENFORCE mode: an unproven/partial 'working' capability
+                        # does NOT satisfy the prerequisite. Gate the dependent —
+                        # wire the need as blocking exactly as an unresolved
+                        # explicit prerequisite would, so the task parks BLOCKED
+                        # instead of spawning on an unproven codebase foundation.
+                        logger.warning(
+                            "[RESEARCH][capability-proof-enforce] Finding '%s' "
+                            "prerequisite capability:%s NOT satisfied — the "
+                            "registry capability is 'working' with proof_status=%s "
+                            "(unproven); enforce mode gates the dependent BLOCKED",
+                            finding_title,
+                            prereq.get("ref"),
+                            _proof_status,
+                        )
+                        needs.append(prereq_need)
+                        unresolved_entries.append(prereq)
+                    elif _proof_status is not None and _proof_status != "proven":
+                        # OBSERVE mode: surface (never gate) a resolution backed by
+                        # a capability declared 'working' with no proven evidence.
+                        # The need still resolves as satisfied-by-the-codebase; this
+                        # only makes the unproven claim visible while enforce is off.
+                        logger.warning(
+                            "[RESEARCH][capability-proof-observe] Finding '%s' "
+                            "prerequisite capability:%s resolved as "
+                            "satisfied-by-the-codebase, but the registry "
+                            "capability is 'working' with proof_status=%s — "
+                            "unproven resolution (observe mode, not gated)",
+                            finding_title,
+                            prereq.get("ref"),
+                            _proof_status,
+                        )
+                    else:
+                        logger.info(
+                            "[RESEARCH] Finding '%s' prerequisite capability:%s is "
+                            "already 'working' per the problem_model registry — "
+                            "satisfied by the codebase, no gate",
+                            finding_title,
+                            prereq.get("ref"),
+                        )
                 elif prereq_need:
                     needs.append(prereq_need)
                     unresolved_entries.append(prereq)

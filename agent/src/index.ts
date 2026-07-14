@@ -65,10 +65,11 @@ import {
   PROVIDER, AUTH_MODE, LLM_EXECUTION_MODE, LLM_CLI_TRANSLATION,
   parseLLMCliTranslation, matchesRateLimit, matchesAuthFailure, matchesVmConfigMissing,
   RateLimitError, AuthFailureError, NoProgressTimeoutError, VmConfigMissingError,
+  RuntimeUnavailableError,
   missingProviderConfigFiles, requiredProviderConfigFiles,
   refreshRuntimeState,
   getProviderRunner, providerSupportsNativeSubagents,
-  __setRunClaudeCodeOverrideForSmoke, codexStreamHasTurnCompleted,
+  __setRunClaudeCodeOverrideForSmoke, __setCommandExistsOverrideForSmoke, codexStreamHasTurnCompleted,
   runClaudeCode, runProviderAgent,
   getLastProviderRunErrorReport, clearLastProviderRunErrorReport,
   type LLMCliTranslation, type ClaudeOutput, type RunnerCommand,
@@ -78,11 +79,11 @@ import {
 export {
   PROVIDER, AUTH_MODE, LLM_EXECUTION_MODE, LLM_CLI_TRANSLATION,
   parseLLMCliTranslation, matchesRateLimit, matchesAuthFailure, matchesVmConfigMissing,
-  RateLimitError, AuthFailureError, NoProgressTimeoutError, VmConfigMissingError,
+  RateLimitError, AuthFailureError, NoProgressTimeoutError, VmConfigMissingError, RuntimeUnavailableError,
   missingProviderConfigFiles, requiredProviderConfigFiles,
   refreshRuntimeState,
   getProviderRunner, providerSupportsNativeSubagents,
-  __setRunClaudeCodeOverrideForSmoke, codexStreamHasTurnCompleted,
+  __setRunClaudeCodeOverrideForSmoke, __setCommandExistsOverrideForSmoke, codexStreamHasTurnCompleted,
   runClaudeCode, runProviderAgent,
   getLastProviderRunErrorReport, clearLastProviderRunErrorReport,
 };
@@ -90,7 +91,7 @@ export type { LLMCliTranslation, ClaudeOutput, RunnerCommand, ValidationCommand,
 export { computeRefreshDelayMs, isBootstrapToken };
 
 // ── Failure categories ───────────────────────────────────────────────────────
-export type FailureCategory = 'clone_failed' | 'build_failed' | 'test_failed' | 'lint_failed' | 'pr_creation_failed' | 'claude_code_failed' | 'parse_failed' | 'fatal' | 'rate_limited' | 'no_progress_timeout' | 'timeout' | 'oauth_rotation_failed' | 'reset_failed' | 'reassigned' | 'external_api' | 'vm_config_missing' | 'github_token_fetch_failed';
+export type FailureCategory = 'clone_failed' | 'build_failed' | 'test_failed' | 'lint_failed' | 'pr_creation_failed' | 'claude_code_failed' | 'parse_failed' | 'fatal' | 'rate_limited' | 'no_progress_timeout' | 'timeout' | 'oauth_rotation_failed' | 'reset_failed' | 'reassigned' | 'external_api' | 'vm_config_missing' | 'github_token_fetch_failed' | 'runtime_unavailable';
 
 // ── Graceful-shutdown signalling (cluster C7) ────────────────────────────────
 // A non-error "shutdown requested" control signal. Thrown from the deep call
@@ -153,7 +154,7 @@ import {
   rotateOAuthCredentialsIfChanged as _rotateOAuthCredentialsIfChanged,
   ClaudeTimeoutError,
 } from './oauth-rotation.js';
-import { clearTestConventionCache } from './prompts/discovery.js';
+import { clearTestConventionCache, clearFileTreeCache } from './prompts/discovery.js';
 export { recordInitialOAuthAuthHash, ClaudeTimeoutError };
 
 /** Rotate OAuth credentials if changed, bound to the local apiPost. */
@@ -2117,17 +2118,60 @@ export function resetPerRoleModuleState(flags: ResetPerRoleModuleStateFlags = {}
   // Test convention cache in discovery.ts is per-repo; stale entries from a
   // prior task's codebase must not carry into a new role on a warm VM.
   clearTestConventionCache();
+  // File-tree cache in discovery.ts — buildFileTree result is stale when the
+  // workspace changes between roles.
+  clearFileTreeCache();
   // Per-task resident-session turn-latency telemetry.
   resetResidentTurnLatencyTelemetry();
+  // Disk-metric cache — clear so the first heartbeat of each task gets a fresh
+  // df reading rather than reusing the prior task's cached values.
+  _dfCacheTimestamp = 0;
 }
 
 // ── Heartbeat ───────────────────────────────────────────────────────────────
 let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
-function collectMetrics(): { rss_mb: number; heap_used_mb: number; cgroup_mb?: number; cgroup_limit_mb?: number; disk_free_mb?: number; disk_total_mb?: number } {
+// ── Disk-metric cache ──────────────────────────────────────────────────────────
+// collectMetrics calls 'df' every heartbeat (2+ times/min) to surface low-disk
+// warnings. Disk usage is static within a task, so cache it with a 60s TTL to
+// avoid blocking the event loop on a subprocess spawn every 30 seconds.
+let _dfCacheTimestamp = 0;
+let _dfCacheDiskFreeMb: number | undefined;
+let _dfCacheDiskTotalMb: number | undefined;
+const DF_CACHE_TTL_MS = 60_000;
+
+function _readDiskMetrics(): { disk_free_mb?: number; disk_total_mb?: number } {
+  const now = Date.now();
+  if (_dfCacheTimestamp > 0 && now - _dfCacheTimestamp < DF_CACHE_TTL_MS) {
+    return { disk_free_mb: _dfCacheDiskFreeMb, disk_total_mb: _dfCacheDiskTotalMb };
+  }
+  try {
+    const dfOut = execFileSync('df', ['-k', '/tmp'], { timeout: 5000 }).toString();
+    const line = dfOut.split('\n')[1];
+    if (line) {
+      const parts = line.trim().split(/\s+/);
+      _dfCacheDiskTotalMb = Math.round(parseInt(parts[1], 10) / 1024);
+      _dfCacheDiskFreeMb = Math.round(parseInt(parts[3], 10) / 1024);
+      _dfCacheTimestamp = now;
+      return { disk_free_mb: _dfCacheDiskFreeMb, disk_total_mb: _dfCacheDiskTotalMb };
+    }
+  } catch { /* disk metrics are best-effort */ }
+  return {};
+}
+
+type MetricsResult = { rss_mb: number; heap_used_mb: number; cgroup_mb?: number; cgroup_limit_mb?: number; disk_free_mb?: number; disk_total_mb?: number };
+
+function _memoryUsageBase(): Pick<MetricsResult, 'rss_mb' | 'heap_used_mb'> {
   const mem = process.memoryUsage();
-  const rss_mb = Math.round(mem.rss / 1024 / 1024 * 10) / 10;
-  const heap_used_mb = Math.round(mem.heapUsed / 1024 / 1024 * 10) / 10;
+  return {
+    rss_mb: Math.round(mem.rss / 1024 / 1024 * 10) / 10,
+    heap_used_mb: Math.round(mem.heapUsed / 1024 / 1024 * 10) / 10,
+  };
+}
+
+// Sync version for crash handler and sendHeartbeatSync (sync-only contexts).
+function collectMetrics(): MetricsResult {
+  const { rss_mb, heap_used_mb } = _memoryUsageBase();
   // Read cgroup memory (includes agent + Claude Code + all subprocesses).
   // The agent's own RSS (93MB) hides the real picture — Claude Code can use
   // several GB. MemoryMax=6G triggers cgroup OOM killer (SIGKILL, no handler).
@@ -2139,17 +2183,23 @@ function collectMetrics(): { rss_mb: number; heap_used_mb: number; cgroup_mb?: n
     const max = fs.readFileSync('/sys/fs/cgroup/memory.max', 'utf-8').trim();
     if (max !== 'max') cgroup_limit_mb = Math.round(parseInt(max, 10) / 1024 / 1024);
   } catch { /* cgroup v2 not available */ }
+  const { disk_free_mb, disk_total_mb } = _readDiskMetrics();
+  return { rss_mb, heap_used_mb, cgroup_mb, cgroup_limit_mb, disk_free_mb, disk_total_mb };
+}
+
+// Async version for heartbeat ticks — avoids blocking the event loop on sysfs reads.
+async function collectMetricsAsync(): Promise<MetricsResult> {
+  const { rss_mb, heap_used_mb } = _memoryUsageBase();
+  let cgroup_mb: number | undefined;
+  let cgroup_limit_mb: number | undefined;
   try {
-    const dfOut = execFileSync('df', ['-k', '/tmp'], { timeout: 5000 }).toString();
-    const line = dfOut.split('\n')[1];
-    if (line) {
-      const parts = line.trim().split(/\s+/);
-      const disk_total_mb = Math.round(parseInt(parts[1], 10) / 1024);
-      const disk_free_mb = Math.round(parseInt(parts[3], 10) / 1024);
-      return { rss_mb, heap_used_mb, cgroup_mb, cgroup_limit_mb, disk_free_mb, disk_total_mb };
-    }
-  } catch { /* disk metrics are best-effort */ }
-  return { rss_mb, heap_used_mb, cgroup_mb, cgroup_limit_mb };
+    const current = (await fs.promises.readFile('/sys/fs/cgroup/memory.current', 'utf-8')).trim();
+    cgroup_mb = Math.round(parseInt(current, 10) / 1024 / 1024);
+    const max = (await fs.promises.readFile('/sys/fs/cgroup/memory.max', 'utf-8')).trim();
+    if (max !== 'max') cgroup_limit_mb = Math.round(parseInt(max, 10) / 1024 / 1024);
+  } catch { /* cgroup v2 not available */ }
+  const { disk_free_mb, disk_total_mb } = _readDiskMetrics();
+  return { rss_mb, heap_used_mb, cgroup_mb, cgroup_limit_mb, disk_free_mb, disk_total_mb };
 }
 
 // Mutex to prevent overlapping heartbeat HTTP calls. Without this, a slow
@@ -2183,7 +2233,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
   // unhandledRejection event, the agent just goes silent until the orchestrator
   // reaper kills it minutes later with no forensic record.
   (async () => {
-    const metrics = collectMetrics();
+    const metrics = await collectMetricsAsync();
     const fix_loop_events = collectFixLoopEventsForFlush();
     const statusMessage = getMessage();
     const tool_trace = snapshotToolTrace({ refreshLastEntry: statusMessage.startsWith('Using tool:') });
@@ -2246,7 +2296,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
     heartbeatInFlightSince = Date.now();
     const myGeneration = ++heartbeatGeneration;
     const start = Date.now();
-    const metrics = collectMetrics();
+    const metrics = await collectMetricsAsync();
     // Proactive OOM warning — SIGKILL from cgroup can't be caught, so warn while we still can
     if (metrics.cgroup_mb && metrics.cgroup_limit_mb) {
       const memPct = metrics.cgroup_mb / metrics.cgroup_limit_mb;
@@ -2308,7 +2358,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
           await new Promise(r => setTimeout(r, delay));
           const retryStart = Date.now();
           try {
-            const retryMetrics = collectMetrics();
+            const retryMetrics = await collectMetricsAsync();
             const retryStatusMessage = getMessage();
             const retryToolTrace = snapshotToolTrace({ refreshLastEntry: retryStatusMessage.startsWith('Using tool:') });
             await apiPost('/api/agent/heartbeat', {
@@ -2913,8 +2963,8 @@ export async function cloneWithRetry(args: string[], timeoutMs = GIT_CLONE_TIMEO
   const taskId = process.env.TASK_ID || '';
   for (let attempt = 0; attempt < CLONE_MAX_RETRIES; attempt++) {
     try {
-      if (attempt > 0 && taskId) sendHeartbeatSync(taskId, `Git clone retry ${attempt + 1}/${CLONE_MAX_RETRIES}...`);
-      execFileSync('git', args, { encoding: 'utf-8', timeout: timeoutMs });
+      if (attempt > 0 && taskId) log(`Git clone retry ${attempt + 1}/${CLONE_MAX_RETRIES}...`);
+      await gitAsync(args, '.', timeoutMs);
       return;
     } catch (e) {
       if (attempt === CLONE_MAX_RETRIES - 1) throw e;
@@ -3383,6 +3433,7 @@ async function completeStartup(
 
 // ── Main ────────────────────────────────────────────────────────────────────
 export async function main() {
+  let _pendingExitCode = 0;
   // Start forensic instrumentation as early as possible. The lag monitor + exit
   // markers don't depend on auth or task claim, so we want them recording from
   // the moment node starts so a pre-claim death still leaves /tmp logs.
@@ -3606,6 +3657,7 @@ export async function main() {
         // process.exit, no pollForNextRole re-entry, no double-role-start).
         if (roleErr instanceof GracefulShutdownSignal) {
           log(`Role abandoned gracefully (reason=${roleErr.reason}) — winding down`);
+          if (roleErr.exitCode !== 0) _pendingExitCode = roleErr.exitCode;
           break;
         }
         throw roleErr;
@@ -3638,6 +3690,7 @@ export async function main() {
     try { execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8', timeout: 30_000 }); } catch { /* ignore */ }
     log('Agent shutdown complete.');
   }
+  if (_pendingExitCode !== 0) process.exit(_pendingExitCode);
 }
 
 // ── Per-role lifecycle (extracted so warm roles re-enter cleanly) ────────────
@@ -4005,6 +4058,11 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
         parkDirective: parkedAfterFailure,
       };
     }
+    // runtime_unavailable is an infra decline (missing CLI binary), not a real
+    // task failure. Convert to GracefulShutdownSignal so main() can exit with
+    // code 42, signalling the runner to skip the failure-streak increment.
+    // eslint-disable-next-line @typescript-eslint/only-throw-error -- GracefulShutdownSignal is a typed control signal, not an Error
+    if (error instanceof RuntimeUnavailableError) throw new GracefulShutdownSignal('runtime_unavailable', 42);
     // Re-throw so the role loop terminates — failures don't get warm
     // continuity; the orchestrator cold-provisions for the next role.
     throw error;

@@ -1,20 +1,57 @@
-import { SettingsAdvancedSection } from './SettingsAdvancedSection';
-import { SettingsGeneralSection } from './SettingsGeneralSection';
-import { SettingsOrchestratorSection } from './SettingsOrchestratorSection';
-import { SettingsNotificationsSection } from './SettingsNotificationsSection';
-import type { NotificationConfig } from './SettingsNotificationsSection';
+import { lazy, Suspense } from 'react';
 import { Users } from 'lucide-react';
-import { ProviderSettingsPanel } from './ProviderSettingsPanel';
-import { ProviderCategoriesPanel } from './ProviderCategoriesPanel';
-import { ProjectBuildConfigSection } from './ProjectBuildConfigSection';
-import { ProjectResourceEnvelopeSection } from './ProjectResourceEnvelopeSection';
-import { ProjectAutoRemediationSection } from './ProjectAutoRemediationSection';
-import { ProjectIssueImplementationSection } from './ProjectIssueImplementationSection';
-import { ProjectAutoReviewSection } from './ProjectAutoReviewSection';
-import { ProjectBranchesSection } from './ProjectBranchesSection';
-import { ProjectAlertDomainsSection } from './ProjectAlertDomainsSection';
-import { SettingsAccountsSection } from './SettingsAccountsSection';
-import { DeploySection } from './SettingsDeploySection';
+import type { NotificationConfig } from './SettingsNotificationsSection';
+import { Skeleton } from './DashboardMetricCardsPrimitives';
+
+const SettingsAdvancedSection = lazy(() =>
+  import('./SettingsAdvancedSection').then(m => ({ default: m.SettingsAdvancedSection })),
+);
+const SettingsGeneralSection = lazy(() =>
+  import('./SettingsGeneralSection').then(m => ({ default: m.SettingsGeneralSection })),
+);
+const SettingsOrchestratorSection = lazy(() =>
+  import('./SettingsOrchestratorSection').then(m => ({ default: m.SettingsOrchestratorSection })),
+);
+const SettingsNotificationsSection = lazy(() =>
+  import('./SettingsNotificationsSection').then(m => ({ default: m.SettingsNotificationsSection })),
+);
+const ProviderSettingsPanel = lazy(() =>
+  import('./ProviderSettingsPanel').then(m => ({ default: m.ProviderSettingsPanel })),
+);
+const ProviderCategoriesPanel = lazy(() =>
+  import('./ProviderCategoriesPanel').then(m => ({ default: m.ProviderCategoriesPanel })),
+);
+const ProjectBuildConfigSection = lazy(() =>
+  import('./ProjectBuildConfigSection').then(m => ({ default: m.ProjectBuildConfigSection })),
+);
+const ProjectResourceEnvelopeSection = lazy(() =>
+  import('./ProjectResourceEnvelopeSection').then(m => ({ default: m.ProjectResourceEnvelopeSection })),
+);
+const ProjectAutoRemediationSection = lazy(() =>
+  import('./ProjectAutoRemediationSection').then(m => ({ default: m.ProjectAutoRemediationSection })),
+);
+const ProjectIssueImplementationSection = lazy(() =>
+  import('./ProjectIssueImplementationSection').then(m => ({ default: m.ProjectIssueImplementationSection })),
+);
+const ProjectAutoReviewSection = lazy(() =>
+  import('./ProjectAutoReviewSection').then(m => ({ default: m.ProjectAutoReviewSection })),
+);
+const ProjectBranchesSection = lazy(() =>
+  import('./ProjectBranchesSection').then(m => ({ default: m.ProjectBranchesSection })),
+);
+const ProjectAlertDomainsSection = lazy(() =>
+  import('./ProjectAlertDomainsSection').then(m => ({ default: m.ProjectAlertDomainsSection })),
+);
+const SettingsAccountsSection = lazy(() =>
+  import('./SettingsAccountsSection').then(m => ({ default: m.SettingsAccountsSection })),
+);
+const DeploySection = lazy(() =>
+  import('./SettingsDeploySection').then(m => ({ default: m.DeploySection })),
+);
+
+function SectionSkeleton() {
+  return <Skeleton className="h-40 w-full" />;
+}
 import type {
   BuildConfig,
   AutoRemediationConfig,
@@ -275,162 +312,174 @@ export function SettingsSectionRouter(props: SettingsSectionRouterProps) {
   switch (props.activeSection) {
     case 'general':
       return (
-        <SettingsGeneralSection
-          apiHealthy={props.apiHealthy}
-          wsConnected={props.wsConnected}
-          lastFetchTime={props.lastFetchTime}
-          defaultTaskType={props.defaultTaskType}
-          onUpdateDefaultTaskType={props.onUpdateDefaultTaskType}
-          viewMode={props.viewMode}
-          onSetViewMode={props.onSetViewMode}
-          allModelOptions={props.allModelOptions}
-          refreshInterval={props.refreshInterval}
-          onUpdateRefreshInterval={props.onUpdateRefreshInterval}
-          pageSize={props.pageSize}
-          onUpdatePageSize={props.onUpdatePageSize}
-          notifyOnComplete={props.notifyOnComplete}
-          onUpdateNotifyOnComplete={props.onUpdateNotifyOnComplete}
-          notifyOnFail={props.notifyOnFail}
-          onUpdateNotifyOnFail={props.onUpdateNotifyOnFail}
-          notifyOnApprovalNeeded={props.notifyOnApprovalNeeded}
-          onUpdateNotifyOnApprovalNeeded={props.onUpdateNotifyOnApprovalNeeded}
-          soundOnComplete={props.soundOnComplete}
-          onUpdateSoundOnComplete={props.onUpdateSoundOnComplete}
-          notifyOnHighSignalMessage={props.notifyOnHighSignalMessage}
-          onUpdateNotifyOnHighSignalMessage={props.onUpdateNotifyOnHighSignalMessage}
-          onNavigateToNotifications={() => props.onNavigateToSection('notifications')}
-          selectedProjectOnboardingProof={props.selectedProjectOnboardingProof}
-        />
+        <Suspense fallback={<SectionSkeleton />}>
+          <SettingsGeneralSection
+            apiHealthy={props.apiHealthy}
+            wsConnected={props.wsConnected}
+            lastFetchTime={props.lastFetchTime}
+            defaultTaskType={props.defaultTaskType}
+            onUpdateDefaultTaskType={props.onUpdateDefaultTaskType}
+            viewMode={props.viewMode}
+            onSetViewMode={props.onSetViewMode}
+            allModelOptions={props.allModelOptions}
+            refreshInterval={props.refreshInterval}
+            onUpdateRefreshInterval={props.onUpdateRefreshInterval}
+            pageSize={props.pageSize}
+            onUpdatePageSize={props.onUpdatePageSize}
+            notifyOnComplete={props.notifyOnComplete}
+            onUpdateNotifyOnComplete={props.onUpdateNotifyOnComplete}
+            notifyOnFail={props.notifyOnFail}
+            onUpdateNotifyOnFail={props.onUpdateNotifyOnFail}
+            notifyOnApprovalNeeded={props.notifyOnApprovalNeeded}
+            onUpdateNotifyOnApprovalNeeded={props.onUpdateNotifyOnApprovalNeeded}
+            soundOnComplete={props.soundOnComplete}
+            onUpdateSoundOnComplete={props.onUpdateSoundOnComplete}
+            notifyOnHighSignalMessage={props.notifyOnHighSignalMessage}
+            onUpdateNotifyOnHighSignalMessage={props.onUpdateNotifyOnHighSignalMessage}
+            onNavigateToNotifications={() => props.onNavigateToSection('notifications')}
+            selectedProjectOnboardingProof={props.selectedProjectOnboardingProof}
+          />
+        </Suspense>
       );
     case 'provider-routing':
       return (
-        <ProviderCategoriesPanel
-          providers={props.providers}
-          selectionMode={props.providerSelectionMode}
-          onUpdateSelectionMode={props.onUpdateProviderSelectionMode}
-          taskTypeCategories={props.taskTypeCategories}
-          onUpdateTaskTypeCategories={props.onUpdateTaskTypeCategories}
-          categoryRouting={props.categoryRouting}
-          onUpdateCategoryRouting={props.onUpdateCategoryRouting}
-          taskTypeRouting={props.taskTypeRouting}
-          onUpdateTaskTypeRouting={props.onUpdateTaskTypeRouting}
-        />
+        <Suspense fallback={<SectionSkeleton />}>
+          <ProviderCategoriesPanel
+            providers={props.providers}
+            selectionMode={props.providerSelectionMode}
+            onUpdateSelectionMode={props.onUpdateProviderSelectionMode}
+            taskTypeCategories={props.taskTypeCategories}
+            onUpdateTaskTypeCategories={props.onUpdateTaskTypeCategories}
+            categoryRouting={props.categoryRouting}
+            onUpdateCategoryRouting={props.onUpdateCategoryRouting}
+            taskTypeRouting={props.taskTypeRouting}
+            onUpdateTaskTypeRouting={props.onUpdateTaskTypeRouting}
+          />
+        </Suspense>
       );
     case 'provider-settings':
       return (
-        <ProviderSettingsPanel
-          providers={props.providers}
-          providerSettingsDefaults={props.providerSettingsDefaults}
-          taskTypeProviderOverrides={props.taskTypeProviderOverrides}
-          providerSettingsByEffort={props.providerSettingsByEffort}
-          maxPlanAccounts={props.maxPlanAccounts}
-          onUpdateDefaults={props.onUpdateProviderSettingsDefaults}
-          onUpdateOverrides={props.onUpdateTaskTypeProviderOverrides}
-          onUpdateProviderSettingsByEffort={props.onUpdateProviderSettingsByEffort}
-        />
+        <Suspense fallback={<SectionSkeleton />}>
+          <ProviderSettingsPanel
+            providers={props.providers}
+            providerSettingsDefaults={props.providerSettingsDefaults}
+            taskTypeProviderOverrides={props.taskTypeProviderOverrides}
+            providerSettingsByEffort={props.providerSettingsByEffort}
+            maxPlanAccounts={props.maxPlanAccounts}
+            onUpdateDefaults={props.onUpdateProviderSettingsDefaults}
+            onUpdateOverrides={props.onUpdateTaskTypeProviderOverrides}
+            onUpdateProviderSettingsByEffort={props.onUpdateProviderSettingsByEffort}
+          />
+        </Suspense>
       );
     case 'orchestrator':
       return (
-        <SettingsOrchestratorSection
-          maxConcurrentVMs={props.maxConcurrentVMs}
-          onUpdateMaxVMs={props.onUpdateMaxVMs}
-          maxRetries={props.maxRetries}
-          onUpdateMaxRetries={props.onUpdateMaxRetries}
-          requireApprovalGates={props.requireApprovalGates}
-          onUpdateRequireApprovalGates={props.onUpdateRequireApprovalGates}
-          autoArchiveEnabled={props.autoArchiveEnabled}
-          onUpdateAutoArchiveEnabled={props.onUpdateAutoArchiveEnabled}
-          autoArchiveTerminalAfterDays={props.autoArchiveTerminalAfterDays}
-          onUpdateAutoArchiveTerminalAfterDays={props.onUpdateAutoArchiveTerminalAfterDays}
-          autoArchiveMaxTerminalTasksPerProject={props.autoArchiveMaxTerminalTasksPerProject}
-          onUpdateAutoArchiveMaxTerminalTasksPerProject={props.onUpdateAutoArchiveMaxTerminalTasksPerProject}
-          autoArchiveIntervalMinutes={props.autoArchiveIntervalMinutes}
-          onUpdateAutoArchiveIntervalMinutes={props.onUpdateAutoArchiveIntervalMinutes}
-          maxAutonomousTasksPerHour={props.maxAutonomousTasksPerHour}
-          onUpdateMaxAutonomousRate={props.onUpdateMaxAutonomousRate}
-          maxGlobalAutonomousTasksPerHour={props.maxGlobalAutonomousTasksPerHour}
-          onUpdateMaxGlobalAutonomousRate={props.onUpdateMaxGlobalAutonomousRate}
-          maxPipelineSlots={props.maxPipelineSlots}
-          onUpdateMaxPipelineSlots={props.onUpdateMaxPipelineSlots}
-          reservedSlotsForTypes={props.reservedSlotsForTypes}
-          onUpdateReservedSlotsForTypes={props.onUpdateReservedSlotsForTypes}
-          evaluatingPipelineTimeoutMinutes={props.evaluatingPipelineTimeoutMinutes}
-          onUpdateEvaluatingPipelineTimeout={props.onUpdateEvaluatingPipelineTimeout}
-          evaluatingFailHours={props.evaluatingFailHours}
-          onUpdateEvaluatingFailHours={props.onUpdateEvaluatingFailHours}
-          ciBackstopTimeoutMinutes={props.ciBackstopTimeoutMinutes}
-          onUpdateCiBackstopTimeout={props.onUpdateCiBackstopTimeout}
-          autonomousResearchIntervalMinutes={props.autonomousResearchIntervalMinutes}
-          onUpdateAutonomousResearchInterval={props.onUpdateAutonomousResearchInterval}
-          directionCooldownMinutes={props.directionCooldownMinutes}
-          onUpdateDirectionCooldownMinutes={props.onUpdateDirectionCooldownMinutes}
-          strategicResearchFrequency={props.strategicResearchFrequency}
-          onUpdateStrategicResearchFrequency={props.onUpdateStrategicResearchFrequency}
-          anyAutonomousEnabled={props.anyAutonomousEnabled}
-          onPauseAllAutonomous={props.onPauseAllAutonomous}
-          onRestartOrchestrator={props.onRestartOrchestrator}
-          selectedProjectId={props.selectedProjectId}
-          directionChurnWindowCycles={props.directionChurnWindowCycles}
-          onUpdateDirectionChurnWindowCycles={props.onUpdateDirectionChurnWindowCycles}
-          directionChurnNonMergeThreshold={props.directionChurnNonMergeThreshold}
-          onUpdateDirectionChurnNonMergeThreshold={props.onUpdateDirectionChurnNonMergeThreshold}
-          directionChurnMinMergeRate={props.directionChurnMinMergeRate}
-          onUpdateDirectionChurnMinMergeRate={props.onUpdateDirectionChurnMinMergeRate}
-          directionLifetimeNonMergeThreshold={props.directionLifetimeNonMergeThreshold}
-          onUpdateDirectionLifetimeNonMergeThreshold={props.onUpdateDirectionLifetimeNonMergeThreshold}
-          directionLifetimeMinMergeRate={props.directionLifetimeMinMergeRate}
-          onUpdateDirectionLifetimeMinMergeRate={props.onUpdateDirectionLifetimeMinMergeRate}
-          directionReviewRecommendationThreshold={props.directionReviewRecommendationThreshold}
-          onUpdateDirectionReviewRecommendationThreshold={props.onUpdateDirectionReviewRecommendationThreshold}
-        />
+        <Suspense fallback={<SectionSkeleton />}>
+          <SettingsOrchestratorSection
+            maxConcurrentVMs={props.maxConcurrentVMs}
+            onUpdateMaxVMs={props.onUpdateMaxVMs}
+            maxRetries={props.maxRetries}
+            onUpdateMaxRetries={props.onUpdateMaxRetries}
+            requireApprovalGates={props.requireApprovalGates}
+            onUpdateRequireApprovalGates={props.onUpdateRequireApprovalGates}
+            autoArchiveEnabled={props.autoArchiveEnabled}
+            onUpdateAutoArchiveEnabled={props.onUpdateAutoArchiveEnabled}
+            autoArchiveTerminalAfterDays={props.autoArchiveTerminalAfterDays}
+            onUpdateAutoArchiveTerminalAfterDays={props.onUpdateAutoArchiveTerminalAfterDays}
+            autoArchiveMaxTerminalTasksPerProject={props.autoArchiveMaxTerminalTasksPerProject}
+            onUpdateAutoArchiveMaxTerminalTasksPerProject={props.onUpdateAutoArchiveMaxTerminalTasksPerProject}
+            autoArchiveIntervalMinutes={props.autoArchiveIntervalMinutes}
+            onUpdateAutoArchiveIntervalMinutes={props.onUpdateAutoArchiveIntervalMinutes}
+            maxAutonomousTasksPerHour={props.maxAutonomousTasksPerHour}
+            onUpdateMaxAutonomousRate={props.onUpdateMaxAutonomousRate}
+            maxGlobalAutonomousTasksPerHour={props.maxGlobalAutonomousTasksPerHour}
+            onUpdateMaxGlobalAutonomousRate={props.onUpdateMaxGlobalAutonomousRate}
+            maxPipelineSlots={props.maxPipelineSlots}
+            onUpdateMaxPipelineSlots={props.onUpdateMaxPipelineSlots}
+            reservedSlotsForTypes={props.reservedSlotsForTypes}
+            onUpdateReservedSlotsForTypes={props.onUpdateReservedSlotsForTypes}
+            evaluatingPipelineTimeoutMinutes={props.evaluatingPipelineTimeoutMinutes}
+            onUpdateEvaluatingPipelineTimeout={props.onUpdateEvaluatingPipelineTimeout}
+            evaluatingFailHours={props.evaluatingFailHours}
+            onUpdateEvaluatingFailHours={props.onUpdateEvaluatingFailHours}
+            ciBackstopTimeoutMinutes={props.ciBackstopTimeoutMinutes}
+            onUpdateCiBackstopTimeout={props.onUpdateCiBackstopTimeout}
+            autonomousResearchIntervalMinutes={props.autonomousResearchIntervalMinutes}
+            onUpdateAutonomousResearchInterval={props.onUpdateAutonomousResearchInterval}
+            directionCooldownMinutes={props.directionCooldownMinutes}
+            onUpdateDirectionCooldownMinutes={props.onUpdateDirectionCooldownMinutes}
+            strategicResearchFrequency={props.strategicResearchFrequency}
+            onUpdateStrategicResearchFrequency={props.onUpdateStrategicResearchFrequency}
+            anyAutonomousEnabled={props.anyAutonomousEnabled}
+            onPauseAllAutonomous={props.onPauseAllAutonomous}
+            onRestartOrchestrator={props.onRestartOrchestrator}
+            selectedProjectId={props.selectedProjectId}
+            directionChurnWindowCycles={props.directionChurnWindowCycles}
+            onUpdateDirectionChurnWindowCycles={props.onUpdateDirectionChurnWindowCycles}
+            directionChurnNonMergeThreshold={props.directionChurnNonMergeThreshold}
+            onUpdateDirectionChurnNonMergeThreshold={props.onUpdateDirectionChurnNonMergeThreshold}
+            directionChurnMinMergeRate={props.directionChurnMinMergeRate}
+            onUpdateDirectionChurnMinMergeRate={props.onUpdateDirectionChurnMinMergeRate}
+            directionLifetimeNonMergeThreshold={props.directionLifetimeNonMergeThreshold}
+            onUpdateDirectionLifetimeNonMergeThreshold={props.onUpdateDirectionLifetimeNonMergeThreshold}
+            directionLifetimeMinMergeRate={props.directionLifetimeMinMergeRate}
+            onUpdateDirectionLifetimeMinMergeRate={props.onUpdateDirectionLifetimeMinMergeRate}
+            directionReviewRecommendationThreshold={props.directionReviewRecommendationThreshold}
+            onUpdateDirectionReviewRecommendationThreshold={props.onUpdateDirectionReviewRecommendationThreshold}
+          />
+        </Suspense>
       );
     case 'deploy':
       return (
-        <DeploySection
-          deployState={props.deployState}
-          onPausePipeline={props.onPausePipeline}
-          onResumePipeline={props.onResumePipeline}
-          onResetHealth={props.onResetHealth}
-          onRollback={props.onRollback}
-          onMarkStable={props.onMarkStable}
-          onRepairState={props.onRepairState}
-          failedRollback={props.failedRollback}
-          zoneHealth={props.zoneHealth}
-        />
+        <Suspense fallback={<SectionSkeleton />}>
+          <DeploySection
+            deployState={props.deployState}
+            onPausePipeline={props.onPausePipeline}
+            onResumePipeline={props.onResumePipeline}
+            onResetHealth={props.onResetHealth}
+            onRollback={props.onRollback}
+            onMarkStable={props.onMarkStable}
+            onRepairState={props.onRepairState}
+            failedRollback={props.failedRollback}
+            zoneHealth={props.zoneHealth}
+          />
+        </Suspense>
       );
     case 'accounts':
       return (
-        <SettingsAccountsSection
-          githubAccount={props.githubAccount}
-          onConnectGitHub={props.onConnectGitHub}
-          maxPlanAccounts={props.maxPlanAccounts}
-          onToggleAccount={props.onToggleAccount}
-          onRemoveAccount={props.onRemoveAccount}
-          onResetRateLimits={props.onResetRateLimits}
-          onRefreshAccountModels={props.onRefreshAccountModels}
-          onUpdateAccount={props.onUpdateAccount}
-          onUpdateAccountCaps={props.onUpdateAccountCaps}
-          providers={props.providers}
-          newAccountName={props.newAccountName}
-          setNewAccountName={props.setNewAccountName}
-          newAccountProvider={props.newAccountProvider}
-          setNewAccountProvider={props.setNewAccountProvider}
-          newAccountAuthMode={props.newAccountAuthMode}
-          setNewAccountAuthMode={props.setNewAccountAuthMode}
-          newAccountToken={props.newAccountToken}
-          setNewAccountToken={props.setNewAccountToken}
-          newAccountProviderMetadata={props.newAccountProviderMetadata}
-          setNewAccountProviderMetadata={props.setNewAccountProviderMetadata}
-          newAccountClaudeConfigJson={props.newAccountClaudeConfigJson}
-          setNewAccountClaudeConfigJson={props.setNewAccountClaudeConfigJson}
-          newAccountDailyTaskCap={props.newAccountDailyTaskCap}
-          setNewAccountDailyTaskCap={props.setNewAccountDailyTaskCap}
-          newAccountMaxConcurrentTasks={props.newAccountMaxConcurrentTasks}
-          setNewAccountMaxConcurrentTasks={props.setNewAccountMaxConcurrentTasks}
-          newAccountAutoDisableAfterRateLimits={props.newAccountAutoDisableAfterRateLimits}
-          setNewAccountAutoDisableAfterRateLimits={props.setNewAccountAutoDisableAfterRateLimits}
-          onAddAccount={props.onAddAccount}
-        />
+        <Suspense fallback={<SectionSkeleton />}>
+          <SettingsAccountsSection
+            githubAccount={props.githubAccount}
+            onConnectGitHub={props.onConnectGitHub}
+            maxPlanAccounts={props.maxPlanAccounts}
+            onToggleAccount={props.onToggleAccount}
+            onRemoveAccount={props.onRemoveAccount}
+            onResetRateLimits={props.onResetRateLimits}
+            onRefreshAccountModels={props.onRefreshAccountModels}
+            onUpdateAccount={props.onUpdateAccount}
+            onUpdateAccountCaps={props.onUpdateAccountCaps}
+            providers={props.providers}
+            newAccountName={props.newAccountName}
+            setNewAccountName={props.setNewAccountName}
+            newAccountProvider={props.newAccountProvider}
+            setNewAccountProvider={props.setNewAccountProvider}
+            newAccountAuthMode={props.newAccountAuthMode}
+            setNewAccountAuthMode={props.setNewAccountAuthMode}
+            newAccountToken={props.newAccountToken}
+            setNewAccountToken={props.setNewAccountToken}
+            newAccountProviderMetadata={props.newAccountProviderMetadata}
+            setNewAccountProviderMetadata={props.setNewAccountProviderMetadata}
+            newAccountClaudeConfigJson={props.newAccountClaudeConfigJson}
+            setNewAccountClaudeConfigJson={props.setNewAccountClaudeConfigJson}
+            newAccountDailyTaskCap={props.newAccountDailyTaskCap}
+            setNewAccountDailyTaskCap={props.setNewAccountDailyTaskCap}
+            newAccountMaxConcurrentTasks={props.newAccountMaxConcurrentTasks}
+            setNewAccountMaxConcurrentTasks={props.setNewAccountMaxConcurrentTasks}
+            newAccountAutoDisableAfterRateLimits={props.newAccountAutoDisableAfterRateLimits}
+            setNewAccountAutoDisableAfterRateLimits={props.setNewAccountAutoDisableAfterRateLimits}
+            onAddAccount={props.onAddAccount}
+          />
+        </Suspense>
       );
     case 'access':
       return (
@@ -477,97 +526,115 @@ export function SettingsSectionRouter(props: SettingsSectionRouterProps) {
       );
     case 'notifications':
       return (
-        <SettingsNotificationsSection
-          webhookUrl={props.notificationConfig.webhook_url}
-          onUpdateWebhookUrl={url => props.onUpdateNotificationConfig({ webhook_url: url })}
-          enabledEvents={props.notificationConfig.enabled_events}
-          onUpdateEnabledEvents={events => props.onUpdateNotificationConfig({ enabled_events: events })}
-          throttleSeconds={props.notificationConfig.throttle_seconds}
-          onUpdateThrottleSeconds={secs => props.onUpdateNotificationConfig({ throttle_seconds: secs })}
-          dailyCostCeilingUsd={props.dailyCostCeilingUsd}
-          onUpdateDailyCostCeiling={props.onUpdateDailyCostCeiling}
-          isAdmin={props.isAdmin}
-          selectedProjectId={props.selectedProjectId}
-        />
+        <Suspense fallback={<SectionSkeleton />}>
+          <SettingsNotificationsSection
+            webhookUrl={props.notificationConfig.webhook_url}
+            onUpdateWebhookUrl={url => props.onUpdateNotificationConfig({ webhook_url: url })}
+            enabledEvents={props.notificationConfig.enabled_events}
+            onUpdateEnabledEvents={events => props.onUpdateNotificationConfig({ enabled_events: events })}
+            throttleSeconds={props.notificationConfig.throttle_seconds}
+            onUpdateThrottleSeconds={secs => props.onUpdateNotificationConfig({ throttle_seconds: secs })}
+            dailyCostCeilingUsd={props.dailyCostCeilingUsd}
+            onUpdateDailyCostCeiling={props.onUpdateDailyCostCeiling}
+            isAdmin={props.isAdmin}
+            selectedProjectId={props.selectedProjectId}
+          />
+        </Suspense>
       );
     case 'build-config':
       return (
-        <ProjectBuildConfigSection
-          githubOwner={props.selectedProjectOwner}
-          githubRepo={props.selectedProjectRepo}
-          isSelfRepo={props.selectedProjectIsSelfRepo}
-          buildConfig={props.buildConfig}
-          onSave={props.onUpdateBuildConfig}
-          onDetect={props.onDetectBuildConfig}
-          detectAvailable={Boolean(props.selectedProjectOwner && props.selectedProjectRepo)}
-          projectId={props.selectedProjectId}
-        />
+        <Suspense fallback={<SectionSkeleton />}>
+          <ProjectBuildConfigSection
+            githubOwner={props.selectedProjectOwner}
+            githubRepo={props.selectedProjectRepo}
+            isSelfRepo={props.selectedProjectIsSelfRepo}
+            buildConfig={props.buildConfig}
+            onSave={props.onUpdateBuildConfig}
+            onDetect={props.onDetectBuildConfig}
+            detectAvailable={Boolean(props.selectedProjectOwner && props.selectedProjectRepo)}
+            projectId={props.selectedProjectId}
+          />
+        </Suspense>
       );
     case 'alert-domains':
       return (
-        <ProjectAlertDomainsSection
-          projectId={props.selectedProjectId}
-          canSave={props.selectedProjectRole === 'owner'}
-        />
+        <Suspense fallback={<SectionSkeleton />}>
+          <ProjectAlertDomainsSection
+            projectId={props.selectedProjectId}
+            canSave={props.selectedProjectRole === 'owner'}
+          />
+        </Suspense>
       );
     case 'auto-review':
       return (
-        <ProjectAutoReviewSection
-          config={props.autoReviewConfig}
-          canSave={props.selectedProjectRole === 'owner'}
-          onSave={props.onUpdateAutoReviewConfig}
-        />
+        <Suspense fallback={<SectionSkeleton />}>
+          <ProjectAutoReviewSection
+            config={props.autoReviewConfig}
+            canSave={props.selectedProjectRole === 'owner'}
+            onSave={props.onUpdateAutoReviewConfig}
+          />
+        </Suspense>
       );
     case 'resource-envelope':
       return (
-        <ProjectResourceEnvelopeSection
-          githubOwner={props.selectedProjectOwner}
-          githubRepo={props.selectedProjectRepo}
-          data={props.resourceEnvelopeData}
-          loading={props.resourceEnvelopeLoading}
-          error={props.resourceEnvelopeError}
-          canSave={props.selectedProjectRole === 'owner'}
-          onSave={props.onUpdateResourceEnvelope}
-        />
+        <Suspense fallback={<SectionSkeleton />}>
+          <ProjectResourceEnvelopeSection
+            githubOwner={props.selectedProjectOwner}
+            githubRepo={props.selectedProjectRepo}
+            data={props.resourceEnvelopeData}
+            loading={props.resourceEnvelopeLoading}
+            error={props.resourceEnvelopeError}
+            canSave={props.selectedProjectRole === 'owner'}
+            onSave={props.onUpdateResourceEnvelope}
+          />
+        </Suspense>
       );
     case 'auto-remediation':
       return (
-        <ProjectAutoRemediationSection
-          githubOwner={props.selectedProjectOwner}
-          githubRepo={props.selectedProjectRepo}
-          config={props.autoRemediationConfig}
-          stats={props.autoRemediationStats}
-          onSave={props.onUpdateAutoRemediationConfig}
-          integrationBranch={props.integrationBranchData?.integration_branch}
-          promotionTarget={props.promotionTargetData?.promotion_target}
-        />
+        <Suspense fallback={<SectionSkeleton />}>
+          <ProjectAutoRemediationSection
+            githubOwner={props.selectedProjectOwner}
+            githubRepo={props.selectedProjectRepo}
+            config={props.autoRemediationConfig}
+            stats={props.autoRemediationStats}
+            onSave={props.onUpdateAutoRemediationConfig}
+            integrationBranch={props.integrationBranchData?.integration_branch}
+            promotionTarget={props.promotionTargetData?.promotion_target}
+          />
+        </Suspense>
       );
     case 'issue-implementation':
       return (
-        <ProjectIssueImplementationSection
-          githubOwner={props.selectedProjectOwner}
-          githubRepo={props.selectedProjectRepo}
-          config={props.issueImplementationConfig}
-          onSave={props.onUpdateIssueImplementationConfig}
-        />
+        <Suspense fallback={<SectionSkeleton />}>
+          <ProjectIssueImplementationSection
+            githubOwner={props.selectedProjectOwner}
+            githubRepo={props.selectedProjectRepo}
+            config={props.issueImplementationConfig}
+            onSave={props.onUpdateIssueImplementationConfig}
+          />
+        </Suspense>
       );
     case 'branches':
       return (
-        <ProjectBranchesSection
-          integrationBranchData={props.integrationBranchData}
-          onSaveIntegrationBranch={props.onUpdateIntegrationBranch}
-          promotionTargetData={props.promotionTargetData}
-          onSavePromotionTarget={props.onUpdatePromotionTarget}
-          canSave={props.selectedProjectRole === 'owner'}
-        />
+        <Suspense fallback={<SectionSkeleton />}>
+          <ProjectBranchesSection
+            integrationBranchData={props.integrationBranchData}
+            onSaveIntegrationBranch={props.onUpdateIntegrationBranch}
+            promotionTargetData={props.promotionTargetData}
+            onSavePromotionTarget={props.onUpdatePromotionTarget}
+            canSave={props.selectedProjectRole === 'owner'}
+          />
+        </Suspense>
       );
     case 'advanced':
       return (
-        <SettingsAdvancedSection
-          healthCheckUrlsInput={props.healthCheckUrlsInput}
-          onHealthCheckUrlsChange={props.onHealthCheckUrlsInputChange}
-          onUpdateHealthCheckUrls={props.onUpdateHealthCheckUrls}
-        />
+        <Suspense fallback={<SectionSkeleton />}>
+          <SettingsAdvancedSection
+            healthCheckUrlsInput={props.healthCheckUrlsInput}
+            onHealthCheckUrlsChange={props.onHealthCheckUrlsInputChange}
+            onUpdateHealthCheckUrls={props.onUpdateHealthCheckUrls}
+          />
+        </Suspense>
       );
   }
 }

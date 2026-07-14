@@ -522,22 +522,25 @@ def _serialize_max_plan_account_row(
 
 
 async def list_authoritative_max_plan_accounts(
-    session: AsyncSession, user_id: str
+    session: AsyncSession,
+    user_id: str,
+    *,
+    limit: int | None = None,
+    offset: int | None = None,
 ) -> list[dict[str, Any]]:
     """Authoritative persisted account roster overlaid with live pool fields."""
     from app.max_plan_pool import _account_by_id, _max_plan_pool_lock
 
-    rows = (
-        (
-            await session.execute(
-                select(MaxPlanAccount)
-                .where(MaxPlanAccount.user_id == user_id)
-                .order_by(MaxPlanAccount.created_at, MaxPlanAccount.id)
-            )
-        )
-        .scalars()
-        .all()
+    q = (
+        select(MaxPlanAccount)
+        .where(MaxPlanAccount.user_id == user_id)
+        .order_by(MaxPlanAccount.created_at, MaxPlanAccount.id)
     )
+    if offset:
+        q = q.offset(offset)
+    if limit is not None:
+        q = q.limit(limit)
+    rows = (await session.execute(q)).scalars().all()
     async with _max_plan_pool_lock:
         mem_by_id = {
             str(account_id): dict(account)
@@ -569,14 +572,25 @@ _FAILURE_CLASS_BUCKET_GROUPS: dict[str, list[str]] = {
 
 @router.get("/max-plan-accounts")
 async def get_max_plan_accounts(
+    limit: int = Query(default=100, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(require_admin),
 ):
+    user_id = current_user["user_id"]
+    total = (
+        await session.execute(
+            select(func.count())
+            .select_from(MaxPlanAccount)
+            .where(MaxPlanAccount.user_id == user_id)
+        )
+    ).scalar_one()
     accounts = await list_authoritative_max_plan_accounts(
-        session, current_user["user_id"]
+        session, user_id, limit=limit, offset=offset
     )
     return {
         "accounts": accounts,
+        "total": total,
         "generated_at": _utcnow().isoformat(),
     }
 
@@ -817,6 +831,65 @@ async def _compute_provider_model_breakdown(
         session, account_ids, expand_accounts=expand_accounts, project_id=project_id
     )
     return {"rows": rows, "generated_at": _utcnow().isoformat()}
+
+
+@router.get("/pool-accounts/project-usage")
+async def get_project_pool_usage(
+    project_id: uuid.UUID = Query(...),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Per-account pool consumption for a single project.
+
+    Returns, for each account in the authenticated user's pool, the project's
+    active task count, daily task count, per-project caps, and whether the
+    project is at any cap on that account. Includes global account usage for
+    cross-project contention visibility.
+
+    Requires project membership (404 if the user is not a member of the project).
+    """
+    from app.max_plan_pool import get_project_account_usage
+
+    user_id = current_user["user_id"]
+    await _get_user_project(project_id, user_id, session)
+
+    accounts = get_project_account_usage(str(project_id), user_id)
+
+    total_project_active = sum(a["project_active_tasks"] for a in accounts)
+    total_project_daily = sum(a["project_daily_task_count"] for a in accounts)
+    accounts_at_cap = sum(1 for a in accounts if a["at_project_cap"])
+
+    return {
+        "project_id": str(project_id),
+        "total_project_active_tasks": total_project_active,
+        "total_project_daily_task_count": total_project_daily,
+        "accounts_at_cap": accounts_at_cap,
+        "total_accounts": len(accounts),
+        "accounts": accounts,
+        "generated_at": _utcnow().isoformat(),
+    }
+
+
+@router.get("/pool-accounts/project-summary")
+async def get_project_pool_summary(
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Pool-wide per-project consumption summary for all of the user's projects.
+
+    Returns one entry per project the user belongs to, with total active tasks,
+    daily task counts, accounts-at-cap counts, and whether per-project caps are
+    configured. Reads from the in-memory pool for counters/caps; project names
+    come from a single batched DB query.
+    """
+    from app.max_plan_pool import get_user_project_pool_summary
+
+    user_id = current_user["user_id"]
+    projects = await get_user_project_pool_summary(user_id, session)
+    return {
+        "projects": projects,
+        "generated_at": _utcnow().isoformat(),
+    }
 
 
 @router.post("/max-plan-accounts")
@@ -1319,6 +1392,111 @@ async def update_max_plan_account(
         )
         if mem_account
         else None,
+    }
+
+
+@router.patch("/max-plan-accounts/{account_id}/per-project-cap")
+async def set_per_project_cap(
+    account_id: str,
+    payload: Dict[str, Any],
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+    cache: DigestCache = Depends(get_digest_cache),
+):
+    """Set or clear per-project LLM usage caps on an account for a specific project.
+
+    Per-project caps limit this account's draw from a single project, preventing
+    one project from starving another within the same user-scoped pool. Each cap
+    is a JSONB dict keyed by ``project_id``. Setting a cap adds/updates the entry;
+    setting it to ``null`` removes the entry for that project.
+
+    Payload:
+      - ``project_id`` (required): the project to cap.
+      - ``daily_task_cap`` (optional): positive integer, null to clear, or absent
+        to leave unchanged.
+      - ``max_concurrent_tasks`` (optional): positive integer, null to clear, or
+        absent to leave unchanged.
+    """
+    from app.max_plan_pool import _account_by_id, _max_plan_pool_lock
+
+    try:
+        acct_uuid = uuid.UUID(account_id)
+    except ValueError as exc:
+        raise _bad_request("Invalid account ID") from exc
+
+    db_account = await session.get(MaxPlanAccount, acct_uuid)
+    if not db_account or db_account.user_id != current_user["user_id"]:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    project_id = payload.get("project_id")
+    if not project_id or not isinstance(project_id, str):
+        raise _bad_request("project_id is required")
+    try:
+        uuid.UUID(project_id)
+    except ValueError as exc:
+        raise _bad_request("project_id must be a valid UUID") from exc
+
+    # Mutate the per-project cap dicts.
+    daily_caps = dict(db_account.project_daily_task_cap or {})
+    concurrent_caps = dict(db_account.project_max_concurrent_tasks or {})
+
+    if "daily_task_cap" in payload:
+        raw = payload["daily_task_cap"]
+        if raw is None:
+            daily_caps.pop(project_id, None)
+        else:
+            try:
+                val = int(raw)
+            except (TypeError, ValueError) as exc:
+                raise _bad_request(
+                    "daily_task_cap must be a positive integer or null"
+                ) from exc
+            if val < 1:
+                raise _bad_request(
+                    "daily_task_cap must be a positive integer or null"
+                )
+            daily_caps[project_id] = val
+
+    if "max_concurrent_tasks" in payload:
+        raw = payload["max_concurrent_tasks"]
+        if raw is None:
+            concurrent_caps.pop(project_id, None)
+        else:
+            try:
+                val = int(raw)
+            except (TypeError, ValueError) as exc:
+                raise _bad_request(
+                    "max_concurrent_tasks must be a positive integer or null"
+                ) from exc
+            if val < 1:
+                raise _bad_request(
+                    "max_concurrent_tasks must be a positive integer or null"
+                )
+            concurrent_caps[project_id] = val
+
+    db_account.project_daily_task_cap = daily_caps or None
+    db_account.project_max_concurrent_tasks = concurrent_caps or None
+    db_account.updated_at = _utcnow()
+    session.add(db_account)
+
+    async with _max_plan_pool_lock:
+        await session.commit()
+        mem_account = _account_by_id.get(account_id)
+        if mem_account:
+            mem_account["project_daily_task_cap"] = (
+                db_account.project_daily_task_cap or {}
+            )
+            mem_account["project_max_concurrent_tasks"] = (
+                db_account.project_max_concurrent_tasks or {}
+            )
+
+    _invalidate_pool_account_digests(cache, current_user["user_id"])
+
+    return {
+        "id": account_id,
+        "project_id": project_id,
+        "project_daily_task_cap": db_account.project_daily_task_cap or {},
+        "project_max_concurrent_tasks": db_account.project_max_concurrent_tasks or {},
     }
 
 

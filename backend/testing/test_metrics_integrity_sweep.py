@@ -177,6 +177,8 @@ def test_registry_contains_initial_checks():
         "capability_claim_reconciliation",
         "merged_pr_count_consistency",
         "criterion_evidence_count_integrity",
+        "criterion_claim_reconciliation",
+        "capability_proof_gate_gap",
     } <= names
 
 
@@ -3239,17 +3241,18 @@ async def test_capability_claim_reconciliation_planned_never_flagged(
 
 
 @pytest.mark.asyncio
-async def test_capability_claim_reconciliation_skips_empty_backing_paths(db):
-    """A working capability with no backing_paths is skipped (nothing to audit)."""
+async def test_capability_claim_reconciliation_empty_backing_paths_no_evidence_flagged(db):
+    """A working capability with empty backing_paths and no evidence_refs is
+    flagged by the free-claim path (claim_contradicts_evidence returns True)."""
     await _project_with_capabilities(
         db,
         [{"name": "repo_map", "status": "working", "backing_paths": []}],
     )
 
     results = await mis.check_capability_claim_reconciliation(_cap_ctx(db))
-    assert all(not r.flagged for r in results), results
-    skipped = [r for r in results if r.status == CheckStatus.SKIPPED]
-    assert skipped
+    flagged = [r for r in results if r.flagged]
+    assert len(flagged) == 1, f"expected 1 flagged, got {results}"
+    assert "repo_map" in flagged[0].detail
 
 
 @pytest.mark.asyncio
@@ -3397,6 +3400,123 @@ async def test_capability_claim_reconciliation_ok_when_proven_ref_present(
     assert all(not r.flagged for r in results), results
     ok = [r for r in results if r.status == CheckStatus.OK]
     assert ok
+
+
+# --- Check: capability_claim_reconciliation (free-claim path) ----------------
+
+
+@pytest.mark.asyncio
+async def test_capability_claim_reconciliation_free_claim_working_no_evidence_flagged(
+    db,
+):
+    """A working capability with no backing_paths and empty evidence_refs IS flagged."""
+    await _project_with_capabilities(
+        db,
+        [
+            {
+                "name": "free_working",
+                "status": "working",
+                # No backing_paths — free-claim path applies.
+                "evidence_refs": [],
+            }
+        ],
+    )
+
+    results = await mis.check_capability_claim_reconciliation(_cap_ctx(db))
+    flagged = [r for r in results if r.flagged]
+    assert len(flagged) == 1, f"expected 1 flagged, got {results}"
+    f = flagged[0]
+    assert f.check == "capability_claim_reconciliation"
+    assert "free_working" in f.detail
+    assert f.severity == "warn"
+
+
+@pytest.mark.asyncio
+async def test_capability_claim_reconciliation_free_claim_working_with_proven_ref_not_flagged(
+    db,
+):
+    """A working capability with no backing_paths but a proven evidence_ref IS NOT flagged."""
+    await _project_with_capabilities(
+        db,
+        [
+            {
+                "name": "free_working_proven",
+                "status": "working",
+                "evidence_refs": [
+                    {
+                        "kind": "named_test",
+                        "ref": "backend/testing/test_something.py",
+                        "proven": True,
+                        "source_id": "task-xyz",
+                    }
+                ],
+            }
+        ],
+    )
+
+    results = await mis.check_capability_claim_reconciliation(_cap_ctx(db))
+    assert all(not r.flagged for r in results), f"expected no flags, got {results}"
+    ok = [r for r in results if r.status == CheckStatus.OK]
+    assert ok
+
+
+@pytest.mark.asyncio
+async def test_capability_claim_reconciliation_free_claim_partial_no_evidence_not_flagged(
+    db,
+):
+    """A partial capability with no backing_paths and empty evidence_refs is NOT flagged."""
+    await _project_with_capabilities(
+        db,
+        [
+            {
+                "name": "free_partial",
+                "status": "partial",
+                "evidence_refs": [],
+            }
+        ],
+    )
+
+    results = await mis.check_capability_claim_reconciliation(_cap_ctx(db))
+    assert all(not r.flagged for r in results), f"expected no flags for partial, got {results}"
+
+
+@pytest.mark.asyncio
+async def test_capability_claim_reconciliation_backing_path_check_still_works_with_free_claim(
+    db, monkeypatch
+):
+    """The existing backing_path reconciliation path is unchanged when a free-claim
+    cap is also present in the same project."""
+    import app.source_ref_validation as srv
+
+    await _project_with_capabilities(
+        db,
+        [
+            {
+                "name": "path_backed",
+                "status": "working",
+                "backing_paths": ["backend/app/removed.py"],
+                "evidence_refs": [],
+            },
+            {
+                "name": "free_working",
+                "status": "working",
+                "evidence_refs": [
+                    {"kind": "named_test", "ref": "backend/testing/test_ok.py", "proven": True}
+                ],
+            },
+        ],
+    )
+
+    async def _removed(path, *args, **kwargs):
+        return False  # all paths removed — backing_path cap should be flagged
+
+    monkeypatch.setattr(srv, "_path_exists_at_head", _removed)
+
+    results = await mis.check_capability_claim_reconciliation(_cap_ctx(db))
+    flagged = [r for r in results if r.flagged]
+    # path_backed has all backing_paths removed → flagged; free_working has a proven ref → not flagged.
+    assert len(flagged) == 1, f"expected 1 flagged (path_backed only), got {results}"
+    assert "path_backed" in flagged[0].detail
 
 
 # --- Check: merged_pr_count_consistency --------------------------------------
@@ -3757,3 +3877,809 @@ async def test_criterion_evidence_count_integrity_runs_in_sweep_tick(db):
     # The check name must appear in the registered set.
     names = {c.name for c in registered_checks()}
     assert "criterion_evidence_count_integrity" in names
+
+
+# --- Check: criterion_claim_reconciliation -----------------------------------
+
+
+@pytest.mark.asyncio
+async def test_criterion_claim_reconciliation_flags_uncovered_active_criterion(db):
+    """An active criterion with no covering evidence is flagged as unbacked."""
+    project = await _project(db)
+    version, criterion = await _open_version_with_criterion(
+        db, project, text="Uncovered active criterion"
+    )  # no evidence rows → uncovered → unproven
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_criterion_claim_reconciliation(ctx)
+    flagged = [r for r in results if r.flagged]
+    assert len(flagged) == 1, f"expected 1 flagged, got {results}"
+    f = flagged[0]
+    assert f.check == "criterion_claim_reconciliation"
+    assert f.self_reported == 1
+    assert f.ground_truth == 0
+    assert f.delta == 1
+    assert criterion.criterion_key in f.detail
+    assert "unproven" in f.detail
+
+
+@pytest.mark.asyncio
+async def test_criterion_claim_reconciliation_ok_when_covered(db):
+    """A criterion with proven task_merge evidence (covered → proven) is not flagged."""
+    project = await _project(db)
+    version, criterion = await _open_version_with_criterion(
+        db, project, text="Covered active criterion"
+    )
+    db.add(
+        CriterionEvidence(
+            project_id=project.id,
+            criterion_id=criterion.id,
+            source_kind="reachability",  # covers on its own → proven
+            detail={"note": "reachable"},
+        )
+    )
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_criterion_claim_reconciliation(ctx)
+    assert all(not r.flagged for r in results), f"unexpected flagged: {results}"
+    ok = [r for r in results if r.status == CheckStatus.OK]
+    assert len(ok) >= 1
+    assert ok[0].delta == 0
+    assert "reconciled" in ok[0].detail
+
+
+@pytest.mark.asyncio
+async def test_criterion_claim_reconciliation_skips_no_open_version(db):
+    """Project with no open version → SKIPPED for that project."""
+    project = await _project(db)
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_criterion_claim_reconciliation(ctx)
+    mine = [r for r in results if r.subject == str(project.id)]
+    assert len(mine) == 1
+    assert mine[0].status == CheckStatus.SKIPPED
+    assert "no open version" in mine[0].detail
+
+
+@pytest.mark.asyncio
+async def test_criterion_claim_reconciliation_skips_no_active_criteria(db):
+    """Open version with no active criteria → SKIPPED for that project."""
+    project = await _project(db)
+    version = ReleaseVersion(project_id=project.id, version_number=1, status="open")
+    db.add(version)
+    await db.commit()
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_criterion_claim_reconciliation(ctx)
+    mine = [r for r in results if r.subject == str(project.id)]
+    assert len(mine) == 1
+    assert mine[0].status == CheckStatus.SKIPPED
+    assert "no active criteria" in mine[0].detail
+
+
+@pytest.mark.asyncio
+async def test_criterion_claim_reconciliation_is_flag_only(db):
+    """The check never mutates CriterionEvidence rows in any mode."""
+    project = await _project(db)
+    version, criterion = await _open_version_with_criterion(
+        db, project, text="Flag-only reconciliation test"
+    )
+    db.add(
+        CriterionEvidence(
+            project_id=project.id,
+            criterion_id=criterion.id,
+            source_kind="task_merge",
+            detail={"proven": False},  # present but not covering → partial
+        )
+    )
+    await db.commit()
+    before = len((
+        await db.execute(
+            select(CriterionEvidence).where(
+                CriterionEvidence.criterion_id == criterion.id
+            )
+        )
+    ).scalars().all())
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_criterion_claim_reconciliation(ctx)
+    # partial evidence does not back a "proven" claim → flagged.
+    assert any(r.flagged for r in results)
+
+    after = len((
+        await db.execute(
+            select(CriterionEvidence).where(
+                CriterionEvidence.criterion_id == criterion.id
+            )
+        )
+    ).scalars().all())
+    assert after == before, f"CriterionEvidence rows changed: {before} → {after}"
+
+
+@pytest.mark.asyncio
+async def test_criterion_claim_reconciliation_runs_in_sweep_tick(db):
+    """The new check is auto-discovered and executed in a full sweep tick."""
+    project = await _project(db)
+    await _open_version_with_criterion(
+        db, project, text="Sweep tick reconciliation test"
+    )
+    now = _utcnow()
+    tick = await run_metrics_integrity_sweep(db, now=now)
+    assert tick is not None
+    names = {c.name for c in registered_checks()}
+    assert "criterion_claim_reconciliation" in names
+
+
+# --- Check: capability_proof_gate_gap ----------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_gate_gap_flags_unproven_working(db):
+    """A project with working capabilities that carry no proven evidence is flagged.
+
+    Caps with no backing_paths cannot be auto-resolved: they remain in delta and
+    are surfaced with ``needs_backing_paths`` in the detail string. The problem_model
+    is never mutated when no auto-resolution is possible.
+
+    Uses a real merge-test verdict context (working capability + no evidence) so
+    the assertion is concrete and non-trivially true.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = await _project(db)
+    # Two working capabilities: one unproven (no evidence_refs, no backing_paths),
+    # one proven.
+    project.problem_model = {
+        "capabilities": [
+            {
+                "name": "repo-map",
+                "status": "working",
+                "evidence_refs": [],  # no proof → unproven; no backing_paths either
+            },
+            {
+                "name": "ci-integration",
+                "status": "working",
+                "evidence_refs": [{"proven": True, "ref": "backend/app/ci.py"}],
+            },
+            {
+                "name": "future-feature",
+                "status": "planned",  # planned → not included in working set
+                "evidence_refs": [],
+            },
+        ]
+    }
+    flag_modified(project, "problem_model")
+    db.add(project)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db,
+        now=_utcnow(),
+        mode="observe",
+        max_projects=25,
+        sample_limit=200,
+        window_days=14,
+    )
+    results = await mis.check_capability_proof_gate_gap(ctx)
+
+    pid = str(project.id)
+    flagged = [r for r in results if r.flagged and r.subject == pid]
+    assert len(flagged) == 1, f"expected 1 flagged result for project, got {results}"
+    f = flagged[0]
+    assert f.check == "capability_proof_gate_gap"
+    # self_reported = total working capabilities (2: repo-map + ci-integration)
+    assert f.self_reported == 2
+    # ground_truth = proven count (1: ci-integration); no auto-resolution possible
+    assert f.ground_truth == 1
+    # delta = unresolved gap (1: repo-map has no backing_paths → needs_backing_paths)
+    assert f.delta == 1
+    assert "repo-map" in f.detail
+    # No backing_paths → detail uses needs_backing_paths marker, not "proven"
+    assert "needs_backing_paths" in f.detail
+
+    # Flag-only for caps without backing_paths: problem_model must be unchanged
+    await db.refresh(project)
+    caps = (project.problem_model or {}).get("capabilities", [])
+    repo_map = next((c for c in caps if c.get("name") == "repo-map"), None)
+    assert repo_map is not None
+    assert repo_map["evidence_refs"] == []
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_gate_gap_triggers_self_heal(db):
+    """An unproven working capability with a backing_path present at HEAD is
+    auto-resolved: proof is recorded in capability_proof_records, the check
+    reports delta == 0 (fully self-healed), and ground_truth increases by 1.
+
+    This is the named acceptance test for the self-heal feature.
+    """
+    from unittest.mock import AsyncMock, patch
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = await _project(db)
+    # One unproven working capability with a backing_path.
+    # backend/app/models.py is a real file in the repo.
+    project.problem_model = {
+        "capabilities": [
+            {
+                "name": "repo-map",
+                "status": "working",
+                "evidence_refs": [],  # no proof → unproven
+                "backing_paths": ["backend/app/models.py"],
+            },
+        ]
+    }
+    flag_modified(project, "problem_model")
+    db.add(project)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db,
+        now=_utcnow(),
+        mode="observe",
+        max_projects=25,
+        sample_limit=200,
+        window_days=14,
+    )
+
+    # Mock _path_exists_at_head to return True for the backing path so the test
+    # doesn't depend on filesystem state. Patch at the source module since the
+    # check imports it with a local `from app.source_ref_validation import`.
+    # Also force named-test discovery to find no covering test (read_head → None)
+    # so this test deterministically exercises the ``backing_path`` fallback tier
+    # rather than depending on whether a checkout exists at HEAD.
+    with patch(
+        "app.source_ref_validation._path_exists_at_head",
+        new=AsyncMock(return_value=True),
+    ), patch(
+        "app.capability_proof._read_file_at_head",
+        new=AsyncMock(return_value=None),
+    ):
+        results = await mis.check_capability_proof_gate_gap(ctx)
+
+    pid = str(project.id)
+    # Fully self-healed → no flagged result, one OK result.
+    flagged = [r for r in results if r.flagged and r.subject == pid]
+    assert flagged == [], f"expected no flagged results after self-heal, got {results}"
+    ok = [r for r in results if r.subject == pid and r.status == CheckStatus.OK]
+    assert len(ok) == 1, f"expected 1 OK result, got {results}"
+    assert ok[0].delta == 0
+    assert ok[0].ground_truth == 1  # auto-resolved from 0 proven to 1
+    assert "auto-resolved" in ok[0].detail
+
+    # Proof must have been recorded in capability_proof_records.
+    await db.refresh(project)
+    proof_records = project.capability_proof_records or {}
+    # normalize_capability_name("repo-map") == "repo-map"
+    assert "repo-map" in proof_records, (
+        f"expected proof entry for 'repo-map' in capability_proof_records, got {proof_records}"
+    )
+    entries = proof_records["repo-map"]
+    assert len(entries) >= 1
+    assert entries[0].get("proof_kind") == "backing_path"
+
+    # evidence_refs should now carry a proven backing_path ref (written by
+    # _append_evidence_refs_to_capabilities inside record_capability_backing_path_proof).
+    caps = (project.problem_model or {}).get("capabilities", [])
+    repo_map = next((c for c in caps if c.get("name") == "repo-map"), None)
+    assert repo_map is not None
+    evidence_refs = repo_map.get("evidence_refs", [])
+    assert any(
+        e.get("proven") is True and e.get("kind") == "backing_path"
+        for e in evidence_refs
+    ), f"expected a proven backing_path evidence_ref, got {evidence_refs}"
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_gate_gap_mints_named_test_present_for_covered_cap(db):
+    """The fleet-wide self-heal mints a ``named_test_present`` proof when a working
+    capability's backing path has a conventionally-named test file present at HEAD
+    that imports the module.
+
+    That discovery is STATIC — file existence plus an import regex; the test is
+    NEVER executed — so the recorded proof is graded ``path_proven``, NOT
+    ``proven``: it cannot clear the enforce gate. Only a real green merge-test
+    acceptance verdict mints the executed ``proven`` ``named_test`` tier.
+    """
+    from unittest.mock import AsyncMock, patch
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = await _project(db)
+    # Working capability backed by a source path whose conventional test file
+    # (backend/testing/test_local_runner.py) exists and imports the module.
+    project.problem_model = {
+        "capabilities": [
+            {
+                "name": "runner-dispatch",
+                "status": "working",
+                "evidence_refs": [],  # no proof → unproven
+                "backing_paths": ["backend/app/local_runner.py"],
+            },
+        ]
+    }
+    flag_modified(project, "problem_model")
+    db.add(project)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db,
+        now=_utcnow(),
+        mode="observe",
+        max_projects=25,
+        sample_limit=200,
+        window_days=14,
+    )
+
+    # _path_exists_at_head → True (both the backing path and its derived test path
+    # resolve at HEAD). _read_file_at_head → a test body that imports the module,
+    # so _named_tests_covering_paths returns the covering test ref and the sweep
+    # takes the named_test_present tier instead of the bare backing_path fallback.
+    test_body = "from app.local_runner import LocalRunner\n\ndef test_it():\n    assert LocalRunner\n"
+    with patch(
+        "app.source_ref_validation._path_exists_at_head",
+        new=AsyncMock(return_value=True),
+    ), patch(
+        "app.capability_proof._read_file_at_head",
+        new=AsyncMock(return_value=test_body),
+    ):
+        results = await mis.check_capability_proof_gate_gap(ctx)
+
+    pid = str(project.id)
+    # Self-heal recorded a proof for the cap → the sweep's own accounting reports
+    # it resolved (one OK result, delta 0). The recorded tier is path_proven.
+    flagged = [r for r in results if r.flagged and r.subject == pid]
+    assert flagged == [], f"expected no flagged results after self-heal, got {results}"
+    ok = [r for r in results if r.subject == pid and r.status == CheckStatus.OK]
+    assert len(ok) == 1, f"expected 1 OK result, got {results}"
+    assert ok[0].delta == 0
+    assert ok[0].ground_truth == 1
+    assert "named_test_present" in ok[0].detail, (
+        f"expected detail to name the named_test_present tier, got {ok[0].detail!r}"
+    )
+
+    # The recorded proof must be the STATIC ``named_test_present`` tier (graded
+    # ``path_proven``) — NOT the executed ``named_test`` tier (graded ``proven``).
+    await db.refresh(project)
+    proof_records = project.capability_proof_records or {}
+    assert "runner-dispatch" in proof_records, (
+        f"expected proof entry for 'runner-dispatch', got {proof_records}"
+    )
+    entries = proof_records["runner-dispatch"]
+    assert len(entries) >= 1
+    assert entries[0].get("proof_kind") == "named_test_present", (
+        f"expected named_test_present proof_kind, got {entries[0].get('proof_kind')!r}"
+    )
+
+    # evidence_refs should carry a named_test_present ref (proven flag set, but
+    # tiered path_proven by the classifier — it does not clear the enforce gate).
+    caps = (project.problem_model or {}).get("capabilities", [])
+    cap = next((c for c in caps if c.get("name") == "runner-dispatch"), None)
+    assert cap is not None
+    evidence_refs = cap.get("evidence_refs", [])
+    assert any(
+        e.get("proven") is True and e.get("kind") == "named_test_present"
+        for e in evidence_refs
+    ), f"expected a named_test_present evidence_ref, got {evidence_refs}"
+
+    # The capability is graded path_proven — the never-executed test file does
+    # NOT graduate it to the enforce-gate-clearing ``proven`` status.
+    from app.capability_registry import working_capability_proof_status
+    status = working_capability_proof_status(project.problem_model)
+    assert status.get("runner-dispatch") == "path_proven", (
+        f"expected path_proven, got {status.get('runner-dispatch')!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_gate_gap_falls_back_to_backing_path_without_test(db):
+    """When the backing path resolves at HEAD but no covering test is discoverable
+    (read_head → None), the self-heal falls back to the structural ``backing_path``
+    tier — preserving the prior behavior for uncovered-but-present capabilities.
+    """
+    from unittest.mock import AsyncMock, patch
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = await _project(db)
+    project.problem_model = {
+        "capabilities": [
+            {
+                "name": "repo-map",
+                "status": "working",
+                "evidence_refs": [],
+                "backing_paths": ["backend/app/models.py"],
+            },
+        ]
+    }
+    flag_modified(project, "problem_model")
+    db.add(project)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db,
+        now=_utcnow(),
+        mode="observe",
+        max_projects=25,
+        sample_limit=200,
+        window_days=14,
+    )
+
+    with patch(
+        "app.source_ref_validation._path_exists_at_head",
+        new=AsyncMock(return_value=True),
+    ), patch(
+        "app.capability_proof._read_file_at_head",
+        new=AsyncMock(return_value=None),
+    ):
+        results = await mis.check_capability_proof_gate_gap(ctx)
+
+    pid = str(project.id)
+    ok = [r for r in results if r.subject == pid and r.status == CheckStatus.OK]
+    assert len(ok) == 1, f"expected 1 OK result, got {results}"
+    assert ok[0].delta == 0
+
+    await db.refresh(project)
+    proof_records = project.capability_proof_records or {}
+    entries = proof_records.get("repo-map", [])
+    assert len(entries) >= 1
+    assert entries[0].get("proof_kind") == "backing_path", (
+        f"expected backing_path fallback, got {entries[0].get('proof_kind')!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_gate_gap_proposes_backing_paths(db):
+    """A working capability with NO declared backing_paths whose name-derived
+    discovery surfaces candidate files splits two ways by the test-presence bar:
+
+    * A capability whose discovered candidate has a convention test file present
+      at HEAD is auto-resolved to a ``named_test_present`` (path_proven) proof —
+      recorded and counted resolved by the sweep, no research obligation needed.
+    * A capability whose discovered candidate is NOT test-covered stays flagged,
+      and the concrete candidate paths are folded into the enrolled research
+      obligation's ``detail`` (proposing backing paths) instead of a blank ask.
+
+    This exercises the enforce-gated production path in
+    ``check_capability_proof_gate_gap`` end-to-end against a real
+    EvergreenBacklogItem ledger, mocking only the IO-injectable
+    discovery/verification seams.
+    """
+    from unittest.mock import AsyncMock, patch
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = await _project(db)
+    project.problem_model = {
+        "capabilities": [
+            # Discovery finds a test-covered candidate → auto-resolve
+            # (named_test_present, path_proven tier).
+            {"name": "runner-dispatch", "status": "working", "evidence_refs": []},
+            # Discovery finds a candidate that is NOT test-covered → suggestion
+            # folded into the research obligation, cap stays flagged.
+            {"name": "audit-sweep", "status": "working", "evidence_refs": []},
+        ]
+    }
+    flag_modified(project, "problem_model")
+    db.add(project)
+    await db.commit()
+
+    covered_candidate = "backend/app/local_runner.py"
+    uncovered_candidate = "backend/app/some_audit_sweep_module.py"
+
+    async def _fake_discover(cap_name, **_kwargs):
+        if cap_name == "runner-dispatch":
+            return [covered_candidate]
+        if cap_name == "audit-sweep":
+            return [uncovered_candidate]
+        return []
+
+    # The covered candidate's conventional test resolves at HEAD and imports the
+    # module → named_test_present tier. The uncovered candidate's test read returns None
+    # → no coverage → falls to the suggestion path. We drive this purely through
+    # _read_file_at_head keyed by path (test file for the covered candidate only).
+    covered_test_path = "backend/testing/test_local_runner.py"
+    test_body = "from app.local_runner import LocalRunner\n\ndef test_it():\n    assert LocalRunner\n"
+
+    async def _fake_read(path):
+        return test_body if path == covered_test_path else None
+
+    ctx = SweepContext(
+        session=db,
+        now=_utcnow(),
+        mode="enforce",
+        max_projects=25,
+        sample_limit=200,
+        window_days=14,
+    )
+    with patch(
+        "app.capability_proof._discover_candidate_backing_paths",
+        new=_fake_discover,
+    ), patch(
+        "app.source_ref_validation._path_exists_at_head",
+        new=AsyncMock(return_value=True),
+    ), patch(
+        "app.capability_proof._read_file_at_head",
+        new=_fake_read,
+    ):
+        results = await mis.check_capability_proof_gate_gap(ctx)
+
+    pid = str(project.id)
+
+    # runner-dispatch auto-resolved to a named_test_present (path_proven) proof.
+    await db.refresh(project)
+    proof_records = project.capability_proof_records or {}
+    assert "runner-dispatch" in proof_records, (
+        f"expected discovery-driven named_test_present proof for 'runner-dispatch', "
+        f"got {proof_records}"
+    )
+    rd_entries = proof_records["runner-dispatch"]
+    assert rd_entries[0].get("proof_kind") == "named_test_present", (
+        f"expected named_test_present proof_kind from discovery, got "
+        f"{rd_entries[0].get('proof_kind')!r}"
+    )
+    # audit-sweep did NOT get a proof (candidate not test-covered).
+    assert "audit-sweep" not in proof_records, (
+        "audit-sweep must NOT be auto-proven from an unverified candidate"
+    )
+
+    # Still flagged: audit-sweep remains an unresolved gap.
+    flagged = [r for r in results if r.flagged and r.subject == pid]
+    assert len(flagged) == 1, f"expected 1 flagged result, got {results}"
+    assert "audit-sweep" in flagged[0].detail
+    assert "discovered candidate" in flagged[0].detail, (
+        f"expected detail to mention discovered candidate suggestions, got "
+        f"{flagged[0].detail!r}"
+    )
+
+    # The research obligation for audit-sweep carries the concrete candidate path
+    # as a proposed backing path; runner-dispatch (auto-resolved) enrolls none.
+    rows = (
+        await db.execute(
+            select(EvergreenBacklogItem).where(
+                EvergreenBacklogItem.project_id == project.id,
+                EvergreenBacklogItem.finding_key.startswith(
+                    mis.CAPABILITY_PROOF_RESEARCH_KEY_PREFIX
+                ),
+            )
+        )
+    ).scalars().all()
+    keys = {r.finding_key for r in rows}
+    assert keys == {mis._capability_proof_research_finding_key(pid, "audit-sweep")}, (
+        f"expected exactly the audit-sweep research obligation, got {keys}"
+    )
+    audit_row = rows[0]
+    assert uncovered_candidate in audit_row.detail, (
+        f"expected discovered candidate path folded into obligation detail, got "
+        f"{audit_row.detail!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_gate_gap_ok_when_all_proven(db):
+    """All working capabilities with proven evidence produce an OK result."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = await _project(db)
+    project.problem_model = {
+        "capabilities": [
+            {
+                "name": "repo-map",
+                "status": "working",
+                "evidence_refs": [{"proven": True, "ref": "backend/app/x.py"}],
+            },
+        ]
+    }
+    flag_modified(project, "problem_model")
+    db.add(project)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe", max_projects=25,
+        sample_limit=200, window_days=14,
+    )
+    results = await mis.check_capability_proof_gate_gap(ctx)
+    pid = str(project.id)
+    assert not any(r.flagged for r in results if r.subject == pid)
+    ok = [r for r in results if r.subject == pid and r.status == CheckStatus.OK]
+    assert len(ok) == 1
+    assert ok[0].delta == 0
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_gate_gap_skips_with_no_capabilities(db):
+    """A project with an empty capabilities list produces a SKIPPED result."""
+    project = await _project(db)
+    # No problem_model set → SKIPPED
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe", max_projects=25,
+        sample_limit=200, window_days=14,
+    )
+    results = await mis.check_capability_proof_gate_gap(ctx)
+    pid = str(project.id)
+    skipped = [r for r in results if r.subject in (pid, "global") and r.status == CheckStatus.SKIPPED]
+    assert len(skipped) >= 1
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_gate_gap_enrolls_research_for_no_backing_paths(db):
+    """ENFORCE mode: each unproven working capability with NO file-like
+    backing_paths and no proof (the ``needs_backing_paths`` bucket) enrolls
+    exactly one deduped per-capability proof-earn research obligation, and
+    re-running the check enrolls nothing new (idempotent across ticks).
+
+    This is the named acceptance test for the gate-gap research-enrollment
+    feature. It exercises the enforce-gated production path in
+    ``check_capability_proof_gate_gap`` end-to-end against a real
+    EvergreenBacklogItem ledger.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = await _project(db)
+    # Two working capabilities, both unproven with NO backing_paths → both land
+    # in needs_backing_paths and must each get a research obligation.
+    project.problem_model = {
+        "capabilities": [
+            {"name": "repo-map", "status": "working", "evidence_refs": []},
+            {"name": "ci-integration", "status": "working", "evidence_refs": []},
+        ]
+    }
+    flag_modified(project, "problem_model")
+    db.add(project)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db,
+        now=_utcnow(),
+        mode="enforce",
+        max_projects=25,
+        sample_limit=200,
+        window_days=14,
+    )
+    results = await mis.check_capability_proof_gate_gap(ctx)
+
+    pid = str(project.id)
+    flagged = [r for r in results if r.flagged and r.subject == pid]
+    assert len(flagged) == 1, f"expected 1 flagged result, got {results}"
+
+    rows = (
+        await db.execute(
+            select(EvergreenBacklogItem).where(
+                EvergreenBacklogItem.project_id == project.id
+            )
+        )
+    ).scalars().all()
+    research_rows = [
+        r
+        for r in rows
+        if r.finding_key.startswith(mis.CAPABILITY_PROOF_RESEARCH_KEY_PREFIX)
+    ]
+    # Exactly one deduped item per unproven capability that needs proof research.
+    assert len(research_rows) == 2, (
+        f"expected 2 per-capability research obligations, got "
+        f"{[r.finding_key for r in research_rows]}"
+    )
+    keys = {r.finding_key for r in research_rows}
+    assert keys == {
+        mis._capability_proof_research_finding_key(pid, "repo-map"),
+        mis._capability_proof_research_finding_key(pid, "ci-integration"),
+    }
+    # Provenance is the dedicated proof-research value, distinct from the generic
+    # metrics-integrity drift provenance.
+    for r in research_rows:
+        assert r.provenance == mis.CAPABILITY_PROOF_RESEARCH_PROVENANCE
+        assert r.provenance != mis.METRICS_INTEGRITY_PROVENANCE
+        assert r.status == "enrolled"
+        assert "repo-map" in r.detail or "ci-integration" in r.detail
+    # finding_key distinct from the generic per-check drift finding key.
+    generic_key = flagged[0].finding_key()
+    assert generic_key not in keys
+    assert generic_key == f"metrics-integrity:capability_proof_gate_gap:{pid}"
+
+    # Idempotency: a second tick creates NO new rows (deduped on finding_key).
+    ctx2 = SweepContext(
+        session=db,
+        now=_utcnow(),
+        mode="enforce",
+        max_projects=25,
+        sample_limit=200,
+        window_days=14,
+    )
+    await mis.check_capability_proof_gate_gap(ctx2)
+    rows_after = (
+        await db.execute(
+            select(EvergreenBacklogItem).where(
+                EvergreenBacklogItem.project_id == project.id,
+                EvergreenBacklogItem.finding_key.startswith(
+                    mis.CAPABILITY_PROOF_RESEARCH_KEY_PREFIX
+                ),
+            )
+        )
+    ).scalars().all()
+    assert len(rows_after) == 2, (
+        "second enforce tick must not create duplicate research obligations, "
+        f"got {[r.finding_key for r in rows_after]}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_gate_gap_observe_does_not_enroll(db):
+    """OBSERVE mode: the same no-backing-paths capability enrolls NO backlog item
+    (enrollment is enforce-gated), while the always-on backing-path self-heal
+    still records a proof for a cap whose backing_path is present at HEAD.
+    """
+    from unittest.mock import AsyncMock, patch
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = await _project(db)
+    project.problem_model = {
+        "capabilities": [
+            # No backing_paths → would enroll research in enforce mode only.
+            {"name": "repo-map", "status": "working", "evidence_refs": []},
+            # Backing path present at HEAD → self-heals in observe mode unchanged.
+            {
+                "name": "ci-integration",
+                "status": "working",
+                "evidence_refs": [],
+                "backing_paths": ["backend/app/models.py"],
+            },
+        ]
+    }
+    flag_modified(project, "problem_model")
+    db.add(project)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db,
+        now=_utcnow(),
+        mode="observe",
+        max_projects=25,
+        sample_limit=200,
+        window_days=14,
+    )
+    with patch(
+        "app.source_ref_validation._path_exists_at_head",
+        new=AsyncMock(return_value=True),
+    ):
+        results = await mis.check_capability_proof_gate_gap(ctx)
+
+    # No enrollment in observe mode: zero research obligations created.
+    research_rows = (
+        await db.execute(
+            select(EvergreenBacklogItem).where(
+                EvergreenBacklogItem.project_id == project.id,
+                EvergreenBacklogItem.finding_key.startswith(
+                    mis.CAPABILITY_PROOF_RESEARCH_KEY_PREFIX
+                ),
+            )
+        )
+    ).scalars().all()
+    assert research_rows == [], (
+        f"observe mode must enroll no research obligations, got "
+        f"{[r.finding_key for r in research_rows]}"
+    )
+
+    # Backing-path self-heal still fires in observe mode: ci-integration proven.
+    await db.refresh(project)
+    proof_records = project.capability_proof_records or {}
+    assert "ci-integration" in proof_records, (
+        f"expected observe-mode self-heal proof for 'ci-integration', got "
+        f"{proof_records}"
+    )
+    pid = str(project.id)
+    flagged = [r for r in results if r.flagged and r.subject == pid]
+    # repo-map remains an unresolved gap (needs_backing_paths), so still flagged.
+    assert len(flagged) == 1
+    assert "repo-map" in flagged[0].detail

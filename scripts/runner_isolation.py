@@ -178,6 +178,10 @@ class Capabilities:
     gpu_names: tuple[str, ...] = ()
     # Human-readable notes surfaced in the preflight (e.g. "docker socket denied").
     notes: tuple[str, ...] = ()
+    # LLM CLI inventory: {"claude": {"present": bool, "version": str}, ...}
+    # Probed once per heartbeat; appended to the capabilities JSONB so the
+    # orchestrator can filter pool LLM runtimes to clis the runner actually has.
+    llm_clis: dict = field(default_factory=dict)
 
     # ── Derived predicates ──
     @property
@@ -351,6 +355,46 @@ def detect_gpus() -> tuple[tuple[int, ...], tuple[str, ...]]:
     return tuple(indices), tuple(names)
 
 
+# Known LLM CLI binaries the runner may advertise in the heartbeat.
+_LLM_CLI_NAMES: tuple[str, ...] = ("claude", "codex", "gemini")
+
+
+def probe_llm_clis() -> dict[str, dict]:
+    """Probe for known LLM CLI binaries and return a present/version map.
+
+    ``shutil.which()`` establishes presence (the binary is on PATH), then
+    ``<binary> --version`` resolves the version string. Any failure in the
+    version subprocess is non-fatal — the entry reads as present with an empty
+    version string (the consumer can distinguish "present but no version info"
+    from "absent").
+
+    Returns a dict keyed on the canonical CLI name::
+
+        {"claude": {"present": True, "version": "0.2.0"},
+         "codex": {"present": False, "version": ""},
+         "gemini": {"present": False, "version": ""}}
+    """
+    result: dict[str, dict] = {}
+    for name in _LLM_CLI_NAMES:
+        path = _which(name)
+        present = path is not None
+        version = ""
+        if present:
+            try:
+                ver = subprocess.run(
+                    [path, "--version"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if ver.returncode == 0:
+                    version = (ver.stdout or ver.stderr or "").strip()
+            except (OSError, subprocess.SubprocessError):
+                pass
+        result[name] = {"present": present, "version": version}
+    return result
+
+
 def detect_capabilities() -> Capabilities:
     """Probe the host once. Every probe is non-fatal (absent tool → unusable)."""
     bwrap_path = _which("bwrap")
@@ -457,7 +501,8 @@ def decide_agent_backend(
       3. *(Compute only — not agent)*: image-native jobs that supply a
          ``container_image`` the experiment must run inside.
 
-    Backends, in preference order:
+    Backends, in decision order (the order is load-bearing — see the opt-in note
+    in the body: checking bwrap first silently neuters the opt-in):
 
       * ``BACKEND_DOCKER`` — ``agent_image`` supplied AND docker usable AND
         task type read-only-eligible (documented necessity #1 above).  This
@@ -477,18 +522,30 @@ def decide_agent_backend(
     CRITICAL invariant: when ``agent_image`` is falsy the result is byte-identical
     to the historical bwrap-or-decline table — the docker branch is inert.
     """
-    # Preferred: rootless bwrap when binary + sandbox are both available.
-    if agent_binary_present and caps.bwrap_ok:
-        return BACKEND_BWRAP
-    # Reserved docker fallback: bwrap unavailable, but prod image + usable docker.
+    # Documented necessity #1 — the prod-parity OPT-IN, and it must be checked
+    # BEFORE bwrap or it can never fire.
+    #
+    # `agent_image` is not incidental: blueprint_runner only resolves one when the
+    # operator explicitly asks (`--docker-agent`, BLUEPRINT_AGENT_BACKEND=docker,
+    # or `--pull`), and leaves it None otherwise. So a truthy agent_image IS the
+    # opt-in signal. Testing bwrap first made that flag a SILENT NO-OP on every
+    # host with bwrap — the operator asked for a prod-parity container run and
+    # quietly got bwrap instead, with nothing said. An opt-in that does nothing
+    # when you opt in is worse than no opt-in at all.
+    #
+    # Still gated by task type: the write/heavy slice never rides the container
+    # path, regardless of the flag.
     if (
         agent_image
         and caps.docker_usable
         and (task_type is None or task_type in AGENT_DOCKER_TYPES)
     ):
         return BACKEND_DOCKER
-    if not agent_binary_present:
-        return DECLINE
+    # Preferred default: rootless bwrap when binary + sandbox are both available.
+    # With no opt-in (agent_image falsy) the docker branch above cannot fire, so
+    # this preserves the historical bwrap-or-decline table byte for byte.
+    if agent_binary_present and caps.bwrap_ok:
+        return BACKEND_BWRAP
     return DECLINE
 
 
@@ -500,28 +557,40 @@ def agent_decline_reason(caps: Capabilities, agent_binary_present: bool) -> str 
     return None
 
 
-def decide_compute_backend(caps: Capabilities, has_image: bool) -> str:
+def decide_compute_backend(
+    caps: Capabilities, has_image: bool, *, allow_host_fallback: bool = False
+) -> str:
     """Choose a compute backend, fail-closed.
 
-    Table (image? × runtime? × bwrap?):
-      image + container-runtime          → container backend (docker/podman/apptainer/enroot)
-      image + no runtime + bwrap         → bwrap (best-effort on host toolchain; image unfulfillable)
-      no image + bwrap                   → bwrap
-      no image + no bwrap                → DECLINE (a container needs an image; nothing else is sandboxed)
-      image + no runtime + no bwrap      → DECLINE
+    Table (image? × runtime? × bwrap? × allow_host_fallback?):
+      image + container-runtime                        → container backend (docker/podman/apptainer/enroot)
+      image + no runtime + bwrap + allow_host_fallback → bwrap (explicit opt-in; image unfulfillable)
+      image + no runtime + bwrap                       → DECLINE (default; honest refusal)
+      no image + bwrap                                 → bwrap
+      no image + no bwrap                              → DECLINE
+      image + no runtime + no bwrap                    → DECLINE
     """
     if has_image and caps.any_container_runtime():
         return caps.preferred_container() or DECLINE
     if caps.bwrap_ok:
+        if has_image and not allow_host_fallback:
+            return DECLINE
         return BACKEND_BWRAP
     return DECLINE
 
 
-def compute_decline_reason(caps: Capabilities, has_image: bool) -> str | None:
-    backend = decide_compute_backend(caps, has_image)
+def compute_decline_reason(
+    caps: Capabilities, has_image: bool, *, allow_host_fallback: bool = False
+) -> str | None:
+    backend = decide_compute_backend(caps, has_image, allow_host_fallback=allow_host_fallback)
     if backend != DECLINE:
         return None
     if has_image:
+        if caps.bwrap_ok and not allow_host_fallback:
+            return (
+                "container_image requested but no usable container runtime — runner declined "
+                "(set allow_host_fallback=true in the launch contract to permit imageless bwrap fallback)"
+            )
         return (
             "container_image requested but no usable container runtime AND no bwrap "
             "sandbox (install a container runtime or bubblewrap)"
@@ -675,7 +744,8 @@ def build_compute_env(
 
     No provider creds (untrusted experiment code never sees LLM keys) and never a
     full os.environ copy. ``injected`` = BLUEPRINT_RESULT_FILE, BLUEPRINT_ARTIFACT_DIR,
-    CUDA_VISIBLE_DEVICES/NVIDIA_VISIBLE_DEVICES, PYTHONPATH, HOME.
+    BLUEPRINT_PROGRESS_FILE, CUDA_VISIBLE_DEVICES/NVIDIA_VISIBLE_DEVICES, PYTHONPATH,
+    HOME.
     """
     env: dict[str, str] = {}
     for key in COMPUTE_ENV_PASSTHROUGH:
@@ -1307,6 +1377,7 @@ def plan_compute_execution(
     workspace_host: str,
     result_file_host: str,
     artifact_dir_host: str,
+    progress_file_host: str | None = None,
     clone_dir_host: str | None,
     cwd_host: str | None,
     job_env: dict[str, str],
@@ -1316,17 +1387,27 @@ def plan_compute_execution(
     ldconfig_output: str = "",
     cpu_limit: str | None = None,
     mem_limit: str | None = None,
+    allow_host_fallback: bool = False,
 ) -> ExecutionPlan:
     """Build the sandbox plan for a compute job, or DECLINE (fail-closed).
 
     All ``*_host`` paths are on the runner filesystem; result_file/artifact_dir/
-    clone_dir are expected to live UNDER ``workspace_host`` (the per-job tmpdir).
+    progress_file/clone_dir are expected to live UNDER ``workspace_host`` (the
+    per-job tmpdir). ``progress_file_host`` is optional: when set, every backend
+    injects ``BLUEPRINT_PROGRESS_FILE`` (append-only JSONL the experiment may
+    write interim progress records to); when None the env var is simply absent —
+    byte-identical to the pre-progress behavior.
+
+    When ``image`` is set but no container runtime is available, the job is DECLINED
+    by default.  Set ``allow_host_fallback=True`` in the launch contract to permit
+    an explicit imageless bwrap fallback (reproducibility trade-off; operator opt-in).
     """
     has_image = bool(image)
-    backend = decide_compute_backend(caps, has_image)
+    backend = decide_compute_backend(caps, has_image, allow_host_fallback=allow_host_fallback)
     if backend == DECLINE:
         return ExecutionPlan.decline(
-            compute_decline_reason(caps, has_image) or "no compute sandbox"
+            compute_decline_reason(caps, has_image, allow_host_fallback=allow_host_fallback)
+            or "no compute sandbox"
         )
 
     # ---- container backends (docker / podman) --------------------------------
@@ -1340,6 +1421,13 @@ def plan_compute_execution(
             "BLUEPRINT_ARTIFACT_DIR": artifacts_in or f"{out_mount}/artifacts",
             "HOME": "/workspace" if clone_dir_host else out_mount,
         }
+        if progress_file_host:
+            # Interim-progress channel (append-only JSONL; the runner tails it
+            # between heartbeats). Mirrors BLUEPRINT_RESULT_FILE path translation.
+            inner["BLUEPRINT_PROGRESS_FILE"] = (
+                _rel_to_sandbox(progress_file_host, workspace_host, out_mount)
+                or f"{out_mount}/progress.jsonl"
+            )
         if clone_dir_host:
             binds.append((clone_dir_host, "/workspace"))
             inner["PYTHONPATH"] = "/workspace"
@@ -1389,6 +1477,11 @@ def plan_compute_execution(
             "BLUEPRINT_ARTIFACT_DIR": artifacts_in or "/workspace/artifacts",
             "HOME": "/workspace",
         }
+        if progress_file_host:
+            inner["BLUEPRINT_PROGRESS_FILE"] = (
+                _rel_to_sandbox(progress_file_host, workspace_host, "/workspace")
+                or "/workspace/progress.jsonl"
+            )
         clone_in = _rel_to_sandbox(clone_dir_host, workspace_host, "/workspace")
         if clone_in:
             inner["PYTHONPATH"] = clone_in
@@ -1431,6 +1524,11 @@ def plan_compute_execution(
         or f"{SANDBOX_WORKSPACE}/artifacts",
         "HOME": SANDBOX_HOME,
     }
+    if progress_file_host:
+        injected["BLUEPRINT_PROGRESS_FILE"] = (
+            _rel_to_sandbox(progress_file_host, workspace_host, SANDBOX_WORKSPACE)
+            or f"{SANDBOX_WORKSPACE}/progress.jsonl"
+        )
     clone_in = _rel_to_sandbox(clone_dir_host, workspace_host, SANDBOX_WORKSPACE)
     if clone_in:
         injected["PYTHONPATH"] = clone_in
@@ -1470,3 +1568,202 @@ def plan_compute_execution(
     return ExecutionPlan(
         backend=backend, argv=argv, env=env, gpu_indices=list(gpu_indices)
     )
+
+
+# Fatal "no usable GPU" diagnostics printed by container entrypoints (notably
+# the NGC / ``nvcr.io/nvidia/pytorch`` images) when the host GPU predates the
+# image's minimum CUDA compute capability — e.g. a Tesla V100 (Volta, CC 7.0)
+# under a container built for Turing+.
+#
+# These are the ONLY pre-run signal for an arch mismatch: ``nvidia-smi -L``
+# queries the DRIVER, which lists the V100 happily regardless of what the
+# image's CUDA runtime can actually use, and the entrypoint prints the banner
+# and still exits 0. Exit code and device visibility both look healthy.
+#
+# MUST stay byte-identical to ``_NO_USABLE_GPU_LOG_MARKERS`` in
+# ``backend/app/compute_jobs.py`` (the reactive post-run guard that reclassifies
+# a SUCCEEDED job on the same markers). ``scripts/`` is deployed standalone on
+# runner hosts with no ``backend`` package importable, so the tuple is
+# DUPLICATED rather than imported; parity is enforced by
+# ``backend/testing/test_runner_isolation_gpu_markers.py``, which fails CI if
+# either list is edited without the other.
+NO_USABLE_GPU_LOG_MARKERS: tuple[str, ...] = (
+    "no supported gpu(s) detected to run this container",
+    "gpu, which is not supported by this container",
+)
+
+# Suffix distinguishing the probe container from the real run's container.
+PROBE_NAME_SUFFIX = "-probe"
+
+
+def no_usable_gpu_marker(text: str) -> str | None:
+    """The first :data:`NO_USABLE_GPU_LOG_MARKERS` entry present in ``text``."""
+    lowered = (text or "").lower()
+    for marker in NO_USABLE_GPU_LOG_MARKERS:
+        if marker in lowered:
+            return marker
+    return None
+
+
+def _force_remove_container(
+    runtime: str | None, name: str | None, env: dict[str, str] | None
+) -> None:
+    """Best-effort ``docker rm -f`` of a probe container orphaned by a timeout.
+
+    ``--rm`` does NOT save us here: on :exc:`subprocess.TimeoutExpired` Python
+    kills the docker CLI *client*, not the container. The container keeps
+    running, ``--rm`` never fires, and the name stays held. Swallows every
+    error — this is cleanup, never a failure path.
+    """
+    if not runtime or not name:
+        return
+    try:
+        subprocess.run(
+            [runtime, "rm", "-f", name],
+            env=env,
+            capture_output=True,
+            timeout=15,
+        )
+    except (subprocess.SubprocessError, OSError):
+        pass
+
+
+def pull_container_image(
+    plan: ExecutionPlan, image: str | None, timeout: int = 1800
+) -> tuple[bool, str]:
+    """Pull *image* explicitly, so the GPU probe does not have to wait on it.
+
+    Without this the probe's own ``docker run`` IS the pull — docker's default
+    pull policy is ``missing`` — and the probe's short timeout would be racing a
+    cold multi-GB download it cannot win. A 14-minute NGC pull against a 30s
+    probe times out, and the job dies reporting a probe timeout instead of the
+    arch mismatch the probe exists to name.
+
+    Best-effort by design: a failed pull is NOT fatal here. ``docker run`` will
+    re-attempt the pull anyway, so letting the probe (or the real run) surface
+    the error keeps ONE authoritative failure path instead of inventing a second
+    one. Returns ``(ok, detail)`` for logging only. Never raises.
+
+    A no-op for imageless/bwrap plans, which have nothing to pull.
+    """
+    if not image or plan.backend not in (BACKEND_DOCKER, BACKEND_PODMAN):
+        return True, "no image to pull"
+    runtime = plan.argv[0] if plan.argv else None
+    if not runtime:
+        return True, "no container runtime in plan"
+    try:
+        result = subprocess.run(
+            [runtime, "pull", image],
+            env=plan.env,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"image pull timed out after {timeout}s"
+    except OSError as exc:
+        return False, f"image pull failed to launch: {exc}"
+    if result.returncode != 0:
+        detail = ((result.stderr or "") + (result.stdout or "")).strip()
+        return False, f"image pull exited {result.returncode}: {detail[:500]}"
+    return True, f"pulled {image}"
+
+
+def probe_gpu_in_sandbox(plan: ExecutionPlan, timeout: int = 30) -> tuple[bool, str]:
+    """Run ``nvidia-smi -L`` inside the EXACT sandbox the real job will use.
+
+    The probe reuses the plan's argv/env verbatim, substituting only the
+    terminal command argument (and, on container backends, the ``--name``) so
+    the sandbox construction is identical (same bwrap bind mounts, same
+    CUDA_VISIBLE_DEVICES, same /sys bind, same docker flags).
+
+    Two independent failures are caught:
+
+      * **Device invisibility** — ``nvidia-smi -L`` fails or lists no GPU, so
+        the real job would silently fall back to CPU.
+      * **Arch incompatibility** — the GPU IS listed (``nvidia-smi`` reads the
+        driver, which is arch-agnostic) but the image's CUDA runtime cannot use
+        it. The entrypoint says so on stderr and still exits 0, so only a marker
+        scan of the COMBINED stdout+stderr can see it. Checking exit code and
+        stdout alone lets a V100/Turing+-image mismatch through the gate, burn
+        the image pull and the full run, and fail later as a confusing
+        "no metric produced".
+
+    Returns ``(True, output)`` when at least one GPU is listed and no
+    no-usable-GPU marker appears; ``(False, reason)`` on any failure (non-zero
+    exit, timeout, OSError, empty GPU list, or arch mismatch). Never raises.
+    """
+    probe_command = "nvidia-smi -L"
+    probe_container: str | None = None
+    runtime: str | None = None
+
+    if plan.backend == BACKEND_BWRAP:
+        # bwrap argv ends with: ... bash -lc <command>
+        # Replace the trailing command string with the probe.
+        if len(plan.argv) >= 3 and plan.argv[-2] == "-lc":
+            probe_argv = list(plan.argv[:-1]) + [probe_command]
+        else:
+            return False, "unexpected bwrap argv shape — cannot build probe"
+    elif plan.backend in (BACKEND_DOCKER, BACKEND_PODMAN):
+        # docker/podman run … image bash -lc <command>
+        # Replace everything after "bash -lc" with the probe.
+        try:
+            bash_idx = plan.argv.index("bash")
+        except ValueError:
+            return False, "unexpected docker argv shape — cannot build probe"
+        probe_argv = list(plan.argv[:bash_idx]) + ["bash", "-lc", probe_command]
+        runtime = probe_argv[0] if probe_argv else None
+        # The probe MUST NOT reuse the real run's container name. A timed-out
+        # probe leaks a still-running container holding that name (see
+        # _force_remove_container), and the real run would then die with
+        # "name already in use". A distinct name makes the collision
+        # structurally impossible even if cleanup also fails.
+        try:
+            name_idx = probe_argv.index("--name")
+        except ValueError:
+            name_idx = -1
+        if 0 <= name_idx < len(probe_argv) - 1:
+            probe_container = probe_argv[name_idx + 1] + PROBE_NAME_SUFFIX
+            probe_argv[name_idx + 1] = probe_container
+    elif plan.backend in (BACKEND_APPTAINER, BACKEND_ENROOT):
+        # apptainer exec … image <command>  →  replace terminal command
+        probe_argv = list(plan.argv[:-1]) + [probe_command]
+    else:
+        return False, f"unsupported backend {plan.backend!r} for GPU probe"
+
+    try:
+        result = subprocess.run(
+            probe_argv,
+            env=plan.env,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        _force_remove_container(runtime, probe_container, plan.env)
+        return False, f"GPU probe timed out after {timeout}s"
+    except OSError as exc:
+        return False, f"GPU probe failed to launch: {exc}"
+
+    stdout = (result.stdout or "").strip()
+    stderr = (result.stderr or "").strip()
+    combined = (stdout + "\n" + stderr).strip()
+
+    if result.returncode != 0:
+        detail = combined or f"exit {result.returncode}"
+        return False, f"nvidia-smi -L exited {result.returncode}: {detail}"
+
+    # Arch gate runs BEFORE the device-visibility check: on a mismatch the GPU
+    # list is populated and the exit code is 0, so the marker is the only
+    # authoritative signal and must not be short-circuited by a healthy-looking
+    # stdout.
+    marker = no_usable_gpu_marker(combined)
+    if marker:
+        return False, (
+            "container reported no usable GPU — host GPU/image compatibility "
+            f"mismatch (matched {marker!r}): {combined}"
+        )
+
+    if not stdout:
+        return False, "nvidia-smi -L returned no output"
+    return True, stdout

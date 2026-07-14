@@ -245,6 +245,29 @@ if [ -f /tmp/done_${cfg.taskId} ]; then
   exit 0
 fi
 
+# ── Zero-effective-diff guard (defense-in-depth) ──────────────────────────────
+# The empty-diff-at-merge incident (PR #14500) merged a code-fix PR whose branch
+# netted to ZERO effective diff vs base yet reported COMPLETED via PR. ./pr open
+# already refuses to open such a PR, but ./done is the terminal success post, so
+# guard it too: if base_commit..HEAD is empty, this branch ships nothing and must
+# not report COMPLETED-with-PR. Route to the sanctioned no-op exits instead. Skip
+# only when the base commit was never recorded (cannot compute the diff
+# faithfully) — the pr-side guard is the primary line of defense there.
+_BASE_COMMIT_FILE="/tmp/base_commit_${cfg.taskId}"
+if [ -s "$_BASE_COMMIT_FILE" ]; then
+  _BASE_COMMIT=$(cat "$_BASE_COMMIT_FILE")
+  _EFFECTIVE_DIFF=$(git -C "${WORKSPACE}" diff --name-only "$_BASE_COMMIT..HEAD" 2>/dev/null || true)
+  if [ -z "$_EFFECTIVE_DIFF" ]; then
+    echo "[done] Branch nets to ZERO effective diff vs base ($_BASE_COMMIT..HEAD is empty)." >&2
+    echo "[done] A code-change task with no effective diff must not report COMPLETED as a PR." >&2
+    echo "[done] If the deliverable already exists on ${cfg.baseBranch} and no change is needed:" >&2
+    echo "[done]   ./done --already-done \\"<reason naming the artifact you verified>\\"" >&2
+    echo "[done] If a sibling PR already merged the same changes (branch superseded):" >&2
+    echo "[done]   ./pr close --superseded-by <winning-PR-number>   (then ./done)" >&2
+    exit 2
+  fi
+fi
+
 # Optional enrichment: if Claude wrote /tmp/fix_responses_<task_id>.json
 # (review-fix dialog-system response), include it in the payload so the
 # orchestrator's verify-mode reviewer can chain-of-custody the fix

@@ -13,6 +13,7 @@ import type { KanbanColumn as KanbanColumnConfig, SortBy } from './KanbanBoard';
 import { getFailureClassBreakdown } from '../utils/failureClass';
 
 const ARCHIVABLE_COLUMNS: TaskStatus[] = ['COMPLETED', 'CANCELLED', 'FAILED'];
+const DEFAULT_MAX_VISIBLE = 50;
 
 const SORT_LABELS: Record<SortBy, string> = {
   newest: 'Newest first',
@@ -378,6 +379,10 @@ export function KanbanColumn({
 }: KanbanColumnProps) {
   const isArchivable = ARCHIVABLE_COLUMNS.includes(col.id);
   const taskIds = useMemo(() => columnTasks.map(t => t.id), [columnTasks]);
+  const [showAll, setShowAll] = useState(false);
+  const visibleTasks = showAll ? columnTasks : columnTasks.slice(0, DEFAULT_MAX_VISIBLE);
+  const hiddenCount = Math.max(0, columnTasks.length - DEFAULT_MAX_VISIBLE);
+  const visibleTaskIds = useMemo(() => visibleTasks.map(t => t.id), [visibleTasks]);
   const shiftClickHandler = useCallback((taskId: string) => {
     onShiftSelect?.(taskId, taskIds);
   }, [onShiftSelect, taskIds]);
@@ -385,8 +390,8 @@ export function KanbanColumn({
 
   const content = (
     <div className={compact ? 'space-y-1.5' : 'space-y-2'}>
-      <SortableContext items={taskIds} strategy={verticalListSortingStrategy}>
-        {columnTasks.map((task, cardIdx) => (
+      <SortableContext items={visibleTaskIds} strategy={verticalListSortingStrategy}>
+        {visibleTasks.map((task, cardIdx) => (
           <SortableCard
             key={task.id}
             task={task}
@@ -419,6 +424,22 @@ export function KanbanColumn({
           />
         ))}
       </SortableContext>
+      {hiddenCount > 0 && !showAll && (
+        <button
+          onClick={() => setShowAll(true)}
+          className="w-full text-xs text-neutral-500 hover:text-neutral-300 py-2 rounded-lg border border-dashed border-neutral-800 hover:border-neutral-700 transition-colors min-h-[44px]"
+        >
+          Show {hiddenCount} more
+        </button>
+      )}
+      {showAll && hiddenCount > 0 && (
+        <button
+          onClick={() => setShowAll(false)}
+          className="w-full text-xs text-neutral-500 hover:text-neutral-300 py-2 rounded-lg border border-dashed border-neutral-800 hover:border-neutral-700 transition-colors min-h-[44px]"
+        >
+          Show less
+        </button>
+      )}
       {columnTasks.length === 0 && !loading && (
         <div className="text-center text-neutral-600 text-xs py-8 border border-dashed border-neutral-800 rounded-xl bg-neutral-900/20">
           {hasActiveFilters ? 'No tasks match filters' : 'No tasks'}

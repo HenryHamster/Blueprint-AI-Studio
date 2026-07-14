@@ -14,7 +14,10 @@ Contract:
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
+import re
 from typing import Any
 
 from sqlalchemy.orm.attributes import flag_modified
@@ -22,26 +25,42 @@ from sqlalchemy.orm.attributes import flag_modified
 from app.capability_registry import (
     annotate_capability_proof_status,
     compose_capability_markers,
+    exempt_capability_names,
     normalize_capability_name,
 )
-from app.evidence_primitive import EvidenceRef  # noqa: F401 — imported for shape doc
+from app.evidence_primitive import (
+    EvidenceRef,  # noqa: F401 — imported for shape doc
+    classify_evidence_tiered,
+)
 
 # Re-exported for back-compat: the annotation body lives in the IO-free
 # capability_registry leaf so every spawn path shares ONE implementation.
 __all__ = [
     "annotate_capability_proof_status",
     "carry_proof_records_for_consolidation",
+    "commission_proof_earn_loop",
     "enrich_problem_model_capability_proofs",
+    "record_capability_backing_path_proof",
+    "record_capability_named_test_proof",
     "record_capability_proof",
     "record_capability_proof_from_trial",
+    "record_gap_evidence",
     "should_record_capability_proof",
 ]
 
 logger = logging.getLogger(__name__)
 
 _PROOF_KIND_NAMED_TEST = "named_test"
+#: Structural-only tier minted by the earn loop / fleet sweep from static
+#: discovery (a convention-named test file exists at HEAD and imports the backing
+#: module) WITHOUT ever executing the test. ``classify_evidence_tiered`` grades
+#: this ``path_proven`` — NOT ``proven`` — so it never clears the enforce gate.
+#: The genuine ``named_test`` tier is reserved for :func:`record_capability_proof`,
+#: which stamps it only from a real green merge-test acceptance verdict.
+_PROOF_KIND_NAMED_TEST_PRESENT = "named_test_present"
 _PROOF_KIND_DOWNSTREAM_ARTIFACT = "downstream_artifact"
 _PROOF_KIND_TRIAL_ADOPTION = "trial_adoption"
+_PROOF_KIND_BACKING_PATH = "backing_path"
 _MAX_PROOF_ENTRIES_PER_CAPABILITY = 10
 
 # Context key where we read the acceptance verdict.
@@ -156,13 +175,31 @@ def _append_evidence_refs_to_capabilities(
 
 
 def enrich_problem_model_capability_proofs(
-    problem_model: Any, proof_records: Any
+    problem_model: Any, proof_records: Any, now: Any = None
 ) -> Any:
     """Return a shallow-copied problem_model with capability proof evidence.
 
-    Each capability entry receives a ``proof_status`` field and, when proof
-    records exist, a ``proof_records`` list containing the durable entries.
+    Each capability entry receives a ``proof_status`` field derived via a
+    two-tier resolution:
+
+    1. **evidence_refs** (tier-1): when the capability carries an ``evidence_refs``
+       list, ``classify_evidence`` determines the status — ``"proven"`` /
+       ``"path_proven"`` / ``"partial"`` / ``"unproven"`` / ``"unverified"``.
+
+    2. **proof_records** (tier-2): when evidence_refs is absent, checks the
+       durable proof-record kinds — ``"proven"`` when at least one record has a
+       non-backing_path proof_kind, ``"path_proven"`` when records exist but ALL
+       are backing_path, ``"unproven"`` otherwise.
+
     Missing / empty / malformed records fail open to claimed-only.
+
+    **Freshness (opt-in).** When ``now`` is supplied it is threaded into the
+    tiered classifier so a ``proven=True`` ref (or a proof-record, whose
+    ``proved_at`` is carried through as the synthetic ref's ``recorded_at``) older
+    than :data:`~app.evidence_primitive.PROOF_FRESHNESS_TTL` demotes below
+    ``proven`` — keeping the strategist-facing badge honest and consistent with
+    the enforce gate. ``now`` defaults to ``None`` (no freshness evaluation) so
+    this display path stays deterministic for callers that do not opt in.
     """
     if not isinstance(problem_model, dict):
         return problem_model
@@ -183,7 +220,30 @@ def enrich_problem_model_capability_proofs(
             if isinstance(cap_name, str)
             else []
         )
-        entry2["proof_status"] = "proven" if entries else "unproven"
+        evidence_refs = entry2.get("evidence_refs")
+        # Derive proof_status from evidence_refs (tier-1) when available,
+        # falling back to proof_record kind checking (tier-2).
+        # Empty list means no refs captured yet — fall through to proof_records
+        # rather than treating as affirmatively cleared.
+        if isinstance(evidence_refs, list) and evidence_refs:
+            entry2["proof_status"] = classify_evidence_tiered(evidence_refs, now=now)
+        elif entries:
+            # Map proof records to EvidenceRef shape for tiered classification.
+            # All stored proof records represent proven evidence (only recorded
+            # when acceptance evidence is verified), so proven=True is correct.
+            # Carry proved_at through as recorded_at so an opt-in freshness caller
+            # (now != None) can expire a stale write-once proof-record.
+            synthetic_refs = [
+                {
+                    "kind": e.get("proof_kind"),
+                    "proven": True,
+                    "recorded_at": e.get("proved_at"),
+                }
+                for e in entries
+            ]
+            entry2["proof_status"] = classify_evidence_tiered(synthetic_refs, now=now)
+        else:
+            entry2["proof_status"] = "unproven"
         if entries:
             entry2["proof_records"] = [dict(proof_entry) for proof_entry in entries]
         annotated_caps.append(entry2)
@@ -252,7 +312,13 @@ def record_capability_proof(task: Any, project: Any) -> list[str]:
         # Avoid duplicating a proof entry for the same task.
         if any(e.get("task_id") == task_id for e in entries):
             continue
-        entries.append(entry)
+        # Append an independent copy per capability. The shared ``entry`` is
+        # built once above, but appending it by reference would alias the SAME
+        # dict across every capability's list in a multi-capability task, so a
+        # later mutation (or downstream enrichment) of one capability's entry
+        # would silently bleed into the others. Copy so each entry is a distinct
+        # object.
+        entries.append(dict(entry))
         # Cap at _MAX_PROOF_ENTRIES_PER_CAPABILITY (keep most recent).
         if len(entries) > _MAX_PROOF_ENTRIES_PER_CAPABILITY:
             entries = entries[-_MAX_PROOF_ENTRIES_PER_CAPABILITY:]
@@ -354,6 +420,293 @@ def record_capability_proof_from_trial(
     )
 
 
+def record_capability_backing_path_proof(project: Any, cap_name: str) -> bool:
+    """Record a bounded proof entry when a working capability's declared
+    ``backing_paths`` all resolve at HEAD (verified by the caller).
+
+    Uses dedup key ``backing:<normalized_cap_name>`` — same prefix-based stable
+    key pattern as ``record_capability_proof_from_trial`` — so a standing
+    verification does not produce duplicate proof entries on re-evaluation.
+
+    Non-raising: all errors are logged at WARNING level so they can never
+    crash the caller (typically a reaper sweep).
+
+    Returns ``True`` when a new entry was recorded, ``False`` when already
+    present (dedup) or when the capability name cannot be normalized.
+    """
+    from app.time_utils import _utcnow
+
+    norm = normalize_capability_name(cap_name)
+    if not norm:
+        logger.warning(
+            "[CAPABILITY_PROOF] cannot record backing-path proof — "
+            "capability name %r could not be normalized",
+            cap_name,
+        )
+        return False
+
+    # Stable dedup key: one proof record per capability backing-path verification.
+    dedup_task_id = f"backing:{norm}"
+    proved_at = _utcnow().isoformat()
+
+    proof_entry: dict[str, Any] = {
+        "task_id": dedup_task_id,
+        "proved_at": proved_at,
+        "proof_kind": _PROOF_KIND_BACKING_PATH,
+        "proof_ref": norm,
+        "commit_sha": "",
+    }
+
+    try:
+        if not isinstance(getattr(project, "capability_proof_records", None), dict):
+            project.capability_proof_records = {}
+    except Exception:
+        logger.warning(
+            "[CAPABILITY_PROOF] failed to read capability_proof_records on project",
+            exc_info=True,
+        )
+        return False
+
+    entries: list[dict] = list(project.capability_proof_records.get(norm) or [])
+    if any(e.get("task_id") == dedup_task_id for e in entries):
+        return False
+
+    entries.append(proof_entry)
+    if len(entries) > _MAX_PROOF_ENTRIES_PER_CAPABILITY:
+        entries = entries[-_MAX_PROOF_ENTRIES_PER_CAPABILITY:]
+    project.capability_proof_records[norm] = entries
+    try:
+        flag_modified(project, "capability_proof_records")
+    except Exception:
+        logger.warning(
+            "[CAPABILITY_PROOF] flag_modified failed for capability_proof_records",
+            exc_info=True,
+        )
+        return False
+
+    logger.info(
+        "[CAPABILITY_PROOF] recorded backing-path proof for cap=%s",
+        norm,
+    )
+
+    _append_evidence_refs_to_capabilities(
+        project,
+        [norm],
+        {
+            "kind": _PROOF_KIND_BACKING_PATH,
+            "ref": norm,
+            "proven": True,
+            "source_id": dedup_task_id,
+            "recorded_at": proved_at,
+        },
+    )
+    return True
+
+
+def record_capability_named_test_proof(
+    project: Any, cap_name: str, test_refs: list[str]
+) -> bool:
+    """Record a bounded ``named_test_present``-tier proof for a capability.
+
+    Called from :func:`commission_proof_earn_loop` when a working capability's
+    declared ``backing_paths`` are not merely present at HEAD but a
+    convention-named test file for them *exists at HEAD and imports the backing
+    module* (identified by :func:`_named_tests_covering_paths`). Crucially, that
+    discovery is purely STATIC — file existence plus an import regex — the test
+    is never executed. This therefore records the structural-only
+    ``named_test_present`` kind, which :func:`classify_evidence_tiered` grades
+    ``path_proven`` (like ``backing_path``), NOT ``proven`` — so it does NOT
+    clear the enforce gate. Only :func:`record_capability_proof`, driven by a real
+    green merge-test acceptance verdict, mints the ``proven`` ``named_test`` tier.
+
+    This is NOT a parallel recording mechanism: it writes to the same durable
+    ``project.capability_proof_records`` store and appends the same
+    EvidenceRef shape (via :func:`_append_evidence_refs_to_capabilities`) as
+    every other recorder in this module — only the ``proof_kind`` and dedup
+    prefix differ.
+
+    Uses dedup key ``named_test_present:<normalized_cap_name>`` — the same stable
+    prefix-based pattern as the trial and backing-path recorders — so a standing
+    verification does not produce duplicate proof entries on re-evaluation.
+
+    Non-raising: all errors are logged at WARNING level so they can never crash
+    the caller (typically a reaper sweep).
+
+    Returns ``True`` when a new entry was recorded, ``False`` when already
+    present (dedup), when the capability name cannot be normalized, or when
+    ``test_refs`` is empty.
+    """
+    from app.time_utils import _utcnow
+
+    norm = normalize_capability_name(cap_name)
+    if not norm:
+        logger.warning(
+            "[CAPABILITY_PROOF] cannot record named-test proof — "
+            "capability name %r could not be normalized",
+            cap_name,
+        )
+        return False
+
+    refs = [r for r in (test_refs or []) if isinstance(r, str) and r.strip()]
+    if not refs:
+        logger.warning(
+            "[CAPABILITY_PROOF] cannot record named-test proof for cap=%s — "
+            "no covering test refs supplied",
+            norm,
+        )
+        return False
+
+    # Stable dedup key: one named-test-present proof record per capability
+    # verification.
+    dedup_task_id = f"named_test_present:{norm}"
+    proved_at = _utcnow().isoformat()
+    proof_ref = ",".join(refs)
+
+    proof_entry: dict[str, Any] = {
+        "task_id": dedup_task_id,
+        "proved_at": proved_at,
+        "proof_kind": _PROOF_KIND_NAMED_TEST_PRESENT,
+        "proof_ref": proof_ref,
+        "test_refs": refs,
+        "commit_sha": "",
+    }
+
+    try:
+        if not isinstance(getattr(project, "capability_proof_records", None), dict):
+            project.capability_proof_records = {}
+    except Exception:  # noqa: BLE001 — recording must degrade, never raise
+        logger.warning(
+            "[CAPABILITY_PROOF] failed to read capability_proof_records on project",
+            exc_info=True,
+        )
+        return False
+
+    entries: list[dict] = list(project.capability_proof_records.get(norm) or [])
+    if any(e.get("task_id") == dedup_task_id for e in entries):
+        return False
+
+    entries.append(proof_entry)
+    if len(entries) > _MAX_PROOF_ENTRIES_PER_CAPABILITY:
+        entries = entries[-_MAX_PROOF_ENTRIES_PER_CAPABILITY:]
+    project.capability_proof_records[norm] = entries
+    try:
+        flag_modified(project, "capability_proof_records")
+    except Exception:  # noqa: BLE001 — recording must degrade, never raise
+        logger.warning(
+            "[CAPABILITY_PROOF] flag_modified failed for capability_proof_records",
+            exc_info=True,
+        )
+        return False
+
+    logger.info(
+        "[CAPABILITY_PROOF] recorded named-test-present (path_proven tier) "
+        "proof for cap=%s refs=%s",
+        norm,
+        refs,
+    )
+
+    _append_evidence_refs_to_capabilities(
+        project,
+        [norm],
+        {
+            "kind": _PROOF_KIND_NAMED_TEST_PRESENT,
+            "ref": proof_ref,
+            "proven": True,
+            "source_id": dedup_task_id,
+            "recorded_at": proved_at,
+        },
+    )
+    return True
+
+
+def record_gap_evidence(task: Any, project: Any) -> None:
+    """Stamp EvidenceRef entries onto the Gap linked to this task's direction.
+
+    Resolves the gap via task.context["direction_id"] → project.directions → gap_id
+    → project.problem_model["gaps"].  Appends an EvidenceRef-shaped entry to the
+    gap's ``evidence_refs`` list when the task carries a proven acceptance verdict.
+
+    Non-raising: all errors are logged at WARNING level so this can never undo a
+    real merge.  Idempotent: deduplicates by source_id.
+    """
+    from app.time_utils import _utcnow
+
+    try:
+        context = getattr(task, "context", None) or {}
+        verdict = context.get(_CODE_ACCEPTANCE_VERDICT_KEY)
+        if not isinstance(verdict, dict) or verdict.get("proven") is not True:
+            return
+
+        direction_id = context.get("direction_id")
+        if not direction_id:
+            return
+
+        # Resolve direction → gap_id.
+        directions = getattr(project, "directions", None) or []
+        if not isinstance(directions, list):
+            return
+        gap_id: str | None = None
+        for d in directions:
+            if isinstance(d, dict) and d.get("id") == direction_id:
+                gap_id = d.get("gap_id")
+                break
+        if not gap_id:
+            return
+
+        # Resolve gap in problem_model.
+        pm = getattr(project, "problem_model", None)
+        if not isinstance(pm, dict):
+            return
+        gaps = pm.get("gaps")
+        if not isinstance(gaps, list):
+            return
+        target_gap: dict | None = None
+        for g in gaps:
+            if isinstance(g, dict) and g.get("id") == gap_id:
+                target_gap = g
+                break
+        if target_gap is None:
+            return
+
+        task_id = str(getattr(task, "id", "") or "")
+        proof_kind = _proof_kind_from_verdict(verdict)
+        proof_ref = _extract_proof_ref(verdict) or ""
+        recorded_at = _utcnow().isoformat()
+
+        ref_entry: dict[str, Any] = {
+            "kind": proof_kind,
+            "ref": proof_ref,
+            "proven": True,
+            "source_id": task_id,
+            "recorded_at": recorded_at,
+        }
+
+        refs: list = target_gap.setdefault("evidence_refs", [])
+        # Dedup by source_id.
+        if task_id and any(
+            isinstance(r, dict) and r.get("source_id") == task_id for r in refs
+        ):
+            return
+
+        refs.append(ref_entry)
+        if len(refs) > _MAX_PROOF_ENTRIES_PER_CAPABILITY:
+            target_gap["evidence_refs"] = refs[-_MAX_PROOF_ENTRIES_PER_CAPABILITY:]
+
+        flag_modified(project, "problem_model")
+        logger.info(
+            "[GAP_EVIDENCE] recorded evidence for task %s gap_id=%s proof_kind=%s",
+            task_id,
+            gap_id,
+            proof_kind,
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[GAP_EVIDENCE] failed to record gap evidence for task %s",
+            getattr(task, "id", None),
+            exc_info=True,
+        )
+
+
 def carry_proof_records_for_consolidation(
     capabilities_consolidated: list[dict[str, Any]],
     proof_records: dict[str, Any],
@@ -416,3 +769,562 @@ def carry_proof_records_for_consolidation(
         )
 
     return result
+
+
+# ── named_test coverage discovery ─────────────────────────────────────────────
+# Convention-based mapping from a capability's backing source path to the test
+# file(s) that would exercise it, plus a reference check confirming the test
+# actually imports the backing module. This is the "identify the test file(s)
+# that exercise a capability's backing paths, and reference them" step that lets
+# the earn loop mint a ``named_test_present`` proof. This discovery is STATIC
+# (file exists + import regex; the test is never executed), so
+# ``classify_evidence_tiered`` grades it ``path_proven`` — the same tier as a
+# ``backing_path`` proof, NOT the executed ``proven`` ``named_test`` tier.
+
+_TS_JS_EXTS: frozenset[str] = frozenset({"ts", "tsx", "js", "jsx"})
+
+
+def _strip_path_suffix(path: str) -> str:
+    """Drop a trailing ``:symbol`` / ``:line`` / ``#L`` suffix from a ref path."""
+    for sep in ("#", ":"):
+        if sep in path:
+            path = path.split(sep, 1)[0]
+    return path.strip()
+
+
+def _path_stem(source_path: str) -> str | None:
+    """Return the bare filename stem (no directory, no extension) of a path."""
+    if not isinstance(source_path, str):
+        return None
+    p = _strip_path_suffix(source_path)
+    filename = p.rsplit("/", 1)[-1]
+    stem, dot, _ext = filename.rpartition(".")
+    return stem if dot and stem else None
+
+
+def _module_dotted_path(source_path: str) -> str | None:
+    """Return the importable dotted module path for a ``backend/app`` source file.
+
+    ``backend/app/capability_proof.py`` → ``app.capability_proof``;
+    ``backend/app/routers/admin_compute_jobs.py`` → ``app.routers.admin_compute_jobs``.
+    Returns ``None`` for non-Python paths or files outside ``backend/app/`` (whose
+    import name is not derivable from the path alone).
+    """
+    if not isinstance(source_path, str):
+        return None
+    p = _strip_path_suffix(source_path)
+    if not p.endswith(".py") or not p.startswith("backend/app/"):
+        return None
+    rel = p[len("backend/") : -len(".py")]  # app/routers/admin_compute_jobs
+    return rel.replace("/", ".")
+
+
+def _candidate_test_paths(source_path: str) -> list[str]:
+    """Return convention-based candidate test file paths for a backing source path.
+
+    Mirrors the repo's real layout conventions:
+      * ``backend/**/<name>.py``   → ``backend/testing/test_<name>.py`` (flattened)
+      * ``scripts/<name>.py``      → ``scripts/test_<name>.py``
+      * ``<dir>/<name>.{ts,tsx,js,jsx}`` → ``<dir>/<name>.test.<ext>`` (sibling)
+
+    Returns ``[]`` for paths whose test convention is not derivable.
+    """
+    if not isinstance(source_path, str) or not source_path.strip():
+        return []
+    p = _strip_path_suffix(source_path)
+    if not p:
+        return []
+    dirname, _, filename = p.rpartition("/")
+    stem, dot, ext = filename.rpartition(".")
+    if not dot or not stem:
+        return []
+    if ext == "py":
+        if p.startswith("backend/"):
+            return [f"backend/testing/test_{stem}.py"]
+        if p.startswith("scripts/"):
+            return [f"scripts/test_{stem}.py"]
+        return [f"{dirname}/test_{stem}.py" if dirname else f"test_{stem}.py"]
+    if ext in _TS_JS_EXTS:
+        base = f"{dirname}/" if dirname else ""
+        return [f"{base}{stem}.test.{ext}"]
+    return []
+
+
+def _test_references_source(content: str, source_path: str) -> bool:
+    """True when ``content`` (a test file's body) imports/references ``source_path``.
+
+    Confirms the conventionally-named test actually exercises the backing module
+    rather than being a same-named coincidence: for a ``backend/app`` module it
+    looks for the importable dotted path (``app.routers.admin_compute_jobs``);
+    otherwise it requires the bare module stem to appear on an ``import``/``from``
+    line (e.g. ``import local_runner`` for a script, or a JS/TS
+    ``import ... from './strategic-resident-lib'``).
+    """
+    if not isinstance(content, str) or not content:
+        return False
+    dotted = _module_dotted_path(source_path)
+    if dotted and dotted in content:
+        return True
+    stem = _path_stem(source_path)
+    if not stem:
+        return False
+    pattern = re.compile(
+        rf"(?:^|\n)[^\n]*\b(?:import|from|require)\b[^\n]*\b{re.escape(stem)}\b"
+    )
+    return bool(pattern.search(content))
+
+
+async def _read_file_at_head(path: str, repo_root: str = "/tmp/workspace") -> str | None:
+    """Return the HEAD contents of ``path`` via ``git show``, or ``None``.
+
+    Tri-state-ish: ``None`` on any indeterminacy (no checkout, git error/timeout,
+    missing file) so the caller degrades to a lower proof tier rather than
+    guessing. Never raises.
+    """
+    if not path or not isinstance(path, str) or not repo_root or not os.path.isdir(repo_root):
+        return None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git",
+            "show",
+            f"HEAD:{path}",
+            cwd=repo_root,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+        except asyncio.TimeoutError:
+            proc.kill()
+            logger.warning("[CAPABILITY_PROOF] git show timeout reading test %s", path)
+            return None
+        if proc.returncode != 0:
+            return None
+        return stdout.decode(errors="replace")
+    except Exception:  # noqa: BLE001 — discovery must degrade, never raise
+        logger.warning(
+            "[CAPABILITY_PROOF] failed to read %s at HEAD", path, exc_info=True
+        )
+        return None
+
+
+async def _named_tests_covering_paths(
+    file_paths: list[str],
+    *,
+    verify_path,
+    read_head=_read_file_at_head,
+) -> list[str]:
+    """Return the covering test refs when EVERY backing path is test-covered.
+
+    For each backing source path, derives its conventional test file(s), confirms
+    the test exists at HEAD (via ``verify_path``, the same tri-state existence
+    checker the earn loop already uses), and confirms the test body references the
+    backing module (:func:`_test_references_source`). A backing path is *covered*
+    when at least one such test is found.
+
+    Returns the deduplicated list of covering test refs ONLY when every path in
+    ``file_paths`` is covered — an all-or-nothing bar so a ``named_test`` proof
+    attests the whole declared surface is test-backed, not just part of it.
+    Returns ``[]`` when any path lacks a discoverable covering test (the caller
+    then falls back to the structural-only ``backing_path`` proof).
+    """
+    covering: list[str] = []
+    seen: set[str] = set()
+    for src in file_paths:
+        path_covered = False
+        for test_path in _candidate_test_paths(src):
+            try:
+                exists = await verify_path(test_path)
+            except Exception:  # noqa: BLE001 — a verify failure is non-fatal
+                exists = None
+            if exists is not True:
+                continue
+            content = await read_head(test_path)
+            if content is None:
+                continue
+            if _test_references_source(content, src):
+                path_covered = True
+                if test_path not in seen:
+                    seen.add(test_path)
+                    covering.append(test_path)
+                break
+        if not path_covered:
+            # One uncovered backing path drops the whole capability to the
+            # structural-only tier — do not over-claim named_test coverage.
+            return []
+    return covering
+
+
+# --- Automated backing-path discovery (proposal path) ------------------------
+
+# Search tokens shorter than this are dropped from capability-name matching:
+# two-char fragments ("ci", "ui") match almost any file and produce noise.
+_CAP_TOKEN_MIN_LEN = 3
+# Hard cap on discovered candidates per capability — bounds both the named_test
+# coverage probe and the suggestion list folded into a research obligation.
+_MAX_DISCOVERED_CANDIDATES = 5
+
+
+async def _list_head_files(repo_root: str = "/tmp/workspace") -> list[str] | None:
+    """Return every tracked file path at HEAD via ``git ls-files``, or ``None``.
+
+    Tri-state-ish, mirroring :func:`_read_file_at_head`: ``None`` on any
+    indeterminacy (no checkout, git error/timeout) so discovery degrades to
+    "found nothing" rather than guessing. Never raises.
+    """
+    if not repo_root or not os.path.isdir(repo_root):
+        return None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git",
+            "ls-files",
+            cwd=repo_root,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+        except asyncio.TimeoutError:
+            proc.kill()
+            logger.warning("[CAPABILITY_PROOF] git ls-files timeout listing HEAD tree")
+            return None
+        if proc.returncode != 0:
+            return None
+        return [
+            line for line in stdout.decode(errors="replace").splitlines() if line.strip()
+        ]
+    except Exception:  # noqa: BLE001 — discovery must degrade, never raise
+        logger.warning(
+            "[CAPABILITY_PROOF] failed to list HEAD files", exc_info=True
+        )
+        return None
+
+
+def _capability_search_tokens(cap_name: str) -> list[str]:
+    """Derive file-search tokens from a capability name.
+
+    Normalizes to kebab-case (:func:`normalize_capability_name`) and splits into
+    the alphanumeric tokens long enough to be discriminating (``>=
+    _CAP_TOKEN_MIN_LEN``). Returns ``[]`` for an unnormalizable name or one whose
+    tokens are all too short to search on.
+    """
+    norm = normalize_capability_name(cap_name)
+    if not norm:
+        return []
+    return [t for t in norm.split("-") if len(t) >= _CAP_TOKEN_MIN_LEN]
+
+
+async def _discover_candidate_backing_paths(
+    cap_name: str,
+    *,
+    list_head_files=_list_head_files,
+    verify_path=None,
+    max_candidates: int = _MAX_DISCOVERED_CANDIDATES,
+) -> list[str]:
+    """Propose candidate backing-path files for a capability that declares none.
+
+    Given a capability name, derive search tokens from its normalized kebab form
+    (:func:`_capability_search_tokens`), scan the HEAD file tree
+    (``list_head_files``), and keep the paths whose *basename* contains EVERY
+    search token — a strict match so a multi-word capability lands on a
+    specifically-named file rather than an incidental single-token hit. Each
+    survivor must also pass :func:`_looks_like_file_path` AND verify present at
+    HEAD via ``verify_path`` (defaults to
+    :func:`app.source_ref_validation._path_exists_at_head`).
+
+    IO is fully injectable (``list_head_files`` / ``verify_path``) so the helper
+    is unit-testable without a git checkout, and — like the rest of the earn
+    loop — it never raises: any discovery/verification failure degrades to a
+    shorter (possibly empty) list.
+
+    Returns a deduplicated, deterministically-ordered (most-specific first),
+    bounded (``max_candidates``) list of candidate paths, or ``[]`` when nothing
+    usable is found. This is advisory only: the caller decides whether the
+    candidates clear the proof bar or merely seed a research obligation — this
+    helper never records a proof or mutates the registry.
+    """
+    from app.source_ref_validation import _looks_like_file_path, _path_exists_at_head
+
+    _verify = verify_path or _path_exists_at_head
+
+    tokens = _capability_search_tokens(cap_name)
+    if not tokens:
+        return []
+
+    try:
+        tree = await list_head_files()
+    except Exception:  # noqa: BLE001 — a listing failure is non-fatal
+        logger.warning(
+            "[CAPABILITY_PROOF] discovery: HEAD file listing failed for cap=%s",
+            cap_name,
+            exc_info=True,
+        )
+        return []
+    if not tree:
+        return []
+
+    # Rank candidate paths by basename specificity (shortest basename first) so
+    # the most on-the-nose match leads; ties break on the full path for stable,
+    # deterministic ordering across runs.
+    scored: list[tuple[int, str]] = []
+    for path in tree:
+        if not isinstance(path, str) or not _looks_like_file_path(path):
+            continue
+        base = path.rsplit("/", 1)[-1].lower()
+        if not all(tok in base for tok in tokens):
+            continue
+        scored.append((len(base), path))
+    if not scored:
+        return []
+    scored.sort(key=lambda sp: (sp[0], sp[1]))
+
+    verified: list[str] = []
+    seen: set[str] = set()
+    for _, path in scored:
+        if path in seen:
+            continue
+        try:
+            exists = await _verify(path)
+        except Exception:  # noqa: BLE001 — a verify failure is non-fatal
+            exists = None
+        if exists is True:
+            seen.add(path)
+            verified.append(path)
+        if len(verified) >= max_candidates:
+            break
+    return verified
+
+
+async def commission_proof_earn_loop(
+    project: Any,
+    demand_result: dict[str, Any],
+    problem_model: dict[str, Any],
+    *,
+    verify_path=None,
+    read_head=None,
+) -> dict[str, Any]:
+    """Earn proof for demanded unproven working capabilities.
+
+    This is the core of the capability-proof EARN loop. It:
+
+    1. Computes the intersection of **demanded capabilities** (from
+       ``demand_result``) and **unproven working capabilities** (from
+       ``problem_model``) via
+       :func:`app.capability_demand.compute_unproven_demanded_capabilities`.
+
+    2. For each demanded unproven capability that declares ``backing_paths``:
+       verifies each path at HEAD via ``verify_path`` (defaults to
+       :func:`app.source_ref_validation._path_exists_at_head`).  When ALL
+       paths are definitely present, it then attempts the *higher* tier:
+       :func:`_named_tests_covering_paths` looks for real test files that
+       exercise (import) every backing path.  When every path has a
+       convention-named test file present at HEAD that imports it, a
+       ``named_test_present`` proof is recorded via
+       :func:`record_capability_named_test_proof`.  That discovery is STATIC —
+       the test is never executed — so :func:`classify_evidence_tiered` grades it
+       ``path_proven`` (the SAME tier as the ``backing_path`` fallback), NOT
+       ``proven``: it does NOT clear the enforce gate.  Only a real green
+       merge-test acceptance verdict (:func:`record_capability_proof`) mints the
+       ``proven`` ``named_test`` tier.  The fallback when no covering test is
+       discoverable is the ``backing_path`` proof
+       (:func:`record_capability_backing_path_proof`, also ``path_proven``).
+
+    3. For each demanded unproven capability that has NO ``backing_paths``:
+       no automated verification is possible — the gap is reported in the
+       return summary so callers (reaper sweeps, advisory hint builders) can
+       surface it.
+
+    Parameters
+    ----------
+    project:
+        The project ORM object (must carry ``problem_model`` and
+        ``capability_proof_records``).
+    demand_result:
+        Output of :func:`collect_missing_capability_demand`.
+    problem_model:
+        The project's ``problem_model`` dict (the IO-free
+        ``working_capability_proof_status`` reader is used on this).
+    verify_path:
+        Callable ``(path: str) -> bool | None`` — async, returns True when
+        the path definitely exists at HEAD, False when definitely absent,
+        None when indeterminate.  Defaults to
+        :func:`app.source_ref_validation._path_exists_at_head`.  Injected
+        for testability (an ``AsyncMock`` or ``lambda`` can be substituted).
+    read_head:
+        Callable ``(path: str) -> str | None`` — async, returns the HEAD
+        contents of a test file (or ``None`` when indeterminate).  Defaults to
+        :func:`_read_file_at_head`.  Injected for testability so the
+        named_test-present branch can be exercised without a git checkout.
+
+    Returns
+    -------
+    A summary dict:
+    ``{"total_demanded_unproven": int, "earned": int, "no_backing_paths": list[str],
+      "still_unproven": list[str], "path_proven_stuck": list[str],
+      "named_test_earned": list[str]}``.
+    Total entries found, count of newly-recorded proofs (named_test_present +
+    backing_path), capability names with no backing_paths, remaining unproven
+    names (failed path check), already-recorded (stuck) names that were not newly
+    recorded, and the subset of newly-recorded names that got a
+    ``named_test_present`` proof (a convention test file is present at HEAD).
+    NOTE: both recorded tiers are graded ``path_proven`` — neither clears the
+    enforce gate; a capability reaches ``proven`` only via a real green
+    merge-test acceptance verdict (:func:`record_capability_proof`).
+    """
+    from app.capability_demand import compute_unproven_demanded_capabilities
+    from app.source_ref_validation import (
+        _looks_like_file_path,
+        _path_exists_at_head,
+    )
+
+    _verify = verify_path or _path_exists_at_head
+    _read_head = read_head or _read_file_at_head
+
+    # Step 1: compute the intersection.
+    demanded_unproven = compute_unproven_demanded_capabilities(
+        demand_result, problem_model
+    )
+    if not demanded_unproven:
+        return {
+            "total_demanded_unproven": 0,
+            "earned": 0,
+            "no_backing_paths": [],
+            "still_unproven": [],
+            "path_proven_stuck": [],
+            "named_test_earned": [],
+        }
+
+    # Step 1b: defensive filter — skip exempt capabilities (they classify as
+    # "proven" via working_capability_proof_status, so they should never appear
+    # in demanded_unproven, but this is a belt-and-suspenders guard).
+    _exempt = exempt_capability_names(problem_model)
+    if _exempt:
+        demanded_unproven = [
+            e
+            for e in demanded_unproven
+            if normalize_capability_name(e.get("ref", "")) not in _exempt
+        ]
+        if not demanded_unproven:
+            return {
+                "total_demanded_unproven": 0,
+                "earned": 0,
+                "no_backing_paths": [],
+                "still_unproven": [],
+                "path_proven_stuck": [],
+                "named_test_earned": [],
+            }
+
+    # Build a lookup: canonical-name -> (raw_name, backing_paths).
+    # We read from the raw capabilities so we can inspect backing_paths regardless
+    # of proof_status (the intersection has already filtered by proof_status).
+    caps_raw = problem_model.get("capabilities") or []
+    cap_backing: dict[str, tuple[str, list[str]]] = {}
+    for cap in caps_raw:
+        if not isinstance(cap, dict):
+            continue
+        raw_name = cap.get("name")
+        if not isinstance(raw_name, str):
+            continue
+        norm_name = normalize_capability_name(raw_name)
+        if not norm_name:
+            continue
+        bp = cap.get("backing_paths")
+        if isinstance(bp, list):
+            cap_backing[norm_name] = (raw_name, bp)
+
+    earned_names: list[str] = []
+    named_test_earned: list[str] = []
+    no_backing_paths: list[str] = []
+    still_unproven: list[str] = []
+    path_proven_stuck: list[str] = []
+
+    for entry in demanded_unproven:
+        ref = entry.get("ref", "")
+        canonical = normalize_capability_name(ref)
+        if not canonical:
+            continue
+
+        raw_name, backing_paths = cap_backing.get(canonical, (None, []))
+        if not backing_paths:
+            no_backing_paths.append(canonical)
+            continue
+
+        # Filter to file-like paths.
+        file_paths = [
+            p for p in backing_paths
+            if isinstance(p, str) and _looks_like_file_path(p)
+        ]
+        if not file_paths:
+            no_backing_paths.append(canonical)
+            continue
+
+        # Verify every path at HEAD.  A single None (indeterminate) or False
+        # (definitely absent) prevents proof recording — only definite True
+        # on ALL paths triggers record.
+        all_present = True
+        for p in file_paths:
+            try:
+                exists = await _verify(p)
+            except Exception:  # noqa: BLE001 — verification failure is non-fatal
+                exists = None
+            if exists is not True:
+                all_present = False
+                break
+
+        if all_present:
+            # If a convention-named test file for every backing path exists at
+            # HEAD and imports the module, record a ``named_test_present`` proof.
+            # This is a STATIC signal (no test is executed), so it is graded
+            # ``path_proven`` — richer metadata than a bare ``backing_path`` proof
+            # but the SAME tier: it does NOT clear the enforce gate. Only a real
+            # green merge-test verdict (record_capability_proof) reaches ``proven``.
+            test_refs = await _named_tests_covering_paths(
+                file_paths, verify_path=_verify, read_head=_read_head
+            )
+            if test_refs:
+                recorded = record_capability_named_test_proof(
+                    project, raw_name or canonical, test_refs
+                )
+                if recorded:
+                    earned_names.append(canonical)
+                    named_test_earned.append(canonical)
+                else:
+                    # Dedup hit: a named_test_present proof was already stamped
+                    # in a prior sweep. Not newly recorded.
+                    path_proven_stuck.append(canonical)
+                continue
+
+            # Fallback: paths present but no discoverable test coverage — record
+            # the structural-only ``backing_path`` proof (graded ``path_proven``).
+            recorded = record_capability_backing_path_proof(project, raw_name or canonical)
+            if recorded:
+                earned_names.append(canonical)
+            else:
+                # Dedup hit (recorded=False): already stamped in a prior sweep.
+                # Do NOT count as earned — the sweep must not commit on no-op
+                # re-runs, and the capability should not be reported as newly
+                # earning proof. Surface as path_proven_stuck so callers can
+                # distinguish genuinely-new from already-recorded.
+                path_proven_stuck.append(canonical)
+        else:
+            still_unproven.append(canonical)
+
+    logger.info(
+        "[CAPABILITY_PROOF] commission_proof_earn_loop: "
+        "total_demanded_unproven=%d earned=%d named_test_earned=%d "
+        "no_backing_paths=%d still_unproven=%d",
+        len(demanded_unproven),
+        len(earned_names),
+        len(named_test_earned),
+        len(no_backing_paths),
+        len(still_unproven),
+    )
+
+    return {
+        "total_demanded_unproven": len(demanded_unproven),
+        "earned": len(earned_names),
+        "no_backing_paths": no_backing_paths,
+        "still_unproven": still_unproven,
+        "path_proven_stuck": path_proven_stuck,
+        "named_test_earned": named_test_earned,
+    }

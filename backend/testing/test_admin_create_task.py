@@ -18,8 +18,12 @@ from httpx import AsyncClient
 from app.models import Project, ProjectMember, ProjectStatus
 
 
-async def _make_project_with_member(db_session, repo="acme/widget"):
-    """Project owned by test-user-123 for the given owner/repo."""
+async def _make_project_with_member(db_session, repo="acme/widget", role="owner"):
+    """Project for the given owner/repo with test-user-123 as a member.
+
+    ``role`` defaults to ``owner``; pass ``viewer``/``member`` to exercise the
+    role floor on the existing-project creation path.
+    """
     owner, name = repo.split("/", 1)
     project = Project(
         name=repo,
@@ -32,7 +36,7 @@ async def _make_project_with_member(db_session, repo="acme/widget"):
     await db_session.commit()
     await db_session.refresh(project)
     db_session.add(
-        ProjectMember(project_id=project.id, user_id="test-user-123", role="owner")
+        ProjectMember(project_id=project.id, user_id="test-user-123", role=role)
     )
     await db_session.commit()
     return project
@@ -526,3 +530,120 @@ async def test_idempotency_key_scoped_per_project(client: AsyncClient, db_sessio
     # Each project has exactly its own single task
     assert await _count_tasks(db_session, project_a.id) == 1
     assert await _count_tasks(db_session, project_b.id) == 1
+
+
+# --- Role floor on the existing-project path ---------------------------------
+#
+# Manual task creation resolves the target project by (owner, repo) scoped to the
+# caller's memberships. Membership alone is NOT authorization to create work: a
+# task executes code and consumes LLM/GPU budget, so the existing-project path
+# requires the member+ floor (viewer is documented read-only). The auto-create
+# branch is unaffected — a caller with no member-visible project for the repo
+# becomes the owner of the brand-new project.
+
+
+async def _count_projects_for_repo(db_session, owner, repo) -> int:
+    from sqlalchemy import func, select
+
+    return (
+        await db_session.execute(
+            select(func.count(Project.id)).where(
+                Project.github_owner == owner, Project.github_repo == repo
+            )
+        )
+    ).scalar_one()
+
+
+@pytest.mark.asyncio
+async def test_viewer_cannot_create_task_on_existing_project(
+    client: AsyncClient, db_session
+):
+    """A viewer on the target project gets 403 and no task is enqueued."""
+    project = await _make_project_with_member(db_session, "acme/widget", role="viewer")
+
+    resp = await client.post(
+        "/api/admin/tasks",
+        json={
+            "github_repo": "acme/widget",
+            "title": "Viewer-enqueued work",
+            "prompt": "spend the budget",
+            "base_branch": "main",
+            "task_type": "create",
+        },
+    )
+
+    assert resp.status_code == 403, resp.text
+    # HTTPException detail surfaces at error.message (main.py http_exception_handler).
+    assert "member" in resp.json()["error"]["message"].lower()
+    # No task enqueued...
+    assert await _count_tasks(db_session, project.id) == 0
+    # ...and the rejection must NOT have fallen through into the auto-create
+    # branch, which would hand the viewer a shadow project they own.
+    assert await _count_projects_for_repo(db_session, "acme", "widget") == 1
+
+
+@pytest.mark.asyncio
+async def test_member_can_create_task_on_existing_project(
+    client: AsyncClient, db_session
+):
+    """The member floor must not over-reject: a member (not owner) can create."""
+    project = await _make_project_with_member(db_session, "acme/widget", role="member")
+
+    resp = await client.post(
+        "/api/admin/tasks",
+        json={
+            "github_repo": "acme/widget",
+            "title": "Member-enqueued work",
+            "prompt": "do the work",
+            "base_branch": "main",
+            "task_type": "create",
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert await _count_tasks(db_session, project.id) == 1
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_repo_prefers_writable_project_over_viewer_one(
+    client: AsyncClient, db_session
+):
+    """Two projects for one repo (viewer on A, owner of B) → create on B, not 403.
+
+    ``ix_project_github_owner_repo`` is NOT unique and the auto-create branch
+    deliberately mints a project per (caller, repo), so a user can legitimately
+    be a viewer on one project for ``acme/widget`` and the owner of another. A
+    membership-scoped ``.scalars().first()`` with no ORDER BY picks either row at
+    random; checking the role only AFTER that pick would 403 the caller roughly
+    half the time — randomly locking them out of creating tasks on their OWN
+    project. The resolver must look for a member+ project FIRST.
+    """
+    viewer_project = await _make_project_with_member(
+        db_session, "acme/widget", role="viewer"
+    )
+    owner_project = await _make_project_with_member(
+        db_session, "acme/widget", role="owner"
+    )
+    assert viewer_project.id != owner_project.id
+    assert await _count_projects_for_repo(db_session, "acme", "widget") == 2
+
+    # Run several times: a nondeterministic pick would flake, not fail outright.
+    for i in range(4):
+        resp = await client.post(
+            "/api/admin/tasks",
+            json={
+                "github_repo": "acme/widget",
+                "title": f"Work on my own project {i}",
+                "prompt": "do the work",
+                "base_branch": "main",
+                "task_type": "create",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+
+    # Every task landed on the project the caller can WRITE to...
+    assert await _count_tasks(db_session, owner_project.id) == 4
+    # ...none on the viewer-only one...
+    assert await _count_tasks(db_session, viewer_project.id) == 0
+    # ...and no shadow project was minted.
+    assert await _count_projects_for_repo(db_session, "acme", "widget") == 2
