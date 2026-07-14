@@ -1,4 +1,4 @@
-import { X, Download } from 'lucide-react';
+import { X, Download, ExternalLink } from 'lucide-react';
 import { useEffect, useRef, useState, useCallback, type KeyboardEvent } from 'react';
 import type { MessageAttachment } from '../types/messages';
 
@@ -44,10 +44,17 @@ export function AttachmentPreviewModal({ attachment, open, onClose }: Attachment
   const isPdf = mimeType === 'application/pdf';
   const displayName = attachment.name || attachment.mime_type || 'File';
 
-  // Create object URL for PDF preview — revoke on close/unmount.
-  // URL.createObjectURL is a browser platform API that requires effect
-  // synchronization; setObjectUrl is needed to trigger re-render with
-  // the new src on the <iframe>.
+  // Persisted chat/message attachments carry a signed GCS `url` rather than an
+  // inline base64 `data` payload (only locally-constructed attachments carry
+  // `data`). Both forms must preview, so we prefer the local blob when present
+  // and otherwise fall back to the remote signed URL.
+  const remoteUrl = attachment.url || null;
+
+  // Create object URL for PDF preview from inline base64 data — revoke on
+  // close/unmount. URL.createObjectURL is a browser platform API that requires
+  // effect synchronization; setObjectUrl is needed to trigger re-render with
+  // the new src on the <iframe>. When only a remote `url` is present there is
+  // no blob to build, so this effect no-ops and the remote URL is used directly.
   useEffect(() => {
     if (!open || !isPdf || !attachment.data) return;
     const blob = base64ToBlob(attachment.data, mimeType);
@@ -113,6 +120,14 @@ export function AttachmentPreviewModal({ attachment, open, onClose }: Attachment
     ? base64ToBlob(attachmentData, mimeType || 'application/octet-stream')
     : null;
 
+  // Source used by the embedded viewers. Prefer a locally-built blob URL (data
+  // path); otherwise use the remote signed URL directly.
+  const imageSrc = attachmentData ? `data:${mimeType};base64,${attachmentData}` : remoteUrl;
+  const pdfSrc = objectUrl || remoteUrl;
+  // "Open in new tab" works for any renderable source (blob or remote URL).
+  const openInTabUrl = (isImage && imageSrc) || (isPdf && pdfSrc) || remoteUrl || null;
+  const canDownload = downloadBlob != null || remoteUrl != null;
+
   return (
     <div
       className="fixed inset-0 z-[85] flex items-center justify-center bg-black/70 backdrop-blur-sm px-4 py-4"
@@ -146,38 +161,66 @@ export function AttachmentPreviewModal({ attachment, open, onClose }: Attachment
 
         {/* Content */}
         <div className="min-h-0 flex-1 overflow-auto flex items-center justify-center">
-          {isImage && attachment.data ? (
+          {isImage && imageSrc ? (
             <img
-              src={`data:${mimeType};base64,${attachment.data}`}
+              src={imageSrc}
               alt={displayName}
-              className="max-h-[calc(100vh-120px)] max-w-full object-contain"
+              className="max-h-[calc(100vh-160px)] max-w-full object-contain"
             />
-          ) : isPdf && objectUrl ? (
+          ) : isPdf && pdfSrc ? (
             <iframe
-              src={objectUrl}
+              src={pdfSrc}
               title={displayName}
-              className="h-[calc(100vh-120px)] w-full border-0"
+              className="h-[calc(100vh-160px)] w-full border-0"
             />
           ) : (
             <div className="flex flex-col items-center gap-4 px-6 py-12">
               <p className="text-sm text-neutral-400">
-                {isPdf && !attachment.data
+                {isPdf
                   ? 'Unable to load PDF data'
                   : `No preview available for ${mimeType || 'this file type'}`}
               </p>
-              {downloadBlob && (
-                <button
-                  type="button"
-                  onClick={() => triggerDownload(downloadBlob, displayName)}
-                  className="inline-flex items-center gap-2 rounded-md border border-neutral-700 bg-neutral-800 px-4 py-2 text-sm text-neutral-200 transition-colors hover:border-neutral-600 hover:bg-neutral-700"
-                >
-                  <Download className="h-4 w-4" />
-                  Download
-                </button>
-              )}
             </div>
           )}
         </div>
+
+        {/* Footer — always-visible open/download fallback */}
+        {(openInTabUrl || canDownload) && (
+          <div className="flex shrink-0 items-center justify-end gap-2 border-t border-neutral-700/60 px-4 py-2.5">
+            {openInTabUrl && (
+              <a
+                href={openInTabUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center gap-2 rounded-md border border-neutral-700 bg-neutral-800 px-3 py-1.5 text-sm text-neutral-200 transition-colors hover:border-neutral-600 hover:bg-neutral-700"
+              >
+                <ExternalLink className="h-4 w-4" />
+                Open in new tab
+              </a>
+            )}
+            {downloadBlob ? (
+              <button
+                type="button"
+                onClick={() => triggerDownload(downloadBlob, displayName)}
+                className="inline-flex items-center gap-2 rounded-md border border-neutral-700 bg-neutral-800 px-3 py-1.5 text-sm text-neutral-200 transition-colors hover:border-neutral-600 hover:bg-neutral-700"
+              >
+                <Download className="h-4 w-4" />
+                Download
+              </button>
+            ) : remoteUrl ? (
+              <a
+                href={remoteUrl}
+                download={displayName}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center gap-2 rounded-md border border-neutral-700 bg-neutral-800 px-3 py-1.5 text-sm text-neutral-200 transition-colors hover:border-neutral-600 hover:bg-neutral-700"
+              >
+                <Download className="h-4 w-4" />
+                Download
+              </a>
+            ) : null}
+          </div>
+        )}
       </div>
     </div>
   );

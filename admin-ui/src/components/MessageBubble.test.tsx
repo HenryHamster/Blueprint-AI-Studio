@@ -564,6 +564,20 @@ describe('MessageBubble', () => {
     expect(img.src).toContain('data:image/png;base64,iVBORw0KGgo=');
   });
 
+  test('renders url-based image attachment as inline thumbnail', () => {
+    render(<MessageBubble {...makeProps({
+      msg: makeMsg({
+        context: {
+          attachments: [
+            { type: 'image', mime_type: 'image/png', url: 'https://gcs/signed/screenshot.png', name: 'screenshot.png' },
+          ],
+        },
+      }),
+    })} />);
+    const img = screen.getByAltText('screenshot.png') as HTMLImageElement;
+    expect(img.src).toContain('https://gcs/signed/screenshot.png');
+  });
+
   test('renders document attachment as file badge', () => {
     render(<MessageBubble {...makeProps({
       msg: makeMsg({

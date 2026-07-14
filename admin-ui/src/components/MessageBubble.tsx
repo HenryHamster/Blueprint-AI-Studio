@@ -127,7 +127,12 @@ function AttachmentThumbnails({ attachments, onPreview }: { attachments: Message
   return (
     <div className="mt-2 flex flex-wrap gap-2">
       {attachments.map((att, i) => {
-        if (att.mime_type?.startsWith('image/') && att.data) {
+        // Persisted attachments carry a signed `url`; locally-built ones carry
+        // inline base64 `data`. Render an inline image thumbnail for either form.
+        const imageSrc = att.mime_type?.startsWith('image/')
+          ? (att.data ? `data:${att.mime_type};base64,${att.data}` : att.url || null)
+          : null;
+        if (imageSrc) {
           return (
             <button
               key={i}
@@ -138,7 +143,7 @@ function AttachmentThumbnails({ attachments, onPreview }: { attachments: Message
               data-viewport-allow-small-target
             >
               <img
-                src={`data:${att.mime_type};base64,${att.data}`}
+                src={imageSrc}
                 alt={att.name || 'Image attachment'}
                 className="max-h-48 max-w-full rounded border border-neutral-700/60 object-contain"
               />
