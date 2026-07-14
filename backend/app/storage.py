@@ -507,6 +507,45 @@ async def upload_compute_job_viewable_stream(
     return compute_job_viewable_uri(job_id, basename)
 
 
+async def delete_compute_job_viewable_file(job_id, basename: str) -> bool:
+    """Best-effort delete of one viewable object from the artifact bucket.
+
+    Used to clean up an orphaned viewable object: the mid-run upload endpoint
+    writes the object BEFORE taking the row lock, and if the under-lock count-cap
+    re-check then refuses a genuinely-new relpath, the durable object would be
+    left with no manifest entry and no ``ComputeJobFile`` row (the terminal pass
+    reconciles from the bundle tarball, not stray ``viewable/`` objects). Returns
+    ``True`` on delete (or if already absent), ``False`` on any error — NEVER
+    raises, so cleanup can never mask the caller's own response.
+    """
+    if not basename:
+        return False
+    object_name = compute_job_viewable_object_name(job_id, basename)
+
+    def _delete() -> None:
+        from google.api_core import exceptions as _gexc
+
+        storage_client = storage.Client(project=GCP_PROJECT_ID)
+        bucket = storage_client.bucket(ARTIFACT_BUCKET_NAME)
+        blob = bucket.blob(object_name)
+        try:
+            blob.delete()
+        except _gexc.NotFound:
+            pass  # already gone — treat as success
+
+    try:
+        await asyncio.to_thread(_delete)
+    except Exception:
+        logger.warning(
+            "Failed to delete orphaned viewable artifact %r for compute job %s",
+            basename,
+            job_id,
+            exc_info=True,
+        )
+        return False
+    return True
+
+
 async def generate_compute_job_artifact_upload_signed_url(
     job_id, *, expires_at: datetime.datetime | None = None
 ) -> str:

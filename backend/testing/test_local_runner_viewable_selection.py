@@ -260,3 +260,304 @@ def test_dir_scan_source_invariants():
     assert "O_NOFOLLOW" in ast.get_source_segment(source, reader), (
         "_read_viewable_file_nofollow must open with O_NOFOLLOW"
     )
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Runner-side mid-run viewable streaming (scripts/local_runner.py)
+#
+# The server-side scan above (app.compute_backends) runs INSIDE the orchestrator
+# for local/local-gpu backends. The runner-subprocess backend, by contrast, runs
+# the job on operator hardware under scripts/local_runner.py — a standalone,
+# stdlib-only daemon that CANNOT import app.*. It therefore carries its OWN inlined
+# viewable classifier/scanner mirroring the policy above, and streams NEW-or-CHANGED
+# viewable files to POST /api/runner/compute-job/{job_id}/viewable WHILE the job
+# runs, so reward-curve plots / rollout frames appear live in the strategic canvas.
+# These are the regression tests for that runner-side path.
+# ───────────────────────────────────────────────────────────────────────────
+
+import sys as _sys  # noqa: E402
+from pathlib import Path as _Path  # noqa: E402
+from unittest import mock  # noqa: E402
+
+_SCRIPTS_DIR = _Path(__file__).resolve().parents[2] / "scripts"
+if str(_SCRIPTS_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_SCRIPTS_DIR))
+
+import local_runner  # noqa: E402
+
+
+def _run_stream(artifact_dir, state, *, upload_return=200):
+    """Drive ``_stream_viewable_files`` with a mocked uploader; return recorded calls.
+
+    ``upload_return`` may be an int status, ``None`` (network error), or a
+    zero-arg callable returning either (to vary the status per call).
+    """
+    calls: list = []
+
+    def fake_upload(orch, token, job_id, relpath, data, content_type):
+        calls.append(
+            {"relpath": relpath, "data": data, "content_type": content_type}
+        )
+        return upload_return() if callable(upload_return) else upload_return
+
+    with mock.patch.object(local_runner, "_upload_viewable", side_effect=fake_upload):
+        local_runner._stream_viewable_files(
+            "http://orch", "tok", "job-1", str(artifact_dir), state
+        )
+    return calls
+
+
+class TestRunnerViewableScan:
+    """The runner's inlined scan mirrors the server allowlist/kinds/symlink policy."""
+
+    def test_scan_classifies_allowlist_and_excludes_svg(self, tmp_path):
+        art = tmp_path / "artifacts"
+        art.mkdir()
+        for name in (
+            "plot.png",
+            "photo.JPG",
+            "anim.gif",
+            "frame.webp",
+            "shot.jpeg",
+            "rollout.mp4",
+            "clip.webm",
+            "chart.svg",  # EXCLUDED by design (script-bearing SVG is an XSS vector)
+            "index.html",
+            "results.json",
+            "noext",
+        ):
+            (art / name).write_bytes(b"x" * 16)
+        by_name = {c["relpath"]: c["kind"] for c in local_runner._scan_viewable_files(str(art))}
+        assert by_name == {
+            "plot.png": "image",
+            "photo.JPG": "image",
+            "anim.gif": "image",
+            "frame.webp": "image",
+            "shot.jpeg": "image",
+            "rollout.mp4": "video",
+            "clip.webm": "video",
+        }
+        assert "chart.svg" not in by_name
+
+    def test_scan_content_types(self, tmp_path):
+        art = tmp_path / "artifacts"
+        art.mkdir()
+        (art / "a.png").write_bytes(b"x" * 8)
+        (art / "b.mp4").write_bytes(b"y" * 8)
+        by_name = {
+            c["relpath"]: c["content_type"]
+            for c in local_runner._scan_viewable_files(str(art))
+        }
+        assert by_name == {"a.png": "image/png", "b.mp4": "video/mp4"}
+
+    def test_scan_empty_zero_byte_and_missing_dir(self, tmp_path):
+        assert local_runner._scan_viewable_files("") == []
+        assert local_runner._scan_viewable_files(str(tmp_path / "missing")) == []
+        art = tmp_path / "artifacts"
+        art.mkdir()
+        (art / "empty.png").write_bytes(b"")  # zero-byte viewable file skipped
+        assert local_runner._scan_viewable_files(str(art)) == []
+
+    def test_scan_keeps_subdir_relpath_and_sorts(self, tmp_path):
+        art = tmp_path / "artifacts"
+        (art / "arm2").mkdir(parents=True)
+        (art / "arm1").mkdir()
+        (art / "arm2" / "reward.png").write_bytes(b"x" * 8)
+        (art / "arm1" / "reward.png").write_bytes(b"x" * 8)
+        (art / "top.png").write_bytes(b"x" * 8)
+        relpaths = [c["relpath"] for c in local_runner._scan_viewable_files(str(art))]
+        assert relpaths == ["arm1/reward.png", "arm2/reward.png", "top.png"]
+
+    def test_scan_skips_symlinked_file(self, tmp_path):
+        secret = tmp_path / "strategic-runner.env"
+        secret.write_bytes(b"BLUEPRINT_RUNNER_TOKEN=leaked")
+        art = tmp_path / "artifacts"
+        art.mkdir()
+        (art / "real.png").write_bytes(b"\x89PNG real")
+        _make_symlink_or_skip(str(secret), str(art / "loss_curve.png"))
+        relpaths = [c["relpath"] for c in local_runner._scan_viewable_files(str(art))]
+        assert relpaths == ["real.png"]
+
+    def test_scan_skips_symlinked_directory(self, tmp_path):
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "leak.png").write_bytes(b"x" * 10)
+        art = tmp_path / "artifacts"
+        art.mkdir()
+        (art / "ok.png").write_bytes(b"y" * 10)
+        _make_symlink_or_skip(str(outside), str(art / "plots"))
+        relpaths = [c["relpath"] for c in local_runner._scan_viewable_files(str(art))]
+        assert relpaths == ["ok.png"]
+
+    def test_scan_refuses_symlinked_artifact_dir(self, tmp_path):
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "leak.png").write_bytes(b"x" * 10)
+        link = tmp_path / "artifacts"
+        _make_symlink_or_skip(str(outside), str(link))
+        assert local_runner._scan_viewable_files(str(link)) == []
+
+
+class TestRunnerViewableRead:
+    """``_read_viewable_bytes`` is the O_NOFOLLOW read used before each upload."""
+
+    def test_reads_regular_file(self, tmp_path):
+        p = tmp_path / "plot.png"
+        p.write_bytes(b"\x89PNG data")
+        assert local_runner._read_viewable_bytes(str(p), 1 << 20) == b"\x89PNG data"
+
+    def test_refuses_symlink_toctou(self, tmp_path):
+        secret = tmp_path / "secret.bin"
+        secret.write_bytes(b"operator secret")
+        art = tmp_path / "artifacts"
+        art.mkdir()
+        _make_symlink_or_skip(str(secret), str(art / "chart.png"))
+        assert local_runner._read_viewable_bytes(str(art / "chart.png"), 1 << 20) is None
+
+    def test_refuses_file_over_cap(self, tmp_path):
+        p = tmp_path / "big.png"
+        p.write_bytes(b"z" * 100)
+        assert local_runner._read_viewable_bytes(str(p), 50) is None
+
+
+class TestRunnerViewableStreaming:
+    """The heartbeat-cadence uploader: dedup, overwrite-refresh, caps, budget, and
+    non-fatal handling of every upload failure."""
+
+    def test_new_file_uploaded_once_then_not_resent(self, tmp_path):
+        art = tmp_path / "artifacts"
+        art.mkdir()
+        (art / "reward.png").write_bytes(b"\x89PNG one")
+        state = local_runner._ViewableStreamState()
+
+        first = _run_stream(art, state)
+        assert [c["relpath"] for c in first] == ["reward.png"]
+        assert first[0]["content_type"] == "image/png"
+
+        # Same (mtime, size) → unchanged → not re-uploaded on the next heartbeat.
+        second = _run_stream(art, state)
+        assert second == []
+
+    def test_overwritten_file_is_resent(self, tmp_path):
+        art = tmp_path / "artifacts"
+        art.mkdir()
+        f = art / "reward_curve.png"
+        f.write_bytes(b"\x89PNG one")
+        state = local_runner._ViewableStreamState()
+        assert len(_run_stream(art, state)) == 1
+
+        # Rewrite with a DIFFERENT size and a bumped mtime (eval step overwrites it).
+        f.write_bytes(b"\x89PNG two-longer-content")
+        os.utime(str(f), (f.stat().st_atime, f.stat().st_mtime + 10))
+        second = _run_stream(art, state)
+        assert [c["relpath"] for c in second] == ["reward_curve.png"]
+
+    def test_oversize_file_skipped_without_error(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(local_runner, "_MAX_VIEWABLE_IMAGE_BYTES", 64)
+        art = tmp_path / "artifacts"
+        art.mkdir()
+        (art / "huge.png").write_bytes(b"x" * 128)  # over the (patched) 64-byte cap
+        (art / "small.png").write_bytes(b"x" * 16)
+        state = local_runner._ViewableStreamState()
+        calls = _run_stream(art, state)
+        assert [c["relpath"] for c in calls] == ["small.png"]
+
+    def test_over_budget_new_files_skipped(self, tmp_path):
+        art = tmp_path / "artifacts"
+        art.mkdir()
+        for i in range(local_runner._MAX_VIEWABLE_FILE_COUNT + 2):
+            (art / f"plot_{i:03d}.png").write_bytes(b"x" * 16)
+        state = local_runner._ViewableStreamState()
+        calls = _run_stream(art, state)
+        assert len(calls) == local_runner._MAX_VIEWABLE_FILE_COUNT
+        # An ALREADY-sent file that is overwritten still re-uploads despite budget.
+        first_relpath = calls[0]["relpath"]
+        f = art / first_relpath
+        f.write_bytes(b"x" * 32)
+        os.utime(str(f), (f.stat().st_atime, f.stat().st_mtime + 10))
+        second = _run_stream(art, state)
+        assert [c["relpath"] for c in second] == [first_relpath]
+
+    def test_upload_failure_is_swallowed_and_retried(self, tmp_path):
+        art = tmp_path / "artifacts"
+        art.mkdir()
+        (art / "reward.png").write_bytes(b"\x89PNG")
+        state = local_runner._ViewableStreamState()
+
+        # A 500 (or 409/429/None) must not raise AND must not record the signature,
+        # so the next heartbeat retries the still-unsent file.
+        for bad in (500, 409, 429, 413, None):
+            calls = _run_stream(art, state, upload_return=bad)
+            assert [c["relpath"] for c in calls] == ["reward.png"]
+        assert state.sent == {}  # never recorded on a non-2xx / network error
+
+        # A subsequent 2xx records it; then it stops re-sending.
+        assert len(_run_stream(art, state, upload_return=201)) == 1
+        assert _run_stream(art, state, upload_return=201) == []
+
+    def test_scan_error_is_swallowed(self, tmp_path):
+        state = local_runner._ViewableStreamState()
+        with mock.patch.object(
+            local_runner, "_scan_viewable_files", side_effect=OSError("boom")
+        ):
+            # Must not raise — mid-run streaming is strictly best-effort.
+            local_runner._stream_viewable_files(
+                "http://orch", "tok", "job-1", str(tmp_path), state
+            )
+
+
+class TestRunnerViewableUpload:
+    """``_upload_viewable`` maps transport outcomes to a status/None, never raising."""
+
+    def test_returns_status_on_success(self):
+        resp = mock.MagicMock()
+        resp.status = 200
+        resp.__enter__.return_value = resp
+        resp.__exit__.return_value = False
+        with mock.patch.object(local_runner.urllib.request, "urlopen", return_value=resp):
+            status = local_runner._upload_viewable(
+                "http://orch", "tok", "job-1", "reward.png", b"\x89PNG", "image/png"
+            )
+        assert status == 200
+
+    def test_returns_code_on_http_error(self):
+        err = local_runner.urllib.error.HTTPError(
+            "http://orch", 409, "terminal", {}, None
+        )
+        with mock.patch.object(local_runner.urllib.request, "urlopen", side_effect=err):
+            status = local_runner._upload_viewable(
+                "http://orch", "tok", "job-1", "reward.png", b"\x89PNG", "image/png"
+            )
+        assert status == 409
+
+    def test_returns_none_on_network_error(self):
+        err = local_runner.urllib.error.URLError("connection refused")
+        with mock.patch.object(local_runner.urllib.request, "urlopen", side_effect=err):
+            status = local_runner._upload_viewable(
+                "http://orch", "tok", "job-1", "reward.png", b"\x89PNG", "image/png"
+            )
+        assert status is None
+
+
+def test_run_compute_job_invokes_viewable_streamer():
+    """AST guard: the compute-job poll loop must call ``_stream_viewable_files`` so
+    the mid-run streaming wiring cannot be silently dropped by a future edit."""
+    source = inspect.getsource(local_runner)
+    tree = ast.parse(source)
+    run_job = next(
+        (
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_run_compute_job"
+        ),
+        None,
+    )
+    assert run_job is not None, "_run_compute_job missing"
+    called = {
+        node.func.id
+        for node in ast.walk(run_job)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    assert "_stream_viewable_files" in called, (
+        "_run_compute_job must invoke _stream_viewable_files on the heartbeat loop"
+    )

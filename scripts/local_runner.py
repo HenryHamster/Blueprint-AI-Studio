@@ -1579,6 +1579,29 @@ _PROGRESS_TS_MAX_CHARS = 64
 # output mid-run (stamped server-side as polling_metadata["live_output"]).
 _RUNNER_LIVE_TAIL_CHARS = 4096
 
+# ── Mid-run viewable-artifact streaming ──────────────────────────────────────
+# WHILE a compute job runs, the runner scans $BLUEPRINT_ARTIFACT_DIR for viewable
+# files (reward-curve plots, rollout frames/videos) and pushes NEW-or-CHANGED
+# ones to POST /api/runner/compute-job/{job_id}/viewable so they render live in
+# the strategic canvas instead of only at job completion. The extension allowlist,
+# per-kind byte caps, and 25-file budget MIRROR the server's (app.storage
+# ._VIEWABLE_CONTENT_TYPES + the /viewable endpoint) so the runner does not waste
+# an upload the server would reject: png/jpg/jpeg/webp/gif images ≤ 8 MiB, mp4/webm
+# videos ≤ 512 MiB, at most 25 distinct viewable objects per job. SVG is excluded
+# by design (a script-bearing SVG served from a signed URL is an XSS vector).
+_VIEWABLE_CONTENT_TYPES = {
+    "png": ("image/png", "image"),
+    "jpg": ("image/jpeg", "image"),
+    "jpeg": ("image/jpeg", "image"),
+    "webp": ("image/webp", "image"),
+    "gif": ("image/gif", "image"),
+    "mp4": ("video/mp4", "video"),
+    "webm": ("video/webm", "video"),
+}
+_MAX_VIEWABLE_IMAGE_BYTES = 8 * 1024 * 1024  # 8 MiB (server caps images here)
+_MAX_VIEWABLE_VIDEO_BYTES = 512 * 1024 * 1024  # 512 MiB (server caps videos here)
+_MAX_VIEWABLE_FILE_COUNT = 25  # at most N individually-addressable objects/job
+
 
 def _report_retry_sleep(attempt: int) -> float:
     """Capped exponential backoff (seconds) for the terminal-report retry loop."""
@@ -3064,6 +3087,239 @@ def _build_multipart_body(
     return bytes(body), f"multipart/form-data; boundary={boundary}"
 
 
+def _classify_viewable(filename: str) -> "tuple[str, str] | None":
+    """Return ``(content_type, kind)`` for a viewable filename, else ``None``.
+
+    Mirrors ``app.storage.viewable_content_type_for_filename``: classification is
+    by the lowercased extension only (png/jpg/jpeg/webp/gif → image, mp4/webm →
+    video; svg deliberately excluded). A name with no recognised viewable
+    extension yields ``None`` so the caller skips it.
+    """
+    if not isinstance(filename, str) or "." not in filename:
+        return None
+    ext = filename.rsplit(".", 1)[-1].lower()
+    return _VIEWABLE_CONTENT_TYPES.get(ext)
+
+
+def _scan_viewable_files(artifact_dir: str) -> list:
+    """Scan *artifact_dir* for viewable files; return sorted candidate dicts.
+
+    Each candidate is ``{"relpath", "abspath", "size", "mtime", "kind",
+    "content_type"}``. ``relpath`` is POSIX-joined and relative to
+    *artifact_dir* so arm-subdir context survives (matching the server's
+    ``sanitize_viewable_relpath``). Mirrors the HOST-side scan policy in
+    ``app.compute_backends._collect_viewable_candidates_from_dir``:
+
+      * extension allowlist only (png/jpg/jpeg/webp/gif/mp4/webm; svg excluded);
+      * symlinked files skipped and symlinked dirs never descended
+        (``os.walk(followlinks=False)`` + ``os.path.islink``) — a planted symlink
+        must never exfiltrate an operator secret via a viewer-accessible object;
+      * non-regular files (fifos/devices) and zero-byte files skipped;
+      * results sorted by relpath.
+
+    Per-kind byte caps and the 25-file budget are NOT applied here (the uploader
+    owns those, since the budget is tracked across heartbeat cycles). Best-effort
+    and total: an ``OSError`` on a single entry is swallowed so a transient stat
+    failure never aborts the whole scan. A missing or symlinked artifact dir
+    yields ``[]``.
+    """
+    if (
+        not artifact_dir
+        or not os.path.isdir(artifact_dir)
+        or os.path.islink(artifact_dir)
+    ):
+        return []
+    candidates: list = []
+    for root, dirs, names in os.walk(artifact_dir, followlinks=False):
+        # Defense in depth: prune symlinked dirs so a swapped entry cannot leak
+        # even if the platform's walk were to follow them.
+        dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(root, d))]
+        for name in names:
+            abspath = os.path.join(root, name)
+            try:
+                if os.path.islink(abspath):
+                    continue
+                classified = _classify_viewable(name)
+                if classified is None:
+                    continue
+                content_type, kind = classified
+                st = os.stat(abspath)
+                if not stat.S_ISREG(st.st_mode):
+                    continue
+                if st.st_size <= 0:
+                    continue
+                relpath = os.path.relpath(abspath, artifact_dir).replace(os.sep, "/")
+                candidates.append(
+                    {
+                        "relpath": relpath,
+                        "abspath": abspath,
+                        "size": st.st_size,
+                        "mtime": st.st_mtime,
+                        "kind": kind,
+                        "content_type": content_type,
+                    }
+                )
+            except OSError:
+                continue
+    candidates.sort(key=lambda c: c["relpath"])
+    return candidates
+
+
+def _read_viewable_bytes(path: str, cap: int) -> "bytes | None":
+    """Read up to ``cap`` bytes of a viewable file with ``O_NOFOLLOW``, or ``None``.
+
+    TOCTOU guard mirroring ``app.compute_backends._read_viewable_file_nofollow``:
+    an entry that was a regular file at scan time but a symlink by read time is
+    refused by the kernel (``O_NOFOLLOW``), never dereferenced. Returns ``None``
+    on any error, on an empty read, or if the file grew past ``cap`` between scan
+    and read.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        with os.fdopen(fd, "rb", closefd=True) as fh:
+            data = fh.read(cap + 1)
+    except OSError:
+        return None
+    if not data or len(data) > cap:
+        return None
+    return data
+
+
+class _ViewableStreamState:
+    """Cross-heartbeat state for mid-run viewable streaming of ONE compute job.
+
+    ``sent`` maps an uploaded ``relpath`` to its last-uploaded ``(mtime, size)``
+    signature so an unchanged file is not re-sent every cycle while an overwritten
+    one (e.g. ``reward_curve.png`` rewritten each eval step) IS re-sent. The
+    ``*_logged`` members keep the bounded skip notices to one line each.
+    """
+
+    __slots__ = ("sent", "oversize_logged", "budget_logged")
+
+    def __init__(self) -> None:
+        self.sent: dict = {}
+        self.oversize_logged: set = set()
+        self.budget_logged = False
+
+
+def _upload_viewable(
+    orchestrator_url: str,
+    token: str,
+    job_id: str,
+    relpath: str,
+    file_bytes: bytes,
+    content_type: str,
+) -> "int | None":
+    """POST one viewable file to the mid-run endpoint. Returns HTTP status, or
+    ``None`` on a network error. Never raises — mid-run streaming is strictly
+    best-effort and must never stall or fail the compute job."""
+    body, ctype = _build_multipart_body(
+        fields={"filename": relpath},
+        file_field="file",
+        filename=relpath,
+        file_bytes=file_bytes,
+        file_content_type=content_type,
+    )
+    url = f"{orchestrator_url}/api/runner/compute-job/{job_id}/viewable"
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": ctype,
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return resp.status
+    except urllib.error.HTTPError as exc:
+        return exc.code
+    except Exception as exc:  # noqa: BLE001 — network blip/timeout is non-fatal
+        print(
+            f"[compute] viewable upload network error for job {job_id} "
+            f"({relpath}): {exc}",
+            flush=True,
+        )
+        return None
+
+
+def _stream_viewable_files(
+    orchestrator_url: str,
+    token: str,
+    job_id: str,
+    artifact_dir: str,
+    state: "_ViewableStreamState",
+) -> None:
+    """Best-effort mid-run push of NEW-or-CHANGED viewable files. NEVER raises.
+
+    Invoked on the heartbeat cadence from ``_run_compute_job``. Uploads each
+    viewable file whose ``(mtime, size)`` signature changed since its last upload
+    (so an overwritten ``reward_curve.png`` re-uploads to refresh the live preview
+    but a stable file is not re-sent every cycle), enforcing the same per-kind
+    size cap and 25-distinct-file budget the server enforces — oversize/over-budget
+    files are SKIPPED with a bounded one-line notice, never crashing. Every upload
+    failure (network blip, 4xx, 5xx) is swallowed and streaming continues, exactly
+    like the interim ``running`` progress reports.
+    """
+    try:
+        candidates = _scan_viewable_files(artifact_dir)
+    except Exception as exc:  # noqa: BLE001 — scanning is strictly best-effort
+        print(f"[compute] viewable scan error for job {job_id}: {exc}", flush=True)
+        return
+
+    for cand in candidates:
+        relpath = cand["relpath"]
+        kind = cand["kind"]
+        size = cand["size"]
+        cap = _MAX_VIEWABLE_VIDEO_BYTES if kind == "video" else _MAX_VIEWABLE_IMAGE_BYTES
+
+        # Per-kind size cap: the server would 413 it, so skip locally (log once).
+        if size > cap:
+            if relpath not in state.oversize_logged:
+                state.oversize_logged.add(relpath)
+                print(
+                    f"[compute] viewable {relpath} ({size} bytes) exceeds the "
+                    f"{cap}-byte {kind} cap for job {job_id}; skipping live preview",
+                    flush=True,
+                )
+            continue
+
+        signature = (cand["mtime"], size)
+        if state.sent.get(relpath) == signature:
+            continue  # unchanged since last upload — don't re-send
+
+        # 25-distinct-file budget: a NEW relpath beyond the cap is skipped, but an
+        # already-sent relpath (overwritten file) still re-uploads to refresh.
+        if relpath not in state.sent and len(state.sent) >= _MAX_VIEWABLE_FILE_COUNT:
+            if not state.budget_logged:
+                state.budget_logged = True
+                print(
+                    f"[compute] viewable budget ({_MAX_VIEWABLE_FILE_COUNT}) reached "
+                    f"for job {job_id}; further new live previews skipped",
+                    flush=True,
+                )
+            continue
+
+        data = _read_viewable_bytes(cand["abspath"], cap)
+        if data is None:
+            continue
+
+        status = _upload_viewable(
+            orchestrator_url, token, job_id, relpath, data, cand["content_type"]
+        )
+        # Record the signature only on a definitive 2xx so a failed upload retries
+        # next heartbeat. Any non-2xx (409 terminal / 413 oversize / 429 cap/rate /
+        # 5xx) or network error (status None) is swallowed and streaming continues.
+        if status is not None and 200 <= status < 300:
+            state.sent[relpath] = signature
+
+
 # Predecessor run-status files stripped from a hydrated resume bundle so they
 # cannot contaminate THIS run's terminal detection / metric parsing. The
 # checkpoint files the resumed command actually needs (weights, optimizer state,
@@ -3773,6 +4029,11 @@ def _run_compute_job(
         # deadline-killed 24h run still surfaces its training trajectory.
         progress_tail = _ProgressTail(progress_file)
 
+        # Mid-run viewable streaming state: tracks which artifact files have been
+        # pushed (by relpath + mtime/size signature) so plots/videos render live
+        # in the strategic canvas while the job is still running (best-effort).
+        viewable_state = _ViewableStreamState()
+
         def _interim_log_tail() -> dict | None:
             # Live-output tail (~4KB) for interim running reports. The server
             # stamps it as polling_metadata["live_output"] (same shape as the
@@ -3946,6 +4207,15 @@ def _run_compute_job(
                     progress=progress_tail.poll(),
                 )
                 return
+
+            # Mid-run: push NEW-or-CHANGED viewable files (reward-curve plots,
+            # rollout frames/videos) so they render live in the strategic canvas
+            # instead of only at job completion. Best-effort — the terminal tarball
+            # upload below is unchanged, and the server dedups terminal against
+            # mid-run by matching storage object paths.
+            _stream_viewable_files(
+                orchestrator_url, token, job_id, artifact_dir, viewable_state
+            )
 
         # Process exited: let the reader drain, then close our read-fd so a leftover
         # reader (backgrounded child still holding the pipe) is unblocked and the fd

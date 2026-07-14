@@ -12,6 +12,8 @@ import app.strategic_context_package as scp
 from app.models import (
     Artifact,
     ArtifactType,
+    ComputeJob,
+    ComputeJobStatus,
     KnowledgeDocument,
     Project,
     Task,
@@ -448,6 +450,190 @@ async def test_svg_is_never_previewable(db_session, monkeypatch):
     assert "viewable_previews" not in item
     assert calls == []
     assert verify_calls == []
+
+
+@pytest.mark.asyncio
+async def test_running_compute_job_midrun_previews_populate_descriptor(
+    db_session, monkeypatch
+):
+    """A RUNNING compute job whose polling_metadata carries mid-run viewable
+    files is surfaced as an evidence artifact with signed viewable_previews, so
+    the strategic-canvas descriptor renders inline (kind=image, populated URL,
+    no unsupported_reason stub) before the job terminates — and no raw
+    storage_uri leaks onto the item."""
+    project, task = await _make_project_task(db_session, name="RunningJob")
+
+    plot_uri = (
+        f"gs://{ARTIFACT_BUCKET_NAME}/compute-jobs/"
+        "22222222-2222-2222-2222-222222222222/artifacts/viewable/reward_curve.png"
+    )
+    job = ComputeJob(
+        project_id=project.id,
+        task_id=task.id,
+        backend="local_process",
+        status=ComputeJobStatus.RUNNING,
+        polling_metadata={
+            "viewable_files": [
+                {
+                    "filename": "reward_curve.png",
+                    "storage_uri": plot_uri,
+                    "kind": "image",
+                    "content_type": "image/png",
+                    "size_bytes": 1024,
+                }
+            ]
+        },
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    async def fake_verify(storage_uri, project_id, session):
+        return None
+
+    calls: list = []
+    monkeypatch.setattr(scp, "verify_artifact_project_ownership", fake_verify)
+    monkeypatch.setattr(scp, "generate_download_signed_url", _fake_signer(calls))
+
+    evidence = await load_strategic_context_evidence(db_session, project.id)
+    items = evidence["artifacts"]["items"]
+    assert len(items) == 1
+    item = items[0]
+    # No-leak contract: raw gs:// never rides on the item itself.
+    assert "storage_uri" not in item
+    assert item["compute_job_running"] is True
+    assert item["task_status"] == "RUNNING"
+    assert item["viewable_previews"] == [
+        {
+            "url": "https://signed.example/reward_curve.png",
+            "storage_uri": plot_uri,
+            "kind": "image",
+            "filename": "reward_curve.png",
+        }
+    ]
+    assert calls == [(plot_uri, scp._PREVIEW_SIGNED_URL_MINUTES)]
+
+    descriptor = _artifact_descriptor(item)
+    assert descriptor["kind"] == "image"
+    assert descriptor["image"]["url"] == "https://signed.example/reward_curve.png"
+    assert "unsupported_reason" not in descriptor
+
+
+@pytest.mark.asyncio
+async def test_terminal_linked_compute_job_not_double_surfaced(
+    db_session, monkeypatch
+):
+    """A compute job already linked to a durable Artifact (artifact_id set) is
+    NOT re-surfaced by the running-job pass, so a terminal job's previews come
+    only from its Artifact — no duplicate live item."""
+    project, task = await _make_project_task(db_session, name="TerminalJob")
+
+    plot_uri = (
+        f"gs://{ARTIFACT_BUCKET_NAME}/compute-jobs/"
+        "33333333-3333-3333-3333-333333333333/artifacts/viewable/final.png"
+    )
+    artifact = Artifact(
+        task_id=task.id,
+        artifact_type=ArtifactType.DEBUG_RESULT,
+        storage_uri=f"gs://{ARTIFACT_BUCKET_NAME}/compute-jobs/x/bundle.tar.gz",
+    )
+    db_session.add(artifact)
+    await db_session.commit()
+    await db_session.refresh(artifact)
+
+    # A SUCCEEDED job linked to that artifact — still carries a viewable_files
+    # manifest in polling_metadata, but must not be double-surfaced.
+    job = ComputeJob(
+        project_id=project.id,
+        task_id=task.id,
+        backend="local_process",
+        status=ComputeJobStatus.SUCCEEDED,
+        artifact_id=artifact.id,
+        polling_metadata={
+            "viewable_files": [
+                {"filename": "final.png", "storage_uri": plot_uri, "kind": "image"}
+            ]
+        },
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    async def fake_verify(storage_uri, project_id, session):
+        return None
+
+    calls: list = []
+    monkeypatch.setattr(scp, "verify_artifact_project_ownership", fake_verify)
+    monkeypatch.setattr(scp, "generate_download_signed_url", _fake_signer(calls))
+
+    evidence = await load_strategic_context_evidence(db_session, project.id)
+    items = evidence["artifacts"]["items"]
+    # Exactly one item — the durable Artifact. No live running-job duplicate.
+    assert len(items) == 1
+    assert all(not it.get("compute_job_running") for it in items)
+
+
+@pytest.mark.asyncio
+async def test_running_job_manifest_ownership_and_svg_filtered(
+    db_session, monkeypatch
+):
+    """The running-job pass reuses the shared signer: a foreign-owned entry is
+    skipped and an svg entry is never signed, so only the owned allowlisted
+    file yields a preview."""
+    project, task = await _make_project_task(db_session, name="RunningFilter")
+
+    own_video = (
+        f"gs://{ARTIFACT_BUCKET_NAME}/compute-jobs/"
+        "44444444-4444-4444-4444-444444444444/artifacts/viewable/rollout.mp4"
+    )
+    foreign = (
+        f"gs://{ARTIFACT_BUCKET_NAME}/compute-jobs/"
+        "00000000-0000-0000-0000-000000000009/artifacts/viewable/evil.png"
+    )
+    svg = (
+        f"gs://{ARTIFACT_BUCKET_NAME}/compute-jobs/"
+        "44444444-4444-4444-4444-444444444444/artifacts/viewable/diagram.svg"
+    )
+    job = ComputeJob(
+        project_id=project.id,
+        task_id=task.id,
+        backend="local_process",
+        status=ComputeJobStatus.POLLING,
+        polling_metadata={
+            "viewable_files": [
+                {"filename": "evil.png", "storage_uri": foreign, "kind": "image"},
+                {"filename": "diagram.svg", "storage_uri": svg, "kind": "image"},
+                {"filename": "rollout.mp4", "storage_uri": own_video, "kind": "video"},
+            ]
+        },
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    async def fake_verify(storage_uri, project_id, session):
+        if storage_uri == foreign:
+            raise Exception("ownership violation")
+
+    calls: list = []
+    monkeypatch.setattr(scp, "verify_artifact_project_ownership", fake_verify)
+    monkeypatch.setattr(scp, "generate_download_signed_url", _fake_signer(calls))
+
+    evidence = await load_strategic_context_evidence(db_session, project.id)
+    items = evidence["artifacts"]["items"]
+    assert len(items) == 1
+    previews = items[0]["viewable_previews"]
+    # Only the owned video resolved; foreign skipped, svg never signed.
+    assert previews == [
+        {
+            "url": "https://signed.example/rollout.mp4",
+            "storage_uri": own_video,
+            "kind": "video",
+            "filename": "rollout.mp4",
+        }
+    ]
+    assert calls == [(own_video, scp._PREVIEW_SIGNED_URL_MINUTES)]
+
+    descriptor = _artifact_descriptor(items[0])
+    assert descriptor["kind"] == "video"
+    assert descriptor["video"]["url"] == "https://signed.example/rollout.mp4"
 
 
 def test_snapshot_sanitizer_strips_signed_preview_urls():

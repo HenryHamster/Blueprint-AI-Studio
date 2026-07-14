@@ -28,6 +28,7 @@ from app.models import (
     Alert,
     AlertSeverity,
     ComputeJob,
+    ComputeJobFile,
     ComputeJobOutcome,
     ComputeJobStatus,
     LocalRunner,
@@ -44,7 +45,12 @@ from app.routers.admin_runners import (
     _normalize_gpu_indices_allowed,
     _runner_health,
 )
-from app.routers.runner import _parse_heartbeat_timestamp, _parse_multipart_form
+from app.routers.runner import (
+    _FileRangeReader,
+    _parse_heartbeat_timestamp,
+    _parse_multipart_form,
+    _parse_multipart_form_stream,
+)
 from app.runner_config import config_generation, live_safe_config
 from app.task_capabilities import STRATEGIC_TASK_TYPES
 from app.workbench_state import (
@@ -5196,6 +5202,60 @@ class TestMultipartParser:
         assert fields == {} and files == {}
 
 
+class TestMultipartStreamParser:
+    """Unit coverage for the memory-bounded streaming multipart parser used by
+    the mid-run viewable endpoint to avoid buffering a multi-hundred-MiB video."""
+
+    @staticmethod
+    def _spool(body: bytes):
+        import io
+
+        return io.BytesIO(body)
+
+    def test_locates_file_range_and_reads_scalar_fields(self):
+        raw = bytes(range(256)) * 8  # includes CRLF-looking byte sequences
+        body, content_type = _build_multipart(raw, 7, len(raw))
+        fields, file_part = _parse_multipart_form_stream(self._spool(body), content_type)
+        assert fields["file_count"] == b"7"
+        assert fields["total_bytes"] == str(len(raw)).encode()
+        assert file_part is not None
+        assert file_part["name"] == "archive"
+        assert file_part["filename"] == "artifacts.tar.gz"
+        assert file_part["length"] == len(raw)
+
+    def test_range_reader_yields_exact_file_bytes(self):
+        raw = bytes(range(256)) * 8
+        body, content_type = _build_multipart(raw, 1, len(raw))
+        spool = self._spool(body)
+        _fields, file_part = _parse_multipart_form_stream(spool, content_type)
+        reader = _FileRangeReader(spool, file_part["start"], file_part["length"])
+        # Chunked reads (as blob.upload_from_file does) reassemble EXACTLY the
+        # file bytes with no trailing CRLF or boundary framing leaked.
+        out = bytearray()
+        while True:
+            chunk = reader.read(97)  # non-aligned chunk size
+            if not chunk:
+                break
+            out += chunk
+        assert bytes(out) == raw
+
+    def test_matches_in_memory_parser_semantics(self):
+        raw = b"\x00\x01FAKE-MP4" * 32
+        body, content_type = _build_multipart(raw, 2, len(raw))
+        mem_fields, mem_files = _parse_multipart_form(body, content_type)
+        spool = self._spool(body)
+        stream_fields, file_part = _parse_multipart_form_stream(spool, content_type)
+        assert stream_fields == mem_fields
+        spool.seek(file_part["start"])
+        assert spool.read(file_part["length"]) == mem_files["archive"]
+
+    def test_missing_boundary_returns_none(self):
+        fields, file_part = _parse_multipart_form_stream(
+            self._spool(b"whatever"), "application/json"
+        )
+        assert fields == {} and file_part is None
+
+
 class TestArtifactUploadEndpoint:
     async def _make_runner_job(self, db_session, *, pinned_runner_id=None):
         project = await _make_project(db_session)
@@ -9698,6 +9758,496 @@ async def test_report_compute_job_cross_project_emits_warning(
     assert str(project_a.id) in msg
     assert str(job.id) in msg
     assert str(project_b.id) in msg
+
+
+class TestMidRunViewableUpload:
+    """Tests for POST /api/runner/compute-job/{job_id}/viewable.
+
+    Verifies that a RUNNING compute job's mid-run viewable-file upload registers a
+    ``ComputeJobFile`` row and an entry in ``polling_metadata['viewable_files']``
+    (surfaced as the admin API's ``viewable_artifacts``) without setting the terminal
+    guard key ``viewable_file_count``, and that the terminal reconcile produces no
+    duplicate rows.
+    """
+
+    async def _make_running_job(
+        self, db_session, status=ComputeJobStatus.RUNNING, **extra_meta
+    ):
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        meta = {"runner_target_id": str(runner.id)}
+        meta.update(extra_meta)
+        job = ComputeJob(
+            project_id=project.id,
+            backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+            status=status,
+            polling_metadata=meta,
+        )
+        db_session.add(job)
+        await db_session.commit()
+        await db_session.refresh(job)
+        return project, runner, token, job
+
+    @staticmethod
+    def _fake_uri(job_id, safe_name: str) -> str:
+        return (
+            "gs://test-bucket/compute-jobs/"
+            f"{job_id}/artifacts/viewable/{safe_name}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_upload_png_on_running_job_creates_row_and_manifest(
+        self, client, db_session
+    ):
+        """Upload a .png to a RUNNING job → ComputeJobFile row + viewable_files entry."""
+        _project, runner, token, job = await self._make_running_job(db_session)
+        safe_name = "reward_curve.png"
+        fake_uri = self._fake_uri(job.id, safe_name)
+
+        with patch("app.storage.upload_compute_job_viewable_file",
+                   return_value=fake_uri):
+            resp = await client.post(
+                f"/api/runner/compute-job/{job.id}/viewable",
+                data={"filename": safe_name},
+                files={"file": (safe_name, b"fake-png-bytes-12345", "image/png")},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        assert resp.status_code == 200, (
+            f"Expected 200, got {resp.status_code}: {resp.text}"
+        )
+        body = resp.json()
+        assert body["ok"] is True
+        assert body["total_viewable_files"] == 1
+        assert body["entry"]["storage_uri"] == fake_uri
+        assert body["entry"]["kind"] == "image"
+        assert body["entry"]["filename"] == safe_name
+
+        # ── ComputeJobFile row exists ────────────────────────────────────────
+        rows = (
+            await db_session.execute(
+                select(ComputeJobFile).where(
+                    ComputeJobFile.compute_job_id == job.id,
+                    ComputeJobFile.storage_uri == fake_uri,
+                )
+            )
+        ).scalars().all()
+        assert len(rows) == 1, (
+            f"Expected exactly 1 ComputeJobFile row, got {len(rows)}"
+        )
+        assert rows[0].safe_relpath == safe_name
+        assert rows[0].media_type == "image"
+
+        # ── polling_metadata['viewable_files'] contains the entry ────────────
+        await db_session.refresh(job)
+        vf = (job.polling_metadata or {}).get("viewable_files", [])
+        assert len(vf) == 1, (
+            f"Expected 1 viewable_files entry, got {len(vf)}"
+        )
+        assert vf[0]["storage_uri"] == fake_uri
+
+        # ── viewable_file_count MUST NOT be set (terminal guard key) ─────────
+        assert "viewable_file_count" not in (job.polling_metadata or {}), (
+            "mid-run upload must not set the terminal guard key viewable_file_count"
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_viewable_file_type_rejected(self, client, db_session):
+        """Upload of a .txt file → 422."""
+        _project, runner, token, job = await self._make_running_job(db_session)
+
+        resp = await client.post(
+            f"/api/runner/compute-job/{job.id}/viewable",
+            data={"filename": "notes.txt"},
+            files={"file": ("notes.txt", b"not an image", "text/plain")},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 422, (
+            f"Expected 422 for non-viewable type, got {resp.status_code}: {resp.text}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_oversize_image_rejected(self, client, db_session):
+        """Image exceeding the per-file byte cap → 413."""
+        _project, runner, token, job = await self._make_running_job(db_session)
+        safe_name = "huge.png"
+        fake_uri = self._fake_uri(job.id, safe_name)
+
+        # Patch the per-image byte cap to a small value so a tiny payload
+        # triggers the limit without allocating 8 MiB of test data.
+        from app.routers import runner as runner_mod
+
+        with patch.object(
+            runner_mod, "_MAX_VIEWABLE_FILE_BYTES", 10
+        ):
+            with patch(
+                "app.storage.upload_compute_job_viewable_file",
+                return_value=fake_uri,
+            ):
+                resp = await client.post(
+                    f"/api/runner/compute-job/{job.id}/viewable",
+                    data={"filename": safe_name},
+                    files={
+                        "file": (
+                            safe_name,
+                            b"x" * 100,  # 100 bytes > patched cap of 10
+                            "image/png",
+                        )
+                    },
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+
+        assert resp.status_code == 413, (
+            f"Expected 413 for oversize file, got {resp.status_code}: {resp.text}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_terminal_job_rejected(self, client, db_session):
+        """Upload to a terminal job → 409."""
+        _project, runner, token, job = await self._make_running_job(
+            db_session, status=ComputeJobStatus.SUCCEEDED
+        )
+
+        resp = await client.post(
+            f"/api/runner/compute-job/{job.id}/viewable",
+            data={"filename": "reward.png"},
+            files={"file": ("reward.png", b"data", "image/png")},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 409, (
+            f"Expected 409 for terminal job, got {resp.status_code}: {resp.text}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_file_cap_enforced(self, client, db_session):
+        """Upload at the 25-file cap → 429."""
+        from app.compute_backends import _MAX_VIEWABLE_FILE_COUNT
+
+        _project, runner, token, job = await self._make_running_job(db_session)
+
+        # Pre-fill viewable_files with `_MAX_VIEWABLE_FILE_COUNT` entries.
+        preexisting = []
+        for i in range(_MAX_VIEWABLE_FILE_COUNT):
+            fname = f"file_{i:03d}.png"
+            furi = self._fake_uri(job.id, fname)
+            preexisting.append({
+                "filename": fname,
+                "storage_uri": furi,
+                "content_type": "image/png",
+                "size_bytes": 100,
+                "kind": "image",
+            })
+        job.polling_metadata = {
+            **(job.polling_metadata or {}),
+            "viewable_files": preexisting,
+        }
+        db_session.add(job)
+        await db_session.commit()
+
+        overflow_name = "overflow.png"
+        with patch(
+            "app.storage.upload_compute_job_viewable_file",
+            return_value=self._fake_uri(job.id, overflow_name),
+        ):
+            resp = await client.post(
+                f"/api/runner/compute-job/{job.id}/viewable",
+                data={"filename": overflow_name},
+                files={
+                    "file": (
+                        overflow_name,
+                        b"data",
+                        "image/png",
+                    )
+                },
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        assert resp.status_code == 429, (
+            f"Expected 429 at file cap, got {resp.status_code}: {resp.text}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_large_video_uses_streaming_seam(self, client, db_session):
+        """A video body that rolls past the in-memory spool threshold is uploaded
+        via the STREAMING seam (``upload_compute_job_viewable_stream``) — its bytes
+        are never buffered whole through the in-memory
+        ``upload_compute_job_viewable_file`` path (the OOM vector the review
+        flagged). The streamed file object yields EXACTLY the file part, with no
+        multipart framing leaked, and the recorded size matches the payload."""
+        from app.routers import runner as runner_mod
+
+        _project, runner, token, job = await self._make_running_job(db_session)
+        safe_name = "rollout.mp4"
+        fake_uri = self._fake_uri(job.id, safe_name)
+        video_bytes = b"\x00\x01FAKE-MP4-PAYLOAD" * 64  # ~1 KiB, distinctive
+
+        captured: dict = {}
+
+        async def _fake_stream(job_id, basename, fileobj, content_type, *, size=None):
+            # Drain the streamed file object exactly as the GCS resumable upload
+            # does, capturing what actually crosses the seam.
+            captured["read"] = fileobj.read()
+            captured["size"] = size
+            captured["content_type"] = content_type
+            captured["basename"] = basename
+            return fake_uri
+
+        # Shrink the spool threshold so the modest test payload rolls to disk and
+        # takes the streaming branch. The in-memory seam MUST NOT be touched.
+        with patch.object(runner_mod, "_MAX_VIEWABLE_FILE_BYTES", 8), \
+                patch.object(runner_mod, "_MULTIPART_BODY_MARGIN", 8), \
+                patch("app.storage.upload_compute_job_viewable_stream", new=_fake_stream), \
+                patch(
+                    "app.storage.upload_compute_job_viewable_file",
+                    new=AsyncMock(side_effect=AssertionError(
+                        "rolled video must not use the in-memory upload seam"
+                    )),
+                ):
+            resp = await client.post(
+                f"/api/runner/compute-job/{job.id}/viewable",
+                data={"filename": safe_name},
+                files={"file": (safe_name, video_bytes, "video/mp4")},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        assert resp.status_code == 200, (
+            f"Expected 200 for streamed video, got {resp.status_code}: {resp.text}"
+        )
+        body = resp.json()
+        assert body["ok"] is True
+        assert body["entry"]["kind"] == "video"
+        assert body["entry"]["storage_uri"] == fake_uri
+        assert body["entry"]["size_bytes"] == len(video_bytes)
+
+        # The streamed bytes are EXACTLY the file part — no multipart framing.
+        assert captured["read"] == video_bytes
+        assert captured["size"] == len(video_bytes)
+        assert captured["content_type"] == "video/mp4"
+        assert captured["basename"] == safe_name
+
+        # DB row + manifest recorded with the streamed size.
+        await db_session.refresh(job)
+        vf = (job.polling_metadata or {}).get("viewable_files", [])
+        assert len(vf) == 1 and vf[0]["size_bytes"] == len(video_bytes)
+        rows = (
+            await db_session.execute(
+                select(ComputeJobFile).where(
+                    ComputeJobFile.compute_job_id == job.id,
+                    ComputeJobFile.storage_uri == fake_uri,
+                )
+            )
+        ).scalars().all()
+        assert len(rows) == 1 and rows[0].media_type == "video"
+        assert rows[0].file_size_bytes == len(video_bytes)
+
+    @pytest.mark.asyncio
+    async def test_reupload_same_relpath_dedup(self, client, db_session):
+        """Re-upload of the same relpath → single manifest entry, single DB row."""
+        _project, runner, token, job = await self._make_running_job(db_session)
+        safe_name = "reward_curve.png"
+        fake_uri = self._fake_uri(job.id, safe_name)
+
+        with patch(
+            "app.storage.upload_compute_job_viewable_file",
+            return_value=fake_uri,
+        ):
+            # First upload
+            resp1 = await client.post(
+                f"/api/runner/compute-job/{job.id}/viewable",
+                data={"filename": safe_name},
+                files={
+                    "file": (
+                        safe_name,
+                        b"v1-data",
+                        "image/png",
+                    )
+                },
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert resp1.status_code == 200, (
+                f"First upload failed: {resp1.status_code}: {resp1.text}"
+            )
+            assert resp1.json()["total_viewable_files"] == 1
+
+            # Second upload (same relpath, larger content)
+            resp2 = await client.post(
+                f"/api/runner/compute-job/{job.id}/viewable",
+                data={"filename": safe_name},
+                files={
+                    "file": (
+                        safe_name,
+                        b"v2-data-larger",
+                        "image/png",
+                    )
+                },
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert resp2.status_code == 200, (
+                f"Second upload failed: {resp2.status_code}: {resp2.text}"
+            )
+            assert resp2.json()["total_viewable_files"] == 1, (
+                "Re-upload must not increase the manifest count"
+            )
+
+        # ── Only ONE ComputeJobFile row ──────────────────────────────────────
+        rows = (
+            await db_session.execute(
+                select(ComputeJobFile).where(
+                    ComputeJobFile.compute_job_id == job.id,
+                    ComputeJobFile.storage_uri == fake_uri,
+                )
+            )
+        ).scalars().all()
+        assert len(rows) == 1, (
+            f"Re-upload must not create duplicate ComputeJobFile row: got "
+            f"{len(rows)} rows for storage_uri={fake_uri}"
+        )
+
+        # ── Only ONE manifest entry ──────────────────────────────────────────
+        await db_session.refresh(job)
+        vf = (job.polling_metadata or {}).get("viewable_files", [])
+        assert len(vf) == 1, (
+            f"Expected 1 viewable_files entry after re-upload, got {len(vf)}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_filename_rejected(self, client, db_session):
+        """Upload without filename → 400."""
+        _project, runner, token, job = await self._make_running_job(db_session)
+
+        resp = await client.post(
+            f"/api/runner/compute-job/{job.id}/viewable",
+            # Only the file, no filename field
+            files={"file": ("img.png", b"data", "image/png")},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 400, (
+            f"Expected 400 for missing filename, got {resp.status_code}: {resp.text}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_terminal_reconcile_no_duplicate_row_for_midrun_file(
+        self, client, db_session
+    ):
+        """Must-hold invariant: mid-run upload then terminal explode ⇒ ONE row.
+
+        Exercises the CROSS-PATH composition the task called out: a file uploaded
+        via the mid-run endpoint (``POST .../viewable``) then reconciled by the
+        terminal ``persist_viewable_files_for_job`` pass. Because the terminal pass
+        recomputes the authoritative superset manifest from the bundle and — for a
+        file already uploaded mid-run — carries the IDENTICAL canonical
+        ``storage_uri``, the SAVEPOINT + UNIQUE(storage_uri) insert in
+        ``_record_viewable_job_files`` is a benign no-op: exactly one
+        ``ComputeJobFile`` row survives for the mid-run relpath, and the terminal
+        guard key ``viewable_file_count`` is stamped.
+        """
+        from app import compute_jobs as compute_jobs_mod
+
+        _project, runner, token, job = await self._make_running_job(db_session)
+        safe_name = "reward_curve.png"
+        fake_uri = self._fake_uri(job.id, safe_name)
+
+        # ── 1. Mid-run upload via the endpoint (RUNNING job) ─────────────────
+        with patch(
+            "app.storage.upload_compute_job_viewable_file",
+            return_value=fake_uri,
+        ):
+            resp = await client.post(
+                f"/api/runner/compute-job/{job.id}/viewable",
+                data={"filename": safe_name},
+                files={"file": (safe_name, b"midrun-png-bytes", "image/png")},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        assert resp.status_code == 200, (
+            f"Mid-run upload failed: {resp.status_code}: {resp.text}"
+        )
+
+        # One row now exists; the terminal guard key must NOT be set yet.
+        await db_session.refresh(job)
+        assert "viewable_file_count" not in (job.polling_metadata or {}), (
+            "mid-run upload must not stamp the terminal guard key"
+        )
+
+        # ── 2. Job goes terminal, then the terminal viewable pass runs ───────
+        job.status = ComputeJobStatus.SUCCEEDED
+        db_session.add(job)
+        await db_session.commit()
+
+        # The terminal pass recomputes the authoritative superset from the
+        # bundle. Simulate that superset: it INCLUDES the mid-run file (identical
+        # storage_uri — this is what makes the dedup hold) plus a second file the
+        # bundle contained but which was never pushed mid-run.
+        second_name = "rollout.mp4"
+        second_uri = self._fake_uri(job.id, second_name)
+        terminal_manifest = [
+            {
+                "filename": safe_name,
+                "storage_uri": fake_uri,
+                "content_type": "image/png",
+                "size_bytes": len(b"midrun-png-bytes"),
+                "kind": "image",
+            },
+            {
+                "filename": second_name,
+                "storage_uri": second_uri,
+                "content_type": "video/mp4",
+                "size_bytes": 4096,
+                "kind": "video",
+            },
+        ]
+
+        with patch.object(
+            compute_jobs_mod,
+            "persist_viewable_artifacts",
+            new=AsyncMock(return_value=(terminal_manifest, 0)),
+        ):
+            manifest, dropped = (
+                await compute_jobs_mod.persist_viewable_files_for_job(
+                    db_session, job
+                )
+            )
+        db_session.add(job)
+        await db_session.commit()
+
+        assert dropped == 0
+        assert len(manifest) == 2, (
+            f"terminal manifest should be the superset (2 files), got {manifest!r}"
+        )
+
+        # ── 3. Exactly ONE ComputeJobFile row for the mid-run relpath ────────
+        rows = (
+            await db_session.execute(
+                select(ComputeJobFile).where(
+                    ComputeJobFile.compute_job_id == job.id,
+                    ComputeJobFile.storage_uri == fake_uri,
+                )
+            )
+        ).scalars().all()
+        assert len(rows) == 1, (
+            "terminal reconcile must not duplicate the mid-run file's row: got "
+            f"{len(rows)} rows for storage_uri={fake_uri}"
+        )
+
+        # The bundle-only file the terminal pass discovered got its own row.
+        second_rows = (
+            await db_session.execute(
+                select(ComputeJobFile).where(
+                    ComputeJobFile.compute_job_id == job.id,
+                    ComputeJobFile.storage_uri == second_uri,
+                )
+            )
+        ).scalars().all()
+        assert len(second_rows) == 1, (
+            "terminal pass should register the bundle-only file exactly once"
+        )
+
+        # ── 4. Terminal guard key is now stamped ─────────────────────────────
+        await db_session.refresh(job)
+        meta = job.polling_metadata or {}
+        assert meta.get("viewable_file_count") == 2, (
+            f"viewable_file_count must be stamped by the terminal pass, got "
+            f"{meta.get('viewable_file_count')!r}"
+        )
 
 
 # ── Capability proof trial: runner job + result ingestion (design 84021e2d §2) ─

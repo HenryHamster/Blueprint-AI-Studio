@@ -21,6 +21,8 @@ from sqlmodel import select
 
 from app.models import (
     Artifact,
+    ComputeJob,
+    ComputeJobStatus,
     Direction,
     KnowledgeDocument,
     Project,
@@ -642,6 +644,73 @@ def selected_ref_descriptor(
 
 _PREVIEW_SIGNED_URL_MINUTES = 5
 
+# Bound how many non-terminal compute jobs we surface live previews for, so a
+# project with many concurrent runs never inflates the context package. These
+# running-job items are prepended to the artifact items (see
+# load_strategic_context_evidence) so live previews win the descriptor cut.
+_RUNNING_JOB_PREVIEW_LIMIT = 4
+
+
+async def _sign_viewable_manifest(
+    session: AsyncSession,
+    project_id,
+    viewable_files: Any,
+) -> List[Dict[str, Any]]:
+    """Mint short-lived signed preview URLs for a ``viewable_files`` manifest.
+
+    Shared by the terminal-artifact path (``_resolve_viewable_previews``, reading
+    an Artifact's ``logs.viewable_files``) and the running-compute-job path
+    (``load_strategic_context_evidence``, reading a job's
+    ``polling_metadata['viewable_files']``). Each entry is
+    ``{filename, storage_uri, kind, ...}``; every one is independently verified
+    for project ownership and re-validated against the viewable-extension
+    allowlist (no svg — script execution via a signed URL), with a stamped
+    ``kind`` that must match the filename's classification.
+
+    Fail-soft: an ownership violation or signing failure skips that one file so
+    the rest of the manifest still resolves. Returns the signed preview list
+    (``[]`` when nothing resolves).
+    """
+    previews: List[Dict[str, Any]] = []
+    if not isinstance(viewable_files, list):
+        return previews
+    for vf in viewable_files:
+        if not isinstance(vf, dict):
+            continue
+        vf_storage_uri = vf.get("storage_uri")
+        vf_kind = vf.get("kind", "image")
+        vf_filename = vf.get("filename", "")
+        if not vf_storage_uri or not isinstance(vf_storage_uri, str):
+            continue
+        # Defense in depth: only allowlisted-extension files whose stamped
+        # kind matches the filename's classification are ever signed — a
+        # manifest entry naming an svg (or misdeclaring its kind) is
+        # skipped even if one was somehow persisted.
+        classified = viewable_content_type_for_filename(vf_filename)
+        if classified is None or classified[1] != vf_kind:
+            continue
+        try:
+            await verify_artifact_project_ownership(
+                vf_storage_uri, project_id, session
+            )
+            signed_url = await generate_download_signed_url(
+                vf_storage_uri,
+                expiration_minutes=_PREVIEW_SIGNED_URL_MINUTES,
+            )
+            previews.append(
+                {
+                    "url": signed_url,
+                    "storage_uri": vf_storage_uri,
+                    "kind": vf_kind,
+                    "filename": vf_filename,
+                }
+            )
+        except Exception:  # noqa: BLE001 — ownership violation or signing
+            # failure — skip this file so it degrades gracefully rather
+            # than breaking the whole evidence package.
+            continue
+    return previews
+
 
 async def _resolve_viewable_previews(
     session: AsyncSession,
@@ -719,44 +788,105 @@ async def _resolve_viewable_previews(
             if isinstance(logs_data, dict)
             else []
         )
-        for vf in viewable_files:
-            if not isinstance(vf, dict):
-                continue
-            vf_storage_uri = vf.get("storage_uri")
-            vf_kind = vf.get("kind", "image")
-            vf_filename = vf.get("filename", "")
-            if not vf_storage_uri or not isinstance(vf_storage_uri, str):
-                continue
-            # Defense in depth: only allowlisted-extension files whose stamped
-            # kind matches the filename's classification are ever signed — a
-            # manifest entry naming an svg (or misdeclaring its kind) is
-            # skipped even if one was somehow persisted.
-            classified = viewable_content_type_for_filename(vf_filename)
-            if classified is None or classified[1] != vf_kind:
-                continue
-            try:
-                await verify_artifact_project_ownership(
-                    vf_storage_uri, project_id, session
-                )
-                signed_url = await generate_download_signed_url(
-                    vf_storage_uri,
-                    expiration_minutes=_PREVIEW_SIGNED_URL_MINUTES,
-                )
-                previews.append(
-                    {
-                        "url": signed_url,
-                        "storage_uri": vf_storage_uri,
-                        "kind": vf_kind,
-                        "filename": vf_filename,
-                    }
-                )
-            except Exception:  # noqa: BLE001 — ownership violation or signing
-                # failure — skip this file so it degrades gracefully rather
-                # than breaking the whole evidence package.
-                continue
     except (json.JSONDecodeError, TypeError, ValueError):
-        pass
+        return previews
+    previews.extend(
+        await _sign_viewable_manifest(session, project_id, viewable_files)
+    )
     return previews
+
+
+_NON_TERMINAL_COMPUTE_JOB_STATUSES = (
+    ComputeJobStatus.QUEUED,
+    ComputeJobStatus.STARTING,
+    ComputeJobStatus.RUNNING,
+    ComputeJobStatus.POLLING,
+)
+
+
+async def _running_job_preview_items(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> List[Dict[str, Any]]:
+    """Surface live viewable previews for RUNNING (non-terminal) compute jobs.
+
+    The backend accumulates a job's mid-run viewable files into
+    ``polling_metadata['viewable_files']`` (same manifest shape stamped at
+    terminal linkage) WHILE the job runs. A running job has not linked a durable
+    Artifact yet, so it would otherwise never appear as a renderable evidence
+    artifact — the operator watching a multi-week RL run would see no live plots
+    or rollout frames in the strategic canvas.
+
+    We build synthetic artifact-shaped items carrying signed ``viewable_previews``
+    (reusing the exact ownership + allowlist + signing pipeline as terminal
+    artifacts via ``_sign_viewable_manifest``) so ``_artifact_descriptor``
+    promotes the descriptor kind to image/video with a populated URL and no
+    ``unsupported_reason`` stub. ``artifact_id IS NULL`` scopes this to jobs not
+    yet linked to a durable artifact, so a terminal job is never double-surfaced.
+    """
+    rows = (
+        await session.execute(
+            select(ComputeJob, Task.title)
+            .options(
+                load_only(
+                    ComputeJob.id,
+                    ComputeJob.task_id,
+                    ComputeJob.status,
+                    ComputeJob.created_at,
+                    ComputeJob.polling_metadata,
+                    raiseload=True,
+                )
+            )
+            .join(Task, ComputeJob.task_id == Task.id, isouter=True)
+            .where(
+                ComputeJob.project_id == project_id,
+                ComputeJob.artifact_id.is_(None),
+                ComputeJob.status.in_(_NON_TERMINAL_COMPUTE_JOB_STATUSES),
+            )
+            .order_by(ComputeJob.updated_at.desc())
+            .limit(_RUNNING_JOB_PREVIEW_LIMIT)
+        )
+    ).all()
+
+    items: List[Dict[str, Any]] = []
+    for job, task_title in rows:
+        pm = job.polling_metadata if isinstance(job.polling_metadata, dict) else {}
+        viewable_files = pm.get("viewable_files")
+        if not isinstance(viewable_files, list) or not viewable_files:
+            continue
+        previews = await _sign_viewable_manifest(
+            session, project_id, viewable_files
+        )
+        if not previews:
+            continue
+        label = _compact_text(task_title, max_chars=100) or "Live compute previews"
+        item = _with_target(
+            {
+                "id": str(job.id),
+                "kind": "storage",
+                "label": label,
+                "artifact_type": "compute_result",
+                "has_logs": True,
+                "task_id": str(job.task_id) if job.task_id else None,
+                "task_title": _compact_text(task_title, max_chars=120),
+                "task_status": getattr(job.status, "value", job.status),
+                "created_at": job.created_at.isoformat()
+                if job.created_at
+                else None,
+                # Live signal so the canvas/panel can badge previews as still
+                # accruing while the job runs.
+                "compute_job_running": True,
+                "viewable_previews": previews,
+            },
+            {
+                "surface": "task",
+                "task_id": str(job.task_id) if job.task_id else None,
+            }
+            if job.task_id
+            else None,
+        )
+        items.append(item)
+    return items
 
 
 async def load_strategic_context_evidence(
@@ -1028,6 +1158,15 @@ async def load_strategic_context_evidence(
             provenance = provenance_by_task.get(item.get("task_id") or "")
             if provenance:
                 item.update(provenance)
+
+    # Prepend live previews for RUNNING compute jobs so the operator watching a
+    # long run sees plots/videos accrue in the canvas before the job terminates.
+    # Prepending puts them ahead of terminal artifacts in the bounded descriptor
+    # cut (_strategic_context_descriptors slices items[:4]); artifact_total stays
+    # the durable-artifact count and is unaffected by these transient items.
+    running_items = await _running_job_preview_items(session, project_id)
+    if running_items:
+        artifact_items = running_items + artifact_items
 
     return {
         "knowledge": {

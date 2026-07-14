@@ -27,6 +27,7 @@ and this endpoint hands those pinned tasks to the polling runner.
 
 import logging
 import math
+import tempfile
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List
@@ -40,8 +41,14 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from app.auth import create_agent_token, get_current_runner
 from app.broadcast import broadcast_to_project
+from app import storage as app_storage
 from app.runner_project_binding import allowed_project_ids
-from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
+from app.compute_backends import (
+    RUNNER_SUBPROCESS_BACKEND_NAME,
+    _MAX_VIEWABLE_FILE_BYTES,
+    _MAX_VIEWABLE_FILE_COUNT,
+    _MAX_VIEWABLE_VIDEO_BYTES,
+)
 from app.compute_jobs import append_progress_sample
 from app.runner_rate_limiter import check_runner_rate_limit
 from app.runner_config import config_generation, live_safe_config
@@ -57,7 +64,7 @@ from app.runner_pull_skip import (
     stamp_skip_reason,
 )
 from app.database import get_session
-from app.models import Alert, AlertSeverity, ComputeJob, ComputeJobStatus, LocalRunner, Project, RunnerHeartbeatSnapshot, Task, TaskStatus, _utcnow
+from app.models import Alert, AlertSeverity, ComputeJob, ComputeJobFile, ComputeJobStatus, LocalRunner, Project, RunnerHeartbeatSnapshot, Task, TaskStatus, _utcnow
 from app.runner_decline import (
     DECLINE_ESCALATION_THRESHOLD as _DECLINE_ESCALATION_THRESHOLD,
     DECLINED_BY_CONTEXT_KEY,
@@ -2026,6 +2033,137 @@ def _parse_multipart_form(body: bytes, content_type: str) -> tuple[dict, dict]:
     return fields, files
 
 
+class _FileRangeReader:
+    """Bounded, forward-only reader over a byte range of a seekable file.
+
+    Presents ``[start, start + length)`` of ``fileobj`` as its own read stream so
+    the (potentially multi-hundred-MiB) file part of a spooled multipart body can
+    be streamed to GCS via ``blob.upload_from_file`` WITHOUT ever buffering it in
+    the orchestrator heap. A single consumer reads it sequentially; not
+    thread-safe (but the resumable upload runs on one worker thread).
+    """
+
+    def __init__(self, fileobj, start: int, length: int):
+        self._f = fileobj
+        self._remaining = max(0, length)
+        self._f.seek(start)
+
+    def read(self, size: int = -1) -> bytes:
+        if self._remaining <= 0:
+            return b""
+        want = self._remaining if size is None or size < 0 else min(size, self._remaining)
+        data = self._f.read(want)
+        self._remaining -= len(data)
+        return data
+
+
+def _parse_multipart_form_stream(
+    fileobj,
+    content_type: str,
+    *,
+    read_chunk: int = 1024 * 1024,
+    header_window: int = 64 * 1024,
+) -> tuple[dict, dict | None]:
+    """Memory-bounded multipart parse over a SEEKABLE binary file.
+
+    The streaming counterpart of :func:`_parse_multipart_form`: instead of
+    slicing an in-memory ``bytes`` body (which forces the whole payload — up to a
+    512 MiB video — onto the heap), it locates each part by scanning the file for
+    boundary delimiters in a bounded sliding window, so the large file part is
+    never loaded into memory. Scalar fields (always small for this endpoint) are
+    read into memory as bytes; the single file part is returned as a byte-range
+    descriptor ``{"name", "filename", "start", "length"}`` the caller streams via
+    :class:`_FileRangeReader`.
+
+    Returns ``(fields, file_part)`` where ``file_part`` is ``None`` when no file
+    part is present. Mirrors the leniency of the in-memory parser (tolerant of
+    field ordering and absent parts; assumes RFC-2046 CRLF delimiters).
+    """
+    fields: dict[str, bytes] = {}
+    file_part: dict | None = None
+
+    boundary = None
+    for piece in content_type.split(";"):
+        piece = piece.strip()
+        if piece.lower().startswith("boundary="):
+            boundary = piece[len("boundary="):].strip().strip('"')
+            break
+    if not boundary:
+        return fields, None
+
+    delimiter = b"--" + boundary.encode("latin-1")
+    dlen = len(delimiter)
+
+    # ── Pass 1: find every delimiter offset with a bounded sliding window ──
+    positions: list[int] = []
+    fileobj.seek(0)
+    overlap = dlen - 1
+    carry = b""
+    base = 0
+    while True:
+        chunk = fileobj.read(read_chunk)
+        if not chunk:
+            break
+        buf = carry + chunk
+        search_from = 0
+        while True:
+            idx = buf.find(delimiter, search_from)
+            if idx == -1:
+                break
+            positions.append(base + idx)
+            search_from = idx + dlen
+        keep = min(len(buf), overlap)
+        base += len(buf) - keep
+        carry = buf[len(buf) - keep:] if keep else b""
+
+    # ── Pass 2: for each segment between delimiters, read its (small) header ──
+    for i in range(len(positions) - 1):
+        seg_start = positions[i] + dlen
+        seg_end = positions[i + 1]
+        if seg_start >= seg_end:
+            continue
+        fileobj.seek(seg_start)
+        window = fileobj.read(min(header_window, seg_end - seg_start))
+        if window.startswith(b"--"):  # closing-boundary remnant
+            continue
+        header_off = 2 if window.startswith(b"\r\n") else 0
+        header_rel = window.find(b"\r\n\r\n", header_off)
+        if header_rel == -1:
+            continue
+        header_block = window[header_off:header_rel].decode("latin-1", "replace")
+        content_start = seg_start + header_rel + 4
+        content_end = seg_end
+        if content_end - content_start >= 2:  # strip CRLF before next delimiter
+            content_end -= 2
+
+        name = None
+        filename = None
+        for hline in header_block.split("\r\n"):
+            if hline.lower().startswith("content-disposition:"):
+                for param in hline.split(";")[1:]:
+                    param = param.strip()
+                    if param.startswith("name="):
+                        name = param[len("name="):].strip().strip('"')
+                    elif param.startswith("filename="):
+                        filename = param[len("filename="):].strip().strip('"')
+        if name is None:
+            continue
+        length = max(0, content_end - content_start)
+        if filename is not None:
+            if file_part is None:  # first file part wins (endpoint sends one)
+                file_part = {
+                    "name": name,
+                    "filename": filename,
+                    "start": content_start,
+                    "length": length,
+                }
+        else:
+            fileobj.seek(content_start)
+            fields[name] = fileobj.read(length)
+
+    return fields, file_part
+
+
 @router.post("/compute-job/{job_id}/artifact")
 async def upload_compute_job_artifact(
     job_id: uuid.UUID,
@@ -2259,3 +2397,304 @@ async def download_compute_job_input_artifact(
         raise HTTPException(status_code=404, detail="resume source bundle not found")
 
     return Response(content=bundle, media_type="application/gzip")
+
+
+@router.post("/compute-job/{job_id}/viewable")
+async def upload_compute_job_viewable(
+    job_id: uuid.UUID,
+    request: Request,
+    runner: LocalRunner = Depends(get_current_runner),
+    session: AsyncSession = Depends(get_session),
+):
+    """Receive a single viewable file for a RUNNING compute job mid-execution.
+
+    Runner-subprocess backends may push individual viewable files
+    (png/jpg/jpeg/webp/gif/mp4/webm) WHILE the job is still RUNNING so they
+    appear in the admin UI's ``viewable_artifacts`` list and strategic canvas
+    BEFORE the job reaches a terminal state.
+
+    Body is ``multipart/form-data``: a ``file`` field carrying the viewable file
+    bytes, plus a ``filename`` form field with the relative path of the file
+    (``reward_curve.png`` or ``arm1/reward.png`` — the same relpath the terminal
+    ``persist_viewable_artifacts`` pipeline uses so the canonical storage URI
+    matches and terminal explosion dedup works naturally).
+
+    The endpoint enforces the same policies as the terminal viewable pipeline:
+    extension-based kind classification, per-kind byte caps (8 MiB for images,
+    512 MiB for videos), and the 25-file per-job count budget.  Terminal jobs are
+    refused — mid-run uploads may only add evidence to a job that is still live.
+
+    Scoped to the pinned runner exactly like ``/report`` and ``/artifact``, so
+    runner A cannot upload viewable files to a job claimed by runner B.
+    """
+    allowed, retry_after = await check_runner_rate_limit(
+        str(runner.id), "upload_compute_job_viewable"
+    )
+    if not allowed:
+        raise HTTPException(status_code=429, headers={"Retry-After": str(retry_after)})
+
+    # ── Read the multipart body memory-safely (spool → streaming parse) ─────
+    # Small bodies (images and small videos) stay in memory; a large video body
+    # rolls to a temp file, so the orchestrator NEVER buffers a multi-hundred-MiB
+    # payload on the heap (a per-request >1 GiB OOM vector under concurrent
+    # pushes). The hard cap covers the largest viewable file (512 MiB video) plus
+    # multipart framing overhead; the spool threshold is the image cap + margin.
+    max_body_bytes = _MAX_VIEWABLE_VIDEO_BYTES + _MULTIPART_BODY_MARGIN
+    spool_threshold = _MAX_VIEWABLE_FILE_BYTES + _MULTIPART_BODY_MARGIN
+    spool = tempfile.SpooledTemporaryFile(max_size=spool_threshold)
+    try:
+        received = 0
+        async for chunk in request.stream():
+            received += len(chunk)
+            if received > max_body_bytes:
+                raise HTTPException(status_code=413, detail="viewable file body exceeds upload cap")
+            spool.write(chunk)
+
+        req_content_type = request.headers.get("content-type", "")
+
+        # At/below the spool threshold the whole body is still in memory: reuse the
+        # in-memory parser + upload seam (unchanged fast path for images and small
+        # videos). Above it the body rolled to disk: parse and upload by STREAMING
+        # the file part so its bytes never re-enter the heap.
+        stream_upload = received > spool_threshold
+        file_part: dict | None = None
+        if stream_upload:
+            fields, file_part = _parse_multipart_form_stream(spool, req_content_type)
+            if file_part is None:
+                raise HTTPException(status_code=400, detail="missing 'file' field in multipart form")
+            file_bytes = None
+            file_length = file_part["length"]
+        else:
+            spool.seek(0)
+            raw = spool.read()
+            fields, files = _parse_multipart_form(raw, req_content_type)
+            file_bytes = files.get("file")
+            if file_bytes is None:
+                raise HTTPException(status_code=400, detail="missing 'file' field in multipart form")
+            file_length = len(file_bytes)
+        if file_length == 0:
+            raise HTTPException(status_code=400, detail="empty viewable file body")
+
+        raw_filename = (fields.get("filename") or b"").decode("latin-1", "replace").strip()
+        if not raw_filename:
+            raise HTTPException(status_code=400, detail="missing or empty 'filename' field")
+
+        # ── Extension-based classification (reuses the terminal path's policy) ──
+        type_info = app_storage.viewable_content_type_for_filename(raw_filename)
+        if type_info is None:
+            raise HTTPException(
+                status_code=422,
+                detail=f"file type not viewable: {raw_filename!r} — "
+                f"supported: png/jpg/jpeg/webp/gif/mp4/webm",
+            )
+        content_type, kind = type_info
+
+        # ── Sanitize the relpath to match the terminal pipeline's object names ──
+        safe_name = app_storage.sanitize_viewable_relpath(raw_filename)
+        if safe_name is None:
+            raise HTTPException(
+                status_code=422,
+                detail=f"filename {raw_filename!r} sanitizes to an empty or unsafe name",
+            )
+
+        # ── Enforce per-kind byte cap ───────────────────────────────────────────
+        size_cap = _MAX_VIEWABLE_VIDEO_BYTES if kind == "video" else _MAX_VIEWABLE_FILE_BYTES
+        if file_length > size_cap:
+            raise HTTPException(
+                status_code=413,
+                detail=f"viewable file {safe_name!r} ({file_length} bytes) exceeds "
+                f"the {size_cap}-byte cap for kind {kind!r}",
+            )
+
+        # ── Flat read: find the job, validate scope + pre-check caps ────────────
+        _job_scope = (
+            ComputeJob.id == job_id,
+            ComputeJob.project_id == runner.project_id,
+            ComputeJob.backend == RUNNER_SUBPROCESS_BACKEND_NAME,
+            ComputeJob.polling_metadata["runner_target_id"].as_string() == str(runner.id),
+        )
+        result = await session.execute(select(ComputeJob).where(*_job_scope))
+        job = result.scalars().first()
+        if job is None:
+            raise HTTPException(status_code=404, detail="compute job not found")
+
+        if job.status in _COMPUTE_JOB_TERMINAL_STATUSES:
+            raise HTTPException(
+                status_code=409,
+                detail="compute job is terminal — mid-run viewable uploads are refused",
+            )
+
+        # The storage_uri for this relpath is deterministic, so we can tell up front
+        # whether this upload REFRESHES an already-registered file (an overwritten
+        # reward_curve.png re-sent every heartbeat) versus ADDS a new one. A refresh
+        # of an existing entry is exempt from the count cap — otherwise once the cap
+        # is reached the runner keeps re-attempting a file it already sent and never
+        # records success.
+        expected_uri = app_storage.compute_job_viewable_uri(job_id, safe_name)
+
+        def _is_registered(meta_dict: Any) -> bool:
+            entries = (meta_dict or {}).get("viewable_files") or []
+            if not isinstance(entries, list):
+                return False
+            return any(
+                isinstance(e, dict) and e.get("storage_uri") == expected_uri
+                for e in entries
+            )
+
+        # Pre-check: count cap under a NO-LOCK read (advisory — the locked re-read
+        # below is authoritative).  If already at cap, refuse early to avoid the
+        # slow GCS round-trip — but only for a genuinely NEW file; a refresh of an
+        # already-registered relpath is always allowed through.
+        meta_snapshot = job.polling_metadata or {}
+        existing_snapshot = meta_snapshot.get("viewable_files") or []
+        if (
+            isinstance(existing_snapshot, list)
+            and len(existing_snapshot) >= _MAX_VIEWABLE_FILE_COUNT
+            and not _is_registered(meta_snapshot)
+        ):
+            raise HTTPException(
+                status_code=429,
+                detail=f"viewable file cap ({_MAX_VIEWABLE_FILE_COUNT}) reached for this job",
+            )
+
+        # ── Slow GCS upload (no row lock held) ─────────────────────────────────
+        # A rolled-to-disk video is STREAMED to GCS via a resumable upload (peak
+        # memory bounded to the 8 MiB chunk window) rather than buffered whole;
+        # in-memory files use the in-memory upload seam.
+        if stream_upload:
+            uploaded_uri = await app_storage.upload_compute_job_viewable_stream(
+                job_id,
+                safe_name,
+                _FileRangeReader(spool, file_part["start"], file_length),
+                content_type,
+                size=file_length,
+            )
+        else:
+            uploaded_uri = await app_storage.upload_compute_job_viewable_file(
+                job_id, safe_name, file_bytes, content_type,
+            )
+        if uploaded_uri is None:
+            logger.warning(
+                "[RUNNERS] GCS upload failed for viewable file %r on job %s — "
+                "storage unavailable; completing request without it",
+                safe_name,
+                job_id,
+            )
+            raise HTTPException(status_code=502, detail="viewable file upload to storage failed")
+    finally:
+        # The spooled body (in-memory or the unlinked temp file) is fully consumed
+        # once the upload above returns — release it before the DB section.
+        spool.close()
+
+    # ── Re-read with row lock: re-check terminal + count cap ───────────────
+    result = await session.execute(
+        select(ComputeJob)
+        .where(*_job_scope)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    job = result.scalars().first()
+    if job is None:
+        raise HTTPException(status_code=404, detail="compute job vanished mid-upload")
+
+    if job.status in _COMPUTE_JOB_TERMINAL_STATUSES:
+        logger.warning(
+            "[RUNNERS] Compute job %s went terminal while viewable file %r "
+            "upload was in flight — discarding mid-run pointer (file is already "
+            "durable in GCS and will be reconciled by the terminal pass)",
+            job_id,
+            safe_name,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail="compute job went terminal during upload — the file is stored "
+            "and will be picked up by the terminal viewable pipeline",
+        )
+
+    meta = dict(job.polling_metadata or {})
+
+    existing_list = meta.get("viewable_files") or []
+    if not isinstance(existing_list, list):
+        existing_list = []
+
+    # Dedup by storage_uri: if this relpath was already uploaded (e.g. an
+    # overwritten reward_curve.png), update the existing entry in place.
+    existing_entry = None
+    for entry in existing_list:
+        if isinstance(entry, dict) and entry.get("storage_uri") == uploaded_uri:
+            existing_entry = entry
+            break
+
+    # Count cap (definitive check under lock). A refresh of an ALREADY-registered
+    # relpath updates its entry in place and does not grow the manifest, so it is
+    # exempt from the cap — only a NEW file counts against it.
+    if existing_entry is None and len(existing_list) >= _MAX_VIEWABLE_FILE_COUNT:
+        # The GCS object we just wrote for this genuinely-new relpath has no
+        # manifest entry and no ComputeJobFile row; the terminal pass reconciles
+        # from the bundle tarball, not from stray viewable/ objects, so it would
+        # be orphaned. Best-effort delete it before refusing so a lost cap race
+        # (pre-lock advisory check passed, under-lock re-check trips) cannot leak
+        # storage.
+        await app_storage.delete_compute_job_viewable_file(job_id, safe_name)
+        raise HTTPException(
+            status_code=429,
+            detail=f"viewable file cap ({_MAX_VIEWABLE_FILE_COUNT}) reached for this job",
+        )
+
+    entry: dict[str, Any] = {
+        "filename": safe_name,
+        "storage_uri": uploaded_uri,
+        "content_type": content_type,
+        "size_bytes": file_length,
+        "kind": kind,
+    }
+
+    if existing_entry is not None:
+        # Update in-place so a re-upload of the same relpath (overwritten
+        # reward_curve.png) keeps one manifest entry.
+        existing_entry.update(entry)
+    else:
+        existing_list.append(entry)
+        meta["viewable_files"] = existing_list
+
+    # ── Create ComputeJobFile row (idempotent via SAVEPOINT + UNIQUE) ──────
+    # Mirrors the pattern in compute_jobs._record_viewable_job_files: a UNIQUE
+    # (storage_uri) constraint means re-entering a file already registered by a
+    # prior mid-run upload — or later by the terminal pass — is a benign no-op.
+    try:
+        async with session.begin_nested():
+            cjf = ComputeJobFile(
+                compute_job_id=job.id,
+                safe_relpath=safe_name,
+                media_type=kind,
+                storage_uri=uploaded_uri,
+                content_type=content_type,
+                file_size_bytes=file_length,
+            )
+            session.add(cjf)
+            await session.flush()
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[RUNNERS] ComputeJobFile insert failed for viewable file %r "
+            "in job=%s — continuing without DB row (file is durable in GCS)",
+            safe_name,
+            job.id,
+            exc_info=True,
+        )
+
+    # NOTE: We intentionally do NOT set ``viewable_file_count`` in
+    # polling_metadata. That key is the idempotency guard for the terminal
+    # ``persist_viewable_files_for_job`` pass; setting it here would skip the
+    # terminal pass entirely, breaking reconciliation.  The terminal pass will
+    # compute the authoritative superset manifest and stamp the count itself.
+
+    job.polling_metadata = meta
+    job.updated_at = _utcnow()
+    session.add(job)
+    await session.commit()
+
+    return {
+        "ok": True,
+        "entry": entry,
+        "total_viewable_files": len(existing_list),
+    }
