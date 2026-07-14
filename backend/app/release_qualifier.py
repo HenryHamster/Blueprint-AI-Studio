@@ -5196,7 +5196,9 @@ async def _finalize_qualification(
             session,
             version,
             qual,
-            "migration_identity_check_unavailable",
+            f"migration_identity_check_unavailable: {migration_detail}"
+            if migration_detail
+            else "migration_identity_check_unavailable",
         )
     migration_collision = migration_verdict == "block"
 
@@ -5224,7 +5226,9 @@ async def _finalize_qualification(
             session,
             version,
             qual,
-            "migration_apply_check_unavailable",
+            f"migration_apply_check_unavailable: {apply_detail}"
+            if apply_detail
+            else "migration_apply_check_unavailable",
         )
     migration_apply_blocked = apply_verdict == "block"
 

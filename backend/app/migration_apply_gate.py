@@ -60,7 +60,7 @@ import tempfile
 import textwrap
 import uuid
 from contextlib import asynccontextmanager
-from typing import NamedTuple
+from typing import Awaitable, Callable, cast, NamedTuple, TypeVar
 from urllib.parse import quote
 
 import sqlalchemy as sa
@@ -77,6 +77,7 @@ from app.migration_chain import (
     find_heads,
 )
 from app.migration_reconciliation import reconcile_pre_renumber_divergence
+from app.time_utils import exponential_backoff
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +154,61 @@ _CANDIDATE_METADATA_SCRIPT = textwrap.dedent(
     print(json.dumps(payload, sort_keys=True))
     """
 )
+
+
+# Retry configuration for transient operations — overridable in tests (via
+# monkeypatch) for speed without altering production behavior.
+_TRANSIENT_RETRY_MAX_ATTEMPTS = 3
+_TRANSIENT_RETRY_BASE_DELAY = 1.0
+_TRANSIENT_RETRY_MAX_DELAY = 16.0
+
+
+_T = TypeVar("_T")
+
+
+async def _with_transient_retry(
+    coro_factory: Callable[[], Awaitable[_T]],
+    *,
+    label: str,
+) -> _T:
+    """Invoke *coro_factory* with bounded exponential backoff on exceptions.
+
+    *coro_factory* is a zero-argument awaitable factory — a lambda or closure
+    — because a consumed coroutine cannot be re-awaited.  On each attempt a
+    fresh coroutine is created so the retry observes a clean call stack.
+
+    Reads retry parameters from module-level ``_TRANSIENT_RETRY_*`` constants
+    so tests can monkeypatch them for speed without altering production.
+
+    After exhausting *max_attempts* consecutive failures, re-raises the *last*
+    exception so existing ``try``/``except`` structures around the caller
+    convert it to ``("defer", ...)``.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(1, _TRANSIENT_RETRY_MAX_ATTEMPTS + 1):
+        if attempt > 1:
+            delay = exponential_backoff(
+                attempt - 1,
+                base=_TRANSIENT_RETRY_BASE_DELAY,
+                cap=_TRANSIENT_RETRY_MAX_DELAY,
+                jitter=0.25,
+            )
+            logger.warning(
+                "[MIGRATION_APPLY_GATE] %s attempt %d/%d transient failure; "
+                "retrying in %.1fs: %s",
+                label,
+                attempt - 1,
+                _TRANSIENT_RETRY_MAX_ATTEMPTS,
+                delay,
+                last_exc,
+            )
+            await asyncio.sleep(delay)
+        try:
+            return await coro_factory()
+        except Exception as exc:  # noqa: BLE001 — retry on transient exceptions
+            last_exc = exc
+    # All attempts exhausted — re-raise the last exception.
+    raise cast(Exception, last_exc)
 
 
 class _ProdState(NamedTuple):
@@ -675,6 +731,29 @@ async def _reflect_scratch_drift(
         )
 
 
+async def _provision_seed_and_detect_drift(
+    prod_url: URL,
+    prod_state: _ProdState,
+    candidate_sources: dict[str, str],
+    required_metadata: sa.MetaData,
+) -> list[str]:
+    """Provision an isolated scratch DB, seed with production's recorded state,
+    apply candidate migrations, and return any schema drift.
+
+    Raises ``_MigrationApplyError`` on seed/apply/collision failure (deferrable).
+    Returns an empty list when the post-upgrade schema satisfies all requirements.
+    """
+    async with ephemeral_postgres_database(prod_url) as (scratch_engine, name):
+        # ISOLATION GUARD: never run DDL against the production database.
+        if name == prod_url.database:
+            raise _MigrationApplyError(
+                "scratch database name collided with production's"
+            )
+        await _seed_scratch(scratch_engine, prod_state)
+        await _apply_candidate_migrations(scratch_engine, candidate_sources)
+        return await _reflect_scratch_drift(scratch_engine, required_metadata)
+
+
 def _is_migration_source(filename: str) -> bool:
     return (
         filename.endswith(".py")
@@ -802,6 +881,61 @@ async def _fetch_candidate_sources(
         return None
 
 
+async def _fetch_candidate_sources_with_retry(
+    gh_token: str,
+    owner: str,
+    repo: str,
+    candidate_ref: str,
+    project_id: str | None,
+) -> dict[str, str] | None:
+    """Fetch candidate migration sources with bounded transient retry.
+
+    Unlike :func:`_with_transient_retry` (which retries only on exceptions),
+    this wrapper also retries on a ``None`` return — because
+    :func:`_fetch_candidate_sources` catches transient exceptions internally
+    and converts them to ``None``.  Both exception and ``None`` are treated
+    as transient signals and retried up to ``_TRANSIENT_RETRY_MAX_ATTEMPTS``
+    times with exponential backoff.
+
+    Returns the sources dict on success, or ``None`` after all retries are
+    exhausted — letting the caller's existing ``if not candidate_sources``
+    check produce the same ``("defer", ...)`` verdict as before.
+    """
+    for attempt in range(1, _TRANSIENT_RETRY_MAX_ATTEMPTS + 1):
+        try:
+            sources = await _fetch_candidate_sources(
+                gh_token, owner, repo, candidate_ref, project_id
+            )
+            if sources is not None:
+                return sources
+        except Exception:  # noqa: BLE001 — transient fetch errors are retried
+            logger.warning(
+                "[MIGRATION_APPLY_GATE] fetch candidate sources at %s attempt %d/%d "
+                "raised unexpected exception (retrying)",
+                candidate_ref,
+                attempt,
+                _TRANSIENT_RETRY_MAX_ATTEMPTS,
+                exc_info=True,
+            )
+        if attempt < _TRANSIENT_RETRY_MAX_ATTEMPTS:
+            delay = exponential_backoff(
+                attempt,
+                base=_TRANSIENT_RETRY_BASE_DELAY,
+                cap=_TRANSIENT_RETRY_MAX_DELAY,
+                jitter=0.25,
+            )
+            logger.warning(
+                "[MIGRATION_APPLY_GATE] fetch candidate sources at %s attempt %d/%d "
+                "transient failure; retrying in %.1fs",
+                candidate_ref,
+                attempt,
+                _TRANSIENT_RETRY_MAX_ATTEMPTS,
+                delay,
+            )
+            await asyncio.sleep(delay)
+    return None
+
+
 async def run_migration_apply_gate(
     *,
     prod_engine: AsyncEngine,
@@ -860,16 +994,9 @@ async def run_migration_apply_gate(
                 "candidate migration sources unavailable: no injected sources and "
                 "incomplete GitHub coordinates (token/owner/repo/ref)",
             )
-        try:
-            candidate_sources = await _fetch_candidate_sources(
-                gh_token, owner, repo, candidate_ref, project_id
-            )
-        except Exception as exc:  # noqa: BLE001 — fetch failure HOLDS
-            return (
-                "defer",
-                f"could not fetch candidate migrations at {candidate_ref!r}: "
-                f"{type(exc).__name__}: {exc}",
-            )
+        candidate_sources = await _fetch_candidate_sources_with_retry(
+            gh_token, owner, repo, candidate_ref, project_id
+        )
         if not candidate_sources:
             return (
                 "defer",
@@ -885,8 +1012,13 @@ async def run_migration_apply_gate(
         return structural_verdict
 
     # 3. Production's REAL recorded state (read-only).
+    # Transient DB connection errors are retried; a definitive ``None``
+    # (no ``alembic_version`` table or empty stamp) is NOT retried.
     try:
-        prod_state = await _read_prod_state(prod_engine)
+        prod_state = await _with_transient_retry(
+            lambda: _read_prod_state(prod_engine),
+            label="read production's recorded state",
+        )
     except Exception as exc:  # noqa: BLE001 — indeterminate prod state HOLDS
         return (
             "defer",
@@ -937,18 +1069,15 @@ async def run_migration_apply_gate(
         required_metadata = candidate_reference_metadata
 
     # 3. Provision an isolated scratch DB, 4. seed it, 5. apply, 6. assert no drift.
+    # The provision/seed/apply/drift block catches transient Postgres errors
+    # (CONCURRENT DB CREATE races, deadlock on write) with bounded retry.
     try:
-        async with ephemeral_postgres_database(prod_url) as (scratch_engine, name):
-            # ISOLATION GUARD: never run DDL against the production database.
-            if name == prod_url.database:
-                return (
-                    "defer",
-                    "refusing to run the migration-apply gate: scratch database "
-                    "name collided with production's",
-                )
-            await _seed_scratch(scratch_engine, prod_state)
-            await _apply_candidate_migrations(scratch_engine, candidate_sources)
-            drift = await _reflect_scratch_drift(scratch_engine, required_metadata)
+        drift = await _with_transient_retry(
+            lambda: _provision_seed_and_detect_drift(
+                prod_url, prod_state, candidate_sources, required_metadata
+            ),
+            label="provision-seed-apply-drift",
+        )
     except _MigrationApplyError as exc:
         return ("defer", str(exc))
     except Exception as exc:  # noqa: BLE001 — any provisioning failure HOLDS

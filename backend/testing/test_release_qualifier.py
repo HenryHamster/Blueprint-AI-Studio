@@ -10389,6 +10389,42 @@ class TestInferDimensionFromInfraError:
         assert rqa._infer_dimension_from_infra_error(infra_error) == expected
 
 
+class TestInferInfraLeg:
+    """_infer_infra_leg maps infra_error codes to the leg component of the
+    infra-failure signature.  Mirror of TestInferDimensionFromInfraError above
+    (same migration-prefix ordering, same fallback behavior)."""
+
+    @pytest.mark.parametrize(
+        ("infra_error", "expected"),
+        [
+            # challenge sub-leg (matched before bare 'audit')
+            ("audit_challenge_missing", "challenge"),
+            ("audit_challenge_binding_incomplete", "challenge"),
+            ("challenge_infra_respawn_cap_exceeded", "challenge"),
+            # the two distinct migration gates (matched before bare 'migration')
+            ("migration_identity_check_unavailable", "migration_identity"),
+            ("migration_apply_check_unavailable", "migration_apply"),
+            ("migration_apply_check_unavailable: scratch DB timeout", "migration_apply"),
+            ("migration_something_else", "migration_identity"),
+            # smoketest
+            ("smoketest_task_failed", "smoketest"),
+            ("smoketest_report_missing", "smoketest"),
+            # audit (default) — every audit_* / bare / unknown code
+            ("audit_task_failed", "audit"),
+            ("audit_report_missing", "audit"),
+            ("audit_infra_respawn_cap_exceeded", "audit"),
+            ("audit_task_failed_provision_failure", "audit"),
+            # unrecognized / empty → 'audit' fallback
+            ("something_unrecognized", "audit"),
+            ("", "audit"),
+        ],
+    )
+    def test_infers_leg(self, infra_error, expected):
+        from app import release_qualifier_audit as rqa
+
+        assert rqa._infer_infra_leg(infra_error) == expected
+
+
 @pytest.mark.asyncio
 async def test_finalize_infra_failure_persists_partial_dimension_results(
     db_session, mocker
@@ -10444,7 +10480,8 @@ async def test_finalize_infra_failure_persists_partial_dimension_results(
 
     # The finalize was held as an infra failure -- not promoted.
     assert result["status"] == "infra_failure"
-    assert result["error"] == "migration_identity_check_unavailable"
+    assert result["error"].startswith("migration_identity_check_unavailable")
+    assert "GitHub 502" in result["error"]
     promote_spy.assert_not_called()
 
     # Query the per-dimension ledger.
@@ -13999,7 +14036,8 @@ async def test_finalize_holds_when_migration_listing_fetch_fails(db_session, moc
 
     # Held as an infra failure — no quality verdict, never promoted.
     assert result["status"] == "infra_failure"
-    assert result["error"] == "migration_identity_check_unavailable"
+    assert result["error"].startswith("migration_identity_check_unavailable")
+    assert "GitHub 502" in result["error"]
     promote_spy.assert_not_called()
 
     await db_session.refresh(version)
@@ -14616,7 +14654,8 @@ async def test_finalize_holds_when_migration_apply_gate_defers(db_session, mocke
     await db_session.commit()
 
     assert result["status"] == "infra_failure"
-    assert result["error"] == "migration_apply_check_unavailable"
+    assert result["error"].startswith("migration_apply_check_unavailable")
+    assert "could not read production" in result["error"]
     promote_spy.assert_not_called()
 
     await db_session.refresh(version)

@@ -118,10 +118,24 @@ def append_infra_failure_child_event(
 
 
 def _infer_infra_leg(infra_error: str) -> str:
+    """Map an infra_error code to its logical qualifier leg.
+
+    The leg forms the first component of the infra-failure signature
+    (``{leg}:{category}:{code}``).  Ordered by specificity so that a sub-leg
+    (``audit_challenge``) is matched before its parent (``audit``), and distinct
+    migration gates (identity vs apply) before a bare ``migration`` fallback.
+    Unrecognized codes default to ``"audit"`` — the historical, dominant leg.
+    """
     if infra_error.startswith("audit_challenge") or infra_error.startswith(
         "challenge_"
     ):
         return "challenge"
+    if infra_error.startswith("migration_identity"):
+        return "migration_identity"
+    if infra_error.startswith("migration_apply"):
+        return "migration_apply"
+    if infra_error.startswith("migration"):
+        return "migration_identity"
     if infra_error.startswith("smoketest"):
         return "smoketest"
     return "audit"
