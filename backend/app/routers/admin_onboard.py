@@ -218,15 +218,18 @@ def _empty_repo_build_config() -> Dict[str, Any]:
 
 def _classify_repo_emptiness(
     root_items: list[Dict[str, Any]], listing_complete: bool = True
-) -> tuple[bool, int | None]:
+) -> tuple[bool | None, int | None]:
     """Classify a repo as empty / near-empty from fetched contents listings.
 
     Returns ``(is_empty, source_file_count)``.
 
-    ``is_empty`` is True ONLY when the repository was read successfully and
-    completely AND has at most ``GREENFIELD_SOURCE_FILE_THRESHOLD`` real source
-    files across the fetched root listing and every nested directory listing the
-    detector walked. Documentation/config/data files, dotfiles, and common
+    ``is_empty`` is tri-state, exactly like the ``has_ci`` signal derived from
+    the same bounded walk. It is True ONLY when the repository was read
+    successfully and completely AND has at most
+    ``GREENFIELD_SOURCE_FILE_THRESHOLD`` real source files across the fetched
+    root listing and every nested directory listing the detector walked; False
+    when the walk completed and found more; and None (undetermined) when the
+    read was incomplete. Documentation/config/data files, dotfiles, and common
     manifests are not counted as source.
 
     ``source_file_count`` is the authoritative real-source total from that same
@@ -238,16 +241,18 @@ def _classify_repo_emptiness(
     ``listing_complete`` is the positive confirmation that every listing needed
     to make this determination was fetched. When it is False (e.g. a nested
     directory listing failed to fetch or the bounded scan hit unread deeper
-    paths), emptiness is indeterminate and this returns ``(False, None)``
-    (treat-as-non-empty) — a repo whose real source lives in a subdirectory we
-    could not read must never be bootstrapped as greenfield on a transient
-    fetch error.
+    paths), emptiness is indeterminate and this returns ``(None, None)``
+    (undetermined, NOT asserted-non-empty) — a repo whose real source lives in a
+    subdirectory we could not read must never be recorded as a durable,
+    authoritative "not empty" on a transient fetch error, and a genuinely
+    greenfield repo whose listing hit a transient failure must not be suppressed
+    out of greenfield mode by a false negative.
 
     ``root_items`` is the raw GitHub ``contents/`` listings already fetched by
     :func:`_detect_build_config`, so it adds zero GitHub cost.
     """
     if not listing_complete:
-        return False, None
+        return None, None
 
     source_file_count = 0
     for item in root_items:
@@ -768,10 +773,15 @@ async def _detect_build_config(
         "directories": directories,
         "env_vars": {},
         "detected_at": datetime.now(timezone.utc).isoformat(),
-        # Deterministic empty/near-empty signal from the already-fetched bounded
-        # contents walk (zero extra GitHub cost beyond detection). Must stay
-        # aligned with agent/src/prompts/discovery.ts and the threshold in
-        # agent/src/constants.ts.
+        # Tri-state empty/near-empty signal from the already-fetched bounded
+        # contents walk (zero extra GitHub cost beyond detection): True when the
+        # walk completed and found at most the greenfield threshold of real
+        # source; False when it completed and found more; None (undetermined)
+        # when the read was incomplete, so emptiness is never asserted from a
+        # partial walk (parity with ``has_ci`` below). ``exclude_none`` drops the
+        # key when None so an undetermined walk persists as absent rather than a
+        # durable False. Must stay aligned with agent/src/prompts/discovery.ts
+        # and the threshold in agent/src/constants.ts.
         "repo_is_empty": repo_is_empty,
         # The authoritative real-source count from the same walk, persisted so
         # the agent's clone-time detector compares against this number instead of

@@ -1486,8 +1486,8 @@ async def test_stale_empty_signal_does_not_flip_on_indeterminate_read():
 
     project = _stale_empty_project()
     session = AsyncMock()
-    # listing_complete=False path returns (False, None); but even a defensive
-    # repo_is_empty=True paired with an unknown count must not flip.
+    # listing_complete=False path returns (None, None) (undetermined); but even
+    # a defensive repo_is_empty=True paired with an unknown count must not flip.
     detected_indeterminate = {
         "repo_is_empty": True,
         "source_file_count": None,

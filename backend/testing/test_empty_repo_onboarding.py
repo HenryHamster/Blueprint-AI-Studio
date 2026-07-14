@@ -18,6 +18,8 @@ classify the empty-repo 404 honestly so the guard can fire.
 """
 
 import base64
+import json
+import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -317,6 +319,69 @@ class TestClassifierAgreement:
 
     def test_empty_repo_build_config_carries_zero_count(self):
         assert _empty_repo_build_config()["source_file_count"] == 0
+
+
+class TestIncompleteListingIsUndetermined:
+    """A partial contents walk must never assert a durable, authoritative
+    ``repo_is_empty=False``. It is tri-state (parity with ``has_ci``): an
+    incomplete read is undetermined (None), which ``exclude_none`` drops so the
+    signal persists as ABSENT — every consumer coalesces absent to "consult the
+    live signal / self-heal", never to a false negative that suppresses
+    greenfield mode on a transient fetch error."""
+
+    def test_incomplete_listing_yields_undetermined_not_non_empty(self):
+        # 1) The pure classifier: an incomplete listing is undetermined (None),
+        #    not an asserted-non-empty False — even when the fetched portion has
+        #    at or below the greenfield source threshold.
+        below_threshold = [{"name": "README.md", "type": "file"}]
+        assert _classify_repo_emptiness([], listing_complete=False) == (None, None)
+        assert _classify_repo_emptiness(
+            below_threshold, listing_complete=False
+        ) == (None, None)
+
+        # A COMPLETED walk still resolves to a definite True/False — only the
+        # incomplete path is undetermined, so existing determinate consumers
+        # keep their concrete signal.
+        assert _classify_repo_emptiness(below_threshold, listing_complete=True) == (
+            True,
+            0,
+        )
+
+        # 2) The persistence seam: an undetermined None survives BuildConfig
+        #    validation and is DROPPED by model_dump(exclude_none=True), so it
+        #    stores as an absent key — distinguishable from a durable False.
+        from app.schemas import BuildConfig
+
+        undetermined = BuildConfig(repo_is_empty=None).model_dump(exclude_none=True)
+        assert "repo_is_empty" not in undetermined
+
+        durable_false = BuildConfig(repo_is_empty=False).model_dump(exclude_none=True)
+        assert durable_false["repo_is_empty"] is False
+
+    @pytest.mark.asyncio
+    async def test_detect_build_config_incomplete_walk_persists_undetermined(self):
+        # End-to-end through _detect_build_config: a subdir listing that fails to
+        # fetch leaves both repo_is_empty and has_ci undetermined (None), and the
+        # schema round-trip drops the undetermined key rather than asserting it.
+        root_files = [
+            {"name": "README.md", "type": "file"},
+            {"name": "backend", "type": "dir"},
+        ]
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[_resp(200, root_files), _resp(502, {})],
+        ):
+            config = await _detect_build_config("tok", "owner", "repo")
+
+        # Parity: repo_is_empty tracks has_ci — both undetermined on a partial walk.
+        assert config["repo_is_empty"] is None
+        assert config["has_ci"] is None
+
+        from app.schemas import BuildConfig
+
+        persisted = BuildConfig(**config).model_dump(exclude_none=True)
+        assert "repo_is_empty" not in persisted
 
 
 class TestBootstrapGuardIsReachable:
@@ -662,3 +727,143 @@ class TestStaleEmptySignalSelfHeal:
         assert healed is False
         assert project.build_config["repo_is_empty"] is False
         session.commit.assert_not_awaited()
+
+
+# ── Plan no-op guard on greenfield repos ─────────────────────────────────────
+# A plan agent that emits {"subtasks": [], "no_op_reason": "..."} on a project
+# whose durable repo_is_empty is True is silently abandoning onboarding — the
+# direction's "fail-loud" invariant. The greenfield guard in plan_completion.py
+# rejects these with FAILED so the failure is visible and retried rather than
+# accepted as a clean CANCELLED. The guard fires ONLY on repo_is_empty is True;
+# absent or False falls through to the normal CANCELLED path.
+
+
+def _make_plan_task():
+    from app.models import Task, TaskStatus
+
+    return Task(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        title="Build greenfield foundation",
+        payloads=[{"type": "plan", "prompt": "build the initial project structure"}],
+        status=TaskStatus.IN_PROGRESS,
+        context={},
+        created_by="ORCHESTRATOR",
+    )
+
+
+def _make_mock_session(project) -> AsyncMock:
+    session = AsyncMock()
+    session.get.return_value = project
+    return session
+
+
+class TestGreenfieldPlanNoOpRejection:
+    """plan_completion: emptiness-citing no-op must FAIL on greenfield, CANCEL otherwise."""
+
+    @pytest.mark.asyncio
+    async def test_greenfield_emptiness_no_op_fails_loud(self):
+        """Core acceptance test: a plan no-op on a greenfield project must FAIL, not CANCEL."""
+        from app.plan_completion import _handle_plan_completion
+        from app.models import TaskStatus
+
+        project = Project(
+            name="greenfield-project",
+            github_owner="owner",
+            github_repo="greenfield-repo",
+            build_config={"repo_is_empty": True, "source_file_count": 0},
+        )
+        task = _make_plan_task()
+        session = _make_mock_session(project)
+
+        no_op_reason = "the codebase is empty, nothing here to build upon at all"
+        logs = json.dumps({"subtasks": [], "no_op_reason": no_op_reason})
+
+        with (
+            patch(
+                "app.compute_backends.resolve_project_default_container_image",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch("app.failure_classification.classify_failure", return_value="CODE_ERROR"),
+            patch("app.failure_classification.persist_failure_category"),
+            patch("app.routers.agent_status.record_task_result"),
+            patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock),
+        ):
+            await _handle_plan_completion(task, logs, session)
+
+        assert task.status == TaskStatus.FAILED, (
+            f"Expected FAILED but got {task.status} — "
+            "a plan that cites emptiness on a greenfield repo must fail loud, not silently cancel"
+        )
+        assert "greenfield" in (task.latest_status_message or "").lower(), (
+            f"Status message must mention 'greenfield': {task.latest_status_message!r}"
+        )
+        assert task.context.get("greenfield_no_op_rejected") is True
+        assert task.context.get("no_op_reason") == no_op_reason
+
+    @pytest.mark.asyncio
+    async def test_non_greenfield_no_op_cancelled_not_failed(self):
+        """Existing behavior preserved: a no-op on a non-greenfield project must CANCEL cleanly."""
+        from app.plan_completion import _handle_plan_completion
+        from app.models import TaskStatus
+
+        project = Project(
+            name="non-greenfield",
+            github_owner="owner",
+            github_repo="non-greenfield",
+            build_config={"repo_is_empty": False, "language": "python"},
+        )
+        task = _make_plan_task()
+        session = _make_mock_session(project)
+
+        no_op_reason = "the work is already done, the PR was merged three days ago"
+        logs = json.dumps({"subtasks": [], "no_op_reason": no_op_reason})
+
+        with (
+            patch(
+                "app.compute_backends.resolve_project_default_container_image",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch("app.failure_classification.persist_failure_category"),
+        ):
+            await _handle_plan_completion(task, logs, session)
+
+        assert task.status == TaskStatus.CANCELLED, (
+            f"Expected CANCELLED but got {task.status} — "
+            "a legitimate no-op on a non-greenfield project must still cancel cleanly"
+        )
+
+    @pytest.mark.asyncio
+    async def test_undetermined_emptiness_no_op_cancelled_not_failed(self):
+        """Undetermined (absent) repo_is_empty must not trigger the greenfield guard."""
+        from app.plan_completion import _handle_plan_completion
+        from app.models import TaskStatus
+
+        project = Project(
+            name="undetermined-empty",
+            github_owner="owner",
+            github_repo="undetermined",
+            build_config={"language": None},  # repo_is_empty absent — undetermined
+        )
+        task = _make_plan_task()
+        session = _make_mock_session(project)
+
+        no_op_reason = "the codebase is empty, nothing to build here at all indeed"
+        logs = json.dumps({"subtasks": [], "no_op_reason": no_op_reason})
+
+        with (
+            patch(
+                "app.compute_backends.resolve_project_default_container_image",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch("app.failure_classification.persist_failure_category"),
+        ):
+            await _handle_plan_completion(task, logs, session)
+
+        assert task.status == TaskStatus.CANCELLED, (
+            "Undetermined (absent) repo_is_empty must not trigger the greenfield guard — "
+            "only repo_is_empty is True fires it"
+        )

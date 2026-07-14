@@ -396,6 +396,48 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
             if isinstance(_raw_reason, str) and len(_raw_reason.strip()) >= 30:
                 _no_op_reason = _raw_reason.strip()[:2000]
         if _no_op_reason is not None:
+            # GREENFIELD GUARD: a plan that cites emptiness on a greenfield project
+            # silently abandons onboarding — no foundation is built and nothing
+            # retries.  Reject with FAILED so the failure is visible and retried
+            # rather than accepted as a clean CANCELLED no-op.  Only fires when the
+            # durable signal is authoritatively True (is True check); absent or False
+            # falls through to the normal CANCELLED path below.
+            if (project.build_config or {}).get("repo_is_empty") is True:
+                from app.failure_classification import (
+                    classify_failure,
+                    persist_failure_category,
+                )
+                from app.routers.agent_status import record_task_result
+
+                _gf_msg = (
+                    "Plan emitted emptiness no-op on a greenfield repo "
+                    "— foundation must be built"
+                )
+                task.latest_status_message = _gf_msg[:500]
+                task.status = TaskStatus.FAILED
+                _fc = classify_failure(task)
+                persist_failure_category(task, _fc)
+                record_task_result(
+                    success=False,
+                    failure_class=_fc,
+                    task_id=str(task.id),
+                    task_type=task.first_payload.get("type", ""),
+                )
+                ctx = dict(task.context or {})
+                ctx["greenfield_no_op_rejected"] = True
+                ctx["no_op_reason"] = _no_op_reason
+                task.context = ctx
+                session.add(task)
+                await _maybe_create_failure_alert(task, session, _gf_msg)
+                await session.commit()
+                logger.error(
+                    "[PLAN] Greenfield no-op rejected for plan %s — FAILED "
+                    "(reason: %s)",
+                    task.id,
+                    _no_op_reason[:120],
+                )
+                return
+
             from app.failure_classification import SCOPE_EMPTY, persist_failure_category
 
             # Land CANCELLED (matching the SCOPE_EMPTY clean-no-op path in

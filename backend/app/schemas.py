@@ -1088,13 +1088,18 @@ class BuildConfig(BaseModel):
     # at most the greenfield source-file threshold after excluding
     # docs/config/data files, dotfiles, and common manifests. If any listing
     # needed for that determination failed to fetch (root or first-level
-    # subdirectory), the read is incomplete and this degrades to False
-    # (treat-as-non-empty) — emptiness is never inferred from a partial read.
-    # Keep this count-based rule aligned with the agent's prompt-time detector
-    # so research/plan bootstrap guidance and the durable onboarding signal
-    # agree. Default False so pre-existing projects (and any repo with detected
-    # source) degrade gracefully.
-    repo_is_empty: bool = False
+    # subdirectory), the read is incomplete and this stays None (undetermined)
+    # — emptiness is NEVER inferred from a partial read, exactly like the
+    # ``has_ci`` sibling below. Keep this count-based rule aligned with the
+    # agent's prompt-time detector so research/plan bootstrap guidance and the
+    # durable onboarding signal agree. Tri-state: True = the bounded walk
+    # completed and found at most the greenfield source threshold; False = the
+    # walk completed and found more; None = the read was incomplete/undetected
+    # (legacy stored configs also have None). ``model_dump(exclude_none=True)``
+    # drops the key when None so an undetermined partial walk persists as an
+    # absent key (which every consumer coalesces to "consult the live signal /
+    # self-heal") rather than a durable, authoritative False.
+    repo_is_empty: bool | None = None
     # The authoritative real-source-file count from the same bounded onboarding
     # walk that produced ``repo_is_empty`` (documentation/config/dotfiles/common
     # manifests excluded by the shared exclusion rules). Persisted so the agent's

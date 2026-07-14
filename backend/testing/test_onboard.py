@@ -2025,7 +2025,12 @@ class TestBuildConfigDetection:
 
     @pytest.mark.asyncio
     async def test_detect_build_config_not_empty_when_nested_fetch_fails(self):
-        """A failed second-level fetch must not yield repo_is_empty=True."""
+        """A failed second-level fetch must not yield an asserted-non-empty signal.
+
+        An incomplete walk is undetermined (None), never a durable False — the
+        greenfield decision is deferred to the live clone-time signal rather
+        than suppressed by a false negative.
+        """
         root_resp = MagicMock()
         root_resp.status_code = 200
         root_resp.json.return_value = [{"name": "apps", "type": "dir"}]
@@ -2046,7 +2051,7 @@ class TestBuildConfigDetection:
             config = await _detect_build_config("fake-token", "owner", "repo")
 
         assert config["directories"] == []
-        assert config["repo_is_empty"] is False
+        assert config["repo_is_empty"] is None
 
     @pytest.mark.asyncio
     async def test_detect_build_config_sets_repo_is_empty_for_readme_only(self):
@@ -2150,6 +2155,9 @@ class TestBuildConfigDetection:
         Regression: a monorepo whose real source lives under subdirectories
         (backend/, agent/, ...) was classified greenfield when a transient
         subdir listing error left the partial listing looking empty.
+
+        The incomplete walk is now recorded as undetermined (None), never a
+        durable False either — emptiness is never asserted from a partial read.
         """
         root_files = [
             {"name": "README.md", "type": "file"},
@@ -2171,7 +2179,7 @@ class TestBuildConfigDetection:
         ):
             config = await _detect_build_config("fake-token", "owner", "repo")
 
-        assert config["repo_is_empty"] is False
+        assert config["repo_is_empty"] is None
 
     @pytest.mark.asyncio
     async def test_detect_build_config_not_empty_when_root_fetch_fails(self):
@@ -4010,16 +4018,20 @@ class TestClassifyRepoEmptiness:
         ]
         assert _classify_repo_emptiness(items) == (True, 0)
 
-    def test_incomplete_listing_is_not_empty(self):
-        """An incomplete read can never be classified as greenfield."""
-        # Even an empty fetched listing degrades to not-empty when the read
-        # was incomplete (a subdir fetch failed). No count is asserted.
-        assert _classify_repo_emptiness([], listing_complete=False) == (False, None)
+    def test_incomplete_listing_is_undetermined_not_asserted_non_empty(self):
+        """An incomplete read is undetermined (None), never an asserted False.
+
+        Tri-state parity with ``has_ci``: emptiness is never inferred from a
+        partial walk. A transient subdir fetch failure must not stamp a durable,
+        authoritative "not empty" — the greenfield decision is deferred (None)
+        and no count is asserted.
+        """
+        assert _classify_repo_emptiness([], listing_complete=False) == (None, None)
 
     def test_incomplete_listing_overrides_below_threshold(self):
-        """Below-threshold source + incomplete read => still not empty."""
+        """Below-threshold source + incomplete read => undetermined, not False."""
         items = [{"name": "README.md", "type": "file"}]
-        assert _classify_repo_emptiness(items, listing_complete=False) == (False, None)
+        assert _classify_repo_emptiness(items, listing_complete=False) == (None, None)
 
 
 class TestOnboardRepoBootstrapSpawn:
