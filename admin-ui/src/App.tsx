@@ -29,15 +29,12 @@ const TaskDetailDrawer = lazy(() => import('./components/TaskDetailDrawer').then
 import { ToastContainer } from './components/Toasts';
 const AlertsPopover = lazy(() => import('./components/AlertsPopover').then(m => ({ default: m.AlertsPopover })));
 const FleetDetailDrawer = lazy(() => import('./components/FleetDetailDrawer').then(m => ({ default: m.FleetDetailDrawer })));
-import { WelcomeScreen } from './components/WelcomeScreen';
-import { ProjectManagementModal } from './components/ProjectManagementModal';
 import { HeaderBar, PrimaryTabNav } from './components/HeaderBar';
 import { SearchFilterBar, SingleSelectDropdown } from './components/SearchFilterBar';
 import { useStrategicSession } from './hooks/useStrategicSession';
 import { useSettingsRouterProps } from './hooks/useSettingsRouterProps';
 import { normalizePrimaryTab, resolvePrimaryTabTarget, type PrimaryTab } from './hooks/useUIState';
 import { defaultComputeExperimentForm } from './hooks/useTaskModal';
-import { BulkActionBar } from './components/BulkActionBar';
 import type { SortBy } from './components/KanbanBoard';
 import { ACTIVE_PIPELINE_STATUSES, CANCELLABLE_STATUSES, COLUMNS, SORT_KEY, TERMINAL_STATUSES } from './appWorkbenchConstants';
 import { Pagination } from './components/Pagination';
@@ -48,13 +45,16 @@ const ActivityFeed = lazy(() => import('./components/ActivityFeed'));
 const StrategicContextWorkspace = lazy(() => import('./components/StrategicContextWorkspace').then(m => ({ default: m.StrategicContextWorkspace })));
 const StrategicContextRail = lazy(() => import('./components/StrategicContextRail').then(m => ({ default: m.StrategicContextRail })));
 const StrategicSessionControl = lazy(() => import('./components/StrategicSessionControl').then(m => ({ default: m.StrategicSessionControl })));
+const WelcomeScreen = lazy(() => import('./components/WelcomeScreen').then(m => ({ default: m.WelcomeScreen })));
+const ProjectManagementModal = lazy(() => import('./components/ProjectManagementModal').then(m => ({ default: m.ProjectManagementModal })));
+const BulkActionBar = lazy(() => import('./components/BulkActionBar').then(m => ({ default: m.BulkActionBar })));
+const CommandPaletteHost = lazy(() => import('./components/CommandPaletteHost').then(m => ({ default: m.CommandPaletteHost })));
+const KeyboardShortcutsOverlay = lazy(() => import('./components/KeyboardShortcutsOverlay').then(m => ({ default: m.KeyboardShortcutsOverlay })));
+const NullBranchDiagnosticsPanel = lazy(() => import('./components/NullBranchDiagnosticsPanel').then(m => ({ default: m.NullBranchDiagnosticsPanel })));
 import type { StrategicAccountSpendStatus, StrategicInteractionMode } from './components/StrategicSessionControl';
-import { CommandPaletteHost } from './components/CommandPaletteHost';
-import { KeyboardShortcutsOverlay } from './components/KeyboardShortcutsOverlay';
 import { FAILURE_CLASS_CONFIG } from './components/TaskCard';
 import type { Task } from './components/TaskCard';
 import { VersionMismatchBanner } from './components/VersionMismatchBanner';
-import { NullBranchDiagnosticsPanel } from './components/NullBranchDiagnosticsPanel';
 import type { ProjectManageSection, ProjectSection, RuntimeSection, RuntimeSettingsSection } from './components/OperatorWorkspaces';
 const ProjectWorkspace = lazy(() => import('./components/OperatorWorkspaces').then(m => ({ default: m.ProjectWorkspace })));
 const RuntimeWorkspace = lazy(() => import('./components/RuntimeWorkspace').then(m => ({ default: m.RuntimeWorkspace })));
@@ -1171,8 +1171,8 @@ export default function App() {
         gatedTaskTypes={s.gatedTaskTypes}
         costSectionAvailable={activeTab === 'runtime' && runtimeSection === 'analytics'}
       />
-      <CommandPaletteHost open={commandPaletteOpen} commands={workbenchCommands} query={commandPaletteQuery} onQueryChange={setCommandPaletteQuery} setOpen={setCommandPaletteOpen} />
-      <KeyboardShortcutsOverlay open={shortcutHelpOpen} onClose={() => setShortcutHelpOpen(false)} />
+      <Suspense fallback={null}><CommandPaletteHost open={commandPaletteOpen} commands={workbenchCommands} query={commandPaletteQuery} onQueryChange={setCommandPaletteQuery} setOpen={setCommandPaletteOpen} /></Suspense>
+      <Suspense fallback={null}><KeyboardShortcutsOverlay open={shortcutHelpOpen} onClose={() => setShortcutHelpOpen(false)} /></Suspense>
       <Suspense fallback={null}>
       <StrategicContextWorkspace
         open={strategicContextWorkspaceOpen}
@@ -1218,7 +1218,7 @@ export default function App() {
         );
       })()}
       <VersionMismatchBanner />
-      {s.userRole === 'admin' && <NullBranchDiagnosticsPanel onConfigure={handleConfigureBranchProject} />}
+      <Suspense fallback={null}>{s.userRole === 'admin' && <NullBranchDiagnosticsPanel onConfigure={handleConfigureBranchProject} />}</Suspense>
       {s.error && (
         <div className="mb-3 md:mb-6 bg-red-950/50 text-red-400 px-4 py-3 rounded-lg text-sm border border-red-900/50 flex items-center gap-2 shrink-0">
           <AlertCircle className="w-4 h-4" />
@@ -1234,10 +1234,12 @@ export default function App() {
       )}
 
       {showWelcomeScreen ? (
+        <Suspense fallback={null}>
         <WelcomeScreen
           onCreateProject={() => setShowNewProjectModal(true)}
           onSignOut={() => { void signOut(); }}
         />
+        </Suspense>
       ) : (
         <WorkbenchFrame>
       {s.showUserManagement && s.userRole === 'admin' ? (
@@ -1684,6 +1686,7 @@ export default function App() {
       )}
 
       {showProjectManagement && (
+        <Suspense fallback={null}>
         <ProjectManagementModal
           projects={s.projects}
           selectedProjectId={s.selectedProjectId}
@@ -1692,6 +1695,7 @@ export default function App() {
           onSelectProject={s.setSelectedProjectId}
           onClose={() => setShowProjectManagement(false)}
         />
+        </Suspense>
       )}
 
       {s.showResearchBrowser && (
@@ -1769,6 +1773,7 @@ export default function App() {
         </ErrorBoundary>
       )}
 
+      <Suspense fallback={null}>
       {s.selectionMode && s.selectedTaskIds.size > 0 && (
         <BulkActionBar
           selectedCount={s.selectedTaskIds.size}
@@ -1783,6 +1788,7 @@ export default function App() {
           toggleSelectionMode={s.toggleSelectionMode}
         />
       )}
+      </Suspense>
 
       {showActivityFeed && (
         <Suspense fallback={null}>

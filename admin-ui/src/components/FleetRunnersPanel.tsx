@@ -1,5 +1,6 @@
 /* eslint-disable react-hooks/set-state-in-effect */
 import { useState, useCallback, useEffect, useRef, useMemo } from 'react';
+import { usePoller } from '../hooks/usePoller';
 import { Compass, Cpu, Copy, Check, KeyRound, RefreshCw, Trash2, SlidersHorizontal, PauseCircle, PlayCircle, Wind, Activity, AlertTriangle } from 'lucide-react';
 import { API_BASE_URL, listFleetRunners, patchRunnerStatus, registerFleetRunner, revokeFleetRunner, rotateFleetRunnerToken, fetchRunnerTelemetry, fetchRunnerStats, listRunnerProjects, addRunnerProject, removeRunnerProject, listOwnedProjects } from '../api';
 import type { FleetRunner, RunnerTelemetryResponse, RunnerStatsResponse, RunnerProjectAllowList, OwnedProjectSummary } from '../api';
@@ -824,11 +825,12 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
     void run();
   }, [load, refreshSignal]);
 
-  useEffect(() => {
-    if (live === true) return;
-    const interval = setInterval(load, 30000);
-    return () => clearInterval(interval);
-  }, [load, live]);
+  usePoller(() => load(), {
+    intervalMs: 30000,
+    enabled: live !== true,
+    leading: false,
+    deps: [projectId],
+  });
 
   // While the enroll dialog is open, resolve the just-enrolled runner from the
   // list so the dialog can show live "waiting… / connected" feedback. Poll faster
