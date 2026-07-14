@@ -163,6 +163,14 @@ def _onboard_patches(build_config=None, default_branch="main"):
             new_callable=AsyncMock,
             return_value=default_branch,
         ),
+        # Onboarding seeds a commitless repo with its first commit before it
+        # reads the tree, so the trunk it stores actually exists. A no-op here:
+        # these tests onboard repos that already have commits.
+        patch(
+            "app.github.ensure_repo_initialized",
+            new_callable=AsyncMock,
+            return_value=False,
+        ),
     )
 
 
@@ -172,10 +180,10 @@ class TestRepoBootstrapOnboardSpawn:
         self, client: AsyncClient, db_session
     ):
         """Onboarding a non-self-repo, non-empty project spawns a repo_bootstrap task."""
-        detect_patch, token_patch, branch_patch = _onboard_patches(
+        detect_patch, token_patch, branch_patch, seed_patch = _onboard_patches(
             build_config={"language": "python", "repo_is_empty": False}
         )
-        with detect_patch, token_patch, branch_patch:
+        with detect_patch, token_patch, branch_patch, seed_patch:
             resp = await client.post(
                 "/api/admin/projects/onboard",
                 json={"github_owner": "acme", "github_repo": "external-repo"},
@@ -216,10 +224,10 @@ class TestRepoBootstrapOnboardSpawn:
         self, client: AsyncClient, db_session
     ):
         """Onboarding a self-repo project must NOT spawn a repo_bootstrap task."""
-        detect_patch, token_patch, branch_patch = _onboard_patches(
+        detect_patch, token_patch, branch_patch, seed_patch = _onboard_patches(
             build_config={"language": "python", "repo_is_empty": False}
         )
-        with detect_patch, token_patch, branch_patch:
+        with detect_patch, token_patch, branch_patch, seed_patch:
             resp = await client.post(
                 "/api/admin/projects/onboard",
                 json={
@@ -277,10 +285,10 @@ class TestRepoBootstrapOnboardSpawn:
         self, client: AsyncClient, db_session
     ):
         """Onboarding a repo_is_empty=True project must NOT spawn a repo_bootstrap task."""
-        detect_patch, token_patch, branch_patch = _onboard_patches(
+        detect_patch, token_patch, branch_patch, seed_patch = _onboard_patches(
             build_config={"repo_is_empty": True}
         )
-        with detect_patch, token_patch, branch_patch:
+        with detect_patch, token_patch, branch_patch, seed_patch:
             resp = await client.post(
                 "/api/admin/projects/onboard",
                 json={"github_owner": "acme", "github_repo": "empty-repo"},
@@ -312,14 +320,14 @@ class TestRepoBootstrapOnboardSpawn:
         self, client: AsyncClient, db_session
     ):
         """Re-onboarding with bootstrap_completed_at set must NOT spawn a second bootstrap."""
-        detect_patch, token_patch, branch_patch = _onboard_patches(
+        detect_patch, token_patch, branch_patch, seed_patch = _onboard_patches(
             build_config={
                 "language": "python",
                 "repo_is_empty": False,
                 "bootstrap_completed_at": "2026-01-01T00:00:00",
             }
         )
-        with detect_patch, token_patch, branch_patch:
+        with detect_patch, token_patch, branch_patch, seed_patch:
             resp = await client.post(
                 "/api/admin/projects/onboard",
                 json={"github_owner": "acme", "github_repo": "already-bootstrapped"},

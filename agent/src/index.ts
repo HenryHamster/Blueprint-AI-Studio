@@ -2961,6 +2961,41 @@ async function refreshCloneToken(args: string[], taskId: string): Promise<boolea
  *  fresh token and rewrite the clone URL before retrying — a token baked in at
  *  role start can expire during a long queue/provision delay, and every plain
  *  retry would otherwise reuse the same dead token. */
+/**
+ * Git's complaint when the requested branch is not on the remote. The text is
+ * word-for-word identical whether the branch was deleted or the repository has
+ * no commits at all, so this pattern alone cannot tell those two apart.
+ */
+const GIT_BRANCH_MISSING = /remote branch .* not found in upstream|could not find remote branch|couldn't find remote ref/i;
+
+/**
+ * Pull the clone URL out of an assembled `git clone` argv. Scans from the right
+ * so the repo URL wins over `-c credential.https://github.com.helper=...`, which
+ * merely *contains* a URL rather than being one.
+ */
+function extractCloneUrl(args: string[]): string | null {
+  for (let i = args.length - 1; i >= 0; i--) {
+    const a = args[i];
+    if (a.startsWith('https://') || a.startsWith('git@')) return a;
+  }
+  return null;
+}
+
+/**
+ * True when the remote advertises zero refs — i.e. the repository has no commits.
+ * This is the only way to distinguish an empty repo from a deleted branch, and a
+ * false positive would be worse than no answer, so an unanswerable probe reports
+ * "not empty" rather than guessing.
+ */
+async function remoteHasNoCommits(cloneUrl: string): Promise<boolean> {
+  try {
+    const refs = await gitAsync(['ls-remote', '--heads', cloneUrl], '.', 30_000);
+    return refs.trim() === '';
+  } catch {
+    return false;
+  }
+}
+
 export async function cloneWithRetry(args: string[], timeoutMs = GIT_CLONE_TIMEOUT): Promise<void> {
   const taskId = process.env.TASK_ID || '';
   for (let attempt = 0; attempt < CLONE_MAX_RETRIES; attempt++) {
@@ -2969,8 +3004,27 @@ export async function cloneWithRetry(args: string[], timeoutMs = GIT_CLONE_TIMEO
       await gitAsync(args, '.', timeoutMs);
       return;
     } catch (e) {
-      if (attempt === CLONE_MAX_RETRIES - 1) throw e;
       const rawMsg = e instanceof Error ? e.message : String(e);
+
+      // A commitless repo is a deterministic failure: no branch will materialize
+      // on retry, so burning the remaining attempts only delays a diagnosis that
+      // is already available. Probe the remote and fail immediately with the real
+      // reason — left to git's ambiguous text, the backend classifies this as
+      // BRANCH_GONE ("Branch deleted (PR merged before clone)"), which is the
+      // wrong story and reads as a benign race instead of an unseeded repo.
+      if (GIT_BRANCH_MISSING.test(rawMsg)) {
+        const cloneUrl = extractCloneUrl(args);
+        if (cloneUrl && await remoteHasNoCommits(cloneUrl)) {
+          throw new Error(
+            'Clone failed: the repository has no commits, so its default branch does not exist yet. '
+            + 'Blueprint seeds an initial commit when a project is onboarded — this repo was never seeded. '
+            + 'Push any commit to the default branch (or re-onboard the project) to fix. '
+            + `Original git error: ${sanitize(rawMsg)}`
+          );
+        }
+      }
+
+      if (attempt === CLONE_MAX_RETRIES - 1) throw e;
       const delay = CLONE_RETRY_BASE_DELAY * Math.pow(2, attempt);
       const isAuthError = GIT_CLONE_AUTH_ERROR.test(rawMsg);
       log(`Git clone failed (attempt ${attempt + 1}/3)${isAuthError ? ' [auth]' : ''}, retrying in ${delay / 1000}s: ${sanitize(rawMsg)}`);

@@ -177,6 +177,44 @@ def _is_real_source_file(name: str) -> bool:
     return True
 
 
+def _is_empty_repository_response(resp: Any) -> bool:
+    """True when a contents listing failed *because the repo has zero commits*.
+
+    GitHub answers ``GET /contents/`` on a commitless repo with
+    404 ``{"message": "This repository is empty."}`` (and the Git Data endpoints
+    answer 409 ``"Git Repository is empty"``). That is a permanent, meaningful
+    state — not the transient GitHub failure a bare non-200 otherwise implies —
+    and the two must not be conflated: treating it as transient is what let
+    ``repo_is_empty`` default to False and spawned a bootstrap against a repo
+    that can never be cloned.
+    """
+    if resp.status_code not in (404, 409):
+        return False
+    try:
+        message = (resp.json() or {}).get("message", "")
+    except Exception:  # noqa: BLE001 — non-JSON body: not the empty-repo signal
+        return False
+    return "repository is empty" in str(message).lower()
+
+
+def _empty_repo_build_config() -> Dict[str, Any]:
+    """The build config for a repository with no commits.
+
+    Same shape a normal detection returns, so ``detection_completed`` is True
+    and the ``repo_is_empty`` guard in ``repo_bootstrap`` is actually reachable.
+    Nothing is asserted that we did not observe: there is no tree, therefore no
+    language, no directories, and demonstrably no CI.
+    """
+    return {
+        "language": None,
+        "directories": [],
+        "env_vars": {},
+        "detected_at": datetime.now(timezone.utc).isoformat(),
+        "repo_is_empty": True,
+        "has_ci": False,
+    }
+
+
 def _classify_repo_emptiness(
     root_items: list[Dict[str, Any]], listing_complete: bool = True
 ) -> bool:
@@ -605,6 +643,11 @@ async def _detect_build_config(
             params=params,
         )
         if resp.status_code != 200:
+            if _is_empty_repository_response(resp):
+                logger.info(
+                    f"[ONBOARD] {owner}/{repo} has no commits — detected as an empty repo"
+                )
+                return _empty_repo_build_config()
             logger.warning(
                 f"[ONBOARD] Failed to list repo contents for {owner}/{repo}: {resp.status_code}"
             )
@@ -837,7 +880,11 @@ async def onboard_project(
     """
 
     token = None
-    from app.github import get_repo_default_branch, get_repo_installation_token
+    from app.github import (
+        ensure_repo_initialized,
+        get_repo_default_branch,
+        get_repo_installation_token,
+    )
 
     token = await get_repo_installation_token(payload.github_owner, payload.github_repo)
     if not token:
@@ -862,6 +909,33 @@ async def onboard_project(
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"Default branch detection failed: {e}",
+        ) from e
+
+    # A repo with zero commits reports a default_branch that does not exist, so
+    # the trunk we are about to store would be a phantom: every clone in the
+    # fleet passes `--branch <trunk>` and would die with "Remote branch not
+    # found in upstream origin", starting with the repo_bootstrap task that is
+    # supposed to seed this very project. Give it its first commit now, while we
+    # still hold a write-capable installation token, so the trunk is real before
+    # anything tries to clone it. No-op on a repo that already has commits.
+    #
+    # Failing loudly here is deliberate: an un-seeded empty repo produces a
+    # project that can never run a single task, and a 502 at onboarding is far
+    # cheaper to diagnose than a bootstrap that retries forever.
+    try:
+        await ensure_repo_initialized(
+            token,
+            payload.github_owner,
+            payload.github_repo,
+            default_branch,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.warning(f"[ONBOARD] Empty-repo initialization failed: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Empty-repo initialization failed: {e}",
         ) from e
 
     # Auto-detect build config from the same branch Blueprint stores as trunk.

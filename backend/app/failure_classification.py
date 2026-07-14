@@ -181,6 +181,16 @@ BLOCKED_PRECONDITION = "BLOCKED_PRECONDITION"
 # merge. The respawn already skips merged PRs gracefully (review_pipeline); this
 # only stops the FIRST attempt from being mislabeled a code defect.
 BRANCH_GONE = "BRANCH_GONE"
+# The repository has no commits at all, so its default branch does not exist and
+# nothing can be cloned from it. Git reports this with the SAME text as a deleted
+# branch ("Remote branch <trunk> not found in upstream origin"), so without this
+# class it lands in BRANCH_GONE and is shown to operators as "Branch deleted (PR
+# merged before clone)" — a benign, transient-sounding lie about a permanent,
+# structural condition. Distinct class so the reason is the truth: the repo was
+# never seeded. Blueprint seeds empty repos at onboarding
+# (`ensure_repo_initialized`); seeing this class means that seed did not happen
+# or was undone, which is an operator fix, not something a retry can resolve.
+REPO_UNINITIALIZED = "REPO_UNINITIALIZED"
 # Agent completed the task but the PR branch was already deleted (merged and
 # auto-deleted), so there was nothing to review or fix. Similar to SCOPE_EMPTY
 # (task had no work to do), routed to that class so it doesn't consume retry
@@ -583,6 +593,26 @@ _BRANCH_GONE_PATTERNS: tuple[str, ...] = (
 )
 
 
+# Signatures emitted when the remote repository has no commits at all. The agent
+# probes the remote (`git ls-remote`) on a missing-branch clone failure and says
+# so explicitly, because git's own error text cannot tell an empty repo apart
+# from a deleted branch; the GitHub API phrasings are matched too.
+_REPO_UNINITIALIZED_PATTERNS: tuple[str, ...] = (
+    "repository has no commits",
+    "this repository is empty",
+    "git repository is empty",
+)
+
+
+def _is_repo_uninitialized(combined: str) -> bool:
+    """True when the failure text shows the remote repo has zero commits.
+
+    Must be checked BEFORE :func:`_is_branch_gone`: an empty repo's clone error
+    also matches the branch-gone patterns, and the more specific cause wins.
+    """
+    return any(kw in combined for kw in _REPO_UNINITIALIZED_PATTERNS)
+
+
 def _is_branch_gone(combined: str) -> bool:
     """True when the failure text shows the target branch/ref no longer exists.
 
@@ -609,6 +639,7 @@ INFRA_CLASSES: frozenset[str] = frozenset(
         SCOPE_OVERFLOW,
         BLOCKED_PRECONDITION,
         BRANCH_GONE,
+        REPO_UNINITIALIZED,
         AGENT_STALLED,
         SCOPE_EMPTY,
         REASSIGNED,
@@ -667,6 +698,7 @@ ALL_FAILURE_CLASSES: tuple[str, ...] = (
     SCOPE_OVERFLOW,
     BLOCKED_PRECONDITION,
     BRANCH_GONE,
+    REPO_UNINITIALIZED,
     SCOPE_EMPTY,
     REASSIGNED,
     NO_PROGRESS_TIMEOUT,
@@ -2386,6 +2418,13 @@ def _classify_failure_class(
     # clone a generic "fatal" CODE_ERROR, and we must override that to a
     # budget-exempt, visible class so no debug/remediation spawns and no retry
     # slot is burned on a branch that will not reappear.
+    # Checked before branch-gone: a commitless repo fails the clone with the same
+    # "Remote branch ... not found in upstream origin" text as a deleted branch,
+    # so branch-gone would swallow it and report a permanent setup gap as a
+    # benign merged-PR race. The specific cause must win over the generic one.
+    if _is_repo_uninitialized(_classify_combined_lower):
+        return REPO_UNINITIALIZED
+
     if _is_branch_gone(_classify_combined_lower):
         return BRANCH_GONE
 

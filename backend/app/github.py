@@ -1279,6 +1279,8 @@ from app.github_refs import (  # noqa: F401
     merge_branch,
     get_branch_sha,
     get_repo_default_branch,
+    repo_has_commits,
+    ensure_repo_initialized,
     delete_branch,
     list_branches,
     get_commit_date,

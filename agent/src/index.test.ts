@@ -8134,3 +8134,89 @@ describe('resolveCredentialsFromSecretVersion', () => {
     );
   });
 });
+
+// ── cloneWithRetry: commitless repositories ──────────────────────────────────
+// A repo with zero commits has no default branch, so `git clone --branch <trunk>`
+// fails with EXACTLY the same text as a branch that was deleted after its PR
+// merged. Retrying cannot conjure a branch, and letting the ambiguous text stand
+// gets the failure classified BRANCH_GONE ("PR merged before clone") — a benign
+// transient story for a permanent setup gap. The remote is the only oracle: a
+// commitless repo advertises zero refs.
+describe('cloneWithRetry — commitless repo', () => {
+  const CLONE_ARGS = [
+    '-c', 'credential.https://github.com.helper=/home/agent/.blueprint/git-credential-helper',
+    'clone', '--depth', '50', '--branch', 'main',
+    'https://github.com/HenryHamster/playground.git', '/tmp/workspace',
+  ];
+  // The literal stderr from the production failure (task 235d7c59, playground).
+  const BRANCH_MISSING_STDERR =
+    "Cloning into '/tmp/workspace'...\nfatal: Remote branch main not found in upstream origin";
+
+  /** A fake `git` child process: emits its output, then closes with `code`. */
+  function fakeGitProc(code: number, { stdout = '', stderr = '' } = {}) {
+    const proc = {
+      stdout: { on: (ev: string, cb: (d: Buffer) => void) => { if (ev === 'data' && stdout) cb(Buffer.from(stdout)); } },
+      stderr: { on: (ev: string, cb: (d: Buffer) => void) => { if (ev === 'data' && stderr) cb(Buffer.from(stderr)); } },
+      on: (ev: string, cb: (c: number) => void) => { if (ev === 'close') setImmediate(() => { cb(code); }); return proc; },
+      kill: vi.fn(),
+    };
+    return proc;
+  }
+
+  /** Script `git`: the clone always fails branch-missing; `ls-remote` reports
+   *  whatever refs the remote is pretending to have. */
+  function scriptGit(refs: string) {
+    vi.mocked(spawn).mockImplementation(((_cmd: string, args: string[]) => {
+      if (args[0] === 'ls-remote') return fakeGitProc(0, { stdout: refs });
+      return fakeGitProc(128, { stderr: BRANCH_MISSING_STDERR });
+    }) as unknown as typeof spawn);
+  }
+
+  const cloneAttempts = () =>
+    vi.mocked(spawn).mock.calls.filter(c => (c[1] as string[]).includes('clone'));
+  const lsRemoteProbes = () =>
+    vi.mocked(spawn).mock.calls.filter(c => (c[1] as string[])[0] === 'ls-remote');
+
+  beforeEach(() => { vi.mocked(spawn).mockReset(); });
+
+  it('zero refs → fails fast with the real reason, burning no retries', async () => {
+    scriptGit(''); // a commitless repo advertises no refs at all
+
+    await expect(cloneWithRetry(CLONE_ARGS)).rejects.toThrow(/repository has no commits/i);
+
+    // The whole point: one attempt, not three. Retrying a repo that has no
+    // commits is pure latency — the branch cannot appear on its own.
+    expect(cloneAttempts()).toHaveLength(1);
+    expect(lsRemoteProbes()).toHaveLength(1);
+  });
+
+  it('probes the remote over the clone URL, not the credential-helper arg', async () => {
+    scriptGit('');
+    await expect(cloneWithRetry(CLONE_ARGS)).rejects.toThrow(/repository has no commits/i);
+
+    expect(lsRemoteProbes()[0][1]).toEqual([
+      'ls-remote', '--heads', 'https://github.com/HenryHamster/playground.git',
+    ]);
+  });
+
+  it('deleted branch on a real repo → NOT reported as commitless, retries as before', async () => {
+    // Same git error, but the remote still has refs: this is the branch-gone
+    // case and must keep its existing behaviour. If the probe were skipped (or
+    // its result ignored) a merged-PR race would be misreported as an unseeded
+    // repo — the mirror image of the bug this fixes.
+    scriptGit('a1b2c3\trefs/heads/main\nd4e5f6\trefs/heads/develop\n');
+
+    vi.useFakeTimers();
+    try {
+      const attempt = cloneWithRetry(CLONE_ARGS);
+      const assertion = expect(attempt).rejects.toThrow(/not found in upstream origin/i);
+      await vi.runAllTimersAsync();
+      await assertion;
+      await expect(attempt).rejects.not.toThrow(/repository has no commits/i);
+    } finally {
+      vi.useRealTimers();
+    }
+
+    expect(cloneAttempts()).toHaveLength(3); // full retry budget, unchanged
+  });
+});

@@ -286,6 +286,11 @@ class TestOnboardAutoRemediation:
                 return_value="tok",
             ),
             patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
                 "app.github.get_repo_default_branch",
                 new_callable=AsyncMock,
                 return_value="main",
@@ -329,6 +334,11 @@ class TestOnboardAutoRemediation:
                 "app.github.get_repo_installation_token",
                 new_callable=AsyncMock,
                 return_value="tok",
+            ),
+            patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
             ),
             patch(
                 "app.github.get_repo_default_branch",
@@ -378,6 +388,11 @@ class TestOnboardAutoRemediation:
                 return_value="tok",
             ),
             patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
                 "app.github.get_repo_default_branch",
                 new_callable=AsyncMock,
                 return_value="master",
@@ -413,6 +428,11 @@ class TestOnboardAutoRemediation:
                 return_value="tok",
             ),
             patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
                 "app.github.get_repo_default_branch",
                 new_callable=AsyncMock,
                 return_value="trunk",
@@ -442,6 +462,11 @@ class TestOnboardAutoRemediation:
                 "app.github.get_repo_installation_token",
                 new_callable=AsyncMock,
                 return_value="tok",
+            ),
+            patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
             ),
             patch(
                 "app.github.get_repo_default_branch",
@@ -487,6 +512,11 @@ class TestOnboardAutoRemediation:
                 return_value="tok",
             ),
             patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
                 "app.github.get_repo_default_branch",
                 new_callable=AsyncMock,
                 return_value="main",
@@ -519,6 +549,11 @@ class TestOnboardAutoRemediation:
                 "app.github.get_repo_installation_token",
                 new_callable=AsyncMock,
                 return_value="tok",
+            ),
+            patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
             ),
             patch(
                 "app.github.get_repo_default_branch",
@@ -561,6 +596,11 @@ class TestOnboardIssueImplementation:
                 "app.github.get_repo_installation_token",
                 new_callable=AsyncMock,
                 return_value="tok",
+            ),
+            patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
             ),
             patch(
                 "app.github.get_repo_default_branch",
@@ -609,6 +649,11 @@ class TestOnboardBranchConfig:
                 "app.github.get_repo_installation_token",
                 new_callable=AsyncMock,
                 return_value="tok",
+            ),
+            patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
             ),
             patch(
                 "app.github.get_repo_default_branch",
@@ -668,6 +713,11 @@ class TestOnboardBranchConfig:
                 return_value="tok",
             ),
             patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
                 "app.github.get_repo_default_branch",
                 new_callable=AsyncMock,
                 return_value="main",
@@ -716,6 +766,11 @@ class TestOnboardBranchConfig:
                 return_value="tok",
             ),
             patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
                 "app.github.get_repo_default_branch",
                 new_callable=AsyncMock,
                 return_value="main",
@@ -761,6 +816,11 @@ class TestOnboardBranchConfig:
                 return_value="tok",
             ),
             patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
                 "app.github.get_repo_default_branch",
                 new_callable=AsyncMock,
                 return_value="main",
@@ -800,6 +860,11 @@ class TestOnboardBranchConfig:
                 "app.github.get_repo_installation_token",
                 new_callable=AsyncMock,
                 return_value="tok",
+            ),
+            patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
             ),
             patch(
                 "app.github.get_repo_default_branch",
@@ -858,6 +923,11 @@ class TestOnboardBranchConfig:
                 "app.github.get_repo_installation_token",
                 new_callable=AsyncMock,
                 return_value="tok",
+            ),
+            patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
             ),
             patch(
                 "app.github.get_repo_default_branch",
@@ -941,6 +1011,11 @@ class TestOnboardDefaultBranchErrors:
                 return_value="tok",
             ),
             patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
                 "app.github.get_repo_default_branch",
                 new_callable=AsyncMock,
                 side_effect=HTTPException(
@@ -984,6 +1059,11 @@ class TestOnboardDefaultBranchErrors:
                 "app.github.get_repo_installation_token",
                 new_callable=AsyncMock,
                 return_value="tok",
+            ),
+            patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
             ),
             patch(
                 "app.github.get_repo_default_branch",
@@ -1064,6 +1144,11 @@ class TestOnboardTaskBranchNamespace:
                 return_value="tok",
             ),
             patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
                 "app.github.get_repo_default_branch",
                 new_callable=AsyncMock,
                 return_value="main",
@@ -1096,6 +1181,11 @@ class TestOnboardTaskBranchNamespace:
                 return_value="tok",
             ),
             patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
                 "app.github.get_repo_default_branch",
                 new_callable=AsyncMock,
                 return_value="main",
@@ -1125,6 +1215,11 @@ class TestOnboardTaskBranchNamespace:
                 "app.github.get_repo_installation_token",
                 new_callable=AsyncMock,
                 return_value="tok",
+            ),
+            patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
             ),
             patch(
                 "app.github.get_repo_default_branch",
@@ -1162,6 +1257,11 @@ class TestOnboardTaskBranchNamespace:
                 return_value="tok",
             ),
             patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
                 "app.github.get_repo_default_branch",
                 new_callable=AsyncMock,
                 return_value="main",
@@ -1190,6 +1290,11 @@ class TestOnboardTaskBranchNamespace:
                 "app.github.get_repo_installation_token",
                 new_callable=AsyncMock,
                 return_value="tok",
+            ),
+            patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
             ),
             patch(
                 "app.github.get_repo_default_branch",
@@ -1230,6 +1335,11 @@ class TestOnboardBranchBackfillIntegration:
                 return_value="tok",
             ),
             patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
                 "app.github.get_repo_default_branch",
                 new_callable=AsyncMock,
                 return_value="develop",
@@ -1267,6 +1377,11 @@ class TestOnboardBranchBackfillIntegration:
                 "app.github.get_repo_installation_token",
                 new_callable=AsyncMock,
                 return_value="tok",
+            ),
+            patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
             ),
             patch(
                 "app.github.get_repo_default_branch",
@@ -1394,6 +1509,11 @@ class TestOnboardStrategicIntentSeed:
                 "app.github.get_repo_installation_token",
                 new_callable=AsyncMock,
                 return_value="tok",
+            ),
+            patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
             ),
             patch(
                 "app.github.get_repo_default_branch",
@@ -3490,6 +3610,11 @@ class TestOnboardDetectionIncompleteMarker:
                 return_value="tok",
             ),
             patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
                 "app.github.get_repo_default_branch",
                 new_callable=AsyncMock,
                 return_value="main",
@@ -3642,6 +3767,11 @@ class TestOnboardRepoBootstrapSpawn:
                 return_value="tok",
             ),
             patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
                 "app.github.get_repo_default_branch",
                 new_callable=AsyncMock,
                 return_value="main",
@@ -3698,6 +3828,11 @@ class TestOnboardRepoBootstrapSpawn:
                 return_value="tok",
             ),
             patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
                 "app.github.get_repo_default_branch",
                 new_callable=AsyncMock,
                 return_value="main",
@@ -3744,6 +3879,11 @@ class TestOnboardWarmPool:
                 return_value="tok",
             ),
             patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
                 "app.github.get_repo_default_branch",
                 new_callable=AsyncMock,
                 return_value="main",
@@ -3774,11 +3914,12 @@ class TestOnboardWarmPool:
         fake_lock.__aenter__ = AsyncMock(return_value=None)
         fake_lock.__aexit__ = AsyncMock(return_value=False)
 
-        p1, p2, p3 = self._common_patches()
+        p1, p2, p3, p4 = self._common_patches()
         with (
             p1,
             p2,
             p3,
+            p4,
             patch("app.routers.admin_settings._apply_settings", _fake_apply),
             patch("app.routers.admin_warm_pool._seed_project_pool", _fake_seed),
             patch("app.warm_pool.warm_pool_project_scope", return_value=set()),
@@ -3825,11 +3966,12 @@ class TestOnboardWarmPool:
             seed_calls.append(project_id)
             return {}
 
-        p1, p2, p3 = self._common_patches()
+        p1, p2, p3, p4 = self._common_patches()
         with (
             p1,
             p2,
             p3,
+            p4,
             patch("app.routers.admin_warm_pool._seed_project_pool", _fake_seed),
         ):
             resp = await client.post(
@@ -3852,11 +3994,12 @@ class TestOnboardWarmPool:
         async def _fake_apply(payload, session, config):
             apply_calls.append(payload)
 
-        p1, p2, p3 = self._common_patches()
+        p1, p2, p3, p4 = self._common_patches()
         with (
             p1,
             p2,
             p3,
+            p4,
             patch("app.routers.admin_settings._apply_settings", _fake_apply),
         ):
             resp = await client.post(
