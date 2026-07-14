@@ -356,6 +356,33 @@ def _runner_gpu_in_container_capable(
     return False
 
 
+def _job_requires_gpu_in_container(
+    accelerator: str | None,
+    container_image: str | None,
+    vram_gb: float | None,
+) -> bool:
+    """Whether a job's declaration requires the runner to expose a GPU INSIDE the
+    container — the trigger condition for the :func:`_runner_gpu_in_container_capable`
+    gate.
+
+    True only when a ``container_image`` is declared AND the job asks for a GPU. A
+    GPU is asked for by EITHER an explicit ``accelerator`` string OR a positive
+    ``vram_gb`` GPU-memory floor: VRAM exists only on a GPU, so an imaged job that
+    reserves VRAM but omits an ``accelerator`` string still needs GPU passthrough
+    into the container and would otherwise fail at runtime with "no supported GPU
+    detected". This mirrors :func:`_runner_gpu_in_container_capable`'s own contract
+    ("container_image AND ``accelerator``/``vram_gb``") — keeping the DISPATCH
+    trigger and the CAPABILITY predicate aligned so the two never drift.
+
+    A non-positive / absent ``vram_gb`` is no GPU request on its own (matching the
+    ``vram_gb is not None and vram_gb > 0`` VRAM-fit gate in
+    ``_select_eligible_runner``), so a plain CPU imaged job is unaffected.
+    """
+    if not container_image:
+        return False
+    return bool(accelerator) or (vram_gb is not None and vram_gb > 0)
+
+
 def _runner_max_concurrent_compute(
     runner: LocalRunner | RunnerDispatchSnapshot,
 ) -> int | None:

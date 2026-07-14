@@ -9588,6 +9588,60 @@ class TestDirectComputeExperimentDispatch:
         assert await _compute_job_for_task(db_session, task.id) is None
 
     @pytest.mark.asyncio
+    async def test_strict_runner_pin_holds_when_gpu_in_container_unavailable_vram_only(
+        self, db_session
+    ):
+        """A job that declares container_image + vram_gb but NO accelerator string
+        is still a GPU job (VRAM lives on a GPU). A strict pin to a docker runner
+        with a GPU but no CDI/hook must hold with the combined
+        missing_gpu_in_container_capability reason — the gate must not be bypassed
+        just because the accelerator key is absent."""
+        project = await _make_project(db_session)
+        docker_runner, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "has_gpu": True,
+                "gpu_count": 1,
+                "gpu_free_vram_mib": [40960],  # plenty of free VRAM
+                "max_concurrent": 2,
+                "isolation_backends": {"docker_usable": True, "docker_cdi_gpu": False},
+            },
+        )
+        task = Task(
+            project_id=project.id,
+            payloads=[
+                _ce_payload(
+                    vram_gb=8.0,
+                    container_image="my-image:latest",
+                    runner_target={"runner_id": str(docker_runner.id), "strict": True},
+                )
+            ],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        outcome = await orch._dispatch_compute_experiment_directly(
+            db_session, task, {project.id: [docker_runner]}, {}
+        )
+
+        assert outcome == "held"
+        await db_session.refresh(task)
+        hold = (task.context or {}).get("runner_pin_hold")
+        assert hold is not None
+        assert hold["reason_code"] == "missing_gpu_in_container_capability", (
+            f"expected 'missing_gpu_in_container_capability', got {hold['reason_code']}"
+        )
+        # The honest detail must name the vram_gb GPU requirement, not a bogus
+        # accelerator string it never had.
+        assert "vram_gb" in hold["detail"], (
+            f"detail must name the vram_gb GPU requirement: {hold['detail']!r}"
+        )
+        assert await _compute_job_for_task(db_session, task.id) is None
+
+    @pytest.mark.asyncio
     async def test_launch_holds_when_no_gpu_arch_compatible_runner(self, db_session):
         """ACCEPTANCE: an image declaring a min_compute_capability above a runner's
         advertised gpu_compute_capabilities is NOT dispatched to that runner — the

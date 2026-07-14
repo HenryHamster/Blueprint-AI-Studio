@@ -1268,6 +1268,77 @@ def test_select_eligible_runner_image_plus_gpu_excludes_no_gpu_docker():
     )
 
 
+def test_job_requires_gpu_in_container_trigger_conditions():
+    """The dispatch trigger fires only for an imaged job that ALSO asks for a GPU —
+    via an accelerator string OR a positive vram_gb — and never for a plain CPU
+    imaged job or a GPU job with no image."""
+    from app.orchestrator_runner_dispatch import _job_requires_gpu_in_container
+
+    img = "my-image:latest"
+    # Image + accelerator → trigger.
+    assert _job_requires_gpu_in_container("gpu", img, None) is True
+    # Image + positive vram_gb, no accelerator → trigger (VRAM lives on a GPU).
+    assert _job_requires_gpu_in_container(None, img, 8.0) is True
+    assert _job_requires_gpu_in_container("", img, 8.0) is True
+    # Image only, no GPU ask → no trigger (plain CPU container job).
+    assert _job_requires_gpu_in_container(None, img, None) is False
+    assert _job_requires_gpu_in_container(None, img, 0) is False
+    assert _job_requires_gpu_in_container(None, img, 0.0) is False
+    # GPU ask but no image → no trigger (nothing to expose a GPU *into*).
+    assert _job_requires_gpu_in_container("gpu", None, None) is False
+    assert _job_requires_gpu_in_container(None, None, 8.0) is False
+
+
+def test_select_eligible_runner_image_plus_vram_only_excludes_no_cdi_docker():
+    """A container_image + vram_gb job with NO accelerator string is still a GPU
+    job: a docker runner with a GPU and free VRAM but no CDI/hook must be excluded
+    by the GPU-in-container gate, leaving only the CDI-capable runner."""
+    from app.orchestrator_runner_dispatch import (
+        _select_eligible_runner,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    # Has a GPU with free VRAM, docker present, but NO CDI and (no hook because
+    # has_gpu False) — cannot expose a GPU inside the container.
+    no_gpu_in_container = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "has_gpu": False,
+            "gpu_free_vram_mib": [40960],
+            "isolation_backends": {"docker_usable": True, "docker_cdi_gpu": False},
+        },
+    )
+    cdi_docker = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "has_gpu": True,
+            "gpu_count": 1,
+            "gpu_free_vram_mib": [40960],
+            "isolation_backends": {"docker_usable": True, "docker_cdi_gpu": True},
+        },
+    )
+    cache = {project_id: [no_gpu_in_container, cdi_docker]}
+    selected = _select_eligible_runner(
+        active_runners_cache=cache,
+        project_id=project_id,
+        task_type="compute_experiment",
+        accelerator=None,  # NO accelerator string — only a vram_gb GPU-memory ask
+        runner_pins_this_cycle={},
+        container_image="my-image:latest",
+        vram_gb=8.0,
+    )
+    assert selected is not None
+    assert selected.id == cdi_docker.id, (
+        "a vram_gb+image job must exclude the non-GPU-in-container docker runner "
+        "even without an explicit accelerator string"
+    )
+
+
 def test_select_eligible_runner_image_plus_gpu_selects_hook_or_cdi():
     """Both CDI and hook docker runners are eligible for image+GPU jobs."""
     from app.orchestrator_runner_dispatch import (
@@ -12843,6 +12914,86 @@ async def test_gpu_in_container_ineligible_holds_with_honest_reason(
     assert "no live runner has docker_usable capability" not in msg, (
         "must not claim docker is missing when it is present — that is the bug "
         f"this hold fixes: {msg!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_gpu_in_container_hold_fires_for_vram_only_no_accelerator(
+    db_session, mocker
+):
+    """A compute_experiment declaring container_image + vram_gb but NO accelerator
+    string is still a GPU job (VRAM lives on a GPU). When every live runner has a
+    container runtime but no GPU-in-container passthrough it must hit the HONEST
+    GPU-in-container hold — not be silently routed to a runner that would fail at
+    runtime, and not fall through to the generic docker-missing hold.
+    """
+    from app.orchestrator_runner_dispatch import (
+        _dispatch_compute_experiment_directly,
+        RunnerDispatchSnapshot,
+    )
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project = make_project(name="GpuInContainerVramHoldProject", user_id=_TEST_USER)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "command": "python3 train.py",
+                "spend_cap_usd": 5.0,
+                "deadline_seconds": 1800,
+                # No "accelerator" — the GPU ask is expressed only via vram_gb.
+                "vram_gb": 8.0,
+                "container_image": "registry.example.com/myproject:sha256-abc",
+            }
+        ],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id = task.id
+
+    # docker present, GPU present with free VRAM, but no CDI and no verified hook
+    # (has_gpu False) → cannot expose a GPU inside the container.
+    runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        capabilities={
+            "task_types": "all",
+            "has_gpu": False,
+            "gpu_free_vram_mib": [40960],
+            "isolation_backends": {"docker_usable": True, "docker_cdi_gpu": False},
+        },
+    )
+    active_runners_cache = {project.id: [runner]}
+
+    result = await _dispatch_compute_experiment_directly(
+        db_session, task, active_runners_cache, runner_pins_this_cycle={}
+    )
+
+    assert result == "held", f"expected 'held', got {result!r}"
+    refreshed = await db_session.get(Task, task_id)
+    assert refreshed.status == TaskStatus.QUEUED
+    ctx = refreshed.context or {}
+    assert ctx.get("awaiting_container_runner_since"), (
+        "the vram-only GPU-in-container hold must reuse the bounded-wait stamp"
+    )
+    msg = refreshed.latest_status_message or ""
+    assert "GPU inside the container" in msg or "GPU-in-container" in msg, (
+        f"status message must name the GPU-in-container passthrough blocker: {msg!r}"
+    )
+    # The honest reason names the vram_gb GPU requirement, not a bogus accelerator.
+    assert "vram_gb" in msg, (
+        f"vram-only hold message should name the vram_gb requirement: {msg!r}"
+    )
+    assert "no live runner has docker_usable capability" not in msg, (
+        "must not claim docker is missing when it is present"
     )
 
 

@@ -289,6 +289,7 @@ from app.runner_eligibility import (  # noqa: F401
     _ACTIVE_AGENT_TASK_COUNT_KEY,
     RunnerDispatchSnapshot,
     _coerce_max_concurrent,
+    _job_requires_gpu_in_container,
     _runner_active_compute_job_count,
     _runner_active_task_count,
     _runner_active_work_count,
@@ -946,6 +947,7 @@ async def _diagnose_strict_runner_pin_hold(
     container_image: str | None,
     runner_pins_this_cycle: dict[uuid.UUID, int],
     min_compute_capability: float | None = None,
+    vram_gb: float | None = None,
     declined_record: dict | None = None,
 ) -> tuple[str, str]:
     """Explain why a strict-pinned runner cannot take this job RIGHT NOW.
@@ -1038,11 +1040,18 @@ async def _diagnose_strict_runner_pin_hold(
                 f"but the runner's GPUs report {reported} — the image cannot run on "
                 "this architecture",
             )
-        if accelerator and container_image and not _runner_gpu_in_container_capable(snapshot):
+        if _job_requires_gpu_in_container(
+            accelerator, container_image, vram_gb
+        ) and not _runner_gpu_in_container_capable(snapshot):
+            gpu_req = (
+                f"accelerator {accelerator!r}"
+                if accelerator
+                else f"vram_gb {vram_gb!r}"
+            )
             return (
                 "missing_gpu_in_container_capability",
                 f"job declares both container_image {container_image!r} and "
-                f"accelerator {accelerator!r} but the runner's container backend "
+                f"{gpu_req} but the runner's container backend "
                 "cannot expose GPUs inside the container (no CDI and no "
                 "nvidia-hook for docker; no native GPU-capable container runtime)",
             )
@@ -1219,15 +1228,16 @@ def _select_eligible_runner(
             # disk_free_bytes are not gated (backward compatible).
             disk_floor = _container_image_min_free_disk_bytes()
             out = [r for r in out if _runner_has_free_disk(r, disk_floor)]
-        if accelerator and container_image:
-            # Combined gate: when BOTH a container image AND an accelerator are
-            # required, the runner must be GPU-in-container capable — merely
-            # having a container runtime AND a GPU independently is not enough
-            # (the job would launch in the container and fail at runtime with
-            # "no supported GPU detected"). A CDI daemon
-            # (docker_cdi_gpu) or an nvidia-hook docker runner (has_gpu verified)
-            # both satisfy this gate; non-docker containers (podman, apptainer,
-            # enroot) handle GPU passthrough natively.
+        if _job_requires_gpu_in_container(accelerator, container_image, vram_gb):
+            # Combined gate: when a container image is required AND the job asks
+            # for a GPU (an explicit accelerator OR a positive vram_gb GPU-memory
+            # floor — VRAM lives only on a GPU), the runner must be GPU-in-container
+            # capable — merely having a container runtime AND a GPU independently is
+            # not enough (the job would launch in the container and fail at runtime
+            # with "no supported GPU detected"). A CDI daemon (docker_cdi_gpu) or an
+            # nvidia-hook docker runner (has_gpu verified) both satisfy this gate;
+            # non-docker containers (podman, apptainer, enroot) handle GPU
+            # passthrough natively.
             out = [r for r in out if _runner_gpu_in_container_capable(r)]
         if vram_gb is not None and vram_gb > 0:
             required_mib = int(vram_gb * 1024)
@@ -1845,6 +1855,7 @@ async def _dispatch_compute_experiment_directly(
             container_image,
             runner_pins_this_cycle,
             min_compute_capability=min_compute_capability,
+            vram_gb=vram_gb,
             # A strict `runner_target` pin is passed to _select_eligible_runner as
             # a SOFT preference, so the decline exclusion DOES drop the pinned
             # runner from the candidate pool (unlike an operator hard pin, which
@@ -2065,7 +2076,9 @@ async def _dispatch_compute_experiment_directly(
     # falls through to the generic hold below, and a fleet with no live runner at
     # all falls through to the cloud backend. Reuses the container-runner hold stamp
     # so the existing bounded-wait sweep covers it unchanged.
-    if runner is None and accelerator and container_image:
+    if runner is None and _job_requires_gpu_in_container(
+        accelerator, container_image, vram_gb
+    ):
         project_runners = active_runners_cache.get(task.project_id) or []
         gpu_in_container_blocked = any(
             _runner_has_container_capability(r)
@@ -2073,10 +2086,11 @@ async def _dispatch_compute_experiment_directly(
             for r in project_runners
         )
         if gpu_in_container_blocked:
+            gpu_req = "an accelerator" if accelerator else f"vram_gb={vram_gb!r}"
             hold_msg = (
                 "Waiting for a runner that can expose a GPU inside the container: "
-                f"job declares both container_image={container_image!r} and an "
-                "accelerator, but every container-capable runner lacks GPU-in-"
+                f"job declares both container_image={container_image!r} and "
+                f"{gpu_req}, but every container-capable runner lacks GPU-in-"
                 "container passthrough (no CDI daemon and no verified nvidia docker "
                 "hook). Docker/the container runtime IS present — enable CDI "
                 "(nvidia-ctk) or the nvidia container runtime so the GPU can be "
@@ -2096,10 +2110,12 @@ async def _dispatch_compute_experiment_directly(
                 await session.commit()
             logger.info(
                 "[RUNNERS] Holding compute_experiment %s: container_image (%r) + "
-                "accelerator declared but no live runner has GPU-in-container "
-                "passthrough (docker present, CDI/nvidia-hook missing)",
+                "GPU requirement (%s) declared but no live runner has "
+                "GPU-in-container passthrough (docker present, CDI/nvidia-hook "
+                "missing)",
                 task.id,
                 container_image,
+                gpu_req,
             )
             return "held"
 
