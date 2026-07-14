@@ -1820,6 +1820,15 @@ export interface FleetRunner {
     // to speak the live-config contract (never reports); True but still pending =
     // reported a stale/rejected generation. Distinguishes those honest cases.
     daemon_reports_applied?: boolean;
+    // Structured config-apply outcome the daemon reported (all additive/optional).
+    // apply_status: 'applied' | 'rejected'. apply_reason names the offending
+    // field(s) — the backend only surfaces it as LIVE when the rejected
+    // generation matches the currently-desired generation (a stale reason tied to
+    // a superseded generation is suppressed to null). rejected_config_generation
+    // is the generation the daemon could not apply. All absent on a legacy daemon.
+    apply_status?: string | null;
+    apply_reason?: string | null;
+    rejected_config_generation?: string | null;
     gpu_indices_allowed?: 'all' | number[];
     // Number of GPUs the runner reserves per compute job (server-authoritative,
     // mirrored top-level for the fleet editor). Absent on runners enrolled before

@@ -1581,6 +1581,33 @@ describe('FleetRunnersPanel — behavioral', () => {
     expect(badge?.textContent).not.toContain('runner too old');
   });
 
+  test('stuck config with a structured rejection reason renders the honest reason, not the ambiguous label', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([
+      {
+        ...SAMPLE_RUNNERS[0],
+        last_seen_at: new Date(Date.now() - 30_000).toISOString(), // live
+        config: {
+          config_generation: 'gen-new',
+          applied_config_generation: 'gen-old',
+          config_pending: true,
+          desired_changed_at: new Date(Date.now() - 5 * 60 * 1000).toISOString(),
+          daemon_reports_applied: true,
+          // Backend already suppressed a stale reason, so a present reason is live.
+          apply_status: 'rejected',
+          apply_reason: 'unrecognized config field(s): foo',
+          rejected_config_generation: 'gen-new',
+        },
+      },
+    ]);
+    const el = await mount();
+
+    const badge = el.querySelector('[data-testid="fleet-runner-config-status"]');
+    expect(badge?.textContent).toContain('config rejected — unrecognized config field(s): foo');
+    expect(badge?.className).toContain('text-red-300');
+    // The honest reason REPLACES the ambiguous fallback.
+    expect(badge?.textContent).not.toContain('rejected it or is stuck');
+  });
+
   test('pending config on an OFFLINE runner reads neutral "queued", never red', async () => {
     vi.mocked(listFleetRunners).mockResolvedValueOnce([
       {
@@ -2422,5 +2449,108 @@ describe('FleetRunnersPanel — behavioral', () => {
 
     expect(el.textContent).toContain('cannot attach a project owned by a different account');
     vi.mocked(listFleetRunners).mockReset();
+  });
+
+  // ── End-to-end enroll walkthrough (single chained test) ─────────────────────
+
+  test('runner-enroll walkthrough: cold start → token dialog → prerequisites → durable install → waiting → timeout fallback → keep-waiting re-arm → connected', async () => {
+    const clipboardWrite = vi.fn(async () => {});
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText: clipboardWrite },
+    });
+
+    // Use fake timers so we can advance past the bounded connect-wait timeout.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      // The runner never connects during the timeout phase (wrong token scenario).
+      vi.mocked(listFleetRunners).mockResolvedValue(SAMPLE_RUNNERS);
+
+      const el = await mount();
+
+      // ── Step 1: click "Enroll runner" ─────────────────────────────────────
+      const enrollBtn = [...el.querySelectorAll('button')].find(b => b.textContent?.includes('Enroll runner'));
+      expect(enrollBtn, 'Enroll runner button must be present').not.toBeNull();
+      await act(async () => { (enrollBtn as HTMLButtonElement).click(); });
+      await act(async () => {});
+
+      // registerFleetRunner was called for this project.
+      expect(registerFleetRunner).toHaveBeenCalledWith('proj-test');
+      // Token dialog appeared with the one-time secret.
+      expect(el.textContent).toContain('Runner enrolled');
+      expect(el.textContent).toContain('tok-secret-xyz');
+      expect(el.textContent).toContain('shown only once');
+
+      // ── Step 2: prerequisites block names real host requirements ───────────
+      const prereq = el.querySelector('[data-testid="runner-prerequisites"]');
+      expect(prereq, 'runner-prerequisites block must be present').not.toBeNull();
+      expect(prereq?.textContent).toContain('Node.js >= 22');
+      expect(prereq?.textContent).toContain('@anthropic-ai/claude-code');
+      expect(prereq?.textContent).toContain('bash blueprint-runner check');
+
+      // ── Step 3: durable install path is offered as recommended ────────────
+      expect(el.textContent).toContain('Durable install');
+      expect(el.textContent).toContain('recommended');
+      const installBtn = el.querySelector('button[title="Copy Linux — per-user service install snippet"]');
+      expect(installBtn, 'Per-user install copy button must be present').not.toBeNull();
+      await act(async () => { (installBtn as HTMLButtonElement).click(); });
+      expect(clipboardWrite).toHaveBeenLastCalledWith(
+        expect.stringContaining('bash blueprint-runner install --token'),
+      );
+
+      // ── Step 4: connection status reads "Waiting" ─────────────────────────
+      const statusEl = () => el.querySelector('[data-testid="runner-connection-status"]');
+      expect(statusEl(), 'runner-connection-status must be present').not.toBeNull();
+      expect(statusEl()?.textContent).toContain('Waiting for your runner to connect');
+
+      // ── Step 5: advance past the bounded timeout — "Not connected yet" ─────
+      await act(async () => { await vi.advanceTimersByTimeAsync(95_000); });
+
+      expect(statusEl()?.textContent).toContain('Not connected yet');
+      expect(statusEl()?.textContent).toContain('bash blueprint-runner check');
+      expect(statusEl()?.textContent).not.toContain('Waiting for your runner to connect');
+
+      // ── Step 6: "Keep waiting" re-arms the optimistic state ───────────────
+      const keepBtn = [...el.querySelectorAll('button')].find(b => b.textContent?.trim() === 'Keep waiting');
+      expect(keepBtn, '"Keep waiting" button must be present after timeout').not.toBeNull();
+      await act(async () => { (keepBtn as HTMLButtonElement).click(); });
+
+      expect(statusEl()?.textContent).toContain('Waiting for your runner to connect');
+      expect(statusEl()?.textContent).not.toContain('Not connected yet');
+
+      // ── Step 7: runner's first heartbeat — status flips to "Connected" ─────
+      const connectedNew: FleetRunner = {
+        id: 'runner-new',
+        hostname: 'walkthrough-host',
+        version: null,
+        status: 'active',
+        capabilities: { task_types: 'all', has_gpu: false, max_concurrent: 1 },
+        health: {
+          device_status: 'connected',
+          device_status_reason: null,
+          is_live: true,
+          seconds_since_last_seen: 3,
+          active_task_count: 0,
+          active_compute_job_count: 0,
+          active_work_count: 0,
+          max_concurrent: 1,
+          available_slots: 1,
+          stale_reason: null,
+          agent_available: true,
+          liveness_window_seconds: 300,
+        },
+        last_seen_at: new Date().toISOString(),
+        created_at: '2026-07-14T00:00:00Z',
+      };
+      vi.mocked(listFleetRunners).mockResolvedValue([...SAMPLE_RUNNERS, connectedNew]);
+      const refreshBtn = el.querySelector('button[aria-label="Refresh runners"]');
+      await act(async () => { (refreshBtn as HTMLButtonElement).click(); });
+      await act(async () => {});
+
+      expect(statusEl()?.textContent).toContain('Connected on this project');
+      expect(statusEl()?.textContent).toContain('walkthrough-host');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

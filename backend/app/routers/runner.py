@@ -516,6 +516,16 @@ class HeartbeatRequest(BaseModel):
     applied_task_types: List[StrictStr] | str | None = None
     applied_gpu_indices_allowed: List[int] | str | None = None
     applied_gpus_per_job: int | None = None
+    # ── Structured config-apply outcome (additive, all optional) ──────────────
+    # When a pushed config block cannot be fully applied (unrecognized non-null
+    # field), the daemon reports a structured outcome: config_apply_status
+    # ("applied"/"rejected"), config_apply_reason (naming the offending
+    # field(s)), and config_rejected_generation (the generation it could not
+    # apply, so the server can distinguish a current failure from a stale one
+    # tied to a superseded generation). All None on an older daemon.
+    config_apply_status: str | None = None
+    config_apply_reason: str | None = None
+    config_rejected_generation: str | None = None
 
 
 # ── /next-task work bounds (runtime-configurable) ────────────────────────────
@@ -1435,6 +1445,18 @@ async def heartbeat(
         applied_report["gpus_per_job"] = max(1, int(payload.applied_gpus_per_job))
     if applied_report:
         caps["applied_config"] = applied_report
+    # Structured config-apply outcome. Same merge discipline: dedicated caps keys,
+    # only written when the daemon reports them, never clobbering the desired
+    # subset. config_apply_status is only meaningful alongside a reason/rejected
+    # generation, so persist each field independently when present.
+    if payload.config_apply_status is not None:
+        caps["config_apply_status"] = str(payload.config_apply_status)[:32]
+    if payload.config_apply_reason is not None:
+        caps["config_apply_reason"] = str(payload.config_apply_reason)[:500]
+    if payload.config_rejected_generation is not None:
+        caps["config_rejected_generation"] = str(payload.config_rejected_generation)[
+            :128
+        ]
     if payload.hostname:
         runner.hostname = payload.hostname[:255]
     if payload.version:

@@ -2994,3 +2994,113 @@ async def test_agent_fetch_tools_cross_project_404(client: AsyncClient, db_sessi
         headers={"x-agent-token": token},
     )
     assert resp.status_code == 404
+
+
+# ===========================================================================
+# End-to-end walkthrough: register → auto-slug → explicit-collision → disable/enable
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_walkthrough_disable_enable_chain(client: AsyncClient, db_session):
+    """E2E walkthrough: register a tool (default slug) → register a second of the same kind
+    and assert auto-uniquified slug (SEV2) → explicit-collision slug → 409 → disable the
+    first tool and verify it leaves the list enabled=False and the agent fetch → re-enable
+    and verify the list and agent fetch reflect the restored state."""
+    from app.auth import create_agent_token
+    from app.models import Task
+
+    # Setup: project with owner membership + a task for agent-token minting
+    project = await _make_project_member(db_session)
+    task = Task(
+        project_id=project.id,
+        vm_instance_id="walkthrough-agent-vm",
+        status="QUEUED",
+        payloads=[{"type": "create", "prompt": "walkthrough"}],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Step 1: register first tool — no explicit slug → default slug = kind name
+    r1 = await client.post(
+        f"{_BASE}/projects/{project.id}/tools",
+        json={"kind": "notes", "title": "First Notes"},
+    )
+    assert r1.status_code == 200, r1.text
+    tool1 = r1.json()
+    assert tool1["slug"] == "notes"
+    assert tool1["enabled"] is True
+    tool1_id = tool1["id"]
+
+    # Step 2: register second tool of same kind without explicit slug → auto-uniquified (SEV2)
+    r2 = await client.post(
+        f"{_BASE}/projects/{project.id}/tools",
+        json={"kind": "notes", "title": "Second Notes"},
+    )
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["slug"] == "notes-2", (
+        f"second tool of same kind must auto-uniquify; got {r2.json()['slug']!r}"
+    )
+
+    # Step 3: explicit slug collision → 409 (auto-uniquify must not weaken this guard)
+    r3 = await client.post(
+        f"{_BASE}/projects/{project.id}/tools",
+        json={"kind": "whiteboard", "slug": "notes"},
+    )
+    assert r3.status_code == 409
+
+    # Step 4: write content to tool1 so it surfaces in the agent-facing fetch
+    put_content = await client.put(
+        f"{_BASE}/projects/{project.id}/tools/{tool1_id}/content",
+        json={"content": {"text": "# Walkthrough\n\nTest hypothesis"}, "base_revision": 0},
+    )
+    assert put_content.status_code == 200
+
+    agent_token = create_agent_token(str(task.id), "walkthrough-agent-vm")
+
+    # Step 5: disable tool1 → list shows enabled=False, agent fetch excludes it
+    patch_off = await client.patch(
+        f"{_BASE}/projects/{project.id}/tools/{tool1_id}",
+        json={"enabled": False},
+    )
+    assert patch_off.status_code == 200
+    assert patch_off.json()["enabled"] is False
+
+    list_after_disable = (await client.get(f"{_BASE}/projects/{project.id}/tools")).json()["tools"]
+    tool1_in_list = next(t for t in list_after_disable if t["id"] == tool1_id)
+    assert tool1_in_list["enabled"] is False
+
+    agent_resp_off = await client.get(
+        f"/api/agent/projects/{project.id}/tools",
+        headers={"x-agent-token": agent_token},
+    )
+    assert agent_resp_off.status_code == 200
+    agent_slugs_off = [t["slug"] for t in agent_resp_off.json()["tools"]]
+    assert "notes" not in agent_slugs_off, (
+        "disabled tool must not appear in agent-facing content fetch"
+    )
+
+    # Step 6: re-enable tool1 → list shows enabled=True, agent fetch includes it
+    patch_on = await client.patch(
+        f"{_BASE}/projects/{project.id}/tools/{tool1_id}",
+        json={"enabled": True},
+    )
+    assert patch_on.status_code == 200
+    assert patch_on.json()["enabled"] is True
+
+    list_after_enable = (await client.get(f"{_BASE}/projects/{project.id}/tools")).json()["tools"]
+    tool1_re_enabled = next(t for t in list_after_enable if t["id"] == tool1_id)
+    assert tool1_re_enabled["enabled"] is True
+
+    agent_resp_on = await client.get(
+        f"/api/agent/projects/{project.id}/tools",
+        headers={"x-agent-token": agent_token},
+    )
+    assert agent_resp_on.status_code == 200
+    agent_tools_on = {t["slug"]: t for t in agent_resp_on.json()["tools"]}
+    assert "notes" in agent_tools_on, (
+        "re-enabled tool with content must appear in agent-facing content fetch"
+    )
+    assert "Walkthrough" in agent_tools_on["notes"]["text"]

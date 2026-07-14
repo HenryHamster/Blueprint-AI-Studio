@@ -550,6 +550,24 @@ def _runner_config_view(capabilities: Dict[str, Any] | None) -> Dict[str, Any]:
     desired_changed_at = caps.get("live_config_changed_at")
     if not isinstance(desired_changed_at, str):
         desired_changed_at = None
+    # Structured config-apply outcome (additive, tolerant of legacy caps). The
+    # daemon-reported reason is only LIVE when the rejected generation matches the
+    # currently-desired generation — a reason tied to a superseded generation is
+    # stale (the operator has since changed the desired config) and must not be
+    # shown as the current failure. An older daemon reports none of these → None.
+    apply_status = caps.get("config_apply_status")
+    if not isinstance(apply_status, str):
+        apply_status = None
+    rejected_generation = caps.get("config_rejected_generation")
+    if not isinstance(rejected_generation, str):
+        rejected_generation = None
+    raw_reason = caps.get("config_apply_reason")
+    if not isinstance(raw_reason, str):
+        raw_reason = None
+    # Suppress a stale reason whose rejected generation no longer matches desired.
+    apply_reason = (
+        raw_reason if rejected_generation == desired_generation else None
+    )
     return {
         "desired": desired,
         "config_generation": desired_generation,
@@ -558,6 +576,9 @@ def _runner_config_view(capabilities: Dict[str, Any] | None) -> Dict[str, Any]:
         "config_pending": applied_generation != desired_generation,
         "desired_changed_at": desired_changed_at,
         "daemon_reports_applied": applied_generation is not None,
+        "apply_status": apply_status,
+        "apply_reason": apply_reason,
+        "rejected_config_generation": rejected_generation,
         "gpu_indices_allowed": desired["gpu_indices_allowed"],
         "gpus_per_job": desired["gpus_per_job"],
     }

@@ -373,3 +373,103 @@ describe('ProjectToolHost — compute image status panel', () => {
     expect(h().textContent).toContain('Up to date');
   });
 });
+
+// ---------------------------------------------------------------------------
+// End-to-end owner walkthrough (chained flow)
+// ---------------------------------------------------------------------------
+
+const WALKTHROUGH_ENABLED: ProjectTool = {
+  id: 'tool-enabled',
+  kind: 'mock-widget',
+  slug: 'mock-widget-enabled',
+  title: 'My Enabled Widget',
+  enabled: true,
+  placement: 'project_section',
+  content_revision: 0,
+  config: {},
+};
+
+const WALKTHROUGH_DISABLED: ProjectTool = {
+  id: 'tool-disabled',
+  kind: 'mock-widget',
+  slug: 'mock-widget-disabled',
+  title: 'My Disabled Widget',
+  enabled: false,
+  placement: 'project_section',
+  content_revision: 0,
+  config: {},
+};
+
+const WALKTHROUGH_TOOLS: FetchProjectToolsResult = {
+  tools: [WALKTHROUGH_ENABLED, WALKTHROUGH_DISABLED],
+  total_count: 2,
+  next_offset: null,
+};
+
+describe('ProjectToolHost — owner walkthrough (end-to-end chained flow)', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    vi.mocked(fetchProjectTools).mockResolvedValue(WALKTHROUGH_TOOLS);
+    vi.mocked(fetchProjectToolManifest).mockResolvedValue({
+      tools: [MANIFEST_TOOL],
+      skills: [],
+      error: null,
+    });
+    vi.mocked(fetchToolKinds).mockResolvedValue(KINDS);
+    vi.mocked(fetchComputeImageStatus).mockResolvedValue({ status: 'no_compute_image_declared' });
+    vi.mocked(fetchAssetToken).mockResolvedValue({ token: 't', expires_at: '2026-07-14T12:00:00Z' });
+    vi.mocked(updateProjectTool).mockImplementation(
+      (_pid, _tid, patch) => Promise.resolve({ ...WALKTHROUGH_ENABLED, ...patch } as ProjectTool),
+    );
+  });
+
+  afterEach(() => {
+    if (root) act(() => { root?.unmount(); });
+    root = null;
+    host?.remove();
+    host = null;
+    localStorage.clear();
+    vi.clearAllMocks();
+  });
+
+  test('owner walks the full project-tools flow without a dead end', async () => {
+    await mount(<ProjectToolHost projectId="proj-walkthrough" myRole="owner" />);
+
+    // Step 1: disabled tool is visible with an Enable control — not silently hidden
+    expect(h().textContent).toContain('My Disabled Widget');
+    const enableBtn = Array.from(h().querySelectorAll('button')).find(
+      b => b.textContent === 'Enable',
+    );
+    expect(enableBtn).toBeTruthy();
+    // The disabled tool's widget body is suppressed, but the row is present
+    expect(h().textContent).not.toContain('My Disabled Widget content');
+
+    // Step 2: manifest-declared tool appears alongside the registered tools
+    expect(h().textContent).toContain('Custom Viewer');
+
+    // Step 3: click Enable → updateProjectTool called with {enabled: true}
+    await act(async () => { enableBtn!.click(); });
+    expect(vi.mocked(updateProjectTool)).toHaveBeenCalledWith(
+      'proj-walkthrough',
+      'tool-disabled',
+      { enabled: true },
+    );
+
+    // Step 4: owner sees Configure control (member-role gating covered by dedicated tests)
+    expect(findButton('Configure')).toBeTruthy();
+
+    // Step 5: hide the manifest tool → it disappears and localStorage records the slug
+    const hideBtn = requireButton('Hide');
+    await act(async () => { hideBtn.click(); });
+    expect(findButton('Hide')).toBeUndefined();
+    expect([...loadHiddenManifestSlugs('proj-walkthrough')]).toContain('custom-viewer');
+
+    // Step 6: Show hidden restore affordance is reachable — hiding is not a permanent trap
+    const showHiddenBtn = requireButton('Show hidden');
+
+    // Step 7: click Show hidden → manifest tool reappears and localStorage is cleared
+    await act(async () => { showHiddenBtn.click(); });
+    expect(findButton('Hide')).toBeTruthy();
+    expect(loadHiddenManifestSlugs('proj-walkthrough').size).toBe(0);
+  });
+});

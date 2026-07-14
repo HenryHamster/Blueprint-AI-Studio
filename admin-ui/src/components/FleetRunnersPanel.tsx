@@ -241,6 +241,20 @@ function configStatus(
       tone: 'bad',
     };
   }
+  // The daemon echoed an applied generation but is still not converged. When it
+  // reported a STRUCTURED rejection reason (backend already suppressed a stale
+  // reason tied to a superseded generation), surface it honestly instead of the
+  // ambiguous "rejected it or is stuck". Fall back to the ambiguous label only
+  // for a legacy daemon that never reported a reason.
+  const reason = config.apply_reason;
+  if (reason) {
+    return {
+      label: `config rejected — ${reason}`,
+      cls: CONFIG_STATUS_CLS.bad,
+      pending: false,
+      tone: 'bad',
+    };
+  }
   return {
     label: 'config not applied — runner rejected it or is stuck',
     cls: CONFIG_STATUS_CLS.bad,

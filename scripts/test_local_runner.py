@@ -741,6 +741,46 @@ class TestLiveRunnerConfig(unittest.TestCase):
         self.assertFalse(holder.apply("not-a-dict"))
         self.assertEqual(holder.max_concurrent(), 2)
 
+    def test_reports_structured_rejected_reason_and_clears_on_apply(self):
+        """A not-fully-applicable block reports a structured rejection naming the
+        offending field(s) and the rejected generation; a fully-applied block
+        clears the rejection state back to an 'applied' outcome."""
+        holder, _ = self._holder()
+        # Clean baseline: no rejection.
+        self.assertTrue(holder.apply({"max_concurrent": 3, "config_generation": "g0"}))
+        rep = holder.report()
+        self.assertEqual(rep["config_apply_status"], "applied")
+        self.assertIsNone(rep["config_apply_reason"])
+        self.assertIsNone(rep["config_rejected_generation"])
+
+        # An unrecognized non-null field is rejected; known field still applied.
+        applied = holder.apply({
+            "max_concurrent": 6,
+            "zzz_field": "x",
+            "aaa_field": 1,
+            "config_generation": "g1",
+        })
+        self.assertFalse(applied)
+        self.assertEqual(holder.max_concurrent(), 6)  # known field still clamped/applied
+        rep = holder.report()
+        self.assertEqual(rep["config_apply_status"], "rejected")
+        # Reason names the specific unrecognized field(s), sorted for determinism.
+        self.assertEqual(
+            rep["config_apply_reason"],
+            "unrecognized config field(s): aaa_field, zzz_field",
+        )
+        self.assertEqual(rep["config_rejected_generation"], "g1")
+        # Applied generation stays at the last fully-applied one.
+        self.assertEqual(rep["applied_config_generation"], "g0")
+
+        # A fully-applicable generation clears the rejection state.
+        self.assertTrue(holder.apply({"max_concurrent": 4, "config_generation": "g2"}))
+        rep = holder.report()
+        self.assertEqual(rep["config_apply_status"], "applied")
+        self.assertIsNone(rep["config_apply_reason"])
+        self.assertIsNone(rep["config_rejected_generation"])
+        self.assertEqual(rep["applied_config_generation"], "g2")
+
 
 class TestComputePollLoopLiveConfig(unittest.TestCase):
     """_compute_poll_loop gates on the LIVE compute limit, not the static arg."""

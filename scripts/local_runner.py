@@ -2210,6 +2210,13 @@ class _LiveRunnerConfig:
         # None until the first server generation is applied; the server treats a
         # null applied generation as pending/unknown (never an error).
         self._applied_generation: str | None = None
+        # Structured rejection state: when a config block cannot be fully applied
+        # (an unrecognized non-null field), record WHY (naming the offending
+        # field(s)) and WHICH generation was rejected so the server/UI can render
+        # an honest "config rejected — <reason>" badge instead of the ambiguous
+        # "rejected it or is stuck". Cleared once a generation applies fully.
+        self._rejection_reason: str | None = None
+        self._rejected_generation: str | None = None
 
     @classmethod
     def _clamp(cls, value) -> int:
@@ -2245,6 +2252,17 @@ class _LiveRunnerConfig:
                 "applied_task_types": self._task_types,
                 "applied_gpu_indices_allowed": self._gpu_indices_allowed,
                 "applied_gpus_per_job": self._gpus_per_job,
+                # Structured apply outcome (additive): "applied" when the last
+                # delivered generation was fully applied, "rejected" when a field
+                # could not be applied. config_apply_reason names the offending
+                # field(s); config_rejected_generation is the generation that was
+                # rejected so the server can tell a current failure from a stale
+                # one tied to a superseded generation. All None on a clean apply.
+                "config_apply_status": (
+                    "rejected" if self._rejection_reason is not None else "applied"
+                ),
+                "config_apply_reason": self._rejection_reason,
+                "config_rejected_generation": self._rejected_generation,
             }
 
     def apply(self, config) -> bool:
@@ -2262,11 +2280,13 @@ class _LiveRunnerConfig:
         # so we refuse to claim the generation as applied and keep reporting the
         # older one (the server renders it as still-pending).
         fully_applicable = True
+        unrecognized: list[str] = []
         for key, value in config.items():
             if key == "config_generation":
                 continue
             if key not in self._KNOWN_KEYS and value is not None:
                 fully_applicable = False
+                unrecognized.append(str(key))
 
         with self._lock:
             mc = config.get("max_concurrent")
@@ -2287,6 +2307,17 @@ class _LiveRunnerConfig:
                 self._apply_gpus_per_job_locked(config.get("gpus_per_job"))
             if fully_applicable and isinstance(generation, str) and generation:
                 self._applied_generation = generation
+            if fully_applicable:
+                # A clean apply clears any prior rejection state.
+                self._rejection_reason = None
+                self._rejected_generation = None
+            else:
+                self._rejection_reason = "unrecognized config field(s): " + ", ".join(
+                    sorted(unrecognized)
+                )
+                self._rejected_generation = (
+                    generation if isinstance(generation, str) and generation else None
+                )
         return fully_applicable
 
     def _apply_gpu_allowlist_locked(self, raw) -> None:

@@ -610,6 +610,51 @@ class TestRunnerConfigView:
         assert too_old["daemon_reports_applied"] is False
         assert rejected["daemon_reports_applied"] is True
 
+    def test_runner_config_reports_rejected_reason(self):
+        """``_runner_config_view`` surfaces the daemon's structured apply-rejection
+        reason ONLY when the rejected generation matches the currently-desired
+        generation; a reason tied to a superseded generation is stale and
+        suppressed to None (the operator has since changed the desired config)."""
+        from app.routers.admin_runners import _runner_config_view
+        from app.runner_config import live_safe_config_generation
+
+        # Case A — rejection tied to the CURRENT desired generation → live reason.
+        caps_live = {"max_concurrent": 4}
+        desired_gen = live_safe_config_generation(caps_live)
+        caps_live.update(
+            {
+                "config_apply_status": "rejected",
+                "config_apply_reason": "unrecognized config field(s): foo",
+                "config_rejected_generation": desired_gen,
+            }
+        )
+        view_live = _runner_config_view(caps_live)
+        assert view_live["apply_status"] == "rejected"
+        assert view_live["apply_reason"] == "unrecognized config field(s): foo"
+        assert view_live["rejected_config_generation"] == desired_gen
+
+        # Case B — rejection tied to a SUPERSEDED generation → reason suppressed.
+        # The operator has since changed the desired config, so the daemon's stale
+        # rejection (against an old generation) must NOT read as the current failure.
+        caps_stale = {
+            "max_concurrent": 8,  # different desired subset → different generation
+            "config_apply_status": "rejected",
+            "config_apply_reason": "unrecognized config field(s): foo",
+            "config_rejected_generation": "some-old-generation",
+        }
+        view_stale = _runner_config_view(caps_stale)
+        # The raw daemon-reported status/generation still pass through additively…
+        assert view_stale["apply_status"] == "rejected"
+        assert view_stale["rejected_config_generation"] == "some-old-generation"
+        # …but the REASON is suppressed because it is tied to a superseded generation.
+        assert view_stale["apply_reason"] is None
+
+        # Case C — legacy daemon reports none of the structured fields → all None.
+        view_legacy = _runner_config_view({"max_concurrent": 2})
+        assert view_legacy["apply_status"] is None
+        assert view_legacy["apply_reason"] is None
+        assert view_legacy["rejected_config_generation"] is None
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Per-job GPU count as a LIVE-SAFE, operator-configurable runner-config knob.
@@ -917,3 +962,117 @@ class TestRunnerMemoryTelemetryContract:
         assert entry["low_memory"] >= 1
         # The per-runner health inside the summary carries the flag the UI renders.
         assert any(r["health"]["memory_low"] for r in entry["runners"])
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# End-to-end runner-enroll walkthrough
+#
+# Chains the server side of the enroll flow in one scenario:
+#   register (token minted) → heartbeat (runner goes live) → rotate token →
+#   revoke (runner deleted), asserting each endpoint's success shape and that
+#   the runner's state is visible in the list endpoint between steps.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestRunnerEnrollWalkthrough:
+    """Server-side walkthrough of the enroll flow, step by step in one scenario."""
+
+    @pytest.mark.asyncio
+    async def test_enroll_walkthrough_register_heartbeat_rotate_revoke(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session, "Enroll Walkthrough Project")
+
+        # ── Step 1: register — token minted ──────────────────────────────────
+        reg_resp = await client.post(
+            f"/api/admin/projects/{project.id}/runners/register",
+            json={"hostname": "walkthrough-box"},
+        )
+        assert reg_resp.status_code == 200, reg_resp.text
+        reg = reg_resp.json()
+        assert "runner_id" in reg
+        assert "token" in reg
+        runner_id = reg["runner_id"]
+        token = reg["token"]
+        assert token  # one-time token must be non-empty
+
+        # List endpoint shows the newly registered runner (not yet live).
+        list_resp = await client.get(f"/api/admin/projects/{project.id}/runners")
+        assert list_resp.status_code == 200, list_resp.text
+        rows = list_resp.json()
+        assert any(r["id"] == runner_id for r in rows), "runner not found in list after register"
+        row = next(r for r in rows if r["id"] == runner_id)
+        assert row["hostname"] == "walkthrough-box"
+        assert row["status"] == "active"
+        # Runner has not heartbeated yet — last_seen_at is null.
+        assert row["last_seen_at"] is None
+
+        # ── Step 2: heartbeat — runner appears live ───────────────────────────
+        hb_resp = await client.post(
+            "/api/runner/heartbeat",
+            json={"active_task_ids": [], "active_work_report": True},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert hb_resp.status_code == 200, hb_resp.text
+
+        # List endpoint shows the runner is now live (last_seen_at set).
+        list_resp2 = await client.get(f"/api/admin/projects/{project.id}/runners")
+        assert list_resp2.status_code == 200, list_resp2.text
+        rows2 = list_resp2.json()
+        row2 = next(r for r in rows2 if r["id"] == runner_id)
+        assert row2["last_seen_at"] is not None, "last_seen_at must be set after heartbeat"
+        # Health should now show the runner as connected (recent heartbeat).
+        health = row2.get("health") or {}
+        assert health.get("device_status") == "connected"
+
+        # ── Step 3: rotate token — old token invalidated, new token minted ───
+        rot_resp = await client.post(
+            f"/api/admin/projects/{project.id}/runners/{runner_id}/rotate-token",
+        )
+        assert rot_resp.status_code == 200, rot_resp.text
+        rot = rot_resp.json()
+        assert rot["runner_id"] == runner_id
+        assert "token" in rot
+        new_token = rot["token"]
+        assert new_token != token, "rotated token must differ from the original"
+
+        # Old token is now invalid — heartbeat with it must return 401/403.
+        old_hb = await client.post(
+            "/api/runner/heartbeat",
+            json={"active_task_ids": []},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert old_hb.status_code in (401, 403), (
+            f"old token should be rejected after rotation, got {old_hb.status_code}"
+        )
+
+        # New token still authenticates successfully.
+        new_hb = await client.post(
+            "/api/runner/heartbeat",
+            json={"active_task_ids": [], "active_work_report": True},
+            headers={"Authorization": f"Bearer {new_token}"},
+        )
+        assert new_hb.status_code == 200, new_hb.text
+
+        # ── Step 4: revoke — runner is deleted and absent from active list ────
+        del_resp = await client.delete(
+            f"/api/admin/projects/{project.id}/runners/{runner_id}",
+        )
+        assert del_resp.status_code == 200, del_resp.text
+
+        # After revocation the runner no longer appears in the active list.
+        list_resp3 = await client.get(f"/api/admin/projects/{project.id}/runners")
+        assert list_resp3.status_code == 200, list_resp3.text
+        rows3 = list_resp3.json()
+        active_ids = [r["id"] for r in rows3]
+        assert runner_id not in active_ids, "revoked runner must not appear in active list"
+
+        # The revoked runner's token can no longer authenticate.
+        revoked_hb = await client.post(
+            "/api/runner/heartbeat",
+            json={"active_task_ids": []},
+            headers={"Authorization": f"Bearer {new_token}"},
+        )
+        assert revoked_hb.status_code in (401, 403), (
+            f"revoked runner token should be rejected, got {revoked_hb.status_code}"
+        )
