@@ -19888,7 +19888,14 @@ async def test_provisioning_retry_deadline_starts_at_retry_time_not_stale_tick_s
         cap=600.0,
     )
     max_backoff = backoff / 0.8 * 1.2  # undo the jitter band both ways
-    assert (deadline - before).total_seconds() <= max_backoff + 5
+    # The deadline is stamped at retry time (retry_at), which lies somewhere in
+    # [before, after] — so `deadline - before` is at most the backoff PLUS however
+    # long the retry call actually took (its DB round-trips). Bound the tolerance
+    # by the MEASURED call window rather than a fixed fudge: a loaded CI shard can
+    # make the DB work take several seconds, and a hardcoded `+5` turned that real
+    # timing into a flaky failure (the test passed in isolation, failed under load).
+    call_window = (after - before).total_seconds()
+    assert (deadline - before).total_seconds() <= max_backoff + call_window + 1
 
 
 def test_viewable_pipeline_streams_bundle_and_peak_memory_is_bounded(tmp_path):
