@@ -1800,6 +1800,15 @@ export interface FleetRunner {
     // True whenever the operator changed config but the daemon has not yet
     // echoed the matching generation (includes the never-reported case).
     config_pending?: boolean;
+    // ISO timestamp of when the desired live-safe config last actually changed
+    // (operator PATCH or enrollment baseline). Paired with last_seen_at it lets
+    // the UI bound how long a push has been pending and flag a STUCK state.
+    // Absent on runners enrolled before this stamp existed (unknown, not stuck).
+    desired_changed_at?: string | null;
+    // Whether the daemon has EVER echoed an applied generation. False = too old
+    // to speak the live-config contract (never reports); True but still pending =
+    // reported a stale/rejected generation. Distinguishes those honest cases.
+    daemon_reports_applied?: boolean;
     gpu_indices_allowed?: 'all' | number[];
     // Number of GPUs the runner reserves per compute job (server-authoritative,
     // mirrored top-level for the fleet editor). Absent on runners enrolled before

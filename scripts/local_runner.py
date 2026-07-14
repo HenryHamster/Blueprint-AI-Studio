@@ -2227,6 +2227,13 @@ def _heartbeat_loop(
     version = _runner_version()
     consecutive_401 = 0
     consecutive_network_failures = 0
+    # Whether ANY heartbeat has ever authenticated (200/204). A token that has
+    # never authenticated and gets a 401 is definitively bad (wrong/revoked, or a
+    # deleted runner) — the daemon fast-fails on that first 401 rather than
+    # retrying ~max_auth_failures times as if it were transient. A token that DID
+    # authenticate before keeps the existing re-arm/streak behavior (an inactive
+    # row re-arms on an authenticated heartbeat; a mid-life revoke is retried).
+    ever_authenticated = False
     while not _shutdown_event.is_set():
         try:
             with lock:
@@ -2407,6 +2414,7 @@ def _heartbeat_loop(
             if status in (200, 204):
                 consecutive_401 = 0
                 consecutive_network_failures = 0
+                ever_authenticated = True
                 # Parse orchestrator version hint so the runner can detect staleness.
                 if isinstance(resp_body, dict):
                     # Apply the server-authoritative live-safe config block (if
@@ -2514,6 +2522,21 @@ def _heartbeat_loop(
                     agent_backend=agent_backend,
                     compute_backend=compute_backend,
                 )
+                if not ever_authenticated:
+                    # First-ever contact was rejected AND the token on disk did not
+                    # change (the reload branch above would have `continue`d). This
+                    # token has never authenticated, so it is almost certainly wrong,
+                    # revoked, or for a deleted runner — retrying it max_auth_failures
+                    # times just delays an inevitable failure behind an optimistic
+                    # "waiting…" spinner. Fail fast with an actionable message.
+                    _die(
+                        "heartbeat rejected with 401 and this runner token has never "
+                        "authenticated — it is almost certainly wrong, revoked, or for "
+                        "a deleted runner. Re-copy the token from the Blueprint console "
+                        "(Fleet -> Enroll runner) and restart, or write the correct "
+                        "token to the runner's token file. Exiting non-zero instead of "
+                        "retrying a token that has never worked."
+                    )
                 if max_auth_failures and consecutive_401 >= max_auth_failures:
                     _die(
                         f"heartbeat rejected with 401 for {consecutive_401} consecutive "

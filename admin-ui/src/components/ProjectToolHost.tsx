@@ -675,6 +675,9 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
 
   function renderToolContent(): ReactNode {
     if (effective.status !== 'ok') return null;
+    // Disabled DB-backed tools are kept visible (their own "Disabled" section
+    // below, with working Enable / Remove controls) — filtering them out of
+    // existence entirely was the permanent-disable trap.
     const enabledTools = effective.tools.filter(t => t.enabled);
     const disabledTools = effective.tools.filter(t => !t.enabled);
     const registeredTools = enabledTools.filter(t => getToolComponent(t.kind) !== undefined);
@@ -691,11 +694,28 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
       hiddenManifestCount > 0 ||
       manifestSkills.length > 0;
 
+    // A durable "N hidden" restore bar so hiding is never itself a trap — shown
+    // even in the empty state so the last hidden tool can always be recovered.
+    const restoreBar = hiddenManifestCount > 0 ? (
+      <div className="flex items-center gap-2 text-xs text-neutral-500">
+        <span>{hiddenManifestCount} project-declared tool{hiddenManifestCount === 1 ? '' : 's'} hidden.</span>
+        <button
+          type="button"
+          data-viewport-allow-small-target
+          onClick={unhideAllManifestTools}
+          className="text-xs font-semibold text-indigo-400 hover:text-indigo-300"
+        >
+          Show hidden
+        </button>
+      </div>
+    ) : null;
+
     if (!hasAnyTool) {
       return (
-        <>
+        <div className="space-y-3">
           <p className="text-sm text-neutral-500">No tools registered for this project.</p>
-        </>
+          {restoreBar}
+        </div>
       );
     }
 
@@ -707,9 +727,27 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
             const ToolComponent = getToolComponent(tool.kind);
             if (!ToolComponent) return null;
             return (
-              <div key={tool.id} className="min-w-0 space-y-1.5">
-                <WorkbenchPanel title={tool.title}>
-                  <ToolComponent projectId={projectId} tool={tool} />
+              <div
+                key={tool.id}
+                className={`min-w-0 space-y-1.5${tool.enabled ? '' : ' opacity-60'}`}
+              >
+                <WorkbenchPanel
+                  title={tool.title}
+                  meta={
+                    tool.enabled ? undefined : (
+                      <span className="inline-flex items-center gap-1 rounded border border-neutral-600 px-1.5 py-0.5 text-ui-sm font-medium uppercase tracking-wider text-neutral-400">
+                        Disabled
+                      </span>
+                    )
+                  }
+                >
+                  {tool.enabled ? (
+                    <ToolComponent projectId={projectId} tool={tool} />
+                  ) : (
+                    <p className="py-8 text-center text-xs text-neutral-500">
+                      This tool is disabled. Enable it to use it.
+                    </p>
+                  )}
                 </WorkbenchPanel>
                 {/* Per-tool management actions (owner only) */}
                 {isOwner && (
@@ -801,6 +839,8 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
             </div>
           )}
         </div>
+
+        {restoreBar}
 
         {/* Disabled tools — kept visible so they can be re-enabled or removed
             (a disabled tool must never become a permanent dead-end). Owner-only:

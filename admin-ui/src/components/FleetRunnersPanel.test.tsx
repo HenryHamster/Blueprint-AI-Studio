@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { FleetRunnersPanel } from './FleetRunnersPanel';
-import { runnerSetupSnippets, DEFAULT_ORCHESTRATOR_URL } from './FleetRunnersPanel.utils';
+import { runnerSetupSnippets, runnerInstallSnippet, RUNNER_PREREQUISITES, DEFAULT_ORCHESTRATOR_URL } from './FleetRunnersPanel.utils';
 import type { FleetRunner } from '../api';
 
 const SAMPLE_RUNNERS: FleetRunner[] = [
@@ -145,6 +145,31 @@ describe('FleetRunnersPanel — behavioral', () => {
     const prod = runnerSetupSnippets('tok', DEFAULT_ORCHESTRATOR_URL);
     expect(prod.macosLinux).toBe("bash blueprint-runner start --token 'tok'");
     expect(prod.macosLinux).not.toContain('--url');
+  });
+
+  test('runnerInstallSnippet builds durable systemd install commands with safe quoting', () => {
+    const install = runnerInstallSnippet("tok'abc", 'https://blueprint.test/a path');
+    // Per-user (systemd --user) and system-wide (sudo) durable service installs.
+    expect(install.userService).toContain('bash blueprint-runner install');
+    expect(install.userService).not.toContain('sudo');
+    expect(install.systemService).toContain('sudo bash blueprint-runner install --system');
+    // The token rides on --token, single-quote-escaped for bash.
+    expect(install.userService).toContain("--token 'tok'\\''abc'");
+    expect(install.systemService).toContain("--token 'tok'\\''abc'");
+    // A non-default backend surfaces an explicit --url override on both.
+    expect(install.userService).toContain("--url 'https://blueprint.test/a path'");
+    expect(install.systemService).toContain("--url 'https://blueprint.test/a path'");
+
+    // Prod default backend omits --url (baked into the launcher).
+    const prod = runnerInstallSnippet('tok', DEFAULT_ORCHESTRATOR_URL);
+    expect(prod.userService).toBe("bash blueprint-runner install --token 'tok'");
+    expect(prod.userService).not.toContain('--url');
+
+    // Prerequisites cover the real host requirements the launcher checks.
+    const joined = RUNNER_PREREQUISITES.join(' ');
+    expect(joined).toContain('Node.js >= 22');
+    expect(joined).toContain('@anthropic-ai/claude-code');
+    expect(joined).toContain('blueprint-runner check');
   });
 
   // ── livenessLabel ────────────────────────────────────────────────────────────
@@ -306,7 +331,7 @@ describe('FleetRunnersPanel — behavioral', () => {
     // same for every preset (the preset is encoded server-side on the runner row).
     expect(el.textContent).toContain('py -3 scripts/blueprint_runner.py start');
     expect(el.textContent).toContain('bash blueprint-runner start');
-    expect(el.textContent).toContain('Run this from the repo root; the first heartbeat connects it below.');
+    expect(el.textContent).toContain('the first heartbeat connects it below');
 
     const psCopyBtn = el.querySelector('button[title="Copy Windows PowerShell setup snippet"]');
     const shellCopyBtn = el.querySelector('button[title="Copy macOS/Linux setup snippet"]');
@@ -415,6 +440,80 @@ describe('FleetRunnersPanel — behavioral', () => {
     const statusAfter = el.querySelector('[data-testid="runner-connection-status"]');
     expect(statusAfter?.textContent).toContain('Connected on this project');
     expect(statusAfter?.textContent).toContain('operator-laptop');
+  });
+
+  test('enroll dialog surfaces prerequisites and the durable install path', async () => {
+    const clipboardWrite = vi.fn(async () => {});
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText: clipboardWrite },
+    });
+    const el = await mount();
+
+    const enrollBtn = [...el.querySelectorAll('button')].find(b => b.textContent?.includes('Enroll runner'));
+    await act(async () => { (enrollBtn as HTMLButtonElement).click(); });
+    await act(async () => {});
+
+    // Prerequisites block names the real host requirements (no more bare command).
+    const prereq = el.querySelector('[data-testid="runner-prerequisites"]');
+    expect(prereq).not.toBeNull();
+    expect(prereq?.textContent).toContain('Node.js >= 22');
+    expect(prereq?.textContent).toContain('@anthropic-ai/claude-code');
+    expect(prereq?.textContent).toContain('bash blueprint-runner check');
+
+    // Durable install path is offered as the recommended option, copyable.
+    expect(el.textContent).toContain('Durable install');
+    expect(el.textContent).toContain('recommended');
+    const installBtn = el.querySelector('button[title="Copy Linux — per-user service install snippet"]');
+    expect(installBtn).not.toBeNull();
+    await act(async () => { (installBtn as HTMLButtonElement).click(); });
+    expect(clipboardWrite).toHaveBeenLastCalledWith(expect.stringContaining('bash blueprint-runner install --token'));
+
+    const sysInstallBtn = el.querySelector('button[title="Copy Linux — system-wide (shared box) install snippet"]');
+    expect(sysInstallBtn).not.toBeNull();
+    await act(async () => { (sysInstallBtn as HTMLButtonElement).click(); });
+    expect(clipboardWrite).toHaveBeenLastCalledWith(expect.stringContaining('sudo bash blueprint-runner install --system'));
+
+    // The quick foreground start remains available as the ephemeral alternative.
+    expect(el.textContent).toContain('Quick start (foreground)');
+  });
+
+  test('enroll dialog falls back to an honest not-connected state after the connect timeout', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      // The runner never connects: every poll returns only the base list, never
+      // the just-enrolled runner-new (a wrong token behaves identically).
+      vi.mocked(listFleetRunners).mockResolvedValue(SAMPLE_RUNNERS);
+      const el = await mount();
+
+      const enrollBtn = [...el.querySelectorAll('button')].find(b => b.textContent?.includes('Enroll runner'));
+      // The runner never heartbeats (mock keeps returning the base list) — a wrong
+      // token would behave identically, so the spinner must not spin forever.
+      await act(async () => { (enrollBtn as HTMLButtonElement).click(); });
+      await act(async () => {});
+
+      let status = el.querySelector('[data-testid="runner-connection-status"]');
+      expect(status?.textContent).toContain('Waiting for your runner to connect');
+
+      // Advance past the bounded connect wait with no heartbeat.
+      await act(async () => { await vi.advanceTimersByTimeAsync(95_000); });
+
+      status = el.querySelector('[data-testid="runner-connection-status"]');
+      expect(status?.textContent).toContain('Not connected yet');
+      expect(status?.textContent).toContain('bash blueprint-runner check');
+      expect(status?.textContent).not.toContain('Waiting for your runner to connect');
+
+      // "Keep waiting" returns to the optimistic state (timer re-arms).
+      const keepBtn = [...el.querySelectorAll('button')].find(b => b.textContent?.trim() === 'Keep waiting');
+      expect(keepBtn).not.toBeNull();
+      await act(async () => { (keepBtn as HTMLButtonElement).click(); });
+
+      status = el.querySelector('[data-testid="runner-connection-status"]');
+      expect(status?.textContent).toContain('Waiting for your runner to connect');
+      expect(status?.textContent).not.toContain('Not connected yet');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   // ── Rotate runner token ──────────────────────────────────────────────────────
@@ -1377,6 +1476,101 @@ describe('FleetRunnersPanel — behavioral', () => {
     // Pending state is amber, distinct from the applied emerald.
     expect(badge?.className).toContain('text-amber-300');
     expect(badge?.textContent).not.toContain('config applied');
+  });
+
+  test('stuck config on a live daemon too old to report reads red "too old", not eternal amber', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([
+      {
+        ...SAMPLE_RUNNERS[0],
+        last_seen_at: new Date(Date.now() - 30_000).toISOString(), // live
+        config: {
+          config_generation: 'gen-new',
+          applied_config_generation: null,
+          config_pending: true,
+          // Changed well past the pending window (2 min) → stuck.
+          desired_changed_at: new Date(Date.now() - 5 * 60 * 1000).toISOString(),
+          daemon_reports_applied: false,
+        },
+      },
+    ]);
+    const el = await mount();
+
+    const badge = el.querySelector('[data-testid="fleet-runner-config-status"]');
+    expect(badge).not.toBeNull();
+    expect(badge?.textContent).toContain('config not applied — runner too old');
+    // STUCK is red, distinct from the optimistic amber pending.
+    expect(badge?.className).toContain('text-red-300');
+    expect(badge?.textContent).not.toContain('applying on next heartbeat');
+  });
+
+  test('stuck config on a live daemon that reported a stale generation reads red "rejected/stuck"', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([
+      {
+        ...SAMPLE_RUNNERS[0],
+        last_seen_at: new Date(Date.now() - 30_000).toISOString(), // live
+        config: {
+          config_generation: 'gen-new',
+          applied_config_generation: 'gen-old',
+          config_pending: true,
+          desired_changed_at: new Date(Date.now() - 5 * 60 * 1000).toISOString(),
+          daemon_reports_applied: true,
+        },
+      },
+    ]);
+    const el = await mount();
+
+    const badge = el.querySelector('[data-testid="fleet-runner-config-status"]');
+    expect(badge?.textContent).toContain('rejected it or is stuck');
+    expect(badge?.className).toContain('text-red-300');
+    // Must NOT mislabel a too-old daemon: it DID report a generation.
+    expect(badge?.textContent).not.toContain('runner too old');
+  });
+
+  test('pending config on an OFFLINE runner reads neutral "queued", never red', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([
+      {
+        ...SAMPLE_RUNNERS[0],
+        last_seen_at: new Date(Date.now() - 15 * 60 * 1000).toISOString(), // offline
+        config: {
+          config_generation: 'gen-new',
+          applied_config_generation: null,
+          config_pending: true,
+          // Even long-stale desired change must not flag red while offline —
+          // pending is expected and applies on reconnect.
+          desired_changed_at: new Date(Date.now() - 30 * 60 * 1000).toISOString(),
+          daemon_reports_applied: false,
+        },
+      },
+    ]);
+    const el = await mount();
+
+    const badge = el.querySelector('[data-testid="fleet-runner-config-status"]');
+    expect(badge?.textContent).toContain('config queued — applies when runner reconnects');
+    expect(badge?.className).not.toContain('text-red-300');
+    expect(badge?.className).toContain('text-neutral-300');
+  });
+
+  test('pending config within the window on a live runner stays amber "applying"', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([
+      {
+        ...SAMPLE_RUNNERS[0],
+        last_seen_at: new Date(Date.now() - 30_000).toISOString(), // live
+        config: {
+          config_generation: 'gen-new',
+          applied_config_generation: null,
+          config_pending: true,
+          // Just changed — well within the 2-minute pending window.
+          desired_changed_at: new Date(Date.now() - 10_000).toISOString(),
+          daemon_reports_applied: false,
+        },
+      },
+    ]);
+    const el = await mount();
+
+    const badge = el.querySelector('[data-testid="fleet-runner-config-status"]');
+    expect(badge?.textContent).toContain('config pending — applying on next heartbeat');
+    expect(badge?.className).toContain('text-amber-300');
+    expect(badge?.className).not.toContain('text-red-300');
   });
 
   test('renders config-applied badge when applied matches desired', async () => {

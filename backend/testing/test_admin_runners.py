@@ -531,6 +531,85 @@ class TestRunnerConfigView:
         caps["gpu_indices_allowed"] = [0, 1]
         assert _runner_config_view(caps)["config_pending"] is True
 
+    def test_desired_changed_at_surfaced_from_stamp(self):
+        from app.routers.admin_runners import _runner_config_view
+
+        # The stamp written by the operator PATCH / registration baseline is
+        # surfaced verbatim so the Fleet UI can bound how long a push has pended.
+        view = _runner_config_view(
+            {"max_concurrent": 2, "live_config_changed_at": "2026-07-14T00:00:00+00:00"}
+        )
+        assert view["desired_changed_at"] == "2026-07-14T00:00:00+00:00"
+
+    def test_desired_changed_at_none_for_legacy_caps_without_stamp(self):
+        from app.routers.admin_runners import _runner_config_view
+
+        # A runner enrolled before the stamp existed has no timestamp → unknown,
+        # never a hard failure (the UI keeps it optimistic, not falsely stuck).
+        view = _runner_config_view({"max_concurrent": 2})
+        assert view["desired_changed_at"] is None
+        # A non-string legacy value is coerced to None rather than surfaced raw.
+        view_bad = _runner_config_view(
+            {"max_concurrent": 2, "live_config_changed_at": 1234567890}
+        )
+        assert view_bad["desired_changed_at"] is None
+
+    def test_daemon_reports_applied_distinguishes_too_old_from_reported(self):
+        from app.routers.admin_runners import _runner_config_view
+
+        # Never echoed a generation → daemon too old to speak the contract.
+        never = _runner_config_view({"max_concurrent": 2})
+        assert never["daemon_reports_applied"] is False
+        assert never["config_pending"] is True
+
+        # Reported a STALE generation → daemon speaks the contract but has not
+        # converged (rejected/stuck), a distinct case from "too old".
+        stale = _runner_config_view(
+            {"max_concurrent": 8, "applied_config_generation": "stale-generation"}
+        )
+        assert stale["daemon_reports_applied"] is True
+        assert stale["config_pending"] is True
+
+    def test_config_status_distinguishes_stuck_from_pending(self):
+        """Acceptance: the serialized config block carries exactly the signals the
+        Fleet UI needs to tell a genuinely-stuck push from a fresh, legitimately
+        pending one — the desired-change timestamp (how long it has pended) and
+        whether the daemon reports applied generations at all (too-old vs
+        rejected). Both pending cases share ``config_pending: True``; the added
+        fields are what make them distinguishable."""
+        from app.routers.admin_runners import _runner_config_view
+
+        # Case A — fresh pending: operator just changed config, daemon has not yet
+        # reported. Stamped, and daemon_reports_applied False.
+        fresh = _runner_config_view(
+            {"max_concurrent": 4, "live_config_changed_at": "2026-07-14T12:00:00+00:00"}
+        )
+        # Case B — too-old daemon: stamped long ago, still never reports applied.
+        too_old = _runner_config_view(
+            {"max_concurrent": 4, "live_config_changed_at": "2026-07-14T00:00:00+00:00"}
+        )
+        # Case C — rejected/stuck daemon: reports a stale generation, non-converged.
+        rejected = _runner_config_view(
+            {
+                "max_concurrent": 4,
+                "live_config_changed_at": "2026-07-14T00:00:00+00:00",
+                "applied_config_generation": "stale-generation",
+            }
+        )
+
+        # All three are pending — config_pending ALONE cannot separate them.
+        assert fresh["config_pending"] is True
+        assert too_old["config_pending"] is True
+        assert rejected["config_pending"] is True
+
+        # The new fields DO separate them:
+        #  - every case surfaces WHEN the desired config last changed (bound the window)
+        assert fresh["desired_changed_at"] == "2026-07-14T12:00:00+00:00"
+        assert too_old["desired_changed_at"] == "2026-07-14T00:00:00+00:00"
+        #  - too-old vs rejected split on whether the daemon reports applied at all
+        assert too_old["daemon_reports_applied"] is False
+        assert rejected["daemon_reports_applied"] is True
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Per-job GPU count as a LIVE-SAFE, operator-configurable runner-config knob.
@@ -649,6 +728,80 @@ class TestGpusPerJobPatchEndpoint:
                 json={"gpus_per_job": bad},
             )
             assert rej.status_code == 422, bad
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Desired-config-changed stamp: the clock the Fleet UI uses to bound how long a
+# config push has been pending (fresh-pending vs genuinely-stuck).
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestLiveConfigChangedStamp:
+    @pytest.mark.asyncio
+    async def test_register_stamps_baseline(self, client: AsyncClient, db_session):
+        """A freshly-registered runner carries a baseline desired-config-changed
+        stamp so its first (never-reported) pending state can be bounded from
+        enrollment rather than reading "just changed" forever."""
+        project = await _make_project(db_session)
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/runners/register",
+            json={"hostname": "fresh-box", "capabilities": {"max_concurrent": 2}},
+        )
+        assert resp.status_code == 200, resp.text
+
+        # The list view surfaces the baseline stamp as desired_changed_at so the
+        # first (never-reported) pending state can be bounded from enrollment.
+        listing = await client.get(f"/api/admin/projects/{project.id}/runners")
+        assert listing.status_code == 200, listing.text
+        rows = listing.json()
+        assert len(rows) == 1
+        cfg = rows[0]["config"]
+        assert isinstance(cfg["desired_changed_at"], str)
+        assert cfg["daemon_reports_applied"] is False
+        assert cfg["config_pending"] is True
+
+    @pytest.mark.asyncio
+    async def test_live_safe_patch_restamps_but_noop_patch_does_not(
+        self, client: AsyncClient, db_session
+    ):
+        """A PATCH that actually moves the live-safe generation re-stamps the
+        desired-config-changed clock; a no-op PATCH (same value re-submitted)
+        leaves the existing stamp untouched — otherwise the STUCK timeout could
+        be reset forever by idempotent re-saves and never fire."""
+        project = await _make_project(db_session)
+        runner = LocalRunner(
+            project_id=project.id,
+            token_hash="a" * 64,
+            hostname="stamp-box",
+            status="active",
+            capabilities={
+                "task_types": "all",
+                "max_concurrent": 2,
+                "live_config_changed_at": "2020-01-01T00:00:00+00:00",
+            },
+        )
+        db_session.add(runner)
+        await db_session.commit()
+        await db_session.refresh(runner)
+
+        # Real change: max_concurrent 2 → 4 moves the generation → re-stamp.
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/capabilities",
+            json={"max_concurrent": 4},
+        )
+        assert resp.status_code == 200, resp.text
+        await db_session.refresh(runner)
+        restamped = runner.capabilities["live_config_changed_at"]
+        assert restamped != "2020-01-01T00:00:00+00:00"
+
+        # No-op: re-submit the SAME value → generation unchanged → stamp preserved.
+        resp2 = await client.patch(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/capabilities",
+            json={"max_concurrent": 4},
+        )
+        assert resp2.status_code == 200, resp2.text
+        await db_session.refresh(runner)
+        assert runner.capabilities["live_config_changed_at"] == restamped
 
 
 class TestRunnerMemoryTelemetryContract:

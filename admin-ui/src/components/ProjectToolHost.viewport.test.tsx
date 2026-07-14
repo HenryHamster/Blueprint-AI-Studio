@@ -171,7 +171,7 @@ describe('ProjectToolHost — viewport regression', () => {
     expect(host.textContent).toContain('No tools registered');
   });
 
-  test('skips disabled tools without crashing', async () => {
+  test('renders a disabled tool with an Enable control instead of hiding it (SEV1)', async () => {
     vi.mocked(fetchProjectTools).mockResolvedValue({
       tools: [
         { ...TOOLS_RESULT.tools[0], id: 'tool-1', kind: 'mock-widget', enabled: false },
@@ -187,7 +187,17 @@ describe('ProjectToolHost — viewport regression', () => {
     await act(async () => { r.render(<ProjectToolHost projectId="proj-a" />); });
     await act(async () => await new Promise(resolve => setTimeout(resolve, 50)));
     if (!host) throw new Error('host not mounted');
+    // The disabled tool's live component body is NOT mounted…
     expect(host.textContent).not.toContain('Mock Widget content');
+    // …but the tool itself is still visible (title + Disabled marker), so it is
+    // no longer a permanent trap, and an Enable control is reachable.
+    expect(host.textContent).toContain('Mock Widget');
+    expect(host.textContent).toContain('Disabled');
+    const enableBtn = [...host.querySelectorAll('button')].find(
+      b => b.textContent === 'Enable',
+    );
+    expect(enableBtn).toBeTruthy();
+    // The enabled sibling still renders normally.
     expect(host.textContent).toContain('Mock Chart');
   });
 
@@ -366,6 +376,64 @@ const SAMPLE_TOOLS: FetchProjectToolsResult = TOOLS_RESULT;
     await act(async () => { hideBtn!.click(); });
     // Tool should no longer be rendered
     expect(host.textContent).not.toContain('Hidden Viewer');
+  });
+
+  test('durably hides a manifest tool across remount and offers a restore (SEV5)', async () => {
+    const projectId = 'proj-durable-hide';
+    localStorage.removeItem(`blueprint:projectTools:hidden:${projectId}`);
+    vi.mocked(fetchProjectTools).mockResolvedValue({ tools: [], total_count: 0, next_offset: null });
+    vi.mocked(fetchProjectToolManifest).mockResolvedValue({
+      tools: [{
+        slug: 'durable-viewer',
+        title: 'Durable Viewer',
+        description: 'A tool the operator hides persistently',
+        placement: 'project_section',
+        entry: 'index.html',
+        kind: 'project',
+        source: 'project',
+      }],
+      skills: [],
+      error: null,
+    });
+
+    // First mount: hide the tool.
+    host = document.createElement('div');
+    host.style.width = '1280px';
+    document.body.appendChild(host);
+    let r = createRoot(host);
+    root = r;
+    await act(async () => { r.render(<ProjectToolHost projectId={projectId} />); });
+    await act(async () => await new Promise(resolve => setTimeout(resolve, 50)));
+    if (!host) throw new Error('host not mounted');
+    expect(host.textContent).toContain('Durable Viewer');
+    const hideBtn = host.querySelector('button[data-viewport-allow-small-target]') as HTMLButtonElement | null;
+    await act(async () => { hideBtn!.click(); });
+    expect(host.textContent).not.toContain('Durable Viewer');
+    // A restore affordance is offered so hiding is not itself a trap.
+    expect(host.textContent).toContain('Show hidden');
+
+    // Persisted to localStorage keyed by projectId.
+    expect(localStorage.getItem(`blueprint:projectTools:hidden:${projectId}`)).toContain('durable-viewer');
+
+    // Simulate a reload: unmount and remount the same project — the tool stays hidden.
+    act(() => { r.unmount(); });
+    host.remove();
+    host = document.createElement('div');
+    host.style.width = '1280px';
+    document.body.appendChild(host);
+    r = createRoot(host);
+    root = r;
+    await act(async () => { r.render(<ProjectToolHost projectId={projectId} />); });
+    await act(async () => await new Promise(resolve => setTimeout(resolve, 50)));
+    expect(host.textContent).not.toContain('Durable Viewer');
+
+    // Restore brings it back.
+    const showBtn = [...host.querySelectorAll('button')].find(b => b.textContent === 'Show hidden');
+    expect(showBtn).toBeTruthy();
+    await act(async () => { showBtn!.click(); });
+    expect(host.textContent).toContain('Durable Viewer');
+
+    localStorage.removeItem(`blueprint:projectTools:hidden:${projectId}`);
   });
 
   test('renders manifest and registered tools without overflow at 1440px', async () => {

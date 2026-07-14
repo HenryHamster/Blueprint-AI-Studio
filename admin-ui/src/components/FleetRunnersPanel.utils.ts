@@ -119,6 +119,55 @@ export function runnerSetupSnippets(
   };
 }
 
+/**
+ * Host prerequisites the launcher requires before `start`/`install` will do
+ * anything useful. Mirrors `check_prerequisites()` in
+ * scripts/blueprint_runner.py (Node >= 22, the `claude` CLI) plus the two
+ * implicit ones the launcher assumes (a repo checkout to run from, and running
+ * the preflight first). Surfaced in the enroll dialog so a first-time operator
+ * isn't dropped at a command-not-found with an eternal "waiting…" spinner.
+ */
+export const RUNNER_PREREQUISITES: ReadonlyArray<string> = [
+  'Clone the Blueprint repo and run every command below from its root — `blueprint-runner` is the wrapper script in that checkout, not a globally-installed binary.',
+  'Node.js >= 22 on PATH — the agent binary runs on Node.',
+  'The Claude Code CLI on PATH: npm install -g @anthropic-ai/claude-code (provides the `claude` command).',
+  'Self-verify before starting: `bash blueprint-runner check` (Windows: `py -3 scripts/blueprint_runner.py check`) runs the preflight and names any missing prerequisite instead of failing silently at first heartbeat.',
+];
+
+export interface RunnerInstallSnippet {
+  /** Per-login durable service (systemd --user); survives logout on Linux. */
+  userService: string;
+  /** System-wide durable service for shared boxes; needs root (sudo). */
+  systemService: string;
+}
+
+/**
+ * Build the durable `blueprint-runner install` commands (a systemd service that
+ * survives logout/reboot) — the RECOMMENDED way to run a runner. The bare
+ * `start` command from {@link runnerSetupSnippets} is the quick/ephemeral
+ * alternative that dies with the shell.
+ *
+ * systemd is Linux-only, so both commands are bash; on macOS/Windows the
+ * foreground `start` command is the supported path (the dialog says so). --url
+ * is appended only for a non-prod backend, matching the start snippets.
+ */
+export function runnerInstallSnippet(token: string, origin: string): RunnerInstallSnippet {
+  const url = normalizeOrigin(origin);
+  const needsUrl = url !== DEFAULT_ORCHESTRATOR_URL;
+
+  const userParts = ['bash blueprint-runner install', '--token', shellQuote(token)];
+  const systemParts = ['sudo bash blueprint-runner install --system', '--token', shellQuote(token)];
+  if (needsUrl) {
+    userParts.push('--url', shellQuote(url));
+    systemParts.push('--url', shellQuote(url));
+  }
+
+  return {
+    userService: userParts.join(' '),
+    systemService: systemParts.join(' '),
+  };
+}
+
 // ── Live-config helpers ──────────────────────────────────────────────────────
 // Shared between the read-only status badges in FleetRunnersPanel and the
 // editable form in FleetRunnerConfigPanel, so both read the runner's config the

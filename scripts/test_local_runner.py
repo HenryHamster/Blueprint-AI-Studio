@@ -3652,11 +3652,19 @@ class TestHeartbeat401Streak(unittest.TestCase):
         local_runner._shutdown_event.clear()
 
     def test_exits_after_consecutive_401_streak(self):
-        """A sustained 401 streak (revoked token) exits the process non-zero (N4)."""
+        """A sustained 401 streak AFTER a successful auth (a token revoked mid-life)
+        exits the process non-zero once the streak reaches max_auth_failures (N4).
+        The leading 200 keeps this on the streak path, distinct from the
+        first-heartbeat fast-fail path."""
         exits = []
+        # 200 first (authenticates), then a 401 streak that reaches the threshold.
+        statuses = iter([200])
 
         def fake_post(url, token, body, **kwargs):
-            return 401, None
+            try:
+                return next(statuses), None
+            except StopIteration:
+                return 401, None
 
         # Patch os._exit so the streak detector doesn't kill the test process.
         def fake_exit(code):
@@ -3678,8 +3686,10 @@ class TestHeartbeat401Streak(unittest.TestCase):
         self.assertEqual(exits, [1])
 
     def test_no_exit_when_streak_resets(self):
-        """A 200 between 401s resets the streak — no exit."""
-        statuses = iter([401, 401, 200, 401])
+        """A 200 between 401s resets the streak — no exit. Leads with a 200 so the
+        token has authenticated (past the first-heartbeat fast-fail) and the test
+        exercises the streak-reset path for a mid-life 401 sequence."""
+        statuses = iter([200, 401, 401, 200, 401])
         exits = []
 
         def fake_post(url, token, body, **kwargs):
@@ -3703,15 +3713,20 @@ class TestHeartbeat401Streak(unittest.TestCase):
 
     def test_token_reload_on_401_prevents_exit(self):
         """When the token file is updated on disk during a 401 streak, the runner
-        detects the new token, resets the counter, and resumes without exit."""
-        # _post always returns 401 while using the old token; after reload the
-        # runner retries with the new token and gets a 200.
+        detects the new token, resets the counter, and resumes without exit. Leads
+        with a 200 so the runner has authenticated (past the first-heartbeat
+        fast-fail) — the live token-swap escape hatch is for a mid-life revoke."""
+        # First heartbeat authenticates; then the old token is revoked (401) and
+        # the operator writes a new token to disk, which the runner picks up.
         call_count = [0]
         tokens_seen = []
 
         def fake_post(url, token, body, **kwargs):
             tokens_seen.append(token)
             call_count[0] += 1
+            # First contact authenticates so ever_authenticated is set.
+            if call_count[0] == 1:
+                return 200, None
             # Old token always gets 401; new token succeeds.
             if token == "new-token":
                 return 200, None
@@ -3749,6 +3764,72 @@ class TestHeartbeat401Streak(unittest.TestCase):
         self.assertEqual(exits, [], "token reload must prevent auth-fatal exit")
         self.assertIn("new-token", tokens_seen,
                       "heartbeat must use the reloaded token")
+
+    def test_fast_fails_on_first_heartbeat_401(self):
+        """A token that has NEVER authenticated and gets a 401 on the very first
+        heartbeat exits immediately — it does not retry max_auth_failures times as
+        if the rejection were transient (wrong/revoked/deleted-runner token)."""
+        posts = []
+        exits = []
+
+        def fake_post(url, token, body, **kwargs):
+            posts.append(token)
+            return 401, None
+
+        def fake_exit(code):
+            exits.append(code)
+            local_runner._shutdown_event.set()
+            raise SystemExit(code)
+
+        with patch.object(local_runner, "_post", fake_post), \
+             patch.object(local_runner, "_load_runner_token", lambda: "tok"), \
+             patch.object(local_runner, "_node_runtime_ok", return_value=False), \
+             patch("os._exit", fake_exit), \
+             patch("time.sleep", lambda s: None):
+            with self.assertRaises(SystemExit):
+                local_runner._heartbeat_loop(
+                    "https://api", "tok", {}, threading.Lock(),
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                    # High threshold: fast-fail must NOT depend on it being reached.
+                    max_auth_failures=20,
+                )
+
+        self.assertEqual(exits, [1], "first-heartbeat 401 must exit non-zero")
+        self.assertEqual(
+            len(posts), 1,
+            "must fail fast on the FIRST 401, not retry a never-authenticated token",
+        )
+
+    def test_401_after_authenticating_does_not_fast_fail(self):
+        """A token that DID authenticate (a 200 first) keeps the existing streak
+        behavior when a later heartbeat 401s — it is retried up to max_auth_failures
+        rather than fast-failing, preserving mid-life revoke / inactive-row re-arm."""
+        statuses = iter([200, 401, 401])
+        exits = []
+
+        def fake_post(url, token, body, **kwargs):
+            try:
+                return next(statuses), None
+            except StopIteration:
+                local_runner._shutdown_event.set()
+                return 204, None
+
+        with patch.object(local_runner, "_post", fake_post), \
+             patch.object(local_runner, "_load_runner_token", lambda: "tok"), \
+             patch.object(local_runner, "_node_runtime_ok", return_value=False), \
+             patch("os._exit", lambda c: exits.append(c)), \
+             patch("time.sleep", lambda s: None):
+            local_runner._heartbeat_loop(
+                "https://api", "tok", {}, threading.Lock(),
+                {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                # Two post-auth 401s stay under the streak threshold → no exit.
+                max_auth_failures=5,
+            )
+
+        self.assertEqual(
+            exits, [],
+            "a 401 after a successful auth must NOT fast-fail below the streak threshold",
+        )
 
 
 class TestDescribeSha(unittest.TestCase):

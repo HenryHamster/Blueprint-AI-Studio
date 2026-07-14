@@ -281,6 +281,68 @@ async def test_register_tool_duplicate_slug(client: AsyncClient, db_session):
 
 
 @pytest.mark.asyncio
+async def test_register_second_tool_of_same_kind_gets_unique_slug(
+    client: AsyncClient, db_session
+):
+    """A 2nd (and Nth) tool of an existing kind with NO explicit slug succeeds
+    with an auto-generated, distinct, pattern-valid slug — instead of 409ing on
+    the (project_id, slug) uniqueness constraint (SEV2 Add-form brick)."""
+    import re as _re
+
+    slug_pat = _re.compile(r"^[a-z0-9][a-z0-9\-_]{0,63}$")
+    project = await _make_project_member(db_session)
+
+    first = await client.post(
+        f"{_BASE}/projects/{project.id}/tools",
+        json={"kind": "whiteboard", "title": "First Board"},
+    )
+    assert first.status_code == 200, first.text
+    slug1 = first.json()["slug"]
+    # The first tool of a kind keeps the historical bare-kind default slug.
+    assert slug1 == "whiteboard"
+
+    second = await client.post(
+        f"{_BASE}/projects/{project.id}/tools",
+        json={"kind": "whiteboard", "title": "Second Board"},
+    )
+    assert second.status_code == 200, second.text
+    slug2 = second.json()["slug"]
+    assert slug2 != slug1
+    assert slug_pat.match(slug2), slug2
+    assert second.json()["kind"] == "whiteboard"
+
+    # A THIRD of the same kind (even with a duplicate title) still succeeds with
+    # yet another distinct slug — the numeric-suffix fallback must terminate.
+    third = await client.post(
+        f"{_BASE}/projects/{project.id}/tools",
+        json={"kind": "whiteboard", "title": "Second Board"},
+    )
+    assert third.status_code == 200, third.text
+    slug3 = third.json()["slug"]
+    assert slug3 not in {slug1, slug2}
+    assert slug_pat.match(slug3), slug3
+
+
+@pytest.mark.asyncio
+async def test_register_explicit_slug_still_409s_on_collision(
+    client: AsyncClient, db_session
+):
+    """Auto-uniquify must NOT weaken the explicit-slug contract: a caller that
+    passes an explicit, already-taken slug still gets a deterministic 409."""
+    project = await _make_project_member(db_session)
+    first = await client.post(
+        f"{_BASE}/projects/{project.id}/tools",
+        json={"kind": "whiteboard", "slug": "explicit-board"},
+    )
+    assert first.status_code == 200, first.text
+    second = await client.post(
+        f"{_BASE}/projects/{project.id}/tools",
+        json={"kind": "notes", "slug": "explicit-board"},
+    )
+    assert second.status_code == 409
+
+
+@pytest.mark.asyncio
 async def test_register_second_tool_of_kind_auto_slugs(client: AsyncClient, db_session):
     """Two registrations of the same kind with no explicit slug both succeed;
     the second auto-uniquifies to '<kind>-2' instead of a 409 dead-end."""

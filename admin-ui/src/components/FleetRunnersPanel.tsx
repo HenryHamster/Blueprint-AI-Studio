@@ -1,6 +1,6 @@
 /* eslint-disable react-hooks/set-state-in-effect */
 import { useState, useCallback, useEffect, useRef, useMemo } from 'react';
-import { Compass, Cpu, Copy, Check, KeyRound, RefreshCw, Trash2, SlidersHorizontal, PauseCircle, PlayCircle, Wind, Activity } from 'lucide-react';
+import { Compass, Cpu, Copy, Check, KeyRound, RefreshCw, Trash2, SlidersHorizontal, PauseCircle, PlayCircle, Wind, Activity, AlertTriangle } from 'lucide-react';
 import { API_BASE_URL, listFleetRunners, patchRunnerStatus, registerFleetRunner, revokeFleetRunner, rotateFleetRunnerToken, fetchRunnerTelemetry, fetchRunnerStats, listRunnerProjects, addRunnerProject, removeRunnerProject, listOwnedProjects } from '../api';
 import type { FleetRunner, RunnerTelemetryResponse, RunnerStatsResponse, RunnerProjectAllowList, OwnedProjectSummary } from '../api';
 import { ConfirmDialog } from './ConfirmDialog';
@@ -10,6 +10,8 @@ import {
   formatBytes,
   formatBackendInventory,
   runnerSetupSnippets,
+  runnerInstallSnippet,
+  RUNNER_PREREQUISITES,
   gpuAllowlistLabel,
   taskTypesLabel,
   gpusPerJobValue,
@@ -19,8 +21,13 @@ import {
 
 const LIVENESS_THRESHOLD_SEC = 300;
 const STALE_THRESHOLD_SEC = 600;
+/** How long the enroll dialog shows the optimistic "waiting…" spinner before
+ *  falling back to an honest "not connected yet" state. Bounded so a wrong token
+ *  (which never connects) can't spin forever. Generous enough to cover a normal
+ *  first-time setup (repo clone + first heartbeat) landing within ~2 heartbeats. */
+const ENROLL_CONNECT_TIMEOUT_MS = 90_000;
 
-type CopyTarget = 'token' | keyof RunnerSetupSnippetCommands;
+type CopyTarget = 'token' | keyof RunnerSetupSnippetCommands | 'installUser' | 'installSystem';
 type TokenDialogMode = 'enroll' | 'rotate';
 
 function fallbackLivenessLabel(lastSeenAt: string | null): { label: string; cls: string } {
@@ -160,25 +167,86 @@ function capsSummary(caps: FleetRunner['capabilities']): string {
  *  live-safe config but the daemon has not yet echoed the matching generation
  *  (applies on the next heartbeat); applied = the daemon's reported generation
  *  matches. Returns null for runners that never reported a config block. */
-function configStatus(runner: FleetRunner): { label: string; cls: string; pending: boolean } | null {
+/** How long a config push may stay pending on a LIVE (heartbeating) runner before
+ *  we stop showing the optimistic "applying on next heartbeat" spinner and call it
+ *  STUCK. A live daemon reconciles live-safe config on its next heartbeat, so
+ *  ~2 heartbeat windows is generous; past it, the runner is either too old to
+ *  honor the config or actively rejected it. Runners that are NOT live are exempt
+ *  (their pending state is expected — it applies when they reconnect). */
+const CONFIG_PENDING_TIMEOUT_SEC = 120;
+
+type ConfigStatusTone = 'good' | 'warn' | 'idle' | 'bad';
+
+const CONFIG_STATUS_CLS: Record<ConfigStatusTone, string> = {
+  good: 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300',
+  warn: 'border-amber-500/40 bg-amber-500/10 text-amber-300',
+  idle: 'border-neutral-700 bg-neutral-800/40 text-neutral-300',
+  bad: 'border-red-500/40 bg-red-500/10 text-red-300',
+};
+
+function configStatus(
+  runner: FleetRunner,
+): { label: string; cls: string; pending: boolean; tone: ConfigStatusTone } | null {
   const config = runner.config;
   if (!config) return null;
-  if (config.config_pending) {
+
+  if (!config.config_pending) {
+    // config_pending is false only once the daemon echoed the desired generation.
+    if (config.applied_config_generation != null) {
+      return {
+        label: 'config applied',
+        cls: CONFIG_STATUS_CLS.good,
+        pending: false,
+        tone: 'good',
+      };
+    }
+    return null;
+  }
+
+  // Pending. A runner that is not heartbeating (offline/paused) is NOT stuck —
+  // pending is expected and applies when it reconnects; never flag it red.
+  if (!isRunnerLive(runner)) {
+    return {
+      label: 'config queued — applies when runner reconnects',
+      cls: CONFIG_STATUS_CLS.idle,
+      pending: true,
+      tone: 'idle',
+    };
+  }
+
+  // Live and pending. Bound how long it has been pending against when the desired
+  // config last changed. Missing stamp (legacy runner) → unknown → keep optimistic
+  // amber, never falsely red.
+  const changedAt = config.desired_changed_at;
+  const pendingSec = changedAt
+    ? (Date.now() - parseTimestamp(changedAt).getTime()) / 1000
+    : null;
+  if (pendingSec == null || pendingSec < CONFIG_PENDING_TIMEOUT_SEC) {
     return {
       label: 'config pending — applying on next heartbeat',
-      cls: 'border-amber-500/40 bg-amber-500/10 text-amber-300',
+      cls: CONFIG_STATUS_CLS.warn,
       pending: true,
+      tone: 'warn',
     };
   }
-  // config_pending is false only once the daemon echoed the desired generation.
-  if (config.applied_config_generation != null) {
+
+  // Live, heartbeating, and STILL not converged past the window → genuinely stuck.
+  // Distinguish a daemon too old to speak the live-config contract (never echoes
+  // an applied generation) from one that reported a stale/rejected generation.
+  if (config.daemon_reports_applied === false) {
     return {
-      label: 'config applied',
-      cls: 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300',
+      label: 'config not applied — runner too old, update it',
+      cls: CONFIG_STATUS_CLS.bad,
       pending: false,
+      tone: 'bad',
     };
   }
-  return null;
+  return {
+    label: 'config not applied — runner rejected it or is stuck',
+    cls: CONFIG_STATUS_CLS.bad,
+    pending: false,
+    tone: 'bad',
+  };
 }
 
 function isStrategicRunner(runner: FleetRunner): boolean {
@@ -334,6 +402,11 @@ interface TokenDialogProps {
   connected: boolean;
   /** Hostname the connected runner reported, shown in the success line. */
   connectedHostname?: string | null;
+  /** True once the bounded connect wait elapsed with no heartbeat: the dialog
+   *  drops the optimistic spinner for an honest "not connected yet" state. */
+  waitTimedOut?: boolean;
+  /** Reset the connect-wait timer and keep waiting (from the timed-out state). */
+  onKeepWaiting?: () => void;
   onDismiss: () => void;
 }
 
@@ -344,12 +417,16 @@ function TokenDialog({
   preset = 'default',
   connected,
   connectedHostname,
+  waitTimedOut = false,
+  onKeepWaiting,
   onDismiss,
 }: TokenDialogProps) {
   const [copied, setCopied] = useState<Record<CopyTarget, boolean>>({
     token: false,
     windowsPowerShell: false,
     macosLinux: false,
+    installUser: false,
+    installSystem: false,
   });
   // The runner POSTs heartbeats to the backend API, not the admin-UI hosting origin (Firebase
   // Hosting only serves the SPA and has no /api/** route). Prefer the configured API base URL;
@@ -357,9 +434,14 @@ function TokenDialog({
   const origin =
     API_BASE_URL || (typeof window !== 'undefined' ? window.location.origin : 'https://your-orchestrator');
   const snippets = runnerSetupSnippets(token, origin);
+  const install = runnerInstallSnippet(token, origin);
   const setupSnippetItems: Array<{ id: keyof RunnerSetupSnippetCommands; label: string; command: string }> = [
     { id: 'windowsPowerShell', label: 'Windows PowerShell', command: snippets.windowsPowerShell },
     { id: 'macosLinux', label: 'macOS/Linux', command: snippets.macosLinux },
+  ];
+  const installSnippetItems: Array<{ id: 'installUser' | 'installSystem'; label: string; command: string }> = [
+    { id: 'installUser', label: 'Linux — per-user service', command: install.userService },
+    { id: 'installSystem', label: 'Linux — system-wide (shared box)', command: install.systemService },
   ];
 
   const copy = async (target: CopyTarget, text: string) => {
@@ -402,8 +484,50 @@ function TokenDialog({
           </div>
         </div>
 
+        {mode === 'enroll' && (
+          <div className="mb-4 rounded border border-neutral-700 bg-neutral-950/60 px-3 py-2.5" data-testid="runner-prerequisites">
+            <div className="text-xs font-semibold text-neutral-300 mb-1.5">Before you start — prerequisites</div>
+            <ul className="space-y-1.5 text-ui-md text-neutral-400 list-disc pl-4">
+              {RUNNER_PREREQUISITES.map((req, i) => (
+                <li key={i}>{req}</li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+        {mode === 'enroll' && (
+          <div className="mb-4 space-y-2">
+            <div className="text-xs text-neutral-400">
+              Durable install <span className="text-emerald-400">(recommended)</span> — runs the runner as a
+              service that survives logout/reboot. Linux/systemd only.
+            </div>
+            <div className="grid gap-2 md:grid-cols-2">
+              {installSnippetItems.map(item => (
+                <div key={item.id} className="min-w-0 rounded border border-neutral-700 bg-neutral-950">
+                  <div className="flex items-center justify-between border-b border-neutral-800 px-3 py-1.5">
+                    <div className="text-ui-md font-semibold uppercase tracking-wide text-neutral-500">{item.label}</div>
+                    <button
+                      onClick={() => copy(item.id, item.command)}
+                      className="flex min-h-[44px] min-w-[44px] items-center justify-center text-neutral-400 transition-colors hover:text-neutral-200 md:min-h-8 md:min-w-8"
+                      title={`Copy ${item.label} install snippet`}
+                      aria-label={`Copy ${item.label} install snippet`}
+                    >
+                      {copied[item.id] ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+                    </button>
+                  </div>
+                  <code className="block max-h-28 overflow-auto whitespace-pre-wrap break-all px-3 py-2 font-mono text-xs text-neutral-300">
+                    {item.command}
+                  </code>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
         <div className="mb-4 space-y-2">
-          <div className="text-xs text-neutral-400">Setup snippets</div>
+          <div className="text-xs text-neutral-400">
+            {mode === 'enroll' ? 'Quick start (foreground) — runs until the shell closes' : 'Setup snippets'}
+          </div>
           <div className="grid gap-2 md:grid-cols-2">
             {setupSnippetItems.map(item => (
               <div key={item.id} className="min-w-0 rounded border border-neutral-700 bg-neutral-950">
@@ -427,7 +551,7 @@ function TokenDialog({
           <div className="text-ui-md text-neutral-500">
             {mode === 'rotate'
               ? 'Stop the existing runner process, then restart it from the repo root with the new token.'
-              : 'Run this from the repo root; the first heartbeat connects it below.'}
+              : 'Run from the repo root. Run `bash blueprint-runner check` first to self-verify; the first heartbeat connects it below.'}
           </div>
         </div>
 
@@ -441,25 +565,48 @@ function TokenDialog({
           </div>
         ) : (
           <div
-            className={`mb-4 flex items-center gap-2 rounded-md border px-3 py-2 text-xs ${
+            className={`mb-4 rounded-md border px-3 py-2 text-xs ${
               connected
                 ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
-                : 'border-amber-500/30 bg-amber-500/10 text-amber-300'
+                : waitTimedOut
+                  ? 'border-red-500/30 bg-red-500/10 text-red-300'
+                  : 'border-amber-500/30 bg-amber-500/10 text-amber-300'
             }`}
             data-testid="runner-connection-status"
           >
             {connected ? (
-              <>
+              <div className="flex items-center gap-2">
                 <Check className="w-4 h-4 shrink-0 text-emerald-400" />
                 <span className="font-medium">
                   Connected on this project{connectedHostname ? ` — ${connectedHostname}` : ''}
                 </span>
-              </>
+              </div>
+            ) : waitTimedOut ? (
+              <div className="space-y-1.5">
+                <div className="flex items-center gap-2">
+                  <AlertTriangle className="w-4 h-4 shrink-0 text-red-300" />
+                  <span className="font-medium">Not connected yet</span>
+                </div>
+                <p className="text-red-200/90">
+                  No heartbeat arrived within the expected window. Check that the token was copied exactly, that the
+                  prerequisites above are met (run <code className="font-mono">bash blueprint-runner check</code>), and
+                  the runner's logs — a wrong or revoked token makes the runner exit on its first heartbeat rather than
+                  connect. First-time setup (repo clone, image build) can also take a few minutes.
+                </p>
+                {onKeepWaiting && (
+                  <button
+                    onClick={onKeepWaiting}
+                    className="mt-1 rounded border border-red-400/40 px-3 py-2 text-red-200 transition-colors hover:bg-red-500/10 min-h-[44px]"
+                  >
+                    Keep waiting
+                  </button>
+                )}
+              </div>
             ) : (
-              <>
+              <div className="flex items-center gap-2">
                 <span className="h-2.5 w-2.5 shrink-0 rounded-full bg-amber-400 animate-pulse" />
                 <span>Waiting for your runner to connect…</span>
-              </>
+              </div>
             )}
           </div>
         )}
@@ -502,6 +649,10 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
     mode: TokenDialogMode;
     preset: RunnerSetupPreset;
   } | null>(null);
+  // Bounded connect wait for the enroll dialog: after this elapses with no
+  // heartbeat, the dialog drops the optimistic spinner for an honest
+  // "not connected yet" state instead of implying success is imminent forever.
+  const [enrollWaitTimedOut, setEnrollWaitTimedOut] = useState(false);
   const [rotating, setRotating] = useState<string | null>(null);
   const [revoking, setRevoking] = useState<string | null>(null);
   const [pendingConfirm, setPendingConfirm] = useState<{ type: 'rotate' | 'revoke'; runner: FleetRunner } | null>(null);
@@ -608,6 +759,23 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
     const interval = setInterval(load, 3000);
     return () => clearInterval(interval);
   }, [pendingToken, enrolledConnected, load]);
+
+  // Reset the honest-timeout state whenever a fresh enroll dialog opens (new
+  // runner id) or the dialog closes, so every enroll starts optimistic.
+  useEffect(() => {
+    setEnrollWaitTimedOut(false);
+  }, [pendingToken?.runnerId]);
+
+  // Bound the optimistic "waiting…" spinner: after ENROLL_CONNECT_TIMEOUT_MS with
+  // no heartbeat, flip to the honest not-connected state. A wrong/revoked token
+  // never connects (the daemon now fast-fails on its first heartbeat), so an
+  // unbounded spinner would misrepresent an already-dead enroll as in-progress.
+  useEffect(() => {
+    if (!pendingToken || pendingToken.mode !== 'enroll') return;
+    if (enrolledConnected || enrollWaitTimedOut) return;
+    const timer = setTimeout(() => setEnrollWaitTimedOut(true), ENROLL_CONNECT_TIMEOUT_MS);
+    return () => clearTimeout(timer);
+  }, [pendingToken, enrolledConnected, enrollWaitTimedOut]);
 
   const handleEnroll = async (preset: RunnerSetupPreset = 'default') => {
     setEnrollingPreset(preset);
@@ -1040,9 +1208,13 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                         className={`inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-xs font-medium ${configState.cls}`}
                         data-testid="fleet-runner-config-status"
                       >
-                        {configState.pending
-                          ? <RefreshCw className="w-3 h-3 animate-spin" />
-                          : <Check className="w-3 h-3" />}
+                        {configState.tone === 'bad'
+                          ? <AlertTriangle className="w-3 h-3" />
+                          : configState.tone === 'good'
+                            ? <Check className="w-3 h-3" />
+                            : configState.tone === 'warn'
+                              ? <RefreshCw className="w-3 h-3 animate-spin" />
+                              : <RefreshCw className="w-3 h-3" />}
                         {configState.label}
                       </span>
                     )}
@@ -1286,6 +1458,8 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
           preset={pendingToken.preset}
           connected={pendingToken.mode === 'enroll' ? enrolledConnected : false}
           connectedHostname={pendingToken.mode === 'enroll' ? enrolledRunner?.hostname : null}
+          waitTimedOut={pendingToken.mode === 'enroll' ? enrollWaitTimedOut : false}
+          onKeepWaiting={() => setEnrollWaitTimedOut(false)}
           onDismiss={() => setPendingToken(null)}
         />
       )}

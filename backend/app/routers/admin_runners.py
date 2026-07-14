@@ -42,6 +42,7 @@ from app.runner_config import (
     GPUS_PER_JOB_MIN,
     config_generation,
     live_safe_config,
+    live_safe_config_generation,
 )
 from app.schemas import redact_command_log_text
 from app.task_capabilities import STRATEGIC_TASK_TYPES, TaskType
@@ -528,6 +529,17 @@ def _runner_config_view(capabilities: Dict[str, Any] | None) -> Dict[str, Any]:
     is what the daemon last reported having in effect (None until it reports).
     ``config_pending`` is True whenever the two generations differ — including the
     "never reported" case, so an old/silent daemon reads as pending, not applied.
+
+    ``desired_changed_at`` is when the live-safe desired config last actually
+    changed (stamped by the operator PATCH / registration baseline). Paired with
+    the runner's ``last_seen_at``, it lets the Fleet UI bound how long a push has
+    been pending and surface a STUCK state instead of eternal "applying".
+    ``daemon_reports_applied`` says whether the daemon has EVER echoed an applied
+    generation at all — this distinguishes a daemon too old to speak the
+    live-config contract (never reports → False) from one that reported a
+    stale/rejected generation (True but non-converged). Both keys are additive and
+    tolerant of legacy caps: a runner enrolled before the stamp existed simply has
+    ``desired_changed_at = None`` (unknown, never a hard failure).
     """
     caps = capabilities or {}
     desired = live_safe_config(caps)
@@ -535,12 +547,17 @@ def _runner_config_view(capabilities: Dict[str, Any] | None) -> Dict[str, Any]:
     applied_generation = caps.get("applied_config_generation")
     if not isinstance(applied_generation, str):
         applied_generation = None
+    desired_changed_at = caps.get("live_config_changed_at")
+    if not isinstance(desired_changed_at, str):
+        desired_changed_at = None
     return {
         "desired": desired,
         "config_generation": desired_generation,
         "applied": caps.get("applied_config"),
         "applied_config_generation": applied_generation,
         "config_pending": applied_generation != desired_generation,
+        "desired_changed_at": desired_changed_at,
+        "daemon_reports_applied": applied_generation is not None,
         "gpu_indices_allowed": desired["gpu_indices_allowed"],
         "gpus_per_job": desired["gpus_per_job"],
     }
@@ -588,6 +605,11 @@ async def register_runner(
         capabilities = _normalize_capabilities(payload.capabilities, payload.preset)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    # Baseline stamp for the desired live-safe config so the Fleet UI can bound how
+    # long the first push has been pending (relative to enrollment) rather than
+    # reading "just changed" forever for a runner that never phones home.
+    capabilities["live_config_changed_at"] = _utcnow().isoformat()
 
     runner = LocalRunner(
         project_id=project_id,
@@ -658,6 +680,11 @@ async def update_runner_capabilities(
 
     # Start from existing capabilities so runner-reported fields survive.
     caps = dict(runner.capabilities or {})
+    # Snapshot the live-safe generation BEFORE the mutation so we can tell a
+    # real config change from a no-op PATCH (same values re-submitted). Only a
+    # real change re-stamps ``live_config_changed_at`` — a no-op must not reset
+    # the pending-window clock, or the STUCK timeout would never fire.
+    generation_before = live_safe_config_generation(caps)
 
     # Detect strategic workload: strategic preset or workload pins concurrency.
     is_strategic = caps.get("runner_preset") in (
@@ -695,6 +722,12 @@ async def update_runner_capabilities(
             caps["gpus_per_job"] = _normalize_gpus_per_job(payload.gpus_per_job)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    # Stamp the desired-config change time only when the live-safe generation
+    # actually moved. A no-op PATCH leaves the existing stamp (and thus the
+    # pending-window clock) untouched.
+    if live_safe_config_generation(caps) != generation_before:
+        caps["live_config_changed_at"] = _utcnow().isoformat()
 
     runner.capabilities = caps
     session.add(runner)
