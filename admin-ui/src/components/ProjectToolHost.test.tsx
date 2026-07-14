@@ -12,6 +12,7 @@ vi.mock('../api/projectTools', async () => {
     fetchProjectTools: vi.fn(),
     fetchProjectToolManifest: vi.fn(),
     fetchToolKinds: vi.fn(),
+    createProjectTool: vi.fn(),
     updateProjectTool: vi.fn(),
     seedProjectTools: vi.fn(),
     fetchAssetToken: vi.fn(),
@@ -23,6 +24,7 @@ import {
   fetchProjectTools,
   fetchProjectToolManifest,
   fetchToolKinds,
+  createProjectTool,
   updateProjectTool,
   fetchAssetToken,
   fetchComputeImageStatus,
@@ -421,6 +423,7 @@ describe('ProjectToolHost — owner walkthrough (end-to-end chained flow)', () =
     vi.mocked(updateProjectTool).mockImplementation(
       (_pid, _tid, patch) => Promise.resolve({ ...WALKTHROUGH_ENABLED, ...patch } as ProjectTool),
     );
+    vi.mocked(createProjectTool).mockResolvedValue({ ...WALKTHROUGH_ENABLED, id: 'tool-new', slug: 'mock-widget' });
   });
 
   afterEach(() => {
@@ -430,6 +433,63 @@ describe('ProjectToolHost — owner walkthrough (end-to-end chained flow)', () =
     host = null;
     localStorage.clear();
     vi.clearAllMocks();
+  });
+
+  test('shows assigned slug on create', async () => {
+    vi.mocked(createProjectTool).mockResolvedValue({
+      id: 'tool-new',
+      kind: 'mock-widget',
+      slug: 'mock-widget-2',
+      title: 'My Widget',
+      enabled: true,
+      placement: 'project_section',
+      content_revision: 0,
+      config: {},
+    });
+
+    await mount(<ProjectToolHost projectId="proj-walkthrough" myRole="owner" />);
+
+    // Open the Add form
+    await act(async () => { requireButton('+ Add tool').click(); });
+    await act(async () => await new Promise(resolve => setTimeout(resolve, 30)));
+
+    // Fill in the title field
+    const titleInput = h().querySelector('input[placeholder="Tool title"]') as HTMLInputElement;
+    await act(async () => { setInputValue(titleInput, 'My Widget'); });
+
+    // Submit
+    await act(async () => { requireButton('Create').click(); });
+    await act(async () => await new Promise(resolve => setTimeout(resolve, 30)));
+
+    // Server-assigned slug (auto-uniquified to 'mock-widget-2') must be visible
+    expect(h().textContent).toContain('mock-widget-2');
+    expect(vi.mocked(createProjectTool)).toHaveBeenCalledWith(
+      'proj-walkthrough',
+      { kind: 'mock-widget', title: 'My Widget' },
+    );
+  });
+
+  test('Enable button is disabled while toggle PATCH is in-flight', async () => {
+    let resolveToggle!: (v: ProjectTool) => void;
+    vi.mocked(updateProjectTool).mockImplementation(
+      () => new Promise(resolve => { resolveToggle = resolve; }),
+    );
+
+    await mount(<ProjectToolHost projectId="proj-walkthrough" myRole="owner" />);
+
+    const enableBtn = requireButton('Enable');
+    expect(enableBtn.disabled).toBe(false);
+
+    // Click — button goes disabled while PATCH is pending
+    await act(async () => { enableBtn.click(); });
+    expect(enableBtn.disabled).toBe(true);
+
+    // Resolve the in-flight PATCH
+    await act(async () => { resolveToggle({ ...WALKTHROUGH_DISABLED, enabled: true }); });
+    await act(async () => await new Promise(resolve => setTimeout(resolve, 30)));
+
+    // Only one PATCH was fired despite button being clicked while in-flight
+    expect(vi.mocked(updateProjectTool)).toHaveBeenCalledTimes(1);
   });
 
   test('owner walks the full project-tools flow without a dead end', async () => {

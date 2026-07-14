@@ -107,6 +107,8 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
   const [newTitle, setNewTitle] = useState('');
   const [creating, setCreating] = useState(false);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [togglingId, setTogglingId] = useState<string | null>(null);
+  const [lastCreatedSlug, setLastCreatedSlug] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [seeding, setSeeding] = useState(false);
   // Hidden manifest-tool slugs are persisted per-project in localStorage so the
@@ -256,6 +258,7 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
   async function handleOpenAddForm() {
     setShowAddForm(true);
     setActionError(null);
+    setLastCreatedSlug(null);
     const kinds = await ensureToolKinds();
     if (!selectedKind && kinds.length > 0) setSelectedKind(kinds[0].kind);
   }
@@ -324,9 +327,10 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
     setCreating(true);
     setActionError(null);
     try {
-      await createProjectTool(projectId, { kind: selectedKind, title: newTitle.trim() });
+      const tool = await createProjectTool(projectId, { kind: selectedKind, title: newTitle.trim() });
       setShowAddForm(false);
       setNewTitle('');
+      setLastCreatedSlug(tool.slug);
       void refresh();
     } catch (err) {
       setActionError(err instanceof Error ? err.message : 'Failed to create tool');
@@ -349,12 +353,15 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
   }
 
   async function handleToggleEnabled(tool: ProjectTool) {
+    setTogglingId(tool.id);
     setActionError(null);
     try {
       await updateProjectToolApi(projectId, tool.id, { enabled: !tool.enabled });
       void refresh();
     } catch (err) {
       setActionError(err instanceof Error ? err.message : 'Failed to update tool');
+    } finally {
+      setTogglingId(null);
     }
   }
 
@@ -599,6 +606,15 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
     );
   }
 
+  function renderCreatedSlugNotice() {
+    if (!lastCreatedSlug) return null;
+    return (
+      <p className="text-xs text-neutral-400" data-testid="created-slug-notice">
+        Tool created — slug: <code className="text-neutral-200">{lastCreatedSlug}</code>
+      </p>
+    );
+  }
+
   function renderAddForm() {
     if (!showAddForm) return null;
     return (
@@ -764,7 +780,8 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
                       type="button"
                       data-viewport-allow-small-target
                       onClick={() => handleToggleEnabled(tool)}
-                      className="text-xs text-neutral-500 hover:text-neutral-300"
+                      disabled={togglingId === tool.id}
+                      className="text-xs text-neutral-500 hover:text-neutral-300 disabled:opacity-50"
                     >
                       {/* Always "Disable" here: this list is filtered to enabled
                           tools. Disabled tools move to the "Disabled" section
@@ -860,7 +877,8 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
                       type="button"
                       data-viewport-allow-small-target
                       onClick={() => handleToggleEnabled(tool)}
-                      className="text-xs text-neutral-400 hover:text-neutral-200"
+                      disabled={togglingId === tool.id}
+                      className="text-xs text-neutral-400 hover:text-neutral-200 disabled:opacity-50"
                     >
                       Enable
                     </button>
@@ -917,6 +935,7 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
       {actionError && <p className="text-sm text-red-400">{actionError}</p>}
       {renderComputeImagePanel()}
       {renderAddForm()}
+      {renderCreatedSlugNotice()}
       {renderError()}
       {renderLoading()}
       {renderToolContent()}
