@@ -22,6 +22,7 @@ from app.models import (
     ProjectMember,
 )
 from app.routers.admin_runners import _normalize_gpus_per_job, _runner_config_view
+from app.time_utils import _utcnow
 from app.runner_config import (
     GPUS_PER_JOB_MAX,
     GPUS_PER_JOB_MIN,
@@ -648,3 +649,118 @@ class TestGpusPerJobPatchEndpoint:
                 json={"gpus_per_job": bad},
             )
             assert rej.status_code == 422, bad
+
+
+class TestRunnerMemoryTelemetryContract:
+    """Cross-system contract lock for memory/CPU health on the fleet read path.
+
+    The runner heartbeat reports ``memory_free_bytes`` / ``cpu_load_avg`` (see
+    scripts/local_runner.py), the ingest stashes them on ``capabilities``, and
+    ``_runner_health`` derives the ``memory_low`` flag alongside the disk flag.
+    The operator surfaces (FleetHealthCard, FleetRunnersPanel) render these to
+    warn on a memory-starved runner. Disk was wired end-to-end; memory/CPU were
+    computed by the backend but silently dropped by the admin-ui contract, so a
+    memory-starved fleet read as healthy. These tests lock the backend read path
+    so a future change can never again drop the fields the operator UI depends
+    on. Threshold: ``_LOW_MEMORY_FREE_BYTES`` = 512 MiB.
+    """
+
+    async def _make_live_runner(self, session, project_id, *, capabilities, hostname):
+        runner = LocalRunner(
+            project_id=project_id,
+            token_hash="a" * 64,
+            hostname=hostname,
+            status="active",
+            last_seen_at=_utcnow() - timedelta(seconds=15),
+            capabilities=capabilities,
+        )
+        session.add(runner)
+        await session.commit()
+        await session.refresh(runner)
+        return runner
+
+    @pytest.mark.asyncio
+    async def test_list_runners_health_emits_memory_and_cpu_and_flags_low_memory(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        low_mem_bytes = 200 * 1024**2  # 200 MiB < 512 MiB threshold
+        runner = await self._make_live_runner(
+            db_session,
+            project.id,
+            hostname="mem-starved",
+            capabilities={
+                "task_types": "all",
+                "max_concurrent": 2,
+                # Disk is healthy; only memory is starved — proves the two flags
+                # are independent and the low-memory case is what trips.
+                "disk_free_bytes": 50 * 1024**3,
+                "memory_free_bytes": low_mem_bytes,
+                "cpu_load_avg": 3.5,
+                "gpu_utilization_pct": 10,
+            },
+        )
+
+        resp = await client.get(f"/api/admin/projects/{project.id}/runners")
+        assert resp.status_code == 200, resp.text
+        health = {r["id"]: r["health"] for r in resp.json()}[str(runner.id)]
+
+        assert health["device_status"] == "connected"
+        assert health["memory_free_bytes"] == low_mem_bytes
+        assert health["memory_low"] is True
+        assert health["cpu_load_avg"] == pytest.approx(3.5)
+        # Disk stays healthy — the memory flag must not be conflated with disk.
+        assert health["disk_low"] is False
+
+    @pytest.mark.asyncio
+    async def test_list_runners_health_omits_low_memory_for_healthy_runner(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner = await self._make_live_runner(
+            db_session,
+            project.id,
+            hostname="mem-healthy",
+            capabilities={
+                "task_types": "all",
+                "max_concurrent": 2,
+                "memory_free_bytes": 8 * 1024**3,  # 8 GiB, well above threshold
+                "cpu_load_avg": 0.25,
+            },
+        )
+
+        resp = await client.get(f"/api/admin/projects/{project.id}/runners")
+        assert resp.status_code == 200, resp.text
+        health = {r["id"]: r["health"] for r in resp.json()}[str(runner.id)]
+
+        assert health["memory_low"] is False
+        assert health["memory_free_bytes"] == 8 * 1024**3
+        assert health["cpu_load_avg"] == pytest.approx(0.25)
+
+    @pytest.mark.asyncio
+    async def test_fleet_health_summary_counts_low_memory(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        await self._make_live_runner(
+            db_session,
+            project.id,
+            hostname="mem-starved",
+            capabilities={
+                "task_types": "all",
+                "max_concurrent": 2,
+                "memory_free_bytes": 100 * 1024**2,  # 100 MiB < threshold
+                "cpu_load_avg": 4.0,
+            },
+        )
+
+        resp = await client.get("/api/admin/fleet/runners/health-summary")
+        assert resp.status_code == 200, resp.text
+        summary = resp.json()
+
+        # Fleet-wide low_memory count is emitted and reflects the starved runner.
+        assert summary["low_memory"] >= 1
+        entry = {e["project_id"]: e for e in summary["per_project"]}[str(project.id)]
+        assert entry["low_memory"] >= 1
+        # The per-runner health inside the summary carries the flag the UI renders.
+        assert any(r["health"]["memory_low"] for r in entry["runners"])

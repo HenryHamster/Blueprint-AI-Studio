@@ -1426,6 +1426,9 @@ export interface FleetHealthProjectEntry {
   stale: number;
   offline: number;
   low_disk: number;
+  // Count of runners below the low-memory threshold. Optional/null-tolerant:
+  // a runner (old build) or serving backend that never reported memory omits it.
+  low_memory?: number;
   runners: FleetRunner[];
 }
 
@@ -1436,6 +1439,7 @@ export interface FleetHealthSummaryResponse {
   stale: number;
   offline: number;
   low_disk: number;
+  low_memory?: number;
   per_project: FleetHealthProjectEntry[];
   project_count: number;
   generated_at: string;
@@ -1719,6 +1723,8 @@ export interface FleetRunner {
     compute_backend?: string;
     // Display-only trust telemetry stashed on capabilities at heartbeat.
     disk_free_bytes?: number;
+    memory_free_bytes?: number;
+    cpu_load_avg?: number;
     gpu_utilization_pct?: number;
     [key: string]: unknown;
   };
@@ -1757,6 +1763,12 @@ export interface FleetRunner {
     consecutive_job_failures?: number;
     disk_free_bytes?: number | null;
     disk_low?: boolean;
+    // Memory-pressure telemetry, symmetric with disk. memory_low is true when
+    // free memory is below the backend's low-memory threshold. Emitted by
+    // _runner_health(); null/absent for runners (old build) that never reported it.
+    memory_free_bytes?: number | null;
+    memory_low?: boolean;
+    cpu_load_avg?: number | null;
     gpu_utilization_pct?: number | null;
     failure_streak_threshold?: number;
   };

@@ -215,6 +215,39 @@ describe('FleetHealthCard', () => {
     expect(getByText('low disk', { selector: 'span' })).toBeTruthy();
   });
 
+  test('renders low memory count when the backend reports memory-starved runners', () => {
+    const { getByText } = render(
+      <FleetHealthCard data={makeSummary({ low_memory: 2 })} loading={false} />,
+    );
+    // Backend emits low_memory but the card previously dropped it — assert it
+    // now renders symmetric with the low-disk warning.
+    const lowMem = getByText('low memory', { selector: 'span' });
+    expect(lowMem).toBeTruthy();
+    expect(lowMem.textContent).toContain('2');
+  });
+
+  test('omits low memory count when no runner is memory-starved', () => {
+    const { queryByText } = render(
+      <FleetHealthCard data={makeSummary({ low_memory: 0 })} loading={false} />,
+    );
+    expect(queryByText('low memory')).toBeNull();
+  });
+
+  test('expanded project shows a low-memory icon on a memory-starved runner', () => {
+    const summary = makeSummary({ low_memory: 1 });
+    // Mark host-lowdisk as also memory-starved to exercise the per-runner icon.
+    const starved = summary.per_project[0].runners[2];
+    if (starved.health) {
+      starved.health.memory_low = true;
+      starved.health.memory_free_bytes = 100 * 1024 ** 2;
+    }
+    const { getByText, getByLabelText } = render(
+      <FleetHealthCard data={summary} loading={false} />,
+    );
+    fireEvent.click(getByText('aaaaaaaa'));
+    expect(getByLabelText('Low memory')).toBeTruthy();
+  });
+
   test('shows per-project section', () => {
     const { getByText } = render(
       <FleetHealthCard data={makeSummary()} loading={false} />,

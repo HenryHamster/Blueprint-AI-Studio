@@ -1168,6 +1168,50 @@ describe('FleetRunnersPanel — behavioral', () => {
     expect(el.querySelector('[data-testid="fleet-runner-connected-summary"]')?.textContent).toBe('1 connected');
   });
 
+  test('memory-starved runner surfaces free memory and warns', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([
+      {
+        ...SAMPLE_RUNNERS[0],
+        capabilities: { task_types: 'all', has_gpu: false, max_concurrent: 2 },
+        health: {
+          device_status: 'connected',
+          device_status_reason: null,
+          is_live: true,
+          degraded: false,
+          degraded_reason: null,
+          seconds_since_last_seen: 10,
+          active_task_count: 0,
+          active_compute_job_count: 0,
+          active_work_count: 0,
+          max_concurrent: 2,
+          available_slots: 2,
+          stale_reason: null,
+          agent_available: true,
+          liveness_window_seconds: 300,
+          last_successful_job_at: new Date(Date.now() - 90_000).toISOString(),
+          seconds_since_last_success: 90,
+          consecutive_job_failures: 0,
+          disk_free_bytes: 53687091200, // 50 GiB — disk healthy
+          disk_low: false,
+          memory_free_bytes: 268435456, // 256 MiB — memory starved
+          memory_low: true,
+          cpu_load_avg: 3.5,
+          failure_streak_threshold: 3,
+        },
+      },
+    ]);
+    const el = await mount();
+
+    const telemetryEl = el.querySelector('[data-testid="fleet-runner-telemetry"]');
+    const telemetry = telemetryEl?.textContent ?? '';
+    // Memory free is surfaced on the telemetry line (previously dropped entirely).
+    expect(telemetry).toContain('256 MiB mem');
+    expect(telemetry).toContain('50 GiB disk');
+    // memory_low trips the warn styling even though disk is healthy and the
+    // runner is not job-failure degraded.
+    expect(telemetryEl?.className).toContain('amber');
+  });
+
   test('empty state renders when no runners enrolled', async () => {
     vi.mocked(listFleetRunners).mockResolvedValueOnce([]);
     const el = await mount();

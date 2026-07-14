@@ -214,7 +214,8 @@ function lastSuccessLabel(runner: FleetRunner): string | null {
 }
 
 /** Trust telemetry one-liner for a runner row: last successful job, GPU util,
- *  disk free. Returns null when the runner reported no telemetry (old runners). */
+ *  disk free, memory free. Returns null when the runner reported no telemetry
+ *  (old runners). Warns on a degraded runner or disk/memory pressure. */
 function telemetrySummary(runner: FleetRunner): { text: string; warn: boolean } | null {
   const health = runner.health;
   const parts: string[] = [];
@@ -226,8 +227,13 @@ function telemetrySummary(runner: FleetRunner): { text: string; warn: boolean } 
   if (typeof gpuUtil === 'number') parts.push(`GPU ${gpuUtil}%`);
   const diskFree = health?.disk_free_bytes ?? runner.capabilities.disk_free_bytes;
   if (typeof diskFree === 'number') parts.push(`${formatBytes(diskFree)} disk`);
+  const memFree = health?.memory_free_bytes ?? runner.capabilities.memory_free_bytes;
+  if (typeof memFree === 'number') parts.push(`${formatBytes(memFree)} mem`);
   if (parts.length === 0) return null;
-  return { text: parts.join(' · '), warn: isRunnerDegraded(runner) || health?.disk_low === true };
+  return {
+    text: parts.join(' · '),
+    warn: isRunnerDegraded(runner) || health?.disk_low === true || health?.memory_low === true,
+  };
 }
 
 function runnerReadinessDetail(runner: FleetRunner, runnerLive: boolean, slots: number | null): string {
