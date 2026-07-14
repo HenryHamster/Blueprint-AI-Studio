@@ -1788,13 +1788,16 @@ export interface FleetRunner {
   created_at: string | null;
 }
 
-/** Register a new fleet runner for a project. Returns the one-time token. */
+/** Register a new fleet runner for a project. Returns the one-time token.
+ *
+ * The backend (POST /projects/{id}/runners/register and .../rotate-token) returns
+ * exactly `{runner_id, token}` — runner tokens do not expire, so there is no
+ * expiry field here. A prior version of this type declared phantom
+ * `token_expires_at`/`expires_at`/`expiresAt` fields that the server never sent,
+ * driving a dead "Token expires" affordance in the enroll dialog; both removed. */
 export interface FleetRunnerRegistrationResult {
   runner_id: string;
   token: string;
-  token_expires_at?: string | null;
-  expires_at?: string | null;
-  expiresAt?: string | null;
 }
 
 export async function registerFleetRunner(

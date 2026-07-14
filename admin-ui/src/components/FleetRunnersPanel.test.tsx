@@ -41,6 +41,23 @@ function typeInto(input: HTMLInputElement, value: string) {
   input.dispatchEvent(new Event('input', { bubbles: true }));
 }
 
+// Open the per-runner Configure panel (all editable config lives there now,
+// reached via the gear toggle in the runner's action strip).
+async function openConfig(el: HTMLDivElement) {
+  const toggle = el.querySelector('[data-testid="fleet-runner-configure-toggle"]') as HTMLButtonElement;
+  if (!toggle) throw new Error('Configure toggle not found');
+  await act(async () => { toggle.click(); });
+  await act(async () => {});
+}
+
+// Click the single "Save changes" button inside an open Configure panel.
+async function saveConfig(el: HTMLDivElement) {
+  const saveBtn = el.querySelector('[data-testid="fleet-runner-config-save"]') as HTMLButtonElement;
+  if (!saveBtn) throw new Error('Config save button not found');
+  await act(async () => { saveBtn.click(); });
+  await act(async () => {});
+}
+
 vi.mock('../api', async () => {
   const { createApiMock } = await import('../test/api-mock-complete');
   return createApiMock({
@@ -287,12 +304,10 @@ describe('FleetRunnersPanel — behavioral', () => {
     expect((shellCopyBtn as HTMLButtonElement).querySelector('.text-emerald-400')).not.toBeNull();
   });
 
-  test('token dialog shows token expiry when registration returns it', async () => {
-    vi.mocked(registerFleetRunner).mockResolvedValueOnce({
-      runner_id: 'runner-new',
-      token: 'tok-secret-xyz',
-      token_expires_at: '2026-07-01T12:00:00Z',
-    });
+  test('enroll dialog does not render a phantom token-expiry line', async () => {
+    // Runner tokens do not expire; the backend register/rotate responses are
+    // exactly {runner_id, token}. The old "Token expires" affordance was dead
+    // (driven by phantom fields the server never sent) and has been removed.
     const el = await mount();
 
     const enrollBtn = [...el.querySelectorAll('button')].find(b => b.textContent?.includes('Enroll runner'));
@@ -300,7 +315,7 @@ describe('FleetRunnersPanel — behavioral', () => {
     await act(async () => {});
 
     expect(el.textContent).toContain('Runner enrolled');
-    expect(el.textContent).toContain('Token expires');
+    expect(el.textContent).not.toContain('Token expires');
   });
 
   test('dismissing the token dialog removes it', async () => {
@@ -1342,11 +1357,9 @@ describe('FleetRunnersPanel — behavioral', () => {
     ]);
     const el = await mount();
 
-    // Currently "all" — open the editor.
+    // Current value surfaced read-only in the header; editing lives in the panel.
     expect(el.textContent).toContain('GPUs: all');
-    const editBtn = el.querySelector('button[aria-label="Edit GPU allowlist"]');
-    expect(editBtn).not.toBeNull();
-    await act(async () => { (editBtn as HTMLButtonElement).click(); });
+    await openConfig(el);
 
     // Uncheck "all" to reveal the index input.
     const allToggle = el.querySelector('input[aria-label="Allow all GPUs"]') as HTMLInputElement;
@@ -1360,12 +1373,9 @@ describe('FleetRunnersPanel — behavioral', () => {
     expect(indexInput).not.toBeNull();
     await act(async () => { typeInto(indexInput, '2, 0, 2'); });
 
-    const saveBtn = el.querySelector('button[aria-label="Save GPU allowlist"]');
-    expect(saveBtn).not.toBeNull();
-    await act(async () => { (saveBtn as HTMLButtonElement).click(); });
-    await act(async () => {});
+    await saveConfig(el);
 
-    // Parsed to a deduped, sorted, non-negative integer array.
+    // Only the changed field is sent, parsed to a deduped, sorted array.
     expect(updateRunnerCapabilities).toHaveBeenCalledWith('proj-test', 'runner-abc123', {
       gpu_indices_allowed: [0, 2],
     });
@@ -1386,26 +1396,23 @@ describe('FleetRunnersPanel — behavioral', () => {
     ]);
     const el = await mount();
 
-    // Currently restricted — open the editor and re-check "all".
+    // Currently restricted — open the panel and re-check "all".
     expect(el.textContent).toContain('GPUs: 0,1');
-    const editBtn = el.querySelector('button[aria-label="Edit GPU allowlist"]');
-    await act(async () => { (editBtn as HTMLButtonElement).click(); });
+    await openConfig(el);
 
     const allToggle = el.querySelector('input[aria-label="Allow all GPUs"]') as HTMLInputElement;
     // Opened from a restricted list → starts unchecked.
     expect(allToggle.checked).toBe(false);
     await act(async () => { allToggle.click(); });
 
-    const saveBtn = el.querySelector('button[aria-label="Save GPU allowlist"]');
-    await act(async () => { (saveBtn as HTMLButtonElement).click(); });
-    await act(async () => {});
+    await saveConfig(el);
 
     expect(updateRunnerCapabilities).toHaveBeenCalledWith('proj-test', 'runner-abc123', {
       gpu_indices_allowed: 'all',
     });
   });
 
-  test('the GPU allowlist editor is absent for non-GPU runners', async () => {
+  test('the GPU allowlist control is absent for non-GPU runners', async () => {
     vi.mocked(listFleetRunners).mockResolvedValueOnce([
       {
         ...SAMPLE_RUNNERS[0],
@@ -1419,7 +1426,9 @@ describe('FleetRunnersPanel — behavioral', () => {
       },
     ]);
     const el = await mount();
-    expect(el.querySelector('button[aria-label="Edit GPU allowlist"]')).toBeNull();
+    await openConfig(el);
+    expect(el.querySelector('input[aria-label="Allow all GPUs"]')).toBeNull();
+    expect(el.querySelector('input[aria-label="GPU indices allowed"]')).toBeNull();
   });
 
   // ── Live config: per-job GPU count + task-type allowlist editors ─────────────
@@ -1440,20 +1449,15 @@ describe('FleetRunnersPanel — behavioral', () => {
     ]);
     const el = await mount();
 
-    // Current value is surfaced, editor closed.
+    // Current value surfaced read-only in the header; edit in the panel.
     expect(el.textContent).toContain('1 GPUs/job');
-    const editBtn = el.querySelector('button[aria-label="Edit GPUs per job"]');
-    expect(editBtn).not.toBeNull();
-    await act(async () => { (editBtn as HTMLButtonElement).click(); });
+    await openConfig(el);
 
     const input = el.querySelector('input[aria-label="GPUs per job"]') as HTMLInputElement;
     expect(input).not.toBeNull();
     await act(async () => { typeInto(input, '4'); });
 
-    const saveBtn = el.querySelector('button[aria-label="Save GPUs per job"]');
-    expect(saveBtn).not.toBeNull();
-    await act(async () => { (saveBtn as HTMLButtonElement).click(); });
-    await act(async () => {});
+    await saveConfig(el);
 
     expect(updateRunnerCapabilities).toHaveBeenCalledWith('proj-test', 'runner-abc123', {
       gpus_per_job: 4,
@@ -1476,22 +1480,19 @@ describe('FleetRunnersPanel — behavioral', () => {
     ]);
     const el = await mount();
 
-    const editBtn = el.querySelector('button[aria-label="Edit GPUs per job"]');
-    await act(async () => { (editBtn as HTMLButtonElement).click(); });
+    await openConfig(el);
 
     const input = el.querySelector('input[aria-label="GPUs per job"]') as HTMLInputElement;
     // Above the max clamps to 8.
     await act(async () => { typeInto(input, '99'); });
-    const saveBtn = el.querySelector('button[aria-label="Save GPUs per job"]');
-    await act(async () => { (saveBtn as HTMLButtonElement).click(); });
-    await act(async () => {});
+    await saveConfig(el);
 
     expect(updateRunnerCapabilities).toHaveBeenCalledWith('proj-test', 'runner-abc123', {
       gpus_per_job: 8,
     });
   });
 
-  test('the gpus_per_job editor is absent for non-GPU runners', async () => {
+  test('the gpus_per_job control is absent for non-GPU runners', async () => {
     vi.mocked(listFleetRunners).mockResolvedValueOnce([
       {
         ...SAMPLE_RUNNERS[0],
@@ -1506,7 +1507,8 @@ describe('FleetRunnersPanel — behavioral', () => {
       },
     ]);
     const el = await mount();
-    expect(el.querySelector('button[aria-label="Edit GPUs per job"]')).toBeNull();
+    await openConfig(el);
+    expect(el.querySelector('input[aria-label="GPUs per job"]')).toBeNull();
   });
 
   test('editing task_types to a list calls updateRunnerCapabilities with the parsed array', async () => {
@@ -1526,9 +1528,7 @@ describe('FleetRunnersPanel — behavioral', () => {
     const el = await mount();
 
     expect(el.textContent).toContain('tasks: all');
-    const editBtn = el.querySelector('button[aria-label="Edit task types"]');
-    expect(editBtn).not.toBeNull();
-    await act(async () => { (editBtn as HTMLButtonElement).click(); });
+    await openConfig(el);
 
     const allToggle = el.querySelector('input[aria-label="Allow all task types"]') as HTMLInputElement;
     expect(allToggle).not.toBeNull();
@@ -1539,9 +1539,7 @@ describe('FleetRunnersPanel — behavioral', () => {
     expect(listInput).not.toBeNull();
     await act(async () => { typeInto(listInput, 'compute_experiment, code_change, compute_experiment'); });
 
-    const saveBtn = el.querySelector('button[aria-label="Save task types"]');
-    await act(async () => { (saveBtn as HTMLButtonElement).click(); });
-    await act(async () => {});
+    await saveConfig(el);
 
     // Deduped, trimmed list preserving input order.
     expect(updateRunnerCapabilities).toHaveBeenCalledWith('proj-test', 'runner-abc123', {
@@ -1566,24 +1564,21 @@ describe('FleetRunnersPanel — behavioral', () => {
     const el = await mount();
 
     expect(el.textContent).toContain('tasks: compute_experiment');
-    const editBtn = el.querySelector('button[aria-label="Edit task types"]');
-    await act(async () => { (editBtn as HTMLButtonElement).click(); });
+    await openConfig(el);
 
     const allToggle = el.querySelector('input[aria-label="Allow all task types"]') as HTMLInputElement;
     // Opened from a restricted list → starts unchecked.
     expect(allToggle.checked).toBe(false);
     await act(async () => { allToggle.click(); });
 
-    const saveBtn = el.querySelector('button[aria-label="Save task types"]');
-    await act(async () => { (saveBtn as HTMLButtonElement).click(); });
-    await act(async () => {});
+    await saveConfig(el);
 
     expect(updateRunnerCapabilities).toHaveBeenCalledWith('proj-test', 'runner-abc123', {
       task_types: 'all',
     });
   });
 
-  test('the task_types editor is suppressed for strategic runners', async () => {
+  test('the task_types control is suppressed for strategic runners', async () => {
     vi.mocked(listFleetRunners).mockResolvedValueOnce([
       {
         ...SAMPLE_RUNNERS[0],
@@ -1604,7 +1599,140 @@ describe('FleetRunnersPanel — behavioral', () => {
       },
     ]);
     const el = await mount();
-    expect(el.querySelector('button[aria-label="Edit task types"]')).toBeNull();
+    await openConfig(el);
+    // Strategic runners have task types pinned; the editable control is replaced
+    // by a read-only value, so the "all" checkbox is absent.
+    expect(el.querySelector('input[aria-label="Allow all task types"]')).toBeNull();
+    expect(el.textContent).toContain('Pinned to the strategic task set');
+  });
+
+  // ── Configure panel: coherent config surface (rebuild) ───────────────────────
+
+  test('config panel is closed by default and opens/closes via the Configure toggle', async () => {
+    const el = await mount();
+    // Closed initially — no config form on screen.
+    expect(el.querySelector('[data-testid="fleet-runner-config-panel"]')).toBeNull();
+    await openConfig(el);
+    expect(el.querySelector('[data-testid="fleet-runner-config-panel"]')).not.toBeNull();
+    // The toggle is a real, discoverable affordance (not a bare pencil icon).
+    const toggle = el.querySelector('[data-testid="fleet-runner-configure-toggle"]') as HTMLButtonElement;
+    expect(toggle.getAttribute('aria-label')).toContain('Configure runner');
+    // Toggling again collapses it.
+    await act(async () => { toggle.click(); });
+    await act(async () => {});
+    expect(el.querySelector('[data-testid="fleet-runner-config-panel"]')).toBeNull();
+  });
+
+  test('walkthrough: a new operator configures a GPU runner end-to-end without reading source', async () => {
+    const runnerBefore: FleetRunner = {
+      ...SAMPLE_RUNNERS[0],
+      capabilities: { task_types: 'all', has_gpu: true, max_concurrent: 2 },
+      config: {
+        config_generation: 'gen-abc',
+        applied_config_generation: 'gen-abc',
+        config_pending: false,
+        gpu_indices_allowed: 'all',
+        gpus_per_job: 1,
+        desired: { task_types: 'all', max_concurrent: 2 },
+      },
+    };
+    // Initial load shows defaults; the post-save reload reflects the applied
+    // config (simulating the backend converging the desired config).
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([runnerBefore]);
+    vi.mocked(listFleetRunners).mockResolvedValue([
+      {
+        ...runnerBefore,
+        capabilities: { ...runnerBefore.capabilities, max_concurrent: 4 },
+        config: {
+          ...runnerBefore.config,
+          gpu_indices_allowed: [0, 1],
+          desired: { task_types: 'all', max_concurrent: 4 },
+        },
+      },
+    ]);
+    const el = await mount();
+
+    // 1. Operator opens the Configure panel from the labelled gear toggle.
+    await openConfig(el);
+    const panel = el.querySelector('[data-testid="fleet-runner-config-panel"]') as HTMLElement;
+    expect(panel).not.toBeNull();
+
+    // 2. Every control carries a plain-language label — no source-reading needed.
+    expect(panel.textContent).toContain('Max concurrent tasks');
+    expect(panel.textContent).toContain('Task types');
+    expect(panel.textContent).toContain('GPU allowlist');
+    expect(panel.textContent).toContain('GPUs per job');
+    expect(panel.textContent).toContain('apply on the runner’s next heartbeat');
+
+    // 3. Nothing changed yet → Save disabled, feedback says "No changes".
+    const saveBtn = el.querySelector('[data-testid="fleet-runner-config-save"]') as HTMLButtonElement;
+    expect(saveBtn.disabled).toBe(true);
+    expect(el.querySelector('[data-testid="fleet-runner-config-feedback"]')?.textContent).toContain('No changes');
+
+    // 4. Operator raises concurrency and restricts GPUs, then saves once.
+    const concInput = el.querySelector('input[aria-label="Max concurrent tasks"]') as HTMLInputElement;
+    await act(async () => { typeInto(concInput, '4'); });
+    const gpuAll = el.querySelector('input[aria-label="Allow all GPUs"]') as HTMLInputElement;
+    await act(async () => { gpuAll.click(); });
+    const gpuIdx = el.querySelector('input[aria-label="GPU indices allowed"]') as HTMLInputElement;
+    await act(async () => { typeInto(gpuIdx, '0,1'); });
+
+    // Feedback reflects unsaved edits before the write.
+    expect(el.querySelector('[data-testid="fleet-runner-config-feedback"]')?.textContent).toContain('Unsaved changes');
+    expect(saveBtn.disabled).toBe(false);
+
+    await saveConfig(el);
+
+    // 5. Exactly the two changed fields are sent in ONE request.
+    expect(updateRunnerCapabilities).toHaveBeenCalledTimes(1);
+    expect(updateRunnerCapabilities).toHaveBeenCalledWith('proj-test', 'runner-abc123', {
+      max_concurrent: 4,
+      gpu_indices_allowed: [0, 1],
+    });
+    // 6. The operator gets explicit save confirmation.
+    expect(el.querySelector('[data-testid="fleet-runner-config-feedback"]')?.textContent).toContain('Saved');
+  });
+
+  test('config panel surfaces a save error instead of failing silently', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValue([
+      {
+        ...SAMPLE_RUNNERS[0],
+        capabilities: { task_types: 'all', has_gpu: false, max_concurrent: 2 },
+        config: { config_pending: false, desired: { max_concurrent: 2 } },
+      },
+    ]);
+    vi.mocked(updateRunnerCapabilities).mockRejectedValueOnce(new Error('HTTP 409 conflict'));
+    const el = await mount();
+
+    await openConfig(el);
+    const concInput = el.querySelector('input[aria-label="Max concurrent tasks"]') as HTMLInputElement;
+    await act(async () => { typeInto(concInput, '8'); });
+    await saveConfig(el);
+
+    const feedback = el.querySelector('[data-testid="fleet-runner-config-feedback"]');
+    expect(feedback?.textContent).toContain('Save failed');
+    expect(feedback?.textContent).toContain('HTTP 409 conflict');
+  });
+
+  test('config panel pins concurrency read-only for strategic runners', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValue([
+      {
+        ...SAMPLE_RUNNERS[0],
+        capabilities: {
+          task_types: ['design_doc_update', 'strategic_review'],
+          has_gpu: false,
+          max_concurrent: 1,
+          runner_preset: 'strategic_local',
+          workload: 'strategic',
+        },
+        config: { config_pending: false, desired: { max_concurrent: 1 } },
+      },
+    ]);
+    const el = await mount();
+    await openConfig(el);
+    // No editable concurrency input; a read-only value + explanation instead.
+    expect(el.querySelector('input[aria-label="Max concurrent tasks"]')).toBeNull();
+    expect(el.textContent).toContain('Pinned to 1 for strategic runners');
   });
 
   // ── Cloud-cost-avoided rollup in the telemetry detail ────────────────────────

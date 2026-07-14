@@ -1,14 +1,18 @@
 /* eslint-disable react-hooks/set-state-in-effect */
 import { useState, useCallback, useEffect, useRef, useMemo } from 'react';
-import { Compass, Cpu, Copy, Check, KeyRound, RefreshCw, Trash2, Edit2, PauseCircle, PlayCircle, Wind, Activity } from 'lucide-react';
-import { API_BASE_URL, listFleetRunners, patchRunnerStatus, registerFleetRunner, revokeFleetRunner, rotateFleetRunnerToken, updateRunnerCapabilities, fetchRunnerTelemetry, fetchRunnerStats } from '../api';
-import type { FleetRunner, FleetRunnerRegistrationResult, RunnerTelemetryResponse, RunnerStatsResponse } from '../api';
+import { Compass, Cpu, Copy, Check, KeyRound, RefreshCw, Trash2, SlidersHorizontal, PauseCircle, PlayCircle, Wind, Activity } from 'lucide-react';
+import { API_BASE_URL, listFleetRunners, patchRunnerStatus, registerFleetRunner, revokeFleetRunner, rotateFleetRunnerToken, fetchRunnerTelemetry, fetchRunnerStats } from '../api';
+import type { FleetRunner, RunnerTelemetryResponse, RunnerStatsResponse } from '../api';
 import { ConfirmDialog } from './ConfirmDialog';
-import { timeAgo, parseTimestamp, formatAbsolute, formatDurationSec } from '../utils/time';
+import { FleetRunnerConfigPanel } from './FleetRunnerConfigPanel';
+import { timeAgo, parseTimestamp, formatDurationSec } from '../utils/time';
 import {
   formatBytes,
   formatBackendInventory,
   runnerSetupSnippets,
+  gpuAllowlistLabel,
+  taskTypesLabel,
+  gpusPerJobValue,
   type RunnerSetupPreset,
   type RunnerSetupSnippetCommands,
 } from './FleetRunnersPanel.utils';
@@ -177,83 +181,6 @@ function configStatus(runner: FleetRunner): { label: string; cls: string; pendin
   return null;
 }
 
-/** Current GPU allowlist for a runner, from the server-authoritative desired
- *  config. Absent / "all" means no restriction (all visible GPUs eligible). */
-function gpuAllowlistValue(runner: FleetRunner): 'all' | number[] {
-  const allow = runner.config?.gpu_indices_allowed;
-  if (Array.isArray(allow)) return allow;
-  return 'all';
-}
-
-function gpuAllowlistLabel(runner: FleetRunner): string {
-  const allow = gpuAllowlistValue(runner);
-  if (allow === 'all') return 'GPUs: all';
-  return allow.length > 0 ? `GPUs: ${allow.join(',')}` : 'GPUs: none';
-}
-
-/** Parse an operator-typed index list ("0, 1 2") into a deduped, sorted,
- *  non-negative integer array — the shape the PATCH endpoint normalizes to. */
-function parseGpuIndexList(text: string): number[] {
-  const seen = new Set<number>();
-  const out: number[] = [];
-  for (const token of text.split(/[\s,]+/)) {
-    if (!token) continue;
-    if (!/^\d+$/.test(token)) continue;
-    const value = Number(token);
-    if (!Number.isInteger(value) || value < 0 || seen.has(value)) continue;
-    seen.add(value);
-    out.push(value);
-  }
-  return out.sort((a, b) => a - b);
-}
-
-// Per-job GPU reservation bounds. Must match backend runner_config.GPUS_PER_JOB_MIN
-// / GPUS_PER_JOB_MAX so the UI clamp agrees with the server-side clamp.
-const GPUS_PER_JOB_MIN = 1;
-const GPUS_PER_JOB_MAX = 8;
-
-/** Current per-job GPU count for a runner, from the server-authoritative config.
- *  Absent means the default of 1 GPU per job (backward compatible). */
-function gpusPerJobValue(runner: FleetRunner): number {
-  const raw = runner.config?.gpus_per_job ?? runner.config?.desired?.gpus_per_job;
-  if (typeof raw !== 'number' || !Number.isFinite(raw)) return GPUS_PER_JOB_MIN;
-  return Math.max(GPUS_PER_JOB_MIN, Math.min(GPUS_PER_JOB_MAX, Math.trunc(raw)));
-}
-
-/** Current task-type allowlist for a runner. Prefers the server-authoritative
- *  desired config; falls back to the runner-reported capabilities for runners
- *  enrolled before the live-config contract (no config block). Absent / "all"
- *  means every task type is eligible. */
-function taskTypesValue(runner: FleetRunner): 'all' | string[] {
-  const desired = runner.config?.desired?.task_types;
-  if (Array.isArray(desired)) return desired;
-  if (desired === 'all') return 'all';
-  const reported = runner.capabilities.task_types;
-  if (Array.isArray(reported)) return reported;
-  return 'all';
-}
-
-function taskTypesLabel(runner: FleetRunner): string {
-  const value = taskTypesValue(runner);
-  if (value === 'all') return 'tasks: all';
-  return value.length > 0 ? `tasks: ${value.join(', ')}` : 'tasks: none';
-}
-
-/** Parse an operator-typed task-type list ("compute_experiment, code_change")
- *  into a deduped, trimmed, non-empty string array — the shape the PATCH
- *  endpoint normalizes ('all' when empty is handled by the caller). */
-function parseTaskTypeList(text: string): string[] {
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const token of text.split(/[\s,]+/)) {
-    const trimmed = token.trim();
-    if (!trimmed || seen.has(trimmed)) continue;
-    seen.add(trimmed);
-    out.push(trimmed);
-  }
-  return out;
-}
-
 function isStrategicRunner(runner: FleetRunner): boolean {
   const taskTypes = runner.capabilities.task_types;
   return runner.capabilities.runner_preset === 'strategic_local'
@@ -397,7 +324,6 @@ interface TokenDialogProps {
   token: string;
   mode?: TokenDialogMode;
   preset?: RunnerSetupPreset;
-  tokenExpiresAt?: string | null;
   /** True once the just-enrolled runner has heartbeated and shows connected. */
   connected: boolean;
   /** Hostname the connected runner reported, shown in the success line. */
@@ -410,7 +336,6 @@ function TokenDialog({
   token,
   mode = 'enroll',
   preset = 'default',
-  tokenExpiresAt,
   connected,
   connectedHostname,
   onDismiss,
@@ -472,12 +397,7 @@ function TokenDialog({
         </div>
 
         <div className="mb-4 space-y-2">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <div className="text-xs text-neutral-400">Setup snippets</div>
-            {tokenExpiresAt && (
-              <div className="text-ui-md text-neutral-500">Token expires {formatAbsolute(tokenExpiresAt)}</div>
-            )}
-          </div>
+          <div className="text-xs text-neutral-400">Setup snippets</div>
           <div className="grid gap-2 md:grid-cols-2">
             {setupSnippetItems.map(item => (
               <div key={item.id} className="min-w-0 rounded border border-neutral-700 bg-neutral-950">
@@ -565,10 +485,6 @@ interface Props {
   onNavigateToTask?: (taskId: string) => void;
 }
 
-function tokenExpiryFromRegisterResult(result: FleetRunnerRegistrationResult): string | null {
-  return result.token_expires_at ?? result.expires_at ?? result.expiresAt ?? null;
-}
-
 export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refreshSignal, live, onNavigateToTask }: Props) {
   const [runners, setRunners] = useState<FleetRunner[]>([]);
   const [loading, setLoading] = useState(true);
@@ -579,25 +495,15 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
     token: string;
     mode: TokenDialogMode;
     preset: RunnerSetupPreset;
-    tokenExpiresAt: string | null;
   } | null>(null);
   const [rotating, setRotating] = useState<string | null>(null);
   const [revoking, setRevoking] = useState<string | null>(null);
-  const [editingCapabilities, setEditingCapabilities] = useState<string | null>(null);
-  const [editMaxConcurrent, setEditMaxConcurrent] = useState<number>(2);
-  const [editingGpuAllowlist, setEditingGpuAllowlist] = useState<string | null>(null);
-  const [gpuAllowlistAll, setGpuAllowlistAll] = useState<boolean>(true);
-  const [gpuAllowlistText, setGpuAllowlistText] = useState<string>('');
-  const [editingGpusPerJob, setEditingGpusPerJob] = useState<string | null>(null);
-  const [editGpusPerJob, setEditGpusPerJob] = useState<number>(GPUS_PER_JOB_MIN);
-  const [editingTaskTypes, setEditingTaskTypes] = useState<string | null>(null);
-  const [taskTypesAll, setTaskTypesAll] = useState<boolean>(true);
-  const [taskTypesText, setTaskTypesText] = useState<string>('');
-  const [updatingCapabilities, setUpdatingCapabilities] = useState<string | null>(null);
   const [pendingConfirm, setPendingConfirm] = useState<{ type: 'rotate' | 'revoke'; runner: FleetRunner } | null>(null);
   const [updatingStatus, setUpdatingStatus] = useState<string | null>(null);
   // Which runner's heartbeat time-series / stats detail is expanded (lazy-loaded).
   const [expandedTelemetry, setExpandedTelemetry] = useState<string | null>(null);
+  // Which runner's configuration form is expanded.
+  const [expandedConfig, setExpandedConfig] = useState<string | null>(null);
   const mountedRef = useRef(true);
 
   useEffect(() => {
@@ -666,7 +572,6 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
         token: result.token,
         mode: 'enroll',
         preset,
-        tokenExpiresAt: tokenExpiryFromRegisterResult(result),
       });
       await load();
     } catch (e) {
@@ -697,7 +602,6 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
           token: result.token,
           mode: 'rotate',
           preset: runner.capabilities.runner_preset === 'strategic_local' ? 'strategic_local' : 'default',
-          tokenExpiresAt: tokenExpiryFromRegisterResult(result),
         });
         await load();
       } catch (e) {
@@ -716,73 +620,6 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
         setRevoking(null);
       }
     }
-  };
-
-  const handleUpdateCapabilities = async (runner: FleetRunner, maxConcurrent: number) => {
-    setUpdatingCapabilities(runner.id);
-    setEditingCapabilities(null);
-    try {
-      await updateRunnerCapabilities(projectId, runner.id, { max_concurrent: maxConcurrent });
-      await load();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setUpdatingCapabilities(null);
-    }
-  };
-
-  const handleUpdateGpuAllowlist = async (runner: FleetRunner, gpuIndicesAllowed: 'all' | number[]) => {
-    setUpdatingCapabilities(runner.id);
-    setEditingGpuAllowlist(null);
-    try {
-      await updateRunnerCapabilities(projectId, runner.id, { gpu_indices_allowed: gpuIndicesAllowed });
-      await load();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setUpdatingCapabilities(null);
-    }
-  };
-
-  const beginEditGpuAllowlist = (runner: FleetRunner) => {
-    const current = gpuAllowlistValue(runner);
-    setGpuAllowlistAll(current === 'all');
-    setGpuAllowlistText(current === 'all' ? '' : current.join(','));
-    setEditingGpuAllowlist(runner.id);
-  };
-
-  const handleUpdateGpusPerJob = async (runner: FleetRunner, gpusPerJob: number) => {
-    const clamped = Math.max(GPUS_PER_JOB_MIN, Math.min(GPUS_PER_JOB_MAX, Math.trunc(gpusPerJob)));
-    setUpdatingCapabilities(runner.id);
-    setEditingGpusPerJob(null);
-    try {
-      await updateRunnerCapabilities(projectId, runner.id, { gpus_per_job: clamped });
-      await load();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setUpdatingCapabilities(null);
-    }
-  };
-
-  const handleUpdateTaskTypes = async (runner: FleetRunner, taskTypes: 'all' | string[]) => {
-    setUpdatingCapabilities(runner.id);
-    setEditingTaskTypes(null);
-    try {
-      await updateRunnerCapabilities(projectId, runner.id, { task_types: taskTypes });
-      await load();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setUpdatingCapabilities(null);
-    }
-  };
-
-  const beginEditTaskTypes = (runner: FleetRunner) => {
-    const current = taskTypesValue(runner);
-    setTaskTypesAll(current === 'all');
-    setTaskTypesText(current === 'all' ? '' : current.join(', '));
-    setEditingTaskTypes(runner.id);
   };
 
   const handleUpdateStatus = async (runner: FleetRunner, status: 'active' | 'paused' | 'draining') => {
@@ -980,6 +817,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
             const hasBackendInfo =
               backends.available.length > 0 || backends.agentBackend !== null || backends.computeBackend !== null;
             const telemetryOpen = expandedTelemetry === runner.id;
+            const configOpen = expandedConfig === runner.id;
             return (
               <div
                 key={runner.id}
@@ -1034,60 +872,12 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                         {activeCount} active
                       </span>
                     )}
-                    {slots !== null && editingCapabilities === runner.id ? (
-                      <span className="inline-flex items-center gap-1 rounded border border-blue-500/30 bg-blue-500/10 px-1.5 py-0.5 text-xs text-blue-300">
-                        <input
-                          type="number"
-                          min={1}
-                          max={64}
-                          value={editMaxConcurrent}
-                          onChange={e => setEditMaxConcurrent(Math.max(1, Math.min(64, Number(e.target.value) || 1)))}
-                          className="w-10 bg-transparent text-center text-xs text-blue-300 outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
-                          autoFocus
-                        />
-                        <span>/ max</span>
-                        {updatingCapabilities !== runner.id ? (
-                          <>
-                            <button
-                              onClick={() => handleUpdateCapabilities(runner, editMaxConcurrent)}
-                              className="text-emerald-400 hover:text-emerald-300 transition-colors min-h-[28px] min-w-[28px] flex items-center justify-center"
-                              title="Save"
-                              aria-label="Save max concurrent"
-                              data-viewport-allow-small-target
-                            >
-                              <Check className="w-3 h-3" />
-                            </button>
-                            <button
-                              onClick={() => setEditingCapabilities(null)}
-                              className="text-neutral-400 hover:text-neutral-200 transition-colors min-h-[28px] min-w-[28px] flex items-center justify-center"
-                              title="Cancel"
-                              aria-label="Cancel"
-                              data-viewport-allow-small-target
-                            >
-                              <span className="text-xs">✕</span>
-                            </button>
-                          </>
-                        ) : (
-                          <span className="text-blue-300 animate-pulse">saving…</span>
-                        )}
-                      </span>
-                    ) : slots !== null && (
+                    {/* Config values are shown read-only here for at-a-glance
+                        status; all editing lives in the Configure panel (gear
+                        toggle in the action strip), reached below. */}
+                    {slots !== null && (
                       <span className="inline-flex items-center gap-1 rounded border border-neutral-700 bg-[#151c25] px-1.5 py-0.5 text-xs text-neutral-300">
                         {hasPerClassCapacity ? `${slots} agent slots free` : `${slots} slots free`}
-                        {runner.capabilities.workload !== 'strategic' && runner.capabilities.runner_preset !== 'strategic_local' && (
-                          <button
-                            onClick={() => {
-                              setEditMaxConcurrent(runner.capabilities.max_concurrent ?? 2);
-                              setEditingCapabilities(runner.id);
-                            }}
-                            className="text-neutral-500 hover:text-neutral-200 transition-colors min-h-[20px] min-w-[20px] flex items-center justify-center"
-                            title="Edit max concurrent"
-                            aria-label="Edit max concurrent"
-                            data-viewport-allow-small-target
-                          >
-                            <Edit2 className="w-3 h-3" />
-                          </button>
-                        )}
                       </span>
                     )}
                     {hasPerClassCapacity && computeSlots !== null && (
@@ -1099,193 +889,19 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                       <span className="rounded border border-purple-500/30 bg-purple-500/10 px-1.5 py-0.5 text-xs text-purple-300">GPU</span>
                     )}
                     {runner.capabilities.has_gpu && (
-                      editingGpuAllowlist === runner.id ? (
-                        <span
-                          className="inline-flex items-center gap-1 rounded border border-purple-500/30 bg-purple-500/10 px-1.5 py-0.5 text-xs text-purple-300"
-                          data-testid="fleet-runner-gpu-allowlist-editor"
-                        >
-                          <label className="inline-flex items-center gap-1">
-                            <input
-                              type="checkbox"
-                              checked={gpuAllowlistAll}
-                              onChange={e => setGpuAllowlistAll(e.target.checked)}
-                              aria-label="Allow all GPUs"
-                            />
-                            all
-                          </label>
-                          {!gpuAllowlistAll && (
-                            <input
-                              type="text"
-                              inputMode="numeric"
-                              value={gpuAllowlistText}
-                              onChange={e => setGpuAllowlistText(e.target.value)}
-                              placeholder="0,1"
-                              aria-label="GPU indices allowed"
-                              className="w-16 bg-transparent text-center text-xs text-purple-300 outline-none"
-                              autoFocus
-                            />
-                          )}
-                          {updatingCapabilities !== runner.id ? (
-                            <>
-                              <button
-                                onClick={() => handleUpdateGpuAllowlist(runner, gpuAllowlistAll ? 'all' : parseGpuIndexList(gpuAllowlistText))}
-                                className="text-emerald-400 hover:text-emerald-300 transition-colors min-h-[28px] min-w-[28px] flex items-center justify-center"
-                                title="Save GPU allowlist"
-                                aria-label="Save GPU allowlist"
-                              >
-                                <Check className="w-3 h-3" />
-                              </button>
-                              <button
-                                onClick={() => setEditingGpuAllowlist(null)}
-                                className="text-neutral-400 hover:text-neutral-200 transition-colors min-h-[28px] min-w-[28px] flex items-center justify-center"
-                                title="Cancel"
-                                aria-label="Cancel GPU allowlist"
-                              >
-                                <span className="text-xs">✕</span>
-                              </button>
-                            </>
-                          ) : (
-                            <span className="text-purple-300 animate-pulse">saving…</span>
-                          )}
-                        </span>
-                      ) : (
-                        <span className="inline-flex items-center gap-1 rounded border border-purple-500/30 bg-purple-500/10 px-1.5 py-0.5 text-xs text-purple-300">
-                          {gpuAllowlistLabel(runner)}
-                          <button
-                            onClick={() => beginEditGpuAllowlist(runner)}
-                            className="flex min-h-[44px] min-w-[44px] items-center justify-center text-purple-300/70 transition-colors hover:text-purple-200 md:min-h-5 md:min-w-5"
-                            title="Edit GPU allowlist"
-                            aria-label="Edit GPU allowlist"
-                          >
-                            <Edit2 className="w-3 h-3" />
-                          </button>
-                        </span>
-                      )
+                      <span className="inline-flex items-center gap-1 rounded border border-purple-500/30 bg-purple-500/10 px-1.5 py-0.5 text-xs text-purple-300">
+                        {gpuAllowlistLabel(runner)}
+                      </span>
                     )}
                     {runner.capabilities.has_gpu && (
-                      editingGpusPerJob === runner.id ? (
-                        <span
-                          className="inline-flex items-center gap-1 rounded border border-purple-500/30 bg-purple-500/10 px-1.5 py-0.5 text-xs text-purple-300"
-                          data-testid="fleet-runner-gpus-per-job-editor"
-                        >
-                          <input
-                            type="number"
-                            min={GPUS_PER_JOB_MIN}
-                            max={GPUS_PER_JOB_MAX}
-                            value={editGpusPerJob}
-                            onChange={e => setEditGpusPerJob(
-                              Math.max(GPUS_PER_JOB_MIN, Math.min(GPUS_PER_JOB_MAX, Number(e.target.value) || GPUS_PER_JOB_MIN)),
-                            )}
-                            className="w-10 bg-transparent text-center text-xs text-purple-300 outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
-                            aria-label="GPUs per job"
-                            autoFocus
-                          />
-                          <span>GPUs/job</span>
-                          {updatingCapabilities !== runner.id ? (
-                            <>
-                              <button
-                                onClick={() => handleUpdateGpusPerJob(runner, editGpusPerJob)}
-                                className="text-emerald-400 hover:text-emerald-300 transition-colors min-h-[28px] min-w-[28px] flex items-center justify-center"
-                                title="Save GPUs per job"
-                                aria-label="Save GPUs per job"
-                              >
-                                <Check className="w-3 h-3" />
-                              </button>
-                              <button
-                                onClick={() => setEditingGpusPerJob(null)}
-                                className="text-neutral-400 hover:text-neutral-200 transition-colors min-h-[28px] min-w-[28px] flex items-center justify-center"
-                                title="Cancel"
-                                aria-label="Cancel GPUs per job"
-                              >
-                                <span className="text-xs">✕</span>
-                              </button>
-                            </>
-                          ) : (
-                            <span className="text-purple-300 animate-pulse">saving…</span>
-                          )}
-                        </span>
-                      ) : (
-                        <span className="inline-flex items-center gap-1 rounded border border-purple-500/30 bg-purple-500/10 px-1.5 py-0.5 text-xs text-purple-300">
-                          {`${gpusPerJobValue(runner)} GPUs/job`}
-                          <button
-                            onClick={() => {
-                              setEditGpusPerJob(gpusPerJobValue(runner));
-                              setEditingGpusPerJob(runner.id);
-                            }}
-                            className="flex min-h-[44px] min-w-[44px] items-center justify-center text-purple-300/70 transition-colors hover:text-purple-200 md:min-h-5 md:min-w-5"
-                            title="Edit GPUs per job"
-                            aria-label="Edit GPUs per job"
-                          >
-                            <Edit2 className="w-3 h-3" />
-                          </button>
-                        </span>
-                      )
+                      <span className="inline-flex items-center gap-1 rounded border border-purple-500/30 bg-purple-500/10 px-1.5 py-0.5 text-xs text-purple-300">
+                        {`${gpusPerJobValue(runner)} GPUs/job`}
+                      </span>
                     )}
                     {runner.capabilities.workload !== 'strategic' && runner.capabilities.runner_preset !== 'strategic_local' && (
-                      editingTaskTypes === runner.id ? (
-                        <span
-                          className="inline-flex items-center gap-1 rounded border border-blue-500/30 bg-blue-500/10 px-1.5 py-0.5 text-xs text-blue-300"
-                          data-testid="fleet-runner-task-types-editor"
-                        >
-                          <label className="inline-flex items-center gap-1">
-                            <input
-                              type="checkbox"
-                              checked={taskTypesAll}
-                              onChange={e => setTaskTypesAll(e.target.checked)}
-                              aria-label="Allow all task types"
-                            />
-                            all
-                          </label>
-                          {!taskTypesAll && (
-                            <input
-                              type="text"
-                              value={taskTypesText}
-                              onChange={e => setTaskTypesText(e.target.value)}
-                              placeholder="compute_experiment, code_change"
-                              aria-label="Task types allowed"
-                              className="w-40 bg-transparent text-center text-xs text-blue-300 outline-none"
-                              autoFocus
-                            />
-                          )}
-                          {updatingCapabilities !== runner.id ? (
-                            <>
-                              <button
-                                onClick={() => {
-                                  const list = parseTaskTypeList(taskTypesText);
-                                  handleUpdateTaskTypes(runner, taskTypesAll || list.length === 0 ? 'all' : list);
-                                }}
-                                className="text-emerald-400 hover:text-emerald-300 transition-colors min-h-[28px] min-w-[28px] flex items-center justify-center"
-                                title="Save task types"
-                                aria-label="Save task types"
-                              >
-                                <Check className="w-3 h-3" />
-                              </button>
-                              <button
-                                onClick={() => setEditingTaskTypes(null)}
-                                className="text-neutral-400 hover:text-neutral-200 transition-colors min-h-[28px] min-w-[28px] flex items-center justify-center"
-                                title="Cancel"
-                                aria-label="Cancel task types"
-                              >
-                                <span className="text-xs">✕</span>
-                              </button>
-                            </>
-                          ) : (
-                            <span className="text-blue-300 animate-pulse">saving…</span>
-                          )}
-                        </span>
-                      ) : (
-                        <span className="inline-flex items-center gap-1 rounded border border-blue-500/30 bg-blue-500/10 px-1.5 py-0.5 text-xs text-blue-300">
-                          {taskTypesLabel(runner)}
-                          <button
-                            onClick={() => beginEditTaskTypes(runner)}
-                            className="flex min-h-[44px] min-w-[44px] items-center justify-center text-blue-300/70 transition-colors hover:text-blue-200 md:min-h-5 md:min-w-5"
-                            title="Edit task types"
-                            aria-label="Edit task types"
-                          >
-                            <Edit2 className="w-3 h-3" />
-                          </button>
-                        </span>
-                      )
+                      <span className="inline-flex items-center gap-1 rounded border border-blue-500/30 bg-blue-500/10 px-1.5 py-0.5 text-xs text-blue-300">
+                        {taskTypesLabel(runner)}
+                      </span>
                     )}
                     {runner.health?.agent_available !== undefined && (
                       <span
@@ -1425,6 +1041,16 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                   </button>
                 )}
                 <button
+                  onClick={() => setExpandedConfig(configOpen ? null : runner.id)}
+                  className={`flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded-md transition-colors hover:bg-emerald-500/10 hover:text-emerald-300 md:min-h-9 md:min-w-9 ${configOpen ? 'text-emerald-300' : 'text-neutral-500'}`}
+                  aria-label={`Configure runner ${runner.hostname ?? runner.id.slice(0, 8)}`}
+                  aria-expanded={configOpen}
+                  data-testid="fleet-runner-configure-toggle"
+                  title="Configure runner (concurrency, task types, GPUs)"
+                >
+                  <SlidersHorizontal className="w-3.5 h-3.5" />
+                </button>
+                <button
                   onClick={() => setExpandedTelemetry(telemetryOpen ? null : runner.id)}
                   className={`flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded-md transition-colors hover:bg-sky-500/10 hover:text-sky-300 md:min-h-9 md:min-w-9 ${telemetryOpen ? 'text-sky-300' : 'text-neutral-500'}`}
                   aria-label={`Toggle telemetry for runner ${runner.hostname ?? runner.id.slice(0, 8)}`}
@@ -1453,6 +1079,14 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                 </button>
                 </div>
               </div>
+              {configOpen && (
+                <FleetRunnerConfigPanel
+                  key={`config-${runner.id}`}
+                  projectId={projectId}
+                  runner={runner}
+                  onSaved={() => load()}
+                />
+              )}
               {telemetryOpen && (
                 <RunnerTelemetryDetail
                   projectId={projectId}
@@ -1472,7 +1106,6 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
           token={pendingToken.token}
           mode={pendingToken.mode}
           preset={pendingToken.preset}
-          tokenExpiresAt={pendingToken.tokenExpiresAt}
           connected={pendingToken.mode === 'enroll' ? enrolledConnected : false}
           connectedHostname={pendingToken.mode === 'enroll' ? enrolledRunner?.hostname : null}
           onDismiss={() => setPendingToken(null)}

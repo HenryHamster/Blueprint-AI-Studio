@@ -118,3 +118,105 @@ export function runnerSetupSnippets(
     macosLinux: shParts.join(' '),
   };
 }
+
+// ── Live-config helpers ──────────────────────────────────────────────────────
+// Shared between the read-only status badges in FleetRunnersPanel and the
+// editable form in FleetRunnerConfigPanel, so both read the runner's config the
+// same way. Every value-extractor prefers the server-authoritative desired
+// config and falls back to the runner-reported capabilities for runners
+// enrolled before the live-config contract.
+
+// Per-job GPU reservation bounds. Must match backend runner_config.GPUS_PER_JOB_MIN
+// / GPUS_PER_JOB_MAX so the UI clamp agrees with the server-side clamp.
+export const GPUS_PER_JOB_MIN = 1;
+export const GPUS_PER_JOB_MAX = 8;
+
+// Agent-task concurrency bounds, mirroring the backend _normalize_max_concurrent
+// clamp so the UI never offers a value the server would reject.
+export const MAX_CONCURRENT_MIN = 1;
+export const MAX_CONCURRENT_MAX = 64;
+
+/** True when this runner's concurrency/task-types are pinned by the strategic
+ *  workload invariant (backend clamps max_concurrent→1, task_types→strategic
+ *  set). Such fields are shown read-only in the config form. */
+export function runnerPinsStrategicConfig(runner: FleetRunner): boolean {
+  return (
+    runner.capabilities?.runner_preset === 'strategic_local' ||
+    runner.capabilities?.workload === 'strategic'
+  );
+}
+
+/** Current agent-task max-concurrency for a runner, from config or capabilities. */
+export function maxConcurrentValue(runner: FleetRunner): number {
+  const raw = runner.config?.desired?.max_concurrent ?? runner.capabilities?.max_concurrent;
+  if (typeof raw !== 'number' || !Number.isFinite(raw)) return 2;
+  return Math.max(MAX_CONCURRENT_MIN, Math.min(MAX_CONCURRENT_MAX, Math.trunc(raw)));
+}
+
+/** Current GPU allowlist for a runner, from the server-authoritative desired
+ *  config. Absent / "all" means no restriction (all visible GPUs eligible). */
+export function gpuAllowlistValue(runner: FleetRunner): 'all' | number[] {
+  const allow = runner.config?.gpu_indices_allowed;
+  if (Array.isArray(allow)) return allow;
+  return 'all';
+}
+
+/** Parse an operator-typed index list ("0, 1 2") into a deduped, sorted,
+ *  non-negative integer array — the shape the PATCH endpoint normalizes to. */
+export function parseGpuIndexList(text: string): number[] {
+  const seen = new Set<number>();
+  const out: number[] = [];
+  for (const token of text.split(/[\s,]+/)) {
+    if (!token) continue;
+    if (!/^\d+$/.test(token)) continue;
+    const value = Number(token);
+    if (!Number.isInteger(value) || value < 0 || seen.has(value)) continue;
+    seen.add(value);
+    out.push(value);
+  }
+  return out.sort((a, b) => a - b);
+}
+
+/** Current per-job GPU count for a runner, from the server-authoritative config.
+ *  Absent means the default of 1 GPU per job (backward compatible). */
+export function gpusPerJobValue(runner: FleetRunner): number {
+  const raw = runner.config?.gpus_per_job ?? runner.config?.desired?.gpus_per_job;
+  if (typeof raw !== 'number' || !Number.isFinite(raw)) return GPUS_PER_JOB_MIN;
+  return Math.max(GPUS_PER_JOB_MIN, Math.min(GPUS_PER_JOB_MAX, Math.trunc(raw)));
+}
+
+/** Current task-type allowlist for a runner. Prefers the desired config; falls
+ *  back to runner-reported capabilities. Absent / "all" means every type. */
+export function taskTypesValue(runner: FleetRunner): 'all' | string[] {
+  const desired = runner.config?.desired?.task_types;
+  if (Array.isArray(desired)) return desired;
+  if (desired === 'all') return 'all';
+  const reported = runner.capabilities?.task_types;
+  if (Array.isArray(reported)) return reported;
+  return 'all';
+}
+
+/** Parse an operator-typed task-type list into a deduped, trimmed array. */
+export function parseTaskTypeList(text: string): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const token of text.split(/[\s,]+/)) {
+    const trimmed = token.trim();
+    if (!trimmed || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    out.push(trimmed);
+  }
+  return out;
+}
+
+export function gpuAllowlistLabel(runner: FleetRunner): string {
+  const allow = gpuAllowlistValue(runner);
+  if (allow === 'all') return 'GPUs: all';
+  return allow.length > 0 ? `GPUs: ${allow.join(',')}` : 'GPUs: none';
+}
+
+export function taskTypesLabel(runner: FleetRunner): string {
+  const value = taskTypesValue(runner);
+  if (value === 'all') return 'tasks: all';
+  return value.length > 0 ? `tasks: ${value.join(', ')}` : 'tasks: none';
+}
