@@ -102,6 +102,93 @@ describe('AttachmentPreviewModal type branching', () => {
     expect(downloadBtn).toBeTruthy();
   });
 
+  test('read-only image (no edit prop) shows no edit toolbar', () => {
+    renderModal({ type: 'image', mime_type: 'image/png', url: 'https://gcs/x.png', name: 'x.png' });
+    expect(screen.queryByLabelText('Rotate image 90 degrees')).toBeNull();
+    expect(screen.queryByLabelText('Crop image')).toBeNull();
+    expect(screen.queryByLabelText('Remove image')).toBeNull();
+  });
+
+  test('editable image renders rotate/crop/replace/remove controls', () => {
+    render(
+      <AttachmentPreviewModal
+        attachment={{ type: 'image', mime_type: 'image/png', url: 'blob:pending', name: 'pending.png' }}
+        open
+        onClose={() => {}}
+        edit={{
+          sourceFile: new File([], 'pending.png', { type: 'image/png' }),
+          onApply: () => {},
+          onRemove: () => {},
+          onReplace: () => {},
+        }}
+      />,
+    );
+    expect(screen.getByLabelText('Rotate image 90 degrees')).toBeTruthy();
+    expect(screen.getByLabelText('Crop image')).toBeTruthy();
+    expect(screen.getByLabelText('Replace image')).toBeTruthy();
+    expect(screen.getByLabelText('Remove image')).toBeTruthy();
+  });
+
+  test('remove and replace controls invoke their callbacks', () => {
+    const onRemove = vi.fn();
+    const onReplace = vi.fn();
+    render(
+      <AttachmentPreviewModal
+        attachment={{ type: 'image', mime_type: 'image/png', url: 'blob:pending', name: 'pending.png' }}
+        open
+        onClose={() => {}}
+        edit={{
+          sourceFile: new File([], 'pending.png', { type: 'image/png' }),
+          onApply: () => {},
+          onRemove,
+          onReplace,
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByLabelText('Remove image'));
+    expect(onRemove).toHaveBeenCalledOnce();
+    fireEvent.click(screen.getByLabelText('Replace image'));
+    expect(onReplace).toHaveBeenCalledOnce();
+  });
+
+  test('entering crop mode swaps Crop for Apply/Cancel and shows guidance', () => {
+    render(
+      <AttachmentPreviewModal
+        attachment={{ type: 'image', mime_type: 'image/png', url: 'blob:pending', name: 'pending.png' }}
+        open
+        onClose={() => {}}
+        edit={{
+          sourceFile: new File([], 'pending.png', { type: 'image/png' }),
+          onApply: () => {},
+          onRemove: () => {},
+          onReplace: () => {},
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByLabelText('Crop image'));
+    expect(screen.getByLabelText('Apply crop')).toBeTruthy();
+    expect(screen.getByLabelText('Cancel crop')).toBeTruthy();
+    expect(screen.queryByLabelText('Crop image')).toBeNull();
+    expect(screen.getByText(/Drag across the image/)).toBeTruthy();
+  });
+
+  test('edit controls are not offered for a non-image editable attachment', () => {
+    render(
+      <AttachmentPreviewModal
+        attachment={{ type: 'attachment', mime_type: 'application/pdf', url: 'blob:doc', name: 'doc.pdf' }}
+        open
+        onClose={() => {}}
+        edit={{
+          sourceFile: new File([], 'doc.pdf', { type: 'application/pdf' }),
+          onApply: () => {},
+          onRemove: () => {},
+          onReplace: () => {},
+        }}
+      />,
+    );
+    expect(screen.queryByLabelText('Rotate image 90 degrees')).toBeNull();
+  });
+
   test('Escape key invokes onClose', () => {
     const onClose = vi.fn();
     render(

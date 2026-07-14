@@ -1,11 +1,36 @@
-import { X, Download, ExternalLink } from 'lucide-react';
-import { useEffect, useRef, useState, useCallback, type KeyboardEvent } from 'react';
+import { X, Download, ExternalLink, RotateCw, Crop, Check, RefreshCw, Trash2 } from 'lucide-react';
+import { useEffect, useRef, useState, useCallback, type KeyboardEvent, type PointerEvent as ReactPointerEvent } from 'react';
 import type { MessageAttachment } from '../types/messages';
+import {
+  computeCropRegion,
+  cropImageFile,
+  rotateImageClockwise,
+  type CropSelection,
+} from '../utils/imageEdits';
+
+/**
+ * Optional pre-send editing surface for a pending (not-yet-uploaded) image
+ * attachment. When supplied, the modal shows rotate/crop/replace/remove
+ * controls that operate on `sourceFile` and hand the re-encoded File back via
+ * `onApply`. Sent (read-only) attachments omit this prop and the modal stays a
+ * pure viewer.
+ */
+export interface AttachmentEditControls {
+  /** The current pending File, used as the source for canvas re-encodes. */
+  sourceFile: File;
+  /** Called with the re-encoded File after a rotate or crop is applied. */
+  onApply: (file: File) => void | Promise<void>;
+  /** Discard this attachment entirely. */
+  onRemove: () => void;
+  /** Swap in a different file (opens the caller's file picker). */
+  onReplace: () => void;
+}
 
 interface AttachmentPreviewModalProps {
   attachment: MessageAttachment;
   open: boolean;
   onClose: () => void;
+  edit?: AttachmentEditControls;
 }
 
 function base64ToBlob(base64: string, mimeType: string): Blob {
@@ -33,7 +58,7 @@ function triggerDownload(blob: Blob, fileName: string) {
   URL.revokeObjectURL(url);
 }
 
-export function AttachmentPreviewModal({ attachment, open, onClose }: AttachmentPreviewModalProps) {
+export function AttachmentPreviewModal({ attachment, open, onClose, edit }: AttachmentPreviewModalProps) {
   const panelRef = useRef<HTMLDivElement>(null);
   const closeButtonRef = useRef<HTMLButtonElement>(null);
   const restoreFocusRef = useRef<HTMLElement | null>(null);
@@ -43,6 +68,28 @@ export function AttachmentPreviewModal({ attachment, open, onClose }: Attachment
   const isImage = mimeType.startsWith('image/');
   const isPdf = mimeType === 'application/pdf';
   const displayName = attachment.name || attachment.mime_type || 'File';
+
+  // ── Pre-send editing state (only meaningful when `edit` + image) ────────────
+  const editImgRef = useRef<HTMLImageElement>(null);
+  const cropStartRef = useRef<{ x: number; y: number } | null>(null);
+  const [cropMode, setCropMode] = useState(false);
+  const [selection, setSelection] = useState<CropSelection | null>(null);
+  const [editBusy, setEditBusy] = useState(false);
+  const [editError, setEditError] = useState<string | null>(null);
+  const editable = Boolean(edit) && isImage;
+
+  // Reset the transient editing UI whenever the modal opens or the underlying
+  // image changes (e.g. after a rotate/crop/replace swaps in new bytes).
+  const attachmentSrcKey = attachment.url || attachment.data || null;
+  useEffect(() => {
+    /* eslint-disable react-hooks/set-state-in-effect */
+    setCropMode(false);
+    setSelection(null);
+    setEditBusy(false);
+    setEditError(null);
+    cropStartRef.current = null;
+    /* eslint-enable react-hooks/set-state-in-effect */
+  }, [open, attachmentSrcKey]);
 
   // Persisted chat/message attachments carry a signed GCS `url` rather than an
   // inline base64 `data` payload (only locally-constructed attachments carry
@@ -113,6 +160,88 @@ export function AttachmentPreviewModal({ attachment, open, onClose }: Attachment
     focusables[nextIndex]?.focus();
   }
 
+  function clampToBox(value: number, max: number): number {
+    if (value < 0) return 0;
+    if (value > max) return max;
+    return value;
+  }
+
+  function handleCropPointerDown(event: ReactPointerEvent<HTMLDivElement>) {
+    if (!cropMode || editBusy || !editImgRef.current) return;
+    const rect = editImgRef.current.getBoundingClientRect();
+    const x = clampToBox(event.clientX - rect.left, rect.width);
+    const y = clampToBox(event.clientY - rect.top, rect.height);
+    cropStartRef.current = { x, y };
+    setSelection({ x, y, w: 0, h: 0 });
+    editImgRef.current.setPointerCapture?.(event.pointerId);
+  }
+
+  function handleCropPointerMove(event: ReactPointerEvent<HTMLDivElement>) {
+    const start = cropStartRef.current;
+    if (!cropMode || !start || !editImgRef.current) return;
+    const rect = editImgRef.current.getBoundingClientRect();
+    const cx = clampToBox(event.clientX - rect.left, rect.width);
+    const cy = clampToBox(event.clientY - rect.top, rect.height);
+    setSelection({
+      x: Math.min(start.x, cx),
+      y: Math.min(start.y, cy),
+      w: Math.abs(cx - start.x),
+      h: Math.abs(cy - start.y),
+    });
+  }
+
+  function handleCropPointerUp() {
+    cropStartRef.current = null;
+  }
+
+  async function applyRotate() {
+    if (!edit || editBusy) return;
+    setEditBusy(true);
+    setEditError(null);
+    try {
+      const rotated = await rotateImageClockwise(edit.sourceFile);
+      await edit.onApply(rotated);
+    } catch {
+      setEditError('Could not rotate this image');
+    } finally {
+      setEditBusy(false);
+    }
+  }
+
+  async function applyCrop() {
+    const img = editImgRef.current;
+    if (!edit || !img || !selection || selection.w < 4 || selection.h < 4) {
+      setEditError('Drag a larger area to crop');
+      return;
+    }
+    setEditBusy(true);
+    setEditError(null);
+    try {
+      const region = computeCropRegion(
+        selection,
+        img.clientWidth,
+        img.clientHeight,
+        img.naturalWidth,
+        img.naturalHeight,
+      );
+      const cropped = await cropImageFile(edit.sourceFile, region);
+      await edit.onApply(cropped);
+      setCropMode(false);
+      setSelection(null);
+    } catch {
+      setEditError('Could not crop this image');
+    } finally {
+      setEditBusy(false);
+    }
+  }
+
+  function toggleCropMode() {
+    setEditError(null);
+    setSelection(null);
+    cropStartRef.current = null;
+    setCropMode(prev => !prev);
+  }
+
   if (!open) return null;
 
   const attachmentData = attachment.data;
@@ -159,9 +288,108 @@ export function AttachmentPreviewModal({ attachment, open, onClose }: Attachment
           </button>
         </div>
 
+        {/* Pre-send edit toolbar (image attachments in the composer only) */}
+        {editable && (
+          <div className="flex shrink-0 flex-wrap items-center gap-2 border-b border-neutral-700/60 px-4 py-2">
+            <button
+              type="button"
+              onClick={applyRotate}
+              disabled={editBusy || cropMode}
+              aria-label="Rotate image 90 degrees"
+              className="inline-flex min-h-11 items-center gap-1.5 rounded-md border border-neutral-700 bg-neutral-800 px-3 text-sm text-neutral-200 transition-colors hover:border-neutral-600 hover:bg-neutral-700 disabled:opacity-40"
+            >
+              <RotateCw className="h-4 w-4" aria-hidden="true" />
+              Rotate
+            </button>
+            {!cropMode ? (
+              <button
+                type="button"
+                onClick={toggleCropMode}
+                disabled={editBusy}
+                aria-label="Crop image"
+                className="inline-flex min-h-11 items-center gap-1.5 rounded-md border border-neutral-700 bg-neutral-800 px-3 text-sm text-neutral-200 transition-colors hover:border-neutral-600 hover:bg-neutral-700 disabled:opacity-40"
+              >
+                <Crop className="h-4 w-4" aria-hidden="true" />
+                Crop
+              </button>
+            ) : (
+              <>
+                <button
+                  type="button"
+                  onClick={applyCrop}
+                  disabled={editBusy}
+                  aria-label="Apply crop"
+                  className="inline-flex min-h-11 items-center gap-1.5 rounded-md border border-emerald-600/60 bg-emerald-600/20 px-3 text-sm text-emerald-200 transition-colors hover:bg-emerald-600/30 disabled:opacity-40"
+                >
+                  <Check className="h-4 w-4" aria-hidden="true" />
+                  Apply crop
+                </button>
+                <button
+                  type="button"
+                  onClick={toggleCropMode}
+                  disabled={editBusy}
+                  aria-label="Cancel crop"
+                  className="inline-flex min-h-11 items-center gap-1.5 rounded-md border border-neutral-700 bg-neutral-800 px-3 text-sm text-neutral-300 transition-colors hover:border-neutral-600 hover:bg-neutral-700 disabled:opacity-40"
+                >
+                  <X className="h-4 w-4" aria-hidden="true" />
+                  Cancel
+                </button>
+              </>
+            )}
+            <span className="flex-1" />
+            <button
+              type="button"
+              onClick={() => edit?.onReplace()}
+              disabled={editBusy}
+              aria-label="Replace image"
+              className="inline-flex min-h-11 items-center gap-1.5 rounded-md border border-neutral-700 bg-neutral-800 px-3 text-sm text-neutral-200 transition-colors hover:border-neutral-600 hover:bg-neutral-700 disabled:opacity-40"
+            >
+              <RefreshCw className="h-4 w-4" aria-hidden="true" />
+              Replace
+            </button>
+            <button
+              type="button"
+              onClick={() => edit?.onRemove()}
+              disabled={editBusy}
+              aria-label="Remove image"
+              className="inline-flex min-h-11 items-center gap-1.5 rounded-md border border-neutral-700 bg-neutral-800 px-3 text-sm text-neutral-300 transition-colors hover:border-red-700/60 hover:text-red-300 disabled:opacity-40"
+            >
+              <Trash2 className="h-4 w-4" aria-hidden="true" />
+              Remove
+            </button>
+            {(editError || cropMode) && (
+              <p className={`w-full text-ui-md leading-snug ${editError ? 'text-red-400' : 'text-neutral-500'}`}>
+                {editError ?? 'Drag across the image to select a crop region, then Apply crop.'}
+              </p>
+            )}
+          </div>
+        )}
+
         {/* Content */}
         <div className="min-h-0 flex-1 overflow-auto flex items-center justify-center">
-          {isImage && imageSrc ? (
+          {editable && imageSrc ? (
+            <div
+              className="relative inline-block leading-none"
+              onPointerDown={handleCropPointerDown}
+              onPointerMove={handleCropPointerMove}
+              onPointerUp={handleCropPointerUp}
+              style={cropMode ? { cursor: 'crosshair', touchAction: 'none' } : undefined}
+            >
+              <img
+                ref={editImgRef}
+                src={imageSrc}
+                alt={displayName}
+                draggable={false}
+                className="max-h-[calc(100vh-220px)] max-w-full select-none"
+              />
+              {cropMode && selection && selection.w > 0 && selection.h > 0 && (
+                <div
+                  className="pointer-events-none absolute border-2 border-emerald-400 bg-emerald-400/10"
+                  style={{ left: selection.x, top: selection.y, width: selection.w, height: selection.h }}
+                />
+              )}
+            </div>
+          ) : isImage && imageSrc ? (
             <img
               src={imageSrc}
               alt={displayName}

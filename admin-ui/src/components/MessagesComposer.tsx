@@ -4,6 +4,8 @@ import { MessageTypeDropdown } from './MessageTypeDropdown';
 import { type ArmingOutcome, composerHintCopy } from './messageArming';
 import type { StrategicContextDescriptorModel } from '../utils/strategicContextDescriptor';
 import { StrategicContextDescriptor } from './StrategicContextDescriptor';
+import { AttachmentPreviewModal } from './AttachmentPreviewModal';
+import type { MessageAttachment } from '../types/messages';
 import { MESSAGE_CONTENT_MAX } from '../api';
 
 export interface PendingAttachment {
@@ -40,6 +42,12 @@ export interface MessagesComposerProps {
   onSubmit: () => void;
   onAddAttachment?: (file: File) => void;
   onRemoveAttachment?: (id: string) => void;
+  /**
+   * Swap the File backing a pending attachment — used by the pre-send preview
+   * for canvas-edited (rotate/crop) results and for picker-based replace. When
+   * omitted the preview stays read-only (no edit controls).
+   */
+  onReplaceAttachmentFile?: (id: string, file: File) => void;
   chrome?: 'full' | 'minimal';
 }
 
@@ -74,10 +82,14 @@ export const MessagesComposer = memo(function MessagesComposer({
   onPickStarterPrompt,
   onAddAttachment,
   onRemoveAttachment,
+  onReplaceAttachmentFile,
   chrome = 'full',
 }: MessagesComposerProps) {
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const replaceInputRef = useRef<HTMLInputElement>(null);
+  const replaceTargetRef = useRef<string | null>(null);
   const [dragOver, setDragOver] = useState(false);
+  const [previewId, setPreviewId] = useState<string | null>(null);
   // Auto-resize textarea — max 3 rows (~96px).
   function handleTextareaInput() {
     const el = textareaRef.current;
@@ -102,11 +114,39 @@ export const MessagesComposer = memo(function MessagesComposer({
   const showHint = Boolean(disabledReason) || !minimal || Boolean(strategistBusy) || lastArming === 'not_armed';
   const hasAttachments = pendingAttachments != null && pendingAttachments.length > 0;
 
+  // The pending attachment whose full-size preview is open (if any). If it was
+  // removed while open, this resolves to undefined and the modal unmounts.
+  const previewAttachment = previewId != null
+    ? pendingAttachments?.find(a => a.id === previewId)
+    : undefined;
+  // Adapt the PendingAttachment (File + object-URL) to the MessageAttachment
+  // shape the preview modal consumes: its object URL is passed as the remote
+  // `url`, which the modal already renders for both <img> and download.
+  const previewMessageAttachment: MessageAttachment | null = previewAttachment
+    ? {
+      type: previewAttachment.mime_type.startsWith('image/') ? 'image' : 'attachment',
+      mime_type: previewAttachment.mime_type,
+      name: previewAttachment.name,
+      size_bytes: previewAttachment.size_bytes,
+      url: previewAttachment.previewUrl ?? undefined,
+    }
+    : null;
+
   // ── File handlers ──────────────────────────────────────────────────────────
   function handleFileChange(e: React.ChangeEvent<HTMLInputElement>) {
     const files = e.target.files;
     if (!files || !onAddAttachment) return;
     for (let i = 0; i < files.length; i++) onAddAttachment(files[i]);
+    e.target.value = '';
+  }
+
+  function handleReplaceFileChange(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    const targetId = replaceTargetRef.current;
+    replaceTargetRef.current = null;
+    if (file && targetId && onReplaceAttachmentFile) {
+      onReplaceAttachmentFile(targetId, file);
+    }
     e.target.value = '';
   }
 
@@ -202,26 +242,61 @@ export const MessagesComposer = memo(function MessagesComposer({
         tabIndex={-1}
         accept="image/*,.pdf,.txt,.csv,.json,.xml,.md,.log,.yaml,.yml,.env,.cfg,.ini,.toml,.js,.ts,.py,.go,.rs,.java,.kt,.swift,.sql,.sh,.bat,.ps1"
       />
+      {/* Hidden input for replacing a pending image from the preview editor */}
+      <input
+        ref={replaceInputRef}
+        type="file"
+        onChange={handleReplaceFileChange}
+        className="hidden"
+        tabIndex={-1}
+        accept="image/*"
+      />
+      {previewAttachment && (
+        <AttachmentPreviewModal
+          open
+          attachment={previewMessageAttachment as MessageAttachment}
+          onClose={() => setPreviewId(null)}
+          edit={onReplaceAttachmentFile ? {
+            sourceFile: previewAttachment.file,
+            onApply: file => onReplaceAttachmentFile(previewAttachment.id, file),
+            onRemove: () => { onRemoveAttachment?.(previewAttachment.id); setPreviewId(null); },
+            onReplace: () => { replaceTargetRef.current = previewAttachment.id; replaceInputRef.current?.click(); },
+          } : undefined}
+        />
+      )}
 
       {/* Attachment preview strip */}
       {hasAttachments && pendingAttachments && (
         <div className={`${minimal ? minimalColumnClass : ''} mb-1.5 flex flex-wrap gap-2 px-1`}>
           {pendingAttachments.map(att => {
             const preview = attHasPreview(att);
+            const sizeLabel = att.size_bytes != null
+              ? `(${att.size_bytes < 1024 ? '<1' : (att.size_bytes / 1024).toFixed(0)} KB)`
+              : null;
             return (
-              <div key={att.id} className="group relative flex items-center gap-1.5 rounded-md border border-neutral-700/60 bg-neutral-800/40 px-2 py-1.5 pr-7 text-xs text-neutral-300">
+              <div key={att.id} className="group relative flex items-stretch rounded-md border border-neutral-700/60 bg-neutral-800/40 pr-7 text-xs text-neutral-300">
                 {preview ? (
-                  <img src={preview} alt={att.name} className="h-8 w-8 rounded object-cover" />
-                ) : att.mime_type?.startsWith('image/') ? (
-                  <Image className="h-4 w-4 shrink-0 text-neutral-500" />
+                  // Image chip is clickable to open the full-size preview/editor.
+                  <button
+                    type="button"
+                    onClick={() => setPreviewId(att.id)}
+                    aria-label={`Open ${att.name} preview`}
+                    className="flex min-h-[44px] items-center gap-1.5 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-neutral-700/40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-neutral-500"
+                  >
+                    <img src={preview} alt={att.name} className="h-8 w-8 rounded object-cover" />
+                    <span className="max-w-[120px] truncate">{att.name}</span>
+                    {sizeLabel && <span className="text-neutral-500 shrink-0">{sizeLabel}</span>}
+                  </button>
                 ) : (
-                  <FileText className="h-4 w-4 shrink-0 text-neutral-500" />
-                )}
-                <span className="max-w-[120px] truncate">{att.name}</span>
-                {att.size_bytes != null && (
-                  <span className="text-neutral-500 shrink-0">
-                    ({att.size_bytes < 1024 ? '<1' : (att.size_bytes / 1024).toFixed(0)} KB)
-                  </span>
+                  <div className="flex items-center gap-1.5 px-2 py-1.5">
+                    {att.mime_type?.startsWith('image/') ? (
+                      <Image className="h-4 w-4 shrink-0 text-neutral-500" />
+                    ) : (
+                      <FileText className="h-4 w-4 shrink-0 text-neutral-500" />
+                    )}
+                    <span className="max-w-[120px] truncate">{att.name}</span>
+                    {sizeLabel && <span className="text-neutral-500 shrink-0">{sizeLabel}</span>}
+                  </div>
                 )}
                 <button
                   type="button"

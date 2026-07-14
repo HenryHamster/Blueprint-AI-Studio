@@ -377,6 +377,19 @@ function revokePendingAttachmentPreviews(attachments: PendingAttachment[]): void
   }
 }
 
+// Build a local object-URL preview for image files small enough to render
+// inline; larger files and non-images get no preview (null).
+function makePendingPreviewUrl(file: File): string | null {
+  if (file.type?.startsWith('image/') && file.size < 10_000_000 && typeof URL.createObjectURL === 'function') {
+    try {
+      return URL.createObjectURL(file);
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
 
 export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion, focusComposerSignal, realtimeRefreshSignal, contextPackage, strategicState, strategicWorkbenchState, targetMessage, onTargetMessageHandled, onStrategicStateRefresh, onStrategicInteraction, onOpenStrategicContextWorkspace, onOpenCommandPalette, onOpenStrategicContextCommands, onStrategicRefresh, strategicSessionTranscript }: MessagesPanelProps) {
   const resolvedVariant = variant ?? (onClose ? 'modal' : 'page');
@@ -1269,14 +1282,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       addToast('This image exceeds ~9.75 MB and may not be visible to the strategist', 'info');
     }
     const id = `att_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    let previewUrl: string | null = null;
-    if (file.type?.startsWith('image/') && file.size < 10_000_000 && typeof URL.createObjectURL === 'function') {
-      try {
-        previewUrl = URL.createObjectURL(file);
-      } catch {
-        previewUrl = null;
-      }
-    }
+    const previewUrl = makePendingPreviewUrl(file);
     setPendingAttachments(prev => {
       const next = [...prev, {
         id,
@@ -1299,6 +1305,40 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         URL.revokeObjectURL(att.previewUrl);
       }
       const next = prev.filter(a => a.id !== id);
+      pendingAttachmentsRef.current = next;
+      return next;
+    });
+  }
+
+  // Swap the File backing an existing pending attachment — used by the pre-send
+  // preview for canvas-edited (rotate/crop) bytes and picker-based replace. The
+  // old object-URL is revoked and a fresh one minted so the chip and any open
+  // preview re-render from the new bytes.
+  function handleReplaceAttachmentFile(id: string, file: File) {
+    if (submittingRef.current || uploading) return;
+    if (file.size > 50 * 1024 * 1024) {
+      addToast('File exceeds the 50 MB size limit and was skipped', 'error');
+      return;
+    }
+    if (file.type?.startsWith('image/') && file.size > MAX_AGENT_IMAGE_BYTES) {
+      addToast('This image exceeds ~9.75 MB and may not be visible to the strategist', 'info');
+    }
+    const previewUrl = makePendingPreviewUrl(file);
+    setPendingAttachments(prev => {
+      const next = prev.map(att => {
+        if (att.id !== id) return att;
+        if (att.previewUrl && typeof URL.revokeObjectURL === 'function') {
+          URL.revokeObjectURL(att.previewUrl);
+        }
+        return {
+          ...att,
+          file,
+          previewUrl,
+          mime_type: file.type || 'application/octet-stream',
+          name: file.name,
+          size_bytes: file.size,
+        };
+      });
       pendingAttachmentsRef.current = next;
       return next;
     });
@@ -2211,6 +2251,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         uploading={uploading}
         onAddAttachment={handleAddAttachment}
         onRemoveAttachment={handleRemoveAttachment}
+        onReplaceAttachmentFile={handleReplaceAttachmentFile}
         onChangeType={handleChangeType}
         onChangeContent={handleChangeContent}
         onCancelReply={handleCancelReply}
