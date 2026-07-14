@@ -40,6 +40,7 @@ from app.models import (
     TaskStatus,
     _utcnow,
 )
+from app.runner_project_binding import allowed_project_ids
 from app.messages_noise_prefs_store import get_messages_noise_prefs_row
 from app.routers.admin_runners import (
     _normalize_gpu_indices_allowed,
@@ -1741,6 +1742,272 @@ class TestAdminRunnerEndpoints:
             "status": runner.status,
             "hostname": runner.hostname,
         }
+
+
+# ── Editable multi-project allow-list admin API ──────────────────────────────
+
+
+class TestRunnerAllowedProjectsEndpoints:
+    """The owner-gated, editable runner<->project allow-list endpoints."""
+
+    async def _register_runner(self, client: AsyncClient, project) -> uuid.UUID:
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/runners/register",
+            json={"hostname": "multi-box"},
+        )
+        assert resp.status_code == 200
+        return uuid.UUID(resp.json()["runner_id"])
+
+    @pytest.mark.asyncio
+    async def test_list_runners_includes_allowed_projects(
+        self, client: AsyncClient, db_session
+    ):
+        """A freshly registered runner shows its enrollment project via the
+        dedicated allow-list endpoint."""
+        project = await _make_project(db_session, name="Home Project")
+        runner_id = await self._register_runner(client, project)
+
+        # Verify the runner appears in the list.
+        resp = await client.get(f"/api/admin/projects/{project.id}/runners")
+        assert resp.status_code == 200
+        rows = resp.json()
+        assert any(r["id"] == str(runner_id) for r in rows)
+
+        # Verify the allow-list via the dedicated endpoint.
+        proj_resp = await client.get(
+            f"/api/admin/projects/{project.id}/runners/{runner_id}/projects"
+        )
+        assert proj_resp.status_code == 200
+        data = proj_resp.json()
+        assert data["enrollment_project_id"] == str(project.id)
+        project_ids = {p["project_id"] for p in data["projects"]}
+        assert project_ids == {str(project.id)}
+
+    @pytest.mark.asyncio
+    async def test_add_project_extends_allow_list_and_get_reflects_it(
+        self, client: AsyncClient, db_session
+    ):
+        """Adding a project the caller owns extends the allow-list; GET and the
+        binding table both reflect the change."""
+        managing = await _make_project(db_session, name="Managing")
+        target = await _make_project(db_session, name="Target")  # owned by TEST_USER
+        runner_id = await self._register_runner(client, managing)
+
+        add = await client.post(
+            f"/api/admin/projects/{managing.id}/runners/{runner_id}/projects",
+            json={"project_id": str(target.id)},
+        )
+        assert add.status_code == 200
+        ids = {p["project_id"] for p in add.json()["projects"]}
+        assert ids == {str(managing.id), str(target.id)}
+
+        # GET reflects the extended allow-list.
+        got = await client.get(
+            f"/api/admin/projects/{managing.id}/runners/{runner_id}/projects"
+        )
+        assert got.status_code == 200
+        got_ids = {p["project_id"] for p in got.json()["projects"]}
+        assert got_ids == {str(managing.id), str(target.id)}
+
+        # Binding rows: home was materialized + the new target row.
+        bindings = (
+            await db_session.execute(
+                select(RunnerProjectBinding.project_id).where(
+                    RunnerProjectBinding.runner_id == runner_id
+                )
+            )
+        ).scalars().all()
+        assert set(bindings) == {managing.id, target.id}
+
+        # Idempotent: re-adding the same project is a no-op, not a duplicate.
+        again = await client.post(
+            f"/api/admin/projects/{managing.id}/runners/{runner_id}/projects",
+            json={"project_id": str(target.id)},
+        )
+        assert again.status_code == 200
+        assert {p["project_id"] for p in again.json()["projects"]} == {
+            str(managing.id),
+            str(target.id),
+        }
+
+    @pytest.mark.asyncio
+    async def test_edit_runner_allowed_projects_requires_owner_on_target(
+        self, client: AsyncClient, db_session
+    ):
+        """The caller owns the managing project but NOT the target project — the
+        add is rejected 403 so an owner of A cannot silently grant a runner
+        access to B they do not own. Covered for both a member-below-owner and a
+        complete non-member on the target, and no binding is created."""
+        managing = await _make_project(db_session, name="Managing Owned")
+        runner_id = await self._register_runner(client, managing)
+
+        # (a) Caller is a MEMBER (not owner) on the target → 403.
+        member_target = await _make_project(
+            db_session, owner_id="other-owner", name="Member Target"
+        )
+        db_session.add(
+            ProjectMember(
+                project_id=member_target.id,
+                user_id=TEST_USER_ID,
+                role="member",
+            )
+        )
+        await db_session.commit()
+        rejected_member = await client.post(
+            f"/api/admin/projects/{managing.id}/runners/{runner_id}/projects",
+            json={"project_id": str(member_target.id)},
+        )
+        assert rejected_member.status_code == 403
+
+        # (b) Caller is NOT a member at all on the target → also 403 (not 404),
+        # so the message is unambiguous about the missing owner role.
+        nonmember_target = await _make_project(
+            db_session, owner_id="other-owner", name="Nonmember Target"
+        )
+        rejected_nonmember = await client.post(
+            f"/api/admin/projects/{managing.id}/runners/{runner_id}/projects",
+            json={"project_id": str(nonmember_target.id)},
+        )
+        assert rejected_nonmember.status_code == 403
+
+        # No binding to either target project was created.
+        bindings = (
+            await db_session.execute(
+                select(RunnerProjectBinding.project_id).where(
+                    RunnerProjectBinding.runner_id == runner_id
+                )
+            )
+        ).scalars().all()
+        assert member_target.id not in bindings
+        assert nonmember_target.id not in bindings
+
+    @pytest.mark.asyncio
+    async def test_add_requires_owner_on_managing_project(
+        self, client: AsyncClient, db_session
+    ):
+        """A caller who only holds member on the MANAGING project cannot edit the
+        allow-list even for a target they own."""
+        managing = await _make_project(
+            db_session, owner_id="other-owner", name="Member-Only Managing"
+        )
+        db_session.add(
+            ProjectMember(
+                project_id=managing.id, user_id=TEST_USER_ID, role="member"
+            )
+        )
+        await db_session.commit()
+        runner, _ = await _make_runner(db_session, managing.id)
+        target = await _make_project(db_session, name="Owned Target")
+
+        resp = await client.post(
+            f"/api/admin/projects/{managing.id}/runners/{runner.id}/projects",
+            json={"project_id": str(target.id)},
+        )
+        assert resp.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_remove_project_shrinks_allow_list(
+        self, client: AsyncClient, db_session
+    ):
+        """Removing a project shrinks the allow-list; GET reflects the change."""
+        managing = await _make_project(db_session, name="Managing R")
+        target = await _make_project(db_session, name="Target R")
+        runner_id = await self._register_runner(client, managing)
+        await client.post(
+            f"/api/admin/projects/{managing.id}/runners/{runner_id}/projects",
+            json={"project_id": str(target.id)},
+        )
+
+        remove = await client.delete(
+            f"/api/admin/projects/{managing.id}/runners/{runner_id}"
+            f"/projects/{target.id}"
+        )
+        assert remove.status_code == 200
+        assert {p["project_id"] for p in remove.json()["projects"]} == {str(managing.id)}
+
+        got = await client.get(
+            f"/api/admin/projects/{managing.id}/runners/{runner_id}/projects"
+        )
+        got_ids = {p["project_id"] for p in got.json()["projects"]}
+        assert got_ids == {str(managing.id)}
+
+    @pytest.mark.asyncio
+    async def test_remove_last_binding_rejected(
+        self, client: AsyncClient, db_session
+    ):
+        """The enrollment project cannot be removed from the allow-list (409),
+        and the runner's allow-list survives intact."""
+        managing = await _make_project(db_session, name="Solo Managing")
+        runner_id = await self._register_runner(client, managing)
+
+        resp = await client.delete(
+            f"/api/admin/projects/{managing.id}/runners/{runner_id}"
+            f"/projects/{managing.id}"
+        )
+        assert resp.status_code == 409
+
+        # Allow-list still has the enrollment project.
+        got = await client.get(
+            f"/api/admin/projects/{managing.id}/runners/{runner_id}/projects"
+        )
+        assert got.status_code == 200
+        project_ids = {p["project_id"] for p in got.json()["projects"]}
+        assert str(managing.id) in project_ids
+
+    @pytest.mark.asyncio
+    async def test_remove_project_not_on_allow_list_404(
+        self, client: AsyncClient, db_session
+    ):
+        managing = await _make_project(db_session, name="Managing NF")
+        target = await _make_project(db_session, name="Target NF")
+        runner_id = await self._register_runner(client, managing)
+        # Add target so removing 'managing' is not blocked by the enrollment-project guard.
+        await client.post(
+            f"/api/admin/projects/{managing.id}/runners/{runner_id}/projects",
+            json={"project_id": str(target.id)},
+        )
+        never_bound = uuid.uuid4()
+        resp = await client.delete(
+            f"/api/admin/projects/{managing.id}/runners/{runner_id}"
+            f"/projects/{never_bound}"
+        )
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_allowed_projects_cross_project_runner_404(
+        self, client: AsyncClient, db_session
+    ):
+        """A runner is only reachable through its own project's path — listing or
+        mutating it through an unrelated project 404s."""
+        managing = await _make_project(db_session, name="Owner Managing X")
+        other = await _make_project(db_session, name="Unrelated X")
+        runner_id = await self._register_runner(client, managing)
+
+        got = await client.get(
+            f"/api/admin/projects/{other.id}/runners/{runner_id}/projects"
+        )
+        assert got.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_add_emits_workbench_refetch(
+        self, client: AsyncClient, db_session
+    ):
+        managing = await _make_project(db_session, name="Emit Managing")
+        target = await _make_project(db_session, name="Emit Target")
+        runner_id = await self._register_runner(client, managing)
+
+        with patch(
+            "app.routers.admin_runners.emit_workbench_refetch",
+            new=AsyncMock(),
+        ) as emit:
+            resp = await client.post(
+                f"/api/admin/projects/{managing.id}/runners/{runner_id}/projects",
+                json={"project_id": str(target.id)},
+            )
+        assert resp.status_code == 200
+        emit.assert_awaited_once()
+        assert emit.await_args.kwargs["resource"] == "local_runner"
+        assert emit.await_args.kwargs["action"] == "allow_list_updated"
 
 
 # ── Live-safe config channel (heartbeat two-way + PATCH + view) ──────────────
@@ -5626,6 +5893,54 @@ class TestOrchestratorRunnerRouting:
         assert ids == {live.id}
 
     @pytest.mark.asyncio
+    async def test_compute_assignments_attribute_running_job_by_claiming_runner(
+        self, db_session
+    ):
+        """A RUNNING job is counted against the runner that AUTHORITATIVELY claimed
+        it (ran_on_runner_id), not the dispatch reservation pin (runner_target_id).
+
+        - A RUNNING job claimed by R2 but pinned to R1 counts for R2.
+        - A QUEUED job (not yet claimed, ran_on_runner_id NULL) counts for its pin.
+        - A legacy RUNNING job with NULL ran_on_runner_id falls back to its pin.
+        """
+        project = await _make_project(db_session)
+        r1, _ = await _make_runner(db_session, project.id)
+        r2, _ = await _make_runner(db_session, project.id)
+
+        # Claimed-and-running on R2, but the stale dispatch pin still names R1.
+        claimed = ComputeJob(
+            project_id=project.id,
+            backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+            status=ComputeJobStatus.RUNNING,
+            ran_on_runner_id=r2.id,
+            polling_metadata={"runner_target_id": str(r1.id)},
+        )
+        # Reserved-but-unclaimed: no ran_on_runner_id yet, pinned to R1.
+        reserved = ComputeJob(
+            project_id=project.id,
+            backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+            status=ComputeJobStatus.QUEUED,
+            ran_on_runner_id=None,
+            polling_metadata={"runner_target_id": str(r1.id)},
+        )
+        # Legacy RUNNING row predating the column — falls back to its pin (R1).
+        legacy = ComputeJob(
+            project_id=project.id,
+            backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+            status=ComputeJobStatus.RUNNING,
+            ran_on_runner_id=None,
+            polling_metadata={"runner_target_id": str(r1.id)},
+        )
+        db_session.add_all([claimed, reserved, legacy])
+        await db_session.commit()
+
+        assignments = await orch._load_runner_compute_job_assignments(
+            db_session, [r1.id, r2.id]
+        )
+        assert set(assignments.get(r2.id, [])) == {str(claimed.id)}
+        assert set(assignments.get(r1.id, [])) == {str(reserved.id), str(legacy.id)}
+
+    @pytest.mark.asyncio
     async def test_loaded_runner_cache_survives_session_expiry(self, db_session):
         """Runner dispatch cache must not lazy-load LocalRunner after rollback/expiry.
 
@@ -8203,6 +8518,94 @@ class TestInputArtifactDownloadEndpoint:
         assert resp.status_code == 200, resp.text
         assert resp.json()["input_artifact_job_id"] == predecessor_id
 
+    @pytest.mark.asyncio
+    async def test_next_compute_job_stamps_ran_on_runner_id(
+        self, client: AsyncClient, db_session
+    ):
+        """Claiming a runner-subprocess compute job via /next-compute-job records
+        the claiming runner as the authoritative ``ran_on_runner_id``."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        job = ComputeJob(
+            project_id=project.id,
+            backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+            status=ComputeJobStatus.STARTING,
+            polling_metadata={
+                "runner_target_id": str(runner.id),
+                "command": "echo hi",
+            },
+        )
+        db_session.add(job)
+        await db_session.commit()
+        assert job.ran_on_runner_id is None
+
+        resp = await client.post(
+            "/api/runner/next-compute-job",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200, resp.text
+        await db_session.refresh(job)
+        assert job.status == ComputeJobStatus.RUNNING
+        assert job.ran_on_runner_id == runner.id
+
+    @pytest.mark.asyncio
+    async def test_report_compute_job_backfills_ran_on_runner_id_when_null(
+        self, client: AsyncClient, db_session
+    ):
+        """A report on a job whose ``ran_on_runner_id`` is still NULL (claimed
+        before this column shipped) idempotently backfills the claiming runner."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        job = ComputeJob(
+            project_id=project.id,
+            backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+            status=ComputeJobStatus.RUNNING,
+            polling_metadata={"runner_target_id": str(runner.id)},
+        )
+        db_session.add(job)
+        await db_session.commit()
+        assert job.ran_on_runner_id is None
+
+        resp = await client.post(
+            f"/api/runner/compute-job/{job.id}/report",
+            json={"exec_status": "running"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200, resp.text
+        await db_session.refresh(job)
+        assert job.ran_on_runner_id == runner.id
+
+    @pytest.mark.asyncio
+    async def test_report_compute_job_does_not_overwrite_ran_on_runner_id(
+        self, client: AsyncClient, db_session
+    ):
+        """A report never overwrites a non-null ``ran_on_runner_id`` — the value
+        stamped at claim time is authoritative and stable across reports."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        # A distinct, real runner (FK requires a valid localrunner row) already
+        # recorded as the authoritative owner — a later report must not clobber it.
+        other_runner, _ = await _make_runner(db_session, project.id)
+        original_runner_id = other_runner.id
+        job = ComputeJob(
+            project_id=project.id,
+            backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+            status=ComputeJobStatus.RUNNING,
+            polling_metadata={"runner_target_id": str(runner.id)},
+            ran_on_runner_id=original_runner_id,
+        )
+        db_session.add(job)
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/runner/compute-job/{job.id}/report",
+            json={"exec_status": "running"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200, resp.text
+        await db_session.refresh(job)
+        assert job.ran_on_runner_id == original_runner_id
+
 
 @pytest.mark.asyncio
 async def test_compute_claim_mints_token_for_claimed_job_project(db_session):
@@ -9832,6 +10235,137 @@ async def test_report_compute_job_cross_project_emits_warning(
     assert str(project_a.id) in msg
     assert str(job.id) in msg
     assert str(project_b.id) in msg
+
+
+async def _add_runner_binding(session, runner_id, project_id):
+    """Add one runner<->project allow-list binding row and commit it."""
+    binding = RunnerProjectBinding(runner_id=runner_id, project_id=project_id)
+    session.add(binding)
+    await session.commit()
+    return binding
+
+
+@pytest.mark.asyncio
+async def test_runner_cannot_claim_job_for_non_allowlisted_project(
+    client: AsyncClient, db_session, caplog
+):
+    """Server-side allow-list is a hard job-claim authorization boundary.
+
+    A runner bound to project A must be rejected — at BOTH the claim
+    (/next-compute-job) and report (/compute-job/{id}/report) surfaces — for a
+    compute job in project B that is NOT on its allow-list; the job stays STARTING
+    (never claimed) and a cross-project WARNING fires. Adding B to the allow-list
+    makes the SAME claim succeed (STARTING→RUNNING). Finally, one runner bound to
+    A AND B serves agent tasks from both projects under ONE unified max_concurrent
+    ledger: a third task holds once the unified limit is reached, regardless of
+    which project it belongs to.
+    """
+    import logging
+
+    project_a = await _make_project(db_session, name="Allowlist A")
+    project_b = await _make_project(db_session, name="Allowlist B")
+    # Runner's home is A, with an explicit allow-list binding to A only.
+    runner, token = await _make_runner(
+        db_session,
+        project_a.id,
+        capabilities={"task_types": "all", "has_gpu": False, "max_concurrent": 2},
+    )
+    await _add_runner_binding(db_session, runner.id, project_a.id)
+    assert await allowed_project_ids(db_session, runner) == {project_a.id}
+
+    # A STARTING compute job in project B, pinned to this runner's id.
+    job_b = ComputeJob(
+        project_id=project_b.id,
+        backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+        status=ComputeJobStatus.STARTING,
+        polling_metadata={"runner_target_id": str(runner.id), "command": "echo b"},
+    )
+    db_session.add(job_b)
+    await db_session.commit()
+    await db_session.refresh(job_b)
+
+    # (1) CLAIM rejected: B is not on the allow-list, so nothing is dispatchable
+    # (204) and the job is NOT transitioned out of STARTING.
+    resp = await client.post(
+        "/api/runner/next-compute-job",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 204, resp.text
+    await db_session.refresh(job_b)
+    assert job_b.status == ComputeJobStatus.STARTING
+
+    # (2) REPORT rejected server-side (404) with a genuine cross-project warning.
+    with caplog.at_level(logging.WARNING, logger="blueprint"):
+        resp = await client.post(
+            f"/api/runner/compute-job/{job_b.id}/report",
+            json={"exec_status": "succeeded", "exit_code": 0},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    assert resp.status_code == 404
+    assert any(
+        "Cross-project" in r.getMessage() for r in caplog.records
+    ), "a non-allowlisted-project report must emit the cross-project warning"
+    await db_session.refresh(job_b)
+    # Evidence untouched — the rejected report never stamped an exec status.
+    assert job_b.status == ComputeJobStatus.STARTING
+    assert "runner_exec_status" not in (job_b.polling_metadata or {})
+
+    # (3) Add B to the allow-list → the SAME claim now succeeds (STARTING→RUNNING).
+    await _add_runner_binding(db_session, runner.id, project_b.id)
+    assert await allowed_project_ids(db_session, runner) == {
+        project_a.id,
+        project_b.id,
+    }
+    resp = await client.post(
+        "/api/runner/next-compute-job",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["job_id"] == str(job_b.id)
+    await db_session.refresh(job_b)
+    assert job_b.status == ComputeJobStatus.RUNNING
+
+    # (4) UNIFIED LEDGER: the runner is now fanned into BOTH project buckets, and a
+    # burst of agent tasks across the two projects is sized against ONE
+    # max_concurrent=2 ledger — the third pin is refused no matter its project.
+    cache = await orch._load_active_runners_cache(db_session)
+    assert runner.id in {r.id for r in cache.get(project_a.id, [])}
+    assert runner.id in {r.id for r in cache.get(project_b.id, [])}
+
+    task_a1 = Task(
+        project_id=project_a.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.QUEUED,
+    )
+    task_b1 = Task(
+        project_id=project_b.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.QUEUED,
+    )
+    task_a2 = Task(
+        project_id=project_a.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.QUEUED,
+    )
+    db_session.add_all([task_a1, task_b1, task_a2])
+    await db_session.commit()
+
+    pins: dict = {}
+    # First task (project A) pins.
+    assert await orch._try_runner_dispatch(db_session, task_a1, cache, pins) is True
+    # Second task (project B) pins onto the SAME runner — the pin count is shared
+    # across projects, so this is the second unit of the unified ledger.
+    assert await orch._try_runner_dispatch(db_session, task_b1, cache, pins) is True
+    assert pins.get(runner.id) == 2
+    # Third task (project A again) must HOLD: unified limit (2) reached across both
+    # projects — proving the ledger is per-runner, not per-project.
+    assert await orch._try_runner_dispatch(db_session, task_a2, cache, pins) is False
+    await db_session.refresh(task_a2)
+    assert task_a2.status == TaskStatus.QUEUED
+    await db_session.refresh(task_a1)
+    await db_session.refresh(task_b1)
+    assert task_a1.status == TaskStatus.PROVISIONING
+    assert task_b1.status == TaskStatus.PROVISIONING
 
 
 class TestMidRunViewableUpload:

@@ -1767,6 +1767,9 @@ async def next_compute_job(
     job.started_at = job.started_at or now
     job.last_heartbeat_at = now
     job.updated_at = now
+    # Authoritative claim moment: the authenticated runner IS the runner that
+    # runs this job. Stamp the durable first-class record of the claiming runner.
+    job.ran_on_runner_id = runner.id
     meta = dict(job.polling_metadata or {})
     meta["runner_claimed_at"] = now.isoformat()
     job.polling_metadata = meta
@@ -1885,13 +1888,18 @@ async def report_compute_job(
     )
     job = result.scalars().first()
     if job is None:
-        # Check whether the job exists under a different project — if so, emit a
-        # structured warning so operators can detect misconfigured runners.
+        # Check whether the job exists under a project NOT on this runner's
+        # allow-list — if so, emit a structured warning so operators can detect
+        # misconfigured runners. (A same-allow-list job that merely missed the
+        # runner-pin filter is a benign pin mismatch, not a cross-project breach.)
         mismatch_result = await session.execute(
             select(ComputeJob).where(ComputeJob.id == job_id).limit(1)
         )
         mismatch_job = mismatch_result.scalars().first()
-        if mismatch_job is not None:
+        if (
+            mismatch_job is not None
+            and mismatch_job.project_id not in allowed_projects
+        ):
             logger.warning(
                 "[RUNNERS] Cross-project access mismatch: runner_id=%s runner_project_id=%s "
                 "job_id=%s job_actual_project_id=%s — runner cannot access jobs from another project",
@@ -1924,6 +1932,12 @@ async def report_compute_job(
                     runner.id,
                 )
         raise HTTPException(status_code=404, detail="compute job not found")
+
+    # Idempotently backfill the authoritative claiming-runner record when still
+    # NULL — covers jobs claimed before this column shipped and any claim path
+    # that missed the stamp. Never overwrite a non-null value.
+    if job.ran_on_runner_id is None:
+        job.ran_on_runner_id = runner.id
 
     meta = dict(job.polling_metadata or {})
     cancel_requested = bool(job.status in _COMPUTE_JOB_TERMINAL_STATUSES)

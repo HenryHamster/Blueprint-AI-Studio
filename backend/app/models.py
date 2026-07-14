@@ -2276,6 +2276,21 @@ class ComputeJob(SQLModel, table=True):
         default_factory=dict,
         sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
     )
+    # Authoritative record of the local runner that actually CLAIMED and ran this
+    # job (stamped at /next-compute-job claim time). Detach-on-delete (SET NULL),
+    # NOT cascade: a compute job is durable history that must outlive a deleted
+    # runner — mirrors task_id / artifact_id above. Distinct from the best-effort
+    # heartbeat active-list and the polling_metadata['runner_target_id'] dispatch
+    # PIN, neither of which authoritatively records the runner that ran the job.
+    ran_on_runner_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(
+            GUID(),
+            ForeignKey("localrunner.id", ondelete="SET NULL"),
+            nullable=True,
+            index=True,
+        ),
+    )
 
     __table_args__ = (
         Index("ix_computejob_project_status", "project_id", "status"),

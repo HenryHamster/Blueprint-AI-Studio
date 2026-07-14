@@ -40,6 +40,7 @@ from app.models import (
     TaskStatus,
 )
 from app.resource_envelope import resolve_project_require_local_runner
+from app.runner_project_binding import allowed_project_ids
 from app.runner_decline import (
     decline_exclusion_is_advisory,
     decline_record_for_runner,
@@ -471,17 +472,35 @@ async def _load_runner_compute_job_assignments(
     least one runner poll/heartbeat. Counting persisted runner-subprocess jobs
     closes that window so a later orchestrator cycle cannot over-assign a runner
     before it has claimed the first job.
+
+    Attribution is by committed DB fact, not the lossy heartbeat list:
+
+    - A CLAIMED, in-flight job (status RUNNING/POLLING) is attributed to
+      ``ran_on_runner_id`` — the runner that actually holds it, stamped at
+      ``/next-compute-job`` claim time. For robustness on legacy rows predating
+      that column, a RUNNING/POLLING job with a NULL ``ran_on_runner_id`` falls
+      back to the ``polling_metadata['runner_target_id']`` dispatch pin.
+    - A NOT-YET-CLAIMED job (status QUEUED/STARTING, ``ran_on_runner_id`` still
+      NULL) is attributed to the ``runner_target_id`` reservation pin so a
+      reserved-but-unclaimed slot is still counted against its target runner.
     """
     if not runner_ids:
         return {}
     from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
+    from sqlalchemy import or_
 
     runner_id_strings = [str(runner_id) for runner_id in runner_ids]
     runner_target_expr = ComputeJob.polling_metadata["runner_target_id"].as_string()
+    claimed_statuses = {ComputeJobStatus.RUNNING, ComputeJobStatus.POLLING}
     try:
         rows = (
             await session.execute(
-                select(ComputeJob.id, runner_target_expr)
+                select(
+                    ComputeJob.id,
+                    ComputeJob.status,
+                    ComputeJob.ran_on_runner_id,
+                    runner_target_expr,
+                )
                 .where(
                     ComputeJob.backend == RUNNER_SUBPROCESS_BACKEND_NAME,
                     ComputeJob.status.in_(
@@ -492,7 +511,10 @@ async def _load_runner_compute_job_assignments(
                             ComputeJobStatus.POLLING,
                         ]
                     ),
-                    runner_target_expr.in_(runner_id_strings),
+                    or_(
+                        ComputeJob.ran_on_runner_id.in_(runner_ids),
+                        runner_target_expr.in_(runner_id_strings),
+                    ),
                 )
                 .order_by(ComputeJob.created_at.asc())
             )
@@ -502,15 +524,26 @@ async def _load_runner_compute_job_assignments(
         return {}
 
     by_runner: dict[uuid.UUID, list[str]] = {}
+    runner_ids_set = set(runner_ids)
     runner_ids_by_string = {
         str(runner_id): runner_id
         for runner_id in runner_ids
     }
-    for job_id, raw_runner_id in rows:
-        runner_id = runner_ids_by_string.get(str(raw_runner_id))
-        if runner_id is None:
+    for job_id, status, ran_on_runner_id, raw_runner_id in rows:
+        # A claimed in-flight job belongs to the runner that actually holds it
+        # (ran_on_runner_id, stamped at claim). Fall back to the reservation pin
+        # only when that authoritative record is absent — i.e. legacy rows
+        # predating the column, or jobs not yet claimed (QUEUED/STARTING, where
+        # ran_on_runner_id is still NULL and the pin reserves the slot).
+        if status in claimed_statuses and ran_on_runner_id is not None:
+            attributed_runner = (
+                ran_on_runner_id if ran_on_runner_id in runner_ids_set else None
+            )
+        else:
+            attributed_runner = runner_ids_by_string.get(str(raw_runner_id))
+        if attributed_runner is None:
             continue
-        by_runner.setdefault(runner_id, []).append(str(job_id))
+        by_runner.setdefault(attributed_runner, []).append(str(job_id))
     return by_runner
 
 
@@ -1025,10 +1058,13 @@ async def _diagnose_strict_runner_pin_hold(
     row = await session.get(LocalRunner, runner_uuid)
     if row is None:
         return ("not_found", "no runner with this id is registered")
-    if row.project_id != project_id:
+    # Enrollment now means allow-list membership, not the single home project: a
+    # multi-project runner bound to this project is validly pinnable even when its
+    # home project_id is a different one.
+    if project_id not in await allowed_project_ids(session, row):
         return (
             "not_enrolled",
-            "runner is enrolled in a different project — a pin must name one "
+            "runner is not on this project's allow-list — a pin must name one "
             "of this project's runners",
         )
     last_seen = (
@@ -1064,7 +1100,12 @@ async def _lookup_runner_hostname(
             "[RUNNERS] hostname lookup failed for runner %s", runner_id
         )
         return None
-    if runner is None or runner.project_id != project_id:
+    if runner is None:
+        return None
+    # Membership, not the single home project: a multi-project runner pinned to
+    # any allowed project still resolves its hostname for the "waiting for <host>"
+    # hold message.
+    if project_id not in await allowed_project_ids(session, runner):
         return None
     return runner.hostname
 

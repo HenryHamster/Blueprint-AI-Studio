@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.admin import _get_user_project_with_role
@@ -994,8 +994,12 @@ async def runner_stats(
     }
 
     runner_id_str = str(runner_id)
-    pin_condition = ComputeJob.polling_metadata["runner_target_id"].as_string() == runner_id_str
-    base_filter = [ComputeJob.project_id == project_id, pin_condition]
+    pin_expr = ComputeJob.polling_metadata["runner_target_id"].as_string()
+    attribution_condition = or_(
+        ComputeJob.ran_on_runner_id == runner_id,
+        and_(ComputeJob.ran_on_runner_id.is_(None), pin_expr == runner_id_str),
+    )
+    base_filter = [ComputeJob.project_id == project_id, attribution_condition]
 
     # Aggregate counts via SQL — avoids loading every row into Python memory
     total_result = await session.execute(
@@ -1469,7 +1473,7 @@ async def remove_runner_project(
     )
     if added_project_id == runner.project_id:
         raise HTTPException(
-            status_code=400,
+            status_code=409,
             detail="the enrollment project cannot be removed from the allow-list",
         )
 

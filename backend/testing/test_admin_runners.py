@@ -403,6 +403,175 @@ class TestRunnerStatsCloudCostAvoided:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# runner_stats endpoint — attribution by authoritative ran_on_runner_id claim
+# (with legacy runner_target_id pin fallback)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestRunnerStatsAttribution:
+    @pytest.mark.asyncio
+    async def test_job_attributed_by_ran_on_runner_id_over_pin(
+        self, client: AsyncClient, db_session
+    ):
+        # A job the runner AUTHORITATIVELY claimed (ran_on_runner_id) is counted for
+        # that runner even when its dispatch pin (runner_target_id) points at a
+        # DIFFERENT runner. Metrics follow the runner that actually ran the job.
+        project = await _make_project(db_session)
+        claimer = LocalRunner(
+            project_id=project.id, token_hash="f" * 64, hostname="claimer", status="active"
+        )
+        other = LocalRunner(
+            project_id=project.id, token_hash="9" * 64, hostname="other", status="active"
+        )
+        db_session.add_all([claimer, other])
+        await db_session.commit()
+        await db_session.refresh(claimer)
+        await db_session.refresh(other)
+
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        job = ComputeJob(
+            project_id=project.id,
+            backend="runner-subprocess",
+            status=ComputeJobStatus.SUCCEEDED,
+            started_at=start,
+            completed_at=start + timedelta(minutes=3),
+            ran_on_runner_id=claimer.id,
+            # Pin points at `other`, but the claimer actually ran it.
+            polling_metadata=_pin(other.id),
+        )
+        db_session.add(job)
+        await db_session.commit()
+
+        # Counted for the runner that CLAIMED it, not the pinned target.
+        claimer_body = (
+            await client.get(
+                f"/api/admin/projects/{project.id}/runners/{claimer.id}/stats"
+            )
+        ).json()
+        assert claimer_body["jobs_run_count"] == 1
+        assert claimer_body["jobs_succeeded_count"] == 1
+        assert {o["job_id"] for o in claimer_body["last_n_outcomes"]} == {str(job.id)}
+
+        # NOT counted for the pinned-but-not-claiming runner.
+        other_body = (
+            await client.get(
+                f"/api/admin/projects/{project.id}/runners/{other.id}/stats"
+            )
+        ).json()
+        assert other_body["jobs_run_count"] == 0
+        assert other_body["last_n_outcomes"] == []
+
+    @pytest.mark.asyncio
+    async def test_job_attributed_by_ran_on_runner_id_without_any_pin(
+        self, client: AsyncClient, db_session
+    ):
+        # A claimed job with NO runner_target_id pin at all is still attributed via
+        # ran_on_runner_id — the authoritative record needs no dispatch pin.
+        project = await _make_project(db_session)
+        runner = LocalRunner(
+            project_id=project.id, token_hash="7" * 64, hostname="nopin", status="active"
+        )
+        db_session.add(runner)
+        await db_session.commit()
+        await db_session.refresh(runner)
+
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        job = ComputeJob(
+            project_id=project.id,
+            backend="runner-subprocess",
+            status=ComputeJobStatus.SUCCEEDED,
+            started_at=start,
+            completed_at=start + timedelta(minutes=2),
+            ran_on_runner_id=runner.id,
+            polling_metadata={},  # no runner_target_id pin
+        )
+        db_session.add(job)
+        await db_session.commit()
+
+        body = (
+            await client.get(
+                f"/api/admin/projects/{project.id}/runners/{runner.id}/stats"
+            )
+        ).json()
+        assert body["jobs_run_count"] == 1
+        assert {o["job_id"] for o in body["last_n_outcomes"]} == {str(job.id)}
+
+    @pytest.mark.asyncio
+    async def test_legacy_null_ran_on_runner_id_falls_back_to_pin(
+        self, client: AsyncClient, db_session
+    ):
+        # A legacy row predating the column (ran_on_runner_id IS NULL) is still
+        # attributed by its runner_target_id pin — historical attribution preserved.
+        project = await _make_project(db_session)
+        runner = LocalRunner(
+            project_id=project.id, token_hash="6" * 64, hostname="legacy", status="active"
+        )
+        db_session.add(runner)
+        await db_session.commit()
+        await db_session.refresh(runner)
+
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        job = ComputeJob(
+            project_id=project.id,
+            backend="runner-subprocess",
+            status=ComputeJobStatus.SUCCEEDED,
+            started_at=start,
+            completed_at=start + timedelta(minutes=4),
+            ran_on_runner_id=None,  # legacy: never stamped
+            polling_metadata=_pin(runner.id),
+        )
+        db_session.add(job)
+        await db_session.commit()
+
+        body = (
+            await client.get(
+                f"/api/admin/projects/{project.id}/runners/{runner.id}/stats"
+            )
+        ).json()
+        assert body["jobs_run_count"] == 1
+        assert {o["job_id"] for o in body["last_n_outcomes"]} == {str(job.id)}
+
+    @pytest.mark.asyncio
+    async def test_pin_no_longer_attributes_once_claimed_elsewhere(
+        self, client: AsyncClient, db_session
+    ):
+        # A legacy pin does NOT double-count a job that carries a (non-NULL)
+        # ran_on_runner_id for a different runner: the NULL-fallback clause only
+        # fires when ran_on_runner_id IS NULL, so a claimed job is attributed once.
+        project = await _make_project(db_session)
+        pinned = LocalRunner(
+            project_id=project.id, token_hash="5" * 64, hostname="pinned", status="active"
+        )
+        claimer = LocalRunner(
+            project_id=project.id, token_hash="4" * 64, hostname="realclaimer", status="active"
+        )
+        db_session.add_all([pinned, claimer])
+        await db_session.commit()
+        await db_session.refresh(pinned)
+        await db_session.refresh(claimer)
+
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        job = ComputeJob(
+            project_id=project.id,
+            backend="runner-subprocess",
+            status=ComputeJobStatus.SUCCEEDED,
+            started_at=start,
+            completed_at=start + timedelta(minutes=1),
+            ran_on_runner_id=claimer.id,
+            polling_metadata=_pin(pinned.id),
+        )
+        db_session.add(job)
+        await db_session.commit()
+
+        pinned_body = (
+            await client.get(
+                f"/api/admin/projects/{project.id}/runners/{pinned.id}/stats"
+            )
+        ).json()
+        assert pinned_body["jobs_run_count"] == 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Live-safe runner config: operator PATCH normalization + desired-vs-applied view
 # (pure helpers, no DB) — the orchestrator half of the two-way heartbeat config
 # channel that lets an operator reconfigure a LIVE runner (concurrency, task-type

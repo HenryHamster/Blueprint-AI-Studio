@@ -25,7 +25,19 @@ from app.models import LocalRunner
 
 
 class RunnerDispatchSnapshot(NamedTuple):
-    """Session-independent view of a live local runner used during dispatch."""
+    """Session-independent view of a live local runner used during dispatch.
+
+    ``project_id`` is a per-(runner, project) VIEW, not the runner's single home
+    project: a multi-project runner appears once per project on its allow-list,
+    each copy sharing the SAME ``capabilities`` dict. Because the unified
+    per-runner load accounting (``_active_agent_task_count`` and
+    ``active_compute_job_ids``, injected once by ``_load_active_runners_cache``)
+    lives in that shared ``capabilities`` dict, every copy reports the SAME
+    load — so a runner serving projects A and B is sized against one unified
+    ``max_concurrent`` ledger and can never double-book across the two. The
+    eligibility predicates below read only ``capabilities`` (never ``project_id``),
+    so the pure-function contract is unchanged by the fan-out.
+    """
 
     id: uuid.UUID
     project_id: uuid.UUID
