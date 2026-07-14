@@ -36,7 +36,7 @@ import {
   shouldRunAutonomousTurn, EXAM_RECORDS_CAP, FOCUS_LIST_SIZE,
   serializeLedger, restoreLedger, refreshSurfaceCatalog,
   compactionThreshold, formatDirectionGroundingText, buildCompactionCheckpoint,
-  decisionsRegisterText, DECISIONS_REGISTER_CAP, isSettledDecisionVerdict,
+  decisionsRegisterText, DECISIONS_REGISTER_CAP, isSettledDecisionVerdict, admitDecisionEntry,
   serializeDecisionsReg, restoreDecisionsReg, parseOperatorDecision, OPERATOR_DECISION_VERDICT,
   formatStrategicMemoryNotes, formatCheckpointState, resolveCheckpointGrounding,
   type MessagesPollResponse, type SessionHeartbeatResponse, type ResidentInboundMessage,
@@ -872,16 +872,13 @@ export async function handleStrategicResident(
       streamer.status('operator turn ended without OPERATOR-DECISION marker — correction may not have been captured');
       return;
     }
-    decisionsReg.push({
+    admitDecisionEntry(decisionsReg, {
       atTick: examTick,
       at: new Date().toISOString(),
       surfaceKey: 'operator:message',
       verdict: OPERATOR_DECISION_VERDICT,
       note,
-    });
-    if (decisionsReg.length > DECISIONS_REGISTER_CAP) {
-      decisionsReg.splice(0, decisionsReg.length - DECISIONS_REGISTER_CAP);
-    }
+    }, DECISIONS_REGISTER_CAP);
     streamer.status('operator correction recorded to durable decisions register');
   };
 
@@ -1277,16 +1274,13 @@ export async function handleStrategicResident(
       // the exam ledger (examRecords) above; only the durable register skips them.
       if (isSettledDecisionVerdict(upd.record.verdict)) {
         const fullTickVerdict = parseTickVerdict(r.resultText);
-        decisionsReg.push({
+        admitDecisionEntry(decisionsReg, {
           atTick: upd.record.atTick,
           at: upd.record.at,
           surfaceKey: upd.record.surfaceKey,
           verdict: upd.record.verdict,
           note: fullTickVerdict?.note ?? upd.record.note,
-        });
-        if (decisionsReg.length > DECISIONS_REGISTER_CAP) {
-          decisionsReg.splice(0, decisionsReg.length - DECISIONS_REGISTER_CAP);
-        }
+        }, DECISIONS_REGISTER_CAP);
       }
       correctiveNextTick = upd.corrective;
       previousTurnAgendaContinue = upd.agendaContinue;

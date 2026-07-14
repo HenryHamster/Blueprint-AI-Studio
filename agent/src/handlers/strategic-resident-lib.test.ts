@@ -20,7 +20,7 @@ import {
   formatStrategicMemoryNotes, formatCheckpointState, resolveCheckpointGrounding,
   type CheckpointGrounding, type CheckpointStateResponse,
   decisionsRegisterText, serializeDecisionsReg, restoreDecisionsReg,
-  isSettledDecisionVerdict,
+  isSettledDecisionVerdict, admitDecisionEntry,
   DECISIONS_REGISTER_CAP, DECISIONS_REG_MAX_BYTES,
   DEFAULT_CONTEXT_LIMIT, COMPACTION_THRESHOLD_RATIO,
   type ExamSurface, type ExamRecord, type ContentBlock,
@@ -1245,6 +1245,110 @@ describe('serializeDecisionsReg / restoreDecisionsReg round-trip', () => {
       expect(typeof e.surfaceKey).toBe('string');
       expect(typeof e.note).toBe('string');
     }
+  });
+});
+
+describe('admitDecisionEntry (priority-aware decisions-register eviction)', () => {
+  const entry = (
+    tick: number,
+    verdict: string,
+    key = `surface:${tick}`,
+  ): DecisionsRegisterEntry => ({
+    atTick: tick,
+    at: `2026-07-10T12:00:${String(tick).padStart(2, '0')}Z`,
+    surfaceKey: key,
+    verdict,
+    note: `note-${tick}`,
+  });
+
+  it('operator decision survives a flood of clear verdicts in the decisions register', () => {
+    // The named-test proof for this direction: an operator correction recorded
+    // early must NOT be evicted by the designed-common flood of autonomous
+    // `clear` verdicts that follows. A pure FIFO cap would drop it once the
+    // clears exceed the cap; the priority-aware admission must preserve it.
+    const register: DecisionsRegisterEntry[] = [];
+    admitDecisionEntry(register, entry(1, 'operator', 'operator:message'), DECISIONS_REGISTER_CAP);
+
+    // Flood the register with far more clears than the cap.
+    for (let i = 0; i < DECISIONS_REGISTER_CAP * 3; i++) {
+      admitDecisionEntry(register, entry(100 + i, 'clear'), DECISIONS_REGISTER_CAP);
+    }
+
+    expect(register.length).toBeLessThanOrEqual(DECISIONS_REGISTER_CAP);
+    // The scarce operator settlement is still present…
+    const operatorEntries = register.filter(e => e.verdict === 'operator');
+    expect(operatorEntries).toHaveLength(1);
+    expect(operatorEntries[0].surfaceKey).toBe('operator:message');
+    // …and it survives a serialize→restore restart round-trip.
+    const restored = restoreDecisionsReg(serializeDecisionsReg(register));
+    expect(restored?.some(e => e.verdict === 'operator')).toBe(true);
+  });
+
+  it('never evicts protected operator/advanced/found entries while any clear remains', () => {
+    const register: DecisionsRegisterEntry[] = [];
+    // Seed one of each protected verdict at the front (oldest positions).
+    admitDecisionEntry(register, entry(1, 'operator'), DECISIONS_REGISTER_CAP);
+    admitDecisionEntry(register, entry(2, 'advanced'), DECISIONS_REGISTER_CAP);
+    admitDecisionEntry(register, entry(3, 'found'), DECISIONS_REGISTER_CAP);
+    // Then a flood of clears.
+    for (let i = 0; i < DECISIONS_REGISTER_CAP * 2; i++) {
+      admitDecisionEntry(register, entry(100 + i, 'clear'), DECISIONS_REGISTER_CAP);
+    }
+    expect(register.length).toBe(DECISIONS_REGISTER_CAP);
+    expect(register.filter(e => e.verdict === 'operator')).toHaveLength(1);
+    expect(register.filter(e => e.verdict === 'advanced')).toHaveLength(1);
+    expect(register.filter(e => e.verdict === 'found')).toHaveLength(1);
+  });
+
+  it('evicts the OLDEST clear first when over cap', () => {
+    const register: DecisionsRegisterEntry[] = [];
+    // Fill to cap entirely with clears, oldest tick first.
+    for (let i = 0; i < DECISIONS_REGISTER_CAP; i++) {
+      admitDecisionEntry(register, entry(i, 'clear'), DECISIONS_REGISTER_CAP);
+    }
+    // One more clear pushes out the oldest (tick 0), keeping tick 1..cap.
+    admitDecisionEntry(register, entry(999, 'clear'), DECISIONS_REGISTER_CAP);
+    expect(register.length).toBe(DECISIONS_REGISTER_CAP);
+    expect(register.some(e => e.atTick === 0)).toBe(false);
+    expect(register.some(e => e.atTick === 999)).toBe(true);
+  });
+
+  it('falls back to evicting the oldest overall when no clear remains', () => {
+    const register: DecisionsRegisterEntry[] = [];
+    // Fill to cap with protected (found) entries, then admit one more.
+    for (let i = 0; i < DECISIONS_REGISTER_CAP; i++) {
+      admitDecisionEntry(register, entry(i, 'found'), DECISIONS_REGISTER_CAP);
+    }
+    admitDecisionEntry(register, entry(999, 'operator'), DECISIONS_REGISTER_CAP);
+    expect(register.length).toBe(DECISIONS_REGISTER_CAP);
+    // Oldest overall (tick 0) was evicted; newest operator entry retained.
+    expect(register.some(e => e.atTick === 0)).toBe(false);
+    expect(register.some(e => e.atTick === 999 && e.verdict === 'operator')).toBe(true);
+  });
+
+  it('a new clear cannot displace a protected entry when the register is all-protected at cap', () => {
+    const register: DecisionsRegisterEntry[] = [];
+    for (let i = 0; i < DECISIONS_REGISTER_CAP; i++) {
+      admitDecisionEntry(register, entry(i, 'operator'), DECISIONS_REGISTER_CAP);
+    }
+    // The incoming clear is itself the only clear, so it is evicted — no
+    // operator entry is lost.
+    admitDecisionEntry(register, entry(999, 'clear'), DECISIONS_REGISTER_CAP);
+    expect(register.length).toBe(DECISIONS_REGISTER_CAP);
+    expect(register.filter(e => e.verdict === 'operator')).toHaveLength(DECISIONS_REGISTER_CAP);
+    expect(register.some(e => e.atTick === 999)).toBe(false);
+  });
+
+  it('serializeDecisionsReg drops clears before operator entries when over the count cap', () => {
+    // An over-cap register (clears at the front, one operator at the back) must
+    // serialize with the operator entry retained — not front-dropped by age.
+    const register: DecisionsRegisterEntry[] = [];
+    for (let i = 0; i < DECISIONS_REGISTER_CAP; i++) register.push(entry(i, 'clear'));
+    register.push(entry(999, 'operator'));
+    const restored = restoreDecisionsReg(serializeDecisionsReg(register));
+    expect(restored).not.toBeNull();
+    expect(restored?.length).toBeLessThanOrEqual(DECISIONS_REGISTER_CAP);
+    expect(restored?.some(e => e.verdict === 'operator')).toBe(true);
   });
 });
 

@@ -1432,6 +1432,48 @@ const SETTLED_DECISION_VERDICTS: ReadonlySet<string> = new Set([
 export function isSettledDecisionVerdict(verdict: string): boolean {
   return SETTLED_DECISION_VERDICTS.has(verdict);
 }
+
+/** Verdicts evicted FIRST when the decisions register is over its cap. A
+ *  `clear` ("nothing actionable on the examined surface") is the designed-common
+ *  autonomous outcome, so a high-volume flood of them must not crowd out and
+ *  evict the scarce operator/advanced/found settlements the register exists to
+ *  preserve — worst at the autonomous<->operator boundary this guards. Any
+ *  verdict NOT in this set (operator/advanced/found) is protected: it is only
+ *  evicted once no low-priority entry remains. */
+const EVICT_FIRST_VERDICTS: ReadonlySet<string> = new Set(['clear']);
+
+/**
+ * Index of the next entry to evict when the decisions register is over cap:
+ * the oldest (lowest-index) low-priority (`clear`) entry, or index 0 (oldest
+ * overall) when no low-priority entry remains. Callers must guard on a
+ * non-empty register. Pure.
+ */
+function decisionEvictIndex(register: DecisionsRegisterEntry[]): number {
+  const idx = register.findIndex(e => EVICT_FIRST_VERDICTS.has(e.verdict));
+  return idx >= 0 ? idx : 0;
+}
+
+/**
+ * Admit `entry` into the durable decisions register with priority-aware
+ * eviction. Appends the entry, then — while the register exceeds `cap` —
+ * evicts the oldest low-priority (`clear`) entry first, falling back to the
+ * oldest entry overall only when no low-priority entry remains. This keeps
+ * scarce operator/advanced/found settlements from being crowded out by routine
+ * clears (the FIFO the register previously used evicted purely by age, so a
+ * flood of clears silently dropped operator corrections). Mutates and returns
+ * `register` in place. Pure aside from that mutation.
+ */
+export function admitDecisionEntry(
+  register: DecisionsRegisterEntry[],
+  entry: DecisionsRegisterEntry,
+  cap: number = DECISIONS_REGISTER_CAP,
+): DecisionsRegisterEntry[] {
+  register.push(entry);
+  while (register.length > cap) {
+    register.splice(decisionEvictIndex(register), 1);
+  }
+  return register;
+}
 /** Default number of focus surfaces surfaced in the prompt each tick. */
 export const FOCUS_LIST_SIZE = 3;
 /** Default floor-tick interval (ms): even with no state change, review at least
@@ -2006,16 +2048,24 @@ export const DECISIONS_REG_MAX_BYTES = 32_000;
  * across process death/VM recycles (not just across in-process compaction).
  */
 export function serializeDecisionsReg(register: DecisionsRegisterEntry[]): string {
-  const trimmed = register.slice(-DECISIONS_REGISTER_CAP);
-  const candidate = JSON.stringify({ entries: trimmed });
+  // Priority-aware cap: evict the oldest `clear` before any protected
+  // operator/advanced/found entry, so persistence never front-drops a scarce
+  // operator settlement just because it is the oldest entry.
+  const working = register.slice();
+  while (working.length > DECISIONS_REGISTER_CAP) {
+    working.splice(decisionEvictIndex(working), 1);
+  }
+  let candidate = JSON.stringify({ entries: working });
   if (Buffer.byteLength(candidate, 'utf8') <= DECISIONS_REG_MAX_BYTES) {
     return candidate;
   }
-  // Trim from the front until it fits.
-  for (let start = 1; start < trimmed.length; start++) {
-    const smaller = JSON.stringify({ entries: trimmed.slice(start) });
-    if (Buffer.byteLength(smaller, 'utf8') <= DECISIONS_REG_MAX_BYTES) {
-      return smaller;
+  // Still over the byte budget: keep evicting (clears first, then oldest
+  // overall) until it fits.
+  while (working.length > 0) {
+    working.splice(decisionEvictIndex(working), 1);
+    candidate = JSON.stringify({ entries: working });
+    if (Buffer.byteLength(candidate, 'utf8') <= DECISIONS_REG_MAX_BYTES) {
+      return candidate;
     }
   }
   return JSON.stringify({ entries: [] });
