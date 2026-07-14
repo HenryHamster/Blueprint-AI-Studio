@@ -1,8 +1,12 @@
 import { afterEach, describe, test } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
-import { StrategicStreamingBubble, StrategicActivityStrip } from './StrategicLiveTurn';
-import type { StrategicActivityItem } from '../utils/strategicSessionLive';
+import { StrategicStreamingBubble, StrategicActivityStrip, StrategicResidentActivityWidget } from './StrategicLiveTurn';
+import type {
+  StrategicActivityItem,
+  StrategicTurnSegment,
+  ResidentActivityState,
+} from '../utils/strategicSessionLive';
 import {
   expectNoOverflowAt,
   expectNoTextTruncationAt,
@@ -16,6 +20,16 @@ const LONG_UNBROKEN_TEXT =
   'https://github.com/HenryHamster/BlueprintAIStudio/blob/main/backend/app/' +
   'a'.repeat(300) +
   '/very_long_module_path_with_no_spaces_that_would_otherwise_overflow.py#L1234567890';
+
+// A turn carrying BOTH a reasoning run and a reply run — the reasoning must render
+// in its own muted, set-apart block above the primary reply and neither may overflow.
+const REASONING_PLUS_REPLY_SEGMENTS: StrategicTurnSegment[] = [
+  {
+    kind: 'reasoning',
+    text: `Weighing the trade-offs: ${'w'.repeat(300)} versus the cheaper path.`,
+  },
+  { kind: 'reply', text: LONG_UNBROKEN_TEXT },
+];
 
 // Worst case for the ephemeral activity strip: activity one-liners whose `.text`
 // is a long unbroken string; each row must truncate inside the scroll container.
@@ -58,10 +72,32 @@ describe('StrategicLiveTurn — viewport regression', () => {
     return act(async () => {
       r.render(
         <>
-          <StrategicStreamingBubble text={LONG_UNBROKEN_TEXT} />
+          <StrategicStreamingBubble segments={[{ kind: 'reply', text: LONG_UNBROKEN_TEXT }]} />
           <StrategicActivityStrip items={LONG_ACTIVITY_ITEMS} latestLifecycle="working" />
         </>,
       );
+    });
+  }
+
+  function mountReasoningTurn() {
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    return act(async () => {
+      r.render(<StrategicStreamingBubble segments={REASONING_PLUS_REPLY_SEGMENTS} />);
+    });
+  }
+
+  function mountResidentWidget(state: ResidentActivityState) {
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    return act(async () => {
+      r.render(<StrategicResidentActivityWidget state={state} />);
     });
   }
 
@@ -122,6 +158,73 @@ describe('StrategicLiveTurn — viewport regression', () => {
   test('in-flight indicator fits 375px without horizontal overflow', async () => {
     await expectNoOverflowAt(375, async () => {
       await mountInFlightTurn();
+    });
+  });
+
+  test('reasoning renders in its own muted block, set apart from the reply, at 900px', async () => {
+    await expectNoOverflowAt(900, async () => {
+      await mountReasoningTurn();
+    });
+    const reasoning = host?.querySelector('[data-testid="strategic-streaming-reasoning"]');
+    const reply = host?.querySelector('[data-testid="strategic-streaming-reply"]');
+    if (!reasoning) throw new Error('expected a distinct reasoning block set apart from the reply');
+    if (!reply) throw new Error('expected the primary reply block');
+    if (!(reasoning.textContent ?? '').startsWith('Reasoning')) {
+      throw new Error(`expected the reasoning block to be labelled "Reasoning", got: "${(reasoning.textContent ?? '').slice(0, 40)}"`);
+    }
+    // Reasoning must not bleed into the reply block (never mistaken for the answer).
+    if ((reply.textContent ?? '').includes('Weighing the trade-offs')) {
+      throw new Error('reasoning text leaked into the reply block');
+    }
+  });
+
+  test('reasoning-plus-reply turn fits 375px without horizontal overflow', async () => {
+    await expectNoOverflowAt(375, async () => {
+      await mountReasoningTurn();
+    });
+  });
+
+  test('resident widget — executing shows the running command + live timer at 900px', async () => {
+    await expectNoOverflowAt(900, async () => {
+      await mountResidentWidget({
+        phase: 'executing',
+        label: 'Working',
+        commandText: `bash scripts/${'e'.repeat(280)}/test-backend.sh`,
+        startMs: Date.now() - 4000,
+      });
+    });
+    const widget = host?.querySelector('[data-testid="strategic-resident-activity"]');
+    if (widget?.getAttribute('data-phase') !== 'executing') throw new Error('expected executing phase');
+    if (!(widget?.textContent ?? '').includes('running…')) {
+      throw new Error(`expected a live timer in executing state, got: "${(widget?.textContent ?? '').slice(0, 120)}"`);
+    }
+  });
+
+  test('resident widget — idle shows waiting copy and NO ticking timer at 900px', async () => {
+    await expectNoOverflowAt(900, async () => {
+      await mountResidentWidget({ phase: 'idle', label: 'Waiting for direction', endMs: Date.now() });
+    });
+    const widget = host?.querySelector('[data-testid="strategic-resident-activity"]');
+    if (widget?.getAttribute('data-phase') !== 'idle') throw new Error('expected idle phase');
+    const text = widget?.textContent ?? '';
+    if (!text.includes('Waiting for direction')) throw new Error(`expected idle copy, got: "${text}"`);
+    if (text.includes('running…')) throw new Error('idle state must not render a ticking timer');
+  });
+
+  test('resident widget — dead/ended shows frozen ended presentation, no timer, at 900px', async () => {
+    await expectNoOverflowAt(900, async () => {
+      await mountResidentWidget({ phase: 'dead', label: 'Session ended', endMs: Date.now() - 60000 });
+    });
+    const widget = host?.querySelector('[data-testid="strategic-resident-activity"]');
+    if (widget?.getAttribute('data-phase') !== 'dead') throw new Error('expected dead phase');
+    const text = widget?.textContent ?? '';
+    if (!text.includes('Session ended')) throw new Error(`expected ended copy, got: "${text}"`);
+    if (text.includes('running…')) throw new Error('dead state must never render a ticking timer');
+  });
+
+  test('resident widget — dead state fits 320px without horizontal overflow', async () => {
+    await expectNoOverflowAt(320, async () => {
+      await mountResidentWidget({ phase: 'dead', label: 'Session ended', endMs: Date.now() });
     });
   });
 });

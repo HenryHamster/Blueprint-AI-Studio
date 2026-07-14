@@ -13,10 +13,11 @@ import type { MessageAttachment, ProjectMessage } from '../types/messages';
 import {
   computeStrategicStreamingTurn,
   computeStrategicSessionActivity,
+  computeResidentActivityState,
   countStrategicReplies,
   type StrategicLiveActivity,
 } from '../utils/strategicSessionLive';
-import { StrategicStreamingBubble, StrategicActivityStrip } from './StrategicLiveTurn';
+import { StrategicStreamingBubble, StrategicActivityStrip, StrategicResidentActivityWidget } from './StrategicLiveTurn';
 import { SaveViewDialog } from './SaveViewDialog';
 import { useMessageList } from './useMessageList';
 import { useMessagesPanelFilters } from './useMessagesPanelFilters';
@@ -815,6 +816,26 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       : { items: [], latestLifecycle: null } as StrategicLiveActivity),
     [conversationMode, strategicSessionTranscript, conversationMessages],
   );
+  // Slow wall-clock tick so the persistent resident-activity widget can transition
+  // to its `dead` state on heartbeat staleness even when NO further WS frame arrives
+  // (a silently-dead session emits nothing). Only runs while a resident session is
+  // present in conversation mode; the InFlightCounter drives the sub-second display.
+  const [residentNowTick, setResidentNowTick] = useState<number>(() => Date.now());
+  const residentSessionSnapshot = currentStrategicState?.resident_session ?? null;
+  useEffect(() => {
+    if (!conversationMode || !residentSessionSnapshot) return;
+    const id = window.setInterval(() => setResidentNowTick(Date.now()), 5000);
+    return () => window.clearInterval(id);
+  }, [conversationMode, residentSessionSnapshot]);
+  // Truthful three-state (executing / idle / dead) resident live-activity, derived
+  // from real feed data + the resident_session snapshot — persistent whenever a
+  // resident session exists, never gated on an in-flight turn.
+  const residentActivity = useMemo(
+    () => (conversationMode
+      ? computeResidentActivityState(strategicSessionTranscript, conversationMessages, residentSessionSnapshot, residentNowTick)
+      : null),
+    [conversationMode, strategicSessionTranscript, conversationMessages, residentSessionSnapshot, residentNowTick],
+  );
   // The activity strip is visible while any resident turn is in flight: operator
   // turns (responding) or autonomous turns (working), but not after done.
   // `workingSince` covers the optimistic-send period before the first lifecycle
@@ -1217,7 +1238,9 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   // Keep the chat pinned to the live streaming preview as it grows — but only
   // when the operator is already near the bottom, so a deliberate scroll-up to
   // read history is never yanked back down mid-turn.
-  const streamingText = streamingTurn?.text ?? '';
+  // Track total streamed length (reply + reasoning) so the view follows growth
+  // during the thinking phase too, not only once reply text starts landing.
+  const streamingText = streamingTurn?.segments.map(s => s.text).join('') ?? '';
   useEffect(() => {
     if (!conversationMode || !streamingText) return;
     const el = scrollRef.current;
@@ -2137,8 +2160,15 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       {/* Messages list — chat-style scroll area */}
       <MessagesListView
         presentation={conversationMode ? 'conversation' : 'triage'}
-        streamingBubble={streamingTurn ? <StrategicStreamingBubble key={streamingTurn.key} text={streamingTurn.text} /> : null}
-        activityStrip={strategicTurnWorking ? <StrategicActivityStrip items={liveActivity.items} /> : null}
+        streamingBubble={streamingTurn ? <StrategicStreamingBubble key={streamingTurn.key} segments={streamingTurn.segments} /> : null}
+        activityStrip={residentActivity ? (
+          <div className="flex w-full flex-col gap-2">
+            <StrategicResidentActivityWidget state={residentActivity} />
+            {residentActivity.phase === 'executing' && strategicTurnWorking && liveActivity.items.length > 0 ? (
+              <StrategicActivityStrip items={liveActivity.items} latestLifecycle={liveActivity.latestLifecycle} />
+            ) : null}
+          </div>
+        ) : null}
         scrollRef={scrollRef}
         dividerDismissedRef={dividerDismissedRef}
         messages={conversationMode ? renderedConversationMessages : messages}
