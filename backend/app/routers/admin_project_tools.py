@@ -35,6 +35,7 @@ import os
 import re
 import time as _time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -48,7 +49,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.database import get_session
-from app.models import Project, ProjectTool, _utcnow
+from app.models import Project, ProjectComputeImage, ProjectTool, _utcnow
 from app.auth import (
     get_current_user,
     AGENT_JWT_SECRET,
@@ -58,6 +59,7 @@ from app.auth import (
 from app.admin_helpers import _get_user_project_with_role
 from app.task_locking import lock_project_or_429
 from app import compute_backends as _cb
+from app import compute_image_build as _cib
 
 logger = logging.getLogger(__name__)
 
@@ -1240,6 +1242,148 @@ _COMPUTE_IMAGE_BUILD_TIMEOUT_SECONDS = int(
 # hot-looping against a saturated builder.
 _COMPUTE_IMAGE_BUILD_RETRY_AFTER_SECONDS = 120
 
+# After the deadline fires we ABORT the build (SIGKILL its docker children) and
+# wait this long for the pipeline to unwind — that unwind is what removes the
+# clone's temp dir and what releases the concurrency slot. Killing the children
+# makes the blocking call return in milliseconds, so this window is slack, not a
+# budget.
+_COMPUTE_IMAGE_BUILD_ABORT_GRACE_SECONDS = 30
+
+
+def _release_image_build_slot(task: "asyncio.Task") -> None:
+    """Release the concurrency slot when the BUILD TASK ends — not when the request does.
+
+    The slot belongs to the *build*, not to the HTTP request that started it. The
+    old code released it in the request's ``finally``, so a 504 (or a client
+    disconnect) handed the slot to the next caller while the abandoned docker
+    build was still running on the host: the bound stopped bounding exactly when
+    it mattered. Tying the release to task completion means the slot is held for
+    the build's true lifetime, and the deadline path below is what makes that
+    lifetime actually end.
+    """
+    _compute_image_build_semaphore.release()
+
+
+async def _abort_and_unwind_image_build(
+    control: "_cib.BuildControl", task: "asyncio.Task", project_id: uuid.UUID
+) -> None:
+    """Stop a deadline-exceeded build for real, and wait for its cleanup.
+
+    ``asyncio.wait_for`` only cancels the coroutine that is *awaiting* the build;
+    the ``docker build`` running in the ``asyncio.to_thread`` worker keeps going,
+    holding the temp dir open while the pipeline's ``TemporaryDirectory`` context
+    tears it down underneath it. Killing the docker children first makes the
+    blocking call return, so the pipeline unwinds in the normal order (temp dir
+    removed, slot released) with nothing still writing into it.
+    """
+    killed = control.abort()
+    logger.warning(
+        "[COMPUTE-IMAGE] aborting deadline-exceeded build for project=%s "
+        "(signalled %d docker child process(es))",
+        project_id,
+        killed,
+    )
+    _, pending = await asyncio.wait({task}, timeout=_COMPUTE_IMAGE_BUILD_ABORT_GRACE_SECONDS)
+    if not pending:
+        _drain_task_exception(task)
+        return
+    # The kill did not land (no child running yet, or a wedged FS call). Cancel as
+    # a last resort and give the unwind a moment; the slot is still released by the
+    # done-callback whenever the task finally finishes.
+    task.cancel()
+    _, still_pending = await asyncio.wait({task}, timeout=5)
+    if still_pending:
+        logger.error(
+            "[COMPUTE-IMAGE] build task for project=%s did not unwind after abort+cancel "
+            "— its concurrency slot stays held until it does (fail-closed)",
+            project_id,
+        )
+    else:
+        _drain_task_exception(task)
+
+
+def _drain_task_exception(task: "asyncio.Task") -> None:
+    """Retrieve an aborted build's exception so asyncio does not log it as unhandled.
+
+    The task died because WE killed it; that is expected, not an unhandled crash.
+    """
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.info("[COMPUTE-IMAGE] aborted build unwound with %r", exc)
+
+
+@dataclass
+class _PreservedBuildRecord:
+    """A ``BuildResult``-shaped view that keeps an already-stored digest.
+
+    ``record_project_compute_image_build`` reads ``pinned_ref``/``tag``/``dep_hash``/
+    ``built`` off whatever it is handed, and unconditionally writes them. Handing it
+    a digest-less result for a dependency hash we have already pinned would NULL the
+    stored digest (and flip ``built`` back to False), so a re-trigger with unchanged
+    deps is exactly when the pin gets destroyed. This preserves what the DB already
+    proved.
+    """
+
+    pinned_ref: str
+    tag: str
+    dep_hash: str
+    built: bool
+    already_present: bool = True
+
+
+async def _preserve_existing_digest_pin(
+    session: AsyncSession, project_id: uuid.UUID, result: Any
+) -> Any:
+    """Never let a digest-less build result overwrite a stored digest.
+
+    An unchanged-deps re-trigger takes ``build_and_push``'s already-present fast
+    path. That path now resolves the digest from the registry, but a registry that
+    is briefly unreachable (or a tag-only push) still yields ``digest=None`` — and
+    "None" there means UNKNOWN, not "no digest". Recording it would unpin the
+    project's compute image, silently: the row keeps its dep_hash and its tag, so
+    nothing looks wrong until a compute job resolves a mutable tag instead of the
+    digest it was promised.
+    """
+    pinned_ref = getattr(result, "pinned_ref", None) or ""
+    if _cb._parse_digest_from_pinned_ref(pinned_ref):
+        return result  # carries a digest — nothing to protect
+
+    dep_hash = getattr(result, "dep_hash", None) or ""
+    if not dep_hash:
+        return result
+
+    existing = (
+        await session.execute(
+            select(ProjectComputeImage)
+            .where(
+                ProjectComputeImage.project_id == project_id,
+                ProjectComputeImage.dep_hash == dep_hash,
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if existing is None or not existing.digest:
+        return result  # nothing stored to protect
+
+    logger.warning(
+        "[COMPUTE-IMAGE] build for project=%s dep_hash=%s resolved no digest; keeping "
+        "the stored pin %s rather than overwriting it with NULL",
+        project_id,
+        dep_hash,
+        existing.pinned_ref,
+    )
+    return _PreservedBuildRecord(
+        pinned_ref=existing.pinned_ref,
+        tag=existing.tag or getattr(result, "tag", "") or "",
+        dep_hash=dep_hash,
+        # An existing built row stays built: the image is in the registry, we just
+        # could not re-read its digest this second.
+        built=bool(existing.built or getattr(result, "built", False)),
+        already_present=bool(getattr(result, "already_present", True)),
+    )
+
 
 @router.post("/projects/{project_id}/compute-image/build")
 async def trigger_project_compute_image_build(
@@ -1265,10 +1409,16 @@ async def trigger_project_compute_image_build(
     state-changing tool endpoints (register/seed/delete) already require.
 
     Concurrency-bounded: returns **429** (with ``Retry-After``) when a build is
-    already in flight, and **504** when the pipeline exceeds its outer deadline.
-    A ``dry_run`` request performs no docker work but still takes a slot — it
-    clones the repo and hashes the deps, which is the cheap part of the same
-    pipeline.
+    already in flight, and **504** when the pipeline exceeds its outer deadline —
+    at which point the build is ABORTED (its docker children are killed) rather
+    than left running headless; the concurrency slot is released when the build
+    itself ends, not when this request does. A ``dry_run`` request performs no
+    docker work but still takes a slot — it clones the repo and hashes the deps,
+    which is the cheap part of the same pipeline.
+
+    The Dockerfile's RUN steps are repo-controlled, so they run on a confined
+    build network (``none`` by default); a 422 is returned if the configured
+    network cannot be proven to block the GCP metadata server.
     """
     project = await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "owner"
@@ -1317,33 +1467,57 @@ async def trigger_project_compute_image_build(
             headers={"Retry-After": str(_COMPUTE_IMAGE_BUILD_RETRY_AFTER_SECONDS)},
         ) from None
 
+    # The build runs as its own TASK, carrying a kill switch (BuildControl) that the
+    # deadline path can use to actually stop the docker subprocesses. The slot is
+    # handed to the task and released when the TASK ends — see
+    # _release_image_build_slot for why releasing it in this request's `finally`
+    # broke the bound on exactly the path (504) where it had to hold.
+    control = _cib.BuildControl()
+    token = _cib.set_build_control(control)
     try:
-        result = await asyncio.wait_for(
+        build_task = asyncio.create_task(
             _cb.build_project_compute_image(
                 project,
                 registry_repo=registry_repo,
                 build_config=build_config,
                 dry_run=dry_run,
-            ),
+            )
+        )
+    except BaseException:
+        _compute_image_build_semaphore.release()
+        raise
+    finally:
+        _cib.reset_build_control(token)
+    build_task.add_done_callback(_release_image_build_slot)
+
+    try:
+        # shield: wait_for must not just *abandon* the build on timeout — we want the
+        # task object alive so we can abort it and watch it unwind.
+        result = await asyncio.wait_for(
+            asyncio.shield(build_task),
             timeout=_COMPUTE_IMAGE_BUILD_TIMEOUT_SECONDS,
         )
     except asyncio.TimeoutError:
         logger.exception(
-            "[COMPUTE-IMAGE] build for project=%s exceeded %ss deadline",
+            "[COMPUTE-IMAGE] build for project=%s exceeded %ss deadline — aborting it",
             project_id,
             _COMPUTE_IMAGE_BUILD_TIMEOUT_SECONDS,
         )
+        await _abort_and_unwind_image_build(control, build_task, project_id)
         raise HTTPException(
             status_code=504,
             detail=(
                 "compute-image build exceeded the "
-                f"{_COMPUTE_IMAGE_BUILD_TIMEOUT_SECONDS}s deadline"
+                f"{_COMPUTE_IMAGE_BUILD_TIMEOUT_SECONDS}s deadline and was aborted"
             ),
         ) from None
+    except _cib.BuildNetworkError as exc:
+        # The build network could not be proven to block the metadata server.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    finally:
-        _compute_image_build_semaphore.release()
+
+    result = await _preserve_existing_digest_pin(session, project.id, result)
 
     row = await _cb.record_project_compute_image_build(
         session,

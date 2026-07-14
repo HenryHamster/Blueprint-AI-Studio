@@ -20,6 +20,9 @@ import re
 import shlex
 import shutil
 import signal
+import sys
+import threading
+import time
 import uuid
 
 import pytest
@@ -16230,6 +16233,387 @@ def test_build_and_push_layer_credential_leak_fails_before_push(tmp_path):
     assert any(c.startswith("docker build") for c in flat)
     assert not any(c.startswith("docker push") for c in flat)
     assert len(layer_scan_called_with) == 1
+
+
+# ---------------------------------------------------------------------------
+# Build-network confinement: a repo-controlled Dockerfile's RUN steps run on the
+# ORCHESTRATOR HOST. With the default docker build network they can reach
+# 169.254.169.254 and trade the host's service-account identity for an access
+# token. Every build must therefore run on a network from which the metadata
+# server is provably unreachable — or not run at all.
+# ---------------------------------------------------------------------------
+
+
+def _ok_proc(stdout="", returncode=0, stderr=""):
+    class P:
+        pass
+
+    p = P()
+    p.returncode = returncode
+    p.stdout = stdout
+    p.stderr = stderr
+    return p
+
+
+def test_resolve_build_network_defaults_to_none(monkeypatch):
+    """No operator opt-in => RUN steps get NO network namespace at all."""
+    monkeypatch.delenv("COMPUTE_IMAGE_BUILD_NETWORK", raising=False)
+    assert _bci.resolve_build_network() == "none"
+    assert _bci.resolve_build_network("") == "none"
+    # Operator opt-in is honored (and is then probed, see below).
+    monkeypatch.setenv("COMPUTE_IMAGE_BUILD_NETWORK", "bp-image-build")
+    assert _bci.resolve_build_network() == "bp-image-build"
+    # An explicit argument still wins (CLI / tests).
+    assert _bci.resolve_build_network("none") == "none"
+
+
+def test_build_and_push_confines_the_run_step_network(tmp_path):
+    """`docker build` is invoked with an explicit, confined --network.
+
+    Omitting --network is what selected the default bridge, from which the GCP
+    metadata server answers. The flag is now non-optional.
+    """
+    repo = _write_repo(tmp_path)
+    cmds = []
+
+    def fake_run(cmd, **kw):
+        cmds.append(cmd)
+        return _ok_proc(stdout="reg/repo/img@sha256:" + "b" * 64)
+
+    _bci.build_and_push(
+        repo_dir=repo,
+        registry_repo="reg/repo",
+        image_name="img",
+        dockerfile=".blueprint/Dockerfile.compute",
+        dep_files=["requirements.txt"],
+        _run=fake_run,
+        _tag_exists=lambda *a, **k: False,
+        _scan_layers_fn=lambda *a, **k: [],
+        build_network="none",
+    )
+    build_cmd = next(c for c in cmds if c[:2] == ["docker", "build"])
+    assert "--network=none" in build_cmd, (
+        "docker build ran without an explicit confined --network — its RUN steps "
+        "would reach 169.254.169.254 from the orchestrator host"
+    )
+
+
+@pytest.mark.parametrize("net", ["host", "bridge", "default", "", "HOST"])
+def test_build_and_push_refuses_unconfined_networks(tmp_path, net):
+    """host/bridge/default all reach the metadata server — the build is refused."""
+    repo = _write_repo(tmp_path)
+    cmds = []
+
+    def fake_run(cmd, **kw):
+        cmds.append(cmd)
+        return _ok_proc()
+
+    with pytest.raises(_bci.BuildNetworkError):
+        _bci.build_and_push(
+            repo_dir=repo,
+            registry_repo="reg/repo",
+            image_name="img",
+            dockerfile=".blueprint/Dockerfile.compute",
+            dep_files=["requirements.txt"],
+            _run=fake_run,
+            _tag_exists=lambda *a, **k: False,
+            _scan_layers_fn=lambda *a, **k: [],
+            build_network=net,
+        )
+    # Nothing was built: the refusal happens BEFORE any RUN step executes.
+    assert not any(c[:2] == ["docker", "build"] for c in cmds)
+
+
+def test_build_refused_when_the_build_network_reaches_the_metadata_server(tmp_path):
+    """A named network is PROBED; if metadata answers, the build never starts."""
+    repo = _write_repo(tmp_path)
+    cmds = []
+
+    def fake_run(cmd, **kw):
+        cmds.append(cmd)
+        if cmd[:2] == ["docker", "run"]:
+            # The probe container reached 169.254.169.254.
+            return _ok_proc(stdout="BP_METADATA_REACHABLE\n")
+        return _ok_proc(stdout="reg/repo/img@sha256:" + "b" * 64)
+
+    with pytest.raises(_bci.BuildNetworkError, match="metadata"):
+        _bci.build_and_push(
+            repo_dir=repo,
+            registry_repo="reg/repo",
+            image_name="img",
+            dockerfile=".blueprint/Dockerfile.compute",
+            dep_files=["requirements.txt"],
+            _run=fake_run,
+            _tag_exists=lambda *a, **k: False,
+            _scan_layers_fn=lambda *a, **k: [],
+            build_network="leaky-net",
+        )
+    assert any(c[:2] == ["docker", "run"] for c in cmds), "the network was not probed"
+    assert not any(c[:2] == ["docker", "build"] for c in cmds), (
+        "docker build ran on a network from which the metadata server is reachable"
+    )
+
+
+def test_build_proceeds_on_a_network_that_blocks_the_metadata_server(tmp_path):
+    """An operator network whose probe reports BLOCKED is usable for RUN steps."""
+    repo = _write_repo(tmp_path)
+    cmds = []
+
+    def fake_run(cmd, **kw):
+        cmds.append(cmd)
+        if cmd[:2] == ["docker", "run"]:
+            return _ok_proc(stdout="BP_METADATA_BLOCKED\n")
+        return _ok_proc(stdout="reg/repo/img@sha256:" + "c" * 64)
+
+    result = _bci.build_and_push(
+        repo_dir=repo,
+        registry_repo="reg/repo",
+        image_name="img",
+        dockerfile=".blueprint/Dockerfile.compute",
+        dep_files=["requirements.txt"],
+        _run=fake_run,
+        _tag_exists=lambda *a, **k: False,
+        _scan_layers_fn=lambda *a, **k: [],
+        build_network="walled-net",
+    )
+    assert result.built is True
+    build_cmd = next(c for c in cmds if c[:2] == ["docker", "build"])
+    assert "--network=walled-net" in build_cmd
+
+
+def test_metadata_probe_fails_closed_when_it_cannot_run(tmp_path):
+    """A probe that never ran proves NOTHING — the build is refused, not waved through.
+
+    Without the sentinel positive-control, a probe that failed for an unrelated
+    reason (image pull failed, docker down) is indistinguishable from
+    "metadata unreachable", which would silently re-open the hole.
+    """
+    repo = _write_repo(tmp_path)
+    cmds = []
+
+    def fake_run(cmd, **kw):
+        cmds.append(cmd)
+        if cmd[:2] == ["docker", "run"]:
+            # Probe image could not be pulled: non-zero exit, no sentinel.
+            return _ok_proc(returncode=125, stdout="", stderr="Unable to find image")
+        return _ok_proc(stdout="reg/repo/img@sha256:" + "d" * 64)
+
+    with pytest.raises(_bci.BuildNetworkError, match="failing closed"):
+        _bci.build_and_push(
+            repo_dir=repo,
+            registry_repo="reg/repo",
+            image_name="img",
+            dockerfile=".blueprint/Dockerfile.compute",
+            dep_files=["requirements.txt"],
+            _run=fake_run,
+            _tag_exists=lambda *a, **k: False,
+            _scan_layers_fn=lambda *a, **k: [],
+            build_network="unknown-net",
+        )
+    assert not any(c[:2] == ["docker", "build"] for c in cmds)
+
+
+def test_metadata_probe_fails_closed_on_a_silent_zero_exit(tmp_path):
+    """Exit 0 with no sentinel (e.g. an entrypoint that ignored the script) is refused."""
+
+    def fake_run(cmd, **kw):
+        if cmd[:2] == ["docker", "run"]:
+            return _ok_proc(returncode=0, stdout="")
+        return _ok_proc()
+
+    with pytest.raises(_bci.BuildNetworkError, match="failing closed"):
+        _bci.assert_build_network_confined("quiet-net", _run=fake_run)
+
+
+def test_metadata_probe_covers_both_metadata_endpoints():
+    """The probe script tries the raw link-local IP and the DNS alias."""
+    assert "169.254.169.254" in _bci._METADATA_PROBE_SCRIPT
+    assert "metadata.google.internal" in _bci._METADATA_PROBE_SCRIPT
+
+
+# ---------------------------------------------------------------------------
+# Digest resolution on the already-present fast path (unchanged-deps re-trigger).
+#
+# The fast path used to read the digest from the LOCAL docker store only, so on a
+# fresh/pruned host it resolved None, returned a tag-only pinned_ref, and the
+# caller persisted digest=NULL — silently destroying the project's digest pin.
+# ---------------------------------------------------------------------------
+
+
+def test_already_present_resolves_digest_from_registry_with_an_empty_local_store(tmp_path):
+    """Fresh host (no local image): the digest still resolves — from the REGISTRY."""
+    repo = _write_repo(tmp_path)
+    registry_digest = "sha256:" + "e" * 64
+    cmds = []
+
+    def fake_run(cmd, **kw):
+        cmds.append(cmd)
+        if cmd[:3] == ["docker", "manifest", "inspect"]:
+            return _ok_proc(
+                stdout=json.dumps(
+                    {
+                        "Ref": "reg/repo/img:tag",
+                        "Descriptor": {
+                            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                            "digest": registry_digest,
+                            "size": 1234,
+                        },
+                    }
+                )
+            )
+        if cmd[:3] == ["docker", "image", "inspect"]:
+            # EMPTY LOCAL STORE — this host never built or pulled the image.
+            return _ok_proc(returncode=1, stdout="", stderr="No such image")
+        return _ok_proc()
+
+    result = _bci.build_and_push(
+        repo_dir=repo,
+        registry_repo="reg/repo",
+        image_name="img",
+        dockerfile=".blueprint/Dockerfile.compute",
+        dep_files=["requirements.txt"],
+        _run=fake_run,
+        _tag_exists=lambda *a, **k: True,  # unchanged deps: already in the registry
+    )
+    assert result.already_present is True
+    assert result.built is False
+    assert result.digest == registry_digest, (
+        "the already-present fast path resolved no digest from the registry — on a "
+        "fresh host it would return a tag-only ref and NULL the project's stored pin"
+    )
+    assert result.pinned_ref == "reg/repo/img@" + registry_digest
+    assert result.digest_unknown is False
+    assert any(c[:3] == ["docker", "manifest", "inspect"] for c in cmds)
+
+
+def test_already_present_marks_the_digest_unknown_when_no_source_resolves_it(tmp_path):
+    """Registry AND local store both silent => digest is UNKNOWN, and says so.
+
+    ``digest=None`` here does NOT mean "this image has no digest"; it means we
+    could not read it. Persisters key on ``digest_unknown`` to refuse to overwrite
+    a stored pin with NULL.
+    """
+    repo = _write_repo(tmp_path)
+
+    def fake_run(cmd, **kw):
+        return _ok_proc(returncode=1, stdout="", stderr="boom")
+
+    result = _bci.build_and_push(
+        repo_dir=repo,
+        registry_repo="reg/repo",
+        image_name="img",
+        dockerfile=".blueprint/Dockerfile.compute",
+        dep_files=["requirements.txt"],
+        _run=fake_run,
+        _tag_exists=lambda *a, **k: True,
+    )
+    assert result.digest is None
+    assert result.digest_unknown is True
+    assert result.pinned_ref == "reg/repo/img:" + result.dep_hash
+
+
+def test_resolve_registry_digest_handles_a_multi_arch_manifest_list():
+    """`docker manifest inspect -v` emits a LIST for multi-arch images."""
+    digest = "sha256:" + "f" * 64
+
+    def fake_run(cmd, **kw):
+        return _ok_proc(
+            stdout=json.dumps(
+                [
+                    {"Ref": "reg/repo/img:t", "Descriptor": {"digest": digest}},
+                    {"Ref": "reg/repo/img:t", "Descriptor": {"digest": "sha256:" + "9" * 64}},
+                ]
+            )
+        )
+
+    assert _bci.resolve_registry_digest("reg/repo/img", "t", _run=fake_run) == digest
+
+
+def test_resolve_registry_digest_returns_none_on_garbage():
+    """A non-JSON / error response resolves to None rather than a bogus digest."""
+
+    def fake_run(cmd, **kw):
+        return _ok_proc(stdout="not json at all")
+
+    assert _bci.resolve_registry_digest("reg/repo/img", "t", _run=fake_run) is None
+
+    def failing_run(cmd, **kw):
+        raise OSError("docker not installed")
+
+    assert _bci.resolve_registry_digest("reg/repo/img", "t", _run=failing_run) is None
+
+
+# ---------------------------------------------------------------------------
+# BuildControl: the outer deadline must actually STOP the build, not abandon it.
+# ---------------------------------------------------------------------------
+
+
+def test_supervised_run_without_a_control_is_plain_subprocess_run():
+    """No control published => unchanged behavior (CLI, reaper, unit tests)."""
+    assert _bci.current_build_control() is None
+    proc = _bci.supervised_run(
+        [sys.executable, "-c", "print('hello')"], capture_output=True, text=True, timeout=30
+    )
+    assert proc.returncode == 0
+    assert "hello" in proc.stdout
+
+
+def test_abort_kills_a_running_child_and_raises():
+    """abort() SIGKILLs the in-flight docker child; the blocking call returns at once."""
+    control = _bci.BuildControl()
+    token = _bci.set_build_control(control)
+    try:
+        threading.Timer(0.5, control.abort).start()
+        started = time.monotonic()
+        with pytest.raises(_bci.BuildAborted):
+            _bci.supervised_run(
+                # Stand-in for `docker build`: a long-running child.
+                [sys.executable, "-c", "import time; time.sleep(120)"],
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+        elapsed = time.monotonic() - started
+    finally:
+        _bci.reset_build_control(token)
+    assert elapsed < 20, (
+        f"the abort did not stop the child (took {elapsed:.1f}s) — a deadline that "
+        "cannot stop the build leaves it running on the orchestrator host"
+    )
+
+
+def test_an_aborted_control_refuses_to_start_new_children():
+    """Abort is sticky: a late `docker push` cannot slip out after the deadline."""
+    control = _bci.BuildControl()
+    control.abort()
+    token = _bci.set_build_control(control)
+    try:
+        with pytest.raises(_bci.BuildAborted):
+            _bci.supervised_run(
+                [sys.executable, "-c", "print('should never run')"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+    finally:
+        _bci.reset_build_control(token)
+
+
+@pytest.mark.asyncio
+async def test_build_control_reaches_the_worker_thread():
+    """The ContextVar transport the router relies on: control survives to_thread.
+
+    ``asyncio.to_thread`` copies the calling context into the worker, so a control
+    published by the request handler before ``create_task`` is visible to the
+    blocking build code — that is what lets the deadline kill the docker children.
+    """
+    control = _bci.BuildControl()
+    token = _bci.set_build_control(control)
+    try:
+        task = asyncio.create_task(asyncio.to_thread(_bci.current_build_control))
+    finally:
+        _bci.reset_build_control(token)
+    assert await task is control
 
 
 # ---------------------------------------------------------------------------

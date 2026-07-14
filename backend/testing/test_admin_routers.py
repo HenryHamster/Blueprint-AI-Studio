@@ -7,6 +7,7 @@ Tests for admin routers:
    clear-wave-deps, rollup, findings)
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -30270,3 +30271,233 @@ class TestComputeImageBuildTrigger:
         resp = await client.post(f"/api/admin/projects/{project.id}/compute-image/build")
 
         assert resp.status_code == 403, resp.text
+
+    @pytest.mark.asyncio
+    async def test_deadline_aborts_the_build_instead_of_abandoning_it(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """A 504 must STOP the build — not walk away from it.
+
+        ``asyncio.wait_for`` cancels the coroutine that is *awaiting* the build; the
+        blocking ``docker build`` in the ``asyncio.to_thread`` worker keeps running.
+        The old code then released the concurrency slot in the request's ``finally``
+        and returned 504, so:
+
+          * the abandoned build kept burning the orchestrator host,
+          * the slot was handed to the next caller while it ran (the bound stopped
+            bounding — repeated 504s fan out N concurrent multi-GB builds), and
+          * the pipeline's temp dir was torn down under the still-running build,
+            which then re-created parts of it — a disk leak.
+
+        The deadline now publishes a kill switch, kills the docker children, waits
+        for the pipeline to unwind, and only then releases the slot.
+        """
+        import tempfile
+        import threading
+        import time as _t
+
+        from app import compute_image_build as _cib
+
+        state = {
+            "control": None,
+            "tmp": None,
+            "thread_exited": threading.Event(),
+            "ran_to_completion": threading.Event(),
+        }
+
+        async def slow_build(*a, **k):
+            # Mirrors compute_backends.build_project_compute_image: a temp-dir
+            # context around a BLOCKING docker call dispatched to a worker thread.
+            state["control"] = _cib.current_build_control()
+            with tempfile.TemporaryDirectory(prefix="compute-image-build-") as tmp:
+                state["tmp"] = tmp
+
+                def blocking_docker_build():
+                    try:
+                        deadline = _t.monotonic() + 20
+                        while _t.monotonic() < deadline:
+                            control = _cib.current_build_control()
+                            if control is not None and control.aborted:
+                                raise _cib.BuildAborted("docker child killed")
+                            _t.sleep(0.02)
+                        state["ran_to_completion"].set()
+                    finally:
+                        state["thread_exited"].set()
+
+                await asyncio.to_thread(blocking_docker_build)
+            raise AssertionError("unreachable: the build should have been aborted")
+
+        apt = self._patch_pipeline(monkeypatch, build_fn=slow_build)
+        monkeypatch.setattr(apt, "_COMPUTE_IMAGE_BUILD_TIMEOUT_SECONDS", 0.5)
+        project = await _make_project(db_session, name="ImgBuild Deadline")
+
+        resp = await client.post(f"/api/admin/projects/{project.id}/compute-image/build")
+
+        assert resp.status_code == 504, resp.text
+
+        # 1. The build REALLY STOPPED. This is the finding: `wait_for` only cancels
+        #    the awaiting coroutine, so the worker thread keeps running long after
+        #    the 504 — burning the host with the slot already handed away.
+        assert state["thread_exited"].wait(5.0), (
+            "the build was still running 5s after the 504 — the deadline abandoned "
+            "it instead of aborting it"
+        )
+        assert not state["ran_to_completion"].is_set(), (
+            "the build ran to completion despite the deadline — it was abandoned, "
+            "not aborted"
+        )
+
+        # 2. It stopped because it was given a kill switch, and the switch was pulled.
+        assert state["control"] is not None, (
+            "no BuildControl reached the build — the deadline has no way to stop the "
+            "docker subprocesses and can only abandon them"
+        )
+        assert state["control"].aborted is True
+
+        # 3. Its temp dir is gone (no disk leak from a half-torn-down clone).
+        assert not os.path.exists(state["tmp"])
+
+        # 4. The slot is released only after that unwind — and it IS released, so
+        #    the bound is not permanently exhausted by repeated 504s.
+        assert not apt._compute_image_build_semaphore.locked()
+
+    @pytest.mark.asyncio
+    async def test_retrigger_with_an_empty_local_docker_store_preserves_the_digest_pin(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """Re-triggering with unchanged deps must NEVER destroy the stored digest pin.
+
+        Unchanged deps take ``build_and_push``'s already-present fast path, which
+        resolved the digest from the LOCAL docker store — empty on a fresh or pruned
+        host. It returned a tag-only ``pinned_ref``, and the UPSERT wrote
+        ``digest=NULL`` over a perfectly good pin (and flipped ``built`` back to
+        False), silently unpinning the project's compute image.
+        """
+        from app.compute_image_build import BuildResult
+        from app.models import ProjectComputeImage
+
+        project = await _make_project(db_session, name="ImgBuild Pin")
+        project_id = project.id
+
+        good_digest = "sha256:" + "a" * 64
+        registry_repo = "us-docker.pkg.dev/p/compute-images"
+        pinned = f"{registry_repo}/proj@{good_digest}"
+        db_session.add(
+            ProjectComputeImage(
+                project_id=project_id,
+                image_name="proj",
+                registry_repo=registry_repo,
+                dep_hash="deadbeef",
+                tag="deadbeef",
+                pinned_ref=pinned,
+                digest=good_digest,
+                built=True,
+            )
+        )
+        await db_session.commit()
+
+        async def already_present_on_a_fresh_host(*a, **k):
+            # Exactly what the fast path yields when neither the local store nor the
+            # registry hands back a digest: already_present, no digest, tag-only ref.
+            return BuildResult(
+                pinned_ref=f"{registry_repo}/proj:deadbeef",
+                tag="deadbeef",
+                dep_hash="deadbeef",
+                already_present=True,
+                built=False,
+                digest=None,
+            )
+
+        self._patch_pipeline(monkeypatch, build_fn=already_present_on_a_fresh_host)
+        resp = await client.post(f"/api/admin/projects/{project_id}/compute-image/build")
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["digest"] == good_digest, (
+            "the unchanged-deps re-trigger overwrote the project's digest pin with "
+            "NULL — the compute image is now unpinned"
+        )
+        assert body["pinned_ref"] == pinned
+        assert body["built"] is True
+
+        # And the DB row itself still carries the pin.
+        row = (
+            await db_session.execute(
+                select(ProjectComputeImage)
+                .where(
+                    ProjectComputeImage.project_id == project_id,
+                    ProjectComputeImage.dep_hash == "deadbeef",
+                )
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one()
+        assert row.digest == good_digest
+        assert row.pinned_ref == pinned
+        assert row.built is True
+
+    @pytest.mark.asyncio
+    async def test_a_digest_bearing_rebuild_still_updates_the_pin(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """The preserve-the-pin guard must not freeze a stale digest in place.
+
+        It only refuses to overwrite a good digest with NOTHING; a build that DOES
+        resolve a new digest still advances the pin.
+        """
+        from app.compute_image_build import BuildResult
+        from app.models import ProjectComputeImage
+
+        project = await _make_project(db_session, name="ImgBuild Repin")
+        registry_repo = "us-docker.pkg.dev/p/compute-images"
+        old_digest = "sha256:" + "a" * 64
+        new_digest = "sha256:" + "b" * 64
+        db_session.add(
+            ProjectComputeImage(
+                project_id=project.id,
+                image_name="proj",
+                registry_repo=registry_repo,
+                dep_hash="deadbeef",
+                tag="deadbeef",
+                pinned_ref=f"{registry_repo}/proj@{old_digest}",
+                digest=old_digest,
+                built=True,
+            )
+        )
+        await db_session.commit()
+
+        async def rebuilt(*a, **k):
+            return BuildResult(
+                pinned_ref=f"{registry_repo}/proj@{new_digest}",
+                tag="deadbeef",
+                dep_hash="deadbeef",
+                already_present=False,
+                built=True,
+                digest=new_digest,
+            )
+
+        self._patch_pipeline(monkeypatch, build_fn=rebuilt)
+        resp = await client.post(f"/api/admin/projects/{project.id}/compute-image/build")
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["digest"] == new_digest
+
+    @pytest.mark.asyncio
+    async def test_an_unconfined_build_network_is_surfaced_as_422(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """A build refused for network confinement is a 422, not a 500 traceback."""
+        from app import compute_image_build as _cib
+
+        async def refuses(*a, **k):
+            raise _cib.BuildNetworkError(
+                "build network 'bridge' can reach the GCP metadata server"
+            )
+
+        apt = self._patch_pipeline(monkeypatch, build_fn=refuses)
+        project = await _make_project(db_session, name="ImgBuild Net")
+
+        resp = await client.post(f"/api/admin/projects/{project.id}/compute-image/build")
+
+        assert resp.status_code == 422, resp.text
+        assert "metadata server" in resp.text
+        assert not apt._compute_image_build_semaphore.locked()

