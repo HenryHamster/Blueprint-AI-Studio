@@ -3,12 +3,12 @@ import userEvent from '@testing-library/user-event';
 import { describe, expect, test, vi } from 'vitest';
 import {
   ProjectWorkspace,
-  RuntimeWorkspace,
   type ProjectManageSection,
   type ProjectSection,
   type RuntimeSection,
   type RuntimeSettingsSection,
 } from './OperatorWorkspaces';
+import { RuntimeWorkspace } from './RuntimeWorkspace';
 import {
   PROJECT_POLICY_SECTIONS,
   RUNTIME_POLICY_SECTIONS,
@@ -418,6 +418,6 @@ describe('Operator workspaces', () => {
         versionLifecycle={{ current_version: { version_number: 7, phase: 'stabilize', phase_changed_at: '2026-01-01T00:00:00Z', opened_at: '2026-01-01T00:00:00Z', qualification_attempts: 0, merged_task_count: 0, goal: null, goal_updated_at: null, goal_editor_info: null, phase_reasoning: null, qualification_state: null, last_qualification: null, active_candidate_sha: null, latest_audit: null, audit_evidence_state: 'none', stale_audit: null }, recent_versions: [], promotion_enabled: false, promotion_readiness: null }}
       />,
     );
-    expect(screen.getByTestId('version-lifecycle-panel')).toHaveTextContent('v7');
+    expect(await screen.findByTestId('version-lifecycle-panel')).toHaveTextContent('v7');
   });
 });

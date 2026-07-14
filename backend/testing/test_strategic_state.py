@@ -775,6 +775,121 @@ async def test_strategic_state_surfaces_resident_session_availability_flag(
 
 
 @pytest.mark.asyncio
+async def test_strategic_liveness_returns_mode_and_session_without_heavy_state(
+    client: AsyncClient, db_session
+):
+    """The lightweight liveness probe returns mode + resident-session fields and
+    omits every heavy strategic-state segment (context package, runtime, events,
+    fingerprints, attention, tasks, cost).
+    """
+    project = await _make_project(db_session)
+    resident_task = Task(
+        project_id=project.id,
+        title="Resident strategic session",
+        payloads=[{"type": "strategic_review"}],
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(resident_task)
+    await db_session.commit()
+    await db_session.refresh(resident_task)
+
+    started_at = (_utcnow() - timedelta(minutes=3)).isoformat()
+    project.vision = {
+        **(project.vision or {}),
+        RESIDENT_SESSION_KEY: {
+            "version": 1,
+            "session_id": "ss-live-9",
+            "task_id": str(resident_task.id),
+            "runner_id": "runner-xyz",
+            "operator_user_id": TEST_USER_ID,
+            "status": STATUS_ACTIVE,
+            "stop_requested": False,
+            "started_at": started_at,
+            "updated_at": started_at,
+            "last_progress_at": None,
+            "last_operator_interaction_at": started_at,
+        },
+    }
+    db_session.add(project)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-liveness")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["project_id"] == str(project.id)
+    # Mode from the workbench row (default "chat" absent an explicit selection).
+    assert data["interaction_mode"] == "chat"
+    # Resident-session liveness projection (mirrors the heavy endpoint's shape).
+    resident = data["resident_session"]
+    assert resident is not None
+    assert resident["session_id"] == "ss-live-9"
+    assert resident["status"] == STATUS_ACTIVE
+    assert resident["stop_requested"] is False
+    # Bounded projection: internal-only fields never leak.
+    assert "operator_user_id" not in resident
+    assert data["resident_session_availability"]["state"] is not None
+    assert data["resident_session_runners"] == []
+    # None of the heavy Phase-1/Phase-2 segments are assembled.
+    for heavy_key in (
+        "context_package",
+        "runtime",
+        "work_session",
+        "attention",
+        "tasks",
+        "messages",
+        "problem_model",
+        "sha_freshness",
+        "state_revision",
+        "model_integrity",
+    ):
+        assert heavy_key not in data, f"heavy key {heavy_key!r} leaked into liveness probe"
+
+
+@pytest.mark.asyncio
+async def test_strategic_liveness_runner_options_and_availability(
+    client: AsyncClient, db_session
+):
+    """The probe surfaces the same runner-picker options and availability verdict
+    the heavy endpoint would, computed from the cheap helpers only.
+
+    With no live runner and the feature enabled, availability is blocked/no_runner;
+    the eligible-live count is derived from the runner options' ``eligible`` flags.
+    """
+    project = await _make_project(db_session)
+    offline = LocalRunner(
+        project_id=project.id,
+        token_hash="d" * 64,
+        hostname="desk-cold",
+        status="active",
+        last_seen_at=_utcnow() - timedelta(hours=1),
+        capabilities={"task_types": "all"},
+    )
+    db_session.add(offline)
+    await db_session.commit()
+    await db_session.refresh(offline)
+
+    original = runtime_config.get(STRATEGIC_SESSION_ENABLED_SETTING, False)
+    try:
+        runtime_config[STRATEGIC_SESSION_ENABLED_SETTING] = True
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/strategic-liveness"
+        )
+    finally:
+        runtime_config[STRATEGIC_SESSION_ENABLED_SETTING] = original
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["resident_session_available"] is True
+    runners = data["resident_session_runners"]
+    assert {r["id"] for r in runners} == {str(offline.id)}
+    assert runners[0]["online"] is False
+    assert runners[0]["eligible"] is False
+    # No eligible live runner -> blocked / no_runner.
+    availability = data["resident_session_availability"]
+    assert availability["state"] == "blocked"
+    assert availability["reason"] == "no_runner"
+
+
+@pytest.mark.asyncio
 async def test_strategic_state_cost_uses_estimated_cost_usd(
     client: AsyncClient, db_session
 ):

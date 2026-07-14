@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlmodel import select
 
-from app.database import get_session
+from app.database import get_session, resolve_dialect_name
 from app.models import (
     Task,
     TaskStatus,
@@ -24,6 +24,7 @@ from app.auth import get_current_user
 from app.admin import _user_project_ids
 from app.failure_classification import classify_failure, classify_failure_taxonomy
 from app.research_completion import resolve_research_findings_for_surface
+from app.sr_review_quality_metrics import _stash_projected_task_fields
 
 logger = logging.getLogger(__name__)
 
@@ -65,30 +66,57 @@ async def get_activity(
     if project_id:
         task_filters.append(Task.project_id == project_id)
 
-    tasks_result = await session.execute(
-        select(Task)
-        .where(*task_filters)
-        .options(
-            load_only(
-                Task.id,
-                Task.status,
-                Task.title,
-                Task.project_id,
-                Task.payloads,
-                Task.created_at,
-                Task.started_at,
-                Task.completed_at,
-                Task.updated_at,
-                Task.context,
-                Task.latest_status_message,
-                Task.plan_output,
-            raiseload=True,)
+    # Project only payloads[0] SQL-side instead of loading the whole payloads
+    # JSONB array (which grows per attempt and is TOAST-able / multi-MB per
+    # row). plan_output is dropped entirely here and fetched narrowly below
+    # only for the handful of tasks that carry a RESEARCH_FINDINGS artifact.
+    # context stays loaded: classify_failure()/classify_failure_taxonomy() read
+    # the full dict for FAILED rows. SQLite (tests without --postgres) can't
+    # return a parsed dict from payloads[0], so it falls back to loading the
+    # array — matching the established digest projection pattern.
+    use_projection = resolve_dialect_name(session) == "postgresql"
+
+    async def _fetch_tasks_with_first_payload(*, extra_cols, filters, order_by):
+        if use_projection:
+            result = await session.execute(
+                select(Task, Task.payloads[0].label("_projected_first_payload"))
+                .where(*filters)
+                .options(load_only(*extra_cols, raiseload=True))
+                .order_by(order_by)
+                .offset(offset)
+                .limit(limit * 3)
+            )
+            tasks = []
+            for row in result.all():
+                _stash_projected_task_fields(row[0], first_payload=row[1] or {})
+                tasks.append(row[0])
+            return tasks
+        result = await session.execute(
+            select(Task)
+            .where(*filters)
+            .options(load_only(*extra_cols, Task.payloads, raiseload=True))
+            .order_by(order_by)
+            .offset(offset)
+            .limit(limit * 3)
         )
-        .order_by(terminal_activity_at.desc())
-        .offset(offset)
-        .limit(limit * 3)
+        return result.scalars().all()
+
+    recent_tasks = await _fetch_tasks_with_first_payload(
+        extra_cols=[
+            Task.id,
+            Task.status,
+            Task.title,
+            Task.project_id,
+            Task.created_at,
+            Task.started_at,
+            Task.completed_at,
+            Task.updated_at,
+            Task.context,
+            Task.latest_status_message,
+        ],
+        filters=task_filters,
+        order_by=terminal_activity_at.desc(),
     )
-    recent_tasks = tasks_result.scalars().all()
 
     task_ids = [t.id for t in recent_tasks] if recent_tasks else []
 
@@ -138,6 +166,18 @@ async def get_activity(
                 }
             elif a.artifact_type == ArtifactType.INVESTIGATION_REPORT and a.logs:
                 investigation_report_map[tid] = a.logs[:2000]
+
+    # Fetch plan_output (JSONB, potentially large research-finding arrays) only
+    # for the tasks that actually emit a RESEARCH_FINDINGS event, instead of
+    # loading it for every terminal row in the feed.
+    plan_output_map: Dict[str, Any] = {}  # task_id -> plan_output
+    if research_artifact_map:
+        research_uuids = [uuid.UUID(tid) for tid in research_artifact_map]
+        plan_output_result = await session.execute(
+            select(Task.id, Task.plan_output).where(Task.id.in_(research_uuids))
+        )
+        for row in plan_output_result.all():
+            plan_output_map[str(row[0])] = row[1]
 
     for t in recent_tasks:
         tid = str(t.id)
@@ -238,7 +278,7 @@ async def get_activity(
                     "error_summary": None,
                     "finding_count": len(
                         resolve_research_findings_for_surface(
-                            t.plan_output, ra.get("artifact_logs")
+                            plan_output_map.get(tid), ra.get("artifact_logs")
                         )
                         or []
                     ),
@@ -261,25 +301,17 @@ async def get_activity(
     if since is not None:
         inprogress_filters.append(Task.created_at >= since)
 
-    inprogress_result = await session.execute(
-        select(Task)
-        .options(
-            load_only(
-                Task.id,
-                Task.payloads,
-                Task.title,
-                Task.started_at,
-                Task.created_at,
-                Task.latest_status_message,
-                raiseload=True,
-            )
-        )
-        .where(*inprogress_filters)
-        .order_by(Task.created_at.desc())
-        .offset(offset)
-        .limit(limit * 3)
+    inprogress_tasks = await _fetch_tasks_with_first_payload(
+        extra_cols=[
+            Task.id,
+            Task.title,
+            Task.started_at,
+            Task.created_at,
+            Task.latest_status_message,
+        ],
+        filters=inprogress_filters,
+        order_by=Task.created_at.desc(),
     )
-    inprogress_tasks = inprogress_result.scalars().all()
 
     for t in inprogress_tasks:
         tid = str(t.id)

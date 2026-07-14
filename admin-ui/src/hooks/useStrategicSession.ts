@@ -5,6 +5,7 @@ import {
   startStrategicSession,
   stopStrategicSession,
   updateStrategicWorkbenchState,
+  type StrategicLivenessResponse,
   type StrategicResidentRunnerOption,
   type StrategicResidentSessionSnapshot,
   type StrategicWorkbenchState,
@@ -22,12 +23,20 @@ interface UseStrategicSessionOptions {
   selectedProjectId: string | null;
   addToast: (message: string, type: 'success' | 'error' | 'info') => void;
   strategicReadModel: StrategicReadModel;
+  /**
+   * Lightweight liveness probe ({@link useStrategicLiveness}) used purely as a
+   * FALLBACK source for the mode indicator and resident-session liveness chip on
+   * reload, before the heavy read model hydrates. Once `strategicReadModel.data`
+   * lands for the selected project its values take precedence, so no flicker.
+   */
+  strategicLiveness?: StrategicLivenessResponse | null;
 }
 
 export function useStrategicSession({
   selectedProjectId,
   addToast,
   strategicReadModel,
+  strategicLiveness,
 }: UseStrategicSessionOptions) {
   const selectedProjectIdRef = useRef(selectedProjectId);
   selectedProjectIdRef.current = selectedProjectId;
@@ -62,25 +71,49 @@ export function useStrategicSession({
   const selectedStrategicReadModel = strategicReadModel.data?.project_id === selectedProjectId
     ? strategicReadModel.data
     : null;
+  // Fast-path liveness probe, used only as a FALLBACK until the heavy read model
+  // hydrates for this project. Guarded on project id so a stale probe from a
+  // previous project is never applied.
+  const selectedStrategicLiveness =
+    strategicLiveness && strategicLiveness.project_id === selectedProjectId
+      ? strategicLiveness
+      : null;
 
+  // Resident-session fields: the heavy read model is fully authoritative ONCE
+  // it has loaded for this project (including a legitimate null session), so it
+  // is not `??`-merged with the probe — that would let a stale liveness snapshot
+  // resurface after the read model reports the session gone. The liveness probe
+  // is used ONLY while the read model is still absent (pre-hydration reload).
+  const residentSource = selectedStrategicReadModel ?? selectedStrategicLiveness;
   const residentStrategicSession =
-    (selectedStrategicReadModel as { resident_session?: StrategicResidentSessionSnapshot | null } | null)?.resident_session
+    (residentSource as { resident_session?: StrategicResidentSessionSnapshot | null } | null)?.resident_session
     ?? null;
   const strategicSessionActive = residentStrategicSession?.status === 'active' && !residentStrategicSession?.stop_requested;
   const strategicSessionStatus = residentStrategicSession?.status ?? null;
   const residentStrategicSessionAvailable =
-    (selectedStrategicReadModel as { resident_session_available?: boolean } | null)?.resident_session_available === true;
+    (residentSource as { resident_session_available?: boolean } | null)?.resident_session_available === true;
   const residentStrategicSessionAvailability =
-    (selectedStrategicReadModel as {
+    (residentSource as {
       resident_session_availability?: { available?: boolean; state?: string | null; reason?: string | null } | null;
     } | null)?.resident_session_availability ?? null;
   const strategicSessionState = residentStrategicSessionAvailability?.state
     ?? (strategicSessionActive ? 'active' : residentStrategicSessionAvailable ? 'ready' : 'off');
   const strategicSessionReason = residentStrategicSessionAvailability?.reason ?? null;
   const strategicWorkbenchState = optimisticStrategicWorkbench ?? strategicReadModelWorkbench;
+  // Mode indicator source: prefer the workbench state (optimistic or heavy read
+  // model), fall back to the fast liveness probe so the mode chip renders on
+  // reload before the heavy fetch lands. Deliberately does NOT synthesize a full
+  // workbench object — active_surface stays absent until the read model loads,
+  // so the tab-restore effect never fires on a phantom surface.
+  const strategicInteractionMode =
+    strategicWorkbenchState?.interaction_mode
+    ?? selectedStrategicLiveness?.interaction_mode
+    ?? null;
   const residentStrategicSessionRunners =
     (selectedStrategicReadModel as { resident_session_runners?: StrategicResidentRunnerOption[] | null } | null)
-      ?.resident_session_runners ?? null;
+      ?.resident_session_runners
+    ?? selectedStrategicLiveness?.resident_session_runners
+    ?? null;
   const strategicSessionSelectedRunnerId =
     strategicWorkbenchState?.preferred_runner_id
     ?? residentStrategicSession?.runner_id
@@ -231,6 +264,7 @@ export function useStrategicSession({
 
   return {
     strategicWorkbenchState,
+    strategicInteractionMode,
     residentStrategicSession,
     strategicSessionActive,
     strategicSessionStatus,

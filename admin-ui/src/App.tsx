@@ -57,10 +57,11 @@ import { VersionMismatchBanner } from './components/VersionMismatchBanner';
 import { NullBranchDiagnosticsPanel } from './components/NullBranchDiagnosticsPanel';
 import type { ProjectManageSection, ProjectSection, RuntimeSection, RuntimeSettingsSection } from './components/OperatorWorkspaces';
 const ProjectWorkspace = lazy(() => import('./components/OperatorWorkspaces').then(m => ({ default: m.ProjectWorkspace })));
-const RuntimeWorkspace = lazy(() => import('./components/OperatorWorkspaces').then(m => ({ default: m.RuntimeWorkspace })));
+const RuntimeWorkspace = lazy(() => import('./components/RuntimeWorkspace').then(m => ({ default: m.RuntimeWorkspace })));
 const PipelineWorkspace = lazy(() => import('./components/PipelineWorkspace').then(m => ({ default: m.PipelineWorkspace })));
 import { WorkbenchFrame, WorkbenchSplit, WorkbenchStatusBar, WorkbenchSurface } from './components/WorkbenchLayout';
 import { useStrategicReadModel } from './hooks/useStrategicReadModel';
+import { useStrategicLiveness } from './hooks/useStrategicLiveness';
 import { useOperatorKeyboardShortcuts } from './hooks/useOperatorKeyboardShortcuts';
 import { useStrategicMessageTarget } from './hooks/useStrategicMessageTarget';
 import { useCommandPaletteState } from './hooks/useCommandPaletteState';
@@ -419,6 +420,11 @@ export default function App() {
     : combinedAlerts.length > 0 ? 'INFO' : null;
 
   const strategicReadModel = useStrategicReadModel(s.selectedProjectId, { pollerEnabled: activeTab === 'chat' });
+  // Fast mode + resident-session liveness probe: resolves the mode indicator and
+  // active/dead chip on reload well before the heavy strategic-state fetch lands.
+  // Once strategicReadModel.data hydrates, its values take precedence (fallback
+  // in useStrategicSession), so there is no flicker when the full state arrives.
+  const strategicLiveness = useStrategicLiveness(s.selectedProjectId, { enabled: activeTab === 'chat' });
   useEffect(() => {
     refreshStrategicReadModelRef.current = () => {
       void strategicReadModel.refresh();
@@ -429,6 +435,7 @@ export default function App() {
   }, [strategicReadModel.refresh]);
   const {
     strategicWorkbenchState,
+    strategicInteractionMode,
     strategicSessionActive,
     strategicSessionStatus,
     residentStrategicSessionAvailable,
@@ -449,7 +456,7 @@ export default function App() {
     handleStopStrategicSession,
     strategicWorkbenchOperatorSurfaceTouchedRef,
     strategicWorkbenchRestoreProjectRef,
-  } = useStrategicSession({ selectedProjectId, addToast: s.addToast, strategicReadModel });
+  } = useStrategicSession({ selectedProjectId, addToast: s.addToast, strategicReadModel, strategicLiveness: strategicLiveness.data });
   const pipelineAttentionCount = useMemo(() => {
     const counts = strategicReadModel.data?.attention?.counts;
     if (!counts) return s.needsAttentionCount;
@@ -824,7 +831,7 @@ export default function App() {
   const openNextWorkbenchSubtab = useCallback(() => {
     cycleCurrentWorkbenchSection(1);
   }, [cycleCurrentWorkbenchSection]);
-  const currentStrategicInteractionMode = normalizeStrategicInteractionMode(strategicWorkbenchState?.interaction_mode);
+  const currentStrategicInteractionMode = normalizeStrategicInteractionMode(strategicInteractionMode);
   const strategicAccountSpend = useMemo<StrategicAccountSpendStatus>(() => {
     const accounts = s.maxPlanAccounts ?? [];
     const cooldownAccounts = accounts.filter(account => Object.keys(account.disabled_models ?? {}).length > 0).length;
@@ -1247,7 +1254,7 @@ export default function App() {
             <>
               <Suspense fallback={null}>
               <StrategicSessionControl
-                mode={normalizeStrategicInteractionMode(strategicWorkbenchState?.interaction_mode)}
+                mode={normalizeStrategicInteractionMode(strategicInteractionMode)}
                 saving={savingStrategicWorkbench}
                 localRunner={strategicReadModel.data?.runtime?.local_runner ?? null}
                 runtimeWork={strategicReadModel.data?.runtime?.work ?? null}

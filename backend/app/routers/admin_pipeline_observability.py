@@ -21,7 +21,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import delete, func
+from sqlalchemy import and_, case, delete, func
 from sqlalchemy import select as sa_select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
@@ -43,6 +43,7 @@ from app.models import (
     _utcnow,
     get_task_total_vm_cost_usd_or_none,
 )
+from app.vm_cost_rates import vm_cost_sql_expr
 
 logger = logging.getLogger(__name__)
 
@@ -164,6 +165,31 @@ def _viewport_metadata_for_failed_task(
     return _viewport_metadata_from_status_text(task.latest_status_message)
 
 
+def _assemble_provider_cost_rows(
+    groups: Dict[str, Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Finalize per-account cost rows (rounding, success_rate, cost_per_merged_pr).
+
+    Shared by the SQL fast path and the SQLite fallback so both emit an
+    identical row shape.
+    """
+    result_rows: List[Dict[str, Any]] = []
+    for g in groups.values():
+        result_rows.append(
+            {
+                **g,
+                "total_cost_usd": round(g["total_cost_usd"], 2),
+                "success_rate": round(g["success_count"] / g["total_tasks"], 3)
+                if g["total_tasks"]
+                else None,
+                "cost_per_merged_pr": round(g["total_cost_usd"] / g["merged_count"], 2)
+                if g["merged_count"]
+                else None,
+            }
+        )
+    return result_rows
+
+
 @router.get("/provider-cost-summary")
 async def get_provider_cost_summary(
     hours: int = Query(24, ge=1, le=168),
@@ -178,6 +204,7 @@ async def get_provider_cost_summary(
     Returns rows sorted by total spend descending.
     """
     window_start = _utcnow() - timedelta(hours=hours)
+    dialect_name = resolve_dialect_name(session)
     filters = [
         Task.vm_stopped_at >= window_start,
         Task.status.in_(
@@ -187,6 +214,77 @@ async def get_provider_cost_summary(
     if project_id:
         filters.append(Task.project_id == project_id)
 
+    groups: Dict[str, Dict[str, Any]] = {}
+
+    if dialect_name == "postgresql":
+        # Fast path: group by account and sum cost/counts in SQL so the
+        # 5000-row scan (which hydrated the JSONB ``context`` of every terminal
+        # task) is replaced by a single aggregate.  Account name/provider are
+        # hydrated afterwards, and rows are assembled identically below.
+        acct_sql = func.coalesce(
+            Task.context["llm_account_id"].astext,
+            Task.context["max_plan_account_id"].astext,
+        )
+        cost_sql = vm_cost_sql_expr(dialect_name)
+        completed = Task.status == TaskStatus.COMPLETED
+        pr_merged = Task.context["pr_merged"].astext == "true"
+        agg_rows = (
+            await session.execute(
+                sa_select(
+                    acct_sql.label("acct_id"),
+                    func.count().label("total_tasks"),
+                    func.sum(case((completed, 1), else_=0)).label("success_count"),
+                    func.sum(
+                        case((and_(completed, pr_merged), 1), else_=0)
+                    ).label("merged_count"),
+                    func.coalesce(func.sum(cost_sql), 0.0).label("total_cost_usd"),
+                )
+                .where(*filters)
+                .group_by(acct_sql)
+            )
+        ).all()
+
+        acct_ids = {r.acct_id for r in agg_rows if r.acct_id}
+        acct_map: Dict[str, Dict[str, str]] = {}
+        if acct_ids:
+            parsed = [uuid.UUID(a) for a in acct_ids if a]
+            if parsed:
+                rows = (
+                    (
+                        await session.execute(
+                            select(MaxPlanAccount).where(MaxPlanAccount.id.in_(parsed))
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                for a in rows:
+                    acct_map[str(a.id)] = {
+                        "name": a.name,
+                        "provider": a.provider.value,
+                    }
+
+        for r in agg_rows:
+            acct_id = r.acct_id
+            info = acct_map.get(
+                acct_id or "", {"name": "unknown", "provider": "unknown"}
+            )
+            key = f"{info['provider']}|{acct_id or 'untracked'}"
+            groups[key] = {
+                "provider": info["provider"],
+                "account_id": acct_id,
+                "account_name": info["name"],
+                "total_tasks": int(r.total_tasks),
+                "success_count": int(r.success_count or 0),
+                "merged_count": int(r.merged_count or 0),
+                "total_cost_usd": float(r.total_cost_usd or 0.0),
+            }
+
+        result_rows = _assemble_provider_cost_rows(groups)
+        result_rows.sort(key=lambda x: x["total_cost_usd"], reverse=True)
+        return {"window_hours": hours, "rows": result_rows}
+
+    # SQLite fallback (test harness without Postgres): compute per-row in Python.
     tasks = (
         (
             await session.execute(
@@ -232,7 +330,6 @@ async def get_provider_cost_summary(
             for a in rows:
                 acct_map[str(a.id)] = {"name": a.name, "provider": a.provider.value}
 
-    groups: Dict[str, Dict[str, Any]] = {}
     for t in tasks:
         acct_id = _acct_id(t.context)
         info = acct_map.get(acct_id or "", {"name": "unknown", "provider": "unknown"})
@@ -258,20 +355,7 @@ async def get_provider_cost_summary(
         if cost is not None:
             g["total_cost_usd"] += cost
 
-    result_rows = []
-    for g in groups.values():
-        result_rows.append(
-            {
-                **g,
-                "total_cost_usd": round(g["total_cost_usd"], 2),
-                "success_rate": round(g["success_count"] / g["total_tasks"], 3)
-                if g["total_tasks"]
-                else None,
-                "cost_per_merged_pr": round(g["total_cost_usd"] / g["merged_count"], 2)
-                if g["merged_count"]
-                else None,
-            }
-        )
+    result_rows = _assemble_provider_cost_rows(groups)
     result_rows.sort(key=lambda x: x["total_cost_usd"], reverse=True)
     return {"window_hours": hours, "rows": result_rows}
 

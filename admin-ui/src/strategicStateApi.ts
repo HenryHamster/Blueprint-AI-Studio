@@ -1057,6 +1057,39 @@ export interface StrategicStateResponse {
   strategic_memory_notes?: StrategicMemoryNote[];
 }
 
+/**
+ * Lightweight mode + resident-session liveness probe (mirrors the backend
+ * `GET /projects/{id}/strategic-liveness` endpoint). Carries ONLY the cheap
+ * fields the chat/workday shell needs to render the mode indicator and the
+ * resident-session liveness chip immediately on reload, computed without any of
+ * the heavy `strategic-state` Phase-1/Phase-2 assembly. The full read model
+ * ({@link fetchStrategicState}) still hydrates the complete state afterward and
+ * takes over once it lands.
+ */
+export interface StrategicLivenessResponse {
+  project_id: string;
+  interaction_mode: StrategicWorkbenchState['interaction_mode'];
+  resident_session?: StrategicResidentSessionSnapshot | null;
+  resident_session_available?: boolean;
+  resident_session_availability?: StrategicResidentSessionAvailability | null;
+  resident_session_runners?: StrategicResidentRunnerOption[] | null;
+}
+
+export async function fetchStrategicLiveness(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<StrategicLivenessResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/strategic-liveness`,
+    undefined,
+    2,
+    30000,
+    signal,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch strategic liveness: ${res.status}`);
+  return res.json() as Promise<StrategicLivenessResponse>;
+}
+
 export async function fetchStrategicState(
   projectId: string,
   signal?: AbortSignal,

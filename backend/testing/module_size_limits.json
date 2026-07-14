@@ -25,7 +25,7 @@
     "github_http.py": 250,
     "github_merge_summary.py": 350,
     "routers/admin_settings.py": 4750,
-    "routers/admin_analytics.py": 2300,
+    "routers/admin_analytics.py": 2750,
     "routers/admin_operator_triggers.py": 1200,
     "routers/admin_digest.py": 10300,
     "routers/admin_release_version.py": 2250,

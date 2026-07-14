@@ -1922,6 +1922,59 @@ async def get_project_strategic_state(
     return result
 
 
+@router.get("/projects/{project_id}/strategic-liveness")
+@limiter.limit("60/minute")
+async def get_project_strategic_liveness(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Lightweight mode + resident-session liveness probe for reload bootstrap.
+
+    Returns ONLY the cheap fields the chat/workday shell needs to render the mode
+    indicator and the resident-session liveness chip immediately on reload:
+    ``interaction_mode`` (one indexed workbench row) plus ``resident_session`` /
+    ``resident_session_availability`` / ``resident_session_runners`` (an in-memory
+    read of ``Project.vision`` + one runner-picker query). It deliberately runs
+    NONE of the heavy ``strategic-state`` Phase-1/Phase-2 assembly — no task focus,
+    operator attention, cost aggregate, fingerprints, context package, runtime
+    summary, event/job feeds, SHA/GitHub freshness, or integrity checks — so it
+    resolves in a fraction of the time. The full read model still hydrates
+    afterward via ``strategic-state`` and takes over once it lands. Guarded with
+    the same ``member``-role project-access check the sibling strategic endpoints
+    use.
+    """
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    # Cheap workbench row (indexed lookup) — the mode indicator's only input.
+    workbench_state = await get_strategic_workbench_state(
+        session,
+        current_user["user_id"],
+        project.id,
+    )
+    # One runner-picker query; the eligible-live count is derived from its
+    # per-runner ``eligible`` flags so no heavy runtime summary is assembled.
+    resident_runner_options = await build_resident_runner_options(session, project.id)
+    eligible_live_runner_count = sum(
+        1 for option in resident_runner_options if option.get("eligible")
+    )
+    return {
+        "project_id": str(project.id),
+        "interaction_mode": workbench_state.get("interaction_mode", "chat"),
+        # In-memory reads off Project.vision — no queries.
+        "resident_session": _resident_session_summary(project),
+        "resident_session_available": _resident_session_available(),
+        "resident_session_availability": _resident_session_availability(
+            project,
+            eligible_live_runner_count=eligible_live_runner_count,
+            runner_options=resident_runner_options,
+        ),
+        "resident_session_runners": resident_runner_options,
+    }
+
+
 @router.get("/projects/{project_id}/strategic-session")
 @limiter.limit("30/minute")
 async def get_project_strategic_session(

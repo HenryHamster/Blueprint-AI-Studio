@@ -21,6 +21,7 @@ vi.mock('../strategicStateApi', async () => {
   stopStrategicSession: vi.fn(),
   getMessageAttachmentUploadUrl: vi.fn(),
   fetchStrategicState: vi.fn(),
+  fetchStrategicLiveness: vi.fn(),
   };
 });
 

@@ -6,6 +6,7 @@ export function createStrategicStateApiMock(overrides: Record<string, unknown> =
     STRATEGIC_STATE_NOT_MODIFIED: NOT_MODIFIED,
     isStrategicStateNotModified: (r: unknown) => r === NOT_MODIFIED,
     fetchStrategicState: vi.fn(),
+    fetchStrategicLiveness: vi.fn(),
     fetchStrategicStateWithRevision: vi.fn(),
     fetchStrategicWorkbenchState: vi.fn(),
     updateStrategicWorkbenchState: vi.fn(),

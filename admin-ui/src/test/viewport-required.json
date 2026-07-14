@@ -18,6 +18,7 @@
     "MetricsDashboard",
     "OrchestratorHealthBar",
     "OperatorWorkspaces",
+    "RuntimeWorkspace",
     "SearchFilterBar",
     "SettingsAccountsSection"
   ]
