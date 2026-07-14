@@ -35,6 +35,10 @@ LLM_TOKEN_PRICING: dict[tuple[str, str], tuple[float, float]] = {
     ("anthropic", "claude-opus-4-8"): (5e-6, 25e-6),
     ("anthropic", "claude-opus-4-7"): (5e-6, 25e-6),
     ("anthropic", "claude-opus-4-6"): (5e-6, 25e-6),
+    # Sonnet 5 lists at $3/$15 per MTok; an intro rate of $2/$10 applies
+    # through 2026-08-31 (platform.claude.com 2026-07). Priced at list so
+    # dashboards don't need a bump when the intro window lapses.
+    ("anthropic", "claude-sonnet-5"): (3e-6, 15e-6),
     ("anthropic", "claude-sonnet-4-6"): (3e-6, 15e-6),
     ("anthropic", "claude-haiku-4-5-20251001"): (1e-6, 5e-6),
     # OpenAI (developers.openai.com/api/docs/pricing, refreshed 2026-07-11 at

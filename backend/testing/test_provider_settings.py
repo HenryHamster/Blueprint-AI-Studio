@@ -45,7 +45,7 @@ async def test_get_settings_includes_provider_scaffolding(client):
     # Effort matrix ships with sensible per-(provider, level) bags including model.
     assert (
         body["provider_settings_by_effort"]["anthropic"]["medium"]["model"]
-        == "claude-sonnet-4-6"
+        == "claude-sonnet-5"
     )
     assert (
         body["provider_settings_by_effort"]["openai"]["low"]["model"] == "gpt-5.6-luna"

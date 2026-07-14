@@ -741,6 +741,9 @@ RATE_LIMIT_PATTERNS = list(
 #     so haiku tracking normalizes to opus via _normalize_rl_model().
 _MODEL_TIER_CASCADE: Dict[str, tuple] = {
     "claude-opus-4-8": ("claude-opus-4-8",),
+    # Sonnet shares the Max-plan session bucket with Opus (see note above), so
+    # a Sonnet 5 429 books against the shared opus-4-8 meter like sonnet-4-6.
+    "claude-sonnet-5": ("claude-opus-4-8",),
     # Legacy mappings kept so prior-queued tasks with older models still resolve
     # to the current shared meter (opus-4-8); all new tasks use 4-8.
     "claude-opus-4-7": ("claude-opus-4-8",),

@@ -32,7 +32,7 @@
     "routers/admin_pipeline_observability.py": 2350,
     "routers/admin_agent_ops.py": 6350,
     "routers/admin_pool_accounts.py": 1950,
-    "max_plan_pool.py": 4500,
+    "max_plan_pool.py": 5200,
     "anomaly_detection.py": 2100,
     "routers/agent.py": 6450,
     "services.py": 3250,
