@@ -16283,6 +16283,110 @@ def test_evaluate_hotfix_scope_pure_predicate():
 
 
 @pytest.mark.asyncio
+async def test_force_promote_records_operator_reason(db_session, mocker):
+    """The operator-supplied justification string is plumbed through
+    force_promote_current_version into the recorded promotion audit metadata
+    (forced_promote_reason), alongside forced_promote_by / forced_promote_at."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    candidate = "facec0de" * 5  # 40-char candidate sha
+    merge_sha = "mainnew" * 5 + "00000"
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain=candidate, main=merge_sha),
+    )
+    mocker.patch(
+        "app.github.list_repo_tree_paths_at_ref",
+        new=AsyncMock(
+            return_value=[{"path": "backend/app/main.py", "size": 10, "sha": "b1"}]
+        ),
+    )
+    _patch_promote_github_defaults(mocker)
+    mocker.patch("app.github.create_branch", new=_create_branch_mock())
+    mocker.patch(
+        "app.github.create_pull_request",
+        new=AsyncMock(return_value={"number": 7, "html_url": "http://pr/7"}),
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(return_value={"merged": True, "message": "Merged"}),
+    )
+    mocker.patch(
+        "app.release_qualifier._spawn_release_audit_task", new=AsyncMock()
+    )
+
+    result = await rq.force_promote_current_version(
+        db_session,
+        project.id,
+        actor="operator-1",
+        reason="prod incident #123 — hotfix must ship now",
+        session_factory=_shared_session_factory(db_session),
+    )
+
+    assert result["status"] == "promoted"
+    await db_session.refresh(version)
+    assert version.last_qualification.get("forced_promote") is True
+    assert version.last_qualification.get("forced_promote_by") == "operator-1"
+    assert (
+        version.last_qualification.get("forced_promote_reason")
+        == "prod incident #123 — hotfix must ship now"
+    )
+
+
+@pytest.mark.asyncio
+async def test_force_promote_reason_defaults_to_none(db_session, mocker):
+    """When no reason is supplied, forced_promote_reason is recorded as None
+    (the metadata key is always present so the audit trail is unambiguous)."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    candidate = "facec0de" * 5
+    merge_sha = "mainnew" * 5 + "00000"
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain=candidate, main=merge_sha),
+    )
+    mocker.patch(
+        "app.github.list_repo_tree_paths_at_ref",
+        new=AsyncMock(
+            return_value=[{"path": "backend/app/main.py", "size": 10, "sha": "b1"}]
+        ),
+    )
+    _patch_promote_github_defaults(mocker)
+    mocker.patch("app.github.create_branch", new=_create_branch_mock())
+    mocker.patch(
+        "app.github.create_pull_request",
+        new=AsyncMock(return_value={"number": 7, "html_url": "http://pr/7"}),
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(return_value={"merged": True, "message": "Merged"}),
+    )
+    mocker.patch(
+        "app.release_qualifier._spawn_release_audit_task", new=AsyncMock()
+    )
+
+    result = await rq.force_promote_current_version(
+        db_session,
+        project.id,
+        actor="operator-1",
+        session_factory=_shared_session_factory(db_session),
+    )
+
+    assert result["status"] == "promoted"
+    await db_session.refresh(version)
+    assert "forced_promote_reason" in version.last_qualification
+    assert version.last_qualification.get("forced_promote_reason") is None
+
+
+@pytest.mark.asyncio
 async def test_force_promote_refuses_when_promotion_in_flight(db_session, mocker):
     """Force-promote refuses when a promotion is already in flight (an audit-passed
     PR open, or the Fix-3 claim) — mirrors /qualify + the version-cut lever, so all

@@ -6642,6 +6642,7 @@ async def _force_promote_locked(
     candidate_sha: str,
     candidate_diff_hash: str | None,
     actor: str | None,
+    reason: str | None = None,
 ) -> dict[str, Any]:
     """Lock + FORCE-promote an open version on a dedicated session (no audit).
 
@@ -6690,16 +6691,18 @@ async def _force_promote_locked(
         "forced_promote": True,
         "forced_promote_by": actor,
         "forced_promote_at": now.isoformat(),
+        "forced_promote_reason": reason,
         "started_at": now.isoformat(),
         "finalized_at": now.isoformat(),
     }
     logger.warning(
         "[RELEASE_QUALIFIER] FORCE-PROMOTE: v%d cutting release branch + opening "
         "promotion PR at candidate %s (audit gate SKIPPED; CI still gates the "
-        "merge) — actor=%s",
+        "merge) — actor=%s reason=%s",
         version.version_number,
         candidate_sha[:8],
         actor,
+        reason,
     )
     result = await promote(
         session,
@@ -6718,6 +6721,7 @@ async def _force_promote_in_dedicated_session(
     candidate_diff_hash: str | None,
     actor: str | None,
     *,
+    reason: str | None = None,
     session_factory=None,
 ) -> dict[str, Any]:
     """Run FORCE-promote on a DEDICATED session (mirrors the reuse-promote path).
@@ -6731,7 +6735,7 @@ async def _force_promote_in_dedicated_session(
     async with factory() as session:
         try:
             result = await _force_promote_locked(
-                session, version_id, candidate_sha, candidate_diff_hash, actor
+                session, version_id, candidate_sha, candidate_diff_hash, actor, reason
             )
         except Exception:
             try:
@@ -6760,6 +6764,7 @@ async def force_promote_current_version(
     *,
     candidate_sha: str | None = None,
     actor: str | None = None,
+    reason: str | None = None,
     session_factory=None,
 ) -> dict[str, Any]:
     """Operator FORCE-PROMOTE the project's open version.
@@ -6802,17 +6807,20 @@ async def force_promote_current_version(
     )
     logger.warning(
         "[RELEASE_QUALIFIER] FORCE-PROMOTE requested: project %s v%d candidate %s "
-        "actor=%s — SKIPPING the audit/qualify gate (CI still gates the merge)",
+        "actor=%s reason=%s — SKIPPING the audit/qualify gate (CI still gates the "
+        "merge)",
         project_id,
         version.version_number,
         candidate_sha[:8],
         actor,
+        reason,
     )
     return await _force_promote_in_dedicated_session(
         version.id,
         candidate_sha,
         candidate_diff_hash,
         actor,
+        reason=reason,
         session_factory=session_factory,
     )
 
