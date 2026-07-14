@@ -13,6 +13,7 @@ from sqlalchemy import func as _func
 from sqlalchemy.exc import IntegrityError, InvalidRequestError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
+from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 from typing import List, Literal
 import uuid
@@ -368,6 +369,67 @@ async def trigger_force_promote(
             detail += f" (PR #{pr_number})"
         raise HTTPException(status_code=409, detail=detail)
     return result
+
+
+@router.post("/projects/{project_id}/ack-env-will-be-bound")
+async def trigger_ack_env_will_be_bound(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """OWNER-only: acknowledge that the missing boot env/secret will be bound in
+    the SAME deploy revision, overriding exactly the ``boot_prereq_missing`` block.
+
+    Slice 4 of design 245212a4.  The deployed-side env-preflight judge compares a
+    candidate's declared boot prerequisites against THIS deployed process's own
+    environ.  When the operator intends to bind the missing secret as part of the
+    same deploy, the current environ does not yet reflect it and the judge would
+    false-block.  This arms a ONE-SHOT acknowledgment on the open version so the
+    NEXT qualification treats ``boot_prereq_missing`` as an explicit, audited
+    override (recorded in the qualification blob — who/when/that it was overridden,
+    NAMES only, never a value) rather than a silent bypass.
+
+    Scoped strictly to ``boot_prereq_missing``: the ack never suppresses any other
+    blocker.  It stays armed across re-qualification until it actually overrides a
+    block once, then clears.  OWNER-only — the most privileged deploy-safety lever.
+    Returns 404 when there is no open version.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+
+    open_version = await release_version.current_open_version(session, project_id)
+    if open_version is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No open release version found for this project.",
+        )
+
+    acknowledged_at = _utcnow().isoformat()
+    # Read-modify-write on the JSONB column: preserve every other field of the
+    # existing qualification record and only add/replace the ack marker.  A None
+    # last_qualification (no qualification yet) becomes a minimal dict carrying
+    # just the ack, which run_qualification's prior_qual read tolerates.
+    qual = dict(open_version.last_qualification or {})
+    qual["ack_env_will_be_bound"] = {
+        "actor": str(current_user["user_id"]),
+        # Presence-only: who + when, never any env value.
+        "acknowledged_at": acknowledged_at,
+    }
+    open_version.last_qualification = qual
+    flag_modified(open_version, "last_qualification")
+    session.add(open_version)
+    await session.commit()
+
+    return {
+        "status": "acknowledged",
+        "scope": "boot_prereq_missing",
+        "acknowledged_at": acknowledged_at,
+        "note": (
+            "one-shot override of the boot_prereq_missing block; clears once it "
+            "overrides that block or stays armed until it fires"
+        ),
+    }
 
 
 # Blocker provenance sources that mark a depends_on edge as a real, structural

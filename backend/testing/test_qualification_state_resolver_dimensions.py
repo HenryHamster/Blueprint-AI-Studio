@@ -9,7 +9,7 @@ _ALL_KEYS = {
     "migration_identity", "migration_apply", "merge_grade",
     "challenge", "acceptance_window",
     "criterion_coverage", "debt_pressure", "goal_alignment",
-    "capability_proof",
+    "capability_proof", "env_preflight",
 }
 
 
@@ -19,7 +19,7 @@ def _by_key(states):
 
 def test_none_last_qualification_returns_all_pending():
     result = resolve_dimension_states(None)
-    assert len(result) == 13
+    assert len(result) == 14
     d = _by_key(result)
     for key in _ALL_KEYS:
         assert d[key]["status"] == "pending", key
@@ -214,6 +214,83 @@ def test_smoketest_disabled_not_applicable():
     result = resolve_dimension_states(qual)
     d = _by_key(result)
     assert d["smoketest"]["status"] == "not_applicable"
+
+
+def test_env_preflight_dark_by_default_is_not_applicable():
+    # Slice 3 ships DARK: a finalized record with no env_preflight_enabled key
+    # (the default, and every legacy record) renders the dimension not_applicable.
+    qual = {
+        "status": "promoted",
+        "blocker": None,
+        "sub_scores": {"audit": 0.9, "test_erosion": 0.85, "smoketest": 0.8},
+        "ci_resolution": {"state": "green"},
+        "migration_safety": "ok",
+        "migration_apply_safety": "ok",
+        "smoketest_enabled": True,
+    }
+    result = resolve_dimension_states(qual)
+    d = _by_key(result)
+    assert d["env_preflight"]["status"] == "not_applicable"
+
+
+def test_env_preflight_enabled_all_present_passed():
+    qual = {
+        "status": "promoted",
+        "blocker": None,
+        "sub_scores": {
+            "audit": 0.9, "test_erosion": 0.85, "smoketest": 0.8,
+            "env_preflight": 1.0,
+        },
+        "ci_resolution": {"state": "green"},
+        "migration_safety": "ok",
+        "migration_apply_safety": "ok",
+        "smoketest_enabled": True,
+        "env_preflight_enabled": True,
+    }
+    result = resolve_dimension_states(qual)
+    d = _by_key(result)
+    assert d["env_preflight"]["status"] == "passed"
+    assert d["env_preflight"]["score"] == pytest.approx(1.0)
+
+
+def test_env_preflight_boot_prereq_missing_blocker_is_failed():
+    # The boot_prereq_missing blocker maps to the env_preflight dimension.
+    qual = {
+        "status": "not_promoted",
+        "blocker": "boot_prereq_missing",
+        "sub_scores": {
+            "audit": 0.9, "test_erosion": 0.85, "smoketest": 0.8,
+            "env_preflight": 0.0,
+            "env_preflight_missing": ["GITHUB_PAT_ENCRYPTION_KEY"],
+        },
+        "ci_resolution": {"state": "green"},
+        "migration_safety": "ok",
+        "migration_apply_safety": "ok",
+        "smoketest_enabled": True,
+        "env_preflight_enabled": True,
+    }
+    result = resolve_dimension_states(qual)
+    d = _by_key(result)
+    assert d["env_preflight"]["status"] == "failed"
+    assert d["env_preflight"]["reason"] == "boot_prereq_missing"
+
+
+def test_env_preflight_enabled_no_manifest_is_unavailable():
+    # Enabled but no env_preflight sub_score (candidate declared no manifest) →
+    # unavailable, never a spurious block.
+    qual = {
+        "status": "promoted",
+        "blocker": None,
+        "sub_scores": {"audit": 0.9, "test_erosion": 0.85, "smoketest": 0.8},
+        "ci_resolution": {"state": "green"},
+        "migration_safety": "ok",
+        "migration_apply_safety": "ok",
+        "smoketest_enabled": True,
+        "env_preflight_enabled": True,
+    }
+    result = resolve_dimension_states(qual)
+    d = _by_key(result)
+    assert d["env_preflight"]["status"] == "unavailable"
 
 
 def test_goal_alignment_unavailable_when_absent():
@@ -502,7 +579,7 @@ def test_debt_pressure_when_present():
 
 def test_returns_all_13_dimensions():
     result = resolve_dimension_states(None)
-    assert len(result) == 13
+    assert len(result) == 14
     keys = {s["key"] for s in result}
     assert keys == _ALL_KEYS
 
@@ -591,7 +668,7 @@ async def test_operator_dimension_state_reads_ledger_when_populated(db_session):
     await db_session.flush()
 
     result = await resolve_dimension_states_from_ledger(db_session, version)
-    assert len(result) == 13
+    assert len(result) == 14
     d = {s["key"]: s for s in result}
 
     # 10 ledger-backed dimensions use ledger values (with status mapping).
@@ -656,7 +733,7 @@ async def test_ledger_empty_falls_back_to_blob(db_session):
     # Deliberately NO ledger rows.
 
     result = await resolve_dimension_states_from_ledger(db_session, version)
-    assert len(result) == 13
+    assert len(result) == 14
     d = {s["key"]: s for s in result}
 
     # All derived from blob — same as calling resolve_dimension_states directly.
@@ -714,7 +791,7 @@ async def test_ledger_different_candidate_sha_falls_back(db_session):
     await db_session.flush()
 
     result = await resolve_dimension_states_from_ledger(db_session, version)
-    assert len(result) == 13
+    assert len(result) == 14
     d = {s["key"]: s for s in result}
 
     # CI is "passed" from blob (ci_resolution.state=green), NOT "failed" from ledger.
@@ -742,7 +819,7 @@ async def test_ledger_no_candidate_sha_falls_back(db_session):
     await db_session.flush()
 
     result = await resolve_dimension_states_from_ledger(db_session, version)
-    assert len(result) == 13
+    assert len(result) == 14
     d = {s["key"]: s for s in result}
     assert d["ci"]["status"] == "pending"
 
@@ -875,7 +952,7 @@ async def test_proof_gate_ledger_backed_path_works(db_session):
     await db_session.flush()
 
     result = await resolve_dimension_states_from_ledger(db_session, version)
-    assert len(result) == 13
+    assert len(result) == 14
     d = {s["key"]: s for s in result}
     assert d["capability_proof"]["status"] == "passed"
 
@@ -1077,7 +1154,7 @@ async def test_challenge_and_acceptance_window_surface_from_ledger(db_session):
     await db_session.flush()
 
     result = await resolve_dimension_states_from_ledger(db_session, version)
-    assert len(result) == 13
+    assert len(result) == 14
     d = {s["key"]: s for s in result}
 
     # Blob would have returned "unavailable" for both; ledger overrides to "passed".

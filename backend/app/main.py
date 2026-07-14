@@ -191,16 +191,26 @@ def _verify_encryption_config():
         ALLOW_PLAINTEXT_CREDENTIALS_ENV,
         is_encryption_active,
     )
+    from app.required_runtime_env import _verify_required_env
+
+    # Presence enforcement is delegated to the declarative manifest: on Cloud Run
+    # it raises RuntimeError when GITHUB_PAT_ENCRYPTION_KEY is absent. This keeps a
+    # single machine-readable source of truth for the boot env contract; the
+    # value-validity specialisation (is the key a parseable Fernet key) stays here.
+    _verify_required_env()
 
     if is_encryption_active():
         return
 
     on_cloud_run = bool(os.getenv("K_REVISION"))
     if on_cloud_run:
+        # Presence already passed (_verify_required_env would have raised), so the
+        # key is set but not a valid Fernet key — the value-validity failure.
         msg = (
-            f"[STARTUP] {ENCRYPTION_KEY_ENV} is not set — field encryption is "
-            "unavailable. This is a fatal configuration error in production. "
-            "Set the environment variable to a valid Fernet key before deploying."
+            f"[STARTUP] {ENCRYPTION_KEY_ENV} is set but is not a valid Fernet key "
+            "— field encryption is unavailable. This is a fatal configuration "
+            "error in production. Set the environment variable to a valid Fernet "
+            "key before deploying."
         )
         logger.error(msg)
         raise RuntimeError(msg)

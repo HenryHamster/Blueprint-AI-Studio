@@ -657,6 +657,56 @@ def test_blocker_labels_have_emitters():
     )
 
 
+def test_boot_prereq_missing_has_operator_label():
+    """The Slice-3 deployed-side env-preflight blocker carries an operator label."""
+    label = rq._BLOCKER_LABELS.get("boot_prereq_missing")
+    assert label is not None
+    assert "deploy-target" in label
+    # Presence-only framing: the label instructs binding secrets, not reading values.
+    assert "bind" in label.lower()
+
+
+def test_deployed_env_presence_snapshot_is_presence_only(monkeypatch):
+    """The deploy-target snapshot reads ONLY bool(os.getenv) — never a value.
+
+    Presence-only HARD RULE (design 245212a4): a candidate-declared secret's
+    VALUE must never be read, compared, logged, or persisted.  The snapshot must
+    be a ``{name: bool}`` map, and a real secret value bound in the process env
+    must never leak into it.
+    """
+    SECRET = "super-secret-fernet-value-xyz"
+    monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", SECRET)
+    monkeypatch.setenv("K_REVISION", "prod-rev-1")
+    monkeypatch.delenv("SOME_ABSENT_VAR", raising=False)
+
+    artifact = {
+        "required_env": [
+            {"name": "GITHUB_PAT_ENCRYPTION_KEY", "scope": "cloud_run"},
+            {"name": "SOME_ABSENT_VAR", "scope": "always"},
+        ]
+    }
+    snap = rq._deployed_env_presence_snapshot(artifact)
+
+    # Every value is a bool — never the underlying env value.
+    assert all(isinstance(v, bool) for v in snap.values())
+    assert snap["GITHUB_PAT_ENCRYPTION_KEY"] is True
+    assert snap["SOME_ABSENT_VAR"] is False
+    # The Cloud Run signal is always snapshotted so the scope can be derived.
+    assert snap["K_REVISION"] is True
+    # The real secret value never appears anywhere in the snapshot.
+    assert SECRET not in repr(snap)
+
+
+def test_deployed_env_presence_snapshot_handles_absent_manifest():
+    # None / malformed artifact still returns at least the Cloud Run signal,
+    # never raises.
+    from app.required_runtime_env import CLOUD_RUN_SIGNAL_ENV
+
+    snap = rq._deployed_env_presence_snapshot(None)
+    assert CLOUD_RUN_SIGNAL_ENV in snap
+    assert all(isinstance(v, bool) for v in snap.values())
+
+
 def test_uncorroborated_attestation_is_fully_retired():
     """The retired attestation gate leaves NO vocabulary behind.
 
@@ -19470,6 +19520,109 @@ async def test_maybe_finalize_both_children_terminal_calls_finalize(db_session, 
     # Version is no longer pending.
     await db_session.refresh(version)
     assert version.last_qualification["status"] == "dry_run"
+
+
+async def _finalize_with_smoketest_logs(db_session, smoke_logs: dict):
+    """Drive a full qualification finalize with the given SMOKETEST_RESULT logs.
+
+    Returns (result_dict, version) after committing. Mirrors
+    test_maybe_finalize_both_children_terminal_calls_finalize's seeding so the
+    only variable is the smoketest artifact body.
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session)
+    audit_task, smoke_task = await _seed_pending_qualification(
+        db_session, project, version,
+        audit_status=TaskStatus.COMPLETED, smoke_status=TaskStatus.COMPLETED,
+    )
+    db_session.add(
+        Artifact(
+            task_id=audit_task.id,
+            artifact_type=ArtifactType.RELEASE_AUDIT_REPORT,
+            logs=json.dumps(
+                {
+                    "audit_score": 1.0,
+                    "findings": [],
+                    "test_erosion": {
+                        "deleted_test_files": [],
+                        "assertion_delta": 2,
+                        "test_count_delta": 1,
+                    },
+                }
+            ),
+        )
+    )
+    db_session.add(
+        Artifact(
+            task_id=smoke_task.id,
+            artifact_type=ArtifactType.SMOKETEST_RESULT,
+            logs=json.dumps(smoke_logs),
+        )
+    )
+    await db_session.commit()
+
+    result = await rq.maybe_finalize_qualification(
+        smoke_task, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+    # Snapshot last_qualification now: a later finalize commits and would expire
+    # this version's attributes, making a deferred lazy-load fail.
+    return result, dict(version.last_qualification)
+
+
+@pytest.mark.asyncio
+async def test_finalize_surfaces_env_preflight_evidence_without_gating(db_session):
+    """Slice 2 acceptance: a qualification run stores the pure-content
+    {required_env, startup_check_names, manifest_source} env_preflight artifact
+    on last_qualification, sanitized to presence-only, with promotion confidence
+    and blocker UNCHANGED vs the same run without the artifact (no gating)."""
+    base_smoke = {
+        "passed": True,
+        "tests": [{"name": "a", "status": "pass"}],
+        "suites": {"startup": {"passed": True}},
+    }
+    env_preflight_body = {
+        "required_env": [
+            # A smuggled value MUST be stripped by the read-side sanitizer.
+            {"name": "GITHUB_PAT_ENCRYPTION_KEY", "scope": "cloud_run", "value": "sekret"},
+        ],
+        "startup_check_names": ["python3 -c \"import app.main\""],
+        "manifest_source": "backend/app/required_runtime_env.py",
+    }
+
+    with_result, with_qual = await _finalize_with_smoketest_logs(
+        db_session, {**base_smoke, "env_preflight": env_preflight_body}
+    )
+    without_result, without_qual = await _finalize_with_smoketest_logs(
+        db_session, dict(base_smoke)
+    )
+
+    # Evidence surfaced, sanitized to presence-only (no smuggled value).
+    stored = with_qual["env_preflight"]
+    assert stored == {
+        "required_env": [{"name": "GITHUB_PAT_ENCRYPTION_KEY", "scope": "cloud_run"}],
+        "startup_check_names": ["python3 -c \"import app.main\""],
+        "manifest_source": "backend/app/required_runtime_env.py",
+    }
+    assert "value" not in stored["required_env"][0]
+
+    # No gating: the run WITHOUT the artifact carries env_preflight=None but the
+    # promotion decision, confidence, and blocker are byte-for-byte identical.
+    assert without_qual["env_preflight"] is None
+    assert with_result["status"] == without_result["status"] == "dry_run"
+    assert with_result["would_promote"] is without_result["would_promote"] is True
+    assert (
+        with_qual["confidence"]
+        == without_qual["confidence"]
+    )
+    assert (
+        with_qual["blocker"]
+        == without_qual["blocker"]
+    )
 
 
 @pytest.mark.asyncio

@@ -1113,3 +1113,334 @@ class TestBlockerExecutionSite:
         # No blocker / unclassified → no label.
         assert rs.blocker_execution_site_label(None) is None
         assert rs.blocker_execution_site_label("qualification_superseded") is None
+
+
+# ---------------------------------------------------------------------------
+# _score_env_preflight — the pure deployed-side env-preflight judge (Slice 3)
+# ---------------------------------------------------------------------------
+
+
+def _manifest(*entries: tuple[str, str]) -> dict:
+    """Build a candidate env-preflight content artifact from (name, scope) pairs."""
+    return {
+        "required_env": [{"name": n, "scope": s} for n, s in entries],
+        "startup_check_names": ["_verify_encryption_config"],
+        "manifest_source": "backend/app/required_runtime_env.py",
+    }
+
+
+class TestScoreEnvPreflight:
+    """The pure presence-diff between candidate-declared prereqs and deploy env."""
+
+    def test_absent_manifest_yields_none_score(self):
+        # No usable manifest → None sub_score (nothing to judge), never a block.
+        score, missing, scope = rs._score_env_preflight(None, {"K_REVISION": True})
+        assert score is None
+        assert missing == []
+        assert scope == "cloud_run"
+
+    def test_non_dict_manifest_and_snapshot(self):
+        score, missing, scope = rs._score_env_preflight("not-a-dict", "nope")
+        assert score is None and missing == [] and scope == "always"
+
+    def test_all_present_scores_one(self):
+        snap = {"K_REVISION": True, "GITHUB_PAT_ENCRYPTION_KEY": True}
+        score, missing, scope = rs._score_env_preflight(
+            _manifest(("GITHUB_PAT_ENCRYPTION_KEY", "cloud_run")), snap
+        )
+        assert score == 1.0
+        assert missing == []
+        assert scope == "cloud_run"
+
+    def test_missing_cloud_run_var_scores_zero_on_cloud_run(self):
+        # The exact v25 class: candidate declares a cloud_run prereq, deploy env
+        # (K_REVISION present) lacks it → 0.0 with the NAME surfaced.
+        snap = {"K_REVISION": True, "GITHUB_PAT_ENCRYPTION_KEY": False}
+        score, missing, scope = rs._score_env_preflight(
+            _manifest(("GITHUB_PAT_ENCRYPTION_KEY", "cloud_run")), snap
+        )
+        assert score == 0.0
+        assert missing == ["GITHUB_PAT_ENCRYPTION_KEY"]
+        assert scope == "cloud_run"
+
+    def test_cloud_run_scope_inactive_when_not_cloud_run(self):
+        # No K_REVISION → deploy target is "always"-only; a cloud_run-scoped var
+        # that is absent must NOT be counted (it is out of scope) → 1.0.
+        snap = {"GITHUB_PAT_ENCRYPTION_KEY": False}
+        score, missing, scope = rs._score_env_preflight(
+            _manifest(("GITHUB_PAT_ENCRYPTION_KEY", "cloud_run")), snap
+        )
+        assert score == 1.0
+        assert missing == []
+        assert scope == "always"
+
+    def test_always_scope_checked_regardless_of_cloud_run(self):
+        # An "always" var is in scope in every runtime.
+        snap = {"SOME_ALWAYS_VAR": False}
+        score, missing, scope = rs._score_env_preflight(
+            _manifest(("SOME_ALWAYS_VAR", "always")), snap
+        )
+        assert score == 0.0
+        assert missing == ["SOME_ALWAYS_VAR"]
+        assert scope == "always"
+
+    def test_missing_names_sorted_and_deduped(self):
+        snap = {"K_REVISION": True, "B": False, "A": False}
+        score, missing, _ = rs._score_env_preflight(
+            _manifest(("B", "cloud_run"), ("A", "always"), ("A", "always")),
+            snap,
+        )
+        assert score == 0.0
+        assert missing == ["A", "B"]  # sorted, de-duplicated
+
+    def test_absent_name_in_snapshot_counts_as_missing(self):
+        # A required var whose NAME is entirely absent from the snapshot is missing.
+        snap = {"K_REVISION": True}
+        score, missing, _ = rs._score_env_preflight(
+            _manifest(("NEVER_SNAPSHOTTED", "cloud_run")), snap
+        )
+        assert score == 0.0
+        assert missing == ["NEVER_SNAPSHOTTED"]
+
+    def test_empty_required_env_is_vacuously_satisfied(self):
+        # A manifest that declares no prerequisites is present → 1.0 (nothing to
+        # block), distinct from an absent manifest (None).
+        score, missing, _ = rs._score_env_preflight(
+            {"required_env": []}, {"K_REVISION": True}
+        )
+        assert score == 1.0 and missing == []
+
+    def test_malformed_entries_skipped(self):
+        # Non-dict entries, missing name/scope, non-str fields — all skipped.
+        artifact = {
+            "required_env": [
+                "not-a-dict",
+                {"name": "OK", "scope": "always"},
+                {"scope": "always"},  # no name
+                {"name": "NOSCOPE"},  # no scope
+                {"name": 123, "scope": "always"},  # non-str name
+            ]
+        }
+        score, missing, _ = rs._score_env_preflight(artifact, {"OK": False})
+        assert score == 0.0
+        assert missing == ["OK"]
+
+    def test_presence_only_never_leaks_or_reads_a_value(self):
+        # HARD RULE: the judge only ever consumes bool(...) of the snapshot. Even
+        # if a malformed caller smuggles a VALUE (a secret string) into the
+        # snapshot, it must be coerced through bool() and never appear in the
+        # returned score / missing list / scope.
+        SECRET = "s3cr3t-fernet-key-do-not-leak"
+        REVISION = "prod-revision-00042"
+        snap = {
+            "K_REVISION": REVISION,  # truthy string, not a bool
+            "GITHUB_PAT_ENCRYPTION_KEY": SECRET,  # truthy string → treated present
+            "MISSING_ONE": "",  # empty string → falsey → missing
+        }
+        score, missing, scope = rs._score_env_preflight(
+            _manifest(
+                ("GITHUB_PAT_ENCRYPTION_KEY", "cloud_run"),
+                ("MISSING_ONE", "always"),
+            ),
+            snap,
+        )
+        # Truthy string present ⇒ satisfied; empty string ⇒ missing.
+        assert score == 0.0
+        assert missing == ["MISSING_ONE"]
+        # K_REVISION being a non-empty string is read as Cloud Run present.
+        assert scope == "cloud_run"
+        # No VALUE ever surfaces in the output.
+        blob = repr((score, missing, scope))
+        assert SECRET not in blob
+        assert REVISION not in blob
+
+
+# ---------------------------------------------------------------------------
+# compute_composite — the boot_prereq_missing hard gate (Slice 3, DARK)
+# ---------------------------------------------------------------------------
+
+
+class TestEnvPreflightGate:
+    def test_disabled_by_default_is_byte_for_byte_unchanged(self):
+        # The judge defaults OFF: even with missing names supplied, no block, no
+        # sub_score, and the composite is identical to the no-env-preflight call.
+        baseline = rs.compute_composite(**_perfect_kwargs())
+        with_flag_off = rs.compute_composite(
+            **_perfect_kwargs(
+                env_preflight_enabled=False,
+                env_preflight_score=0.0,
+                env_preflight_missing=["GITHUB_PAT_ENCRYPTION_KEY"],
+            )
+        )
+        assert with_flag_off == baseline
+        assert with_flag_off["blocker"] is None
+        assert "env_preflight" not in with_flag_off["sub_scores"]
+        assert "env_preflight_missing" not in with_flag_off["sub_scores"]
+
+    def test_enabled_and_missing_hard_blocks(self):
+        result = rs.compute_composite(
+            **_perfect_kwargs(
+                env_preflight_enabled=True,
+                env_preflight_score=0.0,
+                env_preflight_missing=["GITHUB_PAT_ENCRYPTION_KEY"],
+            )
+        )
+        assert result["blocker"] == "boot_prereq_missing"
+        assert result["confidence"] == 0.0
+        assert result["promote"] is False
+        # Missing NAMES surfaced for operators (presence-only).
+        assert result["sub_scores"]["env_preflight_missing"] == [
+            "GITHUB_PAT_ENCRYPTION_KEY"
+        ]
+        assert result["sub_scores"]["env_preflight"] == 0.0
+
+    def test_enabled_all_present_promotes_and_records_sub_score(self):
+        result = rs.compute_composite(
+            **_perfect_kwargs(
+                env_preflight_enabled=True,
+                env_preflight_score=1.0,
+                env_preflight_missing=[],
+            )
+        )
+        assert result["blocker"] is None
+        assert result["sub_scores"]["env_preflight"] == 1.0
+        assert "env_preflight_missing" not in result["sub_scores"]
+        # env_preflight is a pure hard gate (no weight) — an all-present candidate
+        # scores identically to the baseline (no confidence erosion).
+        baseline = rs.compute_composite(**_perfect_kwargs())
+        assert result["confidence"] == baseline["confidence"]
+        assert result["promote"] == baseline["promote"]
+
+    def test_enabled_none_score_does_not_block(self):
+        # Manifest absent on the candidate → None score, empty missing → no block,
+        # and no env_preflight sub_score recorded.
+        result = rs.compute_composite(
+            **_perfect_kwargs(
+                env_preflight_enabled=True,
+                env_preflight_score=None,
+                env_preflight_missing=[],
+            )
+        )
+        assert result["blocker"] is None
+        assert "env_preflight" not in result["sub_scores"]
+
+    def test_ci_red_precedes_boot_prereq(self):
+        # A confirmed red build still wins the ordered chain over env-preflight.
+        result = rs.compute_composite(
+            **_perfect_kwargs(
+                ci_green=False,
+                ci_state=rs._CI_RED,
+                env_preflight_enabled=True,
+                env_preflight_score=0.0,
+                env_preflight_missing=["X"],
+            )
+        )
+        assert result["blocker"] == "ci_not_green"
+
+    def test_migration_apply_precedes_boot_prereq(self):
+        # Deploy-safety ordering: migrations report before env-preflight.
+        result = rs.compute_composite(
+            **_perfect_kwargs(
+                migration_apply_blocked=True,
+                env_preflight_enabled=True,
+                env_preflight_score=0.0,
+                env_preflight_missing=["X"],
+            )
+        )
+        assert result["blocker"] == "migration_apply_drift"
+
+    def test_boot_prereq_precedes_capability_proof(self):
+        # env-preflight is checked before capability-proof (both deploy/quality
+        # gates that fall after the migration family).
+        result = rs.compute_composite(
+            **_perfect_kwargs(
+                env_preflight_enabled=True,
+                env_preflight_score=0.0,
+                env_preflight_missing=["X"],
+                capability_proof_blocked=True,
+            )
+        )
+        assert result["blocker"] == "boot_prereq_missing"
+
+    def test_boot_prereq_missing_is_classified(self):
+        # A newly-emitted blocker MUST carry an execution-site classification.
+        # Slice 4: boot_prereq_missing is neither candidate-side (an automain fix
+        # does not clear it) nor plain deployed (its fix is not "promote the
+        # version") — it is an OPERATOR-ENV action: bind the secret in the deploy
+        # target, which rolls a new revision that self-clears the block.
+        assert (
+            rs.blocker_execution_site("boot_prereq_missing")
+            == rs.EXECUTION_SITE_OPERATOR_ENV
+        )
+
+    def test_operator_env_label_is_distinct_and_describes_the_fix(self):
+        label = rs.blocker_execution_site_label("boot_prereq_missing")
+        assert (
+            label == rs.EXECUTION_SITE_LABELS[rs.EXECUTION_SITE_OPERATOR_ENV]
+        )
+        # Distinct from the deployed and candidate phrases.
+        assert label != rs.EXECUTION_SITE_LABELS[rs.EXECUTION_SITE_DEPLOYED]
+        assert label != rs.EXECUTION_SITE_LABELS[rs.EXECUTION_SITE_CANDIDATE]
+        # Operator-env phrase names the operator action and the self-clear.
+        assert "operator" in label
+        assert "deploy target" in label
+
+    def test_ack_override_suppresses_only_boot_prereq(self):
+        # With the OWNER ack override, an otherwise-blocking env-preflight miss
+        # promotes (block suppressed) — but the missing NAMES and the override
+        # FACT are still recorded (presence-only, never a value).
+        result = rs.compute_composite(
+            **_perfect_kwargs(
+                env_preflight_enabled=True,
+                env_preflight_score=0.0,
+                env_preflight_missing=["GITHUB_PAT_ENCRYPTION_KEY"],
+                env_preflight_ack_override=True,
+            )
+        )
+        assert result["blocker"] is None
+        assert result["sub_scores"]["env_preflight_missing"] == [
+            "GITHUB_PAT_ENCRYPTION_KEY"
+        ]
+        assert result["sub_scores"]["env_preflight_ack_override"] is True
+        # No env VALUE ever leaks into sub_scores.
+        assert "GITHUB_PAT_ENCRYPTION_KEY" in result["sub_scores"]["env_preflight_missing"]
+
+    def test_ack_override_does_not_suppress_other_blockers(self):
+        # The ack is scoped to boot_prereq_missing ONLY: a confirmed red build
+        # still wins even with the override armed.
+        result = rs.compute_composite(
+            **_perfect_kwargs(
+                ci_green=False,
+                ci_state=rs._CI_RED,
+                env_preflight_enabled=True,
+                env_preflight_score=0.0,
+                env_preflight_missing=["X"],
+                env_preflight_ack_override=True,
+            )
+        )
+        assert result["blocker"] == "ci_not_green"
+        # A blocker BELOW boot_prereq_missing in the chain also still fires when
+        # the env block is the only thing the override removes.
+        result2 = rs.compute_composite(
+            **_perfect_kwargs(
+                env_preflight_enabled=True,
+                env_preflight_score=0.0,
+                env_preflight_missing=["X"],
+                env_preflight_ack_override=True,
+                capability_proof_blocked=True,
+            )
+        )
+        assert result2["blocker"] == "capability_proof_gate_blocked"
+
+    def test_ack_override_without_missing_is_noop(self):
+        # Override armed but nothing missing → no block, no override sub_score.
+        result = rs.compute_composite(
+            **_perfect_kwargs(
+                env_preflight_enabled=True,
+                env_preflight_score=1.0,
+                env_preflight_missing=[],
+                env_preflight_ack_override=True,
+            )
+        )
+        assert result["blocker"] is None
+        assert "env_preflight_ack_override" not in result["sub_scores"]

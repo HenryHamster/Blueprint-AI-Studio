@@ -567,6 +567,25 @@ ${smoketestFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
       smoketestResult.passed = smoketestResult.tests.every(t => t.status === 'pass' || t.status === 'skip');
     }
 
+    // Candidate-side env-preflight evidence (Slice 2, design 245212a4). Run the
+    // candidate tree's OWN env-manifest introspector and fold the pure-content
+    // artifact into the SMOKETEST_RESULT. This is EVIDENCE, never a gate: a
+    // failure attaches nothing and MUST NOT change `passed`. Presence-only —
+    // the introspector emits env NAMES/SCOPES, never a value.
+    try {
+      const envPreflightJson = execFileSync(
+        'python3', ['-m', 'app.env_preflight_evidence'],
+        { cwd: `${WORKSPACE}/${smoketestPyDir}`, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] },
+      );
+      const parsedEnvPreflight: unknown = JSON.parse(envPreflightJson);
+      (smoketestResult as Record<string, unknown>).env_preflight = parsedEnvPreflight;
+      sendLog(ws, '\nCaptured candidate env-preflight evidence.\n');
+    } catch (e: unknown) {
+      // Best-effort only — surface a marker but leave `passed` untouched.
+      (smoketestResult as Record<string, unknown>).env_preflight_error = sanitizeError(e);
+      sendLog(ws, `\n[warn] env-preflight evidence unavailable: ${sanitizeError(e)}\n`);
+    }
+
     const passed = smoketestResult.passed;
     const passCount = smoketestResult.tests.filter(t => t.status === 'pass').length;
     const summary = `Smoke tests ${passed ? 'PASSED' : 'FAILED'}: ${passCount}/${smoketestResult.tests.length} passed`;

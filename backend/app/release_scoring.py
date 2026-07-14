@@ -674,6 +674,95 @@ def _score_completion_debt_pressure(
     return max(0.0, 1.0 - open_count / _DEBT_PRESSURE_CEIL)
 
 
+# --- Deployed-side env-preflight judge (Slice 3, design 245212a4) ------------
+# Cloud Run injects this into every revision; its presence is the canonical
+# "am I serving in production on Cloud Run" signal.  Mirrored from
+# ``app.required_runtime_env.CLOUD_RUN_SIGNAL_ENV`` / ``app.main`` so the pure
+# scoring layer can derive the deploy-target scope from a presence snapshot
+# WITHOUT importing the (os-touching) manifest module.
+_CLOUD_RUN_SIGNAL_ENV = "K_REVISION"
+
+
+def _score_env_preflight(
+    env_preflight_artifact: dict[str, Any] | None,
+    deploy_target_env_presence: dict[str, bool] | None,
+) -> tuple[float | None, list[str], str]:
+    """Judge a candidate's declared env prerequisites against the deploy target.
+
+    PURE / PRESENCE-ONLY.  The deployed orchestrator IS the prod Cloud Run
+    service, so ``deploy_target_env_presence`` — a ``{name: bool}`` snapshot of
+    the deployed process's OWN ``os.environ`` (built by the caller with only
+    ``bool(os.getenv(name))``, NEVER a value) — is a faithful presence-proxy of
+    the deploy-target env.  This function reads that snapshot as booleans ONLY:
+    it never receives, compares, logs, or returns an env VALUE, so a value that
+    a malformed caller smuggled into the snapshot is coerced through ``bool()``
+    and can never leak into the returned score / missing list / scope.
+
+    ``env_preflight_artifact`` is the candidate-side content artifact (Slice 2):
+    ``{required_env: [{name, scope}], ...}`` introspected from the candidate
+    tree's OWN manifest.  Scope semantics:
+
+      * ``deploy_target_scope`` is ``"cloud_run"`` when the snapshot shows
+        ``K_REVISION`` present (the deployed process is on Cloud Run), else
+        ``"always"``.
+      * A required var is IN SCOPE when its ``scope`` is active for the deploy
+        target: ``always`` is always active; ``cloud_run`` is active only when
+        ``deploy_target_scope == "cloud_run"``.
+
+    Returns ``(sub_score, missing_names, deploy_target_scope)``:
+
+      * ``sub_score`` — ``1.0`` when every in-scope required var is present,
+        ``0.0`` when any is absent, ``None`` when no usable manifest was supplied
+        (nothing to judge — the caller records the dimension unavailable).
+      * ``missing_names`` — sorted, de-duplicated list of in-scope required var
+        NAMES absent from the snapshot (empty when none missing).
+      * ``deploy_target_scope`` — always returned so the verdict blob can record
+        which scope the judge evaluated against, even when the manifest is absent.
+    """
+    presence = (
+        deploy_target_env_presence
+        if isinstance(deploy_target_env_presence, dict)
+        else {}
+    )
+    # Deploy-target scope from the snapshot's Cloud Run signal (presence-only).
+    deploy_target_scope = (
+        "cloud_run" if bool(presence.get(_CLOUD_RUN_SIGNAL_ENV)) else "always"
+    )
+    active_scopes = (
+        {"always", "cloud_run"}
+        if deploy_target_scope == "cloud_run"
+        else {"always"}
+    )
+
+    required = (
+        env_preflight_artifact.get("required_env")
+        if isinstance(env_preflight_artifact, dict)
+        else None
+    )
+    if not isinstance(required, list):
+        # No usable manifest — nothing to judge (None sub_score, never a block).
+        return None, [], deploy_target_scope
+
+    missing: set[str] = set()
+    for entry in required:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        scope = entry.get("scope")
+        if not isinstance(name, str) or not name:
+            continue
+        if not isinstance(scope, str) or scope not in active_scopes:
+            continue
+        # PRESENCE-ONLY: an absent name and a name whose snapshot bool is falsey
+        # both count as missing.  ``bool(...)`` coerces any smuggled value.
+        if not bool(presence.get(name)):
+            missing.add(name)
+
+    if missing:
+        return 0.0, sorted(missing), deploy_target_scope
+    return 1.0, [], deploy_target_scope
+
+
 def compute_composite(
     ci_green: bool,
     audit_score: float,
@@ -692,6 +781,10 @@ def compute_composite(
     merge_grade_exempt: bool = False,
     debt_pressure_score: float | None = None,
     capability_proof_blocked: bool = False,
+    env_preflight_enabled: bool = False,
+    env_preflight_score: float | None = None,
+    env_preflight_missing: list[str] | None = None,
+    env_preflight_ack_override: bool = False,
 ) -> dict[str, Any]:
     """Compute the composite promotion confidence for a release candidate.
 
@@ -766,6 +859,23 @@ def compute_composite(
         gate is not masked, and before the quality dimensions so a candidate
         whose capability claims are unproven is rejected regardless of audit
         quality.
+      * ``env_preflight_enabled`` is True AND ``env_preflight_missing`` is a
+        non-empty list — the DEPLOYED-side env-preflight judge (Slice 3, design
+        245212a4) found at least one candidate-declared, in-scope boot
+        prerequisite ABSENT from the deploy-target env (``"boot_prereq_missing"``).
+        Presence-only: ``env_preflight_missing`` carries NAMES, never values.
+        ``sub_scores["env_preflight_missing"]`` records the names for operators.
+        This entire dimension is DARK by default: when ``env_preflight_enabled``
+        is False the block is skipped, ``sub_scores["env_preflight"]`` is not
+        recorded, and the composite is byte-for-byte identical to the pre-Slice-3
+        behaviour (the judge contributes NO weight to the audit + test_erosion +
+        smoketest sum — it is a pure hard gate, like the migration gates).
+        ``env_preflight_ack_override`` (Slice 4) is the OWNER-only escape valve:
+        when True it suppresses ONLY this ``boot_prereq_missing`` block (for the
+        same-deploy-binding case where the deployed environ does not yet reflect
+        the pending secret) and records ``sub_scores["env_preflight_ack_override"]
+        = True``.  It touches no other gate — an ordered blocker above still wins
+        and a blocker below still fires; the missing NAMES are still recorded.
       * ``smoketest_score`` is None — the smoketest never produced a usable
         score, treated as a startup-suite failure
         (``"smoketest_startup_failed"``).  ONLY checked when
@@ -860,6 +970,24 @@ def compute_composite(
         # from the filename-identity collision above — checked after it so a
         # candidate failing both reports the identity collision first.
         blocker = "migration_apply_drift"
+    elif env_preflight_enabled and env_preflight_missing and not env_preflight_ack_override:
+        # DEPLOYED-side env-preflight judge (Slice 3, design 245212a4), DARK by
+        # default (env_preflight_enabled defaults False).  A candidate-declared,
+        # in-scope boot prerequisite is ABSENT from the deploy-target env — the
+        # v25 class where a new startup gate crashes prod because its secret is
+        # unbound.  Presence-only: env_preflight_missing carries NAMES, never
+        # values.  Grouped with the migration gates as a deploy-safety hard block,
+        # checked after them so a candidate failing both reports migrations first.
+        #
+        # ``env_preflight_ack_override`` (Slice 4) is the OWNER-only escape valve:
+        # when the operator intends to bind the missing secret AS PART OF the same
+        # deploy, THIS deployed process's environ does not yet reflect it and the
+        # judge would false-block.  The override suppresses ONLY this block (an
+        # explicit acknowledged override, recorded in sub_scores and the audit blob
+        # by the caller — never a silent bypass) and touches no other gate: an
+        # ordered blocker above it (CI, migrations) still wins, and a blocker below
+        # (capability-proof, coverage, quality) still fires on its own merits.
+        blocker = "boot_prereq_missing"
     elif merge_grade_misses:
         # The armable-dark blind-grade gate: coverage_verdict == "misses" AND the
         # operator has raised merge_grade_block_threshold above 0.0.  Distinct from
@@ -913,6 +1041,27 @@ def compute_composite(
     # only blended into confidence when completion_debt_weight > 0 in policy.
     if debt_pressure_score is not None:
         sub_scores["debt_pressure"] = _clamp01(debt_pressure_score)
+
+    # Env-preflight sub-score + missing names (Slice 3, DARK by default).  Only
+    # recorded when the judge is enabled, so a disabled subsystem leaves the
+    # sub_scores dict byte-for-byte unchanged.  env_preflight is a pure hard gate
+    # (block on any missing) — it never contributes a weight to the composite sum,
+    # so an all-present candidate scores identically to the pre-Slice-3 behaviour.
+    if env_preflight_enabled:
+        if env_preflight_score is not None:
+            sub_scores["env_preflight"] = _clamp01(env_preflight_score)
+        if env_preflight_missing:
+            # Presence-only: NAMES, never values.
+            sub_scores["env_preflight_missing"] = [
+                str(n) for n in env_preflight_missing
+            ]
+            # Slice 4: an OWNER acknowledged that the missing prerequisite will be
+            # bound in the same deploy revision, so the hard block above was
+            # suppressed for this run.  Record the override FACT (presence-only:
+            # the fact + the already-recorded missing NAMES, never a value) so the
+            # bypass is auditable rather than silent.
+            if env_preflight_ack_override:
+                sub_scores["env_preflight_ack_override"] = True
 
     # Goal-verification observability (redesign): surface the per-category grade
     # and residual so operators see WHY the gate fired (or would fire), not just
@@ -1011,6 +1160,7 @@ def compute_composite(
 #                 redeploy required.
 EXECUTION_SITE_DEPLOYED = "deployed"
 EXECUTION_SITE_CANDIDATE = "candidate"
+EXECUTION_SITE_OPERATOR_ENV = "operator_env"
 
 BLOCKER_EXECUTION_SITE: dict[str, str] = {
     # Deployed-side: both compare the candidate against the deployed promotion
@@ -1018,6 +1168,16 @@ BLOCKER_EXECUTION_SITE: dict[str, str] = {
     # once the version itself promotes, so a fix on automain is inert until then.
     "migration_identity_collision": EXECUTION_SITE_DEPLOYED,
     "migration_apply_drift": EXECUTION_SITE_DEPLOYED,
+    # Operator-env site (Slice 4, design 245212a4): the env-preflight judge runs in
+    # the DEPLOYED process and compares the candidate's declared boot prerequisites
+    # against the deployed process's OWN environ (a presence-proxy of the deploy
+    # target).  Its fix is NEITHER an automain code change (candidate) NOR
+    # "promote the version" (deployed): it is an OPERATOR action — bind the
+    # secret/env in the Cloud Run deploy target, which rolls a new revision so the
+    # deployed orchestrator's environ then contains it and the block self-clears.
+    # An OWNER may pre-acknowledge that binding via ``ack_env_will_be_bound`` when
+    # it lands in the same deploy (see compute_composite's env_preflight_ack_override).
+    "boot_prereq_missing": EXECUTION_SITE_OPERATOR_ENV,
     # Candidate-side: resolvable by an automain fix that lands in the next
     # candidate tree — CI, the merged diff, or a smoketest running candidate code.
     "ci_not_green": EXECUTION_SITE_CANDIDATE,
@@ -1045,16 +1205,21 @@ EXECUTION_SITE_LABELS: dict[str, str] = {
         "this check runs CANDIDATE-side — a fix on automain clears it on the next "
         "qualification"
     ),
+    EXECUTION_SITE_OPERATOR_ENV: (
+        "this check requires an operator to bind an env/secret in the deploy "
+        "target; it clears on the next revision once the binding exists"
+    ),
 }
 
 
 def blocker_execution_site(blocker: str | None) -> str | None:
     """Classify a promotion-blocker code by where the responsible check runs.
 
-    Returns ``"deployed"`` (inert-until-promote) or ``"candidate"`` (clearable by
-    an automain fix), or ``None`` when there is no blocker or the code is not
-    classified (unknown / force-promote sentinels such as
-    ``qualification_superseded``).
+    Returns ``"deployed"`` (inert-until-promote), ``"candidate"`` (clearable by
+    an automain fix), ``"operator_env"`` (requires an operator to bind an
+    env/secret in the deploy target — clears on the next revision), or ``None``
+    when there is no blocker or the code is not classified (unknown /
+    force-promote sentinels such as ``qualification_superseded``).
     """
     if not blocker:
         return None

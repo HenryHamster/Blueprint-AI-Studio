@@ -13329,6 +13329,91 @@ class TestSetVersionPhase:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# admin_operator_triggers.py — ack-env-will-be-bound (Slice 4, design 245212a4)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestAckEnvWillBeBound:
+    @pytest.mark.asyncio
+    async def test_owner_arms_one_shot_ack(self, client: AsyncClient, db_session):
+        """OWNER arming the ack writes a presence-only marker onto the open
+        version's last_qualification, preserving existing fields."""
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id, phase="stabilize")
+        # Pre-existing qualification content must be preserved on read-modify-write.
+        version.last_qualification = {"status": "not_promoted", "blocker": "boot_prereq_missing"}
+        from sqlalchemy.orm.attributes import flag_modified
+
+        flag_modified(version, "last_qualification")
+        db_session.add(version)
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/ack-env-will-be-bound"
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "acknowledged"
+        assert body["scope"] == "boot_prereq_missing"
+        assert body["acknowledged_at"]
+
+        await db_session.refresh(version)
+        marker = version.last_qualification["ack_env_will_be_bound"]
+        assert marker["actor"] == TEST_USER_ID
+        assert marker["acknowledged_at"] == body["acknowledged_at"]
+        # Presence-only: the marker carries only who/when — never an env value.
+        assert set(marker.keys()) == {"actor", "acknowledged_at"}
+        # Existing fields preserved.
+        assert version.last_qualification["status"] == "not_promoted"
+        assert version.last_qualification["blocker"] == "boot_prereq_missing"
+
+    @pytest.mark.asyncio
+    async def test_arms_ack_when_no_prior_qualification(
+        self, client: AsyncClient, db_session
+    ):
+        """A None last_qualification becomes a minimal dict carrying just the ack."""
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id)
+        assert version.last_qualification is None
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/ack-env-will-be-bound"
+        )
+        assert resp.status_code == 200, resp.text
+        await db_session.refresh(version)
+        assert version.last_qualification["ack_env_will_be_bound"]["actor"] == TEST_USER_ID
+
+    @pytest.mark.asyncio
+    async def test_non_owner_forbidden(self, client: AsyncClient, db_session):
+        """A member (below OWNER) is rejected with 403 — the ack is the most
+        privileged deploy-safety lever."""
+        other = Project(name="Ack Other", user_id="other-owner-uid")
+        db_session.add(other)
+        await db_session.commit()
+        await db_session.refresh(other)
+        db_session.add(
+            ProjectMember(project_id=other.id, user_id=TEST_USER_ID, role="member")
+        )
+        await db_session.commit()
+        await _make_open_version(db_session, other.id)
+
+        resp = await client.post(
+            f"/api/admin/projects/{other.id}/ack-env-will-be-bound"
+        )
+        assert resp.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_no_open_version_returns_404(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/ack-env-will-be-bound"
+        )
+        assert resp.status_code == 404
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # admin_release_version.py — Set Version Goal
 # ═══════════════════════════════════════════════════════════════════════════════
 

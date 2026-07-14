@@ -327,6 +327,52 @@ describe('handleSmoketest — URL health checks', () => {
     expect(call.artifact_type).toBe('SMOKETEST_RESULT');
   });
 
+  it('folds candidate env-preflight evidence into SMOKETEST_RESULT on success', async () => {
+    const smoketestResult = { passed: true, tests: [{ name: 'startup', status: 'pass', message: '' }] };
+    vi.mocked(readHandlerOutput).mockReturnValue(smoketestResult);
+    const preflight = {
+      required_env: [{ name: 'GITHUB_PAT_ENCRYPTION_KEY', scope: 'cloud_run' }],
+      startup_check_names: ['python3 -c "import app.main"'],
+      manifest_source: 'backend/app/required_runtime_env.py',
+    };
+    vi.mocked(execFileSync).mockImplementation((cmd: unknown, args: unknown) => {
+      const argsArr = args as string[];
+      if (cmd === 'python3' && Array.isArray(argsArr) && argsArr.includes('app.env_preflight_evidence')) {
+        return JSON.stringify(preflight);
+      }
+      return Buffer.from('');
+    });
+
+    await handleSmoketest(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('COMPLETED');
+    const stored = JSON.parse(call.logs as string) as { passed: boolean; env_preflight?: unknown };
+    expect(stored.env_preflight).toEqual(preflight);
+    expect(stored.passed).toBe(true);
+  });
+
+  it('does not change passed and still persists SMOKETEST_RESULT when env-preflight subprocess fails', async () => {
+    const smoketestResult = { passed: true, tests: [{ name: 'startup', status: 'pass', message: '' }] };
+    vi.mocked(readHandlerOutput).mockReturnValue(smoketestResult);
+    vi.mocked(execFileSync).mockImplementation((cmd: unknown, args: unknown) => {
+      const argsArr = args as string[];
+      if (cmd === 'python3' && Array.isArray(argsArr) && argsArr.includes('app.env_preflight_evidence')) {
+        throw new Error('module import failed');
+      }
+      return Buffer.from('');
+    });
+
+    await handleSmoketest(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('COMPLETED');
+    const stored = JSON.parse(call.logs as string) as { passed: boolean; env_preflight?: unknown; env_preflight_error?: string };
+    expect(stored.passed).toBe(true);
+    expect(stored.env_preflight).toBeUndefined();
+    expect(stored.env_preflight_error).toBeTruthy();
+  });
+
   it('reports FAILED when smoketestResult.passed is false', async () => {
     const smoketestResult = { passed: false, tests: [{ name: 'pytest', status: 'fail', message: 'AssertionError' }] };
     vi.mocked(readHandlerOutput).mockReturnValue(smoketestResult);

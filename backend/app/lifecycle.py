@@ -709,6 +709,7 @@ async def lifespan(app):
         _verify_schema_drift,
         _init_deployment_state,
     )
+    from app.required_runtime_env import _verify_required_env
     from app.notification import _send_webhook_notification
     from app.reaper import reaper_service
     from app.services import (
@@ -727,6 +728,12 @@ async def lifespan(app):
 
     # Startup: Initialize DB tables
     await init_db()
+
+    # Validate the declarative required-runtime-env manifest — fail fast when a
+    # variable this app needs to boot is absent for the current runtime scope.
+    # This is the single-funnel presence gate; _verify_encryption_config delegates
+    # its presence check here and adds Fernet value-validity on top.
+    _verify_required_env()
 
     # Validate encryption configuration — fail fast in production if the
     # encryption key is missing; warn in development if neither key nor

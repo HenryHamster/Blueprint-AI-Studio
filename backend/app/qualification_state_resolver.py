@@ -315,6 +315,7 @@ def resolve_dimension_states(
         ("debt_pressure", "Debt Pressure"),
         ("goal_alignment", "Goal Alignment"),
         ("capability_proof", "Capability Proof"),
+        ("env_preflight", "Env Preflight"),
     ]
 
     _BLOCKER_TO_DIM: dict[str, str] = {
@@ -328,6 +329,7 @@ def resolve_dimension_states(
         "audit_missing": "audit",
         "test_file_deleted": "test_erosion",
         "capability_proof_gate_blocked": "capability_proof",
+        "boot_prereq_missing": "env_preflight",
     }
 
     def _all(status: str, reason: str | None = None) -> list[dict[str, Any]]:
@@ -352,6 +354,10 @@ def resolve_dimension_states(
     sub_scores: dict[str, Any] = q.get("sub_scores") or {}
     ci_resolution: dict[str, Any] = q.get("ci_resolution") or {}
     smoketest_enabled: bool = bool(q.get("smoketest_enabled", True))
+    # Slice 3 (design 245212a4): the deployed-side env-preflight judge ships DARK.
+    # Default False so legacy records (and every run before the flag is armed)
+    # render the env_preflight dimension not_applicable — never a spurious block.
+    env_preflight_enabled: bool = bool(q.get("env_preflight_enabled", False))
     migration_safety = q.get("migration_safety")
     migration_apply_safety = q.get("migration_apply_safety")
     merge_grade_status = q.get("merge_grade_status")
@@ -546,6 +552,24 @@ def resolve_dimension_states(
                 score = float(acc_fraction)
             else:
                 dim_status = "unavailable"
+        elif key == "env_preflight":
+            # Slice 3 (design 245212a4): DARK by default.  When the judge is
+            # disabled the dimension is not_applicable (no boot_prereq_missing
+            # block can fire).  When enabled: a real block surfaces as "failed"
+            # via blocker_dim above (boot_prereq_missing → env_preflight); a
+            # recorded env_preflight sub_score of 1.0 is "passed"; a None score
+            # (no candidate manifest seen) is "unavailable".
+            if not env_preflight_enabled:
+                dim_status = "not_applicable"
+            else:
+                raw = sub_scores.get("env_preflight")
+                if raw is not None and float(raw) > 0.0:
+                    dim_status = "passed"
+                    score = float(raw)
+                else:
+                    # 0.0 with no blocker attributed here, or absent — surface as
+                    # unavailable (a genuine 0.0 block is caught by blocker_dim).
+                    dim_status = "unavailable"
         elif key == "capability_proof":
             # Mirror the ledger's capability-proof semantics (release_qualifier
             # ~3593): OFF → unavailable (gate inactive), OBSERVE/ENFORCE → passed.
@@ -567,8 +591,10 @@ def resolve_dimension_states(
 
 
 # Dimensions the QualificationDimensionResult ledger writes (11 total, 11 of which
-# overlap with the 13 UI dimensions). The 2 UI-only dimensions NOT in the ledger
-# (criterion_coverage, goal_alignment) must still be derived from the blob.
+# overlap with the 14 UI dimensions). The 3 UI-only dimensions NOT in the ledger
+# (criterion_coverage, goal_alignment, env_preflight) must still be derived from
+# the blob — env_preflight (Slice 3) is blob-only until the Slice-5 M0 alignment
+# promotes it to a per-(candidate_sha, dimension) ledger dimension.
 _LEDGER_DIMENSION_KEYS: frozenset[str] = frozenset({
     "audit", "test_erosion", "smoketest", "ci",
     "migration_identity", "migration_apply", "merge_grade", "debt_pressure",
@@ -596,8 +622,8 @@ async def resolve_dimension_states_from_ledger(
     dimension states from the ledger for the 11 overlapping dimensions (audit,
     test_erosion, smoketest, ci, migration_identity, migration_apply, merge_grade,
     debt_pressure, capability_proof, challenge, acceptance_window) plus the
-    synchronous blob derivation for the 2 dimensions the ledger does not write
-    (criterion_coverage, goal_alignment). When no ledger rows exist for this
+    synchronous blob derivation for the 3 dimensions the ledger does not write
+    (criterion_coverage, goal_alignment, env_preflight). When no ledger rows exist for this
     candidate SHA, fall back entirely to the original
     :func:`resolve_dimension_states` (pure, from ``last_qualification``).
 
@@ -627,9 +653,9 @@ async def resolve_dimension_states_from_ledger(
     if not rows:
         return resolve_dimension_states(version.last_qualification)
 
-    # Start with the full blob-derived state (all 13 dimensions). Then overwrite
-    # the 11 ledger-backed dimensions with ledger data. The 2 blob-only dimensions
-    # (criterion_coverage, goal_alignment) are preserved from the blob.
+    # Start with the full blob-derived state (all 14 dimensions). Then overwrite
+    # the 11 ledger-backed dimensions with ledger data. The 3 blob-only dimensions
+    # (criterion_coverage, goal_alignment, env_preflight) are preserved from the blob.
     result = resolve_dimension_states(version.last_qualification)
     ledger_map = {row.dimension: row for row in rows}
 

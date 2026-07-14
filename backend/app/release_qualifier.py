@@ -65,6 +65,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import logging
+import os
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -219,6 +220,7 @@ from app.release_scoring import (
     _reconcile_audit_with_challenge,
     _score_audit,
     _score_completion_debt_pressure,
+    _score_env_preflight,
     _score_smoketest,
     compute_challenged_vs_unchallenged_telemetry,  # noqa: F401 — re-exported for callers/tests
     compute_composite,
@@ -262,6 +264,7 @@ from app.release_qualifier_sweep import (
     sweep_stuck_qualifications,  # noqa: F401 — re-exported for reaper + tests
 )
 from app.migration_apply_gate import run_migration_apply_gate
+from app.env_preflight_evidence import sanitize_env_preflight_artifact
 from app.rollup_migration_validation import (
     check_qualification_migration_identity,
 )
@@ -562,6 +565,12 @@ def _policy_from_runtime_config() -> dict[str, Any] | None:
             if _v is not None:
                 with contextlib.suppress(TypeError, ValueError):
                     result[_k] = float(_v)
+        # Slice 3 (design 245212a4): dark-by-default deployed-side env-preflight
+        # judge flag.  Threaded through the rubric so a fleet-level runtime_config
+        # arm reaches _finalize_qualification's policy fallback.
+        _epf = _runtime_config.get("env_preflight_enabled")
+        if _epf is not None:
+            result["env_preflight_enabled"] = bool(_epf)
         return result
     except Exception as exc:  # noqa: BLE001 — fall back to the file/default on any failure
         logger.warning(
@@ -797,6 +806,10 @@ def _resolve_fleet_policy_with_provenance() -> tuple[dict[str, Any], str, str | 
             if _k in parsed:
                 with contextlib.suppress(TypeError, ValueError):
                     result[_k] = float(parsed[_k])
+        # Slice 3 (design 245212a4): dark-by-default deployed-side env-preflight
+        # judge flag from the on-disk rubric (default False when absent).
+        if "env_preflight_enabled" in parsed:
+            result["env_preflight_enabled"] = bool(parsed["env_preflight_enabled"])
         return result, "yaml_file", None
     except Exception as exc:  # noqa: BLE001 — fall back on any failure, never raise
         error = f"{exc.__class__.__name__}: {exc}"
@@ -2290,6 +2303,23 @@ async def run_qualification(
             "smoketest_enabled", _runtime_config.get("smoketest_enabled")
         )
     )
+    # Slice 3 (design 245212a4): the DEPLOYED-side env-preflight judge ships
+    # DARK — env_preflight_enabled defaults False.  Resolve with the same source
+    # precedence as the promotion rubric: per-project build_config override, then
+    # the fleet runtime_config flag, then the promotion_policy.yaml default, then
+    # False.  Record it on the pending qual so _finalize_qualification scores
+    # against the flag state in force when the run STARTED, not a value that
+    # flipped mid-run.  When False the judge is fully inert (no boot_prereq_missing
+    # blocker, no env_preflight sub_score, default promotion behaviour unchanged).
+    _env_preflight_build = (project.build_config or {}).get("env_preflight_enabled")
+    if _env_preflight_build is not None:
+        env_preflight_enabled = bool(_env_preflight_build)
+    elif _runtime_config.get("env_preflight_enabled") is not None:
+        env_preflight_enabled = bool(_runtime_config.get("env_preflight_enabled"))
+    else:
+        env_preflight_enabled = bool(
+            _load_policy(project).get("env_preflight_enabled", False)
+        )
     audit_task_id: str | None = None
     challenge_task_id: str | None = None
     audit_challenge_task_id: str | None = None
@@ -2487,6 +2517,9 @@ async def run_qualification(
         "ci_green": ci_green,
         "ci_state": ci_state,
         "smoketest_enabled": smoketest_enabled,
+        # Slice 3 (design 245212a4): dark-by-default deployed-side env-preflight
+        # judge flag, captured at spawn so finalize scores against the in-force state.
+        "env_preflight_enabled": env_preflight_enabled,
         "started_at": started_at,
         "audit_task_id": audit_task_id,
         "challenge_task_id": challenge_task_id,
@@ -2503,6 +2536,14 @@ async def run_qualification(
         "keyless_requalification_consumed_at": prior_qual.get(
             "keyless_requalification_consumed_at"
         ),
+        # Slice 4 (design 245212a4): OWNER-armed one-shot acknowledgment that the
+        # missing boot prerequisite will be bound in the same deploy revision.
+        # Carried forward from the prior verdict (base_record REPLACES
+        # last_qualification, so an armed ack must survive re-qualification) so it
+        # is still armed when this finalize scores env-preflight.  Consumed by
+        # _finalize_qualification only once it actually overrides a
+        # boot_prereq_missing block.
+        "ack_env_will_be_bound": prior_qual.get("ack_env_will_be_bound"),
         # Dimensions already resolved (passed/failed/blocked) for this
         # candidate_sha from a prior finalize — carried forward from the
         # per-dimension ledger so _finalize_qualification can compose from
@@ -2597,6 +2638,11 @@ _BLOCKER_LABELS: dict[str, str] = {
     "merge_grade_misses": (
         "the merged diffs 'misses' the version goal per the blind merge-grade "
         "and the merge_grade_block_threshold is armed"
+    ),
+    "boot_prereq_missing": (
+        "a boot/env prerequisite the candidate declares is absent from the "
+        "deploy-target environment (presence-only): bind the missing secret(s) "
+        "in the deploy target before promotion"
     ),
     # NOTE: ``uncorroborated_attestation`` was retired with the attestation gate
     # it labeled (replaced by the per-category goal-verification gate, whose
@@ -3943,6 +3989,36 @@ async def _dual_write_dimension_results(
         )
 
 
+def _deployed_env_presence_snapshot(
+    env_preflight_artifact: dict[str, Any] | None,
+) -> dict[str, bool]:
+    """Presence-only ``{name: bool}`` snapshot of the DEPLOYED process's environ.
+
+    Slice 3 (design 245212a4).  This runs in ``_finalize_qualification``, which
+    executes inside the deployed prod Cloud Run orchestrator — so the deployed
+    process's OWN ``os.environ`` is a faithful presence-proxy of the deploy-target
+    env.  We snapshot only the names the candidate declared it needs (from the
+    candidate-side ``env_preflight`` content artifact) plus the Cloud Run signal
+    (``K_REVISION``) so :func:`_score_env_preflight` can derive the deploy-target
+    scope.
+
+    PRESENCE-ONLY HARD RULE: every value is ``bool(os.getenv(name))`` — the env
+    VALUE is NEVER read, compared, logged, or persisted.  A key maps to ``True``
+    iff the variable is set to a non-empty string in this process.
+    """
+    from app.required_runtime_env import CLOUD_RUN_SIGNAL_ENV
+
+    names: set[str] = {CLOUD_RUN_SIGNAL_ENV}
+    if isinstance(env_preflight_artifact, dict):
+        for entry in env_preflight_artifact.get("required_env") or []:
+            if isinstance(entry, dict):
+                name = entry.get("name")
+                if isinstance(name, str) and name:
+                    names.add(name)
+    # PRESENCE-ONLY: bool(...) — never the value itself.
+    return {name: bool(os.getenv(name)) for name in names}
+
+
 async def _finalize_qualification(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
@@ -4422,6 +4498,71 @@ async def _finalize_qualification(
         # Carry the specific smoketest-failure detail (failed suite / named tests)
         # so the agent can target it when smoketest is the binding constraint.
         smoketest_detail = _extract_smoketest_detail(smoketest_result)
+
+    # Candidate-side env-preflight evidence (Slice 2, design 245212a4). The
+    # smoketest agent introspected the candidate tree's OWN env manifest and
+    # folded a pure-content artifact into SMOKETEST_RESULT. Read it back and
+    # sanitize it to the strict presence-only shape. This is EVIDENCE ONLY:
+    # env_preflight (the CANDIDATE evidence artifact) itself NEVER feeds
+    # compute_composite — it is stored on last_qualification unchanged as the
+    # candidate's declaration. The Slice-3 DEPLOYED judge below reads it as input.
+    # None when no fresh smoketest_result exists (e.g. the same-SHA ledger-reuse
+    # path) or the artifact was absent/malformed.
+    env_preflight = (
+        sanitize_env_preflight_artifact(smoketest_result.get("env_preflight"))
+        if isinstance(smoketest_result, dict)
+        else None
+    )
+
+    # DEPLOYED-side env-preflight judge (Slice 3, design 245212a4), DARK by
+    # default.  Read the flag captured on the pending record at spawn (mirrors
+    # smoketest_enabled); legacy records predate it and default to False.  A
+    # promotion_policy.yaml / runtime rubric default is the last-resort fallback
+    # so the flag can be armed centrally.  The judge scores the candidate's
+    # declared env prerequisites (env_preflight artifact) against a PRESENCE-ONLY
+    # snapshot of THIS deployed process's own os.environ — never a value.  When
+    # the flag is False every downstream use is inert (score/missing ignored,
+    # no boot_prereq_missing blocker, no sub_score, no verdict blob).
+    env_preflight_enabled = bool(
+        qual.get("env_preflight_enabled", policy.get("env_preflight_enabled", False))
+    )
+    env_preflight_score, env_preflight_missing, env_preflight_scope = (
+        _score_env_preflight(
+            env_preflight, _deployed_env_presence_snapshot(env_preflight)
+        )
+    )
+    # Presence-only verdict blob — recorded ONLY when the judge is enabled, so a
+    # dark run leaves last_qualification byte-for-byte unchanged.  ``required`` is
+    # the candidate-declared [{name, scope}] list; ``missing`` is NAMES only.
+    env_preflight_verdict: dict[str, Any] | None = None
+    if env_preflight_enabled and isinstance(env_preflight, dict):
+        env_preflight_verdict = {
+            "required": env_preflight.get("required_env") or [],
+            "missing": env_preflight_missing,
+            "deploy_target_scope": env_preflight_scope,
+        }
+
+    # Slice 4 (design 245212a4): OWNER-armed ack that the missing boot
+    # prerequisite will be bound in the same deploy revision.  The override
+    # applies ONLY when the env-preflight judge is enabled AND it actually found
+    # a missing prerequisite (otherwise there is nothing to override and the ack
+    # stays armed for a later run).  It suppresses exactly the boot_prereq_missing
+    # block inside compute_composite and NO other gate.  Presence-only: the ack
+    # marker carries who/when, never any env value.
+    _env_ack = qual.get("ack_env_will_be_bound")
+    env_preflight_ack_override = bool(
+        _env_ack and env_preflight_enabled and env_preflight_missing
+    )
+    env_preflight_ack_applied: dict[str, Any] | None = None
+    if env_preflight_ack_override and isinstance(_env_ack, dict):
+        env_preflight_ack_applied = {
+            "actor": _env_ack.get("actor"),
+            "acknowledged_at": _env_ack.get("acknowledged_at"),
+            "overridden_blocker": "boot_prereq_missing",
+            # Presence-only: NAMES of the acknowledged-missing prerequisites,
+            # never any value.
+            "missing": [str(n) for n in env_preflight_missing],
+        }
 
     # Persist smoketest to the per-dimension ledger immediately so it
     # survives a later-gate infra failure before _dual_write_dimension_results.
@@ -5560,6 +5701,15 @@ async def _finalize_qualification(
         merge_grade_exempt=_merge_grade_exempt,
         debt_pressure_score=_debt_pressure_score,
         capability_proof_blocked=capability_proof_blocked,
+        # Slice 3 (design 245212a4): DARK-by-default deployed-side env-preflight
+        # judge.  Score/missing are ignored entirely when env_preflight_enabled
+        # is False, preserving byte-for-byte default promotion behaviour.
+        env_preflight_enabled=env_preflight_enabled,
+        env_preflight_score=env_preflight_score,
+        env_preflight_missing=env_preflight_missing,
+        # Slice 4: OWNER-armed one-shot override of the boot_prereq_missing block
+        # (scoped to that blocker only — see _env_ack above).
+        env_preflight_ack_override=env_preflight_ack_override,
     )
 
     # --- Acceptance-window counts (additive evidence, no score impact) -----
@@ -5638,6 +5788,33 @@ async def _finalize_qualification(
         "challenger_refuted_audit_findings": challenger_refuted_audit_findings,
         "test_erosion_detail": test_erosion_detail,
         "smoketest_detail": smoketest_detail,
+        # Candidate-side env-preflight evidence (Slice 2, design 245212a4):
+        # pure-content {required_env, startup_check_names, manifest_source}
+        # introspected from the candidate tree. Stored UNCHANGED — no gating,
+        # never read by compute_composite or the promotion decision. None when
+        # the smoketest child produced no such artifact.
+        "env_preflight": env_preflight,
+        # Slice 3 (design 245212a4): the deployed-side judge flag + verdict blob.
+        # env_preflight_enabled is read back by the state resolver to render the
+        # env_preflight dimension (not_applicable when dark).  env_preflight_verdict
+        # is {required:[{name,scope}], missing:[names], deploy_target_scope} —
+        # presence-only, None when the judge was disabled or no manifest was seen.
+        "env_preflight_enabled": env_preflight_enabled,
+        "env_preflight_verdict": env_preflight_verdict,
+        # Slice 4 (design 245212a4): OWNER-armed one-shot ack that the missing
+        # boot prerequisite will be bound in the same deploy revision.
+        #   * ack_env_will_be_bound — the ARMED marker.  Carried forward UNCHANGED
+        #     while it has not yet overridden a block (so it stays armed across
+        #     re-qualification), and CLEARED to None the run it actually overrides
+        #     one — a one-shot bypass, never sticky.
+        #   * env_preflight_ack_applied — audit record of the applied override
+        #     (actor / acknowledged_at / overridden_blocker + presence-only missing
+        #     NAMES); None when no override was applied this run.  Presence-only: no
+        #     env VALUE is ever recorded.
+        "ack_env_will_be_bound": (
+            None if env_preflight_ack_override else qual.get("ack_env_will_be_bound")
+        ),
+        "env_preflight_ack_applied": env_preflight_ack_applied,
         "audit_missing_reason": audit_missing_reason,
         "audit_reconciliation": audit_reconciliation,
         "migration_safety": migration_verdict,
