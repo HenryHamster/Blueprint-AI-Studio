@@ -56,6 +56,7 @@ VALID_TASK_TYPES: set[str] = {
     "design",
     "repo_bootstrap",
     "salvage_bundle",
+    "capability_proof_trial",
 }
 
 VALID_EFFORTS: set[str] = {"low", "medium", "high", "max"}

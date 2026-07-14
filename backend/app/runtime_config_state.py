@@ -332,6 +332,15 @@ runtime_config: Dict = {
             "CAPABILITY_PROOF_GATE_AUTO_GRADUATION_ENFORCE_THRESHOLD", "0.95"
         )
     ),
+    # Slice-1 DARK flag for the machine-verified capability-proof earn path
+    # (design 84021e2d): gates the executed-named_test trial dispatch/enrollment
+    # that later slices add. Default OFF — the executed-proof recorder and this
+    # flag ship dark; no caller reads it yet. Flip via PATCH /api/admin/settings
+    # (no deploy) once the trial-dispatch slice lands.
+    "capability_proof_execution_trials_enabled": os.getenv(
+        "CAPABILITY_PROOF_EXECUTION_TRIALS_ENABLED", "false"
+    ).lower()
+    in ("1", "true", "yes"),
     # Co-change auto-decomposition: split a medium research finding's files into
     # independent co-change/dir clusters and spawn one small sub-finding per
     # cluster (research_completion -> cochange_decomposition.py). Default OFF:
@@ -2195,6 +2204,11 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     _set(
                         "capability_proof_gate_auto_graduation_enabled",
                         bool(config_json["capability_proof_gate_auto_graduation_enabled"]),
+                    )
+                if "capability_proof_execution_trials_enabled" in config_json:
+                    _set(
+                        "capability_proof_execution_trials_enabled",
+                        bool(config_json["capability_proof_execution_trials_enabled"]),
                     )
                 for _cap_grad_float_key in (
                     "capability_proof_gate_auto_graduation_observe_threshold",

@@ -2356,7 +2356,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                     else {}
                 )
                 _earn_result = await commission_proof_earn_loop(
-                    project, _missing_demand, _pm
+                    project, _missing_demand, _pm, session=session
                 )
                 if _earn_result.get("earned", 0) > 0:
                     logger.info(

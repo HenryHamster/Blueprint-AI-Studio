@@ -4289,6 +4289,98 @@ async def test_capability_proof_gate_gap_mints_named_test_present_for_covered_ca
 
 
 @pytest.mark.asyncio
+async def test_capability_proof_gate_gap_enrolls_trial_when_flag_on(db):
+    """Slice 3 (design 84021e2d): with ``capability_proof_execution_trials_enabled``
+    ON, the self-heal ENROLLS a bounded ``capability_proof_trial`` for a
+    discovered-covered capability (earning the real ``proven`` tier via an actual
+    test run) instead of minting the STATIC ``named_test_present`` proof."""
+    from unittest.mock import AsyncMock, patch
+
+    from sqlalchemy import select
+    from sqlalchemy.orm.attributes import flag_modified
+
+    from app.models import Task
+    from app.shared_state import runtime_config
+
+    project = await _project(db)
+    project.problem_model = {
+        "capabilities": [
+            {
+                "name": "runner-dispatch",
+                "status": "working",
+                "evidence_refs": [],  # no proof → unproven
+                "backing_paths": ["backend/app/local_runner.py"],
+            },
+        ]
+    }
+    flag_modified(project, "problem_model")
+    db.add(project)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db,
+        now=_utcnow(),
+        mode="observe",
+        max_projects=25,
+        sample_limit=200,
+        window_days=14,
+    )
+
+    test_body = "from app.local_runner import LocalRunner\n\ndef test_it():\n    assert LocalRunner\n"
+    _prev = runtime_config.get("capability_proof_execution_trials_enabled")
+    runtime_config["capability_proof_execution_trials_enabled"] = True
+    try:
+        with patch(
+            "app.source_ref_validation._path_exists_at_head",
+            new=AsyncMock(return_value=True),
+        ), patch(
+            "app.capability_proof._read_file_at_head",
+            new=AsyncMock(return_value=test_body),
+        ), patch(
+            "app.capability_proof._default_read_head_sha",
+            new=AsyncMock(return_value="cafef00d"),
+        ):
+            results = await mis.check_capability_proof_gate_gap(ctx)
+    finally:
+        if _prev is None:
+            runtime_config.pop("capability_proof_execution_trials_enabled", None)
+        else:
+            runtime_config["capability_proof_execution_trials_enabled"] = _prev
+
+    pid = str(project.id)
+    # No STATIC named_test_present proof was minted — the cap is handled by a
+    # real execution trial instead.
+    await db.refresh(project)
+    proof_records = project.capability_proof_records or {}
+    assert "runner-dispatch" not in proof_records, (
+        f"flag-on self-heal must NOT mint a static proof, got {proof_records}"
+    )
+
+    # A bounded capability_proof_trial task was enrolled for the cap.
+    tasks = (
+        await db.execute(select(Task).where(Task.project_id == project.id))
+    ).scalars().all()
+    trial_tasks = [
+        t for t in tasks
+        if (t.first_payload or {}).get("type") == "capability_proof_trial"
+    ]
+    assert len(trial_tasks) == 1, (
+        f"expected exactly 1 enrolled trial, got {[t.title for t in tasks]}"
+    )
+    assert trial_tasks[0].first_payload.get("cap") == "runner-dispatch"
+
+    # The cap remains a pending gap this sweep (proof lands only when the trial
+    # runs green) and is reported distinctly as an enrolled execution trial.
+    flagged = [r for r in results if r.flagged and r.subject == pid]
+    assert len(flagged) == 1, (
+        f"expected the enrolled cap to remain a pending gap, got {results}"
+    )
+    assert "execution trial" in flagged[0].detail, (
+        f"expected detail to name the enrolled execution trial, got {flagged[0].detail!r}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_capability_proof_gate_gap_falls_back_to_backing_path_without_test(db):
     """When the backing path resolves at HEAD but no covering test is discoverable
     (read_head → None), the self-heal falls back to the structural ``backing_path``

@@ -3635,6 +3635,7 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
 
     from app.capability_proof import (
         _discover_candidate_backing_paths,
+        _maybe_enroll_proof_trial,
         _named_tests_covering_paths,
         _read_file_at_head,
         record_capability_backing_path_proof,
@@ -3749,6 +3750,7 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
         # backing_path-tier.
         auto_resolved: list[str] = []
         named_test_present_resolved: list[str] = []
+        trials_enrolled: list[str] = []
         needs_backing_paths: list[str] = []
         # Distinct unresolved buckets — kept separate so the FLAGGED detail is
         # truthful about WHY each cap is still a gap (a dedup no-op that already
@@ -3812,6 +3814,21 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
 
                 try:
                     if test_refs:
+                        # Slice 3 (design 84021e2d): under the execution-trials
+                        # flag, ENROLL a bounded capability_proof_trial that RUNS
+                        # the covering tests (a green run mints the real ``proven``
+                        # tier) instead of minting the static named_test_present
+                        # proof. Flag-off / degraded falls through unchanged.
+                        _trial = await _maybe_enroll_proof_trial(
+                            ctx.session,
+                            project,
+                            raw_name or cap_name,
+                            cap_name,
+                            test_refs,
+                        )
+                        if _trial in ("enrolled", "fresh"):
+                            trials_enrolled.append(cap_name)
+                            continue
                         recorded = record_capability_named_test_proof(
                             project, raw_name or cap_name, test_refs
                         )
@@ -3890,6 +3907,20 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
                     test_refs = []
 
                 if test_refs:
+                    # Slice 3 (design 84021e2d): enroll an execution trial for the
+                    # discovered-covered candidate set under the flag; a green run
+                    # earns the real ``proven`` tier. Flag-off/degraded falls
+                    # through to the unchanged static named_test_present recording.
+                    _trial = await _maybe_enroll_proof_trial(
+                        ctx.session,
+                        project,
+                        raw_name or cap_name,
+                        cap_name,
+                        test_refs,
+                    )
+                    if _trial in ("enrolled", "fresh"):
+                        trials_enrolled.append(cap_name)
+                        continue
                     try:
                         recorded = record_capability_named_test_proof(
                             project, raw_name or cap_name, test_refs
@@ -3990,10 +4021,27 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
                         await ctx.session.rollback()
 
         new_proven = proven_count + len(auto_resolved)
-        unresolved = needs_backing_paths + verification_failed + already_recorded
+        # Caps with an enrolled execution trial are NOT yet proven — the trial
+        # must run green first — so they still count as an unresolved gap this
+        # sweep, but are reported distinctly (a real proof is en route) rather
+        # than as a static resolution or a verification failure.
+        unresolved = (
+            needs_backing_paths
+            + verification_failed
+            + already_recorded
+            + trials_enrolled
+        )
 
         if unresolved:
             detail_parts: list[str] = []
+            if trials_enrolled:
+                preview_te = ", ".join(sorted(trials_enrolled)[:3])
+                if len(trials_enrolled) > 3:
+                    preview_te += f" (+{len(trials_enrolled) - 3} more)"
+                detail_parts.append(
+                    f"{len(trials_enrolled)} execution trial(s) enrolled "
+                    f"(pending green run → proven): {preview_te}"
+                )
             if auto_resolved:
                 preview_ar = ", ".join(sorted(auto_resolved)[:3])
                 if len(auto_resolved) > 3:

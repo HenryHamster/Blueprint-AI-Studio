@@ -275,6 +275,7 @@ export const TASK_TYPES_WITHOUT_HINT: ReadonlySet<string> = new Set([
   'release_merge_grade', // Uses merge-grade.ts bespoke prompt assembly (blind goal-coverage grader)
   'repo_bootstrap',          // Uses specialized.ts bespoke prompt assembly (external-repo first-cycle bootstrap)
   'salvage_bundle',          // Uses standard.ts handleSalvageBundle bespoke prompt assembly (consolidated fix batch)
+  'capability_proof_trial',  // Uses capability-proof-trial.ts; runs the targeted covering tests directly, no Claude prompt
 ]);
 
 // ── Dynamic Task Type Hints (based on project build configuration) ───────────

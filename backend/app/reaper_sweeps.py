@@ -940,6 +940,7 @@ async def sweep_proof_earn_loop(session, now=None) -> dict[str, Any]:
         "no_backing_paths": [],
         "still_unproven": [],
         "path_proven_stuck": [],
+        "named_test_executed": [],
     }
 
     for project in rows:
@@ -988,7 +989,7 @@ async def sweep_proof_earn_loop(session, now=None) -> dict[str, Any]:
                 }
 
             result = await commission_proof_earn_loop(
-                project, demand_result, pm
+                project, demand_result, pm, session=session
             )
             if result.get("total_demanded_unproven", 0) > 0:
                 combined["total_demanded_unproven"] += result["total_demanded_unproven"]
@@ -996,6 +997,9 @@ async def sweep_proof_earn_loop(session, now=None) -> dict[str, Any]:
                 combined["no_backing_paths"].extend(result.get("no_backing_paths", []))
                 combined["still_unproven"].extend(result.get("still_unproven", []))
                 combined["path_proven_stuck"].extend(result.get("path_proven_stuck", []))
+                combined["named_test_executed"].extend(
+                    result.get("named_test_executed", [])
+                )
                 if result["earned"] > 0:
                     session.add(project)
                     await session.commit()
@@ -1009,12 +1013,19 @@ async def sweep_proof_earn_loop(session, now=None) -> dict[str, Any]:
             with contextlib.suppress(Exception):
                 await session.rollback()
 
-    if combined["earned"] or combined["still_unproven"] or combined["path_proven_stuck"]:
+    if (
+        combined["earned"]
+        or combined["still_unproven"]
+        or combined["path_proven_stuck"]
+        or combined["named_test_executed"]
+    ):
         logger.info(
             "[REAPER] Step 22b: proof-earn loop: total_demanded_unproven=%d "
-            "earned=%d no_backing_paths=%d still_unproven=%d path_proven_stuck=%d",
+            "earned=%d named_test_executed=%d no_backing_paths=%d "
+            "still_unproven=%d path_proven_stuck=%d",
             combined["total_demanded_unproven"],
             combined["earned"],
+            len(combined["named_test_executed"]),
             len(combined["no_backing_paths"]),
             len(combined["still_unproven"]),
             len(combined["path_proven_stuck"]),

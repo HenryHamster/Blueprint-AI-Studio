@@ -11,13 +11,14 @@ Covers:
 """
 
 import uuid
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from app.capability_proof import (
     _MAX_PROOF_ENTRIES_PER_CAPABILITY,
     _PROOF_KIND_BACKING_PATH,
+    _PROOF_KIND_NAMED_TEST,
     _PROOF_KIND_NAMED_TEST_PRESENT,
     _PROOF_KIND_TRIAL_ADOPTION,
     _candidate_test_paths,
@@ -34,6 +35,7 @@ from app.capability_proof import (
     commission_proof_earn_loop,
     enrich_problem_model_capability_proofs,
     record_capability_backing_path_proof,
+    record_capability_named_test_execution_proof,
     record_capability_named_test_proof,
     record_capability_proof,
     record_capability_proof_from_trial,
@@ -41,7 +43,9 @@ from app.capability_proof import (
     should_record_capability_proof,
 )
 from app.capability_registry import (
+    _ledger_proof_status,
     capability_need_blocked_by_proof_gate,
+    ledger_corroborated_proof_status,
     registry_capability_evidence_refs_map,
     working_capability_proof_status,
 )
@@ -3257,6 +3261,265 @@ class TestEarnLoopNamedTestTier:
         assert result["named_test_earned"] == []
 
 
+class TestEarnLoopExecutionTrialEnrollment:
+    """Slice 3 (design 84021e2d): under ``capability_proof_execution_trials_enabled``,
+    the earn loop ENROLLS a bounded execution trial for a discovered-covered
+    capability (earning the real ``proven`` tier via an actual test run) instead of
+    recording the static ``named_test_present`` (``path_proven``) proof. Flag-off,
+    no-session, and degraded-enroll cases preserve the exact prior static path.
+    Enrollment is cadence-guarded on the executed proof's freshness + HEAD sha."""
+
+    _CAP = "capability-proof-gate"
+
+    @classmethod
+    def _project_and_demand(cls, backing_paths, records=None):
+        project = MagicMock()
+        project.capability_proof_records = records if records is not None else {}
+        project.problem_model = {
+            "capabilities": [
+                {"name": cls._CAP, "status": "working", "backing_paths": backing_paths}
+            ]
+        }
+        demand = {
+            "total": 1,
+            "demands": [{"kind": "capability", "ref": cls._CAP, "dependent_count": 2}],
+        }
+        return project, demand
+
+    @staticmethod
+    async def _verify(p):
+        # Both the backing path and its convention-named test exist at HEAD.
+        return p in {
+            "backend/app/capability_proof.py",
+            "backend/testing/test_capability_proof.py",
+        }
+
+    @staticmethod
+    async def _read(p):
+        if p == "backend/testing/test_capability_proof.py":
+            return "from app.capability_proof import record_capability_named_test_proof\n"
+        return None
+
+    @staticmethod
+    def _exec_record(recorded_at, commit_sha):
+        return {
+            "capability-proof-gate": [
+                {
+                    "task_id": "named_test_exec:capability-proof-gate",
+                    "recorded_at": recorded_at,
+                    "proof_kind": "named_test",
+                    "commit_sha": commit_sha,
+                    "executed": True,
+                }
+            ]
+        }
+
+    @pytest.mark.asyncio
+    async def test_earn_loop_enrolls_trial_when_flag_on(self):
+        """ACCEPTANCE (design 84021e2d Slice 3): flag ON + covering tests
+        discovered ⇒ the earn loop enrolls a ``capability_proof_trial`` and reports
+        the cap under ``named_test_executed`` — it does NOT record the static
+        ``named_test_present`` proof."""
+        project, demand = self._project_and_demand(["backend/app/capability_proof.py"])
+        fake_task = MagicMock()
+        fake_task.id = uuid.uuid4()
+        enroll = AsyncMock(return_value=fake_task)
+        head = AsyncMock(return_value="deadbeef")
+        rc = {"capability_proof_execution_trials_enabled": True}
+
+        with patch("app.capability_proof.flag_modified"), \
+                patch("app.shared_state.runtime_config", new=rc), \
+                patch("app.capability_proof.enroll_capability_proof_trial", enroll), \
+                patch("app.capability_proof.record_capability_named_test_proof") as rec:
+            result = await commission_proof_earn_loop(
+                project, demand, project.problem_model,
+                verify_path=self._verify, read_head=self._read,
+                session=object(), read_head_sha=head,
+            )
+
+        # A trial was enrolled with the discovered covering tests + current HEAD.
+        enroll.assert_awaited_once()
+        _args, _kwargs = enroll.call_args
+        assert _args[2] == self._CAP  # raw_name/canonical
+        assert "backend/testing/test_capability_proof.py" in _args[3]  # test_refs
+        assert _kwargs.get("head_sha") == "deadbeef"
+        # The STATIC named_test_present recorder was NOT invoked.
+        rec.assert_not_called()
+        # The summary reports the executed-trial cap, not the static earn.
+        assert result["named_test_executed"] == [self._CAP]
+        assert result["named_test_earned"] == []
+        assert result["earned"] == 0
+        # And nothing was written to the static path_proven ledger.
+        assert project.capability_proof_records == {}
+
+    @pytest.mark.asyncio
+    async def test_earn_loop_flag_off_records_named_test_present(self):
+        """Regression guard: flag OFF (default) ⇒ exact prior behaviour — the
+        static ``named_test_present`` proof is recorded, NO trial is enrolled, and
+        ``named_test_executed`` is empty."""
+        project, demand = self._project_and_demand(["backend/app/capability_proof.py"])
+        enroll = AsyncMock(return_value=MagicMock())
+        rc = {"capability_proof_execution_trials_enabled": False}
+
+        with patch("app.capability_proof.flag_modified"), \
+                patch("app.shared_state.runtime_config", new=rc), \
+                patch("app.capability_proof.enroll_capability_proof_trial", enroll):
+            result = await commission_proof_earn_loop(
+                project, demand, project.problem_model,
+                verify_path=self._verify, read_head=self._read,
+                session=object(),
+            )
+
+        enroll.assert_not_awaited()
+        assert result["named_test_executed"] == []
+        assert result["named_test_earned"] == [self._CAP]
+        assert result["earned"] == 1
+        entry = project.capability_proof_records[self._CAP][0]
+        assert entry["proof_kind"] == _PROOF_KIND_NAMED_TEST_PRESENT
+
+    @pytest.mark.asyncio
+    async def test_earn_loop_flag_on_no_session_falls_back_to_static(self):
+        """Flag ON but no ``session`` supplied ⇒ the loop cannot enroll a trial, so
+        it falls back to the UNCHANGED static ``named_test_present`` recording."""
+        project, demand = self._project_and_demand(["backend/app/capability_proof.py"])
+        enroll = AsyncMock(return_value=MagicMock())
+        rc = {"capability_proof_execution_trials_enabled": True}
+
+        with patch("app.capability_proof.flag_modified"), \
+                patch("app.shared_state.runtime_config", new=rc), \
+                patch("app.capability_proof.enroll_capability_proof_trial", enroll):
+            result = await commission_proof_earn_loop(
+                project, demand, project.problem_model,
+                verify_path=self._verify, read_head=self._read,
+                session=None,
+            )
+
+        enroll.assert_not_awaited()
+        assert result["named_test_executed"] == []
+        assert result["named_test_earned"] == [self._CAP]
+        entry = project.capability_proof_records[self._CAP][0]
+        assert entry["proof_kind"] == _PROOF_KIND_NAMED_TEST_PRESENT
+
+    @pytest.mark.asyncio
+    async def test_earn_loop_enroll_noop_falls_back_to_static(self):
+        """Flag ON, session present, but enrollment degrades to a no-op (``None``)
+        — e.g. the flag flipped off mid-flight — ⇒ the loop falls back to the
+        static ``named_test_present`` recording rather than dropping the cap."""
+        project, demand = self._project_and_demand(["backend/app/capability_proof.py"])
+        enroll = AsyncMock(return_value=None)
+        head = AsyncMock(return_value="deadbeef")
+        rc = {"capability_proof_execution_trials_enabled": True}
+
+        with patch("app.capability_proof.flag_modified"), \
+                patch("app.shared_state.runtime_config", new=rc), \
+                patch("app.capability_proof.enroll_capability_proof_trial", enroll):
+            result = await commission_proof_earn_loop(
+                project, demand, project.problem_model,
+                verify_path=self._verify, read_head=self._read,
+                session=object(), read_head_sha=head,
+            )
+
+        enroll.assert_awaited_once()
+        assert result["named_test_executed"] == []
+        assert result["named_test_earned"] == [self._CAP]
+        entry = project.capability_proof_records[self._CAP][0]
+        assert entry["proof_kind"] == _PROOF_KIND_NAMED_TEST_PRESENT
+
+    @pytest.mark.asyncio
+    async def test_fresh_matching_executed_proof_suppresses_reenroll(self):
+        """Cadence guard: a fresh green executed proof whose ``commit_sha`` matches
+        HEAD suppresses re-enrollment — no trial, no static downgrade."""
+        from datetime import datetime
+
+        now = datetime(2026, 7, 14, 0, 0, 0)
+        records = self._exec_record(now.isoformat(), "deadbeef")
+        project, demand = self._project_and_demand(
+            ["backend/app/capability_proof.py"], records=records
+        )
+        enroll = AsyncMock(return_value=MagicMock())
+        head = AsyncMock(return_value="deadbeef")
+        rc = {"capability_proof_execution_trials_enabled": True}
+
+        with patch("app.capability_proof.flag_modified"), \
+                patch("app.shared_state.runtime_config", new=rc), \
+                patch("app.capability_proof.enroll_capability_proof_trial", enroll), \
+                patch("app.capability_proof.record_capability_named_test_proof") as rec:
+            result = await commission_proof_earn_loop(
+                project, demand, project.problem_model,
+                verify_path=self._verify, read_head=self._read,
+                session=object(), read_head_sha=head, now=now,
+            )
+
+        enroll.assert_not_awaited()
+        rec.assert_not_called()
+        assert result["named_test_executed"] == []
+        assert result["named_test_earned"] == []
+        assert result["earned"] == 0
+
+    @pytest.mark.asyncio
+    async def test_stale_executed_proof_reenrolls(self):
+        """Cadence guard: an executed proof aged past ``PROOF_FRESHNESS_TTL``
+        re-enrolls a fresh trial (the genuine re-verification loop)."""
+        from datetime import datetime, timedelta
+
+        from app.evidence_primitive import PROOF_FRESHNESS_TTL
+
+        now = datetime(2026, 7, 14, 0, 0, 0)
+        stale = (now - PROOF_FRESHNESS_TTL - timedelta(days=1)).isoformat()
+        records = self._exec_record(stale, "deadbeef")
+        project, demand = self._project_and_demand(
+            ["backend/app/capability_proof.py"], records=records
+        )
+        fake_task = MagicMock()
+        fake_task.id = uuid.uuid4()
+        enroll = AsyncMock(return_value=fake_task)
+        head = AsyncMock(return_value="deadbeef")
+        rc = {"capability_proof_execution_trials_enabled": True}
+
+        with patch("app.capability_proof.flag_modified"), \
+                patch("app.shared_state.runtime_config", new=rc), \
+                patch("app.capability_proof.enroll_capability_proof_trial", enroll):
+            result = await commission_proof_earn_loop(
+                project, demand, project.problem_model,
+                verify_path=self._verify, read_head=self._read,
+                session=object(), read_head_sha=head, now=now,
+            )
+
+        enroll.assert_awaited_once()
+        assert result["named_test_executed"] == [self._CAP]
+
+    @pytest.mark.asyncio
+    async def test_head_moved_reenrolls(self):
+        """Cadence guard: a still-fresh executed proof whose ``commit_sha`` differs
+        from the current HEAD re-enrolls a trial to re-verify the new tree."""
+        from datetime import datetime
+
+        now = datetime(2026, 7, 14, 0, 0, 0)
+        records = self._exec_record(now.isoformat(), "oldsha0000")
+        project, demand = self._project_and_demand(
+            ["backend/app/capability_proof.py"], records=records
+        )
+        fake_task = MagicMock()
+        fake_task.id = uuid.uuid4()
+        enroll = AsyncMock(return_value=fake_task)
+        head = AsyncMock(return_value="newsha1111")
+        rc = {"capability_proof_execution_trials_enabled": True}
+
+        with patch("app.capability_proof.flag_modified"), \
+                patch("app.shared_state.runtime_config", new=rc), \
+                patch("app.capability_proof.enroll_capability_proof_trial", enroll):
+            result = await commission_proof_earn_loop(
+                project, demand, project.problem_model,
+                verify_path=self._verify, read_head=self._read,
+                session=object(), read_head_sha=head, now=now,
+            )
+
+        enroll.assert_awaited_once()
+        _args, _kwargs = enroll.call_args
+        assert _kwargs.get("head_sha") == "newsha1111"
+        assert result["named_test_executed"] == [self._CAP]
+
+
 class TestCapabilityProofFreshnessExpiry:
     """Capability proofs expire and force re-verification once stale.
 
@@ -4076,3 +4339,194 @@ class TestConsumerGateSharesTheReleaseRule:
         )
         assert set(detail["corroborated"]) == {"real-cap"}
         assert set(detail["exempt_cleared"]) == {"human-process-cap"}
+
+
+# ── record_capability_named_test_execution_proof ─────────────────────────────
+
+
+class TestRecordCapabilityNamedTestExecutionProof:
+    """The executed-named_test recorder mints the GENUINE ``proven`` tier.
+
+    Unlike :func:`record_capability_named_test_proof` (static discovery →
+    ``named_test_present`` → ``path_proven``), this recorder stamps the executed
+    ``named_test`` kind, which grades ``proven`` everywhere and corroborates at
+    the enforce gate. It also re-verifies freshness: a second call REPLACES the
+    prior entry rather than deduping it away.
+    """
+
+    def test_named_test_execution_proof_grades_proven(self):
+        """Acceptance: a fresh execution proof grades ``proven`` (not path_proven).
+
+        This is the proof-of-capability seam for design 84021e2d Slice 1 — it
+        exercises the new recorder end-to-end through the shared tiering readers
+        (``classify_evidence_tiered`` on the appended EvidenceRef, and
+        ``working_capability_proof_status`` on the problem_model).
+        """
+        cap_name = "language-aware-repo-map"
+        project = _make_project_with_problem_model(cap_name)
+
+        with patch("app.capability_proof.flag_modified"):
+            result = record_capability_named_test_execution_proof(
+                project,
+                cap_name,
+                ["backend/testing/test_prompt.py::test_map"],
+                head_sha="deadbeef",
+            )
+
+        assert result is True
+        entries = project.capability_proof_records[cap_name]
+        assert len(entries) == 1
+        e = entries[0]
+        # The genuine executed tier — NOT the structural named_test_present tier.
+        assert e["proof_kind"] == _PROOF_KIND_NAMED_TEST
+        assert e["proof_kind"] != _PROOF_KIND_NAMED_TEST_PRESENT
+        assert e["executed"] is True
+        assert e["commit_sha"] == "deadbeef"
+        assert e["task_id"] == "named_test_exec:language-aware-repo-map"
+        assert e["test_refs"] == ["backend/testing/test_prompt.py::test_map"]
+
+        # The appended EvidenceRef classifies ``proven`` (named_test is a machine
+        # kind, not in BACKING_ONLY_KINDS).
+        cap = project.problem_model["capabilities"][0]
+        refs = cap["evidence_refs"]
+        assert len(refs) == 1
+        assert refs[0]["kind"] == _PROOF_KIND_NAMED_TEST
+        assert refs[0]["commit_sha"] == "deadbeef"
+        assert classify_evidence_tiered(refs) == "proven"
+
+        # And the working-capability reader grades the whole capability ``proven``.
+        status_map = working_capability_proof_status(project.problem_model)
+        assert status_map.get(cap_name) == "proven"
+
+    def test_named_test_present_still_path_proven(self):
+        """The STATIC recorder is unchanged — it still grades path_proven, so the
+        two recorders are genuinely distinct tiers."""
+        cap_name = "repo-map"
+        static_project = _make_project_with_problem_model(cap_name)
+        with patch("app.capability_proof.flag_modified"):
+            record_capability_named_test_proof(
+                static_project, cap_name, ["backend/testing/test_repo_map.py"]
+            )
+        static_refs = static_project.problem_model["capabilities"][0]["evidence_refs"]
+        assert classify_evidence_tiered(static_refs) == "path_proven"
+
+    def test_ledger_corroborated_keeps_proven(self):
+        """``ledger_corroborated_proof_status`` does NOT demote an executed proof.
+
+        The platform ledger written by the recorder grades ``proven`` via
+        ``_ledger_proof_status``, so a ``proven`` tier-1 claim is corroborated
+        (kept), not demoted to ``unverified``.
+        """
+        cap_name = "repo-map"
+        project = _make_project_with_problem_model(cap_name)
+        with patch("app.capability_proof.flag_modified"):
+            record_capability_named_test_execution_proof(
+                project, cap_name, ["backend/testing/test_repo_map.py"], head_sha="abc"
+            )
+
+        records = project.capability_proof_records
+        assert _ledger_proof_status(records, cap_name) == "proven"
+        corroborated = ledger_corroborated_proof_status(
+            {cap_name: "proven"}, records
+        )
+        assert corroborated[cap_name] == "proven"
+
+    def test_second_call_replaces_rather_than_appends(self):
+        """A second call with a newer commit_sha REPLACES the prior entry.
+
+        Freshness re-verification: the ledger holds exactly one
+        ``named_test_exec:{norm}`` entry, carrying the newer sha and a refreshed
+        timestamp — not two entries.
+        """
+        cap_name = "repo-map"
+        project = _make_project_with_problem_model(cap_name)
+        with patch("app.capability_proof.flag_modified"):
+            first = record_capability_named_test_execution_proof(
+                project, cap_name, ["test_a.py"], head_sha="sha-old"
+            )
+            second = record_capability_named_test_execution_proof(
+                project, cap_name, ["test_a.py"], head_sha="sha-new"
+            )
+
+        assert first is True
+        # Replace-in-place returns True (a fresh proof WAS recorded), not False.
+        assert second is True
+
+        entries = project.capability_proof_records[cap_name]
+        assert len(entries) == 1
+        assert entries[0]["commit_sha"] == "sha-new"
+
+        # The appended EvidenceRef is replaced in place too — one fresh ref.
+        refs = project.problem_model["capabilities"][0]["evidence_refs"]
+        assert len(refs) == 1
+        assert refs[0]["commit_sha"] == "sha-new"
+
+    def test_empty_test_refs_records_nothing(self):
+        """An empty (or whitespace-only) ``test_refs`` records nothing."""
+        cap_name = "repo-map"
+        project = _make_project_with_problem_model(cap_name)
+        with patch("app.capability_proof.flag_modified") as mock_fm:
+            result = record_capability_named_test_execution_proof(
+                project, cap_name, ["", "   "], head_sha="abc"
+            )
+        assert result is False
+        assert cap_name not in project.capability_proof_records
+        mock_fm.assert_not_called()
+
+    def test_vacuous_green_records_nothing(self):
+        """A non-verifying (skipped/empty) executed suite records nothing."""
+        cap_name = "repo-map"
+        project = _make_project_with_problem_model(cap_name)
+        with patch("app.capability_proof.flag_modified") as mock_fm:
+            result = record_capability_named_test_execution_proof(
+                project, cap_name, ["test_a.py"], head_sha="abc",
+                suite_verifying=False,
+            )
+        assert result is False
+        assert cap_name not in project.capability_proof_records
+        mock_fm.assert_not_called()
+
+    def test_unnormalizable_name_records_nothing(self):
+        """A capability name that cannot be normalized returns False."""
+        project = _make_project()
+        with patch("app.capability_proof.flag_modified") as mock_fm:
+            result = record_capability_named_test_execution_proof(
+                project, "", ["test_a.py"], head_sha="abc"
+            )
+        assert result is False
+        mock_fm.assert_not_called()
+
+    def test_bounded_at_max_entries(self):
+        """The proof entry list stays bounded at _MAX_PROOF_ENTRIES_PER_CAPABILITY."""
+        cap_key = "repo-map"
+        existing = [
+            {
+                "task_id": f"task-{i}",
+                "proved_at": "2026-01-01T00:00:00",
+                "proof_kind": "named_test",
+                "proof_ref": cap_key,
+                "commit_sha": "",
+            }
+            for i in range(_MAX_PROOF_ENTRIES_PER_CAPABILITY)
+        ]
+        project = _make_project_with_problem_model(cap_key)
+        project.capability_proof_records = {cap_key: existing[:]}
+        with patch("app.capability_proof.flag_modified"):
+            result = record_capability_named_test_execution_proof(
+                project, cap_key, ["test_a.py"], head_sha="abc"
+            )
+        assert result is True
+        entries = project.capability_proof_records[cap_key]
+        assert len(entries) == _MAX_PROOF_ENTRIES_PER_CAPABILITY
+        assert entries[-1]["task_id"] == "named_test_exec:repo-map"
+
+    def test_normalizes_cap_name_with_underscores(self):
+        """Underscored names normalize to hyphens (same key convention)."""
+        project = _make_project()
+        with patch("app.capability_proof.flag_modified"):
+            result = record_capability_named_test_execution_proof(
+                project, "related_tests", ["test_a.py"], head_sha="abc"
+            )
+        assert result is True
+        assert "related-tests" in project.capability_proof_records
+        assert "related_tests" not in project.capability_proof_records

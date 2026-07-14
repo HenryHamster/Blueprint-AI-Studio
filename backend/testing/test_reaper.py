@@ -17919,3 +17919,68 @@ async def test_proof_earn_loop_honors_its_own_cadence_gate(reaper_db, mocker):
     finally:
         _rs._last_backing_proof_sweep = _prev_backing
         _rs._last_proof_earn_loop_sweep = _prev_earn
+
+
+@pytest.mark.asyncio
+async def test_proof_earn_loop_threads_named_test_executed_and_session(reaper_db, mocker):
+    """Step 22b threads the execution-trial signal (Slice 3, design 84021e2d).
+
+    The sweep must (a) pass the DB ``session`` into ``commission_proof_earn_loop``
+    so it can enroll a bounded ``capability_proof_trial``, and (b) accumulate the
+    per-project ``named_test_executed`` list into the combined summary so operators
+    can see which capabilities are earning the real ``proven`` tier this sweep.
+    """
+    _prev_backing = _rs._last_backing_proof_sweep
+    _prev_earn = _rs._last_proof_earn_loop_sweep
+    _rs._last_backing_proof_sweep = None
+    _rs._last_proof_earn_loop_sweep = None
+    try:
+        project = await _make_project(reaper_db)
+        project.problem_model = {
+            "capabilities": [
+                {
+                    "name": "ci-pipeline",
+                    "status": "working",
+                    "backing_paths": ["backend/app/capability_proof.py"],
+                }
+            ]
+        }
+        reaper_db.add(project)
+        await reaper_db.commit()
+
+        now = _utcnow()
+
+        mocker.patch(
+            "app.capability_demand.collect_missing_capability_demand",
+            new=AsyncMock(
+                return_value={
+                    "total": 1,
+                    "demands": [{"kind": "capability", "ref": "ci-pipeline"}],
+                }
+            ),
+        )
+        commission_spy = mocker.patch(
+            "app.capability_proof.commission_proof_earn_loop",
+            new=AsyncMock(
+                return_value={
+                    "total_demanded_unproven": 1,
+                    "earned": 0,
+                    "no_backing_paths": [],
+                    "still_unproven": [],
+                    "path_proven_stuck": [],
+                    "named_test_executed": ["ci-pipeline"],
+                }
+            ),
+        )
+
+        result = await _rs.sweep_proof_earn_loop(reaper_db, now)
+
+        # (a) The sweep passed the DB session through (keyword arg) so the earn
+        # loop can enroll a trial.
+        commission_spy.assert_awaited_once()
+        assert commission_spy.await_args.kwargs.get("session") is reaper_db
+        # (b) named_test_executed is accumulated into the combined summary.
+        assert result["named_test_executed"] == ["ci-pipeline"]
+    finally:
+        _rs._last_backing_proof_sweep = _prev_backing
+        _rs._last_proof_earn_loop_sweep = _prev_earn

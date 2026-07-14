@@ -88,6 +88,7 @@ def test_evaluation_declarations_match_expected_assignment():
         "design": "forward-quality",
         "repo_bootstrap": "none",
         "salvage_bundle": "code-ci-review",
+        "capability_proof_trial": "none",
     }
 
 

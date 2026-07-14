@@ -331,6 +331,7 @@ EXPECTED_TYPES = {
     "design",
     "repo_bootstrap",
     "salvage_bundle",
+    "capability_proof_trial",
 }
 
 

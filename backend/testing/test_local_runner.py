@@ -9638,3 +9638,253 @@ async def test_report_compute_job_cross_project_emits_warning(
     assert str(project_a.id) in msg
     assert str(job.id) in msg
     assert str(project_b.id) in msg
+
+
+# ── Capability proof trial: runner job + result ingestion (design 84021e2d §2) ─
+#
+# Slice 2: a `capability_proof_trial` task runs ONLY a working capability's
+# declared covering tests as a targeted runner job; the ingestion completion
+# handler mints a genuine `proven` named_test proof on GREEN and records NOTHING
+# (never demotes) on RED. Everything is dark, gated on the runtime flag.
+
+
+async def _make_trial_project(session, cap_name: str):
+    """A project carrying one working capability with no proof yet."""
+    project = await _make_project(session, name="Proof Trial Project")
+    project.problem_model = {"capabilities": [{"name": cap_name, "status": "working"}]}
+    project.capability_proof_records = {}
+    flag_modified(project, "problem_model")
+    flag_modified(project, "capability_proof_records")
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+    return project
+
+
+def _make_trial_task(project, cap_name: str, test_refs, head_sha="deadbeef"):
+    return Task(
+        project_id=project.id,
+        title=f"Capability proof trial: {cap_name}",
+        payloads=[{
+            "type": "capability_proof_trial",
+            "cap": cap_name,
+            "test_refs": test_refs,
+            "head_sha": head_sha,
+        }],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+    )
+
+
+class _TrialFlag:
+    """Context manager toggling the dark trial flag and restoring it."""
+
+    def __init__(self, value: bool):
+        self.value = value
+        self._prev = None
+
+    def __enter__(self):
+        from app.shared_state import runtime_config
+
+        self._rc = runtime_config
+        self._prev = runtime_config.get("capability_proof_execution_trials_enabled")
+        runtime_config["capability_proof_execution_trials_enabled"] = self.value
+        return self
+
+    def __exit__(self, *exc):
+        if self._prev is None:
+            self._rc.pop("capability_proof_execution_trials_enabled", None)
+        else:
+            self._rc["capability_proof_execution_trials_enabled"] = self._prev
+        return False
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_trial_green_records_proven(db_session):
+    """A GREEN trial result ingestion mints a genuine `proven` named_test proof
+    and the capability reads `proven` (design 84021e2d Slice 2 acceptance seam).
+
+    This exercises the production ingestion handler
+    ``_handle_capability_proof_trial_completion`` end-to-end through the shared
+    proof recorder and the ``working_capability_proof_status`` reader.
+    """
+    import json as _json
+
+    from app.capability_registry import working_capability_proof_status
+    from app.task_completion import _handle_capability_proof_trial_completion
+
+    cap = "language-aware-repo-map"
+    test_refs = ["backend/testing/test_prompt.py::test_map"]
+    project = await _make_trial_project(db_session, cap)
+    task = _make_trial_task(project, cap, test_refs, head_sha="cafef00d")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    green = {
+        "type": "capability_proof_trial",
+        "cap": cap,
+        "head_sha": "cafef00d",
+        "test_refs": test_refs,
+        "ran": True,
+        "passed": True,
+        "could_not_run": False,
+        "skipped_summary": {"total": 3, "skipped": 0},
+    }
+
+    with _TrialFlag(True):
+        await _handle_capability_proof_trial_completion(task, _json.dumps(green), db_session)
+
+    await db_session.refresh(project)
+
+    # The capability now reads the genuine `proven` tier.
+    status_map = working_capability_proof_status(project.problem_model)
+    assert status_map.get(cap) == "proven"
+
+    # A durable executed-named_test proof was recorded in the ledger.
+    entries = project.capability_proof_records[cap]
+    assert len(entries) == 1
+    e = entries[0]
+    assert e["proof_kind"] == "named_test"
+    assert e["executed"] is True
+    assert e["commit_sha"] == "cafef00d"
+    assert e["test_refs"] == test_refs
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_trial_red_records_no_proof(db_session):
+    """A RED trial records NO proof and never demotes; the contradiction is
+    stamped on the task context for strategist visibility only."""
+    import json as _json
+
+    from app.capability_registry import working_capability_proof_status
+    from app.task_completion import _handle_capability_proof_trial_completion
+
+    cap = "repo-map-red"
+    test_refs = ["backend/testing/test_prompt.py"]
+    project = await _make_trial_project(db_session, cap)
+    task = _make_trial_task(project, cap, test_refs)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    red = {
+        "type": "capability_proof_trial",
+        "cap": cap,
+        "head_sha": "deadbeef",
+        "test_refs": test_refs,
+        "ran": True,
+        "passed": False,
+        "could_not_run": False,
+    }
+
+    with _TrialFlag(True):
+        await _handle_capability_proof_trial_completion(task, _json.dumps(red), db_session)
+
+    await db_session.refresh(project)
+    await db_session.refresh(task)
+
+    # No proof recorded — the capability is NOT proven.
+    assert working_capability_proof_status(project.problem_model).get(cap) != "proven"
+    assert cap not in (project.capability_proof_records or {})
+    # The red result is surfaced (non-demoting) on the task context.
+    contradiction = (task.context or {}).get("capability_proof_trial_contradiction")
+    assert contradiction is not None
+    assert contradiction["cap"] == cap
+    assert contradiction["passed"] is False
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_trial_flag_off_records_nothing(db_session):
+    """With the dark flag OFF, even a GREEN trial records nothing."""
+    import json as _json
+
+    from app.capability_registry import working_capability_proof_status
+    from app.task_completion import _handle_capability_proof_trial_completion
+
+    cap = "repo-map-darkoff"
+    test_refs = ["backend/testing/test_prompt.py::test_x"]
+    project = await _make_trial_project(db_session, cap)
+    task = _make_trial_task(project, cap, test_refs)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    green = {
+        "type": "capability_proof_trial", "cap": cap, "head_sha": "abc",
+        "test_refs": test_refs, "ran": True, "passed": True, "could_not_run": False,
+    }
+
+    with _TrialFlag(False):
+        await _handle_capability_proof_trial_completion(task, _json.dumps(green), db_session)
+
+    await db_session.refresh(project)
+    assert working_capability_proof_status(project.problem_model).get(cap) != "proven"
+    assert cap not in (project.capability_proof_records or {})
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_trial_skipped_suite_records_nothing(db_session):
+    """A green-but-all-skipped (non-verifying) trial records no proof."""
+    import json as _json
+
+    from app.capability_registry import working_capability_proof_status
+    from app.task_completion import _handle_capability_proof_trial_completion
+
+    cap = "repo-map-skipped"
+    project = await _make_trial_project(db_session, cap)
+    task = _make_trial_task(project, cap, ["backend/testing/test_prompt.py"])
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    vacuous = {
+        "type": "capability_proof_trial", "cap": cap, "head_sha": "abc",
+        "test_refs": ["backend/testing/test_prompt.py"],
+        "ran": True, "passed": True, "could_not_run": False,
+        "skipped_summary": {"total": 4, "skipped": 4},
+    }
+
+    with _TrialFlag(True):
+        await _handle_capability_proof_trial_completion(task, _json.dumps(vacuous), db_session)
+
+    await db_session.refresh(project)
+    assert working_capability_proof_status(project.problem_model).get(cap) != "proven"
+    assert cap not in (project.capability_proof_records or {})
+
+
+@pytest.mark.asyncio
+async def test_enroll_capability_proof_trial_creates_bounded_task(db_session):
+    """enroll_capability_proof_trial persists a bounded trial task when the flag
+    is on, caps the test-file count, and is a no-op when the flag is off."""
+    from app.capability_proof import (
+        CAPABILITY_PROOF_TRIAL_WALL_CLOCK_SECONDS,
+        MAX_CAPABILITY_PROOF_TRIAL_TEST_FILES,
+        enroll_capability_proof_trial,
+    )
+
+    project = await _make_trial_project(db_session, "enroll-cap")
+
+    # Flag OFF → no-op.
+    with _TrialFlag(False):
+        none_task = await enroll_capability_proof_trial(
+            db_session, project, "enroll-cap", ["backend/testing/test_a.py"], "sha"
+        )
+    assert none_task is None
+
+    # Flag ON → a QUEUED trial task with the bounded launch contract.
+    many_refs = [f"backend/testing/test_{i}.py" for i in range(MAX_CAPABILITY_PROOF_TRIAL_TEST_FILES + 5)]
+    with _TrialFlag(True):
+        task = await enroll_capability_proof_trial(
+            db_session, project, "Enroll Cap", many_refs, "sha123"
+        )
+    assert task is not None
+    assert task.status == TaskStatus.QUEUED
+    payload = task.first_payload
+    assert payload["type"] == "capability_proof_trial"
+    # Capability name normalized to canonical kebab form.
+    assert payload["cap"] == "enroll-cap"
+    # Test-file count hard-capped.
+    assert len(payload["test_refs"]) == MAX_CAPABILITY_PROOF_TRIAL_TEST_FILES
+    assert payload["head_sha"] == "sha123"
+    assert payload["wall_clock_seconds"] == CAPABILITY_PROOF_TRIAL_WALL_CLOCK_SECONDS

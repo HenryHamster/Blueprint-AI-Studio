@@ -2,7 +2,7 @@
   "_doc": "Loose upper bounds to catch runaway file growth. Read by test_invariants.py and updated by agents via POST /api/agent/annotate (annotation_type='size_breach'). Per feedback_guardrails_not_straitjackets.md: never ratchet down \u2014 only bump when work justifies it.",
   "backend": {
     "main.py": 3900,
-    "task_completion.py": 5900,
+    "task_completion.py": 7000,
     "task_completion_self_audit.py": 600,
     "task_lifecycle.py": 7750,
     "task_lifecycle_requeue.py": 1250,
@@ -146,6 +146,7 @@
     "review_loop_convergence.py": 1950,
     "routers/admin_project_tools.py": 1800,
     "compute_image_build.py": 1750,
+    "capability_proof.py": 1900,
     "routers/admin_runners.py": 1750
   },
   "agent": {

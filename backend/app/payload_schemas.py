@@ -1235,6 +1235,12 @@ _MODEL_FOR_TYPE: dict[TaskType, type[BasePayload]] = {
     TaskType.design: DesignPayload,
     TaskType.repo_bootstrap: RepoBootstrapPayload,
     TaskType.salvage_bundle: BasePayload,
+    # capability_proof_trial carries a small free-form payload ({cap, test_refs,
+    # head_sha, max_test_files, wall_clock_seconds}); the extra-field-tolerant
+    # BasePayload validates it without constraining the shape (mirrors
+    # salvage_bundle). The bounded caps are enforced at enrollment + in the agent
+    # handler, not by the schema.
+    TaskType.capability_proof_trial: BasePayload,
 }
 
 

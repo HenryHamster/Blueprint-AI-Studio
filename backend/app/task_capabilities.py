@@ -43,6 +43,7 @@ class TaskType(str, Enum):
     design = "design"
     repo_bootstrap = "repo_bootstrap"
     salvage_bundle = "salvage_bundle"
+    capability_proof_trial = "capability_proof_trial"
 
 
 AgentMode = Literal["write", "read_only"]
@@ -714,6 +715,41 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         cost_ceiling_usd=8.0,
         evaluation="code-ci-review",
     ),
+    TaskCapability(
+        TaskType.capability_proof_trial,
+        "Capability Proof Trial",
+        "read_only",
+        default_category="ops",
+        user_launchable=False,
+        # No LLM provider runs — the handler runs a bounded, targeted test suite
+        # (the capability's declared convention-named covering tests) and reports a
+        # pass/fail verdict; it never selects a model/account.
+        provider_configurable=False,
+        # Not operator/strategist-spawnable and not a plan child: it is enrolled
+        # programmatically by a later slice's sweep (via
+        # ``capability_proof.enroll_capability_proof_trial``), never authored by an
+        # agent or operator.
+        description=(
+            "Machine-verified capability-proof trial: run ONLY a working "
+            "capability's declared convention-named covering tests as a targeted "
+            "runner job, decoupled from the merge gate. A green run mints a genuine "
+            "``proven`` named_test proof into the capability-proof ledger; a red run "
+            "records nothing and NEVER demotes an existing proof. Ships dark, gated "
+            "on ``capability_proof_execution_trials_enabled``."
+        ),
+        # A single targeted agent run produces the verdict; it needs a code
+        # checkout to run the tests, but opens no PR — its durable product is the
+        # ingested proof, so output_kind is ``none`` and there is no forward merge
+        # gate (``evaluation="none"``). The ingestion completion handler consumes
+        # the reported result.
+        output_kind="none",
+        requires_code=True,
+        evaluation_strategy="metric",
+        cost_ceiling_usd=2.0,
+        completion_handler="capability_proof_trial",
+        evaluation="none",
+        run_shape="single_agent",
+    ),
 )
 
 TASK_CAPABILITY_BY_TYPE: dict[TaskType, TaskCapability] = {
@@ -966,6 +1002,7 @@ AUTONOMOUS_SPAWN_SERVICING_TASK_TYPES: frozenset[str] = frozenset(
         TaskType.release_merge_grade.value,
         TaskType.self_audit.value,
         TaskType.salvage_bundle.value,
+        TaskType.capability_proof_trial.value,
     }
 )
 # Map of strategic task-type value -> its declared two-phase-cycle ordering

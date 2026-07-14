@@ -3705,6 +3705,166 @@ async def _maybe_spawn_sweep_aggregate_followon(
     return child
 
 
+def _parse_capability_proof_trial_result(task: Task, logs: str) -> dict | None:
+    """Extract a ``capability_proof_trial`` agent-reported result dict.
+
+    The agent's bespoke handler reports
+    ``{cap, head_sha, test_refs, ran, passed, skipped_summary, could_not_run}``.
+    We accept it from either the durable ``task.plan_output`` (a dict) or the raw
+    reported ``logs`` (JSON, optionally wrapped under a
+    ``capability_proof_trial_result`` key). Returns the result dict, or ``None``
+    when nothing parseable is present. Never raises.
+    """
+    po = getattr(task, "plan_output", None)
+    if isinstance(po, dict) and ("ran" in po or po.get("type") == "capability_proof_trial"):
+        return po
+    if isinstance(logs, str) and logs.strip():
+        try:
+            parsed = json.loads(logs)
+        except (ValueError, TypeError):
+            parsed = None
+        if isinstance(parsed, dict):
+            inner = parsed.get("capability_proof_trial_result")
+            if isinstance(inner, dict):
+                return inner
+            if "ran" in parsed or parsed.get("type") == "capability_proof_trial":
+                return parsed
+    return None
+
+
+async def _handle_capability_proof_trial_completion(
+    task: Task, logs: str, session: AsyncSession
+) -> None:
+    """Ingest a ``capability_proof_trial``'s executed-test result into the ledger.
+
+    Slice 2 of the machine-verified capability-proof earn path (design 84021e2d).
+    The agent handler runs ONLY a capability's declared convention-named covering
+    tests as a targeted runner job and reports
+    ``{cap, head_sha, test_refs, ran, passed, skipped_summary, could_not_run}``.
+    This handler is the INGESTION half:
+
+      * On a GREEN result (:func:`ci_resolution.capability_proof_trial_is_green` —
+        the tests actually ran and passed and the suite verified something), it
+        mints the genuine ``proven`` named_test proof via
+        :func:`record_capability_named_test_execution_proof`.
+      * On a RED / skipped / could-not-run result, per design §7 it NEVER demotes:
+        no proof is recorded; the contradiction is stamped on ``task.context`` for
+        strategist visibility only (it does NOT touch the capability's
+        proof-scoring evidence_refs, so an existing ``proven`` is untouched).
+
+    Fully **dark + fail-open**: everything is gated on the
+    ``capability_proof_execution_trials_enabled`` runtime flag (default False), and
+    any parse/lookup/record error leaves the capability at its existing proof,
+    never worse. Non-raising (the post-commit dispatcher already guards, but the
+    contract here is explicitly no-raise so a malformed trial can never strand the
+    surrounding commit).
+    """
+    try:
+        if not _runtime_config.get("capability_proof_execution_trials_enabled", False):
+            logger.info(
+                "[CAP_TRIAL] flag off — ingestion skipped for task %s", task.id
+            )
+            return
+
+        from app.capability_proof import (  # noqa: PLC0415
+            record_capability_named_test_execution_proof,
+        )
+        from app.ci_resolution import (  # noqa: PLC0415
+            capability_proof_trial_is_green,
+        )
+
+        result = _parse_capability_proof_trial_result(task, logs)
+        if result is None:
+            logger.warning(
+                "[CAP_TRIAL] no parseable trial result for task %s — ingesting nothing",
+                task.id,
+            )
+            return
+
+        cap = result.get("cap")
+        if not isinstance(cap, str) or not cap.strip():
+            logger.warning(
+                "[CAP_TRIAL] trial result for task %s missing 'cap' — ingesting nothing",
+                task.id,
+            )
+            return
+        head_sha = result.get("head_sha")
+        refs = [
+            r for r in (result.get("test_refs") or []) if isinstance(r, str) and r.strip()
+        ]
+
+        project = await session.get(Project, task.project_id)
+        if project is None:
+            logger.warning(
+                "[CAP_TRIAL] project %s gone for trial task %s — ingesting nothing",
+                task.project_id,
+                task.id,
+            )
+            return
+
+        if capability_proof_trial_is_green(result):
+            recorded = record_capability_named_test_execution_proof(
+                project,
+                cap,
+                refs,
+                head_sha if isinstance(head_sha, str) else None,
+                suite_verifying=True,
+            )
+            if recorded:
+                await session.commit()
+                logger.info(
+                    "[CAP_TRIAL] GREEN trial — recorded proven named_test proof for "
+                    "cap=%s (task %s, sha=%s)",
+                    cap,
+                    task.id,
+                    head_sha,
+                )
+            else:
+                logger.info(
+                    "[CAP_TRIAL] GREEN trial for cap=%s (task %s) but recorder minted "
+                    "nothing (empty refs / unnormalizable / vacuous) — no proof",
+                    cap,
+                    task.id,
+                )
+            return
+
+        # Non-green: NEVER demote (design §7). Surface the contradiction on the
+        # task context for the strategist; the capability keeps its existing proof.
+        ctx = dict(task.context or {})
+        ctx["capability_proof_trial_contradiction"] = {
+            "cap": cap,
+            "head_sha": head_sha if isinstance(head_sha, str) else None,
+            "test_refs": refs,
+            "ran": bool(result.get("ran")),
+            "passed": bool(result.get("passed")),
+            "could_not_run": bool(result.get("could_not_run")),
+            "recorded_at": _utcnow().isoformat(),
+        }
+        task.context = ctx
+        flag_modified(task, "context")
+        await session.commit()
+        logger.info(
+            "[CAP_TRIAL] non-green trial for cap=%s (task %s) — no proven proof "
+            "recorded, existing proof untouched",
+            cap,
+            task.id,
+        )
+    except Exception:  # noqa: BLE001 — ingestion must fail open, never raise
+        logger.warning(
+            "[CAP_TRIAL] ingestion failed for task %s (fail-open — capability left "
+            "at existing proof)",
+            getattr(task, "id", None),
+            exc_info=True,
+        )
+        try:
+            await session.rollback()
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "[CAP_TRIAL] rollback after ingestion failure also failed",
+                exc_info=True,
+            )
+
+
 async def _handle_compute_experiment_completion(
     task: Task, logs: str, session: AsyncSession, *, owns_commit: bool = True
 ):

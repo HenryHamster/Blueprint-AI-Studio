@@ -1252,6 +1252,60 @@ def _suite_is_non_verifying(verdict: dict[str, Any]) -> bool:
     return False
 
 
+def capability_proof_trial_suite_verifying(result: Any) -> bool:
+    """Whether a ``capability_proof_trial`` result's executed covering suite
+    actually verified something — it ran at least one non-skipped test.
+
+    Mirrors the intent of :func:`_suite_is_non_verifying`: an executed run where
+    every collected test was skipped verified nothing and must NOT mint a proof.
+    The agent's targeted-run classification already reports ``ran=False`` for an
+    all-skipped / absent suite (so :func:`capability_proof_trial_is_green` rejects
+    it), and this is the belt-and-suspenders check on the informational
+    ``skipped_summary`` block: non-verifying ONLY on POSITIVE evidence of an
+    all-skipped run (``total > 0 and skipped >= total``). A missing / partial /
+    zero-total summary is treated as verifying, so an agent that could not parse
+    exact counts (but did classify ``ran``) is not spuriously rejected.
+    """
+    if not isinstance(result, dict):
+        return False
+    summary = result.get("skipped_summary")
+    if isinstance(summary, dict):
+        total = summary.get("total")
+        skipped = summary.get("skipped")
+        if (
+            isinstance(total, int)
+            and total > 0
+            and isinstance(skipped, int)
+            and skipped >= total
+        ):
+            return False
+    return True
+
+
+def capability_proof_trial_is_green(result: Any) -> bool:
+    """Whether a ``capability_proof_trial`` result proves the covering tests ran
+    GREEN — the machine evidence that mints a genuine ``proven`` named_test proof.
+
+    True only when the targeted run of ONLY the capability's declared covering
+    tests actually executed and passed: ``could_not_run`` is not set, ``ran`` is
+    True, ``passed`` is True, AND the suite was verifying (not all-skipped, per
+    :func:`capability_proof_trial_suite_verifying`). Mirrors the conservative
+    shape of :func:`acceptance_test_is_green`: every other combination — an
+    un-targetable ref (``could_not_run``), a red/failing run, a skipped/absent
+    suite, or a missing/old-shape result — yields False, so no proof is minted on
+    ambiguity and a red trial never fabricates a green.
+    """
+    if not isinstance(result, dict):
+        return False
+    if result.get("could_not_run") is True:
+        return False
+    if result.get("ran") is not True:
+        return False
+    if result.get("passed") is not True:
+        return False
+    return capability_proof_trial_suite_verifying(result)
+
+
 def pr_self_suppressed_suite(verdict: Any) -> bool:
     """Whether the PR's OWN diff made the suite stop verifying by disabling tests.
 
