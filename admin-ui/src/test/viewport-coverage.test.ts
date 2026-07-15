@@ -8,8 +8,35 @@ import {
   checkBackendExemptionMirror,
   checkEscapeHatchBudget,
   classifyEscapeHatchOverage,
+  isBenignPlaywrightRouteRace,
   SINGLE_OPT_OUT_HEADROOM,
 } from './viewport-checks.js';
+
+describe('viewport runner unhandled-error filter', () => {
+  it('accepts only the known provider-owned duplicate fulfill race', () => {
+    expect(
+      isBenignPlaywrightRouteRace({
+        message: 'route.fulfill: Route is already handled!',
+        stack: 'at ../node_modules/@vitest/browser-playwright/dist/index.js:989:20',
+      }),
+    ).toBe(true);
+  });
+
+  it.each([
+    new Error('application rejection'),
+    {
+      message: 'route.fulfill: Route is already handled!',
+      stack: 'at src/test-owned-route.ts:12:3',
+    },
+    {
+      message: 'different provider failure',
+      stack: 'at ../node_modules/@vitest/browser-playwright/dist/index.js:989:20',
+    },
+    'route.fulfill: Route is already handled!',
+  ])('rejects non-matching errors %#', (error) => {
+    expect(isBenignPlaywrightRouteRace(error)).toBe(false);
+  });
+});
 
 describe('viewport test coverage invariant', () => {
   it('fails CI when a required component is missing all three viewport assertions at required widths', () => {
