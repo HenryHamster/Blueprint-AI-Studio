@@ -88,6 +88,21 @@ def test_route_event_alert_types_mapped():
     assert route_event("migration.slot_contention") == STRATEGIST_INTERNAL
 
 
+def test_route_event_self_hosted_fleet_health_alert_types_are_operator_visible():
+    """Every self-hosted fleet health incident has its intended audience."""
+    action_needed = {
+        "runner.low_disk",
+        "runner.low_memory",
+        "runner.token_stale",
+        "runner.fleet_no_healthy",
+        "runner.post_update_silent",
+        "runner.cross_project_access",
+    }
+    for event_type in action_needed:
+        assert route_event(event_type) == OPERATOR_ACTION_NEEDED
+    assert route_event("runner.idle_gpu") == OPERATOR_FYI
+
+
 def test_route_event_hotfix_backmerge_size_violation_is_strategist_internal():
     """Module size-overflow alerts are strategist-internal bookkeeping."""
     assert route_event("hotfix_backmerge.size_violation") == STRATEGIST_INTERNAL
@@ -161,6 +176,51 @@ def test_all_alert_policy_event_types_have_registry_entry_or_explicit_audience()
         + "\n\nAdd each to _EVENT_AUDIENCE_REGISTRY in backend/app/message_audience.py "
         "or set an explicit ``audience`` on its AlertEventPolicy in "
         "backend/app/alert_policy.py."
+    )
+
+
+def test_runner_health_alert_event_constants_are_registered():
+    """Runner health emitters cannot silently fall through the audience gate.
+
+    ``runner_health_alerts`` declares its event constants at module scope and
+    passes them as ``event_type`` to ``create_project_alert_if_allowed``.
+    Derive that set from the source rather than duplicating it, so a future
+    runner-health alert must receive an explicit audience registration.
+    """
+    source_path = os.path.join(
+        os.path.dirname(__file__), "..", "app", "runner_health_alerts.py"
+    )
+    with open(source_path, encoding="utf-8") as source_file:
+        tree = ast.parse(source_file.read(), filename=source_path)
+
+    string_constants = {
+        node.targets[0].id: node.value.value
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and isinstance(node.value, ast.Constant)
+        and isinstance(node.value.value, str)
+    }
+    emitted_event_types: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or _ast_called_name(node) != "create_project_alert_if_allowed":
+            continue
+        for keyword in node.keywords:
+            if keyword.arg != "event_type":
+                continue
+            if isinstance(keyword.value, ast.Constant) and isinstance(keyword.value.value, str):
+                emitted_event_types.add(keyword.value.value)
+            elif isinstance(keyword.value, ast.Name):
+                event_type = string_constants.get(keyword.value.id)
+                if event_type is not None:
+                    emitted_event_types.add(event_type)
+
+    assert emitted_event_types, "Expected runner health alert emitters"
+    missing = emitted_event_types - get_registered_event_types()
+    assert not missing, (
+        "Runner health alert event types missing from the audience registry: "
+        + ", ".join(sorted(missing))
     )
 
 

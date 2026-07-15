@@ -93,8 +93,17 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     "cost.spend_hold": OPERATOR_ACTION_NEEDED,
     "capacity.quota_exhausted": OPERATOR_ACTION_NEEDED,
     "capacity.all_accounts_blocked": OPERATOR_ACTION_NEEDED,
+    # Self-hosted fleet runner health incidents: operator-owned hardware needs
+    # operator remediation; idle GPU capacity is advisory only.
     "runner.deactivated": OPERATOR_ACTION_NEEDED,
     "runner.degraded": OPERATOR_FYI,
+    "runner.low_disk": OPERATOR_ACTION_NEEDED,
+    "runner.low_memory": OPERATOR_ACTION_NEEDED,
+    "runner.idle_gpu": OPERATOR_FYI,
+    "runner.token_stale": OPERATOR_ACTION_NEEDED,
+    "runner.fleet_no_healthy": OPERATOR_ACTION_NEEDED,
+    "runner.post_update_silent": OPERATOR_ACTION_NEEDED,
+    "runner.cross_project_access": OPERATOR_ACTION_NEEDED,
     # GCE task-VM proactive resource-health alerts (warm-pool monitoring parity):
     # surfaced to the operator so an OOM- or disk-bound VM is visible in the fleet
     # health summary BEFORE the VM is killed, not only via teardown forensics.
