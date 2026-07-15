@@ -1910,28 +1910,23 @@ async def _apply_operator_kill_result(
     return live
 
 
-async def finalize_orphan_runner_job(
+async def finalize_silent_compute_job(
     session, job: ComputeJob, *, now
 ) -> bool:
-    """Drive a silently-dead runner-subprocess job to TIMED_OUT.
+    """Drive a silent runner-subprocess or GCP job to TIMED_OUT.
 
-    Re-locks the job (FOR UPDATE), validates it is still RUNNING with
-    backend=runner-subprocess and that the heartbeat is still stale
-    (the lock serializes with any concurrent /report that refreshes
-    ``last_heartbeat_at`` while the persisted status remains RUNNING),
-    drives it to TIMED_OUT with terminal_kind ``"runner_died_silently"``,
-    records terminal-reason history, links durable artifacts, persists
-    viewable files, fires the compute-job-terminal wake, and commits.
-
-    Returns True if the job was finalized; False if it was already
-    terminal, no longer a runner-subprocess job, or the heartbeat is
-    now fresh (lock-time race).
+    Re-locks and re-checks heartbeat staleness before finalizing. GCP jobs are
+    finalized only after successful VM deletion; failed deletes retain RUNNING
+    state with a durable diagnostic for retry.
     """
     live = await _lock_compute_job(session, job.id)
     if live is None or live.status in _COMPUTE_JOB_TERMINAL_STATUSES:
         await session.commit()
         return False
-    if live.backend != RUNNER_SUBPROCESS_BACKEND_NAME:
+    if live.status != ComputeJobStatus.RUNNING or live.backend not in (
+        RUNNER_SUBPROCESS_BACKEND_NAME,
+        GCP_BACKEND_NAME,
+    ):
         await session.commit()
         return False
 
@@ -1943,22 +1938,61 @@ async def finalize_orphan_runner_job(
     # still healthy and must not be terminalized.
     stale_cutoff = now - timedelta(seconds=RUNNER_SILENT_TIMEOUT_SECONDS)
     hb = live.last_heartbeat_at
-    if hb is not None:
-        if hb >= stale_cutoff:
-            await session.commit()
-            return False
-    elif live.started_at is None or live.started_at >= stale_cutoff:
+    if hb is not None and hb >= stale_cutoff:
+        await session.commit()
+        return False
+    # GCP RUNNING means the first heartbeat was received; provisioning owns the
+    # no-first-heartbeat case.
+    if live.backend == GCP_BACKEND_NAME and hb is None:
+        await session.commit()
+        return False
+    if (
+        live.backend == RUNNER_SUBPROCESS_BACKEND_NAME
+        and hb is None
+        and (live.started_at is None or live.started_at >= stale_cutoff)
+    ):
         await session.commit()
         return False
 
-    terminal_reason = "runner_died_silently"
+    terminal_reason = (
+        "vm_died_silently"
+        if live.backend == GCP_BACKEND_NAME
+        else "runner_died_silently"
+    )
+    if live.backend == GCP_BACKEND_NAME:
+        terminate_started_at = _utcnow()
+        try:
+            terminated = await get_compute_backend(live.backend).terminate(
+                live, reason="heartbeat_stale"
+            )
+            if not terminated:
+                raise RuntimeError("GCP VM delete did not complete")
+        except Exception as exc:
+            failed_at = _utcnow()
+            logger.exception(
+                "[COMPUTE_JOB] stale-heartbeat terminate failed for GCP job=%s",
+                live.id,
+            )
+            await session.rollback()
+            await _persist_compute_rpc_failure(
+                session,
+                job_id=job.id,
+                operation="terminate",
+                exc=exc,
+                started_at=terminate_started_at,
+                failed_at=failed_at,
+                next_retry_at=None,
+                reason="heartbeat_stale",
+            )
+            return False
+
     _finalize_terminal_job(
         live,
         status=ComputeJobStatus.TIMED_OUT,
         outcome=ComputeJobOutcome.TIMED_OUT,
         terminal_reason=terminal_reason,
         now=now,
-        terminal_kind="runner_died_silently",
+        terminal_kind=terminal_reason,
     )
     _record_terminal_reason_history(session, live)
     await _link_terminal_artifact(session, live)
@@ -1973,6 +2007,11 @@ async def finalize_orphan_runner_job(
         )
     await session.commit()
     return True
+
+
+async def finalize_orphan_runner_job(session, job: ComputeJob, *, now) -> bool:
+    """Backward-compatible name for runner-only callers."""
+    return await finalize_silent_compute_job(session, job, now=now)
 
 
 async def list_compute_jobs(

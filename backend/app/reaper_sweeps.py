@@ -47,10 +47,10 @@ from app.blocked_task_unblock_sweeps import (
     event_driven_unblock_dependents,
     event_driven_unblock_on_knowledge,
 )
-from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
+from app.compute_backends import GCP_BACKEND_NAME, RUNNER_SUBPROCESS_BACKEND_NAME
 from app.compute_jobs import (
     RUNNER_SILENT_TIMEOUT_SECONDS,
-    finalize_orphan_runner_job,
+    finalize_silent_compute_job,
     finalize_runner_subprocess_job_for_dead_runner,
 )
 from app.database import AsyncSessionLocal
@@ -2684,15 +2684,10 @@ async def sweep_refresh_project_compute_images(
 
 
 async def sweep_silent_runner_compute_jobs(session, now=None) -> int:
-    """Step 22f: Reap silent runner-subprocess compute jobs.
+    """Step 22f: Reap silent runner-subprocess and GCP compute jobs.
 
-    Finds RUNNING runner-subprocess jobs whose last_heartbeat_at has not
-    advanced past RUNNER_SILENT_TIMEOUT_SECONDS and finalizes each as
-    ``runner_died_silently`` via :func:`finalize_orphan_runner_job`,
-    freeing the project concurrency slot and spend ceiling.
-
-    Best-effort per job: a failure in one job (already terminal at lock
-    time, unexpected backend, any error) does not block the next.
+    GCP jobs delete their VM before finalization; runner jobs only finalize.
+    Best-effort per job so one failure does not block the next.
     Returns the number of jobs finalized.
     """
     _now = now or _utcnow()
@@ -2702,10 +2697,19 @@ async def sweep_silent_runner_compute_jobs(session, now=None) -> int:
         select(ComputeJob)
         .where(
             ComputeJob.status == ComputeJobStatus.RUNNING,
-            ComputeJob.backend == RUNNER_SUBPROCESS_BACKEND_NAME,
-            (ComputeJob.last_heartbeat_at.is_(None)
-             & (ComputeJob.started_at < stale_cutoff))
-            | (ComputeJob.last_heartbeat_at < stale_cutoff),
+            ComputeJob.backend.in_((RUNNER_SUBPROCESS_BACKEND_NAME, GCP_BACKEND_NAME)),
+            (
+                (ComputeJob.backend == RUNNER_SUBPROCESS_BACKEND_NAME)
+                & (
+                    (ComputeJob.last_heartbeat_at.is_(None)
+                     & (ComputeJob.started_at < stale_cutoff))
+                    | (ComputeJob.last_heartbeat_at < stale_cutoff)
+                )
+            )
+            | (
+                (ComputeJob.backend == GCP_BACKEND_NAME)
+                & (ComputeJob.last_heartbeat_at < stale_cutoff)
+            ),
         )
         .limit(50)
     )
@@ -2714,17 +2718,17 @@ async def sweep_silent_runner_compute_jobs(session, now=None) -> int:
     finalized = 0
     for job in rows:
         try:
-            ok = await finalize_orphan_runner_job(session, job, now=_now)
+            ok = await finalize_silent_compute_job(session, job, now=_now)
             if ok:
                 finalized += 1
         except Exception:
             logger.exception(
-                f"[REAPER] Failed to finalize silent runner job {job.id}"
+                f"[REAPER] Failed to finalize silent compute job {job.id}"
             )
             await session.rollback()
     if finalized:
         logger.info(
-            f"[REAPER] Finalized {finalized} silent runner compute job(s)"
+            f"[REAPER] Finalized {finalized} silent compute job(s)"
         )
     return finalized
 

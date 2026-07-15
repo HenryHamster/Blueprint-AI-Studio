@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app import compute_jobs
 from app.compute_backends import (
+    GCP_BACKEND_NAME,
     PROGRESS_FILE_ENV,
     RUNNER_SUBPROCESS_BACKEND_NAME,
     _build_container_run_prefix,
@@ -803,6 +804,24 @@ async def test_process_once_surfaces_metric_name_mismatch_without_killing(
 # ---------------------------------------------------------------------------
 
 
+async def _setup_running_gcp_job(db_session, *, heartbeat_age_seconds: int):
+    task = await _setup_task(db_session)
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python train.py",
+        spend_cap_usd=1.0,
+        deadline_seconds=86400,
+    )
+    now = _utcnow()
+    job.backend = GCP_BACKEND_NAME
+    job.status = ComputeJobStatus.RUNNING
+    job.started_at = now - timedelta(hours=2)
+    job.last_heartbeat_at = now - timedelta(seconds=heartbeat_age_seconds)
+    await db_session.commit()
+    return job, now
+
+
 @pytest.mark.asyncio
 async def test_sweep_reaps_runner_job_with_stale_heartbeat(db_session):
     """A RUNNING runner-subprocess job with stale last_heartbeat_at is
@@ -859,30 +878,114 @@ async def test_sweep_skips_recently_heartbeating_runner_job(db_session):
 
 
 @pytest.mark.asyncio
-async def test_sweep_skips_non_runner_backends(db_session):
-    """Non-runner-subprocess jobs (GCP, local) with stale heartbeats are
-    not touched by the sweep."""
-    task = await _setup_task(db_session)
-    job = await compute_jobs.create_compute_job(
+async def test_sweep_terminates_and_finalizes_gcp_job_with_stale_heartbeat(
+    db_session, monkeypatch
+):
+    """A stale RUNNING GCP job deletes its VM before becoming TIMED_OUT."""
+    job, now = await _setup_running_gcp_job(
         db_session,
-        task,
-        command="python train.py",
-        spend_cap_usd=1.0,
-        deadline_seconds=86400,
+        heartbeat_age_seconds=RUNNER_SILENT_TIMEOUT_SECONDS + 60,
     )
-    now = _utcnow()
-    # Set backend to something that is NOT runner-subprocess
-    job.backend = "gcp"
-    job.status = ComputeJobStatus.RUNNING
-    job.started_at = now - timedelta(hours=2)
-    job.last_heartbeat_at = now - timedelta(seconds=RUNNER_SILENT_TIMEOUT_SECONDS + 60)
+    job.external_compute_id = "stale-gcp-vm"
     await db_session.commit()
 
+    terminate_reasons: list[str] = []
+
+    class _GcpBackend:
+        async def terminate(self, persisted_job, *, reason):
+            assert persisted_job.id == job.id
+            terminate_reasons.append(reason)
+            return True
+
+    monkeypatch.setattr(compute_jobs, "get_compute_backend", lambda _: _GcpBackend())
+    finalized = await sweep_silent_runner_compute_jobs(db_session, now=now)
+
+    assert finalized == 1
+    assert terminate_reasons == ["heartbeat_stale"]
+    await db_session.refresh(job)
+    assert job.status == ComputeJobStatus.TIMED_OUT
+    assert job.outcome == ComputeJobOutcome.TIMED_OUT
+    assert (job.polling_metadata or {}).get("terminal_kind") == "vm_died_silently"
+    assert job.terminal_reason == "vm_died_silently"
+
+
+@pytest.mark.asyncio
+async def test_sweep_skips_gcp_job_with_fresh_heartbeat(db_session, monkeypatch):
+    """A recent GCP heartbeat neither deletes the VM nor changes the row."""
+    job, now = await _setup_running_gcp_job(
+        db_session,
+        heartbeat_age_seconds=60,
+    )
+
+    class _GcpBackend:
+        async def terminate(self, persisted_job, *, reason):
+            raise AssertionError(f"fresh GCP job must not terminate: {reason}")
+
+    monkeypatch.setattr(compute_jobs, "get_compute_backend", lambda _: _GcpBackend())
     finalized = await sweep_silent_runner_compute_jobs(db_session, now=now)
 
     assert finalized == 0
     await db_session.refresh(job)
     assert job.status == ComputeJobStatus.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_sweep_gcp_lock_time_fresh_heartbeat_wins_race(db_session, monkeypatch):
+    """A heartbeat committed after selection but before locked recheck prevents deletion."""
+    job, now = await _setup_running_gcp_job(
+        db_session,
+        heartbeat_age_seconds=RUNNER_SILENT_TIMEOUT_SECONDS + 60,
+    )
+
+    original_lock = compute_jobs._lock_compute_job
+
+    async def _heartbeat_before_locked_recheck(session, job_id):
+        live = await original_lock(session, job_id)
+        assert live is not None
+        live.last_heartbeat_at = now
+        await session.commit()
+        return await original_lock(session, job_id)
+
+    class _GcpBackend:
+        async def terminate(self, persisted_job, *, reason):
+            raise AssertionError(f"fresh lock-time heartbeat must win: {reason}")
+
+    monkeypatch.setattr(compute_jobs, "_lock_compute_job", _heartbeat_before_locked_recheck)
+    monkeypatch.setattr(compute_jobs, "get_compute_backend", lambda _: _GcpBackend())
+    finalized = await sweep_silent_runner_compute_jobs(db_session, now=now)
+
+    assert finalized == 0
+    await db_session.refresh(job)
+    assert job.status == ComputeJobStatus.RUNNING
+    assert job.last_heartbeat_at == now
+
+
+@pytest.mark.asyncio
+async def test_sweep_keeps_gcp_job_running_when_stale_heartbeat_terminate_fails(
+    db_session, monkeypatch
+):
+    """A failed GCP delete leaves the row live with a retryable diagnostic."""
+    job, now = await _setup_running_gcp_job(
+        db_session,
+        heartbeat_age_seconds=RUNNER_SILENT_TIMEOUT_SECONDS + 60,
+    )
+
+    class _GcpBackend:
+        async def terminate(self, persisted_job, *, reason):
+            assert reason == "heartbeat_stale"
+            raise OSError("GCP delete unavailable")
+
+    monkeypatch.setattr(compute_jobs, "get_compute_backend", lambda _: _GcpBackend())
+    finalized = await sweep_silent_runner_compute_jobs(db_session, now=now)
+
+    assert finalized == 0
+    await db_session.refresh(job)
+    assert job.status == ComputeJobStatus.RUNNING
+    diagnostic = (job.polling_metadata or {}).get("compute_rpc_diagnostic")
+    assert diagnostic is not None
+    assert diagnostic["operation"] == "terminate"
+    assert diagnostic["reason"] == "heartbeat_stale"
+    assert diagnostic["error_type"] == "OSError"
 
 
 @pytest.mark.asyncio
