@@ -590,21 +590,12 @@ def test_taxonomy_infra_related_for_agent_reported_rate_limited():
 # ── parse_failed + rate-limit correlation ─────────────────────────────────────
 
 
-def test_normalize_agent_category_parse_failed_with_rate_limit_is_rate_limit(
+def test_normalize_agent_category_parse_failed_ignores_other_attempt_cooldown(
     monkeypatch,
 ):
-    """parse_failed coinciding with an active rate-limit window must be reclassified
-    to RATE_LIMIT so it does not burn the code-error retry budget."""
-    monkeypatch.setattr(
-        "app.failure_classification._account_was_rate_limited",
-        lambda task, at_time=None: True,
-    )
-    monkeypatch.setattr(
-        "app.failure_classification._pool_was_rate_limited",
-        lambda task=None, at_time=None: False,
-    )
+    """An account cooldown from another attempt cannot rewrite parse failure."""
     t = _task("")
-    assert normalize_agent_failure_category("parse_failed", t) == "RATE_LIMIT"
+    assert normalize_agent_failure_category("parse_failed", t) == "CODE_ERROR"
 
 
 def test_normalize_agent_category_parse_failed_without_rate_limit_is_code_error(
@@ -612,14 +603,6 @@ def test_normalize_agent_category_parse_failed_without_rate_limit_is_code_error(
 ):
     """parse_failed with no active rate-limit window must remain CODE_ERROR —
     a genuine malformed-output failure should not be silently reclassified."""
-    monkeypatch.setattr(
-        "app.failure_classification._account_was_rate_limited",
-        lambda task, at_time=None: False,
-    )
-    monkeypatch.setattr(
-        "app.failure_classification._pool_was_rate_limited",
-        lambda task=None, at_time=None: False,
-    )
     t = _task("")
     assert normalize_agent_failure_category("parse_failed", t) == "CODE_ERROR"
 

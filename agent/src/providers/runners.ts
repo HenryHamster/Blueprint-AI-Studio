@@ -20,6 +20,7 @@ import { writePlaybookHelper, writeMessagesHelper, writeSymbolsHelper, retryPost
 import { AGENT_TOKEN_FILE_ENV, GITHUB_TOKEN_FILE_ENV, agentTokenShellFn } from '../token-file.js';
 import { normalizeProviderTokenUsage } from './usage.js';
 import { applyDeepSeekModelEnv, pinDeepSeekModel } from './deepseek-env.js';
+import { maybeConsumeCodexWeeklyReset } from './codex-rate-limit-reset.js';
 
 export type ProviderName = 'anthropic' | 'openai' | 'gemini' | 'zai' | 'deepseek';
 export type AuthMode = 'oauth' | 'api_key' | 'service_account';
@@ -1091,6 +1092,28 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
   if (!_commandExists(cliCommand)) {
     sendLog(ws, `[preflight] CLI binary '${cliCommand}' not found on PATH — declining task (runtime_unavailable)\n`);
     throw new RuntimeUnavailableError(cliCommand);
+  }
+
+  // OAuth accounts may have earned Codex rate-limit reset credits. Consume one
+  // exact credit only when the real seven-day window is exhausted. Exact IDs
+  // make concurrent starts converge on one redemption, while probe failures
+  // fail open to the normal Codex CLI classification path.
+  if (runner.provider === 'openai' && runner.authMode === 'oauth') {
+    statusRef.value = 'Checking Codex usage';
+    const reset = await maybeConsumeCodexWeeklyReset({
+      command: cliCommand,
+      env: runCommand.env,
+    });
+    if (reset.status === 'reset') {
+      sendLog(ws, '[codex-usage] Seven-day usage was exhausted; consumed one available reset credit and continuing.\n');
+    } else if (reset.status === 'no_credit' && reset.exhausted) {
+      const detail = reset.availableCreditCount > 0 && !reset.creditDetailsAvailable
+        ? 'credit details unavailable, so automatic redemption was skipped safely'
+        : 'no reset credit is available';
+      sendLog(ws, `[codex-usage] Seven-day usage is exhausted; ${detail}.\n`);
+    } else if (reset.status === 'probe_failed') {
+      sendLog(ws, `[codex-usage] Usage-reset preflight unavailable (${sanitize(reset.reason)}); continuing with standard Codex handling.\n`);
+    }
   }
 
   // Provision the ambient helper CLIs (./note, ./playbook, ./messages) that

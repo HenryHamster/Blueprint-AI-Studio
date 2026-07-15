@@ -10,10 +10,12 @@ from app.max_plan_pool import (
     _max_plan_pools,
     apply_task_llm_runtime_context,
     clear_task_llm_runtime_context,
+    reconcile_llm_runtime_identity,
     select_llm_runtime_for_task,
 )
 from app.llm_cost_attribution import compute_llm_cost_breakdown
 from app.models import TaskStatus
+from app.task_blocked import reset_task_for_fresh_attempt
 from app.orchestrator import (
     _resolve_env_runtime_fallback,
     _sync_task_payload_runtime_fields,
@@ -28,6 +30,75 @@ def _translation_args(env: dict) -> list[str]:
 
 
 _TEST_USER = "runtime-user"
+
+
+def test_reconcile_runtime_identity_makes_account_and_provider_authoritative():
+    runtime_config = {
+        "provider_tier_model_map": {
+            "anthropic": {"sonnet": "claude-sonnet-4-6"},
+            "openai": {"sonnet": "gpt-5.6-terra"},
+        }
+    }
+
+    identity = reconcile_llm_runtime_identity(
+        account={"id": "openai-1", "provider": "openai", "auth_mode": "oauth"},
+        account_id="stale-id",
+        provider="anthropic",
+        auth_mode="api_key",
+        model="claude-sonnet-4-6",
+        quality_tier="sonnet",
+        runtime_config=runtime_config,
+    )
+
+    assert identity.account_id == "openai-1"
+    assert identity.provider == "openai"
+    assert identity.auth_mode == "oauth"
+    assert identity.model == "gpt-5.6-terra"
+
+
+def test_fresh_attempt_restores_requested_model_and_clears_runtime_identity():
+    task = make_task(
+        payloads=[{"type": "create", "model": "claude-sonnet-4-6"}],
+        context={
+            "llm_account_id": "anthropic-1",
+            "llm_provider": "anthropic",
+            "llm_auth_mode": "oauth",
+            "llm_model": "claude-sonnet-4-6",
+            "runner_target_id": "runner-dead-1",
+            "runner_hostname": "dead-runner.local",
+            "forced_runner_target_id": "operator-pin-1",
+            "_requested_payload_model": "gpt-5.6-sol",
+            "_resolved_payload_model": "claude-sonnet-4-6",
+            "agent_error_report": {"exit_code": 1},
+        },
+    )
+    task.llm_account_id = "anthropic-1"
+
+    reset_task_for_fresh_attempt(task)
+
+    assert task.first_payload["model"] == "gpt-5.6-sol"
+    assert task.llm_account_id is None
+    assert "llm_provider" not in task.context
+    assert "llm_model" not in task.context
+    assert "runner_target_id" not in task.context
+    assert "runner_hostname" not in task.context
+    assert task.context["forced_runner_target_id"] == "operator-pin-1"
+    assert "agent_error_report" not in task.context
+    assert task.context.get("_fresh_attempt_started_at")
+
+
+def test_fresh_attempt_preserves_legacy_explicit_model_without_provenance():
+    task = make_task(
+        payloads=[{"type": "create", "model": "gpt-5.5"}],
+        context={
+            "llm_provider": "openai",
+            "llm_model": "gpt-5.5",
+        },
+    )
+
+    reset_task_for_fresh_attempt(task)
+
+    assert task.first_payload["model"] == "gpt-5.5"
 
 
 @pytest.fixture()

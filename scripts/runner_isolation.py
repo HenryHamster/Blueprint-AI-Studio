@@ -357,41 +357,174 @@ def detect_gpus() -> tuple[tuple[int, ...], tuple[str, ...]]:
 
 # Known LLM CLI binaries the runner may advertise in the heartbeat.
 _LLM_CLI_NAMES: tuple[str, ...] = ("claude", "codex", "gemini")
+MIN_CODEX_CLI_VERSION: tuple[int, int, int] = (0, 144, 1)
 
 
-def probe_llm_clis() -> dict[str, dict]:
-    """Probe for known LLM CLI binaries and return a present/version map.
+def _llm_cli_probe_reason(name: str, output: str) -> str:
+    """Return a stable, non-secret reason for a failed CLI startup probe."""
+    lowered = output.lower()
+    if name == "codex" and (
+        "missing optional dependency @openai/codex-" in lowered
+        or "could not find package @openai/codex-" in lowered
+    ):
+        return "missing_native_package"
+    return "version_probe_failed"
 
-    ``shutil.which()`` establishes presence (the binary is on PATH), then
-    ``<binary> --version`` resolves the version string. Any failure in the
-    version subprocess is non-fatal — the entry reads as present with an empty
-    version string (the consumer can distinguish "present but no version info"
-    from "absent").
+
+def _llm_cli_result(
+    name: str,
+    completed: subprocess.CompletedProcess,
+    *,
+    executable_found: bool = True,
+) -> dict:
+    """Convert a quota-free ``--version`` subprocess result to capability state."""
+    version = ""
+    healthy = False
+    reason: str | None = None
+    if completed.returncode == 0:
+        version = (completed.stdout or completed.stderr or "").strip()
+        healthy = bool(version)
+        if not healthy:
+            reason = "empty_version_output"
+        elif name == "codex":
+            match = re.search(r"\b(\d+)\.(\d+)\.(\d+)\b", version)
+            if not match:
+                healthy = False
+                reason = "unparseable_version"
+            elif tuple(int(part) for part in match.groups()) < MIN_CODEX_CLI_VERSION:
+                healthy = False
+                reason = "unsupported_version"
+    else:
+        output = "\n".join((completed.stdout or "", completed.stderr or ""))
+        reason = _llm_cli_probe_reason(name, output)
+    return {
+        "present": healthy,
+        "executable_found": executable_found,
+        "healthy": healthy,
+        "version": version,
+        "reason": reason,
+    }
+
+
+def _unavailable_llm_cli(reason: str, *, executable_found: bool = False) -> dict:
+    return {
+        "present": False,
+        "executable_found": executable_found,
+        "healthy": False,
+        "version": "",
+        "reason": reason,
+    }
+
+
+def probe_llm_clis(*, env: dict[str, str] | None = None) -> dict[str, dict]:
+    """Probe known LLM CLIs and return eligibility plus installation state.
+
+    A PATH entry alone is not enough: npm can leave the Codex JavaScript shim in
+    place while its platform-native optional package is missing. ``present``
+    therefore means *runnable and dispatch-eligible*, not merely found by
+    ``shutil.which``. ``executable_found`` preserves the latter distinction,
+    and ``healthy`` is the explicit signal understood by newer consumers.
+
+    ``<binary> --version`` exercises provider CLI startup without making an API
+    request or consuming model quota. A non-zero/empty/exception result fails
+    closed. This also catches Codex's concrete
+    ``Missing optional dependency @openai/codex-linux-x64`` failure.
 
     Returns a dict keyed on the canonical CLI name::
 
-        {"claude": {"present": True, "version": "0.2.0"},
-         "codex": {"present": False, "version": ""},
-         "gemini": {"present": False, "version": ""}}
+        {"claude": {"present": True, "executable_found": True,
+                    "healthy": True, "version": "0.2.0", "reason": None},
+         "codex": {"present": False, "executable_found": True,
+                   "healthy": False, "version": "",
+                   "reason": "missing_native_package"}}
+
+    ``present`` retains its legacy field name so today's server-side selector
+    immediately excludes a newly reported unhealthy CLI. Older heartbeat
+    payloads that contain only ``present``/``version`` remain valid.
     """
     result: dict[str, dict] = {}
     for name in _LLM_CLI_NAMES:
         path = _which(name)
-        present = path is not None
-        version = ""
-        if present:
-            try:
-                ver = subprocess.run(
-                    [path, "--version"],
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
+        executable_found = path is not None
+        if not executable_found:
+            result[name] = _unavailable_llm_cli("not_found")
+            continue
+        try:
+            ver = subprocess.run(
+                [path, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                env=env,
+            )
+            result[name] = _llm_cli_result(name, ver)
+        except subprocess.TimeoutExpired:
+            result[name] = _unavailable_llm_cli(
+                "version_probe_timeout", executable_found=True
+            )
+        except (OSError, subprocess.SubprocessError):
+            result[name] = _unavailable_llm_cli(
+                "version_probe_error", executable_found=True
+            )
+    return result
+
+
+def probe_container_llm_clis(
+    image: str,
+    *,
+    runtime: str = BACKEND_DOCKER,
+) -> dict[str, dict]:
+    """Probe CLIs inside the selected agent image without calling a provider API.
+
+    The image's entrypoint is replaced with each CLI and only ``--version`` is
+    executed. This catches both directions of host/image drift: a healthy host
+    must not mask a broken image, and a healthy image must not be disabled by a
+    host that intentionally has no provider CLIs.
+    """
+    if not image:
+        return {
+            name: _unavailable_llm_cli("image_not_configured")
+            for name in _LLM_CLI_NAMES
+        }
+    result: dict[str, dict] = {}
+    for name in _LLM_CLI_NAMES:
+        try:
+            completed = subprocess.run(
+                [
+                    runtime,
+                    "run",
+                    "--rm",
+                    "--entrypoint",
+                    name,
+                    image,
+                    "--version",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            output = "\n".join(
+                (completed.stdout or "", completed.stderr or "")
+            ).lower()
+            missing_entrypoint = completed.returncode in (125, 126, 127) and any(
+                marker in output
+                for marker in (
+                    "executable file not found",
+                    "executable not found",
+                    "command not found",
+                    "no such file or directory",
                 )
-                if ver.returncode == 0:
-                    version = (ver.stdout or ver.stderr or "").strip()
-            except (OSError, subprocess.SubprocessError):
-                pass
-        result[name] = {"present": present, "version": version}
+            )
+            if missing_entrypoint:
+                result[name] = _unavailable_llm_cli("not_found")
+            else:
+                result[name] = _llm_cli_result(name, completed)
+        except subprocess.TimeoutExpired:
+            result[name] = _unavailable_llm_cli(
+                "version_probe_timeout", executable_found=True
+            )
+        except (OSError, subprocess.SubprocessError):
+            result[name] = _unavailable_llm_cli("container_probe_error")
     return result
 
 
@@ -889,6 +1022,29 @@ def tool_dirs_for(paths: list[str]) -> list[str]:
     return dirs
 
 
+def npm_tool_roots(paths: list[str]) -> list[str]:
+    """Package roots needed by npm ``node_modules/.bin`` shims in bwrap.
+
+    System-global CLIs normally live under an existing /usr or /opt base bind.
+    Blueprint-managed CLIs live in a private runner directory, so binding only
+    the shim/real entry file would omit sibling JS and native optional packages.
+    Bind the containing release root read-only when a resolved tool came through
+    ``node_modules/.bin``.
+    """
+    roots: list[str] = []
+    for path in paths:
+        bin_dir = os.path.dirname(path)
+        node_modules = os.path.dirname(bin_dir)
+        if (
+            os.path.basename(bin_dir) == ".bin"
+            and os.path.basename(node_modules) == "node_modules"
+        ):
+            root = os.path.dirname(node_modules)
+            if root and root not in roots:
+                roots.append(root)
+    return roots
+
+
 def resolve_tools(names: list[str], source_env: dict[str, str] | None = None) -> list[str]:
     """Resolve tool names to realpaths (skipping any not found)."""
     path_env = (source_env or {}).get("PATH") if source_env else None
@@ -1333,7 +1489,12 @@ def plan_agent_execution(
     agent_pkg_root = os.path.dirname(os.path.dirname(agent_real))
 
     tools = resolve_tools(list(_AGENT_SANDBOX_TOOLS), source_env)
-    ro_binds = [*_BASE_RO_BINDS, agent_pkg_root, agent_real]
+    ro_binds = [
+        *_BASE_RO_BINDS,
+        agent_pkg_root,
+        agent_real,
+        *npm_tool_roots(tools),
+    ]
 
     env = build_agent_env(
         source_env,

@@ -1,6 +1,7 @@
 import logging
 import os
 import asyncio
+import hashlib
 import time
 import uuid
 from pathlib import Path
@@ -789,9 +790,19 @@ async def test_agent_status_update_persists_runtime_identity(
     now = _utcnow()
 
     project = Project(name="Agent Runtime Identity Test", user_id="test-user-123")
+    account = MaxPlanAccount(
+        user_id="test-user-123",
+        name="runtime-openai-account",
+        provider=LLMProviderName.OPENAI,
+        auth_mode=LLMAuthMode.API_KEY,
+    )
     db_session.add(project)
+    db_session.add(account)
     await db_session.commit()
     await db_session.refresh(project)
+    await db_session.refresh(account)
+
+    account_id = str(account.id)
 
     task = Task(
         project_id=project.id,
@@ -799,7 +810,10 @@ async def test_agent_status_update_persists_runtime_identity(
         vm_instance_id="agent-vm-runtime",
         status=TaskStatus.IN_PROGRESS,
         vm_provisioned_at=now - timedelta(minutes=5),
-        context={"llm_account_id": "acct-1", "max_plan_account_id": "acct-1"},
+        context={
+            "llm_account_id": account_id,
+            "max_plan_account_id": account_id,
+        },
     )
     db_session.add(task)
     await db_session.commit()
@@ -826,7 +840,7 @@ async def test_agent_status_update_persists_runtime_identity(
     assert task.context["llm_model"] == "gpt-5.4"
     assert task.context["llm_execution_mode"] == "default"
     assert task.provider == "openai"
-    assert task.account_id == "acct-1"
+    assert task.account_id == account_id
     assert task.model == "gpt-5.4"
     assert task.estimated_cost_usd is not None
 
@@ -847,10 +861,8 @@ async def test_terminal_heartbeat_records_atomic_provider_model_pair(
     Three sub-cases in one test to satisfy the acceptance gate:
     1. Agent-reported pair wins over context pair when both present.
     2. Context pair used atomically when agent reports neither field.
-    3. Mixed sources (context provider only + agent model only) do NOT
-       produce a chimera row; the pair falls through to partial blend but
-       does NOT combine context-provider with payload-model as a unit when
-       context_model is absent.
+    3. Mixed sources (context provider only + agent model only) are ignored
+       rather than producing a chimera row.
     """
     mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
     now = _utcnow()
@@ -868,8 +880,6 @@ async def test_terminal_heartbeat_records_atomic_provider_model_pair(
         status=TaskStatus.IN_PROGRESS,
         vm_provisioned_at=now - timedelta(minutes=5),
         context={
-            "llm_account_id": "acct-1",
-            "max_plan_account_id": "acct-1",
             "llm_provider": "anthropic",
             "llm_model": "claude-fable-5",
         },
@@ -970,17 +980,95 @@ async def test_terminal_heartbeat_records_atomic_provider_model_pair(
     )
     assert resp3.status_code == 200
     await db_session.refresh(task3)
-    # Neither branch (agent pair nor context pair) is complete:
-    # falls through to partial blend — context provider + payload model.
-    # This IS the last-resort degraded path (not a clean chimera elimination),
-    # but the key assertion is that the full agent pair branch is not triggered
-    # when only one of {provider, model} is in the payload.
-    # provider comes from ctx, model comes from payload (partial blend)
-    assert task3.provider == "openai"
-    assert task3.model == "claude-sonnet-4-6"
-    # Critically: the pair openai:claude-sonnet-4-6 was formed by partial blend,
-    # not by the atomic agent-pair or context-pair branches. When the agent
-    # reports BOTH provider and model, the agent pair wins entirely (sub-case 1).
+    assert task3.provider is None
+    assert task3.model is None
+    assert task3.context.get("llm_provider") == "openai"
+    assert "llm_model" not in task3.context
+
+
+@pytest.mark.asyncio
+async def test_agent_status_cache_miss_uses_db_account_identity(
+    client: AsyncClient, db_session, mocker
+):
+    """A cold API instance must not accept account A + provider/model B."""
+    import app.max_plan_pool as pool_mod
+    from app.shared_state import runtime_config as _runtime_config
+
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mocker.patch.object(pool_mod, "_account_by_id", {})
+    mocker.patch.dict(
+        _runtime_config,
+        {
+            "provider_tier_model_map": {
+                "openai": {
+                    "opus": "gpt-5.6-sol",
+                    "sonnet": "gpt-5.6-terra",
+                    "haiku": "gpt-5.4-mini",
+                },
+                "anthropic": {
+                    "opus": "claude-opus-4-8",
+                    "sonnet": "claude-sonnet-4-6",
+                    "haiku": "claude-haiku-4-5-20251001",
+                },
+            }
+        },
+        clear=False,
+    )
+
+    project = Project(name="Cold identity cache", user_id="cold-identity-user")
+    account = MaxPlanAccount(
+        user_id="cold-identity-user",
+        name="cold-openai",
+        provider=LLMProviderName.OPENAI,
+        auth_mode=LLMAuthMode.OAUTH,
+    )
+    db_session.add(project)
+    db_session.add(account)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await db_session.refresh(account)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "quality_tier": "sonnet"}],
+        vm_instance_id="agent-vm-cold-identity",
+        status=TaskStatus.IN_PROGRESS,
+        vm_provisioned_at=_utcnow() - timedelta(minutes=5),
+        llm_account_id=str(account.id),
+        context={
+            "llm_account_id": str(account.id),
+            "max_plan_account_id": str(account.id),
+            "llm_provider": "anthropic",
+            "llm_auth_mode": "oauth",
+            "llm_model": "claude-sonnet-4-6",
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-cold-identity")
+    response = await client.post(
+        "/api/agent/status",
+        json={
+            "task_id": str(task.id),
+            "status": "COMPLETED",
+            "artifact_type": "ERROR_LOG",
+            "logs": "attempted cross-provider report",
+            "provider": "anthropic",
+            "model": "claude-sonnet-4-6",
+        },
+        headers={"x-agent-token": token},
+    )
+
+    assert response.status_code == 200
+    await db_session.refresh(task)
+    assert task.llm_account_id == str(account.id)
+    assert task.context.get("llm_provider") == "openai"
+    assert task.context.get("llm_auth_mode") == "oauth"
+    assert task.context.get("llm_model") == "gpt-5.6-terra"
+    assert task.provider == "openai"
+    assert task.model == "gpt-5.6-terra"
 
 
 @pytest.mark.asyncio
@@ -1803,8 +1891,8 @@ async def test_agent_heartbeat_malformed_tool_trace_t_does_not_advance_progress(
     assert resp2.status_code == 200
     await db_session.refresh(task)
     assert task.last_tool_use_at is not None
-    contact2 = await db_session.get(VmContact, vm_id)
-    assert contact2.last_tool_use_at is not None
+    await db_session.refresh(contact)
+    assert contact.last_tool_use_at is not None
 
 
 def test_parse_latest_tool_use_at_returns_none_on_malformed_tail():
@@ -1940,7 +2028,11 @@ async def test_task_contact_failure_does_not_lose_vm_contact_write(db_session):
     import uuid as _uuid
 
     from app.models import TaskContact, VmContact
+    from app.database import resolve_dialect_name
     from app.routers.agent import _record_vm_contact
+
+    if resolve_dialect_name(db_session) != "postgresql":
+        pytest.skip("requires PostgreSQL foreign-key enforcement")
 
     runner_vm = "runner:savepoint-isolation"
     ghost_task_id = _uuid.uuid4()  # never inserted → FK violation on taskcontact
@@ -10726,12 +10818,16 @@ async def test_external_api_requeue_sets_exponential_backoff(
         await db_session.refresh(task)
         assert task.status == TaskStatus.QUEUED, f"retry {retry_num}: expected QUEUED"
         ctx = task.context or {}
-        assert "retry_after" in ctx, f"retry {retry_num}: retry_after not set"
+        assert task.retry_after_until is not None, (
+            f"retry {retry_num}: retry_after_until not set"
+        )
         assert "provision_failures" not in ctx, (
             f"retry {retry_num}: provision_failures should be cleared on graceful requeue"
         )
+        assert ctx.get("_api_failure_retries") == retry_num
+        assert ctx.get("_fresh_attempt_started_at")
 
-        retry_after_dt = datetime.fromisoformat(ctx["retry_after"])
+        retry_after_dt = task.retry_after_until
         expected_delay = min(2**retry_num * 120, 1800)
         actual_delay = (retry_after_dt - before).total_seconds()
         assert actual_delay >= expected_delay - 2, (
@@ -10766,10 +10862,9 @@ async def test_external_api_requeue_sets_exponential_backoff(
     assert resp.status_code == 200
 
     await db_session.refresh(task)
-    # Falls through to general retry path — no EXTERNAL_API-specific retry_after is set
-    ctx = task.context or {}
-    assert "retry_after" not in ctx, (
-        "after EXTERNAL_API cap exceeded, retry_after should not be set by EXTERNAL_API path"
+    # Falls through to general retry path — no EXTERNAL_API-specific deadline is set.
+    assert task.retry_after_until is None, (
+        "after EXTERNAL_API cap exceeded, retry_after_until should not be set"
     )
 
 
@@ -11987,8 +12082,8 @@ async def test_external_api_provider_model_config_falls_back_without_backoff(
     assert task.status == TaskStatus.QUEUED
     assert task.payloads[0]["model"] == "gemini-2.5-pro"
     ctx = task.context or {}
-    assert ctx["failure_category"] == "EXTERNAL_API"
-    assert ctx["external_api_subtype"] == "provider_model_config"
+    assert "failure_category" not in ctx
+    assert "external_api_subtype" not in ctx
     assert ctx["llm_provider"] == "gemini"
     assert ctx["llm_auth_mode"] == "api_key"
     assert ctx["llm_model"] == "gemini-2.5-pro"
@@ -17204,7 +17299,12 @@ async def test_rotate_credentials_updates_openai_oauth_secret(
     res = await client.post(
         "/api/agent/credentials/rotate",
         headers={"x-agent-token": token},
-        json={"secret": new_blob},
+        json={
+            "secret": new_blob,
+            "base_hash": hashlib.sha256(
+                b'{"tokens":{"access_token":"old","refresh_token":"rt-old"}}'
+            ).hexdigest(),
+        },
     )
 
     assert res.status_code == 200, res.text
@@ -17212,6 +17312,118 @@ async def test_rotate_credentials_updates_openai_oauth_secret(
 
     await db_session.refresh(account)
     assert account.secret_blob_ref == "projects/test/secrets/rotate/versions/2"
+
+
+@pytest.mark.asyncio
+async def test_rotate_credentials_stale_writer_adopts_winner_without_overwrite(
+    client: AsyncClient, db_session, mocker
+):
+    old_blob = '{"tokens":{"access_token":"old","refresh_token":"rt-old"}}'
+    winner_blob = '{"tokens":{"access_token":"winner","refresh_token":"rt-winner"}}'
+    loser_blob = '{"tokens":{"access_token":"loser","refresh_token":"rt-loser"}}'
+    old_hash = hashlib.sha256(old_blob.encode("utf-8")).hexdigest()
+    store_secret = mocker.patch(
+        "app.secrets_manager.store_user_secret",
+        new=AsyncMock(return_value="projects/test/secrets/rotate-cas/versions/2"),
+    )
+    mocker.patch(
+        "app.secrets_manager.get_user_secret",
+        new=AsyncMock(return_value=winner_blob),
+    )
+    task, account, _ = await _make_openai_oauth_task(db_session)
+    token = create_agent_token(str(task.id), "agent-vm-rotate")
+
+    winner = await client.post(
+        "/api/agent/credentials/rotate",
+        headers={"x-agent-token": token},
+        json={"secret": winner_blob, "base_hash": old_hash},
+    )
+    assert winner.status_code == 200, winner.text
+    assert winner.json() == {"rotated": True}
+
+    stale = await client.post(
+        "/api/agent/credentials/rotate",
+        headers={"x-agent-token": token},
+        json={"secret": loser_blob, "base_hash": old_hash},
+    )
+    assert stale.status_code == 200, stale.text
+    assert stale.json() == {
+        "rotated": False,
+        "reason": "stale_credential",
+        "secret": winner_blob,
+    }
+    store_secret.assert_awaited_once()
+    await db_session.refresh(account)
+    assert account.secret_blob_ref == "projects/test/secrets/rotate-cas/versions/2"
+
+
+@pytest.mark.asyncio
+async def test_rotate_credentials_requires_version_for_legacy_concurrent_writer(
+    client: AsyncClient, db_session, mocker
+):
+    from app.max_plan_pool import _account_by_id
+
+    store_secret = mocker.patch(
+        "app.secrets_manager.store_user_secret",
+        new=AsyncMock(return_value="projects/test/secrets/legacy/versions/2"),
+    )
+    task, account, _ = await _make_openai_oauth_task(db_session)
+    mocker.patch.dict(
+        _account_by_id,
+        {str(account.id): {"active_tasks": 2}},
+    )
+    token = create_agent_token(str(task.id), "agent-vm-rotate")
+
+    response = await client.post(
+        "/api/agent/credentials/rotate",
+        headers={"x-agent-token": token},
+        json={
+            "secret": '{"tokens":{"access_token":"fresh","refresh_token":"rt-fresh"}}'
+        },
+    )
+
+    assert response.status_code == 409
+    assert "credential version required" in response.text
+    store_secret.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_rotate_credentials_requires_version_for_legacy_pool_peer(
+    client: AsyncClient, db_session, mocker
+):
+    from app.max_plan_pool import _account_by_id
+    from app.warm_pool import register_pool_vm
+
+    store_secret = mocker.patch(
+        "app.secrets_manager.store_user_secret",
+        new=AsyncMock(return_value="projects/test/secrets/legacy-pool/versions/2"),
+    )
+    _, account, project = await _make_openai_oauth_task(db_session)
+    for vm_id in ("agent-vm-legacy-writer", "agent-vm-legacy-peer"):
+        await register_pool_vm(
+            db_session,
+            vm_instance_id=vm_id,
+            project_id=project.id,
+            account_id=str(account.id),
+            provider="openai",
+            auth_mode="oauth",
+            state=PoolVmState.IDLE,
+        )
+    await db_session.commit()
+    mocker.patch.dict(_account_by_id, {str(account.id): {"active_tasks": 0}})
+    token = create_vm_scoped_token("agent-vm-legacy-writer", str(project.id))
+
+    response = await client.post(
+        "/api/agent/credentials/rotate",
+        headers={"x-agent-token": token},
+        json={
+            "secret": '{"tokens":{"access_token":"fresh","refresh_token":"rt-fresh"}}'
+        },
+    )
+
+    assert response.status_code == 409
+    assert "credential version required" in response.text
+    store_secret.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -22340,12 +22552,13 @@ async def test_agent_viewport_screenshot_download_url_storage_failure(
 
 
 @pytest.mark.asyncio
-async def test_generic_failure_with_rate_limited_account_requeues_free(
+async def test_generic_failure_ignores_unrelated_account_cooldown_and_burns_retry(
     client: AsyncClient, db_session, mocker
 ):
-    """Account-state-correlated RATE_LIMIT: a generic failure (no rate-limit keywords
-    in logs) while the assigned account is in cooldown should be classified RATE_LIMIT
-    and requeued without burning attempt_count.
+    """A generic failure cannot borrow RATE_LIMIT from ambient account cooldown.
+
+    Only direct provider/runtime evidence authorizes a free rate-limit requeue;
+    without it, the failure remains CODE_ERROR and consumes a normal retry.
     """
     from app.time_utils import _utcnow
     import app.max_plan_pool as pool_mod
@@ -22393,8 +22606,8 @@ async def test_generic_failure_with_rate_limited_account_requeues_free(
     task_id_str = str(task.id)
 
     token = create_agent_token(task_id_str, "agent-vm-rl-corr-001")
-    # Generic failure — no rate-limit keywords; classification must fall through
-    # to account-state correlation (_account_was_rate_limited) to return RATE_LIMIT.
+    # Generic failure — no rate-limit keywords or explicit provider signal. The
+    # separate account cooldown is not evidence about this task's failure.
     payload = {
         "task_id": task_id_str,
         "status": "FAILED",
@@ -22408,12 +22621,13 @@ async def test_generic_failure_with_rate_limited_account_requeues_free(
 
     await db_session.refresh(task)
     assert task.status == TaskStatus.QUEUED, (
-        f"Account-state-correlated RATE_LIMIT should requeue to QUEUED, got {task.status}"
+        f"Retryable CODE_ERROR should requeue to QUEUED, got {task.status}"
     )
-    # attempt_count must NOT be incremented — free requeue, not a retry burn
-    assert task.attempt_count == 0, (
-        f"attempt_count must stay 0 on free RATE_LIMIT requeue, got {task.attempt_count}"
+    assert task.attempt_count == 1, (
+        f"generic CODE_ERROR must burn one retry, got {task.attempt_count}"
     )
+    # Fresh-attempt reset intentionally removes the prior attempt's normalized
+    # failure category; the retry debit is the durable classification signal.
 
 
 @pytest.mark.asyncio
@@ -22502,8 +22716,8 @@ async def test_rate_limit_parks_and_retains_vm_when_alternate_account_eligible(
         json={
             "task_id": str(task.id),
             "status": "FAILED",
-            "failure_category": "claude_code_failed",
-            "logs": "Process exited with code 1",
+            "failure_category": "rate_limited",
+            "logs": "API Error: Rate limit reached",
         },
         headers={"x-agent-token": token},
     )
@@ -22601,8 +22815,8 @@ async def test_rate_limit_falls_back_to_cold_requeue_when_park_unavailable(
         json={
             "task_id": str(task.id),
             "status": "FAILED",
-            "failure_category": "claude_code_failed",
-            "logs": "Process exited with code 1",
+            "failure_category": "rate_limited",
+            "logs": "API Error: Rate limit reached",
         },
         headers={"x-agent-token": token},
     )
@@ -22797,13 +23011,10 @@ def _healthy_account_pool_and_task_ctx(account_id: str) -> dict:
 async def test_provider_death_error_report_requeues_without_burning_retry(
     client: AsyncClient, db_session, mocker
 ):
-    """Spec test (incident 2026-06-06): a rate-limited instant exit — the CLI
-    died 5s after start (exit 1, init banner only, model never produced output)
-    — ships a structured error report proving the provider-layer death. The
-    backend must consume the report as the PRIMARY signal and classify
-    provider-transient (RATE_LIMIT requeue path: account rotation, no retry
-    burn) even though the account looks healthy and the logs contain no
-    rate-limit text for the heuristics to match.
+    """An instant CLI exit without quota evidence is a provisioning failure.
+
+    Run shape alone cannot distinguish a missing native package from provider
+    throttling, so it must not blacklist the shared account.
     """
     import app.max_plan_pool as pool_mod
 
@@ -22862,15 +23073,11 @@ async def test_provider_death_error_report_requeues_without_burning_retry(
     assert task.status == TaskStatus.QUEUED, (
         f"error-report provider death should requeue to QUEUED, got {task.status}"
     )
-    # Retries preserved — the whole point of the structured report.
-    assert task.attempt_count == 0, (
-        f"attempt_count must stay 0 on report-driven RATE_LIMIT requeue, got {task.attempt_count}"
-    )
+    assert task.attempt_count == 1
     ctx = task.context or {}
-    assert ctx.get("failure_category") == "RATE_LIMIT"
-    assert ctx.get("rate_limit_inferred_from") == "error_report_startup_death"
-    # The sanitized report is persisted for forensics.
-    assert ctx.get("agent_error_report", {}).get("exit_code") == 1
+    assert "rate_limit_inferred_from" not in ctx
+    assert "blacklisted_accounts" not in ctx
+    assert ctx.get("_fresh_attempt_started_at")
 
 
 @pytest.mark.asyncio
@@ -22942,7 +23149,7 @@ async def test_completed_run_error_report_still_burns_code_error_retry(
         f"attempt_count must be 1 after CODE_ERROR retry burn, got {task.attempt_count}"
     )
     ctx = task.context or {}
-    assert ctx.get("failure_category") == "CODE_ERROR"
+    assert ctx.get("agent_failure_category_raw") == "claude_code_failed"
     assert "rate_limit_inferred_from" not in ctx
 
 
@@ -23010,12 +23217,12 @@ async def test_failed_status_without_report_drops_stale_report(
     )
     # Without the stale report (and with a healthy account), the generic label
     # classifies CODE_ERROR and burns the retry — same as the no-report test.
-    assert ctx.get("failure_category") == "CODE_ERROR"
+    assert ctx.get("agent_failure_category_raw") == "claude_code_failed"
     assert task.attempt_count == 1
 
 
 @pytest.mark.asyncio
-async def test_generic_accountless_failure_uses_scoped_db_pool_rl_check(
+async def test_generic_accountless_failure_skips_ambient_db_pool_rl_check(
     client: AsyncClient, db_session, mocker
 ):
     """Accountless DB RL correlation must preserve provider/model scope.
@@ -23027,12 +23234,6 @@ async def test_generic_accountless_failure_uses_scoped_db_pool_rl_check(
     """
     mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
     mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
-    pool_wide_mock = mocker.patch(
-        "app.routers.agent_status.db_pool_wide_rate_limit_cooldown",
-        new_callable=AsyncMock,
-        return_value=True,
-    )
-
     project = Project(
         name="Scoped DB Pool RL Test", user_id="test-user-scoped-db-pool-001"
     )
@@ -23070,13 +23271,7 @@ async def test_generic_accountless_failure_uses_scoped_db_pool_rl_check(
 
     await db_session.refresh(task)
     assert task.status == TaskStatus.QUEUED
-    assert task.attempt_count == 0
-    pool_wide_mock.assert_awaited_once_with(
-        at_time=task.started_at,
-        providers=["anthropic"],
-        model="claude-sonnet-4-6",
-        user_id=None,
-    )
+    assert task.attempt_count == 1
 
 
 @pytest.mark.asyncio
@@ -23094,22 +23289,12 @@ async def test_requeue_parent_task_uses_vm_stopped_at_for_rate_limit_correlation
     is detected, and the child's failure class is RATE_LIMIT (INFRA — budget
     not reduced).
 
-    Verification: _account_was_rate_limited side_effect returns True only when
-    at_time is not None. If the call site omits at_time, the side_effect returns
-    False → CODE_ERROR → budget reduction in compute_effective_max_requeues.
+    The parent still remains eligible for evaluation under the evidence-first
+    failure policy; ambient account cooldown is intentionally irrelevant.
     """
     mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
     mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
     mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
-
-    def _rl_only_at_failure_time(task, at_time=None):
-        # Return True (rate-limited) only when a failure instant was provided.
-        return at_time is not None
-
-    mocker.patch(
-        "app.failure_classification._account_was_rate_limited",
-        side_effect=_rl_only_at_failure_time,
-    )
 
     project = Project(name="Requeue atTime Test", user_id="test-user-requeue-attime")
     db_session.add(project)

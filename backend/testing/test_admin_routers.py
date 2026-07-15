@@ -19743,12 +19743,22 @@ class TestBulkRetrySessionFactory:
         task = Task(
             project_id=project.id,
             title="Retry me",
-            payloads=[{"type": "create", "prompt": "x"}],
+            payloads=[{"type": "create", "prompt": "x", "model": "claude-sonnet-4-6"}],
             status=TaskStatus.FAILED,
             vm_instance_id="agent-vm-old",
             attempt_count=3,
             retry_after_until=datetime(2099, 1, 1),
-            context={"_retry_after_resets": 5},
+            llm_account_id="stale-account",
+            context={
+                "_retry_after_resets": 5,
+                "llm_account_id": "stale-account",
+                "llm_provider": "anthropic",
+                "llm_model": "claude-sonnet-4-6",
+                "runner_target_id": "dead-runner",
+                "forced_runner_target_id": "operator-pin",
+                "_requested_payload_model": "gpt-5.6-sol",
+                "_resolved_payload_model": "claude-sonnet-4-6",
+            },
         )
         db_session.add(task)
         await db_session.commit()
@@ -19771,6 +19781,11 @@ class TestBulkRetrySessionFactory:
         assert task.attempt_count == 0
         assert task.vm_instance_id != "agent-vm-old"
         assert task.retry_after_until is None
+        assert task.llm_account_id is None
+        assert task.first_payload["model"] == "gpt-5.6-sol"
+        assert "runner_target_id" not in (task.context or {})
+        assert (task.context or {})["forced_runner_target_id"] == "operator-pin"
+        assert (task.context or {}).get("_fresh_attempt_started_at")
         assert "_retry_after_resets" not in (task.context or {})
 
 
@@ -19858,14 +19873,22 @@ class TestRequeueClearsStaleFailureVerdict:
         task = Task(
             project_id=project.id,
             title="Failed then requeued",
-            payloads=[{"type": "create", "prompt": "x"}],
+            payloads=[{"type": "create", "prompt": "x", "model": "claude-sonnet-4-6"}],
             status=TaskStatus.FAILED,
             vm_instance_id="agent-vm-old",
             attempt_count=3,
+            llm_account_id="stale-account",
             context={
                 "failure_class": "CODE_ERROR",
                 "failure_category": "claude_code_failed",
                 "_api_failure_retries": 2,
+                "llm_account_id": "stale-account",
+                "llm_provider": "anthropic",
+                "llm_model": "claude-sonnet-4-6",
+                "runner_target_id": "dead-runner",
+                "forced_runner_target_id": "operator-pin",
+                "_requested_payload_model": "gpt-5.6-sol",
+                "_resolved_payload_model": "claude-sonnet-4-6",
             },
         )
         db_session.add(task)
@@ -19885,6 +19908,11 @@ class TestRequeueClearsStaleFailureVerdict:
         assert "failure_class" not in ctx
         assert "failure_category" not in ctx
         assert "_api_failure_retries" not in ctx
+        assert task.llm_account_id is None
+        assert task.first_payload["model"] == "gpt-5.6-sol"
+        assert "runner_target_id" not in ctx
+        assert ctx["forced_runner_target_id"] == "operator-pin"
+        assert ctx.get("_fresh_attempt_started_at")
         assert task.attempt_count == 0
 
 

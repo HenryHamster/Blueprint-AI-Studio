@@ -322,14 +322,14 @@ export function useSettings(addToast: AddToast) {
         method: 'POST', headers: await authHeaders(),
       });
       if (res.ok) {
-        addToast('Rate limits cleared', 'success');
+        addToast('Blueprint cooldowns cleared; provider quota unchanged', 'success');
         await fetchMaxPlanAccounts();
       } else {
         const data = await res.json().catch(() => ({}));
         const detail = typeof data?.detail === 'string' ? data.detail : null;
-        addToast(detail ? `Failed to reset rate limits: ${detail}` : 'Failed to reset rate limits', 'error');
+        addToast(detail ? `Failed to clear Blueprint cooldowns: ${detail}` : 'Failed to clear Blueprint cooldowns', 'error');
       }
-    } catch (err) { console.error('Failed to reset rate limits:', err); addToast('Failed to reset rate limits', 'error'); }
+    } catch (err) { console.error('Failed to clear Blueprint cooldowns:', err); addToast('Failed to clear Blueprint cooldowns', 'error'); }
   };
 
   const refreshAccountModels = async (id: string) => {

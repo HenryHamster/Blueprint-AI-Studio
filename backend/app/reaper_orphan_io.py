@@ -1,8 +1,8 @@
 """External-I/O helpers for the per-orphan reap loop.
 
 Extracted from reaper.reaper_service()'s per-orphan mutation loop. The
-I/O block (GCP VM-status check, durable-DB rate-limit cross-instance
-fallback, account-disable calls, serial-console capture, GitHub PR-state
+I/O block (GCP VM-status check, account-disable calls, serial-console capture,
+GitHub PR-state
 lookup) runs deliberately WITHOUT the task row lock held. This module
 bundles all four serial I/O calls into _run_orphan_io(), which returns a
 frozen OrphanIoSnapshot to the caller. Keeping the lock-free window
@@ -41,7 +41,7 @@ class OrphanIoSnapshot:
     # GCP VM-status result
     is_spot_preemption: bool
 
-    # Rate-limit / dead-auth classification (updated by durable-DB check)
+    # Evidence-based rate-limit / dead-auth classification
     is_rate_limited: bool
     rl_acct_id: str | None
     rl_model: str | None
@@ -83,12 +83,9 @@ async def _run_orphan_io(
     """
     # Deferred imports — avoid circular dependency with app.main
     from app.max_plan_pool import (
-        db_account_was_rate_limited,
-        db_pool_wide_rate_limit_cooldown,
         disable_account_model,
         disable_account_for_auth,
         get_task_llm_account_id,
-        get_task_rate_limit_scope,
         _extract_task_model,
     )
 
@@ -163,43 +160,6 @@ async def _run_orphan_io(
                 logger.debug(
                     f"[REAPER] get_vm_status failed for {fresh_task.vm_instance_id}: {e}"
                 )
-
-    # 1.5. Durable DB rate-limit check (cross-instance fallback).
-    # The in-memory classify_failure above consults only
-    # _account_was_rate_limited (same-process cache). When the cooldown
-    # was recorded on a different Cloud Run instance or before a restart,
-    # the cache is empty and the task would be silently misclassified
-    # CODE_ERROR. Augment the flag with durable DB state before the
-    # account-disable I/O step so all reaper deaths get the same
-    # cross-instance treatment that agent_status.py already applies on
-    # the agent-reported path.
-    # Skip DB rate-limit fallback when dead-auth is already confirmed —
-    # the account needs a hard-disable, not a cooldown.
-    if not is_rate_limited and not is_dead_auth and not is_spot_preemption:
-        _db_rl_acct = get_task_llm_account_id(fresh_task)
-        _at_time_rl = fresh_task.last_heartbeat or fresh_task.started_at
-        _db_rl_scope = get_task_rate_limit_scope(fresh_task)
-        if _db_rl_acct:
-            if await db_account_was_rate_limited(_db_rl_acct, at_time=_at_time_rl):
-                is_rate_limited = True
-                logger.info(
-                    "[REAPER] Task %s reclassified RATE_LIMIT via "
-                    "durable DB state (account=%s) — in-memory cache missed",
-                    fresh_task.id,
-                    _db_rl_acct,
-                )
-        elif await db_pool_wide_rate_limit_cooldown(
-            at_time=_at_time_rl,
-            providers=_db_rl_scope.get("providers"),
-            model=_db_rl_scope.get("model"),
-            user_id=_db_rl_scope.get("user_id"),
-        ):
-            is_rate_limited = True
-            logger.info(
-                "[REAPER] Task %s (no account) reclassified RATE_LIMIT "
-                "via pool-wide DB state — pool was fully blocked at failure time",
-                fresh_task.id,
-            )
 
     # 2. Rate-limited account-disable I/O (called only when is_rate_limited
     #    AND not is_spot_preemption; mirrors the original elif chain where

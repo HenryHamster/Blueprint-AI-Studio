@@ -3940,6 +3940,39 @@ describe('park directives and warm continuation', () => {
     expect(process.env.TASK_ID).toBe('task-next');
   });
 
+  it('refreshes a same-account rotating credential without re-exec', async () => {
+    process.env.TASK_ID = 'task-prior';
+    process.env.VM_INSTANCE_ID = 'vm-codex-refresh';
+    const materializeClaimCredentialState = vi.fn();
+    const performWarmRetarget = vi.fn();
+
+    const result = await continueWarmContinuation({
+      priorTaskId: 'task-prior',
+      priorPrNumber: 10,
+      baseBranch: 'main',
+    }, {
+      pollForNextRole: () => Promise.resolve({
+        action: 'claim',
+        taskId: 'task-codex-next',
+        agentToken: 'rotated-codex-jwt',
+        secretManifest: {
+          env: { PROVIDER: 'openai', AUTH_MODE: 'oauth' },
+          files: [{ path: '/opt/agent/openai/auth.json', content: '{}' }],
+          metadata: { retarget: true, credential_refresh_only: true },
+        },
+      }),
+      resetForNextRole: vi.fn(),
+      activateClaimedRole: vi.fn(),
+      materializeClaimCredentialState,
+      performWarmRetarget,
+      resolveVmInstanceId: () => 'vm-codex-refresh',
+    });
+
+    expect(result).toEqual({ action: 'continue' });
+    expect(materializeClaimCredentialState).toHaveBeenCalledOnce();
+    expect(performWarmRetarget).not.toHaveBeenCalled();
+  });
+
   it('sets lane workspace env for a lane-phase warm claim', async () => {
     process.env.TASK_ID = 'task-prior';
     process.env.VM_INSTANCE_ID = 'vm-lane-claim';
@@ -5439,6 +5472,7 @@ describe('main non-pool startup OAuth rotation', () => {
     expect(rotateBody).toEqual({
       secret: '{"refresh_token":"new"}',
       task_id: 'cold-preclaim-task',
+      base_hash: '1e635d25b15e673604a31c77273e40df029959ff84f66a3140080a3a8f45e4c4',
     });
     expect(vi.mocked(fs.writeFileSync).mock.calls).toEqual(expect.arrayContaining([
       [

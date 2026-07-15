@@ -1419,8 +1419,8 @@ export function log(msg: string) {
 // (backend/app/compute_manifest.py) produces and what the boot-time
 // materialize_manifest.py consumes: an env dict (provider/auth/model + secret
 // env), provider credential files, and metadata. The backend includes this
-// under the next-role response's `secret_manifest` ONLY when the warm-claimed
-// task re-targets to an LLM account different from the VM's frozen boot account.
+// under the next-role response's `secret_manifest` when the warm-claimed task
+// changes LLM identity or needs a newer same-account rotating credential.
 export interface SecretManifest {
   env?: Record<string, unknown>;
   files?: { path: string; content?: string; mode?: string }[];
@@ -1585,10 +1585,9 @@ export async function pollForNextRole(opts: PollForNextRoleOptions): Promise<Pol
             continue;
           }
           if (body.action === 'claim' && typeof body.task_id === 'string') {
-            // secret_manifest is present ONLY for account-divergent re-targets;
-            // an object with an env/files shape signals the role loop to
-            // re-materialize + re-exec. Anything else (absent/null) → same-account
-            // JWT-only rotation, byte-for-byte unchanged from before.
+            // A manifest re-materializes credentials for either an account
+            // change or a same-account rotating-credential refresh. The latter
+            // is marked in metadata and does not require a process re-exec.
             const sm = body.secret_manifest;
             const secretManifest = (sm && typeof sm === 'object' && !Array.isArray(sm))
               ? (sm as SecretManifest)
@@ -3818,7 +3817,9 @@ export async function continueWarmContinuation(
   process.env.BLUEPRINT_WARM_HANDOFF = '1';
   resetPerRoleModuleState({ warmStart: true });
 
-  if (pollResult.secretManifest) {
+  const credentialRefreshOnly =
+    pollResult.secretManifest?.metadata?.credential_refresh_only === true;
+  if (pollResult.secretManifest && !credentialRefreshOnly) {
     log('Warm claim is account-divergent — re-materializing provider creds + re-exec');
     try {
       await deps.performWarmRetarget(pollResult.secretManifest, {
@@ -3833,6 +3834,9 @@ export async function continueWarmContinuation(
       throw err;
     }
     return { action: 'exit' };
+  }
+  if (credentialRefreshOnly) {
+    log('Warm claim refreshed same-account rotating provider credentials in place');
   }
 
   return { action: 'continue' };

@@ -19,10 +19,13 @@ from app.failure_classification import (
     VIEWPORT_REGRESSION,
     EXTERNAL_API_SUBTYPE_DB_CONNECTIVITY,
     EXTERNAL_API_SUBTYPE_GITHUB_PR_CREATE,
+    EXTERNAL_API_SUBTYPE_GITHUB_RATE_LIMIT,
+    EXTERNAL_API_SUBTYPE_INTERNAL_RATE_LIMIT,
     EXTERNAL_API_SUBTYPE_NETWORK_TRANSIENT,
     EXTERNAL_API_SUBTYPE_OTHER,
     EXTERNAL_API_SUBTYPE_PROVIDER_AUTH,
     EXTERNAL_API_SUBTYPE_PROVIDER_MODEL_CONFIG,
+    EXTERNAL_API_SUBTYPE_PROVIDER_OVERLOAD,
     EXTERNAL_API_SUBTYPE_PROVIDER_QUOTA,
     MIGRATION_ERROR,
     NO_PROGRESS_TIMEOUT,
@@ -398,9 +401,9 @@ class TestStuckLlmCallReclassifiedToRateLimit:
             "Fatal error: Claude Code exceeded 45-minute time limit",
             {"llm_call_count": 1, "total_input_tokens": 0, "total_output_tokens": 0},
         )
-        assert classify_failure(t) == RATE_LIMIT
-        assert t.context.get("rate_limit_inferred_from") == "stuck_llm_call_no_output"
-        assert t.context.get("rate_limit_kind") == "unknown"
+        assert classify_failure(t) == NO_PROGRESS_TIMEOUT
+        assert t.context.get("provider_failure_inferred_from") == "stuck_llm_call_no_output"
+        assert "rate_limit_kind" not in t.context
 
     def test_tool_use_stall_zero_output_reclassifies(self):
         # Agent wraps the mid-stream stall as a fatal ClaudeTimeoutError.
@@ -408,7 +411,7 @@ class TestStuckLlmCallReclassifiedToRateLimit:
             "Fatal error: mid-stream tool-use stall: tool in-flight for >30 min without result",
             {"llm_call_count": 1, "total_input_tokens": 0, "total_output_tokens": 0},
         )
-        assert classify_failure(t) == RATE_LIMIT
+        assert classify_failure(t) == NO_PROGRESS_TIMEOUT
 
     def test_output_tokens_present_stays_agent_timeout(self):
         # Real work happened (output produced) before the stall → genuine timeout.
@@ -489,17 +492,17 @@ class TestCliDeathReclassifiedToRateLimit:
 
     def test_init_banner_only_tail_reclassifies(self):
         t = self._dead(self._INIT_ONLY_TAIL)
-        assert classify_failure(t) == RATE_LIMIT
+        assert classify_failure(t) == PROVISION_FAILURE
         assert (
-            t.context.get("rate_limit_inferred_from")
+            t.context.get("provider_failure_inferred_from")
             == "cli_startup_death_init_only_tail"
         )
-        assert t.context.get("rate_limit_kind") == "unknown"
+        assert "rate_limit_kind" not in t.context
 
     def test_stream_cut_tail_reclassifies(self):
         t = self._dead(self._STREAM_CUT_TAIL, category="incomplete")
-        assert classify_failure(t) == RATE_LIMIT
-        assert t.context.get("rate_limit_inferred_from") == "cli_stream_cut_tail"
+        assert classify_failure(t) == NO_PROGRESS_TIMEOUT
+        assert t.context.get("provider_failure_inferred_from") == "cli_stream_cut_tail"
 
     def test_zero_output_telemetry_reclassifies_without_tail(self):
         # Telemetry alone (no output tail captured) is sufficient: an LLM call
@@ -508,8 +511,8 @@ class TestCliDeathReclassifiedToRateLimit:
             "Claude subprocess exited with code 1 without shipping a PR.",
             summary={"llm_call_count": 1, "total_output_tokens": 0},
         )
-        assert classify_failure(t) == RATE_LIMIT
-        assert t.context.get("rate_limit_inferred_from") == "stuck_llm_call_no_output"
+        assert classify_failure(t) == NO_PROGRESS_TIMEOUT
+        assert t.context.get("provider_failure_inferred_from") == "stuck_llm_call_no_output"
 
     def test_real_output_after_init_stays_code_error(self):
         # The model produced assistant output and the run reached a terminal
@@ -589,16 +592,16 @@ class TestAgentErrorReportClassification:
     def test_startup_death_report_classifies_rate_limit(self):
         # The incident signature: instant exit, model never produced output.
         t = self._failed(self._report())
-        assert classify_failure(t) == RATE_LIMIT
-        assert t.context.get("rate_limit_inferred_from") == "error_report_startup_death"
-        assert t.context.get("rate_limit_kind") == "unknown"
+        assert classify_failure(t) == PROVISION_FAILURE
+        assert t.context.get("provider_failure_inferred_from") == "error_report_startup_death"
+        assert "rate_limit_kind" not in t.context
 
     def test_startup_death_report_via_normalize(self):
         # The status-write boundary path (normalize_agent_failure_category) —
         # the exact route the agent's FAILED POST takes.
         t = self._failed(self._report())
-        assert normalize_agent_failure_category("claude_code_failed", t) == RATE_LIMIT
-        assert t.context.get("rate_limit_inferred_from") == "error_report_startup_death"
+        assert normalize_agent_failure_category("claude_code_failed", t) == PROVISION_FAILURE
+        assert t.context.get("provider_failure_inferred_from") == "error_report_startup_death"
 
     def test_provider_error_event_report_classifies_rate_limit(self):
         t = self._failed(
@@ -613,17 +616,44 @@ class TestAgentErrorReportClassification:
                 ],
             )
         )
-        assert classify_failure(t) == RATE_LIMIT
-        assert (
-            t.context.get("rate_limit_inferred_from") == "error_report_provider_error"
-        )
+        assert classify_failure(t) == EXTERNAL_API
+        assert t.context.get("provider_failure_inferred_from") == "provider_overloaded"
 
     def test_stream_cut_report_classifies_rate_limit(self):
         # Model produced output but the run never reached its terminal result
         # event and exited non-zero — the stream was severed mid-write.
         t = self._failed(self._report(model_output_seen=True))
-        assert classify_failure(t) == RATE_LIMIT
-        assert t.context.get("rate_limit_inferred_from") == "error_report_stream_cut"
+        assert classify_failure(t) == NO_PROGRESS_TIMEOUT
+        assert t.context.get("provider_failure_inferred_from") == "error_report_stream_cut"
+
+    def test_missing_codex_native_package_is_provision_failure(self):
+        report = self._report(
+            provider="openai",
+            stderr_tail=(
+                "Error: Missing optional dependency @openai/codex-linux-x64. "
+                "Reinstall @openai/codex so the native binary is available."
+            ),
+        )
+        t = self._failed(report)
+        assert classify_failure(t) == PROVISION_FAILURE
+        assert "rate_limit_kind" not in t.context
+
+    def test_codex_chatgpt_unsupported_model_is_config_failure(self):
+        report = self._report(
+            provider="openai",
+            provider_errors=[
+                {
+                    "code": "400",
+                    "message": (
+                        "The 'claude-sonnet-4-6' model is not supported when "
+                        "using Codex with a ChatGPT account."
+                    ),
+                }
+            ],
+        )
+        t = self._failed(report)
+        assert classify_failure(t) == EXTERNAL_API
+        assert "rate_limit_kind" not in t.context
 
     def test_completed_run_report_stays_code_error(self):
         # Genuine code failure: the model ran, produced output, and reached its
@@ -674,9 +704,9 @@ class TestAgentErrorReportClassification:
         )
         t = _task(msg, {"failure_category": "claude_code_failed"})
         t.api_call_summary = None
-        assert classify_failure(t) == RATE_LIMIT
+        assert classify_failure(t) == PROVISION_FAILURE
         assert (
-            t.context.get("rate_limit_inferred_from")
+            t.context.get("provider_failure_inferred_from")
             == "cli_startup_death_init_only_tail"
         )
 
@@ -689,7 +719,7 @@ class TestAgentErrorReportClassification:
             {AGENT_ERROR_REPORT_CONTEXT_KEY: self._report()},
         )
         t.api_call_summary = None
-        assert classify_failure(t) == RATE_LIMIT
+        assert classify_failure(t) == PROVISION_FAILURE
 
     def test_malformed_report_falls_back_to_text_heuristics(self):
         # A non-dict report value behaves exactly like "no report".
@@ -706,9 +736,9 @@ class TestAgentErrorReportClassification:
             },
         )
         t.api_call_summary = None
-        assert classify_failure(t) == RATE_LIMIT
+        assert classify_failure(t) == PROVISION_FAILURE
         assert (
-            t.context.get("rate_limit_inferred_from")
+            t.context.get("provider_failure_inferred_from")
             == "cli_startup_death_init_only_tail"
         )
 
@@ -782,7 +812,7 @@ class TestSanitizeAgentErrorReport:
         t = _task("exited 1", {"failure_category": "fatal"})
         t.api_call_summary = None
         t.context = {**t.context, AGENT_ERROR_REPORT_CONTEXT_KEY: out}
-        assert classify_failure(t) == RATE_LIMIT
+        assert classify_failure(t) == PROVISION_FAILURE
 
 
 class TestNormalizeAgentFailureCategory:
@@ -829,6 +859,21 @@ class TestNormalizeAgentFailureCategory:
         task = _task("Fatal error: TypeError: cannot read property of undefined")
 
         assert normalize_agent_failure_category("fatal", task) == CODE_ERROR
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "Fatal error: GitHub API returned HTTP 429 Too Many Requests",
+            "Fatal error: Blueprint internal API rate limit reached (429)",
+        ],
+    )
+    def test_generic_fatal_non_llm_429_is_not_provider_rate_limit(self, message):
+        task = _task(
+            message,
+            {"llm_provider": "openai", "llm_auth_mode": "oauth"},
+        )
+
+        assert normalize_agent_failure_category("fatal", task) == EXTERNAL_API
 
     def test_build_failed_routes_to_provision_failure(self):
         """Agent emits build_failed for test setup failures (Postgres sidecar
@@ -2405,7 +2450,7 @@ class TestExternalApiSubtypeFromMessage:
     def test_provider_quota_overloaded(self):
         assert (
             _external_api_subtype_from_message("Error: Overloaded")
-            == EXTERNAL_API_SUBTYPE_PROVIDER_QUOTA
+            == EXTERNAL_API_SUBTYPE_PROVIDER_OVERLOAD
         )
 
     def test_provider_quota_capacity_preempts_generic_auth(self):
@@ -2413,7 +2458,7 @@ class TestExternalApiSubtypeFromMessage:
             _external_api_subtype_from_message(
                 "api.deepseek.com overloaded: authentication fails"
             )
-            == EXTERNAL_API_SUBTYPE_PROVIDER_QUOTA
+            == EXTERNAL_API_SUBTYPE_PROVIDER_OVERLOAD
         )
 
     def test_provider_quota_context_length(self):
@@ -2424,12 +2469,20 @@ class TestExternalApiSubtypeFromMessage:
             == EXTERNAL_API_SUBTYPE_PROVIDER_QUOTA
         )
 
+    def test_internal_429_is_not_llm_provider_quota(self):
+        assert (
+            _external_api_subtype_from_message(
+                "Blueprint internal API /api/agent returned 429 too many requests"
+            )
+            == EXTERNAL_API_SUBTYPE_INTERNAL_RATE_LIMIT
+        )
+
     def test_provider_quota_github_rate_limit(self):
         assert (
             _external_api_subtype_from_message(
                 "api.github.com returned 429 too many requests"
             )
-            == EXTERNAL_API_SUBTYPE_PROVIDER_QUOTA
+            == EXTERNAL_API_SUBTYPE_GITHUB_RATE_LIMIT
         )
 
     def test_network_transient_503(self):
@@ -2899,7 +2952,7 @@ class TestDeadAuthClassification:
             stderr_tail="token_refresh_failed: permanent 401 from token endpoint"
         )
         t = self._dead_auth_task(report)
-        assert classify_failure(t) == RATE_LIMIT
+        assert classify_failure(t) == PROVISION_FAILURE
         assert "dead_auth_matched_pattern" not in t.context
 
     # ── Disambiguation: must NOT classify as dead-auth ─────────────────────
@@ -2920,7 +2973,7 @@ class TestDeadAuthClassification:
             model_output_seen=True,
         )
         t = self._dead_auth_task(report)
-        assert classify_failure(t) == RATE_LIMIT
+        assert classify_failure(t) == NO_PROGRESS_TIMEOUT
 
     def test_api_key_auth_mode_no_dead_auth(self):
         # API-key auth has no OAuth session to die; dead-auth patterns must not fire.
@@ -2942,8 +2995,9 @@ class TestDeadAuthClassification:
         }
         t = _task("agent died", ctx)
         t.api_call_summary = None
-        # API-key has no dead_auth_patterns, so falls through to RATE_LIMIT
-        assert classify_failure(t) == RATE_LIMIT
+        # API-key has no dead_auth_patterns; unexplained startup death is a
+        # runner/provision failure, not an account cooldown.
+        assert classify_failure(t) == PROVISION_FAILURE
 
     def test_no_report_no_dead_auth(self):
         # Without an error report (old agents) there's no stderr_tail to check —
@@ -3679,7 +3733,7 @@ class TestSanitizeReportAppliesRedaction:
         t = _task("exited 1", {"failure_category": "fatal"})
         t.api_call_summary = None
         t.context = {**t.context, AGENT_ERROR_REPORT_CONTEXT_KEY: out}
-        assert classify_failure(t) == RATE_LIMIT
+        assert classify_failure(t) == PROVISION_FAILURE
 
 
 class TestIsRecoverableInfraTerminal:

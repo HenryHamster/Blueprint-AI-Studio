@@ -80,28 +80,33 @@ class ResolveTokenTests(unittest.TestCase):
 class PrerequisiteTests(unittest.TestCase):
     def test_all_ok_when_node_new_enough_and_claude_present(self):
         with patch.object(br, "_node_major", return_value=22), \
-             patch.object(br.shutil, "which", return_value="/usr/bin/claude"):
+             patch.object(br.shutil, "which", return_value="/usr/bin/claude"), \
+             patch.object(br, "_codex_prerequisite", return_value=br.Prereq("codex", True, "0.144.1")):
             results = {p.name: p for p in br.check_prerequisites()}
         self.assertTrue(results["node"].ok)
         self.assertTrue(results["claude"].ok)
+        self.assertTrue(results["codex"].ok)
 
     def test_node_too_old_flagged_with_actionable_fix(self):
         with patch.object(br, "_node_major", return_value=18), \
-             patch.object(br.shutil, "which", return_value="/usr/bin/claude"):
+             patch.object(br.shutil, "which", return_value="/usr/bin/claude"), \
+             patch.object(br, "_codex_prerequisite", return_value=br.Prereq("codex", True, "0.144.1")):
             results = {p.name: p for p in br.check_prerequisites()}
         self.assertFalse(results["node"].ok)
         self.assertIn("22", results["node"].fix)
 
     def test_node_missing_flagged(self):
         with patch.object(br, "_node_major", return_value=None), \
-             patch.object(br.shutil, "which", return_value="/usr/bin/claude"):
+             patch.object(br.shutil, "which", return_value="/usr/bin/claude"), \
+             patch.object(br, "_codex_prerequisite", return_value=br.Prereq("codex", True, "0.144.1")):
             results = {p.name: p for p in br.check_prerequisites()}
         self.assertFalse(results["node"].ok)
         self.assertIn("nodejs.org", results["node"].fix)
 
     def test_claude_missing_flagged_with_install_hint(self):
         with patch.object(br, "_node_major", return_value=22), \
-             patch.object(br.shutil, "which", return_value=None):
+             patch.object(br.shutil, "which", return_value=None), \
+             patch.object(br, "_codex_prerequisite", return_value=br.Prereq("codex", True, "0.144.1")):
             results = {p.name: p for p in br.check_prerequisites()}
         self.assertFalse(results["claude"].ok)
         self.assertIn("claude-code", results["claude"].fix)
@@ -114,6 +119,41 @@ class PrerequisiteTests(unittest.TestCase):
     def test_node_major_none_on_missing_binary(self):
         with patch.object(br.subprocess, "run", side_effect=FileNotFoundError):
             self.assertIsNone(br._node_major())
+
+    def test_codex_path_shim_with_missing_native_package_is_rejected(self):
+        failed = MagicMock(
+            returncode=1,
+            stdout="",
+            stderr="Error: Missing optional dependency @openai/codex-linux-x64",
+        )
+        with patch.object(br.shutil, "which", return_value="/usr/bin/codex"), \
+             patch.object(br.subprocess, "run", return_value=failed):
+            result = br._codex_prerequisite()
+        self.assertFalse(result.ok)
+        self.assertIn("native Codex package is missing", result.detail)
+        self.assertIn("--include=optional", result.fix)
+        self.assertIn("0.144.1", result.fix)
+
+    def test_codex_below_gpt_5_6_minimum_is_rejected(self):
+        old = MagicMock(returncode=0, stdout="codex-cli 0.143.0\n", stderr="")
+        with patch.object(br.shutil, "which", return_value="/usr/bin/codex"), \
+             patch.object(br.subprocess, "run", return_value=old):
+            result = br._codex_prerequisite()
+        self.assertFalse(result.ok)
+        self.assertIn("older than required", result.detail)
+
+    def test_codex_version_probe_is_quota_free_and_healthy(self):
+        current = MagicMock(returncode=0, stdout="codex-cli 0.144.1\n", stderr="")
+        with patch.object(br.shutil, "which", return_value="/usr/bin/codex"), \
+             patch.object(br.subprocess, "run", return_value=current) as run:
+            result = br._codex_prerequisite()
+        self.assertTrue(result.ok)
+        run.assert_called_once_with(
+            ["/usr/bin/codex", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
 
 
 class RunLocalRunnerTests(unittest.TestCase):
@@ -181,6 +221,50 @@ class MainTests(unittest.TestCase):
         self.assertFalse(kwargs["check"])
         # URL flag propagated to the delegated runner.
         self.assertEqual(run_mock.call_args.args[1], "https://o.example")
+
+    def test_start_with_broken_codex_keeps_other_capacity_online(self):
+        """Codex is provider-specific: its failure must not stop the runner."""
+        with patch.dict("os.environ", {}, clear=True), \
+             patch.object(br, "_docker_usable", return_value=False), \
+             patch.object(br, "check_prerequisites", return_value=[
+                 br.Prereq("node", True, "v22"),
+                 br.Prereq("claude", True, "/usr/bin/claude"),
+                 br.Prereq(
+                     "codex", False,
+                     "PATH shim found, but the native Codex package is missing",
+                     br._CODEX_REPAIR,
+                 ),
+             ]), \
+             patch.object(br, "run_local_runner", return_value=0) as run_mock:
+            rc = br.main(["start", "--token", "tok"])
+        self.assertEqual(rc, 0)
+        run_mock.assert_called_once()
+
+    def test_start_with_missing_claude_reaches_background_maintainer(self):
+        """Missing Claude is repairable and must not keep compute/Codex offline."""
+        with patch.dict("os.environ", {}, clear=True), \
+             patch.object(br, "_docker_usable", return_value=False), \
+             patch.object(br, "check_prerequisites", return_value=[
+                 br.Prereq("node", True, "v22"),
+                 br.Prereq("claude", False, "not found", "install claude"),
+                 br.Prereq("codex", True, "codex-cli 0.144.1"),
+             ]), \
+             patch.object(br, "run_local_runner", return_value=0) as run_mock:
+            rc = br.main(["start", "--token", "tok"])
+        self.assertEqual(rc, 0)
+        run_mock.assert_called_once()
+
+    def test_check_with_broken_codex_is_nonzero(self):
+        with patch.dict("os.environ", {}, clear=True), \
+             patch.object(br, "_docker_usable", return_value=False), \
+             patch.object(br, "check_prerequisites", return_value=[
+                 br.Prereq("node", True, "v22"),
+                 br.Prereq("claude", True, "/usr/bin/claude"),
+                 br.Prereq("codex", False, "missing native package", br._CODEX_REPAIR),
+             ]), \
+             patch.object(br, "run_local_runner", return_value=0):
+            rc = br.main(["check", "--token", "tok"])
+        self.assertEqual(rc, 1)
 
     def test_check_returns_nonzero_when_prereq_missing_even_if_runner_ok(self):
         with patch.dict("os.environ", {}, clear=True), \

@@ -29,6 +29,7 @@ export default defineConfig({
   plugins: [react(), tailwindcss()],
   test: {
     include: ['src/**/*.viewport.test.{ts,tsx}'],
+    fileParallelism: false,
     css: true,
     setupFiles: ['./src/test/viewport-setup.ts'],
     // Default reporters: capture output is informational (PNGs + manifest are

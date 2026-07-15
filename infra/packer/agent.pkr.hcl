@@ -64,10 +64,9 @@ variable "source_git_sha" {
 # the agent local pytest gate fleet-wide (Blueprint fix/verify lane). Verified on a throwaway VM:
 # system 9.1.1 + user 7.4.3 -> ImportError; system pinned 7.4.3 -> real test passes EXIT=0.
 # REBUILD + REDEPLOY the agent image to take effect; merging this alone does not change live VMs.
-# Rebuild trigger 2026-07-14: GPT-5.6 sol/terra/luna Codex rollout. The install below is
-# intentionally latest, but the active image predates the 5.6 picker. Rebuild before the
-# runtime config smoke pin moves to gpt-5.6-sol; the bake-time version gate prevents an old
-# registry/cache result from producing an image that rejects the new model ids.
+# Rebuild trigger 2026-07-14: GPT-5.6 sol/terra/luna Codex rollout. Codex is pinned
+# to the first fleet-approved release for these models, optional native packages
+# are forced on, and the quota-free version smoke catches a broken npm PATH shim.
 source "googlecompute" "agent_image" {
   project_id          = var.project_id
   source_image_family = "ubuntu-2204-lts"
@@ -108,8 +107,8 @@ build {
       "# Pre-pull python:3.11-slim (base image for backend Docker build) to eliminate",
       "# the cold-pull on the fallback docker-build path (~1-2 min on a fresh VM).",
       "sudo docker pull python:3.11-slim",
-      "sudo npm install -g @anthropic-ai/claude-code @openai/codex @google/gemini-cli",
-      "codex_version=$(codex --version | awk '{print $NF}'); dpkg --compare-versions \"$codex_version\" ge 0.144.1 || { echo \"Codex CLI >= 0.144.1 required for GPT-5.6 models; got $codex_version\" >&2; exit 1; }",
+      "sudo npm install -g --include=optional @anthropic-ai/claude-code @openai/codex@0.144.1 @google/gemini-cli",
+      "codex_version=$(codex --version | awk '{print $NF}'); test \"$codex_version\" = 0.144.1 || { echo \"Codex CLI 0.144.1 required for GPT-5.6 models; got $codex_version\" >&2; exit 1; }",
       "sudo apt-get install -y python3-pip",
       "# Pin the baked system pytest stack to EXACTLY backend/requirements.txt's versions.",
       "# This install was previously unpinned, so a rebuild silently drifted to pytest 9.1.1.",
@@ -128,7 +127,7 @@ build {
       "sudo apt-get install -y apt-transport-https ca-certificates jq universal-ctags",
       "# Pre-warm CLI installs so the baked image already has first-run caches",
       "claude --version || true",
-      "codex --version || true",
+      "codex --version",
       "gemini --version || true"
     ]
   }

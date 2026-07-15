@@ -78,7 +78,7 @@ from app.failure_classification import (
     _persist_stuck_call_reclassification,
 )
 from app.retry_budget import append_failure_class_history
-from app.task_blocked import strip_fresh_attempt_context
+from app.task_blocked import reset_task_for_fresh_attempt
 from app.time_utils import (
     _utcnow,
     clear_retry_after,
@@ -2031,13 +2031,10 @@ async def reaper_service():
                                 bank_task_current_attempt(task, stopped_at=_utcnow())
                                 task.latest_status_message = f"Reaped ({retry_label}): {reap_reason} [zone={reap_zone}, acct={reap_acct}]"
                                 task.status = TaskStatus.QUEUED
-                                task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
-                                task.last_heartbeat = None
-                                task.started_at = None
                                 _pre_strip_reaper_ctx = task.context or {}
-                                reaper_ctx = strip_fresh_attempt_context(
-                                    _pre_strip_reaper_ctx
-                                )
+                                reset_task_for_fresh_attempt(task)
+                                task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
+                                reaper_ctx = dict(task.context or {})
                                 # provision_failures is a task-lifetime counter
                                 # that must survive ALL reap retries — only
                                 # admin/clone resurrects should get a clean slate.

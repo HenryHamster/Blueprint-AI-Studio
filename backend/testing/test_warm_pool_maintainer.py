@@ -2111,6 +2111,38 @@ async def test_default_provision_fn_honors_requested_account(
 
 
 @pytest.mark.asyncio
+async def test_default_provision_fn_serializes_taskless_codex_refresh_probe(
+    db_session, warm_pool_on, mocker
+):
+    provision = mocker.patch(
+        "app.compute.provision_pool_vm", new=AsyncMock(return_value=object())
+    )
+    project = await _make_project(db_session)
+    other_project = await _make_project(db_session)
+    existing = await _register(
+        db_session, other_project, "agent-vm-codex-refresh-probe", PoolVmState.IDLE,
+        account_id="acct-codex", provider="openai", model="gpt-5.6-terra",
+    )
+    async with _PoolAccounts([{
+        "id": "acct-codex", "provider": "openai", "auth_mode": "oauth",
+        "runtime_ready": True,
+        "runtime_secret": '{"tokens":{"access_token":"opaque","refresh_token":"rt"}}',
+    }]):
+        blocked = await _wpm._default_pool_provision_fn(
+            db_session, project.id, account_id="acct-codex"
+        )
+        assert blocked is False
+        provision.assert_not_awaited()
+        await db_session.delete(existing)
+        await db_session.commit()
+        first_probe = await _wpm._default_pool_provision_fn(
+            db_session, project.id, account_id="acct-codex"
+        )
+        assert first_probe is True
+        provision.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_stale_pool_image_ids_unions_outdated(mocker):
     """_stale_pool_image_ids unions temporal-staleness with pre-promotion
     outdatedness (a newer valid image already exists), so the fleet converges

@@ -1461,10 +1461,9 @@ async def test_cost_ceiling_failure_breakdown_classifies_projected_failed_row(
     )
     payload = dispatch_mock.call_args.args[2]
     breakdown = payload["cost_by_failure_class"]
-    # The stalled-LLM FAILED row must be classified (RATE_LIMIT via the
-    # 0-output-token reclassification, which needs api_call_summary loaded).
-    assert breakdown.get("RATE_LIMIT", 0) > 0, (
-        f"expected RATE_LIMIT bucket in cost_by_failure_class, got {breakdown!r}"
+    # The stalled-LLM row remains budget-exempt without blacklisting an account.
+    assert breakdown.get("no_progress_timeout", 0) > 0, (
+        f"expected no_progress_timeout bucket in cost_by_failure_class, got {breakdown!r}"
     )
     assert breakdown.get("COMPLETED", 0) > 0
 

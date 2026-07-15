@@ -1927,6 +1927,63 @@ class TestRunnerEndpoints:
         assert task_instance.status == TaskStatus.PROVISIONING
 
     @pytest.mark.asyncio
+    async def test_next_task_reconciles_model_to_selected_account_provider(
+        self, client: AsyncClient, db_session
+    ):
+        """Local dispatch must apply the same final identity guard as cloud."""
+        from app.max_plan_pool import LLMSelectionResult
+
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.PROVISIONING,
+            vm_instance_id=f"runner:{runner.id}",
+            context={"runner_target_id": str(runner.id)},
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        selection = LLMSelectionResult(
+            provider="anthropic",
+            auth_mode="api_key",
+            model="claude-sonnet-4-6",
+            quality_tier="sonnet",
+            account={
+                "id": "acct-openai",
+                "provider": "openai",
+                "auth_mode": "oauth",
+                "runtime_secret": "openai-oauth-token",
+                "provider_metadata": {},
+            },
+            settings={},
+        )
+        runtime_config = {
+            "provider_selection_mode": "exclusive",
+            "provider_tier_model_map": {
+                "anthropic": {"sonnet": "claude-sonnet-4-6"},
+                "openai": {"sonnet": "gpt-5.6-terra"},
+            },
+        }
+        with patch("app.shared_state.runtime_config", new=runtime_config), patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new=AsyncMock(return_value=selection),
+        ):
+            response = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        assert response.status_code == 200
+        assert response.json()["credentials"]["env"]["PROVIDER"] == "openai"
+        await db_session.refresh(task)
+        assert task.llm_account_id == "acct-openai"
+        assert task.context["llm_provider"] == "openai"
+        assert task.context["llm_auth_mode"] == "oauth"
+        assert task.context["llm_model"] == "gpt-5.6-terra"
+
+    @pytest.mark.asyncio
     async def test_next_task_rolls_back_dispatch_on_credential_exception(
         self, client: AsyncClient, db_session
     ):
@@ -2598,9 +2655,9 @@ class TestRunnerEndpoints:
         silently. Both counters are pre-incremented by the selector, so a dispatch
         that never happened must refund BOTH.
 
-        The race is forced deterministically: the account selection itself marks the
-        task dispatched (as a concurrent poll would), so the winner re-lock — which
-        re-checks `started_at IS NULL` — finds nothing.
+        The race is forced deterministically: account selection commits
+        ``started_at`` through a second session (as a concurrent poll would), so
+        the winner re-lock — which re-checks `started_at IS NULL` — finds nothing.
         """
         project = await _make_project(db_session)
         runner, token = await _make_runner(db_session, project.id)
@@ -2609,10 +2666,23 @@ class TestRunnerEndpoints:
         db_session.add(task)
         await db_session.commit()
 
+        Session = async_sessionmaker(
+            db_session.bind,
+            class_=AsyncSession,
+            expire_on_commit=False,
+        )
+
         async def _select_and_steal(**kwargs):
             # A concurrent poll wins the row between our unlocked read and our
-            # re-lock: started_at is set, so the claim guard excludes it.
-            kwargs["task"].started_at = _utcnow()
+            # re-lock. Persist through another identity map: mutating the
+            # request's ORM object alone is not flushed by the test session and
+            # therefore does not simulate a real competing transaction.
+            async with Session() as other_session:
+                stolen = await other_session.get(Task, kwargs["task"].id)
+                assert stolen is not None
+                stolen.started_at = _utcnow()
+                other_session.add(stolen)
+                await other_session.commit()
             return self._selection()
 
         release_mock = AsyncMock()

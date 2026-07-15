@@ -120,6 +120,155 @@ from app.time_utils import (
 logger = logging.getLogger("blueprint")
 
 
+def _dispatch_gate_metadata(row: tuple) -> dict:
+    if not row:
+        return {}
+    metadata = _shared_state.deploy_monitoring.get("task_result_metadata", {})
+    value = metadata.get(row[0])
+    return value if isinstance(value, dict) else {}
+
+
+def _partition_dispatch_gate_results(results: list[tuple]) -> tuple[list[tuple], list[tuple]]:
+    """Split deploy-regression samples from operational failures.
+
+    Successful work remains in the regression denominator. Infra/provider
+    failures are retained in a separate operational stream so they can trigger
+    a separately-labelled waste breaker without claiming the deployment's code
+    is bad.
+    """
+    from app.failure_classification import INFRA_CLASSES
+
+    regression: list[tuple] = []
+    operational: list[tuple] = []
+    for row in results:
+        is_failure = len(row) > 1 and row[1] == "failure"
+        failure_class = row[2] if len(row) > 2 else ""
+        timeout_subtype = _dispatch_gate_metadata(row).get("timeout_subtype")
+        code_caused_timeout = failure_class == "AGENT_TIMEOUT" and timeout_subtype in {
+            "oom",
+            "process_crash",
+        }
+        if is_failure and failure_class in INFRA_CLASSES and not code_caused_timeout:
+            operational.append(row)
+        else:
+            regression.append(row)
+    return regression, operational
+
+
+def _task_type_code_failure_rate(
+    results: list[tuple], task_type: str
+) -> tuple[float, int]:
+    regression, _operational = _partition_dispatch_gate_results(results)
+    relevant = [
+        row
+        for row in regression
+        if len(row) >= 4 and row[3] and row[3] == task_type
+    ]
+    if not relevant:
+        return 0.0, 0
+    failures = sum(1 for row in relevant if row[1] == "failure")
+    return failures / len(relevant), len(relevant)
+
+
+def _configured_dispatch_providers(runtime_config: dict) -> set[str]:
+    """Return providers that an actual canonical task route can select."""
+    providers: set[str] = set()
+    for routing_key in ("category_routing", "task_type_routing"):
+        routing = runtime_config.get(routing_key) or {}
+        if not isinstance(routing, dict):
+            continue
+        for route in routing.values():
+            if isinstance(route, dict):
+                providers.update(
+                    p for p in route.get("providers", []) if isinstance(p, str) and p
+                )
+    model_preferences = runtime_config.get("task_type_model_preferences") or {}
+    if isinstance(model_preferences, dict):
+        for preferences in model_preferences.values():
+            if not isinstance(preferences, list):
+                continue
+            providers.update(
+                str(entry["provider"])
+                for entry in preferences
+                if isinstance(entry, dict) and entry.get("provider")
+            )
+    # Legacy configurations without canonical routes still use the tier map's
+    # provider set. Once any canonical route exists, an unrouted tier-map entry
+    # must not keep the global operational gate permanently fail-open.
+    if not providers:
+        tier_map = runtime_config.get("provider_tier_model_map") or {}
+        if isinstance(tier_map, dict):
+            providers.update(str(p) for p in tier_map if p)
+    return providers
+
+
+def _operational_failure_burst(
+    results: list[tuple], configured_providers: set[str] | None = None
+) -> tuple[bool, int, int]:
+    """Trip globally only when every configured cloud provider route is failing.
+
+    Local-runner failures are route-local: a broken workstation must never
+    poison healthy cloud or sibling-runner capacity. A later non-operational
+    result on the same route resets its failure streak.
+    """
+    window = results[-10:]
+    _regression, operational = _partition_dispatch_gate_results(window)
+    waste_classes = {
+        "RATE_LIMIT",
+        "PROVISION_FAILURE",
+        "EXTERNAL_API",
+        "DEAD_AUTH",
+        "NO_PROGRESS_TIMEOUT",
+        "AGENT_STALLED",
+        "AGENT_TIMEOUT",
+        "PARK_WAKE_TIMEOUT",
+        "PARK_WAKE_STRANDED",
+    }
+    operational_ids = {id(row) for row in operational}
+    configured = {p for p in (configured_providers or set()) if p}
+    route_streaks: dict[tuple[str, str, str], int] = {}
+    global_waste_failures: list[tuple] = []
+    for row in window:
+        metadata = _dispatch_gate_metadata(row)
+        provider = str(metadata.get("provider") or "")
+        if not provider:
+            continue
+        runner_id = str(metadata.get("runner_id") or "")
+        backend = str(metadata.get("backend") or ("local_runner" if runner_id else "cloud"))
+        route = (provider, backend, runner_id)
+        is_waste = id(row) in operational_ids and row[2] in waste_classes
+        if is_waste:
+            route_streaks[route] = route_streaks.get(route, 0) + 1
+            if backend != "local_runner":
+                global_waste_failures.append(row)
+        else:
+            route_streaks[route] = 0
+    routes_by_provider: dict[str, list[tuple[str, int]]] = {}
+    for (provider, backend, _runner_id), streak in route_streaks.items():
+        routes_by_provider.setdefault(provider, []).append((backend, streak))
+    unhealthy_providers = {
+        provider
+        for provider, routes in routes_by_provider.items()
+        # An observed non-local route is required. Local-only failures cannot
+        # prove that cloud fallback is unavailable.
+        if any(backend != "local_runner" for backend, _streak in routes)
+        # Every observed route for this provider must still be unhealthy. A
+        # later success on either a local or cloud route keeps useful capacity
+        # flowing and prevents a global sleep.
+        and all(streak >= 2 for _backend, streak in routes)
+    }
+    all_routes_unavailable = bool(configured) and configured.issubset(
+        unhealthy_providers
+    )
+    return (
+        len(window) >= 8
+        and len(global_waste_failures) >= 8
+        and all_routes_unavailable,
+        len(global_waste_failures),
+        len(window),
+    )
+
+
 async def _reconcile_active_per_account(session: AsyncSession) -> Dict[str, int]:
     """Count active (PROVISIONING/IN_PROGRESS) tasks per LLM account id.
 
@@ -894,7 +1043,13 @@ def _sync_task_payload_runtime_fields(
     model: str | None,
     execution_mode: str | None,
 ) -> bool:
-    """Keep payload runtime hints aligned with the resolved task runtime identity."""
+    """Keep payload runtime hints aligned without losing the requested model.
+
+    ``payload.model`` is consumed by legacy agents, so it still carries the
+    resolved model at dispatch.  Provenance lives in task context: a fresh
+    attempt can restore the original request (or remove a purely runtime stamp)
+    instead of treating the last provider's resolved model as a new constraint.
+    """
     if not task.payloads:
         return False
     payload = task.payloads[0]
@@ -902,6 +1057,15 @@ def _sync_task_payload_runtime_fields(
         payload = {}
         task.payloads[0] = payload
     changed = False
+    if model:
+        ctx = dict(getattr(task, "context", None) or {})
+        if "_resolved_payload_model" not in ctx:
+            requested_model = payload.get("model")
+            if isinstance(requested_model, str) and requested_model.strip():
+                ctx["_requested_payload_model"] = requested_model.strip()
+        if ctx.get("_resolved_payload_model") != model:
+            ctx["_resolved_payload_model"] = model
+        task.context = ctx
     if model and payload.get("model") != model:
         payload["model"] = model
         changed = True
@@ -993,7 +1157,7 @@ async def orchestrator_worker():
         apply_task_llm_runtime_context,
         clear_task_llm_runtime_context,
         get_task_llm_account_id,
-        reconcile_model_for_provider,
+        reconcile_llm_runtime_identity,
         resolve_task_quality_tier,
         select_llm_runtime_for_task,
     )
@@ -1558,8 +1722,54 @@ async def orchestrator_worker():
                 # Types with >70% failure rate (min 3 samples) are skipped in the dispatch loop
                 # below without throttling healthy types.
                 _failing_types: set = set()
-                if len(recent_results) >= 5:
-                    recent_window = recent_results[-10:]
+                regression_results, _operational_results = (
+                    _partition_dispatch_gate_results(recent_results)
+                )
+                _op_burst, _op_failures, _op_sample = _operational_failure_burst(
+                    recent_results,
+                    _configured_dispatch_providers(_runtime_config),
+                )
+                if _op_burst:
+                    # Separate operational waste breaker. This is deliberately
+                    # not the deployment regression gate: provider quota and
+                    # broken runner images say nothing about shipped code.
+                    logger.warning(
+                        "[ORCHESTRATOR] Operational failure burst (%s/%s) — "
+                        "pausing dispatch for %ss",
+                        _op_failures,
+                        _op_sample,
+                        ORCHESTRATOR_THROTTLE_SECONDS,
+                    )
+                    try:
+                        await ws_manager.broadcast_to_all(
+                            "pipeline_throttle",
+                            {
+                                "reason": "operational_failure_burst",
+                                "detail": (
+                                    f"{_op_failures}/{_op_sample} recent tasks failed "
+                                    "for provider/runtime reasons"
+                                ),
+                                "recovery_seconds": ORCHESTRATOR_THROTTLE_SECONDS,
+                            },
+                        )
+                    except Exception:
+                        logger.exception(
+                            "[ORCHESTRATOR] Failed to broadcast operational throttle"
+                        )
+                    await recheck_disabled_accounts()
+                    _orchestrator_last_cycle = _utcnow()
+                    try:
+                        await _check_monitoring_window()
+                        await _check_external_health()
+                        await _check_pause_mode()
+                    except Exception:
+                        logger.exception(
+                            "[ORCHESTRATOR] Monitoring checks failed during operational throttle"
+                        )
+                    await asyncio.sleep(ORCHESTRATOR_THROTTLE_SECONDS)
+                    continue
+                if len(regression_results) >= 5:
+                    recent_window = regression_results[-10:]
                     recent_failures = sum(1 for r in recent_window if r[1] == "failure")
                     recent_rate = recent_failures / len(recent_window)
                     _failure_gate = _shared_state.anomaly_adjustments[
@@ -1607,13 +1817,11 @@ async def orchestrator_worker():
                     else:
                         # Per-type gate: detect individual failing types and skip only them
                         seen_types = {
-                            r[3] for r in recent_results if len(r) > 3 and r[3]
+                            r[3] for r in regression_results if len(r) > 3 and r[3]
                         }
                         for ttype in seen_types:
-                            rate, sample_size = (
-                                _shared_state.get_task_type_failure_rate(
-                                    ttype, window_minutes=15
-                                )
+                            rate, sample_size = _task_type_code_failure_rate(
+                                recent_results, ttype
                             )
                             if sample_size >= 3 and rate >= 0.7:
                                 _failing_types.add(ttype)
@@ -1633,8 +1841,8 @@ async def orchestrator_worker():
                             _last_type_throttle_broadcast.get(_ftype), 60
                         ):
                             _last_type_throttle_broadcast[_ftype] = _utcnow()
-                            _frate, _fsample = _shared_state.get_task_type_failure_rate(
-                                _ftype, window_minutes=15
+                            _frate, _fsample = _task_type_code_failure_rate(
+                                recent_results, _ftype
                             )
                             try:
                                 await ws_manager.broadcast_to_all(
@@ -1657,8 +1865,8 @@ async def orchestrator_worker():
                 for _rtype in _recovered_types:
                     if _is_cadence_due(_last_type_unthrottle_broadcast.get(_rtype), 60):
                         _last_type_unthrottle_broadcast[_rtype] = _utcnow()
-                        _rrate, _rsample = _shared_state.get_task_type_failure_rate(
-                            _rtype, window_minutes=15
+                        _rrate, _rsample = _task_type_code_failure_rate(
+                            recent_results, _rtype
                         )
                         logger.info(
                             f"[ORCHESTRATOR] Per-type failure gate cleared: '{_rtype}' recovered ({_rrate:.0%} failure rate, n={_rsample})"
@@ -3846,28 +4054,52 @@ async def orchestrator_worker():
                         # (and, in a rollup, review-fix iterations wasted). Re-derive a
                         # model valid for the resolved provider; no-op when already
                         # consistent or the model is operator-custom (infers to None).
-                        _reconciled_model = reconcile_model_for_provider(
-                            runtime_provider,
-                            runtime_model,
-                            (
+                        _runtime_identity = reconcile_llm_runtime_identity(
+                            account=account,
+                            account_id=account_id,
+                            provider=runtime_provider,
+                            auth_mode=runtime_auth_mode,
+                            model=runtime_model,
+                            quality_tier=(
                                 runtime_selection.quality_tier
                                 if runtime_selection
                                 else None
                             )
                             or resolve_task_quality_tier(task, _runtime_config),
-                            _runtime_config,
+                            runtime_config=_runtime_config,
                         )
-                        if _reconciled_model != runtime_model:
+                        if (
+                            _runtime_identity.provider != runtime_provider
+                            or _runtime_identity.auth_mode != runtime_auth_mode
+                            or _runtime_identity.model != runtime_model
+                        ):
                             logger.warning(
-                                "[ORCHESTRATOR] Cross-provider model mismatch for task "
-                                "%s: provider=%s but model=%s is foreign; re-derived "
-                                "to %s",
+                                "[ORCHESTRATOR] Reconciled inconsistent runtime identity "
+                                "for task %s: account=%s provider=%s->%s auth=%s->%s "
+                                "model=%s->%s",
                                 task.id,
+                                _runtime_identity.account_id,
                                 runtime_provider,
+                                _runtime_identity.provider,
+                                runtime_auth_mode,
+                                _runtime_identity.auth_mode,
                                 runtime_model,
-                                _reconciled_model,
+                                _runtime_identity.model,
                             )
-                            runtime_model = _reconciled_model
+                        account_id = _runtime_identity.account_id
+                        runtime_provider = _runtime_identity.provider
+                        runtime_auth_mode = _runtime_identity.auth_mode
+                        runtime_model = _runtime_identity.model
+                        if (
+                            isinstance(runtime_provider_settings, dict)
+                            and runtime_model
+                            and runtime_provider_settings.get("model")
+                            and runtime_provider_settings.get("model") != runtime_model
+                        ):
+                            runtime_provider_settings = {
+                                **runtime_provider_settings,
+                                "model": runtime_model,
+                            }
 
                         if _sync_task_payload_runtime_fields(
                             task,

@@ -543,11 +543,67 @@ _PROVIDER_MODEL_CONFIG_PATTERNS: tuple[str, ...] = (
     # access to it"; "the selected model may not exist or you may not have access")
     "does not exist or you do not have access",
     "may not exist or you may not have access",
+    # Codex ChatGPT OAuth rejects provider-foreign model ids with this exact
+    # 400. This is a dispatch/configuration defect, never account throttling.
+    "is not supported when using codex with a chatgpt account",
+    "unsupported model",
 )
 
 
 def _provider_model_config_rejection(combined: str) -> bool:
-    return any(kw in combined for kw in _PROVIDER_MODEL_CONFIG_PATTERNS)
+    if any(kw in combined for kw in _PROVIDER_MODEL_CONFIG_PATTERNS):
+        return True
+    # Keep the generic form anchored on an actual model rejection. Do not
+    # match ordinary language such as "unsupported operand type".
+    return bool(
+        re.search(
+            r"(?:the\s+)?['\"]?[a-z0-9_.:-]+['\"]?\s+model\s+is\s+not\s+supported",
+            combined,
+        )
+    )
+
+
+# Deterministic provider-CLI installation/startup failures. A JS shim being
+# present on PATH is not sufficient when its platform package is absent (the
+# Codex npm package's optional native dependency is the production incident).
+# These failures happen before any provider request and must never cool down an
+# account or participate in rate-limit correlation.
+_RUNTIME_UNAVAILABLE_PATTERNS: tuple[str, ...] = (
+    "missing optional dependency @openai/codex-",
+    "@openai/codex-linux-x64",
+    "@openai/codex-linux-arm64",
+    "could not find native codex binary",
+    "codex cli is not runnable",
+    "codex: command not found",
+    "command not found: codex",
+    "spawn codex enoent",
+)
+
+
+def _runtime_unavailable(combined: str) -> bool:
+    return any(kw in combined for kw in _RUNTIME_UNAVAILABLE_PATTERNS)
+
+
+_EXPLICIT_PROVIDER_RATE_LIMIT_PATTERNS: tuple[str, ...] = (
+    "rate limit reached",
+    "rate_limit_error",
+    "rate_limit_exceeded",
+    "too many requests",
+    "api usage exhausted",
+    "usage limit reached",
+    "you've hit your limit",
+    "you've hit your usage limit",
+    "insufficient_quota",
+)
+
+
+def _explicit_provider_rate_limit_evidence(combined: str) -> bool:
+    """True only for provider-emitted quota/throttle signatures.
+
+    Intentionally excludes bare ``429`` and generic ``quota`` so GitHub/GCP
+    failures and prose in task output cannot cool an LLM account.
+    """
+    return any(kw in combined for kw in _EXPLICIT_PROVIDER_RATE_LIMIT_PATTERNS)
 
 
 # Deterministic agent/CLI permission-flag rejections. The model CLIs refuse
@@ -1603,22 +1659,67 @@ def _persist_dead_auth_context(task: "Task", matched_pattern: str) -> None:
         logger.exception("[FAILURE_CLASS] Failed to persist dead_auth context")
 
 
+def _persist_operational_reclassification_context(
+    task: "Task", inferred_from: str
+) -> None:
+    """Record a non-quota provider/runtime inference without rate-limit keys."""
+    try:
+        ctx = dict(task.context or {})
+        ctx["provider_failure_inferred_from"] = inferred_from
+        # Remove breadcrumbs from an older attempt. Their presence must not
+        # make a runtime/config failure look eligible for account cooldown.
+        ctx.pop("rate_limit_correlation_reclassified", None)
+        ctx.pop("rate_limit_inferred_from", None)
+        task.context = ctx
+    except Exception:
+        logger.exception(
+            "[FAILURE_CLASS] Failed to persist operational reclassification marker"
+        )
+
+
+def _error_report_text(report: dict) -> str:
+    parts: list[str] = []
+    stderr_tail = report.get("stderr_tail")
+    if isinstance(stderr_tail, str):
+        parts.append(stderr_tail)
+    provider_errors = report.get("provider_errors")
+    if isinstance(provider_errors, list):
+        for entry in provider_errors:
+            if not isinstance(entry, dict):
+                continue
+            for key in ("code", "message"):
+                value = entry.get(key)
+                if isinstance(value, str):
+                    parts.append(value)
+    return " ".join(parts).lower()
+
+
 def _agent_error_report_reclass(task: "Task") -> str | None:
     """Consume the structured agent error report as the primary signal for a
     generic CODE_ERROR-labelled failure.
 
-    Returns DEAD_AUTH when the startup-death signal has a provider-declared
-    dead-auth signature (permanent — auto-disable the account). Returns
-    RATE_LIMIT (and persists the reclassification breadcrumb + rate_limit_kind
-    for cooldown bookkeeping) for other provider-layer deaths. Returns None
-    when no report exists or the report shows a completed run. Callers must
-    fall back to the text heuristics ONLY when no report exists (old agents)."""
+    Only explicit provider quota evidence returns RATE_LIMIT. A non-zero exit
+    before model output is merely a run-shape fact: it can be a missing native
+    package, unsupported model, bad auth, or provider quota. Treating that shape
+    itself as quota created false account cooldowns and retry storms.
+
+    Deterministic runtime startup failures return PROVISION_FAILURE; model/API
+    compatibility rejections return EXTERNAL_API; unexplained startup deaths
+    return PROVISION_FAILURE; unexplained mid-stream cuts return
+    NO_PROGRESS_TIMEOUT. Returns None for completed/readable runs."""
     report = get_agent_error_report(task)
     if report is None:
         return None
     signal = _error_report_provider_death_signal(report)
     if signal is None:
         return None
+    report_text = _error_report_text(report)
+    if _runtime_unavailable(report_text):
+        _persist_operational_reclassification_context(task, "runtime_unavailable")
+        return PROVISION_FAILURE
+    if _provider_model_config_rejection(report_text):
+        _persist_operational_reclassification_context(task, "provider_model_config")
+        return EXTERNAL_API
     # Dead-auth check before rate-limit — a dead OAuth session is permanent
     # (operator must re-auth); a rate limit is transient. Misclassifying
     # permanent as transient burns attempts on an account that keeps dying.
@@ -1630,8 +1731,18 @@ def _agent_error_report_reclass(task: "Task") -> str | None:
         if dead_auth_pattern:
             _persist_dead_auth_context(task, dead_auth_pattern)
             return DEAD_AUTH
-    _persist_stuck_call_reclassification(task, signal)
-    return RATE_LIMIT
+    text_override = _text_provider_failure_override(
+        task, report_text, structured_provider_error=True
+    )
+    if text_override:
+        return text_override
+    if "overloaded" in report_text:
+        _persist_operational_reclassification_context(task, "provider_overloaded")
+        return EXTERNAL_API
+    _persist_operational_reclassification_context(task, signal)
+    if signal == "error_report_startup_death":
+        return PROVISION_FAILURE
+    return NO_PROGRESS_TIMEOUT
 
 
 # The agent wrapper embeds the last 10KB of Claude CLI output in the ERROR_LOG
@@ -1707,14 +1818,44 @@ _EXECUTION_STALL_SIGNATURES = (
 )
 
 
-def _text_provider_failure_override(task: "Task", combined: str) -> str | None:
+def _text_provider_failure_override(
+    task: "Task",
+    combined: str,
+    *,
+    structured_provider_error: bool = False,
+) -> str | None:
     """Return a strong provider/API class from text, or None.
 
     Used only to override generic agent labels like "fatal"; precise agent
     categories such as test_failed/lint_failed remain authoritative.
     """
+    if _runtime_unavailable(combined):
+        return PROVISION_FAILURE
+
     if _provider_model_config_rejection(combined):
         return EXTERNAL_API
+
+    # A generic agent label can wrap GitHub/backend traffic too. Exclude those
+    # sources before any LLM throttle phrase; only a structured provider error
+    # may use the cross-provider phrase bank directly.
+    if any(
+        marker in combined
+        for marker in (
+            "github",
+            "api.github.com",
+            "internal api",
+            "dispatch api",
+            "blueprint api",
+            "/api/agent",
+        )
+    ) and any(
+        marker in combined
+        for marker in ("429", "too many requests", "rate limit")
+    ):
+        return EXTERNAL_API
+
+    if structured_provider_error and _explicit_provider_rate_limit_evidence(combined):
+        return RATE_LIMIT
 
     signal = _task_rate_limit_signal(task, combined)
     if signal is not None:
@@ -1857,17 +1998,6 @@ def normalize_agent_failure_category(
                 return override
             if any(kw in combined for kw in _VIEWPORT_INFRA_UNAVAILABLE_PATTERNS):
                 return PROVISION_FAILURE
-        if (
-            mapped == CODE_ERROR
-            and label_lower in _ALL_GENERIC_CODE_ERROR_LABELS
-            and (
-                db_rl_override
-                or _account_was_rate_limited(task, at_time=at_time)
-                or _pool_was_rate_limited(task, at_time=at_time)
-            )
-        ):
-            _persist_correlation_reclassification_context(task)
-            return RATE_LIMIT
         # panel_review_lens_failed maps to PROVISION_FAILURE in the category
         # table, but the lens subprocess stderr (stored in latest_status_message
         # via failPanelClosed) may contain dead-auth or rate-limit signals that
@@ -2014,6 +2144,9 @@ EXTERNAL_API_SUBTYPE_PROVIDER_AUTH = "provider_auth"
 EXTERNAL_API_SUBTYPE_PROVIDER_QUOTA = "provider_quota"
 EXTERNAL_API_SUBTYPE_PROVIDER_MODEL_CONFIG = "provider_model_config"
 EXTERNAL_API_SUBTYPE_GITHUB_PR_CREATE = "github_pr_create"
+EXTERNAL_API_SUBTYPE_GITHUB_RATE_LIMIT = "github_rate_limit"
+EXTERNAL_API_SUBTYPE_INTERNAL_RATE_LIMIT = "internal_rate_limit"
+EXTERNAL_API_SUBTYPE_PROVIDER_OVERLOAD = "provider_overload"
 EXTERNAL_API_SUBTYPE_DB_CONNECTIVITY = "db_connectivity"
 EXTERNAL_API_SUBTYPE_NETWORK_TRANSIENT = "network_transient"
 EXTERNAL_API_SUBTYPE_OTHER = "other"
@@ -2044,6 +2177,25 @@ def _external_api_subtype_from_message(combined: str) -> str:
     if _provider_model_config_rejection(combined):
         return EXTERNAL_API_SUBTYPE_PROVIDER_MODEL_CONFIG
 
+    rate_markers = ("rate limit", "429", "too many requests")
+    if any(marker in combined for marker in ("github", "api.github.com")) and any(
+        marker in combined for marker in rate_markers
+    ):
+        return EXTERNAL_API_SUBTYPE_GITHUB_RATE_LIMIT
+    if any(
+        marker in combined
+        for marker in (
+            "internal api",
+            "dispatch api",
+            "blueprint api",
+            "/api/agent",
+            "/api/runner",
+        )
+    ) and any(marker in combined for marker in rate_markers):
+        return EXTERNAL_API_SUBTYPE_INTERNAL_RATE_LIMIT
+    if "overloaded" in combined:
+        return EXTERNAL_API_SUBTYPE_PROVIDER_OVERLOAD
+
     # Provider quota / rate exhaustion / capacity (non-auth upstream limits).
     # Check this before generic auth because some OpenAI-compatible gateways pair
     # 401-ish wording with balance/quota text; those should cooldown/retry rather
@@ -2051,7 +2203,6 @@ def _external_api_subtype_from_message(combined: str) -> str:
     if any(
         kw in combined
         for kw in (
-            "overloaded",
             "rate limit",
             "429",
             "too many requests",
@@ -2127,12 +2278,6 @@ def _external_api_subtype_from_message(combined: str) -> str:
     ):
         return EXTERNAL_API_SUBTYPE_GITHUB_PR_CREATE
 
-    # GitHub rate limits.
-    if any(gh_kw in combined for gh_kw in ("github", "api.github.com")) and any(
-        kw in combined for kw in ("rate limit", "429", "too many requests")
-    ):
-        return EXTERNAL_API_SUBTYPE_PROVIDER_QUOTA
-
     # Transient network / TLS / DNS errors.
     if any(
         kw in combined
@@ -2180,13 +2325,9 @@ def classify_failure_with_confidence(
         (task.latest_status_message or "").lower() + " " + (logs or "").lower()
     ).strip()
     combined_lower = combined.lower()
-    # Silent-rate-limit reclassification. An AGENT_TIMEOUT whose text is an
-    # execution/time-limit stall (the agent's 45-min ClaudeTimeoutError, or a
-    # mid-stream tool_use stall) AND whose telemetry shows an LLM call started
-    # but produced 0 output tokens is a silent provider hang — a 429/529 the
-    # Claude Code SDK absorbed via internal retry, surfacing no rate-limit text.
-    # That is NOT a code/agent defect: treat it as RATE_LIMIT so it holds/reroutes
-    # instead of burning the retry budget and terminal-failing a healthy task.
+    # A zero-output execution stall is operational, but is not evidence that
+    # the assigned account was throttled. Route through the budget-exempt
+    # no-progress path without mutating account cooldown state.
     # Scoped to execution-stall signatures so cancellations / heartbeat-loss /
     # OOM (which can also show 0 output) are NOT swept in. Runs before the
     # agent_category early-exit so the agent's own 'fatal' label can't mask it.
@@ -2197,8 +2338,10 @@ def classify_failure_with_confidence(
         and _stuck_llm_call_no_progress(task)
         and any(sig in combined_lower for sig in _EXECUTION_STALL_SIGNATURES)
     ):
-        _persist_stuck_call_reclassification(task)
-        return FailureClassification(failure_class=RATE_LIMIT, confidence=0.7)
+        _persist_operational_reclassification_context(task, "stuck_llm_call_no_output")
+        return FailureClassification(
+            failure_class=NO_PROGRESS_TIMEOUT, confidence=0.7
+        )
     # CLI-death reclassification for CODE_ERROR. A Claude CLI process that died
     # without the model ever producing output (init-banner-only tail,
     # 0-output-token telemetry) or that was severed mid-stream (delta events
@@ -2216,26 +2359,15 @@ def classify_failure_with_confidence(
         failure_class == CODE_ERROR
         and str(agent_category or "").lower() in _ALL_GENERIC_CODE_ERROR_LABELS
     ):
-        # Structured agent error report — the PRIMARY signal. When the agent
-        # shipped one, its run-shape verdict is authoritative in BOTH
-        # directions: a provider-layer death reclassifies to RATE_LIMIT at
-        # high confidence, and a report showing a completed run SUPPRESSES the
-        # text-tail guessing below (so e.g. an init banner quoted inside an
-        # otherwise-complete run's logs can no longer false-positive). The
-        # text heuristics run only when no report exists (old agents).
+        # Structured reports are interpreted by the same evidence-based helper
+        # as the write-boundary path. Run shape alone never means quota.
         report = get_agent_error_report(task)
         if report is not None:
-            report_signal = _error_report_provider_death_signal(report)
-            if report_signal:
-                if report_signal == "error_report_startup_death":
-                    dead_auth_pattern = _check_dead_auth_from_stderr(task, report)
-                    if dead_auth_pattern:
-                        _persist_dead_auth_context(task, dead_auth_pattern)
-                        return FailureClassification(
-                            failure_class=DEAD_AUTH, confidence=0.9
-                        )
-                _persist_stuck_call_reclassification(task, report_signal)
-                return FailureClassification(failure_class=RATE_LIMIT, confidence=0.9)
+            report_class = _agent_error_report_reclass(task)
+            if report_class:
+                return FailureClassification(
+                    failure_class=report_class, confidence=0.9
+                )
         else:
             cli_death_signal = (
                 "stuck_llm_call_no_output"
@@ -2247,8 +2379,15 @@ def classify_failure_with_confidence(
                 else None
             )
             if cli_death_signal:
-                _persist_stuck_call_reclassification(task, cli_death_signal)
-                return FailureClassification(failure_class=RATE_LIMIT, confidence=0.7)
+                _persist_operational_reclassification_context(task, cli_death_signal)
+                fallback_class = (
+                    PROVISION_FAILURE
+                    if cli_death_signal == "cli_startup_death_init_only_tail"
+                    else NO_PROGRESS_TIMEOUT
+                )
+                return FailureClassification(
+                    failure_class=fallback_class, confidence=0.7
+                )
     if agent_category:
         return FailureClassification(failure_class=failure_class, confidence=0.9)
     if failure_class == MIGRATION_ERROR:
@@ -2448,13 +2587,6 @@ def _classify_failure_class(
                     return PROVISION_FAILURE
                 if any(kw in combined for kw in _VIEWPORT_PATTERNS):
                     return VIEWPORT_REGRESSION
-                if agent_lower in _ALL_GENERIC_CODE_ERROR_LABELS and (
-                    db_rl_override
-                    or _account_was_rate_limited(task, at_time=at_time)
-                    or _pool_was_rate_limited(task, at_time=at_time)
-                ):
-                    _persist_correlation_reclassification_context(task)
-                    return RATE_LIMIT
             # panel_review_lens_failed: the task logs contain the raw lens
             # subprocess stderr (via failPanelClosed's detail string). A dead
             # OAuth session in a Codex lens runner appears there instead of in a
@@ -2497,19 +2629,10 @@ def _classify_failure_class(
     logs_lower = (logs or "").lower()
     combined = status_msg + " " + logs_lower
 
-    # Empty/whitespace-only combined log — agent crashed or never communicated.
-    # Check account state FIRST: a silent death during a rate-limit cooldown
-    # should classify as RATE_LIMIT, not AGENT_TIMEOUT, so no retry attempt is burned.
-    # Pool-wide check covers pre-assignment deaths (no account assigned yet) and
-    # cross-instance cases where db_rl_override carries the durable DB signal.
+    # Empty/whitespace-only output is an agent timeout. Another task's account
+    # cooldown is not evidence about this attempt and must not rewrite it as a
+    # rate limit.
     if not combined.strip():
-        if (
-            db_rl_override
-            or _account_was_rate_limited(task, at_time=at_time)
-            or _pool_was_rate_limited(task, at_time=at_time)
-        ):
-            _persist_correlation_reclassification_context(task)
-            return RATE_LIMIT
         return AGENT_TIMEOUT
 
     # Cascade cancellations and supersessions — administrative orchestrator decisions
@@ -2547,6 +2670,12 @@ def _classify_failure_class(
         ]
     ):
         return "EXTERNAL_API"
+
+    # Local CLI/package readiness failures occur before a provider request.
+    # Check them before any run-shape/report inference and never cool an LLM
+    # account for a broken runner installation.
+    if _runtime_unavailable(combined):
+        return PROVISION_FAILURE
 
     # Provision failures — GCP quota, network, VM startup issues, SSH/init script errors, disk exhaustion.
     # "provision" is matched via _PROVISION_PHRASE_RE so benign mentions like
@@ -2802,20 +2931,6 @@ def _classify_failure_class(
     report_class = _agent_error_report_reclass(task)
     if report_class:
         return report_class
-
-    # Account-state correlation: before defaulting to CODE_ERROR, check if the
-    # assigned account was in rate-limit cooldown, OR if the entire pool was blocked.
-    # Generic failures (no keywords, no structured signal) during a multi-hour block
-    # are most likely throttling-induced; classifying as RATE_LIMIT avoids burning a
-    # retry attempt. Pool-wide check fires even when no account was assigned (pre-
-    # assignment death) or when the assigned account itself was not flagged.
-    if (
-        db_rl_override
-        or _account_was_rate_limited(task, at_time=at_time)
-        or _pool_was_rate_limited(task, at_time=at_time)
-    ):
-        _persist_correlation_reclassification_context(task)
-        return RATE_LIMIT
 
     # Default: code error — record fingerprint for residual-pattern analysis.
     # Pass `logs` so the fingerprint keys on the actual error signature

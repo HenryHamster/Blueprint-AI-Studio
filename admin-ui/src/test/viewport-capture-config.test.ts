@@ -32,6 +32,16 @@ describe('vitest.viewport.capture.config.ts — capture-mode deltas', () => {
     expect(src).toContain("setupFiles: ['./src/test/viewport-setup.ts']");
     expect(src).toContain('tailwindcss()');
   });
+
+  it('serializes viewport files so Playwright routes cannot race each other', () => {
+    const gateSrc = readFileSync(
+      path.join(ADMIN_UI_ROOT, 'vitest.viewport.config.ts'),
+      'utf-8',
+    );
+
+    expect(src).toContain('fileParallelism: false');
+    expect(gateSrc).toContain('fileParallelism: false');
+  });
 });
 
 describe('package.json — capture script', () => {
