@@ -64,7 +64,7 @@ from typing import Awaitable, Callable, cast, NamedTuple, TypeVar
 from urllib.parse import quote
 
 import sqlalchemy as sa
-from sqlalchemy.engine import URL
+from sqlalchemy.engine import URL, make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.pool import NullPool
 from sqlmodel import SQLModel
@@ -732,7 +732,7 @@ async def _reflect_scratch_drift(
 
 
 async def _provision_seed_and_detect_drift(
-    prod_url: URL,
+    scratch_base_url: URL,
     prod_state: _ProdState,
     candidate_sources: dict[str, str],
     required_metadata: sa.MetaData,
@@ -743,11 +743,11 @@ async def _provision_seed_and_detect_drift(
     Raises ``_MigrationApplyError`` on seed/apply/collision failure (deferrable).
     Returns an empty list when the post-upgrade schema satisfies all requirements.
     """
-    async with ephemeral_postgres_database(prod_url) as (scratch_engine, name):
+    async with ephemeral_postgres_database(scratch_base_url) as (scratch_engine, name):
         # ISOLATION GUARD: never run DDL against the production database.
-        if name == prod_url.database:
+        if name == scratch_base_url.database:
             raise _MigrationApplyError(
-                "scratch database name collided with production's"
+                "scratch database name collided with the scratch server's default database"
             )
         await _seed_scratch(scratch_engine, prod_state)
         await _apply_candidate_migrations(scratch_engine, candidate_sources)
@@ -946,6 +946,7 @@ async def run_migration_apply_gate(
     project_id: str | None = None,
     required_metadata: sa.MetaData | None = None,
     candidate_sources: dict[str, str] | None = None,
+    scratch_db_url: str | None = None,
 ) -> Verdict:
     """Pre-promotion scratch-DB migration-apply gate.
 
@@ -969,11 +970,24 @@ async def run_migration_apply_gate(
     from a fresh apply of its own migration chain AND compares that to the
     candidate code's required schema so a forgotten migration still blocks.
 
+    *scratch_db_url* is an optional dedicated Postgres target for ephemeral
+    database provisioning (``CREATE DATABASE``). When provided, the gate creates
+    scratch/reference databases on this server instead of the production
+    Postgres connection. In the deployed environment the production connection
+    is typically a limited-role pool user that cannot ``CREATE DATABASE``, so
+    every candidate would defer with ``migration_apply_check_unavailable``.
+    Supplying a scratch-capable target unblocks the gate pre-promotion. When
+    ``None`` (default), the gate falls back to *prod_engine*'s URL — the
+    correct path for dev/test environments where the Postgres user can create
+    databases.
+
     ISOLATION SAFETY: production is only ever read; the scratch database is a
     freshly-provisioned, separately-named Postgres database, and the orchestrator
     asserts its name differs from production's before any DDL.
     """
     prod_url = prod_engine.url
+    scratch_base_url = make_url(scratch_db_url) if scratch_db_url else prod_url
+
     if not prod_url.get_backend_name().startswith("postgresql"):
         # The renumber-skip class is a Postgres-deploy phenomenon; the gate needs
         # a real migration-applying Postgres scratch target. With a non-Postgres
@@ -1039,7 +1053,7 @@ async def run_migration_apply_gate(
         # either injected or already fetched above (else we returned 'defer').
         try:
             candidate_reference_metadata = await _build_candidate_reference_schema(
-                prod_url, candidate_sources
+                scratch_base_url, candidate_sources
             )
             candidate_required_metadata = await _build_candidate_required_metadata(
                 gh_token=gh_token,
@@ -1074,7 +1088,7 @@ async def run_migration_apply_gate(
     try:
         drift = await _with_transient_retry(
             lambda: _provision_seed_and_detect_drift(
-                prod_url, prod_state, candidate_sources, required_metadata
+                scratch_base_url, prod_state, candidate_sources, required_metadata
             ),
             label="provision-seed-apply-drift",
         )

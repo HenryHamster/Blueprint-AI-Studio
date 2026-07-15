@@ -2892,6 +2892,7 @@ async def _resolve_migration_apply_at_finalize(
             return ("ok", None)
         token, owner, repo = resolved
         prod_engine = resolve_async_engine(session)
+        scratch_db_url = os.getenv("MIGRATION_APPLY_SCRATCH_DATABASE_URL")
         try:
             verdict, detail = await run_migration_apply_gate(
                 prod_engine=prod_engine,
@@ -2900,6 +2901,7 @@ async def _resolve_migration_apply_at_finalize(
                 repo=repo,
                 candidate_ref=candidate_sha,
                 project_id=str(version.project_id),
+                scratch_db_url=scratch_db_url,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
@@ -2936,6 +2938,7 @@ async def _resolve_migration_apply_at_finalize(
             repo=repo,
             candidate_ref=candidate_sha,
             project_id=str(version.project_id),
+            scratch_db_url=scratch_db_url,
         )
         logger.info(
             "[RELEASE_QUALIFIER] finalize migration-apply gate retry for v%d "
