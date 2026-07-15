@@ -40,6 +40,22 @@ export function isBenignPlaywrightRouteRace(error) {
   return isDuplicateFulfill;
 }
 
+/**
+ * Catch the benign rejection at the Playwright route-callback boundary. The
+ * provider otherwise drops the callback promise into the process-level
+ * unhandled-rejection path before Vitest's onUnhandledError filter can own it.
+ */
+export function guardPlaywrightRouteHandler(handler) {
+  return async (...args) => {
+    try {
+      return await handler(...args);
+    } catch (error) {
+      if (isBenignPlaywrightRouteRace(error)) return undefined;
+      throw error;
+    }
+  };
+}
+
 // Single source of truth for viewport-test exemptions: the committed JSON
 // viewport-exempt.json. Components listed there are internal/utility and never
 // rendered standalone on an operator page — overflow is handled by the parent
