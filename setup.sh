@@ -415,6 +415,11 @@ prompt_secret_or_skip "GITHUB_CLIENT_ID"      "GitHub OAuth client ID (from App 
 prompt_secret_or_skip "GITHUB_CLIENT_SECRET"  "GitHub OAuth client secret (Generate a client secret)" "true"
 prompt_secret_or_skip "GITHUB_PRIVATE_KEY"    "GitHub App private key (paste full PEM contents)" "true"
 prompt_secret_or_skip "GITHUB_WEBHOOK_SECRET" "GitHub webhook secret (the value you set on the App)" "true"
+# These boot-required secrets use the same placeholder path so Cloud Run's
+# --set-secrets validation fails at deploy time only for a missing secret name.
+# Replace placeholders with the real values before relying on the service.
+prompt_secret_or_skip "GITHUB_PAT_ENCRYPTION_KEY" "Fernet key used to encrypt GitHub PATs" "true"
+prompt_secret_or_skip "MIGRATION_APPLY_SCRATCH_DATABASE_URL" "Dedicated scratch Postgres URL for migration qualification" "true"
 
 # ─── Build → Migrate → Deploy ───────────────────────────────────────────────
 #
@@ -463,15 +468,14 @@ ok "Migrations complete"
 
 info "Deploying backend to Cloud Run..."
 # Mirrors cloudbuild.yaml's deploy step (kept inline so the bootstrap order
-# is build → migrate → deploy). Drift risk: if cloudbuild.yaml's env-var or
-# secret list changes, this needs updating too. Watchpoint: anyone who edits
-# cloudbuild.yaml should grep for "VM_PROVISIONING_MODEL" here.
+# is build → migrate → deploy). The deploy-parity test reads the machine-readable
+# required-runtime-env manifest and both lists below to prevent boot-env drift.
 gcloud run deploy blueprint-orchestrator \
   --image="$IMAGE_TAG" \
   --region="$REGION" \
   --service-account="$ORCHESTRATOR_SA" \
-  --set-env-vars="GCP_PROJECT_ID=$PROJECT_ID,GCP_ZONE=${ZONE},VPC_NETWORK=agent-sandbox-vpc,VPC_SUBNET=agent-sandbox-subnet,AGENT_SERVICE_ACCOUNT_EMAIL=agent-naked-sa@${PROJECT_ID}.iam.gserviceaccount.com,ARTIFACT_BUCKET_NAME=${PROJECT_ID}-agent-artifacts,ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-http://localhost:3000},ORCHESTRATOR_URL=${ORCHESTRATOR_URL},LOCAL_MODE=false,MAX_CONCURRENT_VMS=10,INITIAL_ADMIN_EMAIL=${ADMIN_EMAIL:-},VM_PROVISIONING_MODEL=SPOT,DISABLED_REGIONS=us-east1;us-east4;us-west1" \
-  --set-secrets="DATABASE_URL=DATABASE_URL:latest,AGENT_JWT_SECRET=AGENT_JWT_SECRET:latest,WS_TICKET_SECRET=WS_TICKET_SECRET:latest,GITHUB_APP_ID=GITHUB_APP_ID:latest,GITHUB_CLIENT_ID=GITHUB_CLIENT_ID:latest,GITHUB_CLIENT_SECRET=GITHUB_CLIENT_SECRET:latest,GITHUB_PRIVATE_KEY=GITHUB_PRIVATE_KEY:latest,GITHUB_WEBHOOK_SECRET=GITHUB_WEBHOOK_SECRET:latest,ADMIN_API_KEY=ADMIN_API_KEY:latest" \
+  --set-env-vars="GCP_PROJECT_ID=$PROJECT_ID,GCP_ZONE=${ZONE},VPC_NETWORK=agent-sandbox-vpc,VPC_SUBNET=agent-sandbox-subnet,AGENT_SERVICE_ACCOUNT_EMAIL=agent-naked-sa@${PROJECT_ID}.iam.gserviceaccount.com,ARTIFACT_BUCKET_NAME=${PROJECT_ID}-agent-artifacts,ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-http://localhost:3000},ORCHESTRATOR_URL=${ORCHESTRATOR_URL},LOCAL_MODE=false,MAX_CONCURRENT_VMS=10,MAX_PROVISION_SLOTS=2,MACHINE_TYPE=n2-standard-2,INITIAL_ADMIN_EMAIL=${ADMIN_EMAIL:-},VM_PROVISIONING_MODEL=STANDARD,DISABLED_REGIONS=us-east4;us-west1,CLOUD_RUN_JOB_NAME=projects/${PROJECT_ID}/locations/${REGION}/jobs/blueprint-agent-job" \
+  --set-secrets="DATABASE_URL=DATABASE_URL:latest,AGENT_JWT_SECRET=AGENT_JWT_SECRET:latest,WS_TICKET_SECRET=WS_TICKET_SECRET:latest,GITHUB_APP_ID=GITHUB_APP_ID:latest,GITHUB_CLIENT_ID=GITHUB_CLIENT_ID:latest,GITHUB_CLIENT_SECRET=GITHUB_CLIENT_SECRET:latest,GITHUB_PRIVATE_KEY=GITHUB_PRIVATE_KEY:latest,GITHUB_WEBHOOK_SECRET=GITHUB_WEBHOOK_SECRET:latest,ADMIN_API_KEY=ADMIN_API_KEY:latest,METRICS_TOKEN=METRICS_TOKEN:latest,GITHUB_PAT_ENCRYPTION_KEY=GITHUB_PAT_ENCRYPTION_KEY:latest,MIGRATION_APPLY_SCRATCH_DATABASE_URL=MIGRATION_APPLY_SCRATCH_DATABASE_URL:latest" \
   --no-cpu-throttling --cpu-boost \
   --vpc-egress=all-traffic --network=agent-sandbox-vpc --subnet=agent-sandbox-subnet \
   --project="$PROJECT_ID" --quiet

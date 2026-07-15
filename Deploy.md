@@ -26,6 +26,14 @@ This runs in two phases:
 - `firebase` CLI (`npm install -g firebase-tools`)
 - Node.js 20+
 
+## Required deploy secrets
+
+Before deploying a current backend revision, create these Secret Manager secrets
+once. `GITHUB_PAT_ENCRYPTION_KEY` must contain the live Fernet key already used
+by the service, and `MIGRATION_APPLY_SCRATCH_DATABASE_URL` must contain the
+scratch Postgres URL required by the migration-apply gate. Cloud Run validates
+both secret bindings during deployment.
+
 ---
 
 ## GitHub App Setup
