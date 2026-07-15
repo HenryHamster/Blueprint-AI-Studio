@@ -711,7 +711,10 @@ async def _resolve_pool_credentials_for_dispatch(
         if project is None:
             return True, _ResolvedDispatch(credentials=None), None, None
 
-        from app.max_plan_pool import select_llm_runtime_for_task
+        from app.max_plan_pool import (
+            reconcile_llm_runtime_identity,
+            select_llm_runtime_for_task,
+        )
         from app.compute_manifest import (
             _apply_llm_env,
             _resolve_provider_materials,
@@ -746,17 +749,53 @@ async def _resolve_pool_credentials_for_dispatch(
         account = selection.account
         selected_account_id = account.get("id")
 
+        identity = reconcile_llm_runtime_identity(
+            account=account,
+            account_id=selected_account_id,
+            provider=selection.provider,
+            auth_mode=selection.auth_mode,
+            model=selection.model,
+            quality_tier=selection.quality_tier,
+            runtime_config=_rc_dict,
+        )
+        if (
+            identity.provider != selection.provider
+            or identity.auth_mode != selection.auth_mode
+            or identity.model != selection.model
+        ):
+            logger.warning(
+                "[RUNNERS] Reconciled inconsistent runtime identity for task %s: "
+                "account=%s provider=%s->%s auth=%s->%s model=%s->%s",
+                task.id,
+                identity.account_id,
+                selection.provider,
+                identity.provider,
+                selection.auth_mode,
+                identity.auth_mode,
+                selection.model,
+                identity.model,
+            )
+
+        provider_settings = selection.settings
+        if (
+            isinstance(provider_settings, dict)
+            and identity.model
+            and provider_settings.get("model")
+            and provider_settings.get("model") != identity.model
+        ):
+            provider_settings = {**provider_settings, "model": identity.model}
+
         # Build credential env/files using the same provider-impl path that
         # cloud-VM manifests use — BEFORE stamping the task, so an exception
         # here leaves the row untouched.
         materials = _resolve_provider_materials(
             oauth_token=account.get("runtime_secret") or account.get("oauth_token"),
             claude_config_json=account.get("claude_config_json"),
-            provider=selection.provider,
-            auth_mode=selection.auth_mode,
-            model=selection.model,
+            provider=identity.provider,
+            auth_mode=identity.auth_mode,
+            model=identity.model,
             provider_metadata=account.get("provider_metadata"),
-            provider_settings=selection.settings,
+            provider_settings=provider_settings,
         )
         cred_env: dict[str, str] = {
             "PROVIDER": materials.provider_name,
@@ -764,9 +803,9 @@ async def _resolve_pool_credentials_for_dispatch(
         }
         _apply_llm_env(
             cred_env,
-            model=selection.model,
+            model=identity.model,
             execution_mode=selection.execution_mode,
-            provider_settings=selection.settings,
+            provider_settings=provider_settings,
             materials=materials,
         )
         credentials = {
@@ -784,8 +823,8 @@ async def _resolve_pool_credentials_for_dispatch(
             task.id,
             task_type,
             runner.id,
-            selection.provider,
-            selection.model,
+            identity.provider,
+            identity.model,
         )
         # The runtime-context stamp happens in _apply_dispatch_credentials, on
         # the winner only — see this function's docstring.
@@ -793,10 +832,10 @@ async def _resolve_pool_credentials_for_dispatch(
             True,
             _ResolvedDispatch(
                 credentials=credentials,
-                account_id=account.get("id"),
-                provider=selection.provider,
-                auth_mode=selection.auth_mode,
-                model=selection.model,
+                account_id=identity.account_id,
+                provider=identity.provider,
+                auth_mode=identity.auth_mode,
+                model=identity.model,
                 execution_mode=selection.execution_mode,
             ),
             None,

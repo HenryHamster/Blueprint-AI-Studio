@@ -45,6 +45,547 @@ def _docker_caps(gpu_indices=()):
     )
 
 
+def _healthy_llm_clis():
+    return {
+        "claude": {
+            "present": True, "executable_found": True, "healthy": True,
+            "version": "claude 1.0.0", "reason": None,
+        },
+        "codex": {
+            "present": True, "executable_found": True, "healthy": True,
+            "version": "codex-cli 0.144.1", "reason": None,
+        },
+        "gemini": {
+            "present": True, "executable_found": True, "healthy": True,
+            "version": "gemini 1.0.0", "reason": None,
+        },
+    }
+
+
+def _broken_codex_llm_clis(reason="missing_native_package"):
+    result = _healthy_llm_clis()
+    result["codex"] = {
+        "present": False, "executable_found": True, "healthy": False,
+        "version": "", "reason": reason,
+    }
+    return result
+
+
+class TestLlmCliBackendProbe(unittest.TestCase):
+    def setUp(self):
+        local_runner._IMAGE_LLM_CLI_PROBE_CACHE.clear()
+
+    def tearDown(self):
+        local_runner._IMAGE_LLM_CLI_PROBE_CACHE.clear()
+
+    def test_docker_backend_uses_healthy_image_not_broken_host(self):
+        image_health = _healthy_llm_clis()
+        with patch.object(
+            local_runner, "_agent_image_identity", return_value="sha256:new"
+        ), patch.object(
+            iso, "probe_container_llm_clis", return_value=image_health
+        ) as container_probe, patch.object(
+            iso, "probe_llm_clis", return_value=_broken_codex_llm_clis()
+        ) as host_probe:
+            source, result = local_runner._probe_llm_clis_for_agent_backend(
+                iso.BACKEND_DOCKER, "registry/agent:prod"
+            )
+
+        self.assertEqual(source, "docker:registry/agent:prod@sha256:new")
+        self.assertTrue(result["codex"]["healthy"])
+        container_probe.assert_called_once_with("registry/agent:prod")
+        host_probe.assert_not_called()
+
+    def test_docker_backend_uses_broken_image_not_healthy_host(self):
+        image_health = _broken_codex_llm_clis()
+        with patch.object(
+            local_runner, "_agent_image_identity", return_value="sha256:broken"
+        ), patch.object(
+            iso, "probe_container_llm_clis", return_value=image_health
+        ) as container_probe, patch.object(
+            iso, "probe_llm_clis", return_value=_healthy_llm_clis()
+        ) as host_probe:
+            source, result = local_runner._probe_llm_clis_for_agent_backend(
+                iso.BACKEND_DOCKER, "registry/agent:prod"
+            )
+
+        self.assertEqual(source, "docker:registry/agent:prod@sha256:broken")
+        self.assertFalse(result["codex"]["healthy"])
+        container_probe.assert_called_once_with("registry/agent:prod")
+        host_probe.assert_not_called()
+
+    def test_bwrap_backend_uses_host_not_configured_image(self):
+        host_health = _healthy_llm_clis()
+        with patch.object(
+            iso, "probe_llm_clis", return_value=host_health
+        ) as host_probe, patch.object(
+            iso, "probe_container_llm_clis", return_value=_broken_codex_llm_clis()
+        ) as container_probe:
+            source, result = local_runner._probe_llm_clis_for_agent_backend(
+                iso.BACKEND_BWRAP, "registry/agent:configured-but-not-selected"
+            )
+
+        self.assertEqual(source, "host")
+        self.assertTrue(result["codex"]["healthy"])
+        host_probe.assert_called_once_with(
+            env=local_runner._cli_subprocess_env()
+        )
+        container_probe.assert_not_called()
+
+    def _hybrid_heartbeat(self, *, host_health, image_health):
+        posted = []
+
+        def fake_post(url, token, body, **kwargs):
+            posted.append(body)
+            local_runner._shutdown_event.set()
+            return 200, {"ok": True}
+
+        caps = iso.Capabilities(
+            bwrap_path="/usr/bin/bwrap",
+            unshare_path="/usr/bin/unshare",
+            userns_ok=True,
+            docker_usable=True,
+        )
+        local_runner._shutdown_event.clear()
+        try:
+            with (
+                patch.object(local_runner, "_post", side_effect=fake_post),
+                patch.object(
+                    local_runner,
+                    "_locate_agent_binary",
+                    return_value=["node", "/agent/dist/index.js"],
+                ),
+                patch.object(local_runner, "_node_runtime_ok", return_value=True),
+                patch.object(
+                    local_runner,
+                    "_agent_image_identity",
+                    return_value="sha256:hybrid",
+                ),
+                patch.object(
+                    iso, "probe_llm_clis", return_value=host_health
+                ) as host_probe,
+                patch.object(
+                    iso,
+                    "probe_container_llm_clis",
+                    return_value=image_health,
+                ) as image_probe,
+            ):
+                local_runner._heartbeat_loop(
+                    "https://api",
+                    "tok",
+                    {},
+                    threading.Lock(),
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                    agent_sandbox_ok=True,
+                    caps=caps,
+                    agent_image="registry/agent:prod",
+                )
+        finally:
+            local_runner._shutdown_event.clear()
+        self.assertEqual(len(posted), 1)
+        self.assertEqual(host_probe.call_count, 1)
+        self.assertEqual(image_probe.call_count, 1)
+        return posted[0]
+
+    def test_hybrid_healthy_image_broken_host_fails_provider_closed(self):
+        body = self._hybrid_heartbeat(
+            host_health=_broken_codex_llm_clis(),
+            image_health=_healthy_llm_clis(),
+        )
+        self.assertTrue(body["agent_available"])
+        self.assertFalse(body["llm_clis"]["codex"]["healthy"])
+        self.assertFalse(body["llm_clis"]["codex"]["present"])
+        self.assertIsNone(body["cli_inventory"]["codex"])
+        self.assertTrue(body["llm_clis"]["claude"]["healthy"])
+        self.assertIsNotNone(body["cli_inventory"]["claude"])
+
+    def test_hybrid_broken_image_healthy_host_fails_provider_closed(self):
+        body = self._hybrid_heartbeat(
+            host_health=_healthy_llm_clis(),
+            image_health=_broken_codex_llm_clis(),
+        )
+        self.assertTrue(body["agent_available"])
+        self.assertFalse(body["llm_clis"]["codex"]["healthy"])
+        self.assertFalse(body["llm_clis"]["codex"]["present"])
+        self.assertIsNone(body["cli_inventory"]["codex"])
+        self.assertTrue(body["llm_clis"]["claude"]["healthy"])
+        self.assertIsNotNone(body["cli_inventory"]["claude"])
+
+    def test_same_tag_new_image_id_invalidates_cached_probe(self):
+        identities = iter(("sha256:old", "sha256:new"))
+        with patch.object(
+            local_runner,
+            "_agent_image_identity",
+            side_effect=lambda _image: next(identities),
+        ), patch.object(
+            iso,
+            "probe_container_llm_clis",
+            side_effect=(_broken_codex_llm_clis(), _healthy_llm_clis()),
+        ) as container_probe:
+            _, old_result = local_runner._probe_llm_clis_for_agent_backend(
+                iso.BACKEND_DOCKER, "registry/agent:prod"
+            )
+            _, new_result = local_runner._probe_llm_clis_for_agent_backend(
+                iso.BACKEND_DOCKER, "registry/agent:prod"
+            )
+
+        self.assertFalse(old_result["codex"]["healthy"])
+        self.assertTrue(new_result["codex"]["healthy"])
+        self.assertEqual(container_probe.call_count, 2)
+        self.assertEqual(
+            set(local_runner._IMAGE_LLM_CLI_PROBE_CACHE),
+            {("registry/agent:prod", "sha256:new")},
+        )
+
+    def test_one_transient_failure_grace_then_fails_closed(self):
+        last_healthy = {}
+        failures = {}
+        source = "docker:registry/agent:prod@sha256:one"
+        healthy = local_runner._stabilize_llm_cli_probe(
+            source, _healthy_llm_clis(), last_healthy, failures
+        )
+        transient = _broken_codex_llm_clis("version_probe_timeout")
+        first = local_runner._stabilize_llm_cli_probe(
+            source, transient, last_healthy, failures
+        )
+        second = local_runner._stabilize_llm_cli_probe(
+            source, transient, last_healthy, failures
+        )
+
+        self.assertTrue(healthy["codex"]["healthy"])
+        self.assertTrue(first["codex"]["healthy"])
+        self.assertTrue(first["codex"]["probe_stale"])
+        self.assertEqual(first["codex"]["probe_warning"], "version_probe_timeout")
+        self.assertFalse(second["codex"]["healthy"])
+
+    def test_deterministic_failure_has_no_grace(self):
+        last_healthy = {}
+        failures = {}
+        source = "host"
+        local_runner._stabilize_llm_cli_probe(
+            source, _healthy_llm_clis(), last_healthy, failures
+        )
+        failed = local_runner._stabilize_llm_cli_probe(
+            source, _broken_codex_llm_clis(), last_healthy, failures
+        )
+        self.assertFalse(failed["codex"]["healthy"])
+
+
+class TestManagedCliMaintenance(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old_cli_dir = os.environ.get("BLUEPRINT_RUNNER_CLI_DIR")
+        self.old_path = os.environ.get("PATH")
+        os.environ["BLUEPRINT_RUNNER_CLI_DIR"] = self.tmp.name
+        os.environ["PATH"] = "/operator/bin"
+
+    def tearDown(self):
+        if self.old_cli_dir is None:
+            os.environ.pop("BLUEPRINT_RUNNER_CLI_DIR", None)
+        else:
+            os.environ["BLUEPRINT_RUNNER_CLI_DIR"] = self.old_cli_dir
+        if self.old_path is None:
+            os.environ.pop("PATH", None)
+        else:
+            os.environ["PATH"] = self.old_path
+        self.tmp.cleanup()
+
+    @staticmethod
+    def _which(name, path=None):
+        if name == "npm" and path is None:
+            return "/tools/npm"
+        if path:
+            candidate = os.path.join(path, name)
+            return candidate if os.path.isfile(candidate) else None
+        return None
+
+    def _successful_install_run(self, args, **kwargs):
+        if "install" in args:
+            staging = args[args.index("--prefix") + 1]
+            bin_dir = os.path.join(staging, "node_modules", ".bin")
+            os.makedirs(bin_dir, exist_ok=True)
+            Path(os.path.join(bin_dir, "codex")).write_text("shim")
+            return subprocess.CompletedProcess(args, 0, stdout="installed", stderr="")
+        return subprocess.CompletedProcess(
+            args, 0, stdout="codex-cli 0.144.1", stderr=""
+        )
+
+    def test_stages_verifies_and_atomically_activates(self):
+        with patch.object(local_runner.shutil, "which", side_effect=self._which), \
+             patch.object(
+                 local_runner.subprocess,
+                 "run",
+                 side_effect=self._successful_install_run,
+             ):
+            self.assertTrue(
+                local_runner._install_managed_cli(
+                    "codex", "/tools/npm", "@openai/codex", "0.144.1"
+                )
+            )
+
+        manifest = local_runner._read_json(
+            os.path.join(self.tmp.name, "codex", "active.json")
+        )
+        self.assertEqual(manifest["version"], "0.144.1")
+        active_bin = local_runner._managed_cli_bin("codex")
+        self.assertIsNotNone(active_bin)
+        self.assertEqual(os.environ["PATH"].split(os.pathsep)[0], active_bin)
+        self.assertIn("/operator/bin", os.environ["PATH"])
+
+    def test_failed_verification_does_not_replace_active_release(self):
+        with patch.object(local_runner.shutil, "which", side_effect=self._which), \
+             patch.object(
+                 local_runner.subprocess,
+                 "run",
+                 side_effect=self._successful_install_run,
+             ):
+            self.assertTrue(
+                local_runner._install_managed_cli(
+                    "codex", "/tools/npm", "@openai/codex", "0.144.1"
+                )
+            )
+        active_path = os.path.join(self.tmp.name, "codex", "active.json")
+        before = local_runner._read_json(active_path)
+
+        def old_version(args, **kwargs):
+            if "install" in args:
+                return self._successful_install_run(args, **kwargs)
+            return subprocess.CompletedProcess(
+                args, 0, stdout="codex-cli 0.143.0", stderr=""
+            )
+
+        with patch.object(local_runner.shutil, "which", side_effect=self._which), \
+             patch.object(local_runner.subprocess, "run", side_effect=old_version):
+            self.assertFalse(
+                local_runner._install_managed_cli(
+                    "codex", "/tools/npm", "@openai/codex", "0.144.1"
+                )
+            )
+        self.assertEqual(local_runner._read_json(active_path), before)
+
+    def test_outdated_codex_repairs_to_reviewed_exact_version(self):
+        inventory = _healthy_llm_clis()
+        inventory["codex"] = {
+            "present": False,
+            "executable_found": True,
+            "healthy": False,
+            "version": "codex-cli 0.143.0",
+            "reason": "unsupported_version",
+        }
+        with patch.object(local_runner.shutil, "which", return_value="/tools/npm"), \
+             patch.object(iso, "probe_llm_clis", return_value=inventory), \
+             patch.object(local_runner, "_npm_latest_version", return_value="1.0.0"), \
+             patch.object(local_runner, "_install_managed_cli", return_value=True) as install:
+            local_runner._maintain_host_llm_clis_once(now=1000)
+
+        install.assert_called_once_with(
+            "codex", "/tools/npm", "@openai/codex", "0.144.1"
+        )
+
+    def test_install_failure_is_backed_off_and_does_not_log_subprocess_output(self):
+        inventory = _healthy_llm_clis()
+        inventory["codex"] = _broken_codex_llm_clis()["codex"]
+        secret = "npm-registry-token-must-not-appear"
+
+        def failed_install(args, **kwargs):
+            return subprocess.CompletedProcess(args, 1, stdout="", stderr=secret)
+
+        stdout = io.StringIO()
+        with patch.object(local_runner.shutil, "which", return_value="/tools/npm"), \
+             patch.object(iso, "probe_llm_clis", return_value=inventory), \
+             patch.object(local_runner, "_npm_latest_version", return_value="1.0.0"), \
+             patch.object(local_runner.subprocess, "run", side_effect=failed_install), \
+             contextlib.redirect_stdout(stdout):
+            local_runner._maintain_host_llm_clis_once(now=2000)
+
+        state = local_runner._read_json(
+            local_runner._cli_backoff_path("codex")
+        )
+        self.assertEqual(state["failures"], 1)
+        self.assertEqual(state["next_retry_at"], 2060)
+        self.assertNotIn(secret, stdout.getvalue())
+        self.assertIn("keeping the previous CLI", stdout.getvalue())
+
+    def test_install_view_and_verification_receive_secret_free_environment(self):
+        secrets = {
+            "BLUEPRINT_RUNNER_TOKEN": "runner-secret",
+            "BLUEPRINT_ORCHESTRATOR_URL": "https://secret-orchestrator",
+            "AGENT_SECRET_TOKEN": "agent-secret",
+            "OPENAI_API_KEY": "openai-secret",
+            "CODEX_API_KEY": "codex-secret",
+            "ANTHROPIC_API_KEY": "anthropic-secret",
+            "CLAUDE_CODE_OAUTH_TOKEN": "oauth-secret",
+            "GH_TOKEN": "github-secret",
+            "GITHUB_TOKEN": "github-secret-2",
+            "DATABASE_URL": "postgresql://secret",
+            "PATH": "/safe/bin",
+            "HOME": "/safe/home",
+            "HTTPS_PROXY": "https://safe-proxy",
+        }
+        calls = []
+
+        def safe_run(args, **kwargs):
+            calls.append((list(args), dict(kwargs.get("env") or {})))
+            if "view" in args:
+                return subprocess.CompletedProcess(
+                    args, 0, stdout="1.2.3", stderr=""
+                )
+            return self._successful_install_run(args, **kwargs)
+
+        with (
+            patch.dict(os.environ, secrets, clear=False),
+            patch.object(local_runner.shutil, "which", side_effect=self._which),
+            patch.object(local_runner.subprocess, "run", side_effect=safe_run),
+        ):
+            self.assertEqual(
+                local_runner._npm_latest_version("/tools/npm", "example"),
+                "1.2.3",
+            )
+            self.assertTrue(
+                local_runner._install_managed_cli(
+                    "codex", "/tools/npm", "@openai/codex", "0.144.1"
+                )
+            )
+
+        self.assertEqual(len(calls), 3)  # npm view, npm install, CLI --version
+        for _, child_env in calls:
+            self.assertEqual(child_env["PATH"], "/safe/bin")
+            self.assertEqual(child_env["HOME"], "/safe/home")
+            self.assertEqual(child_env["HTTPS_PROXY"], "https://safe-proxy")
+            for key in secrets:
+                if key not in {"PATH", "HOME", "HTTPS_PROXY"}:
+                    self.assertNotIn(key, child_env)
+
+    def test_cross_process_lock_serializes_maintainers(self):
+        first = local_runner._acquire_cli_process_lock()
+        try:
+            self.assertIsNotNone(first)
+            self.assertIsNone(local_runner._acquire_cli_process_lock())
+        finally:
+            local_runner._release_cli_process_lock(first)
+
+    def test_final_gap_successor_cannot_enter_before_directory_rmdir(self):
+        held = local_runner._acquire_cli_process_lock()
+        self.assertIsNotNone(held)
+        lock_path, owner_token = held
+        blocked = []
+
+        def injected_successor():
+            try:
+                os.mkdir(lock_path)
+            except FileExistsError:
+                blocked.append(True)
+
+        self.assertTrue(
+            local_runner._remove_cli_lock_directory(
+                lock_path,
+                expected_owner_token=owner_token,
+                before_rmdir=injected_successor,
+            )
+        )
+        self.assertEqual(blocked, [True])
+        self.assertFalse(os.path.exists(lock_path))
+
+    def test_partial_and_corrupt_lock_publications_recover_after_grace(self):
+        lock_path = os.path.join(self.tmp.name, ".maintenance.lock")
+        for corrupt in (False, True):
+            os.mkdir(lock_path)
+            if corrupt:
+                Path(
+                    os.path.join(lock_path, local_runner._CLI_LOCK_OWNER_FILE)
+                ).write_text("{partial", encoding="utf-8")
+            old = (
+                time.time()
+                - local_runner._CLI_LOCK_PUBLICATION_GRACE_SECONDS
+                - 1
+            )
+            os.utime(lock_path, (old, old))
+            held = local_runner._acquire_cli_process_lock()
+            self.assertIsNotNone(held)
+            local_runner._release_cli_process_lock(held)
+            self.assertFalse(os.path.exists(lock_path))
+
+    def test_dead_owner_lock_is_reclaimed_but_live_owner_is_not(self):
+        lock_path = os.path.join(self.tmp.name, ".maintenance.lock")
+        os.mkdir(lock_path)
+        owner_path = os.path.join(lock_path, local_runner._CLI_LOCK_OWNER_FILE)
+        Path(owner_path).write_text(
+            json.dumps(
+                {
+                    "owner_token": "dead-owner",
+                    "pid": 999999,
+                    "created_at": 1,
+                }
+            ),
+            encoding="utf-8",
+        )
+        old = time.time() - local_runner._CLI_LOCK_PUBLICATION_GRACE_SECONDS - 1
+        os.utime(lock_path, (old, old))
+        held = local_runner._acquire_cli_process_lock()
+        self.assertIsNotNone(held)
+        local_runner._release_cli_process_lock(held)
+
+        live = local_runner._acquire_cli_process_lock()
+        self.assertIsNotNone(live)
+        os.utime(live[0], (old, old))
+        self.assertIsNone(local_runner._acquire_cli_process_lock())
+        local_runner._release_cli_process_lock(live)
+
+    @unittest.skipUnless(os.name == "nt", "Windows control-event regression")
+    def test_pid_liveness_probe_does_not_broadcast_ctrl_c_on_windows(self):
+        with patch.object(local_runner.os, "kill") as kill:
+            self.assertTrue(local_runner._pid_is_alive(os.getpid()))
+        kill.assert_not_called()
+
+    def test_release_retention_is_bounded(self):
+        releases = os.path.join(self.tmp.name, "codex", "releases")
+        os.makedirs(releases)
+        paths = []
+        for index in range(4):
+            path = os.path.join(releases, f"release-{index}")
+            os.makedirs(path)
+            os.utime(path, (100 + index, 100 + index))
+            paths.append(path)
+        local_runner._prune_managed_cli_releases(
+            releases, paths[-1], keep=2
+        )
+        self.assertEqual(
+            sorted(os.listdir(releases)), ["release-2", "release-3"]
+        )
+
+    def test_docker_backend_is_image_managed_and_skips_host_mutation(self):
+        self.assertFalse(
+            local_runner._host_cli_maintenance_allowed(
+                _docker_caps(), "registry/agent:prod"
+            )
+        )
+        self.assertTrue(
+            local_runner._host_cli_maintenance_allowed(_bwrap_caps(), None)
+        )
+
+    def test_hybrid_docker_and_bwrap_keeps_host_maintenance_for_write_slice(self):
+        caps = iso.Capabilities(
+            bwrap_path="/usr/bin/bwrap",
+            unshare_path="/usr/bin/unshare",
+            userns_ok=True,
+            docker_usable=True,
+        )
+        image = "registry/agent:prod"
+        self.assertTrue(local_runner._host_cli_maintenance_allowed(caps, image))
+        self.assertEqual(
+            iso.decide_agent_backend(
+                caps, True, task_type="research", agent_image=image
+            ),
+            iso.BACKEND_DOCKER,
+        )
+        self.assertEqual(
+            iso.decide_agent_backend(
+                caps, True, task_type="feature", agent_image=image
+            ),
+            iso.BACKEND_BWRAP,
+        )
+
+
 def _gpu_state(indices):
     return {
         "allowed": list(indices),
@@ -2770,6 +3311,88 @@ class TestGpuDetection(unittest.TestCase):
         body = posted_bodies[0]
         self.assertIsNone(body["llm_clis"])
 
+    def test_explicit_unhealthy_cli_fails_closed_in_flat_inventory(self):
+        """A new unhealthy signal wins over a legacy-looking present=True shim."""
+        posted_bodies = []
+        fake_llm_clis = {
+            "claude": {"present": True, "version": "0.2.0"},
+            "codex": {
+                "present": True,
+                "executable_found": True,
+                "healthy": False,
+                "version": "",
+                "reason": "missing_native_package",
+            },
+        }
+
+        def fake_post(url, token, body, **kwargs):
+            posted_bodies.append(body)
+            local_runner._shutdown_event.set()
+            return 200, {"ok": True}
+
+        local_runner._shutdown_event.clear()
+        try:
+            with patch.object(local_runner, "_post", fake_post), \
+                 patch.object(local_runner, "_runner_version", return_value="v22-abc"), \
+                 patch.object(local_runner, "_locate_agent_binary", return_value=["node", "/agent/dist/index.js"]), \
+                 patch.object(local_runner, "_node_runtime_ok", return_value=True), \
+                 patch.object(iso, "probe_llm_clis", return_value=fake_llm_clis):
+                local_runner._heartbeat_loop(
+                    "https://api",
+                    "tok",
+                    {},
+                    threading.Lock(),
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                    caps=_bwrap_caps(),
+                    agent_image=None,
+                )
+        finally:
+            local_runner._shutdown_event.clear()
+
+        body = posted_bodies[0]
+        # Normalized for old orchestrators that only consume ``present``.
+        self.assertFalse(body["llm_clis"]["codex"]["present"])
+        self.assertFalse(body["llm_clis"]["codex"]["healthy"])
+        self.assertIsNone(body["cli_inventory"]["codex"])
+        # Legacy heartbeat/probe entries with no healthy bit still work.
+        self.assertEqual(body["cli_inventory"]["claude"], "0.2.0")
+
+    def test_below_minimum_codex_fails_closed_in_heartbeat(self):
+        posted_bodies = []
+        probed = _healthy_llm_clis()
+        probed["codex"] = iso._llm_cli_result(
+            "codex",
+            subprocess.CompletedProcess(
+                ["codex", "--version"], 0, stdout="codex-cli 0.143.0", stderr=""
+            ),
+        )
+
+        def fake_post(url, token, body, **kwargs):
+            posted_bodies.append(body)
+            local_runner._shutdown_event.set()
+            return 200, {"ok": True}
+
+        local_runner._shutdown_event.clear()
+        try:
+            with patch.object(local_runner, "_post", fake_post), \
+                 patch.object(local_runner, "_runner_version", return_value="v22-abc"), \
+                 patch.object(local_runner, "_locate_agent_binary", return_value=["node", "/agent/dist/index.js"]), \
+                 patch.object(local_runner, "_node_runtime_ok", return_value=True), \
+                 patch.object(iso, "probe_llm_clis", return_value=probed):
+                local_runner._heartbeat_loop(
+                    "https://api", "tok", {}, threading.Lock(),
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                    caps=_bwrap_caps(),
+                )
+        finally:
+            local_runner._shutdown_event.clear()
+
+        codex = posted_bodies[0]["llm_clis"]["codex"]
+        self.assertEqual(codex["reason"], "unsupported_version")
+        self.assertFalse(codex["healthy"])
+        self.assertFalse(codex["present"])
+        self.assertIsNone(posted_bodies[0]["cli_inventory"]["codex"])
+
     def test_docker_only_declares_read_only_agent_slice(self):
         """A docker-only box (docker+image, NO bwrap) DECLARES the read-only agent
         slice in supported_agent_task_types.
@@ -2790,7 +3413,11 @@ class TestGpuDetection(unittest.TestCase):
         local_runner._shutdown_event.clear()
         try:
             with patch.object(local_runner, "_post", fake_post), \
-                 patch.object(local_runner, "_locate_agent_binary", return_value=None):
+                 patch.object(local_runner, "_locate_agent_binary", return_value=None), \
+                 patch.object(
+                     local_runner, "_probe_llm_clis_for_agent_backend",
+                     return_value=("docker:test", _healthy_llm_clis()),
+                 ):
                 local_runner._heartbeat_loop(
                     "https://api", "tok", active_tasks, lock,
                     {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
@@ -2827,7 +3454,11 @@ class TestGpuDetection(unittest.TestCase):
             with patch.object(local_runner, "_post", fake_post), \
                  patch.object(local_runner, "_locate_agent_binary",
                               return_value=["node", "/agent/dist/index.js"]), \
-                 patch.object(local_runner, "_node_runtime_ok", return_value=True):
+                 patch.object(local_runner, "_node_runtime_ok", return_value=True), \
+                 patch.object(
+                     local_runner, "_probe_llm_clis_for_agent_backend",
+                     return_value=("docker:test", _healthy_llm_clis()),
+                 ):
                 local_runner._heartbeat_loop(
                     "https://api", "tok", active_tasks, lock,
                     {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
@@ -4720,7 +5351,11 @@ class TestDockerAgentBackend(unittest.TestCase):
         # Host toolchain ABSENT (docker-only box): no agent dist, no node runtime.
         with patch.object(local_runner, "_post", fake_post), \
              patch.object(local_runner, "_locate_agent_binary", return_value=None), \
-             patch.object(local_runner, "_node_runtime_ok", return_value=False):
+             patch.object(local_runner, "_node_runtime_ok", return_value=False), \
+             patch.object(
+                 local_runner, "_probe_llm_clis_for_agent_backend",
+                 return_value=("docker:test", _healthy_llm_clis()),
+             ):
             local_runner._heartbeat_loop(
                 "https://api", "tok", {}, threading.Lock(),
                 {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
@@ -4872,7 +5507,11 @@ class TestAgentImagePresence(unittest.TestCase):
 
         with patch.object(local_runner, "_post", fake_post), \
              patch.object(local_runner, "_locate_agent_binary", return_value=None), \
-             patch.object(local_runner, "_node_runtime_ok", return_value=False):
+             patch.object(local_runner, "_node_runtime_ok", return_value=False), \
+             patch.object(
+                 local_runner, "_probe_llm_clis_for_agent_backend",
+                 return_value=("docker:test", _healthy_llm_clis()),
+             ):
             local_runner._heartbeat_loop(
                 "https://api", "tok", {}, threading.Lock(),
                 {"has_gpu": False, "gpu_count": 0, "gpu_names": []},

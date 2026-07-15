@@ -1185,6 +1185,9 @@ def test_fresh_attempt_context_strip_preserves_retry_guidance_history():
             "_dispatch_prep_failures": 3,
             "provision_failures": 2,
             "llm_account_id": "acct-1",
+            "agent_error_report": {"exit_code": 1},
+            "_requested_payload_model": "gpt-5.6-sol",
+            "_resolved_payload_model": "claude-sonnet-4-6",
             "_previous_failure_class": "SCOPE_OVERFLOW",
             "_failure_class_history": ["SCOPE_OVERFLOW"],
         }
@@ -1200,8 +1203,56 @@ def test_fresh_attempt_context_strip_preserves_retry_guidance_history():
     assert "_dispatch_prep_failures" not in ctx
     assert "provision_failures" not in ctx
     assert "llm_account_id" not in ctx
+    assert "agent_error_report" not in ctx
+    assert "_requested_payload_model" not in ctx
+    assert "_resolved_payload_model" not in ctx
     assert ctx["_previous_failure_class"] == "SCOPE_OVERFLOW"
     assert ctx["_failure_class_history"] == ["SCOPE_OVERFLOW"]
+
+
+@pytest.mark.asyncio
+async def test_fresh_attempt_payload_model_restore_survives_flush_and_expire(tl_db):
+    """Nested JSONB restoration must be durable, not only visible in memory."""
+    from app.task_blocked import reset_task_for_fresh_attempt
+
+    session, _factory = tl_db
+    project = await _make_project(session)
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "create",
+                "model": "claude-sonnet-4-6",
+                "execution_mode": "default",
+            }
+        ],
+        status=TaskStatus.IN_PROGRESS,
+        llm_account_id="aaaaaaaa-0001-4000-a000-000000000099",
+        context={
+            "llm_account_id": "aaaaaaaa-0001-4000-a000-000000000099",
+            "llm_provider": "anthropic",
+            "llm_model": "claude-sonnet-4-6",
+            "agent_error_report": {"exit_code": 1},
+            "_requested_payload_model": "gpt-5.6-sol",
+            "_resolved_payload_model": "claude-sonnet-4-6",
+            "_previous_failure_class": "RATE_LIMIT",
+        },
+    )
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+
+    reset_task_for_fresh_attempt(task)
+    session.add(task)
+    await session.flush()
+    session.expire(task, ["payloads", "context"])
+    await session.refresh(task, attribute_names=["payloads", "context"])
+
+    assert task.payloads[0]["model"] == "gpt-5.6-sol"
+    assert task.payloads[0]["execution_mode"] == "default"
+    assert task.context.get("_previous_failure_class") == "RATE_LIMIT"
+    assert "agent_error_report" not in task.context
+    assert "llm_model" not in task.context
 
 
 def test_clear_blocker_metadata_allows_clean_reescalation():
@@ -3454,7 +3505,6 @@ async def test_process_post_commit_persists_timing_fields(tl_db, mocker):
         context={"existing": "value"},
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
     )
-
     payload = AgentStatusPayload(
         task_id=task.id,
         status=TaskStatus.COMPLETED,
@@ -3570,6 +3620,14 @@ async def test_process_post_commit_transient_handler_failure_requeues_after_roll
         latest_status_message="[18.6MB] Using tool: Bash",
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
     )
+    task.vm_provisioned_at = _utcnow() - timedelta(minutes=5)
+    task.vm_stopped_at = _utcnow()
+    task.api_call_summary = {
+        "total_input_tokens": 1200,
+        "total_output_tokens": 300,
+        "llm_call_count": 2,
+    }
+    await session.commit()
 
     async def _failing_handler(t, logs, sess):
         # Mirror the real handler: stage partial uncommitted work (a child task,
@@ -3618,6 +3676,11 @@ async def test_process_post_commit_transient_handler_failure_requeues_after_roll
     # Recovery persisted: the task was requeued for a fresh attempt.
     assert refetched.status == TaskStatus.QUEUED
     assert refetched.attempt_count == 1
+    assert refetched.llm_input_tokens_banked == 1200
+    assert refetched.llm_output_tokens_banked == 300
+    assert refetched.llm_call_count_banked == 2
+    assert refetched.api_call_summary is None
+    assert len(refetched.attempt_history or []) == 1
     assert (refetched.latest_status_message or "").startswith(
         "Handler hit transient error, requeuing"
     )

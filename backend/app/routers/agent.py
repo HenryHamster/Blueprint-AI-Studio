@@ -13,7 +13,7 @@ from typing import Dict, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Header, Query, Request
 from fastapi.responses import JSONResponse
-from sqlalchemy import and_, func, or_, text
+from sqlalchemy import Uuid, and_, bindparam, func, or_, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
@@ -1154,8 +1154,7 @@ async def claim_task(
 
     _MAX_ANCESTOR_DEPTH = 5
     if task.parent_task_id is not None:
-        _ancestor_result = await session.execute(
-            text(
+        _ancestor_query = text(
                 """
                 WITH RECURSIVE ancestor_chain(id, parent_task_id, depth) AS (
                     SELECT id, parent_task_id, 0
@@ -1170,11 +1169,16 @@ async def claim_task(
                 SELECT id FROM ancestor_chain
                 WHERE id != :self_id
                 """
-            ),
+            ).bindparams(
+                bindparam("start_id", type_=Uuid(as_uuid=True)),
+                bindparam("self_id", type_=Uuid(as_uuid=True)),
+            )
+        _ancestor_result = await session.execute(
+            _ancestor_query,
             {
-                "start_id": str(task.parent_task_id),
+                "start_id": task.parent_task_id,
                 "max_depth": _MAX_ANCESTOR_DEPTH,
-                "self_id": str(task.id),
+                "self_id": task.id,
             },
         )
         for _row in _ancestor_result:

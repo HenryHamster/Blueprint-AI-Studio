@@ -6,6 +6,8 @@ keeping assertions deterministic without fixtures or locks.
 """
 
 import asyncio
+import base64
+import json
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -33,10 +35,13 @@ from app.max_plan_pool import (
     _USAGE_METER_REFRESH_INTERVAL_SECONDS,
     _USAGE_SNAPSHOT_TTL_SECONDS,
     _account_at_cap,
+    _codex_oauth_requires_refresh_probe,
     _account_available_for_model,
     _project_at_cap,
     _account_by_id,
     _account_state_for_model,
+    _apply_rate_limit_mutations,
+    _apply_usage_cap_mutations,
     _build_rate_limit_state_blob,
     _apply_usage_gate,
     _cached_usage_snapshot,
@@ -56,10 +61,12 @@ from app.max_plan_pool import (
     _normalize_rl_model,
     _pending_cap_persists,
     _pending_rl_persists,
+    _persist_rate_limit_state,
     _prune_health_events,
     _refresh_usage_snapshot,
     _restore_usage_state,
     _serialize_disabled_model_info,
+    _stage_usage_delta,
     _snapshot_from_persisted_usage,
     _usage_gate_should_skip,
     _usage_headroom_rank,
@@ -100,6 +107,15 @@ def _acct(**kw) -> dict:
     return base
 
 
+def _codex_oauth_secret(expires_at_epoch: float) -> str:
+    payload = base64.urlsafe_b64encode(
+        json.dumps({"exp": expires_at_epoch}).encode("utf-8")
+    ).decode("ascii").rstrip("=")
+    return json.dumps(
+        {"tokens": {"access_token": f"header.{payload}.sig", "refresh_token": "rotating-refresh-token"}}
+    )
+
+
 @pytest.fixture(autouse=True)
 def _autoclean_pool_state():
     """Clear all shared in-memory pool state before AND after every test.
@@ -115,11 +131,13 @@ def _autoclean_pool_state():
     _max_plan_pools.clear()
     _account_by_id.clear()
     _pending_cap_persists.clear()
+    _pending_rl_persists.clear()
     _account_failure_log.clear()
     yield
     _max_plan_pools.clear()
     _account_by_id.clear()
     _pending_cap_persists.clear()
+    _pending_rl_persists.clear()
     _account_failure_log.clear()
 
 
@@ -526,6 +544,80 @@ class TestAccountAtCap:
     def test_concurrent_cap_under_limit_returns_none(self):
         acct = _acct(max_concurrent_tasks=2, active_tasks=1)
         assert _account_at_cap(acct) is None
+
+    def test_fresh_codex_oauth_keeps_normal_concurrency(self):
+        acct = _acct(provider="openai", auth_mode="oauth", active_tasks=8,
+            runtime_secret=_codex_oauth_secret(time.time() + 6 * 60 * 60))
+        assert _account_at_cap(acct) is None
+        assert _codex_oauth_requires_refresh_probe(acct) == (False, True)
+
+    def test_near_expiry_codex_oauth_serializes_only_refresh_probe(self):
+        secret = _codex_oauth_secret(time.time() + 4 * 60 * 60)
+        first = _acct(provider="openai", auth_mode="oauth", active_tasks=0, runtime_secret=secret)
+        follower = {**first, "active_tasks": 1}
+        assert _account_at_cap(first) is None
+        assert "refresh probe" in (_account_at_cap(follower) or "")
+        assert _codex_oauth_requires_refresh_probe(first) == (True, True)
+
+    def test_opaque_codex_oauth_serializes_conservatively(self):
+        acct = _acct(provider="openai", auth_mode="oauth", active_tasks=1,
+            runtime_secret='{"tokens":{"access_token":"opaque","refresh_token":"rt"}}')
+        reason = _account_at_cap(acct)
+        assert reason is not None
+        assert "expiry unknown" in reason
+        assert _codex_oauth_requires_refresh_probe(acct) == (True, False)
+
+
+class TestCodexOauthConcurrencyGate:
+    def _seed(self, secret: str) -> dict:
+        acct = _acct(
+            id="codex-concurrent",
+            user_id="codex-user",
+            provider="openai",
+            auth_mode="oauth",
+            oauth_token=None,
+            runtime_secret=secret,
+            runtime_ready=True,
+            disabled_models={},
+        )
+        _max_plan_pools["codex-user"] = [acct]
+        _account_by_id[acct["id"]] = acct
+        return acct
+
+    async def test_fresh_access_token_admits_multiple_tasks(self):
+        acct = self._seed(_codex_oauth_secret(time.time() + 6 * 60 * 60))
+
+        first = await select_max_plan_account(
+            "codex-user", provider="openai", model="gpt-5.6-terra"
+        )
+        second = await select_max_plan_account(
+            "codex-user", provider="openai", model="gpt-5.6-terra"
+        )
+
+        assert first is acct
+        assert second is acct
+        assert acct["active_tasks"] == 2
+
+    async def test_refresh_probe_reopens_concurrency_after_rotation(self):
+        acct = self._seed(_codex_oauth_secret(time.time() + 4 * 60 * 60))
+
+        probe = await select_max_plan_account(
+            "codex-user", provider="openai", model="gpt-5.6-terra"
+        )
+        blocked = await select_max_plan_account(
+            "codex-user", provider="openai", model="gpt-5.6-terra"
+        )
+        assert probe is acct
+        assert blocked is None
+
+        # Rotation endpoint updates runtime_secret in place immediately after
+        # provider validation; the probe remains active but followers reopen.
+        acct["runtime_secret"] = _codex_oauth_secret(time.time() + 6 * 60 * 60)
+        follower = await select_max_plan_account(
+            "codex-user", provider="openai", model="gpt-5.6-terra"
+        )
+        assert follower is acct
+        assert acct["active_tasks"] == 2
 
 
 # ── _project_at_cap ──────────────────────────────────────────────────────────
@@ -1900,6 +1992,216 @@ class TestLatencyAwareSelection:
         )
         assert result is not None
         assert result[0]["id"] == "slow"
+
+
+class TestCooldownProviderIdentity:
+    async def test_rejects_cross_provider_model_before_cascade(self):
+        """A stale Claude model cannot write/cascade onto an OpenAI account."""
+        acct = _acct(id="openai-a", provider="openai")
+        _account_by_id["openai-a"] = acct
+        with patch("app.max_plan_pool._persist_rate_limit_state"):
+            await disable_account_model(
+                "openai-a", "claude-sonnet-4-6", provider="openai"
+            )
+        assert "disabled_models" not in acct
+
+    async def test_ordinary_rate_limit_persists_provider_identity(self):
+        acct = _acct(id="openai-a", provider="openai")
+        _account_by_id["openai-a"] = acct
+        with patch("app.max_plan_pool._persist_rate_limit_state"):
+            await disable_account_model(
+                "openai-a", "gpt-5.6-sol", provider="openai"
+            )
+        info = acct["disabled_models"]["gpt-5.6-sol"]
+        assert info["provider"] == "openai"
+        assert _serialize_disabled_model_info(info)["provider"] == "openai"
+
+    async def test_unknown_model_identity_fails_closed(self):
+        acct = _acct(id="openai-a", provider="openai")
+        _account_by_id["openai-a"] = acct
+        with patch("app.max_plan_pool._persist_rate_limit_state"):
+            await disable_account_model(
+                "openai-a", "customer-private-model", provider="openai"
+            )
+        assert "disabled_models" not in acct
+
+    async def test_explicit_custom_model_escape_is_available(self):
+        acct = _acct(id="openai-a", provider="openai")
+        _account_by_id["openai-a"] = acct
+        with patch("app.max_plan_pool._persist_rate_limit_state"):
+            await disable_account_model(
+                "openai-a",
+                "customer-private-model",
+                provider="openai",
+                allow_unknown_model_identity=True,
+            )
+        assert acct["disabled_models"]["customer-private-model"]["provider"] == "openai"
+
+    def test_authoritative_disable_merge_preserves_concurrent_state(self):
+        now = _utcnow().isoformat()
+        blob = {
+            "disabled_models": {
+                "gpt-existing": {
+                    "hits": 2,
+                    "at": now,
+                    "provider": "openai",
+                }
+            },
+            "outcome_events": [{"at": now, "success": True}],
+        }
+        merged = _apply_rate_limit_mutations(
+            blob,
+            [
+                {
+                    "op": "disable_models",
+                    "models": {
+                        "gpt-5.6-sol": {
+                            "at": now,
+                            "provider": "openai",
+                        }
+                    },
+                    "outcome_event": {"at": now, "success": False},
+                }
+            ],
+        )
+        assert merged is not None
+        assert "gpt-existing" in merged["disabled_models"]
+        assert merged["disabled_models"]["gpt-5.6-sol"]["hits"] == 1
+        assert len(merged["outcome_events"]) == 2
+
+    def test_authoritative_clear_removes_only_requested_model(self):
+        now = _utcnow().isoformat()
+        blob = {
+            "disabled_models": {
+                "gpt-a": {"hits": 1, "at": now, "provider": "openai"},
+                "gpt-b": {"hits": 1, "at": now, "provider": "openai"},
+            },
+            "outcome_events": [{"at": now, "success": False}],
+        }
+        merged = _apply_rate_limit_mutations(
+            blob, [{"op": "clear_models", "models": ["gpt-a"]}]
+        )
+        assert merged is not None
+        assert set(merged["disabled_models"]) == {"gpt-b"}
+        assert len(merged["outcome_events"]) == 1
+
+    def test_startup_cooldown_mutation_preserves_models_and_outcomes(self):
+        now = _utcnow().isoformat()
+        blob = {
+            "disabled_models": {
+                "gpt-a": {"hits": 1, "at": now, "provider": "openai"}
+            },
+            "outcome_events": [{"at": now, "success": False}],
+        }
+        merged = _apply_rate_limit_mutations(
+            blob,
+            [
+                {
+                    "op": "set_startup_cooldown",
+                    "at": now,
+                    "reason": "startup-failure cooldown: test",
+                }
+            ],
+        )
+        assert merged is not None
+        assert set(merged["disabled_models"]) == {"gpt-a"}
+        assert len(merged["outcome_events"]) == 1
+        assert merged["startup_failure_cooldown_at"] == now
+
+    @pytest.mark.parametrize(
+        "condition",
+        [
+            # A clear that observed an older generation cannot erase a newer hit.
+            {
+                "observed_at": "2026-07-14T10:00:00+00:00",
+                "provider": "openai",
+                "clear_at": "2026-07-14T12:00:00+00:00",
+            },
+            # A success timestamp older than the observed hit cannot clear it.
+            {
+                "observed_at": "2026-07-14T11:00:00+00:00",
+                "provider": "openai",
+                "clear_at": "2026-07-14T10:30:00+00:00",
+            },
+            # The model key alone is insufficient across providers.
+            {
+                "observed_at": "2026-07-14T11:00:00+00:00",
+                "provider": "anthropic",
+                "clear_at": "2026-07-14T12:00:00+00:00",
+            },
+        ],
+    )
+    def test_conditional_clear_cannot_erase_newer_or_other_provider_hit(
+        self, condition
+    ):
+        blob = {
+            "disabled_models": {
+                "gpt-5.6-sol": {
+                    "hits": 2,
+                    "at": "2026-07-14T11:00:00+00:00",
+                    "provider": "openai",
+                }
+            }
+        }
+        merged = _apply_rate_limit_mutations(
+            blob,
+            [
+                {
+                    "op": "clear_models",
+                    "models": {"gpt-5.6-sol": condition},
+                }
+            ],
+        )
+        assert "gpt-5.6-sol" in merged["disabled_models"]
+
+    def test_startup_clear_cannot_erase_newer_generation(self):
+        merged = _apply_rate_limit_mutations(
+            {
+                "startup_failure_cooldown_at": "2026-07-14T11:00:00+00:00",
+                "startup_failure_disabled_reason": "new generation",
+            },
+            [
+                {
+                    "op": "clear_startup_cooldown",
+                    "observed_at": "2026-07-14T10:00:00+00:00",
+                    "clear_at": "2026-07-14T12:00:00+00:00",
+                }
+            ],
+        )
+        assert merged["startup_failure_cooldown_at"] == "2026-07-14T11:00:00+00:00"
+
+    async def test_stale_cache_cooldown_persist_preserves_operator_disable(
+        self, monkeypatch
+    ):
+        acct_id = str(uuid.uuid4())
+        acct = _acct(id=acct_id, provider="openai", enabled=True)
+        acct["_pending_rate_limit_mutations"] = [
+            {
+                "op": "disable_models",
+                "models": {
+                    "gpt-5.6-sol": {
+                        "at": _utcnow().isoformat(),
+                        "provider": "openai",
+                    }
+                },
+            }
+        ]
+        _account_by_id[acct_id] = acct
+        db_acct = _FakeDbAcct(acct_id)
+        db_acct.enabled = False
+        db_acct.disabled_reason = "operator disabled"
+        monkeypatch.setattr(
+            "app.max_plan_pool.AsyncSessionLocal",
+            lambda: _FakeAsyncSessionCtxWithAcct(db_acct),
+        )
+
+        await _persist_rate_limit_state(acct_id)
+
+        assert db_acct.enabled is False
+        assert db_acct.disabled_reason == "operator disabled"
+        assert acct["enabled"] is False
+        assert acct["disabled_reason"] == "operator disabled"
+        assert "gpt-5.6-sol" in db_acct.rate_limit_state["disabled_models"]
 
 
 # ── disable_account_model(kind="regression") + clear_account_model_regression ─
@@ -3500,7 +3802,7 @@ class TestRecordAccountStartupFailure:
         assert acct.get("startup_failure_cooldown_at") is not None
         reason = acct.get("disabled_reason", "")
         assert reason.startswith("startup-failure cooldown")
-        assert "a" in _pending_cap_persists
+        assert "a" in _pending_rl_persists
 
     async def test_single_zone_failures_do_not_trip_breaker(self):
         acct = _pool_acct("a")
@@ -3580,7 +3882,8 @@ class TestStartupFailureAccountState:
 @pytest.mark.asyncio
 class TestRecheckClearsStartupCooldown:
     async def test_recheck_clears_expired_cooldown(self, monkeypatch):
-        acct = _pool_acct("a")
+        acct_id = str(uuid.uuid4())
+        acct = _pool_acct(acct_id)
         now = _utcnow()
         expired_at = now - timedelta(seconds=_STARTUP_FAILURE_COOLDOWN_SECONDS + 60)
         acct["startup_failure_cooldown_at"] = expired_at
@@ -3588,17 +3891,47 @@ class TestRecheckClearsStartupCooldown:
             "startup-failure cooldown: 5 failures in 120min across zones us-central1-b, us-central1-c"
         )
 
-        # Patch DB calls so we don't need a real DB session
+        db_acct = _FakeDbAcct(acct_id)
+        db_acct.rate_limit_state = {
+            "startup_failure_cooldown_at": expired_at.isoformat(),
+            "startup_failure_disabled_reason": acct["disabled_reason"],
+        }
+        db_acct.disabled_reason = acct["disabled_reason"]
         monkeypatch.setattr(
             "app.max_plan_pool.AsyncSessionLocal",
-            lambda: _FakeAsyncSessionCtx(),
+            lambda: _FakeAsyncSessionCtxWithAcct(db_acct),
         )
         await recheck_disabled_accounts()
 
         assert acct.get("startup_failure_cooldown_at") is None
-        # disabled_reason is cleared (queued for DB persist)
         assert acct.get("disabled_reason") is None
-        assert "a" in _pending_cap_persists
+        assert acct_id not in _pending_cap_persists
+
+    async def test_recheck_preserves_newer_startup_generation(self, monkeypatch):
+        acct_id = str(uuid.uuid4())
+        now = _utcnow()
+        old_at = now - timedelta(seconds=_STARTUP_FAILURE_COOLDOWN_SECONDS + 60)
+        newer_at = now - timedelta(seconds=30)
+        acct = _pool_acct(
+            acct_id,
+            startup_failure_cooldown_at=old_at,
+            disabled_reason="startup-failure cooldown: old",
+        )
+        db_acct = _FakeDbAcct(acct_id)
+        db_acct.rate_limit_state = {
+            "startup_failure_cooldown_at": newer_at.isoformat(),
+            "startup_failure_disabled_reason": "startup-failure cooldown: newer",
+        }
+        db_acct.disabled_reason = "startup-failure cooldown: newer"
+        monkeypatch.setattr(
+            "app.max_plan_pool.AsyncSessionLocal",
+            lambda: _FakeAsyncSessionCtxWithAcct(db_acct),
+        )
+
+        await recheck_disabled_accounts()
+
+        assert acct["startup_failure_cooldown_at"] == newer_at
+        assert acct["disabled_reason"] == "startup-failure cooldown: newer"
 
     async def test_recheck_does_not_clear_active_cooldown(self, monkeypatch):
         acct = _pool_acct("a")
@@ -3621,7 +3954,8 @@ class TestRecheckClearsStartupCooldown:
         """Regression: _pending_rl_persists retry must not wipe disabled_reason
         while a startup-failure cooldown is still active (enabled=True accounts
         that carry a disabled_reason for UI visibility)."""
-        acct = _pool_acct("a")
+        acct_id = str(uuid.uuid4())
+        acct = _pool_acct(acct_id)
         now = _utcnow()
         acct["startup_failure_cooldown_at"] = now - timedelta(seconds=30)  # active
         expected_reason = (
@@ -3630,11 +3964,17 @@ class TestRecheckClearsStartupCooldown:
         acct["disabled_reason"] = expected_reason
 
         # Simulate a previously failed rl-persist that queued a retry
-        if "a" not in _pending_rl_persists:
-            _pending_rl_persists.append("a")
+        if acct_id not in _pending_rl_persists:
+            _pending_rl_persists.append(acct_id)
 
-        fake_db_acct = _FakeDbAcct()
+        fake_db_acct = _FakeDbAcct(acct_id)
         fake_db_acct.disabled_reason = expected_reason
+        fake_db_acct.rate_limit_state = {
+            "startup_failure_cooldown_at": acct[
+                "startup_failure_cooldown_at"
+            ].isoformat(),
+            "startup_failure_disabled_reason": expected_reason,
+        }
 
         monkeypatch.setattr(
             "app.max_plan_pool.AsyncSessionLocal",
@@ -3647,16 +3987,196 @@ class TestRecheckClearsStartupCooldown:
         # DB-side reason must NOT have been wiped
         assert fake_db_acct.disabled_reason == expected_reason
 
+    async def test_cap_flush_does_not_copy_stale_enabled_state(self, monkeypatch):
+        acct_id = str(uuid.uuid4())
+        generation = _utcnow()
+        acct = _pool_acct(
+            acct_id,
+            enabled=True,
+            daily_task_count=7,
+            daily_task_count_reset_at=generation,
+        )
+        db_acct = _FakeDbAcct(acct_id)
+        db_acct.daily_task_count_reset_at = generation
+        db_acct.enabled = False
+        db_acct.disabled_reason = "operator disabled"
+        _stage_usage_delta(acct, 7, None)
+        monkeypatch.setattr(
+            "app.max_plan_pool.AsyncSessionLocal",
+            lambda: _FakeAsyncSessionCtxWithAcct(db_acct),
+        )
+
+        await recheck_disabled_accounts()
+
+        assert db_acct.enabled is False
+        assert db_acct.disabled_reason == "operator disabled"
+        assert acct["enabled"] is False
+        assert acct["disabled_reason"] == "operator disabled"
+        assert db_acct.daily_task_count == 7
+
+    async def test_usage_cap_deltas_merge_distinct_pod_project_updates(self):
+        generation = _utcnow()
+        db_acct = _FakeDbAcct()
+        db_acct.daily_task_count_reset_at = generation
+        db_acct.project_state = {"existing": {"daily_task_count": 4, "cap": 9}}
+
+        _apply_usage_cap_mutations(
+            db_acct,
+            [
+                {
+                    "op": "usage_delta",
+                    "generation": generation.isoformat(),
+                    "delta": 1,
+                    "project_id": "project-a",
+                    "project_delta": 1,
+                }
+            ],
+        )
+        _apply_usage_cap_mutations(
+            db_acct,
+            [
+                {
+                    "op": "usage_delta",
+                    "generation": generation.isoformat(),
+                    "delta": 1,
+                    "project_id": "project-b",
+                    "project_delta": 1,
+                }
+            ],
+        )
+
+        assert db_acct.daily_task_count == 2
+        assert db_acct.project_state["project-a"]["daily_task_count"] == 1
+        assert db_acct.project_state["project-b"]["daily_task_count"] == 1
+        assert db_acct.project_state["existing"] == {"daily_task_count": 4, "cap": 9}
+
+    async def test_usage_delta_near_reset_boundary_is_rejected_without_time_tolerance(
+        self,
+    ):
+        current_generation = _utcnow()
+        stale_generation = current_generation - timedelta(seconds=1)
+        db_acct = _FakeDbAcct()
+        db_acct.daily_task_count = 3
+        db_acct.daily_task_count_reset_at = current_generation
+        db_acct.rate_limit_state = {
+            "usage_window_origin": {
+                "generation": current_generation.isoformat(),
+                "kind": "daily_reset",
+            }
+        }
+
+        _apply_usage_cap_mutations(
+            db_acct,
+            [
+                {
+                    "op": "usage_delta",
+                    "generation": stale_generation.isoformat(),
+                    "observed_generation_missing": True,
+                    "delta": 1,
+                    "project_id": "stale-project",
+                    "project_delta": 1,
+                }
+            ],
+        )
+
+        assert db_acct.daily_task_count == 3
+        assert "stale-project" not in (db_acct.project_state or {})
+
+    async def test_concurrent_first_use_generation_aliases_explicit_initialization(
+        self,
+    ):
+        winning_generation = _utcnow()
+        losing_generation = winning_generation + timedelta(seconds=1)
+        db_acct = _FakeDbAcct()
+        db_acct.daily_task_count_reset_at = winning_generation
+        db_acct.rate_limit_state = {
+            "usage_window_origin": {
+                "generation": winning_generation.isoformat(),
+                "kind": "initialization",
+            }
+        }
+
+        _apply_usage_cap_mutations(
+            db_acct,
+            [
+                {
+                    "op": "usage_delta",
+                    "generation": losing_generation.isoformat(),
+                    "observed_generation_missing": True,
+                    "delta": 1,
+                    "project_id": "project-b",
+                    "project_delta": 1,
+                }
+            ],
+        )
+
+        assert db_acct.daily_task_count == 1
+        assert db_acct.project_state["project-b"]["daily_task_count"] == 1
+
+    async def test_operator_reset_tombstone_rejects_old_but_accepts_new_hit(self):
+        reset_at = _utcnow()
+        old_at = (reset_at - timedelta(seconds=1)).isoformat()
+        new_at = (reset_at + timedelta(seconds=1)).isoformat()
+        state = {"cooldown_reset_at": reset_at.isoformat()}
+
+        state = _apply_rate_limit_mutations(
+            state,
+            [
+                {
+                    "op": "disable_models",
+                    "models": {
+                        "gpt-5.6-sol": {
+                            "at": old_at,
+                            "provider": "openai",
+                        }
+                    },
+                }
+            ],
+        )
+        assert "disabled_models" not in state
+        state = _apply_rate_limit_mutations(
+            state,
+            [
+                {
+                    "op": "disable_models",
+                    "models": {
+                        "gpt-5.6-sol": {
+                            "at": new_at,
+                            "provider": "openai",
+                        }
+                    },
+                }
+            ],
+        )
+        assert state["disabled_models"]["gpt-5.6-sol"]["hits"] == 1
+
 
 class _FakeDbAcct:
     """Minimal stub for a DB MaxPlanAccount row."""
 
-    rate_limit_state = None
-    enabled = True
-    disabled_reason = None
-    disabled_at = None
-    daily_task_count = 0
-    daily_task_count_reset_at = None
+    def __init__(self, acct_id: str | None = None):
+        self.id = uuid.UUID(acct_id) if acct_id else uuid.uuid4()
+        self.rate_limit_state = None
+        self.enabled = True
+        self.disabled_reason = None
+        self.disabled_at = None
+        self.daily_task_count = 0
+        self.daily_task_count_reset_at = None
+        self.project_state = None
+
+
+class _FakeExecuteResult:
+    def __init__(self, db_acct: _FakeDbAcct | None):
+        self._db_acct = db_acct
+
+    def scalar_one_or_none(self):
+        return self._db_acct
+
+    def scalars(self):
+        return self
+
+    def all(self):
+        return [self._db_acct] if self._db_acct is not None else []
 
 
 class _FakeAsyncSessionCtxWithAcct:
@@ -3673,6 +4193,9 @@ class _FakeAsyncSessionCtxWithAcct:
 
     async def get(self, *_a, **_k):
         return self._db_acct
+
+    async def execute(self, *_a, **_k):
+        return _FakeExecuteResult(self._db_acct)
 
     async def commit(self):
         pass
@@ -3692,6 +4215,9 @@ class _FakeAsyncSessionCtx:
 
     async def get(self, *_a, **_k):
         return None
+
+    async def execute(self, *_a, **_k):
+        return _FakeExecuteResult(None)
 
     async def commit(self):
         pass

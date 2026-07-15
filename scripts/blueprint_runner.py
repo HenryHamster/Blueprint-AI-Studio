@@ -13,7 +13,7 @@ the most common enrollment failure — is impossible.
 The token may also come from ``BLUEPRINT_RUNNER_TOKEN`` (which, unlike ``--token``,
 keeps it off this launcher's own argv / ``/proc/cmdline``).
 
-Prerequisites (Node.js >= 22 and the ``claude`` CLI) are installed by the
+Prerequisites (Node.js >= 22 plus provider CLIs) are installed by the
 operator the normal way. This launcher only *checks* for them and prints an
 actionable message when one is missing — it never bundles or installs anything
 (standard dev-tool convention). ``local_runner.py`` still enforces its own
@@ -41,9 +41,15 @@ from datetime import datetime, timezone
 DEFAULT_ORCHESTRATOR_URL = "https://blueprint-orchestrator-mmtfi5aysa-uc.a.run.app"
 
 # The node agent (agent/dist/index.js) requires a modern Node runtime and spawns
-# the `claude` CLI for agent tasks. These are the only two host prerequisites the
-# launcher checks; everything else is handled by local_runner's own preflight.
+# provider CLIs for agent tasks. Everything else is handled by local_runner's
+# own fail-closed preflight.
 MIN_NODE_MAJOR = 22
+MIN_CODEX_VERSION = (0, 144, 1)
+PINNED_CODEX_VERSION = "0.144.1"
+_CODEX_REPAIR = (
+    f"Reinstall Codex with optional native packages: npm install -g "
+    f"--include=optional @openai/codex@{PINNED_CODEX_VERSION}"
+)
 
 # Default local tag for the prod agent container image (built from agent/Dockerfile).
 # On `start`, when docker is usable, the launcher ensures this image exists (builds
@@ -158,12 +164,59 @@ def _check_provider_credentials() -> bool:
     return any(os.environ.get(k, "").strip() for k in _CREDENTIAL_KEYS)
 
 
+def _codex_prerequisite() -> Prereq:
+    """Check that Codex is on PATH *and* can load its native executable.
+
+    ``codex --version`` is deliberately used as the smoke: it enters the npm
+    launcher/native-package startup path, catches a missing
+    ``@openai/codex-<platform>`` optional dependency, and never calls an API.
+    """
+    codex_path = shutil.which("codex")
+    if not codex_path:
+        return Prereq("codex", False, "not found on PATH", _CODEX_REPAIR)
+    try:
+        result = subprocess.run(
+            [codex_path, "--version"], capture_output=True, text=True, timeout=5
+        )
+    except subprocess.TimeoutExpired:
+        return Prereq("codex", False, "startup probe timed out", _CODEX_REPAIR)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return Prereq(
+            "codex", False, f"could not execute ({type(exc).__name__})", _CODEX_REPAIR
+        )
+
+    output = "\n".join((result.stdout or "", result.stderr or "")).strip()
+    if result.returncode != 0:
+        lowered = output.lower()
+        if (
+            "missing optional dependency @openai/codex-" in lowered
+            or "could not find package @openai/codex-" in lowered
+        ):
+            detail = "PATH shim found, but the native Codex package is missing"
+        else:
+            detail = f"startup probe failed (exit {result.returncode})"
+        return Prereq("codex", False, detail, _CODEX_REPAIR)
+
+    match = re.search(r"\b(\d+)\.(\d+)\.(\d+)\b", output)
+    if not match:
+        return Prereq("codex", False, "version probe returned no version", _CODEX_REPAIR)
+    version = tuple(int(part) for part in match.groups())
+    if version < MIN_CODEX_VERSION:
+        return Prereq(
+            "codex",
+            False,
+            f"v{'.'.join(map(str, version))} is older than required v{PINNED_CODEX_VERSION}",
+            _CODEX_REPAIR,
+        )
+    return Prereq("codex", True, f"{output.splitlines()[0]} ({codex_path})")
+
+
 def check_prerequisites() -> list[Prereq]:
     """Check the host prerequisites for running Blueprint agent tasks.
 
-    Returns a Prereq per requirement (Node.js >= MIN_NODE_MAJOR, the ``claude``
-    CLI). Never installs anything — a missing prerequisite carries an actionable
-    ``fix`` string the caller prints verbatim.
+    Returns a Prereq per requirement (Node.js >= MIN_NODE_MAJOR plus runnable
+    ``claude`` and ``codex`` CLIs). Never installs anything — a missing
+    prerequisite carries an actionable ``fix`` string the caller prints verbatim.
     """
     results: list[Prereq] = []
 
@@ -201,6 +254,11 @@ def check_prerequisites() -> list[Prereq]:
                 "Install the Claude Code CLI: npm install -g @anthropic-ai/claude-code",
             )
         )
+
+    # OpenAI credentials are assigned per task, so the absence of an OPENAI_API_KEY
+    # on this host does not mean OpenAI cannot be routed here. Always require a
+    # runnable Codex CLI; compute-only operators can invoke local_runner.py directly.
+    results.append(_codex_prerequisite())
 
     return results
 
@@ -1483,6 +1541,12 @@ def main(argv: list[str] | None = None) -> int:
     prereqs = check_prerequisites()
     _print_prereqs(prereqs, url)
     missing = [p for p in prereqs if not p.ok]
+    # Provider-specific capability failures must not take unrelated capacity
+    # offline. Host local_runner starts its Blueprint-owned staged maintainer for
+    # Claude/Codex, while heartbeat health keeps only the broken provider
+    # ineligible until verification. Node remains a hard agent-runtime blocker.
+    provider_cli_names = {"claude", "codex"}
+    start_blockers = [p for p in missing if p.name not in provider_cli_names]
 
     if not _check_provider_credentials():
         print(
@@ -1529,12 +1593,23 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if (rc == 0 and not missing) else 1
 
     # start
-    if missing:
+    if start_blockers:
         print(
             "\nCannot start: install the missing prerequisite(s) listed above, then re-run.",
             file=sys.stderr,
         )
         return 1
+    missing_provider_clis = [p.name for p in missing if p.name in provider_cli_names]
+    if missing_provider_clis:
+        print(
+            "\n[WARNING] Starting with unhealthy provider CLI(s): "
+            f"{', '.join(sorted(missing_provider_clis))}. A host runner will "
+            "attempt a staged Blueprint-managed repair in the background; each "
+            "provider remains ineligible until its version probe succeeds. Other "
+            "provider and compute capacity remain available.",
+            file=sys.stderr,
+            flush=True,
+        )
     print(flush=True)
     return run_local_runner(token, url, check=False, agent_image=image_result.image)
 

@@ -32,6 +32,20 @@ from app.models import (
 TEST_USER_ID = "test-user-123"
 
 
+def test_error_log_artifacts_are_scoped_to_the_fresh_attempt_boundary():
+    from app.admin import _artifact_is_current_attempt
+
+    boundary = datetime.now(timezone.utc)
+    task = Task(
+        project_id=uuid.uuid4(),
+        payloads=[{"type": "create"}],
+        context={"_fresh_attempt_started_at": boundary.isoformat()},
+    )
+
+    assert not _artifact_is_current_attempt(task, boundary - timedelta(seconds=1))
+    assert _artifact_is_current_attempt(task, boundary + timedelta(seconds=1))
+
+
 async def _make_project(session, name="Compute Project"):
     project = Project(name=name, user_id=TEST_USER_ID)
     session.add(project)

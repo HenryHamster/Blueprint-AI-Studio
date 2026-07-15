@@ -30,7 +30,9 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 
-from app.models import Task, TaskStatus
+from sqlalchemy.orm.attributes import flag_modified
+
+from app.models import Task, TaskStatus, bank_task_current_attempt
 from app.time_utils import _utcnow, clear_retry_after
 
 # Canonical failure class for precondition blockers (mirrors
@@ -63,6 +65,22 @@ FRESH_ATTEMPT_CONTEXT_STRIP_KEYS: frozenset[str] = frozenset(
         "llm_auth_mode",
         "llm_model",
         "llm_execution_mode",
+        # The concrete runner selected for the just-finished attempt is runtime
+        # identity too. Keep operator intent (forced/preferred runner keys),
+        # but never pin a fresh attempt back to the prior concrete runner.
+        "runner_target_id",
+        "runner_hostname",
+        "agent_error_report",
+        "external_api_subtype",
+        "provider_failure_inferred_from",
+        "dead_auth_matched_pattern",
+        "rate_limit_kind",
+        "rate_limit_retry_after_seconds",
+        "rate_limit_matched_pattern",
+        "rate_limit_correlation_reclassified",
+        "rate_limit_inferred_from",
+        "_requested_payload_model",
+        "_resolved_payload_model",
         "_infra_wait",
         "blacklisted_accounts",
         "provision_failed_accounts",
@@ -452,6 +470,37 @@ def strip_fresh_attempt_context(
     return ctx
 
 
+def restore_requested_payload_model_for_fresh_attempt(
+    payloads: object,
+    context: object,
+) -> bool:
+    """Undo the prior dispatch's runtime ``payload.model`` stamp in place.
+
+    New dispatches record both the original request and resolved model in task
+    context. Rows created before that provenance existed are left untouched:
+    equality with context.llm_model is not enough to distinguish a runtime
+    stamp from a genuine operator constraint.
+    """
+
+    if not isinstance(payloads, list) or not payloads:
+        return False
+    payload = payloads[0]
+    if not isinstance(payload, dict):
+        return False
+    ctx = context if isinstance(context, dict) else {}
+    current = payload.get("model")
+    resolved = ctx.get("_resolved_payload_model")
+    requested = ctx.get("_requested_payload_model")
+    runtime_stamped = bool(resolved and current == resolved)
+    if not runtime_stamped:
+        return False
+    if isinstance(requested, str) and requested.strip():
+        payload["model"] = requested.strip()
+    else:
+        payload.pop("model", None)
+    return True
+
+
 def clear_blocker_metadata(task: Task) -> None:
     """Drop the structured blocker metadata from the task context.
 
@@ -504,14 +553,35 @@ def reset_task_for_fresh_attempt(task: Task) -> None:
     the old agent binding and per-attempt liveness markers while preserving
     retry-guidance history that belongs across attempts.
     """
+    # Bank before clearing/replacing any live-attempt fields. Some retry callers
+    # already bank in order to snapshot guidance; the helper is idempotent after
+    # that first call because banking clears the live VM/token evidence.
+    bank_task_current_attempt(
+        task,
+        stopped_at=task.vm_stopped_at or _utcnow(),
+    )
+
+    # ``payloads`` is JSONB. Mutating a nested payload in place is not reliably
+    # visible to SQLAlchemy, so restore through a copied container and mark the
+    # column dirty before the retry is flushed.
+    payloads = list(task.payloads or [])
+    if payloads and isinstance(payloads[0], dict):
+        payloads[0] = dict(payloads[0])
+    if restore_requested_payload_model_for_fresh_attempt(payloads, task.context):
+        task.payloads = payloads
+        flag_modified(task, "payloads")
     clear_blocker_metadata(task)
     task.last_heartbeat = None
     task.started_at = None
     task.vm_instance_id = None
     task.parked_at = None
     task.park_reason = None
+    task.llm_account_id = None
     clear_retry_after(task)
-    task.context = strip_fresh_attempt_context(task.context or {})
+    task.context = {
+        **strip_fresh_attempt_context(task.context or {}),
+        "_fresh_attempt_started_at": _utcnow().isoformat(),
+    }
 
 
 def unblock_to_queued(task: Task, *, message: Optional[str] = None) -> None:

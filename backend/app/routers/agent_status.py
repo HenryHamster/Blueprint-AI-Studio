@@ -28,6 +28,7 @@ from app.models import (
     AlertSeverity,
     Artifact,
     ArtifactType,
+    MaxPlanAccount,
     Project,
     Task,
     TaskStatus,
@@ -65,15 +66,16 @@ from app.max_plan_pool import (
     _extract_task_model,
     clear_rate_limit_state_on_success,
     clear_regression_on_success,
-    db_account_was_rate_limited,
-    db_pool_wide_rate_limit_cooldown,
     disable_account_for_auth,
     disable_account_model,
     get_task_llm_account_id,
     get_task_llm_auth_mode,
     get_task_llm_execution_mode,
-    get_task_rate_limit_scope,
+    get_task_llm_model,
     get_task_llm_provider,
+    get_llm_account_identity,
+    reconcile_llm_runtime_identity,
+    resolve_task_quality_tier,
     record_completion_event,
     record_task_outcome,
 )
@@ -85,6 +87,7 @@ from app.task_lifecycle import (
 from app.rollup_management import _check_and_trigger_rollup
 from app.payload_schemas import validate_internal_payload as _validate_internal_payload
 from app.task_completion import _compute_first_attempt_succeeded
+from app.task_blocked import reset_task_for_fresh_attempt
 from app.artifact_prerequisites import (
     deliver_artifact_to_dependents,
     stamp_artifact_logical_key,
@@ -106,7 +109,52 @@ router = APIRouter()
 
 
 _recorded_task_ids: set = set()  # Track which task IDs have already recorded results
+_recorded_task_entries: dict[str, tuple] = {}
 _AGENT_STATUS_TERMINAL_STATUSES = TASK_AGENT_STATUS_IDEMPOTENT_STATUSES
+
+
+async def _get_authoritative_llm_account_identity(
+    session: AsyncSession, account_id: str | None
+) -> dict | None:
+    """Resolve non-secret account identity from cache, then the current DB.
+
+    Agent status is accepted on every API instance, while the in-memory pool is
+    instance-local. A cache miss therefore cannot mean "unassigned" and must
+    not make agent-reported provider/model fields authoritative.
+    """
+    cached = get_llm_account_identity(account_id)
+    if cached is not None or not account_id:
+        return cached
+    try:
+        account_uuid = uuid.UUID(str(account_id))
+    except (TypeError, ValueError, AttributeError):
+        logger.warning(
+            "[AGENT STATUS] Cannot resolve non-UUID LLM account identity %r",
+            account_id,
+        )
+        return None
+    account = (
+        (
+            await session.execute(
+                select(MaxPlanAccount).where(MaxPlanAccount.id == account_uuid)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if account is None:
+        logger.warning(
+            "[AGENT STATUS] Assigned LLM account %s is absent from cache and DB",
+            account_id,
+        )
+        return None
+    provider = getattr(account.provider, "value", account.provider)
+    auth_mode = getattr(account.auth_mode, "value", account.auth_mode)
+    return {
+        "id": str(account.id),
+        "provider": str(provider) if provider is not None else None,
+        "auth_mode": str(auth_mode) if auth_mode is not None else None,
+    }
 
 
 def _is_deadlock_error(exc: BaseException) -> bool:
@@ -368,28 +416,69 @@ def record_task_result(
     """
     from app.shared_state import deploy_monitoring
 
-    # Deduplicate: only record one result per task
-    if task_id:
-        if task_id in _recorded_task_ids:
-            return
-        _recorded_task_ids.add(task_id)
-        # Keep the set bounded
-        if len(_recorded_task_ids) > 200:
-            _recorded_task_ids.clear()
-
     # Override the bucket when the task was auto-spawned remediation.
     if auto_remediation or (task_context and task_context.get("auto_remediation")):
         task_type = "auto_remediation"
 
+    metadata = deploy_monitoring.setdefault("task_result_metadata", {})
+    recorded_at = _utcnow()
+    timestamp = recorded_at.isoformat()
+    while timestamp in metadata:
+        recorded_at += timedelta(microseconds=1)
+        timestamp = recorded_at.isoformat()
     entry = (
-        _utcnow().isoformat(),
+        timestamp,
         "success" if success else "failure",
         failure_class,
         task_type,
     )
-    deploy_monitoring["task_results"].append(
-        entry
-    )  # deque(maxlen=100) handles cap automatically
+    gate_metadata = {
+        "provider": (task_context or {}).get("llm_provider"),
+        "account_id": (task_context or {}).get("llm_account_id")
+        or (task_context or {}).get("max_plan_account_id"),
+        "model": (task_context or {}).get("llm_model"),
+        "timeout_subtype": (task_context or {}).get("timeout_subtype"),
+        "runner_id": (task_context or {}).get("runner_target_id"),
+        "backend": (
+            (task_context or {}).get("agent_backend")
+            or (
+                "local_runner"
+                if (task_context or {}).get("runner_target_id")
+                else "cloud"
+            )
+        ),
+    }
+
+    # One final outcome per task. A later terminal success must replace an
+    # earlier failure/requeue sample instead of being dropped forever; otherwise
+    # operational route health self-latches until the 15-minute window expires.
+    replaced = False
+    if task_id and task_id in _recorded_task_ids:
+        previous = _recorded_task_entries.get(task_id)
+        if previous is not None:
+            for index, existing in enumerate(deploy_monitoring["task_results"]):
+                if existing == previous:
+                    deploy_monitoring["task_results"][index] = entry
+                    metadata.pop(previous[0], None)
+                    replaced = True
+                    break
+    if not replaced:
+        deploy_monitoring["task_results"].append(entry)
+    metadata[entry[0]] = gate_metadata
+    # The deque evicts old samples automatically. Keep its parallel metadata
+    # index equally bounded so evicted route identities cannot accumulate or be
+    # accidentally matched after a timestamp collision.
+    live_timestamps = {row[0] for row in deploy_monitoring["task_results"] if row}
+    for timestamp in list(metadata):
+        if timestamp not in live_timestamps:
+            metadata.pop(timestamp, None)
+
+    if task_id:
+        _recorded_task_ids.add(task_id)
+        _recorded_task_entries[task_id] = entry
+        if len(_recorded_task_ids) > 200:
+            _recorded_task_ids.clear()
+            _recorded_task_entries.clear()
 
     if success:
         _shared_state.deploy_monitoring["last_completion_time"] = _utcnow()
@@ -1342,26 +1431,102 @@ async def update_agent_status(
 
     # 2. Update task status
     task.status = payload.status
-    if payload.provider or payload.auth_mode or payload.model or payload.execution_mode:
+    # Runtime identity is assigned at dispatch. Agent telemetry may report a
+    # complete, provider-valid pair (for example, a same-provider model
+    # fallback), but partial or cross-provider reports must never blend with the
+    # existing account/context and manufacture a chimera.
+    _assigned_account_id = get_task_llm_account_id(task)
+    _assigned_account = await _get_authoritative_llm_account_identity(
+        session, _assigned_account_id
+    )
+    _quality_tier = resolve_task_quality_tier(task, _runtime_config)
+    _runtime_identity = reconcile_llm_runtime_identity(
+        account=_assigned_account,
+        account_id=_assigned_account_id,
+        provider=get_task_llm_provider(task),
+        auth_mode=get_task_llm_auth_mode(task),
+        model=get_task_llm_model(task),
+        quality_tier=_quality_tier,
+        runtime_config=_runtime_config,
+    )
+    _agent_reported_complete_pair = bool(payload.provider and payload.model)
+    if _agent_reported_complete_pair:
+        _reported_identity = reconcile_llm_runtime_identity(
+            account=_assigned_account,
+            account_id=_assigned_account_id,
+            provider=payload.provider,
+            auth_mode=payload.auth_mode or _runtime_identity.auth_mode,
+            model=payload.model,
+            quality_tier=_quality_tier,
+            runtime_config=_runtime_config,
+        )
+        _reported_pair_is_valid = (
+            # An assigned account must be resolved from cache or DB before an
+            # agent is allowed to change its provider/model pair. Otherwise a
+            # cold API instance could accept account A + provider/model B.
+            (_assigned_account is not None or _assigned_account_id is None)
+            and
+            _reported_identity.provider == str(payload.provider).strip()
+            and _reported_identity.model == str(payload.model).strip()
+            and (
+                _runtime_identity.provider is None
+                or _reported_identity.provider == _runtime_identity.provider
+            )
+        )
+        if _reported_pair_is_valid:
+            _runtime_identity = _reported_identity
+        else:
+            logger.warning(
+                "[AGENT STATUS] Ignoring mismatched runtime report for task %s: "
+                "assigned account=%s provider=%s model=%s; reported provider=%s "
+                "model=%s",
+                task.id,
+                _runtime_identity.account_id,
+                _runtime_identity.provider,
+                _runtime_identity.model,
+                payload.provider,
+                payload.model,
+            )
+    elif payload.provider or payload.auth_mode or payload.model:
+        logger.warning(
+            "[AGENT STATUS] Ignoring partial runtime report for task %s "
+            "(provider=%s auth=%s model=%s)",
+            task.id,
+            payload.provider,
+            payload.auth_mode,
+            payload.model,
+        )
+
+    if any(
+        (
+            _runtime_identity.account_id,
+            _runtime_identity.provider,
+            _runtime_identity.auth_mode,
+            _runtime_identity.model,
+        )
+    ):
         task.context = apply_task_llm_runtime_context(
             task.context,
-            account_id=get_task_llm_account_id(task),
-            provider=payload.provider or get_task_llm_provider(task),
-            auth_mode=payload.auth_mode or get_task_llm_auth_mode(task),
-            model=payload.model or (task.context or {}).get("llm_model"),
-            execution_mode=payload.execution_mode or get_task_llm_execution_mode(task),
+            account_id=_runtime_identity.account_id,
+            provider=_runtime_identity.provider,
+            auth_mode=_runtime_identity.auth_mode,
+            model=_runtime_identity.model,
+            execution_mode=(
+                payload.execution_mode or get_task_llm_execution_mode(task)
+            ),
         )
+        task.llm_account_id = _runtime_identity.account_id
         flag_modified(task, "context")
-    payloads = list(task.payloads or [])
-    if payloads:
-        payload_updated = False
-        if payload.model and not payloads[0].get("model"):
-            payloads[0]["model"] = payload.model
-            payload_updated = True
-        if payload.execution_mode and not payloads[0].get("execution_mode"):
+    elif payload.execution_mode:
+        task.context = {
+            **(task.context or {}),
+            "llm_execution_mode": payload.execution_mode,
+        }
+        flag_modified(task, "context")
+    if payload.execution_mode:
+        payloads = list(task.payloads or [])
+        if payloads and not payloads[0].get("execution_mode"):
             payloads[0]["execution_mode"] = payload.execution_mode
-            payload_updated = True
-        if payload_updated:
             task.payloads = payloads
             flag_modified(task, "payloads")
     # Preserve logs as status message when:
@@ -1405,24 +1570,9 @@ async def update_agent_status(
     if payload.failure_category:
         from app.failure_classification import normalize_agent_failure_category
 
-        _fc_at_time = task.last_heartbeat or task.started_at
-        _fc_acct_id = get_task_llm_account_id(task)
-        _fc_scope = get_task_rate_limit_scope(task)
-        _db_rl = (
-            await db_account_was_rate_limited(_fc_acct_id, at_time=_fc_at_time)
-            if _fc_acct_id
-            else await db_pool_wide_rate_limit_cooldown(
-                at_time=_fc_at_time,
-                providers=_fc_scope.get("providers"),
-                model=_fc_scope.get("model"),
-                user_id=_fc_scope.get("user_id"),
-            )
-        )
         normalized_failure_category = normalize_agent_failure_category(
             payload.failure_category,
             task,
-            at_time=_fc_at_time,
-            db_rl_override=_db_rl,
         )
         ctx = dict(task.context or {})
         ctx["failure_category"] = normalized_failure_category
@@ -1838,7 +1988,10 @@ async def update_agent_status(
                 if acct_id_clear and model_clear:
                     try:
                         await clear_rate_limit_state_on_success(
-                            acct_id_clear, model_clear
+                            acct_id_clear,
+                            model_clear,
+                            provider=get_task_llm_provider(task),
+                            success_at=task.completed_at or _utcnow(),
                         )
                     except Exception as e:
                         logger.warning(
@@ -1847,7 +2000,10 @@ async def update_agent_status(
                         )
                     try:
                         _rr = await clear_regression_on_success(
-                            acct_id_clear, model_clear
+                            acct_id_clear,
+                            model_clear,
+                            provider=get_task_llm_provider(task),
+                            success_at=task.completed_at or _utcnow(),
                         )
                         if _rr and task.project_id:
                             from app.notification_dispatch import (
@@ -2067,6 +2223,7 @@ async def update_agent_status(
                             await disable_account_model(
                                 acct_id,
                                 model,
+                                provider=get_task_llm_provider(task),
                                 retry_after_seconds=_rl_ctx.get(
                                     "rate_limit_retry_after_seconds"
                                 ),
@@ -2090,6 +2247,7 @@ async def update_agent_status(
                             blacklisted.append(acct_id_for_blacklist)
                         ctx["blacklisted_accounts"] = blacklisted
                     should_requeue = True
+                    external_retry_delay_minutes: float | None = None
                     if failure_class == "EXTERNAL_API":
                         if (
                             external_api_subtype
@@ -2251,7 +2409,7 @@ async def update_agent_status(
                                 delay = exponential_backoff(
                                     api_retries, base=240, cap=1800, jitter=0
                                 )
-                                set_retry_after(ctx, delay / 60)
+                                external_retry_delay_minutes = delay / 60
                                 logger.info(
                                     f"[AGENT STATUS] Task {task.id} EXTERNAL_API retry {api_retries} — backoff {delay}s"
                                 )
@@ -2262,6 +2420,37 @@ async def update_agent_status(
                         bank_task_current_attempt(task, stopped_at=now)
                         ctx = with_task_attempt_banking(task, ctx)
                         task.context = ctx
+                        # This is a genuinely new attempt on the same row. Bank
+                        # the old attempt first, then clear its binding/verdict/
+                        # model stamp through the shared boundary. Reattach only
+                        # deliberate cross-attempt routing guidance.
+                        _retry_context_keys = {
+                            "_api_failure_retries",
+                            "blacklisted_accounts",
+                            "model_fallback",
+                        }
+                        if (
+                            failure_class == "EXTERNAL_API"
+                            and external_api_subtype
+                            == EXTERNAL_API_SUBTYPE_PROVIDER_MODEL_CONFIG
+                        ):
+                            _retry_context_keys.update(
+                                {
+                                    "llm_provider",
+                                    "llm_auth_mode",
+                                    "llm_model",
+                                    "llm_execution_mode",
+                                }
+                            )
+                        _retry_context = {
+                            key: ctx[key] for key in _retry_context_keys if key in ctx
+                        }
+                        reset_task_for_fresh_attempt(task)
+                        ctx = {**(task.context or {}), **_retry_context}
+                        task.context = ctx
+                        if external_retry_delay_minutes is not None:
+                            set_retry_after(task, external_retry_delay_minutes)
+                            ctx = dict(task.context or {})
                         task.status = TaskStatus.QUEUED
                         # The earlier FAILED assignment fired the SQLAlchemy set event
                         # which added task.id to _terminated_task_ids, revoking the JWT.
@@ -2535,21 +2724,21 @@ async def update_agent_status(
                     now_da = _utcnow()
                     bank_task_current_attempt(task, stopped_at=now_da)
                     ctx = with_task_attempt_banking(task, ctx)
-                    ctx.pop("_slot_released", None)
-                    ctx.pop("provision_failures", None)
-                    # Clear the stale DEAD_AUTH verdict and matched pattern so
-                    # the next attempt is classified fresh for its own provider.
-                    # Without this, the short-circuit in _classify_failure_class
-                    # fires on the next attempt and can disable a new account
-                    # (even a different provider's) with the stale pattern.
-                    ctx.pop("failure_class", None)
+                    task.context = ctx
+                    _dead_auth_blacklist = list(
+                        ctx.get("blacklisted_accounts") or []
+                    )
+                    reset_task_for_fresh_attempt(task)
+                    ctx = dict(task.context or {})
+                    if _dead_auth_blacklist:
+                        ctx["blacklisted_accounts"] = _dead_auth_blacklist
+                    # The shared boundary clears the stale DEAD_AUTH verdict,
+                    # report, identity and payload runtime stamp. Keep only the
+                    # account blacklist as cross-attempt routing guidance.
                     ctx.pop("dead_auth_matched_pattern", None)
                     task.context = ctx
                     task.status = TaskStatus.QUEUED
-                    task.retry_after_until = None
                     task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
-                    task.last_heartbeat = None
-                    task.started_at = None
                     task.latest_status_message = (
                         "Dead auth session — requeued onto different account"
                     )
@@ -2617,27 +2806,10 @@ async def update_agent_status(
                         normalize_agent_failure_category,
                     )
 
-                    _fc_at_time2 = task.last_heartbeat or task.started_at
-                    _fc_acct_id2 = get_task_llm_account_id(task)
-                    _fc_scope2 = get_task_rate_limit_scope(task)
-                    _db_rl2 = (
-                        await db_account_was_rate_limited(
-                            _fc_acct_id2, at_time=_fc_at_time2
-                        )
-                        if _fc_acct_id2
-                        else await db_pool_wide_rate_limit_cooldown(
-                            at_time=_fc_at_time2,
-                            providers=_fc_scope2.get("providers"),
-                            model=_fc_scope2.get("model"),
-                            user_id=_fc_scope2.get("user_id"),
-                        )
-                    )
                     ctx = dict(task.context or {})
                     ctx["failure_category"] = normalize_agent_failure_category(
                         payload.failure_category,
                         task,
-                        at_time=_fc_at_time2,
-                        db_rl_override=_db_rl2,
                     )
                     task.context = ctx
                     flag_modified(task, "context")
@@ -2659,14 +2831,13 @@ async def update_agent_status(
         # Persist runtime LLM telemetry on Task for durable analytics.
         # Resolve (provider, model) as an atomic pair to prevent chimera rows
         # (e.g. openai:claude-opus-4-8) where sources are blended per-field.
-        # Priority: agent-reported pair (what actually ran, including CLI fallbacks)
-        # > dispatch-time context pair > partial blend as last-resort degradation.
+        # Status ingest above accepts a complete, valid agent-reported pair into
+        # context and rejects partial/mismatched reports. Context is therefore
+        # the sole validated source for durable attribution here.
         _ctx_terminal = dict(task.context or {})
         _ctx_provider = _ctx_terminal.get("llm_provider")
         _ctx_model = _ctx_terminal.get("llm_model")
-        if payload.provider and payload.model:
-            _provider, _model = payload.provider, payload.model
-        elif _ctx_provider and _ctx_model:
+        if _ctx_provider and _ctx_model:
             _provider, _model = _ctx_provider, _ctx_model
         else:
             # No complete pair from either source — do not blend halves across
@@ -3199,6 +3370,18 @@ async def update_agent_status(
         ):
             task.attempt_count += 1
             bank_task_current_attempt(task, stopped_at=task.vm_stopped_at)
+            _prior_retry_ctx = dict(task.context or {})
+            reset_task_for_fresh_attempt(task)
+            ctx = dict(task.context or {})
+            for _guidance_key in (
+                "_api_failure_retries",
+                "blacklisted_accounts",
+                "rate_limit_counts",
+                "model_fallback",
+            ):
+                if _guidance_key in _prior_retry_ctx:
+                    ctx[_guidance_key] = _prior_retry_ctx[_guidance_key]
+            task.context = ctx
             task.status = TaskStatus.QUEUED
             # The earlier FAILED assignment fired the SQLAlchemy set event
             # which added task.id to _terminated_task_ids, revoking the JWT.
@@ -3208,10 +3391,7 @@ async def update_agent_status(
 
             _terminated_task_ids.pop(str(task.id), None)
             task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
-            task.last_heartbeat = None
-            task.started_at = None  # Fresh timeout window for the new VM
             # Add retry delay for transient failures to avoid hammering exhausted resources
-            ctx = dict(task.context or {})
             if failure_class == "RATE_LIMIT":
                 # Track per-account rate-limit hit count for exponential backoff
                 rl_counts = dict(ctx.get("rate_limit_counts") or {})

@@ -344,6 +344,22 @@ class TestGpuAssignment(unittest.TestCase):
 # ── Env allowlist ─────────────────────────────────────────────────────────────
 
 class TestEnvAllowlist(unittest.TestCase):
+    def test_managed_npm_cli_release_root_is_discovered_for_read_only_bind(self):
+        paths = [
+            "/home/runner/.blueprint/managed-clis/codex/releases/"
+            "release-1/node_modules/@openai/codex/bin/codex.js",
+            "/home/runner/.blueprint/managed-clis/codex/releases/"
+            "release-1/node_modules/.bin/codex",
+            "/usr/bin/git",
+        ]
+        self.assertEqual(
+            iso.npm_tool_roots(paths),
+            [
+                "/home/runner/.blueprint/managed-clis/codex/releases/"
+                "release-1"
+            ],
+        )
+
     def test_agent_env_never_leaks_runner_secrets(self):
         source = {
             "BLUEPRINT_RUNNER_TOKEN": "SECRET-RUNNER-TOKEN",
@@ -1155,14 +1171,52 @@ class TestProbeLlmClis(unittest.TestCase):
             with mock.patch.object(
                 iso.subprocess, "run",
                 side_effect=lambda args, **kw: subprocess.CompletedProcess(
-                    args=args, returncode=0, stdout=f"{args[0]} 0.2.0\n", stderr=""
+                    args=args,
+                    returncode=0,
+                    stdout=(
+                        "codex-cli 0.144.1\n"
+                        if args[0].endswith("codex")
+                        else f"{args[0]} 0.2.0\n"
+                    ),
+                    stderr="",
                 ),
             ):
                 result = iso.probe_llm_clis()
         self.assertEqual(set(result), {"claude", "codex", "gemini"})
         for name in ("claude", "codex", "gemini"):
             self.assertTrue(result[name]["present"])
-            self.assertIn("0.2.0", result[name]["version"])
+            self.assertTrue(result[name]["executable_found"])
+            self.assertTrue(result[name]["healthy"])
+            self.assertIsNone(result[name]["reason"])
+        self.assertIn("0.2.0", result["claude"]["version"])
+        self.assertIn("0.144.1", result["codex"]["version"])
+        self.assertIn("0.2.0", result["gemini"]["version"])
+
+    def test_explicit_probe_environment_is_used_for_every_version_process(self):
+        safe_env = {"PATH": "/safe/bin", "HOME": "/safe/home"}
+        with (
+            mock.patch.object(
+                iso, "_which", side_effect=self._which_side_effect
+            ),
+            mock.patch.object(
+                iso.subprocess,
+                "run",
+                side_effect=lambda args, **kw: subprocess.CompletedProcess(
+                    args=args,
+                    returncode=0,
+                    stdout=(
+                        "codex-cli 0.144.1"
+                        if args[0].endswith("codex")
+                        else "cli 1.0.0"
+                    ),
+                    stderr="",
+                ),
+            ) as run,
+        ):
+            iso.probe_llm_clis(env=safe_env)
+        self.assertEqual(run.call_count, 3)
+        for call in run.call_args_list:
+            self.assertEqual(call.kwargs["env"], safe_env)
 
     def test_all_absent(self):
         with mock.patch.object(iso, "_which", return_value=None):
@@ -1170,6 +1224,9 @@ class TestProbeLlmClis(unittest.TestCase):
         self.assertEqual(set(result), {"claude", "codex", "gemini"})
         for name in ("claude", "codex", "gemini"):
             self.assertFalse(result[name]["present"])
+            self.assertFalse(result[name]["executable_found"])
+            self.assertFalse(result[name]["healthy"])
+            self.assertEqual(result[name]["reason"], "not_found")
             self.assertEqual(result[name]["version"], "")
 
     def test_mixed_present_absent(self):
@@ -1202,8 +1259,11 @@ class TestProbeLlmClis(unittest.TestCase):
                 ),
             ):
                 result = iso.probe_llm_clis()
-        self.assertTrue(result["codex"]["present"])   # present because which found it
-        self.assertEqual(result["codex"]["version"], "")  # but no version string
+        self.assertFalse(result["codex"]["present"])
+        self.assertTrue(result["codex"]["executable_found"])
+        self.assertFalse(result["codex"]["healthy"])
+        self.assertEqual(result["codex"]["reason"], "version_probe_failed")
+        self.assertEqual(result["codex"]["version"], "")
 
     def test_present_but_version_subprocess_oserror(self):
         def which_all(name):
@@ -1215,8 +1275,87 @@ class TestProbeLlmClis(unittest.TestCase):
                 side_effect=OSError("exec format error"),
             ):
                 result = iso.probe_llm_clis()
-        self.assertTrue(result["claude"]["present"])   # present because which found it
-        self.assertEqual(result["claude"]["version"], "")  # but no version string
+        self.assertFalse(result["claude"]["present"])
+        self.assertTrue(result["claude"]["executable_found"])
+        self.assertFalse(result["claude"]["healthy"])
+        self.assertEqual(result["claude"]["reason"], "version_probe_error")
+        self.assertEqual(result["claude"]["version"], "")
+
+    def test_codex_missing_native_optional_package_is_explicit_and_ineligible(self):
+        with mock.patch.object(iso, "_which", side_effect=self._which_side_effect):
+            with mock.patch.object(
+                iso.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess(
+                    args=["/usr/bin/codex", "--version"], returncode=1,
+                    stdout="",
+                    stderr=(
+                        "Error: Missing optional dependency "
+                        "@openai/codex-linux-x64. Reinstall Codex."
+                    ),
+                ),
+            ):
+                result = iso.probe_llm_clis()
+        self.assertTrue(result["codex"]["executable_found"])
+        self.assertFalse(result["codex"]["healthy"])
+        self.assertFalse(result["codex"]["present"])
+        self.assertEqual(result["codex"]["reason"], "missing_native_package")
+
+    def test_codex_below_minimum_is_ineligible_even_when_runnable(self):
+        with mock.patch.object(iso, "_which", side_effect=self._which_side_effect):
+            with mock.patch.object(
+                iso.subprocess,
+                "run",
+                side_effect=lambda args, **kw: subprocess.CompletedProcess(
+                    args=args,
+                    returncode=0,
+                    stdout=(
+                        "codex-cli 0.143.0\n"
+                        if args[0].endswith("codex")
+                        else f"{args[0]} 1.0.0\n"
+                    ),
+                    stderr="",
+                ),
+            ):
+                result = iso.probe_llm_clis()
+        self.assertTrue(result["codex"]["executable_found"])
+        self.assertFalse(result["codex"]["healthy"])
+        self.assertFalse(result["codex"]["present"])
+        self.assertEqual(result["codex"]["version"], "codex-cli 0.143.0")
+        self.assertEqual(result["codex"]["reason"], "unsupported_version")
+
+    def test_container_probe_uses_image_entrypoint_not_host_path(self):
+        def fake_run(args, **kwargs):
+            cli = args[args.index("--entrypoint") + 1]
+            version = "codex-cli 0.144.1" if cli == "codex" else f"{cli} 1.0.0"
+            return subprocess.CompletedProcess(args, 0, stdout=version, stderr="")
+
+        with mock.patch.object(iso.subprocess, "run", side_effect=fake_run) as run:
+            result = iso.probe_container_llm_clis("agent:test")
+        self.assertTrue(result["codex"]["healthy"])
+        self.assertEqual(run.call_count, 3)
+        for call in run.call_args_list:
+            self.assertEqual(call.args[0][0:2], ["docker", "run"])
+            self.assertIn("agent:test", call.args[0])
+
+    def test_container_probe_broken_codex_is_ineligible_despite_host(self):
+        def fake_run(args, **kwargs):
+            cli = args[args.index("--entrypoint") + 1]
+            if cli == "codex":
+                return subprocess.CompletedProcess(
+                    args,
+                    1,
+                    stdout="",
+                    stderr=(
+                        "Missing optional dependency @openai/codex-linux-x64"
+                    ),
+                )
+            return subprocess.CompletedProcess(args, 0, stdout=f"{cli} 1.0.0", stderr="")
+
+        with mock.patch.object(iso.subprocess, "run", side_effect=fake_run):
+            result = iso.probe_container_llm_clis("agent:broken")
+        self.assertFalse(result["codex"]["present"])
+        self.assertEqual(result["codex"]["reason"], "missing_native_package")
 
     def test_empty_caps_on_capabilities_dataclass(self):
         """llm_clis defaults to {} on a freshly-constructed Capabilities."""

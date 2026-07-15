@@ -1527,7 +1527,12 @@ async def reset_account_rate_limits(
     current_user: dict = Depends(require_admin),
     cache: DigestCache = Depends(get_digest_cache),
 ):
-    """Clear all rate-limit state (disabled_models) for a Max plan account."""
+    """Clear Blueprint's local cooldown state for a Max plan account.
+
+    This does not call the provider or consume a provider reset credit. It may
+    re-enable a full account only when Blueprint itself disabled it for a
+    cooldown; auth and unrelated operator disables remain authoritative.
+    """
     from app.max_plan_pool import (
         _account_by_id,
         _max_plan_pool_lock,
@@ -1539,37 +1544,70 @@ async def reset_account_rate_limits(
     except ValueError as exc:
         raise _bad_request("Invalid account ID") from exc
 
-    db_account = await session.get(MaxPlanAccount, acct_uuid)
-    if not db_account or db_account.user_id != current_user["user_id"]:
-        raise HTTPException(status_code=404, detail="Account not found")
-
     async with _max_plan_pool_lock:
+        # Match the hot-path lock order (pool lock, then DB row lock) so an
+        # operator clear cannot deadlock with a concurrent cooldown mutation.
+        db_account = (
+            await session.execute(
+                select(MaxPlanAccount)
+                .where(
+                    MaxPlanAccount.id == acct_uuid,
+                    MaxPlanAccount.user_id == current_user["user_id"],
+                )
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if not db_account:
+            raise HTTPException(status_code=404, detail="Account not found")
+
+        disabled_reason = db_account.disabled_reason or ""
+        blueprint_cooldown_disable = disabled_reason.startswith(
+            ("auto-disabled after", "startup-failure cooldown")
+        )
         mem_account = _account_by_id.get(account_id)
+        reset_at = _utcnow()
+        # Keep a durable generation tombstone. A failure observed before this
+        # click but persisted later by another pod must not resurrect the local
+        # cooldown; genuinely later failures carry a newer event timestamp.
+        db_account.rate_limit_state = {"cooldown_reset_at": reset_at.isoformat()}
+        if blueprint_cooldown_disable:
+            db_account.enabled = True
+            db_account.disabled_reason = None
+            db_account.disabled_at = None
+        db_account.updated_at = reset_at
+        session.add(db_account)
+        await session.commit()
+
+        # Update the cache only after commit. A failed transaction must leave
+        # local routing state unchanged instead of falsely advertising a clear.
         if mem_account:
             mem_account.pop("disabled_models", None)
             mem_account.pop("startup_failure_cooldown_at", None)
             mem_account.pop("startup_failure_events", None)
-            mem_account["enabled"] = True
-            mem_account.pop("disabled_at", None)
             mem_account.pop("rl_hit_count", None)
-            mem_account["disabled_reason"] = None
-
-    db_account.rate_limit_state = None
-    db_account.enabled = True
-    db_account.disabled_reason = None
-    db_account.disabled_at = None
-    db_account.updated_at = _utcnow()
-    session.add(db_account)
-    await session.commit()
-
-    if account_id in _pending_rl_persists:
-        _pending_rl_persists.remove(account_id)
+            # Drop pre-click deltas; this explicit operator clear supersedes
+            # cooldown mutations already staged in this process. A later hit
+            # will stage a fresh generation after the pool lock is released.
+            mem_account.pop("_pending_rate_limit_mutations", None)
+            mem_account["enabled"] = db_account.enabled
+            mem_account["disabled_at"] = db_account.disabled_at
+            mem_account["disabled_reason"] = db_account.disabled_reason
+        # Remove only pre-click retry work while still holding the pool lock.
+        # A post-click failure cannot enqueue its new retry until this lock is
+        # released, so it cannot be accidentally removed here.
+        if account_id in _pending_rl_persists:
+            _pending_rl_persists.remove(account_id)
 
     logger.info(
-        f"[POOL] Rate-limit state reset for account {db_account.name} ({account_id}) by user {current_user['user_id']}"
+        f"[POOL] Blueprint cooldown state reset for account {db_account.name} ({account_id}) by user {current_user['user_id']}"
     )
     _invalidate_pool_account_digests(cache, current_user["user_id"])
-    return {"message": f"Rate-limit state cleared for account {db_account.name}"}
+    return {
+        "message": f"Blueprint cooldown state cleared for account {db_account.name}",
+        "provider_quota_changed": False,
+        "provider_reset_credit_consumed": False,
+        "account_reenabled": blueprint_cooldown_disable,
+    }
 
 
 @router.post("/max-plan-accounts/{account_id}/regression-quarantine/clear")

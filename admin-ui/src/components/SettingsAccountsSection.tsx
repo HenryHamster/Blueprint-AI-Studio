@@ -492,10 +492,11 @@ function AccountRow({
           <button
             onClick={() => run('reset', () => onResetRateLimits(account.id))}
             disabled={isBusy}
+            title="Clear Blueprint's local cooldown only; this does not reset provider quota or consume a Codex reset credit"
             data-viewport-allow-small-target
             className="mt-1.5 w-full text-ui-md text-amber-400/70 hover:text-amber-300 disabled:opacity-40 bg-amber-950/30 hover:bg-amber-950/50 rounded-lg px-2 py-1 transition-colors"
           >
-            {busy === 'reset' ? 'Clearing…' : 'Clear rate limits'}
+            {busy === 'reset' ? 'Clearing…' : 'Clear Blueprint cooldowns'}
           </button>
         </div>
       )}

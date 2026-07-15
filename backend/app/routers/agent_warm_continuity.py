@@ -563,10 +563,10 @@ async def _finalize_warm_claim(
     the resolved provider/auth/model/account is acquired and stamped onto the
     task context, and — only when the resolved account differs from the boot
     account — the resolved account's secret manifest is added to the response
-    under ``secret_manifest`` so the agent can re-materialize credentials. The
-    field is additive: an older agent that ignores it behaves exactly as today,
-    and same-account claims (the common case) never emit it. With the flag off
-    this is a no-op and the response is byte-for-byte unchanged.
+    under ``secret_manifest`` so the agent can re-materialize credentials.
+    OpenAI OAuth claims also receive the latest manifest when staying on the
+    same account because refresh tokens rotate independently of account identity.
+    The field remains additive for older agents that ignore it.
     """
     from app.compute import VM_PROVISIONING_MODEL
 
@@ -664,6 +664,46 @@ async def _finalize_warm_claim(
                 auth_mode=boot_account.get("auth_mode"),
                 model=boot_account.get("model"),
             )
+
+        # OpenAI OAuth credentials rotate independently of account identity.
+        # A same-account warm VM may therefore hold an older auth.json than the
+        # backend even though its provider/account/model tuple still matches.
+        # Always re-materialize the authoritative credential before every warm
+        # Codex role; account-mismatch-only retargeting is insufficient here.
+        boot_provider = (
+            str(boot_account.get("provider") or "").strip().lower()
+            if boot_account
+            else ""
+        )
+        boot_auth_mode = (
+            str(boot_account.get("auth_mode") or "").strip().lower()
+            if boot_account
+            else ""
+        )
+        if (
+            secret_manifest is None
+            and boot_account is not None
+            and boot_provider == "openai"
+            and boot_auth_mode == "oauth"
+        ):
+            from app.max_plan_pool import build_account_retarget_manifest
+
+            secret_manifest = build_account_retarget_manifest(
+                boot_account.get("account_id"),
+                provider=boot_provider,
+                auth_mode=boot_auth_mode,
+                model=boot_account.get("model"),
+                task=task,
+                runtime_config=_shared_state.runtime_config,
+            )
+            if secret_manifest is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail="latest Codex OAuth credential unavailable for warm claim",
+                )
+            metadata = dict(secret_manifest.get("metadata") or {})
+            metadata["credential_refresh_only"] = True
+            secret_manifest["metadata"] = metadata
 
         # Park-and-retarget is a transient QUEUED-state marker only. Once this
         # warm claim lands the task is active again, so clear the bounded-park
@@ -906,9 +946,16 @@ async def next_role(
             if run_account_id:
                 run_account = {
                     "account_id": str(run_account_id),
-                    "provider": pctx.get("llm_provider"),
-                    "auth_mode": pctx.get("llm_auth_mode"),
-                    "model": pctx.get("llm_model"),
+                    # Older pins and a few direct dispatch seams may omit one
+                    # or more identity fields while still naming the same boot
+                    # account. Inherit those fields from the durable PoolVm row
+                    # so OAuth refresh handling does not silently disappear.
+                    "provider": pctx.get("llm_provider")
+                    or (member_boot or {}).get("provider"),
+                    "auth_mode": pctx.get("llm_auth_mode")
+                    or (member_boot or {}).get("auth_mode"),
+                    "model": pctx.get("llm_model")
+                    or (member_boot or {}).get("model"),
                 }
             else:
                 # Account wildcard / local VM: no re-target, run on boot identity.

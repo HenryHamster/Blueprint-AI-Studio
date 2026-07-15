@@ -47,18 +47,21 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && pip3 install --no-cache-dir ruff
 
-# LLM provider CLIs — mirrors agent.pkr.hcl:107. The VM image installs these
-# UNPINNED (latest-at-bake); the ARGs default to that same behaviour but let you
-# pin to the exact versions the deployed VM ships. PINNING IS RECOMMENDED: an
-# unpinned CLI drift has caused fleet-wide breakage before (cf. the unpinned
-# system-pytest console_main regression noted at agent.pkr.hcl:109-116).
+# LLM provider CLIs — mirrors agent.pkr.hcl. Codex is pinned because model
+# compatibility and its platform-native optional package are dispatch-critical;
+# an unpinned rebuild or npm configured with omit=optional can leave a PATH shim
+# that crashes before inference.
 ARG CLAUDE_CODE_VERSION=latest
-ARG CODEX_VERSION=latest
+ARG CODEX_VERSION=0.144.1
 ARG GEMINI_VERSION=latest
-RUN npm install -g \
+# The version smoke enters Codex's JS-shim -> native-package startup path
+# without an API call. Missing @openai/codex-linux-x64 or drift fails the build.
+RUN npm install -g --include=optional \
         "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
         "@openai/codex@${CODEX_VERSION}" \
-        "@google/gemini-cli@${GEMINI_VERSION}"
+        "@google/gemini-cli@${GEMINI_VERSION}" \
+    && codex_version="$(codex --version | awk '{print $NF}')" \
+    && test "${codex_version}" = "${CODEX_VERSION}"
 
 # Default git identity for any commits the agent makes — agent.pkr.hcl:118-119.
 # --system so it applies regardless of which user the container runs as.
