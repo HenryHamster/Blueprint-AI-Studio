@@ -1264,3 +1264,203 @@ def test_artifact_descriptor_runner_falls_back_to_target_id_only():
     detail_by_label = {d["label"]: d["value"] for d in desc["details"]}
     assert detail_by_label["Executed on"] == "cloud-gpu"
     assert detail_by_label["Runner"] == "runner-9"
+
+
+def test_artifact_descriptor_stamps_viewable_files_dropped():
+    """_artifact_descriptor promotes viewable_files_dropped from the item dict
+    when it is a positive integer."""
+    item = {
+        "id": "art-1",
+        "artifact_type": "COMPUTE_RESULT",
+        "logical_key": "demo.mp4",
+        "label": "Demo",
+        "task_title": "Training run",
+        "task_status": "completed",
+        "viewable_files_dropped": 3,
+    }
+    desc = _artifact_descriptor(item)
+    assert desc is not None
+    assert desc["viewable_files_dropped"] == 3
+
+
+def test_artifact_descriptor_omits_viewable_files_dropped_when_zero():
+    """_artifact_descriptor omits viewable_files_dropped from the descriptor
+    when the value is 0, negative, or absent."""
+    item = {
+        "id": "art-2",
+        "artifact_type": "COMPUTE_RESULT",
+        "logical_key": "plot.png",
+        "label": "Plot",
+        "task_title": "Training run",
+        "task_status": "completed",
+    }
+    desc = _artifact_descriptor(item)
+    assert desc is not None
+    assert "viewable_files_dropped" not in desc
+
+    # Explicit zero also omitted.
+    item["viewable_files_dropped"] = 0
+    desc = _artifact_descriptor(item)
+    assert "viewable_files_dropped" not in desc
+
+    # Negative value also omitted.
+    item["viewable_files_dropped"] = -1
+    desc = _artifact_descriptor(item)
+    assert "viewable_files_dropped" not in desc
+
+
+@pytest.mark.asyncio
+async def test_terminal_artifact_viewable_files_dropped_stamped(db_session):
+    """A terminal artifact whose logs contain viewable_files_dropped stamps it
+    onto the evidence item, and _artifact_descriptor promotes it."""
+    project = Project(name="DroppedTerminal", user_id=TEST_USER_ID)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="compute task",
+        status="completed",
+        payloads=[{"type": "research", "prompt": "test"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = {
+        "compute_job_id": "job-1",
+        "viewable_files": [
+            {"filename": "plot.png", "storage_uri": "gs://bucket/obj1", "kind": "image", "content_type": "image/png"},
+        ],
+        "viewable_files_dropped": 3,
+    }
+    artifact = Artifact(
+        task_id=task.id,
+        artifact_type="COMPUTE_RESULT",
+        storage_uri="gs://bucket/result",
+        logs=json.dumps(logs),
+    )
+    db_session.add(artifact)
+    await db_session.commit()
+    await db_session.refresh(artifact)
+
+    with (
+        patch("app.strategic_context_package.verify_artifact_project_ownership") as mock_verify,
+        patch("app.strategic_context_package.generate_download_signed_url") as mock_sign,
+    ):
+        mock_verify.return_value = None
+        mock_sign.return_value = "https://signed-url/plot.png?token=abc"
+        result = await load_strategic_context_evidence(db_session, project.id)
+
+    artifacts = result["artifacts"]["items"]
+    assert len(artifacts) == 1
+    item = artifacts[0]
+    assert item["viewable_files_dropped"] == 3
+
+    descriptor = _artifact_descriptor(item)
+    assert descriptor["viewable_files_dropped"] == 3
+
+
+@pytest.mark.asyncio
+async def test_terminal_artifact_omits_viewable_files_dropped_when_zero(db_session):
+    """A terminal artifact whose logs lack viewable_files_dropped (or have it 0)
+    produces an item and descriptor without the key."""
+    project = Project(name="NoDropsTerminal", user_id=TEST_USER_ID)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="compute task",
+        status="completed",
+        payloads=[{"type": "research", "prompt": "test"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # No viewable_files_dropped in logs.
+    logs = {
+        "compute_job_id": "job-1",
+        "viewable_files": [],
+    }
+    artifact = Artifact(
+        task_id=task.id,
+        artifact_type="COMPUTE_RESULT",
+        storage_uri="gs://bucket/result",
+        logs=json.dumps(logs),
+    )
+    db_session.add(artifact)
+    await db_session.commit()
+    await db_session.refresh(artifact)
+
+    with (
+        patch("app.strategic_context_package.verify_artifact_project_ownership") as mock_verify,
+        patch("app.strategic_context_package.generate_download_signed_url") as mock_sign,
+    ):
+        mock_verify.return_value = None
+        mock_sign.return_value = "https://signed-url/plot.png?token=abc"
+        result = await load_strategic_context_evidence(db_session, project.id)
+
+    artifacts = result["artifacts"]["items"]
+    assert len(artifacts) == 1
+    item = artifacts[0]
+    assert "viewable_files_dropped" not in item
+
+    descriptor = _artifact_descriptor(item)
+    assert "viewable_files_dropped" not in descriptor
+
+
+@pytest.mark.asyncio
+async def test_running_job_viewable_files_dropped_stamped(
+    db_session, monkeypatch
+):
+    """A running compute job with viewable_files_dropped in its polling_metadata
+    produces an evidence item carrying the dropped count, and _artifact_descriptor
+    promotes it."""
+    project, task = await _make_project_task(db_session, name="RunningDropped")
+
+    plot_uri = (
+        f"gs://{ARTIFACT_BUCKET_NAME}/compute-jobs/"
+        "33333333-3333-3333-3333-333333333333/artifacts/viewable/reward_curve.png"
+    )
+    job = ComputeJob(
+        project_id=project.id,
+        task_id=task.id,
+        backend="local_process",
+        status=ComputeJobStatus.RUNNING,
+        polling_metadata={
+            "viewable_files": [
+                {
+                    "filename": "reward_curve.png",
+                    "storage_uri": plot_uri,
+                    "kind": "image",
+                    "content_type": "image/png",
+                    "size_bytes": 1024,
+                }
+            ],
+            "viewable_files_dropped": 2,
+        },
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    async def fake_verify(*a):
+        return None
+
+    async def fake_sign(*a, **kw):
+        return "https://signed.example/reward_curve.png"
+
+    monkeypatch.setattr(scp, "verify_artifact_project_ownership", fake_verify)
+    monkeypatch.setattr(scp, "generate_download_signed_url", fake_sign)
+
+    evidence = await load_strategic_context_evidence(db_session, project.id)
+    items = evidence["artifacts"]["items"]
+    assert len(items) == 1
+    item = items[0]
+    assert item["viewable_files_dropped"] == 2
+
+    descriptor = _artifact_descriptor(item)
+    assert descriptor["viewable_files_dropped"] == 2

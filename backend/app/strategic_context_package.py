@@ -885,6 +885,11 @@ async def _running_job_preview_items(
             if job.task_id
             else None,
         )
+        # Stamp viewable_files_dropped from polling_metadata so the strategic
+        # canvas can surface the omission count to the operator for running jobs.
+        dropped = pm.get("viewable_files_dropped")
+        if isinstance(dropped, int) and dropped > 0:
+            item["viewable_files_dropped"] = dropped
         items.append(item)
     return items
 
@@ -1094,6 +1099,22 @@ async def load_strategic_context_evidence(
         )
         if viewable_previews:
             item["viewable_previews"] = viewable_previews
+        # Stamp viewable_files_dropped from the artifact's logs manifest so the
+        # strategic canvas can surface the omission count to the operator (mirrors
+        # how ComputeJobsPanel surfaces the same count in the task-detail drawer).
+        if artifact.logs:
+            try:
+                logs_data = (
+                    json.loads(artifact.logs)
+                    if isinstance(artifact.logs, str)
+                    else artifact.logs
+                )
+                if isinstance(logs_data, dict):
+                    dropped = logs_data.get("viewable_files_dropped")
+                    if isinstance(dropped, int) and dropped > 0:
+                        item["viewable_files_dropped"] = dropped
+            except (json.JSONDecodeError, TypeError, ValueError):
+                pass
         artifact_items.append(item)
 
     # Stamp run provenance + earned evidence tier onto compute_experiment
@@ -1533,6 +1554,13 @@ def _artifact_descriptor(artifact: Dict[str, Any]) -> Dict[str, Any] | None:
     evidence_tier = _compact_text(artifact.get("evidence_tier"), max_chars=60)
     if evidence_tier:
         descriptor["evidence_tier"] = evidence_tier
+    # viewable_files_dropped from the compute-job viewable-files persistence
+    # pipeline (capped at 25 files / 8 MiB each). Additive/backward-compatible
+    # — the frontend surfaces the count as an amber "N file(s) omitted" note;
+    # absent/0/None for descriptors without dropped files.
+    viewable_files_dropped = artifact.get("viewable_files_dropped")
+    if isinstance(viewable_files_dropped, int) and viewable_files_dropped > 0:
+        descriptor["viewable_files_dropped"] = viewable_files_dropped
     if kind == "markdown":
         descriptor["body"] = (
             descriptor["summary"] or "Read-only artifact metadata is available."

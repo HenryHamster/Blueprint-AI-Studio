@@ -380,4 +380,98 @@ describe('StrategicContextArtifactSlot — lazy signed-URL resolution', () => {
     expect(host!.textContent).not.toContain('Machine verified');
     expect(host!.textContent).not.toContain('Self-reported');
   });
+
+  test('renders an amber omitted-files note when viewable_files_dropped > 0 for an image descriptor', async () => {
+    const pkg = makePackage({
+      descriptors: [
+        {
+          schema_version: 1,
+          id: 'art-dropped',
+          kind: 'image',
+          title: 'Training plot',
+          status: 'ready',
+          image: { url: 'https://storage.example.com/plot.png', alt: 'Training plot' },
+          images: [
+            { url: 'https://storage.example.com/plot.png', alt: 'plot.png', filename: 'plot.png' },
+          ],
+          viewable_files_dropped: 2,
+        },
+      ],
+    });
+
+    await render(pkg, 'proj-1');
+
+    const note = host!.querySelector('[data-testid="strategic-artifact-omitted-note"]');
+    expect(note).not.toBeNull();
+    expect(note!.textContent).toContain('2 files omitted');
+    expect(note!.className).toContain('text-amber-400/90');
+  });
+
+  test('renders omitted note for a pdf descriptor as well', async () => {
+    const pkg = makePackage({
+      descriptors: [
+        {
+          schema_version: 1,
+          id: 'art-pdf-dropped',
+          kind: 'pdf',
+          title: 'Report',
+          status: 'ready',
+          pdf: { url: null, alt: 'report.pdf', storage_uri: 'gs://bucket/proj/report.pdf' },
+          pdfs: [
+            { url: null, alt: 'report.pdf', filename: 'report.pdf', storage_uri: 'gs://bucket/proj/report.pdf' },
+          ],
+          viewable_files_dropped: 5,
+        },
+      ],
+    });
+
+    await render(pkg, null);
+
+    const note = host!.querySelector('[data-testid="strategic-artifact-omitted-note"]');
+    expect(note).not.toBeNull();
+    expect(note!.textContent).toContain('5 files omitted');
+  });
+
+  test('omits the omitted-files note when viewable_files_dropped is absent', async () => {
+    const pkg = makePackage({
+      descriptors: [
+        {
+          schema_version: 1,
+          id: 'art-no-drops',
+          kind: 'image',
+          title: 'Training plot',
+          status: 'ready',
+          image: { url: 'https://storage.example.com/plot.png', alt: 'Training plot' },
+          images: [
+            { url: 'https://storage.example.com/plot.png', alt: 'plot.png', filename: 'plot.png' },
+          ],
+        },
+      ],
+    });
+
+    await render(pkg, 'proj-1');
+
+    expect(host!.querySelector('[data-testid="strategic-artifact-omitted-note"]')).toBeNull();
+  });
+
+  test('omits the omitted-files note when descriptor kind is not media', async () => {
+    const pkg = makePackage({
+      descriptors: [
+        {
+          schema_version: 1,
+          id: 'art-non-media',
+          kind: 'resource_detail',
+          title: 'A report',
+          status: 'ready',
+          details: [{ label: 'Type', value: 'design_doc' }],
+          // Even with a dropped count, non-media kinds should not show the note.
+          viewable_files_dropped: 3,
+        },
+      ],
+    });
+
+    await render(pkg, 'proj-1');
+
+    expect(host!.querySelector('[data-testid="strategic-artifact-omitted-note"]')).toBeNull();
+  });
 });

@@ -174,6 +174,10 @@ export interface StrategicContextRenderableDescriptor {
    *  Rendered via the shared EvidenceTierBadge; absent for non-compute
    *  artifacts. */
   evidence_tier?: string | null;
+  /** Number of viewable output files omitted when building the preview set
+   *  (exceeds the cap of 25 files / 8 MiB each). Rendered as an amber
+   *  "N file(s) omitted" note; absent/null for descriptors with no drops. */
+  viewable_files_dropped?: number | null;
   metrics?: StrategicContextDescriptorMetric[];
   columns?: StrategicContextDescriptorTableColumn[];
   rows?: StrategicContextDescriptorTableRow[];
