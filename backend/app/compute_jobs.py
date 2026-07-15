@@ -70,6 +70,7 @@ from app.models import (
     ComputeJobFile,
     ComputeJobOutcome,
     ComputeJobStatus,
+    LocalRunner,
     Project,
     ReleaseVersion,
     Task,
@@ -3155,6 +3156,61 @@ async def _apply_polled_compute_job_result(
             if status.live_output is not None:
                 _set_meta(live, live_output=dict(status.live_output))
             _apply_watchdog_metric_mismatch_marker(live, progress_metric_mismatch)
+        await session.commit()
+        return True
+
+
+async def finalize_runner_subprocess_job_for_dead_runner(
+    session_factory,
+    job_id: uuid.UUID,
+    *,
+    runner_id: uuid.UUID,
+    liveness_cutoff: datetime,
+    now: datetime,
+) -> bool:
+    """Fail a claimed runner job when its runner is still confirmed dead.
+
+    The reaper's candidate scan is deliberately only an optimization.  Re-check
+    the runner under the job lock here, immediately before the irreversible
+    terminal transition, so a recovered runner or a normal terminal report wins
+    any race with the sweep.
+    """
+    async with session_factory() as session:
+        live = await _lock_compute_job(session, job_id)
+        if (
+            live is None
+            or live.backend != RUNNER_SUBPROCESS_BACKEND_NAME
+            or live.status not in {ComputeJobStatus.STARTING, ComputeJobStatus.RUNNING}
+            or live.ran_on_runner_id != runner_id
+        ):
+            return False
+
+        runner = await session.get(LocalRunner, runner_id, with_for_update=True)
+        if runner is None or (
+            runner.status == "active"
+            and runner.last_seen_at is not None
+            and runner.last_seen_at >= liveness_cutoff
+        ):
+            return False
+
+        _finalize_terminal_job(
+            live,
+            status=ComputeJobStatus.FAILED,
+            outcome=ComputeJobOutcome.FAILURE,
+            terminal_reason="runner_subprocess_runner_dead",
+            now=now,
+        )
+        _record_terminal_reason_history(session, live)
+        await _link_terminal_artifact(session, live)
+        await persist_viewable_files_for_job(session, live)
+        if live.task_id is not None:
+            from app.task_lifecycle import fire_task_wakes
+
+            await fire_task_wakes(
+                session,
+                wake_source_kind=COMPUTE_JOB_TERMINAL_WAKE_KIND,
+                wake_source_ref=str(live.id),
+            )
         await session.commit()
         return True
 

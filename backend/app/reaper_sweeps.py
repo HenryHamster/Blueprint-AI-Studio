@@ -13,7 +13,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlmodel import select
 
 from app.blocked_task_unblock_sweeps import (
@@ -47,7 +47,11 @@ from app.blocked_task_unblock_sweeps import (
     event_driven_unblock_dependents,
     event_driven_unblock_on_knowledge,
 )
-from app.models import Task, TaskStatus
+from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
+from app.compute_jobs import finalize_runner_subprocess_job_for_dead_runner
+from app.database import AsyncSessionLocal
+from app.models import ComputeJob, ComputeJobStatus, LocalRunner, Task, TaskStatus
+from app.runner_health_monitors import _RUNNER_LIVENESS_SECONDS
 from app.time_utils import _is_cadence_due, _utcnow
 from app.reaper_fleet_health_sweeps import (
     sweep_merge_gate_verification_degradation,
@@ -2675,6 +2679,56 @@ async def sweep_refresh_project_compute_images(
     return summary
 
 
+async def sweep_stranded_runner_subprocess_compute_jobs(
+    session,
+    now: datetime,
+    *,
+    session_factory=AsyncSessionLocal,
+) -> int:
+    """Finalize claimed runner-subprocess jobs after a runner dies.
+
+    A runner's last report is stored only in ``polling_metadata``.  If the
+    runner crashes or becomes partitioned, the normal monitor therefore sees
+    STARTING/RUNNING forever.  ``ran_on_runner_id`` is the authoritative claim
+    record; never use the dispatch-only ``runner_target_id`` pin here.
+    """
+    liveness_cutoff = now - timedelta(seconds=_RUNNER_LIVENESS_SECONDS)
+    candidates = (
+        await session.execute(
+            select(ComputeJob.id, ComputeJob.ran_on_runner_id)
+            .join(LocalRunner, LocalRunner.id == ComputeJob.ran_on_runner_id)
+            .where(
+                ComputeJob.backend == RUNNER_SUBPROCESS_BACKEND_NAME,
+                ComputeJob.status.in_(
+                    [ComputeJobStatus.STARTING, ComputeJobStatus.RUNNING]
+                ),
+                or_(
+                    LocalRunner.status != "active",
+                    LocalRunner.last_seen_at.is_(None),
+                    LocalRunner.last_seen_at < liveness_cutoff,
+                ),
+            )
+        )
+    ).all()
+
+    finalized = 0
+    for job_id, runner_id in candidates:
+        if runner_id is not None and await finalize_runner_subprocess_job_for_dead_runner(
+            session_factory,
+            job_id,
+            runner_id=runner_id,
+            liveness_cutoff=liveness_cutoff,
+            now=now,
+        ):
+            finalized += 1
+    if finalized:
+        logger.warning(
+            "[REAPER] finalized %d stranded runner-subprocess compute job(s)",
+            finalized,
+        )
+    return finalized
+
+
 __all__ = [
     # Re-exported from app.blocked_task_unblock_sweeps (constants)
     "_BLOCKED_ESCALATE_AFTER",
@@ -2721,4 +2775,5 @@ __all__ = [
     "sweep_closed_handmerge_prs",
     "sweep_protect_referenced_compute_image_digests",
     "sweep_refresh_project_compute_images",
+    "sweep_stranded_runner_subprocess_compute_jobs",
 ]

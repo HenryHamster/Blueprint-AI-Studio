@@ -72,6 +72,7 @@ from app.models import (
     ReleaseDeployArtifact,
     ReleaseVersion,
     Task,
+    TaskHistory,
     TaskStatus,
     TaskWakeRegistration,
     WakeAction,
@@ -1770,6 +1771,71 @@ async def _register_runner(session, project):
     await session.commit()
     await session.refresh(runner)
     return runner, token
+
+
+@pytest.mark.asyncio
+async def test_stranded_runner_subprocess_sweep_finalizes_only_dead_claimed_jobs(db_session):
+    """Dead claimed runners finalize jobs; fresh, unclaimed, and other jobs survive."""
+    from app.reaper_sweeps import sweep_stranded_runner_subprocess_compute_jobs
+    from app.runner_health_monitors import _RUNNER_LIVENESS_SECONDS
+
+    now = _utcnow()
+    project = await _make_project_owner(db_session, name="Stranded runner sweep")
+    stale_runner = LocalRunner(project_id=project.id, token_hash="stale", last_seen_at=now - timedelta(seconds=_RUNNER_LIVENESS_SECONDS + 1))
+    inactive_runner = LocalRunner(project_id=project.id, token_hash="inactive", status="inactive", last_seen_at=now)
+    boundary_runner = LocalRunner(project_id=project.id, token_hash="boundary", last_seen_at=now - timedelta(seconds=_RUNNER_LIVENESS_SECONDS))
+    task = Task(project_id=project.id, status=TaskStatus.PARKED)
+    db_session.add_all([stale_runner, inactive_runner, boundary_runner, task])
+    await db_session.commit()
+
+    def job(status=ComputeJobStatus.RUNNING, backend=RUNNER_SUBPROCESS_BACKEND_NAME, **kwargs):
+        return ComputeJob(project_id=project.id, backend=backend, status=status, **kwargs)
+
+    stranded_running = job(task_id=task.id, ran_on_runner_id=stale_runner.id)
+    stranded_starting = job(status=ComputeJobStatus.STARTING, ran_on_runner_id=inactive_runner.id)
+    boundary_job = job(ran_on_runner_id=boundary_runner.id)
+    unclaimed_job = job()
+    other_backend_job = job(backend="local-subprocess", ran_on_runner_id=stale_runner.id)
+    terminal_job = job(status=ComputeJobStatus.FAILED, outcome=ComputeJobOutcome.FAILURE, ran_on_runner_id=stale_runner.id)
+    db_session.add_all([stranded_running, stranded_starting, boundary_job, unclaimed_job, other_backend_job, terminal_job])
+    await db_session.flush()
+    wake = TaskWakeRegistration(task_id=task.id, project_id=project.id, wake_source_kind=compute_jobs.COMPUTE_JOB_TERMINAL_WAKE_KIND, wake_source_ref=str(stranded_running.id), wake_action=WakeAction.FINALIZE)
+    db_session.add(wake)
+    await db_session.commit()
+
+    session_factory = async_sessionmaker(resolve_async_engine(db_session), expire_on_commit=False, class_=AsyncSession)
+    assert (
+        await sweep_stranded_runner_subprocess_compute_jobs(
+            db_session, now, session_factory=session_factory
+        )
+        == 2
+    )
+
+    await db_session.refresh(stranded_running)
+    await db_session.refresh(stranded_starting)
+    await db_session.refresh(boundary_job)
+    await db_session.refresh(unclaimed_job)
+    await db_session.refresh(other_backend_job)
+    await db_session.refresh(terminal_job)
+    await db_session.refresh(wake)
+    assert stranded_running.status == ComputeJobStatus.FAILED
+    assert stranded_running.outcome == ComputeJobOutcome.FAILURE
+    assert stranded_running.terminal_reason == "runner_subprocess_runner_dead"
+    assert stranded_starting.status == ComputeJobStatus.FAILED
+    assert stranded_starting.terminal_reason == "runner_subprocess_runner_dead"
+    assert wake.fired_at is not None
+    history = (await db_session.execute(select(TaskHistory).where(TaskHistory.task_id == task.id))).scalars().all()
+    assert any(row.action == "COMPUTE_TERMINATED" for row in history)
+    assert boundary_job.status == ComputeJobStatus.RUNNING
+    assert unclaimed_job.status == ComputeJobStatus.RUNNING
+    assert other_backend_job.status == ComputeJobStatus.RUNNING
+    assert terminal_job.status == ComputeJobStatus.FAILED
+    assert (
+        await sweep_stranded_runner_subprocess_compute_jobs(
+            db_session, now, session_factory=session_factory
+        )
+        == 0
+    )
 
 
 @pytest.mark.asyncio

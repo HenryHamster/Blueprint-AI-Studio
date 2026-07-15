@@ -306,6 +306,7 @@ from app.reaper_sweeps import (
     sweep_closed_handmerge_prs,
     sweep_protect_referenced_compute_image_digests,
     sweep_refresh_project_compute_images,
+    sweep_stranded_runner_subprocess_compute_jobs,
     sweep_proof_earn_loop,
     _sweep_strategic_cycle_starvation,
 )
@@ -2810,6 +2811,23 @@ async def reaper_service():
                     await sweep_unblock_blocked_tasks(session, now)
                 except Exception as e:
                     logger.error(f"[REAPER] Unblock sweep error: {e}", exc_info=True)
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 12a: Runner-death compute recovery — a runner-subprocess
+                # job has no backend-side liveness signal once its claiming runner
+                # stops reporting. Finalize only jobs tied to a confirmed-dead
+                # claiming runner, then let the normal wake step deliver its task.
+                _mark_reaper_progress()
+                try:
+                    await sweep_stranded_runner_subprocess_compute_jobs(
+                        session, now, session_factory=AsyncSessionLocal
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Stranded runner compute-job sweep error: {e}",
+                        exc_info=True,
+                    )
                     with contextlib.suppress(Exception):
                         await session.rollback()
 
