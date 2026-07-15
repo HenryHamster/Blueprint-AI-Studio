@@ -1,4 +1,6 @@
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import {
   checkRequiredComponentAssertions,
   checkAllComponentsHaveTests,
@@ -65,6 +67,25 @@ describe('viewport runner unhandled-error filter', () => {
     });
 
     await expect(guarded()).rejects.toThrow('application route failed');
+  });
+});
+
+describe('viewport-checks runtime/declaration contract', () => {
+  it('declares exactly the named exports implemented by the Node-loaded helper', () => {
+    // This module deliberately remains JavaScript because the viewport gate and
+    // Vitest config import it directly under Node. Keep its TypeScript companion
+    // declaration in lockstep so a newly exported runtime helper cannot break
+    // unrelated admin-ui typechecks after its own runtime tests have passed.
+    const implementation = readFileSync(resolve('src/test/viewport-checks.js'), 'utf8');
+    const declaration = readFileSync(resolve('src/test/viewport-checks.d.ts'), 'utf8');
+    const runtimeNames = [...implementation.matchAll(/^export\s+(?:async\s+)?(?:function|const|let|class)\s+(\w+)/gm)]
+      .map(([, name]) => name)
+      .sort();
+    const declaredNames = [...declaration.matchAll(/^export\s+declare\s+(?:function|const|let|class)\s+(\w+)/gm)]
+      .map(([, name]) => name)
+      .sort();
+
+    expect(declaredNames).toEqual(runtimeNames);
   });
 });
 
