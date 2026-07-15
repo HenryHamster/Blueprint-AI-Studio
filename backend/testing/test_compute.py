@@ -345,7 +345,10 @@ class TestAgentSecretManifest:
         assert manifest["env"]["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-test"
         assert manifest["env"]["TASK_ID"] == str(task_id)
         assert manifest["metadata"]["task_type"] == "create"
-        assert manifest["files"] == []
+        # Anthropic always materializes ~/.claude.json (even without claude_config_json)
+        # so the CLI doesn't stall on the onboarding dialog.
+        assert len(manifest["files"]) == 1
+        assert manifest["files"][0]["path"] == "/home/agent/.claude.json"
 
     def test_build_agent_secret_manifest_materializes_file_based_provider_auth(self):
         task_id = uuid.uuid4()
@@ -473,6 +476,90 @@ class TestAgentSecretManifest:
         assert manifest["env"]["LLM_SETTINGS"] == "{}"
         assert "LLM_CLI_TRANSLATION" in manifest["env"]
         assert manifest["metadata"]["model"] == "claude-opus-4-8"
+
+    def test_anthropic_omitted_claude_config_json_materializes_minimal_file(self):
+        """Anthropic provider without claude_config_json still produces a
+        ~/.claude.json file entry so the CLI doesn't stall on onboarding."""
+        import json as _json
+        task_id = uuid.uuid4()
+        manifest = compute.build_agent_secret_manifest(
+            vm_instance_id="vm-no-config",
+            task_id=task_id,
+            oauth_token="sk-ant-oauth01-xyz",
+            task_type="create",
+            provider="anthropic",
+            auth_mode="oauth",
+        )
+        files = manifest["files"]
+        assert len(files) == 1
+        assert files[0]["path"] == "/home/agent/.claude.json"
+        # Content must not carry secrets — only the structural config shell
+        content = _json.loads(files[0]["content"])
+        assert "CLAUDE_CODE_OAUTH_TOKEN" not in files[0]["content"]
+        assert "sk-ant" not in files[0]["content"]
+        assert isinstance(content, dict)
+
+    def test_anthropic_supplied_claude_config_json_preserved(self):
+        """When claude_config_json is supplied, it is forwarded verbatim
+        (the VM-side normalizer merges hasTrustDialogAccepted on top)."""
+        import json as _json
+        operator_config = _json.dumps(
+            {"hasCompletedOnboarding": True, "email": "op@example.com"}
+        )
+        task_id = uuid.uuid4()
+        manifest = compute.build_agent_secret_manifest(
+            vm_instance_id="vm-with-config",
+            task_id=task_id,
+            oauth_token="sk-ant-oauth01-abc",
+            task_type="fix",
+            provider="anthropic",
+            auth_mode="oauth",
+            claude_config_json=operator_config,
+        )
+        files = manifest["files"]
+        assert len(files) == 1
+        assert files[0]["path"] == "/home/agent/.claude.json"
+        content = _json.loads(files[0]["content"])
+        assert content["hasCompletedOnboarding"] is True
+        assert content["email"] == "op@example.com"
+        # Operator fields preserved; trust injection happens in materialize_manifest.py
+        assert "sk-ant" not in files[0]["content"]
+
+    def test_anthropic_claude_json_path_is_home_anchored(self):
+        """The manifest path must use /home/agent so the agent runner can
+        re-anchor it to the live $HOME (e.g. /home inside a bwrap sandbox)."""
+        task_id = uuid.uuid4()
+        manifest = compute.build_agent_secret_manifest(
+            vm_instance_id="vm-home-anchor",
+            task_id=task_id,
+            oauth_token="sk-ant-oauth01-def",
+            task_type="create",
+            provider="anthropic",
+            auth_mode="oauth",
+        )
+        claude_file = next(
+            (f for f in manifest["files"] if f["path"].endswith(".claude.json")), None
+        )
+        assert claude_file is not None, "expected .claude.json in manifest files"
+        # Canonical home-agent path so re-anchoring logic matches '.claude.json' tail
+        assert claude_file["path"] == "/home/agent/.claude.json"
+
+    def test_non_anthropic_omitted_claude_config_json_no_file(self):
+        """Non-Anthropic providers without claude_config_json must NOT add a
+        .claude.json file — OpenAI/ZAI/DeepSeek/Gemini don't need the onboarding bypass."""
+        task_id = uuid.uuid4()
+        manifest = compute.build_agent_secret_manifest(
+            vm_instance_id="vm-openai-no-config",
+            task_id=task_id,
+            oauth_token='{"tokens":{"access_token":"abc"}}',
+            task_type="create",
+            provider="openai",
+            auth_mode="oauth",
+        )
+        claude_file = next(
+            (f for f in manifest["files"] if f["path"].endswith(".claude.json")), None
+        )
+        assert claude_file is None, "non-Anthropic provider must not add .claude.json"
 
 
 @pytest.mark.asyncio
