@@ -923,7 +923,7 @@ async def _maybe_enroll_proof_trial(
     * ``"fresh"`` — a fresh green executed proof already covers HEAD
       (:func:`_fresh_executed_proof_covers_head`); nothing to re-verify this
       sweep. The caller does NOT downgrade to a static proof.
-    * ``None`` — the execution-trials flag is off (dark default) or enrollment
+    * ``None`` — the execution-trials flag is disabled or enrollment
       degraded to a no-op; the caller falls back to the UNCHANGED static
       ``named_test_present`` / ``backing_path`` (``path_proven``) recording.
 
@@ -975,10 +975,10 @@ async def enroll_capability_proof_trial(
     tests), and on a green run the ingestion completion handler mints a genuine
     ``proven`` named_test proof (:func:`record_capability_named_test_execution_proof`).
 
-    This is the ENROLL half — later slices call it from a sweep; it is deliberately
-    NOT wired to any sweep here. It is fully **dark**: gated on the
-    ``capability_proof_execution_trials_enabled`` runtime flag (default False), so
-    with the flag off it is a no-op returning ``None``.
+    This is the ENROLL half, called by the proof-earn sweep and on-demand
+    discovery. It is gated on the ``capability_proof_execution_trials_enabled``
+    runtime flag (default True); with the operator kill switch off it is a no-op
+    returning ``None``.
 
     Bounded launch contract (design §3.2 / §6.2): ``test_refs`` is normalized and
     capped to :data:`MAX_CAPABILITY_PROOF_TRIAL_TEST_FILES`, and a wall-clock

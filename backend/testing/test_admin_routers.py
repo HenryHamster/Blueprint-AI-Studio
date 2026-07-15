@@ -9972,39 +9972,36 @@ class TestNotificationConfigSettings:
     async def test_capability_proof_execution_trials_enabled_round_trip_and_persist(
         self, client: AsyncClient, db_session
     ):
-        """capability_proof_execution_trials_enabled (the Slice-1 dark flag gating
-        the executed-named_test trial dispatch) defaults False, is settable via
-        PATCH, surfaces on GET, lands in the in-memory runtime_config, and
-        persists into DeploymentState.runtime_config_json — so a later slice can
-        flip it on at runtime without a redeploy. Guards all four wiring points
-        (allowlist, apply branch, GET response, persist dict)."""
+        """The executed-test earn path defaults on, while its operator kill switch
+        round-trips through PATCH, GET, runtime config, and persisted settings."""
         from app.models import DeploymentState
         from app.shared_state import runtime_config as _rc
 
-        original = _rc.get("capability_proof_execution_trials_enabled", False)
-        # Defaults OFF (dark).
+        original = _rc.get("capability_proof_execution_trials_enabled", True)
+        # The complete discovery -> execution -> ingestion path is active by
+        # default, so pre-existing working capabilities can earn ``proven``.
         body = (await client.get("/api/admin/settings")).json()
-        assert body["capability_proof_execution_trials_enabled"] is False
+        assert body["capability_proof_execution_trials_enabled"] is True
 
         db_session.add(DeploymentState())
         await db_session.commit()
         try:
             resp = await client.patch(
                 "/api/admin/settings",
-                json={"capability_proof_execution_trials_enabled": True},
+                json={"capability_proof_execution_trials_enabled": False},
             )
             assert resp.status_code == 200, resp.text
 
             body = (await client.get("/api/admin/settings")).json()
-            assert body["capability_proof_execution_trials_enabled"] is True
-            assert _rc.get("capability_proof_execution_trials_enabled") is True
+            assert body["capability_proof_execution_trials_enabled"] is False
+            assert _rc.get("capability_proof_execution_trials_enabled") is False
 
             row = await db_session.get(DeploymentState, 1)
             assert row is not None
             assert row.runtime_config_json is not None
             assert (
                 row.runtime_config_json["capability_proof_execution_trials_enabled"]
-                is True
+                is False
             )
 
             # Non-boolean is rejected.

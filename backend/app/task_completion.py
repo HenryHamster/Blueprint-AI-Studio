@@ -3752,9 +3752,9 @@ async def _handle_capability_proof_trial_completion(
         strategist visibility only (it does NOT touch the capability's
         proof-scoring evidence_refs, so an existing ``proven`` is untouched).
 
-    Fully **dark + fail-open**: everything is gated on the
-    ``capability_proof_execution_trials_enabled`` runtime flag (default False), and
-    any parse/lookup/record error leaves the capability at its existing proof,
+    Operator-disableable + fail-open: the
+    ``capability_proof_execution_trials_enabled`` runtime flag defaults to True,
+    and any parse/lookup/record error leaves the capability at its existing proof,
     never worse. Non-raising (the post-commit dispatcher already guards, but the
     contract here is explicitly no-raise so a malformed trial can never strand the
     surrounding commit).

@@ -734,8 +734,8 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
             "capability's declared convention-named covering tests as a targeted "
             "runner job, decoupled from the merge gate. A green run mints a genuine "
             "``proven`` named_test proof into the capability-proof ledger; a red run "
-            "records nothing and NEVER demotes an existing proof. Ships dark, gated "
-            "on ``capability_proof_execution_trials_enabled``."
+            "records nothing and NEVER demotes an existing proof. Operators can "
+            "pause it with ``capability_proof_execution_trials_enabled``."
         ),
         # A single targeted agent run produces the verdict; it needs a code
         # checkout to run the tests, but opens no PR — its durable product is the

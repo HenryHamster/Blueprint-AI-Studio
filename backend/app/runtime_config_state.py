@@ -332,13 +332,13 @@ runtime_config: Dict = {
             "CAPABILITY_PROOF_GATE_AUTO_GRADUATION_ENFORCE_THRESHOLD", "0.95"
         )
     ),
-    # Slice-1 DARK flag for the machine-verified capability-proof earn path
-    # (design 84021e2d): gates the executed-named_test trial dispatch/enrollment
-    # that later slices add. Default OFF — the executed-proof recorder and this
-    # flag ship dark; no caller reads it yet. Flip via PATCH /api/admin/settings
-    # (no deploy) once the trial-dispatch slice lands.
+    # Machine-verified capability-proof earn path: gates the bounded,
+    # executed-named_test trial dispatch/enrollment.  Default ON now that the
+    # complete path is wired (discovery -> targeted execution -> green-result
+    # ingestion -> proven evidence). Operators retain the PATCH/env kill switch
+    # for a fleet that needs to pause trial dispatch.
     "capability_proof_execution_trials_enabled": os.getenv(
-        "CAPABILITY_PROOF_EXECUTION_TRIALS_ENABLED", "false"
+        "CAPABILITY_PROOF_EXECUTION_TRIALS_ENABLED", "true"
     ).lower()
     in ("1", "true", "yes"),
     # Co-change auto-decomposition: split a medium research finding's files into
