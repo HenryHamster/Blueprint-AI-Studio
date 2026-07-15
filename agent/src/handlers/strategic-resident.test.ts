@@ -54,6 +54,7 @@ vi.mock('./strategic-helpers.js', () => ({
 }));
 vi.mock('../providers/runners.js', () => ({
   provisionAmbientHelpers: vi.fn(),
+  claudeHelpSupportsPartialMessages: vi.fn(() => true),
 }));
 vi.mock('../providers/resident-session.js', () => ({
   startResidentClaudeSession: vi.fn(),

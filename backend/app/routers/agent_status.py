@@ -443,7 +443,10 @@ def record_task_result(
             (task_context or {}).get("agent_backend")
             or (
                 "local_runner"
-                if (task_context or {}).get("runner_target_id")
+                if (
+                    (task_context or {}).get("runner_target_id")
+                    or (task_context or {}).get("runner_hostname")
+                )
                 else "cloud"
             )
         ),

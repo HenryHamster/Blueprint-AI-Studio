@@ -360,6 +360,17 @@ class TestEnvAllowlist(unittest.TestCase):
             ],
         )
 
+    def test_global_npm_package_root_is_discovered_for_optional_native_bind(self):
+        paths = [
+            "/home/henry/node22/lib/node_modules/@openai/codex/bin/codex.js",
+            "/home/henry/node22/bin/codex",
+            "/usr/bin/git",
+        ]
+        self.assertEqual(
+            iso.npm_tool_roots(paths),
+            ["/home/henry/node22/lib/node_modules/@openai/codex"],
+        )
+
     def test_agent_env_never_leaks_runner_secrets(self):
         source = {
             "BLUEPRINT_RUNNER_TOKEN": "SECRET-RUNNER-TOKEN",

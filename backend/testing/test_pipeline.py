@@ -840,6 +840,33 @@ class TestTaskResultDedup:
             "provider"
         ] == "anthropic"
 
+    def test_runner_hostname_marks_result_as_local_runner(self):
+        from collections import deque
+
+        import app.shared_state as ss
+        from app.routers.agent_status import (
+            _recorded_task_entries,
+            _recorded_task_ids,
+            record_task_result,
+        )
+
+        ss.deploy_monitoring["task_results"] = deque(maxlen=100)
+        ss.deploy_monitoring["task_result_metadata"] = {}
+        _recorded_task_ids.clear()
+        _recorded_task_entries.clear()
+
+        record_task_result(
+            success=False,
+            failure_class="PROVISION_FAILURE",
+            task_id="local-runner-hostname-only",
+            task_context={"runner_hostname": "dgx-1"},
+        )
+
+        timestamp = ss.deploy_monitoring["task_results"][0][0]
+        assert ss.deploy_monitoring["task_result_metadata"][timestamp][
+            "backend"
+        ] == "local_runner"
+
 
 # ── Task Type Ring Buffer & Per-Type Failure Rate ─────────────────────────
 

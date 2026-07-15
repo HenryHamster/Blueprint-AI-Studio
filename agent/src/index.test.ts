@@ -82,6 +82,7 @@ import { buildFixtureCapabilityContract } from './testSetup.js';
 import {
   _setLastProviderRunErrorReportForTesting,
   __setCommandExistsOverrideForSmoke,
+  claudeHelpSupportsPartialMessages,
   type ProviderRunErrorReport,
 } from './providers/runners.js';
 import { clearPidRegistry, _getRegisteredPids } from './processTracking.js';
@@ -1986,6 +1987,19 @@ describe('provider runner prompt transport', () => {
     expect(command.args).toContain('--verbose');
   });
 
+  it('detects whether the installed Claude CLI supports partial-message streaming', () => {
+    expect(
+      claudeHelpSupportsPartialMessages(
+        'Usage: claude [options]\n  --include-partial-messages  emit stream deltas',
+      ),
+    ).toBe(true);
+    expect(
+      claudeHelpSupportsPartialMessages(
+        'Usage: claude [options]\n  --output-format <format>',
+      ),
+    ).toBe(false);
+  });
+
   it('uses Claude Code with the Anthropic-compatible endpoint for Z.AI', () => {
     process.env.PROVIDER = 'zai';
     process.env.AUTH_MODE = 'oauth';
@@ -3711,6 +3725,7 @@ describe('persistAndPostStatus workspace_prep shipping', () => {
 
   beforeEach(() => {
     resetWorkspacePrepOutcome();
+    vi.mocked(fs.readdirSync).mockReturnValue([]);
     fetchMock = makeFetchMock().mockResolvedValue({
       ok: true,
       status: 200,
@@ -3727,12 +3742,11 @@ describe('persistAndPostStatus workspace_prep shipping', () => {
     delete process.env.BLUEPRINT_LANE_MODE;
   });
 
-  // skipIf(win32): the mock keys fs.existsSync on the POSIX path '/ws/.git', but
-  // prepareWorkspaceForRole builds the path with path.join (backslashes on Windows),
-  // so the strict === never matches and warm-reuse resolves cold. POSIX-only test.
-  it.skipIf(process.platform === 'win32')('includes the recorded workspace prep outcome in /api/agent/status', async () => {
+  it('includes the recorded workspace prep outcome in /api/agent/status', async () => {
     const existsSpy = vi.mocked(fs.existsSync);
-    existsSpy.mockImplementation(path => path === '/ws/.git');
+    existsSpy.mockImplementation(
+      value => String(value).replaceAll('\\', '/') === '/ws/.git',
+    );
     process.env.BLUEPRINT_WARM_HANDOFF = '1';
     process.env.BLUEPRINT_LANE_MODE = '1';
 
@@ -3765,7 +3779,9 @@ describe('persistAndPostStatus workspace_prep shipping', () => {
 
   it('resetPerRoleModuleState clears stale workspace_prep before the next role ships', async () => {
     const existsSpy = vi.mocked(fs.existsSync);
-    existsSpy.mockImplementation(path => path === '/ws/.git');
+    existsSpy.mockImplementation(
+      value => String(value).replaceAll('\\', '/') === '/ws/.git',
+    );
     process.env.BLUEPRINT_WARM_HANDOFF = '1';
     process.env.BLUEPRINT_LANE_MODE = '1';
 
