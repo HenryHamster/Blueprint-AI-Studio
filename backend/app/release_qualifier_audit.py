@@ -188,10 +188,14 @@ def _infer_dimension_from_infra_error(infra_error: str) -> str:
 def _infra_failure_signature(
     infra_error: str, child_failures: list[dict[str, Any]]
 ) -> str:
-    terminal = child_failures[-1] if child_failures else {}
-    leg = terminal.get("leg") or _infer_infra_leg(infra_error)
-    category = terminal.get("failure_category") or terminal.get("status") or "unknown"
-    return f"{leg}:{category}:{infra_error}"
+    """Build a repetition key from the failing gate, not its diagnostics.
+
+    Child task failures are useful evidence, but are unrelated to a deterministic
+    gate error (and can vary between attempts).  Including them made a stable
+    migration gate look transient and prevented incapacity escalation.
+    """
+    del child_failures
+    return f"{_infer_infra_leg(infra_error)}:unknown:{infra_error}"
 
 
 async def _collect_terminal_infra_child_events(
@@ -1003,6 +1007,22 @@ async def _handle_infra_failure(
         else None
     )
 
+    hotfix_preview: dict[str, Any] | None = None
+    if is_permanent_gate_incapacity:
+        # Make the sanctioned remediation concrete at the point incapacity is
+        # declared.  This is read-only and deliberately best-effort: inability
+        # to preview must not turn a held release into a promotion.
+        try:
+            hotfix_preview = await _release_qualifier_module().check_hotfix_scope_preview(
+                session, version.project_id, candidate_sha=qual.get("candidate_sha")
+            )
+        except Exception:  # noqa: BLE001 — remediation guidance is best-effort
+            logger.warning(
+                "[RELEASE_QUALIFIER] hotfix scope preview failed for v%d",
+                version.version_number,
+                exc_info=True,
+            )
+
     # Phase 1b read: compose already-resolved dimension facts from the per-dimension
     # ledger into the record and verdict sub_scores, so a passed audit/CI/etc. is
     # visible in the verdict instead of being discarded by a transient infra defer
@@ -1035,14 +1055,19 @@ async def _handle_infra_failure(
         and current_streak % _MIN_INFRA_ERROR_STREAK == 0
     ):
         if is_permanent_gate_incapacity:
+            preview_text = (
+                f"Eligible narrow diff: {hotfix_preview.get('changed_files', [])}. "
+                if hotfix_preview and hotfix_preview.get("eligible")
+                else "Hotfix scope preview unavailable or ineligible; inspect it before acting. "
+            )
             alert_message = (
                 f"The migration-apply gate for v{version.version_number} is "
                 f"persistently incapable across {same_signature_streak} "
                 f"same-signature attempts ({infra_error!r}) — the underlying "
                 f"condition will not self-resolve by retry. Sanctioned "
-                f"remediation: use force-promote "
-                f"(POST /projects/{{id}}/promote/force) after manually "
-                f"verifying the migration chain against production's schema. "
+                f"{preview_text}Sanctioned remediation: use the hotfix scope "
+                f"preview and approved hotfix endpoint (POST /projects/{{id}}/promote/hotfix), "
+                f"not whole-tree force-promotion. "
                 f"Signature: {signature}."
             )
         else:
@@ -1078,13 +1103,19 @@ async def _handle_infra_failure(
 
     rq = _release_qualifier_module()
     if is_permanent_gate_incapacity:
+        preview_text = (
+            f" Eligible narrow diff: {hotfix_preview.get('changed_files', [])}."
+            if hotfix_preview and hotfix_preview.get("eligible")
+            else " Hotfix scope preview is unavailable or ineligible; do not force-promote."
+        )
         notify_message = (
             f"v{version.version_number} migration-apply gate is persistently "
             f"incapable across {same_signature_streak} same-signature attempts "
             f"({infra_error.replace('_', ' ')}) — the underlying condition "
-            f"will not self-resolve by retry. Sanctioned remediation: use "
-            f"force-promote (POST /projects/{{id}}/promote/force) after manually "
-            f"verifying the migration chain against production's schema."
+            f"will not self-resolve by retry. "
+            f"Use the sanctioned hotfix scope preview and endpoint "
+            f"(POST /projects/{{id}}/promote/hotfix), not whole-tree force-promotion."
+            f"{preview_text}"
         )
     else:
         notify_message = (
