@@ -1023,13 +1023,16 @@ def tool_dirs_for(paths: list[str]) -> list[str]:
 
 
 def npm_tool_roots(paths: list[str]) -> list[str]:
-    """Package roots needed by npm ``node_modules/.bin`` shims in bwrap.
+    """Package roots needed by npm-managed CLIs inside bwrap.
 
     System-global CLIs normally live under an existing /usr or /opt base bind.
     Blueprint-managed CLIs live in a private runner directory, so binding only
     the shim/real entry file would omit sibling JS and native optional packages.
     Bind the containing release root read-only when a resolved tool came through
-    ``node_modules/.bin``.
+    ``node_modules/.bin``.  Global npm prefixes use ``<prefix>/bin/<tool>``
+    symlinks whose real path is under ``<prefix>/lib/node_modules/<package>``;
+    bind that package root too so nested optional native packages (notably
+    ``@openai/codex-linux-*``) remain visible in the sandbox.
     """
     roots: list[str] = []
     for path in paths:
@@ -1042,7 +1045,31 @@ def npm_tool_roots(paths: list[str]) -> list[str]:
             root = os.path.dirname(node_modules)
             if root and root not in roots:
                 roots.append(root)
-    return roots
+
+        # A resolved global npm shim points at the real package entry file, for
+        # example:
+        #   /home/runner/node22/lib/node_modules/@openai/codex/bin/codex.js
+        # Binding only that file leaves the package's nested optional native
+        # dependency outside bwrap.  Capture the package root, including scoped
+        # packages, when no broader managed-release root covers it.
+        normalized = path.replace("\\", "/")
+        match = re.match(
+            r"^(.*?/node_modules/(?:@[^/]+/)?[^/]+)(?:/|$)", normalized
+        )
+        if match:
+            package_root = match.group(1)
+            if package_root and package_root not in roots:
+                roots.append(package_root)
+
+    # Prefer a broader release root over a nested package root when both were
+    # discovered from the real entry file plus its node_modules/.bin shim.
+    return [
+        root
+        for root in roots
+        if not any(
+            other != root and _covered_by(root, (other,)) for other in roots
+        )
+    ]
 
 
 def resolve_tools(names: list[str], source_env: dict[str, str] | None = None) -> list[str]:

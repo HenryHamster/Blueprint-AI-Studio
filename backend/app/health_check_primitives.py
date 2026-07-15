@@ -439,6 +439,12 @@ def get_dispatch_health_snapshot(ext: dict) -> dict:
 def check_gcp_health(ext: dict) -> Optional[str]:
     """Check GCP health via recent provisioning success/failure tracking.
 
+    Local-runner failures can share the broad ``PROVISION_FAILURE`` operational
+    class (for example a provider CLI that cannot start inside bwrap), but they
+    are not evidence about GCP. Route metadata recorded alongside task results
+    keeps those samples out of both the provision-failure count and its
+    corroborating recent-failure window.
+
     Returns 'gcp' if failed, None if healthy.
     """
     # Audit C10: naive UTC cutoff to match record_task_result()'s naive ISO
@@ -447,10 +453,16 @@ def check_gcp_health(ext: dict) -> Optional[str]:
     fresh_all = [
         r for r in _shared_state.deploy_monitoring["task_results"] if r[0] >= cutoff
     ]
-    recent_provisions = [r for r in fresh_all if r[2] == "PROVISION_FAILURE"]
+    metadata = _shared_state.deploy_monitoring.get("task_result_metadata", {})
+    fresh_cloud = [
+        r
+        for r in fresh_all
+        if metadata.get(r[0], {}).get("backend") != "local_runner"
+    ]
+    recent_provisions = [r for r in fresh_cloud if r[2] == "PROVISION_FAILURE"]
     if len(recent_provisions) >= 3:
         # Check if ALL recent failures are provision failures (guard against empty filter)
-        recent_all = fresh_all[-5:]
+        recent_all = fresh_cloud[-5:]
         recent_failures = [r for r in recent_all if r[1] == "failure"]
         if recent_failures and all(
             r[2] == "PROVISION_FAILURE" for r in recent_failures

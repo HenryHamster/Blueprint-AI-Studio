@@ -1,6 +1,6 @@
 import fs from 'fs';
 import os from 'os';
-import { spawn } from 'child_process';
+import { execFileSync, spawn } from 'child_process';
 import type WebSocket from 'ws';
 import { registerChildPid, unregisterChildPid } from '../processTracking.js';
 import { getCheckRunawayStatus, isCheckInvocation, recordCheckOutcome } from '../fix-loop-events.js';
@@ -66,6 +66,35 @@ export function __setCommandExistsOverrideForSmoke(fn: ((command: string) => boo
 
 function _commandExists(command: string): boolean {
   return _commandExistsOverride ? _commandExistsOverride(command) : commandExistsOnPath(command);
+}
+
+const CLAUDE_PARTIAL_MESSAGES_FLAG = '--include-partial-messages';
+
+export function claudeHelpSupportsPartialMessages(helpText: string): boolean {
+  return helpText.includes(CLAUDE_PARTIAL_MESSAGES_FLAG);
+}
+
+function _claudeSupportsPartialMessages(command: string, env: NodeJS.ProcessEnv): boolean {
+  try {
+    const help = execFileSync(command, ['--help'], {
+      env,
+      encoding: 'utf8',
+      timeout: 5_000,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    // Test doubles and unusual wrappers can successfully return no help text.
+    // That is not positive evidence that the flag is unsupported, so preserve
+    // the historical behavior in that ambiguous case.
+    const helpText = typeof help === 'string' ? help.trim() : '';
+    return helpText.length === 0
+      ? true
+      : claudeHelpSupportsPartialMessages(helpText);
+  } catch {
+    // A failed help probe must not make an otherwise runnable provider CLI
+    // unusable. Keep the historical flag and let the normal structured error
+    // path report a real launch failure.
+    return true;
+  }
 }
 
 const RATE_LIMIT_PATTERNS: Readonly<Record<ProviderName, Partial<Record<AuthMode, readonly string[]>>>> = {
@@ -1094,6 +1123,30 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
     throw new RuntimeUnavailableError(cliCommand);
   }
 
+  // Claude Code CLI releases differ on partial-message support. Passing an
+  // unknown flag exits before the provider request, so probe the local binary's
+  // help text and omit the flag when unsupported. The content-progress watchdog
+  // below is disabled in that compatibility mode because it relies on the
+  // incremental deltas this flag enables; raw-stream, tool, and wall-clock
+  // watchdogs remain active.
+  let partialMessageProgressAvailable = runCommand.args.includes(
+    CLAUDE_PARTIAL_MESSAGES_FLAG,
+  );
+  if (
+    cliCommand === 'claude'
+    && partialMessageProgressAvailable
+    && !_claudeSupportsPartialMessages(cliCommand, runCommand.env)
+  ) {
+    runCommand.args = runCommand.args.filter(
+      arg => arg !== CLAUDE_PARTIAL_MESSAGES_FLAG,
+    );
+    partialMessageProgressAvailable = false;
+    sendLog(
+      ws,
+      `[preflight] Claude CLI does not support ${CLAUDE_PARTIAL_MESSAGES_FLAG}; using compatible stream mode\n`,
+    );
+  }
+
   // OAuth accounts may have earned Codex rate-limit reset credits. Consume one
   // exact credit only when the real seven-day window is exhausted. Exact IDs
   // make concurrent starts converge on one redemption, while probe failures
@@ -1256,7 +1309,8 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
     // it as a rate-limit so the orchestrator holds/reroutes instead of letting
     // the call ride to the wall-clock backstop → AGENT_TIMEOUT → retry-
     // budget burn → terminal failure of a healthy task (incident 2026-05-29).
-    let llmProgressWatchdog: NodeJS.Timeout | null = setInterval(() => {
+    let llmProgressWatchdog: NodeJS.Timeout | null = partialMessageProgressAvailable
+      ? setInterval(() => {
       // Fire ONLY when the content stream is stale AND no tool is in flight.
       //
       // The no-progress watchdog exists for ONE failure mode: a silent provider
@@ -1309,7 +1363,8 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
           });
         }
       }
-    }, 60_000);
+      }, 60_000)
+      : null;
 
     let checkRunawayWatchdog: NodeJS.Timeout | null = null;
     if (enableCheckWatchdog && !process.env.DISABLE_CHECK_RUNAWAY_WATCHDOG) {

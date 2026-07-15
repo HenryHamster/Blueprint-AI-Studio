@@ -1245,6 +1245,42 @@ def test_check_gcp_health_fresh_provision_failures_return_failed():
     assert ext["gcp"] is False
 
 
+def test_check_gcp_health_ignores_local_runner_provision_failures():
+    rows = [
+        (_ts(5), "failure", "PROVISION_FAILURE", "strategic_review"),
+        (_ts(4), "failure", "PROVISION_FAILURE", "strategic_review"),
+        (_ts(3), "failure", "PROVISION_FAILURE", "design_doc_update"),
+    ]
+    _shared_state.deploy_monitoring["task_results"] = deque(rows, maxlen=100)
+    _shared_state.deploy_monitoring["task_result_metadata"] = {
+        row[0]: {"backend": "local_runner"} for row in rows
+    }
+
+    ext = {"errors": {}}
+    assert _hcp.check_gcp_health(ext) is None
+    assert ext["gcp"] is True
+
+
+def test_check_gcp_health_still_counts_cloud_failures_with_local_runner_noise():
+    cloud_rows = [
+        (_ts(5), "failure", "PROVISION_FAILURE", "create"),
+        (_ts(4), "failure", "PROVISION_FAILURE", "create"),
+        (_ts(3), "failure", "PROVISION_FAILURE", "create"),
+    ]
+    local_row = (_ts(2), "failure", "PROVISION_FAILURE", "strategic_review")
+    _shared_state.deploy_monitoring["task_results"] = deque(
+        [*cloud_rows, local_row], maxlen=100
+    )
+    _shared_state.deploy_monitoring["task_result_metadata"] = {
+        **{row[0]: {"backend": "cloud"} for row in cloud_rows},
+        local_row[0]: {"backend": "local_runner"},
+    }
+
+    ext = {"errors": {}}
+    assert _hcp.check_gcp_health(ext) == "gcp"
+    assert ext["gcp"] is False
+
+
 def _ts_naive(minutes_ago: float) -> str:
     """Production-faithful task_results timestamp.
 
