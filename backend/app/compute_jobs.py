@@ -429,6 +429,36 @@ def _compute_job_has_durable_bundle(job: ComputeJob) -> bool:
     return isinstance(runner_artifact, dict) and bool(runner_artifact.get("uri"))
 
 
+def _has_verified_resume_provenance(job: ComputeJob) -> bool:
+    """Whether a resume-derived source affirmatively completed hydration.
+
+    Ordinary terminal jobs predate this provenance and remain valid sources. A
+    job that itself declared a predecessor is different: without this exact
+    proof, its bundle may contain fragments from a failed extraction.
+    """
+    meta = job.polling_metadata or {}
+    declared_source = meta.get("input_artifact_job_id")
+    if not declared_source:
+        return True
+    provenance = meta.get("resume_provenance")
+    if not isinstance(provenance, dict) or provenance.get("ok") is not True:
+        return False
+    try:
+        declared = str(uuid.UUID(str(declared_source)))
+        reported = str(uuid.UUID(str(provenance.get("resumed_from_job_id"))))
+    except (ValueError, AttributeError, TypeError):
+        return False
+    file_count = provenance.get("file_count")
+    return (
+        reported == declared
+        and isinstance(file_count, int)
+        and not isinstance(file_count, bool)
+        and file_count > 0
+        and isinstance(provenance.get("recorded_at"), str)
+        and bool(provenance["recorded_at"].strip())
+    )
+
+
 async def _resolve_resume_source_job_id(
     session, *, project_id, input_artifact_job_id: str
 ) -> str:
@@ -501,6 +531,17 @@ async def _resolve_resume_source_job_id(
                     f"input_artifact_job_id {parsed} produced no durable artifact "
                     "bundle (no result_reference / artifact / runner_artifact) — "
                     "nothing to resume from"
+                ),
+                "input_artifact_job_id": str(parsed),
+            }
+        )
+    if not _has_verified_resume_provenance(source):
+        raise ComputeLaunchPreconditionFailed(
+            {
+                "error": "input_artifact_job_resume_provenance_invalid",
+                "message": (
+                    f"input_artifact_job_id {parsed} is itself a resumed job but "
+                    "has no affirmative, source-matched successful hydration provenance"
                 ),
                 "input_artifact_job_id": str(parsed),
             }

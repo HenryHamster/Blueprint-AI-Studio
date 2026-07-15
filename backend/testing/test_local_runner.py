@@ -8,6 +8,7 @@ Covers the four new surfaces:
 """
 
 import asyncio
+import os
 import uuid
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -11276,6 +11277,7 @@ class TestRunnerResumeFail_Closed:
         from unittest.mock import patch
 
         reports = []
+        uploads = []
 
         def fake_report(orch_url, token, job_id, *, exec_status, exit_code=None,
                         result_metrics=None, command_log=None,
@@ -11289,13 +11291,18 @@ class TestRunnerResumeFail_Closed:
             return False
 
         def fake_download(orch_url, token, job_id, artifact_dir):
+            # Model a buggy extractor that left a predecessor fragment. The
+            # terminal finally path must still scrub and suppress its upload.
+            with open(os.path.join(artifact_dir, "partial-checkpoint.pt"), "wb") as fh:
+                fh.write(b"partial predecessor")
             return {"ok": False, "reason": "http_404"}
 
         job = self._make_job(input_artifact_job_id="pred-job-001")
         active: set = {"test-resume-001"}
 
         with patch.object(local_runner, "_report_compute_job", fake_report), \
-             patch.object(local_runner, "_download_input_artifact", fake_download):
+             patch.object(local_runner, "_download_input_artifact", fake_download), \
+             patch.object(local_runner, "_upload_artifact", lambda *_args: uploads.append(True)):
             local_runner._run_compute_job(
                 job, "https://api.example.com", "tok",
                 active, threading.Lock(),
@@ -11318,6 +11325,7 @@ class TestRunnerResumeFail_Closed:
         assert hydration.get("reason") == "http_404", (
             f"expected reason='http_404' in resume_hydration, got: {hydration!r}"
         )
+        assert uploads == [], "failed hydration must not upload predecessor fragments"
         # Job must be removed from active_jobs so capacity is released.
         assert "test-resume-001" not in active
 
@@ -11355,13 +11363,7 @@ class TestRunnerResumeFail_Closed:
         assert terminal[-1]["exec_status"] == "failed"
 
     def test_runner_resume_proceeds_when_bundle_available(self):
-        """A successful hydration lets the job proceed (regression guard).
-
-        When _download_input_artifact returns ok=True the first exec_status
-        report must be 'running', not 'failed' — the fix must not accidentally
-        fail-close successful resumes.  We stop early (via _EarlyExit) after the
-        first report so no subprocess execution is needed.
-        """
+        """Successful proof is repeated on a later durable terminal report."""
         import sys
         import pathlib
         import threading
@@ -11369,33 +11371,38 @@ class TestRunnerResumeFail_Closed:
         import local_runner
         from unittest.mock import patch
 
-        first_status: list = []
+        reports: list = []
 
-        class _EarlyExit(Exception):
-            pass
-
-        def fake_report(orch_url, token, job_id, *, exec_status, **_kw):
-            if not first_status:
-                first_status.append(exec_status)
-            raise _EarlyExit(exec_status)
+        def fake_report(
+            orch_url, token, job_id, *, exec_status, resume_hydration=None, **_kw
+        ):
+            reports.append(
+                {"exec_status": exec_status, "resume_hydration": resume_hydration}
+            )
+            return False
 
         def fake_download(orch_url, token, job_id, artifact_dir):
             return {"ok": True, "file_count": 3, "bytes": 1024}
 
-        job = self._make_job(input_artifact_job_id="pred-job-003")
-        try:
-            with patch.object(local_runner, "_report_compute_job", fake_report), \
-                 patch.object(local_runner, "_download_input_artifact", fake_download):
-                local_runner._run_compute_job(
-                    job, "https://api.example.com", "tok",
-                    set(), threading.Lock(),
-                    capabilities=self._bwrap_caps(),
-                )
-        except _EarlyExit:
-            pass
-
-        assert first_status, "expected at least one exec_status report"
-        assert first_status[0] == "running", (
-            f"expected first report 'running' after successful hydration, "
-            f"got: {first_status[0]!r}"
+        job = self._make_job(
+            input_artifact_job_id="pred-job-003",
+            repo_clone={"owner": "o", "repo": "r", "ref": "main"},
+            repo_token="token",
         )
+        with patch.object(local_runner, "_report_compute_job", fake_report), \
+             patch.object(local_runner, "_download_input_artifact", fake_download), \
+             patch.object(local_runner, "_clone_repo", return_value=(False, 1)):
+            local_runner._run_compute_job(
+                job, "https://api.example.com", "tok",
+                set(), threading.Lock(),
+                capabilities=self._bwrap_caps(),
+            )
+
+        assert reports[0]["exec_status"] == "running"
+        terminal = [r for r in reports if r["exec_status"] == "failed"][-1]
+        assert terminal["resume_hydration"] == {
+            "ok": True,
+            "file_count": 3,
+            "bytes": 1024,
+            "resumed_from_job_id": "pred-job-003",
+        }

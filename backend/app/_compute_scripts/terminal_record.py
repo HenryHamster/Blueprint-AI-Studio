@@ -9,7 +9,8 @@ is TERMINATED — so a successful run with no captured marker would otherwise be
 misclassified FAILURE. The durable record closes that race.
 
 The record mirrors the serial markers exactly — status, exit code, reason, and
-the same base64-encoded metrics / command-log / release-echo payloads — so the
+the same base64-encoded metrics / command-log / release-echo / resume-provenance
+payloads — so the
 backend reuses one decode path for both the serial fast-path and the durable
 reconcile.
 
@@ -19,6 +20,7 @@ argv[3]: exit_code (integer string; a non-integer is recorded as null)
 argv[4]: reason (e.g. completed, command_failed, runtime_ttl, repo_clone_failed)
 argv[5]: result file path (optional; metrics JSON the command wrote) — may be absent
 argv[6]: command-log path (optional; bounded combined stdout/stderr) — may be absent
+argv[7]: resume provenance (optional; base64-encoded JSON) — may be absent
 env BLUEPRINT_RELEASE_SHA: optional release SHA echoed back for live-proof jobs
 
 Best-effort by contract: every failure mode is swallowed and the script still
@@ -150,6 +152,7 @@ def main():
     reason = sys.argv[4]
     result_file = sys.argv[5] if len(sys.argv) > 5 else ""
     command_log = sys.argv[6] if len(sys.argv) > 6 else ""
+    resume_provenance_b64 = sys.argv[7] if len(sys.argv) > 7 else ""
 
     try:
         exit_code = int(exit_code_raw)
@@ -171,6 +174,7 @@ def main():
         "metrics_b64": _b64_file(result_file),
         "command_log_b64": _b64_file(command_log, redact_command_log=True),
         "release_echo_b64": release_echo_b64,
+        "resume_provenance_b64": resume_provenance_b64,
     }
 
     try:

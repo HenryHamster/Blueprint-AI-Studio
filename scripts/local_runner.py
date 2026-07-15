@@ -4233,15 +4233,18 @@ def _download_input_artifact(
     if len(payload) > _RUNNER_ARTIFACT_MAX_BYTES:
         return {"ok": False, "reason": "bundle_too_large"}
 
+    os.makedirs(os.path.dirname(artifact_dir), exist_ok=True)
+    stage_dir = tempfile.mkdtemp(prefix=".bp_resume_stage_", dir=os.path.dirname(artifact_dir))
     try:
         with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as tar:
-            tar.extractall(artifact_dir, members=_safe_resume_members(tar, artifact_dir))
+            tar.extractall(stage_dir, members=_safe_resume_members(tar, stage_dir))
     except Exception as exc:  # noqa: BLE001
+        shutil.rmtree(stage_dir, ignore_errors=True)
         return {"ok": False, "reason": f"extract_error:{type(exc).__name__}"}
 
     # Strip predecessor run-status files anywhere in the extracted tree so they
     # are not mistaken for THIS run's outputs.
-    for root, _dirs, names in os.walk(artifact_dir):
+    for root, _dirs, names in os.walk(stage_dir):
         for name in names:
             if name in _RESUME_STALE_ARTIFACT_NAMES:
                 try:
@@ -4251,7 +4254,7 @@ def _download_input_artifact(
 
     file_count = 0
     total_bytes = 0
-    for root, _dirs, names in os.walk(artifact_dir):
+    for root, _dirs, names in os.walk(stage_dir):
         for name in names:
             path = os.path.join(root, name)
             if os.path.isfile(path):
@@ -4261,7 +4264,16 @@ def _download_input_artifact(
                 except OSError:
                     pass
     if file_count == 0:
+        shutil.rmtree(stage_dir, ignore_errors=True)
         return {"ok": False, "reason": "no_files_after_extract"}
+    try:
+        os.makedirs(artifact_dir, exist_ok=True)
+        for name in os.listdir(stage_dir):
+            os.replace(os.path.join(stage_dir, name), os.path.join(artifact_dir, name))
+    except OSError as exc:
+        shutil.rmtree(stage_dir, ignore_errors=True)
+        return {"ok": False, "reason": f"publish_error:{type(exc).__name__}"}
+    shutil.rmtree(stage_dir, ignore_errors=True)
     return {"ok": True, "file_count": file_count, "bytes": total_bytes}
 
 
@@ -4538,6 +4550,8 @@ def _run_compute_job(
     # consecutive-failure counter; None (cancel, graceful shutdown) is neutral —
     # operator-initiated stops are not a runner-health signal. Recorded in finally.
     outcome: str | None = None
+    suppress_artifact_upload = False
+    resume_hydration: dict | None = None
     try:
         # ── Fail-closed gate: refuse anything we cannot sandbox, before any work.
         if iso.decide_compute_backend(caps, has_image, allow_host_fallback=allow_host_fallback) == iso.DECLINE:
@@ -4582,15 +4596,15 @@ def _run_compute_job(
         # silently restarting from scratch (which would discard weeks of progress
         # and burn a full deadline on an unintended from-scratch run).
         if input_artifact_job_id:
-            provenance = _download_input_artifact(
+            resume_hydration = _download_input_artifact(
                 orchestrator_url, token, job_id, artifact_dir
             )
-            provenance["resumed_from_job_id"] = str(input_artifact_job_id)
-            if provenance.get("ok"):
+            resume_hydration["resumed_from_job_id"] = str(input_artifact_job_id)
+            if resume_hydration.get("ok"):
                 print(
                     f"[compute] job {job_id}: resumed from {input_artifact_job_id} "
-                    f"({provenance.get('file_count')} file(s), "
-                    f"{provenance.get('bytes')} bytes hydrated)",
+                    f"({resume_hydration.get('file_count')} file(s), "
+                    f"{resume_hydration.get('bytes')} bytes hydrated)",
                     flush=True,
                 )
                 _report_compute_job(
@@ -4598,10 +4612,15 @@ def _run_compute_job(
                     token,
                     job_id,
                     exec_status="running",
-                    resume_hydration=provenance,
+                    resume_hydration=resume_hydration,
                 )
             else:
-                reason = provenance.get("reason", "unknown")
+                # Staging normally means this is already empty; clear defensively
+                # before ``finally`` so no predecessor fragment can be uploaded.
+                shutil.rmtree(artifact_dir, ignore_errors=True)
+                os.makedirs(artifact_dir, exist_ok=True)
+                suppress_artifact_upload = True
+                reason = resume_hydration.get("reason", "unknown")
                 print(
                     f"[compute] job {job_id}: checkpoint resume from "
                     f"{input_artifact_job_id} FAILED ({reason}); aborting job",
@@ -4619,7 +4638,7 @@ def _run_compute_job(
                         "command never started",
                         "truncated": False,
                     },
-                    resume_hydration=provenance,
+                    resume_hydration=resume_hydration,
                 )
                 return
 
@@ -4652,6 +4671,7 @@ def _run_compute_job(
                         f"failed (exit={clone_rc}); command never started",
                         "truncated": False,
                     },
+                    resume_hydration=resume_hydration,
                 )
                 return
             if not cwd:
@@ -4674,6 +4694,7 @@ def _run_compute_job(
                     f"failed for image {container_image!r}; command never started",
                     "truncated": False,
                 },
+                resume_hydration=resume_hydration,
             )
             return
 
@@ -4730,6 +4751,7 @@ def _run_compute_job(
                     "text": f"Runner declined job (fail-closed isolation): {plan.decline_reason}",
                     "truncated": False,
                 },
+                resume_hydration=resume_hydration,
             )
             return
 
@@ -4809,6 +4831,7 @@ def _run_compute_job(
                             "text": terminal_reason,
                             "truncated": False,
                         },
+                        resume_hydration=resume_hydration,
                     )
                     return
             else:
@@ -4866,6 +4889,7 @@ def _run_compute_job(
                     "text": f"[runner] failed to start command: {exc}",
                     "truncated": False,
                 },
+                resume_hydration=resume_hydration,
             )
             return
 
@@ -4874,7 +4898,13 @@ def _run_compute_job(
             f"gpus={assigned_gpus}",
             flush=True,
         )
-        _report_compute_job(orchestrator_url, token, job_id, exec_status="running")
+        _report_compute_job(
+            orchestrator_url,
+            token,
+            job_id,
+            exec_status="running",
+            resume_hydration=resume_hydration,
+        )
 
         # Capture stdout with dedup + head/tail budget (see _BoundedDedupLog).
         log_capture = _BoundedDedupLog(
@@ -5001,6 +5031,7 @@ def _run_compute_job(
                         f"({runtime_deadline_seconds}s) exceeded"
                     ),
                     progress=progress_tail.poll(),
+                    resume_hydration=resume_hydration,
                 )
                 return
 
@@ -5032,6 +5063,7 @@ def _run_compute_job(
                             "update) exceeded"
                         ),
                         progress=progress_tail.poll(),
+                        resume_hydration=resume_hydration,
                     )
                     return
 
@@ -5044,6 +5076,7 @@ def _run_compute_job(
                         "killed by runner: runner shutting down"
                     ),
                     progress=progress_tail.poll(),
+                    resume_hydration=resume_hydration,
                 )
                 return
 
@@ -5052,6 +5085,7 @@ def _run_compute_job(
                 exec_status="running",
                 command_log=_interim_log_tail(),
                 progress=progress_tail.poll(),
+                resume_hydration=resume_hydration,
             )
             if cancel:
                 _teardown()
@@ -5062,6 +5096,7 @@ def _run_compute_job(
                         "killed by runner: cancel requested by orchestrator"
                     ),
                     progress=progress_tail.poll(),
+                    resume_hydration=resume_hydration,
                 )
                 return
 
@@ -5095,6 +5130,7 @@ def _run_compute_job(
             result_metrics=result_metrics,
             command_log=command_log,
             progress=progress_tail.poll(),
+            resume_hydration=resume_hydration,
         )
         print(f"[compute] job {job_id} {exec_status_final} (exit={exit_code_val})",
               flush=True)
@@ -5113,9 +5149,15 @@ def _run_compute_job(
                     "text": f"[runner] unexpected runner error: {exc}",
                     "truncated": False,
                 }
-            _report_compute_job(orchestrator_url, token, job_id,
-                                 exec_status="failed", exit_code=1,
-                                 command_log=crash_log)
+            _report_compute_job(
+                orchestrator_url,
+                token,
+                job_id,
+                exec_status="failed",
+                exit_code=1,
+                command_log=crash_log,
+                resume_hydration=resume_hydration,
+            )
         except Exception:
             pass
     finally:
@@ -5126,7 +5168,7 @@ def _run_compute_job(
             elif outcome == "failure":
                 telemetry.record_failure()
         # Upload durable artifacts BEFORE tearing down tmpdir (every terminal path).
-        if artifact_dir:
+        if artifact_dir and not suppress_artifact_upload:
             _upload_artifact(orchestrator_url, token, job_id, artifact_dir)
         _release_gpus(gpu_state, assigned_gpus)
         with lock:

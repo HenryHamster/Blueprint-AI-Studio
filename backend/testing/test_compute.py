@@ -1214,6 +1214,7 @@ def _terminal_record_bytes(
     metrics: dict | None = None,
     command_log: dict | None = None,
     release_sha: str = "",
+    resume_provenance: dict | None = None,
     schema_version: int = 1,
 ) -> bytes:
     """terminal.json bytes exactly as the on-VM terminal_record.py would write."""
@@ -1227,6 +1228,11 @@ def _terminal_record_bytes(
             _b64_text(json.dumps(command_log)) if command_log is not None else ""
         ),
         "release_echo_b64": _b64_text(release_sha) if release_sha else "",
+        "resume_provenance_b64": (
+            _b64_text(json.dumps(resume_provenance))
+            if resume_provenance is not None
+            else ""
+        ),
     }
     return json.dumps(record).encode("utf-8")
 
@@ -1366,6 +1372,117 @@ def test_gcp_startup_script_resume_hydration_is_fail_closed():
     _assert_bash_syntax_ok(script)
 
 
+def _run_gcp_resume_block(
+    monkeypatch, tmp_path, *, members: dict[str, bytes], fail_publication: bool = False
+):
+    """Execute only the generated hydration block with local test fixtures."""
+    import subprocess
+
+    artifact_dir = tmp_path / "artifacts"
+    bundle = tmp_path / "source.tar.gz"
+    with tarfile.open(bundle, "w:gz") as archive:
+        for name, payload in members.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(payload)
+            archive.addfile(info, io.BytesIO(payload))
+
+    monkeypatch.setattr(
+        compute_backends_module, "_GCP_ARTIFACT_DIR_PATH", str(artifact_dir)
+    )
+    source_id = uuid.uuid4()
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="true",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        runtime_deadline_seconds=3600,
+        input_artifact_job_id=str(source_id),
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec,
+        artifact_upload_url="https://storage.example.com/upload",
+        input_artifact_download_url=bundle.as_uri(),
+    )
+    start_marker = "rm -rf /tmp/blueprint_resume_stage; rm -f /tmp/blueprint_resume_bundle.tar.gz"
+    start = script.index(start_marker)
+    end = script.index(start_marker, start + 1) + len(start_marker)
+    block = script[start:end]
+    prelude = (
+        "curl() { return 1; }; upload_artifacts() { :; }; "
+        "poweroff() { :; }; shutdown() { :; }; TTL_PID=; _NP_WATCHDOG_PID=; "
+    )
+    if fail_publication:
+        prelude += "cp() { return 1; }; "
+    proc = subprocess.run(
+        ["bash", "-c", prelude + block],
+        capture_output=True,
+        text=True,
+    )
+    return proc, artifact_dir, source_id
+
+
+def test_gcp_resume_rejects_empty_accepted_archive(monkeypatch, tmp_path):
+    """An archive with no regular files cannot become a successful checkpoint."""
+    proc, artifact_dir, _source_id = _run_gcp_resume_block(
+        monkeypatch, tmp_path, members={}
+    )
+
+    assert proc.returncode == 1
+    assert not (artifact_dir / "resume_hydration.ok").exists()
+    assert (artifact_dir / "resume_hydration.failed").is_file()
+    assert "resume_hydration_failed" in proc.stdout
+
+
+def test_gcp_resume_scrubs_failed_publication(monkeypatch, tmp_path):
+    """A failed staged copy is checked and no partial checkpoint survives."""
+    proc, artifact_dir, _source_id = _run_gcp_resume_block(
+        monkeypatch,
+        tmp_path,
+        members={"checkpoint/model.pt": b"weights"},
+        fail_publication=True,
+    )
+
+    assert proc.returncode == 1
+    assert not (artifact_dir / "checkpoint/model.pt").exists()
+    assert not (artifact_dir / "resume_hydration.ok").exists()
+    assert (artifact_dir / "resume_hydration.failed").is_file()
+
+
+def test_gcp_resume_provenance_is_valid_for_chained_source(monkeypatch, tmp_path):
+    """Successful GCP hydration emits every field the next chain hop requires."""
+    proc, _artifact_dir, source_id = _run_gcp_resume_block(
+        monkeypatch, tmp_path, members={"checkpoint/model.pt": b"weights"}
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    serial = "\n".join(
+        [
+            "BLUEPRINT_COMPUTE_STATUS=RUNNING",
+            next(
+                line
+                for line in proc.stdout.splitlines()
+                if line.startswith(compute_backends_module._SERIAL_RESUME_PREFIX)
+            ),
+        ]
+    )
+    status = compute_backends_module._parse_serial_status(serial)
+    assert status is not None and status.resume_provenance is not None
+    provenance = status.resume_provenance
+    assert provenance["resumed_from_job_id"] == str(source_id)
+    assert provenance["file_count"] == 1
+    assert datetime.fromisoformat(provenance["recorded_at"]).tzinfo is not None
+
+    resumed_gcp_job = MagicMock(
+        backend=compute_backends_module.GCP_BACKEND_NAME,
+        polling_metadata={
+            "input_artifact_job_id": str(source_id),
+            "resume_provenance": provenance,
+        },
+    )
+    assert compute_jobs._has_verified_resume_provenance(resumed_gcp_job) is True
+
+
 def test_gcp_startup_script_emits_resume_serial_marker():
     """The GCP startup script emits _SERIAL_RESUME_PREFIX on both the success and
     failure branches of the resume block so the operator can always distinguish a
@@ -1502,13 +1619,17 @@ async def test_gcp_poll_status_reconciles_terminated_vm_from_durable_success(
     marker is captured; the VM reads TERMINATED with no marker. poll_status must
     reconcile to SUCCEEDED from the durable terminal.json, NOT report FAILURE."""
     backend = GcpComputeBackend()
+    source_id = uuid.uuid4()
     job = ComputeJob(
         id=uuid.uuid4(),
         project_id=uuid.uuid4(),
         backend=backend.name,
         external_compute_id="compute-job-vm-fast0001",
         status=ComputeJobStatus.RUNNING,
-        polling_metadata={"zone": "us-central1-f"},
+        polling_metadata={
+            "zone": "us-central1-f",
+            "input_artifact_job_id": str(source_id),
+        },
     )
 
     # Serial output carries NO terminal marker (lost to the poweroff race).
@@ -1524,6 +1645,12 @@ async def test_gcp_poll_status_reconciles_terminated_vm_from_durable_success(
                 exit_code=0,
                 reason="completed",
                 metrics={"mean_act_gain": 0.16},
+                resume_provenance={
+                    "ok": True,
+                    "file_count": 3,
+                    "recorded_at": "2026-07-15T00:00:00+00:00",
+                    "resumed_from_job_id": str(source_id),
+                },
             )
         }
     )
@@ -1540,6 +1667,9 @@ async def test_gcp_poll_status_reconciles_terminated_vm_from_durable_success(
     assert status.status == ComputeJobStatus.SUCCEEDED
     assert status.exit_code == 0
     assert status.metrics == {"mean_act_gain": 0.16}
+    assert status.resume_provenance is not None
+    assert status.resume_provenance["ok"] is True
+    assert status.resume_provenance["resumed_from_job_id"] == str(source_id)
     assert download_calls == [job.id]
 
 
@@ -2454,6 +2584,99 @@ async def test_local_backend_resume_records_provenance(monkeypatch):
     assert terminal is not None
     assert terminal.status == ComputeJobStatus.SUCCEEDED
     assert terminal.exit_code == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("adoption_path", ["memory", "persisted_pid", "terminal"])
+async def test_local_resume_adoption_recovers_durable_provenance(
+    monkeypatch, tmp_path, adoption_path
+):
+    """Every idempotent adoption path recovers proof after DB persistence loss."""
+    monkeypatch.setattr(
+        compute_backends_module, "_LOCAL_STATE_ROOT", str(tmp_path / "state")
+    )
+    backend = LocalSubprocessComputeBackend()
+    source_id = uuid.uuid4()
+    job_id = uuid.uuid4()
+    external_id = f"local-{job_id}"
+    os.makedirs(
+        compute_backends_module._local_state_dir_for_external_id(external_id),
+        exist_ok=True,
+    )
+    provenance = {
+        "ok": True,
+        "file_count": 4,
+        "recorded_at": "2026-07-15T00:00:00+00:00",
+        "resumed_from_job_id": str(source_id),
+    }
+    compute_backends_module._write_local_resume_provenance_for_external_id(
+        external_id, provenance
+    )
+
+    if adoption_path == "memory":
+        proc = MagicMock()
+        proc.pid = 4101
+        proc.poll.return_value = None
+        backend._processes[external_id] = compute_backends_module._LocalProcessHandle(
+            proc=proc, started_at=datetime(2026, 7, 15)
+        )
+    elif adoption_path == "persisted_pid":
+        monkeypatch.setattr(
+            compute_backends_module,
+            "_local_subprocess_pid_for_external_id",
+            lambda _external_id: 4102,
+        )
+
+        async def running(_pid):
+            return True
+
+        monkeypatch.setattr(compute_backends_module, "_aio_is_pid_running", running)
+    else:
+        compute_backends_module._write_local_state_text(
+            compute_backends_module._local_terminal_path_for_external_id(external_id),
+            "STATUS=SUCCEEDED\nEXIT_CODE=0",
+        )
+
+    result = await backend.launch(
+        ComputeLaunchSpec(
+            job_id=job_id,
+            external_id=external_id,
+            command="must-not-run",
+            machine_type="e2-standard-2",
+            spend_cap_usd=1.0,
+            deadline_at=None,
+            input_artifact_job_id=str(source_id),
+        )
+    )
+
+    assert result.metadata["resume_provenance"] == provenance
+
+
+def test_local_resume_provenance_recovery_rejects_mismatched_source(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(
+        compute_backends_module, "_LOCAL_STATE_ROOT", str(tmp_path / "state")
+    )
+    external_id = "local-source-match"
+    os.makedirs(
+        compute_backends_module._local_state_dir_for_external_id(external_id),
+        exist_ok=True,
+    )
+    compute_backends_module._write_local_resume_provenance_for_external_id(
+        external_id,
+        {
+            "ok": True,
+            "file_count": 1,
+            "resumed_from_job_id": str(uuid.uuid4()),
+        },
+    )
+    assert (
+        compute_backends_module._read_local_resume_provenance_for_external_id(
+            external_id, uuid.uuid4()
+        )
+        is None
+    )
 
 
 def test_safe_extract_artifact_bundle_rejects_path_traversal(tmp_path):
@@ -21748,6 +21971,91 @@ async def test_compute_job_resume_rejects_bundleless_input_artifact(
 
 
 @pytest.mark.asyncio
+async def test_compute_job_resume_rejects_failed_or_unverified_hydration_source(
+    db_session, monkeypatch
+):
+    """A chained checkpoint source needs exact affirmative hydration proof.
+
+    A durable bundle alone is not trustworthy when its producing job was itself
+    resumed: failed, missing, malformed, and source-mismatched provenance can
+    describe a partial predecessor extraction.  The launch precondition must
+    reject each one before it creates a successor row.
+    """
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    task = await _make_compute_task(db_session)
+    original_source = uuid.uuid4()
+    cases = (
+        None,
+        {"ok": False, "resumed_from_job_id": str(original_source), "file_count": 1},
+        {"ok": True, "resumed_from_job_id": "not-a-uuid", "file_count": 1},
+        {
+            "ok": True,
+            "resumed_from_job_id": str(uuid.uuid4()),
+            "file_count": 1,
+            "recorded_at": _utcnow().isoformat(),
+        },
+    )
+    for provenance in cases:
+        predecessor = await _make_resume_predecessor_job(
+            db_session, project_id=task.project_id, with_bundle=True
+        )
+        predecessor.polling_metadata = {"input_artifact_job_id": str(original_source)}
+        if provenance is not None:
+            predecessor.polling_metadata["resume_provenance"] = provenance
+        db_session.add(predecessor)
+        await db_session.commit()
+
+        with pytest.raises(compute_jobs.ComputeLaunchPreconditionFailed) as exc:
+            await compute_jobs.create_compute_job(
+                db_session,
+                task,
+                command="python train.py --resume",
+                machine_type="e2-standard-2",
+                spend_cap_usd=1.0,
+                deadline_seconds=300,
+                input_artifact_job_id=str(predecessor.id),
+            )
+        assert exc.value.detail["error"] == "input_artifact_job_resume_provenance_invalid"
+        successors = (
+            await db_session.execute(
+                select(ComputeJob).where(
+                    ComputeJob.polling_metadata["input_artifact_job_id"].as_string()
+                    == str(predecessor.id)
+                )
+            )
+        ).scalars().all()
+        assert successors == []
+
+    # A source that completed hydration can still be FAILED: command failure
+    # must not discard its valid checkpoint bundle.
+    verified = await _make_resume_predecessor_job(
+        db_session, project_id=task.project_id, with_bundle=True
+    )
+    verified.status = ComputeJobStatus.FAILED
+    verified.polling_metadata = {
+        "input_artifact_job_id": str(original_source),
+        "resume_provenance": {
+            "ok": True,
+            "resumed_from_job_id": str(original_source),
+            "file_count": 1,
+            "recorded_at": _utcnow().isoformat(),
+        },
+    }
+    db_session.add(verified)
+    await db_session.commit()
+    successor = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python train.py --resume",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        input_artifact_job_id=str(verified.id),
+    )
+    assert successor.polling_metadata["input_artifact_job_id"] == str(verified.id)
+
+
+@pytest.mark.asyncio
 async def test_compute_job_resume_rejects_non_terminal_source(db_session, monkeypatch):
     """A still-RUNNING or POLLING predecessor is refused as a resume source.
 
@@ -21841,10 +22149,9 @@ async def test_gcp_startup_script_hydrates_input_artifact_bundle(monkeypatch):
     script = provision_calls[0]
     # Downloads the predecessor bundle and extracts it into the artifact dir.
     assert "https://storage.example.com/predecessor-bundle" in script
-    assert (
-        f"tar -C {shlex.quote(compute_backends_module._GCP_ARTIFACT_DIR_PATH)} "
-        f"--no-same-owner -xzf" in script
-    )
+    assert "/tmp/blueprint_resume_stage" in script
+    assert "tarfile.open" in script
+    assert "m.isreg() or m.isdir()" in script
     assert "resume_hydration.ok" in script
     assert "resume_hydration.failed" in script
 
@@ -22306,6 +22613,105 @@ def test_checkpoint_resume_streams_predecessor_bundle_and_peak_memory_is_bounded
         "predecessor bundle in the orchestrator heap instead of streaming it to "
         "disk (this is the leader OOM on multi-GB checkpoints)"
     )
+
+
+@pytest.mark.parametrize("directory_only", [False, True])
+def test_local_checkpoint_resume_rejects_bundle_without_regular_files(
+    tmp_path, directory_only
+):
+    """Empty and directory-only archives cannot earn successful provenance."""
+    source = tmp_path / "source.tar.gz"
+    with tarfile.open(source, "w:gz") as archive:
+        if directory_only:
+            directory = tarfile.TarInfo("checkpoint/")
+            directory.type = tarfile.DIRTYPE
+            archive.addfile(directory)
+
+    def _fake_stream(_job_id, dest_path):
+        shutil.copyfile(source, dest_path)
+        return True
+
+    dest_dir = tmp_path / "artifacts"
+    with patch.object(
+        compute_backends_module, "_download_artifact_bundle_to_path", _fake_stream
+    ), pytest.raises(RuntimeError, match="contains no resumable files"):
+        asyncio.run(
+            compute_backends_module._rehydrate_input_artifact_bundle(
+                "predecessor-job-id", str(dest_dir)
+            )
+        )
+
+    assert not dest_dir.exists()
+
+
+def test_local_checkpoint_resume_strips_stale_status_files_before_counting(tmp_path):
+    """A bundle containing only predecessor status files is not a checkpoint."""
+    source = tmp_path / "source.tar.gz"
+    with tarfile.open(source, "w:gz") as archive:
+        for name in compute_backends_module._RESUME_STALE_ARTIFACT_FILENAMES:
+            payload = b"stale predecessor status"
+            info = tarfile.TarInfo(name)
+            info.size = len(payload)
+            archive.addfile(info, io.BytesIO(payload))
+
+    def _fake_stream(_job_id, dest_path):
+        shutil.copyfile(source, dest_path)
+        return True
+
+    dest_dir = tmp_path / "artifacts"
+    with patch.object(
+        compute_backends_module, "_download_artifact_bundle_to_path", _fake_stream
+    ), pytest.raises(RuntimeError, match="contains no resumable files"):
+        asyncio.run(
+            compute_backends_module._rehydrate_input_artifact_bundle(
+                "predecessor-job-id", str(dest_dir)
+            )
+        )
+
+    assert not dest_dir.exists()
+
+
+def test_local_checkpoint_resume_cleans_injected_partial_atomic_publication(
+    tmp_path,
+):
+    """A publication error after one entry cannot expose a partial durable tree."""
+    source = tmp_path / "source.tar.gz"
+    with tarfile.open(source, "w:gz") as archive:
+        for name, payload in (("first.ckpt", b"one"), ("second.ckpt", b"two")):
+            info = tarfile.TarInfo(name)
+            info.size = len(payload)
+            archive.addfile(info, io.BytesIO(payload))
+
+    def _fake_stream(_job_id, dest_path):
+        shutil.copyfile(source, dest_path)
+        return True
+
+    dest_dir = tmp_path / "artifacts"
+    dest_dir.mkdir()
+    (dest_dir / "incomplete-from-prior-attempt.ckpt").write_bytes(b"old")
+    real_replace = os.replace
+
+    def _interrupt_atomic_replace(src, dst):
+        if os.path.basename(src).startswith(".bp-resume-stage-"):
+            os.mkdir(dst)
+            first_entry = sorted(os.listdir(src))[0]
+            real_replace(os.path.join(src, first_entry), os.path.join(dst, first_entry))
+            raise OSError("injected interruption after first top-level entry")
+        return real_replace(src, dst)
+
+    with patch.object(
+        compute_backends_module, "_download_artifact_bundle_to_path", _fake_stream
+    ), patch.object(
+        compute_backends_module.os, "replace", _interrupt_atomic_replace
+    ), pytest.raises(RuntimeError, match="could not be published"):
+        asyncio.run(
+            compute_backends_module._rehydrate_input_artifact_bundle(
+                "predecessor-job-id", str(dest_dir)
+            )
+        )
+
+    assert not dest_dir.exists()
+    assert not list(tmp_path.glob("artifacts.bp-incomplete-*"))
 
 
 def test_no_progress_watchdog_escalates_to_sigkill_when_sigterm_is_ignored(
