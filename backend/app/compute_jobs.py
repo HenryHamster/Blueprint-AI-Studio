@@ -213,9 +213,14 @@ _LIVE_PROOF_MARKER_KEYS = (
     "requires_live_release",
 )
 
-# Progress-metric ring buffer — bounded time-series written into polling_metadata.
+# Progress-metric history — bounded, server-timestamped time-series written into
+# polling_metadata.  Samples are coalesced to one per metric/minute, which keeps
+# a full 24-hour contract window (1441 points) even when a runner emits very
+# high-frequency or unrelated-metric telemetry.
 _PROGRESS_METRIC_KEY_RE = re.compile(r"^[A-Za-z0-9_./-]+$")
-_PROGRESS_SERIES_MAX_SAMPLES = 50
+_PROGRESS_SAMPLE_BUCKET_SECONDS = 60
+_PROGRESS_SERIES_MAX_SAMPLES_PER_METRIC = 1500
+_PROGRESS_SERIES_MAX_METRICS = 16
 
 # Stable terminal-kind label for a no-progress early-cut.  Callers that cut a
 # job for a stalled progress trend pass this as terminal_kind to
@@ -235,7 +240,9 @@ def append_progress_sample(
 ) -> dict:
     """Append a progress sample to the ring buffer in a polling_metadata dict.
 
-    Returns a new dict with the sample appended (drop-oldest at 50 entries).
+    Returns a new dict with the sample appended.  History is bounded per metric
+    rather than globally, so chatty auxiliary metrics cannot evict the declared
+    metric needed to enforce a long watchdog window.
     Silently ignores non-finite values, bad metric keys, or any other error
     so the caller never raises on malformed input.
     """
@@ -248,10 +255,39 @@ def append_progress_sample(
         if not isinstance(t, str) or not t:
             return meta
         meta = dict(meta)
-        series: list = list(meta.get("progress_series") or [])
+        timestamp = _parse_naive_iso_datetime(t)
+        series: list = [item for item in list(meta.get("progress_series") or []) if isinstance(item, dict)]
+        # Keep at most 16 metric names, reserving a slot for a newly declared
+        # metric; the configured metric is always retained.
+        metric_names = {item.get("name") for item in series if isinstance(item.get("name"), str)}
+        if metric not in metric_names and len(metric_names) >= _PROGRESS_SERIES_MAX_METRICS:
+            declared = meta.get("declared_metric")
+            removable = next((name for name in metric_names if name != declared), None)
+            if removable is None:
+                return meta
+            series = [item for item in series if item.get("name") != removable]
+        bucket = (
+            int(timestamp.timestamp()) // _PROGRESS_SAMPLE_BUCKET_SECONDS
+            if timestamp is not None
+            else None
+        )
+        # A server can receive many reports in one minute.  Replacing the bucket's
+        # point retains the latest observed value without allowing report rate to
+        # shrink the retained time horizon.
+        series = [
+            item for item in series
+            if not (
+                item.get("name") == metric
+                and bucket is not None
+                and (parsed := _parse_naive_iso_datetime(item.get("t"))) is not None
+                and int(parsed.timestamp()) // _PROGRESS_SAMPLE_BUCKET_SECONDS == bucket
+            )
+        ]
         series.append({"t": t, "name": metric, "value": float_val})
-        if len(series) > _PROGRESS_SERIES_MAX_SAMPLES:
-            series = series[-_PROGRESS_SERIES_MAX_SAMPLES:]
+        metric_series = [item for item in series if item.get("name") == metric]
+        if len(metric_series) > _PROGRESS_SERIES_MAX_SAMPLES_PER_METRIC:
+            keep = {id(item) for item in metric_series[-_PROGRESS_SERIES_MAX_SAMPLES_PER_METRIC:]}
+            series = [item for item in series if item.get("name") != metric or id(item) in keep]
         meta["progress_series"] = series
         return meta
     except Exception:
@@ -391,6 +427,28 @@ async def _resolve_resume_source_job_id(
                 "input_artifact_job_id": str(parsed),
             }
         )
+    source_meta = source.polling_metadata or {}
+    if source_meta.get("input_artifact_job_id") is not None:
+        provenance = source_meta.get("resume_provenance")
+        valid_provenance = (
+            isinstance(provenance, dict)
+            and provenance.get("ok") is True
+            and str(provenance.get("resumed_from_job_id") or "")
+            == str(source_meta.get("input_artifact_job_id"))
+            and isinstance(provenance.get("file_count"), int)
+            and provenance["file_count"] > 0
+        )
+        if not valid_provenance:
+            raise ComputeLaunchPreconditionFailed(
+                {
+                    "error": "input_artifact_job_resume_provenance_invalid",
+                    "message": (
+                        "input_artifact_job_id has incomplete or failed resume "
+                        "hydration provenance and cannot be used as a checkpoint ancestor"
+                    ),
+                    "input_artifact_job_id": str(parsed),
+                }
+            )
     return str(parsed)
 
 
@@ -612,6 +670,16 @@ async def create_compute_job(
             project_id=locked_task.project_id,
             input_artifact_job_id=input_artifact_job_id,
         )
+        if capped_np_timeout is None or not (isinstance(declared_metric, str) and declared_metric.strip()):
+            raise ComputeLaunchPreconditionFailed(
+                {
+                    "error": "resume_requires_watchdog",
+                    "message": (
+                        "resumed compute jobs require declared_metric and a positive "
+                        "no_progress_timeout_seconds so stalled checkpoint runs are cut"
+                    ),
+                }
+            )
     launch_request_fingerprint = _build_launch_request_fingerprint(
         command=command,
         machine_type=resolved_machine_type,
@@ -1300,13 +1368,23 @@ def _no_progress_stalled(job: ComputeJob, *, now: datetime) -> bool:
     if (now - job.started_at).total_seconds() < grace_seconds:
         return False
     samples = _watched_progress_samples(job, metric)
+    if not samples:
+        # Reporting under another name is a contract mismatch, not silence.  It
+        # is surfaced as unprotected and must not be mistaken for a missing signal.
+        if _watchdog_metric_name_mismatch(job):
+            return False
+        # A declared watchdog is an enforcement promise, not merely telemetry
+        # decoration: after its grace window, missing telemetry is no progress.
+        return True
+    window_start = now - timedelta(seconds=window_seconds)
+    if samples[-1][0] < window_start:
+        return True
     if len(samples) < COMPUTE_JOB_NO_PROGRESS_MIN_SAMPLES:
         return False
     # Enough history: the oldest recorded sample must be at least a full window
     # old, else we have not yet observed a window's worth of the metric.
     if (now - samples[0][0]).total_seconds() < window_seconds:
         return False
-    window_start = now - timedelta(seconds=window_seconds)
     window = [(t, v) for (t, v) in samples if t >= window_start]
     if len(window) < COMPUTE_JOB_NO_PROGRESS_MIN_SAMPLES:
         return False
@@ -1385,8 +1463,9 @@ def derive_watchdog_protection_status(polling_metadata: dict | None) -> dict:
                 last_ts = ts
                 last_t = t_str
 
-    # Detect metric-name mismatch: samples exist but none match the declared metric.
-    inert_reason: str | None = None
+    # A declared metric without a matching sample is not protected: once grace
+    # elapses it will be cut for missing telemetry.  Surface that honestly.
+    inert_reason: str | None = "no_progress_samples" if last_t is None else None
     if last_t is None:
         mismatch = _watchdog_metric_name_mismatch(_job)
         if mismatch:
@@ -1417,6 +1496,14 @@ def _status_is_runtime_timeout(status: ComputeStatusResult) -> bool:
     if message in {"runtime_ttl", "runtime_timeout", "command_runtime_timeout"}:
         return True
     return status.exit_code == 124
+
+
+def _status_is_no_progress_timeout(status: ComputeStatusResult) -> bool:
+    """True for every backend's reserved no-progress terminal signal."""
+    return (
+        status.exit_code == 125
+        or "no_progress_timeout" in (status.message or "").strip().lower()
+    )
 
 
 # Fatal "no usable GPU" diagnostics printed by container entrypoints (notably
@@ -2796,6 +2883,7 @@ async def _process_single_compute_job(
             return
         accrued_cost_usd = max(float(job.accrued_cost_usd or 0.0), cost.total_cost_usd)
         timeout_like = _status_is_runtime_timeout(status)
+        no_progress_like = _status_is_no_progress_timeout(status)
         # A backend-reported SUCCEEDED that nonetheless emitted a fatal
         # no-usable-GPU diagnostic is not a real success — the container never
         # had a supported GPU and could not produce its metric. Reclassify it as
@@ -2834,7 +2922,7 @@ async def _process_single_compute_job(
             )
             and await collect_terminal_artifact_reference(job) is None
         )
-        if timeout_like:
+        if timeout_like or no_progress_like:
             outcome = ComputeJobOutcome.TIMED_OUT
         elif no_usable_gpu or no_data:
             outcome = ComputeJobOutcome.FAILURE
@@ -2851,13 +2939,16 @@ async def _process_single_compute_job(
             status=status,
             accrued_cost_usd=accrued_cost_usd,
             terminal_status=ComputeJobStatus.TIMED_OUT
-            if timeout_like
+            if timeout_like or no_progress_like
             else status.status,
             outcome=outcome,
             terminal_reason=(
                 "compute job exceeded runtime deadline"
                 if timeout_like
                 else (
+                    "no_progress_timeout"
+                    if no_progress_like
+                    else (
                     _NO_USABLE_GPU_TERMINAL_REASON
                     if no_usable_gpu
                     else (
@@ -2867,9 +2958,11 @@ async def _process_single_compute_job(
                             status_message=status.message, outcome=outcome
                         )
                     )
+                    )
                 )
             ),
             exit_code=status.exit_code,
+            terminal_kind=NO_PROGRESS_TERMINAL_REASON if no_progress_like else None,
         )
         return
 
@@ -3023,7 +3116,7 @@ async def _process_single_compute_job(
             terminal_status=ComputeJobStatus.TIMED_OUT,
             outcome=ComputeJobOutcome.TIMED_OUT,
             terminal_reason=(
-                "compute job made no measurable progress on declared metric "
+                "no_progress_timeout: compute job made no measurable progress on declared metric "
                 f"{watched_metric!r} over "
                 f"{int((job.polling_metadata or {}).get('no_progress_timeout_seconds') or COMPUTE_JOB_NO_PROGRESS_WINDOW_SECONDS)}s — "
                 "cut early to reclaim compute"

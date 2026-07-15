@@ -2032,7 +2032,11 @@ async def report_compute_job(
                         meta,
                         metric=rec["metric"],
                         value=rec["value"],
-                        t=rec.get("ts") or now.isoformat(),
+                        # Runner payload timestamps are sandbox-authored.  They are
+                        # useful display data in `progress`, but watchdog timing
+                        # must use the server receipt time so a job cannot extend
+                        # or backdate its own protection window.
+                        t=now.isoformat(),
                     )
         if payload.exec_status in ("succeeded", "failed"):
             meta["runner_finished_at"] = now.isoformat()

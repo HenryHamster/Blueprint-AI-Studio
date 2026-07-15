@@ -132,14 +132,16 @@ def test_append_progress_sample_drops_bad_metric_key():
     assert append_progress_sample({}, metric="loss!", value=1.0, t="t0") == {}
 
 
-def test_append_progress_sample_ring_buffer_caps_at_50():
+def test_append_progress_sample_history_is_bounded_per_metric():
     meta: dict = {}
-    for i in range(55):
+    for i in range(compute_jobs._PROGRESS_SERIES_MAX_SAMPLES_PER_METRIC + 5):
         meta = append_progress_sample(meta, metric="loss", value=float(i), t=f"t{i}")
     series = meta["progress_series"]
-    assert len(series) == 50
+    assert len(series) == compute_jobs._PROGRESS_SERIES_MAX_SAMPLES_PER_METRIC
     assert series[0]["value"] == pytest.approx(5.0), "oldest 5 samples dropped"
-    assert series[-1]["value"] == pytest.approx(54.0)
+    assert series[-1]["value"] == pytest.approx(
+        float(compute_jobs._PROGRESS_SERIES_MAX_SAMPLES_PER_METRIC + 4)
+    )
 
 
 def test_append_progress_sample_does_not_mutate_input():
@@ -344,6 +346,15 @@ def test_no_progress_stalled_false_without_declared_metric():
     assert _no_progress_stalled(job, now=now) is False
 
 
+def test_no_progress_stalled_true_when_declared_metric_never_arrives():
+    now = datetime(2026, 1, 2, 12, 0, 0)
+    job, _ = _make_stub_job(
+        metric="loss", samples=[], started_offset_seconds=4000,
+        extra_meta={"no_progress_timeout_seconds": 300},
+    )
+    assert _no_progress_stalled(job, now=now) is True
+
+
 def test_no_progress_stalled_false_during_grace_period():
     metric = "val/loss"
     # Job only started 10 minutes ago (well inside the 30-min grace)
@@ -360,7 +371,7 @@ def test_no_progress_stalled_false_with_insufficient_samples():
     # Only 1 flat sample — below MIN_SAMPLES floor
     job, now = _make_stub_job(
         metric=metric,
-        samples=[(2000, metric, 1.0)],
+        samples=[(0, metric, 1.0)],
         started_offset_seconds=int(COMPUTE_JOB_NO_PROGRESS_GRACE_SECONDS) + 3600,
     )
     assert _no_progress_stalled(job, now=now) is False

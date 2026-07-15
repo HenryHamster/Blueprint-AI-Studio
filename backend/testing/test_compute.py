@@ -1843,8 +1843,8 @@ async def test_runner_report_exit_125_finalizes_no_progress_timeout_through_moni
     client, db_session
 ):
     """END-TO-END: a runner no-progress watchdog kill (exit 125) reported over the
-    HTTP /report endpoint is finalized by the monitor as a FAILURE whose durable
-    terminal_reason classifies to NO_PROGRESS_TIMEOUT — NOT CODE_ERROR.
+    HTTP /report endpoint is finalized by the monitor as an intentional TIMED_OUT
+    no-progress cut whose durable terminal_reason classifies to NO_PROGRESS_TIMEOUT.
 
     This is the full pipeline the unit test only samples at poll_status: the
     reserved exit code produced by scripts/local_runner.py's watchdog must survive
@@ -1877,10 +1877,11 @@ async def test_runner_report_exit_125_finalizes_no_progress_timeout_through_moni
     await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
 
     await db_session.refresh(job)
-    assert job.status == ComputeJobStatus.FAILED
-    assert job.outcome == ComputeJobOutcome.FAILURE
+    assert job.status == ComputeJobStatus.TIMED_OUT
+    assert job.outcome == ComputeJobOutcome.TIMED_OUT
     assert (job.polling_metadata or {}).get("exit_code") == 125
     assert job.terminal_reason == "no_progress_timeout"
+    assert (job.polling_metadata or {}).get("terminal_kind") == "no_progress"
     # 3) The classifier keys the terminal reason to a platform kill, not a defect.
     assert (
         classify_compute_terminal_reason(job.terminal_reason, None)
@@ -21590,6 +21591,8 @@ async def test_compute_job_resume_hydrates_prior_bundle(client, db_session, monk
         spend_cap_usd=1.0,
         deadline_seconds=300,
         input_artifact_job_id=str(predecessor.id),
+        declared_metric="loss",
+        no_progress_timeout_seconds=120,
     )
     assert job.backend == compute_backends_module.RUNNER_SUBPROCESS_BACKEND_NAME
     assert job.polling_metadata.get("input_artifact_job_id") == str(predecessor.id)
@@ -21755,6 +21758,36 @@ async def test_compute_job_resume_rejects_bundleless_input_artifact(
             input_artifact_job_id=str(predecessor.id),
         )
     assert exc.value.detail["error"] == "input_artifact_job_has_no_bundle"
+
+
+@pytest.mark.asyncio
+async def test_compute_job_resume_rejects_failed_ancestor_hydration(db_session, monkeypatch):
+    """A bundle from a failed resume hydration is never lineage-eligible."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    task = await _make_compute_task(db_session)
+    predecessor = await _make_resume_predecessor_job(
+        db_session, project_id=task.project_id, with_bundle=True
+    )
+    predecessor.polling_metadata = {
+        "input_artifact_job_id": str(uuid.uuid4()),
+        "resume_provenance": {"ok": False, "reason": "extract_error"},
+    }
+    db_session.add(predecessor)
+    await db_session.commit()
+
+    with pytest.raises(compute_jobs.ComputeLaunchPreconditionFailed) as exc:
+        await compute_jobs.create_compute_job(
+            db_session,
+            task,
+            command="python train.py",
+            machine_type="e2-standard-2",
+            spend_cap_usd=1.0,
+            deadline_seconds=300,
+            input_artifact_job_id=str(predecessor.id),
+            declared_metric="loss",
+            no_progress_timeout_seconds=120,
+        )
+    assert exc.value.detail["error"] == "input_artifact_job_resume_provenance_invalid"
 
 
 @pytest.mark.asyncio

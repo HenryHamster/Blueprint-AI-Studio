@@ -206,6 +206,9 @@ async def _rehydrate_input_artifact_bundle(
     """
     handle, tmp_path = tempfile.mkstemp(prefix="bp-resume-", suffix=".tar.gz")
     os.close(handle)
+    staging_dir = f"{dest_dir}.resume-staging"
+    shutil.rmtree(staging_dir, ignore_errors=True)
+    os.makedirs(staging_dir, exist_ok=True)
     try:
         try:
             downloaded = await asyncio.to_thread(
@@ -222,19 +225,35 @@ async def _rehydrate_input_artifact_bundle(
                 f"{input_artifact_job_id} has no durable artifact bundle to resume from"
             )
         try:
-            return await asyncio.to_thread(
-                _safe_extract_artifact_bundle_path, tmp_path, dest_dir
+            file_count = await asyncio.to_thread(
+                _safe_extract_artifact_bundle_path, tmp_path, staging_dir
             )
         except (tarfile.TarError, OSError) as exc:
             raise RuntimeError(
                 "input_artifact_rehydration_failed: predecessor bundle for "
                 f"{input_artifact_job_id} could not be extracted: {exc}"
             ) from exc
+        if file_count <= 0:
+            raise RuntimeError(
+                "input_artifact_rehydration_failed: predecessor bundle for "
+                f"{input_artifact_job_id} contained no checkpoint files"
+            )
+        try:
+            shutil.rmtree(dest_dir, ignore_errors=True)
+            os.replace(staging_dir, dest_dir)
+        except OSError as exc:
+            raise RuntimeError(
+                "input_artifact_rehydration_failed: extracted checkpoint could not "
+                f"be published: {exc}"
+            ) from exc
+        return file_count
     finally:
         try:
             os.unlink(tmp_path)
         except OSError:
             pass
+        if os.path.exists(staging_dir):
+            shutil.rmtree(staging_dir, ignore_errors=True)
 
 _SERIAL_STATUS_PREFIX = "BLUEPRINT_COMPUTE_STATUS="
 _SERIAL_EXIT_PREFIX = "BLUEPRINT_COMPUTE_EXIT_CODE="
@@ -930,7 +949,7 @@ class LocalSubprocessComputeBackend:
                 "ok": True,
                 "file_count": file_count,
                 "recorded_at": _utcnow().isoformat(),
-                "resumed_from_job_id": spec.input_artifact_job_id,
+                "resumed_from_job_id": str(spec.input_artifact_job_id),
             }
         env = {k: os.environ[k] for k in ("PATH", "HOME") if k in os.environ}
         env.update(spec.env or {})
@@ -3141,6 +3160,7 @@ def _build_gcp_startup_script(
         _resume_fail_q = shlex.quote(
             os.path.join(_GCP_ARTIFACT_DIR_PATH, "resume_hydration.failed")
         )
+        _resume_stage_q = shlex.quote(f"{_GCP_ARTIFACT_DIR_PATH}.resume-staging")
         _resume_stale = " ".join(
             shlex.quote(os.path.join(_GCP_ARTIFACT_DIR_PATH, _name))
             for _name in (
@@ -3152,6 +3172,7 @@ def _build_gcp_startup_script(
         )
         resume_block = (
             f"rm -f {_resume_bundle_q}\n"
+            f"rm -rf {_resume_stage_q} && mkdir -p {_resume_stage_q}\n"
             f"if timeout {upload_timeout} curl --fail --silent --show-error "
             f"--location --output {_resume_bundle_q} {_resume_url_q} "
             f">/dev/null 2>&1 || timeout {upload_timeout} python3 -c "
@@ -3163,19 +3184,22 @@ def _build_gcp_startup_script(
             f"  RESUME_DL=0\n"
             f"fi\n"
             f'if [ "$RESUME_DL" = 1 ] && [ -s {_resume_bundle_q} ] && '
-            f"tar -C {artifact_dir} --no-same-owner -xzf {_resume_bundle_q} "
+            f"tar -C {_resume_stage_q} --no-same-owner -xzf {_resume_bundle_q} "
             f">/dev/null 2>&1; then\n"
-            f"  rm -f {_resume_stale}\n"
-            f"  _BP_RESUME_FC=$(find {artifact_dir} -type f 2>/dev/null | wc -l)\n"
+            f"  rm -f {_resume_stale.replace(_GCP_ARTIFACT_DIR_PATH, _GCP_ARTIFACT_DIR_PATH + '.resume-staging')}\n"
+            f"  _BP_RESUME_FC=$(find {_resume_stage_q} -type f 2>/dev/null | wc -l)\n"
+            f"  if [ \"$_BP_RESUME_FC\" -lt 1 ]; then RESUME_DL=0; fi\n"
+            f"  if [ \"$RESUME_DL\" = 1 ]; then rm -rf {artifact_dir} && mv {_resume_stage_q} {artifact_dir} || RESUME_DL=0; fi\n"
             f"  __BP_RESUME_D=$(python3 -c 'import json,base64,sys; print("
             f"base64.b64encode(json.dumps({{"
-            f'"ok":True,"file_count":int(sys.argv[1])}}).encode()).decode())\' '
+            f'"ok":True,"file_count":int(sys.argv[1]),"resumed_from_job_id":{json.dumps(spec.input_artifact_job_id)} }}).encode()).decode())\' '
             f"\"$_BP_RESUME_FC\" 2>/dev/null || true)\n"
-            f'  [ -n "$__BP_RESUME_D" ] && echo "{_SERIAL_RESUME_PREFIX}$__BP_RESUME_D" || true\n'
-            f"  echo resumed > {_resume_ok_q} 2>/dev/null || true\n"
-            f'  echo "[resume] hydrated predecessor checkpoint bundle into '
+            f'  [ "$RESUME_DL" = 1 ] && [ -n "$__BP_RESUME_D" ] && echo "{_SERIAL_RESUME_PREFIX}$__BP_RESUME_D" || true\n'
+            f"  [ \"$RESUME_DL\" = 1 ] && echo resumed > {_resume_ok_q} 2>/dev/null || true\n"
+            f'  [ "$RESUME_DL" = 1 ] && echo "[resume] hydrated predecessor checkpoint bundle into '
             f'artifact dir"\n'
-            f"else\n"
+            f"fi\n"
+            f'if [ "$RESUME_DL" != 1 ]; then\n'
             f"  echo failed > {_resume_fail_q} 2>/dev/null || true\n"
             f'  echo "[resume] predecessor checkpoint hydration FAILED — aborting '
             f'run (fail-closed; refusing to run against an empty workspace)"\n'

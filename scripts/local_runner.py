@@ -4233,15 +4233,22 @@ def _download_input_artifact(
     if len(payload) > _RUNNER_ARTIFACT_MAX_BYTES:
         return {"ok": False, "reason": "bundle_too_large"}
 
+    # Extract into a sibling staging directory first.  A corrupt/partial bundle
+    # must never leave files in the final artifact workspace, because finally
+    # uploads that workspace even when this job fails.
+    staging_dir = f"{artifact_dir}.resume-staging"
+    shutil.rmtree(staging_dir, ignore_errors=True)
+    os.makedirs(staging_dir, exist_ok=True)
     try:
         with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as tar:
-            tar.extractall(artifact_dir, members=_safe_resume_members(tar, artifact_dir))
+            tar.extractall(staging_dir, members=_safe_resume_members(tar, staging_dir))
     except Exception as exc:  # noqa: BLE001
+        shutil.rmtree(staging_dir, ignore_errors=True)
         return {"ok": False, "reason": f"extract_error:{type(exc).__name__}"}
 
-    # Strip predecessor run-status files anywhere in the extracted tree so they
+    # Strip predecessor run-status files anywhere in the staged tree so they
     # are not mistaken for THIS run's outputs.
-    for root, _dirs, names in os.walk(artifact_dir):
+    for root, _dirs, names in os.walk(staging_dir):
         for name in names:
             if name in _RESUME_STALE_ARTIFACT_NAMES:
                 try:
@@ -4251,7 +4258,7 @@ def _download_input_artifact(
 
     file_count = 0
     total_bytes = 0
-    for root, _dirs, names in os.walk(artifact_dir):
+    for root, _dirs, names in os.walk(staging_dir):
         for name in names:
             path = os.path.join(root, name)
             if os.path.isfile(path):
@@ -4261,7 +4268,15 @@ def _download_input_artifact(
                 except OSError:
                     pass
     if file_count == 0:
+        shutil.rmtree(staging_dir, ignore_errors=True)
         return {"ok": False, "reason": "no_files_after_extract"}
+    # Publish only a complete, verified checkpoint workspace.
+    try:
+        shutil.rmtree(artifact_dir, ignore_errors=True)
+        os.replace(staging_dir, artifact_dir)
+    except OSError as exc:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        return {"ok": False, "reason": f"publish_error:{type(exc).__name__}"}
     return {"ok": True, "file_count": file_count, "bytes": total_bytes}
 
 

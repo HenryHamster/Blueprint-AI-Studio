@@ -376,9 +376,8 @@ def _validate_compute_launch_contract(
 
     input_artifact_job_id = contract.get("input_artifact_job_id")
     if input_artifact_job_id is not None:
-        # Shape check only — the orchestrator does the authoritative same-project +
-        # bundle-exists validation at create_compute_job time (needs the DB). Here we
-        # only reject an obviously-malformed UUID so a bad reference is caught early.
+        # Shape-check first so malformed direct-dispatch payloads retain their
+        # actionable UUID diagnostic rather than being masked by the resume guard.
         try:
             uuid.UUID(str(input_artifact_job_id))
         except (ValueError, AttributeError, TypeError):
@@ -387,6 +386,18 @@ def _validate_compute_launch_contract(
                 f"input_artifact_job_id must be a UUID string "
                 f"({input_artifact_job_id!r})",
             )
+        if no_progress_timeout is None:
+            return (
+                False,
+                "resumed compute experiments require no_progress_timeout_seconds",
+            )
+        if not (isinstance(declared_metric, str) and declared_metric.strip()):
+            return (
+                False,
+                "resumed compute experiments require a declared_metric for the watchdog",
+            )
+        # The orchestrator performs authoritative same-project + bundle-exists
+        # validation at create_compute_job time (it has the DB session).
 
     env = contract.get("env")
     if env is not None:
