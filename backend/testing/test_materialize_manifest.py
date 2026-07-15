@@ -279,8 +279,8 @@ class TestAnthropicTrustMaterialization:
 
     When an Anthropic pool entry omits claude_config_json, the manifest
     builder now always includes a .claude.json file with content ``{}``.
-    _normalize_materialized_file_content merges hasTrustDialogAccepted
-    into /tmp/workspace so the CLI doesn't stall on the onboarding dialog.
+    _normalize_materialized_file_content marks onboarding complete and merges
+    hasTrustDialogAccepted into /tmp/workspace so the CLI doesn't stall.
     """
 
     def _monkeypatch_uid_gid(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -309,6 +309,7 @@ class TestAnthropicTrustMaterialization:
         assert materialize_manifest.main(["m", str(manifest), str(env_out)]) == 0
 
         data = json.loads(target.read_text(encoding="utf-8"))
+        assert data["hasCompletedOnboarding"] is True
         assert data["projects"]["/tmp/workspace"]["hasTrustDialogAccepted"] is True
         # No secrets in the config file
         raw = target.read_text(encoding="utf-8")

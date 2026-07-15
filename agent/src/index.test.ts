@@ -4742,22 +4742,66 @@ describe('bootstrapPoolMode', () => {
           CLAUDE_CODE_OAUTH_TOKEN: 'sandbox-claude-token',
         },
         files: [
-          { path: '/home/agent/.claude.json', content: '{"hasCompletedOnboarding":true}', mode: '0600' },
+          {
+            path: '/home/agent/.claude.json',
+            content: JSON.stringify({
+              email: 'operator@example.com',
+              projects: { '/other/project': { hasTrustDialogAccepted: false } },
+            }),
+            mode: '0600',
+          },
         ],
         metadata: { retarget: true, provider: 'anthropic', auth_mode: 'oauth' },
       }, 'test: sandbox-reanchor');
 
       const writePaths = vi.mocked(fs.writeFileSync).mock.calls.map(c => c[0]);
       // Written where the CLI actually reads it…
-      expect(vi.mocked(fs.writeFileSync).mock.calls).toEqual(expect.arrayContaining([
-        ['/home/.claude.json', '{"hasCompletedOnboarding":true}', expect.objectContaining({ mode: 0o600 })],
-      ]));
+      const claudeWrite = vi.mocked(fs.writeFileSync).mock.calls.find(c => c[0] === '/home/.claude.json');
+      expect(claudeWrite).toBeDefined();
+      const config: unknown = JSON.parse(claudeWrite?.[1] as string);
+      expect(config).toMatchObject({
+        hasCompletedOnboarding: true,
+        email: 'operator@example.com',
+        projects: {
+          '/other/project': { hasTrustDialogAccepted: false },
+          '/tmp/workspace': { hasTrustDialogAccepted: true },
+        },
+      });
+      expect(claudeWrite?.[2]).toEqual(expect.objectContaining({ mode: 0o600 }));
       // …and NOT at the backend's hardcoded /home/agent path.
       expect(writePaths).not.toContain('/home/agent/.claude.json');
     } finally {
       if (savedHome !== undefined) process.env.HOME = savedHome; else delete process.env.HOME;
       if (savedVmId !== undefined) process.env.VM_INSTANCE_ID = savedVmId; else delete process.env.VM_INSTANCE_ID;
       vi.mocked(fs.existsSync).mockReturnValue(false);
+      _resetCredentialStateForTesting();
+    }
+  });
+
+  it('normalizes an omitted Claude config under sandbox HOME without adding credentials', () => {
+    const savedHome = process.env.HOME;
+    try {
+      _resetCredentialStateForTesting();
+      process.env.HOME = '/home';
+      vi.mocked(fs.writeFileSync).mockClear();
+
+      _materializeClaimCredentialStateForTesting({
+        env: { PROVIDER: 'anthropic', AUTH_MODE: 'oauth' },
+        files: [{ path: '/home/agent/.claude.json', content: '{}', mode: '0600' }],
+        metadata: { retarget: true, provider: 'anthropic', auth_mode: 'oauth' },
+      }, 'test: sandbox-minimal-claude-config');
+
+      const claudeWrite = vi.mocked(fs.writeFileSync).mock.calls.find(c => c[0] === '/home/.claude.json');
+      expect(claudeWrite).toBeDefined();
+      const config: unknown = JSON.parse(claudeWrite?.[1] as string);
+      expect(config).toEqual({
+        hasCompletedOnboarding: true,
+        projects: { '/tmp/workspace': { hasTrustDialogAccepted: true } },
+      });
+      expect(claudeWrite?.[1]).not.toContain('OAUTH_TOKEN');
+      expect(claudeWrite?.[1]).not.toContain('sk-ant');
+    } finally {
+      if (savedHome !== undefined) process.env.HOME = savedHome; else delete process.env.HOME;
       _resetCredentialStateForTesting();
     }
   });

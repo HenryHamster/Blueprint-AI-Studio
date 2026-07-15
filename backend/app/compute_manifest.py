@@ -108,9 +108,10 @@ def _resolve_provider_materials(
     if provider_enum == LLMProviderName.ANTHROPIC:
         # Always materialize ~/.claude.json for Anthropic so the CLI doesn't
         # stall on the onboarding dialog when claude_config_json is omitted.
-        # _normalize_materialized_file_content in materialize_manifest.py injects
-        # hasTrustDialogAccepted into /tmp/workspace on top of whatever the
-        # operator supplied. Do NOT put secrets or credentials here.
+        # _normalize_materialized_file_content in materialize_manifest.py marks
+        # onboarding complete and injects hasTrustDialogAccepted for
+        # /tmp/workspace on top of whatever the operator supplied. Do NOT put
+        # secrets or credentials here.
         files.append(
             FileMaterial(
                 path="/home/agent/.claude.json",

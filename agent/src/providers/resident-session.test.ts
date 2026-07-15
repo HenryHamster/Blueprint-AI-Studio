@@ -42,9 +42,9 @@ vi.mock('./resident-stream.js', async (importOriginal) => {
 
 vi.mock('./runners.js', () => ({
   claudeHelpSupportsPartialMessages: vi.fn(() => true),
-  probeClaudeCapabilities: vi.fn(() => null),
-  stripUnsupportedClaudeOptionalArgs: vi.fn((args: string[]) => args),
   __resetClaudeCapabilityCacheForTesting: vi.fn(),
+  probeClaudeCapabilities: vi.fn(() => null),
+  stripUnsupportedClaudeOptionalArgs: vi.fn((args: readonly string[]) => [...args]),
   getProviderRunner: vi.fn(() => ({
     provider: 'anthropic',
     displayName: 'claude',

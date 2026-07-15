@@ -105,6 +105,7 @@ def _normalize_materialized_file_content(path: pathlib.Path, content: str) -> st
         return content
     if not isinstance(parsed, dict):
         return content
+    parsed["hasCompletedOnboarding"] = True
     projects = parsed.get("projects")
     if not isinstance(projects, dict):
         projects = {}
