@@ -156,9 +156,42 @@ describe('startResidentClaudeSession', () => {
 
     const r = await turn;
     expect(r.resultText).toBe('hi back');
+    expect(r.accumulatedTurnText).toBe('hi back');
     expect(r.interrupted).toBe(false);
     expect(events.filter((e) => e.kind === 'text').map((e) => e.text)).toEqual(['hi ', 'back']);
     expect(session.sessionId()).toBe('sess-1');
+    session.close();
+  });
+
+  it('keeps streamed marker text distinct when a tool call precedes a non-empty markerless result', async () => {
+    const ctl = makeControllableChild();
+    vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);
+    const session = startResidentClaudeSession({});
+    const turn = session.sendTurn('advance');
+    ctl.pushLine({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'TICK-VERDICT: ADVANCED — streamed\n' } } });
+    ctl.pushLine({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: './strategic create-direction' } }] } });
+    ctl.pushLine({ type: 'result', result: 'closing tool summary' });
+
+    await expect(turn).resolves.toMatchObject({
+      resultText: 'closing tool summary',
+      accumulatedTurnText: 'TICK-VERDICT: ADVANCED — streamed\n',
+      sawToolUse: true,
+    });
+    session.close();
+  });
+
+  it('keeps the existing empty-final-result fallback while exposing accumulated text', async () => {
+    const ctl = makeControllableChild();
+    vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);
+    const session = startResidentClaudeSession({});
+    const turn = session.sendTurn('advance');
+    ctl.pushLine({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'streamed fallback' } } });
+    ctl.pushLine({ type: 'result', result: '' });
+
+    await expect(turn).resolves.toMatchObject({
+      resultText: 'streamed fallback',
+      accumulatedTurnText: 'streamed fallback',
+    });
     session.close();
   });
 

@@ -208,6 +208,7 @@ const mockPrepareWorkspaceForRole = vi.mocked(prepareWorkspaceForRole);
 function turnResult(over: Partial<ResidentTurnResult> = {}): ResidentTurnResult {
   return {
     resultText: '',
+    accumulatedTurnText: '',
     interrupted: false,
     timedOut: false,
     hardTimedOut: false,
@@ -273,8 +274,8 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
     // Backend-side handled set + a call-order trace shared across the mocks.
     const handledIds: string[] = [];
     const events: string[] = [];
-    let messagePollCount = 0;
     let capturedCheckpoint = '';
+    let messagePollCount = 0;
 
     mockApiGet.mockImplementation((url: string) => {
       // WORKSPACE is stubbed to '' here, so the per-turn "workspace vanished"
@@ -388,6 +389,7 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
       from_type: 'user',
     };
     const events: string[] = [];
+    let capturedCheckpoint = '';
     let messagePollCount = 0;
     vi.mocked(recordResidentTurnLatency).mockClear();
 
@@ -422,14 +424,21 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
         s1Calls += 1;
         events.push(s1Calls === 1 ? 'auto' : 'op');
         return Promise.resolve(turnResult({
-          resultText: s1Calls === 1 ? 'looked around' : 'answered the operator',
+          resultText: s1Calls === 1 ? 'closing tool summary' : 'answered the operator',
+          accumulatedTurnText: s1Calls === 1
+            ? 'TICK-VERDICT: ADVANCED — accumulated tick note survives the closing tool call'
+            : '',
           inputTokens: 5_000,
         }));
       },
       () => true,
     );
     const session2 = makeSession(
-      () => { events.push('prime'); return Promise.resolve(turnResult({ inputTokens: 0 })); },
+      (text) => {
+        events.push('prime');
+        capturedCheckpoint = typeof text === 'string' ? text : JSON.stringify(text);
+        return Promise.resolve(turnResult({ inputTokens: 0 }));
+      },
       () => false,
     );
     let spawnCount = 0;
@@ -459,6 +468,7 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
     expect(iOp).toBeGreaterThanOrEqual(0);
     expect(iSpawn2).toBeGreaterThan(iOp);
     expect(iPrime).toBeGreaterThan(iSpawn2);
+    expect(capturedCheckpoint).toContain('accumulated tick note survives the closing tool call');
 
     // The interrupt/post-turn operator path now records pickup-lag telemetry (it
     // previously passed no created_at → the lag was invisible in the summary).
@@ -690,7 +700,8 @@ describe('recloneResidentWorkspace — fresh READ-scoped credential at the momen
     });
     const session = makeSession(
       () => Promise.resolve(turnResult({
-        resultText: 'I agree, approach Y is better.\nOPERATOR-DECISION: use approach Y, not X',
+        resultText: 'I agree, approach Y is better.',
+        accumulatedTurnText: 'OPERATOR-DECISION: use approach Y, not X',
       })),
       () => true,
     );

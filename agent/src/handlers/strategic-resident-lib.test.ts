@@ -1607,6 +1607,34 @@ describe('classifyTickOutcome (unevidenced / corrective path)', () => {
     expect(upd.agendaContinue).toBe(true);
   });
 
+  it('classifyTickOutcome uses accumulated markers only when final result is markerless', () => {
+    const upd = classifyTickOutcome({
+      resultText: 'closing tool summary',
+      accumulatedTurnText: '> **AGENDA-CONTINUE**\n**TICK-VERDICT: ADVANCED — streamed marker survived**',
+      sawToolUse: true, focus, atTick: 7, at: 'ts',
+    });
+    expect(upd.record).toMatchObject({ verdict: 'advanced', note: 'streamed marker survived' });
+    expect(upd.agendaContinue).toBe(true);
+  });
+
+  it('prefers a final-result marker over a conflicting accumulated marker', () => {
+    const upd = classifyTickOutcome({
+      resultText: 'TICK-VERDICT: CLEAR code:backend — final result wins',
+      accumulatedTurnText: 'TICK-VERDICT: FOUND direction:old — stale stream marker',
+      sawToolUse: true, focus, atTick: 7, at: 'ts',
+    });
+    expect(upd.record).toMatchObject({ verdict: 'clear', note: 'final result wins' });
+  });
+
+  it('uses accumulated AGENDA-CONTINUE when the final result has only a verdict', () => {
+    const upd = classifyTickOutcome({
+      resultText: 'TICK-VERDICT: ADVANCED — final marker',
+      accumulatedTurnText: 'AGENDA-CONTINUE',
+      sawToolUse: true, focus, atTick: 7, at: 'ts',
+    });
+    expect(upd.agendaContinue).toBe(true);
+  });
+
   it('classifyTickOutcome does not mark interrupted turns corrective', () => {
     // An interrupted turn (operator preemption, authority suspend, stall watchdog)
     // produces empty resultText and sawToolUse=false — no TICK-VERDICT marker was

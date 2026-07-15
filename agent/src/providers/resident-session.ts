@@ -48,6 +48,9 @@ const DEFAULT_RESIDENT_TURN_HARD_TIMEOUT_MS = 15 * 60_000;
 export interface ResidentTurnResult {
   /** authoritative final assistant text for this turn (from the `result` event) */
   resultText: string;
+  /** all assistant text streamed before the terminal result; retained separately
+   *  so marker consumers can recover a marker hidden by a closing tool call. */
+  accumulatedTurnText: string;
   /** the turn was cut short by a cooperative interrupt (new operator input / stop) */
   interrupted: boolean;
   /** the turn's per-turn stall watchdog fired (no output within the turn budget) */
@@ -300,6 +303,7 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
       : null;
     t.resolve({
       resultText: finalText,
+      accumulatedTurnText: t.accumulated,
       interrupted: t.interrupted,
       timedOut: t.timedOut,
       hardTimedOut: t.hardTimedOut,
@@ -599,7 +603,7 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
   function sendTurn(textOrBlocks: string | Array<Record<string, unknown>>, opts?: { stallTimeoutMs?: number }): Promise<ResidentTurnResult> {
     if (!alive || closed) {
       return Promise.resolve({
-        resultText: '', interrupted: false, timedOut: false, hardTimedOut: false,
+        resultText: '', accumulatedTurnText: '', interrupted: false, timedOut: false, hardTimedOut: false,
         appliedStrategicOp: false, sawToolUse: false, sentOperatorMessage: false,
         processGone: true, ttftMs: null, turnMs: 0, toolCallCount: 0,
         totalToolCallDurationMs: 0, meanInterTokenMs: null, inputTokens: 0,
@@ -641,7 +645,7 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
         activeTurn = null;
         emit({ kind: 'error', text: `failed to write turn: ${String(e)}` });
         resolve({
-          resultText: '', interrupted: false, timedOut: false, hardTimedOut: false,
+          resultText: '', accumulatedTurnText: '', interrupted: false, timedOut: false, hardTimedOut: false,
           appliedStrategicOp: false, sawToolUse: false, sentOperatorMessage: false,
           processGone: !alive, ttftMs: null, turnMs: Date.now() - startedAtMs, toolCallCount: 0,
           totalToolCallDurationMs: 0, meanInterTokenMs: null, inputTokens: 0,
