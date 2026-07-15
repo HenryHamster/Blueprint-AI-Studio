@@ -28,8 +28,14 @@ export const ESLINT_VIEWPORT_PATTERN = 'eslint-disable[^\\n]*viewport';
  */
 export function isBenignPlaywrightRouteRace(error) {
   if (!error || typeof error !== 'object') return false;
+  // Playwright throws the raw message. Vitest's reporter decorates the same
+  // error with the `route.fulfill:` API prefix when it renders CI output, so
+  // accept either representation while retaining provider-stack provenance.
+  const isDuplicateFulfill =
+    error.message === 'Route is already handled!' ||
+    error.message === 'route.fulfill: Route is already handled!';
   return (
-    error.message === 'route.fulfill: Route is already handled!' &&
+    isDuplicateFulfill &&
     typeof error.stack === 'string' &&
     error.stack.includes('@vitest/browser-playwright')
   );

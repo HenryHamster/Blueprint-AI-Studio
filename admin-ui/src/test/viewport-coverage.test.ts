@@ -13,10 +13,13 @@ import {
 } from './viewport-checks.js';
 
 describe('viewport runner unhandled-error filter', () => {
-  it('accepts only the known provider-owned duplicate fulfill race', () => {
+  it.each([
+    'Route is already handled!',
+    'route.fulfill: Route is already handled!',
+  ])('accepts the known provider-owned duplicate fulfill race: %s', message => {
     expect(
       isBenignPlaywrightRouteRace({
-        message: 'route.fulfill: Route is already handled!',
+        message,
         stack: 'at ../node_modules/@vitest/browser-playwright/dist/index.js:989:20',
       }),
     ).toBe(true);
@@ -26,6 +29,10 @@ describe('viewport runner unhandled-error filter', () => {
     new Error('application rejection'),
     {
       message: 'route.fulfill: Route is already handled!',
+      stack: 'at src/test-owned-route.ts:12:3',
+    },
+    {
+      message: 'Route is already handled!',
       stack: 'at src/test-owned-route.ts:12:3',
     },
     {
