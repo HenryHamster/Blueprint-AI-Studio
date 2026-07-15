@@ -539,9 +539,12 @@ class TestRunnerViewableUpload:
         assert status is None
 
 
-def test_run_compute_job_invokes_viewable_streamer():
-    """AST guard: the compute-job poll loop must call ``_stream_viewable_files`` so
-    the mid-run streaming wiring cannot be silently dropped by a future edit."""
+def test_run_compute_job_flushes_viewables_before_terminal_handoff():
+    """A final scan must run after exit and before the terminal job report.
+
+    This preserves outputs written immediately before a short command exits,
+    including videos too large for the terminal artifact bundle.
+    """
     source = inspect.getsource(local_runner)
     tree = ast.parse(source)
     run_job = next(
@@ -553,11 +556,13 @@ def test_run_compute_job_invokes_viewable_streamer():
         None,
     )
     assert run_job is not None, "_run_compute_job missing"
-    called = {
-        node.func.id
-        for node in ast.walk(run_job)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-    }
-    assert "_stream_viewable_files" in called, (
-        "_run_compute_job must invoke _stream_viewable_files on the heartbeat loop"
+    final_stream_call = source.index(
+        "# A command can create its final plot or rollout video immediately before"
     )
+    terminal_report = source.index(
+        "exec_status=exec_status_final,", final_stream_call
+    )
+    assert final_stream_call < terminal_report
+    final_segment = source[final_stream_call:terminal_report]
+    assert "_stream_viewable_files(" in final_segment
+    assert "viewable_state" in final_segment

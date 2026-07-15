@@ -5081,6 +5081,16 @@ def _run_compute_job(
         _close_stdout()
         reader.join(timeout=1)
 
+        # A command can create its final plot or rollout video immediately before
+        # exiting, without waiting long enough to reach the next heartbeat. Flush
+        # once while the job is still RUNNING: the viewable endpoint rejects
+        # terminal jobs, and the durable artifact bundle may be skipped when it
+        # exceeds its much smaller upload cap. Reuse the live state so already
+        # uploaded files are not sent again.
+        _stream_viewable_files(
+            orchestrator_url, token, job_id, artifact_dir, viewable_state
+        )
+
         result_metrics = _parse_result_metrics(result_file)
 
         command_log = _terminal_command_log()
