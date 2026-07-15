@@ -13,7 +13,7 @@ import { useArchive } from './hooks/useArchive';
 import { useDeploymentState } from './hooks/useDeploymentState';
 import { useLogViewer } from './hooks/useLogViewer';
 import { useSearchFilters } from './hooks/useSearchFilters';
-import { useUIState } from './hooks/useUIState';
+import { normalizePrimaryTab, useUIState } from './hooks/useUIState';
 import { useTaskModal } from './hooks/useTaskModal';
 import { useSettings } from './hooks/useSettings';
 import { useUserManagement } from './hooks/useUserManagement';
@@ -129,12 +129,34 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, 
   useEffect(() => { selectedProjectIdRef.current = selectedProjectId; }, [selectedProjectId]);
 
   const {
+    activeTab, setActiveTab,
+    showResearchBrowser, setShowResearchBrowser,
+    showKnowledgeBrowser, setShowKnowledgeBrowser,
+    showActivityFeed, setShowActivityFeed, lastActivityFeedOpen, prevLastActivityFeedOpen,
+    showFleetDetail, setShowFleetDetail,
+    showAlertsPopover, setShowAlertsPopover,
+    showDirections, setShowDirections,
+    showMetrics, setShowMetrics,
+    showUserManagement, setShowUserManagement,
+    selectionMode, setSelectionMode, selectedTaskIds, setSelectedTaskIds,
+    toggleSelectionMode, toggleTaskSelection, bulkColumnToggle, shiftSelectRange,
+    confirmDialog, setConfirmDialog,
+  } = useUIState();
+  // Runtime data is expensive and irrelevant on the default Chat surface.
+  // Once Runtime has been opened, keep its health data live for its header and
+  // workspace affordances even while the operator visits another tab.
+  const [runtimeTabVisited, setRuntimeTabVisited] = useState(() => normalizePrimaryTab(activeTab) === 'runtime');
+  useEffect(() => {
+    if (normalizePrimaryTab(activeTab) === 'runtime') setRuntimeTabVisited(true);
+  }, [activeTab]);
+
+  const {
     deployState, setDeployState,
     handlePausePipeline, handleResumePipeline, handleResetHealth,
     handleRollback, handleMarkStable, handleRepairState,
     failedRollback,
     zoneHealth, orchestratorHealth, detailedHealth, diagnostics,
-  } = useDeploymentState(addToast, user, fetchTasksRef, selectedProjectId);
+  } = useDeploymentState(addToast, user, fetchTasksRef, selectedProjectId, runtimeTabVisited);
 
   const {
     logTask, logLines, logsConnecting, wsDisconnected, wsDisconnectReason,
@@ -160,20 +182,6 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, 
     realtimeWsEnabled: !authLoading && Boolean(user),
   });
 
-  const {
-    activeTab, setActiveTab,
-    showResearchBrowser, setShowResearchBrowser,
-    showKnowledgeBrowser, setShowKnowledgeBrowser,
-    showActivityFeed, setShowActivityFeed, lastActivityFeedOpen, prevLastActivityFeedOpen,
-    showFleetDetail, setShowFleetDetail,
-    showAlertsPopover, setShowAlertsPopover,
-    showDirections, setShowDirections,
-    showMetrics, setShowMetrics,
-    showUserManagement, setShowUserManagement,
-    selectionMode, setSelectionMode, selectedTaskIds, setSelectedTaskIds,
-    toggleSelectionMode, toggleTaskSelection, bulkColumnToggle, shiftSelectRange,
-    confirmDialog, setConfirmDialog,
-  } = useUIState();
   const [researchFeed, setResearchFeed] = useState<Task[]>([]);
   const [fleetRunnersRefreshSignal, setFleetRunnersRefreshSignal] = useState(0);
   if (refreshFleetRunnersRef) {

@@ -15,7 +15,11 @@ export interface UseVersionLifecycleResult {
   refreshVersionLifecycle: () => Promise<void>;
 }
 
-export function useVersionLifecycle(selectedProjectId: string | null): UseVersionLifecycleResult {
+export function useVersionLifecycle(
+  selectedProjectId: string | null,
+  opts?: { pollerEnabled?: boolean },
+): UseVersionLifecycleResult {
+  const pollerEnabled = opts?.pollerEnabled ?? true;
   const [versionLifecycle, setVersionLifecycle] = useState<VersionLifecycleResponse | null>(null);
   const [versionLifecycleError, setVersionLifecycleError] = useState<string | null>(null);
   const [versionLifecycleLastSuccessAt, setVersionLifecycleLastSuccessAt] = useState<string | null>(null);
@@ -49,7 +53,7 @@ export function useVersionLifecycle(selectedProjectId: string | null): UseVersio
     } catch {
       if (!signal.aborted) setVersionLifecycleError('Version lifecycle refresh failed');
     }
-  }, { intervalMs: DEFAULT_POLL_MS, deps: [selectedProjectId] });
+  }, { intervalMs: DEFAULT_POLL_MS, enabled: Boolean(selectedProjectId) && pollerEnabled, deps: [selectedProjectId, pollerEnabled] });
 
   const refreshVersionLifecycle = useCallback(async () => {
     if (!selectedProjectId) return;

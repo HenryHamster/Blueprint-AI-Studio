@@ -1,6 +1,7 @@
 /* eslint-disable react-hooks/refs, react-hooks/set-state-in-effect */
 import { memo, useState, useEffect, useCallback, useRef, useMemo } from 'react';
-import { auth, getIdToken } from '../firebase';
+import { auth } from '../firebase';
+import { currentUiSurface, reportUiLoadTiming } from '../uiLoadTiming';
 import { apiFetch, API_BASE_URL, authHeaders, type StrategicRefreshMarker } from '../api';
 import type { StrategicCycleProgress, StrategicCycleCompletion, StrategicSessionDelta } from '../hooks/useLogViewer';
 import { parseTimestamp, timeAgo } from '../utils/time';
@@ -1246,15 +1247,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     if (loading || initialLoadDoneRef.current || !conversationMode) return;
     initialLoadDoneRef.current = true;
     const ms = Math.round(performance.now());
-    const surface = (window.location.hash.replace(/^#\/?/, '').split('/')[0] || 'chat').slice(0, 64);
-    getIdToken().then(token => {
-      if (!token) return;
-      fetch('/api/admin/ui-load-timing', {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ surface, page_ready_ms: ms, sample_type: 'chat_data_ready' }),
-      }).catch(() => {});
-    }).catch(() => {});
+    reportUiLoadTiming(currentUiSurface(), ms, 'chat_data_ready');
   }, [loading, conversationMode]);
 
   useEffect(() => {
