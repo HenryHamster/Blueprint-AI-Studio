@@ -6,9 +6,12 @@ import type { StrategicSessionResponse, StrategicStateResponse } from '../strate
 
 vi.mock('../strategicStateApi', async () => {
   const NOT_MODIFIED = { notModified: true } as const;
+  const CONVERSATION_NOT_MODIFIED = { notModified: true } as const;
   return {
   STRATEGIC_STATE_NOT_MODIFIED: NOT_MODIFIED,
   isStrategicStateNotModified: (r: unknown) => r === NOT_MODIFIED,
+  STRATEGIC_CONVERSATION_NOT_MODIFIED: CONVERSATION_NOT_MODIFIED,
+  isStrategicConversationNotModified: (r: unknown) => r === CONVERSATION_NOT_MODIFIED,
   fetchStrategicStateWithRevision: vi.fn(),
   fetchStrategicWorkbenchState: vi.fn(),
   updateStrategicWorkbenchState: vi.fn(),

@@ -2928,6 +2928,49 @@ async def test_strategic_conversation_endpoint_passes_include_message_id(
 
 
 @pytest.mark.asyncio
+async def test_strategic_conversation_etag_revalidates_and_binds_pinned_message(
+    client: AsyncClient, db_session
+):
+    """A transcript ETag 304s only for the exact pinned transcript requested."""
+    project = await _make_project(db_session)
+    base_time = _utcnow() - timedelta(hours=2)
+    older = ProjectMessage(
+        project_id=project.id, message_type=MessageType.NOTE,
+        from_type="strategic", content="pinned older", created_at=base_time,
+    )
+    db_session.add_all([older, *[
+        ProjectMessage(
+            project_id=project.id, message_type=MessageType.NOTE,
+            from_type="strategic", content=f"recent {i}",
+            created_at=base_time + timedelta(minutes=i + 1),
+        )
+        for i in range(5)
+    ]])
+    await db_session.commit()
+
+    unpinned = await client.get(f"/api/admin/projects/{project.id}/strategic-conversation")
+    assert unpinned.status_code == 200
+    etag = unpinned.headers.get("ETag")
+    assert etag and etag.startswith('"')
+
+    unchanged = await client.get(
+        f"/api/admin/projects/{project.id}/strategic-conversation",
+        headers={"If-None-Match": etag},
+    )
+    assert unchanged.status_code == 304
+    assert unchanged.headers.get("ETag") == etag
+    assert not unchanged.content
+
+    pinned = await client.get(
+        f"/api/admin/projects/{project.id}/strategic-conversation?include_message_id={older.id}",
+        headers={"If-None-Match": etag},
+    )
+    assert pinned.status_code == 200
+    assert pinned.headers.get("ETag") != etag
+    assert pinned.json()["conversation"]["items"][0]["id"] == str(older.id)
+
+
+@pytest.mark.asyncio
 async def test_strategic_session_create_persists_project_session(
     client: AsyncClient, db_session
 ):
@@ -7952,6 +7995,10 @@ async def test_strategic_state_matching_revision_returns_304_skips_assembly(
         "app.routers.admin_project_strategic_session.build_workbench_event_feed",
         new_callable=AsyncMock,
     )
+    attention_spy = mocker.patch(
+        "app.routers.admin_project_strategic_session.build_operator_attention",
+        new_callable=AsyncMock,
+    )
 
     # Second call WITH the matching revision token → 304, empty body.
     resp2 = await client.get(
@@ -7970,6 +8017,7 @@ async def test_strategic_state_matching_revision_returns_304_skips_assembly(
     runtime_spy.assert_not_called()
     workbench_spy.assert_not_called()
     events_spy.assert_not_called()
+    attention_spy.assert_not_called()
 
 
 # The visible response segments and the mutation that must flip the broad

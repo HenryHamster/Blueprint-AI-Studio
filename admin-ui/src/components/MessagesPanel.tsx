@@ -34,6 +34,7 @@ import { DirectionsAddForm } from './DirectionsAddForm';
 import {
   createStrategicSessionMessage,
   fetchStrategicConversation,
+  isStrategicConversationNotModified,
   getMessageAttachmentUploadUrl,
   type StrategicContextPackageDescriptor,
   type StrategicMessageTarget,
@@ -581,6 +582,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   const prevMessageCountRef = useRef(0);
   const fetchMessagesRequestSeqRef = useRef(0);
   const lastStrategicSessionTargetFetchRef = useRef<string | null>(null);
+  const strategicConversationEtagRef = useRef<string | null>(null);
   const lastRealtimeRefreshSignalRef = useRef<number | null>(null);
   const getStrategicSessionIncludeMessageId = useCallback((projectId: string | null, currentTargetMessageId: string | null): string | null => {
     if (!projectId) return null;
@@ -1003,6 +1005,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     if (!selectedProjectId) {
       strategicSessionPinnedTargetRef.current = null;
       lastStrategicSessionTargetFetchRef.current = null;
+      strategicConversationEtagRef.current = null;
       return;
     }
     if (strategicSessionPinnedTargetRef.current?.projectId !== selectedProjectId) {
@@ -1012,6 +1015,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       strategicSessionPinnedTargetRef.current = { projectId: selectedProjectId, messageId: targetMessageId };
     }
     lastStrategicSessionTargetFetchRef.current = null;
+    strategicConversationEtagRef.current = null;
   }, [selectedProjectId, targetMessageId]);
 
   useEffect(() => {
@@ -1093,7 +1097,12 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     try {
       if (conversationMode) {
         const includeMessageId = getStrategicSessionIncludeMessageId(selectedProjectId, targetMessageId);
-        const result = await fetchStrategicConversation(selectedProjectId, includeMessageId);
+        const result = await fetchStrategicConversation(
+          selectedProjectId,
+          includeMessageId,
+          undefined,
+          strategicConversationEtagRef.current,
+        );
         const currentIncludeMessageId = getStrategicSessionIncludeMessageId(
           selectedProjectIdRef.current,
           targetMessageIdRef.current,
@@ -1106,6 +1115,8 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
           return;
         }
         lastStrategicSessionTargetFetchRef.current = includeMessageId;
+        if (isStrategicConversationNotModified(result)) return;
+        strategicConversationEtagRef.current = result.etag ?? null;
         const sessionMessages = result.conversation?.items ?? [];
         sessionMessages.forEach(m => seenMessageIdsRef.current.add(m.id));
         hasInitiallyLoadedRef.current = true;

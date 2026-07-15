@@ -4,6 +4,8 @@ import {
   checkInStrategicSession,
   executeStrategicWorkSessionCommand,
   fetchStrategicStateWithRevision,
+  fetchStrategicConversation,
+  isStrategicConversationNotModified,
   isStrategicStateNotModified,
   STRATEGIC_STATE_NOT_MODIFIED,
   updateStrategicWorkbenchState,
@@ -29,6 +31,27 @@ const savedWorkbench: StrategicWorkbenchState = {
   session_started_at: null,
   last_interaction_at: null,
 };
+
+describe('fetchStrategicConversation', () => {
+  beforeEach(() => {
+    apiFetchMock.mockReset();
+  });
+
+  test('sends the held ETag and returns a sentinel for a 304 transcript poll', async () => {
+    apiFetchMock.mockResolvedValue(new Response(null, { status: 304 }));
+
+    const result = await fetchStrategicConversation('proj-1', 'pinned-1', undefined, '"conversation-1"');
+
+    expect(isStrategicConversationNotModified(result)).toBe(true);
+    expect(apiFetchMock).toHaveBeenCalledWith(
+      '/api/admin/projects/proj-1/strategic-conversation?include_message_id=pinned-1',
+      { headers: { 'If-None-Match': '"conversation-1"' } },
+      2,
+      30000,
+      undefined,
+    );
+  });
+});
 
 describe('updateStrategicWorkbenchState', () => {
   beforeEach(() => {

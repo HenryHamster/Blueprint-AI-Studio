@@ -33,6 +33,7 @@ from app.models import (
     ComputeJobStatus,
     Direction,
     LocalRunner,
+    MessagesLastSeen,
     MessagesNoisePrefs,
     ProjectMessage,
     MessageType,
@@ -1170,6 +1171,12 @@ async def _compute_strategic_state_fingerprints(
             MessagesNoisePrefs.user_id == user_id,
         )
     )
+    attention_last_seen_updated_at = await session.scalar(
+        select(MessagesLastSeen.updated_at).where(
+            MessagesLastSeen.project_id == project_id,
+            MessagesLastSeen.user_id == user_id,
+        )
+    )
     runner_row = (
         await session.execute(
             select(func.count(), func.max(LocalRunner.last_seen_at)).where(
@@ -1240,6 +1247,11 @@ async def _compute_strategic_state_fingerprints(
     return {
         "workbench_updated_at": str(workbench_updated_at)
         if workbench_updated_at
+        else None,
+        # Marking messages seen changes unread attention counts without changing
+        # any message or task row, so this per-user source must flip the guard.
+        "attention_last_seen_updated_at": str(attention_last_seen_updated_at)
+        if attention_last_seen_updated_at
         else None,
         "runner_count": int(runner_row[0] or 0),
         "runner_max_seen": str(runner_row[1]) if runner_row[1] else None,
@@ -1488,7 +1500,6 @@ async def get_project_strategic_state(
         .group_by(ProjectMessage.status)
     )
     task_focus = await _build_task_focus(session, project.id)
-    attention = await build_operator_attention(session, project, current_user["user_id"])
     _open_version_res = await session.execute(
         select(ReleaseVersion)
         .where(
@@ -1626,7 +1637,7 @@ async def get_project_strategic_state(
         directions_summary=directions_summary,
         message_counts=message_counts,
         task_counts=task_counts,
-        attention=attention,
+        attention=None,
         fingerprints=fingerprints,
     )
     if state_revision is not None and state_revision == _revision:
@@ -1643,6 +1654,11 @@ async def get_project_strategic_state(
         # Empty body, no full-body ETag (never assembled). The client keys this
         # path on ?state_revision= and keeps its held ETag untouched on a 304.
         return Response(status_code=304)
+
+    # Attention uses bounded previews but still performs several queries.  The
+    # revision fingerprint covers its source rows, so only construct it when a
+    # changed response actually needs to be assembled.
+    attention = await build_operator_attention(session, project, current_user["user_id"])
 
     # Revision miss (or first-load with no token): build the full context
     # package. With the broad guard above, reaching here means a visible segment
@@ -2012,7 +2028,9 @@ async def get_project_strategic_session(
 async def get_project_strategic_conversation(
     request: Request,
     project_id: uuid.UUID,
+    response: Response,
     include_message_id: uuid.UUID | None = Query(None),
+    if_none_match: str | None = Header(None, alias="If-None-Match"),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -2031,7 +2049,15 @@ async def get_project_strategic_conversation(
         context_package=None,
         include_message_id=include_message_id,
     )
-    return {"conversation": conversation}
+    result = {"conversation": conversation}
+    # The selected include_message_id changes the transcript itself, so hashing
+    # the complete envelope naturally binds a pinned-message request to its
+    # validator rather than accidentally reusing the unpinned transcript ETag.
+    etag = _compute_strategic_state_etag(result)
+    if _if_none_match_hits(if_none_match, etag):
+        return Response(status_code=304, headers={"ETag": _quote_etag(etag)})
+    response.headers["ETag"] = _quote_etag(etag)
+    return result
 
 
 @router.post("/projects/{project_id}/strategic-session")

@@ -1280,19 +1280,33 @@ export async function fetchStrategicConversation(
   projectId: string,
   includeMessageId?: string | null,
   signal?: AbortSignal,
-): Promise<{ conversation: StrategicSessionConversation }> {
+  etag?: string | null,
+): Promise<{ conversation: StrategicSessionConversation; etag?: string } | StrategicConversationNotModified> {
   const params = new URLSearchParams();
   if (includeMessageId) params.set('include_message_id', includeMessageId);
   const query = params.toString();
   const res = await apiFetch(
     `/api/admin/projects/${encodeURIComponent(projectId)}/strategic-conversation${query ? `?${query}` : ''}`,
-    undefined,
+    etag ? { headers: { 'If-None-Match': etag } } : undefined,
     2,
     30000,
     signal,
   );
+  if (res.status === 304) return STRATEGIC_CONVERSATION_NOT_MODIFIED;
   if (!res.ok) throw new Error(`Failed to fetch Strategic conversation: ${res.status}`);
-  return res.json() as Promise<{ conversation: StrategicSessionConversation }>;
+  const body = await res.json() as { conversation: StrategicSessionConversation };
+  const responseEtag = res.headers.get('ETag');
+  return responseEtag ? { ...body, etag: responseEtag } : body;
+}
+
+/** Empty transcript-poll response: callers retain their existing conversation. */
+export const STRATEGIC_CONVERSATION_NOT_MODIFIED = { notModified: true } as const;
+export type StrategicConversationNotModified = typeof STRATEGIC_CONVERSATION_NOT_MODIFIED;
+
+export function isStrategicConversationNotModified(
+  result: { conversation: StrategicSessionConversation; etag?: string } | StrategicConversationNotModified,
+): result is StrategicConversationNotModified {
+  return result === STRATEGIC_CONVERSATION_NOT_MODIFIED;
 }
 
 export async function createStrategicSessionMessage(
