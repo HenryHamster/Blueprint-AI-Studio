@@ -622,7 +622,10 @@ export interface QualificationTriggerState {
   last_attempt: Record<string, unknown> | null;
   next_expected_trigger: string;
   blocking: string[];
-  attempts: { count: number; cap: number };
+  /** All qualification attempts recorded for this version; never capped. */
+  lifetime_qualification_attempts: number;
+  /** Retry attempts for the current transient-error episode only. */
+  error_retry_episode: { count: number; cap: number };
   knob: 'on' | 'observe' | 'off';
   evaluated_at: string;
   decision?: {

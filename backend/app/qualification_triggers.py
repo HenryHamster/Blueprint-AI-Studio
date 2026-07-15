@@ -383,7 +383,8 @@ def explain_qualification_trigger(
           "last_attempt": {...},
           "next_expected_trigger": "<event>",
           "blocking": [...],
-          "attempts": {"count": N, "cap": 5},
+          "lifetime_qualification_attempts": N,
+          "error_retry_episode": {"count": M, "cap": 5},
           "knob": "on|observe|off",
           "evaluated_at": "...",
           "decision": {...}   # resolver output for debugging
@@ -454,8 +455,11 @@ def explain_qualification_trigger(
         "last_attempt": last_attempt,
         "next_expected_trigger": next_expected,
         "blocking": decision.blocking,
-        "attempts": {
-            "count": qualification_attempts,
+        # These are deliberately separate: lifetime attempts are diagnostic
+        # history, while the cap applies only to retries in this error episode.
+        "lifetime_qualification_attempts": qualification_attempts,
+        "error_retry_episode": {
+            "count": error_redrive_count,
             "cap": _MAX_ERROR_REDRIVE_ATTEMPTS,
         },
         "knob": knob,

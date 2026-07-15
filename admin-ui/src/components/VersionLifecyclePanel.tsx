@@ -75,6 +75,12 @@ function QualificationTriggerRow({ state }: { state: QualificationTriggerState }
       {state.next_expected_trigger && state.auto_trigger === 'waiting' && (
         <span className="text-neutral-600 italic">next: {state.next_expected_trigger.replace(/_/g, ' ')}</span>
       )}
+      <span className="text-neutral-600">
+        lifetime qualifications: {state.lifetime_qualification_attempts}
+      </span>
+      <span className="text-neutral-600">
+        error retry episode: {state.error_retry_episode.count}/{state.error_retry_episode.cap}
+      </span>
     </div>
   );
 }
@@ -611,7 +617,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
               <span className={`text-ui-sm font-semibold px-1.5 py-0.5 rounded border ${cv.phase === 'stabilize' ? 'bg-amber-500/10 border-amber-500/30 text-amber-400' : 'bg-blue-500/10 border-blue-500/30 text-blue-400'}`}>{cv.phase}</span>
               {cv.phase_changed_at && <span className="text-ui-sm text-neutral-500">{timeAgo(cv.phase_changed_at)}</span>}
               <span className="text-ui-sm text-neutral-500">{cv.merged_task_count} tasks merged</span>
-              {cv.qualification_attempts > 0 && <span className="text-ui-sm text-neutral-500">{cv.qualification_attempts} qual{cv.qualification_attempts !== 1 ? 's' : ''}</span>}
+              {cv.qualification_attempts > 0 && <span className="text-ui-sm text-neutral-500">{cv.qualification_attempts} lifetime qualification{cv.qualification_attempts !== 1 ? 's' : ''}</span>}
               {cv.active_candidate_sha && (
                 <span
                   data-testid="active-candidate-sha"

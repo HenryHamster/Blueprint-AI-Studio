@@ -11501,6 +11501,7 @@ async def test_qualification_trigger_state_surface_explains_armed_and_blocked(
     """
     from httpx import AsyncClient  # noqa: PLC0415
     from app.auth import create_agent_token  # noqa: PLC0415
+    from app.release_qualifier_sweep import _MAX_ERROR_REDRIVE_ATTEMPTS  # noqa: PLC0415
     from app.shared_state import runtime_config as _test_runtime_config  # noqa: PLC0415
 
     assert isinstance(client, AsyncClient)
@@ -11575,7 +11576,11 @@ async def test_qualification_trigger_state_surface_explains_armed_and_blocked(
     assert blocked is not None
     assert blocked["auto_trigger"] == "waiting"
     assert blocked["next_expected_trigger"] is not None
-    assert blocked["attempts"]["count"] == 0
+    assert blocked["lifetime_qualification_attempts"] == 0
+    assert blocked["error_retry_episode"] == {
+        "count": 0,
+        "cap": _MAX_ERROR_REDRIVE_ATTEMPTS,
+    }
     assert blocked["decision"]["reason"] == "criterion_not_met"
     assert blocked["decision"]["fire"] is False
     assert any(
@@ -21550,7 +21555,7 @@ async def test_sweep_error_redrive_allows_versions_with_many_lifetime_attempts(
         # No error_redrive_count — this is the first error episode.
     }
     # Many lifetime attempts from previous qualification episodes (the bug trigger).
-    version.qualification_attempts = 10
+    version.qualification_attempts = 11
     db_session.add(version)
     await db_session.commit()
 
@@ -21588,6 +21593,9 @@ async def test_sweep_error_redrive_allows_versions_with_many_lifetime_attempts(
     assert count == 0
     await db_session.refresh(version)
     assert version.last_qualification["status"] == "pending"
+    # The successfully spawned qualification begins a new episode. Its retry
+    # counter must not inherit the previous error episode's retry history.
+    assert "error_redrive_count" not in version.last_qualification
 
 
 @pytest.mark.asyncio

@@ -90,6 +90,36 @@ describe('VersionLifecyclePanel', () => {
     vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
   });
 
+  it('separates lifetime qualifications from the current error retry episode', () => {
+    render(
+      <VersionLifecyclePanel
+        data={makeVersionLifecycleResponse({
+          current_version: makeCurrentVersion({
+            phase: 'stabilize',
+            qualification_attempts: 11,
+            qualification_trigger_state: {
+              auto_trigger: 'armed',
+              last_attempt: null,
+              next_expected_trigger: 'sweep_retry',
+              blocking: [],
+              lifetime_qualification_attempts: 11,
+              error_retry_episode: { count: 0, cap: 5 },
+              knob: 'on',
+              evaluated_at: '2026-01-01T00:00:00Z',
+            },
+          }),
+        })}
+        loading={false}
+        projectId="proj-1"
+        onRefresh={mockRefresh}
+      />
+    );
+
+    expect(screen.getByText('11 lifetime qualifications')).toBeInTheDocument();
+    expect(screen.getByText('lifetime qualifications: 11')).toBeInTheDocument();
+    expect(screen.getByText('error retry episode: 0/5')).toBeInTheDocument();
+  });
+
   it('renders the promotion policy source and fallback reason', () => {
     vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
 
