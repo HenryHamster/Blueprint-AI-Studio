@@ -17756,6 +17756,65 @@ def test_build_and_push_builds_when_hash_new(tmp_path):
     assert result.pinned_ref == "reg/repo/img@sha256:" + "b" * 64
 
 
+def test_build_and_push_sanitizes_authenticated_git_metadata_from_context(tmp_path):
+    """A Dockerfile that encodes its whole context cannot recover Git credentials."""
+    repo = _write_repo(
+        tmp_path,
+        dockerfile=(
+            b"FROM scratch\nCOPY . /project\n"
+            b"RUN find /project -type f -exec base64 {} \\;\n"
+        ),
+    )
+    token = "ghs_abcdefghijklmnopqrstuvwxyz1234567890"
+    repo_path = tmp_path / "repo"
+    (repo_path / ".git").mkdir()
+    (repo_path / ".git" / "config").write_text(
+        f"[credential]\n\ttoken = {token}\n"
+    )
+    (repo_path / "vendor").mkdir()
+    (repo_path / "vendor" / ".git").mkdir()
+    (repo_path / "vendor" / ".git" / "config").write_text(token)
+    (repo_path / "project-source.txt").write_text("ordinary project source\n")
+    os.symlink("project-source.txt", repo_path / "project-source-link")
+    contexts = []
+
+    def fake_run(cmd, **kw):
+        if cmd[:2] == ["docker", "build"]:
+            context = cmd[-1]
+            contexts.append(context)
+            assert cmd[cmd.index("-f") + 1] == os.path.join(
+                context, ".blueprint", "Dockerfile.compute"
+            )
+            assert not os.path.exists(os.path.join(context, ".git"))
+            assert not os.path.exists(os.path.join(context, "vendor", ".git"))
+            with open(os.path.join(context, "project-source.txt"), "rb") as fh:
+                assert fh.read() == b"ordinary project source\n"
+            assert os.path.islink(os.path.join(context, "project-source-link"))
+            copied_files = []
+            for root, _dirs, files in os.walk(context):
+                for name in files:
+                    with open(os.path.join(root, name), "rb") as copied_file:
+                        copied_files.append(copied_file.read())
+            # This simulates the Dockerfile's base64 command over every copied file.
+            encoded_context = base64.b64encode(b"\0".join(copied_files))
+            assert token.encode() not in base64.b64decode(encoded_context)
+        return _ok_proc(stdout="reg/repo/img@sha256:" + "c" * 64)
+
+    _bci.build_and_push(
+        repo_dir=repo,
+        registry_repo="reg/repo",
+        image_name="img",
+        dockerfile=".blueprint/Dockerfile.compute",
+        dep_files=["requirements.txt"],
+        _run=fake_run,
+        _tag_exists=lambda *a, **k: False,
+        _scan_layers_fn=lambda *a, **k: [],
+    )
+
+    assert len(contexts) == 1
+    assert not os.path.exists(contexts[0]), "temporary Docker context was not cleaned up"
+
+
 def test_build_and_push_credential_leak_fails_before_push(tmp_path):
     """A leaked credential in the Dockerfile fails the build BEFORE any push."""
     repo = _write_repo(
