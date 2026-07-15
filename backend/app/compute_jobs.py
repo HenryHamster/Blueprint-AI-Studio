@@ -1524,18 +1524,18 @@ _NO_USABLE_GPU_TERMINAL_REASON = (
     "container reported no usable GPU — host GPU/image compatibility mismatch"
 )
 
-# A metric-or-arms job that exits 0 while reporting ZERO metrics AND leaving ZERO
-# durable artifacts produced no usable result — the command silently no-op'd
-# (crashed before writing its result marker, mis-declared its metric, wrote to the
-# wrong path, etc.) yet the backend reports SUCCEEDED. Left as SUCCESS this
-# masquerades as a clean run and poisons the evidence/knowledge record. Detecting
-# the empty terminal lets the poller reclassify it as a FAILURE so the missing
-# result surfaces loudly. The arms sweep path is especially vulnerable: its
-# pre-flight metric assertion is deliberately skipped (see
-# _run_and_apply_preflight_smoke: declared_metric_for_smoke is None for arms).
+# A metric-or-arms job that exits 0 without fulfilling its declared result
+# contract produced no usable result — the command silently no-op'd (crashed
+# before writing its result marker, mis-declared its metric, wrote to the wrong
+# path, etc.) yet the backend reports SUCCEEDED. Incidental durable files (logs
+# and checkpoints) are preserved and linked, but are not evidence that the
+# declared metric or per-arm result was delivered. Detecting the unfulfilled
+# terminal lets the poller reclassify it as a FAILURE so the missing result
+# surfaces loudly. The arms sweep path is especially vulnerable: its pre-flight
+# metric assertion is deliberately skipped (see _run_and_apply_preflight_smoke:
+# declared_metric_for_smoke is None for arms).
 _NO_DATA_TERMINAL_REASON = (
-    "compute job exited 0 but reported no metrics and produced no durable "
-    "artifacts — no usable result"
+    "compute job exited 0 but never measured its declared result — no usable result"
 )
 
 # Seeded into polling_metadata["status_message"] at job-creation time (see the
@@ -1696,6 +1696,41 @@ def _status_has_no_reported_metrics(status: ComputeStatusResult) -> bool:
     """
     metrics = status.metrics
     return not isinstance(metrics, dict) or not metrics
+
+
+def _task_declares_arms(task: Task | None) -> bool:
+    """True when the task contract requires a per-arm result block."""
+    return bool((task.first_payload or {}).get("arms")) if task is not None else False
+
+
+def _arms_have_reported_data(job: ComputeJob, status: ComputeStatusResult) -> bool:
+    """Return whether an arms contract has any numeric per-arm result.
+
+    Use the same current-poll-or-sticky result source as the terminal metric
+    resolver. A flat metric or incidental artifact cannot fulfill an arms
+    contract: the success evaluator needs a numeric value inside an arm block.
+    """
+    result_metrics = (
+        status.metrics
+        if isinstance(status.metrics, dict) and status.metrics
+        else (job.polling_metadata or {}).get("result_metrics")
+    )
+    arms = result_metrics.get("arms") if isinstance(result_metrics, dict) else None
+    return isinstance(arms, dict) and any(
+        isinstance(arm, dict)
+        and any(_coerce_metric_number(value) is not None for value in arm.values())
+        for arm in arms.values()
+    )
+
+
+def _no_data_terminal_reason(artifact_reference: Any | None) -> str:
+    """Explain an unfulfilled result contract without discarding artifacts."""
+    if artifact_reference is None:
+        return _NO_DATA_TERMINAL_REASON
+    return (
+        f"{_NO_DATA_TERMINAL_REASON}; durable artifacts preserved "
+        f"(uri={artifact_reference.uri}, file_count={artifact_reference.file_count})"
+    )
 
 
 def _job_expects_data(job: ComputeJob, task: Task | None) -> bool:
@@ -2932,34 +2967,36 @@ async def _process_single_compute_job(
             and status.status == ComputeJobStatus.SUCCEEDED
             and _status_reports_no_usable_gpu(status)
         )
-        # A backend-reported SUCCEEDED for a job that DECLARED it would produce a
-        # metric (or is an arms sweep) yet reported ZERO metrics AND left ZERO
-        # durable artifacts is not a real success — the command silently no-op'd.
-        # Reclassify it as a FAILURE so the missing result surfaces loudly instead
-        # of finalizing as a clean, empty SUCCESS. Peer of the no_usable_gpu branch.
-        # Guarded by _job_expects_data so pure side-effect commands (no metric, no
-        # arms) are NOT false-rejected. Artifact detection is best-effort and never
-        # raises (collect_terminal_artifact_reference is fail-soft by contract).
+        # A backend-reported SUCCEEDED for a job that DECLARED a scalar metric or
+        # per-arm output but never fulfilled that contract is not a real success.
+        # Incidental durable files are preserved by _link_terminal_artifact, but
+        # cannot prove delivery: a log or checkpoint does not measure the declared
+        # result. Guarded by _job_expects_data so pure side-effect commands (no
+        # metric, no arms) are NOT false-rejected. Artifact detection remains
+        # best-effort and never raises (collect_terminal_artifact_reference is
+        # fail-soft by contract).
         #
         # For a job with a contract-declared SCALAR metric, defer to the precise
         # _declared_metric_unmeasured resolver, which mirrors the success-criterion
         # gate's FULL resolution (result file, per-arm block, stdout fallback, and
         # the sticky metric a PRIOR poll persisted). That prevents the coarse
         # current-poll metrics check from false-rejecting a run whose metric was
-        # only ever reported via stdout, inside an arm, or on an earlier poll. Jobs
-        # with no declared scalar metric (arms-only sweeps, criterion-only tasks)
-        # keep the original coarse no-data check.
+        # only ever reported via stdout, inside an arm, or on an earlier poll. An
+        # arms-only sweep instead requires at least one numeric per-arm result;
+        # a flat metric cannot fulfill that distinct contract.
+        declared_metric = _declared_progress_metric(job)
         no_data = (
             not timeout_like
             and not no_usable_gpu
             and status.status == ComputeJobStatus.SUCCEEDED
-            and _status_has_no_reported_metrics(status)
             and _job_expects_data(job, task)
             and (
-                _declared_progress_metric(job) is None
-                or _declared_metric_unmeasured(job, status)
+                (declared_metric is not None and _declared_metric_unmeasured(job, status))
+                or (_task_declares_arms(task) and not _arms_have_reported_data(job, status))
             )
-            and await collect_terminal_artifact_reference(job) is None
+        )
+        terminal_artifact_reference = (
+            await collect_terminal_artifact_reference(job) if no_data else None
         )
         if timeout_like or no_progress_like:
             outcome = ComputeJobOutcome.TIMED_OUT
@@ -2991,7 +3028,7 @@ async def _process_single_compute_job(
                     _NO_USABLE_GPU_TERMINAL_REASON
                     if no_usable_gpu
                     else (
-                        _NO_DATA_TERMINAL_REASON
+                        _no_data_terminal_reason(terminal_artifact_reference)
                         if no_data
                         else _resolve_terminal_reason(
                             status_message=status.message, outcome=outcome

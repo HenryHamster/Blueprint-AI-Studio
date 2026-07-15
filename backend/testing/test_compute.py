@@ -3926,6 +3926,15 @@ async def _run_no_data_guard_job(
     )
     meta = dict(job.polling_metadata or {})
     meta["preflight_smoke_done"] = True
+    declared_metric = task_payload.get("declared_metric")
+    criterion = task_payload.get("success_criterion")
+    if not declared_metric and isinstance(criterion, dict):
+        declared_metric = criterion.get("metric")
+    if isinstance(declared_metric, str) and declared_metric.strip():
+        # Production job creation stamps this launch-contract value. Mirror that
+        # durable declaration so the no-data harness exercises the precise
+        # terminal resolver rather than only task-payload fallback behavior.
+        meta["declared_metric"] = declared_metric.strip()
     job.polling_metadata = meta
     await db_session.commit()
 
@@ -4010,7 +4019,7 @@ async def test_process_compute_jobs_once_reclassifies_arms_no_data_as_failure(
         db_session,
         monkeypatch,
         task_payload={"type": "research", "arms": {"fp16": {"metric": "tflops"}}},
-        status_metrics=None,
+        status_metrics={"elapsed_seconds": 12.0},
         artifact_reference=None,
     )
     assert job.outcome == ComputeJobOutcome.FAILURE
@@ -4108,7 +4117,7 @@ async def test_no_declared_metric_metricless_still_success(db_session, monkeypat
 
 @pytest.mark.asyncio
 async def test_no_data_guard_respects_durable_artifacts(db_session, monkeypatch):
-    """A metric-less job that left a durable artifact is NOT a no-data failure."""
+    """Incidental artifacts do not fulfill an unmeasured declared metric."""
     reference = TerminalArtifactReference(
         uri="file:///tmp/artifacts",
         backend="local",
@@ -4119,10 +4128,37 @@ async def test_no_data_guard_respects_durable_artifacts(db_session, monkeypatch)
         db_session,
         monkeypatch,
         task_payload={"type": "research", "declared_metric": "val/loss"},
-        status_metrics=None,
+        status_metrics={"elapsed_seconds": 12.0},
         artifact_reference=reference,
     )
-    assert job.outcome == ComputeJobOutcome.SUCCESS
+    assert job.outcome == ComputeJobOutcome.FAILURE
+    assert "never measured its declared result" in (job.terminal_reason or "")
+    assert "durable artifacts preserved" in (job.terminal_reason or "")
+    assert "uri=file:///tmp/artifacts" in (job.terminal_reason or "")
+    assert "file_count=3" in (job.terminal_reason or "")
+
+
+@pytest.mark.asyncio
+async def test_no_data_guard_reclassifies_arms_with_incidental_artifact(
+    db_session, monkeypatch
+):
+    """An arms job needs per-arm data; a stray artifact must not rescue SUCCESS."""
+    reference = TerminalArtifactReference(
+        uri="file:///tmp/arms-checkpoint",
+        backend="local",
+        file_count=1,
+        total_size_bytes=512,
+    )
+    job = await _run_no_data_guard_job(
+        db_session,
+        monkeypatch,
+        task_payload={"type": "research", "arms": {"fp16": {"metric": "tflops"}}},
+        status_metrics={"elapsed_seconds": 12.0},
+        artifact_reference=reference,
+    )
+    assert job.outcome == ComputeJobOutcome.FAILURE
+    assert "never measured its declared result" in (job.terminal_reason or "")
+    assert "uri=file:///tmp/arms-checkpoint" in (job.terminal_reason or "")
 
 
 @pytest.mark.asyncio
