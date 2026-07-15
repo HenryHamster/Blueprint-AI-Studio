@@ -16579,6 +16579,10 @@ def test_evaluate_hotfix_scope_pure_predicate():
     v = hotfix_policy.evaluate_hotfix_scope(["backend/app/release_scoring.py"])
     assert v.eligible is True
 
+    # The scope validator must be able to repair its own allowlist.
+    v = hotfix_policy.evaluate_hotfix_scope(["backend/app/hotfix_policy.py"])
+    assert v.eligible is True
+
     # Product file → ineligible.
     v = hotfix_policy.evaluate_hotfix_scope(
         ["backend/app/release_scoring.py", "backend/app/compute_jobs.py"]
@@ -19681,8 +19685,12 @@ class TestFinalizeInfraFailure:
 
 
     @pytest.mark.asyncio
-    async def test_permanent_gate_incapacity_classification(self, db_session):
-        """3 consecutive gate errors stay identical despite child diagnostics."""
+    async def test_permanent_gate_incapacity_recommends_hotfix_channel_when_eligible(
+        self, db_session, mocker
+    ):
+        """3 consecutive same-signature migration_apply_check_unavailable errors
+        classify as permanent gate-incapacity and recommend the eligible narrow
+        hotfix channel, not force-promote."""
         from app import release_qualifier_audit as rqa
 
         project, version = await _make_project_and_version(db_session)
@@ -19712,6 +19720,19 @@ class TestFinalizeInfraFailure:
         db_session.add(version)
         await db_session.commit()
         await db_session.refresh(version)
+        preview_mock = mocker.patch(
+            "app.release_qualifier.check_hotfix_scope_preview",
+            new=AsyncMock(
+                return_value={
+                    "status": "eligible",
+                    "eligible": True,
+                    "reason": "all changed files are hotfix-eligible",
+                    "offending_files": [],
+                    "candidate_sha": "dead" * 10,
+                    "prior_deployed_sha": "beef" * 10,
+                }
+            ),
+        )
 
         result = await rqa._handle_infra_failure(
             db_session,
@@ -19724,10 +19745,15 @@ class TestFinalizeInfraFailure:
         assert result["status"] == "infra_failure"
         assert result["is_permanent_gate_incapacity"] is True
         assert result["same_signature_streak"] == 3
+        assert result["hotfix_scope_preview"]["eligible"] is True
+        preview_mock.assert_awaited_once_with(
+            db_session, project.id, candidate_sha="dead" * 10
+        )
 
         await db_session.refresh(version)
 
-        # Verify a force-promote Alert was raised with the right message.
+        # The persisted alert gives the operator the narrow endpoint, rather
+        # than authorizing the entire candidate tree through force-promote.
         alerts = (
             (await db_session.execute(
                 select(Alert).where(
@@ -19741,11 +19767,201 @@ class TestFinalizeInfraFailure:
         assert len(alerts) >= 1
         latest = alerts[-1]
         assert "persistently incapable" in latest.message
-        assert "hotfix scope" in latest.message
-        assert "promote/hotfix" in latest.message
-        assert "whole-tree force-promotion" in latest.message
+        assert "POST /projects/{id}/promote/hotfix" in latest.message
+        assert "force-promote" not in latest.message
         assert "agent VM" not in latest.message
         assert "clone pipeline" not in latest.message
+
+    @pytest.mark.asyncio
+    async def test_permanent_gate_incapacity_holds_when_hotfix_scope_is_ineligible(
+        self, db_session, mocker
+    ):
+        """3 consecutive same-signature migration_apply errors classify as
+        permanent gate-incapacity, but an INELIGIBLE hotfix scope preview must
+        keep the release held and surface the not-eligible reason clause in BOTH
+        the persisted alert and the operator notification."""
+        from app import release_qualifier_audit as rqa
+
+        project, version = await _make_project_and_version(db_session)
+        sig = "migration_apply:unknown:migration_apply_check_unavailable"
+        same_entry = {
+            "finalized_at": "2026-07-10T00:00:00",
+            "error": "migration_apply_check_unavailable",
+            "signature": sig,
+            "candidate_sha": "dead" * 10,
+            "failing_leg": "migration_apply",
+            "child_failures": [],
+        }
+        version.last_qualification = {
+            "status": "pending",
+            "candidate_sha": "dead" * 10,
+            "ci_green": True,
+            "smoketest_enabled": False,
+            "started_at": "2026-07-10T00:00:00",
+            "audit_task_id": None,
+            "smoketest_task_id": None,
+            "prior_infra_streak": 2,
+            "infra_attempt_history": [
+                dict(same_entry, finalized_at="2026-07-10T00:00:00"),
+                dict(same_entry, finalized_at="2026-07-10T00:01:00"),
+            ],
+        }
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+        preview_mock = mocker.patch(
+            "app.release_qualifier.check_hotfix_scope_preview",
+            new=AsyncMock(
+                return_value={
+                    "status": "ineligible",
+                    "eligible": False,
+                    "reason": "changed files touch code outside migrations",
+                    "offending_files": ["app/main.py"],
+                    "candidate_sha": "dead" * 10,
+                    "prior_deployed_sha": "beef" * 10,
+                }
+            ),
+        )
+        notify_mock = mocker.patch(
+            "app.release_qualifier._notify_operator", new=AsyncMock()
+        )
+
+        result = await rqa._handle_infra_failure(
+            db_session,
+            version,
+            dict(version.last_qualification),
+            "migration_apply_check_unavailable",
+        )
+        await db_session.commit()
+
+        assert result["status"] == "infra_failure"
+        assert result["is_permanent_gate_incapacity"] is True
+        assert result["same_signature_streak"] == 3
+        assert result["hotfix_scope_preview"]["eligible"] is False
+        preview_mock.assert_awaited_once_with(
+            db_session, project.id, candidate_sha="dead" * 10
+        )
+
+        await db_session.refresh(version)
+
+        # An ineligible candidate is held rather than being routed through a
+        # whole-tree qualification bypass.
+        alerts = (
+            (await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.severity == "WARNING",
+                )
+            ))
+            .scalars()
+            .all()
+        )
+        assert len(alerts) >= 1
+        latest = alerts[-1]
+        assert "persistently incapable" in latest.message
+        assert "force-promote" not in latest.message
+        assert "POST /projects/{id}/promote/hotfix" in latest.message
+        assert "keep the release held" in latest.message
+        assert "not eligible" in latest.message
+        assert "changed files touch code outside migrations" in latest.message
+
+        # The operator notification carries the same fail-closed guidance.
+        notify_mock.assert_awaited()
+        notify_message = notify_mock.await_args.args[3]
+        assert "hotfix scope is not eligible" in notify_message
+        assert "POST /projects/{id}/promote/hotfix" in notify_message
+        assert "Keep the release held" in notify_message
+        assert "force-promote" not in notify_message
+        assert "changed files touch code outside migrations" in notify_message
+
+    @pytest.mark.asyncio
+    async def test_permanent_gate_incapacity_holds_when_hotfix_preview_is_unavailable(
+        self, db_session, mocker
+    ):
+        """When check_hotfix_scope_preview raises, the preview-unavailable path
+        must keep the release held and surface the 'unavailable' status clause
+        rather than authorizing a whole-tree qualification bypass."""
+        from app import release_qualifier_audit as rqa
+
+        project, version = await _make_project_and_version(db_session)
+        sig = "migration_apply:unknown:migration_apply_check_unavailable"
+        same_entry = {
+            "finalized_at": "2026-07-10T00:00:00",
+            "error": "migration_apply_check_unavailable",
+            "signature": sig,
+            "candidate_sha": "dead" * 10,
+            "failing_leg": "migration_apply",
+            "child_failures": [],
+        }
+        version.last_qualification = {
+            "status": "pending",
+            "candidate_sha": "dead" * 10,
+            "ci_green": True,
+            "smoketest_enabled": False,
+            "started_at": "2026-07-10T00:00:00",
+            "audit_task_id": None,
+            "smoketest_task_id": None,
+            "prior_infra_streak": 2,
+            "infra_attempt_history": [
+                dict(same_entry, finalized_at="2026-07-10T00:00:00"),
+                dict(same_entry, finalized_at="2026-07-10T00:01:00"),
+            ],
+        }
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+        preview_mock = mocker.patch(
+            "app.release_qualifier.check_hotfix_scope_preview",
+            new=AsyncMock(side_effect=RuntimeError("scope preview backend down")),
+        )
+        notify_mock = mocker.patch(
+            "app.release_qualifier._notify_operator", new=AsyncMock()
+        )
+
+        result = await rqa._handle_infra_failure(
+            db_session,
+            version,
+            dict(version.last_qualification),
+            "migration_apply_check_unavailable",
+        )
+        await db_session.commit()
+
+        assert result["status"] == "infra_failure"
+        assert result["is_permanent_gate_incapacity"] is True
+        assert result["same_signature_streak"] == 3
+        # A failed preview is recorded as not-eligible so it cannot become a
+        # silent hotfix authorization.
+        assert result["hotfix_scope_preview"]["eligible"] is False
+        preview_mock.assert_awaited_once_with(
+            db_session, project.id, candidate_sha="dead" * 10
+        )
+
+        await db_session.refresh(version)
+
+        alerts = (
+            (await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.severity == "WARNING",
+                )
+            ))
+            .scalars()
+            .all()
+        )
+        assert len(alerts) >= 1
+        latest = alerts[-1]
+        assert "persistently incapable" in latest.message
+        assert "force-promote" not in latest.message
+        assert "POST /projects/{id}/promote/hotfix" in latest.message
+        assert "keep the release held" in latest.message
+        assert "not eligible" in latest.message
+
+        notify_mock.assert_awaited()
+        notify_message = notify_mock.await_args.args[3]
+        assert "hotfix scope is not eligible" in notify_message
+        assert "POST /projects/{id}/promote/hotfix" in notify_message
+        assert "Keep the release held" in notify_message
+        assert "force-promote" not in notify_message
 
     @pytest.mark.asyncio
     async def test_permanent_gate_incapacity_resets_on_different_signature(

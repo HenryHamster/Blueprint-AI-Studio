@@ -928,6 +928,53 @@ async def _handle_infra_failure(
             same_signature_streak >= _MIN_INFRA_ERROR_STREAK
         )
 
+    # A permanent migration-apply incapacity is a release-machinery problem,
+    # not evidence that the complete candidate tree is safe to ship.  Ask the
+    # existing, candidate-pinned preview whether the narrow hotfix lane can
+    # carry the gate repair instead.  This is deliberately best-effort: a
+    # GitHub/credential failure must never prevent the qualifier from recording
+    # its infra-failure hold.
+    _rq = _release_qualifier_module()
+    hotfix_scope_preview: dict[str, Any] | None = None
+    if is_permanent_gate_incapacity:
+        candidate_sha = qual.get("candidate_sha")
+        if not candidate_sha:
+            hotfix_scope_preview = {
+                "status": "preview_unavailable",
+                "eligible": False,
+                "detail": "qualification did not retain a candidate SHA",
+            }
+        else:
+            try:
+                preview = await _rq.check_hotfix_scope_preview(
+                    session, version.project_id, candidate_sha=candidate_sha
+                )
+                hotfix_scope_preview = {
+                    key: preview[key]
+                    for key in (
+                        "status",
+                        "eligible",
+                        "reason",
+                        "offending_files",
+                        "candidate_sha",
+                        "prior_deployed_sha",
+                        "detail",
+                    )
+                    if key in preview
+                }
+            except Exception as exc:  # noqa: BLE001 -- escalation remains non-fatal
+                logger.warning(
+                    "[RELEASE_QUALIFIER] hotfix scope preview failed during "
+                    "permanent gate-incapacity escalation: %s",
+                    exc,
+                )
+                hotfix_scope_preview = {
+                    "status": "preview_unavailable",
+                    "eligible": False,
+                    "detail": f"{type(exc).__name__}: {exc}"[:300],
+                    "candidate_sha": candidate_sha,
+                }
+
     infra_evidence = {
         "error": infra_error,
         "signature": signature,
@@ -940,6 +987,8 @@ async def _handle_infra_failure(
         "attempt": attempt_entry,
         "attempt_history": attempt_history,
     }
+    if hotfix_scope_preview is not None:
+        infra_evidence["hotfix_scope_preview"] = hotfix_scope_preview
 
     # Per-dimension failure isolation (Phase 1): infer WHICH dimension the infra
     # failure belongs to so only that (candidate_sha, dimension) ledger fact is
@@ -972,6 +1021,8 @@ async def _handle_infra_failure(
         "audit_challenge_spawn_error": qual.get("audit_challenge_spawn_error"),
         "smoketest_task_id": qual.get("smoketest_task_id"),
     }
+    if hotfix_scope_preview is not None:
+        record["hotfix_scope_preview"] = hotfix_scope_preview
     version.last_qualification = record
     flag_modified(version, "last_qualification")
     release_version.set_version_phase(
@@ -993,7 +1044,6 @@ async def _handle_infra_failure(
     # Skip when failing_dimension is None (e.g. ledger-integrity codes) — there
     # is no single dimension to blame and writing 'audit' would overwrite a
     # legitimately-resolved audit fact.
-    _rq = _release_qualifier_module()
     dimension_infra_streak = (
         await _rq._record_infra_dimension_unavailable(
             session,
@@ -1006,22 +1056,6 @@ async def _handle_infra_failure(
         if failing_dimension is not None
         else None
     )
-
-    hotfix_preview: dict[str, Any] | None = None
-    if is_permanent_gate_incapacity:
-        # Make the sanctioned remediation concrete at the point incapacity is
-        # declared.  This is read-only and deliberately best-effort: inability
-        # to preview must not turn a held release into a promotion.
-        try:
-            hotfix_preview = await _release_qualifier_module().check_hotfix_scope_preview(
-                session, version.project_id, candidate_sha=qual.get("candidate_sha")
-            )
-        except Exception:  # noqa: BLE001 — remediation guidance is best-effort
-            logger.warning(
-                "[RELEASE_QUALIFIER] hotfix scope preview failed for v%d",
-                version.version_number,
-                exc_info=True,
-            )
 
     # Phase 1b read: compose already-resolved dimension facts from the per-dimension
     # ledger into the record and verdict sub_scores, so a passed audit/CI/etc. is
@@ -1055,21 +1089,26 @@ async def _handle_infra_failure(
         and current_streak % _MIN_INFRA_ERROR_STREAK == 0
     ):
         if is_permanent_gate_incapacity:
-            preview_text = (
-                f"Eligible narrow diff: {hotfix_preview.get('changed_files', [])}. "
-                if hotfix_preview and hotfix_preview.get("eligible")
-                else "Hotfix scope preview unavailable or ineligible; inspect it before acting. "
-            )
-            alert_message = (
-                f"The migration-apply gate for v{version.version_number} is "
-                f"persistently incapable across {same_signature_streak} "
-                f"same-signature attempts ({infra_error!r}) — the underlying "
-                f"condition will not self-resolve by retry. Sanctioned "
-                f"{preview_text}Sanctioned remediation: use the hotfix scope "
-                f"preview and approved hotfix endpoint (POST /projects/{{id}}/promote/hotfix), "
-                f"not whole-tree force-promotion. "
-                f"Signature: {signature}."
-            )
+            if hotfix_scope_preview and hotfix_scope_preview.get("eligible"):
+                alert_message = (
+                    f"The migration-apply gate for v{version.version_number} is "
+                    f"persistently incapable across {same_signature_streak} "
+                    f"same-signature attempts ({infra_error!r}). The failed "
+                    f"candidate is eligible for the narrow sanctioned remediation: "
+                    f"POST /projects/{{id}}/promote/hotfix. Signature: {signature}."
+                )
+            else:
+                alert_message = (
+                    f"The migration-apply gate for v{version.version_number} is "
+                    f"persistently incapable across {same_signature_streak} "
+                    f"same-signature attempts ({infra_error!r}) — the underlying "
+                    f"condition will not self-resolve by retry. Hotfix scope is "
+                    f"not eligible ({(hotfix_scope_preview or {}).get('reason') or (hotfix_scope_preview or {}).get('status', 'unavailable')}); "
+                    f"keep the release held. Prepare a corrected narrow candidate "
+                    f"for POST /projects/{{id}}/promote/hotfix, or repair the "
+                    f"qualification path and re-queue normal qualification. "
+                    f"Signature: {signature}."
+                )
         else:
             alert_message = (
                 f"The release qualifier for v{version.version_number} has "
@@ -1101,22 +1140,25 @@ async def _handle_infra_failure(
             infra_error,
         )
 
-    rq = _release_qualifier_module()
     if is_permanent_gate_incapacity:
-        preview_text = (
-            f" Eligible narrow diff: {hotfix_preview.get('changed_files', [])}."
-            if hotfix_preview and hotfix_preview.get("eligible")
-            else " Hotfix scope preview is unavailable or ineligible; do not force-promote."
-        )
-        notify_message = (
-            f"v{version.version_number} migration-apply gate is persistently "
-            f"incapable across {same_signature_streak} same-signature attempts "
-            f"({infra_error.replace('_', ' ')}) — the underlying condition "
-            f"will not self-resolve by retry. "
-            f"Use the sanctioned hotfix scope preview and endpoint "
-            f"(POST /projects/{{id}}/promote/hotfix), not whole-tree force-promotion."
-            f"{preview_text}"
-        )
+        if hotfix_scope_preview and hotfix_scope_preview.get("eligible"):
+            notify_message = (
+                f"v{version.version_number} migration-apply gate is persistently "
+                f"incapable across {same_signature_streak} same-signature attempts "
+                f"({infra_error.replace('_', ' ')}) — the failed candidate is "
+                f"eligible for the narrow sanctioned remediation: POST "
+                f"/projects/{{id}}/promote/hotfix."
+            )
+        else:
+            notify_message = (
+                f"v{version.version_number} migration-apply gate is persistently "
+                f"incapable across {same_signature_streak} same-signature attempts "
+                f"({infra_error.replace('_', ' ')}) — hotfix scope is not eligible "
+                f"({(hotfix_scope_preview or {}).get('reason') or (hotfix_scope_preview or {}).get('status', 'unavailable')}). "
+                f"Keep the release held. Prepare a corrected narrow candidate for "
+                f"POST /projects/{{id}}/promote/hotfix, or repair the qualification "
+                f"path and re-queue normal qualification."
+            )
     else:
         notify_message = (
             f"v{version.version_number} qualifier infrastructure failure — "
@@ -1125,7 +1167,7 @@ async def _handle_infra_failure(
             f"re-qualification. Consecutive infra errors: {current_streak}. "
             f"Signature: {signature}; same as previous: {same_error_as_prior}."
         )
-    await rq._notify_operator(
+    await _rq._notify_operator(
         session,
         version,
         "release_infra_failure",
@@ -1139,11 +1181,12 @@ async def _handle_infra_failure(
             "consecutive_infra_errors": current_streak,
             "is_permanent_gate_incapacity": is_permanent_gate_incapacity,
             "same_signature_streak": same_signature_streak,
+            "hotfix_scope_preview": hotfix_scope_preview,
         },
     )
 
     _webhook_task = asyncio.ensure_future(
-        rq.dispatch_external_notification(
+        _rq.dispatch_external_notification(
             version.project_id,
             "RELEASE_INFRA_FAILURE",
             {
@@ -1157,6 +1200,7 @@ async def _handle_infra_failure(
                 "consecutive_infra_errors": current_streak,
                 "is_permanent_gate_incapacity": is_permanent_gate_incapacity,
                 "same_signature_streak": same_signature_streak,
+                "hotfix_scope_preview": hotfix_scope_preview,
             },
         )
     )
@@ -1190,6 +1234,7 @@ async def _handle_infra_failure(
         "consecutive_infra_errors": current_streak,
         "is_permanent_gate_incapacity": is_permanent_gate_incapacity,
         "same_signature_streak": same_signature_streak,
+        "hotfix_scope_preview": hotfix_scope_preview,
         # Per-dimension isolation (Phase 1): which single dimension was marked
         # unavailable, and that dimension's own infra-error streak (distinct from
         # the attempt-level ``consecutive_infra_errors`` above).

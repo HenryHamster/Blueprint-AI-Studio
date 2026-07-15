@@ -50,6 +50,9 @@ HOTFIX_ELIGIBLE_MODULES: frozenset[str] = frozenset(
         "backend/app/acceptance_gate.py",
         "backend/app/category_verdict_ledger.py",
         "backend/app/qualification_state_resolver.py",
+        # The scope validator itself must be hotfixable so the channel can
+        # repair its own authorization surface.
+        "backend/app/hotfix_policy.py",
         # main.py is allowlisted but GUARDED: a diff that alters
         # EXPECTED_SCHEMA_REVISION is rejected below (a revision bump without the
         # matching migration deployed wedges boot).
