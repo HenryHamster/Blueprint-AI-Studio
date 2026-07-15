@@ -6649,6 +6649,65 @@ class TestBootDiskType:
         # Disk zone must track the machine-type zone (same insert target).
         assert f"zones/{captured['zone']}/" in captured["machine_type"]
 
+    async def test_ssd_quota_retries_same_zone_with_pd_standard(
+        self, monkeypatch, clean_zone_health
+    ):
+        inserts = []
+
+        def _capture_insert(*args, **kwargs):
+            inst = kwargs["instance_resource"]
+            inserts.append(
+                {
+                    "zone": kwargs["zone"],
+                    "disk_type": inst.disks[0].initialize_params.disk_type,
+                }
+            )
+            op = MagicMock()
+            op.name = f"op-disk-fallback-{len(inserts)}"
+            if len(inserts) == 1:
+                op.result.side_effect = Exception(
+                    "403 FORBIDDEN QUOTA_EXCEEDED: Quota 'SSD_TOTAL_GB' exceeded"
+                )
+            return op
+
+        async def _ok(*args, **kwargs):
+            return True
+
+        async def _noop(*args, **kwargs):
+            return None
+
+        monkeypatch.setattr(compute, "_acquire_provision_slot", _ok)
+        monkeypatch.setattr(compute, "_release_provision_slot", _noop)
+
+        with patch("google.cloud.compute_v1.InstancesClient") as mock_client:
+            mock_client.return_value.get.side_effect = Exception("404 was not found")
+            mock_client.return_value.insert.side_effect = _capture_insert
+
+            result = await compute._provision_gcp(
+                "vm-disktype-fallback-test",
+                uuid.uuid4(),
+                secret_version_name="projects/p/secrets/s/versions/1",
+            )
+
+        assert result is True
+        assert len(inserts) == 2
+        assert inserts[0]["zone"] == inserts[1]["zone"]
+        assert inserts[0]["disk_type"].endswith("/diskTypes/pd-balanced")
+        assert inserts[1]["disk_type"].endswith("/diskTypes/pd-standard")
+
+
+@pytest.mark.parametrize(
+    "message,expected",
+    [
+        ("Quota 'SSD_TOTAL_GB' exceeded", True),
+        ("quota SSD-TOTAL-GB exhausted", True),
+        ("Quota CPUS exceeded", False),
+        ("ZONE_RESOURCE_POOL_EXHAUSTED", False),
+    ],
+)
+def test_is_ssd_boot_disk_quota_exhaustion(message, expected):
+    assert compute._is_ssd_boot_disk_quota_exhaustion(message) is expected
+
 
 @pytest.mark.asyncio
 async def test_get_recent_terminal_compute_spend_terminal_only_and_windowed(db_session):
