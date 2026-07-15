@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app import compute_jobs
 from app.compute_backends import (
     PROGRESS_FILE_ENV,
+    RUNNER_SUBPROCESS_BACKEND_NAME,
     _build_container_run_prefix,
     _build_local_wrapper_command,
     ComputeCostResult,
@@ -34,12 +35,14 @@ from app.compute_backends import (
 from app.compute_jobs import (
     NO_PROGRESS_TERMINAL_REASON,
     COMPUTE_JOB_NO_PROGRESS_GRACE_SECONDS,
+    RUNNER_SILENT_TIMEOUT_SECONDS,
     _WATCHDOG_STATUS_META_KEY,
     _apply_watchdog_metric_mismatch_marker,
     _no_progress_stalled,
     _watchdog_metric_name_mismatch,
     append_progress_sample,
 )
+from app.reaper_sweeps import sweep_silent_runner_compute_jobs
 from app.database import resolve_async_engine
 from app.models import (
     ComputeJobOutcome,
@@ -782,3 +785,117 @@ async def test_process_once_surfaces_metric_name_mismatch_without_killing(
     assert marker["state"] == "inert_metric_name_mismatch"
     assert marker["declared_metric"] == "val/loss"
     assert marker["observed_metrics"] == ["train/loss"]
+
+
+# ---------------------------------------------------------------------------
+# ── SILENT RUNNER SWEEP (Step 22f) ───────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sweep_reaps_runner_job_with_stale_heartbeat(db_session):
+    """A RUNNING runner-subprocess job with stale last_heartbeat_at is
+    finalized as TIMED_OUT with terminal_kind 'runner_died_silently'."""
+    task = await _setup_task(db_session)
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python train.py",
+        spend_cap_usd=1.0,
+        deadline_seconds=86400,
+    )
+    now = _utcnow()
+    job.backend = RUNNER_SUBPROCESS_BACKEND_NAME
+    job.status = ComputeJobStatus.RUNNING
+    job.started_at = now - timedelta(hours=2)
+    job.last_heartbeat_at = now - timedelta(seconds=RUNNER_SILENT_TIMEOUT_SECONDS + 60)
+    await db_session.commit()
+
+    finalized = await sweep_silent_runner_compute_jobs(db_session, now=now)
+
+    assert finalized == 1
+    await db_session.refresh(job)
+    assert job.status == ComputeJobStatus.TIMED_OUT
+    assert job.outcome == ComputeJobOutcome.TIMED_OUT
+    assert (job.polling_metadata or {}).get("terminal_kind") == "runner_died_silently"
+    assert (job.terminal_reason or "") == "runner_died_silently"
+
+
+@pytest.mark.asyncio
+async def test_sweep_skips_recently_heartbeating_runner_job(db_session):
+    """A RUNNING runner-subprocess job with a recent last_heartbeat_at is
+    left untouched by the sweep."""
+    task = await _setup_task(db_session)
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python train.py",
+        spend_cap_usd=1.0,
+        deadline_seconds=86400,
+    )
+    now = _utcnow()
+    job.backend = RUNNER_SUBPROCESS_BACKEND_NAME
+    job.status = ComputeJobStatus.RUNNING
+    job.started_at = now - timedelta(hours=2)
+    job.last_heartbeat_at = now - timedelta(seconds=60)
+    await db_session.commit()
+
+    finalized = await sweep_silent_runner_compute_jobs(db_session, now=now)
+
+    assert finalized == 0
+    await db_session.refresh(job)
+    assert job.status == ComputeJobStatus.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_sweep_skips_non_runner_backends(db_session):
+    """Non-runner-subprocess jobs (GCP, local) with stale heartbeats are
+    not touched by the sweep."""
+    task = await _setup_task(db_session)
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python train.py",
+        spend_cap_usd=1.0,
+        deadline_seconds=86400,
+    )
+    now = _utcnow()
+    # Set backend to something that is NOT runner-subprocess
+    job.backend = "gcp"
+    job.status = ComputeJobStatus.RUNNING
+    job.started_at = now - timedelta(hours=2)
+    job.last_heartbeat_at = now - timedelta(seconds=RUNNER_SILENT_TIMEOUT_SECONDS + 60)
+    await db_session.commit()
+
+    finalized = await sweep_silent_runner_compute_jobs(db_session, now=now)
+
+    assert finalized == 0
+    await db_session.refresh(job)
+    assert job.status == ComputeJobStatus.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_sweep_skips_non_running_runner_jobs(db_session):
+    """Runner-subprocess jobs in non-RUNNING statuses (STARTING, SUCCEEDED)
+    with stale heartbeats are not touched by the sweep."""
+    for initial_status in (ComputeJobStatus.STARTING, ComputeJobStatus.SUCCEEDED):
+        task = await _setup_task(db_session)
+        job = await compute_jobs.create_compute_job(
+            db_session,
+            task,
+            command="python train.py",
+            spend_cap_usd=1.0,
+            deadline_seconds=86400,
+        )
+        now = _utcnow()
+        job.backend = RUNNER_SUBPROCESS_BACKEND_NAME
+        job.status = initial_status
+        job.started_at = now - timedelta(hours=2)
+        job.last_heartbeat_at = now - timedelta(seconds=RUNNER_SILENT_TIMEOUT_SECONDS + 60)
+        await db_session.commit()
+
+        finalized = await sweep_silent_runner_compute_jobs(db_session, now=now)
+
+        assert finalized == 0
+        await db_session.refresh(job)
+        assert job.status == initial_status

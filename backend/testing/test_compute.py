@@ -21698,6 +21698,50 @@ async def test_compute_job_resume_rejects_bundleless_input_artifact(
 
 
 @pytest.mark.asyncio
+async def test_compute_job_resume_rejects_non_terminal_source(db_session, monkeypatch):
+    """A still-RUNNING or POLLING predecessor is refused as a resume source.
+
+    Resuming from a non-terminal job risks rehydrating a partial/mid-checkpoint
+    bundle — the design doc flags this as 'infinite chaining of dead runs'.
+    """
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    task = await _make_compute_task(db_session)
+
+    for non_terminal_status in (
+        ComputeJobStatus.RUNNING,
+        ComputeJobStatus.POLLING,
+        ComputeJobStatus.QUEUED,
+        ComputeJobStatus.STARTING,
+    ):
+        job = ComputeJob(
+            project_id=task.project_id,
+            backend=compute_backends_module.RUNNER_SUBPROCESS_BACKEND_NAME,
+            machine_type="e2-standard-2",
+            status=non_terminal_status,
+            accrued_cost_usd=0.0,
+            result_reference=storage.compute_job_artifact_uri(uuid.uuid4()),
+        )
+        db_session.add(job)
+        await db_session.commit()
+        await db_session.refresh(job)
+
+        with pytest.raises(compute_jobs.ComputeLaunchPreconditionFailed) as exc:
+            await compute_jobs.create_compute_job(
+                db_session,
+                task,
+                command="python train.py",
+                machine_type="e2-standard-2",
+                spend_cap_usd=1.0,
+                deadline_seconds=300,
+                input_artifact_job_id=str(job.id),
+            )
+        assert exc.value.detail["error"] == "input_artifact_job_not_terminal", (
+            f"expected rejection for status={non_terminal_status}"
+        )
+        assert exc.value.detail["source_status"] == non_terminal_status.value
+
+
+@pytest.mark.asyncio
 async def test_gcp_startup_script_hydrates_input_artifact_bundle(monkeypatch):
     """When a resume source is set, GcpComputeBackend.launch mints a download
     signed URL and the startup script pulls + extracts the predecessor bundle

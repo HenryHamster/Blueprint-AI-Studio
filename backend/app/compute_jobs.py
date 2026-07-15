@@ -222,6 +222,13 @@ _PROGRESS_SERIES_MAX_SAMPLES = 50
 # _finalize_terminal_job so the disposition is distinct from a wall-clock expiry.
 NO_PROGRESS_TERMINAL_REASON = "no_progress"
 
+# Runner-subprocess silent-death timeout. A runner is expected to heartbeat
+# every ~60s; after this many seconds without a heartbeat the job is reaped
+# as a silent orphan, freeing the project concurrency slot and spend ceiling.
+RUNNER_SILENT_TIMEOUT_SECONDS = int(
+    os.getenv("COMPUTE_JOB_RUNNER_SILENT_TIMEOUT_SECONDS", "600")
+)
+
 
 def append_progress_sample(
     meta: dict, *, metric: str, value: float, t: str
@@ -352,6 +359,24 @@ async def _resolve_resume_source_job_id(
                     "cross-project checkpoint resume is refused"
                 ),
                 "input_artifact_job_id": str(parsed),
+            }
+        )
+    _source_status = (
+        source.status
+        if isinstance(source.status, ComputeJobStatus)
+        else ComputeJobStatus(source.status)
+    )
+    if _source_status not in _COMPUTE_JOB_TERMINAL_STATUSES:
+        raise ComputeLaunchPreconditionFailed(
+            {
+                "error": "input_artifact_job_not_terminal",
+                "message": (
+                    f"input_artifact_job_id {parsed} is still {_source_status.value} — "
+                    "resuming from a non-terminal job risks rehydrating a "
+                    "partial/mid-checkpoint bundle"
+                ),
+                "input_artifact_job_id": str(parsed),
+                "source_status": _source_status.value,
             }
         )
     if not _compute_job_has_durable_bundle(source):
@@ -1796,6 +1821,71 @@ async def _apply_operator_kill_result(
     await session.commit()
     await session.refresh(live)
     return live
+
+
+async def finalize_orphan_runner_job(
+    session, job: ComputeJob, *, now
+) -> bool:
+    """Drive a silently-dead runner-subprocess job to TIMED_OUT.
+
+    Re-locks the job (FOR UPDATE), validates it is still RUNNING with
+    backend=runner-subprocess and that the heartbeat is still stale
+    (the lock serializes with any concurrent /report that refreshes
+    ``last_heartbeat_at`` while the persisted status remains RUNNING),
+    drives it to TIMED_OUT with terminal_kind ``"runner_died_silently"``,
+    records terminal-reason history, links durable artifacts, persists
+    viewable files, fires the compute-job-terminal wake, and commits.
+
+    Returns True if the job was finalized; False if it was already
+    terminal, no longer a runner-subprocess job, or the heartbeat is
+    now fresh (lock-time race).
+    """
+    live = await _lock_compute_job(session, job.id)
+    if live is None or live.status in _COMPUTE_JOB_TERMINAL_STATUSES:
+        await session.commit()
+        return False
+    if live.backend != RUNNER_SUBPROCESS_BACKEND_NAME:
+        await session.commit()
+        return False
+
+    # Re-check heartbeat staleness under the lock.  A concurrent /report
+    # (which refreshes last_heartbeat_at while keeping the status RUNNING)
+    # may have committed between the initial SELECT (without FOR UPDATE)
+    # and this lock.  With populate_existing=True the row above reflects
+    # the latest committed state: if the heartbeat is now fresh the job is
+    # still healthy and must not be terminalized.
+    stale_cutoff = now - timedelta(seconds=RUNNER_SILENT_TIMEOUT_SECONDS)
+    hb = live.last_heartbeat_at
+    if hb is not None:
+        if hb >= stale_cutoff:
+            await session.commit()
+            return False
+    elif live.started_at is None or live.started_at >= stale_cutoff:
+        await session.commit()
+        return False
+
+    terminal_reason = "runner_died_silently"
+    _finalize_terminal_job(
+        live,
+        status=ComputeJobStatus.TIMED_OUT,
+        outcome=ComputeJobOutcome.TIMED_OUT,
+        terminal_reason=terminal_reason,
+        now=now,
+        terminal_kind="runner_died_silently",
+    )
+    _record_terminal_reason_history(session, live)
+    await _link_terminal_artifact(session, live)
+    await persist_viewable_files_for_job(session, live)
+    if live.task_id is not None:
+        from app.task_lifecycle import fire_task_wakes
+
+        await fire_task_wakes(
+            session,
+            wake_source_kind=COMPUTE_JOB_TERMINAL_WAKE_KIND,
+            wake_source_ref=str(live.id),
+        )
+    await session.commit()
+    return True
 
 
 async def list_compute_jobs(

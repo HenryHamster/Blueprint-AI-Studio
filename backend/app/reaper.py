@@ -308,6 +308,7 @@ from app.reaper_sweeps import (
     sweep_refresh_project_compute_images,
     sweep_stranded_runner_subprocess_compute_jobs,
     sweep_proof_earn_loop,
+    sweep_silent_runner_compute_jobs,
     _sweep_strategic_cycle_starvation,
 )
 from app.acceptance_gate import backfill_acceptance_verdicts
@@ -3242,6 +3243,27 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(
                         f"[REAPER] Moot pending-confirmation sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 22f: Silent runner compute-job sweep — reap runner-subprocess
+                # jobs whose runner process died (SIGKILL / host reboot) without self-
+                # reporting, freeing the project's concurrency slot and spend ceiling
+                # instead of letting them burn the full wall-clock deadline doing zero
+                # work. Wrapped so it can never crash the cycle.
+                _mark_reaper_progress()
+                try:
+                    _silent_reaped = await sweep_silent_runner_compute_jobs(session, now)
+                    if _silent_reaped:
+                        logger.info(
+                            f"[REAPER] Step 22f: finalized {_silent_reaped} silent "
+                            "runner compute job(s)"
+                        )
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Silent runner compute-job sweep error: {e}",
                         exc_info=True,
                     )
                     with contextlib.suppress(Exception):

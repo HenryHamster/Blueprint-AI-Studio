@@ -48,7 +48,11 @@ from app.blocked_task_unblock_sweeps import (
     event_driven_unblock_on_knowledge,
 )
 from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
-from app.compute_jobs import finalize_runner_subprocess_job_for_dead_runner
+from app.compute_jobs import (
+    RUNNER_SILENT_TIMEOUT_SECONDS,
+    finalize_orphan_runner_job,
+    finalize_runner_subprocess_job_for_dead_runner,
+)
 from app.database import AsyncSessionLocal
 from app.models import ComputeJob, ComputeJobStatus, LocalRunner, Task, TaskStatus
 from app.runner_health_monitors import _RUNNER_LIVENESS_SECONDS
@@ -2679,6 +2683,52 @@ async def sweep_refresh_project_compute_images(
     return summary
 
 
+async def sweep_silent_runner_compute_jobs(session, now=None) -> int:
+    """Step 22f: Reap silent runner-subprocess compute jobs.
+
+    Finds RUNNING runner-subprocess jobs whose last_heartbeat_at has not
+    advanced past RUNNER_SILENT_TIMEOUT_SECONDS and finalizes each as
+    ``runner_died_silently`` via :func:`finalize_orphan_runner_job`,
+    freeing the project concurrency slot and spend ceiling.
+
+    Best-effort per job: a failure in one job (already terminal at lock
+    time, unexpected backend, any error) does not block the next.
+    Returns the number of jobs finalized.
+    """
+    _now = now or _utcnow()
+    stale_cutoff = _now - timedelta(seconds=RUNNER_SILENT_TIMEOUT_SECONDS)
+
+    stmt = (
+        select(ComputeJob)
+        .where(
+            ComputeJob.status == ComputeJobStatus.RUNNING,
+            ComputeJob.backend == RUNNER_SUBPROCESS_BACKEND_NAME,
+            (ComputeJob.last_heartbeat_at.is_(None)
+             & (ComputeJob.started_at < stale_cutoff))
+            | (ComputeJob.last_heartbeat_at < stale_cutoff),
+        )
+        .limit(50)
+    )
+    rows = (await session.execute(stmt)).scalars().all()
+
+    finalized = 0
+    for job in rows:
+        try:
+            ok = await finalize_orphan_runner_job(session, job, now=_now)
+            if ok:
+                finalized += 1
+        except Exception:
+            logger.exception(
+                f"[REAPER] Failed to finalize silent runner job {job.id}"
+            )
+            await session.rollback()
+    if finalized:
+        logger.info(
+            f"[REAPER] Finalized {finalized} silent runner compute job(s)"
+        )
+    return finalized
+
+
 async def sweep_stranded_runner_subprocess_compute_jobs(
     session,
     now: datetime,
@@ -2775,5 +2825,6 @@ __all__ = [
     "sweep_closed_handmerge_prs",
     "sweep_protect_referenced_compute_image_digests",
     "sweep_refresh_project_compute_images",
+    "sweep_silent_runner_compute_jobs",
     "sweep_stranded_runner_subprocess_compute_jobs",
 ]
