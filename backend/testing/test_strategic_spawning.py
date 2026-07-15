@@ -14576,7 +14576,7 @@ class TestBuildCycleStartReconciliation:
             f"is present (resolver already documented the substitution); got: {conflicts}"
         )
 
-    def test_qualification_surface_conflicts_criterion_coverage_vs_confidence(self):
+    def test_qualification_surface_conflicts_ignores_partial_evidence_coverage(self):
         from app.strategic_spawning import _build_cycle_start_reconciliation
 
         direction_stats = [
@@ -14587,7 +14587,8 @@ class TestBuildCycleStartReconciliation:
             "last_qualification": {
                 "candidate_sha": "abc123def456789",
                 "status": "pending",
-                # Confidence MEETS threshold
+                # Candidate-bound qualification remains confident while monotonic
+                # evidence coverage is still partial.
                 "confidence": 0.85,
                 "threshold": 0.80,
             },
@@ -14613,9 +14614,8 @@ class TestBuildCycleStartReconciliation:
             for c in conflicts
             if c.get("conflict_type") == "criterion_coverage_vs_confidence"
         ]
-        assert len(coverage_conflicts) == 1
-        assert "confidence" in coverage_conflicts[0]["description"].lower()
-        assert "covered" in coverage_conflicts[0]["description"].lower()
+        assert coverage_conflicts == []
+        assert out["counts"]["qualification_surface_conflicts"] == 0
 
     def test_qualification_surface_conflicts_none_when_surfaces_agree(self):
         # A genuinely agreeing set of surfaces should produce NO conflicts

@@ -64,6 +64,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import json
 import logging
 import os
 import uuid
@@ -91,10 +92,7 @@ from app.acceptance_gate import (
     classify_merged_acceptance_context,
     classify_undeclared_reason,
 )
-from app.acceptance_criteria import (
-    get_active_criteria_rubric,
-    get_version_coverage_summary,
-)
+from app.acceptance_criteria import get_criteria_for_version, get_version_coverage_summary
 
 # Per-(sha, category) goal-verdict ledger (goal-verification redesign).  A SIBLING
 # module owns this file; it may not be present in every checkout during the
@@ -313,6 +311,214 @@ _NEVER_GRADED_GAP = (
     "non-contentless goal)."
 )
 
+_RUBRIC_PROVENANCE_VERSION = 1
+_MAX_RUBRIC_DIFF_KEYS = 20
+
+
+def _canonicalize_rubric(raw: Any) -> list[dict[str, str]]:
+    if not isinstance(raw, list):
+        return []
+    canonical: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("criterion_key") or item.get("category_key") or "").strip()
+        if not key or key in seen:
+            continue
+        text = " ".join(str(item.get("text") or "").split())
+        canonical.append({"criterion_key": key, "text": text})
+        seen.add(key)
+    return canonical
+
+
+def _rubric_fingerprint(snapshot: list[dict[str, str]]) -> str:
+    encoded = json.dumps(
+        _canonicalize_rubric(snapshot),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _qualification_attempt_id(
+    version: release_version.ReleaseVersion,
+    qual: dict[str, Any] | None = None,
+) -> str | None:
+    raw = (qual or {}).get("qualification_attempt_id")
+    if raw is None:
+        raw = (version.last_qualification or {}).get("qualification_attempt_id")
+    return str(raw) if raw not in (None, "") else None
+
+
+def _rubric_provenance(
+    snapshot: list[dict[str, str]],
+    *,
+    source: str,
+    qualification_attempt_id: str | None,
+) -> dict[str, Any]:
+    return {
+        "schema_version": _RUBRIC_PROVENANCE_VERSION,
+        "source": source,
+        "fingerprint": _rubric_fingerprint(snapshot),
+        "criteria": snapshot,
+        "qualification_attempt_id": qualification_attempt_id,
+    }
+
+
+def _rubric_detail_provenance(detail: Any) -> dict[str, Any] | None:
+    if not isinstance(detail, dict):
+        return None
+    nested = detail.get("rubric_provenance")
+    if isinstance(nested, dict):
+        return nested
+    if isinstance(detail.get("fingerprint"), str) and isinstance(
+        detail.get("criteria"), list
+    ):
+        return detail
+    return None
+
+
+def _rubric_dimension_reusable(
+    detail: Any,
+    *,
+    fingerprint: str,
+    qualification_attempt_id: str | None,
+) -> bool:
+    provenance = _rubric_detail_provenance(detail)
+    if provenance is None or provenance.get("fingerprint") != fingerprint:
+        return False
+    # A rubric-bound fact proves a particular qualification attempt, not merely
+    # a rubric's contents.  Older projections may not yet carry the first-class
+    # attempt id; fail closed in that rolling state rather than letting a
+    # same-SHA re-drive silently borrow a prior blind grade.
+    stored_attempt_id = provenance.get("qualification_attempt_id")
+    if qualification_attempt_id is None or stored_attempt_id in (None, ""):
+        return False
+    return stored_attempt_id == qualification_attempt_id
+
+
+async def _snapshot_qualification_rubric(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    rows = await get_criteria_for_version(session, version.id)
+    active = _canonicalize_rubric(
+        [
+            {"criterion_key": row.criterion_key, "text": row.text}
+            for row in rows
+            if row.status == "active"
+        ]
+    )
+    lifecycle = [
+        {
+            "criterion_key": str(row.criterion_key),
+            "status": str(row.status),
+        }
+        for row in rows
+        if row.criterion_key
+    ]
+    return active, lifecycle
+
+
+async def _resolve_launched_rubric(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+    qual: dict[str, Any],
+) -> tuple[list[dict[str, str]] | None, dict[str, Any] | None, str | None]:
+    if isinstance(qual.get("rubric_snapshot"), list):
+        snapshot = _canonicalize_rubric(qual["rubric_snapshot"])
+        fingerprint = _rubric_fingerprint(snapshot)
+        stored = qual.get("rubric_fingerprint")
+        if stored not in (None, fingerprint):
+            return None, None, "stored_rubric_fingerprint_mismatch"
+        return (
+            snapshot,
+            _rubric_provenance(
+                snapshot,
+                source="attempt_projection",
+                qualification_attempt_id=_qualification_attempt_id(version, qual),
+            ),
+            None,
+        )
+
+    task_id = qual.get("merge_grade_task_id")
+    if task_id:
+        try:
+            task = await session.get(Task, uuid.UUID(str(task_id)))
+        except (TypeError, ValueError, AttributeError):
+            task = None
+        payload = task.first_payload if task is not None else None
+        if isinstance(payload, dict) and isinstance(payload.get("categories"), list):
+            snapshot = _canonicalize_rubric(payload["categories"])
+            return (
+                snapshot,
+                _rubric_provenance(
+                    snapshot,
+                    source="legacy_merge_grade_task_payload",
+                    qualification_attempt_id=_qualification_attempt_id(version, qual),
+                ),
+                None,
+            )
+        return None, None, "merge_grade_task_payload_has_no_rubric"
+
+    return None, None, "pending_attempt_has_no_rubric_snapshot_or_grade_payload"
+
+
+def _bounded_rubric_drift(
+    launched: list[dict[str, str]],
+    live: list[dict[str, str]],
+    launched_lifecycle: Any,
+    live_lifecycle: list[dict[str, str]],
+) -> dict[str, Any] | None:
+    launched_by_key = {row["criterion_key"]: row["text"] for row in launched}
+    live_by_key = {row["criterion_key"]: row["text"] for row in live}
+    prior_status = {
+        str(row.get("criterion_key")): str(row.get("status"))
+        for row in (launched_lifecycle or [])
+        if isinstance(row, dict) and row.get("criterion_key")
+    }
+    live_status = {
+        str(row.get("criterion_key")): str(row.get("status"))
+        for row in live_lifecycle
+        if row.get("criterion_key")
+    }
+    added = [key for key in live_by_key if key not in launched_by_key]
+    removed = [key for key in launched_by_key if key not in live_by_key]
+    changed = [
+        key
+        for key in launched_by_key.keys() & live_by_key.keys()
+        if launched_by_key[key] != live_by_key[key]
+    ]
+    if not added and not removed and not changed:
+        return None
+    changes: list[dict[str, str]] = []
+    for key in added:
+        kind = (
+            "reinstated"
+            if prior_status.get(key) in {"retracted", "superseded"}
+            else "added"
+        )
+        changes.append({"criterion_key": key, "change": kind})
+    for key in removed:
+        status = live_status.get(key)
+        kind = status if status in {"retracted", "superseded"} else "removed"
+        changes.append({"criterion_key": key, "change": kind})
+    changes.extend(
+        {"criterion_key": key, "change": "changed"} for key in changed
+    )
+    bounded_changes = changes[:_MAX_RUBRIC_DIFF_KEYS]
+    return {
+        "added_keys": added[:_MAX_RUBRIC_DIFF_KEYS],
+        "removed_keys": removed[:_MAX_RUBRIC_DIFF_KEYS],
+        "changed_keys": changed[:_MAX_RUBRIC_DIFF_KEYS],
+        "changes": bounded_changes,
+        "total_changes": len(changes),
+        "truncated": len(changes) > len(bounded_changes),
+        "launched_fingerprint": _rubric_fingerprint(launched),
+        "live_fingerprint": _rubric_fingerprint(live),
+    }
+
 
 def _never_graded_category_verdicts(active_keys: set[str]) -> list[dict[str, Any]]:
     """Fail-CLOSED verdicts for a candidate that was NEVER graded.
@@ -358,6 +564,11 @@ def _coerce_ledger_category_verdict(v: Any) -> dict[str, Any]:
         "status": getattr(v, "status", None),
         "tier": getattr(v, "tier", "judged"),
         "gap": getattr(v, "gap", None),
+        "grader_run_id": (
+            str(getattr(v, "grader_run_id", ""))
+            if getattr(v, "grader_run_id", None)
+            else None
+        ),
     }
 
 
@@ -2336,6 +2547,22 @@ async def run_qualification(
     # _finalize_qualification).  Contentless == empty for this purpose.
     version_goal = (version.goal or "").strip()
     _merge_grade_goal_usable = bool(version_goal) and not is_contentless_goal(version_goal)
+    # Freeze the exact ordered acceptance contract BEFORE consulting reusable
+    # facts or spawning the blind grader.
+    rubric_snapshot, rubric_lifecycle_snapshot = await _snapshot_qualification_rubric(
+        session, version
+    )
+    # An acceptance rubric and every fact derived from it belong to this exact
+    # launch, not just to a version or candidate SHA.  Persist the UUID in the
+    # pending projection below so finalization, task payloads, and ledger
+    # provenance all use one durable attempt identity.
+    qualification_attempt_id = str(uuid.uuid4())
+    rubric_provenance = _rubric_provenance(
+        rubric_snapshot,
+        source="qualification_launch",
+        qualification_attempt_id=qualification_attempt_id,
+    )
+    rubric_fingerprint = rubric_provenance["fingerprint"]
     # Consult the per-dimension fact ledger before spawning children (Phase 1
     # ledger reuse).  On a re-drive at the same candidate_sha, dimensions that
     # already resolved (passed/failed/blocked) in a prior finalize are carried
@@ -2349,11 +2576,28 @@ async def run_qualification(
     resolved_dims: dict[str, dict[str, Any]] = {}
     for dim, row in prior_dim_results.items():
         if row.status in _LEDGER_RESOLVED_STATUSES:
+            if dim == "merge_grade" and not _rubric_dimension_reusable(
+                row.detail,
+                fingerprint=rubric_fingerprint,
+                qualification_attempt_id=qualification_attempt_id,
+            ):
+                logger.info(
+                    "[RELEASE_QUALIFIER] v%d candidate %s refusing merge-grade "
+                    "reuse: stored attempt/rubric provenance does not match "
+                    "the newly launched rubric %s",
+                    version.version_number,
+                    candidate_sha[:8],
+                    rubric_fingerprint[:12],
+                )
+                continue
             resolved_dims[dim] = {
                 "status": row.status,
                 "sub_score": row.sub_score,
                 "blocker": row.blocker,
                 "detail": row.detail,
+                "producing_task_id": (
+                    str(row.producing_task_id) if row.producing_task_id else None
+                ),
             }
     # Audit-challenge parity on reuse: a stored audit fact with status "failed"
     # carries a finding-driven DEDUCTION that is only trustworthy once the
@@ -2449,10 +2693,9 @@ async def run_qualification(
             # diff per ACTIVE acceptance-criterion CATEGORY, so pass the rubric
             # (stable ``criterion_key`` + text) into the payload.  The agent keys
             # its per-category verdicts back on these keys.
-            _mg_criteria = await get_active_criteria_rubric(session, version.id)
             _mg_categories = [
                 {"category_key": c.get("criterion_key"), "text": c.get("text")}
-                for c in _mg_criteria
+                for c in rubric_snapshot
                 if c.get("criterion_key")
             ]
             merge_grade_task = await _spawn_release_merge_grade_task(
@@ -2465,6 +2708,8 @@ async def run_qualification(
                 version_goal=version_goal,
                 merged_pr_numbers=merged_pr_numbers,
                 categories=_mg_categories,
+                rubric_fingerprint=rubric_fingerprint,
+                qualification_attempt_id=qualification_attempt_id,
             )
             merge_grade_task_id = str(merge_grade_task.id)
         if _smoketest_needed:
@@ -2488,6 +2733,7 @@ async def run_qualification(
             "error": "spawn_failed",
             "detail": str(exc)[:300],
             "candidate_sha": candidate_sha,
+            "qualification_attempt_id": qualification_attempt_id,
             "ci_green": ci_green,
             "ci_state": ci_state,
             "started_at": started_at,
@@ -2529,6 +2775,11 @@ async def run_qualification(
         "audit_challenge_spawn_pending": audit_challenge_spawn_pending,
         "smoketest_task_id": smoketest_task_id,
         "merge_grade_task_id": merge_grade_task_id,
+        "qualification_attempt_id": qualification_attempt_id,
+        "rubric_snapshot": rubric_snapshot,
+        "rubric_fingerprint": rubric_fingerprint,
+        "rubric_lifecycle_snapshot": rubric_lifecycle_snapshot,
+        "rubric_provenance": rubric_provenance,
         "prior_infra_streak": prior_infra_streak,
         "previous_infra_failure_signature": prior_infra_failure_signature,
         "previous_infra_failure_candidate_sha": prior_infra_failure_candidate_sha,
@@ -4023,6 +4274,105 @@ def _deployed_env_presence_snapshot(
     return {name: bool(os.getenv(name)) for name in names}
 
 
+async def _record_rubric_provenance_outcome(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+    qual: dict[str, Any],
+    *,
+    status: str,
+    rubric_provenance: dict[str, Any] | None,
+    rubric_drift: dict[str, Any] | None = None,
+    provenance_error: str | None = None,
+    policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Hold an attempt whose launched acceptance contract cannot finalize."""
+    finalized_at = _utcnow().isoformat()
+    verdict_status = "rubric_unknown" if status == "rubric_provenance_unknown" else status
+    record: dict[str, Any] = {
+        "status": status,
+        "candidate_sha": qual.get("candidate_sha"),
+        "candidate_diff_hash": qual.get("candidate_diff_hash"),
+        "qualification_attempt_id": qual.get("qualification_attempt_id"),
+        "confidence": 0.0,
+        "sub_scores": {},
+        "blocker": status,
+        "threshold": (policy or {}).get("threshold"),
+        "started_at": qual.get("started_at"),
+        "finalized_at": finalized_at,
+        "audit_task_id": qual.get("audit_task_id"),
+        "smoketest_task_id": qual.get("smoketest_task_id"),
+        "merge_grade_task_id": qual.get("merge_grade_task_id"),
+        "rubric_snapshot": (
+            rubric_provenance.get("criteria") if rubric_provenance else None
+        ),
+        "rubric_fingerprint": (
+            rubric_provenance.get("fingerprint") if rubric_provenance else None
+        ),
+        "rubric_provenance": rubric_provenance,
+        "rubric_drift": rubric_drift,
+        "rubric_provenance_error": provenance_error,
+        # Deliberately absent: this attempt never gates on live categories and
+        # never fabricates verdicts for categories outside its launched rubric.
+        "category_verdicts": None,
+        "residual_uncaptured_gap": None,
+        "merge_grade": {
+            "status": status,
+            "blocked": True,
+            "rubric_provenance": rubric_provenance,
+            "rubric_drift": rubric_drift,
+            "rubric_provenance_error": provenance_error,
+        },
+        "merge_grade_status": verdict_status,
+        "merge_grade_coverage": None,
+        "merge_grade_biggest_gap": None,
+    }
+    version.last_qualification = record
+    flag_modified(version, "last_qualification")
+    release_version.set_version_phase(
+        version,
+        "stabilize",
+        reasoning=(
+            f"qualification v{version.version_number}: acceptance rubric changed "
+            "while the blind grade was in flight; launch a fresh grade"
+            if status == "rubric_changed"
+            else f"qualification v{version.version_number}: launched rubric provenance unknown"
+        ),
+    )
+    session.add(version)
+    await _record_qualification_verdict(
+        session,
+        version,
+        record,
+        terminal_status=verdict_status,
+        would_promote=False,
+        promotion_enabled=resolve_project_promotion_enabled(version.project_id),
+    )
+    await _notify_operator(
+        session,
+        version,
+        "release_rubric_changed" if status == "rubric_changed" else "release_rubric_unknown",
+        (
+            f"v{version.version_number} was not promoted because its acceptance "
+            "rubric changed while the blind merge-grade was in flight. A fresh "
+            "grade will use the new rubric."
+            if status == "rubric_changed"
+            else f"v{version.version_number} was held because the pending grade's "
+            "rubric provenance could not be reconstructed. A fresh grade is required."
+        ),
+        extra={
+            "blocker": status,
+            "rubric_drift": rubric_drift,
+            "rubric_provenance_error": provenance_error,
+        },
+    )
+    return {
+        "status": status,
+        "blocker": status,
+        "rubric_drift": rubric_drift,
+        "rubric_provenance_error": provenance_error,
+    }
+
+
 async def _finalize_qualification(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
@@ -4105,6 +4455,62 @@ async def _finalize_qualification(
 
     _policy_project = await session.get(Project, version.project_id)
     policy = _load_policy(_policy_project)
+
+    # Resolve the launch contract before checking child infrastructure state.
+    # Rubric drift is authoritative for this attempt: a lifecycle/text change
+    # must be recorded even if a required child also failed while it ran.
+    (
+        launched_rubric,
+        rubric_provenance,
+        rubric_provenance_error,
+    ) = await _resolve_launched_rubric(session, version, qual)
+    if launched_rubric is None or rubric_provenance is None:
+        return await _record_rubric_provenance_outcome(
+            session,
+            version,
+            qual,
+            status="rubric_provenance_unknown",
+            rubric_provenance=None,
+            provenance_error=rubric_provenance_error,
+            policy=policy,
+        )
+
+    live_criterion_rows = await get_criteria_for_version(session, version.id)
+    live_rubric = _canonicalize_rubric(
+        [
+            {"criterion_key": row.criterion_key, "text": row.text}
+            for row in live_criterion_rows
+            if row.status == "active"
+        ]
+    )
+    live_lifecycle = [
+        {"criterion_key": str(row.criterion_key), "status": str(row.status)}
+        for row in live_criterion_rows
+        if row.criterion_key
+    ]
+    rubric_drift = _bounded_rubric_drift(
+        launched_rubric,
+        live_rubric,
+        qual.get("rubric_lifecycle_snapshot"),
+        live_lifecycle,
+    )
+    if rubric_drift is not None:
+        logger.info(
+            "[RELEASE_QUALIFIER] v%d candidate %s rubric changed while the "
+            "blind merge-grade was in flight: %s",
+            version.version_number,
+            (candidate_sha or "")[:8],
+            rubric_drift,
+        )
+        return await _record_rubric_provenance_outcome(
+            session,
+            version,
+            qual,
+            status="rubric_changed",
+            rubric_provenance=rubric_provenance,
+            rubric_drift=rubric_drift,
+            policy=policy,
+        )
 
     # --- Infra-failure detection: check required child terminal statuses ------
     # A FAILED, CANCELLED, or BLOCKED required child means the qualifier pipeline
@@ -5236,16 +5642,12 @@ async def _finalize_qualification(
         )
     migration_apply_blocked = apply_verdict == "block"
 
-    # Acceptance-criteria coverage summary + the ACTIVE-criteria rubric.  Computed
-    # once here (before the merge-grade block) so the rubric can be threaded into
-    # the per-category grade below.  ``criterion_coverage`` is still persisted for
-    # observability / back-compat; ``active_categories`` are the CATEGORIES the
-    # goal-verification redesign grades the merged diff against.
+    # Keep today's coverage summary for observability; gate on launched rubric.
     criterion_coverage = await get_version_coverage_summary(session, version.id)
     active_categories: list[dict[str, Any]] = [
         {"category_key": c.get("criterion_key"), "text": c.get("text")}
-        for c in (criterion_coverage.get("criteria") or [])
-        if c.get("status") == "active" and c.get("criterion_key")
+        for c in launched_rubric
+        if c.get("criterion_key")
     ]
 
     # --- Blind merge-grade artifact validation (dir d-c0fe439f) -------------
@@ -5357,6 +5759,11 @@ async def _finalize_qualification(
                 session, version, qual, "merge_grade_grader_lacks_category_verdicts"
             )
 
+    merge_grade_cert = {
+        **merge_grade_cert,
+        "rubric_provenance": rubric_provenance,
+    }
+
     ci_state = ci_resolution.get("state", _CI_RED)
     ci_required = True
     if _pre_gates is not None and "ci_required" in _pre_gates:
@@ -5415,6 +5822,7 @@ async def _finalize_qualification(
             session, version, candidate_sha, "merge_grade",
             status=_mg_ledger_status,
             sub_score=_mg_coverage if isinstance(_mg_coverage, (int, float)) and not isinstance(_mg_coverage, bool) else None,
+            detail=merge_grade_cert,
             producing_task_id=merge_grade_task_id,
         )
 
@@ -5466,8 +5874,12 @@ async def _finalize_qualification(
         # only guards the case where a grade DID run but its verdicts cannot be
         # trusted (absent for active keys, or the read raised).
         _merge_grade_ran = bool(merge_grade_task_id) or ("merge_grade" in resolved_dims)
+        _expected_grader_run_id = merge_grade_task_id or resolved_dims.get(
+            "merge_grade", {}
+        ).get("producing_task_id")
+        if _expected_grader_run_id is not None:
+            _expected_grader_run_id = str(_expected_grader_run_id)
         _fresh_category_verdicts = merge_grade_cert.get("category_verdicts")
-        _ledger_write_failed = False
         if _fresh_category_verdicts is not None:
             # Fresh grade this finalize: write each category verdict + the residual.
             try:
@@ -5490,7 +5902,6 @@ async def _finalize_qualification(
                     merge_grade_cert.get("residual_uncaptured_gap"),
                 )
             except Exception:  # noqa: BLE001 — ledger write failure must not crash finalize
-                _ledger_write_failed = True
                 logger.warning(
                     "[RELEASE_QUALIFIER] v%d failed to persist per-category "
                     "goal-verification verdicts to the ledger — gating on the "
@@ -5498,12 +5909,9 @@ async def _finalize_qualification(
                     "finalize",
                     version.version_number,
                 )
-        if _ledger_write_failed:
-            # FIX 2 — fail CLOSED.  Persistence hiccupped, so a ledger read-back
-            # would see stale/absent rows and (via a None gate input) SKIP the
-            # category gate entirely, letting a ``not_met`` candidate promote.  The
-            # freshly-computed in-memory grade is authoritative: feed it to the gate
-            # directly (filtered to the active keys, exactly like the read-back).
+        if _fresh_category_verdicts is not None:
+            # Gate on fresh evidence directly; this also fails closed if the
+            # best-effort ledger write hiccupped or older same-SHA rows exist.
             # Fail-open state 1/3: the write failed AND the freshly-computed
             # verdicts do not cover any currently-active criterion (e.g. the
             # grader only graded now-retracted categories).  Absent evidence for
@@ -5542,6 +5950,13 @@ async def _finalize_qualification(
                     for cv in (
                         _coerce_ledger_category_verdict(_v)
                         for _v in (_ledger_verdicts or [])
+                        if _expected_grader_run_id is None
+                        or str(
+                            _v.get("grader_run_id")
+                            if isinstance(_v, dict)
+                            else getattr(_v, "grader_run_id", None)
+                        )
+                        == _expected_grader_run_id
                     )
                     if cv.get("category_key") in _active_keys
                 ] or (
@@ -5830,6 +6245,12 @@ async def _finalize_qualification(
         "migration_apply_safety": apply_verdict,
         "migration_apply_safety_detail": apply_detail,
         "criterion_coverage": criterion_coverage,
+        # Attempt-scoped acceptance contract (coverage above remains live).
+        "qualification_attempt_id": qual.get("qualification_attempt_id"),
+        "rubric_snapshot": launched_rubric,
+        "rubric_fingerprint": rubric_provenance.get("fingerprint"),
+        "rubric_provenance": rubric_provenance,
+        "rubric_drift": None,
         # Goal-verification redesign: the per-category verdicts + residual that
         # drove the gate this finalize (sha-keyed; None when no rubric / ledger
         # absent / exempt).  Persisted so the CI-unresolved-recovery recompute in

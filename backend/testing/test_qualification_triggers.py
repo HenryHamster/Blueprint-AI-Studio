@@ -174,6 +174,14 @@ class TestT1InitialFire:
 # T2 — error_redrive
 # ---------------------------------------------------------------------------
 
+
+@pytest.mark.parametrize("status", ["rubric_changed", "rubric_provenance_unknown"])
+def test_rubric_outcomes_redrive_with_a_fresh_snapshot(status):
+    d = _resolve(status=status)
+    assert d.fire
+    assert d.trigger == "rubric_redrive"
+
+
 class TestT2ErrorRedrive:
     # With the coverage gate retired, a version sitting at ``error`` no longer
     # short-circuits at T1 — it falls through to T2, which keeps the

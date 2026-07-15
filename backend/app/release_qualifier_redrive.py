@@ -108,6 +108,10 @@ _MAX_ERROR_REDRIVE_ATTEMPTS = 5
 # once this many consecutive re-drives still result in infra_failure.
 _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS = 3
 
+_RUBRIC_REDRIVE_STATUSES: frozenset[str] = frozenset(
+    {"rubric_changed", "rubric_provenance_unknown"}
+)
+
 # Transient error codes the sweep is allowed to re-drive.  Permanent errors
 # (e.g. project misconfiguration) should not be blindly retried.
 _TRANSIENT_ERROR_CODES: frozenset[str] = frozenset({"sha_error", "no_credentials"})
@@ -400,6 +404,39 @@ async def _redrive_infra_failure_qualification(
         # qualification_attempts) on every path it takes; rolling back would
         # discard those writes and leave the version in the old infra_failure
         # state.
+        await redrive_session.commit()
+        return bool(result and result.get("status") == "spawned")
+
+
+async def _redrive_rubric_qualification(
+    version_id,
+    *,
+    session_factory=None,
+) -> bool:
+    """Launch a fresh grade after a frozen-rubric attempt could not conclude.
+
+    ``rubric_changed`` and ``rubric_provenance_unknown`` deliberately do not
+    prove the candidate.  Re-entering ``run_qualification`` snapshots today's
+    active contract and starts a new blind merge-grade; the coordinator's row
+    lock makes repeated sweeps harmless once the replacement is pending.
+    """
+    from app import release_qualifier
+
+    factory = session_factory or AsyncSessionLocal
+    async with factory() as redrive_session:
+        version = await redrive_session.get(release_version.ReleaseVersion, version_id)
+        if version is None:
+            return False
+        qual = version.last_qualification
+        if (
+            not isinstance(qual, dict)
+            or qual.get("status") not in _RUBRIC_REDRIVE_STATUSES
+            or version.phase != "stabilize"
+        ):
+            return False
+        result = await release_qualifier.run_qualification(
+            redrive_session, version.project_id, version
+        )
         await redrive_session.commit()
         return bool(result and result.get("status") == "spawned")
 

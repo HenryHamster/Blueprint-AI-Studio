@@ -65,6 +65,7 @@ from app.release_qualifier_redrive import (
     _redrive_infra_failure_qualification,
     _redrive_not_promoted_qualification,
     _redrive_promotion_failed_qualification,
+    _redrive_rubric_qualification,
 )
 
 logger = logging.getLogger(__name__)
@@ -1907,6 +1908,29 @@ async def sweep_stuck_qualifications(
             logger.info(
                 "[RELEASE_QUALIFIER] sweep re-drove infra_failure version %s "
                 "(transient infra cleared — qualification spawned)",
+                version_id,
+            )
+
+    # A rubric-changed / unknown-provenance attempt intentionally proves
+    # nothing.  Re-drive it on the next lifecycle sweep so it snapshots the
+    # current rubric and launches a fresh blind grade instead of stranding in
+    # stabilize until an operator manually retries.
+    for version_id in version_ids:
+        try:
+            redriven = await _redrive_rubric_qualification(
+                version_id,
+                session_factory=session_factory,
+            )
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] sweep: rubric re-drive failed for version %s",
+                version_id,
+            )
+            continue
+        if redriven:
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep re-drove rubric outcome for version %s "
+                "(fresh rubric snapshot qualification spawned)",
                 version_id,
             )
 

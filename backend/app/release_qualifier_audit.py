@@ -518,6 +518,8 @@ async def _spawn_release_merge_grade_task(
     version_goal: str,
     merged_pr_numbers: list[int],
     categories: list[dict[str, Any]] | None = None,
+    rubric_fingerprint: str | None = None,
+    qualification_attempt_id: str | None = None,
 ) -> Task:
     """Create + queue a blind ``release_merge_grade`` task for the qualifier.
 
@@ -555,6 +557,8 @@ async def _spawn_release_merge_grade_task(
         # partial + cited diff evidence + gap).  Empty list ⇒ no rubric; the agent
         # then grades only the holistic goal coverage.
         "categories": list(categories or []),
+        "rubric_fingerprint": rubric_fingerprint,
+        "qualification_attempt_id": qualification_attempt_id,
         # Explicitly pin to Opus — regression guard against silent downgrade
         # (mirrors release_audit / release_audit_challenge).
         "quality_tier": "opus",
@@ -599,6 +603,8 @@ async def _spawn_release_merge_grade_task(
         context={
             "release_version_id": str(version_id),
             "candidate_sha": candidate_sha,
+            "qualification_attempt_id": qualification_attempt_id,
+            "rubric_fingerprint": rubric_fingerprint,
             "scope": "medium",
         },
     )
@@ -614,6 +620,8 @@ async def _spawn_release_merge_grade_task(
                 "diff_range": diff_range,
                 "release_version_id": str(version_id),
                 "merged_pr_count": len(merged_pr_numbers),
+                "rubric_fingerprint": rubric_fingerprint,
+                "qualification_attempt_id": qualification_attempt_id,
             },
         )
     )

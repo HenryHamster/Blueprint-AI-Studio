@@ -1183,8 +1183,9 @@ def _build_cycle_start_reconciliation(
         framing across cycles.
       * ``qualification_surface_conflicts`` — disagreements between the payload's
         qualification narrative surfaces (``last_qualification``, derived
-        ``qualification_state``, ``criterion_coverage``, ``promotion_readiness``,
-        and candidate currency). Populated only when ``version_phase_block`` is
+        ``qualification_state``, ``promotion_readiness``, and candidate currency).
+        Criterion evidence coverage remains observational rather than release
+        truth. Populated only when ``version_phase_block`` is
         present (LTS split). Each conflict names the two surfaces, what each
         asserts, and a reason for the disagreement.
 
@@ -1572,7 +1573,6 @@ def _build_cycle_start_reconciliation(
     if isinstance(version_phase_block, dict):
         vpb_last_qual = version_phase_block.get("last_qualification")
         vpb_qual_state = version_phase_block.get("qualification_state")
-        vpb_criterion_cov = version_phase_block.get("criterion_coverage")
         vpb_promotion_ready = version_phase_block.get("promotion_readiness")
         vpb_candidate_currency = version_phase_block.get(
             "last_qualification_candidate_currency"
@@ -1642,36 +1642,7 @@ def _build_cycle_start_reconciliation(
                         }
                     )
 
-        # Disagreement 3: criterion_coverage unmapped vs confidence/threshold
-        if isinstance(vpb_criterion_cov, dict) and isinstance(vpb_last_qual, dict):
-            covered = int(vpb_criterion_cov.get("covered", 0) or 0)
-            total = int(vpb_criterion_cov.get("total", 0) or 0)
-            confidence = vpb_last_qual.get("confidence")
-            threshold = vpb_last_qual.get("threshold")
-            # When confidence meets threshold but NOT all criteria are covered,
-            # the two surfaces disagree on "ready to promote" assessment.
-            if (
-                total > 0
-                and covered < total
-                and confidence is not None
-                and threshold is not None
-                and isinstance(confidence, (int, float))
-                and isinstance(threshold, (int, float))
-                and confidence >= threshold
-            ):
-                qualification_surface_conflicts.append(
-                    {
-                        "conflict_type": "criterion_coverage_vs_confidence",
-                        "description": (
-                            f"Confidence {confidence:.2%} meets threshold "
-                            f"{threshold:.2%}, but only {covered}/{total} criteria "
-                            "are covered. The version is deemed ready by confidence "
-                            "but incomplete by criterion coverage."
-                        ),
-                    }
-                )
-
-        # Disagreement 4: promotion_readiness trend vs current qualification status
+        # Disagreement 3: promotion_readiness trend vs current qualification status
         if isinstance(vpb_promotion_ready, dict) and isinstance(vpb_last_qual, dict):
             ready_state = vpb_promotion_ready.get("ready")
             qual_status = vpb_last_qual.get("status")

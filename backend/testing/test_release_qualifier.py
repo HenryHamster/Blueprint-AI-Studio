@@ -6959,6 +6959,13 @@ async def test_run_qualification_spawns_merge_grade_child_when_goal_set(
     db_session.add(version)
     await db_session.commit()
     await db_session.refresh(version)
+    await _add_version_criterion(
+        db_session,
+        project,
+        version,
+        key="c-analytics-ui",
+        text="Render analytics for the operator",
+    )
 
     candidate = "feed1234" * 5
     mocker.patch(
@@ -7012,10 +7019,281 @@ async def test_run_qualification_spawns_merge_grade_child_when_goal_set(
     assert payload["candidate_sha"] == candidate
     assert payload["version_goal"] == "deliver user analytics dashboard"
     assert payload["merged_prs"] == [101, 102]
+    assert lq["rubric_snapshot"] == [
+        {
+            "criterion_key": "c-analytics-ui",
+            "text": "Render analytics for the operator",
+        },
+    ]
+    assert payload["categories"] == [
+        {"category_key": row["criterion_key"], "text": row["text"]}
+        for row in lq["rubric_snapshot"]
+    ]
+    assert payload["rubric_fingerprint"] == lq["rubric_fingerprint"]
+    assert uuid.UUID(lq["qualification_attempt_id"])
+    assert payload["qualification_attempt_id"] == lq["qualification_attempt_id"]
+    assert lq["rubric_provenance"]["qualification_attempt_id"] == lq[
+        "qualification_attempt_id"
+    ]
+    assert lq["rubric_fingerprint"] == rq._rubric_fingerprint(
+        lq["rubric_snapshot"]
+    )
     # Regression guard: promotion judgment must be pinned to Opus so a future
     # cost-saving runtime-config edit cannot silently downgrade it.
     assert payload.get("quality_tier") == "opus", (
         f"release_merge_grade must pin quality_tier=opus; got {payload.get('quality_tier')!r}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("lifecycle_change", "expected_change", "merge_grade_failed"),
+    [
+        ("add", "added", True),
+        ("reinstate", "reinstated", False),
+        ("retract", "retracted", False),
+        ("supersede", "superseded", False),
+        ("change", "changed", False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_in_flight_rubric_lifecycle_changes_require_fresh_grade(
+    db_session, mocker, lifecycle_change, expected_change, merge_grade_failed
+):
+    from app import shared_state
+
+    shared_state.runtime_config["smoketest_enabled"] = False
+    shared_state.runtime_config["promotion_enabled"] = True
+    project, version = await _make_project_and_version(
+        db_session, phase="stabilize"
+    )
+    version.goal = "Ship a rubric-bound qualification"
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    await _add_version_criterion(
+        db_session,
+        project,
+        version,
+        key="c-stable",
+        text="Stable acceptance requirement",
+    )
+    mutable = await _add_version_criterion(
+        db_session,
+        project,
+        version,
+        key="c-lifecycle",
+        text="Lifecycle acceptance requirement",
+    )
+    if lifecycle_change in {"add", "reinstate"}:
+        mutable.status = "retracted"
+        db_session.add(mutable)
+        await db_session.commit()
+        await db_session.refresh(mutable)
+
+    candidate = "a11ce123" * 5
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch("app.github.get_branch_sha", new=AsyncMock(return_value=candidate))
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"status": "completed", "conclusion": "success"}),
+    )
+    mocker.patch(
+        "app.release_qualifier._merged_pr_numbers_for_version",
+        new=AsyncMock(return_value=[15001]),
+    )
+    promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    launched = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+    assert launched["status"] == "spawned"
+    await db_session.refresh(version)
+    first_task_id = version.last_qualification["merge_grade_task_id"]
+    first_fingerprint = version.last_qualification["rubric_fingerprint"]
+    first_attempt_id = version.last_qualification["qualification_attempt_id"]
+    assert uuid.UUID(first_attempt_id)
+
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    for task in tasks:
+        task.status = (
+            TaskStatus.FAILED
+            if merge_grade_failed and str(task.id) == first_task_id
+            else TaskStatus.COMPLETED
+        )
+        db_session.add(task)
+
+    if lifecycle_change == "add":
+        await _add_version_criterion(
+            db_session,
+            project,
+            version,
+            key="c-added",
+            text="Added while grading",
+            sync_pending_rubric=False,
+        )
+    elif lifecycle_change == "reinstate":
+        mutable.status = "active"
+        db_session.add(mutable)
+    elif lifecycle_change == "retract":
+        mutable.status = "retracted"
+        db_session.add(mutable)
+    elif lifecycle_change == "supersede":
+        mutable.status = "superseded"
+        db_session.add(mutable)
+    else:
+        mutable.text = "Materially changed acceptance requirement"
+        db_session.add(mutable)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    result = await rq._finalize_qualification(
+        db_session,
+        version,
+        _pre_gates={
+            "ci_green": True,
+            "ci_resolution": {"state": "green", "resolved_sha": candidate},
+        },
+    )
+    await db_session.commit()
+
+    assert result["status"] == "rubric_changed"
+    assert result["blocker"] == "rubric_changed"
+    assert expected_change in {
+        change["change"] for change in result["rubric_drift"]["changes"]
+    }
+    promote_spy.assert_not_called()
+    await db_session.refresh(version)
+    assert version.last_qualification["category_verdicts"] is None
+    assert version.last_qualification["rubric_fingerprint"] == first_fingerprint
+    verdict = (
+        await db_session.execute(
+            select(QualificationVerdict)
+            .where(QualificationVerdict.release_version_id == version.id)
+            .order_by(QualificationVerdict.created_at.desc())
+        )
+    ).scalars().first()
+    assert verdict is not None
+    assert verdict.terminal_status == "rubric_changed"
+    assert verdict.blocker == "rubric_changed"
+    assert verdict.merge_grade_detail["rubric_drift"]["total_changes"] >= 1
+
+    redrive = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+    assert redrive["status"] == "spawned"
+    await db_session.refresh(version)
+    assert version.last_qualification["merge_grade_task_id"] != first_task_id
+    assert version.last_qualification["rubric_fingerprint"] != first_fingerprint
+    assert uuid.UUID(version.last_qualification["qualification_attempt_id"])
+    assert version.last_qualification["qualification_attempt_id"] != first_attempt_id
+
+
+@pytest.mark.parametrize("outcome", ["rubric_changed", "rubric_provenance_unknown"])
+@pytest.mark.asyncio
+async def test_sweep_redrives_rubric_outcome_once_with_fresh_merge_grade(
+    db_session, mocker, outcome
+):
+    """The lifecycle sweep replaces either non-conclusive rubric outcome once.
+
+    This covers the public scheduled path (rather than only the trigger
+    resolver): the replacement must be a pending qualification with a newly
+    launched blind merge-grade, and the next sweep must observe that pending
+    attempt and not create duplicate children.
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["smoketest_enabled"] = False
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.goal = "Re-grade the frozen acceptance rubric"
+    version.last_qualification = {
+        "status": outcome,
+        "candidate_sha": "priorrubric" * 4,
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    await _add_version_criterion(
+        db_session,
+        project,
+        version,
+        key="c-sweep-redrive",
+        text="Launch a fresh blind grade after rubric recovery",
+    )
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock())
+    mocker.patch(
+        "app.release_qualifier._merged_pr_numbers_for_version",
+        new=AsyncMock(return_value=[]),
+    )
+
+    first_count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert first_count == 0  # A re-drive launches work; it does not finalize work.
+    assert version.last_qualification["status"] == "pending"
+    first_merge_grade_id = version.last_qualification["merge_grade_task_id"]
+    assert first_merge_grade_id is not None
+    assert version.qualification_attempts == 1
+    first_tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert sorted((task.first_payload or {}).get("type") for task in first_tasks) == [
+        "release_audit",
+        "release_merge_grade",
+    ]
+    merge_grade = next(
+        task
+        for task in first_tasks
+        if (task.first_payload or {}).get("type") == "release_merge_grade"
+    )
+    assert str(merge_grade.id) == first_merge_grade_id
+
+    second_count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert second_count == 0
+    assert version.last_qualification["status"] == "pending"
+    assert version.last_qualification["merge_grade_task_id"] == first_merge_grade_id
+    assert version.qualification_attempts == 1
+    task_count = (
+        await db_session.execute(
+            select(sa_func.count()).where(Task.project_id == project.id)
+        )
+    ).scalar_one()
+    assert task_count == len(first_tasks)
+
+
+def test_rubric_dimension_reuse_requires_both_attempt_ids():
+    detail = {
+        "rubric_provenance": {
+            "fingerprint": "same-rubric",
+            "qualification_attempt_id": "prior-attempt",
+        }
+    }
+
+    assert not rq._rubric_dimension_reusable(
+        detail, fingerprint="same-rubric", qualification_attempt_id=None
+    )
+    assert not rq._rubric_dimension_reusable(
+        {"rubric_provenance": {"fingerprint": "same-rubric"}},
+        fingerprint="same-rubric",
+        qualification_attempt_id="current-attempt",
+    )
+    assert rq._rubric_dimension_reusable(
+        detail, fingerprint="same-rubric", qualification_attempt_id="prior-attempt"
     )
 
 
@@ -9802,11 +10080,8 @@ async def _seed_qualification_children(
         await db_session.refresh(challenge_task)
         challenge_task_id = str(challenge_task.id)
 
-    # Blind merge-grade child (dir d-c0fe439f). When seed_merge_grade is set, a
-    # COMPLETED release_merge_grade child is created and its id recorded; when
-    # merge_grade_logs is supplied a RELEASE_MERGE_GRADE artifact is attached
-    # (omit it to exercise the MISSING-artifact infra-hold path).
     merge_grade_task_id: str | None = None
+    merge_grade_task: Task | None = None
     if seed_merge_grade:
         merge_grade_task = Task(
             project_id=project.id,
@@ -9833,6 +10108,23 @@ async def _seed_qualification_children(
     if version_goal is not None:
         version.goal = version_goal
 
+    rubric_snapshot, rubric_lifecycle = await rq._snapshot_qualification_rubric(
+        db_session, version
+    )
+    rubric_fingerprint = rq._rubric_fingerprint(rubric_snapshot)
+    if merge_grade_task is not None:
+        merge_grade_task.payloads = [
+            {
+                **(merge_grade_task.first_payload or {}),
+                "categories": [
+                    {"category_key": row["criterion_key"], "text": row["text"]}
+                    for row in rubric_snapshot
+                ],
+                "rubric_fingerprint": rubric_fingerprint,
+            }
+        ]
+        db_session.add(merge_grade_task)
+
     version.last_qualification = {
         "status": "pending",
         "candidate_sha": _candidate_sha,
@@ -9843,6 +10135,9 @@ async def _seed_qualification_children(
         "smoketest_task_id": str(smoke_task.id),
         "challenge_task_id": challenge_task_id,
         "merge_grade_task_id": merge_grade_task_id,
+        "rubric_snapshot": rubric_snapshot,
+        "rubric_fingerprint": rubric_fingerprint,
+        "rubric_lifecycle_snapshot": rubric_lifecycle,
     }
     db_session.add(version)
     await db_session.commit()
@@ -9858,6 +10153,7 @@ async def _add_version_criterion(
     key: str,
     text: str,
     source_kind: str | None = None,
+    sync_pending_rubric: bool = True,
 ):
     criterion = VersionAcceptanceCriterion(
         project_id=project.id,
@@ -9883,7 +10179,133 @@ async def _add_version_criterion(
         )
     await db_session.commit()
     await db_session.refresh(criterion)
+    if sync_pending_rubric and (version.last_qualification or {}).get("status") == "pending":
+        snapshot, lifecycle = await rq._snapshot_qualification_rubric(
+            db_session, version
+        )
+        fingerprint = rq._rubric_fingerprint(snapshot)
+        qual = {
+            **(version.last_qualification or {}),
+            "rubric_snapshot": snapshot,
+            "rubric_fingerprint": fingerprint,
+            "rubric_lifecycle_snapshot": lifecycle,
+        }
+        merge_grade_id = qual.get("merge_grade_task_id")
+        if merge_grade_id:
+            merge_grade_task = await db_session.get(Task, uuid.UUID(str(merge_grade_id)))
+            if merge_grade_task is not None:
+                merge_grade_task.payloads = [
+                    {
+                        **(merge_grade_task.first_payload or {}),
+                        "categories": [
+                            {"category_key": row["criterion_key"], "text": row["text"]}
+                            for row in snapshot
+                        ],
+                        "rubric_fingerprint": fingerprint,
+                    }
+                ]
+                db_session.add(merge_grade_task)
+        version.last_qualification = qual
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
     return criterion
+
+
+@pytest.mark.asyncio
+async def test_legacy_pending_rubric_reconstructed_from_merge_grade_payload(
+    db_session,
+):
+    project, version = await _make_project_and_version(db_session)
+    task = Task(
+        project_id=project.id,
+        title="legacy merge grade",
+        payloads=[{
+            "type": "release_merge_grade",
+            "categories": [{
+                "category_key": "c-legacy",
+                "text": "Legacy payload criterion",
+            }],
+        }],
+        vm_instance_id="vm-legacy-grade",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.flush()
+    qual = {"status": "pending", "merge_grade_task_id": str(task.id)}
+    await db_session.commit()
+
+    snapshot, provenance, error = await rq._resolve_launched_rubric(
+        db_session, version, qual
+    )
+    assert error is None
+    assert snapshot == [{
+        "criterion_key": "c-legacy",
+        "text": "Legacy payload criterion",
+    }]
+    assert provenance["source"] == "legacy_merge_grade_task_payload"
+    assert provenance["fingerprint"] == rq._rubric_fingerprint(snapshot)
+
+
+@pytest.mark.asyncio
+async def test_legacy_pending_without_snapshot_or_task_is_provenance_unknown(
+    db_session,
+):
+    project, version = await _make_project_and_version(db_session)
+    snapshot, provenance, error = await rq._resolve_launched_rubric(
+        db_session, version, {"status": "pending"}
+    )
+
+    assert snapshot is None
+    assert provenance is None
+    assert error == "pending_attempt_has_no_rubric_snapshot_or_grade_payload"
+
+
+@pytest.mark.asyncio
+async def test_legacy_pending_unknown_rubric_holds_without_live_substitution(
+    db_session, mocker
+):
+    project, version = await _make_project_and_version(db_session)
+    await _add_version_criterion(
+        db_session,
+        project,
+        version,
+        key="c-unknown",
+        text="Must not be borrowed from live state",
+    )
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={"audit_score": 1.0, "test_erosion": {}},
+        smoke_logs={"passed": True, "suites": {"startup": {"passed": True}}},
+        version_goal="Ship provenance safety",
+        seed_merge_grade=True,
+        merge_grade_logs={"covers_goal": True, "coverage_score": 1.0},
+    )
+    qual = dict(version.last_qualification or {})
+    for key in ("rubric_snapshot", "rubric_fingerprint", "rubric_lifecycle_snapshot"):
+        qual.pop(key, None)
+    merge_task = await db_session.get(Task, uuid.UUID(qual["merge_grade_task_id"]))
+    merge_task.payloads = [
+        {key: value for key, value in merge_task.first_payload.items() if key != "categories"}
+    ]
+    version.last_qualification = qual
+    db_session.add_all([version, merge_task])
+    await db_session.commit()
+    await db_session.refresh(version)
+    promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(
+        db_session, version, _pre_gates=dict(_REUSE_PATH_PRE_GATES)
+    )
+    await db_session.commit()
+
+    assert result["status"] == "rubric_provenance_unknown"
+    assert result["rubric_provenance_error"] == "merge_grade_task_payload_has_no_rubric"
+    promote_spy.assert_not_called()
+    await db_session.refresh(version)
+    assert version.last_qualification["category_verdicts"] is None
 
 
 @pytest.mark.asyncio
@@ -11398,6 +11820,25 @@ async def test_category_gate_read_back_exception_fails_closed(db_session, mocker
         key="c-needs-verify",
         text="Widget path must be verified",
     )
+    qual = dict(version.last_qualification or {})
+    qual["merge_grade_task_id"] = None
+    qual["resolved_dimensions"] = {
+        "merge_grade": {
+            "status": "passed",
+            "sub_score": 0.9,
+            "detail": {
+                "rubric_provenance": rq._rubric_provenance(
+                    qual["rubric_snapshot"],
+                    source="same_attempt_reuse",
+                    qualification_attempt_id=None,
+                )
+            },
+        }
+    }
+    version.last_qualification = qual
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
 
     # Make the ledger read-back raise (unreadable evidence).
     from app import category_verdict_ledger as _cvl
@@ -11448,6 +11889,12 @@ async def test_category_gate_no_verdict_for_active_criterion_fails_closed(
         text="This criterion was never graded into the ledger",
     )
     version.goal = "Ship the widget end to end"
+    rubric_snapshot = [
+        {
+            "criterion_key": "c-ungraded",
+            "text": "This criterion was never graded into the ledger",
+        }
+    ]
     version.last_qualification = {
         "status": "pending",
         "candidate_sha": sha,
@@ -11458,6 +11905,8 @@ async def test_category_gate_no_verdict_for_active_criterion_fails_closed(
         "smoketest_task_id": None,
         "challenge_task_id": None,
         "merge_grade_task_id": None,
+        "rubric_snapshot": rubric_snapshot,
+        "rubric_fingerprint": rq._rubric_fingerprint(rubric_snapshot),
         # Re-drive: every quality gate already resolved for this tree, including
         # merge_grade — so no fresh merge-grade artifact / category verdicts are
         # produced and the gate must read the (empty) category ledger back.
@@ -22389,6 +22838,13 @@ async def test_infra_redrive_isolates_failure_to_one_dimension_ledger_facts_surv
     await _seed_dimension_row(
         db_session, project, version, "merge_grade",
         status="passed", candidate_sha=sha,
+        detail={
+            "rubric_provenance": rq._rubric_provenance(
+                [],
+                source="prior_attempt",
+                qualification_attempt_id=None,
+            )
+        },
     )
     await db_session.commit()
 
