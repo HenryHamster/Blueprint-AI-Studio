@@ -368,7 +368,10 @@ class TestEnvAllowlist(unittest.TestCase):
         ]
         self.assertEqual(
             iso.npm_tool_roots(paths),
-            ["/home/henry/node22/lib/node_modules/@openai"],
+            [
+                "/home/henry/node22/lib/node_modules/@openai",
+                "/home/henry/node22/bin",
+            ],
         )
 
     def test_unscoped_global_npm_package_keeps_narrow_package_bind(self):
@@ -378,7 +381,10 @@ class TestEnvAllowlist(unittest.TestCase):
         ]
         self.assertEqual(
             iso.npm_tool_roots(paths),
-            ["/home/henry/node22/lib/node_modules/some-cli"],
+            [
+                "/home/henry/node22/lib/node_modules/some-cli",
+                "/home/henry/node22/bin",
+            ],
         )
 
     def test_agent_env_never_leaks_runner_secrets(self):
@@ -553,6 +559,31 @@ class TestBwrapArgv(unittest.TestCase):
     def test_network_not_unshared(self):
         # Agent + compute need egress; net namespace must NOT be unshared.
         self.assertNotIn("--unshare-net", self._argv())
+
+    def test_global_npm_directory_binds_preserve_cli_symlink(self):
+        package_scope = "/home/henry/node22/lib/node_modules/@openai"
+        npm_bin = "/home/henry/node22/bin"
+        real_entry = f"{package_scope}/codex/bin/codex.js"
+        shim = f"{npm_bin}/codex"
+        argv = self._argv(
+            ro_binds=[package_scope, npm_bin],
+            tool_paths=[real_entry, shim],
+        )
+        joined = " ".join(argv)
+        self.assertIn(f"--ro-bind-try {package_scope} {package_scope}", joined)
+        self.assertIn(f"--ro-bind-try {npm_bin} {npm_bin}", joined)
+        self.assertNotIn(f"--ro-bind-try {real_entry} {real_entry}", joined)
+        self.assertNotIn(f"--ro-bind-try {shim} {shim}", joined)
+
+    def test_managed_release_bind_preserves_dot_bin_symlink(self):
+        release = "/home/runner/.blueprint/managed-clis/codex/releases/release-1"
+        real_entry = f"{release}/node_modules/@openai/codex/bin/codex.js"
+        shim = f"{release}/node_modules/.bin/codex"
+        argv = self._argv(ro_binds=[release], tool_paths=[real_entry, shim])
+        joined = " ".join(argv)
+        self.assertIn(f"--ro-bind-try {release} {release}", joined)
+        self.assertNotIn(f"--ro-bind-try {real_entry} {real_entry}", joined)
+        self.assertNotIn(f"--ro-bind-try {shim} {shim}", joined)
 
     def test_fresh_tmpfs_home_and_no_host_home(self):
         argv = self._argv()

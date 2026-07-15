@@ -991,7 +991,17 @@ def build_bwrap_argv(
 
     # Read-only toolchain / config. --ro-bind-try skips paths absent on this host.
     seen_src: set[str] = set()
-    for src in [*ro, *tools, *libs]:
+    # A tool already covered by a directory bind must not be mounted again at
+    # its individual path.  In particular, bind-mounting an npm ``bin`` symlink
+    # dereferences it into a regular file.  Node then resolves modules relative
+    # to the shim location instead of the package entry point and cannot find
+    # sibling optional native packages.  Keeping the broader directory mount
+    # preserves the symlink exactly as installed on the host.
+    covering_roots = tuple(src for src in [*ro, *libs] if src)
+    uncovered_tools = [
+        path for path in tools if not _covered_by(path, covering_roots)
+    ]
+    for src in [*ro, *uncovered_tools, *libs]:
         if src and src not in seen_src:
             seen_src.add(src)
             argv += ["--ro-bind-try", src, src]
@@ -1033,9 +1043,12 @@ def npm_tool_roots(paths: list[str]) -> list[str]:
     symlinks whose real path is under ``<prefix>/lib/node_modules/<package>``.
     For a scoped global package, bind the whole scope directory rather than
     only the package root: npm may install platform optional dependencies as
-    siblings (notably ``@openai/codex`` and ``@openai/codex-linux-*``).
+    siblings (notably ``@openai/codex`` and ``@openai/codex-linux-*``).  Also
+    bind a global prefix's ``bin`` directory so its package shims remain
+    symlinks inside bwrap instead of being dereferenced by an individual bind.
     """
     roots: list[str] = []
+    global_npm_prefixes: list[str] = []
     for path in paths:
         bin_dir = os.path.dirname(path)
         node_modules = os.path.dirname(bin_dir)
@@ -1060,6 +1073,11 @@ def npm_tool_roots(paths: list[str]) -> list[str]:
         )
         if match:
             node_modules_root = match.group(1).rstrip("/")
+            global_suffix = "/lib/node_modules"
+            if node_modules_root.endswith(global_suffix):
+                prefix = node_modules_root[: -len(global_suffix)]
+                if prefix and prefix not in global_npm_prefixes:
+                    global_npm_prefixes.append(prefix)
             scope = (match.group(2) or "").rstrip("/")
             bind_root = (
                 f"{node_modules_root}/{scope}"
@@ -1068,6 +1086,16 @@ def npm_tool_roots(paths: list[str]) -> list[str]:
             )
             if bind_root and bind_root not in roots:
                 roots.append(bind_root)
+
+    # Global npm exposes package executables through <prefix>/bin symlinks.
+    # Bind that directory alongside the package root so build_bwrap_argv can
+    # omit the individual shim bind and preserve Node's real module location.
+    for path in paths:
+        parent = posixpath.dirname(path.replace("\\", "/"))
+        for prefix in global_npm_prefixes:
+            bin_root = f"{prefix}/bin"
+            if parent == bin_root and bin_root not in roots:
+                roots.append(bin_root)
 
     # Prefer a broader release root over a nested package root when both were
     # discovered from the real entry file plus its node_modules/.bin shim.
