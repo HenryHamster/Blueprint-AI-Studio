@@ -82,7 +82,10 @@ import { buildFixtureCapabilityContract } from './testSetup.js';
 import {
   _setLastProviderRunErrorReportForTesting,
   __setCommandExistsOverrideForSmoke,
+  __resetClaudeCapabilityCacheForTesting,
   claudeHelpSupportsPartialMessages,
+  probeClaudeCapabilities,
+  stripUnsupportedClaudeOptionalArgs,
   type ProviderRunErrorReport,
 } from './providers/runners.js';
 import { clearPidRegistry, _getRegisteredPids } from './processTracking.js';
@@ -128,6 +131,7 @@ beforeEach(() => {
   // Bypass the pre-flight CLI-exists check: provider binaries (claude, codex, etc.)
   // are not installed in the test environment; spawn is mocked separately.
   __setCommandExistsOverrideForSmoke(() => true);
+  __resetClaudeCapabilityCacheForTesting();
   process.env.PROVIDER = 'anthropic';
   process.env.AUTH_MODE = 'oauth';
   delete process.env.LLM_MODEL;
@@ -2017,6 +2021,36 @@ describe('provider runner prompt transport', () => {
         'Usage: claude [options]\n  --output-format <format>',
       ),
     ).toBe(false);
+  });
+
+  it('caches Claude capabilities by binary version and preserves model routing while stripping unsupported optional flag values', () => {
+    vi.mocked(execFileSync).mockReset();
+    vi.mocked(execFileSync)
+      .mockReturnValueOnce('claude 1.2.3')
+      .mockReturnValueOnce('Usage: claude [options]\n  --model <model>\n  --effort <level>');
+    const first = probeClaudeCapabilities('claude', process.env);
+    const second = probeClaudeCapabilities('claude', process.env);
+
+    expect(first).toEqual(new Set(['--model', '--effort']));
+    expect(second).toBe(first);
+    expect(execFileSync).toHaveBeenCalledTimes(2);
+    expect(stripUnsupportedClaudeOptionalArgs(
+      ['--model', 'glm-5.2', '--effort', 'high', '--include-partial-messages'], first,
+    )).toEqual(['--model', 'glm-5.2', '--effort', 'high']);
+    expect(stripUnsupportedClaudeOptionalArgs(
+      ['--model', 'glm-5.2', '--effort', 'high', '--include-partial-messages'], new Set(['--model']),
+    )).toEqual(['--model', 'glm-5.2']);
+  });
+
+  it('fails open when the Claude capability probe is ambiguous or fails', () => {
+    vi.mocked(execFileSync).mockReset();
+    vi.mocked(execFileSync).mockReturnValueOnce('claude 1.2.4').mockReturnValueOnce('');
+    expect(probeClaudeCapabilities('claude', process.env)).toBeNull();
+    expect(stripUnsupportedClaudeOptionalArgs(['--effort', 'high'], null)).toEqual(['--effort', 'high']);
+
+    __resetClaudeCapabilityCacheForTesting();
+    vi.mocked(execFileSync).mockImplementationOnce(() => { throw new Error('help unavailable'); });
+    expect(probeClaudeCapabilities('claude', process.env)).toBeNull();
   });
 
   it('uses Claude Code with the Anthropic-compatible endpoint for Z.AI', () => {
@@ -6745,6 +6779,34 @@ describe('LLM-no-progress watchdog (in-flight-tool suppression)', () => {
     const result = await promise;
     expect(result.exitCode).toBe(0);
     expect(killSpy).not.toHaveBeenCalledWith(-7805, 'SIGTERM');
+    killSpy.mockRestore();
+  }, 20_000);
+
+  it('disables only the partial-message no-progress watchdog when an old CLI does not advertise partial streaming', async () => {
+    vi.mocked(execFileSync).mockReset();
+    vi.mocked(execFileSync)
+      .mockReturnValueOnce('claude 0.9.0')
+      .mockReturnValueOnce('Usage: claude [options]\n  --output-format <format>');
+    const { child, handlers, emitStdout } = makeChild(7809);
+    vi.mocked(spawn).mockReturnValueOnce(child as unknown as ReturnType<typeof spawn>);
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+
+    const promise = runProviderAgent('hello', null, { value: '' });
+    await Promise.resolve();
+    const STEP = CLAUDE_STREAM_STALL_MS - 60_000;
+    let remaining = LLM_NO_PROGRESS_STALL_MS + 120_000;
+    while (remaining > STEP) {
+      await vi.advanceTimersByTimeAsync(STEP);
+      emitStdout(JSON.stringify({ type: 'system' }));
+      remaining -= STEP;
+    }
+    if (remaining > 0) await vi.advanceTimersByTimeAsync(remaining);
+
+    expect(killSpy).not.toHaveBeenCalledWith(-7809, 'SIGTERM');
+    child.exitCode = 0;
+    handlers.close?.(0, null);
+    await vi.runAllTimersAsync();
+    expect((await promise).exitCode).toBe(0);
     killSpy.mockRestore();
   }, 20_000);
 

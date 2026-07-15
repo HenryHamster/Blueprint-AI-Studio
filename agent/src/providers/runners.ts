@@ -69,32 +69,76 @@ function _commandExists(command: string): boolean {
 }
 
 const CLAUDE_PARTIAL_MESSAGES_FLAG = '--include-partial-messages';
+const CLAUDE_OPTIONAL_FLAG_VALUE_COUNTS: Readonly<Record<string, number>> = {
+  [CLAUDE_PARTIAL_MESSAGES_FLAG]: 0,
+  '--effort': 1,
+};
+const claudeCapabilityCache = new Map<string, ReadonlySet<string> | null>();
+const claudeCapabilityByCommand = new Map<string, ReadonlySet<string> | null>();
 
 export function claudeHelpSupportsPartialMessages(helpText: string): boolean {
   return helpText.includes(CLAUDE_PARTIAL_MESSAGES_FLAG);
 }
 
-function _claudeSupportsPartialMessages(command: string, env: NodeJS.ProcessEnv): boolean {
+function claudeFlagsFromHelp(helpText: string): ReadonlySet<string> {
+  return new Set(helpText.match(/--[a-zA-Z0-9-]+/g) ?? []);
+}
+
+/**
+ * Returns the optional Claude CLI capabilities advertised by this binary.
+ * A failed or ambiguous probe deliberately returns null (fail open): launch
+ * compatibility is then determined by the CLI's normal error path instead of
+ * treating an unavailable `--help` surface as proof that flags are unsupported.
+ */
+export function probeClaudeCapabilities(command: string, env: NodeJS.ProcessEnv): ReadonlySet<string> | null {
+  const commandCached = claudeCapabilityByCommand.get(command);
+  if (commandCached !== undefined) return commandCached;
   try {
+    const version = execFileSync(command, ['--version'], {
+      env, encoding: 'utf8', timeout: 5_000, stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim();
+    if (!version) return null;
+    const cacheKey = `${command}\u0000${version}`;
+    const cached = claudeCapabilityCache.get(cacheKey);
+    if (cached !== undefined) {
+      claudeCapabilityByCommand.set(command, cached);
+      return cached;
+    }
     const help = execFileSync(command, ['--help'], {
       env,
       encoding: 'utf8',
       timeout: 5_000,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
-    // Test doubles and unusual wrappers can successfully return no help text.
-    // That is not positive evidence that the flag is unsupported, so preserve
-    // the historical behavior in that ambiguous case.
     const helpText = typeof help === 'string' ? help.trim() : '';
-    return helpText.length === 0
-      ? true
-      : claudeHelpSupportsPartialMessages(helpText);
+    const capabilities = helpText ? claudeFlagsFromHelp(helpText) : null;
+    claudeCapabilityCache.set(cacheKey, capabilities);
+    claudeCapabilityByCommand.set(command, capabilities);
+    return capabilities;
   } catch {
-    // A failed help probe must not make an otherwise runnable provider CLI
-    // unusable. Keep the historical flag and let the normal structured error
-    // path report a real launch failure.
-    return true;
+    return null;
   }
+}
+
+export function stripUnsupportedClaudeOptionalArgs(
+  args: readonly string[], capabilities: ReadonlySet<string> | null,
+): string[] {
+  if (!capabilities) return [...args];
+  const compatible: string[] = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const valueCount = CLAUDE_OPTIONAL_FLAG_VALUE_COUNTS[args[index]];
+    if (Object.hasOwn(CLAUDE_OPTIONAL_FLAG_VALUE_COUNTS, args[index]) && !capabilities.has(args[index])) {
+      index += valueCount;
+      continue;
+    }
+    compatible.push(args[index]);
+  }
+  return compatible;
+}
+
+export function __resetClaudeCapabilityCacheForTesting(): void {
+  claudeCapabilityCache.clear();
+  claudeCapabilityByCommand.clear();
 }
 
 const RATE_LIMIT_PATTERNS: Readonly<Record<ProviderName, Partial<Record<AuthMode, readonly string[]>>>> = {
@@ -1138,28 +1182,23 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
     throw new RuntimeUnavailableError(cliCommand);
   }
 
-  // Claude Code CLI releases differ on partial-message support. Passing an
-  // unknown flag exits before the provider request, so probe the local binary's
-  // help text and omit the flag when unsupported. The content-progress watchdog
-  // below is disabled in that compatibility mode because it relies on the
-  // incremental deltas this flag enables; raw-stream, tool, and wall-clock
-  // watchdogs remain active.
-  let partialMessageProgressAvailable = runCommand.args.includes(
-    CLAUDE_PARTIAL_MESSAGES_FLAG,
-  );
-  if (
-    cliCommand === 'claude'
-    && partialMessageProgressAvailable
-    && !_claudeSupportsPartialMessages(cliCommand, runCommand.env)
-  ) {
-    runCommand.args = runCommand.args.filter(
-      arg => arg !== CLAUDE_PARTIAL_MESSAGES_FLAG,
-    );
-    partialMessageProgressAvailable = false;
+  // Claude-compatible CLIs vary by installed version. Negotiate their optional
+  // flags before launch so an old binary reaches the model instead of rejecting
+  // argv locally. Required model/provider routing is never part of this filter.
+  let partialMessageProgressAvailable = runCommand.args.includes(CLAUDE_PARTIAL_MESSAGES_FLAG);
+  if (cliCommand === 'claude') {
+    const capabilities = probeClaudeCapabilities(cliCommand, runCommand.env);
+    const compatibleArgs = stripUnsupportedClaudeOptionalArgs(runCommand.args, capabilities);
+    const removedPartialMessages = partialMessageProgressAvailable
+      && !compatibleArgs.includes(CLAUDE_PARTIAL_MESSAGES_FLAG);
+    runCommand.args = compatibleArgs;
+    partialMessageProgressAvailable = compatibleArgs.includes(CLAUDE_PARTIAL_MESSAGES_FLAG);
+    if (removedPartialMessages) {
     sendLog(
       ws,
       `[preflight] Claude CLI does not support ${CLAUDE_PARTIAL_MESSAGES_FLAG}; using compatible stream mode\n`,
     );
+    }
   }
 
   // OAuth accounts may have earned Codex rate-limit reset credits. Consume one
