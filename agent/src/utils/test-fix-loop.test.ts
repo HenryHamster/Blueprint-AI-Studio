@@ -22,6 +22,9 @@ vi.mock('../index.js', () => ({
 // runClaudeCode must never be invoked for maxFixAttempts:0 runs — stub anyway.
 vi.mock('../providers/runners.js', () => ({
   claudeHelpSupportsPartialMessages: vi.fn(() => true),
+  probeClaudeCapabilities: vi.fn(() => null),
+  stripUnsupportedClaudeOptionalArgs: vi.fn((args: string[]) => args),
+  __resetClaudeCapabilityCacheForTesting: vi.fn(),
   runClaudeCode: vi.fn().mockResolvedValue(undefined),
 }));
 

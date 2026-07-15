@@ -1136,13 +1136,14 @@ async def onboard_project(
             is_first_bootstrap=True,
             spawn_reason="first_cycle",
         )
-        if _result.outcome == "spawned":
+        if _result.outcome == "spawned" or _result.build_config_changed:
             await session.commit()
-            logger.info(
-                "[ONBOARD] Spawned repo_bootstrap task %s for project %s",
-                _result.task_id,
-                project.id,
-            )
+            if _result.outcome == "spawned":
+                logger.info(
+                    "[ONBOARD] Spawned repo_bootstrap task %s for project %s",
+                    _result.task_id,
+                    project.id,
+                )
     except Exception:
         logger.exception(
             "[ONBOARD] Failed to spawn repo_bootstrap task for project %s — continuing",

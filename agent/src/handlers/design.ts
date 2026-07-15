@@ -29,6 +29,7 @@ import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import {
   configureAgentPermissions, computePromptFingerprint, buildFileTree,
   isGreenfieldRepo, buildGreenfieldCitationGuidance,
+  verifyCloneDelivered,
   DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE, buildContextPrefix, buildRetryContext, readClaudeMd,
   writePlaybookHelper, writeMessagesHelper, writeDesignDocHelper, formatPlaybook, type PlaybookEntry,
 } from '../prompt.js';
@@ -267,6 +268,11 @@ export async function handleDesign(
     workspace: WORKSPACE, repoUrl: cloneUrl, githubToken: ghToken,
     branch: baseBranch, baseBranch, depth: DEFAULT_CLONE_DEPTH,
   });
+  // Do not build grounding context from a partial or wrong checkout. A durable
+  // non-empty/live-empty disagreement must surface as clone_failed so the
+  // backend can self-heal the stale onboarding signal instead of emitting an
+  // ungrounded design that later fails citation validation.
+  verifyCloneDelivered(task, baseBranch);
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
   // The design prompt advertises `./design-doc get <key>` for architectural

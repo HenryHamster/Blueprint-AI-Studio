@@ -113,7 +113,9 @@ async def _self_heal_undetermined_emptiness(
     Resolve the signal authoritatively while we still hold a write-capable
     installation token: seed a truly commitless repo (giving the trunk a real
     commit) and stamp ``repo_is_empty=True`` with the full empty-repo config
-    shape; stamp ``False`` when the repo demonstrably has commits. Both cases
+    shape. For a repository with commits, use the canonical source-file
+    classifier rather than treating a commit as proof of real source; a
+    README-only or scaffold-only repository is still greenfield. Both cases
     persist to ``project.build_config`` (caller commits) so the durable signal
     stops being undetermined and future sweeps classify it correctly.
 
@@ -139,11 +141,38 @@ async def _self_heal_undetermined_emptiness(
             return "undetermined"
 
         if await repo_has_commits(token, owner, repo):
-            build_cfg["repo_is_empty"] = False
+            # Commit existence only distinguishes a cloneable repository from a
+            # commitless one. The onboarding detector is the authoritative
+            # classifier for greenfield status because it excludes README and
+            # scaffold files from its bounded source-file count.
+            from app.build_config_detection import apply_operator_build_config_overrides
+            from app.routers.admin_onboard import _detect_build_config
+
+            detected = await _detect_build_config(
+                token,
+                owner,
+                repo,
+                ref=project.integration_branch,
+            )
+            if (
+                not detected
+                or detected.get("detection_incomplete")
+                or not isinstance(detected.get("repo_is_empty"), bool)
+                or not isinstance(detected.get("source_file_count"), int)
+            ):
+                return "undetermined"
+
+            detected = apply_operator_build_config_overrides(dict(detected), build_cfg)
+            # Keep the gate below on the same updated mapping; it intentionally
+            # reads ``build_cfg`` so this legacy self-heal does not need a
+            # second eligibility path.  Detection owns its fields, but this is
+            # also a lifecycle record: retain durable bootstrap/recovery and
+            # command-writeback evidence the detector cannot derive.
+            build_cfg.update(detected)
             project.build_config = build_cfg
             flag_modified(project, "build_config")
             session.add(project)
-            return "non_empty"
+            return "empty" if build_cfg["repo_is_empty"] else "non_empty"
 
         # Commitless: seed the trunk so `--branch <trunk>` clones stop dying,
         # then stamp the durable empty-repo signal so the guard suppresses the
@@ -176,6 +205,11 @@ class BootstrapSpawnResult:
     outcome: Literal["spawned", "already_active", "already_completed", "not_eligible"]
     task_id: str | None = None
     reason: str = ""
+    # A legacy emptiness self-heal can update the durable config even when the
+    # request correctly decides not to enqueue a task. HTTP callers use this
+    # signal to commit that narrow, successful repair without committing an
+    # unrelated no-op outcome.
+    build_config_changed: bool = False
 
 
 async def spawn_bootstrap_task(
@@ -215,6 +249,7 @@ async def spawn_bootstrap_task(
     """
     build_cfg = dict(project.build_config or {})
     is_refresh = spawn_reason == REFRESH_SPAWN_REASON
+    build_config_changed = False
 
     if project_is_deploy_repo(project):
         return BootstrapSpawnResult(
@@ -227,22 +262,27 @@ async def spawn_bootstrap_task(
     # otherwise coalesce that to "not empty", so a genuinely commitless legacy
     # repo loops clone_failed forever. Resolve the signal against the live repo
     # first: a real empty repo is seeded + stamped here (and suppressed by the
-    # guard below); a repo with commits is stamped non-empty and proceeds. A
-    # no-token / GitHub-error self-heal leaves the signal undetermined and falls
-    # through to the prior behavior, so nothing regresses.
+    # guard below); a repo with commits is classified by its real source-file
+    # count and proceeds only when that count exceeds the greenfield threshold.
+    # A no-token / GitHub-error/incomplete detection leaves the signal
+    # undetermined and falls through to the prior behavior, so nothing regresses.
     if build_cfg.get("repo_is_empty") is None:
+        config_before_self_heal = dict(build_cfg)
         await _self_heal_undetermined_emptiness(project, build_cfg, session)
+        build_config_changed = build_cfg != config_before_self_heal
 
     if build_cfg.get("repo_is_empty"):
         return BootstrapSpawnResult(
             outcome="not_eligible",
             reason="repo_is_empty",
+            build_config_changed=build_config_changed,
         )
 
     if build_cfg.get("bootstrap_completed_at") and not is_refresh:
         return BootstrapSpawnResult(
             outcome="already_completed",
             reason="bootstrap_completed_at already set",
+            build_config_changed=build_config_changed,
         )
 
     # Check for existing active bootstrap task.
@@ -263,6 +303,7 @@ async def spawn_bootstrap_task(
             outcome="already_active",
             task_id=str(existing[0]),
             reason="existing active repo_bootstrap task",
+            build_config_changed=build_config_changed,
         )
 
     if is_refresh:

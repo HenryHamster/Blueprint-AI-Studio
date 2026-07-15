@@ -2075,7 +2075,7 @@ async def retry_project_bootstrap(
         is_first_bootstrap=False,
         spawn_reason="operator_retry",
     )
-    if result.outcome == "spawned":
+    if result.outcome == "spawned" or result.build_config_changed:
         await session.commit()
 
     return {
@@ -2117,7 +2117,7 @@ async def refresh_project_bootstrap(
         is_first_bootstrap=False,
         spawn_reason=REFRESH_SPAWN_REASON,
     )
-    if result.outcome == "spawned":
+    if result.outcome == "spawned" or result.build_config_changed:
         await session.commit()
 
     return {

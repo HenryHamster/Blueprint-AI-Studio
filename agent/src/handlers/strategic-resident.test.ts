@@ -58,6 +58,9 @@ vi.mock('./strategic-helpers.js', () => ({
 vi.mock('../providers/runners.js', () => ({
   provisionAmbientHelpers: vi.fn(),
   claudeHelpSupportsPartialMessages: vi.fn(() => true),
+  probeClaudeCapabilities: vi.fn(() => null),
+  stripUnsupportedClaudeOptionalArgs: vi.fn((args: string[]) => args),
+  __resetClaudeCapabilityCacheForTesting: vi.fn(),
 }));
 vi.mock('../providers/resident-session.js', () => ({
   startResidentClaudeSession: vi.fn(),

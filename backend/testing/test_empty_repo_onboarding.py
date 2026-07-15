@@ -483,16 +483,27 @@ class TestLegacyUndeterminedEmptinessSelfHeal:
         assert project.build_config["has_ci"] is False
 
     @pytest.mark.asyncio
-    async def test_repo_with_commits_is_stamped_non_empty_and_spawns(self, db_session):
-        # Undetermined signal + a repo that actually has commits: no seeding, the
-        # signal is stamped repo_is_empty=False, and bootstrap proceeds normally.
+    async def test_readme_only_committed_repo_is_greenfield_and_suppresses_bootstrap(
+        self, db_session
+    ):
+        # A commit only proves the remote is cloneable. The canonical detector
+        # must still classify README-only history as greenfield, stamp its
+        # authoritative source count, and suppress the doomed bootstrap.
         project = _legacy_undetermined_project(
-            name="legacy/has-commits", github_repo="has-commits"
+            name="legacy/readme-only", github_repo="readme-only"
         )
         db_session.add(project)
         await db_session.flush()
 
         ensure_mock = AsyncMock(return_value=False)
+        detected = {
+            "language": None,
+            "directories": [],
+            "env_vars": {},
+            "repo_is_empty": True,
+            "source_file_count": 0,
+            "has_ci": False,
+        }
         with (
             patch(
                 "app.github.get_repo_installation_token",
@@ -505,6 +516,62 @@ class TestLegacyUndeterminedEmptinessSelfHeal:
                 return_value=True,
             ),
             patch("app.github.ensure_repo_initialized", ensure_mock),
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value=detected,
+            ) as detect_mock,
+        ):
+            result = await spawn_bootstrap_task(
+                project,
+                db_session,
+                is_first_bootstrap=False,
+                spawn_reason="recovery_sweep",
+            )
+        await db_session.commit()
+
+        assert result.outcome == "not_eligible"
+        assert result.reason == "repo_is_empty"
+        # A repo with commits must never be seeded.
+        ensure_mock.assert_not_awaited()
+        detect_mock.assert_awaited_once_with(
+            "tok", "legacy", "readme-only", ref="main"
+        )
+        assert project.build_config["repo_is_empty"] is True
+        assert project.build_config["source_file_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_source_rich_committed_repo_is_stamped_non_empty_and_spawns(
+        self, db_session
+    ):
+        project = _legacy_undetermined_project(
+            name="legacy/source-rich", github_repo="source-rich"
+        )
+        db_session.add(project)
+        await db_session.flush()
+
+        with (
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+            patch(
+                "app.github.repo_has_commits",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value={
+                    "language": "python",
+                    "directories": [{"path": "./", "type": "python"}],
+                    "repo_is_empty": False,
+                    "source_file_count": 2,
+                    "has_ci": False,
+                },
+            ),
         ):
             result = await spawn_bootstrap_task(
                 project,
@@ -515,9 +582,109 @@ class TestLegacyUndeterminedEmptinessSelfHeal:
         await db_session.commit()
 
         assert result.outcome == "spawned"
-        # A repo with commits must never be seeded.
-        ensure_mock.assert_not_awaited()
         assert project.build_config["repo_is_empty"] is False
+        assert project.build_config["source_file_count"] == 2
+
+    @pytest.mark.asyncio
+    async def test_committed_self_heal_preserves_completed_and_recovery_metadata(
+        self, db_session
+    ):
+        """Detection fields refresh without erasing non-repo lifecycle evidence."""
+        project = _legacy_undetermined_project(
+            name="legacy/completed-source-rich",
+            github_repo="completed-source-rich",
+            build_config={
+                "language": "python",
+                "bootstrap_completed_at": "2026-01-01T00:00:00+00:00",
+                "bootstrap_degraded_reason": "prior_overview_missing",
+                "bootstrap_recovery_state": "exhausted",
+                "bootstrap_command_memory_status": "written",
+                "bootstrap_command_memory_updated_at": "2026-01-02T00:00:00+00:00",
+                "custom_bootstrap_evidence": {"task_id": "prior-task"},
+            },
+        )
+        db_session.add(project)
+        await db_session.flush()
+
+        with (
+            patch("app.github.get_repo_installation_token", new_callable=AsyncMock, return_value="tok"),
+            patch("app.github.repo_has_commits", new_callable=AsyncMock, return_value=True),
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value={
+                    "language": "typescript",
+                    "directories": [{"path": "./", "type": "node"}],
+                    "repo_is_empty": False,
+                    "source_file_count": 4,
+                    "has_ci": True,
+                },
+            ),
+        ):
+            result = await spawn_bootstrap_task(
+                project, db_session, is_first_bootstrap=False, spawn_reason="operator_retry"
+            )
+        await db_session.commit()
+
+        assert result.outcome == "already_completed"
+        assert result.build_config_changed is True
+        assert project.build_config["language"] == "typescript"
+        assert project.build_config["bootstrap_completed_at"] == "2026-01-01T00:00:00+00:00"
+        assert project.build_config["bootstrap_degraded_reason"] == "prior_overview_missing"
+        assert project.build_config["bootstrap_recovery_state"] == "exhausted"
+        assert project.build_config["bootstrap_command_memory_status"] == "written"
+        assert project.build_config["custom_bootstrap_evidence"] == {"task_id": "prior-task"}
+
+        # A refresh deliberately bypasses the completed gate, but must retain
+        # the timestamp while doing so; otherwise a later retry can duplicate
+        # first-bootstrap work.
+        refresh = await spawn_bootstrap_task(
+            project, db_session, is_first_bootstrap=False, spawn_reason="operator_refresh"
+        )
+        assert refresh.outcome == "spawned"
+        assert project.build_config["bootstrap_completed_at"] == "2026-01-01T00:00:00+00:00"
+
+    @pytest.mark.asyncio
+    async def test_incomplete_committed_repo_detection_falls_through_unstamped(
+        self, db_session
+    ):
+        project = _legacy_undetermined_project(
+            name="legacy/incomplete", github_repo="incomplete"
+        )
+        db_session.add(project)
+        await db_session.flush()
+
+        with (
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+            patch(
+                "app.github.repo_has_commits",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value={
+                    "repo_is_empty": None,
+                    "source_file_count": None,
+                    "detection_incomplete": True,
+                },
+            ),
+        ):
+            result = await spawn_bootstrap_task(
+                project,
+                db_session,
+                is_first_bootstrap=False,
+                spawn_reason="recovery_sweep",
+            )
+        await db_session.commit()
+
+        assert result.outcome == "spawned"
+        assert "repo_is_empty" not in project.build_config
 
     @pytest.mark.asyncio
     async def test_no_token_leaves_signal_undetermined_and_falls_through(
