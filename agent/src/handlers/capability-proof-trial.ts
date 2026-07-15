@@ -49,6 +49,8 @@ export interface CapabilityProofTrialResult {
   type: 'capability_proof_trial';
   cap: string;
   head_sha: string | null;
+  /** The SHA queued when the trial was enrolled; retained for drift visibility. */
+  queued_head_sha: string | null;
   test_refs: string[];
   ran: boolean;
   passed: boolean;
@@ -185,7 +187,9 @@ export async function handleCapabilityProofTrial(
     sendLog(ws, `Capability proof trial: ${!cap ? 'no capability' : testRefs.length === 0 ? 'no test refs' : 'refs not cleanly targetable'} — reporting could_not_run.\n`);
     await report({
       type: 'capability_proof_trial',
-      cap, head_sha: headSha, test_refs: testRefs,
+      // This path has no checkout, so it intentionally reports only the queued
+      // identity rather than claiming it was executed.
+      cap, head_sha: headSha, queued_head_sha: headSha, test_refs: testRefs,
       ran: false, passed: false, could_not_run: true,
     });
     return;
@@ -199,6 +203,19 @@ export async function handleCapabilityProofTrial(
     workspace: WORKSPACE, repoUrl: cloneUrl, githubToken: ghToken,
     branch: baseBranch, baseBranch, depth: DEFAULT_CLONE_DEPTH,
   });
+
+  // The base branch can advance after this trial is queued. Proof provenance
+  // must name the checkout that ran the tests, never the queued branch head.
+  // A failed identity lookup is indeterminate, not permission to echo the
+  // queued SHA; test execution and its classification still proceed normally.
+  let executedHeadSha: string | null = null;
+  try {
+    const resolved = await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: WORKSPACE });
+    executedHeadSha = resolved.trim() || null;
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    sendLog(ws, `Capability proof trial [${cap}]: could not resolve checkout SHA: ${message}\n`);
+  }
 
   statusRef.value = `Running covering tests for capability '${cap}'...`;
   sendLog(ws, `Capability proof trial [${cap}]: ${runner.cmd} ${runner.args.join(' ')} (cwd=${runner.cwd})\n`);
@@ -229,7 +246,7 @@ export async function handleCapabilityProofTrial(
 
   await report({
     type: 'capability_proof_trial',
-    cap, head_sha: headSha, test_refs: testRefs,
+    cap, head_sha: executedHeadSha, queued_head_sha: headSha, test_refs: testRefs,
     ran, passed, could_not_run: couldNotRun,
     ...(skippedSummary ? { skipped_summary: skippedSummary } : {}),
   });

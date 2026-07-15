@@ -1,8 +1,29 @@
-import { describe, it, expect } from 'vitest';
+import { beforeEach, describe, it, expect, vi } from 'vitest';
+
+vi.mock('../index.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../index.js')>();
+  return {
+    ...actual,
+    WORKSPACE: '/tmp/capability-proof-workspace',
+    execFileAsync: vi.fn(),
+    persistAndPostStatus: vi.fn().mockResolvedValue(undefined),
+    resolveBaseBranch: vi.fn().mockReturnValue('main'),
+    sendLog: vi.fn(),
+    validateBranchName: vi.fn((branch: string) => branch),
+  };
+});
+
+vi.mock('../workspacePrep.js', () => ({
+  prepareWorkspaceForRole: vi.fn().mockResolvedValue(undefined),
+}));
+
 import {
   buildCapabilityProofTrialRunner,
+  handleCapabilityProofTrial,
   parseTrialSkippedSummary,
 } from './capability-proof-trial.js';
+import { execFileAsync, persistAndPostStatus } from '../index.js';
+import { prepareWorkspaceForRole } from '../workspacePrep.js';
 
 const WS = '/tmp/ws';
 
@@ -74,5 +95,54 @@ describe('parseTrialSkippedSummary', () => {
   it('returns undefined when no counts are parseable (do not fabricate)', () => {
     expect(parseTrialSkippedSummary('')).toBeUndefined();
     expect(parseTrialSkippedSummary('some unrelated output')).toBeUndefined();
+  });
+});
+
+describe('handleCapabilityProofTrial checkout provenance', () => {
+  const payload = {
+    cap: 'repo-map',
+    head_sha: 'queued-sha',
+    test_refs: ['agent/src/handlers/capability-proof-trial.test.ts'],
+  };
+  const statusRef = { value: '' };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(prepareWorkspaceForRole).mockResolvedValue(undefined);
+  });
+
+  async function runTrial(): Promise<Record<string, unknown>> {
+    await handleCapabilityProofTrial(
+      'task-1', payload, {}, 'token', 'owner', 'repo', null, statusRef,
+    );
+    const report = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    return JSON.parse(report.logs as string) as Record<string, unknown>;
+  }
+
+  it('reports the checked-out SHA while retaining a different queued SHA', async () => {
+    vi.mocked(execFileAsync)
+      .mockResolvedValueOnce('executed-sha\n')
+      .mockResolvedValueOnce('1 passed\n');
+
+    const result = await runTrial();
+
+    expect(execFileAsync).toHaveBeenNthCalledWith(
+      1, 'git', ['rev-parse', 'HEAD'], { cwd: '/tmp/capability-proof-workspace' },
+    );
+    expect(result).toMatchObject({
+      head_sha: 'executed-sha', queued_head_sha: 'queued-sha', ran: true, passed: true,
+    });
+  });
+
+  it('reports an indeterminate SHA when rev-parse fails without changing run classification', async () => {
+    vi.mocked(execFileAsync)
+      .mockRejectedValueOnce(new Error('git unavailable'))
+      .mockResolvedValueOnce('1 passed\n');
+
+    const result = await runTrial();
+
+    expect(result).toMatchObject({
+      head_sha: null, queued_head_sha: 'queued-sha', ran: true, passed: true, could_not_run: false,
+    });
   });
 });
