@@ -26,6 +26,13 @@ describe('viewport runner unhandled-error filter', () => {
   });
 
   it.each([
+    'Route is already handled!',
+    'route.fulfill: Route is already handled!',
+  ])('accepts Vitest serialized Playwright provenance without a stack: %s', message => {
+    expect(isBenignPlaywrightRouteRace({ message, log: [] })).toBe(true);
+  });
+
+  it.each([
     new Error('application rejection'),
     {
       message: 'route.fulfill: Route is already handled!',
@@ -38,6 +45,10 @@ describe('viewport runner unhandled-error filter', () => {
     {
       message: 'different provider failure',
       stack: 'at ../node_modules/@vitest/browser-playwright/dist/index.js:989:20',
+    },
+    {
+      message: 'Route is already handled!',
+      log: 'not-playwright-structured-log',
     },
     'route.fulfill: Route is already handled!',
   ])('rejects non-matching errors %#', (error) => {

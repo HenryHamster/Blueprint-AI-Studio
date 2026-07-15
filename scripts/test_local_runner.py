@@ -4791,7 +4791,7 @@ class TestDockerAgentBackend(unittest.TestCase):
     # ---- plan + spawn + container tracking -----------------------------------
 
     def _spawn(self, *, backend, container_name, agent_image, agent_binary, caps,
-               task_type="research"):
+               task_type="research", llm_env=None):
         active_tasks: dict = {}
         agent_started_at: dict = {}
         agent_teardown: dict = {}
@@ -4828,6 +4828,7 @@ class TestDockerAgentBackend(unittest.TestCase):
                 agent_started_at=agent_started_at,
                 agent_teardown=agent_teardown,
                 lock=threading.Lock(),
+                llm_env=llm_env,
             )
         return {
             "spawned": spawned, "active": active_tasks, "started": agent_started_at,
@@ -4861,6 +4862,27 @@ class TestDockerAgentBackend(unittest.TestCase):
         # Injected identity env is passed through unchanged.
         self.assertEqual(pkw["injected_env"]["AGENT_SECRET_TOKEN"], "agent-tok")
         self.assertEqual(pkw["injected_env"]["TASK_ID"], "task-xyz")
+
+    def test_bwrap_spawn_relocates_codex_home_before_planning(self):
+        r = self._spawn(
+            backend=iso.BACKEND_BWRAP,
+            container_name=None,
+            agent_image=None,
+            agent_binary=["node", "/agent/dist/index.js"],
+            caps=_bwrap_caps(),
+            llm_env={
+                "PROVIDER": "openai",
+                "AUTH_MODE": "oauth",
+                "CODEX_HOME": "/opt/agent/openai",
+            },
+        )
+
+        _, pkw = r["plan"].call_args
+        self.assertEqual(
+            pkw["injected_env"]["CODEX_HOME"],
+            "/workspace/opt/agent/openai",
+        )
+        self.assertEqual(pkw["injected_env"]["PROVIDER"], "openai")
 
     def test_real_iso_interface_docker_plan_and_container_name(self):
         """Integration guard against interface drift: drive _spawn_agent_task with the
@@ -5342,6 +5364,27 @@ class TestSafeCredentialPath(unittest.TestCase):
         """Helper: assert path raises ValueError."""
         with self.assertRaises(ValueError):
             local_runner._safe_credential_path(fpath, self._tmpdir)
+
+    def test_bwrap_provider_paths_relocate_to_workspace_mount(self):
+        original = {
+            "PROVIDER": "openai",
+            "CODEX_HOME": "/opt/agent/openai",
+            "GOOGLE_APPLICATION_CREDENTIALS": "/opt/agent/gemini/sa.json",
+            "OPENAI_API_KEY": "not-a-path",
+        }
+        relocated = local_runner._relocate_bwrap_credential_env(original)
+
+        self.assertEqual(relocated["CODEX_HOME"], "/workspace/opt/agent/openai")
+        self.assertEqual(
+            relocated["GOOGLE_APPLICATION_CREDENTIALS"],
+            "/workspace/opt/agent/gemini/sa.json",
+        )
+        self.assertEqual(relocated["OPENAI_API_KEY"], "not-a-path")
+        self.assertEqual(original["CODEX_HOME"], "/opt/agent/openai")
+
+    def test_relative_provider_paths_are_not_rewritten(self):
+        env = {"CODEX_HOME": "relative/codex"}
+        self.assertEqual(local_runner._relocate_bwrap_credential_env(env), env)
 
     def test_normal_path_with_leading_slash_is_accepted(self):
         """A normal path under /root is resolved relative to workspace root."""

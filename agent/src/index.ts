@@ -498,25 +498,25 @@ function agentHome(): string {
 //       ~/.gemini/settings.json — Gemini CLI custom-alias settings
 const HOME_ANCHORED_CRED_SUBPATHS = ['.claude.json', '.gemini/settings.json'] as const;
 
-// (2) install-dir-anchored — /opt/agent/openai/auth.json (pointed at by
-//     CODEX_HOME) and /opt/agent/gemini/sa.json (GOOGLE_APPLICATION_CREDENTIALS).
-//     The backend manifest (build_agent_secret_manifest →
-//     providers/{openai,gemini}.py) sets BOTH the file path AND its pointing env
-//     var to these absolute /opt/agent paths, so they are NOT HOME-relative;
-//     this client-side mirror must match the server verbatim or the boot-
-//     credential snapshot would miss them. /opt/agent is bound READ-ONLY inside
-//     the fleet-runner sandbox, so a write here can legitimately fail there —
-//     materializeCredentialState treats it as best-effort.
-const INSTALL_DIR_ANCHORED_CRED_PATHS = [
-  '/opt/agent/openai/auth.json',
-  '/opt/agent/gemini/sa.json',
-] as const;
+// (2) install-dir-anchored — Codex and Gemini credentials are pointed to by
+//     environment variables. Cloud images use /opt/agent, while a local bwrap
+//     runner relocates them into its writable /workspace mount. Resolve the
+//     live env paths so snapshots and OAuth rotation follow the same files the
+//     provider CLIs actually use.
+function installDirAnchoredCredPaths(): string[] {
+  const codexHome = process.env.CODEX_HOME?.trim().replace(/\/+$/, '');
+  const googleCredentials = process.env.GOOGLE_APPLICATION_CREDENTIALS?.trim();
+  return [
+    codexHome ? `${codexHome}/auth.json` : '/opt/agent/openai/auth.json',
+    googleCredentials || '/opt/agent/gemini/sa.json',
+  ];
+}
 
 function knownManagedCredentialFilePaths(): string[] {
   const home = agentHome();
   return [
     ...HOME_ANCHORED_CRED_SUBPATHS.map(sub => `${home}/${sub}`),
-    ...INSTALL_DIR_ANCHORED_CRED_PATHS,
+    ...installDirAnchoredCredPaths(),
   ];
 }
 
@@ -539,13 +539,10 @@ function resolveManagedCredentialWritePath(manifestPath: string): string {
   return manifestPath;
 }
 
-// /opt/agent is bound READ-ONLY inside the fleet-runner sandbox, so writing the
-// provider creds anchored there can fail. The anthropic/Claude path does NOT
-// depend on them, so materialization treats these writes as best-effort (log +
-// continue) instead of failing the whole role. Enabling openai/gemini on a
-// sandboxed runner needs a COORDINATED backend relocation of the file path AND
-// its pointing env var (CODEX_HOME / GOOGLE_APPLICATION_CREDENTIALS) out of
-// /opt/agent — deliberately NOT done agent-side.
+// Older runners may still expose read-only /opt/agent credential paths, so
+// materialization remains best-effort (log + continue) for compatibility.
+// Current bwrap runners relocate the pointing env vars and files together into
+// /workspace before starting the agent.
 function isReadOnlyInstallDirCredPath(writePath: string): boolean {
   return writePath.startsWith('/opt/agent/');
 }
