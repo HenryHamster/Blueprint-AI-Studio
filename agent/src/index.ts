@@ -567,6 +567,37 @@ function parseSecretFileMode(raw: unknown): number {
   return 0o600;
 }
 
+// The backend's VM-startup materializer applies the same normalization before
+// writing ~/.claude.json. Fleet runners materialize a returned credential
+// manifest in-process instead, so keep the invariant here as well: an omitted
+// config becomes a minimal non-secret onboarding/trust config, while a valid
+// operator-supplied object retains all of its other settings.
+function normalizeClaudeConfigContent(filePath: string, content: string): string {
+  if (path.basename(filePath) !== '.claude.json') return content;
+  try {
+    const config: unknown = JSON.parse(content || '{}');
+    if (!config || typeof config !== 'object' || Array.isArray(config)) return content;
+    const parsed = config as Record<string, unknown>;
+    parsed.hasCompletedOnboarding = true;
+    const projects = parsed.projects;
+    const normalizedProjects = projects && typeof projects === 'object' && !Array.isArray(projects)
+      ? projects as Record<string, unknown>
+      : {};
+    parsed.projects = normalizedProjects;
+    const workspace = normalizedProjects['/tmp/workspace'];
+    const normalizedWorkspace = workspace && typeof workspace === 'object' && !Array.isArray(workspace)
+      ? workspace as Record<string, unknown>
+      : {};
+    normalizedProjects['/tmp/workspace'] = normalizedWorkspace;
+    normalizedWorkspace.hasTrustDialogAccepted = true;
+    return JSON.stringify(parsed);
+  } catch {
+    // Preserve malformed operator configuration exactly; replacing it would
+    // discard account-supplied state and hide its validation error.
+    return content;
+  }
+}
+
 function ensureParentDirectorySync(filePath: string): void {
   const parent = path.dirname(filePath);
   fs.mkdirSync(parent, { recursive: true, mode: 0o700 });
@@ -636,7 +667,11 @@ function materializeCredentialState(
       continue;
     }
     ensureParentDirectorySync(writePath);
-    writePrivateFileSync(writePath, file.content, file.mode);
+    writePrivateFileSync(
+      writePath,
+      normalizeClaudeConfigContent(writePath, file.content),
+      file.mode,
+    );
     materializedPaths.push(writePath);
   }
   for (const [key, value] of Object.entries(state.env)) {

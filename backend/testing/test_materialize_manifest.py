@@ -274,6 +274,99 @@ class TestFileMaterialization:
         ), f"materialized file should be chowned (via its atomic temp); got {sorted(chowned_paths)}"
 
 
+class TestAnthropicTrustMaterialization:
+    """Tests for the minimal ~/.claude.json materialization path.
+
+    When an Anthropic pool entry omits claude_config_json, the manifest
+    builder now always includes a .claude.json file with content ``{}``.
+    _normalize_materialized_file_content marks onboarding complete and merges
+    hasTrustDialogAccepted into /tmp/workspace so the CLI doesn't stall.
+    """
+
+    def _monkeypatch_uid_gid(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        uid = os.getuid() if hasattr(os, "getuid") else 0
+        gid = os.getgid() if hasattr(os, "getgid") else 0
+        monkeypatch.setattr(
+            materialize_manifest,
+            "_lookup_uid_gid",
+            lambda _user: (uid, gid),
+        )
+        monkeypatch.setattr(os, "chown", lambda *_: None, raising=False)
+
+    def test_omitted_config_materializes_minimal_trust_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Manifest with empty .claude.json content ({}) produces a file
+        with hasTrustDialogAccepted injected into /tmp/workspace."""
+        self._monkeypatch_uid_gid(monkeypatch)
+        target = tmp_path / ".claude.json"
+        manifest = _write_manifest(
+            tmp_path,
+            env={"PROVIDER": "anthropic", "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-test"},
+            files=[{"path": str(target), "content": "{}", "mode": "0600"}],
+        )
+        env_out = tmp_path / "agent.env"
+        assert materialize_manifest.main(["m", str(manifest), str(env_out)]) == 0
+
+        data = json.loads(target.read_text(encoding="utf-8"))
+        assert data["hasCompletedOnboarding"] is True
+        assert data["projects"]["/tmp/workspace"]["hasTrustDialogAccepted"] is True
+        # No secrets in the config file
+        raw = target.read_text(encoding="utf-8")
+        assert "sk-ant" not in raw
+        assert "CLAUDE_CODE_OAUTH_TOKEN" not in raw
+
+    def test_supplied_config_preserved_and_trust_injected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Operator-supplied claude_config_json is preserved and trust is
+        merged on top — not replaced."""
+        self._monkeypatch_uid_gid(monkeypatch)
+        operator_content = json.dumps(
+            {
+                "hasCompletedOnboarding": True,
+                "email": "op@example.com",
+                "projects": {"/other/path": {"hasTrustDialogAccepted": False}},
+            }
+        )
+        target = tmp_path / ".claude.json"
+        manifest = _write_manifest(
+            tmp_path,
+            env={"PROVIDER": "anthropic"},
+            files=[{"path": str(target), "content": operator_content, "mode": "0600"}],
+        )
+        env_out = tmp_path / "agent.env"
+        assert materialize_manifest.main(["m", str(manifest), str(env_out)]) == 0
+
+        data = json.loads(target.read_text(encoding="utf-8"))
+        # Operator fields preserved
+        assert data["hasCompletedOnboarding"] is True
+        assert data["email"] == "op@example.com"
+        assert data["projects"]["/other/path"]["hasTrustDialogAccepted"] is False
+        # Trust injected for /tmp/workspace
+        assert data["projects"]["/tmp/workspace"]["hasTrustDialogAccepted"] is True
+
+    def test_home_reanchored_path_still_normalizes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """When the agent re-anchors /home/agent/.claude.json to a different
+        $HOME (e.g. /home inside a bwrap sandbox), the normalization still
+        fires because it keys on the filename .claude.json, not the prefix."""
+        self._monkeypatch_uid_gid(monkeypatch)
+        # Simulate re-anchored path: /home/.claude.json instead of /home/agent/
+        reanchored = tmp_path / ".claude.json"
+        manifest = _write_manifest(
+            tmp_path,
+            env={"PROVIDER": "anthropic"},
+            files=[{"path": str(reanchored), "content": "{}", "mode": "0600"}],
+        )
+        env_out = tmp_path / "agent.env"
+        assert materialize_manifest.main(["m", str(manifest), str(env_out)]) == 0
+
+        data = json.loads(reanchored.read_text(encoding="utf-8"))
+        assert data["projects"]["/tmp/workspace"]["hasTrustDialogAccepted"] is True
+
+
 class TestNssBypass:
     def test_lookup_reads_passwd_not_pwd_module(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
