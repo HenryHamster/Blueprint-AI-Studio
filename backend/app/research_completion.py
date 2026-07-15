@@ -4354,6 +4354,63 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         needs_approval = _budget_requires_approval or _compute_requires_approval
 
         direction_id = finding.get("direction_id")
+
+        # Knowledge-commission dedup guard (web_research / design only).
+        # Skip the finding when a knowledge document for the same direction AND
+        # topic was produced within the cooldown window, OR when an identical
+        # knowledge task is currently in-flight for that direction+topic pair.
+        # Both checks require direction_id AND topic — a missing key disables
+        # the guard (callers must allow the commission rather than over-block).
+        if task_type in ("web_research", "design"):
+            from app.knowledge_query import (  # noqa: PLC0415
+                knowledge_doc_recently_produced,
+                knowledge_task_in_flight,
+            )
+            from app.shared_state import runtime_config as _rc_kguard  # noqa: PLC0415
+
+            _kguard_topic = finding.get("topic") or title
+            _kguard_dir = direction_id or (task.context or {}).get("direction_id")
+            _kguard_cooldown_cfg = _rc_kguard.get("knowledge_commission_cooldown_hours")
+            _kguard_cooldown: float | None = (
+                float(_kguard_cooldown_cfg)
+                if isinstance(_kguard_cooldown_cfg, (int, float))
+                and not isinstance(_kguard_cooldown_cfg, bool)
+                else None
+            )
+            try:
+                _kguard_recent = await knowledge_doc_recently_produced(
+                    session,
+                    task.project_id,
+                    _kguard_dir,
+                    _kguard_topic,
+                    cooldown_hours=_kguard_cooldown,
+                )
+                _kguard_active = await knowledge_task_in_flight(
+                    session, task.project_id, _kguard_dir, _kguard_topic
+                )
+            except Exception:  # noqa: BLE001 — guard is advisory; must not crash spawn
+                logger.warning(
+                    "[RESEARCH] knowledge-commission dedup guard failed for task %s "
+                    "(direction=%s, topic=%r) — allowing commission",
+                    task.id,
+                    _kguard_dir,
+                    _kguard_topic,
+                    exc_info=True,
+                )
+                _kguard_recent = _kguard_active = False
+            if _kguard_recent or _kguard_active:
+                _reason = "recent_doc" if _kguard_recent else "in_flight_task"
+                logger.info(
+                    "[RESEARCH] Skipping %s commission for finding '%s' "
+                    "(direction=%s, topic=%r): %s",
+                    task_type,
+                    title,
+                    _kguard_dir,
+                    _kguard_topic,
+                    _reason,
+                )
+                continue
+
         # Ignore finding.model: it's a legacy anthropic-only hint that
         # silently anchored children to a provider regardless of the
         # operator's category_routing. Model resolution is the
@@ -4970,6 +5027,19 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 "research_completion:finding:compute_experiment",
             )
         else:
+            # For knowledge task types (web_research / design), stamp the
+            # dedup key fields (topic + direction_id) onto the payload so the
+            # knowledge_task_in_flight guard can detect duplicate commissions
+            # from concurrent research cycles.  Callers that already set topic
+            # explicitly (e.g. strategic spawner) are unaffected.
+            _knowledge_payload_extras: dict = {}
+            if task_type in ("web_research", "design"):
+                _ktopic = finding.get("topic") or title
+                _kdir = direction_id or (task.context or {}).get("direction_id")
+                if _ktopic:
+                    _knowledge_payload_extras["topic"] = _ktopic
+                if _kdir:
+                    _knowledge_payload_extras["direction_id"] = _kdir
             finding_payload = validate_internal_payload(
                 {
                     "type": task_type,
@@ -4993,6 +5063,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                         if _registry_vocab and task_type in _VOCAB_RENDERING_TASK_TYPES
                         else {}
                     ),
+                    **_knowledge_payload_extras,
                 },
                 f"research_completion:finding:{task_type}",
             )
