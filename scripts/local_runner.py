@@ -4062,6 +4062,37 @@ def _multipart_viewable_chunks(
     yield crlf + b"--" + bnd + b"--" + crlf
 
 
+def _multipart_viewable_chunks_from_file(
+    fh, expected_size: int, boundary: str, relpath: str, content_type: str
+):
+    """Yield a multipart body from an already-open, size-checked descriptor."""
+    bnd = boundary.encode("latin-1")
+    crlf = b"\r\n"
+    yield b"--" + bnd + crlf
+    yield b'Content-Disposition: form-data; name="filename"' + crlf + crlf
+    yield relpath.encode() + crlf
+    yield b"--" + bnd + crlf
+    yield (
+        f'Content-Disposition: form-data; name="file"; filename="{relpath}"'.encode()
+        + crlf
+    )
+    yield f"Content-Type: {content_type}".encode() + crlf + crlf
+    remaining = expected_size
+    while remaining:
+        st = os.fstat(fh.fileno())
+        if not stat.S_ISREG(st.st_mode) or st.st_size != expected_size:
+            raise OSError("viewable artifact changed during upload")
+        chunk = fh.read(min(_VIEWABLE_UPLOAD_CHUNK_BYTES, remaining))
+        if not chunk:
+            raise OSError("viewable artifact truncated during upload")
+        remaining -= len(chunk)
+        yield chunk
+    st = os.fstat(fh.fileno())
+    if not stat.S_ISREG(st.st_mode) or st.st_size != expected_size:
+        raise OSError("viewable artifact changed during upload")
+    yield crlf + b"--" + bnd + b"--" + crlf
+
+
 def _viewable_multipart_length(boundary: str, relpath: str, size: int, content_type: str) -> int:
     """Return the exact content length emitted by ``_multipart_viewable_chunks``."""
     bnd = boundary.encode("latin-1")
@@ -4130,6 +4161,14 @@ class _ViewableStreamState:
         self.thread.start()
         return True
 
+    def drain_upload(self) -> None:
+        """Wait for and commit the in-flight delivery at terminal handoff."""
+        with self.lock:
+            thread = self.thread
+        if thread is not None:
+            thread.join()
+        self.reap()
+
 
 def _upload_viewable(
     orchestrator_url: str,
@@ -4153,22 +4192,30 @@ def _upload_viewable(
     boundary = "----blueprintrunner" + os.urandom(16).hex()
     ctype = f"multipart/form-data; boundary={boundary}"
     url = f"{orchestrator_url}/api/runner/compute-job/{job_id}/viewable"
-    req = urllib.request.Request(
-        url,
-        data=_multipart_viewable_chunks(path, size, cap, boundary, relpath, content_type),
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": ctype,
-            "Accept": "application/json",
-            "Content-Length": str(
-                _viewable_multipart_length(boundary, relpath, size, content_type)
-            ),
-        },
-        method="POST",
-    )
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            return int(resp.status)
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        with os.fdopen(os.open(path, flags), "rb", closefd=True) as fh:
+            st = os.fstat(fh.fileno())
+            # Validate before Request/urlopen; stale scan results retry next heartbeat.
+            if not stat.S_ISREG(st.st_mode) or st.st_size != size:
+                return None
+            req = urllib.request.Request(
+                url,
+                data=_multipart_viewable_chunks_from_file(
+                    fh, size, boundary, relpath, content_type
+                ),
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": ctype,
+                    "Accept": "application/json",
+                    "Content-Length": str(
+                        _viewable_multipart_length(boundary, relpath, size, content_type)
+                    ),
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                return int(resp.status)
     except urllib.error.HTTPError as exc:
         return exc.code
     except Exception as exc:  # noqa: BLE001 — network blip/timeout is non-fatal
@@ -4186,6 +4233,8 @@ def _stream_viewable_files(
     job_id: str,
     artifact_dir: str,
     state: "_ViewableStreamState",
+    *,
+    drain: bool = False,
 ) -> None:
     """Best-effort mid-run push of NEW-or-CHANGED viewable files. NEVER raises.
 
@@ -4204,7 +4253,10 @@ def _stream_viewable_files(
         print(f"[compute] viewable scan error for job {job_id}: {exc}", flush=True)
         return
 
-    state.reap()
+    if drain:
+        state.drain_upload()
+    else:
+        state.reap()
     for cand in candidates:
         relpath = cand["relpath"]
         kind = cand["kind"]
@@ -4255,7 +4307,15 @@ def _stream_viewable_files(
             relpath,
             signature,
         ):
+            if drain:
+                state.drain_upload()
+                return _stream_viewable_files(
+                    orchestrator_url, token, job_id, artifact_dir, state, drain=True
+                )
             return
+        if drain:
+            state.drain_upload()
+            continue
         # One scheduling decision per heartbeat, even if a tiny local upload
         # completes before this loop reaches the next candidate.
         return
@@ -5186,7 +5246,7 @@ def _run_compute_job(
         # exceeds its much smaller upload cap. Reuse the live state so already
         # uploaded files are not sent again.
         _stream_viewable_files(
-            orchestrator_url, token, job_id, artifact_dir, viewable_state
+            orchestrator_url, token, job_id, artifact_dir, viewable_state, drain=True
         )
 
         result_metrics = _parse_result_metrics(result_file)

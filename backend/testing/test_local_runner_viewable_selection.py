@@ -574,6 +574,77 @@ class TestRunnerViewableUpload:
             )
         assert status is None
 
+    def test_scan_to_open_size_change_does_not_contact_receiver(self, tmp_path):
+        """A stale scan result is rejected before it can advertise Content-Length."""
+        p = tmp_path / "reward.png"
+        p.write_bytes(b"x" * 1024)
+        p.write_bytes(b"x" * 8)  # mutation after the scan supplied size=1024
+        with mock.patch.object(local_runner.urllib.request, "urlopen") as urlopen:
+            status = local_runner._upload_viewable(
+                "http://127.0.0.1:1", "tok", "job-1", "reward.png", str(p), 1024,
+                "image/png",
+            )
+        assert status is None
+        urlopen.assert_not_called()
+
+    def test_short_read_aborts_real_receiver_without_waiting_for_content_length(self, tmp_path, monkeypatch):
+        """A transfer-time truncate closes a real receiver instead of timing out."""
+        class Receiver(http.server.BaseHTTPRequestHandler):
+            started = threading.Event()
+            finished = threading.Event()
+            received = 0
+            eof = False
+
+            def do_POST(self):  # noqa: N802 - required stdlib handler spelling
+                self.connection.settimeout(3)
+                expected = int(self.headers["Content-Length"])
+                type(self).started.set()
+                try:
+                    while type(self).received < expected:
+                        chunk = self.rfile.read(min(64 * 1024, expected - type(self).received))
+                        if not chunk:
+                            type(self).eof = True
+                            break
+                        type(self).received += len(chunk)
+                except TimeoutError:
+                    pass
+                finally:
+                    type(self).finished.set()
+
+            def log_message(self, *_args):
+                pass
+
+        p = tmp_path / "rollout.mp4"
+        size = 64 * 1024 * 1024
+        with open(p, "wb") as fh:
+            fh.truncate(size)
+        monkeypatch.setattr(local_runner, "_VIEWABLE_UPLOAD_CHUNK_BYTES", 64 * 1024)
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Receiver)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+
+        def truncate_after_request_starts():
+            assert Receiver.started.wait(2), "request never reached receiver"
+            with open(p, "r+b") as fh:
+                fh.truncate(0)
+
+        truncator = threading.Thread(target=truncate_after_request_starts, daemon=True)
+        truncator.start()
+        try:
+            status = local_runner._upload_viewable(
+                f"http://127.0.0.1:{server.server_port}", "tok", "job-1", "rollout.mp4",
+                str(p), size, "video/mp4",
+            )
+            assert status is None
+            assert Receiver.finished.wait(2), "receiver waited for the advertised body"
+            assert Receiver.eof
+            assert Receiver.received < size
+        finally:
+            truncator.join(timeout=1)
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=1)
+
     def test_512m_slow_receiver_keeps_compute_heartbeats_and_cancel_checks_cadenced(
         self, tmp_path
     ):
@@ -697,3 +768,53 @@ def test_run_compute_job_flushes_viewables_before_terminal_handoff():
     final_segment = source[final_stream_call:terminal_report]
     assert "_stream_viewable_files(" in final_segment
     assert "viewable_state" in final_segment
+
+
+def test_run_compute_job_drains_delayed_final_viewables_before_terminal_report():
+    """Delayed final uploads complete before terminal reporting."""
+    uploads: list[str] = []
+    reports: list[str] = []
+    upload_started = threading.Event()
+    allow_uploads = threading.Event()
+
+    def fake_plan(**kwargs):
+        artifact_dir = kwargs["artifact_dir_host"]
+        script = (
+            "import os; "
+            "open(os.path.join(os.environ['ARTIFACT_DIR'], 'a.png'), 'wb').write(b'a'); "
+            "open(os.path.join(os.environ['ARTIFACT_DIR'], 'b.png'), 'wb').write(b'b')"
+        )
+        return type("Plan", (), {"declined": False, "backend": "test",
+            "argv": [sys.executable, "-c", script], "env": {**os.environ, "ARTIFACT_DIR": artifact_dir},
+            "container_name": "test-job"})()
+
+    def fake_upload(*args):
+        uploads.append(args[3])
+        upload_started.set()
+        assert allow_uploads.wait(2)
+        return 200
+
+    def fake_report(_orch, _token, _job_id, *, exec_status, **_kwargs):
+        reports.append(exec_status)
+        return False
+
+    with mock.patch.object(local_runner.iso, "decide_compute_backend", return_value="test"), \
+         mock.patch.object(local_runner.iso, "plan_compute_execution", side_effect=fake_plan), \
+         mock.patch.object(local_runner, "_upload_viewable", side_effect=fake_upload), \
+         mock.patch.object(local_runner, "_upload_artifact"), \
+         mock.patch.object(local_runner, "_report_compute_job", side_effect=fake_report), \
+         mock.patch.object(local_runner, "_RUNNER_HEARTBEAT_INTERVAL", 0.1):
+        worker = threading.Thread(target=local_runner._run_compute_job,
+            args=({"job_id": "final-viewables", "command": "unused", "env": {}},
+                  "http://orch", "tok", set(), threading.Lock()),
+            kwargs={"capabilities": type("Caps", (), {"has_gpu": False})()},
+        )
+        worker.start()
+        assert upload_started.wait(2)
+        assert not any(status in {"succeeded", "failed"} for status in reports)
+        allow_uploads.set()
+        worker.join(timeout=3)
+
+    assert not worker.is_alive()
+    assert uploads == ["a.png", "b.png"]
+    assert reports[-1] == "succeeded"
