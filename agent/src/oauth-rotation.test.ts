@@ -1,16 +1,18 @@
 import { vi, describe, it, expect, beforeEach } from 'vitest';
 
-const { mockReadFileSync, mockExistsSync } = vi.hoisted(() => {
+const { mockReadFileSync, mockWriteFileSync, mockExistsSync } = vi.hoisted(() => {
   const mockReadFileSync = vi.fn();
+  const mockWriteFileSync = vi.fn();
   const mockExistsSync = vi.fn().mockReturnValue(false);
   process.env.PROVIDER = 'openai';
   process.env.AUTH_MODE = 'oauth';
-  return { mockReadFileSync, mockExistsSync };
+  return { mockReadFileSync, mockWriteFileSync, mockExistsSync };
 });
 
 vi.mock('fs', () => ({
   default: {
     readFileSync: mockReadFileSync,
+    writeFileSync: mockWriteFileSync,
     existsSync: mockExistsSync,
   },
 }));
@@ -22,9 +24,12 @@ beforeEach(() => {
   vi.clearAllMocks();
   mockExistsSync.mockReturnValue(false);
   mockReadFileSync.mockReset();
+  mockWriteFileSync.mockReset();
   process.env.PROVIDER = 'openai';
   process.env.AUTH_MODE = 'oauth';
   refreshRuntimeState();
+  recordInitialOAuthAuthHash();
+  mockReadFileSync.mockClear();
 });
 
 describe('ClaudeTimeoutError', () => {
@@ -64,6 +69,49 @@ describe('rotateOAuthCredentialsIfChanged', () => {
     expect(apiPostFn).toHaveBeenCalledWith(
       '/api/agent/credentials/rotate',
       expect.objectContaining({ task_id: 'task-1' }),
+    );
+  });
+
+  it('posts the credential version it started from', async () => {
+    mockReadFileSync.mockReturnValueOnce(Buffer.from('old-token-data'));
+    recordInitialOAuthAuthHash();
+    mockExistsSync.mockReturnValue(true);
+    mockReadFileSync
+      .mockReturnValueOnce(Buffer.from('new-token-data'))
+      .mockReturnValueOnce('new-token-data');
+    const apiPostFn = vi.fn().mockResolvedValue({ rotated: true });
+
+    await rotateOAuthCredentialsIfChanged('task-cas', apiPostFn);
+
+    expect(apiPostFn).toHaveBeenCalledWith(
+      '/api/agent/credentials/rotate',
+      expect.objectContaining({
+        task_id: 'task-cas',
+        base_hash: '2ff6867f3bbcdad12fd175a0ace50a541baf9a93f1d3b253630f1a3c15d50f6b',
+      }),
+    );
+  });
+
+  it('adopts the authoritative credential when another VM wins rotation', async () => {
+    mockReadFileSync.mockReturnValueOnce(Buffer.from('old-token-data'));
+    recordInitialOAuthAuthHash();
+    mockExistsSync.mockReturnValue(true);
+    mockReadFileSync
+      .mockReturnValueOnce(Buffer.from('losing-token-data'))
+      .mockReturnValueOnce('losing-token-data')
+      .mockReturnValueOnce(Buffer.from('winner-token-data'));
+    const apiPostFn = vi.fn().mockResolvedValue({
+      rotated: false,
+      reason: 'stale_credential',
+      secret: 'winner-token-data',
+    });
+
+    await rotateOAuthCredentialsIfChanged('task-loser', apiPostFn);
+
+    expect(mockWriteFileSync).toHaveBeenCalledWith(
+      '/opt/agent/openai/auth.json',
+      'winner-token-data',
+      { encoding: 'utf-8', mode: 0o600 },
     );
   });
 

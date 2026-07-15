@@ -644,6 +644,7 @@ async def _default_pool_provision_fn(
     from app.max_plan_pool import (
         _account_at_cap,
         _account_runtime_ready,
+        _codex_oauth_requires_refresh_probe,
         _max_plan_pool_lock,
         _max_plan_pools,
         _normalize_auth_mode,
@@ -683,6 +684,32 @@ async def _default_pool_provision_fn(
             account_id,
         )
         return False
+
+    # Taskless pool VMs validate provider auth at boot and can trigger Codex's
+    # in-place OAuth refresh before they ever consume an active-task slot. Near
+    # expiry, allow only one live pool member for the account to perform that
+    # refresh; once it persists a fresh access token this gate opens again and
+    # the maintainer can fill the remaining warm target normally.
+    requires_refresh_probe, _ = _codex_oauth_requires_refresh_probe(account)
+    if requires_refresh_probe:
+        existing_probe = (
+            await session.execute(
+                select(PoolVm.id)
+                .where(
+                    PoolVm.account_id == str(account.get("id")),
+                    PoolVm.state.in_(LIVE_POOL_STATES),
+                )
+                .limit(1)
+            )
+        ).first()
+        if existing_probe is not None:
+            logger.info(
+                "[WARM-POOL] Codex OAuth refresh probe already live for project %s "
+                "account %s — defer additional pool VM",
+                project_id,
+                account.get("id"),
+            )
+            return False
 
     from app.compute import provision_pool_vm
 

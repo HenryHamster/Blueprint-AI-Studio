@@ -5964,6 +5964,7 @@ async def _process_post_commit(
                         f"finding(s): {handler_exc!r}"
                     ) from handler_exc
                 if is_transient and task.attempt_count < _runtime_config["max_retries"]:
+                    reset_task_for_fresh_attempt(task)
                     task.status = TaskStatus.QUEUED
                     # The earlier COMPLETED/FAILED assignment fired the SQLAlchemy set
                     # event which added task.id to _terminated_task_ids, revoking the
@@ -5974,8 +5975,6 @@ async def _process_post_commit(
                     _terminated_task_ids.pop(str(task.id), None)
                     task.attempt_count += 1
                     task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
-                    task.last_heartbeat = None
-                    task.started_at = None
                     # Handler ran after a successful VM provision — reset provision budget
                     # so a transient handler failure doesn't consume retries meant for VM issues.
                     handler_ctx = dict(task.context or {})

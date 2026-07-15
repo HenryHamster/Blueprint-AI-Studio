@@ -105,9 +105,8 @@ from app.admin_task_mutations import (
     _handle_task_pr_approval,
     modify_task_apply,
 )
-from app.task_blocked import strip_fresh_attempt_context
+from app.task_blocked import reset_task_for_fresh_attempt
 from app.llm_cost_attribution import _task_llm_cost as _calc_task_llm_cost
-from app.time_utils import clear_retry_after
 from app.routers.admin_operator_triggers import (  # noqa: F401
     _record_failure_result,
     router as _operator_triggers_router,
@@ -240,6 +239,36 @@ TERMINAL_STATUSES = [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELL
 # up to ~100KB of research_findings plus unbounded status_log, so 500 rows
 # x large-tail payload stays safely under Cloud Run's 32 MB response limit.
 ADMIN_TASKS_MAX_LIMIT = 500
+
+
+def _fresh_attempt_boundary(task: Task) -> datetime | None:
+    """Return the UTC-naive boundary after which current-attempt logs count."""
+
+    raw = (task.context or {}).get("_fresh_attempt_started_at")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
+def _artifact_is_current_attempt(
+    task: Task,
+    artifact_created_at: datetime | None,
+) -> bool:
+    boundary = _fresh_attempt_boundary(task)
+    if boundary is None:
+        return True
+    if artifact_created_at is None:
+        return False
+    created_at = artifact_created_at
+    if created_at.tzinfo is not None:
+        created_at = created_at.astimezone(timezone.utc).replace(tzinfo=None)
+    return created_at >= boundary
 
 # Columns loaded for the task list endpoint. Excludes the three JSONB blobs that
 # are only accessed in the detail endpoint: attempt_history_db, api_call_summary,
@@ -449,6 +478,7 @@ async def get_all_tasks(
                 Artifact.task_id,
                 Artifact.artifact_type,
                 Artifact.logs,
+                Artifact.created_at,
                 _logs_rn,
             )
             .where(
@@ -465,9 +495,15 @@ async def get_all_tasks(
         )
         logs_stmt = select(_ranked_logs).where(_ranked_logs.c.rn == 1)
         logs_artifacts = (await session.execute(logs_stmt)).all()
+        _tasks_by_id = {str(task.id): task for task in tasks}
         for a in logs_artifacts:
             tid = str(a.task_id)
-            if a.artifact_type == ArtifactType.ERROR_LOG and a.logs and tid not in logs_map:
+            if (
+                a.artifact_type == ArtifactType.ERROR_LOG
+                and a.logs
+                and tid not in logs_map
+                and _artifact_is_current_attempt(_tasks_by_id[tid], a.created_at)
+            ):
                 logs_map[tid] = a.logs[:2000]
             if a.artifact_type == ArtifactType.RESEARCH_FINDINGS and a.logs and tid not in research_artifact_logs_map:
                 research_artifact_logs_map[tid] = a.logs[:100000]
@@ -901,14 +937,9 @@ async def _bulk_retry_one_task(
                 await _requeue_parent_task(task, scoped_session)
             else:
                 old_vm = task.vm_instance_id
+                reset_task_for_fresh_attempt(task)
                 task.attempt_count = 0
                 task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
-                task.last_heartbeat = None
-                # Reset attempt-scoped state for a clean slate — matches
-                # single-task admin retry.
-                clear_retry_after(task)
-                bulk_ctx = strip_fresh_attempt_context(task.context or {})
-                task.context = bulk_ctx
             history = TaskHistory(
                 task_id=task.id,
                 action="MODIFIED",
@@ -1753,7 +1784,11 @@ async def get_task(
         )
         if a.artifact_type == ArtifactType.PULL_REQUEST and a.pr_url:
             pr_url = a.pr_url
-        if a.artifact_type == ArtifactType.ERROR_LOG and a.logs:
+        if (
+            a.artifact_type == ArtifactType.ERROR_LOG
+            and a.logs
+            and _artifact_is_current_attempt(task, a.created_at)
+        ):
             error_logs = a.logs
         if a.artifact_type == ArtifactType.RESEARCH_FINDINGS and a.logs:
             research_findings = a.logs[:100000]  # raw logs; resolved below

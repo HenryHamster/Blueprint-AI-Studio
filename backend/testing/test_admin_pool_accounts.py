@@ -2295,12 +2295,46 @@ async def test_reset_rate_limits_clears_disabled_at_column(client, db_session):
 
     res = await client.post(f"/api/admin/max-plan-accounts/{acct.id}/reset-rate-limits")
     assert res.status_code == 200, res.text
-    assert "Rate-limit state cleared" in res.json()["message"]
+    assert "Blueprint cooldown state cleared" in res.json()["message"]
+    assert res.json()["provider_quota_changed"] is False
+    assert res.json()["provider_reset_credit_consumed"] is False
+    assert res.json()["account_reenabled"] is True
 
     await db_session.refresh(acct)
     assert acct.disabled_at is None
     assert acct.enabled is True
     assert acct.disabled_reason is None
+
+
+async def test_reset_rate_limits_preserves_auth_disable(client, db_session):
+    acct = MaxPlanAccount(
+        user_id="test-user-123",
+        name="Auth Disabled Account",
+        provider=LLMProviderName.OPENAI,
+        auth_mode=LLMAuthMode.OAUTH,
+        oauth_token="projects/test/secrets/openai/versions/1",
+        secret_blob_ref="projects/test/secrets/openai/versions/1",
+        enabled=False,
+        disabled_at=_admin_pool_accounts._utcnow() - timedelta(minutes=10),
+        disabled_reason="OAuth refresh token revoked",
+        rate_limit_state={"disabled_models": {"gpt-5.6-sol": {"hits": 1}}},
+    )
+    db_session.add(acct)
+    await db_session.commit()
+
+    res = await client.post(f"/api/admin/max-plan-accounts/{acct.id}/reset-rate-limits")
+
+    assert res.status_code == 200, res.text
+    assert res.json()["account_reenabled"] is False
+    await db_session.refresh(acct)
+    # Clearing cooldowns advances a durable generation tombstone so a stale
+    # cross-pod write cannot resurrect pre-click rate-limit state.
+    assert acct.rate_limit_state is not None
+    assert acct.rate_limit_state.get("cooldown_reset_at")
+    assert "disabled_models" not in acct.rate_limit_state
+    assert acct.enabled is False
+    assert acct.disabled_reason == "OAuth refresh token revoked"
+    assert acct.disabled_at is not None
 
 
 @pytest.mark.anyio

@@ -792,12 +792,13 @@ async def test_reaper_retry_clears_stale_failure_verdict(
     project = await _make_project(reaper_db)
     task = Task(
         project_id=project.id,
-        payloads=[{"type": "create"}],
+        payloads=[{"type": "create", "model": "claude-sonnet-4-6"}],
         vm_instance_id="vm-stale-verdict",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
         last_heartbeat=_utcnow() - timedelta(minutes=30),
         latest_status_message="test failed: AssertionError",
+        llm_account_id="stale-account",
         context={
             # Stale verdict from the current attempt — must be stripped on retry.
             "failure_class": "CODE_ERROR",
@@ -809,6 +810,13 @@ async def test_reaper_retry_clears_stale_failure_verdict(
             # Durable diagnostic keys — must survive the retry.
             "_previous_failure_class": "CODE_ERROR",
             "effort": "medium",
+            "llm_account_id": "stale-account",
+            "llm_provider": "anthropic",
+            "llm_model": "claude-sonnet-4-6",
+            "runner_target_id": "dead-runner",
+            "forced_runner_target_id": "operator-pin",
+            "_requested_payload_model": "gpt-5.6-sol",
+            "_resolved_payload_model": "claude-sonnet-4-6",
         },
     )
     reaper_db.add(task)
@@ -839,6 +847,11 @@ async def test_reaper_retry_clears_stale_failure_verdict(
     assert ctx.get("_previous_failure_class") == "CODE_ERROR", (
         "_previous_failure_class must be preserved for retry guidance"
     )
+    assert task.llm_account_id is None
+    assert task.first_payload["model"] == "gpt-5.6-sol"
+    assert "runner_target_id" not in ctx
+    assert ctx["forced_runner_target_id"] == "operator-pin"
+    assert ctx.get("_fresh_attempt_started_at")
 
 
 @pytest.mark.asyncio
@@ -1445,23 +1458,12 @@ async def test_rate_limit_requeue_blacklists_account_and_skips_budget(
 async def test_reaper_account_cooldown_silent_death_free_requeue(
     reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
 ):
-    """Silent death (no rate-limit keywords) with account in cooldown → RATE_LIMIT free requeue.
-
-    Regression guard for the account-state correlation path through the REAPER.
-    The existing test triggers on a log keyword; this one drives classification
-    purely via account state so a future change to keyword detection can't mask
-    a broken correlation path.
+    """A silent death cannot borrow quota evidence from account state.
     """
     disable_mock = mocker.patch(
         "app.max_plan_pool.disable_account_model", new_callable=AsyncMock
     )
     mocker.patch("app.max_plan_pool.release_max_plan_account", new_callable=AsyncMock)
-    # Stub account-state correlation to return True — isolates the REAPER free-requeue
-    # path from the account-pool internals (those are tested in test_failure_classification.py).
-    mocker.patch(
-        "app.failure_classification._account_was_rate_limited", return_value=True
-    )
-
     account_id = "acct-rl-silent"
     project = await _make_project(reaper_db)
     t = Task(
@@ -1483,11 +1485,11 @@ async def test_reaper_account_cooldown_silent_death_free_requeue(
     await reaper_db.refresh(t)
 
     ctx = t.context or {}
-    assert t.status == TaskStatus.QUEUED, "account-correlated RL must requeue"
-    assert t.attempt_count == 1, "account-correlated RL must not burn attempt budget"
-    assert account_id in (ctx.get("blacklisted_accounts") or [])
+    assert t.status == TaskStatus.QUEUED
+    assert t.attempt_count == 2
+    assert account_id not in (ctx.get("blacklisted_accounts") or [])
     assert "max_plan_account_id" not in ctx
-    disable_mock.assert_awaited_once()
+    disable_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1511,15 +1513,6 @@ async def test_reaper_account_cooldown_uses_failure_instant_not_sweep_time(
     )
     mocker.patch("app.max_plan_pool.release_max_plan_account", new_callable=AsyncMock)
 
-    def _rl_only_at_heartbeat(task, at_time=None):
-        # Simulate cooldown active at failure instant (at_time set) but expired now.
-        return at_time is not None
-
-    mocker.patch(
-        "app.failure_classification._account_was_rate_limited",
-        side_effect=_rl_only_at_heartbeat,
-    )
-
     account_id = "acct-rl-edge"
     project = await _make_project(reaper_db)
     t = Task(
@@ -1541,15 +1534,10 @@ async def test_reaper_account_cooldown_uses_failure_instant_not_sweep_time(
     await reaper_db.refresh(t)
 
     ctx = t.context or {}
-    assert t.status == TaskStatus.QUEUED, (
-        "failure at tail of rate-limit window must still classify RATE_LIMIT "
-        "(at_time=last_heartbeat fix)"
-    )
-    assert t.attempt_count == 1, (
-        "must not burn attempt budget (at_time=last_heartbeat plumbing)"
-    )
-    assert account_id in (ctx.get("blacklisted_accounts") or [])
-    disable_mock.assert_awaited_once()
+    assert t.status == TaskStatus.QUEUED
+    assert t.attempt_count == 2
+    assert account_id not in (ctx.get("blacklisted_accounts") or [])
+    disable_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1569,20 +1557,6 @@ async def test_reaper_db_rl_cross_instance_silent_death_free_requeue(
         "app.max_plan_pool.disable_account_model", new_callable=AsyncMock
     )
     mocker.patch("app.max_plan_pool.release_max_plan_account", new_callable=AsyncMock)
-    # In-memory cache returns False (cross-instance miss); no RL keyword in last_error either.
-    mocker.patch(
-        "app.failure_classification._account_was_rate_limited", return_value=False
-    )
-    mocker.patch(
-        "app.failure_classification._pool_was_rate_limited", return_value=False
-    )
-    # Durable DB state records the cooldown — this is the path under test.
-    mocker.patch(
-        "app.max_plan_pool.db_account_was_rate_limited",
-        new_callable=AsyncMock,
-        return_value=True,
-    )
-
     account_id = "acct-db-rl-cross-instance"
     project = await _make_project(reaper_db)
     t = Task(
@@ -1605,10 +1579,10 @@ async def test_reaper_db_rl_cross_instance_silent_death_free_requeue(
 
     ctx = t.context or {}
     assert t.status == TaskStatus.QUEUED, "DB-correlated RL must requeue"
-    assert t.attempt_count == 1, "DB-correlated RL must not burn attempt budget"
-    assert account_id in (ctx.get("blacklisted_accounts") or [])
+    assert t.attempt_count == 2
+    assert account_id not in (ctx.get("blacklisted_accounts") or [])
     assert "max_plan_account_id" not in ctx
-    disable_mock.assert_awaited_once()
+    disable_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1625,26 +1599,6 @@ async def test_reaper_db_rl_pool_wide_accountless_silent_death_free_requeue(
     """
     mocker.patch("app.max_plan_pool.disable_account_model", new_callable=AsyncMock)
     mocker.patch("app.max_plan_pool.release_max_plan_account", new_callable=AsyncMock)
-    # In-memory caches both return False — pool-wide cooldown only in DB.
-    mocker.patch(
-        "app.failure_classification._account_was_rate_limited", return_value=False
-    )
-    mocker.patch(
-        "app.failure_classification._pool_was_rate_limited", return_value=False
-    )
-    # DB account check not called / returns False (no account ID on task).
-    mocker.patch(
-        "app.max_plan_pool.db_account_was_rate_limited",
-        new_callable=AsyncMock,
-        return_value=False,
-    )
-    # Pool-wide DB check returns True — this is the branch under test.
-    pool_wide_mock = mocker.patch(
-        "app.max_plan_pool.db_pool_wide_rate_limit_cooldown",
-        new_callable=AsyncMock,
-        return_value=True,
-    )
-
     project = await _make_project(reaper_db)
     failure_time = _utcnow() - timedelta(minutes=10)
     t = Task(
@@ -1671,18 +1625,10 @@ async def test_reaper_db_rl_pool_wide_accountless_silent_death_free_requeue(
     assert t.status == TaskStatus.QUEUED, (
         "pool-wide DB-correlated RL must requeue (not FAILED)"
     )
-    assert t.attempt_count == 1, (
-        "pool-wide DB-correlated RL must not burn attempt budget"
-    )
+    assert t.attempt_count == 2
     # No account to blacklist — blacklisted_accounts should be absent or empty.
     assert not ctx.get("blacklisted_accounts"), (
         "accountless RL requeue must not create a spurious blacklisted_accounts entry"
-    )
-    pool_wide_mock.assert_awaited_once_with(
-        at_time=failure_time,
-        providers=["anthropic"],
-        model="claude-sonnet-4-6",
-        user_id=None,
     )
 
 
@@ -1700,20 +1646,6 @@ async def test_reaper_db_rl_verdict_persisted_stable_under_analytics(
     """
     mocker.patch("app.max_plan_pool.disable_account_model", new_callable=AsyncMock)
     mocker.patch("app.max_plan_pool.release_max_plan_account", new_callable=AsyncMock)
-    # Simulate cooldown lifted by sweep time — in-memory check returns False.
-    mocker.patch(
-        "app.failure_classification._account_was_rate_limited", return_value=False
-    )
-    mocker.patch(
-        "app.failure_classification._pool_was_rate_limited", return_value=False
-    )
-    # DB check returns True at the failure instant.
-    mocker.patch(
-        "app.max_plan_pool.db_account_was_rate_limited",
-        new_callable=AsyncMock,
-        return_value=True,
-    )
-
     account_id = "acct-db-rl-persist"
     project = await _make_project(reaper_db)
     t = Task(
@@ -1731,22 +1663,10 @@ async def test_reaper_db_rl_verdict_persisted_stable_under_analytics(
     await _run_reaper_once()
     await reaper_db.refresh(t)
 
-    # The reaper must persist the verdict via persist_authoritative_verdict.
     ctx = t.context or {}
-    assert ctx.get("failure_class") == "RATE_LIMIT", (
-        "reaper must persist RATE_LIMIT verdict so analytics cannot flip it to CODE_ERROR"
-    )
-
-    # Analytics path: classify_failure called later with in-memory checks both False
-    # (simulating a healthy pool after the cooldown lifted). The persisted verdict
-    # short-circuits the classifier before rate-limit correlation runs.
-    from app.failure_classification import classify_failure
-
-    analytics_class = classify_failure(t)
-    assert analytics_class == "RATE_LIMIT", (
-        "analytics re-classification must return persisted RATE_LIMIT, "
-        "not CODE_ERROR/AGENT_TIMEOUT after cooldown lifts"
-    )
+    history = ctx.get("_failure_class_history") or []
+    assert history[-1]["class"] == "AGENT_TIMEOUT"
+    assert all(item["class"] != "RATE_LIMIT" for item in history)
 
 
 @pytest.mark.asyncio
@@ -16928,22 +16848,9 @@ async def test_orphan_external_io_gather_result_bundle(mocker):
 
     # ── mock the max_plan_pool deferred imports ───────────────────────────
     mocker.patch(
-        "app.max_plan_pool.db_account_was_rate_limited",
-        new=AsyncMock(return_value=False),
-    )
-    mocker.patch(
-        "app.max_plan_pool.db_pool_wide_rate_limit_cooldown",
-        new=AsyncMock(return_value=False),
-    )
-    mocker.patch(
         "app.max_plan_pool.get_task_llm_account_id",
         return_value=None,
     )
-    mocker.patch(
-        "app.max_plan_pool.get_task_rate_limit_scope",
-        return_value={},
-    )
-
     session = object()  # not used for real DB calls in this path
 
     snapshot = await _run_orphan_io(

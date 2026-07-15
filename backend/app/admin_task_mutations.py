@@ -336,9 +336,7 @@ async def _apply_status_mutation(
         # task moved from BLOCKED/failed-retry back to QUEUED would still look and
         # classify as blocked work (stale context['blocker'], budget-exempt
         # failure_class) on its next dispatch. Safe no-op on never-blocked tasks.
-        from app.task_blocked import clear_blocker_metadata, strip_fresh_attempt_context
-
-        clear_blocker_metadata(task)
+        from app.task_blocked import reset_task_for_fresh_attempt
 
         task_type = (task.first_payload).get("type", "")
         is_parent_type = task_type in ("research", "plan")
@@ -361,15 +359,9 @@ async def _apply_status_mutation(
             changes["retried_children"] = retried
         else:
             old_vm_id = task.vm_instance_id
+            reset_task_for_fresh_attempt(task)
             task.attempt_count = 0
             task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
-            task.last_heartbeat = None
-            task.started_at = None
-            # Clear attempt-scoped state: stale retry counters, runtime account
-            # routing, failure verdicts, blocker state, and dispatch-prep crash
-            # counters must not poison the fresh attempt.
-            requeue_ctx = strip_fresh_attempt_context(task.context or {})
-            task.context = requeue_ctx
             changes["attempt_count"] = 0
             changes["vm_instance_id"] = task.vm_instance_id
             changes["_old_vm_to_delete"] = old_vm_id

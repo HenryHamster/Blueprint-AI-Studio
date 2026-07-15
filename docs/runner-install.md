@@ -5,6 +5,59 @@ Blueprint as a task executor. This guide covers enrolling a runner, persisting i
 credentials, and wiring it into systemd so it survives reboots and restarts
 automatically on crash.
 
+Agent-capable runners need Node.js 22+, Claude Code, and Codex CLI 0.144.1 or
+newer. Install the fleet-approved Codex build with optional native packages
+enabled (some npm configurations omit them):
+
+```bash
+npm install -g --include=optional @openai/codex@0.144.1
+codex --version
+```
+
+The version command is a quota-free startup smoke. It must print
+`codex-cli 0.144.1` (or a later compatible version); merely finding `codex` on
+`PATH` is insufficient.
+
+For host/bwrap runners, that manual command is now a fallback rather than the
+normal repair path. While the runner stays online, a background maintainer:
+
+- detects missing, broken, or older-than-policy Codex and missing/outdated
+  Claude Code;
+- installs repairs under `~/.blueprint/managed-clis/` instead of overwriting
+  operator-owned global npm packages;
+- serializes concurrent maintainers, installs into a staging release, exercises
+  `<cli> --version`, and only then atomically switches the active manifest and
+  prepends that verified release to `PATH`;
+- keeps the previous/global CLI active on failure and persists exponential
+  retry backoff. Captured npm output is never written to runner logs, because
+  registry configuration can contain credentials.
+
+Codex repair installs the reviewed exact `0.144.1` package and accepts compatible
+healthy versions `>=0.144.1`. Claude Code preserves the image policy of tracking
+the current npm `latest` release. Docker-only agent runners remain image-managed
+and never mutate host packages. Hybrid Docker+bwrap runners also maintain and
+probe host CLIs because write/heavy tasks still route through bwrap; their flat
+provider heartbeat is healthy only when every selectable backend is healthy.
+
+Set `BLUEPRINT_RUNNER_CLI_MAINTENANCE=0` to opt out. Override the managed root
+with `BLUEPRINT_RUNNER_CLI_DIR` or the six-hour recheck interval with
+`BLUEPRINT_RUNNER_CLI_MAINTENANCE_INTERVAL` (seconds, minimum 60). `npm` must be
+available for automatic repair; its absence is non-fatal and does not affect
+healthy provider or compute capacity.
+
+For ChatGPT OAuth accounts, the agent also uses Codex's app-server protocol to
+read the real usage windows before a Codex turn. It redeems one exact credit only
+when the exact 10,080-minute weekly window is exhausted and the response includes
+a stable reset time and credit ID. A cross-process lock under `CODEX_HOME`
+serializes local checks. The persisted completion marker and deterministic
+server idempotency key are scoped to a one-way hash of
+`auth.json`'s `tokens.account_id` plus the weekly reset timestamp, so token
+rotation is stable while different accounts remain isolated. Raw account IDs,
+tokens, credit IDs, and app-server stderr are never logged or persisted. Missing
+account identity, reset time, or detailed credit IDs causes redemption to be
+skipped safely. A failed probe falls back to normal Codex execution and
+rate-limit classification.
+
 ---
 
 ## 1. Enroll a runner
@@ -229,6 +282,24 @@ never run, you will see:
 This is an **actionable** warning — it prints only when agent source is detected
 on the host but the `tsx` development-server entry point is unavailable. A
 compute-only runner (no agent source) stays quiet.
+
+`blueprint-runner check` and `blueprint-runner start` also execute
+`codex --version`. A JavaScript shim with a missing native package is reported as:
+
+```text
+  codex       : [MISSING] PATH shim found, but the native Codex package is missing
+                 -> Reinstall Codex with optional native packages: npm install -g --include=optional @openai/codex@0.144.1
+```
+
+Until that probe succeeds, the heartbeat advertises Codex as unhealthy and the
+orchestrator will not route OpenAI work to the runner. The check makes no OpenAI
+API call and consumes no model quota. Older runner heartbeat schemas remain
+accepted; the explicit unhealthy signal from updated runners fails closed.
+`blueprint-runner check` exits non-zero, but `blueprint-runner start` continues
+so healthy Claude and compute capacity are not taken offline by one provider CLI.
+On a running host/bwrap runner the background maintainer then attempts the
+Blueprint-owned staged repair described above; after verification, the next
+heartbeat advertises the repaired CLI. `--check` itself performs no download.
 
 ---
 

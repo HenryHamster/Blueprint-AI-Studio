@@ -220,8 +220,8 @@ async def test_failure_distribution_projection_loads_api_call_summary(db_session
     async with TestingSessionLocal() as fresh_session:
         result = await compute_pipeline_health_summary(fresh_session, project.id)
 
-    assert result["failure_distribution"].get("RATE_LIMIT") == 1, (
-        "stalled-LLM failure must reclassify to RATE_LIMIT — got "
+    assert result["failure_distribution"].get("no_progress_timeout") == 1, (
+        "stalled-LLM failure must remain retryable without cooling an account — got "
         f"{result['failure_distribution']!r}; api_call_summary was likely "
         "unreadable on the projected row"
     )

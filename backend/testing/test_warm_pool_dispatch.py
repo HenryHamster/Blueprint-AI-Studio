@@ -61,6 +61,7 @@ async def _make_idle_member(
     vm_instance_id,
     account_id="acct-1",
     provider="anthropic",
+    auth_mode=None,
     model="claude-opus-4-8",
 ):
     member = await register_pool_vm(
@@ -69,6 +70,7 @@ async def _make_idle_member(
         project_id=project.id,
         account_id=account_id,
         provider=provider,
+        auth_mode=auth_mode,
         model=model,
         state=PoolVmState.IDLE,
     )
@@ -681,6 +683,38 @@ async def test_next_role_no_manifest_when_account_matches(
         body = resp.json()
         assert body["action"] == "claim"
         assert body.get("secret_manifest") is None
+    finally:
+        _clear_accounts()
+
+
+@pytest.mark.asyncio
+async def test_next_role_refreshes_same_account_openai_oauth_manifest(
+    db_session, client, warm_pool_retarget_on
+):
+    project = await _make_project(db_session, name="Codex Same Account Refresh")
+    await _make_idle_member(
+        db_session, project, vm_instance_id="vm-codex-same",
+        account_id="acct-codex", provider="openai", auth_mode="oauth",
+        model="gpt-5.6-terra",
+    )
+    _seed_account("acct-codex", provider="openai", auth_mode="oauth")
+    try:
+        task = await _make_queued_task(db_session, project, model="gpt-5.6-terra")
+        leased = await _dispatch(db_session, task, provider="openai",
+            model="gpt-5.6-terra", account="acct-codex")
+        await db_session.commit()
+        assert leased is not None
+        tok = create_vm_scoped_token("vm-codex-same", str(project.id))
+        resp = await client.post(
+            "/api/agent/next-role", json={"vm_instance_id": "vm-codex-same"},
+            headers={"X-Agent-Token": tok},
+        )
+        assert resp.status_code == 200, resp.text
+        manifest = resp.json().get("secret_manifest")
+        assert manifest is not None
+        assert manifest["metadata"]["credential_refresh_only"] is True
+        auth_file = next(item for item in manifest["files"] if item["path"].endswith("auth.json"))
+        assert auth_file["content"] == "secret-acct-codex"
     finally:
         _clear_accounts()
 

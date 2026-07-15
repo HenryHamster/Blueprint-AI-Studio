@@ -1,8 +1,14 @@
+import base64
 import json
+from datetime import datetime, timezone
 
 import pytest
 
 from app.models import LLMAuthMode, LLMProviderName
+from app.providers.openai import (
+    codex_oauth_access_token_expires_at,
+    codex_oauth_credential_hash,
+)
 from app.providers.registry import get_provider, list_providers
 
 
@@ -255,6 +261,31 @@ def test_openai_oauth_accepts_valid_shape():
     raw = '{"tokens":{"access_token":"at","refresh_token":"rt"},"OPENAI_API_KEY":null}'
     result = provider.validate_secret(raw, LLMAuthMode.OAUTH, {})
     assert result.secret == raw
+
+
+def test_openai_oauth_extracts_access_expiry_for_dispatch_safety():
+    expires = 2_000_000_000
+    payload = base64.urlsafe_b64encode(
+        json.dumps({"exp": expires}).encode("utf-8")
+    ).decode("ascii").rstrip("=")
+    secret = json.dumps({"tokens": {"access_token": f"header.{payload}.sig"}})
+    assert codex_oauth_access_token_expires_at(secret) == datetime.fromtimestamp(
+        expires, timezone.utc
+    ).replace(tzinfo=None)
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [None, "", "not-json", '{"tokens":{}}', '{"tokens":{"access_token":"opaque"}}'],
+)
+def test_openai_oauth_expiry_parser_fails_closed(secret):
+    assert codex_oauth_access_token_expires_at(secret) is None
+
+
+def test_openai_oauth_credential_hash_is_byte_exact():
+    assert codex_oauth_credential_hash("auth-json") != codex_oauth_credential_hash(
+        "auth-json\n"
+    )
 
 
 def test_providers_expose_default_execution_mode_only():

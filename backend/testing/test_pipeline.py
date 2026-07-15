@@ -800,6 +800,46 @@ class TestTaskResultDedup:
         )
         assert len(deploy_monitoring["task_results"]) == initial_count + 2
 
+    def test_later_success_replaces_earlier_failure_and_route_metadata(self):
+        from collections import deque
+
+        import app.shared_state as ss
+        from app.routers.agent_status import (
+            _recorded_task_entries,
+            _recorded_task_ids,
+            record_task_result,
+        )
+
+        ss.deploy_monitoring["task_results"] = deque(maxlen=100)
+        ss.deploy_monitoring["task_result_metadata"] = {}
+        _recorded_task_ids.clear()
+        _recorded_task_entries.clear()
+
+        record_task_result(
+            success=False,
+            failure_class="PROVISION_FAILURE",
+            task_id="route-recovers",
+            task_context={"llm_provider": "openai"},
+        )
+        failed_timestamp = ss.deploy_monitoring["task_results"][0][0]
+        record_task_result(
+            success=True,
+            task_id="route-recovers",
+            task_context={"llm_provider": "anthropic"},
+        )
+
+        assert list(ss.deploy_monitoring["task_results"])[0][1:] == (
+            "success",
+            "",
+            "",
+        )
+        assert len(ss.deploy_monitoring["task_results"]) == 1
+        assert failed_timestamp not in ss.deploy_monitoring["task_result_metadata"]
+        current_timestamp = ss.deploy_monitoring["task_results"][0][0]
+        assert ss.deploy_monitoring["task_result_metadata"][current_timestamp][
+            "provider"
+        ] == "anthropic"
+
 
 # ── Task Type Ring Buffer & Per-Type Failure Rate ─────────────────────────
 
@@ -1028,6 +1068,198 @@ class TestPerTypeDispatchGate:
         _rate, n = get_task_type_failure_rate("create", window_minutes=15)
         assert n == 2
         assert n < 3  # Gate requires minimum 3 samples
+
+
+class TestDispatchGateFailureClassPartition:
+    def test_configured_providers_use_canonical_routes_not_tier_map(self):
+        from app.orchestrator import _configured_dispatch_providers
+
+        assert _configured_dispatch_providers(
+            {
+                "category_routing": {"_default": {"providers": ["openai"]}},
+                "task_type_routing": {},
+                "task_type_model_preferences": {
+                    "smoketest": [{"provider": "openai", "model": "gpt-5.6-sol"}]
+                },
+                "provider_tier_model_map": {
+                    "openai": {"opus": "gpt-5.6-sol"},
+                    "anthropic": {"opus": "claude-opus-4-8"},
+                },
+            }
+        ) == {"openai"}
+
+    def test_infra_failures_do_not_count_as_code_regression(self):
+        from app.orchestrator import _partition_dispatch_gate_results
+        from app.time_utils import _utcnow
+
+        ts = _utcnow().isoformat()
+        rows = [
+            (ts, "failure", "RATE_LIMIT", "create"),
+            (ts, "failure", "PROVISION_FAILURE", "create"),
+            (ts, "failure", "EXTERNAL_API", "create"),
+            (ts, "failure", "CODE_ERROR", "create"),
+            (ts, "success", "", "create"),
+        ]
+        regression, operational = _partition_dispatch_gate_results(rows)
+        assert [row[2] for row in regression] == ["CODE_ERROR", ""]
+        assert [row[2] for row in operational] == [
+            "RATE_LIMIT",
+            "PROVISION_FAILURE",
+            "EXTERNAL_API",
+        ]
+
+    def test_per_type_code_rate_excludes_infra_from_denominator(self):
+        from app.orchestrator import _task_type_code_failure_rate
+        from app.time_utils import _utcnow
+
+        ts = _utcnow().isoformat()
+        rate, sample = _task_type_code_failure_rate(
+            [
+                (ts, "failure", "RATE_LIMIT", "create"),
+                (ts, "failure", "PROVISION_FAILURE", "create"),
+                (ts, "failure", "CODE_ERROR", "create"),
+                (ts, "success", "", "create"),
+            ],
+            "create",
+        )
+        assert (rate, sample) == (0.5, 2)
+
+    def test_repeated_infra_still_trips_operational_burst(self):
+        import app.shared_state as ss
+        from app.orchestrator import _operational_failure_burst
+        from app.time_utils import _utcnow
+
+        rows = []
+        metadata = {}
+        for offset in range(8):
+            ts = (_utcnow() + timedelta(microseconds=offset)).isoformat()
+            rows.append((ts, "failure", "PROVISION_FAILURE", "create"))
+            metadata[ts] = {"provider": "openai"}
+        ss.deploy_monitoring["task_result_metadata"] = metadata
+        tripped, failures, sample = _operational_failure_burst(
+            rows, {"openai"}
+        )
+        assert (tripped, failures, sample) == (True, 8, 8)
+
+    def test_one_bad_provider_does_not_globally_stop_healthy_route(self):
+        import app.shared_state as ss
+        from app.orchestrator import _operational_failure_burst
+        from app.time_utils import _utcnow
+
+        rows = []
+        metadata = {}
+        for offset in range(8):
+            ts = (_utcnow() + timedelta(microseconds=offset)).isoformat()
+            rows.append((ts, "failure", "PROVISION_FAILURE", "create"))
+            metadata[ts] = {"provider": "openai"}
+        ss.deploy_monitoring["task_result_metadata"] = metadata
+
+        assert _operational_failure_burst(rows, {"openai", "anthropic"}) == (
+            False,
+            8,
+            8,
+        )
+
+    def test_later_success_recovers_provider_route(self):
+        import app.shared_state as ss
+        from app.orchestrator import _operational_failure_burst
+        from app.time_utils import _utcnow
+
+        rows = []
+        metadata = {}
+        for offset in range(8):
+            ts = (_utcnow() + timedelta(microseconds=offset)).isoformat()
+            rows.append((ts, "failure", "PROVISION_FAILURE", "create"))
+            metadata[ts] = {"provider": "openai", "backend": "cloud"}
+        success_ts = (_utcnow() + timedelta(seconds=1)).isoformat()
+        rows.append((success_ts, "success", "", "create"))
+        metadata[success_ts] = {"provider": "openai", "backend": "cloud"}
+        ss.deploy_monitoring["task_result_metadata"] = metadata
+
+        assert _operational_failure_burst(rows, {"openai"})[0] is False
+
+    def test_broken_local_runner_cannot_poison_cloud_route(self):
+        import app.shared_state as ss
+        from app.orchestrator import _operational_failure_burst
+        from app.time_utils import _utcnow
+
+        rows = []
+        metadata = {}
+        for offset in range(8):
+            ts = (_utcnow() + timedelta(microseconds=offset)).isoformat()
+            rows.append((ts, "failure", "PROVISION_FAILURE", "create"))
+            metadata[ts] = {
+                "provider": "openai",
+                "backend": "local_runner",
+                "runner_id": "broken-runner",
+            }
+        ss.deploy_monitoring["task_result_metadata"] = metadata
+
+        assert _operational_failure_burst(rows, {"openai"}) == (False, 0, 8)
+
+    def test_healthy_local_route_prevents_failed_cloud_route_global_throttle(self):
+        import app.shared_state as ss
+        from app.orchestrator import _operational_failure_burst
+        from app.time_utils import _utcnow
+
+        rows = []
+        metadata = {}
+        for offset in range(8):
+            ts = (_utcnow() + timedelta(microseconds=offset)).isoformat()
+            rows.append((ts, "failure", "PROVISION_FAILURE", "create"))
+            metadata[ts] = {"provider": "openai", "backend": "cloud"}
+        local_success = (_utcnow() + timedelta(seconds=1)).isoformat()
+        rows.append((local_success, "success", "", "create"))
+        metadata[local_success] = {
+            "provider": "openai",
+            "backend": "local_runner",
+            "runner_id": "healthy-runner",
+        }
+        ss.deploy_monitoring["task_result_metadata"] = metadata
+
+        assert _operational_failure_burst(rows, {"openai"})[0] is False
+
+    def test_all_configured_provider_routes_can_trip_operational_burst(self):
+        import app.shared_state as ss
+        from app.orchestrator import _operational_failure_burst
+        from app.time_utils import _utcnow
+
+        rows = []
+        metadata = {}
+        for offset in range(8):
+            ts = (_utcnow() + timedelta(microseconds=offset)).isoformat()
+            rows.append((ts, "failure", "PROVISION_FAILURE", "create"))
+            metadata[ts] = {
+                "provider": "openai" if offset < 4 else "anthropic"
+            }
+        ss.deploy_monitoring["task_result_metadata"] = metadata
+
+        assert _operational_failure_burst(rows, {"openai", "anthropic"}) == (
+            True,
+            8,
+            8,
+        )
+
+    def test_code_caused_timeout_stays_in_regression_gate(self):
+        import app.shared_state as ss
+        from app.orchestrator import _partition_dispatch_gate_results
+        from app.time_utils import _utcnow
+
+        oom_ts = _utcnow().isoformat()
+        heartbeat_ts = (_utcnow() + timedelta(microseconds=1)).isoformat()
+        ss.deploy_monitoring["task_result_metadata"] = {
+            oom_ts: {"timeout_subtype": "oom"},
+            heartbeat_ts: {"timeout_subtype": "heartbeat_lost"},
+        }
+        regression, operational = _partition_dispatch_gate_results(
+            [
+                (oom_ts, "failure", "AGENT_TIMEOUT", "create"),
+                (heartbeat_ts, "failure", "AGENT_TIMEOUT", "create"),
+            ]
+        )
+
+        assert [row[0] for row in regression] == [oom_ts]
+        assert [row[0] for row in operational] == [heartbeat_ts]
 
 
 class TestTypeUnthrottleBroadcast:

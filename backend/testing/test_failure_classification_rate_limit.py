@@ -1,9 +1,8 @@
-"""Rate-limit correlation / pool-wide reclassification tests for failure_classification.
+"""Evidence-first rate-limit classification compatibility tests.
 
 Extracted from test_failure_classification.py to keep that module focused; this
-file covers the multi-instance-safe RATE_LIMIT reclassification path (account
-cooldown correlation, pool-wide views, db_rl_override authority, and the
-authoritative-verdict short-circuit).
+file preserves helper compatibility while proving that ambient account/pool
+cooldowns never replace direct evidence from the failing attempt.
 """
 
 from unittest.mock import MagicMock
@@ -29,7 +28,7 @@ def _task(msg: str = "", ctx: dict | None = None) -> Task:
 
 
 class TestAccountStateRateLimitCorrelation:
-    """Generic failures during account rate-limit cooldowns classify as RATE_LIMIT."""
+    """An account cooldown from another attempt is not failure evidence."""
 
     def _make_rl_account(self, account_id: str, in_cooldown: bool) -> dict:
         from datetime import timedelta
@@ -62,7 +61,7 @@ class TestAccountStateRateLimitCorrelation:
         task = _task(
             "", ctx={"failure_category": "incomplete", "llm_account_id": account_id}
         )
-        assert classify_failure(task) == RATE_LIMIT
+        assert classify_failure(task) == CODE_ERROR
 
     def test_incomplete_with_healthy_account_stays_code_error(self, monkeypatch):
         account_id = "acct-healthy-1"
@@ -89,7 +88,7 @@ class TestAccountStateRateLimitCorrelation:
         task = _task(
             "failed to read investigation report", ctx={"llm_account_id": account_id}
         )
-        assert classify_failure(task) == RATE_LIMIT
+        assert classify_failure(task) == CODE_ERROR
 
     def test_default_fallback_with_no_account_stays_code_error(self, monkeypatch):
         import app.max_plan_pool as pool_mod
@@ -157,7 +156,7 @@ class TestAccountStateRateLimitCorrelation:
         monkeypatch.setattr(pool_mod, "_account_by_id", fake_pool)
 
         task = _task("", ctx={"llm_account_id": account_id})
-        assert normalize_agent_failure_category("incomplete", task) == RATE_LIMIT
+        assert normalize_agent_failure_category("incomplete", task) == CODE_ERROR
 
     def test_normalize_incomplete_with_healthy_account(self, monkeypatch):
         account_id = "acct-healthy-2"
@@ -171,7 +170,7 @@ class TestAccountStateRateLimitCorrelation:
 
 
 class TestPoolWideRateLimitCorrelation:
-    """Pool-wide cooldown correlates generic deaths even when no account was assigned."""
+    """Pool state alone cannot classify an individual attempt."""
 
     def test_pre_assignment_death_pool_wide_block(self, monkeypatch):
         """No account assigned, entire pool blocked → RATE_LIMIT (not CODE_ERROR)."""
@@ -181,7 +180,7 @@ class TestPoolWideRateLimitCorrelation:
             pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None, **_: True
         )
         task = _task("", ctx={"failure_category": "incomplete"})
-        assert classify_failure(task) == RATE_LIMIT
+        assert classify_failure(task) == CODE_ERROR
 
     def test_healthy_account_pool_wide_block_still_rate_limit(self, monkeypatch):
         """Assigned account is healthy; pool-wide block drives RATE_LIMIT."""
@@ -199,7 +198,7 @@ class TestPoolWideRateLimitCorrelation:
         task = _task(
             "", ctx={"failure_category": "incomplete", "llm_account_id": account_id}
         )
-        assert classify_failure(task) == RATE_LIMIT
+        assert classify_failure(task) == CODE_ERROR
 
     def test_pool_not_blocked_generic_failure_code_error(self, monkeypatch):
         """Pool not in cooldown → generic incomplete stays CODE_ERROR."""
@@ -368,8 +367,8 @@ class TestMultiInstancePartialPoolView:
         task = _task(
             "", ctx={"failure_category": "incomplete", "llm_provider": "anthropic"}
         )
-        assert classify_failure(task) == RATE_LIMIT
-        assert task.context.get("rate_limit_correlation_reclassified") is True
+        assert classify_failure(task) == CODE_ERROR
+        assert "rate_limit_correlation_reclassified" not in task.context
 
     def test_db_rl_override_reclassifies_despite_insufficient_local_view(
         self, monkeypatch
@@ -390,7 +389,7 @@ class TestMultiInstancePartialPoolView:
         task = _task(
             "", ctx={"failure_category": "incomplete", "llm_provider": "anthropic"}
         )
-        assert classify_failure(task, db_rl_override=True) == RATE_LIMIT
+        assert classify_failure(task, db_rl_override=True) == CODE_ERROR
 
     def test_accountless_global_verdict_unaffected_by_gate(self, monkeypatch):
         """Scope-less (no provider, no account) pre-assignment death keeps the
@@ -405,7 +404,7 @@ class TestMultiInstancePartialPoolView:
         monkeypatch.setattr(pool_mod, "_max_plan_pools", {})
 
         task = _task("", ctx={"failure_category": "incomplete"})
-        assert classify_failure(task) == RATE_LIMIT
+        assert classify_failure(task) == CODE_ERROR
 
     def test_local_pool_view_sufficient_predicate(self, monkeypatch):
         """Unit-level: predicate is True for no-scope and for a loaded in-scope
@@ -476,20 +475,10 @@ class TestAtTimeFailureInstantCorrelation:
 
         account_id = "acct-at-time-test"
 
-        # Account was rate-limited; cooldown active at failure_time, expired by sweep_time.
-        def _account_corr(task, at_time=None):
-            # Simulate cooldown active only when at_time is provided (failure instant).
-            # When at_time is None (sweep time), the cooldown has already cleared.
-            return at_time is not None
-
         monkeypatch.setattr(
             pool_mod,
             "_account_by_id",
             {account_id: self._make_rl_account(account_id, in_cooldown=True)},
-        )
-        monkeypatch.setattr(
-            "app.failure_classification._account_was_rate_limited",
-            _account_corr,
         )
         # Pool-wide check must be disabled so only the account-level at_time
         # correlation drives the result — isolates the variable under test.
@@ -505,11 +494,9 @@ class TestAtTimeFailureInstantCorrelation:
             },
         )
 
-        # With at_time=failure_time (non-None), cooldown is detected → RATE_LIMIT.
+        # Ambient cooldown state is not evidence, even at the failure instant.
         failure_time = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=5)
-        assert classify_failure(task, at_time=failure_time) == RATE_LIMIT, (
-            "failure at failure_time must be RATE_LIMIT (cooldown active then)"
-        )
+        assert classify_failure(task, at_time=failure_time) == CODE_ERROR
 
         # With at_time=None (sweep time), cooldown has expired → CODE_ERROR.
         assert classify_failure(task, at_time=None) == CODE_ERROR, (
@@ -529,20 +516,10 @@ class TestAtTimeFailureInstantCorrelation:
 
         account_id = "acct-agent-status-test"
 
-        # Account was rate-limited; cooldown active at failure_time, expired by sweep_time.
-        def _account_corr(task, at_time=None):
-            # Simulate cooldown active only when at_time is provided (failure instant).
-            # When at_time is None (sweep time), the cooldown has already cleared.
-            return at_time is not None
-
         monkeypatch.setattr(
             pool_mod,
             "_account_by_id",
             {account_id: self._make_rl_account(account_id, in_cooldown=True)},
-        )
-        monkeypatch.setattr(
-            "app.failure_classification._account_was_rate_limited",
-            _account_corr,
         )
         # Pool-wide check must be disabled so only the account-level at_time
         # correlation drives the result — isolates the variable under test.
@@ -568,10 +545,7 @@ class TestAtTimeFailureInstantCorrelation:
             task, at_time=task.last_heartbeat or task.started_at
         )
 
-        # Should detect rate-limit because at_time is provided
-        assert failure_class_with_at_time == RATE_LIMIT, (
-            "agent_status path with at_time=last_heartbeat must classify as RATE_LIMIT"
-        )
+        assert failure_class_with_at_time == CODE_ERROR
 
         # Verify that calling without at_time (old broken path) would miss the rate-limit
         failure_class_without_at_time = classify_failure(task, at_time=None)
@@ -594,19 +568,10 @@ class TestAtTimeFailureInstantCorrelation:
 
         account_id = "acct-normalize-at-time"
 
-        def _account_corr(task, at_time=None):
-            # Cooldown active only when at_time is provided (failure instant);
-            # expired at sweep time (at_time=None).
-            return at_time is not None
-
         monkeypatch.setattr(
             pool_mod,
             "_account_by_id",
             {account_id: self._make_rl_account(account_id, in_cooldown=True)},
-        )
-        monkeypatch.setattr(
-            "app.failure_classification._account_was_rate_limited",
-            _account_corr,
         )
         # Isolate the account-level at_time correlation from the pool-wide check.
         monkeypatch.setattr(
@@ -616,11 +581,11 @@ class TestAtTimeFailureInstantCorrelation:
         failure_time = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=5)
         task = _task("", ctx={"llm_account_id": account_id})
 
-        # Generic code-error label + cooldown active at the failure instant → RATE_LIMIT.
+        # Generic labels remain code errors without direct quota evidence.
         assert (
             normalize_agent_failure_category("incomplete", task, at_time=failure_time)
-            == RATE_LIMIT
-        ), "generic label at failure instant must correlate to RATE_LIMIT"
+            == CODE_ERROR
+        )
 
         # Same label re-classified at sweep time (at_time=None) → CODE_ERROR.
         assert (
@@ -630,7 +595,7 @@ class TestAtTimeFailureInstantCorrelation:
 
 
 class TestDbRlOverrideCorrelation:
-    """db_rl_override bypasses in-memory pool so cross-instance rate-limit correlation works."""
+    """Legacy DB-cooldown hints cannot replace attempt-local evidence."""
 
     def test_db_rl_override_true_reclassifies_generic_to_rate_limit(self, monkeypatch):
         """db_rl_override=True upgrades a generic CODE_ERROR to RATE_LIMIT even when
@@ -647,7 +612,7 @@ class TestDbRlOverrideCorrelation:
         result = normalize_agent_failure_category(
             "incomplete", task, db_rl_override=True
         )
-        assert result == RATE_LIMIT
+        assert result == CODE_ERROR
 
     def test_db_rl_override_false_falls_through_to_code_error(self, monkeypatch):
         """db_rl_override=False (default) with no in-memory cooldown → CODE_ERROR."""
@@ -695,8 +660,8 @@ class TestDbRlOverrideCorrelation:
         result = normalize_agent_failure_category(
             "incomplete", task, db_rl_override=True
         )
-        assert result == RATE_LIMIT
-        assert task.context.get("rate_limit_correlation_reclassified") is True
+        assert result == CODE_ERROR
+        assert "rate_limit_correlation_reclassified" not in task.context
 
 
 class TestParseFailedCorrelation:
@@ -735,9 +700,9 @@ class TestParseFailedCorrelation:
 
         task = _task("", ctx={"llm_account_id": account_id})
         result = normalize_agent_failure_category("parse_failed", task)
-        assert result == RATE_LIMIT
-        assert task.context.get("rate_limit_correlation_reclassified") is True
-        assert task.context.get("rate_limit_kind") == "unknown"
+        assert result == CODE_ERROR
+        assert "rate_limit_correlation_reclassified" not in task.context
+        assert "rate_limit_kind" not in task.context
 
     def test_parse_failed_with_healthy_pool_stays_code_error(self, monkeypatch):
         account_id = "acct-pf-healthy-1"
@@ -785,11 +750,11 @@ class TestParseFailedCorrelation:
         )
 
         task = _task("", ctx={"failure_category": "parse_failed"})
-        assert classify_failure(task) == RATE_LIMIT
+        assert classify_failure(task) == CODE_ERROR
 
 
 class TestCorrelationReclassificationMarker:
-    """Verify _persist_correlation_reclassification_context is written correctly."""
+    """Ambient cooldowns never write quota evidence into task context."""
 
     def _make_rl_account(self, account_id: str) -> dict:
         from datetime import timedelta
@@ -817,15 +782,9 @@ class TestCorrelationReclassificationMarker:
         for label in ("incomplete", "fatal"):
             task = _task("", ctx={"failure_category": label})
             result = normalize_agent_failure_category(label, task)
-            assert result == RATE_LIMIT, (
-                f"label={label} should reclassify to RATE_LIMIT"
-            )
-            assert task.context.get("rate_limit_correlation_reclassified") is True, (
-                f"label={label} missing correlation marker"
-            )
-            assert task.context.get("rate_limit_kind") == "unknown", (
-                f"label={label} missing rate_limit_kind"
-            )
+            assert result == CODE_ERROR
+            assert "rate_limit_correlation_reclassified" not in task.context
+            assert "rate_limit_kind" not in task.context
 
     def test_correlation_marker_not_written_when_text_signal_matched(self, monkeypatch):
         """When the text signal fires, _persist_rate_limit_signal_context runs — not correlation marker."""
@@ -938,14 +897,12 @@ class TestPersistAuthoritativeVerdictShortCircuit:
             pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None, **_: True
         )
         task = _task("", ctx={"failure_category": "incomplete"})
-        # No persist_authoritative_verdict call — re-derives from pool state.
-        assert classify_failure(task) == RATE_LIMIT
+        # No persist_authoritative_verdict call — direct evidence is still required.
+        assert classify_failure(task) == CODE_ERROR
 
 
 class TestReaperDbRlOverrideClassifyFailure:
-    """Reaper path: silent death + DB-confirmed rate-limit the in-memory cache
-    never saw → RATE_LIMIT.  Exercises classify_failure / classify_failure_with_confidence
-    with db_rl_override=True and the full persist→analytics-stable sequence."""
+    """Legacy DB cooldown hints do not classify an ambiguous attempt."""
 
     def test_classify_failure_db_rl_override_reclassifies_generic(self, monkeypatch):
         """In-memory pool empty (cross-instance); reaper passes db_rl_override=True
@@ -959,7 +916,7 @@ class TestReaperDbRlOverrideClassifyFailure:
 
         task = _task("", ctx={"failure_category": "claude_code_failed"})
         assert classify_failure(task) == CODE_ERROR, "baseline without override"
-        assert classify_failure(task, db_rl_override=True) == RATE_LIMIT
+        assert classify_failure(task, db_rl_override=True) == CODE_ERROR
 
     def test_classify_failure_with_confidence_db_rl_override(self, monkeypatch):
         """classify_failure_with_confidence passes db_rl_override through; result is RATE_LIMIT."""
@@ -972,7 +929,7 @@ class TestReaperDbRlOverrideClassifyFailure:
 
         task = _task("", ctx={"failure_category": "incomplete"})
         result = classify_failure_with_confidence(task, db_rl_override=True)
-        assert result.failure_class == RATE_LIMIT
+        assert result.failure_class == CODE_ERROR
 
     def test_db_rl_override_then_persist_analytics_stable(self, monkeypatch):
         """Full reaper sequence: classify with db_rl_override=True → persist verdict →
@@ -986,18 +943,16 @@ class TestReaperDbRlOverrideClassifyFailure:
 
         task = _task("", ctx={"failure_category": "claude_code_failed"})
 
-        # Step 1: reaper classifies at failure instant with DB-confirmed RL.
+        # Step 1: ambient DB state does not replace attempt-local evidence.
         reaper_class = classify_failure(task, db_rl_override=True)
-        assert reaper_class == RATE_LIMIT
+        assert reaper_class == CODE_ERROR
 
         # Step 2: reaper persists the authoritative verdict.
         persist_authoritative_verdict(task, reaper_class)
 
         # Step 3: analytics path (digest, anomaly detection) calls classify_failure
         # hours later with no override and no active cooldown — must not flip to CODE_ERROR.
-        assert classify_failure(task) == RATE_LIMIT, (
-            "analytics path must return persisted RATE_LIMIT, not re-derive CODE_ERROR"
-        )
+        assert classify_failure(task) == CODE_ERROR
 
     def test_db_rl_override_does_not_override_authoritative_labels(self, monkeypatch):
         """Authoritative labels (test_failed) are not upgraded to RATE_LIMIT even
@@ -1014,12 +969,7 @@ class TestReaperDbRlOverrideClassifyFailure:
 
 
 class TestSilentDeathPoolWideCoverage:
-    """Empty-combined-log path (no status message, no failure_category) with pool-wide block.
-
-    Regression: the empty-combined early exit previously only checked
-    _account_was_rate_limited, so a pre-assignment death during a pool-wide
-    block returned AGENT_TIMEOUT instead of RATE_LIMIT.
-    """
+    """A silent death remains AGENT_TIMEOUT without direct quota evidence."""
 
     def test_accountless_silent_death_pool_blocked_rate_limit(self, monkeypatch):
         """No account assigned, empty log, pool blocked → RATE_LIMIT (not AGENT_TIMEOUT)."""
@@ -1031,8 +981,8 @@ class TestSilentDeathPoolWideCoverage:
         )
         # No failure_category, no account id, empty status message — pure silent death.
         task = _task("", ctx={})
-        assert classify_failure(task) == RATE_LIMIT
-        assert task.context.get("rate_limit_correlation_reclassified") is True
+        assert classify_failure(task) == AGENT_TIMEOUT
+        assert "rate_limit_correlation_reclassified" not in task.context
 
     def test_accountless_silent_death_pool_not_blocked_agent_timeout(self, monkeypatch):
         """No account, empty log, pool not blocked → AGENT_TIMEOUT (no false positive)."""
@@ -1054,5 +1004,5 @@ class TestSilentDeathPoolWideCoverage:
             pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None, **_: False
         )
         task = _task("", ctx={})
-        assert classify_failure(task, db_rl_override=True) == RATE_LIMIT
-        assert task.context.get("rate_limit_correlation_reclassified") is True
+        assert classify_failure(task, db_rl_override=True) == AGENT_TIMEOUT
+        assert "rate_limit_correlation_reclassified" not in task.context

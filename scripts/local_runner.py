@@ -52,6 +52,14 @@ Optional environment variables:
     BLUEPRINT_RUNNER_GPUS_PER_JOB     GPUs assigned per compute job (default: 1)
     BLUEPRINT_RUNNER_CPU_LIMIT        Best-effort CPU cap (cores) per task
     BLUEPRINT_RUNNER_MEM_LIMIT        Best-effort memory cap per task (e.g. 8g)
+    BLUEPRINT_RUNNER_CLI_MAINTENANCE  Host CLI self-maintenance (default: 1;
+                                      set 0/false/no/off to disable).
+    BLUEPRINT_RUNNER_CLI_DIR          Blueprint-managed CLI release root
+                                      (default: ~/.blueprint/managed-clis).
+    BLUEPRINT_RUNNER_CLI_MAINTENANCE_INTERVAL
+                                      Recheck interval seconds (default: 21600,
+                                      floor 60). Failed installs also use
+                                      persisted exponential backoff.
 
 ISOLATION (fail-closed): every task — agent or compute — runs inside an isolation
 boundary or the runner declines it. There is NO bare/unsandboxed execution path.
@@ -92,6 +100,7 @@ import io
 import json
 import typing
 import os
+import re
 import shutil
 import signal
 import socket
@@ -102,6 +111,7 @@ import tarfile
 import tempfile
 import threading
 import random
+import secrets
 import time
 import urllib.error
 import urllib.request
@@ -539,6 +549,562 @@ def _load_runner_token() -> str | None:
         return token or None
     except OSError:
         return None
+
+
+# ── Blueprint-managed provider CLIs ─────────────────────────────────────────
+
+_MANAGED_CLI_POLICY: dict[str, tuple[str, str]] = {
+    # Codex accepts compatible newer versions, but repair/bootstrap uses the
+    # reviewed exact version so a registry change cannot silently alter runners.
+    "codex": ("@openai/codex", "0.144.1"),
+    # Preserve the existing Docker/Packer policy for Claude Code: current latest.
+    "claude": ("@anthropic-ai/claude-code", "latest"),
+}
+_CLI_MAINTENANCE_LOCK = threading.Lock()
+_CLI_MAINTENANCE_INTERVAL_SECONDS = 6 * 60 * 60
+_CLI_INSTALL_TIMEOUT_SECONDS = 180
+_CLI_LOCK_STALE_SECONDS = 15 * 60
+_CLI_LOCK_PUBLICATION_GRACE_SECONDS = 30
+_CLI_LOCK_OWNER_FILE = "owner.json"
+_CLI_SUBPROCESS_ENV_KEYS = (
+    # Executable discovery and user-level npm configuration.
+    "PATH",
+    "HOME",
+    "USERPROFILE",
+    # Locale and terminal basics.
+    "LANG",
+    "LC_ALL",
+    "TERM",
+    # Temporary directories.
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    # Registry/network transport without provider or runner credentials.
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "NODE_EXTRA_CA_CERTS",
+    # Windows process-launch essentials.
+    "SystemRoot",
+    "SYSTEMROOT",
+    "WINDIR",
+    "ComSpec",
+    "COMSPEC",
+    "PATHEXT",
+)
+
+
+def _cli_subprocess_env(source: dict[str, str] | None = None) -> dict[str, str]:
+    """Return the minimal environment trusted CLI install/probe subprocesses need.
+
+    npm lifecycle code and newly downloaded CLI shims are executable code. They
+    must not inherit enrollment, orchestrator, GitHub, or provider credentials
+    from the long-lived runner process.
+    """
+    values = os.environ if source is None else source
+    return {
+        key: value
+        for key in _CLI_SUBPROCESS_ENV_KEYS
+        if isinstance((value := values.get(key)), str) and value
+    }
+
+
+def _managed_cli_base() -> str:
+    override = os.environ.get("BLUEPRINT_RUNNER_CLI_DIR", "").strip()
+    return os.path.abspath(
+        os.path.expanduser(
+            override or os.path.join(_credential_dir(), "managed-clis")
+        )
+    )
+
+
+def _atomic_json(path: str, payload: dict) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(path))
+    try:
+        os.write(fd, json.dumps(payload, sort_keys=True).encode())
+    finally:
+        os.close(fd)
+    try:
+        try:
+            os.chmod(tmp_path, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp_path, path)
+        tmp_path = ""
+    finally:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
+def _read_json(path: str) -> dict:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            value = json.load(fh)
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def _managed_cli_bin(name: str) -> str | None:
+    """Resolve a verified active release without trusting path traversal."""
+    cli_root = os.path.join(_managed_cli_base(), name)
+    manifest = _read_json(os.path.join(cli_root, "active.json"))
+    relative = manifest.get("release")
+    if not isinstance(relative, str) or not relative:
+        return None
+    release = os.path.abspath(os.path.join(cli_root, relative))
+    try:
+        if os.path.commonpath((cli_root, release)) != os.path.abspath(cli_root):
+            return None
+    except ValueError:
+        return None
+    bin_dir = os.path.join(release, "node_modules", ".bin")
+    return bin_dir if os.path.isdir(bin_dir) else None
+
+
+def _activate_managed_cli_paths() -> list[str]:
+    """Prepend verified Blueprint releases and remove superseded managed paths."""
+    base = _managed_cli_base()
+    current = os.environ.get("PATH", "").split(os.pathsep)
+    retained: list[str] = []
+    for entry in current:
+        if not entry:
+            continue
+        try:
+            inside = os.path.commonpath((base, os.path.abspath(entry))) == base
+        except ValueError:
+            inside = False
+        if not inside:
+            retained.append(entry)
+    active = [
+        path
+        for name in _MANAGED_CLI_POLICY
+        if (path := _managed_cli_bin(name)) is not None
+    ]
+    os.environ["PATH"] = os.pathsep.join([*active, *retained])
+    return active
+
+
+def _version_text(output: str) -> str | None:
+    match = re.search(r"\b(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)\b", output)
+    return match.group(1) if match else None
+
+
+def _npm_latest_version(npm: str, package: str) -> str | None:
+    try:
+        result = subprocess.run(
+            [npm, "view", package, "version"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=_cli_subprocess_env(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return _version_text(result.stdout or "") if result.returncode == 0 else None
+
+
+def _cli_backoff_path(name: str) -> str:
+    return os.path.join(_managed_cli_base(), name, "maintenance.json")
+
+
+def _cli_in_backoff(name: str, now: float) -> bool:
+    state = _read_json(_cli_backoff_path(name))
+    retry_at = state.get("next_retry_at", 0)
+    return isinstance(retry_at, (int, float)) and retry_at > now
+
+
+def _record_cli_install_result(name: str, *, succeeded: bool, now: float) -> None:
+    if succeeded:
+        _atomic_json(
+            _cli_backoff_path(name),
+            {"failures": 0, "next_retry_at": 0, "last_success_at": now},
+        )
+        return
+    old = _read_json(_cli_backoff_path(name))
+    failures = min(int(old.get("failures", 0) or 0) + 1, 10)
+    delay = min(6 * 60 * 60, 60 * (2 ** (failures - 1)))
+    _atomic_json(
+        _cli_backoff_path(name),
+        {"failures": failures, "next_retry_at": now + delay},
+    )
+
+
+def _read_cli_lock_owner(path: str) -> dict | None:
+    """Read valid owner metadata from an atomically held lock directory."""
+    try:
+        owner_path = os.path.join(path, _CLI_LOCK_OWNER_FILE)
+        value = _read_json(owner_path)
+        if not isinstance(value.get("owner_token"), str):
+            return None
+        if not isinstance(value.get("pid"), int):
+            return None
+        if not isinstance(value.get("created_at"), (int, float)):
+            return None
+        return value
+    except (OSError, TypeError):
+        return None
+
+
+def _pid_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+
+    # On Windows, ``os.kill(pid, 0)`` is not the harmless existence probe it is
+    # on POSIX. Signal 0 is ``CTRL_C_EVENT`` there, and GenerateConsoleCtrlEvent
+    # can broadcast Ctrl+C to every process sharing the runner's console (for
+    # example the operator's Codex CLI). Query the process handle instead.
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        process_query_limited_information = 0x1000
+        error_access_denied = 5
+        still_active = 259
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = (
+            wintypes.DWORD,
+            wintypes.BOOL,
+            wintypes.DWORD,
+        )
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetExitCodeProcess.argtypes = (
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.DWORD),
+        )
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        handle = kernel32.OpenProcess(
+            process_query_limited_information, False, pid
+        )
+        if not handle:
+            # An access-denied process still exists; other failures mean there
+            # is no safely queryable live process for this PID.
+            return ctypes.get_last_error() == error_access_denied
+        try:
+            exit_code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return True
+            return exit_code.value == still_active
+        finally:
+            kernel32.CloseHandle(handle)
+
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def _remove_cli_lock_directory(
+    path: str,
+    *,
+    expected_owner_token: str | None,
+    allow_unpublished: bool = False,
+    before_rmdir=None,
+) -> bool:
+    """Remove owner metadata inside the held directory, then drop the directory.
+
+    A successor cannot create the same directory until rmdir completes, so
+    release has no pathname gap in which it can unlink a successor's lock.
+    """
+    owner = _read_cli_lock_owner(path)
+    if expected_owner_token is not None:
+        if owner is None or owner.get("owner_token") != expected_owner_token:
+            return False
+    elif not allow_unpublished:
+        return False
+    try:
+        for name in os.listdir(path):
+            if name == _CLI_LOCK_OWNER_FILE or (
+                name.startswith(".owner.") and name.endswith(".tmp")
+            ):
+                os.remove(os.path.join(path, name))
+        if before_rmdir is not None:
+            before_rmdir()
+        os.rmdir(path)
+        return True
+    except OSError:
+        return False
+
+
+def _reclaim_abandoned_cli_lock(path: str) -> bool:
+    try:
+        age = time.time() - os.path.getmtime(path)
+    except OSError:
+        return False
+    if age < _CLI_LOCK_PUBLICATION_GRACE_SECONDS:
+        return False
+    owner = _read_cli_lock_owner(path)
+    if owner is None:
+        return _remove_cli_lock_directory(
+            path, expected_owner_token=None, allow_unpublished=True
+        )
+    if _pid_is_alive(owner["pid"]):
+        return False
+    return _remove_cli_lock_directory(
+        path, expected_owner_token=owner["owner_token"]
+    )
+
+
+def _acquire_cli_process_lock() -> tuple[str, str] | None:
+    base = _managed_cli_base()
+    os.makedirs(base, exist_ok=True)
+    path = os.path.join(base, ".maintenance.lock")
+    owner_token = secrets.token_hex(32)
+
+    def _create() -> tuple[str, str]:
+        os.mkdir(path, 0o700)
+        owner_path = os.path.join(path, _CLI_LOCK_OWNER_FILE)
+        temp_path = os.path.join(path, f".owner.{owner_token}.tmp")
+        payload = json.dumps(
+            {
+                "owner_token": owner_token,
+                "pid": os.getpid(),
+                "created_at": time.time(),
+            },
+            sort_keys=True,
+        ).encode()
+        try:
+            fd = os.open(temp_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            try:
+                os.write(fd, payload)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.replace(temp_path, owner_path)
+            return path, owner_token
+        except OSError:
+            _remove_cli_lock_directory(
+                path, expected_owner_token=None, allow_unpublished=True
+            )
+            raise
+
+    try:
+        return _create()
+    except FileExistsError:
+        try:
+            if _reclaim_abandoned_cli_lock(path):
+                return _create()
+        except (OSError, FileExistsError):
+            pass
+        return None
+    except OSError:
+        return None
+
+
+def _release_cli_process_lock(
+    held: tuple[str, str] | None,
+) -> None:
+    if held is None:
+        return
+    path, owner_token = held
+    _remove_cli_lock_directory(path, expected_owner_token=owner_token)
+
+
+def _prune_managed_cli_releases(
+    releases: str, active_release: str, *, keep: int = 2
+) -> None:
+    """Keep the active release plus the newest rollback release, best-effort."""
+    try:
+        candidates = [
+            os.path.join(releases, entry)
+            for entry in os.listdir(releases)
+            if entry.startswith("release-")
+            and os.path.isdir(os.path.join(releases, entry))
+        ]
+        candidates.sort(key=os.path.getmtime, reverse=True)
+        retained = {os.path.abspath(active_release)}
+        retained.update(os.path.abspath(path) for path in candidates[:keep])
+        for path in candidates:
+            if os.path.abspath(path) not in retained:
+                shutil.rmtree(path, ignore_errors=True)
+    except OSError:
+        pass
+
+
+def _install_managed_cli(
+    name: str,
+    npm: str,
+    package: str,
+    target: str,
+) -> bool:
+    """Stage, verify, then atomically activate one Blueprint-owned CLI."""
+    cli_root = os.path.join(_managed_cli_base(), name)
+    releases = os.path.join(cli_root, "releases")
+    os.makedirs(releases, exist_ok=True)
+    staging = tempfile.mkdtemp(prefix=".stage-", dir=releases)
+    subprocess_env = _cli_subprocess_env()
+    try:
+        result = subprocess.run(
+            [
+                npm,
+                "install",
+                "--prefix",
+                staging,
+                "--include=optional",
+                "--omit=dev",
+                "--no-audit",
+                "--no-fund",
+                "--loglevel=error",
+                f"{package}@{target}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_CLI_INSTALL_TIMEOUT_SECONDS,
+            env=subprocess_env,
+        )
+        if result.returncode != 0:
+            return False
+        bin_dir = os.path.join(staging, "node_modules", ".bin")
+        executable = shutil.which(name, path=bin_dir)
+        if not executable:
+            return False
+        verified = subprocess.run(
+            [executable, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=subprocess_env,
+        )
+        info = iso._llm_cli_result(name, verified)
+        if info.get("healthy") is not True:
+            return False
+        actual = _version_text(info.get("version") or "")
+        if target != "latest" and actual != target:
+            return False
+
+        safe_version = re.sub(r"[^0-9A-Za-z._-]", "_", actual or target)
+        unique = os.path.basename(staging).removeprefix(".stage-")
+        final_name = f"release-{int(time.time())}-{safe_version}-{unique}"
+        final_dir = os.path.join(releases, final_name)
+        os.replace(staging, final_dir)
+        staging = ""
+        _atomic_json(
+            os.path.join(cli_root, "active.json"),
+            {
+                "release": os.path.relpath(final_dir, cli_root),
+                "version": actual or target,
+            },
+        )
+        _activate_managed_cli_paths()
+        _prune_managed_cli_releases(releases, final_dir)
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
+    finally:
+        if staging:
+            shutil.rmtree(staging, ignore_errors=True)
+
+
+def _maintain_host_llm_clis_once(*, now: float | None = None) -> None:
+    """Repair host CLIs without ever mutating operator-managed global installs."""
+    if os.environ.get("BLUEPRINT_RUNNER_CLI_MAINTENANCE", "1").strip().lower() in {
+        "0", "false", "no", "off",
+    }:
+        return
+    npm = shutil.which("npm")
+    if not npm:
+        print("[runner] CLI maintenance skipped: npm is unavailable.", flush=True)
+        return
+    timestamp = time.time() if now is None else now
+    with _CLI_MAINTENANCE_LOCK:
+        held = _acquire_cli_process_lock()
+        if held is None:
+            return
+        try:
+            _activate_managed_cli_paths()
+            inventory = iso.probe_llm_clis(env=_cli_subprocess_env())
+            for name, (package, policy_target) in _MANAGED_CLI_POLICY.items():
+                if _cli_in_backoff(name, timestamp):
+                    continue
+                info = inventory.get(name) or {}
+                target: str | None = None
+                if info.get("healthy") is not True:
+                    target = policy_target
+                elif name == "claude":
+                    latest = _npm_latest_version(npm, package)
+                    actual = _version_text(info.get("version") or "")
+                    if latest and actual and latest != actual:
+                        target = latest
+                # Codex health already enforces >= the reviewed minimum. Healthy
+                # compatible operator installs are left alone; repairs go managed.
+                if target is None:
+                    continue
+                print(
+                    f"[runner] maintaining Blueprint-managed {name} CLI "
+                    f"(policy {target})...",
+                    flush=True,
+                )
+                succeeded = _install_managed_cli(
+                    name, npm, package, target
+                )
+                _record_cli_install_result(
+                    name, succeeded=succeeded, now=timestamp
+                )
+                if succeeded:
+                    print(
+                        f"[runner] Blueprint-managed {name} CLI verified and activated.",
+                        flush=True,
+                    )
+                else:
+                    # Never echo npm stdout/stderr: registry configuration can
+                    # contain credentials. Existing healthy capacity stays active.
+                    print(
+                        f"[runner] WARNING: managed {name} CLI install/verification "
+                        "failed; keeping the previous CLI and backing off.",
+                        flush=True,
+                    )
+        finally:
+            _release_cli_process_lock(held)
+
+
+def _host_cli_maintenance_loop() -> None:
+    while not _shutdown_event.is_set():
+        try:
+            _maintain_host_llm_clis_once()
+        except Exception as exc:
+            print(
+                f"[runner] WARNING: CLI maintenance error ({type(exc).__name__}); "
+                "existing capacity is unchanged.",
+                flush=True,
+            )
+        interval = _env_float(
+            "BLUEPRINT_RUNNER_CLI_MAINTENANCE_INTERVAL",
+            float(_CLI_MAINTENANCE_INTERVAL_SECONDS),
+            minimum=60.0,
+        )
+        if _shutdown_event.wait(interval):
+            return
+
+
+def _host_cli_maintenance_allowed(
+    caps: "iso.Capabilities", agent_image: str | None
+) -> bool:
+    """Manage host CLIs whenever bwrap remains a selectable agent backend.
+
+    A configured Docker image only covers the light read-only task slice. On a
+    hybrid Docker+bwrap runner, write/heavy tasks still select bwrap and require
+    healthy host CLIs. A genuinely Docker-only runner has no selectable host
+    backend and remains image-managed.
+    """
+    del agent_image  # Image selection cannot remove the bwrap fallback slice.
+    return caps.bwrap_ok
 
 
 def _write_status_json(
@@ -2410,6 +2976,192 @@ class _LiveRunnerConfig:
 
 # ── Heartbeat (background thread) ─────────────────────────────────────────────
 
+_IMAGE_LLM_CLI_PROBE_CACHE: dict[
+    tuple[str, str], tuple[float, dict[str, dict]]
+] = {}
+_IMAGE_LLM_CLI_PROBE_TTL_SECONDS = 300.0
+_TRANSIENT_CLI_PROBE_REASONS = frozenset(
+    {
+        "version_probe_timeout",
+        "version_probe_error",
+        "version_probe_failed",
+        "container_probe_error",
+    }
+)
+
+
+def _agent_image_identity(agent_image: str) -> str | None:
+    """Return the immutable ID of the locally selected Docker image.
+
+    Tags are mutable, so keying CLI health only by ``repo:tag`` could keep a
+    pre-deploy result after the same tag is rebuilt. An unresolved identity is
+    deliberately not cacheable; the caller still probes the image and retries
+    identity resolution on the next heartbeat.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "docker",
+                "image",
+                "inspect",
+                "--format={{.Id}}",
+                agent_image,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    image_id = (result.stdout or "").strip()
+    return image_id if result.returncode == 0 and image_id else None
+
+
+def _probe_llm_clis_for_agent_backend(
+    agent_backend: str | None,
+    agent_image: str | None,
+) -> tuple[str, dict[str, dict]]:
+    """Probe the CLI environment that the advertised agent backend will use."""
+    if agent_backend == iso.BACKEND_DOCKER and agent_image:
+        image_id = _agent_image_identity(agent_image)
+        source = f"docker:{agent_image}@{image_id or 'unresolved'}"
+        cache_key = (agent_image, image_id) if image_id else None
+        now = time.monotonic()
+        cached = (
+            _IMAGE_LLM_CLI_PROBE_CACHE.get(cache_key)
+            if cache_key is not None
+            else None
+        )
+        if cached is not None and now - cached[0] < _IMAGE_LLM_CLI_PROBE_TTL_SECONDS:
+            return source, {name: dict(info) for name, info in cached[1].items()}
+        probed = iso.probe_container_llm_clis(agent_image)
+        # Cache stable success/deterministic failure. A transport/timeout failure
+        # is retried next heartbeat so the hysteresis below observes real probes,
+        # not the same cached failure twice.
+        if cache_key is not None and not any(
+            isinstance(info, dict)
+            and info.get("reason") in _TRANSIENT_CLI_PROBE_REASONS
+            for info in probed.values()
+        ):
+            # Discard results for older IDs behind the same mutable tag.
+            for old_key in tuple(_IMAGE_LLM_CLI_PROBE_CACHE):
+                if old_key[0] == agent_image and old_key != cache_key:
+                    _IMAGE_LLM_CLI_PROBE_CACHE.pop(old_key, None)
+            _IMAGE_LLM_CLI_PROBE_CACHE[cache_key] = (
+                now,
+                {name: dict(info) for name, info in probed.items()},
+            )
+        return source, probed
+    return "host", iso.probe_llm_clis(env=_cli_subprocess_env())
+
+
+def _stabilize_llm_cli_probe(
+    source: str,
+    current: dict[str, dict],
+    last_healthy: dict[tuple[str, str], dict],
+    transient_failures: dict[tuple[str, str], int],
+) -> dict[str, dict]:
+    """Avoid one transient startup probe flapping otherwise healthy capacity.
+
+    Deterministic failures (missing binary/native package, unsupported version)
+    fail closed immediately. After a prior healthy observation, a timeout or
+    generic non-zero probe gets one heartbeat of grace and must fail again before
+    eligibility is withdrawn. Cold-start failures never receive grace.
+    """
+    stabilized: dict[str, dict] = {}
+    for name, raw in current.items():
+        info = dict(raw) if isinstance(raw, dict) else {}
+        key = (source, name)
+        if info.get("healthy") is True:
+            last_healthy[key] = dict(info)
+            transient_failures.pop(key, None)
+            stabilized[name] = info
+            continue
+        if info.get("reason") in _TRANSIENT_CLI_PROBE_REASONS and key in last_healthy:
+            count = transient_failures.get(key, 0) + 1
+            transient_failures[key] = count
+            if count < 2:
+                previous = dict(last_healthy[key])
+                previous["probe_warning"] = info.get("reason")
+                previous["probe_stale"] = True
+                stabilized[name] = previous
+                continue
+        else:
+            transient_failures.pop(key, None)
+        stabilized[name] = info
+    return stabilized
+
+
+def _llm_cli_is_eligible(info: dict) -> bool:
+    healthy = info.get("healthy")
+    return bool(healthy) if isinstance(healthy, bool) else bool(info.get("present"))
+
+
+def _intersect_llm_cli_health(
+    inventories: dict[str, dict[str, dict]],
+) -> dict[str, dict]:
+    """Conservatively flatten provider health across selectable agent backends.
+
+    The heartbeat schema is provider-flat, while a hybrid runner routes light
+    read-only work through Docker and write/heavy work through host bwrap. Until
+    the schema can express per-task-slice health, a provider is dispatchable only
+    when it is healthy on every selectable backend. Other providers are evaluated
+    independently, so one broken Codex installation does not suppress Claude,
+    Gemini, or compute capacity.
+    """
+    names = {
+        name
+        for inventory in inventories.values()
+        for name in inventory
+    }
+    combined: dict[str, dict] = {}
+    for name in sorted(names):
+        details = {
+            backend: (
+                dict(inventory[name])
+                if isinstance(inventory.get(name), dict)
+                else {
+                    "present": False,
+                    "healthy": False,
+                    "version": "",
+                    "reason": "not_reported",
+                }
+            )
+            for backend, inventory in inventories.items()
+        }
+        backend_health = {
+            backend: _llm_cli_is_eligible(info)
+            for backend, info in details.items()
+        }
+        failed = [
+            backend for backend, healthy in backend_health.items() if not healthy
+        ]
+        selected = (
+            next(info for backend, info in details.items() if backend in failed)
+            if failed
+            else next(iter(details.values()))
+        )
+        selected["backend_health"] = backend_health
+        selected["backend_versions"] = {
+            backend: info.get("version") or None
+            for backend, info in details.items()
+        }
+        if failed:
+            selected.update(
+                {
+                    "present": False,
+                    "healthy": False,
+                    "reason": "unhealthy_on_selectable_backend:"
+                    + ",".join(sorted(failed)),
+                }
+            )
+        else:
+            selected["present"] = True
+            selected["healthy"] = True
+            selected["reason"] = None
+        combined[name] = selected
+    return combined
+
 def _heartbeat_loop(
     orchestrator_url: str,
     token: str,
@@ -2447,6 +3199,8 @@ def _heartbeat_loop(
     # authenticate before keeps the existing re-arm/streak behavior (an inactive
     # row re-arms on an authenticated heartbeat; a mid-life revoke is retried).
     ever_authenticated = False
+    _llm_cli_last_healthy: dict[tuple[str, str], dict] = {}
+    _llm_cli_transient_failures: dict[tuple[str, str], int] = {}
     while not _shutdown_event.is_set():
         try:
             with lock:
@@ -2559,19 +3313,61 @@ def _heartbeat_loop(
                 compute_backend = iso.decide_compute_backend(
                     caps, has_image=agent_image is not None
                 )
-                llm_clis = iso.probe_llm_clis()
+                # A hybrid runner has two selectable task slices: Docker for
+                # light read-only tasks and host bwrap for write/heavy tasks.
+                # Probe/stabilize each leg independently, then conservatively
+                # intersect each provider into the flat heartbeat schema.
+                probe_targets: list[tuple[str, str]] = []
+                if bwrap_agent_ok:
+                    probe_targets.append(("host", iso.BACKEND_BWRAP))
+                if docker_agent_ok:
+                    probe_targets.append(("docker", iso.BACKEND_DOCKER))
+                if not probe_targets:
+                    probe_targets.append(("host", agent_backend))
+                backend_inventories: dict[str, dict[str, dict]] = {}
+                for label, backend in probe_targets:
+                    _cli_source, probed_clis = _probe_llm_clis_for_agent_backend(
+                        backend, agent_image
+                    )
+                    backend_inventories[label] = _stabilize_llm_cli_probe(
+                        _cli_source,
+                        probed_clis,
+                        _llm_cli_last_healthy,
+                        _llm_cli_transient_failures,
+                    )
+                llm_clis = (
+                    _intersect_llm_cli_health(backend_inventories)
+                    if len(backend_inventories) > 1
+                    else next(iter(backend_inventories.values()))
+                )
+                # New explicit health is authoritative. Normalize it into the
+                # legacy dispatch bit as well, so an older orchestrator that
+                # only understands ``present`` still fails closed.
+                llm_clis = {
+                    name: (
+                        {**info, "present": False}
+                        if isinstance(info, dict) and info.get("healthy") is False
+                        else info
+                    )
+                    for name, info in llm_clis.items()
+                }
             else:
                 isolation_backends = None
                 agent_backend = None
                 compute_backend = None
                 llm_clis = None
             # Flat CLI inventory derived from the same probe: {name: version|None}.
-            # Absent binary ⇒ None; present with an unknown version ⇒ "". Probed
-            # every heartbeat, so startup AND post-self-update (the process
-            # restarts and re-probes) are both covered without extra hooks.
+            # New probes report an explicit ``healthy`` bit; it takes precedence
+            # over the legacy ``present`` bit so a PATH shim whose native package
+            # failed to load is never advertised as usable. Older two-field probe
+            # dictionaries remain compatible through the ``present`` fallback.
             cli_inventory = (
                 {
-                    name: ((info.get("version") or "") if info.get("present") else None)
+                    name: (
+                        (info.get("version") or "")
+                        if _llm_cli_is_eligible(info)
+                        else None
+                    )
                     for name, info in llm_clis.items()
                     if isinstance(info, dict)
                 }
@@ -5487,6 +6283,25 @@ def main() -> None:
             flush=True,
         )
         agent_image = None
+
+    # Activate previously verified Blueprint-owned host CLIs before any host
+    # preflight/probe. Maintain them asynchronously so npm/registry trouble can
+    # never take healthy Claude, Gemini, compute, or heartbeat capacity offline.
+    # A genuinely Docker-only runner is image-managed and does not mutate host
+    # dependencies. Hybrid Docker+bwrap runners still maintain the host CLIs
+    # needed by their write/heavy bwrap task slice.
+    host_agent_backend = _host_cli_maintenance_allowed(caps, agent_image)
+    if host_agent_backend:
+        _activate_managed_cli_paths()
+        if not check_mode:
+            threading.Thread(
+                target=_host_cli_maintenance_loop,
+                name="blueprint-cli-maintenance",
+                daemon=True,
+            ).start()
+
+    # Resolve after managed PATH activation so bwrap binds the verified release.
+    agent_binary = _locate_agent_binary()
 
     # LOUD warning (Fix 2): a docker-only box (docker + agent image usable, but NO
     # bwrap) can run ONLY the read-only agent slice (iso.AGENT_DOCKER_TYPES). The

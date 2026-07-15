@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+import json
 import logging
 import re
+from datetime import datetime, timezone
 from typing import Any, Mapping
 
 from app.models import LLMAuthMode, LLMProviderName
@@ -22,7 +26,104 @@ logger = logging.getLogger(__name__)
 _OPENAI_LIST_MODELS_URL = "https://api.openai.com/v1/models"
 _MODEL_LISTING_TIMEOUT_SECONDS = 5.0
 
+# Agent roles can run for up to four hours.  Keep one additional hour for VM
+# startup, provider validation and final-status persistence.  When a Codex OAuth
+# access token has less time than this remaining, account selection serializes a
+# single refresh probe instead of handing the same rotating refresh token to
+# several isolated VMs.
+CODEX_OAUTH_MIN_CONCURRENT_TTL_SECONDS = 5 * 60 * 60
+
 _API_KEY_RE = re.compile(r"sk-[A-Za-z0-9_\-]+")
+
+
+def codex_oauth_credential_hash(secret: str) -> str:
+    """Return the version fingerprint agents use for rotation compare-and-swap."""
+
+    return hashlib.sha256(secret.encode("utf-8")).hexdigest()
+
+
+def codex_oauth_access_token_expires_at(secret: str | None) -> datetime | None:
+    """Read the unverified ``exp`` claim from a Codex ``auth.json`` access token.
+
+    This is a dispatch-safety clock, not authentication: signature validation is
+    still Codex/OpenAI's responsibility.  Malformed or opaque tokens return None
+    so callers can fail closed by serializing refresh-capable work.
+    """
+
+    if not isinstance(secret, str) or not secret.strip():
+        return None
+    try:
+        parsed = json.loads(secret)
+        token = parsed["tokens"]["access_token"]
+        if not isinstance(token, str):
+            return None
+        parts = token.split(".")
+        if len(parts) < 2:
+            return None
+        payload = parts[1]
+        payload += "=" * (-len(payload) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload.encode("ascii")))
+        exp = claims.get("exp")
+        if isinstance(exp, bool) or not isinstance(exp, (int, float)):
+            return None
+        return datetime.fromtimestamp(float(exp), tz=timezone.utc).replace(tzinfo=None)
+    except (
+        KeyError,
+        TypeError,
+        ValueError,
+        OverflowError,
+        OSError,
+    ):
+        return None
+
+
+def codex_oauth_requires_refresh_probe(
+    account: Mapping[str, Any], *, now: datetime | None = None
+) -> tuple[bool, bool]:
+    """Return whether an OAuth account must serialize its next Codex claim.
+
+    The second value reports whether the access-token expiry was readable.
+    Opaque credentials fail closed because isolated agents must not race the
+    same rotating refresh token.
+    """
+
+    provider = account.get("provider")
+    if isinstance(provider, LLMProviderName):
+        provider = provider.value
+    auth_mode = account.get("auth_mode")
+    if isinstance(auth_mode, LLMAuthMode):
+        auth_mode = auth_mode.value
+    if str(provider or "").lower() != LLMProviderName.OPENAI.value or str(
+        auth_mode or ""
+    ).lower() != LLMAuthMode.OAUTH.value:
+        return False, True
+    secret = account.get("runtime_secret") or account.get("oauth_token")
+    expires_at = codex_oauth_access_token_expires_at(secret)
+    if expires_at is None:
+        return True, False
+    reference = now or datetime.now(timezone.utc).replace(tzinfo=None)
+    return (
+        (expires_at - reference).total_seconds()
+        <= CODEX_OAUTH_MIN_CONCURRENT_TTL_SECONDS,
+        True,
+    )
+
+
+def codex_oauth_refresh_serialization_reason(
+    account: Mapping[str, Any], *, now: datetime | None = None
+) -> str | None:
+    """Gate only the refresh-capable overlap, not ordinary parallel work."""
+
+    if int(account.get("active_tasks") or 0) <= 0:
+        return None
+    requires_probe, expiry_known = codex_oauth_requires_refresh_probe(
+        account, now=now
+    )
+    if not requires_probe:
+        return None
+    if not expiry_known:
+        return "Codex OAuth refresh probe already in flight (access-token expiry unknown)"
+    return "Codex OAuth refresh probe already in flight"
 
 _API_KEY_RATE_LIMIT_PATTERNS: tuple[str, ...] = (
     "quota exceeded. check your plan and billing",

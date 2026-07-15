@@ -26,7 +26,11 @@ from app.retry_budget import (
     compute_effective_max_requeues,
 )
 from app.retry_prompt import _build_retry_prompt_suffix, merge_retry_prompt_suffix
-from app.task_blocked import strip_fresh_attempt_context
+from app.task_blocked import (
+    restore_requested_payload_model_for_fresh_attempt,
+    strip_fresh_attempt_context,
+)
+from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -599,7 +603,11 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
         _raw_agent_cat = (child_ctx.get("failure_category") or "").lower()
         if failure_class == "CODE_ERROR" and _raw_agent_cat == "scope_overflow":
             failure_class = "SCOPE_OVERFLOW"
-        clone_ctx = strip_fresh_attempt_context(child_ctx)
+        restore_requested_payload_model_for_fresh_attempt(new_payloads, child_ctx)
+        clone_ctx = {
+            **strip_fresh_attempt_context(child_ctx),
+            "_fresh_attempt_started_at": _utcnow().isoformat(),
+        }
 
         # Preserve the prior attempt's provider/model under a non-stripped key
         # so retry guidance can branch on what actually failed (e.g. emit

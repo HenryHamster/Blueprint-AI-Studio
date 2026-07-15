@@ -57,7 +57,30 @@ export async function rotateOAuthCredentialsIfChanged(
   } catch (e) {
     throw new Error(`read ${path} failed: ${e instanceof Error ? e.message : String(e)}`);
   }
-  const result = await apiPostFn('/api/agent/credentials/rotate', { secret: contents, task_id: taskId });
+  const result = await apiPostFn('/api/agent/credentials/rotate', {
+    secret: contents,
+    task_id: taskId,
+    base_hash: initialOAuthAuthHash,
+  });
+  if (
+    result
+    && typeof result === 'object'
+    && !Array.isArray(result)
+    && (result as { reason?: unknown }).reason === 'stale_credential'
+  ) {
+    const replacement = (result as { secret?: unknown }).secret;
+    if (typeof replacement !== 'string' || !replacement) {
+      throw new Error('backend rejected stale OAuth rotation without a replacement credential');
+    }
+    // Another VM won the compare-and-swap. Adopt the authoritative credential
+    // instead of failing the task or overwriting the newer token.
+    fs.writeFileSync(path, replacement, { encoding: 'utf-8', mode: 0o600 });
+    initialOAuthAuthHash = hashFileOrNull(path);
+    if (initialOAuthAuthHash === null) {
+      throw new Error(`adopt refreshed OAuth credential at ${path} failed`);
+    }
+    return;
+  }
   if (!result || typeof result !== 'object' || Array.isArray(result) || (result as { rotated?: unknown }).rotated !== true) {
     let reason = 'unexpected response';
     if (result && typeof result === 'object' && !Array.isArray(result)) {

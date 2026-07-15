@@ -22,6 +22,10 @@ from app.field_encryption import decrypt_field
 from app.max_plan_project_state import reconcile_project_state
 from app.models import LLMAuthMode, LLMProviderName
 from app.providers.base import UsageSnapshot, merge_settings
+from app.providers.openai import (
+    codex_oauth_refresh_serialization_reason as _codex_oauth_refresh_serialization_reason,
+    codex_oauth_requires_refresh_probe as _codex_oauth_requires_refresh_probe,  # noqa: F401 - compatibility re-export
+)
 from app.providers.registry import get_provider
 from app.time_utils import _utcnow
 
@@ -61,6 +65,16 @@ class LLMSelectionResult:
     @property
     def account_id(self) -> str | None:
         return self.account.get("id") if self.account else None
+
+
+@dataclass(frozen=True)
+class LLMRuntimeIdentity:
+    """A reconciled runtime assignment that must travel as one value."""
+
+    account_id: str | None
+    provider: str | None
+    auth_mode: str | None
+    model: str | None
 
 
 def _task_context(task_or_ctx: Any) -> dict[str, Any]:
@@ -264,6 +278,70 @@ def reconcile_model_for_provider(
         quality_tier or DEFAULT_QUALITY_TIER, runtime_config
     )
     return rederived or model
+
+
+def reconcile_llm_runtime_identity(
+    *,
+    account: Mapping[str, Any] | None,
+    account_id: str | None,
+    provider: str | LLMProviderName | None,
+    auth_mode: str | LLMAuthMode | None,
+    model: str | None,
+    quality_tier: str | None,
+    runtime_config: Mapping[str, Any],
+) -> LLMRuntimeIdentity:
+    """Return one internally-consistent runtime assignment.
+
+    A selected account is authoritative for account id, provider, and auth
+    mode. The provider is then authoritative for model reconciliation. With no
+    account (environment-credential fallback), the supplied provider/auth pair
+    remains authoritative and the same model guard still applies.
+    """
+
+    account_provider: str | None = None
+    account_auth_mode: str | None = None
+    resolved_account_id = str(account_id) if account_id else None
+    if account is not None:
+        raw_account_id = account.get("id")
+        if raw_account_id:
+            resolved_account_id = str(raw_account_id)
+        account_provider = _normalize_provider_name(account.get("provider"))
+        # Historical pool rows without a provider are Anthropic accounts.
+        if account_provider is None:
+            account_provider = LLMProviderName.ANTHROPIC.value
+        account_auth_mode = _normalize_auth_mode(account.get("auth_mode"))
+        if account_auth_mode is None:
+            account_auth_mode = LLMAuthMode.OAUTH.value
+
+    resolved_provider = account_provider or _normalize_provider_name(provider)
+    resolved_auth_mode = account_auth_mode or _normalize_auth_mode(auth_mode)
+    resolved_model = reconcile_model_for_provider(
+        resolved_provider,
+        model.strip() if isinstance(model, str) and model.strip() else None,
+        quality_tier,
+        runtime_config,
+    )
+    return LLMRuntimeIdentity(
+        account_id=resolved_account_id,
+        provider=resolved_provider,
+        auth_mode=resolved_auth_mode,
+        model=resolved_model,
+    )
+
+
+def get_llm_account_identity(account_id: str | None) -> dict[str, Any] | None:
+    """Return non-secret identity fields for a cached pool account."""
+
+    if not account_id:
+        return None
+    account = _account_by_id.get(str(account_id))
+    if account is None:
+        return None
+    return {
+        "id": account.get("id"),
+        "provider": account.get("provider"),
+        "auth_mode": account.get("auth_mode"),
+    }
 
 
 ALL_PROVIDERS: tuple[str, ...] = tuple(p.value for p in LLMProviderName)
@@ -1270,6 +1348,28 @@ async def load_max_plan_pool():
 _DAILY_WINDOW_SECONDS = 24 * 60 * 60
 
 
+def _stage_usage_cap_mutation(acct: dict, mutation: dict) -> None:
+    acct.setdefault("_pending_usage_cap_mutations", []).append(mutation)
+    _pending_cap_persists.add(acct["id"])
+
+
+def _stage_usage_delta(acct: dict, delta: int, project_id: str | None) -> None:
+    generation = acct.get("daily_task_count_reset_at")
+    _stage_usage_cap_mutation(
+        acct,
+        {
+            "op": "usage_delta",
+            "generation": generation.isoformat() if generation else None,
+            "observed_generation_missing": bool(
+                acct.get("_daily_generation_initialized_from_none")
+            ),
+            "delta": int(delta),
+            "project_id": project_id,
+            "project_delta": int(delta) if project_id else 0,
+        },
+    )
+
+
 def _daily_reset_if_elapsed(acct: dict, now: datetime | None = None) -> bool:
     """Reset the daily counter if the 24h window since reset_at has elapsed (or
     no reset_at has been set yet). Returns True when a reset happened so callers
@@ -1278,6 +1378,7 @@ def _daily_reset_if_elapsed(acct: dict, now: datetime | None = None) -> bool:
     reset_at = acct.get("daily_task_count_reset_at")
     if reset_at is None:
         acct["daily_task_count_reset_at"] = now
+        acct["_daily_generation_initialized_from_none"] = True
         acct["daily_task_count"] = int(acct.get("daily_task_count") or 0)
         return False
     if (now - reset_at).total_seconds() >= _DAILY_WINDOW_SECONDS:
@@ -1290,6 +1391,14 @@ def _daily_reset_if_elapsed(acct: dict, now: datetime | None = None) -> bool:
             for proj_entry in pstate.values():
                 if isinstance(proj_entry, dict) and "daily_task_count" in proj_entry:
                     proj_entry["daily_task_count"] = 0
+        _stage_usage_cap_mutation(
+            acct,
+            {
+                "op": "daily_reset",
+                "observed_generation": reset_at.isoformat(),
+                "generation": now.isoformat(),
+            },
+        )
         # Zeroed entries are COLLECTED on the next ~300s pool rebuild (which is
         # the growth vector: it copies the map forward and re-persists it), not
         # here on the hot dispatch path. See max_plan_project_state.
@@ -1309,6 +1418,9 @@ def _account_at_cap(acct: dict) -> str | None:
         concurrent_cap
     ):
         return f"concurrent cap ({concurrent_cap}) reached"
+    oauth_refresh_reason = _codex_oauth_refresh_serialization_reason(acct)
+    if oauth_refresh_reason:
+        return oauth_refresh_reason
     return None
 
 
@@ -2410,23 +2522,248 @@ def _build_rate_limit_state_blob(acct: Dict[str, Any]) -> dict | None:
     return out if out else None
 
 
+def _stage_rate_limit_mutation(acct: Dict[str, Any], mutation: dict) -> None:
+    """Stage a serializable DB-authoritative cooldown mutation on an account."""
+    acct.setdefault("_pending_rate_limit_mutations", []).append(mutation)
+
+
+def _apply_rate_limit_mutations(blob: dict, mutations: list[dict]) -> dict | None:
+    """Apply cooldown deltas to a DB blob already locked FOR UPDATE."""
+    state = dict(blob or {})
+    disabled_models = {
+        model: dict(info)
+        for model, info in (state.get("disabled_models") or {}).items()
+        if isinstance(info, dict)
+    }
+    outcomes = [
+        dict(event)
+        for event in (state.get("outcome_events") or [])
+        if isinstance(event, dict)
+    ]
+    reset_at_raw = state.get("cooldown_reset_at")
+    try:
+        reset_at = datetime.fromisoformat(reset_at_raw) if reset_at_raw else None
+    except (TypeError, ValueError):
+        reset_at = None
+
+    def _predates_operator_reset(raw_at: Any) -> bool:
+        if reset_at is None or not raw_at:
+            return False
+        try:
+            return datetime.fromisoformat(str(raw_at)) <= reset_at
+        except (TypeError, ValueError):
+            # A malformed/unstamped cooldown mutation cannot safely supersede an
+            # explicit operator reset generation.
+            return True
+
+    for mutation in mutations:
+        op = mutation.get("op")
+        if op == "disable_models":
+            for model, incoming in (mutation.get("models") or {}).items():
+                if _predates_operator_reset(incoming.get("at")):
+                    continue
+                existing = dict(disabled_models.get(model) or {})
+                existing["hits"] = int(existing.get("hits", 0)) + 1
+                for key in (
+                    "at",
+                    "kind",
+                    "retry_after_seconds",
+                    "provider",
+                    "regression_stats",
+                ):
+                    if key in incoming:
+                        existing[key] = incoming[key]
+                disabled_models[model] = existing
+            outcome = mutation.get("outcome_event")
+            if isinstance(outcome, dict) and not _predates_operator_reset(
+                outcome.get("at")
+            ):
+                outcomes.append(dict(outcome))
+        elif op == "clear_models":
+            required_kind = mutation.get("required_kind")
+            model_conditions = mutation.get("models") or {}
+            if isinstance(model_conditions, list):
+                model_conditions = {model: {} for model in model_conditions}
+            for model, condition in model_conditions.items():
+                existing = disabled_models.get(model)
+                if existing is None:
+                    continue
+                if required_kind and existing.get("kind") != required_kind:
+                    continue
+                observed_at = condition.get("observed_at")
+                if observed_at and existing.get("at") != observed_at:
+                    continue
+                observed_provider = condition.get("provider")
+                if observed_provider and existing.get("provider") != observed_provider:
+                    continue
+                clear_at = condition.get("clear_at")
+                if clear_at:
+                    try:
+                        existing_at_dt = datetime.fromisoformat(existing.get("at", ""))
+                        clear_at_dt = datetime.fromisoformat(clear_at)
+                    except (TypeError, ValueError):
+                        continue
+                    if existing_at_dt > clear_at_dt:
+                        continue
+                disabled_models.pop(model, None)
+        elif op == "set_startup_cooldown":
+            if _predates_operator_reset(mutation.get("at")):
+                continue
+            state["startup_failure_cooldown_at"] = mutation["at"]
+            reason = mutation.get("reason")
+            if reason:
+                state["startup_failure_disabled_reason"] = reason
+        elif op == "clear_startup_cooldown":
+            existing_at = state.get("startup_failure_cooldown_at")
+            observed_at = mutation.get("observed_at")
+            if observed_at and existing_at != observed_at:
+                continue
+            clear_at = mutation.get("clear_at")
+            if clear_at:
+                try:
+                    existing_at_dt = datetime.fromisoformat(existing_at or "")
+                    clear_at_dt = datetime.fromisoformat(clear_at)
+                except (TypeError, ValueError):
+                    continue
+                if existing_at_dt > clear_at_dt:
+                    continue
+            state.pop("startup_failure_cooldown_at", None)
+            state.pop("startup_failure_disabled_reason", None)
+
+    if disabled_models:
+        state["disabled_models"] = disabled_models
+    else:
+        state.pop("disabled_models", None)
+    cutoff = _utcnow() - timedelta(seconds=_OUTCOME_WINDOW_SECONDS)
+    fresh_outcomes = []
+    for event in outcomes:
+        try:
+            at_dt = datetime.fromisoformat(event.get("at", ""))
+        except (TypeError, ValueError):
+            continue
+        if at_dt > cutoff:
+            fresh_outcomes.append(event)
+    if fresh_outcomes:
+        state["outcome_events"] = fresh_outcomes[-_OUTCOME_EVENTS_CAP:]
+    else:
+        state.pop("outcome_events", None)
+    return state or None
+
+
+def _refresh_account_rate_limit_state(acct: Dict[str, Any], blob: dict | None) -> None:
+    """Refresh this pod's cooldown cache from the committed authoritative blob."""
+    state = blob or {}
+    restored_dm: dict[str, dict] = {}
+    for model, raw in (state.get("disabled_models") or {}).items():
+        if not isinstance(raw, dict) or not raw.get("at"):
+            continue
+        try:
+            info = dict(raw)
+            info["at"] = datetime.fromisoformat(raw["at"])
+        except (TypeError, ValueError):
+            continue
+        restored_dm[model] = info
+    if restored_dm:
+        acct["disabled_models"] = restored_dm
+    else:
+        acct.pop("disabled_models", None)
+
+    restored_outcomes = []
+    for raw in state.get("outcome_events") or []:
+        if not isinstance(raw, dict) or not raw.get("at"):
+            continue
+        try:
+            event = dict(raw)
+            event["at"] = datetime.fromisoformat(raw["at"])
+        except (TypeError, ValueError):
+            continue
+        restored_outcomes.append(event)
+    if restored_outcomes:
+        acct["outcome_events"] = restored_outcomes
+    else:
+        acct.pop("outcome_events", None)
+    startup_at = state.get("startup_failure_cooldown_at")
+    if startup_at:
+        try:
+            acct["startup_failure_cooldown_at"] = datetime.fromisoformat(startup_at)
+        except (TypeError, ValueError):
+            acct.pop("startup_failure_cooldown_at", None)
+    else:
+        acct.pop("startup_failure_cooldown_at", None)
+
+
 async def _persist_rate_limit_state(acct_id: str) -> None:
-    """Persist a single account's in-memory disabled_models + outcome_events to DB.
-    Caller MUST hold _max_plan_pool_lock. Raises on DB failure — caller is
-    responsible for queuing retries via _pending_rl_persists."""
+    """Persist cooldown state without cross-pod lost updates.
+
+    Cooldown callers stage precise mutations. The DB row is locked, those
+    mutations are applied to the latest blob, and this pod is refreshed from
+    the committed result. A caller without a staged blob mutation preserves the
+    authoritative blob and may only update non-blob account columns.
+    """
     from app.models import MaxPlanAccount
+    from sqlmodel import select as sql_select
 
     acct = _account_by_id.get(acct_id)
     if acct is None:
         return
+    mutations = list(acct.get("_pending_rate_limit_mutations") or [])
     async with AsyncSessionLocal() as rl_session:
-        db_acct = await rl_session.get(MaxPlanAccount, uuid.UUID(acct_id))
+        result = await rl_session.execute(
+            sql_select(MaxPlanAccount)
+            .where(MaxPlanAccount.id == uuid.UUID(acct_id))
+            .with_for_update()
+        )
+        db_acct = result.scalar_one_or_none()
         if db_acct is None:
             return
-        db_acct.rate_limit_state = _build_rate_limit_state_blob(acct)
-        db_acct.enabled = acct.get("enabled", True)
+        if mutations:
+            committed_blob = _apply_rate_limit_mutations(
+                db_acct.rate_limit_state or {}, mutations
+            )
+        else:
+            committed_blob = db_acct.rate_limit_state
+        db_acct.rate_limit_state = committed_blob
+        # Field ownership: ordinary cooldown mutations own only the blob. They
+        # must never copy this pod's cached enabled/disabled state over an
+        # operator or auth change committed by another session.
+        for mutation in mutations:
+            if mutation.get("op") == "disable_account":
+                reset_raw = (committed_blob or {}).get("cooldown_reset_at")
+                disabled_at_raw = mutation.get("disabled_at")
+                is_auto_cooldown_disable = str(mutation.get("reason") or "").startswith(
+                    "auto-disabled after"
+                )
+                if reset_raw and disabled_at_raw and is_auto_cooldown_disable:
+                    try:
+                        if datetime.fromisoformat(disabled_at_raw) <= datetime.fromisoformat(
+                            reset_raw
+                        ):
+                            continue
+                    except (TypeError, ValueError):
+                        continue
+                db_acct.enabled = False
+                raw_disabled_at = mutation.get("disabled_at")
+                db_acct.disabled_at = (
+                    datetime.fromisoformat(raw_disabled_at)
+                    if raw_disabled_at
+                    else None
+                )
+                db_acct.disabled_reason = mutation.get("reason")
+            elif mutation.get("op") == "set_startup_cooldown":
+                db_acct.disabled_reason = mutation.get("reason")
         rl_session.add(db_acct)
         await rl_session.commit()
+    if mutations:
+        del acct["_pending_rate_limit_mutations"][: len(mutations)]
+        if not acct["_pending_rate_limit_mutations"]:
+            acct.pop("_pending_rate_limit_mutations", None)
+    _refresh_account_rate_limit_state(acct, committed_blob)
+    # The locked row is also authoritative for operator/auth-owned fields.
+    # Refresh this pod's cache after preserving them so it cannot continue
+    # dispatching an account that another session disabled.
+    acct["enabled"] = db_acct.enabled
+    acct["disabled_at"] = db_acct.disabled_at
+    acct["disabled_reason"] = db_acct.disabled_reason
 
 
 def _queue_rate_limit_persist_retry(acct_id: str) -> None:
@@ -3167,7 +3504,7 @@ async def select_max_plan_account_balanced(
             proj_state = account.setdefault("project_state", {}).setdefault(project_id, {})
             proj_state["active_tasks"] = proj_state.get("active_tasks", 0) + 1
             proj_state["daily_task_count"] = proj_state.get("daily_task_count", 0) + 1
-        _pending_cap_persists.add(account["id"])
+        _stage_usage_delta(account, 1, project_id)
         selected_winner = (account, prov, model)
 
     await _maybe_refresh_account_secret(selected_winner[0])
@@ -3339,7 +3676,7 @@ async def select_max_plan_account(
             proj_state = account.setdefault("project_state", {}).setdefault(project_id, {})
             proj_state["active_tasks"] = proj_state.get("active_tasks", 0) + 1
             proj_state["daily_task_count"] = proj_state.get("daily_task_count", 0) + 1
-        _pending_cap_persists.add(account["id"])
+        _stage_usage_delta(account, 1, project_id)
         selected = account
 
     await _maybe_refresh_account_secret(selected)
@@ -3869,7 +4206,7 @@ async def release_max_plan_account(
                     current_daily = proj_state.get("daily_task_count", 0)
                     if current_daily > 0:
                         proj_state["daily_task_count"] = current_daily - 1
-                _pending_cap_persists.add(account_id)
+                _stage_usage_delta(account, -1, project_id)
             if account["active_tasks"] == 0:
                 secret_ref = account.get("secret_blob_ref")
                 if secret_ref and str(secret_ref).startswith("projects/"):
@@ -3977,6 +4314,7 @@ async def disable_account_model(
     regression_stats: dict | None = None,
     provider: str | None = None,
     task_type: str | None = None,
+    allow_unknown_model_identity: bool = False,
 ) -> None:
     """Mark an account's cascade of models as rate-limited and persist.
 
@@ -4002,41 +4340,88 @@ async def disable_account_model(
       distinct_accounts, started_at) is persisted on the entry so operators
       can see why the model was quarantined.
 
-    Model names like ``claude-opus-4-7`` are already provider-disambiguated
-    in this codebase, so disabled_models stays keyed by model name; the
-    explicit ``provider`` is stashed on the entry as metadata for richer
-    notification payloads but does NOT participate in the dict key.
+    The account provider, explicit provider (when supplied), and inferred model
+    provider must agree before any cascade is written. Provider is persisted on
+    every entry, including ordinary rate limits/quarantines, so readers can
+    validate the cooldown identity instead of trusting a model-only key.
 
     Acquires _max_plan_pool_lock. On DB persist failure, appends to
     _pending_rl_persists for retry (same contract as clear_rate_limit_state_on_success).
     """
     if not acct_id or not model:
         return
-    # Normalize Haiku → Opus so the meter is keyed correctly. Regression is
-    # per-(provider, model) and operates on the actual model name — skip the
-    # Haiku→Opus normalization and the cascade since cascade-disabling other
-    # models on a regression of one would be over-broad.
-    if kind != "regression":
-        model = _normalize_rl_model(model)
-        cascade = cascade_disabled_models(model)
-    else:
-        cascade = (model,)
     async with _max_plan_pool_lock:
         acct = _account_by_id.get(acct_id)
         if acct is None:
             return
+        account_provider = (
+            _normalize_provider_name(acct.get("provider"))
+            or LLMProviderName.ANTHROPIC.value
+        )
+        explicit_provider = _normalize_provider_name(provider)
+        model_provider = infer_provider_for_model(model, _runtime_config_snapshot())
+        if model_provider is None:
+            model_lower = model.lower()
+            if model_lower.startswith("claude-"):
+                model_provider = LLMProviderName.ANTHROPIC.value
+            elif model_lower.startswith(("gpt-", "codex-", "o1", "o3", "o4")):
+                model_provider = LLMProviderName.OPENAI.value
+            elif model_lower.startswith("gemini-"):
+                model_provider = LLMProviderName.GEMINI.value
+            elif model_lower.startswith("deepseek-"):
+                model_provider = LLMProviderName.DEEPSEEK.value
+            elif model_lower.startswith("glm-"):
+                model_provider = LLMProviderName.ZAI.value
+        if model_provider is None and not allow_unknown_model_identity:
+            logger.error(
+                "[POOL] Rejected cooldown mutation with unknown model identity "
+                "account=%s account_provider=%s explicit_provider=%s model=%s",
+                acct_id,
+                account_provider,
+                explicit_provider,
+                model,
+            )
+            return
+        if (
+            (explicit_provider and explicit_provider != account_provider)
+            or (model_provider and model_provider != account_provider)
+            or (
+                explicit_provider
+                and model_provider
+                and explicit_provider != model_provider
+            )
+        ):
+            logger.error(
+                "[POOL] Rejected cross-provider cooldown mutation account=%s "
+                "account_provider=%s explicit_provider=%s model=%s model_provider=%s",
+                acct_id,
+                account_provider,
+                explicit_provider,
+                model,
+                model_provider,
+            )
+            return
+        cooldown_provider = explicit_provider or model_provider or account_provider
+
+        # Normalize Haiku → Opus so the meter is keyed correctly. Regression is
+        # per-(provider, model) and operates on the actual model name — skip the
+        # Haiku→Opus normalization and cascade for regression entries.
+        if kind != "regression":
+            model = _normalize_rl_model(model)
+            cascade = cascade_disabled_models(model)
+        else:
+            cascade = (model,)
         dm = acct.setdefault("disabled_models", {})
         now = _utcnow()
         for m in cascade:
             info = dm.setdefault(m, {"hits": 0})
             info["hits"] += 1
             info["at"] = now
+            info["provider"] = cooldown_provider
             if kind == "quota_exhausted":
                 info["kind"] = "quota_exhausted"
             elif kind == "regression":
                 info["kind"] = "regression"
-                if provider:
-                    info["provider"] = provider
                 if regression_stats is not None:
                     info["regression_stats"] = dict(regression_stats)
             if retry_after_seconds is not None:
@@ -4050,6 +4435,15 @@ async def disable_account_model(
             logger.warning(
                 f"[POOL] Account {acct['name']} regression-quarantined on model {primary_key} "
                 f"(flat {_REGRESSION_COOLDOWN_SECONDS // 60}min reprobe cooldown)"
+            )
+            _stage_rate_limit_mutation(
+                acct,
+                {
+                    "op": "disable_models",
+                    "models": {
+                        m: _serialize_disabled_model_info(dm[m]) for m in cascade
+                    },
+                },
             )
             await _persist_rate_limit_state_best_effort(acct_id, "regression state")
             return
@@ -4099,7 +4493,14 @@ async def disable_account_model(
             acct["enabled"] = False
             acct["disabled_at"] = now
             acct["disabled_reason"] = reason
-            _pending_cap_persists.add(acct_id)
+            _stage_rate_limit_mutation(
+                acct,
+                {
+                    "op": "disable_account",
+                    "disabled_at": now.isoformat(),
+                    "reason": reason,
+                },
+            )
             logger.warning(f"[POOL] Account {acct['name']} auto-disabled: {reason}")
 
         if kind != "quota_exhausted" and _check_quarantine_trigger(acct_id):
@@ -4110,6 +4511,20 @@ async def disable_account_model(
                 f"high-confidence failures — {_QUARANTINE_COOLDOWN_SECONDS // 60}min recheck cooldown"
             )
 
+        _stage_rate_limit_mutation(
+            acct,
+            {
+                "op": "disable_models",
+                "models": {
+                    m: _serialize_disabled_model_info(dm[m]) for m in cascade
+                },
+                "outcome_event": {
+                    "at": now.isoformat(),
+                    "success": False,
+                    **({"task_type": task_type} if task_type else {}),
+                },
+            },
+        )
         await _persist_rate_limit_state_best_effort(acct_id, "rate-limit state")
 
 
@@ -4141,7 +4556,10 @@ async def disable_account_for_auth(acct_id: str, reason: str) -> bool:
         # must not fire for a non-recoverable auth failure.
         acct["disabled_at"] = None
         acct["disabled_reason"] = reason
-        _pending_cap_persists.add(acct_id)
+        _stage_rate_limit_mutation(
+            acct,
+            {"op": "disable_account", "disabled_at": None, "reason": reason},
+        )
         logger.warning(
             f"[POOL] Account {acct['name']} HARD-DISABLED (non-recoverable auth): {reason}"
         )
@@ -4201,16 +4619,29 @@ async def record_account_startup_failure(acct_id: str, zone: str) -> None:
             f"{', '.join(sorted(zones))}"
         )
         acct["disabled_reason"] = reason
-        _pending_cap_persists.add(acct_id)
         logger.warning(
             f"[POOL] Account {acct['name']} startup-failure breaker tripped — "
             f"{len(events)} failures across {len(zones)} zone(s) "
             f"({_STARTUP_FAILURE_COOLDOWN_SECONDS // 60}min cooldown): {', '.join(sorted(zones))}"
         )
+        _stage_rate_limit_mutation(
+            acct,
+            {
+                "op": "set_startup_cooldown",
+                "at": now.isoformat(),
+                "reason": reason,
+            },
+        )
         await _persist_rate_limit_state_best_effort(acct_id, "startup-failure cooldown")
 
 
-async def clear_rate_limit_state_on_success(acct_id: str, model: str) -> bool:
+async def clear_rate_limit_state_on_success(
+    acct_id: str,
+    model: str,
+    *,
+    provider: str | None = None,
+    success_at: datetime | None = None,
+) -> bool:
     """Clear cascade-scoped disabled_models entries after a successful task.
 
     Cascade: Opus success clears (opus, sonnet, haiku); Sonnet success clears
@@ -4226,25 +4657,42 @@ async def clear_rate_limit_state_on_success(acct_id: str, model: str) -> bool:
     # Normalize Haiku → Opus so clearing Haiku's bucket clears the shared meter.
     model = _normalize_rl_model(model)
     cascade = cascade_disabled_models(model)
+    success_at = success_at or _utcnow()
     async with _max_plan_pool_lock:
         acct = _account_by_id.get(acct_id)
         if acct is None:
             return False
         dm = acct.get("disabled_models") or {}
-        cleared = []
+        clear_conditions: dict[str, dict] = {}
         for m in cascade:
-            if m in dm:
-                cleared.append(m)
+            info = dm.get(m)
+            if info is not None:
+                observed_provider = (
+                    _normalize_provider_name(provider)
+                    or info.get("provider")
+                    or _normalize_provider_name(acct.get("provider"))
+                    or LLMProviderName.ANTHROPIC.value
+                )
+                clear_conditions[m] = {
+                    "observed_at": info["at"].isoformat(),
+                    "provider": observed_provider,
+                    "clear_at": success_at.isoformat(),
+                }
                 del dm[m]
-        if not cleared:
+        if not clear_conditions:
             return False
         if not dm:
             acct.pop("disabled_models", None)
         logger.info(
-            f"[POOL] Account {acct['name']} cleared disabled models {cleared} after successful {model} task"
+            f"[POOL] Account {acct['name']} clearing disabled models {list(clear_conditions)} after successful {model} task"
+        )
+        _stage_rate_limit_mutation(
+            acct, {"op": "clear_models", "models": clear_conditions}
         )
         await _persist_rate_limit_state_best_effort(acct_id, "rate-limit clear")
-        return True
+        return all(
+            m not in (acct.get("disabled_models") or {}) for m in clear_conditions
+        )
 
 
 async def clear_account_model_regression(
@@ -4281,17 +4729,44 @@ async def clear_account_model_regression(
         stored_provider = info.get("provider")
         if provider and stored_provider and stored_provider != provider:
             return False
+        observed_at = info["at"].isoformat()
+        observed_provider = (
+            provider
+            or stored_provider
+            or _normalize_provider_name(acct.get("provider"))
+            or LLMProviderName.ANTHROPIC.value
+        )
         del dm[model]
         if not dm:
             acct.pop("disabled_models", None)
         logger.info(
             f"[POOL] Account {acct['name']} cleared regression-quarantine on {model} (manual override)"
         )
+        _stage_rate_limit_mutation(
+            acct,
+            {
+                "op": "clear_models",
+                "models": {
+                    model: {
+                        "observed_at": observed_at,
+                        "provider": observed_provider,
+                        "clear_at": _utcnow().isoformat(),
+                    }
+                },
+                "required_kind": "regression",
+            },
+        )
         await _persist_rate_limit_state_best_effort(acct_id, "regression clear")
-        return True
+        return model not in (acct.get("disabled_models") or {})
 
 
-async def clear_regression_on_success(acct_id: str, model: str) -> dict | None:
+async def clear_regression_on_success(
+    acct_id: str,
+    model: str,
+    *,
+    provider: str | None = None,
+    success_at: datetime | None = None,
+) -> dict | None:
     """Clear a regression-kind disabled_models entry after a successful probe task.
 
     Returns the cleared entry's metadata dict (account_id, account_label,
@@ -4312,6 +4787,14 @@ async def clear_regression_on_success(acct_id: str, model: str) -> dict | None:
         info = dm.get(model)
         if info is None or info.get("kind") != "regression":
             return None
+        success_at = success_at or _utcnow()
+        observed_at = info["at"].isoformat()
+        observed_provider = (
+            provider
+            or info.get("provider")
+            or _normalize_provider_name(acct.get("provider"))
+            or LLMProviderName.ANTHROPIC.value
+        )
         stats = info.get("regression_stats") or {}
         recovery_info = {
             "account_id": acct_id,
@@ -4331,7 +4814,23 @@ async def clear_regression_on_success(acct_id: str, model: str) -> dict | None:
         logger.info(
             f"[POOL] Account {acct['name']} auto-recovered regression on {model} after probe success"
         )
+        _stage_rate_limit_mutation(
+            acct,
+            {
+                "op": "clear_models",
+                "models": {
+                    model: {
+                        "observed_at": observed_at,
+                        "provider": observed_provider,
+                        "clear_at": success_at.isoformat(),
+                    }
+                },
+                "required_kind": "regression",
+            },
+        )
         await _persist_rate_limit_state_best_effort(acct_id, "regression recovery")
+        if model in (acct.get("disabled_models") or {}):
+            return None
         return recovery_info
 
 
@@ -4430,6 +4929,94 @@ async def scan_account_model_regressions(session) -> list[dict[str, Any]]:
     return fired
 
 
+def _apply_usage_cap_mutations(db_acct: Any, mutations: list[dict]) -> None:
+    """Apply generation-aware usage deltas to one row locked account."""
+
+    project_state = {
+        str(project_id): dict(value) if isinstance(value, dict) else value
+        for project_id, value in (db_acct.project_state or {}).items()
+    }
+    generation_aliases: dict[str, datetime] = {}
+    rate_limit_state = dict(db_acct.rate_limit_state or {})
+    window_origin = dict(rate_limit_state.get("usage_window_origin") or {})
+
+    for mutation in mutations:
+        op = mutation.get("op")
+        if op == "daily_reset":
+            try:
+                observed = datetime.fromisoformat(mutation["observed_generation"])
+                requested = datetime.fromisoformat(mutation["generation"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            current = db_acct.daily_task_count_reset_at
+            if current == observed:
+                db_acct.daily_task_count = 0
+                db_acct.daily_task_count_reset_at = requested
+                for entry in project_state.values():
+                    if isinstance(entry, dict) and "daily_task_count" in entry:
+                        entry["daily_task_count"] = 0
+                generation_aliases[mutation["generation"]] = requested
+                window_origin = {
+                    "generation": requested.isoformat(),
+                    "kind": "daily_reset",
+                }
+            elif current is not None and current > observed:
+                # Another pod already won this reset generation. Its timestamp
+                # is authoritative; following deltas from our equivalent reset
+                # belong to that same new window.
+                generation_aliases[mutation["generation"]] = current
+            continue
+
+        if op != "usage_delta":
+            continue
+        raw_generation = mutation.get("generation")
+        try:
+            requested_generation = (
+                generation_aliases.get(str(raw_generation))
+                or datetime.fromisoformat(str(raw_generation))
+            )
+        except (TypeError, ValueError):
+            continue
+        current = db_acct.daily_task_count_reset_at
+        if current is None:
+            db_acct.daily_task_count_reset_at = requested_generation
+            current = requested_generation
+            window_origin = {
+                "generation": current.isoformat(),
+                "kind": "initialization",
+            }
+        elif current != requested_generation:
+            # Only a row explicitly stamped as a first-use initialization may
+            # alias another pod's equivalent observed-missing generation. A
+            # genuinely stale delta after a daily reset is always rejected,
+            # regardless of how close the two timestamps happen to be.
+            if not (
+                mutation.get("observed_generation_missing") is True
+                and window_origin.get("kind") == "initialization"
+                and window_origin.get("generation") == current.isoformat()
+            ):
+                continue
+        db_acct.daily_task_count = max(
+            0, int(db_acct.daily_task_count or 0) + int(mutation.get("delta") or 0)
+        )
+        project_id = mutation.get("project_id")
+        if project_id:
+            entry = project_state.setdefault(str(project_id), {})
+            if not isinstance(entry, dict):
+                entry = {}
+                project_state[str(project_id)] = entry
+            entry["daily_task_count"] = max(
+                0,
+                int(entry.get("daily_task_count") or 0)
+                + int(mutation.get("project_delta") or 0),
+            )
+
+    db_acct.project_state = project_state or None
+    if window_origin:
+        rate_limit_state["usage_window_origin"] = window_origin
+    db_acct.rate_limit_state = rate_limit_state or None
+
+
 async def recheck_disabled_accounts():
     """Re-enable legacy full-account disables after cooldown and drain the
     persist-retry queue. Per-model disables are NOT auto-deleted here — the
@@ -4451,16 +5038,12 @@ async def recheck_disabled_accounts():
                 and (now - sf_cooldown_at).total_seconds()
                 >= _STARTUP_FAILURE_COOLDOWN_SECONDS
             ):
-                acct.pop("startup_failure_cooldown_at", None)
-                reason = acct.get("disabled_reason") or ""
-                if reason.startswith("startup-failure cooldown"):
-                    acct["disabled_reason"] = None
-                    _pending_cap_persists.add(acct["id"])
-                logger.info(
-                    f"[POOL] Startup-failure cooldown cleared for {acct['name']} "
-                    f"({_STARTUP_FAILURE_COOLDOWN_SECONDS // 60}min elapsed)"
-                )
-                changed_accounts.append(acct)
+                # Do not clear the cache yet. The DB compare below must prove
+                # this is still the same cooldown; another pod may have written
+                # a newer startup failure after this stale snapshot.
+                acct["_startup_clear_observed_at"] = sf_cooldown_at
+                if acct not in changed_accounts:
+                    changed_accounts.append(acct)
 
             # Legacy full-account disable (backward compat)
             if not acct.get("enabled", True):
@@ -4470,22 +5053,48 @@ async def recheck_disabled_accounts():
                 rl_hit_count = acct.get("rl_hit_count", 1)
                 cooldown_minutes = min(30 * (2 ** (rl_hit_count - 1)), 240)
                 if (now - disabled_at).total_seconds() >= cooldown_minutes * 60:
-                    acct["enabled"] = True
-                    acct["disabled_at"] = None
-                    changed_accounts.append(acct)
-                    logger.warning(
-                        f"[POOL] Re-enabled account {acct['name']} after {cooldown_minutes:.0f}min cooldown (rl_hit #{rl_hit_count})"
-                    )
+                    # Compare the observed disable generation under DB row lock
+                    # before changing either DB or local state. This prevents a
+                    # stale pod from undoing a newer auth/operator disable.
+                    acct["_reenable_observed_disabled_at"] = disabled_at
+                    acct["_reenable_observed_reason"] = acct.get("disabled_reason")
+                    if acct not in changed_accounts:
+                        changed_accounts.append(acct)
 
-    # Retry any previously failed rate-limit persists
+    # Retry failed cooldown mutations through the row-locked delta path. Do not
+    # fold them into the legacy changed_accounts full-blob batch: doing so would
+    # resurrect the cross-pod lost-update bug on the retry sweep.
     if _pending_rl_persists:
         retry_ids = list(_pending_rl_persists)
         for acct_id in retry_ids:
-            acct = _account_by_id.get(acct_id)
-            if acct and acct not in changed_accounts:
-                changed_accounts.append(acct)
+            try:
+                async with _max_plan_pool_lock:
+                    await _persist_rate_limit_state(acct_id)
+                if acct_id in _pending_rl_persists:
+                    _pending_rl_persists.remove(acct_id)
+            except Exception as exc:  # noqa: PERF203 - account retries are isolated
+                logger.warning(
+                    "[POOL] Failed to retry row-locked rate-limit mutation for %s: %s",
+                    acct_id,
+                    exc,
+                )
 
-    # Persist changes to DB (outside lock to avoid holding it during IO)
+    if changed_accounts:
+        persisted_accounts: list[dict] = []
+        for acct in changed_accounts:
+            try:
+                uuid.UUID(acct["id"])
+            except (KeyError, TypeError, ValueError):  # noqa: PERF203 - per-account validation
+                if acct.pop("_startup_clear_observed_at", None) is not None:
+                    acct.pop("startup_failure_cooldown_at", None)
+                    if (acct.get("disabled_reason") or "").startswith("startup-failure cooldown"):
+                        acct["disabled_reason"] = None
+                if acct.pop("_reenable_observed_disabled_at", None) is not None:
+                    acct.update(enabled=True, disabled_at=None)
+                acct.pop("_reenable_observed_reason", None)
+            else:
+                persisted_accounts.append(acct)
+        changed_accounts = persisted_accounts
     if changed_accounts:
         try:
             async with AsyncSessionLocal() as rl_session:
@@ -4495,7 +5104,9 @@ async def recheck_disabled_accounts():
                     str(a.id): a
                     for a in (
                         await rl_session.execute(
-                            sql_select(MaxPlanAccount).where(MaxPlanAccount.id.in_(acct_ids))
+                            sql_select(MaxPlanAccount)
+                            .where(MaxPlanAccount.id.in_(acct_ids))
+                            .with_for_update()
                         )
                     )
                     .scalars()
@@ -4504,71 +5115,131 @@ async def recheck_disabled_accounts():
                 for acct in changed_accounts:
                     db_acct = db_accounts.get(acct["id"])
                     if db_acct:
-                        db_acct.rate_limit_state = _build_rate_limit_state_blob(acct)
-                        db_acct.enabled = acct.get("enabled", True)
-                        if acct.get("enabled", True):
-                            # Guard: don't wipe disabled_reason while a startup-failure
-                            # cooldown is still active — that reason is visible in the UI
-                            # and managed by the cap-persist path, not this rl-persist path.
-                            sf_cooldown_at = acct.get("startup_failure_cooldown_at")
-                            has_active_sf_cooldown = (
-                                sf_cooldown_at is not None
-                                and (_utcnow() - sf_cooldown_at).total_seconds()
-                                < _STARTUP_FAILURE_COOLDOWN_SECONDS
+                        # This sweep owns only startup-cooldown/full-account
+                        # fields. Merge those into the row-locked authoritative
+                        # blob; never replace disabled_models/outcome_events
+                        # from this pod's potentially stale cache.
+                        authoritative_state = dict(db_acct.rate_limit_state or {})
+                        startup_observed = acct.get("_startup_clear_observed_at")
+                        persisted_startup_at = authoritative_state.get(
+                            "startup_failure_cooldown_at"
+                        )
+                        if (
+                            startup_observed is not None
+                            and persisted_startup_at == startup_observed.isoformat()
+                        ):
+                            authoritative_state.pop(
+                                "startup_failure_cooldown_at", None
                             )
-                            if not has_active_sf_cooldown:
+                            authoritative_state.pop(
+                                "startup_failure_disabled_reason", None
+                            )
+                            if (db_acct.disabled_reason or "").startswith(
+                                "startup-failure cooldown"
+                            ):
                                 db_acct.disabled_reason = None
-                                acct["disabled_reason"] = None
+                        db_acct.rate_limit_state = authoritative_state or None
+                        reenable_observed = acct.get(
+                            "_reenable_observed_disabled_at"
+                        )
+                        if (
+                            reenable_observed is not None
+                            and db_acct.enabled is False
+                            and db_acct.disabled_at == reenable_observed
+                            and db_acct.disabled_reason
+                            == acct.get("_reenable_observed_reason")
+                        ):
+                            db_acct.enabled = True
                             db_acct.disabled_at = None
-                        else:
-                            db_acct.disabled_at = acct.get("disabled_at")
+                            if (db_acct.disabled_reason or "").startswith(
+                                "auto-disabled after"
+                            ):
+                                db_acct.disabled_reason = None
                         rl_session.add(db_acct)
                 await rl_session.commit()
-            # Clear any retried accounts on success
+            # Refresh only fields this compare-and-mutate batch owns.
             for acct in changed_accounts:
+                db_acct = db_accounts.get(acct["id"])
+                if db_acct is not None:
+                    _refresh_account_rate_limit_state(
+                        acct, db_acct.rate_limit_state
+                    )
+                    acct["enabled"] = db_acct.enabled
+                    acct["disabled_at"] = db_acct.disabled_at
+                    acct["disabled_reason"] = db_acct.disabled_reason
+                acct.pop("_startup_clear_observed_at", None)
+                acct.pop("_reenable_observed_disabled_at", None)
+                acct.pop("_reenable_observed_reason", None)
                 if acct["id"] in _pending_rl_persists:
                     _pending_rl_persists.remove(acct["id"])
         except Exception as e:
             logger.warning(f"[POOL] Failed to persist rate-limit state changes: {e}")
 
-    # Flush dirty usage-cap state (daily counter + auto-disable reason) to DB.
+    # Flush usage-counter DELTAS under both the process lock and DB row locks.
+    # Copying a pod's whole cached project_state loses increments made by other
+    # pods and can silently bypass configured account/project caps.
     if _pending_cap_persists:
-        flush_ids = list(_pending_cap_persists)
         try:
-            async with AsyncSessionLocal() as cap_session:
-                # Batch-fetch all accounts in a single query
-                cap_ids = [uuid.UUID(a) for a in flush_ids]
-                cap_accounts = {
-                    str(a.id): a
-                    for a in (
-                        await cap_session.execute(
-                            sql_select(MaxPlanAccount).where(MaxPlanAccount.id.in_(cap_ids))
+            async with _max_plan_pool_lock:
+                flush_ids = list(_pending_cap_persists)
+                mutation_snapshots = {
+                    acct_id: list(
+                        (_account_by_id.get(acct_id) or {}).get(
+                            "_pending_usage_cap_mutations", []
                         )
                     )
-                    .scalars()
-                    .all()
+                    for acct_id in flush_ids
                 }
-                for acct_id in flush_ids:
+                async with AsyncSessionLocal() as cap_session:
+                    cap_ids = [uuid.UUID(a) for a in flush_ids]
+                    cap_accounts = {
+                        str(a.id): a
+                        for a in (
+                            await cap_session.execute(
+                                sql_select(MaxPlanAccount)
+                                .where(MaxPlanAccount.id.in_(cap_ids))
+                                .with_for_update()
+                            )
+                        )
+                        .scalars()
+                        .all()
+                    }
+                    for acct_id, mutations in mutation_snapshots.items():
+                        db_acct = cap_accounts.get(acct_id)
+                        if db_acct is None or not mutations:
+                            continue
+                        _apply_usage_cap_mutations(db_acct, mutations)
+                        cap_session.add(db_acct)
+                    await cap_session.commit()
+
+                for acct_id, mutations in mutation_snapshots.items():
                     acct = _account_by_id.get(acct_id)
-                    if not acct:
-                        _pending_cap_persists.discard(acct_id)
-                        continue
                     db_acct = cap_accounts.get(acct_id)
-                    if db_acct is None:
+                    if acct is None or db_acct is None:
                         _pending_cap_persists.discard(acct_id)
                         continue
-                    db_acct.daily_task_count = int(acct.get("daily_task_count") or 0)
-                    db_acct.daily_task_count_reset_at = acct.get(
-                        "daily_task_count_reset_at"
-                    )
-                    db_acct.disabled_reason = acct.get("disabled_reason")
-                    db_acct.enabled = acct.get("enabled", True)
-                    db_acct.disabled_at = acct.get("disabled_at")
-                    db_acct.project_state = acct.get("project_state")
-                    cap_session.add(db_acct)
-                await cap_session.commit()
-            for acct_id in flush_ids:
-                _pending_cap_persists.discard(acct_id)
+                    pending = acct.get("_pending_usage_cap_mutations") or []
+                    del pending[: len(mutations)]
+                    if pending:
+                        acct["_pending_usage_cap_mutations"] = pending
+                        continue
+                    acct.pop("_pending_usage_cap_mutations", None)
+                    acct.pop("_daily_generation_initialized_from_none", None)
+                    acct["daily_task_count"] = int(db_acct.daily_task_count or 0)
+                    acct["daily_task_count_reset_at"] = db_acct.daily_task_count_reset_at
+                    authoritative_projects = db_acct.project_state or {}
+                    local_projects = acct.setdefault("project_state", {})
+                    for project_id, persisted in authoritative_projects.items():
+                        if not isinstance(persisted, dict):
+                            continue
+                        local = local_projects.setdefault(project_id, {})
+                        local["daily_task_count"] = int(
+                            persisted.get("daily_task_count") or 0
+                        )
+                    acct["enabled"] = db_acct.enabled
+                    acct["disabled_at"] = db_acct.disabled_at
+                    acct["disabled_reason"] = db_acct.disabled_reason
+                    _pending_cap_persists.discard(acct_id)
         except Exception as e:
             logger.warning(f"[POOL] Failed to persist usage-cap state: {e}")
 

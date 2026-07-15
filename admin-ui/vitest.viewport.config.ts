@@ -18,6 +18,10 @@ export default defineConfig({
   plugins: [react(), tailwindcss()],
   test: {
     include: ['src/**/*.viewport.test.{ts,tsx}'],
+    // Browser files share Vitest's Playwright transport route. Serializing
+    // files prevents concurrent contexts from fulfilling the same internal
+    // request twice ("Route is already handled") under CI load.
+    fileParallelism: false,
     css: true,
     setupFiles: ['./src/test/viewport-setup.ts'],
     // JSON reporter writes a structured failure manifest so the regression
