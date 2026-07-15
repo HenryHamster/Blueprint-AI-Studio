@@ -8,6 +8,7 @@ import {
   checkBackendExemptionMirror,
   checkEscapeHatchBudget,
   classifyEscapeHatchOverage,
+  guardPlaywrightRouteHandler,
   isBenignPlaywrightRouteRace,
   SINGLE_OPT_OUT_HEADROOM,
 } from './viewport-checks.js';
@@ -33,26 +34,37 @@ describe('viewport runner unhandled-error filter', () => {
   });
 
   it.each([
+    'Route is already handled!',
+    'route.fulfill: Route is already handled!',
+  ])('accepts the raw pre-serialization provider error: %s', message => {
+    expect(isBenignPlaywrightRouteRace({ message })).toBe(true);
+  });
+
+  it.each([
     new Error('application rejection'),
-    {
-      message: 'route.fulfill: Route is already handled!',
-      stack: 'at src/test-owned-route.ts:12:3',
-    },
-    {
-      message: 'Route is already handled!',
-      stack: 'at src/test-owned-route.ts:12:3',
-    },
     {
       message: 'different provider failure',
       stack: 'at ../node_modules/@vitest/browser-playwright/dist/index.js:989:20',
     },
-    {
-      message: 'Route is already handled!',
-      log: 'not-playwright-structured-log',
-    },
     'route.fulfill: Route is already handled!',
   ])('rejects non-matching errors %#', (error) => {
     expect(isBenignPlaywrightRouteRace(error)).toBe(false);
+  });
+
+  it('swallows the exact duplicate-fulfill rejection at the route callback boundary', async () => {
+    const guarded = guardPlaywrightRouteHandler(async () => {
+      throw new Error('Route is already handled!');
+    });
+
+    await expect(guarded()).resolves.toBeUndefined();
+  });
+
+  it('rethrows every other route callback failure', async () => {
+    const guarded = guardPlaywrightRouteHandler(async () => {
+      throw new Error('application route failed');
+    });
+
+    await expect(guarded()).rejects.toThrow('application route failed');
   });
 });
 
