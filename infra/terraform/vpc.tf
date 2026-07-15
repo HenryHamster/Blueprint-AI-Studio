@@ -36,64 +36,54 @@ resource "google_compute_router_nat" "agent_nat" {
 }
 
 # ------------------------------------------------------------------------------
-# Multi-region NAT — DISABLED for cost
+# Multi-region NAT — us-east1 capacity fallback
 #
-# 4-region NAT (us-central1 + us-east1 + us-east4 + us-west1) was costing
-# ~$130/mo (4 × $32). The 3 extra regions buy region-level Compute API outage
-# fallback, which is a once-or-twice-a-year event. Zonal fallback within
-# us-central1 (4 zones a/b/c/f) covers the much-more-common single-zone
-# failures.
+# 4-region NAT (us-central1 + us-east1 + us-east4 + us-west1) cost roughly
+# $130/mo (4 × $32), so east4 and west1 remain disabled. us-east1 is kept as
+# the single paid fallback because a 2026-07-15 Iowa stockout affected several
+# CPU families while us-east1 N2 capacity remained available.
 #
-# When this is dropped, compute.py is configured (via DISABLED_REGIONS env
-# var on Cloud Run) to skip these regions explicitly with a clear log
-# instead of attempting to spawn VMs there and silently failing on
-# missing-subnet errors. See backend/cloudbuild.yaml --set-env-vars.
+# compute.py is configured via DISABLED_REGIONS to skip east4 and west1.
 #
-# To restore (when scaling justifies the spend):
-#   1. Uncomment the locals block + 3 resources below.
-#   2. terraform apply.
-#   3. Update backend/cloudbuild.yaml: remove the disabled regions from
-#      DISABLED_REGIONS=... or set it to "" entirely.
-#   4. Redeploy Cloud Run so the new env var takes effect.
+# To restore another region, add it to additional_regions, terraform apply,
+# remove it from DISABLED_REGIONS in backend/cloudbuild.yaml, and redeploy.
 # ------------------------------------------------------------------------------
 
-# locals {
-#   additional_regions = {
-#     "us-east4" = "10.0.2.0/24"
-#     "us-east1" = "10.0.3.0/24"
-#     "us-west1" = "10.0.4.0/24"
-#   }
-# }
+locals {
+  additional_regions = {
+    "us-east1" = "10.0.3.0/24"
+  }
+}
 
-# resource "google_compute_subnetwork" "agent_subnet_extra" {
-#   for_each                 = local.additional_regions
-#   name                     = "agent-sandbox-subnet-${each.key}"
-#   ip_cidr_range            = each.value
-#   region                   = each.key
-#   network                  = google_compute_network.agent_vpc.id
-#   private_ip_google_access = true
-# }
+resource "google_compute_subnetwork" "agent_subnet_extra" {
+  for_each                 = local.additional_regions
+  name                     = "agent-sandbox-subnet-${each.key}"
+  ip_cidr_range            = each.value
+  region                   = each.key
+  network                  = google_compute_network.agent_vpc.id
+  private_ip_google_access = true
+}
 
-# resource "google_compute_router" "nat_router_extra" {
-#   for_each = local.additional_regions
-#   name     = "agent-nat-router-${each.key}"
-#   region   = each.key
-#   network  = google_compute_network.agent_vpc.id
-# }
+resource "google_compute_router" "nat_router_extra" {
+  for_each = local.additional_regions
+  name     = "agent-nat-router-${each.key}"
+  region   = each.key
+  network  = google_compute_network.agent_vpc.id
+}
 
-# resource "google_compute_router_nat" "agent_nat_extra" {
-#   for_each                           = local.additional_regions
-#   name                               = "agent-nat-${each.key}"
-#   router                             = google_compute_router.nat_router_extra[each.key].name
-#   region                             = each.key
-#   nat_ip_allocate_option             = "AUTO_ONLY"
-#   source_subnetwork_ip_ranges_to_nat = "ALL_SUBNETWORKS_ALL_IP_RANGES"
-#
-#   log_config {
-#     enable = true
-#     filter = "ERRORS_ONLY"
-#   }
-# }
+resource "google_compute_router_nat" "agent_nat_extra" {
+  for_each                           = local.additional_regions
+  name                               = "agent-nat-${each.key}"
+  router                             = google_compute_router.nat_router_extra[each.key].name
+  region                             = each.key
+  nat_ip_allocate_option             = "AUTO_ONLY"
+  source_subnetwork_ip_ranges_to_nat = "ALL_SUBNETWORKS_ALL_IP_RANGES"
+
+  log_config {
+    enable = true
+    filter = "ERRORS_ONLY"
+  }
+}
 
 # Firewall Rule: Allow IAP SSH (Identity-Aware Proxy) for debugging agents securely
 resource "google_compute_firewall" "allow_iap_ssh" {

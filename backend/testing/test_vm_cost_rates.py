@@ -23,6 +23,14 @@ def test_c2d_capacity_fallback_uses_explicit_us_central1_rate():
     assert spot == 0.023988 / 3600
 
 
+def test_n2_capacity_fallback_uses_explicit_us_east1_rate():
+    on_demand = get_vm_rate_per_second(machine_type="n2-standard-2", spot=False)
+    spot = get_vm_rate_per_second(machine_type="n2-standard-2", spot=True)
+
+    assert on_demand == 0.097118 / 3600
+    assert spot == 0.041876 / 3600
+
+
 def test_unknown_machine_type_logs_and_falls_back(caplog: LogCaptureFixture):
     with caplog.at_level(logging.WARNING):
         on_demand = get_vm_rate_per_second(machine_type="e2-unknown-999", spot=False)

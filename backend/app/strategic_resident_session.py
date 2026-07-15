@@ -183,6 +183,14 @@ _LIVE_TASK_STATUSES = frozenset(
 
 _RESIDENT_STRATEGIC_TASK_TYPE = "strategic_review"
 
+# The resident agent uses the Claude streaming/session protocol even when the
+# underlying model is served by a compatible third-party provider. OpenAI's
+# Codex JSONL transport cannot host that protocol, so resident tasks must carry
+# an explicit per-task routing constraint instead of inheriting the broader
+# strategic category preference (which may validly put OpenAI first for normal
+# one-shot strategic reviews).
+_RESIDENT_PROVIDER_PREFERENCE = ("anthropic", "zai", "deepseek")
+
 # A live strategic_review task is only *adoptable* into a resident session while
 # it has NOT yet begun executing. Handler dispatch — the one-shot
 # ``handleStrategic`` vs the streaming ``handleStrategicResident`` — is decided
@@ -981,6 +989,7 @@ def _resident_born_context(
     context: dict[str, Any] = {
         "_resident_session": True,
         "strategic_session_id": session_id,
+        "provider_preference": list(_RESIDENT_PROVIDER_PREFERENCE),
     }
     if runner_id:
         context["preferred_runner_target_id"] = str(runner_id)
@@ -1056,6 +1065,7 @@ def _stamp_resident_context(
     context = dict(task.context or {})
     context["_resident_session"] = True
     context["strategic_session_id"] = session_id
+    context["provider_preference"] = list(_RESIDENT_PROVIDER_PREFERENCE)
     # Carry the persisted exam ledger forward (adopt-path twin of the born-context
     # seed) so an adopted cadence task continues the examination rotation across a
     # restart. Absent leaves the merged context unchanged.

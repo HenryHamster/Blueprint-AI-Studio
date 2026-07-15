@@ -9564,6 +9564,7 @@ def test_gpu_facts_do_not_leak_into_cpu_create_gate():
 
     assert set(vcr.supported_machine_types()) == {
         "c2d-standard-2",
+        "n2-standard-2",
         "e2-standard-2",
         "e2-standard-4",
         "e2-standard-8",
