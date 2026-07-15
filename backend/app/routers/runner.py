@@ -2033,6 +2033,7 @@ async def report_compute_job(
                         metric=rec["metric"],
                         value=rec["value"],
                         t=rec.get("ts") or now.isoformat(),
+                        received_at=now,
                     )
         if payload.exec_status in ("succeeded", "failed"):
             meta["runner_finished_at"] = now.isoformat()

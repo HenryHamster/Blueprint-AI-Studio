@@ -692,6 +692,7 @@ describe('ComputeJobsPanel — viewport regression', () => {
         task_type: 'compute_experiment',
         experiment: 'rl-reward-v3',
         watchdog_active: true,
+        watchdog_state: 'protected',
         no_progress_timeout_seconds: 1800,
         last_progress_at: new Date(Date.now() - 300_000).toISOString(),
         progress_series: [
@@ -728,6 +729,7 @@ describe('ComputeJobsPanel — viewport regression', () => {
         task_type: 'compute_experiment',
         experiment: 'rl-reward-v4',
         watchdog_active: false,
+        watchdog_state: 'inert',
         watchdog_inert_reason: 'no_declared_metric',
         no_progress_timeout_seconds: null,
         last_progress_at: null,
@@ -747,9 +749,9 @@ describe('ComputeJobsPanel — viewport regression', () => {
         await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
         const text = host.textContent ?? '';
         if (!text.includes('Protected')) throw new Error('Protected badge not rendered');
-        if (!text.includes('Unprotected')) throw new Error('Unprotected badge not rendered');
+        if (!text.includes('Inert')) throw new Error('Inert badge not rendered');
         if (!text.includes('no_declared_metric')) throw new Error('inert reason not rendered');
-        if (!text.includes('Watchdog will NOT cut')) throw new Error('watchdog warning not rendered');
+        if (!text.includes('Watchdog will not currently cut')) throw new Error('watchdog warning not rendered');
       },
       { waitMs: 60 },
     );

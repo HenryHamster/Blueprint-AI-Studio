@@ -888,29 +888,39 @@ export interface ComputeJob {
    *  rows and jobs where nothing was omitted. */
   viewable_artifacts_dropped_count?: number | null;
   /** Bounded time-series of intermediate progress samples emitted during the
-   *  job. Each sample has an ISO timestamp, a metric name, and a numeric value.
-   *  Absent on legacy rows or jobs that did not emit progress. */
-  progress_series?: Array<{ t: string; name: string; value: number }> | null;
+   *  job. `t` is runner-authored presentation time; `received_at` is the
+   *  authenticated server clock used for watchdog enforcement. */
+  progress_series?: Array<{
+    t: string;
+    name: string;
+    value: number;
+    received_at?: string;
+  }> | null;
   /** Stable terminal disposition marker set when a job ends. Distinguishes a
    *  no-progress watchdog cut ('no_progress') from a full wall-clock expiry
    *  ('deadline'), budget cap ('spend_cap'), operator kill ('operator'), and
    *  natural failure ('failure'). Absent on legacy rows. */
   terminal_kind?: 'deadline' | 'no_progress' | 'spend_cap' | 'operator' | 'failure' | null;
-  /** True when the server-side no-progress watchdog is actively monitoring this
-   *  job (i.e. a declared_metric was found and the metric-name bridge is intact).
-   *  False when the watchdog exists but is inert. Absent on legacy rows or when
-   *  the watchdog subsystem is not involved. */
+  /** True only when the server has enough fresh receipt-time history to enforce
+   *  a no-progress cut right now. */
   watchdog_active?: boolean | null;
+  /** Additive watchdog state. Older backends omit it; consumers should fall back
+   *  to watchdog_active when absent. */
+  watchdog_state?:
+    | 'protected'
+    | 'warming_up'
+    | 'insufficient_history'
+    | 'stale_telemetry'
+    | 'inert'
+    | null;
   /** Effective no-progress timeout in seconds enforced for this job, derived
    *  from the per-job override if set, otherwise the global default. Null when
    *  the watchdog is not configured for this job. */
   no_progress_timeout_seconds?: number | null;
-  /** ISO timestamp of the most recent progress sample recorded for this job.
-   *  Null when no progress samples have been emitted yet. */
+  /** Server receipt timestamp of the most recent enforceable progress sample.
+   *  Null when no trustworthy progress samples have been emitted yet. */
   last_progress_at?: string | null;
-  /** Human-readable reason the watchdog is NOT protecting this job, e.g.
-   *  'no_declared_metric' or 'metric_name_mismatch'. Null when watchdog_active
-   *  is true or when the watchdog is not involved. */
+  /** Machine-readable reason the watchdog is not currently protecting this job. */
   watchdog_inert_reason?: string | null;
   /** Cross-job checkpoint resume: predecessor job ID that the backend validated
    *  as the resume source for checkpoint hydration. Present when the compute job

@@ -153,10 +153,10 @@ PROVISIONING_RETRY_BACKOFF_BASE_SECONDS = int(
     os.getenv("COMPUTE_PROVISIONING_RETRY_BACKOFF_SECONDS", "120")
 )
 # No-progress watchdog. A long-running compute job (e.g. multi-day RL training)
-# can burn its entire wall-clock deadline while learning nothing; the surfacing
-# half (a bounded progress-metric ring buffer in polling_metadata, written from
-# runner heartbeats via append_progress_sample) already ships. These constants
-# drive the CONSUMER that reads that trend and cuts a stalled job early.
+# can burn its entire wall-clock deadline while learning nothing. Progress is
+# retained as a bounded receipt-time envelope in polling_metadata, written from
+# authenticated runner heartbeats via append_progress_sample. These constants
+# drive the consumer that reads that trend and cuts a stalled job early.
 #
 # The watchdog is FAIL-OPEN by construction: it fires ONLY when the job declares
 # a metric to watch (polling_metadata['declared_metric']) AND enough progress
@@ -166,9 +166,6 @@ PROVISIONING_RETRY_BACKOFF_BASE_SECONDS = int(
 COMPUTE_JOB_NO_PROGRESS_GRACE_SECONDS = float(
     os.getenv("COMPUTE_JOB_NO_PROGRESS_GRACE_SECONDS", "1800")
 )
-# The progress ring buffer holds at most 50 samples (drop-oldest); at the ~60s
-# heartbeat cadence that is ~50 min of history, so the stall window must stay
-# comfortably under that to ever accumulate a full window of samples.
 COMPUTE_JOB_NO_PROGRESS_WINDOW_SECONDS = float(
     os.getenv("COMPUTE_JOB_NO_PROGRESS_WINDOW_SECONDS", "1800")
 )
@@ -217,9 +214,19 @@ _LIVE_PROOF_MARKER_KEYS = (
     "requires_live_release",
 )
 
-# Progress-metric ring buffer — bounded time-series written into polling_metadata.
+# Progress-metric history — bounded time-series written into polling_metadata.
 _PROGRESS_METRIC_KEY_RE = re.compile(r"^[A-Za-z0-9_./-]+$")
-_PROGRESS_SERIES_MAX_SAMPLES = 50
+# The declared metric receives timeout-relative buckets. Each bucket retains at
+# most first/latest/min/max, preserving coverage and the exact value envelope
+# needed by the plateau predicate. A small recent tail of other metrics remains
+# available for presentation and metric-name mismatch diagnostics.
+_PROGRESS_WATCHDOG_BUCKETS = 66
+_PROGRESS_BUCKET_REPRESENTATIVES = 4
+_PROGRESS_OTHER_METRIC_SAMPLES = 32
+_PROGRESS_SERIES_MAX_SAMPLES = (
+    _PROGRESS_WATCHDOG_BUCKETS * _PROGRESS_BUCKET_REPRESENTATIVES
+    + _PROGRESS_OTHER_METRIC_SAMPLES
+)
 
 # Stable terminal-kind label for a no-progress early-cut.  Callers that cut a
 # job for a stalled progress trend pass this as terminal_kind to
@@ -234,14 +241,97 @@ RUNNER_SILENT_TIMEOUT_SECONDS = int(
 )
 
 
-def append_progress_sample(
-    meta: dict, *, metric: str, value: float, t: str
-) -> dict:
-    """Append a progress sample to the ring buffer in a polling_metadata dict.
+def _progress_bucket_seconds(meta: dict) -> float:
+    """Return the compaction bucket width for this job's watchdog window."""
+    raw_window = meta.get("no_progress_timeout_seconds")
+    try:
+        window = float(raw_window) if raw_window is not None else float(
+            COMPUTE_JOB_NO_PROGRESS_WINDOW_SECONDS
+        )
+    except (TypeError, ValueError):
+        window = float(COMPUTE_JOB_NO_PROGRESS_WINDOW_SECONDS)
+    return max(1.0, window / (_PROGRESS_WATCHDOG_BUCKETS - 2))
 
-    Returns a new dict with the sample appended (drop-oldest at 50 entries).
-    Silently ignores non-finite values, bad metric keys, or any other error
-    so the caller never raises on malformed input.
+
+def _compact_progress_series(
+    series: list,
+    *,
+    declared_metric: str | None,
+    received_at: datetime,
+    bucket_seconds: float,
+) -> list:
+    """Bound progress history without losing declared-metric plateau evidence."""
+    if declared_metric is None:
+        return series[-_PROGRESS_OTHER_METRIC_SAMPLES:]
+
+    def bucket_for(value: datetime) -> int:
+        naive_seconds = (
+            value.toordinal() * 86_400
+            + value.hour * 3_600
+            + value.minute * 60
+            + value.second
+            + value.microsecond / 1_000_000
+        )
+        return int(naive_seconds // bucket_seconds)
+
+    current_bucket = bucket_for(received_at)
+    first_bucket = current_bucket - (_PROGRESS_WATCHDOG_BUCKETS - 1)
+    buckets: dict[int, list[tuple[int, dict, datetime, float]]] = {}
+    recent_other: list[tuple[int, dict]] = []
+
+    for index, sample in enumerate(series):
+        if not isinstance(sample, dict):
+            continue
+        name = sample.get("name")
+        value = _coerce_metric_number(sample.get("value"))
+        if not isinstance(name, str) or value is None:
+            continue
+        receipt = _parse_naive_iso_datetime(sample.get("received_at"))
+        if name == declared_metric and receipt is not None and receipt <= received_at:
+            bucket = bucket_for(receipt)
+            if first_bucket <= bucket <= current_bucket:
+                buckets.setdefault(bucket, []).append(
+                    (index, sample, receipt, float(value))
+                )
+                continue
+        # Keep only a small diagnostic/presentation tail outside the declared
+        # metric's enforceable receipt-time envelope.
+        recent_other.append((index, sample))
+
+    selected: list[tuple[int, dict]] = []
+    for bucket in sorted(buckets):
+        records = buckets[bucket]
+        representatives = {
+            min(records, key=lambda item: (item[2], item[0]))[0],
+            max(records, key=lambda item: (item[2], item[0]))[0],
+            min(records, key=lambda item: (item[3], item[2], item[0]))[0],
+            max(records, key=lambda item: (item[3], item[2], item[0]))[0],
+        }
+        selected.extend(
+            (index, sample)
+            for index, sample, _, _ in records
+            if index in representatives
+        )
+
+    selected.extend(recent_other[-_PROGRESS_OTHER_METRIC_SAMPLES:])
+    selected.sort(key=lambda item: item[0])
+    return [sample for _, sample in selected[-_PROGRESS_SERIES_MAX_SAMPLES:]]
+
+
+def append_progress_sample(
+    meta: dict,
+    *,
+    metric: str,
+    value: float,
+    t: str,
+    received_at: datetime | str | None = None,
+) -> dict:
+    """Append a bounded progress sample using authenticated receipt time.
+
+    ``t`` is runner-authored presentation metadata only. ``received_at`` is the
+    server clock used for compaction and enforcement; callers may omit it for a
+    local server timestamp. Malformed input is ignored so telemetry can never
+    break a heartbeat.
     """
     try:
         if not isinstance(metric, str) or not _PROGRESS_METRIC_KEY_RE.fullmatch(metric):
@@ -251,14 +341,34 @@ def append_progress_sample(
             return meta
         if not isinstance(t, str) or not t:
             return meta
+        receipt = (
+            _parse_naive_iso_datetime(received_at)
+            if received_at is not None
+            else _utcnow()
+        )
+        if receipt is None:
+            return meta
         meta = dict(meta)
         series: list = list(meta.get("progress_series") or [])
-        series.append({"t": t, "name": metric, "value": float_val})
-        if len(series) > _PROGRESS_SERIES_MAX_SAMPLES:
-            series = series[-_PROGRESS_SERIES_MAX_SAMPLES:]
-        meta["progress_series"] = series
+        series.append(
+            {
+                "t": t,
+                "name": metric,
+                "value": float_val,
+                "received_at": receipt.isoformat(),
+            }
+        )
+        declared_metric = meta.get("declared_metric")
+        if not isinstance(declared_metric, str) or not declared_metric:
+            declared_metric = None
+        meta["progress_series"] = _compact_progress_series(
+            series,
+            declared_metric=declared_metric,
+            received_at=receipt,
+            bucket_seconds=_progress_bucket_seconds(meta),
+        )
         return meta
-    except Exception:
+    except Exception:  # noqa: BLE001 - telemetry ingestion must remain fail-open
         return meta
 
 
@@ -1190,11 +1300,11 @@ def _declared_progress_metric(job: ComputeJob) -> str | None:
 def _watched_progress_samples(
     job: ComputeJob, metric: str
 ) -> list[tuple[datetime, float]]:
-    """Return time-sorted ``(t, value)`` samples for ``metric`` from the ring buffer.
+    """Return receipt-time-sorted samples for the declared metric.
 
-    Reads the bounded ``progress_series`` written by ``append_progress_sample``.
-    Malformed entries (bad timestamp, non-numeric value, wrong/absent name) are
-    silently skipped so a single bad heartbeat can never corrupt the trend.
+    ``received_at`` is written by the authenticated ingestion route and is the
+    only enforcement clock. Runner-authored ``t`` remains presentation metadata.
+    Legacy or malformed entries without a receipt time are skipped fail-open.
     """
     series = (job.polling_metadata or {}).get("progress_series")
     if not isinstance(series, list):
@@ -1203,13 +1313,29 @@ def _watched_progress_samples(
     for sample in series:
         if not isinstance(sample, dict) or sample.get("name") != metric:
             continue
-        ts = _parse_naive_iso_datetime(sample.get("t"))
+        ts = _parse_naive_iso_datetime(sample.get("received_at"))
         val = _coerce_metric_number(sample.get("value"))
         if ts is None or val is None:
             continue
         out.append((ts, float(val)))
     out.sort(key=lambda pair: pair[0])
     return out
+
+
+def _effective_watchdog_window_seconds(meta: dict) -> float:
+    raw_per_job = meta.get("no_progress_timeout_seconds")
+    if raw_per_job is not None:
+        try:
+            return float(raw_per_job)
+        except (TypeError, ValueError):
+            pass
+    return float(COMPUTE_JOB_NO_PROGRESS_WINDOW_SECONDS)
+
+
+def _effective_watchdog_grace_seconds(meta: dict) -> float:
+    if meta.get("no_progress_timeout_seconds") is not None:
+        return _effective_watchdog_window_seconds(meta)
+    return float(COMPUTE_JOB_NO_PROGRESS_GRACE_SECONDS)
 
 
 def _watchdog_metric_name_mismatch(job: ComputeJob) -> list[str]:
@@ -1226,10 +1352,10 @@ def _watchdog_metric_name_mismatch(job: ComputeJob) -> list[str]:
     log) instead of the lever failing silent.
 
     Returns the sorted, de-duplicated set of metric names actually present in the
-    progress ring buffer when ALL of the following hold; otherwise ``[]``:
+    bounded progress history when ALL of the following hold; otherwise ``[]``:
 
     * the job declares a metric to watch;
-    * the ring buffer holds at least one well-formed sample (the job IS reporting
+    * the history holds at least one well-formed sample (the job IS reporting
       progress, so a genuinely silent job — no telemetry at all — is never flagged;
       that case is the watchdog's normal fail-open domain, not a name mismatch); and
     * none of those samples carry the declared metric's name.
@@ -1281,127 +1407,126 @@ def _no_progress_stalled(job: ComputeJob, *, now: datetime) -> bool:
     it is used as both the grace period and the plateau-detection window instead
     of the global env-var defaults.
     """
-    meta = job.polling_metadata or {}
-    raw_per_job = meta.get("no_progress_timeout_seconds")
-    if raw_per_job is not None:
-        try:
-            per_job_seconds = float(raw_per_job)
-        except (TypeError, ValueError):
-            per_job_seconds = None
-    else:
-        per_job_seconds = None
-
-    window_seconds = per_job_seconds if per_job_seconds is not None else COMPUTE_JOB_NO_PROGRESS_WINDOW_SECONDS
-    grace_seconds = per_job_seconds if per_job_seconds is not None else COMPUTE_JOB_NO_PROGRESS_GRACE_SECONDS
-
-    if window_seconds <= 0:
+    evaluation = _evaluate_watchdog_protection(job, now=now)
+    if evaluation["watchdog_state"] != "protected":
         return False
-    metric = _declared_progress_metric(job)
-    if metric is None:
-        return False
-    if job.started_at is None:
-        return False
-    if (now - job.started_at).total_seconds() < grace_seconds:
-        return False
-    samples = _watched_progress_samples(job, metric)
-    if len(samples) < COMPUTE_JOB_NO_PROGRESS_MIN_SAMPLES:
-        return False
-    # Enough history: the oldest recorded sample must be at least a full window
-    # old, else we have not yet observed a window's worth of the metric.
-    if (now - samples[0][0]).total_seconds() < window_seconds:
-        return False
-    window_start = now - timedelta(seconds=window_seconds)
-    window = [(t, v) for (t, v) in samples if t >= window_start]
-    if len(window) < COMPUTE_JOB_NO_PROGRESS_MIN_SAMPLES:
-        return False
-    values = [v for (_, v) in window]
+    values = evaluation["_window_values"]
     spread = max(values) - min(values)
     reference = max((abs(v) for v in values), default=0.0)
     tolerance = COMPUTE_JOB_NO_PROGRESS_EPSILON * (reference if reference > 0 else 1.0)
     return spread <= tolerance
 
 
-def derive_watchdog_protection_status(polling_metadata: dict | None) -> dict:
-    """Derive the four watchdog-protection status fields from a job's polling_metadata.
+def _evaluate_watchdog_protection(job: ComputeJob, *, now: datetime) -> dict:
+    """Return the current enforceability state plus the safe plateau window."""
+    meta = job.polling_metadata or {}
+    metric = _declared_progress_metric(job)
+    window_seconds = _effective_watchdog_window_seconds(meta)
+    grace_seconds = _effective_watchdog_grace_seconds(meta)
+
+    def result(
+        state: str,
+        reason: str | None,
+        *,
+        last: datetime | None = None,
+        values: list[float] | None = None,
+    ) -> dict:
+        return {
+            "watchdog_state": state,
+            "watchdog_active": state == "protected",
+            "no_progress_timeout_seconds": (
+                int(window_seconds) if metric is not None else None
+            ),
+            "last_progress_at": last.isoformat() if last is not None else None,
+            "watchdog_inert_reason": reason,
+            "_window_values": values or [],
+        }
+
+    if metric is None:
+        return result("inert", "no_declared_metric")
+    if window_seconds <= 0:
+        return result("inert", "timeout_disabled")
+
+    samples = [
+        (receipt, value)
+        for receipt, value in _watched_progress_samples(job, metric)
+        if receipt <= now
+    ]
+    last = samples[-1][0] if samples else None
+    if not samples and _watchdog_metric_name_mismatch(job):
+        return result("inert", "metric_name_mismatch")
+
+    started_at = _parse_naive_iso_datetime(getattr(job, "started_at", None))
+    if started_at is None:
+        return result("insufficient_history", "missing_start_time", last=last)
+    if (now - started_at).total_seconds() < grace_seconds:
+        return result("warming_up", "warming_up", last=last)
+    if not samples:
+        series = meta.get("progress_series")
+        reason = (
+            "malformed_history"
+            if isinstance(series, list) and series
+            else "no_telemetry"
+        )
+        return result("insufficient_history", reason)
+
+    window_start = now - timedelta(seconds=window_seconds)
+    if last is not None and last < window_start:
+        return result("stale_telemetry", "stale_telemetry", last=last)
+    if samples[0][0] > window_start:
+        return result("insufficient_history", "insufficient_window", last=last)
+
+    # Include the whole compaction bucket crossing the trailing-window boundary.
+    # That can only retain older variation and delay a cut; it can never hide
+    # progress or make a cut occur prematurely.
+    conservative_start = window_start - timedelta(
+        seconds=_progress_bucket_seconds(meta)
+    )
+    window = [
+        (receipt, value)
+        for receipt, value in samples
+        if conservative_start <= receipt <= now
+    ]
+    if len(window) < COMPUTE_JOB_NO_PROGRESS_MIN_SAMPLES:
+        return result("insufficient_history", "insufficient_samples", last=last)
+    return result(
+        "protected",
+        None,
+        last=last,
+        values=[value for _, value in window],
+    )
+
+
+def derive_watchdog_protection_status(
+    polling_metadata: dict | None,
+    *,
+    started_at: datetime | str | None = None,
+    now: datetime | None = None,
+) -> dict:
+    """Derive honest watchdog protection fields for a serialized compute job.
 
     Intended for inclusion in serialized compute-job response payloads.  The
     derivation mirrors ``_no_progress_stalled`` exactly so operators see the same
     effective timeout the watchdog would use — there is no forked definition.
 
     Returns a dict with:
-      watchdog_active (bool): True when the job has a declared progress metric
-          AND an effective non-progress window > 0.
+      watchdog_state (str): protected, warming_up, insufficient_history,
+          stale_telemetry, or inert.
+      watchdog_active (bool): True only when a cut is currently enforceable.
       no_progress_timeout_seconds (int|None): Effective timeout in seconds
           (per-job override if set, else global default). None when no metric declared.
       last_progress_at (str|None): ISO timestamp of the most recent
           progress_series sample matching the declared metric, or None.
-      watchdog_inert_reason (str|None): Why the watchdog will not fire —
-          'no_declared_metric' or 'metric_name_mismatch'. None when active.
+      watchdog_inert_reason (str|None): Machine-readable reason a cut is not
+          currently enforceable. None only while protected.
     """
     from types import SimpleNamespace
 
     meta = polling_metadata or {}
-    _job = SimpleNamespace(polling_metadata=meta)
-
-    # Resolve effective timeout — identical to the resolution in _no_progress_stalled.
-    raw_per_job = meta.get("no_progress_timeout_seconds")
-    per_job_seconds: float | None = None
-    if raw_per_job is not None:
-        try:
-            per_job_seconds = float(raw_per_job)
-        except (TypeError, ValueError):
-            pass
-    effective_seconds = (
-        per_job_seconds if per_job_seconds is not None else COMPUTE_JOB_NO_PROGRESS_WINDOW_SECONDS
-    )
-
-    metric = _declared_progress_metric(_job)
-
-    if metric is None:
-        return {
-            "watchdog_active": False,
-            "no_progress_timeout_seconds": None,
-            "last_progress_at": None,
-            "watchdog_inert_reason": "no_declared_metric",
-        }
-
-    if effective_seconds <= 0:
-        return {
-            "watchdog_active": False,
-            "no_progress_timeout_seconds": int(effective_seconds),
-            "last_progress_at": None,
-            "watchdog_inert_reason": "timeout_disabled",
-        }
-
-    # Find the most recent sample in progress_series matching the declared metric.
-    series = meta.get("progress_series")
-    last_t: str | None = None
-    if isinstance(series, list):
-        last_ts: datetime | None = None
-        for sample in series:
-            if not isinstance(sample, dict) or sample.get("name") != metric:
-                continue
-            t_str = sample.get("t")
-            ts = _parse_naive_iso_datetime(t_str)
-            if ts is None:
-                continue
-            if last_ts is None or ts > last_ts:
-                last_ts = ts
-                last_t = t_str
-
-    # Detect metric-name mismatch: samples exist but none match the declared metric.
-    inert_reason: str | None = None
-    if last_t is None:
-        mismatch = _watchdog_metric_name_mismatch(_job)
-        if mismatch:
-            inert_reason = "metric_name_mismatch"
-
-    return {
-        "watchdog_active": inert_reason is None,
-        "no_progress_timeout_seconds": int(effective_seconds),
-        "last_progress_at": last_t,
-        "watchdog_inert_reason": inert_reason,
-    }
+    job = SimpleNamespace(polling_metadata=meta, started_at=started_at)
+    evaluation = _evaluate_watchdog_protection(job, now=now or _utcnow())
+    evaluation.pop("_window_values", None)
+    return evaluation
 
 
 def _provisioning_timeout_seconds(job: ComputeJob, *, now: datetime) -> float | None:

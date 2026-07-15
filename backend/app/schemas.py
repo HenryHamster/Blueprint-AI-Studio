@@ -576,7 +576,12 @@ def serialize_compute_job_response(job: object) -> Dict[str, Any]:
     # Promote watchdog protection-status fields so the agent surface always has them.
     # Lazy import avoids the circular dependency (compute_jobs imports schemas).
     from app.compute_jobs import derive_watchdog_protection_status  # noqa: PLC0415
-    data.update(derive_watchdog_protection_status(data.get("polling_metadata")))
+    data.update(
+        derive_watchdog_protection_status(
+            data.get("polling_metadata"),
+            started_at=data.get("started_at"),
+        )
+    )
     return data
 
 

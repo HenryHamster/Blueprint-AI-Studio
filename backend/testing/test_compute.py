@@ -15249,7 +15249,11 @@ def test_no_progress_stalled_detects_plateau_and_spares_advancing_metric():
             # Spread the samples evenly across the trailing window.
             t = now - timedelta(seconds=window * (n - 1 - i) / (n - 1))
             meta = append_progress_sample(
-                meta, metric="loss", value=v, t=t.isoformat()
+                meta,
+                metric="loss",
+                value=v,
+                t=t.isoformat(),
+                received_at=t,
             )
         return ComputeJob(
             command="true",
@@ -15303,7 +15307,13 @@ def test_no_progress_stalled_respects_per_job_timeout():
         n = len(values)
         for i, v in enumerate(values):
             t = now - timedelta(seconds=window_seconds * (n - 1 - i) / (n - 1))
-            meta = append_progress_sample(meta, metric="loss", value=v, t=t.isoformat())
+            meta = append_progress_sample(
+                meta,
+                metric="loss",
+                value=v,
+                t=t.isoformat(),
+                received_at=t,
+            )
         return ComputeJob(
             command="true",
             machine_type="e2-standard-2",
@@ -15342,7 +15352,11 @@ def test_no_progress_stalled_respects_per_job_timeout():
     for i, v in enumerate([0.5] * n):
         t = now - timedelta(seconds=per_job_timeout * (n - 1 - i) / (n - 1))
         global_job_meta = append_progress_sample(
-            global_job_meta, metric="loss", value=v, t=t.isoformat()
+            global_job_meta,
+            metric="loss",
+            value=v,
+            t=t.isoformat(),
+            received_at=t,
         )
     global_job = ComputeJob(
         command="true",
@@ -16784,7 +16798,7 @@ async def test_spawn_followup_suppressed_for_engine_authored_task_with_false(db_
     spawn_mock.assert_not_called()
 
 
-# ── Progress-series ring buffer + terminal_kind disposition ──────────────────
+# ── Progress-series compaction + terminal_kind disposition ──────────────────
 
 def test_append_progress_sample_basic():
     """A valid metric+value is appended as {t, name, value} into progress_series."""
@@ -16796,6 +16810,7 @@ def test_append_progress_sample_basic():
     assert len(series) == 1
     assert series[0]["name"] == "loss"
     assert series[0]["value"] == 0.42
+    assert datetime.fromisoformat(series[0]["received_at"]) <= _utcnow()
     assert series[0]["t"] == "2026-01-01T00:00:00"
 
 
@@ -16817,17 +16832,27 @@ def test_append_progress_sample_non_finite_value():
         assert result == {}, f"expected no mutation for value={bad_val}"
 
 
-def test_append_progress_sample_ring_buffer_cap():
-    """After 55 samples only the last 50 are retained (drop-oldest)."""
+def test_append_progress_sample_history_is_bounded():
+    """Declared-metric history stays bounded under high-frequency telemetry."""
     from app.compute_jobs import append_progress_sample
 
-    meta: dict = {}
-    for i in range(55):
-        meta = append_progress_sample(meta, metric="step", value=float(i), t=f"t{i}")
+    now = datetime(2026, 1, 2, 0, 0, 0)
+    meta: dict = {
+        "declared_metric": "step",
+        "no_progress_timeout_seconds": 3600,
+    }
+    for i in range(1000):
+        receipt = now + timedelta(seconds=i)
+        meta = append_progress_sample(
+            meta,
+            metric="step",
+            value=float(i),
+            t=f"t{i}",
+            received_at=receipt,
+        )
     series = meta["progress_series"]
-    assert len(series) == 50
-    assert series[0]["value"] == 5.0, "oldest 5 samples should have been dropped"
-    assert series[-1]["value"] == 54.0
+    assert len(series) <= 296
+    assert series[-1]["value"] == 999.0
 
 
 def test_append_progress_sample_does_not_mutate_input():
@@ -16874,6 +16899,7 @@ def test_merge_progress_report_bridges_new_records_to_progress_series():
             metric=rec["metric"],
             value=rec["value"],
             t=rec.get("ts") or now.isoformat(),
+            received_at=now,
         )
 
     series = meta.get("progress_series", [])
@@ -17088,22 +17114,29 @@ def test_serialize_compute_job_response_safe_absent_on_legacy_rows():
 
 
 def test_serialize_compute_job_response_safe_promotes_watchdog_protection_status():
-    """serialize_compute_job_response_safe promotes the four watchdog-protection status
+    """serialize_compute_job_response_safe promotes watchdog-protection status
     fields as first-class fields on the operator-facing payload.
 
     Three sub-cases:
-    (1) Protected running job: declared metric + effective timeout -> watchdog_active=True,
-        correct no_progress_timeout_seconds, last_progress_at equals newest matching sample.
+    (1) Protected running job: declared metric + enough fresh receipt-time history
+        -> watchdog_active=True and watchdog_state='protected'.
     (2) No declared metric: watchdog_active=False, watchdog_inert_reason='no_declared_metric'.
     (3) Metric-name mismatch: samples exist but none match declared metric ->
         watchdog_inert_reason='metric_name_mismatch'.
     """
     from app.schemas import serialize_compute_job_response_safe
+    from app.models import _utcnow
 
     # --- Case 1: protected job with declared metric and matching samples ---
+    now = _utcnow()
     progress_series = [
-        {"t": "2026-01-01T00:00:00", "name": "reward", "value": 1.0},
-        {"t": "2026-01-01T00:01:00", "name": "reward", "value": 1.1},
+        {
+            "t": "runner-authored",
+            "received_at": (now - timedelta(seconds=age)).isoformat(),
+            "name": "reward",
+            "value": 1.0,
+        }
+        for age in (3600, 2700, 1800, 900, 0)
     ]
     job_protected = ComputeJob(
         id=uuid.uuid4(),
@@ -17111,6 +17144,7 @@ def test_serialize_compute_job_response_safe_promotes_watchdog_protection_status
         backend="local-subprocess",
         status=ComputeJobStatus.RUNNING,
         spend_cap_usd=1.0,
+        started_at=now - timedelta(hours=2),
         polling_metadata={
             "declared_metric": "reward",
             "no_progress_timeout_seconds": 3600,
@@ -17119,8 +17153,9 @@ def test_serialize_compute_job_response_safe_promotes_watchdog_protection_status
     )
     data = serialize_compute_job_response_safe(job_protected)
     assert data["watchdog_active"] is True, "watchdog must be active for a protected job"
+    assert data["watchdog_state"] == "protected"
     assert data["no_progress_timeout_seconds"] == 3600, "per-job timeout must be reported"
-    assert data["last_progress_at"] == "2026-01-01T00:01:00", "must return newest matching sample"
+    assert data["last_progress_at"] == now.isoformat(), "must return newest server receipt time"
     assert data["watchdog_inert_reason"] is None, "no inert reason for an active watchdog"
 
     # --- Case 2: no declared metric ---
@@ -17148,13 +17183,18 @@ def test_serialize_compute_job_response_safe_promotes_watchdog_protection_status
         polling_metadata={
             "declared_metric": "reward",
             "progress_series": [
-                {"t": "2026-01-01T00:00:00", "name": "loss", "value": 0.5},
-                {"t": "2026-01-01T00:01:00", "name": "loss", "value": 0.4},
+                {
+                    "t": "runner-authored",
+                    "received_at": now.isoformat(),
+                    "name": "loss",
+                    "value": 0.5,
+                },
             ],
         },
     )
     data3 = serialize_compute_job_response_safe(job_mismatch)
     assert data3["watchdog_active"] is False
+    assert data3["watchdog_state"] == "inert"
     assert data3["watchdog_inert_reason"] == "metric_name_mismatch"
     assert data3["last_progress_at"] is None
 
@@ -17187,6 +17227,7 @@ def test_runner_bridge_last_progress_at_reflects_written_samples():
             metric=rec["metric"],
             value=rec["value"],
             t=rec.get("ts") or now.isoformat(),
+            received_at=now,
         )
 
     job = ComputeJob(
@@ -17199,13 +17240,15 @@ def test_runner_bridge_last_progress_at_reflects_written_samples():
     )
     data = serialize_compute_job_response_safe(job)
 
-    # The bridge wrote samples under key 'name'; the watchdog reads 'name'.
-    # last_progress_at must reflect the most recent bridged sample.
-    assert data["last_progress_at"] == "2026-06-01T00:01:00", (
-        "last_progress_at must equal the most recent runner-bridged sample timestamp"
+    # The bridge preserves runner-authored t for presentation but the watchdog
+    # exposes authenticated server receipt time as last_progress_at.
+    assert data["progress_series"][-1]["t"] == "2026-06-01T00:01:00"
+    assert data["last_progress_at"] == now.isoformat(), (
+        "last_progress_at must use server receipt time, not the runner timestamp"
     )
-    assert data["watchdog_active"] is True, "watchdog must be active after bridge populates progress_series"
-    assert data["watchdog_inert_reason"] is None
+    assert data["watchdog_active"] is False
+    assert data["watchdog_state"] == "insufficient_history"
+    assert data["watchdog_inert_reason"] == "missing_start_time"
 
 
 @pytest.mark.asyncio
@@ -21074,7 +21117,7 @@ async def test_viewable_pipeline_skips_backends_without_a_bundle(
 
 # ── No-progress watchdog ──────────────────────────────────────────────────────
 #
-# The surfacing half (progress_series ring buffer + declared_metric) already
+# The surfacing half (bounded progress_series + declared_metric) already
 # shipped; these cover the CONSUMER wired in this change: _no_progress_stalled
 # and its enforcement in _process_single_compute_job.
 
@@ -21089,7 +21132,7 @@ def _progress_job(*, metric, samples, started_offset_seconds, extra_meta=None):
     """Build an in-memory job-like object for pure watchdog-trend tests.
 
     ``samples`` is a list of ``(seconds_before_now, name, value)`` tuples for the
-    progress ring buffer; ``started_offset_seconds`` is how long ago the job
+    progress history; ``started_offset_seconds`` is how long ago the job
     started.
     """
     from types import SimpleNamespace
@@ -21101,6 +21144,7 @@ def _progress_job(*, metric, samples, started_offset_seconds, extra_meta=None):
     series = [
         {
             "t": (now - timedelta(seconds=age)).isoformat(),
+            "received_at": (now - timedelta(seconds=age)).isoformat(),
             "name": name,
             "value": value,
         }
@@ -21283,6 +21327,7 @@ async def test_process_compute_jobs_once_cuts_stalled_no_progress_job(
     meta["progress_series"] = [
         {
             "t": (now - timedelta(seconds=age)).isoformat(),
+            "received_at": (now - timedelta(seconds=age)).isoformat(),
             "name": "val/loss",
             "value": 2.71828,
         }
@@ -21364,6 +21409,7 @@ async def test_process_compute_jobs_once_keeps_progressing_job_running(
     meta["progress_series"] = [
         {
             "t": (now - timedelta(seconds=age)).isoformat(),
+            "received_at": (now - timedelta(seconds=age)).isoformat(),
             "name": "val/loss",
             "value": 3.0 - i * 0.15,
         }

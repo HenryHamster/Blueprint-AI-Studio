@@ -1928,11 +1928,35 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
               })()}
               {(() => {
                 if (!active) return null;
-                // watchdog_active is undefined on older backends — show nothing
-                if (job.watchdog_active == null) return null;
+                // Older backends only send watchdog_active. Preserve that display
+                // while preferring the additive, honest state when available.
+                if (job.watchdog_state == null && job.watchdog_active == null) return null;
                 const timeoutSec = job.no_progress_timeout_seconds;
                 const lastProgressAt = job.last_progress_at;
                 const inertReason = job.watchdog_inert_reason;
+                const watchdogState = job.watchdog_state
+                  ?? (job.watchdog_active ? 'protected' : 'legacy_unprotected');
+                const protectedNow = watchdogState === 'protected';
+                const stateLabel = watchdogState === 'warming_up'
+                  ? 'Warming up'
+                  : watchdogState === 'insufficient_history'
+                    ? 'Insufficient history'
+                    : watchdogState === 'stale_telemetry'
+                      ? 'Stale telemetry'
+                      : watchdogState === 'inert'
+                        ? 'Inert'
+                        : 'Unprotected';
+                const stateExplanation = watchdogState === 'warming_up'
+                  ? 'Watchdog will not currently cut this job: its observation window is still warming up.'
+                  : watchdogState === 'insufficient_history'
+                    ? 'Watchdog will not currently cut this job: there is not enough trustworthy receipt-time history.'
+                    : watchdogState === 'stale_telemetry'
+                      ? 'Watchdog will not currently cut this job: progress telemetry is stale.'
+                      : watchdogState === 'inert'
+                        ? `Watchdog will not currently cut this job: ${inertReason ?? 'not_configured'}. A stalled run may continue until its wall-clock deadline.`
+                        : inertReason
+                          ? `Watchdog will not currently cut this job: ${inertReason}. A stalled run may continue until its wall-clock deadline.`
+                          : null;
                 let lastProgressAgo: string | null = null;
                 if (lastProgressAt) {
                   const diffSec = Math.max(0, Math.round((nowMs - new Date(lastProgressAt).getTime()) / 1000));
@@ -1940,7 +1964,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                 }
                 return (
                   <div className="mb-1.5" data-testid="compute-watchdog-status">
-                    {job.watchdog_active ? (
+                    {protectedNow ? (
                       <div className="flex flex-wrap items-center gap-1.5 text-ui-sm">
                         <span
                           className="rounded border border-emerald-500/40 bg-emerald-500/10 px-1.5 py-0.5 text-ui-xs font-semibold text-emerald-300"
@@ -1966,7 +1990,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                             className="rounded border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 text-ui-xs font-semibold text-amber-300"
                             data-testid="compute-watchdog-unprotected"
                           >
-                            Unprotected
+                            {stateLabel}
                           </span>
                           {lastProgressAgo && (
                             <span className="text-neutral-500 font-mono">
@@ -1974,16 +1998,14 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                             </span>
                           )}
                         </div>
-                        {inertReason && (
+                        {stateExplanation && (
                           <div
                             className="mt-1 rounded border border-amber-500/30 bg-amber-500/8 px-2 py-1.5 text-ui-sm text-amber-200"
                             data-testid="compute-watchdog-inert-warning"
                           >
                             <div className="flex items-start gap-1.5">
                               <AlertTriangle className="w-3 h-3 shrink-0 mt-0.5" />
-                              <span>
-                                Watchdog will NOT cut this job: <span className="font-mono">{inertReason}</span>. A stalled run will waste resources until its wall-clock deadline.
-                              </span>
+                              <span>{stateExplanation}</span>
                             </div>
                           </div>
                         )}
