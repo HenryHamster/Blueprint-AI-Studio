@@ -897,3 +897,191 @@ async def test_drop_database_rejects_invalid_name_without_connecting():
     url = make_url("postgresql+asyncpg://u:p@localhost:5432/nope")
     with pytest.raises(ValueError, match="Invalid database name"):
         await _drop_database(url, "my\"db")
+
+
+# --- scratch_db_url routing -------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_scratch_db_url_routes_scratch_provisioning_to_dedicated_target(
+    monkeypatch,
+):
+    """When ``scratch_db_url`` is provided, the gate must provision the scratch
+    and reference databases on the dedicated target, NOT the production URL.
+
+    The deployed production Postgres user typically cannot ``CREATE DATABASE``,
+    so every candidate would defer with ``migration_apply_check_unavailable``.
+    Providing a scratch-capable target unblocks the gate pre-promotion.
+    """
+    import app.migration_apply_gate as gate_mod
+    from sqlalchemy.engine import make_url
+
+    scratch_target = "postgresql+asyncpg://scratch_user:p@scratch-host:5432/postgres"
+    prod_url = make_url("postgresql+asyncpg://prod_user:p@prod-db:5432/proddb")
+
+    prod_meta = sa.MetaData()
+    sa.Table("widget", prod_meta, sa.Column("id", sa.Integer, primary_key=True))
+
+    monkeypatch.setattr(
+        gate_mod,
+        "_read_prod_state",
+        AsyncMock(return_value=gate_mod._ProdState(revision="a01", metadata=prod_meta)),
+    )
+
+    # Capture the base_url passed to _build_candidate_reference_schema and
+    # _provision_seed_and_detect_drift to verify the scratch target is used.
+    observed: dict[str, object] = {}
+
+    async def _capture_build_candidate_reference_schema(
+        base_url, candidate_sources
+    ):
+        observed["build_reference_base_url"] = base_url
+        return prod_meta
+
+    async def _capture_provision_seed_and_detect_drift(
+        scratch_base_url, prod_state, candidate_sources, required_metadata
+    ):
+        observed["provision_base_url"] = scratch_base_url
+        return []
+
+    monkeypatch.setattr(
+        gate_mod,
+        "_build_candidate_reference_schema",
+        _capture_build_candidate_reference_schema,
+    )
+    monkeypatch.setattr(
+        gate_mod,
+        "_build_candidate_required_metadata",
+        AsyncMock(return_value=prod_meta),
+    )
+    monkeypatch.setattr(
+        gate_mod,
+        "_provision_seed_and_detect_drift",
+        _capture_provision_seed_and_detect_drift,
+    )
+
+    # Create an engine whose URL differs from the scratch target to prove the
+    # gate does NOT fall back to prod_url when scratch_db_url is given.
+    engine = create_async_engine(str(prod_url))
+    try:
+        verdict, detail = await run_migration_apply_gate(
+            prod_engine=engine,
+            candidate_sources={"0001_init.py": "revision='0001'\ndown_revision=None\n"},
+            scratch_db_url=scratch_target,
+        )
+    finally:
+        await engine.dispose()
+
+    assert verdict == "ok", detail
+
+    # Both internal functions must receive the scratch target URL, not prod.
+    # Compare URL components individually: str(URL) redacts passwords to "***",
+    # so we check host/port/database which are stable across password redaction.
+    expected = make_url(scratch_target)
+    build_ref = observed.get("build_reference_base_url")
+    assert build_ref is not None, (
+        "_build_candidate_reference_schema was not called"
+    )
+    assert build_ref.host == expected.host, (
+        f"_build_candidate_reference_schema host {build_ref.host!r} != {expected.host!r}"
+    )
+    assert build_ref.database == expected.database, (
+        f"_build_candidate_reference_schema database {build_ref.database!r} != {expected.database!r}"
+    )
+
+    provision_ref = observed.get("provision_base_url")
+    assert provision_ref is not None, (
+        "_provision_seed_and_detect_drift was not called"
+    )
+    assert provision_ref.host == expected.host, (
+        f"_provision_seed_and_detect_drift host {provision_ref.host!r} != {expected.host!r}"
+    )
+    assert provision_ref.database == expected.database, (
+        f"_provision_seed_and_detect_drift database {provision_ref.database!r} != {expected.database!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_scratch_db_url_none_falls_back_to_prod_url(monkeypatch):
+    """When ``scratch_db_url`` is ``None`` (default), the gate must fall back
+    to the production engine's URL for scratch provisioning — the correct path
+    for dev/test environments where the Postgres user can CREATE DATABASE."""
+    import app.migration_apply_gate as gate_mod
+    from sqlalchemy.engine import make_url
+
+    prod_url = make_url("postgresql+asyncpg://prod_user:p@prod-db:5432/proddb")
+
+    prod_meta = sa.MetaData()
+    sa.Table("widget", prod_meta, sa.Column("id", sa.Integer, primary_key=True))
+
+    monkeypatch.setattr(
+        gate_mod,
+        "_read_prod_state",
+        AsyncMock(return_value=gate_mod._ProdState(revision="a01", metadata=prod_meta)),
+    )
+
+    observed: dict[str, object] = {}
+
+    async def _capture_build_candidate_reference_schema(
+        base_url, candidate_sources
+    ):
+        observed["build_reference_base_url"] = base_url
+        return prod_meta
+
+    async def _capture_provision_seed_and_detect_drift(
+        scratch_base_url, prod_state, candidate_sources, required_metadata
+    ):
+        observed["provision_base_url"] = scratch_base_url
+        return []
+
+    monkeypatch.setattr(
+        gate_mod,
+        "_build_candidate_reference_schema",
+        _capture_build_candidate_reference_schema,
+    )
+    monkeypatch.setattr(
+        gate_mod,
+        "_build_candidate_required_metadata",
+        AsyncMock(return_value=prod_meta),
+    )
+    monkeypatch.setattr(
+        gate_mod,
+        "_provision_seed_and_detect_drift",
+        _capture_provision_seed_and_detect_drift,
+    )
+
+    engine = create_async_engine(str(prod_url))
+    try:
+        verdict, detail = await run_migration_apply_gate(
+            prod_engine=engine,
+            candidate_sources={"0001_init.py": "revision='0001'\ndown_revision=None\n"},
+            # scratch_db_url omitted — should default to None
+        )
+    finally:
+        await engine.dispose()
+
+    assert verdict == "ok", detail
+
+    # With scratch_db_url=None, the gate must use the prod engine's URL.
+    # Compare host/database individually — str(URL) redacts passwords.
+    build_ref = observed.get("build_reference_base_url")
+    assert build_ref is not None, (
+        "_build_candidate_reference_schema was not called"
+    )
+    assert build_ref.host == prod_url.host, (
+        f"_build_candidate_reference_schema host {build_ref.host!r} != {prod_url.host!r}"
+    )
+    assert build_ref.database == prod_url.database, (
+        f"_build_candidate_reference_schema database {build_ref.database!r} != {prod_url.database!r}"
+    )
+
+    provision_ref = observed.get("provision_base_url")
+    assert provision_ref is not None, (
+        "_provision_seed_and_detect_drift was not called"
+    )
+    assert provision_ref.host == prod_url.host, (
+        f"_provision_seed_and_detect_drift host {provision_ref.host!r} != {prod_url.host!r}"
+    )
+    assert provision_ref.database == prod_url.database, (
+        f"_provision_seed_and_detect_drift database {provision_ref.database!r} != {prod_url.database!r}"
+    )
