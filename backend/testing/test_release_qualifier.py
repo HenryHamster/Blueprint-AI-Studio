@@ -37,6 +37,7 @@ Covers:
 from __future__ import annotations
 from datetime import timezone
 
+import asyncio
 import contextlib
 import json
 import uuid
@@ -16493,6 +16494,385 @@ async def test_hotfix_promote_accepts_machinery_diff_and_writes_audit_trail(
     assert version.last_qualification.get("hotfix_promote_scope_modules") == [
         "backend/app/release_scoring.py"
     ]
+
+
+@pytest.mark.asyncio
+async def test_hotfix_promote_audit_repair_failure_does_not_mask_committed_result(
+    db_session, mocker
+):
+    """The audit remains best-effort because the promotion commits first."""
+    project, _version = await _make_project_and_version(
+        db_session, phase="stabilize"
+    )
+    _patch_hotfix_promote_github(
+        mocker,
+        changed_files=[
+            ("backend/app/release_scoring.py", "@@ -1 +1 @@\n-x\n+y\n"),
+        ],
+    )
+    mocker.patch(
+        "app.release_qualifier._reconcile_hotfix_audit_trail",
+        new=AsyncMock(side_effect=RuntimeError("audit database unavailable")),
+    )
+
+    result = await rq.hotfix_promote_current_version(
+        db_session,
+        project.id,
+        actor="operator-1",
+        reason="best-effort audit regression",
+        scope_modules=["backend/app/release_scoring.py"],
+        session_factory=_shared_session_factory(db_session),
+    )
+
+    assert result["status"] == "promoted"
+
+
+@pytest.mark.asyncio
+async def test_hotfix_promotion_reconciles_audit_after_crash(db_session, mocker):
+    """A committed hotfix survives request rollback with its debt and Alert restored.
+
+    ``hotfix_promote_current_version`` commits the promotion in its dedicated
+    session but stages its audit trail in the caller's session.  This models a
+    crash in that gap, then exercises the real periodic sweep twice to prove
+    recovery and idempotency rather than merely testing the writer in isolation.
+    """
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    project_id, version_id = project.id, version.id
+    _patch_hotfix_promote_github(
+        mocker,
+        changed_files=[
+            ("backend/app/release_scoring.py", "@@ -1 +1 @@\n-x\n+y\n"),
+        ],
+    )
+
+    result = await rq.hotfix_promote_current_version(
+        db_session,
+        project_id,
+        actor="operator-crash-test",
+        reason="restore the promised audit trail",
+        scope_modules=["backend/app/release_scoring.py"],
+        session_factory=_shared_session_factory(db_session),
+    )
+    assert result["status"] == "promoted"
+
+    # Simulate process/request loss after the dedicated promotion commit.
+    await db_session.rollback()
+    reloaded_version = await db_session.get(type(version), version_id)
+    assert reloaded_version.last_qualification["hotfix_promote_diff_file_list"] == [
+        "backend/app/release_scoring.py"
+    ]
+
+    first_count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+    second_count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    debt_rows = list(
+        (
+            await db_session.execute(
+                select(CompletionDebtEntry).where(
+                    CompletionDebtEntry.project_id == project_id,
+                    CompletionDebtEntry.kind == "hotfix_deploy_pending_backfill",
+                )
+            )
+        ).scalars()
+    )
+    alert_rows = list(
+        (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project_id,
+                    Alert.source == "hotfix_promote",
+                )
+            )
+        ).scalars()
+    )
+    assert first_count >= 1
+    assert second_count == 0
+    assert len(debt_rows) == 1
+    assert debt_rows[0].detail["actor"] == "operator-crash-test"
+    assert len(alert_rows) == 1
+    assert alert_rows[0].dedupe_key == f"hotfix_deploy_alert:{project_id}:" + (
+        "facec0de" * 5
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "promotion_pending",
+    [
+        {
+            "pr_number": 41,
+            "pr_url": "https://github.test/pull/41",
+            "auto_merge_enabled": True,
+            "enabled_at": "2026-07-15T00:00:00",
+        },
+        {
+            "pr_number": 42,
+            "pr_url": "https://github.test/pull/42",
+            "auto_merge_enabled": False,
+            "managed_check_wait": True,
+            "migration_carrying": True,
+            "enabled_at": "2026-07-15T00:00:00",
+        },
+    ],
+    ids=["pending_auto_merge", "pending_managed_check_wait"],
+)
+async def test_hotfix_pending_wait_reconciles_audit_after_request_crash(
+    db_session, promotion_pending
+):
+    """The two return-only wait statuses persist as pending + sub-state.
+
+    Model a crash after that durable promotion commit but before request-side
+    audit repair.  The sweep must recognize both persisted shapes and create
+    the missing debt and Alert.
+    """
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    candidate_sha = "c1wa1t00" * 5
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": candidate_sha,
+        "hotfix_promote": True,
+        "hotfix_promote_by": "operator-crashed",
+        "hotfix_promote_reason": "CI wait crash recovery",
+        "hotfix_promote_scope_modules": ["backend/app/release_qualifier.py"],
+        "hotfix_promote_diff_file_list": ["backend/app/release_qualifier.py"],
+        "hotfix_promote_prior_deployed_sha": "prior000" * 5,
+        "promotion_pending": promotion_pending,
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    debt_key = f"hotfix_deploy:{project.id}:{candidate_sha}"
+    alert_key = f"hotfix_deploy_alert:{project.id}:{candidate_sha}"
+    assert count >= 1
+    assert (
+        await db_session.execute(
+            select(CompletionDebtEntry).where(
+                CompletionDebtEntry.dedupe_key == debt_key
+            )
+        )
+    ).scalar_one_or_none() is not None
+    assert (
+        await db_session.execute(select(Alert).where(Alert.dedupe_key == alert_key))
+    ).scalar_one_or_none() is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("debt_status", "seed_alert", "expected_debt_status"),
+    [
+        ("open", False, "open"),
+        (None, True, "open"),
+        ("resolved", False, "resolved"),
+        ("dismissed", False, "dismissed"),
+    ],
+    ids=["debt_only", "alert_only", "resolved_debt", "dismissed_debt"],
+)
+async def test_hotfix_partial_audit_repair_preserves_existing_debt_state(
+    db_session, debt_status, seed_alert, expected_debt_status
+):
+    """Partial recovery creates only the missing artifact.
+
+    In particular, a later normal qualification's resolved debt and an
+    operator-dismissed debt are historical facts and must never be reopened.
+    """
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    candidate_sha = "part1al0" * 5
+    debt_key = f"hotfix_deploy:{project.id}:{candidate_sha}"
+    alert_key = f"hotfix_deploy_alert:{project.id}:{candidate_sha}"
+    version.status = "promoted"
+    version.last_qualification = {
+        "status": "promoted",
+        "candidate_sha": candidate_sha,
+        "hotfix_promote": True,
+        "hotfix_promote_by": "operator-partial",
+        "hotfix_promote_reason": "partial audit repair",
+        "hotfix_promote_scope_modules": ["backend/app/release_qualifier.py"],
+        "hotfix_promote_diff_file_list": ["backend/app/release_qualifier.py"],
+    }
+    if debt_status is not None:
+        debt = CompletionDebtEntry(
+            project_id=project.id,
+            kind="hotfix_deploy_pending_backfill",
+            dedupe_key=debt_key,
+            status=debt_status,
+            title="existing hotfix debt",
+            source="hotfix_promote",
+            resolution_reason=(
+                "normal gate already passed" if debt_status != "open" else None
+            ),
+        )
+        db_session.add(debt)
+    if seed_alert:
+        db_session.add(
+            Alert(
+                project_id=project.id,
+                severity="WARNING",
+                title="existing hotfix alert",
+                message="existing",
+                source="hotfix_promote",
+                dedupe_key=alert_key,
+            )
+        )
+    db_session.add(version)
+    await db_session.commit()
+
+    repaired = await rq._reconcile_hotfix_audit_trail(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert repaired is True
+
+    debt_rows = list(
+        (
+            await db_session.execute(
+                select(CompletionDebtEntry).where(
+                    CompletionDebtEntry.dedupe_key == debt_key
+                )
+            )
+        ).scalars()
+    )
+    alert_rows = list(
+        (await db_session.execute(select(Alert).where(Alert.dedupe_key == alert_key)))
+        .scalars()
+    )
+    assert len(debt_rows) == 1
+    assert debt_rows[0].status == expected_debt_status
+    if debt_status in {"resolved", "dismissed"}:
+        assert debt_rows[0].resolution_reason == "normal gate already passed"
+    assert len(alert_rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_hotfix_sweep_prefilters_normal_and_complete_release_history(
+    db_session, mocker
+):
+    """Only a hotfix with a missing artifact enters a dedicated repair session."""
+    _normal_project, normal = await _make_project_and_version(db_session)
+    complete_project, complete = await _make_project_and_version(db_session)
+    missing_project, missing = await _make_project_and_version(db_session)
+    complete_sha = "c0mplete" * 5
+    missing_sha = "m1ssing0" * 5
+
+    normal.status = "promoted"
+    normal.last_qualification = {"status": "promoted", "candidate_sha": "normal00" * 5}
+    complete.status = "promoted"
+    complete.last_qualification = {
+        "status": "promoted",
+        "candidate_sha": complete_sha,
+        "hotfix_promote": True,
+    }
+    missing.status = "promoted"
+    missing.last_qualification = {
+        "status": "promoted",
+        "candidate_sha": missing_sha,
+        "hotfix_promote": True,
+    }
+    db_session.add(
+        CompletionDebtEntry(
+            project_id=complete_project.id,
+            kind="hotfix_deploy_pending_backfill",
+            dedupe_key=f"hotfix_deploy:{complete_project.id}:{complete_sha}",
+            status="open",
+            title="complete debt",
+            source="hotfix_promote",
+        )
+    )
+    db_session.add(
+        Alert(
+            project_id=complete_project.id,
+            severity="WARNING",
+            title="complete alert",
+            message="complete",
+            source="hotfix_promote",
+            dedupe_key=f"hotfix_deploy_alert:{complete_project.id}:{complete_sha}",
+        )
+    )
+    db_session.add_all([normal, complete, missing])
+    await db_session.commit()
+
+    reconcile = mocker.patch(
+        "app.release_qualifier_sweep._reconcile_hotfix_audit_trail",
+        new=AsyncMock(return_value=False),
+    )
+    await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+
+    reconcile.assert_awaited_once()
+    assert reconcile.await_args.args[0] == missing.id
+    assert complete_project.id != missing_project.id
+
+
+@pytest.mark.asyncio
+async def test_hotfix_request_and_sweep_writers_serialize_on_version_lock(
+    db_session,
+):
+    """Concurrent request/reaper repairs create one debt and one Alert."""
+    if db_session.bind.dialect.name == "sqlite":
+        pytest.skip("requires independent transactions and row locks; runs on Postgres")
+
+    from sqlalchemy.ext.asyncio import AsyncSession as _AsyncSession
+
+    engine = db_session.bind
+
+    @contextlib.asynccontextmanager
+    async def _dedicated_factory():
+        async with _AsyncSession(engine, expire_on_commit=False) as dedicated:
+            yield dedicated
+
+    project, version = await _make_project_and_version(db_session)
+    candidate_sha = "c0ncur00" * 5
+    version.status = "promoted"
+    version.last_qualification = {
+        "status": "promoted",
+        "candidate_sha": candidate_sha,
+        "hotfix_promote": True,
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    outcomes = await asyncio.gather(
+        rq._reconcile_hotfix_audit_trail(
+            version.id, session_factory=_dedicated_factory
+        ),
+        rq._reconcile_hotfix_audit_trail(
+            version.id, session_factory=_dedicated_factory
+        ),
+    )
+    assert sorted(outcomes) == [False, True]
+
+    debt_key = f"hotfix_deploy:{project.id}:{candidate_sha}"
+    alert_key = f"hotfix_deploy_alert:{project.id}:{candidate_sha}"
+    assert len(
+        list(
+            (
+                await db_session.execute(
+                    select(CompletionDebtEntry).where(
+                        CompletionDebtEntry.dedupe_key == debt_key
+                    )
+                )
+            ).scalars()
+        )
+    ) == 1
+    assert len(
+        list(
+            (
+                await db_session.execute(
+                    select(Alert).where(Alert.dedupe_key == alert_key)
+                )
+            ).scalars()
+        )
+    ) == 1
 
 
 @pytest.mark.asyncio

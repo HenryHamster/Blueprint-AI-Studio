@@ -34,6 +34,7 @@ from app.migration_apply_gate import (
     ephemeral_postgres_database,
     run_migration_apply_gate,
 )
+from app.required_runtime_env import _verify_required_env
 
 # Same Postgres-vs-SQLite selection conftest uses. The scratch-DB cases need a
 # server we can CREATE DATABASE on (CI's `test` user is a superuser).
@@ -50,6 +51,26 @@ requires_postgres = pytest.mark.skipif(
 
 def _base_url():
     return make_url(os.environ["DATABASE_URL"])
+
+
+def test_scratch_prereq_declared_and_diagnosed(monkeypatch):
+    """Cloud Run declares the dedicated scratch target before gate attempts.
+
+    This is intentionally adjacent to the real migration-apply gate suite:
+    production startup diagnoses the missing dedicated target before a gate
+    attempt can fall back to pool credentials that cannot create databases.
+    """
+    monkeypatch.setenv("K_REVISION", "app-00042-abc")
+    monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", "test-presence-only")
+    monkeypatch.delenv("MIGRATION_APPLY_SCRATCH_DATABASE_URL", raising=False)
+
+    with pytest.raises(RuntimeError) as exc:
+        _verify_required_env()
+
+    message = str(exc.value)
+    assert "MIGRATION_APPLY_SCRATCH_DATABASE_URL" in message
+    assert "migration-apply qualification gate" in message
+    assert "CREATE DATABASE" in message
 
 
 # --- Synthetic candidate migration chains ----------------------------------

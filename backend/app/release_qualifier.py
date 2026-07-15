@@ -261,6 +261,7 @@ from app.release_qualifier_sweep import (
     _redrive_deferred_unsynced_qualification,  # noqa: F401 — re-exported for tests
     _redrive_dry_run_candidate,  # noqa: F401 — re-exported for tests
     _redrive_not_promoted_qualification,  # noqa: F401 — re-exported for tests
+    _reconcile_hotfix_audit_trail,
     sweep_stuck_qualifications,  # noqa: F401 — re-exported for reaper + tests
 )
 from app.migration_apply_gate import run_migration_apply_gate
@@ -7058,6 +7059,8 @@ async def _hotfix_promote_locked(
     actor: str | None,
     reason: str | None,
     scope_modules: list[str] | None,
+    diff_file_list: list[str],
+    prior_deployed_sha: str | None,
 ) -> dict[str, Any]:
     """Lock + HOTFIX-promote an open version on a dedicated session (no audit).
 
@@ -7105,6 +7108,10 @@ async def _hotfix_promote_locked(
         "hotfix_promote_at": now.isoformat(),
         "hotfix_promote_reason": reason,
         "hotfix_promote_scope_modules": _scope_modules,
+        # These are committed with the bypass itself so the sweep can recreate
+        # its promised audit trail if the request session dies after promotion.
+        "hotfix_promote_diff_file_list": list(diff_file_list),
+        "hotfix_promote_prior_deployed_sha": prior_deployed_sha,
         "started_at": now.isoformat(),
         "finalized_at": now.isoformat(),
     }
@@ -7137,6 +7144,8 @@ async def _hotfix_promote_in_dedicated_session(
     *,
     reason: str | None,
     scope_modules: list[str] | None,
+    diff_file_list: list[str],
+    prior_deployed_sha: str | None,
     session_factory=None,
 ) -> dict[str, Any]:
     """Run HOTFIX-promote on a DEDICATED session (mirrors the force-promote path).
@@ -7157,6 +7166,8 @@ async def _hotfix_promote_in_dedicated_session(
                 actor,
                 reason,
                 scope_modules,
+                diff_file_list,
+                prior_deployed_sha,
             )
         except Exception:
             try:
@@ -7189,6 +7200,8 @@ async def _record_hotfix_audit_trail(
     scope_modules: list[str] | None,
     diff_file_list: list[str] | None,
     prior_deployed_sha: str | None,
+    record_debt: bool = True,
+    record_alert: bool = True,
 ) -> None:
     """Durable, append-only audit trail for a hotfix promote that took effect.
 
@@ -7207,12 +7220,15 @@ async def _record_hotfix_audit_trail(
       * a WARNING :class:`Alert` so the operator sees the hotfix-deploy event.
 
     Best-effort: the completion-debt recorder never raises, and a failure to add
-    the Alert must not undo the (already-committed) promotion.  Both are staged
-    on the request ``session``; the caller commits.
+    the Alert must not undo the (already-committed) promotion.  The shared
+    request/sweep reconciliation caller owns the surrounding version lock and
+    commits this session.
     """
     from app.completion_debt import (
         KIND_HOTFIX_DEPLOY_PENDING_BACKFILL,
         arecord_completion_debt,
+        hotfix_deploy_alert_dedupe_key,
+        hotfix_deploy_debt_dedupe_key,
     )
     from app.models import Alert, AlertSeverity
 
@@ -7226,33 +7242,47 @@ async def _record_hotfix_audit_trail(
         "diff_file_list": _diff_files,
         "prior_deployed_sha": prior_deployed_sha,
     }
-    await arecord_completion_debt(
-        session,
-        dedupe_key=f"hotfix_deploy:{project_id}:{candidate_sha}",
-        kind=KIND_HOTFIX_DEPLOY_PENDING_BACKFILL,
-        title=(
-            f"Hotfix-deploy of release machinery at {candidate_sha[:8]} owes "
-            "normal-gate re-qualification"
-        ),
-        project_id=project_id,
-        source="hotfix_promote",
-        detail=detail,
-    )
-    try:
-        session.add(
-            Alert(
-                project_id=project_id,
-                severity=AlertSeverity.WARNING,
-                title=f"Hotfix-deploy: release machinery fast-tracked at {candidate_sha[:8]}",
-                message=(
-                    f"An OWNER hotfix-deploy fast-tracked candidate {candidate_sha[:8]} "
-                    "(release machinery only) ahead of the normal qualification gate. "
-                    f"Actor={actor} reason={reason!r}. This bypass is owed re-qualification "
-                    "by the normal gate (tracked as open completion debt)."
-                ),
-                source="hotfix_promote",
-            )
+    if record_debt:
+        await arecord_completion_debt(
+            session,
+            dedupe_key=hotfix_deploy_debt_dedupe_key(project_id, candidate_sha),
+            kind=KIND_HOTFIX_DEPLOY_PENDING_BACKFILL,
+            title=(
+                f"Hotfix-deploy of release machinery at {candidate_sha[:8]} owes "
+                "normal-gate re-qualification"
+            ),
+            project_id=project_id,
+            source="hotfix_promote",
+            detail=detail,
         )
+    if not record_alert:
+        return
+    try:
+        alert_key = hotfix_deploy_alert_dedupe_key(project_id, candidate_sha)
+        existing_alert = (
+            await session.execute(
+                select(Alert).where(
+                    Alert.project_id == project_id,
+                    Alert.dedupe_key == alert_key,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing_alert is None:
+            session.add(
+                Alert(
+                    project_id=project_id,
+                    severity=AlertSeverity.WARNING,
+                    title=f"Hotfix-deploy: release machinery fast-tracked at {candidate_sha[:8]}",
+                    message=(
+                        f"An OWNER hotfix-deploy fast-tracked candidate {candidate_sha[:8]} "
+                        "(release machinery only) ahead of the normal qualification gate. "
+                        f"Actor={actor} reason={reason!r}. This bypass is owed re-qualification "
+                        "by the normal gate (tracked as open completion debt)."
+                    ),
+                    source="hotfix_promote",
+                    dedupe_key=alert_key,
+                )
+            )
     except Exception:  # noqa: BLE001 — an Alert failure must not undo the promotion
         logger.warning(
             "[RELEASE_QUALIFIER] hotfix-promote: failed to stage operator Alert "
@@ -7385,19 +7415,26 @@ async def hotfix_promote_current_version(
         actor,
         reason=reason,
         scope_modules=scope_modules,
+        diff_file_list=changed_files,
+        prior_deployed_sha=prior_deployed_sha,
         session_factory=session_factory,
     )
     if result.get("status") in _HOTFIX_PROMOTE_ATTEMPTED_STATUSES:
-        await _record_hotfix_audit_trail(
-            session,
-            project_id,
-            candidate_sha=candidate_sha,
-            actor=actor,
-            reason=reason,
-            scope_modules=scope_modules,
-            diff_file_list=changed_files,
-            prior_deployed_sha=prior_deployed_sha,
-        )
+        # Request completion and crash recovery use the same version-locked
+        # repair path.  This serializes their Alert check+insert and commits the
+        # audit independently of the caller's transaction.
+        try:
+            await _reconcile_hotfix_audit_trail(
+                version.id,
+                session_factory=session_factory,
+            )
+        except Exception:  # noqa: BLE001 — promotion already committed; sweep repairs
+            logger.warning(
+                "[RELEASE_QUALIFIER] hotfix-promote: immediate audit repair failed "
+                "for version %s; periodic recovery will retry",
+                version.id,
+                exc_info=True,
+            )
     return result
 
 

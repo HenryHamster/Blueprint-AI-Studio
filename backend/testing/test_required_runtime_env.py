@@ -27,6 +27,7 @@ from app.required_runtime_env import (
 )
 
 CLOUD_RUN_ENV = "K_REVISION"
+MIGRATION_APPLY_SCRATCH_DATABASE_URL = "MIGRATION_APPLY_SCRATCH_DATABASE_URL"
 
 
 def _clear_env(monkeypatch, *names):
@@ -72,6 +73,20 @@ def test_encryption_key_entry_uses_shared_constant():
     assert entry.reason, "entry must carry a human reason"
 
 
+def test_migration_apply_scratch_url_is_declared_for_cloud_run():
+    entries = [
+        r
+        for r in REQUIRED_RUNTIME_ENV
+        if r.name == MIGRATION_APPLY_SCRATCH_DATABASE_URL
+    ]
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry.scope == "cloud_run"
+    assert entry.presence_only is True
+    assert "migration-apply" in entry.reason
+    assert "CREATE DATABASE" in entry.reason
+
+
 # --------------------------------------------------------------------------- #
 # active_scopes()
 # --------------------------------------------------------------------------- #
@@ -108,6 +123,10 @@ def test_cloud_run_missing_key_raises(monkeypatch):
 def test_cloud_run_present_key_passes(monkeypatch):
     monkeypatch.setenv(CLOUD_RUN_ENV, "app-00042-abc")
     monkeypatch.setenv(ENCRYPTION_KEY_ENV, "any-non-empty-value")
+    monkeypatch.setenv(
+        MIGRATION_APPLY_SCRATCH_DATABASE_URL,
+        "postgresql://scratch-user@localhost/scratch-control",
+    )
     # Presence-only: value need not be a valid Fernet key here.
     assert _verify_required_env() is None
 
@@ -123,6 +142,17 @@ def test_presence_only_empty_string_treated_absent(monkeypatch):
     monkeypatch.setenv(ENCRYPTION_KEY_ENV, "")
     with pytest.raises(RuntimeError):
         _verify_required_env()
+
+
+def test_cloud_run_missing_scratch_url_is_diagnosed(monkeypatch):
+    monkeypatch.setenv(CLOUD_RUN_ENV, "app-00042-abc")
+    monkeypatch.setenv(ENCRYPTION_KEY_ENV, "any-non-empty-value")
+    _clear_env(monkeypatch, MIGRATION_APPLY_SCRATCH_DATABASE_URL)
+    with pytest.raises(RuntimeError) as exc:
+        _verify_required_env()
+    message = str(exc.value)
+    assert MIGRATION_APPLY_SCRATCH_DATABASE_URL in message
+    assert "CREATE DATABASE" in message
 
 
 # --------------------------------------------------------------------------- #

@@ -70,6 +70,16 @@ REQUIRED_RUNTIME_ENV: list[EnvRequirement] = [
             "credentials in plaintext."
         ),
     ),
+    EnvRequirement(
+        name="MIGRATION_APPLY_SCRATCH_DATABASE_URL",
+        scope="cloud_run",
+        reason=(
+            "The migration-apply qualification gate needs a dedicated scratch "
+            "Postgres target whose pool user can CREATE DATABASE. Without this "
+            "target, production pool credentials may repeatedly defer "
+            "migration_apply_check_unavailable."
+        ),
+    ),
 ]
 
 

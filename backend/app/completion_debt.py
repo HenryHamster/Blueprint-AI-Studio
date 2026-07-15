@@ -66,6 +66,16 @@ _MAX_TITLE_LEN = 500
 _OPEN_COMPLETION_DEBT_LIMIT = 10
 
 
+def hotfix_deploy_debt_dedupe_key(project_id: Any, candidate_sha: str) -> str:
+    """Stable identity for the normal-gate backfill owed by one hotfix deploy."""
+    return f"hotfix_deploy:{project_id}:{candidate_sha}"
+
+
+def hotfix_deploy_alert_dedupe_key(project_id: Any, candidate_sha: str) -> str:
+    """Stable identity for the operator alert accompanying one hotfix deploy."""
+    return f"hotfix_deploy_alert:{project_id}:{candidate_sha}"
+
+
 def _is_async_session(session: Any) -> bool:
     """True for an ``AsyncSession`` (which exposes ``.sync_session``).
 
