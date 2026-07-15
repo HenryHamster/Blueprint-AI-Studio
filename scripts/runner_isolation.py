@@ -1030,9 +1030,10 @@ def npm_tool_roots(paths: list[str]) -> list[str]:
     the shim/real entry file would omit sibling JS and native optional packages.
     Bind the containing release root read-only when a resolved tool came through
     ``node_modules/.bin``.  Global npm prefixes use ``<prefix>/bin/<tool>``
-    symlinks whose real path is under ``<prefix>/lib/node_modules/<package>``;
-    bind that package root too so nested optional native packages (notably
-    ``@openai/codex-linux-*``) remain visible in the sandbox.
+    symlinks whose real path is under ``<prefix>/lib/node_modules/<package>``.
+    For a scoped global package, bind the whole scope directory rather than
+    only the package root: npm may install platform optional dependencies as
+    siblings (notably ``@openai/codex`` and ``@openai/codex-linux-*``).
     """
     roots: list[str] = []
     for path in paths:
@@ -1049,17 +1050,24 @@ def npm_tool_roots(paths: list[str]) -> list[str]:
         # A resolved global npm shim points at the real package entry file, for
         # example:
         #   /home/runner/node22/lib/node_modules/@openai/codex/bin/codex.js
-        # Binding only that file leaves the package's nested optional native
-        # dependency outside bwrap.  Capture the package root, including scoped
-        # packages, when no broader managed-release root covers it.
+        # Binding only that file leaves sibling optional native dependencies
+        # outside bwrap.  For scoped packages capture the scope root; for
+        # unscoped packages capture the package root.  A broader managed-release
+        # root discovered through node_modules/.bin still wins below.
         normalized = path.replace("\\", "/")
         match = re.match(
-            r"^(.*?/node_modules/(?:@[^/]+/)?[^/]+)(?:/|$)", normalized
+            r"^(.*?/node_modules/)(@[^/]+/)?([^/]+)(?:/|$)", normalized
         )
         if match:
-            package_root = match.group(1)
-            if package_root and package_root not in roots:
-                roots.append(package_root)
+            node_modules_root = match.group(1).rstrip("/")
+            scope = (match.group(2) or "").rstrip("/")
+            bind_root = (
+                f"{node_modules_root}/{scope}"
+                if scope
+                else f"{node_modules_root}/{match.group(3)}"
+            )
+            if bind_root and bind_root not in roots:
+                roots.append(bind_root)
 
     # Prefer a broader release root over a nested package root when both were
     # discovered from the real entry file plus its node_modules/.bin shim.

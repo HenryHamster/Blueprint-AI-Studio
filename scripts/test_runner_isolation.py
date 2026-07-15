@@ -360,7 +360,7 @@ class TestEnvAllowlist(unittest.TestCase):
             ],
         )
 
-    def test_global_npm_package_root_is_discovered_for_optional_native_bind(self):
+    def test_global_npm_scope_root_is_discovered_for_optional_native_bind(self):
         paths = [
             "/home/henry/node22/lib/node_modules/@openai/codex/bin/codex.js",
             "/home/henry/node22/bin/codex",
@@ -368,7 +368,17 @@ class TestEnvAllowlist(unittest.TestCase):
         ]
         self.assertEqual(
             iso.npm_tool_roots(paths),
-            ["/home/henry/node22/lib/node_modules/@openai/codex"],
+            ["/home/henry/node22/lib/node_modules/@openai"],
+        )
+
+    def test_unscoped_global_npm_package_keeps_narrow_package_bind(self):
+        paths = [
+            "/home/henry/node22/lib/node_modules/some-cli/bin/cli.js",
+            "/home/henry/node22/bin/some-cli",
+        ]
+        self.assertEqual(
+            iso.npm_tool_roots(paths),
+            ["/home/henry/node22/lib/node_modules/some-cli"],
         )
 
     def test_agent_env_never_leaks_runner_secrets(self):
