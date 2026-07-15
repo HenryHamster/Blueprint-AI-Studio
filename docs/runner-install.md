@@ -62,9 +62,10 @@ rate-limit classification.
 
 ## 1. Enroll a runner
 
-In the admin UI go to **Settings → Runners → Register runner**. Choose a preset
-(`default`, `strategic`, etc.) and click **Register**. Copy the one-time token
-shown — it is never displayed again.
+In the admin UI, open the **Runtime** tab and the **Devices and runners**
+section, then click **Enroll runner**. Choose a preset (`default` or
+`strategic_local`) and enroll the runner. Copy the one-time token shown — it is
+never displayed again.
 
 ---
 
@@ -306,6 +307,7 @@ heartbeat advertises the repaired CLI. `--check` itself performs no download.
 ## 8. Re-enrollment
 
 If the runner token is revoked or lost and you cannot recover it from
-`~/.blueprint/runner_token`, re-enroll via the admin UI (Settings → Runners →
-Register runner). This mints a new token and a new runner identity. Run the new
-token through the first-launch step above to persist it.
+`~/.blueprint/runner_token`, re-enroll via the admin UI: open the **Runtime**
+tab, go to **Devices and runners**, and click **Enroll runner**. This mints a
+new token and a new runner identity. Run the new token through the first-launch
+step above to persist it.
