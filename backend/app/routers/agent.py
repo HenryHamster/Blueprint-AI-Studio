@@ -1191,6 +1191,8 @@ async def claim_task(
     )
     if _migration_reservation is not None:
         response["migration_reservation"] = {
+            # The revision is a verbatim allocation; the down-revision is an
+            # advisory task-base anchor for checkout-local migration authoring.
             "provisional_revision": _migration_reservation.provisional_revision,
             "provisional_down_revision": (
                 _migration_reservation.provisional_down_revision

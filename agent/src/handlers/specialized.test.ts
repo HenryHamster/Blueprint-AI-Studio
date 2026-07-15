@@ -1458,7 +1458,9 @@ describe('handleMigrate — stale-branch handling and runCodeChangeTask delegati
     const prompt = capturedMigratePrompt();
     expect(prompt).toContain('Reserved migration revision');
     expect(prompt).toContain('revision = "0153"');
-    expect(prompt).toContain('down_revision = "0151"');
+    expect(prompt).toContain('actual pre-new-migration chain head');
+    expect(prompt).toContain('advisory parent is `0151`; use it only if the actual head cannot be determined');
+    expect(prompt).not.toContain('down_revision = "0151"');
     expect(prompt).toContain('0153_<short_description>.py');
     expect(prompt).toContain('EXPECTED_SCHEMA_REVISION = "0153"');
   });

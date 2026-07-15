@@ -754,8 +754,9 @@ async def _list_versions_dir_entries(
     repo: str,
     ref: str,
     project_id: str | None = None,
+    versions_dir: str = "backend/alembic/versions",
 ) -> list[dict] | None:
-    """Fetch the ``alembic/versions`` directory listing at *ref*.
+    """Fetch a migration versions directory listing at *ref*.
 
     Returns the list of file entries (each a GitHub contents dict carrying at
     least ``name`` and its git blob ``sha``) on HTTP 200, or ``None`` when the
@@ -771,7 +772,7 @@ async def _list_versions_dir_entries(
         "Accept": "application/vnd.github.v3+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
-    versions_dir = "backend/alembic/versions"
+    versions_dir = versions_dir.strip("/")
     encoded_path = quote(versions_dir, safe="/")
     encoded_ref = quote(ref, safe="")
     url = (
@@ -809,8 +810,9 @@ async def list_versions_at_ref(
     repo: str,
     ref: str,
     project_id: str | None = None,
+    versions_dir: str = "backend/alembic/versions",
 ) -> list[str]:
-    """List the Alembic migration filenames under ``alembic/versions`` at *ref*.
+    """List Alembic migration filenames under *versions_dir* at *ref*.
 
     Supplies the rollup migration guard with the *target branch's current*
     migration set so the combined chain (target head + the rollup's added
@@ -827,7 +829,7 @@ async def list_versions_at_ref(
     an inability to read the target branch's migrations).
     """
     entries = await _list_versions_dir_entries(
-        token, owner, repo, ref, project_id=project_id
+        token, owner, repo, ref, project_id=project_id, versions_dir=versions_dir
     )
     if entries is None:
         return []
