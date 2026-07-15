@@ -138,6 +138,32 @@ def test_registry_contains_all_known_event_types():
     assert "hotfix_backmerge.size_violation" in registered
 
 
+def test_all_alert_policy_event_types_have_registry_entry_or_explicit_audience():
+    """Every key in alert_policy.ALERT_EVENT_POLICIES must be in the audience
+    registry or carry an explicit non-null ``policy.audience``.
+
+    Drift direction: a new operator-facing alert added to ALERT_EVENT_POLICIES
+    without a registry entry silently fails closed to ``strategist-internal``
+    and never reaches the operator.  This test forces a conscious
+    operator-visibility decision for every alert event type.
+    """
+    from app.alert_policy import ALERT_EVENT_POLICIES
+
+    registered = get_registered_event_types()
+    missing: list[str] = []
+    for event_type, policy in ALERT_EVENT_POLICIES.items():
+        if event_type not in registered and policy.audience is None:
+            missing.append(event_type)
+
+    assert not missing, (
+        "Alert policy event types without a registry entry or explicit audience:\n"
+        + "\n".join(f"  - {et}" for et in sorted(missing))
+        + "\n\nAdd each to _EVENT_AUDIENCE_REGISTRY in backend/app/message_audience.py "
+        "or set an explicit ``audience`` on its AlertEventPolicy in "
+        "backend/app/alert_policy.py."
+    )
+
+
 # ── External-webhook audience gate ──────────────────────────────────────
 
 
@@ -346,11 +372,13 @@ def test_stamp_message_audience_handles_none_context():
 # post_event_message stamps the audience inline; the directly-constructed
 # BLOCKER escalation rows in notification_dispatch.py must route through the
 # same gate (stamp_message_audience) instead of building a raw context dict.
-# This AST scan is the structural ratchet: a NEW system-authored
-# ProjectMessage added to notification_dispatch.py without an audience stamp
-# in its enclosing function fails CI, closing the fail-closed guarantee's hole.
+# This AST scan is the structural ratchet: a NEW operator-reaching (system,
+# agent, or strategic-authored) ProjectMessage added to notification_dispatch.py
+# without an audience stamp in its enclosing function fails CI, closing the
+# fail-closed guarantee's hole.
 
 _AUDIENCE_STAMP_CALLS = frozenset({"stamp_message_audience", "route_event"})
+_OPERATOR_REACHING_FROM_TYPES: frozenset[str] = frozenset({"system", "agent", "strategic"})
 
 
 def _ast_called_name(call: ast.Call) -> str | None:
@@ -364,19 +392,53 @@ def _ast_called_name(call: ast.Call) -> str | None:
 
 
 def _collect_ungated_emitters(source: str, *, filename: str, rel: str) -> list[str]:
-    """Return offender strings for system ProjectMessage sites whose enclosing
-    function does not call an audience-stamping helper."""
+    """Return offender strings for operator-reaching ProjectMessage sites whose
+    enclosing function does not call an audience-stamping helper."""
 
-    def _is_system_message_call(node: ast.Call) -> bool:
+    def _param_defaults(func_node) -> dict[str, ast.expr]:
+        """Map each parameter name that has a default to its default AST node.
+
+        Covers positional-or-keyword defaults (tail-aligned to ``args.args``) and
+        keyword-only defaults (``kwonlyargs``/``kw_defaults``). Parameters without a
+        default are absent from the map.
+        """
+        fargs = func_node.args
+        defaults: dict[str, ast.expr] = {}
+        posargs = fargs.args
+        if fargs.defaults:
+            for name, default in zip(posargs[-len(fargs.defaults):], fargs.defaults):
+                defaults[name.arg] = default
+        for name, default in zip(fargs.kwonlyargs, fargs.kw_defaults):
+            if default is not None:
+                defaults[name.arg] = default
+        return defaults
+
+    def _is_operator_reaching_message_call(node: ast.Call, enclosing) -> bool:
+        """A ProjectMessage(...) construction whose ``from_type`` provably reaches
+        the operator surface (system/agent/strategic).
+
+        ``from_type`` is operator-reaching when it is either a literal constant in
+        the operator-reaching set, OR a bare parameter reference whose *default*
+        value is such a constant. The defaulted-parameter case closes the hole
+        where an emitter (e.g. ``post_question_answer(from_type="strategic")``)
+        passes ``from_type=from_type`` — a non-literal that the constant-only check
+        skipped even though its default reaches the operator. A parameter with no
+        resolvable constant default stays skipped (its runtime value is unknown at
+        scan time)."""
         if _ast_called_name(node) != "ProjectMessage":
             return False
+        param_defaults = _param_defaults(enclosing) if enclosing is not None else {}
         for kw in node.keywords:
-            if (
-                kw.arg == "from_type"
-                and isinstance(kw.value, ast.Constant)
-                and kw.value.value == "system"
-            ):
-                return True
+            if kw.arg != "from_type":
+                continue
+            val = kw.value
+            if isinstance(val, ast.Constant):
+                return val.value in _OPERATOR_REACHING_FROM_TYPES
+            if isinstance(val, ast.Name):
+                default = param_defaults.get(val.id)
+                if isinstance(default, ast.Constant):
+                    return default.value in _OPERATOR_REACHING_FROM_TYPES
+            return False
         return False
 
     def _stamps_audience(func_node) -> bool:
@@ -394,17 +456,19 @@ def _collect_ungated_emitters(source: str, *, filename: str, rel: str) -> list[s
 
     offenders: list[str] = []
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Call) or not _is_system_message_call(node):
+        if not isinstance(node, ast.Call) or _ast_called_name(node) != "ProjectMessage":
             continue
         enclosing = None
         for fn in funcs:
             if fn.lineno <= node.lineno <= (fn.end_lineno or fn.lineno):
                 if enclosing is None or fn.lineno > enclosing.lineno:
                     enclosing = fn
+        if not _is_operator_reaching_message_call(node, enclosing):
+            continue
         func_name = enclosing.name if enclosing is not None else "<module>"
         if enclosing is None or not _stamps_audience(enclosing):
             offenders.append(
-                f"  {rel}:{node.lineno} in {func_name}() — system ProjectMessage "
+                f"  {rel}:{node.lineno} in {func_name}() — operator-reaching ProjectMessage "
                 "site not routed through the audience gate (no "
                 "stamp_message_audience/route_event call)"
             )
@@ -431,7 +495,7 @@ def test_scan_flags_unstamped_system_message():
         source, filename="synthetic.py", rel="synthetic.py"
     )
     assert offenders == [
-        "  synthetic.py:4 in post_thing() — system ProjectMessage site not "
+        "  synthetic.py:4 in post_thing() — operator-reaching ProjectMessage site not "
         "routed through the audience gate (no stamp_message_audience/route_event call)"
     ]
 
@@ -459,13 +523,223 @@ def test_scan_accepts_stamped_system_message():
     assert offenders == []
 
 
+def test_scan_flags_unstamped_agent_message():
+    """An agent-authored ProjectMessage with no audience-stamping call is flagged."""
+    source = dedent(
+        """
+        async def post_agent_thing(session, project_id, content):
+            ctx = {"event_type": "some_event"}
+            msg = ProjectMessage(
+                project_id=project_id,
+                from_type="agent",
+                content=content,
+                context=ctx,
+            )
+            session.add(msg)
+            return msg
+        """
+    )
+    offenders = _collect_ungated_emitters(
+        source, filename="synthetic.py", rel="synthetic.py"
+    )
+    assert offenders == [
+        "  synthetic.py:4 in post_agent_thing() — operator-reaching ProjectMessage site not "
+        "routed through the audience gate (no stamp_message_audience/route_event call)"
+    ]
+
+
+def test_scan_accepts_stamped_agent_message():
+    """An agent-authored ProjectMessage whose function stamps the audience passes."""
+    source = dedent(
+        """
+        async def post_agent_thing(session, project_id, content):
+            ctx = {"event_type": "some_event"}
+            ctx = stamp_message_audience(ctx, "some_event")
+            msg = ProjectMessage(
+                project_id=project_id,
+                from_type="agent",
+                content=content,
+                context=ctx,
+            )
+            session.add(msg)
+            return msg
+        """
+    )
+    offenders = _collect_ungated_emitters(
+        source, filename="synthetic.py", rel="synthetic.py"
+    )
+    assert offenders == []
+
+
+def test_scan_flags_unstamped_strategic_message():
+    """A strategic-authored ProjectMessage with no audience-stamping call is flagged."""
+    source = dedent(
+        """
+        async def post_strategic_thing(session, project_id, content):
+            ctx = {"event_type": "some_event"}
+            msg = ProjectMessage(
+                project_id=project_id,
+                from_type="strategic",
+                content=content,
+                context=ctx,
+            )
+            session.add(msg)
+            return msg
+        """
+    )
+    offenders = _collect_ungated_emitters(
+        source, filename="synthetic.py", rel="synthetic.py"
+    )
+    assert offenders == [
+        "  synthetic.py:4 in post_strategic_thing() — operator-reaching ProjectMessage site not "
+        "routed through the audience gate (no stamp_message_audience/route_event call)"
+    ]
+
+
+def test_scan_accepts_stamped_strategic_message():
+    """A strategic-authored ProjectMessage whose function stamps the audience passes."""
+    source = dedent(
+        """
+        async def post_strategic_thing(session, project_id, content):
+            ctx = {"event_type": "some_event"}
+            ctx = stamp_message_audience(ctx, "some_event")
+            msg = ProjectMessage(
+                project_id=project_id,
+                from_type="strategic",
+                content=content,
+                context=ctx,
+            )
+            session.add(msg)
+            return msg
+        """
+    )
+    offenders = _collect_ungated_emitters(
+        source, filename="synthetic.py", rel="synthetic.py"
+    )
+    assert offenders == []
+
+
+def test_scan_skips_user_message():
+    """A user-authored ProjectMessage is NOT operator-reaching — it is skipped."""
+    source = dedent(
+        """
+        async def post_user_thing(session, project_id, content):
+            ctx = {"event_type": "chat"}
+            msg = ProjectMessage(
+                project_id=project_id,
+                from_type="user",
+                content=content,
+                context=ctx,
+            )
+            session.add(msg)
+            return msg
+        """
+    )
+    offenders = _collect_ungated_emitters(
+        source, filename="synthetic.py", rel="synthetic.py"
+    )
+    assert offenders == []
+
+
+def test_scan_skips_non_constant_from_type():
+    """A ProjectMessage whose from_type is a variable (not a constant) is skipped —
+    it cannot be proven operator-reaching at scan time."""
+    source = dedent(
+        """
+        async def post_variable_thing(session, project_id, content, from_type):
+            msg = ProjectMessage(
+                project_id=project_id,
+                from_type=from_type,
+                content=content,
+                context={},
+            )
+            session.add(msg)
+            return msg
+        """
+    )
+    offenders = _collect_ungated_emitters(
+        source, filename="synthetic.py", rel="synthetic.py"
+    )
+    assert offenders == []
+
+
+def test_scan_flags_defaulted_operator_reaching_from_type():
+    """A ProjectMessage whose from_type is a parameter that DEFAULTS to an
+    operator-reaching constant (e.g. "strategic") is flagged when unstamped — the
+    default reaches the operator even though the argument is not a literal at the
+    construction site."""
+    source = dedent(
+        """
+        async def post_answer(session, project_id, content, from_type="strategic"):
+            msg = ProjectMessage(
+                project_id=project_id,
+                from_type=from_type,
+                content=content,
+                context={"event_type": "question_answer"},
+            )
+            session.add(msg)
+            return msg
+        """
+    )
+    offenders = _collect_ungated_emitters(
+        source, filename="synthetic.py", rel="synthetic.py"
+    )
+    assert offenders == [
+        "  synthetic.py:3 in post_answer() — operator-reaching ProjectMessage site not "
+        "routed through the audience gate (no stamp_message_audience/route_event call)"
+    ]
+
+
+def test_scan_accepts_stamped_defaulted_operator_reaching_from_type():
+    """The same defaulted-from_type emitter passes once its function stamps."""
+    source = dedent(
+        """
+        async def post_answer(session, project_id, content, from_type="strategic"):
+            ctx = stamp_message_audience({"event_type": "question_answer"}, "question_answer")
+            msg = ProjectMessage(
+                project_id=project_id,
+                from_type=from_type,
+                content=content,
+                context=ctx,
+            )
+            session.add(msg)
+            return msg
+        """
+    )
+    offenders = _collect_ungated_emitters(
+        source, filename="synthetic.py", rel="synthetic.py"
+    )
+    assert offenders == []
+
+
+def test_scan_skips_defaulted_user_from_type():
+    """A parameter that defaults to "user" is NOT operator-reaching — skipped."""
+    source = dedent(
+        """
+        async def post_user_default(session, project_id, content, from_type="user"):
+            msg = ProjectMessage(
+                project_id=project_id,
+                from_type=from_type,
+                content=content,
+                context={},
+            )
+            session.add(msg)
+            return msg
+        """
+    )
+    offenders = _collect_ungated_emitters(
+        source, filename="synthetic.py", rel="synthetic.py"
+    )
+    assert offenders == []
+
+
 def test_no_operator_visible_emitter_bypasses_audience_gate():
-    """Whole-file invariant: every system-authored ProjectMessage constructed in
+    """Whole-file invariant: every operator-reaching ProjectMessage constructed in
     notification_dispatch.py routes its audience through the shared gate.
 
     Exercises the production stamping seam: reverting any of the seven
-    escalation-poster stamps (or adding a new raw system ProjectMessage) makes
-    this scan flag the offending site and fail CI.
+    escalation-poster stamps (or adding a new raw operator-reaching
+    ProjectMessage) makes this scan flag the offending site and fail CI.
     """
     app_dir = os.path.normpath(
         os.path.join(os.path.dirname(__file__), "..", "app")
@@ -478,7 +752,7 @@ def test_no_operator_visible_emitter_bypasses_audience_gate():
         source, filename=fpath, rel="notification_dispatch.py"
     )
     assert not offenders, (
-        "Found system-authored ProjectMessage site(s) in notification_dispatch.py "
+        "Found operator-reaching ProjectMessage site(s) in notification_dispatch.py "
         "that do NOT route their audience through the shared gate "
         "(stamp_message_audience/route_event). Every operator-reaching emitter must "
         "be stamped so a fail-closed audience classification is guaranteed:\n"
@@ -532,4 +806,32 @@ async def test_residual_fix_escalation_message_stamps_operator_action_needed(
     )
     assert msg.context["audience"] == OPERATOR_ACTION_NEEDED
     assert msg.context["event_type"] == "residual_fix_escalated"
+    mock_session.add.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_question_answer_stamps_audience_default_from_type(monkeypatch):
+    """post_question_answer stamps the registry audience on its context even with
+    the default operator-reaching from_type="strategic". Binds the reply's
+    visibility to the registry (OPERATOR_FYI today) instead of leaving it an
+    unstamped, always-visible row."""
+    import uuid as _uuid
+
+    import app.notification_dispatch as nd
+
+    mock_session = AsyncMock()
+    mock_session.add = AsyncMock()
+
+    orig_id = _uuid.uuid4()
+    msg = await nd.post_question_answer(
+        mock_session,
+        project_id="00000000-0000-0000-0000-000000000001",
+        original_msg_id=orig_id,
+        answer="here you go",
+    )
+    # Default from_type is the operator-reaching "strategic".
+    assert msg.from_type == "strategic"
+    assert msg.context["event_type"] == "question_answer"
+    assert msg.context["audience"] == OPERATOR_FYI
+    assert msg.context["reply_to"] == str(orig_id)
     mock_session.add.assert_called_once()

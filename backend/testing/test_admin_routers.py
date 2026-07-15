@@ -29744,6 +29744,219 @@ class TestStrategicPendingConfirmDedup:
             )
         assert resp.status_code == 400, resp.text
 
+    @pytest.mark.asyncio
+    async def test_pending_confirm_appends_revision_log_entry(self, db_session):
+        """pending_confirm bumps revision and appends a revision_log entry with
+        pending_confirmation_added containing the confirmation id."""
+        project, task, token = await self._setup(db_session)
+        headers = {"x-agent-token": token}
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/agent/strategic",
+                headers=headers,
+                json={
+                    "task_id": str(task.id),
+                    "op": "pending_confirm",
+                    "data": {
+                        "id": "p-fixed-id-001",
+                        "type": "credentials_needed",
+                        "proposal": "Need API key.",
+                    },
+                },
+            )
+        assert resp.status_code == 200, resp.text
+
+        await db_session.refresh(project)
+        pm = project.problem_model or {}
+        assert pm.get("revision", 0) >= 1, "revision must be bumped after pending_confirm"
+        log = pm.get("revision_log", [])
+        assert log, "revision_log must be non-empty after pending_confirm"
+        last_entry = log[-1]
+        assert last_entry.get("changes", {}).get("pending_confirmation_added") == [
+            "p-fixed-id-001"
+        ], f"unexpected revision_log entry: {last_entry}"
+
+    @pytest.mark.asyncio
+    async def test_resolve_pending_confirm_appends_revision_log_entry(self, db_session):
+        """resolve_pending_confirm bumps revision and appends a revision_log entry with
+        pending_confirmation_resolved containing the cleared id when removed=True."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project, task, token = await self._setup(db_session)
+        project.problem_model = {
+            "revision": 5,
+            "pending_user_confirmation": [
+                {
+                    "id": "p-clear-me",
+                    "type": "credentials_needed",
+                    "proposal": "Need a token.",
+                    "rationale": "",
+                    "created_at": "2026-01-01T00:00:00",
+                },
+            ],
+        }
+        flag_modified(project, "problem_model")
+        db_session.add(project)
+        await db_session.commit()
+
+        headers = {"x-agent-token": token}
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/agent/strategic",
+                headers=headers,
+                json={
+                    "task_id": str(task.id),
+                    "op": "resolve_pending_confirm",
+                    "data": {"id": "p-clear-me"},
+                },
+            )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["removed"] is True
+
+        await db_session.refresh(project)
+        pm = project.problem_model or {}
+        assert pm.get("revision", 0) == 6, f"revision must be bumped to 6, got {pm.get('revision')}"
+        log = pm.get("revision_log", [])
+        assert log, "revision_log must be non-empty after resolve_pending_confirm"
+        last_entry = log[-1]
+        assert last_entry.get("changes", {}).get("pending_confirmation_resolved") == [
+            "p-clear-me"
+        ], f"unexpected revision_log entry: {last_entry}"
+
+    @pytest.mark.asyncio
+    async def test_resolve_pending_confirm_unknown_id_no_revision_log(self, db_session):
+        """When removed=False (unknown id), revision and revision_log are unchanged."""
+        project, task, token = await self._setup(db_session)
+        initial_revision = (project.problem_model or {}).get("revision", 0)
+        initial_log_len = len((project.problem_model or {}).get("revision_log", []))
+
+        headers = {"x-agent-token": token}
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/agent/strategic",
+                headers=headers,
+                json={
+                    "task_id": str(task.id),
+                    "op": "resolve_pending_confirm",
+                    "data": {"id": "p-does-not-exist"},
+                },
+            )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["removed"] is False
+
+        await db_session.refresh(project)
+        pm = project.problem_model or {}
+        assert pm.get("revision", 0) == initial_revision, "revision must not change when removed=False"
+        assert len(pm.get("revision_log", [])) == initial_log_len, "revision_log must not grow when removed=False"
+
+    @pytest.mark.asyncio
+    async def test_pending_confirm_preserves_user_provenance(self, db_session):
+        """A pending_confirm add is a collection-only write to the agent-owned
+        confirmation queue: it must NOT restamp last_updated_by as "agent" and
+        thereby erase the "user" provenance a context-only operator edit set.
+        _preserve_operator_intent reads last_updated_by == "user" to protect the
+        operator's context against a later blank-context agent proposal."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project, task, token = await self._setup(db_session)
+        # Simulate a context-only operator edit: user-owned provenance + context.
+        project.problem_model = {
+            "revision": 3,
+            "last_updated_by": "user",
+            "context": {"notes": "operator-set context that must survive"},
+            "pending_user_confirmation": [],
+        }
+        flag_modified(project, "problem_model")
+        db_session.add(project)
+        await db_session.commit()
+
+        headers = {"x-agent-token": token}
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/agent/strategic",
+                headers=headers,
+                json={
+                    "task_id": str(task.id),
+                    "op": "pending_confirm",
+                    "data": {
+                        "id": "p-keep-prov",
+                        "type": "credentials_needed",
+                        "proposal": "Need a key.",
+                    },
+                },
+            )
+        assert resp.status_code == 200, resp.text
+
+        await db_session.refresh(project)
+        pm = project.problem_model or {}
+        assert pm.get("last_updated_by") == "user", (
+            "pending_confirm must preserve the operator's 'user' provenance, "
+            f"got {pm.get('last_updated_by')!r}"
+        )
+        assert pm.get("context", {}).get("notes") == "operator-set context that must survive"
+        assert pm.get("revision", 0) == 4, "revision must still be bumped"
+
+    @pytest.mark.asyncio
+    async def test_resolve_pending_confirm_preserves_user_provenance(self, db_session):
+        """A resolve_pending_confirm is likewise a collection-only write: clearing
+        an agent-owned confirmation must not erase the operator's "user"
+        provenance."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project, task, token = await self._setup(db_session)
+        project.problem_model = {
+            "revision": 7,
+            "last_updated_by": "user",
+            "context": {"notes": "operator-set context that must survive"},
+            "pending_user_confirmation": [
+                {
+                    "id": "p-resolve-prov",
+                    "type": "credentials_needed",
+                    "proposal": "Need a token.",
+                    "rationale": "",
+                    "created_at": "2026-01-01T00:00:00",
+                },
+            ],
+        }
+        flag_modified(project, "problem_model")
+        db_session.add(project)
+        await db_session.commit()
+
+        headers = {"x-agent-token": token}
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/agent/strategic",
+                headers=headers,
+                json={
+                    "task_id": str(task.id),
+                    "op": "resolve_pending_confirm",
+                    "data": {"id": "p-resolve-prov"},
+                },
+            )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["removed"] is True
+
+        await db_session.refresh(project)
+        pm = project.problem_model or {}
+        assert pm.get("last_updated_by") == "user", (
+            "resolve_pending_confirm must preserve the operator's 'user' provenance, "
+            f"got {pm.get('last_updated_by')!r}"
+        )
+        assert pm.get("context", {}).get("notes") == "operator-set context that must survive"
+        assert pm.get("revision", 0) == 8, "revision must still be bumped"
+
 
 class TestRecordFindingResolutionViaStrategicOp:
     """POST /api/agent/strategic op=record_finding_resolution — finding ledger write."""

@@ -4183,6 +4183,22 @@ async def strategic_operation(
                 ),
             )
         current_model.pending_user_confirmation.append(pending)
+        from app.problem_model import append_revision_log as _append_revision_log
+
+        now_iso = _utcnow().isoformat()
+        current_model.revision = (current_model.revision or 0) + 1
+        current_model.last_updated = now_iso
+        # Collection-only write to the agent-owned confirmation queue: do NOT
+        # restamp last_updated_by as "agent". That field is whole-model write
+        # attribution, and _preserve_operator_intent reads it (== "user") to know
+        # a context-only operator edit is operator-owned. Overwriting it here would
+        # let a later agent proposal with blank context silently wipe the operator's
+        # context. The revision bump + revision-log entry keep this change audited.
+        _append_revision_log(
+            current_model,
+            "added pending_user_confirmation",
+            {"pending_confirmation_added": [pending.id]},
+        )
         project.problem_model = current_model.model_dump()
         flag_modified(project, "problem_model")
         session.add(project)
@@ -4226,6 +4242,21 @@ async def strategic_operation(
         removed = len(before) - len(remaining)
         if removed:
             current_model.pending_user_confirmation = remaining
+            from app.problem_model import append_revision_log as _append_revision_log
+
+            now_iso = _utcnow().isoformat()
+            current_model.revision = (current_model.revision or 0) + 1
+            current_model.last_updated = now_iso
+            # Collection-only write to the agent-owned confirmation queue: preserve
+            # the prior last_updated_by (see the pending_confirm branch above). This
+            # provenance is whole-model write attribution that _preserve_operator_intent
+            # relies on to protect an operator context edit; restamping "agent" here
+            # would erase it.
+            _append_revision_log(
+                current_model,
+                "resolved pending_user_confirmation",
+                {"pending_confirmation_resolved": [target_id]},
+            )
             project.problem_model = current_model.model_dump()
             flag_modified(project, "problem_model")
             session.add(project)

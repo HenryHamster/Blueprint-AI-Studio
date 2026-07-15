@@ -2447,17 +2447,27 @@ async def post_question_answer(
     to (NULL/None when none is active), matching the session-identity scoping on
     the operator-send surface so the reply is addressed to the same conversation.
     """
+    # Route the context through the shared audience gate so the reply carries a
+    # fail-closed audience classification instead of an unstamped context dict.
+    # ``from_type`` defaults to the operator-reaching "strategic", so an unstamped
+    # row here would stay operator-visible even if the registry later reclassifies
+    # ``question_answer`` as strategist-internal. Stamping binds visibility to the
+    # registry resolution (currently OPERATOR_FYI) regardless of from_type.
+    context = stamp_message_audience(
+        {
+            "event_type": "question_answer",
+            "reply_to": str(original_msg_id),
+            "answer": answer,
+        },
+        "question_answer",
+    )
     msg = ProjectMessage(
         project_id=project_id,
         message_type=MessageType.NOTE,
         from_type=from_type,
         from_task_id=task_id,
         content=f"Answer: {answer}",
-        context={
-            "event_type": "question_answer",
-            "reply_to": str(original_msg_id),
-            "answer": answer,
-        },
+        context=context,
         resident_session_id=resident_session_id,
     )
     session.add(msg)
