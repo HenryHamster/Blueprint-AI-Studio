@@ -575,8 +575,21 @@ def _knowledge_index_entry(doc: KnowledgeDocument, summary_chars: int) -> dict:
             verdict.get("unavailable_cause") if is_compute else None
         ),
         "criterion_met": criterion_met,
+        "criterion_unmeasured_reason": (
+            verdict.get("criterion_unmeasured_reason") if is_compute else None
+        ),
         "criterion": verdict.get("criterion") if is_compute else None,
         "per_arm_verdicts": verdict.get("per_arm_verdicts") if is_compute else None,
+        "evidence_tier": verdict.get("evidence_tier") if is_compute else None,
+        "run_provenance": (
+            {
+                "executing_backend": diag.get("executing_backend"),
+                "runner_hostname": diag.get("runner_hostname"),
+                "runner_target_id": diag.get("runner_target_id"),
+            }
+            if is_compute and (diag := verdict.get("terminal_diagnostics")) is not None
+            else None
+        ),
         "origin_provenance": serialize_origin_provenance(doc),
         "lifecycle_status": doc.lifecycle_status,
         "created_at": doc.created_at.isoformat() if doc.created_at else None,

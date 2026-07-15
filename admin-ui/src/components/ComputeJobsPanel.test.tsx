@@ -3169,6 +3169,91 @@ describe('ComputeJobsPanel render + kill', () => {
     expect(table.textContent).toContain('run-b: 0.95 MET ($0.53)');
   });
 
+  test('compares_runs_grouped_by_sweep_id: renders evidence_tier badge and provenance in comparison table', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([]));
+    fetchComputeSweepGroups.mockResolvedValue({
+      sweep_groups: {
+        'sweep-tier': [
+          {
+            id: 'doc-tier-1',
+            title: 'accuracy_v2 run A',
+            summary: 'Covered run',
+            compute_acceptance_grade: 'acceptance',
+            criterion_met: true,
+            criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
+            arm_label: 'run-a',
+            created_at: '2026-06-21T10:00:00Z',
+            evidence_tier: 'covered',
+            run_provenance: { executing_backend: 'local-subprocess', runner_hostname: 'host-xyz', runner_target_id: null },
+          },
+          {
+            id: 'doc-tier-2',
+            title: 'accuracy_v2 run B',
+            summary: 'Attested run',
+            compute_acceptance_grade: 'measured_only',
+            criterion_met: false,
+            criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
+            arm_label: 'run-b',
+            created_at: '2026-06-21T11:00:00Z',
+            evidence_tier: 'attested',
+            run_provenance: null,
+          },
+          {
+            id: 'doc-tier-3',
+            title: 'accuracy_v2 run C',
+            summary: 'No tier',
+            compute_acceptance_grade: null,
+            criterion_met: null,
+            arm_label: 'run-c',
+            created_at: '2026-06-21T12:00:00Z',
+          },
+        ],
+      },
+    });
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByTestId('sweep-knowledge-groups');
+    const compareBtn = await findByTestId('sweep-knowledge-compare-toggle');
+    await act(async () => { compareBtn.click(); });
+    const table = await findByTestId('sweep-knowledge-comparison-table');
+    expect(table.textContent).toContain('Machine verified');
+    expect(table.textContent).toContain('Attested');
+    const provenanceLabels = table.querySelectorAll('[data-testid="sweep-knowledge-provenance-label"]');
+    expect(provenanceLabels.length).toBeGreaterThanOrEqual(1);
+    expect(provenanceLabels[0].textContent).toContain('host-xyz');
+    expect(table.textContent).toContain('Tier / Provenance');
+  });
+
+  test('compares_runs_grouped_by_sweep_id: renders evidence_tier badge in per-arm list view', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([]));
+    fetchComputeSweepGroups.mockResolvedValue({
+      sweep_groups: {
+        'sweep-list': [
+          {
+            id: 'doc-list-1',
+            title: 'list view run A',
+            summary: 'Covered',
+            arm_label: 'run-a',
+            criterion_met: true,
+            evidence_tier: 'covered',
+            created_at: '2026-06-22T10:00:00Z',
+          },
+          {
+            id: 'doc-list-2',
+            title: 'list view run B',
+            summary: 'No tier',
+            arm_label: 'run-b',
+            criterion_met: false,
+            created_at: '2026-06-22T11:00:00Z',
+          },
+        ],
+      },
+    });
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByTestId('sweep-knowledge-groups');
+    const group = await findByTestId('sweep-knowledge-group');
+    expect(group.textContent).toContain('Machine verified');
+  });
+
   test('compares_runs_grouped_by_sweep_id: hides sweep knowledge groups section when no groups returned', async () => {
     fetchComputeJobs.mockResolvedValue(wrapJobs([]));
     fetchComputeSweepGroups.mockResolvedValue({ sweep_groups: {} });

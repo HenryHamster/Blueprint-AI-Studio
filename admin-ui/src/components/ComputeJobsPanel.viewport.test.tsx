@@ -354,12 +354,15 @@ const progressSeriesJobs: ComputeJob[] = [
 
 let jobsToReturn: ComputeJob[] = stressJobs;
 
+let sweepGroupsToReturn: import('../api').ComputeSweepGroupsResponse = { sweep_groups: {} };
+
 vi.mock('../api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../api')>();
   return {
     ...actual,
     fetchComputeJobs: vi.fn(async () => jobsToReturn),
     fetchComputeJobsPaged: vi.fn(async () => ({ jobs: jobsToReturn, hasMore: false })),
+    fetchComputeSweepGroups: vi.fn(async () => sweepGroupsToReturn),
     killComputeJob: vi.fn(async () => stressJobs[0]),
     analyzeComputeJob: vi.fn(),
     resolveArtifactDownloadUrl: vi.fn(async () => 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=='),
@@ -749,6 +752,69 @@ describe('ComputeJobsPanel — viewport regression', () => {
         if (!text.includes('Watchdog will NOT cut')) throw new Error('watchdog warning not rendered');
       },
       { waitMs: 60 },
+    );
+  });
+
+  test('renders sweep comparison table with evidence tier badge and provenance at 1280px', async () => {
+    jobsToReturn = [];
+    sweepGroupsToReturn = {
+      sweep_groups: {
+        'sw-vp-tier': [
+          {
+            id: 'doc-vp-1',
+            title: 'accuracy sweep run A',
+            summary: 'Covered on operator hardware',
+            compute_acceptance_grade: 'acceptance' as const,
+            criterion_met: true,
+            criterion: { metric: 'accuracy', operator: '>=' as const, threshold: 0.9 },
+            arm_label: 'run-a',
+            created_at: new Date(Date.now() - 600_000).toISOString(),
+            evidence_tier: 'covered' as const,
+            run_provenance: { executing_backend: 'local-subprocess', runner_hostname: 'host-vp', runner_target_id: null },
+          },
+          {
+            id: 'doc-vp-2',
+            title: 'accuracy sweep run B',
+            summary: 'Cloud attested',
+            compute_acceptance_grade: 'measured_only' as const,
+            criterion_met: false,
+            criterion: { metric: 'accuracy', operator: '>=' as const, threshold: 0.9 },
+            arm_label: 'run-b',
+            created_at: new Date(Date.now() - 700_000).toISOString(),
+            evidence_tier: 'attested' as const,
+            run_provenance: null,
+          },
+        ],
+      },
+    };
+    await expectFullViewportAt(
+      1280,
+      async () => {
+        host = document.createElement('div');
+        host.style.padding = '12px';
+        document.body.appendChild(host);
+        const r = createRoot(host);
+        root = r;
+        await act(async () => {
+          r.render(<ComputeJobsPanel projectId="proj-1" />);
+        });
+        await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+        const text = host.textContent ?? '';
+        if (!text.includes('Sweep comparisons')) throw new Error('Sweep comparisons section not rendered');
+        const compareBtn = host.querySelector('[data-testid="sweep-knowledge-compare-toggle"]') as HTMLButtonElement | null;
+        if (!compareBtn) throw new Error('sweep-knowledge-compare-toggle not found');
+        await act(async () => { compareBtn.click(); });
+        await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 30)); });
+        const table = host.querySelector('[data-testid="sweep-knowledge-comparison-table"]');
+        if (!table) throw new Error('sweep-knowledge-comparison-table not rendered after Compare click');
+        const tableText = table.textContent ?? '';
+        if (!tableText.includes('Machine verified')) throw new Error('EvidenceTierBadge "Machine verified" not rendered in comparison table');
+        if (!tableText.includes('Attested')) throw new Error('EvidenceTierBadge "Attested" not rendered in comparison table');
+        const provLabels = table.querySelectorAll('[data-testid="sweep-knowledge-provenance-label"]');
+        if (provLabels.length === 0) throw new Error('sweep-knowledge-provenance-label not rendered in comparison table');
+        if (!(provLabels[0].textContent ?? '').includes('host-vp')) throw new Error('runner hostname not shown in provenance label');
+      },
+      { waitMs: 80 },
     );
   });
 

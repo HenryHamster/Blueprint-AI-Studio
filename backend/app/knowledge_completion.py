@@ -1362,6 +1362,21 @@ def _build_compute_experiment_document(
     identity = experiment or benchmark or "compute experiment"
 
     crit_met = criterion.get("met") if isinstance(criterion, dict) else None
+    criterion_unmeasured_reason: str | None = None
+    # When the criterion was declared but the metric was not measurable (absent
+    # or non-numeric), treat as None (unmeasured) rather than False (not met) so
+    # the UI can distinguish a genuine "didn't pass" from "couldn't measure".
+    if isinstance(criterion, dict) and not criterion.get("measurable", True):
+        crit_met = None
+        metric = criterion.get("metric") or ""
+        if not result_metrics:
+            criterion_unmeasured_reason = "no_result_metrics"
+        elif metric and not any(
+            k == metric or k.lower() == metric.lower() for k in result_metrics
+        ):
+            criterion_unmeasured_reason = "metric_key_absent"
+        else:
+            criterion_unmeasured_reason = "metric_not_numeric"
 
     if crit_met is True:
         verdict_phrase = "criterion met"
@@ -1582,6 +1597,8 @@ def _build_compute_experiment_document(
         "criterion": criterion,
         "criterion_met": crit_met,
     }
+    if criterion_unmeasured_reason is not None:
+        verdict_record["criterion_unmeasured_reason"] = criterion_unmeasured_reason
     if evidence_tier is not None:
         verdict_record["evidence_tier"] = evidence_tier
     if terminal_diagnostics:

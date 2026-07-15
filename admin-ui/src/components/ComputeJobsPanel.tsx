@@ -386,6 +386,13 @@ function SweepKnowledgeGroupsSection({
 
   const verdictLabel = (met: boolean | null | undefined) => met === true ? 'MET' : met === false ? 'NOT MET' : 'UNMEASURED';
   const gradeLabel = (grade: string | null | undefined) => grade === 'acceptance' ? 'accepted' : grade === 'measured_only' ? 'measured' : '—';
+  const provenanceLabel = (doc: ComputeSweepGroupsResponse['sweep_groups'][string][number]) => {
+    const backend = doc.run_provenance?.executing_backend;
+    if (!backend) return null;
+    const { label } = computeJobExecutionLocation(backend);
+    const host = doc.run_provenance?.runner_hostname ?? doc.run_provenance?.runner_target_id;
+    return host ? `${label} · ${host}` : label;
+  };
   const armEvidence = (doc: ComputeSweepGroupsResponse['sweep_groups'][string][number]) => {
     const verdicts = doc.per_arm_verdicts ? Object.entries(doc.per_arm_verdicts) : [];
     if (verdicts.length === 0) return doc.criterion?.metric ?? '—';
@@ -444,6 +451,7 @@ function SweepKnowledgeGroupsSection({
                     <tr>
                       <th className="text-left pr-3 pb-1 text-neutral-500 font-normal">Run</th>
                       <th className="text-left pr-3 pb-1 text-neutral-500 font-normal">Verdict</th>
+                      <th className="text-left pr-3 pb-1 text-neutral-500 font-normal">Tier / Provenance</th>
                       <th className="text-left pr-3 pb-1 text-neutral-500 font-normal">Criterion</th>
                       <th className="text-left pr-3 pb-1 text-neutral-500 font-normal">Evidence</th>
                       <th className="text-left pb-1 text-neutral-500 font-normal">Summary</th>
@@ -466,6 +474,16 @@ function SweepKnowledgeGroupsSection({
                           )}
                         </td>
                         <td className="py-0.5 pr-3 text-neutral-400">{verdictLabel(doc.criterion_met)} / {gradeLabel(doc.compute_acceptance_grade)}</td>
+                        <td className="py-0.5 pr-3" data-testid="sweep-knowledge-tier-cell">
+                          <div className="flex flex-col gap-0.5">
+                            <EvidenceTierBadge tier={doc.evidence_tier} />
+                            {provenanceLabel(doc) && (
+                              <span className="text-neutral-500 text-ui-xs truncate max-w-36" data-testid="sweep-knowledge-provenance-label">
+                                {provenanceLabel(doc)}
+                              </span>
+                            )}
+                          </div>
+                        </td>
                         <td className="py-0.5 pr-3 text-neutral-400">{doc.criterion ? `${doc.criterion.metric} ${doc.criterion.operator} ${doc.criterion.threshold}` : '—'}</td>
                         <td className="py-0.5 pr-3 text-neutral-400 max-w-xs truncate">{armEvidence(doc)}</td>
                         <td className="py-0.5 text-neutral-400 max-w-xs truncate">{doc.summary?.slice(0, 80) ?? '—'}</td>
@@ -491,6 +509,7 @@ function SweepKnowledgeGroupsSection({
                         doc.arm_label ?? doc.title
                       )}
                     </span>
+                    <EvidenceTierBadge tier={doc.evidence_tier} />
                     {doc.criterion_met !== undefined && (
                       <span className={`shrink-0 rounded border px-1 py-0.5 text-ui-xs ${doc.criterion_met === true ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300' : doc.criterion_met === false ? 'border-red-500/40 bg-red-500/15 text-red-300' : 'border-amber-500/40 bg-amber-500/15 text-amber-300'}`}>
                         {verdictLabel(doc.criterion_met)}

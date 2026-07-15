@@ -1100,6 +1100,12 @@ export interface ComputeSweepKnowledgeEntry {
   arm_label?: string | null;
   created_at?: string | null;
   source_kind?: string | null;
+  evidence_tier?: 'covered' | 'attested' | 'backfilled' | 'partial' | 'uncovered' | null;
+  run_provenance?: {
+    executing_backend?: string | null;
+    runner_hostname?: string | null;
+    runner_target_id?: string | null;
+  } | null;
 }
 
 export interface ComputeSweepGroupsResponse {
@@ -1363,6 +1369,12 @@ export interface KnowledgeDocument {
   /** Criterion verdict (True/False/None) from the success criterion evaluation for compute_experiment
    *  documents. None = unmeasured/not evaluable. Distinct from compute_acceptance_grade. */
   criterion_met?: boolean | null;
+  /** Machine-readable reason the criterion was unmeasured (criterion_met === null).
+   *  'no_result_metrics': experiment produced no metrics at all;
+   *  'metric_key_absent': metrics were produced but the declared key was absent (possible name mismatch);
+   *  'metric_not_numeric': key exists but value is not numeric.
+   *  Absent/null when criterion_met is true or false. */
+  criterion_unmeasured_reason?: 'no_result_metrics' | 'metric_key_absent' | 'metric_not_numeric' | null;
   /** Proof-strength tier for compute_experiment documents: 'covered' (local hw execution),
    *  'attested' (cloud execution), 'backfilled' (metrics without direct run evidence),
    *  'partial' (attempted but incomplete), 'uncovered' (no execution evidence). Null for

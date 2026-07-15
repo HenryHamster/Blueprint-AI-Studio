@@ -1753,6 +1753,97 @@ async def test_sweep_groups_endpoint_non_member_404(client: AsyncClient, db_sess
     assert resp.status_code == 404
 
 
+@pytest.mark.asyncio
+async def test_sweep_groups_entry_includes_evidence_tier_and_provenance(
+    client: AsyncClient, db_session
+):
+    """Sweep-groups entries expose evidence_tier and run_provenance from forward_quality_verdict."""
+    project = await _make_project(db_session, name="Sweep Groups Tier Provenance")
+    await _add_member(db_session, project.id, "viewer")
+
+    terminal_diagnostics = {
+        "executing_backend": "local-subprocess",
+        "runner_hostname": "host-abc",
+        "runner_target_id": "runner-123",
+    }
+
+    async def _seed_with_tier(arm_label: str, tier: str) -> None:
+        task = Task(
+            project_id=project.id,
+            title=f"sweep task {arm_label}",
+            status=TaskStatus.COMPLETED,
+            payloads=[
+                {
+                    "type": "compute_experiment",
+                    "base_branch": "main",
+                    "sweep_id": "sw-tier-test",
+                    "experiment": arm_label,
+                }
+            ],
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+        doc = KnowledgeDocument(
+            project_id=project.id,
+            source_task_id=task.id,
+            source_kind=SourceKind.COMPUTE_EXPERIMENT.value,
+            title=f"arm {arm_label}",
+            summary="Summary.",
+            body="# Body",
+            topic="exp",
+            sweep_id="sw-tier-test",
+            arm_label=arm_label,
+            forward_quality_verdict={
+                "analysis_mode": "deterministic",
+                "criterion_met": True,
+                "evidence_tier": tier,
+                "terminal_diagnostics": terminal_diagnostics,
+            },
+        )
+        db_session.add(doc)
+        await db_session.commit()
+
+    await _seed_with_tier("baseline", "covered")
+    await _seed_with_tier("treatment", "attested")
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs/sweep-groups")
+    assert resp.status_code == 200
+    groups = resp.json()["sweep_groups"]
+    assert "sw-tier-test" in groups
+    entries = {e["arm_label"]: e for e in groups["sw-tier-test"]}
+
+    baseline = entries["baseline"]
+    assert baseline["evidence_tier"] == "covered"
+    assert baseline["run_provenance"] is not None
+    assert baseline["run_provenance"]["executing_backend"] == "local-subprocess"
+    assert baseline["run_provenance"]["runner_hostname"] == "host-abc"
+    assert baseline["run_provenance"]["runner_target_id"] == "runner-123"
+
+    treatment = entries["treatment"]
+    assert treatment["evidence_tier"] == "attested"
+    assert treatment["run_provenance"]["executing_backend"] == "local-subprocess"
+
+
+@pytest.mark.asyncio
+async def test_sweep_groups_entry_null_tier_for_missing_verdict_fields(
+    client: AsyncClient, db_session
+):
+    """Sweep-groups entries have null evidence_tier and run_provenance when verdict lacks them."""
+    project = await _make_project(db_session, name="Sweep Groups No Tier")
+    await _add_member(db_session, project.id, "viewer")
+    await _seed_sweep_doc(db_session, project, sweep_id="sw-no-tier", arm_label="baseline")
+    await _seed_sweep_doc(db_session, project, sweep_id="sw-no-tier", arm_label="treatment")
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs/sweep-groups")
+    assert resp.status_code == 200
+    groups = resp.json()["sweep_groups"]
+    assert "sw-no-tier" in groups
+    for entry in groups["sw-no-tier"]:
+        assert entry["evidence_tier"] is None
+        assert entry["run_provenance"] is None
+
+
 # ---------------------------------------------------------------------------
 # POST /api/admin/compute-jobs/{job_id}/ask — grounded Q&A endpoint tests
 # ---------------------------------------------------------------------------
