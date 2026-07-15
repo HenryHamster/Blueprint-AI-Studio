@@ -104,7 +104,11 @@ async def _load_local_runner_status(
 def _agent_visible_vision(vision: dict[str, Any] | None) -> dict[str, Any]:
     """Return project vision without backend-only operator session metadata."""
 
-    visible = dict(vision or {})
+    visible = {
+        key: value
+        for key, value in (vision or {}).items()
+        if not key.startswith("_")
+    }
     visible.pop(STRATEGIC_LOCAL_CONTINUATION_KEY, None)
     return visible
 
@@ -217,4 +221,3 @@ async def _resolve_local_continuation_runner_intent(
     if preferred_runner_target_id:
         context["preferred_runner_target_id"] = preferred_runner_target_id
     return context
-

@@ -4140,6 +4140,27 @@ async def test_checkpoint_state_applies_agent_view_trim(
     )
 
 
+def test_agent_visible_vision_excludes_backend_ledgers():
+    """Strategic prompts receive only operator-visible vision fields."""
+    from app.strategic_local_runner import _agent_visible_vision
+
+    vision = {
+        "purpose": "Make research projects easier to run",
+        "revision": 42,
+        "_rejected_agent_edits": [{"content": "obsolete update"}],
+        "_research_spawn_counted_ids": ["research-id"],
+        "_recently_retired_directions": [{"id": "direction-id"}],
+        STRATEGIC_LOCAL_CONTINUATION_KEY: {"secret": "internal-only"},
+    }
+
+    visible = _agent_visible_vision(vision)
+
+    assert visible["purpose"] == vision["purpose"]
+    assert visible["revision"] == vision["revision"]
+    assert not any(key.startswith("_") for key in visible)
+    assert STRATEGIC_LOCAL_CONTINUATION_KEY not in visible
+
+
 # ---------------------------------------------------------------------------
 # cycle_in_flight: named block reason + completion retry
 # ---------------------------------------------------------------------------
