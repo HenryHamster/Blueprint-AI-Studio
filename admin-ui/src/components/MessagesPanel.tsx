@@ -846,9 +846,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     dividerTime,
   });
 
-  // Badge/tab-title count. Passes eventPrefs/tempMutes so muted types are excluded and
-  // surfaced types are included — matching App.tsx's closed-panel count exactly so the
-  // badge does not jump when the operator opens the panel.
+  // Legacy fallback when the canonical strategic attention read model is unavailable.
   const highSignalCount = useMemo(
     () => countHighSignalMessages(messages, eventPrefs, tempMutes),
     [messages, eventPrefs, tempMutes],
@@ -1304,17 +1302,17 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     }
   }, [conversationMode, streamingText]);
 
-  // Update parent with the high-signal count for the tab-title badge. When the
-  // strategic read model carries the canonical attention model, report its
-  // needs_operator count so the tab badge, StrategicContextRail, and in-panel
-  // needs-action set all agree on a single authority.
+  // Update the tab-title badge from the canonical attention read model whenever
+  // available, including the full message-list view. This keeps it aligned with
+  // the closed-panel count; legacy callers without that model retain the
+  // high-signal fallback.
   useEffect(() => {
     if (usesStrategicReadModel) {
       onMessageCountChange?.(attentionNeeds);
       return;
     }
     onMessageCountChange?.(highSignalCount);
-  }, [conversationMode, highSignalCount, onMessageCountChange, usesStrategicReadModel, attentionNeeds]);
+  }, [highSignalCount, onMessageCountChange, usesStrategicReadModel, attentionNeeds]);
 
   // Track scroll position for "scroll to bottom" button
   useEffect(() => {

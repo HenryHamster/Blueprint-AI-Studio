@@ -784,6 +784,62 @@ describe('MessagesPanel chrome modes', () => {
     expect(_strategicSessionGetCalls()).toHaveLength(0);
   });
 
+  test('reports_server_needs_operator_count_for_badge_in_list_mode', async () => {
+    const onMessageCountChange = vi.fn();
+    await renderPanel({
+      strategicState: makeStrategicState(),
+      onMessageCountChange,
+    }, [
+      makeMsg({ id: 'blocker', message_type: 'BLOCKER' }),
+      makeMsg({ id: 'feedback', message_type: 'FEEDBACK' }),
+    ]);
+
+    await waitFor(() => expect(onMessageCountChange).toHaveBeenLastCalledWith(1));
+  });
+
+  test('keeps reporting server needs_operator count across a poll cycle in list mode', async () => {
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+    // The initial load and the subsequent poll return the SAME messages, so
+    // messageListsEqual short-circuits setMessages and the memoized
+    // highSignalCount (2) never changes — this is the exact path where the
+    // reporting effect does not re-run. If the list-mode fetchMessages count
+    // update were unguarded it would overwrite the badge with highSignalCount (2)
+    // on the poll; the strategic read model must stay the single count authority.
+    _mockMessagesFetchSequence([
+      [makeMsg({ id: 'blocker', message_type: 'BLOCKER' }), makeMsg({ id: 'feedback', message_type: 'FEEDBACK' })],
+      [makeMsg({ id: 'blocker', message_type: 'BLOCKER' }), makeMsg({ id: 'feedback', message_type: 'FEEDBACK' })],
+    ]);
+    const onMessageCountChange = vi.fn();
+
+    await mountPanel({
+      strategicState: makeStrategicState(),
+      onMessageCountChange,
+      realtimeRefreshSignal: 0,
+    });
+    await waitFor(() => expect(onMessageCountChange).toHaveBeenLastCalledWith(1));
+    const callsBefore = _messagesGetCalls().length;
+
+    // Bump the realtime refresh signal to force a poll with unchanged messages.
+    await act(async () => {
+      root?.render(
+        <MessagesPanel
+          selectedProjectId="proj-1"
+          addToast={() => {}}
+          onMessageCountChange={onMessageCountChange}
+          strategicState={makeStrategicState()}
+          realtimeRefreshSignal={1}
+        />,
+      );
+    });
+    await waitFor(() => expect(_messagesGetCalls().length).toBeGreaterThan(callsBefore));
+
+    // The high-signal fallback (2) must never win: the badge stays at the
+    // canonical needs_operator count (1) even after a poll that leaves the
+    // message list unchanged.
+    expect(onMessageCountChange).not.toHaveBeenCalledWith(2);
+    expect(onMessageCountChange).toHaveBeenLastCalledWith(1);
+  });
+
   test('realtime refresh signal immediately reloads generic messages', async () => {
     _suppressSinceLastVisit('test-user@example.com', 'proj-1');
     _mockMessagesFetchSequence([
