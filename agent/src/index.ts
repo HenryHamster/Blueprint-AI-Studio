@@ -572,7 +572,11 @@ function parseSecretFileMode(raw: unknown): number {
 // manifest in-process instead, so keep the invariant here as well: an omitted
 // config becomes a minimal non-secret onboarding/trust config, while a valid
 // operator-supplied object retains all of its other settings.
-function normalizeClaudeConfigContent(filePath: string, content: string): string {
+export function normalizeClaudeConfigContent(
+  filePath: string,
+  content: string,
+  workspace = WORKSPACE,
+): string {
   if (path.basename(filePath) !== '.claude.json') return content;
   try {
     const config: unknown = JSON.parse(content || '{}');
@@ -584,11 +588,11 @@ function normalizeClaudeConfigContent(filePath: string, content: string): string
       ? projects as Record<string, unknown>
       : {};
     parsed.projects = normalizedProjects;
-    const workspace = normalizedProjects['/tmp/workspace'];
-    const normalizedWorkspace = workspace && typeof workspace === 'object' && !Array.isArray(workspace)
-      ? workspace as Record<string, unknown>
+    const workspaceConfig = normalizedProjects[workspace];
+    const normalizedWorkspace = workspaceConfig && typeof workspaceConfig === 'object' && !Array.isArray(workspaceConfig)
+      ? workspaceConfig as Record<string, unknown>
       : {};
-    normalizedProjects['/tmp/workspace'] = normalizedWorkspace;
+    normalizedProjects[workspace] = normalizedWorkspace;
     normalizedWorkspace.hasTrustDialogAccepted = true;
     return JSON.stringify(parsed);
   } catch {

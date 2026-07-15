@@ -860,6 +860,8 @@ class TestAgentPlan(unittest.TestCase):
         # bind mountpoint itself) so the agent's rm -rf avoids EBUSY.
         self.assertEqual(plan.env["AGENT_WORKSPACE"], "/workspace/agent")
         self.assertIn("/tmp/ws/t1", plan.argv)
+        self.assertIn("--chdir", plan.argv)
+        self.assertEqual(plan.argv[plan.argv.index("--chdir") + 1], "/workspace")
 
     def test_agent_plan_docker_backend(self):
         plan = iso.plan_agent_execution(

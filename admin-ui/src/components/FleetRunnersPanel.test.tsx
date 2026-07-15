@@ -859,7 +859,7 @@ describe('FleetRunnersPanel — behavioral', () => {
     expect(el.querySelector('[data-testid="fleet-next-action"]')?.textContent).toContain('Fleet has dispatch capacity');
   });
 
-  test('surfaces blocked agent availability as the fleet next action', async () => {
+  test('keeps a compute-only runner ready when its agent runtime is unavailable', async () => {
     vi.mocked(listFleetRunners).mockResolvedValueOnce([
       {
         ...SAMPLE_RUNNERS[0],
@@ -882,9 +882,11 @@ describe('FleetRunnersPanel — behavioral', () => {
     ]);
     const el = await mount();
 
-    expect(el.querySelector('[data-testid="fleet-next-action"]')?.textContent).toContain('Inspect agent availability');
-    expect(el.textContent).toContain('agent unavailable');
-    expect(el.textContent).toContain('Next: Restart or inspect the local agent');
+    expect(el.querySelector('[data-testid="fleet-runner-agent-readiness"]')?.textContent).toBe('0 agent');
+    expect(el.querySelector('[data-testid="fleet-runner-compute-readiness"]')?.textContent).toBe('1 compute');
+    expect(el.querySelector('[data-testid="fleet-next-action"]')?.textContent).toContain('Fleet has dispatch capacity');
+    expect(el.textContent).toContain('ready');
+    expect(el.textContent).not.toContain('Next: Restart or inspect the local agent');
     expect(el.textContent).toContain('2 slots free');
   });
 
@@ -1082,7 +1084,7 @@ describe('FleetRunnersPanel — behavioral', () => {
 
     expect(rows).toHaveLength(3);
     expect(el.textContent).toContain('connected');
-    expect(el.textContent).toContain('1/3');
+    expect(el.querySelector('[data-testid="fleet-runner-compute-readiness"]')?.textContent).toBe('1 compute');
     expect(rows[0].textContent).toContain('connected');
     expect(rows[1].textContent).toContain('stale');
     expect(rows[2].textContent).toContain('offline');
@@ -1115,7 +1117,7 @@ describe('FleetRunnersPanel — behavioral', () => {
     const el = await mount();
 
     expect(el.textContent).toContain('stale');
-    expect(el.textContent).toContain('0/1');
+    expect(el.querySelector('[data-testid="fleet-runner-compute-readiness"]')?.textContent).toBe('0 compute');
     expect(el.querySelector('[data-testid="fleet-runner-work-capacity"]')?.textContent).toBe('0/-');
   });
 
@@ -1304,7 +1306,7 @@ describe('FleetRunnersPanel — behavioral', () => {
 
     expect(el.querySelector('[data-testid="fleet-runner-work-capacity"]')?.textContent).toBe('2/2');
     expect(el.querySelector('[data-testid="fleet-runner-compute-capacity"]')?.textContent).toBe('1/4');
-    expect(el.querySelector('[data-testid="fleet-next-action"]')?.textContent).toContain('Fleet has dispatch capacity');
+    expect(el.querySelector('[data-testid="fleet-next-action"]')?.textContent).toContain('Compute capacity is available');
     expect(el.querySelector('[data-testid="fleet-next-action"]')?.textContent).not.toContain('Capacity is full');
   });
 
@@ -1421,7 +1423,8 @@ describe('FleetRunnersPanel — behavioral', () => {
     expect(el.textContent).toContain('connected but failing');
     expect(el.textContent).toContain('failing');
     // Not counted as ready (degraded is live but failing).
-    expect(el.textContent).toContain('0/1 ready');
+    expect(el.querySelector('[data-testid="fleet-runner-agent-readiness"]')?.textContent).toBe('0 agent');
+    expect(el.querySelector('[data-testid="fleet-runner-compute-readiness"]')?.textContent).toBe('0 compute');
     // Failing count surfaced in the readiness summary tile.
     expect(el.querySelector('[data-testid="fleet-runner-connected-summary"]')?.textContent).toContain('1 failing');
     // Telemetry line renders GPU util, disk free, and the failure streak.
@@ -1468,7 +1471,8 @@ describe('FleetRunnersPanel — behavioral', () => {
     const el = await mount();
 
     expect(el.textContent).not.toContain('connected but failing');
-    expect(el.textContent).toContain('1/1 ready');
+    expect(el.querySelector('[data-testid="fleet-runner-agent-readiness"]')?.textContent).toBe('1 agent');
+    expect(el.querySelector('[data-testid="fleet-runner-compute-readiness"]')?.textContent).toBe('1 compute');
     const telemetry = el.querySelector('[data-testid="fleet-runner-telemetry"]')?.textContent ?? '';
     expect(telemetry).toContain('last success');
     expect(telemetry).toContain('GPU 12%');

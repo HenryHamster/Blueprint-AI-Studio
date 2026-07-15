@@ -175,6 +175,11 @@ function isComputeCapable(runner: FleetRunner): boolean {
   return taskTypes === 'all' || (Array.isArray(taskTypes) && taskTypes.includes('compute_experiment'));
 }
 
+function isAgentCapable(runner: FleetRunner): boolean {
+  const taskTypes = runner.capabilities.task_types;
+  return taskTypes === 'all' || (Array.isArray(taskTypes) && taskTypes.some(type => type !== 'compute_experiment'));
+}
+
 function capsSummary(caps: FleetRunner['capabilities']): string {
   const parts: string[] = [];
   if (caps.task_types) {
@@ -387,7 +392,12 @@ interface RunnerReadiness {
   ready: boolean;
 }
 
-function runnerReadiness(runner: FleetRunner, runnerLive: boolean, slots: number | null): RunnerReadiness {
+function runnerReadiness(
+  runner: FleetRunner,
+  runnerLive: boolean,
+  slots: number | null,
+  workload: 'agent' | 'compute' = 'agent',
+): RunnerReadiness {
   const detail = runnerReadinessDetail(runner, runnerLive, slots);
   if (runner.status !== 'active') {
     return { label: 'inactive', detail, nextAction: 'Re-enroll or revoke this runner', tone: 'neutral', ready: false };
@@ -405,7 +415,7 @@ function runnerReadiness(runner: FleetRunner, runnerLive: boolean, slots: number
       ready: false,
     };
   }
-  if (runner.health?.agent_available === false) {
+  if (workload === 'agent' && runner.health?.agent_available === false) {
     const agentReason = runner.health?.agent_unavailable_reason;
     const nextAction = agentReason ?? 'Restart or inspect the local agent';
     return { label: 'agent unavailable', detail, nextAction, tone: 'bad', ready: false };
@@ -1048,14 +1058,19 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
     };
   }, [runners]);
 
-  const { readyRunners, eligibleStrategicRunners } = useMemo(() => {
-    const readiness = liveRunners.map(runner => runnerReadiness(runner, true, availableSlots(runner)));
+  const { readyAgentRunners, readyComputeRunners, eligibleStrategicRunners } = useMemo(() => {
+    const agentReadiness = liveRunners
+      .filter(isAgentCapable)
+      .map(runner => runnerReadiness(runner, true, availableSlots(runner), 'agent'));
+    const computeReadiness = liveComputeRunners
+      .map(runner => runnerReadiness(runner, true, availableComputeSlots(runner), 'compute'));
     const strategicReadiness = liveStrategicRunners.map(runner => runnerReadiness(runner, true, availableSlots(runner)));
     return {
-      readyRunners: readiness.filter(r => r.ready).length,
+      readyAgentRunners: agentReadiness.filter(r => r.ready).length,
+      readyComputeRunners: computeReadiness.filter(r => r.ready).length,
       eligibleStrategicRunners: strategicReadiness.filter(r => r.ready).length,
     };
-  }, [liveRunners, liveStrategicRunners]);
+  }, [liveRunners, liveComputeRunners, liveStrategicRunners]);
 
   const { failingRunners, agentUnavailable, strategicAgentUnavailable, agentCapacity, computeCapacity, gpuCapacityLabel } = useMemo(() => {
     const gpuSlotValues = liveGpuRunners.map(availableComputeSlots);
@@ -1081,9 +1096,10 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
     if (loading) return null;
     if (runners.length === 0) return 'Enroll a runner, then start it to send the first heartbeat.';
     if (localOnlyBlocked) return 'Start or enroll a connected compute-capable local runner.';
-    if (agentUnavailable > 0) return 'Inspect agent availability on the affected runner host.';
     if (failingRunners > 0) return 'A connected runner is failing its jobs; inspect the host logs before relying on it.';
     if (liveRunners.length === 0) return 'Check runner hosts; no active runner is connected.';
+    if (agentCapacity.free === 0 && computeCapacity.free > 0) return 'Compute capacity is available; inspect agent availability or free an agent slot for agent work.';
+    if (agentUnavailable > 0 && computeCapacity.free === 0) return 'Inspect agent availability on the affected runner host.';
     if (!hasUnknownCapacity && knownFreeCapacity === 0) return 'Capacity is full; wait for work to finish or enroll another runner.';
     if (hasUnknownCapacity && knownFreeCapacity === 0) return 'Confirm runner slot telemetry; connected capacity is not reporting slots.';
     return 'Fleet has dispatch capacity.';
@@ -1133,8 +1149,9 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
         <div className="grid grid-cols-2 gap-2 text-xs lg:grid-cols-4">
           <div className="rounded-md border border-neutral-800 bg-[#0d1218] px-2.5 py-2">
             <div className="text-ui-md uppercase tracking-wide text-neutral-500">readiness</div>
-            <div className={`mt-0.5 font-mono ${readyRunners > 0 ? 'text-emerald-300' : 'text-amber-300'}`}>
-              {readyRunners}/{runners.length} ready
+            <div className={`mt-0.5 font-mono ${readyAgentRunners + readyComputeRunners > 0 ? 'text-emerald-300' : 'text-amber-300'}`}>
+              <span data-testid="fleet-runner-agent-readiness">{readyAgentRunners} agent</span>{' · '}
+              <span data-testid="fleet-runner-compute-readiness">{readyComputeRunners} compute</span>{' ready'}
             </div>
             <div className={`mt-0.5 truncate text-ui-sm ${failingRunners > 0 ? 'text-amber-300' : 'text-neutral-600'}`} data-testid="fleet-runner-connected-summary">
               {failingRunners > 0
@@ -1216,8 +1233,14 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
             const hasPerClassCapacity = runner.health?.max_concurrent_compute != null
               && runner.health.max_concurrent_compute !== runner.health.max_concurrent;
             const strategicRunner = isStrategicRunner(runner);
-            const readiness = runnerReadiness(runner, runnerLive, slots);
-            const workday = workdayReadinessLine(readiness, strategicRunner);
+            const agentReadiness = isAgentCapable(runner)
+              ? runnerReadiness(runner, runnerLive, slots, 'agent')
+              : null;
+            const computeReadiness = isComputeCapable(runner)
+              ? runnerReadiness(runner, runnerLive, computeSlots, 'compute')
+              : null;
+            const readiness = agentReadiness ?? computeReadiness ?? runnerReadiness(runner, runnerLive, slots, 'agent');
+            const workday = workdayReadinessLine(agentReadiness ?? readiness, strategicRunner);
             const telemetry = telemetrySummary(runner);
             const configState = configStatus(runner);
             const backends = formatBackendInventory(runner.capabilities);
@@ -1360,6 +1383,11 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                     <span className={`rounded border px-1.5 py-0.5 text-xs font-medium ${readinessClasses(readiness.tone)}`}>
                       {readiness.label}
                     </span>
+                    {agentReadiness && computeReadiness && (
+                      <span className="text-ui-md text-neutral-500" data-testid="fleet-runner-workload-readiness">
+                        agent {agentReadiness.label} · compute {computeReadiness.label}
+                      </span>
+                    )}
                     {configState && (
                       <span
                         className={`inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-xs font-medium ${configState.cls}`}
