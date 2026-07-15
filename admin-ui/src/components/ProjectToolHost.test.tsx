@@ -469,7 +469,7 @@ describe('ProjectToolHost — owner walkthrough (end-to-end chained flow)', () =
     );
   });
 
-  test('Enable button is disabled while toggle PATCH is in-flight', async () => {
+  test('Enable button shows in-flight state while toggle PATCH is pending', async () => {
     let resolveToggle!: (v: ProjectTool) => void;
     vi.mocked(updateProjectTool).mockImplementation(
       () => new Promise(resolve => { resolveToggle = resolve; }),
@@ -480,9 +480,10 @@ describe('ProjectToolHost — owner walkthrough (end-to-end chained flow)', () =
     const enableBtn = requireButton('Enable');
     expect(enableBtn.disabled).toBe(false);
 
-    // Click — button goes disabled while PATCH is pending
+    // Click — button goes disabled and shows "Enabling…" while PATCH is pending
     await act(async () => { enableBtn.click(); });
     expect(enableBtn.disabled).toBe(true);
+    expect(enableBtn.textContent).toBe('Enabling…');
 
     // Resolve the in-flight PATCH
     await act(async () => { resolveToggle({ ...WALKTHROUGH_DISABLED, enabled: true }); });

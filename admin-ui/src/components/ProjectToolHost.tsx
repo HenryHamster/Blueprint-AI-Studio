@@ -787,7 +787,7 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
                           tools. Disabled tools move to the "Disabled" section
                           below, which carries its own Enable control — so a
                           disabled tool is never stranded. */}
-                      Disable
+                      {togglingId === tool.id ? 'Disabling…' : 'Disable'}
                     </button>
                     <button
                       type="button"
@@ -880,7 +880,7 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
                       disabled={togglingId === tool.id}
                       className="text-xs text-neutral-400 hover:text-neutral-200 disabled:opacity-50"
                     >
-                      Enable
+                      {togglingId === tool.id ? 'Enabling…' : 'Enable'}
                     </button>
                     <button
                       type="button"
