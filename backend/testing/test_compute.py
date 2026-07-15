@@ -1365,6 +1365,50 @@ def test_gcp_startup_script_resume_hydration_is_fail_closed():
     _assert_bash_syntax_ok(script)
 
 
+def test_gcp_startup_script_emits_resume_serial_marker():
+    """The GCP startup script emits _SERIAL_RESUME_PREFIX on both the success and
+    failure branches of the resume block so the operator can always distinguish a
+    continued-from-checkpoint run from a from-scratch restart."""
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        runtime_deadline_seconds=3600,
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec,
+        artifact_upload_url="https://storage.example.com/upload",
+        input_artifact_download_url="https://storage.example.com/resume-bundle",
+    )
+
+    # The success branch emits the prefix with a base64-encoded payload.
+    prefix = compute_backends_module._SERIAL_RESUME_PREFIX
+    assert prefix in script, (
+        f"_SERIAL_RESUME_PREFIX ({prefix!r}) must appear in the startup script"
+    )
+
+    # The failure branch carries the pre-computed failed provenance marker.
+    assert compute_backends_module._SERIAL_RESUME_FAILED_B64 in script, (
+        "pre-computed failed resume marker must be in the failure branch"
+    )
+
+    # The prefix appears before the fail-closed path (before 'resume_hydration_failed')
+    # as well as on the success path.
+    resume_reason_idx = script.find("resume_hydration_failed")
+    fail_marker_idx = script.find(
+        compute_backends_module._SERIAL_RESUME_FAILED_B64
+    )
+    # The failure-branch serial marker must appear near the resume_hydration_failed
+    # reason, not orphaned elsewhere in the script.
+    assert 0 <= fail_marker_idx < resume_reason_idx + 200, (
+        "failure branch serial marker must be near the resume_hydration_failed reason"
+    )
+
+    _assert_bash_syntax_ok(script)
+
+
 def test_gcp_startup_script_no_resume_block_without_download_url():
     """Without a resume source, no resume-hydration block (or its fail-closed
     abort) is emitted — the fail-closed path is scoped to actual resume jobs."""
@@ -2254,6 +2298,92 @@ async def test_input_artifact_rehydration_fails_loudly_when_bundle_missing(monke
     )
     with pytest.raises(RuntimeError, match="input_artifact_rehydration_failed"):
         await backend.launch(spec)
+
+
+@pytest.mark.asyncio
+async def test_local_backend_resume_records_provenance(monkeypatch):
+    """Cross-job checkpoint resume stamps resume_provenance into launch metadata so
+    the operator and agent surfaces can distinguish a continued-from-checkpoint run
+    from a from-scratch restart."""
+    backend = LocalSubprocessComputeBackend()
+
+    # First job: write a checkpoint file.
+    first_id = uuid.uuid4()
+    first_spec = ComputeLaunchSpec(
+        job_id=first_id,
+        command='echo "step-42" > "$BLUEPRINT_ARTIFACT_DIR/model.ckpt"',
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+    )
+    first_result = await backend.launch(first_spec)
+    first_artifact_dir = first_result.metadata["artifact_dir"]
+    first_job = ComputeJob(
+        id=first_id,
+        project_id=uuid.uuid4(),
+        backend=backend.name,
+        external_compute_id=first_result.external_id,
+        status=ComputeJobStatus.RUNNING,
+        polling_metadata={"pid": first_result.metadata["pid"]},
+    )
+    await _await_local_terminal(first_job)
+
+    # Build the predecessor's durable bundle from its artifact dir.
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        tar.add(first_artifact_dir, arcname=".")
+    bundle_bytes = buf.getvalue()
+
+    def fake_stream_to_path(job_id, dest_path):
+        if str(job_id) != str(first_id):
+            return False
+        with open(dest_path, "wb") as handle:
+            handle.write(bundle_bytes)
+        return True
+
+    monkeypatch.setattr(
+        compute_backends_module,
+        "_download_artifact_bundle_to_path",
+        fake_stream_to_path,
+    )
+
+    # Second job: launched WITH the predecessor reference.
+    second_id = uuid.uuid4()
+    second_spec = ComputeLaunchSpec(
+        job_id=second_id,
+        command="true",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        input_artifact_job_id=first_id,
+    )
+    second_result = await backend.launch(second_spec)
+
+    # Resume provenance MUST be present in the launch metadata.
+    provenance = second_result.metadata.get("resume_provenance")
+    assert provenance is not None, "resume_provenance not stamped in launch metadata"
+    assert provenance.get("ok") is True, "ok must be True for successful rehydration"
+    assert isinstance(provenance.get("file_count"), int), "file_count must be an int"
+    assert provenance.get("file_count") >= 1, "at least one file must be rehydrated"
+    assert provenance.get("resumed_from_job_id") == str(first_id), \
+        "resumed_from_job_id must match the predecessor job id"
+    assert isinstance(provenance.get("recorded_at"), str), \
+        "recorded_at must be an ISO timestamp"
+
+    # Verify the second command can see the rehydrated file.
+    second_job = ComputeJob(
+        id=second_id,
+        project_id=uuid.uuid4(),
+        backend=backend.name,
+        external_compute_id=second_result.external_id,
+        status=ComputeJobStatus.RUNNING,
+        polling_metadata={"pid": second_result.metadata["pid"]},
+    )
+    await _await_local_terminal(second_job)
+    terminal = compute_backends_module._read_local_terminal_status(second_job)
+    assert terminal is not None
+    assert terminal.status == ComputeJobStatus.SUCCEEDED
+    assert terminal.exit_code == 0
 
 
 def test_safe_extract_artifact_bundle_rejects_path_traversal(tmp_path):
@@ -12861,6 +12991,74 @@ def test_parse_serial_status_garbled_echo_is_tolerated():
     status = compute_backends_module._parse_serial_status(serial)
     assert status is not None
     assert status.echoed_release_sha is None
+
+
+def test_parse_serial_status_decodes_resume_marker():
+    """_parse_serial_status decodes BLUEPRINT_COMPUTE_RESUME into
+    resume_provenance dict."""
+    payload_b64 = base64.b64encode(
+        json.dumps({"ok": True, "file_count": 3}).encode()
+    ).decode("ascii")
+    serial = "\n".join(
+        [
+            "BLUEPRINT_COMPUTE_STATUS=RUNNING",
+            f"BLUEPRINT_COMPUTE_RESUME={payload_b64}",
+        ]
+    )
+    status = compute_backends_module._parse_serial_status(serial)
+    assert status is not None
+    assert status.status == ComputeJobStatus.RUNNING
+    assert status.resume_provenance is not None
+    assert status.resume_provenance.get("ok") is True
+    assert status.resume_provenance.get("file_count") == 3
+
+
+def test_parse_serial_status_missing_resume_yields_none():
+    """_parse_serial_status returns resume_provenance=None when marker is absent."""
+    serial = "\n".join(
+        [
+            "BLUEPRINT_COMPUTE_STATUS=RUNNING",
+        ]
+    )
+    status = compute_backends_module._parse_serial_status(serial)
+    assert status is not None
+    assert status.status == ComputeJobStatus.RUNNING
+    assert status.resume_provenance is None
+
+
+def test_parse_serial_status_garbled_resume_is_tolerated():
+    """Garbled resume provenance marker is tolerated — resume_provenance stays None."""
+    serial = "\n".join(
+        [
+            "BLUEPRINT_COMPUTE_STATUS=RUNNING",
+            "BLUEPRINT_COMPUTE_RESUME=not-valid-base64-$$$",
+        ]
+    )
+    status = compute_backends_module._parse_serial_status(serial)
+    assert status is not None
+    assert status.status == ComputeJobStatus.RUNNING
+    assert status.resume_provenance is None
+
+
+def test_parse_serial_status_resume_passes_through_terminal():
+    """Resume provenance serial marker is preserved through terminal status
+    (SUCCEEDED/FAILED), not only on RUNNING status."""
+    payload_b64 = base64.b64encode(
+        json.dumps({"ok": False, "file_count": 0, "reason": "resume_hydration_failed"}).encode()
+    ).decode("ascii")
+    serial = "\n".join(
+        [
+            "BLUEPRINT_COMPUTE_STATUS=FAILED",
+            "BLUEPRINT_COMPUTE_EXIT_CODE=1",
+            f"BLUEPRINT_COMPUTE_RESUME={payload_b64}",
+        ]
+    )
+    status = compute_backends_module._parse_serial_status(serial)
+    assert status is not None
+    assert status.status == ComputeJobStatus.FAILED
+    assert status.resume_provenance is not None
+    assert status.resume_provenance.get("ok") is False
+    assert status.resume_provenance.get("reason") == "resume_hydration_failed"
 
 
 def test_local_wrapper_command_writes_release_echo_to_terminal_file():

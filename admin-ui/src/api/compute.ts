@@ -912,6 +912,17 @@ export interface ComputeJob {
    *  'no_declared_metric' or 'metric_name_mismatch'. Null when watchdog_active
    *  is true or when the watchdog is not involved. */
   watchdog_inert_reason?: string | null;
+  /** Cross-job checkpoint resume: predecessor job ID that the backend validated
+   *  as the resume source for checkpoint hydration. Present when the compute job
+   *  was launched with a checkpoint source; absent otherwise. Promoted from
+   *  polling_metadata by the backend serialization layer. */
+  input_artifact_job_id?: string | null;
+  /** What actually happened at checkpoint hydration time. A dict with keys:
+   *  `ok` (boolean), `resumed_from_job_id` (string), `file_count` (int),
+   *  `recorded_at` (ISO timestamp), and optionally `reason` (string when !ok).
+   *  Absent when no resume was attempted. Promoted from polling_metadata by the
+   *  backend serialization layer. */
+  resume_provenance?: Record<string, unknown> | null;
 }
 
 export interface ComputeJobsSummary {

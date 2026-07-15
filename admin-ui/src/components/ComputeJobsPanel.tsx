@@ -971,6 +971,15 @@ export function CompactJobsTable({
                         · {runnerName}
                       </span>
                     )}
+                    {job.input_artifact_job_id && (
+                      <span
+                        className="text-emerald-500 shrink-0"
+                        title={`Resumed from ${job.input_artifact_job_id}`}
+                        data-testid="compact-table-resume"
+                      >
+                        ↻
+                      </span>
+                    )}
                   </span>
                 </td>
                 <td className="py-1.5 pr-3 whitespace-nowrap">
@@ -1702,6 +1711,32 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                       );
                     }
                     return null;
+                  })()}
+                  {(() => {
+                    const inputJobId = job.input_artifact_job_id;
+                    if (!inputJobId) return null;
+                    const truncated = inputJobId.length > 8 ? inputJobId.slice(0, 8) + '…' : inputJobId;
+                    const prov = job.resume_provenance;
+                    const ok = prov?.ok === true;
+                    const reason = typeof prov?.reason === 'string' ? prov.reason : null;
+                    const fileCount = typeof prov?.file_count === 'number' ? prov.file_count : null;
+                    const resumedFrom = typeof prov?.resumed_from_job_id === 'string' ? prov.resumed_from_job_id : null;
+                    const displayId = resumedFrom ?? truncated;
+                    return (
+                      <div
+                        className={`text-ui-sm font-mono mt-0.5 ${ok ? 'text-emerald-400' : reason ? 'text-amber-400' : 'text-sky-400'}`}
+                        data-testid="compute-resume-provenance"
+                      >
+                        resumed from{' '}
+                        <span
+                          className={ok ? 'text-emerald-200' : reason ? 'text-amber-200' : 'text-sky-200'}
+                        >
+                          {displayId}
+                        </span>
+                        {ok && fileCount != null && <> · {fileCount} files</>}
+                        {reason && <> · {reason}</>}
+                      </div>
+                    );
                   })()}
                   {(() => {
                     const evidence = asLiveReleaseEvidence(job.polling_metadata?.live_release_evidence);

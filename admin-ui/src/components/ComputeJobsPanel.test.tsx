@@ -650,6 +650,126 @@ describe('ComputeJobsPanel watchdog protection status', () => {
   });
 });
 
+describe('ComputeJobsPanel resume provenance rendering', () => {
+  afterEach(() => {
+    fetchComputeJobs.mockReset();
+    fetchComputeJobsAggregateSummary.mockReset();
+    fetchHeldComputeExperiments.mockReset();
+    fetchAwaitingLocalRunnerHolds.mockReset();
+    fetchComputeSweepGroups.mockReset();
+  });
+
+  function setupMocks() {
+    fetchComputeJobsAggregateSummary.mockResolvedValue(null);
+    fetchHeldComputeExperiments.mockResolvedValue([]);
+    fetchAwaitingLocalRunnerHolds.mockResolvedValue([]);
+    fetchComputeSweepGroups.mockResolvedValue({ groups: [], has_more: false });
+  }
+
+  test('card view shows resumed provenance line for a job that resumed from predecessor', async () => {
+    setupMocks();
+    const job = makeJob({
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      completed_at: new Date().toISOString(),
+      input_artifact_job_id: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
+      resume_provenance: {
+        ok: true,
+        resumed_from_job_id: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
+        file_count: 5,
+        recorded_at: new Date().toISOString(),
+      },
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([job]));
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const el = await findByTestId('compute-resume-provenance');
+    expect(el.textContent).toContain('resumed from');
+    expect(el.textContent).toContain('a1b2c3d4');
+    expect(el.textContent).toContain('5 files');
+    // Successful resume should render in green
+    expect(el.className).toContain('text-emerald-400');
+  });
+
+  test('card view shows resume-failed indicator when hydration failed', async () => {
+    setupMocks();
+    const job = makeJob({
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      completed_at: new Date().toISOString(),
+      input_artifact_job_id: 'dead-beef-1234-5678-0000',
+      resume_provenance: {
+        ok: false,
+        resumed_from_job_id: 'dead-beef-1234-5678-0000',
+        file_count: 0,
+        reason: 'checkpoint bundle not found',
+        recorded_at: new Date().toISOString(),
+      },
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([job]));
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const el = await findByTestId('compute-resume-provenance');
+    expect(el.textContent).toContain('resumed from');
+    expect(el.textContent).toContain('dead-beef');
+    expect(el.textContent).toContain('checkpoint bundle not found');
+    // Failed resume should render in amber
+    expect(el.className).toContain('text-amber-400');
+  });
+
+  test('card view shows scheduled resume indicator when input_artifact_job_id set but pre-hydration', async () => {
+    setupMocks();
+    const job = makeJob({
+      status: 'RUNNING',
+      outcome: null,
+      input_artifact_job_id: 'resume-id-for-test-abc-123',
+      resume_provenance: null,
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([job]));
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const el = await findByTestId('compute-resume-provenance');
+    expect(el.textContent).toContain('resumed from');
+    expect(el.textContent).toContain('resume-i');
+    // Pre-hydration (no provenance yet) should render in sky blue
+    expect(el.className).toContain('text-sky-400');
+  });
+
+  test('card view does not render resume indicator when input_artifact_job_id is absent', async () => {
+    setupMocks();
+    fetchComputeJobs.mockResolvedValue(wrapJobs([makeJob({
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      completed_at: new Date().toISOString(),
+    })]));
+    const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('compute_experiment: sweep');
+    expect(queryByTestId('compute-resume-provenance')).toBeNull();
+  });
+
+  test('compact table shows resume indicator when input_artifact_job_id is present', async () => {
+    setupMocks();
+    const job = makeJob({
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      per_arm_verdicts: { armA: { value: 0.91, met: true, cost_usd: null } },
+      final_cost_usd: 1.0,
+      completed_at: new Date().toISOString(),
+      input_artifact_job_id: 'table-resume-id-5678',
+      resume_provenance: { ok: true, file_count: 3, resumed_from_job_id: 'table-resume-id-5678', recorded_at: new Date().toISOString() },
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([job]));
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    // Switch to table view
+    const toggleBtn = await findByTestId('compute-view-mode-toggle');
+    await act(async () => { toggleBtn.click(); });
+    const table = await findByTestId('compact-jobs-table');
+    const resumeIcon = table.querySelector('[data-testid="compact-table-resume"]');
+    expect(resumeIcon).toBeTruthy();
+    expect(resumeIcon?.getAttribute('title')).toContain('table-resume-id-5678');
+  });
+});
+
 describe('ComputeJobsPanel render + kill', () => {
   afterEach(() => {
     fetchComputeJobs.mockReset();

@@ -3056,8 +3056,9 @@ def _merge_salvaged_status(
     """Return a new status snapshot with late-arriving fields from salvaged merged in.
 
     The terminal outcome, status code, and cost semantics all come from ``base``.
-    Only metrics, command_log, and echoed_release_sha are overridden by non-None
-    values from the post-terminate poll so late-emitted evidence is not dropped.
+    Only metrics, command_log, echoed_release_sha, and resume_provenance are
+    overridden by non-None values from the post-terminate poll so late-emitted
+    evidence is not dropped.
     """
     if salvaged is None:
         return base
@@ -3073,6 +3074,9 @@ def _merge_salvaged_status(
         echoed_release_sha=salvaged.echoed_release_sha
         if salvaged.echoed_release_sha is not None
         else base.echoed_release_sha,
+        resume_provenance=salvaged.resume_provenance
+        if salvaged.resume_provenance is not None
+        else base.resume_provenance,
     )
 
 
@@ -3112,6 +3116,12 @@ async def _apply_polled_compute_job_result(
             _set_meta(live, command_log=dict(status.command_log))
         if status.echoed_release_sha is not None:
             _set_meta(live, release_echo_sha=status.echoed_release_sha)
+        # Propagate resume provenance from the serial/launch status into
+        # polling_metadata so it reaches the operator and agent surfaces via
+        # serialize_compute_job_response. Only written once (first poll that
+        # carries it); subsequent polls with the same provenance are idempotent.
+        if status.resume_provenance is not None:
+            _set_meta(live, resume_provenance=dict(status.resume_provenance))
         if compute_rpc_diagnostic is None:
             _clear_compute_rpc_diagnostic(live)
         if terminal_status is not None and outcome is not None:

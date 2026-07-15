@@ -248,6 +248,22 @@ _SERIAL_COMMAND_LOG_PREFIX = "BLUEPRINT_COMPUTE_COMMAND_LOG="
 # Single-line, base64-encoded marker carrying the echoed release SHA so the
 # completion handler can verify the runtime was bound to the promoted release.
 _SERIAL_RELEASE_ECHO_PREFIX = "BLUEPRINT_COMPUTE_RELEASE_ECHO="
+# Single-line, base64-encoded marker carrying the cross-job checkpoint resume
+# provenance from the startup script (ok, file_count, reason). Emitted on both
+# the success and the fail-closed branches of the resume block so the operator
+# can always tell whether a resumed job continued from its predecessor's
+# checkpoint or restarted from zero — the waste the direction exists to prevent.
+_SERIAL_RESUME_PREFIX = "BLUEPRINT_COMPUTE_RESUME="
+# Pre-computed base64-encoded resume-provenance payload for the fail-closed
+# branch of the startup-script resume block (hydration never started). Used in
+# ``_build_gcp_startup_script`` where the static string avoids on-VM base64
+# encoding overhead for a known-at-generation-time value.
+_SERIAL_RESUME_FAILED_B64: str = base64.b64encode(
+    json.dumps(
+        {"ok": False, "file_count": 0, "reason": "resume_hydration_failed"},
+        separators=(",", ":"),
+    ).encode()
+).decode()
 
 # Well-known env var pointing the launched command at a result file it may write
 # (a small flat JSON object of metric-name -> number). Absence = no metrics.
@@ -776,6 +792,10 @@ class ComputeStatusResult:
     # Live output tail written by the runner during execution. Only populated for
     # RUNNING local jobs that have flushed a live_tail.b64 to the artifact dir.
     live_output: dict[str, Any] | None = None
+    # Resume provenance from cross-job checkpoint hydration, decoded from the
+    # ``_SERIAL_RESUME_PREFIX`` serial marker (GCP backend) or stamped at launch
+    # time (local backend). ``None`` means no resume was attempted.
+    resume_provenance: dict[str, Any] | None = None
 
 
 @dataclass(slots=True)
@@ -897,11 +917,21 @@ class LocalSubprocessComputeBackend:
         # wrapper's later `mkdir -p` is idempotent and never removes these files.
         # A missing/unreadable bundle raises (fails the job LOUDLY) rather than
         # letting the command run against an empty workspace.
+        # Stamp resume provenance into launch metadata so it flows through
+        # polling_metadata and reaches the operator/agent surface via
+        # serialize_compute_job_response.
+        resume_provenance: dict[str, Any] | None = None
         if spec.input_artifact_job_id is not None:
-            await _rehydrate_input_artifact_bundle(
+            file_count = await _rehydrate_input_artifact_bundle(
                 spec.input_artifact_job_id,
                 _local_artifact_dir_for_external_id(external_id),
             )
+            resume_provenance = {
+                "ok": True,
+                "file_count": file_count,
+                "recorded_at": _utcnow().isoformat(),
+                "resumed_from_job_id": spec.input_artifact_job_id,
+            }
         env = {k: os.environ[k] for k in ("PATH", "HOME") if k in os.environ}
         env.update(spec.env or {})
         wrapper_command = _build_local_wrapper_command(
@@ -927,12 +957,15 @@ class LocalSubprocessComputeBackend:
         self._processes[external_id] = _LocalProcessHandle(
             proc=proc, started_at=started_at
         )
+        launch_metadata: dict[str, Any] = {"pid": proc.pid, **artifact_meta}
+        if resume_provenance:
+            launch_metadata["resume_provenance"] = resume_provenance
         return ComputeLaunchResult(
             external_id=external_id,
             started_at=started_at,
             cost_rate_per_second=0.0,
             message=f"spawned local subprocess pid={proc.pid}",
-            metadata={"pid": proc.pid, **artifact_meta},
+            metadata=launch_metadata,
         )
 
     async def poll_status(self, job: ComputeJob) -> ComputeStatusResult:
@@ -3133,6 +3166,12 @@ def _build_gcp_startup_script(
             f"tar -C {artifact_dir} --no-same-owner -xzf {_resume_bundle_q} "
             f">/dev/null 2>&1; then\n"
             f"  rm -f {_resume_stale}\n"
+            f"  _BP_RESUME_FC=$(find {artifact_dir} -type f 2>/dev/null | wc -l)\n"
+            f"  __BP_RESUME_D=$(python3 -c 'import json,base64,sys; print("
+            f"base64.b64encode(json.dumps({{"
+            f'"ok":True,"file_count":int(sys.argv[1])}}).encode()).decode())\' '
+            f"\"$_BP_RESUME_FC\" 2>/dev/null || true)\n"
+            f'  [ -n "$__BP_RESUME_D" ] && echo "{_SERIAL_RESUME_PREFIX}$__BP_RESUME_D" || true\n'
             f"  echo resumed > {_resume_ok_q} 2>/dev/null || true\n"
             f'  echo "[resume] hydrated predecessor checkpoint bundle into '
             f'artifact dir"\n'
@@ -3143,6 +3182,7 @@ def _build_gcp_startup_script(
             f'  echo "{_SERIAL_REASON_PREFIX}resume_hydration_failed"\n'
             f'  echo "{_SERIAL_STATUS_PREFIX}FAILED"\n'
             f'  echo "{_SERIAL_EXIT_PREFIX}1"\n'
+            f'  echo "{_SERIAL_RESUME_PREFIX}{_SERIAL_RESUME_FAILED_B64}"\n'
             f"  python3 /tmp/blueprint_terminal_record.py "
             f"{artifact_dir} FAILED 1 resume_hydration_failed "
             f"{result_file} {command_log_path} >/dev/null 2>&1 || true\n"
@@ -3447,6 +3487,32 @@ def _decode_release_echo_sha(raw_b64: str | None) -> str | None:
     return result or None
 
 
+def _decode_resume_provenance(raw_b64: str | None) -> dict[str, Any] | None:
+    """Decode a base64 JSON resume-provenance marker. Returns None on any error."""
+    if not raw_b64:
+        return None
+    candidate = raw_b64.strip()
+    if not candidate:
+        return None
+    try:
+        decoded = base64.b64decode(candidate, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    try:
+        raw = decoded.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        return None
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(data, dict) and data:
+        return data
+    return None
+
+
 def _parse_serial_status(serial_output: str) -> ComputeStatusResult | None:
     status_line: str | None = None
     exit_code: int | None = None
@@ -3454,6 +3520,7 @@ def _parse_serial_status(serial_output: str) -> ComputeStatusResult | None:
     metrics_b64: str | None = None
     command_log_b64: str | None = None
     release_echo_b64: str | None = None
+    resume_provenance_b64: str | None = None
     for raw_line in serial_output.splitlines():
         line = raw_line.strip()
         if line.startswith(_SERIAL_STATUS_PREFIX):
@@ -3471,13 +3538,19 @@ def _parse_serial_status(serial_output: str) -> ComputeStatusResult | None:
             command_log_b64 = line[len(_SERIAL_COMMAND_LOG_PREFIX) :]
         elif line.startswith(_SERIAL_RELEASE_ECHO_PREFIX):
             release_echo_b64 = line[len(_SERIAL_RELEASE_ECHO_PREFIX) :]
+        elif line.startswith(_SERIAL_RESUME_PREFIX):
+            resume_provenance_b64 = line[len(_SERIAL_RESUME_PREFIX) :]
     if status_line is None:
         return None
     if status_line == "RUNNING":
-        return ComputeStatusResult(status=ComputeJobStatus.RUNNING)
+        return ComputeStatusResult(
+            status=ComputeJobStatus.RUNNING,
+            resume_provenance=_decode_resume_provenance(resume_provenance_b64),
+        )
     metrics = _decode_result_metrics(metrics_b64)
     command_log = _decode_command_log(command_log_b64)
     echoed_release_sha = _decode_release_echo_sha(release_echo_b64)
+    resume_provenance = _decode_resume_provenance(resume_provenance_b64)
     if status_line == "SUCCEEDED":
         return ComputeStatusResult(
             status=ComputeJobStatus.SUCCEEDED,
@@ -3487,6 +3560,7 @@ def _parse_serial_status(serial_output: str) -> ComputeStatusResult | None:
             metrics=metrics,
             command_log=command_log,
             echoed_release_sha=echoed_release_sha,
+            resume_provenance=resume_provenance,
         )
     return ComputeStatusResult(
         status=ComputeJobStatus.FAILED,
@@ -3496,6 +3570,7 @@ def _parse_serial_status(serial_output: str) -> ComputeStatusResult | None:
         metrics=metrics,
         command_log=command_log,
         echoed_release_sha=echoed_release_sha,
+        resume_provenance=resume_provenance,
     )
 
 
