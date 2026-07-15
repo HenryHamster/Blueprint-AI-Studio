@@ -246,6 +246,11 @@ async def test_start_helper_adopts_task_and_arms_lease(db_session):
     refreshed = await db_session.get(Task, task.id)
     assert refreshed.context.get("_resident_session") is True
     assert refreshed.context.get("strategic_session_id") == snapshot["session_id"]
+    assert refreshed.context.get("provider_preference") == [
+        "anthropic",
+        "zai",
+        "deepseek",
+    ]
 
     # Session-state blob + continuation lease marker both live in vision.
     fresh_project = await db_session.get(Project, project.id)
@@ -3110,6 +3115,7 @@ async def test_spawn_wrapper_seeds_born_context_into_creating_insert(
     extra = captured["extra_context"]
     assert extra["_resident_session"] is True
     assert extra["strategic_session_id"] == session_id
+    assert extra["provider_preference"] == ["anthropic", "zai", "deepseek"]
     assert extra["preferred_runner_target_id"] == runner_id
     assert extra[srs.STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY] is True
     assert (
@@ -3135,11 +3141,12 @@ async def test_spawn_wrapper_seeds_born_context_into_creating_insert(
 
 @pytest.mark.asyncio
 async def test_born_context_unpinned_when_no_runner():
-    """With no runner, born-context carries ONLY the resident flags (no local-
-    runner pin) — matching the unpinned cloud-fallback stamping semantics."""
+    """With no runner, born-context still constrains the resident protocol to
+    Claude-compatible providers but carries no local-runner pin."""
     ctx = srs._resident_born_context("ss-nopin", None)
     assert ctx["_resident_session"] is True
     assert ctx["strategic_session_id"] == "ss-nopin"
+    assert ctx["provider_preference"] == ["anthropic", "zai", "deepseek"]
     assert "preferred_runner_target_id" not in ctx
     assert srs.STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY not in ctx
 
