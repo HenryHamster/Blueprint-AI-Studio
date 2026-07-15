@@ -2,6 +2,7 @@ import { defineConfig } from 'vitest/config';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
 import { playwright } from '@vitest/browser-playwright';
+import { isBenignPlaywrightRouteRace } from './src/test/viewport-checks.js';
 
 // Browser-mode runner used by `npm run test:viewport`. Kept separate from
 // vitest.config.ts so the existing jsdom suite (`npm run test:run`) is
@@ -22,6 +23,14 @@ export default defineConfig({
     // files prevents concurrent contexts from fulfilling the same internal
     // request twice ("Route is already handled") under CI load.
     fileParallelism: false,
+    // Vitest's Playwright module-mocking transport can race its own route
+    // teardown after every viewport assertion has completed, producing an
+    // unhandled `route.fulfill: Route is already handled!`. Filter only that
+    // exact provider-origin error; application errors and assertion failures
+    // remain fatal. viewport-coverage.test.ts asserts the fail-closed boundary.
+    onUnhandledError(error) {
+      if (isBenignPlaywrightRouteRace(error)) return false;
+    },
     css: true,
     setupFiles: ['./src/test/viewport-setup.ts'],
     // JSON reporter writes a structured failure manifest so the regression

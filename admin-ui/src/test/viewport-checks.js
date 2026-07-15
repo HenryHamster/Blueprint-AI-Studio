@@ -21,6 +21,26 @@ const VIEWPORT_DEBT_PY = path.join(__dirname, '../../../backend/app/viewport_deb
 // so the count shown in the Viewport Debt panel matches the count CI enforces.
 export const ESLINT_VIEWPORT_PATTERN = 'eslint-disable[^\\n]*viewport';
 
+/**
+ * Identify Vitest browser-playwright's benign duplicate route-fulfill race.
+ * Matching the message alone could hide an application-owned Playwright route
+ * bug, so the stack must also prove the error came from Vitest's provider.
+ */
+export function isBenignPlaywrightRouteRace(error) {
+  if (!error || typeof error !== 'object') return false;
+  // Playwright throws the raw message. Vitest's reporter decorates the same
+  // error with the `route.fulfill:` API prefix when it renders CI output, so
+  // accept either representation while retaining provider-stack provenance.
+  const isDuplicateFulfill =
+    error.message === 'Route is already handled!' ||
+    error.message === 'route.fulfill: Route is already handled!';
+  return (
+    isDuplicateFulfill &&
+    typeof error.stack === 'string' &&
+    error.stack.includes('@vitest/browser-playwright')
+  );
+}
+
 // Single source of truth for viewport-test exemptions: the committed JSON
 // viewport-exempt.json. Components listed there are internal/utility and never
 // rendered standalone on an operator page — overflow is handled by the parent
