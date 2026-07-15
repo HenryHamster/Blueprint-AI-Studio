@@ -675,6 +675,54 @@ async def _find_adoptable_strategic_review_task(
     return None
 
 
+async def _find_spawned_resident_strategic_task(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    session_id: str,
+) -> Task | None:
+    """Recover this start request's born-resident task after an immediate claim.
+
+    A pinned local runner can claim the task between the canonical spawn's commit
+    and :func:`_find_adoptable_strategic_review_task`.  At that point the task is
+    no longer adoptable (``started_at`` is set / status is ``IN_PROGRESS``), but
+    it is already safe to finalize because the creating INSERT carried both the
+    resident flag and this request's unique ``strategic_session_id``.  Refresh
+    rows from the database so an identity-map copy created by the spawn does not
+    hide a claim committed on the runner's connection.
+    """
+    rows = (
+        (
+            await session.execute(
+                select(Task)
+                .where(
+                    Task.project_id == project_id,
+                    Task.archived.is_(False),
+                    Task.status.in_(
+                        [
+                            TaskStatus.QUEUED,
+                            TaskStatus.PROVISIONING,
+                            TaskStatus.IN_PROGRESS,
+                        ]
+                    ),
+                )
+                .order_by(Task.created_at.desc())
+                .execution_options(populate_existing=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for task in rows:
+        context = task.context or {}
+        if (
+            context.get("_resident_session") is True
+            and str(context.get("strategic_session_id") or "") == str(session_id)
+            and (task.first_payload or {}).get("type") == _RESIDENT_STRATEGIC_TASK_TYPE
+        ):
+            return task
+    return None
+
+
 async def _spawn_resident_strategic_task(
     session: AsyncSession,
     project: Project,
@@ -745,7 +793,17 @@ async def _spawn_resident_strategic_task(
         # runner pin still ride in via ``extra_context``.
         resident_minimal=True,
     )
-    return await _find_adoptable_strategic_review_task(session, project.id)
+    task = await _find_adoptable_strategic_review_task(session, project.id)
+    if task is not None:
+        return task
+    # The hard-pinned runner may have claimed the born-resident task before the
+    # adoptable re-query.  Recover only the task stamped with THIS start's unique
+    # session id; an unrelated cadence task must still make the start fail closed.
+    return await _find_spawned_resident_strategic_task(
+        session,
+        project.id,
+        session_id,
+    )
 
 
 def _resident_runner_display_name(runner: Any) -> str:
