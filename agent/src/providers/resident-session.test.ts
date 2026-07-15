@@ -41,6 +41,7 @@ vi.mock('./resident-stream.js', async (importOriginal) => {
 });
 
 vi.mock('./runners.js', () => ({
+  claudeHelpSupportsPartialMessages: vi.fn(() => true),
   getProviderRunner: vi.fn(() => ({
     provider: 'anthropic',
     displayName: 'claude',
