@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_MACHINE_TYPE = "e2-standard-2"
 
 # Pricing per machine type: (on_demand_hourly, spot_hourly)
-# Updated 2025-02: GCP pricing for standard E2 machines in us-central1.
+# Updated 2026-07: GCP pricing for standard E2/C2D machines in us-central1.
 # Rates beyond the default are scaled to keep the existing common-type behavior
 # stable while making non-default machine types visible and distinct.
 VM_COST_RATES: dict[str, Tuple[float, float]] = {
@@ -20,6 +20,9 @@ VM_COST_RATES: dict[str, Tuple[float, float]] = {
     "e2-standard-8": (0.268, 0.080),
     "e2-standard-16": (0.536, 0.160),
     "e2-standard-32": (1.072, 0.320),
+    # Capacity fallback for region-wide E2/N2 stockouts. Google Cloud's Iowa
+    # price sheet lists $0.090798 on-demand and $0.023988 current Spot hourly.
+    "c2d-standard-2": (0.090798, 0.023988),
 }
 
 

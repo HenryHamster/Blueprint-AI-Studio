@@ -138,9 +138,42 @@ _gcp_ops_semaphore = asyncio.Semaphore(8)  # list/delete/get — fast ops (~10s)
 _PROVISION_REDIS_KEY = "blueprint:active-provisions"
 _PROVISION_SLOT_TTL = 600  # 10 min — auto-reclaim if process crashes
 
+# Admission must be one Redis operation.  The previous pipeline() performed
+# ZCARD and ZADD separately, so concurrent Cloud Run instances could all read
+# the same sub-limit count before any of them inserted their lease.  In a cold
+# backlog that turned a nominal 10-slot limit into a region-wide insert burst.
+_ACQUIRE_PROVISION_SLOT_LUA = """
+local key = KEYS[1]
+local now = tonumber(ARGV[1])
+local limit = tonumber(ARGV[2])
+local vm_id = ARGV[3]
+local expires_at = tonumber(ARGV[4])
+
+redis.call('ZREMRANGEBYSCORE', key, '-inf', now)
+
+-- A retry for an already-admitted VM renews its lease without consuming a
+-- second slot or being rejected merely because the set is now full.
+if redis.call('ZSCORE', key, vm_id) then
+    redis.call('ZADD', key, expires_at, vm_id)
+    return 1
+end
+
+if redis.call('ZCARD', key) >= limit then
+    return 0
+end
+
+redis.call('ZADD', key, expires_at, vm_id)
+return 1
+"""
+
 
 async def _acquire_provision_slot(vm_id: str) -> bool:
-    """Acquire a global provision slot via Redis. Falls back to local semaphore check."""
+    """Atomically acquire a global provision slot via Redis.
+
+    Redis ``EVAL`` keeps expiry cleanup, capacity inspection, and lease insert
+    in one server-side operation.  This is the actual cross-instance guard;
+    the process-local semaphore below remains the thread-pool backstop.
+    """
     from app.redis_client import get_redis
 
     r = await get_redis()
@@ -148,15 +181,16 @@ async def _acquire_provision_slot(vm_id: str) -> bool:
         return True  # No Redis — rely on local semaphore only
     try:
         now = time.time()
-        pipe = r.pipeline()
-        pipe.zremrangebyscore(_PROVISION_REDIS_KEY, 0, now)  # Clean expired
-        pipe.zcard(_PROVISION_REDIS_KEY)
-        results = await pipe.execute()
-        count = results[1]
-        if count >= _MAX_GLOBAL_PROVISIONS:
-            return False
-        await r.zadd(_PROVISION_REDIS_KEY, {vm_id: now + _PROVISION_SLOT_TTL})
-        return True
+        admitted = await r.eval(
+            _ACQUIRE_PROVISION_SLOT_LUA,
+            1,
+            _PROVISION_REDIS_KEY,
+            now,
+            _MAX_GLOBAL_PROVISIONS,
+            vm_id,
+            now + _PROVISION_SLOT_TTL,
+        )
+        return bool(int(admitted))
     except Exception as e:
         logger.warning(
             f"[REDIS] Provision slot acquire failed, using local semaphore: {e}"
