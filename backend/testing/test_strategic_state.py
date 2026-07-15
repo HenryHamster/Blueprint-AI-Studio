@@ -6071,6 +6071,50 @@ async def test_operator_attention_surfaces_bug_and_feedback_as_watch_items(
 
 
 @pytest.mark.asyncio
+async def test_operator_attention_uses_routed_audience_for_action_messages(
+    client: AsyncClient, db_session
+):
+    """Only the canonical action audience reaches needs_operator attention."""
+    project = await _make_project(db_session)
+    action = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.NOTE,
+        from_type="system",
+        content="An operator decision is required.",
+        status="open",
+        context={"event_type": "criterion_retracted", "audience": "operator-action-needed"},
+    )
+    fyi = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.NOTE,
+        from_type="system",
+        content="An operator-visible FYI.",
+        status="open",
+        context={"event_type": "capability_proof_gate_graduated_observe", "audience": "operator-fyi"},
+    )
+    internal = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.NOTE,
+        from_type="system",
+        content="Strategist bookkeeping only.",
+        status="open",
+        context={"event_type": "pr_merged", "audience": "strategist-internal"},
+    )
+    db_session.add_all([action, fyi, internal])
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/operator-attention?project_id={project.id}")
+    assert resp.status_code == 200
+    attention = resp.json()
+
+    assert attention["counts"]["needs_operator"] == 1
+    items = {item["id"]: item for item in attention["items"]}
+    assert items[f"message:{action.id}"]["severity"] == "needs_operator"
+    assert f"message:{fyi.id}" not in items
+    assert f"message:{internal.id}" not in items
+
+
+@pytest.mark.asyncio
 async def test_operator_attention_same_priority_items_use_newest_tie_break(
     client: AsyncClient, db_session
 ):

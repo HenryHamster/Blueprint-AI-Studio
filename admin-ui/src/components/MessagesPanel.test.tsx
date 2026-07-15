@@ -573,6 +573,22 @@ function makeStrategicState(overrides: Partial<StrategicStateResponse> = {}): St
   };
 }
 
+function strategicStateForActionMessage(messageId: string): StrategicStateResponse {
+  const state = makeStrategicState();
+  const attention = state.attention;
+  const item = attention?.items[0];
+  if (!attention || !item) return state;
+  state.attention = {
+    ...attention,
+    items: [{
+      ...item,
+      id: `message:${messageId}`,
+      ref: { kind: 'message', id: messageId, project_id: 'proj-1' },
+    }],
+  };
+  return state;
+}
+
 describe('MessagesPanel chrome modes', () => {
   let root: Root | null = null;
   let host: HTMLDivElement | null = null;
@@ -1981,6 +1997,7 @@ describe('MessagesPanel toast notifications', () => {
           onClose={() => {}}
           addToast={mockAddToast}
           onMessageCountChange={() => {}}
+          strategicState={strategicStateForActionMessage('msg-2')}
         />
       );
 
@@ -2002,7 +2019,7 @@ describe('MessagesPanel toast notifications', () => {
         expect(mockAddToast).toHaveBeenCalledTimes(1);
       });
       const [summary, level] = mockAddToast.mock.calls[0];
-      expect(summary).toContain('BLOCKER');
+      expect(summary).toContain('needs-action message');
       expect(summary).toContain('Second blocker arrived later');
       expect(level).toBe('error');
     } finally {
@@ -2072,6 +2089,40 @@ describe('MessagesPanel toast notifications', () => {
     expect(mockAddToast).not.toHaveBeenCalled();
   });
 
+  test('uses the desktop preference only to present canonical needs_operator attention', async () => {
+    vi.useFakeTimers();
+    const originalNotification = window.Notification;
+    const desktopNotification = vi.fn();
+    Object.assign(desktopNotification, { permission: 'granted' });
+    Object.defineProperty(window, 'Notification', { configurable: true, value: desktopNotification });
+    try {
+      const actionMessage = {
+        id: 'action-1', project_id: 'proj-1', message_type: 'NOTE', from_type: 'system',
+        from_task_id: null, content: 'A decision needs your review',
+        context: { audience: 'operator-action-needed' }, status: 'open', resolution: null,
+        resolved_at: null, created_at: '2026-05-06T10:00:00Z',
+      };
+      const addToast = vi.fn();
+      _mockMessagesFetchSequence([[], [actionMessage]]);
+
+      render(<MessagesPanel
+        selectedProjectId="proj-1" onClose={() => {}} addToast={addToast}
+        onMessageCountChange={() => {}} notifyOnHighSignalMessage
+        strategicState={strategicStateForActionMessage('action-1')}
+      />);
+
+      await vi.waitFor(() => expect(_messagesGetCalls().length).toBeGreaterThanOrEqual(1));
+      await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+      await vi.waitFor(() => expect(addToast).toHaveBeenCalledTimes(1));
+      expect(desktopNotification).toHaveBeenCalledWith('NOTE', {
+        body: 'A decision needs your review',
+      });
+    } finally {
+      Object.defineProperty(window, 'Notification', { configurable: true, value: originalNotification });
+      vi.useRealTimers();
+    }
+  });
+
   test('does not fire toast for routine NOTE messages on initial load', async () => {
     const mockAddToast = vi.fn();
     const note = {
@@ -2107,7 +2158,7 @@ describe('MessagesPanel toast notifications', () => {
     expect(mockAddToast).not.toHaveBeenCalled();
   });
 
-  test('fires toast when new high-signal NOTE (failure_alert) arrives on subsequent poll', async () => {
+  test('does not promote operator-FYI high-signal NOTE into a toast', async () => {
     vi.useFakeTimers();
     try {
       const mockAddToast = vi.fn();
@@ -2125,8 +2176,8 @@ describe('MessagesPanel toast notifications', () => {
         created_at: '2026-05-06T10:00:00Z',
       };
 
-      // First fetch returns empty (initial load — should NOT toast).
-      // Second fetch (poll) returns the failure_alert — toast SHOULD fire with 'error'.
+      // This remains a locally high-signal event but lacks a canonical
+      // needs_operator attention item, so it must stay non-intrusive.
       _mockMessagesFetchSequence([[], [failureAlert]]);
 
       render(
@@ -2152,13 +2203,7 @@ describe('MessagesPanel toast notifications', () => {
       await vi.waitFor(() => {
         expect(_messagesGetCalls().length).toBeGreaterThanOrEqual(2);
       });
-      await vi.waitFor(() => {
-        expect(mockAddToast).toHaveBeenCalledTimes(1);
-      });
-      const [summary, severity] = mockAddToast.mock.calls[0];
-      expect(summary).toContain('high-signal message');
-      expect(summary).toContain('Pipeline failure detected');
-      expect(severity).toBe('error');
+      expect(mockAddToast).not.toHaveBeenCalled();
     } finally {
       vi.useRealTimers();
     }
@@ -2197,6 +2242,7 @@ describe('MessagesPanel toast notifications', () => {
           onClose={() => {}}
           addToast={mockAddToast}
           onMessageCountChange={() => {}}
+          strategicState={strategicStateForActionMessage('msg-1')}
         />
       );
 
@@ -2220,7 +2266,7 @@ describe('MessagesPanel toast notifications', () => {
     }
   });
 
-  test('fires toast with info severity for high-signal FEEDBACK', async () => {
+  test('does not promote strategic-internal or FYI feedback into a toast', async () => {
     vi.useFakeTimers();
     try {
       const mockAddToast = vi.fn();
@@ -2228,10 +2274,10 @@ describe('MessagesPanel toast notifications', () => {
         id: 'msg-1',
         project_id: 'proj-1',
         message_type: 'FEEDBACK',
-        from_type: 'user',
+        from_type: 'system',
         from_task_id: null,
         content: 'Consider adding validation',
-        context: {},
+        context: { audience: 'operator-fyi' },
         status: 'open',
         resolution: null,
         resolved_at: null,
@@ -2257,11 +2303,7 @@ describe('MessagesPanel toast notifications', () => {
         await vi.advanceTimersByTimeAsync(30_000);
       });
 
-      await vi.waitFor(() => {
-        expect(mockAddToast).toHaveBeenCalledTimes(1);
-      });
-      const [, severity] = mockAddToast.mock.calls[0];
-      expect(severity).toBe('info');
+      expect(mockAddToast).not.toHaveBeenCalled();
     } finally {
       vi.useRealTimers();
     }

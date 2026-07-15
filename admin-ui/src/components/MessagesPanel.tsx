@@ -6,7 +6,6 @@ import type { StrategicCycleProgress, StrategicCycleCompletion, StrategicSession
 import { parseTimestamp, timeAgo } from '../utils/time';
 import { type EventPref, saveEventPrefs, effectiveSignal, getToastSeverity, countHighSignalMessages } from './eventPrefs';
 import { type TemporaryMutes } from './temporaryMutes';
-import { groupRoutineMessages, outcomeBreakdown, isFailingGroup } from './messageGrouping';
 import { loadLastSeen, saveLastSeen } from './lastSeen';
 import { saveServerNoisePrefs } from './serverSync';
 import type { MessageAttachment, ProjectMessage } from '../types/messages';
@@ -171,6 +170,17 @@ function attentionItemIcon(kind?: string): string {
   if (kind === 'direction') return '🧭';
   if (kind === 'runner') return '🖥';
   return '📌';
+}
+
+function isMessageNeedingOperatorAttention(
+  message: ProjectMessage,
+  attention: StrategicStateResponse['attention'] | null | undefined,
+): boolean {
+  return attention?.items.some(item => (
+    item.kind === 'message'
+    && item.severity === 'needs_operator'
+    && item.ref?.id === message.id
+  )) ?? false;
 }
 
 function messageReplyFromLabel(msg: ProjectMessage): string {
@@ -445,6 +455,9 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   const effectiveContextPackage = contextPackage ?? currentStrategicState?.context_package ?? null;
   const workbenchState = strategicWorkbenchState ?? currentStrategicState?.workbench ?? null;
   const strategicAttention = currentStrategicState?.attention ?? null;
+  const strategicAttentionRef = useRef(strategicAttention);
+  // eslint-disable-next-line react-hooks/refs
+  strategicAttentionRef.current = strategicAttention;
   const refreshStrategicState = onStrategicStateRefresh ?? onStrategicRefresh;
   const recordStrategicInteraction = useCallback(() => {
     if (!onStrategicInteraction) return;
@@ -732,7 +745,6 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   // Track seen messages to detect new arrivals and avoid initial-load toast spam
   const seenMessageIdsRef = useRef<Set<string>>(new Set());
   const hasInitiallyLoadedRef = useRef(false);
-  const seenPromotedGroupKeysRef = useRef<Set<string>>(new Set());
   const eventPrefsRef = useRef(eventPrefs);
   // eslint-disable-next-line react-hooks/refs
   eventPrefsRef.current = eventPrefs;
@@ -747,7 +759,6 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   useEffect(() => {
     let active = true;
     seenMessageIdsRef.current = new Set();
-    seenPromotedGroupKeysRef.current = new Set();
     hasInitiallyLoadedRef.current = false;
     setWebhookStats(null);
     optimisticStrategicRefreshRef.current = null;
@@ -1139,40 +1150,28 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
 
       // Detect new high-signal messages for toast alerts
       if (hasInitiallyLoadedRef.current) {
-        const newHighSignal = msgs.filter(m =>
+        const newNeedsOperator = msgs.filter(m =>
           m.status === 'open' &&
-          effectiveSignal(m, eventPrefsRef.current, tempMutesRef.current) === 'high' &&
+          isMessageNeedingOperatorAttention(m, strategicAttentionRef.current) &&
+          effectiveSignal(m, eventPrefsRef.current, tempMutesRef.current) !== 'mute' &&
           !seenMessageIdsRef.current.has(m.id)
         );
 
-        if (newHighSignal.length > 0) {
-          const summary = newHighSignal.length === 1
-            ? `New ${newHighSignal[0].message_type === 'BLOCKER' ? 'BLOCKER' : newHighSignal[0].message_type === 'BUG_REPORT' ? 'BUG' : newHighSignal[0].message_type === 'FEEDBACK' ? 'FEEDBACK' : 'high-signal message'}: ${newHighSignal[0].content.slice(0, 80)}`
-            : `${newHighSignal.length} new high-signal messages`;
+        if (newNeedsOperator.length > 0) {
+          const summary = newNeedsOperator.length === 1
+            ? `New needs-action message: ${newNeedsOperator[0].content.slice(0, 80)}`
+            : `${newNeedsOperator.length} new needs-action messages`;
 
-          // Use the highest severity among the new messages
-          const toastSeverity = newHighSignal.some(m => getToastSeverity(m) === 'error') ? 'error' : 'info';
+          const toastSeverity = newNeedsOperator.some(m => getToastSeverity(m) === 'error') ? 'error' : 'info';
           addToastRef.current(summary, toastSeverity);
 
-          // Fire desktop notifications for each high-signal message when opted in
+          // Local settings may suppress or present canonical attention; they do
+          // not decide which server-routed messages are intrusive.
           if (notifyOnHighSignalMessageRef.current && 'Notification' in window && Notification.permission === 'granted') {
-            for (const msg of newHighSignal) {
+            for (const msg of newNeedsOperator) {
               new Notification(msg.message_type, { body: msg.content.slice(0, 100) });
             }
           }
-        }
-      }
-
-      // Detect + toast for newly promoted failing routine groups
-      const wasLoaded = hasInitiallyLoadedRef.current;
-      const routineMsgs = msgs.filter(m => m.status === 'open' && effectiveSignal(m, eventPrefsRef.current, tempMutesRef.current) === 'routine');
-      for (const row of groupRoutineMessages(routineMsgs)) {
-        if (row.kind === 'group' && isFailingGroup(row.msgs) && eventPrefsRef.current[row.event_type] !== 'mute') {
-          if (wasLoaded && !seenPromotedGroupKeysRef.current.has(row.key)) {
-            const bd = outcomeBreakdown(row.msgs);
-            addToastRef.current(`Failing group: ${row.msgs.length} ${row.label} ${bd}`, 'error');
-          }
-          seenPromotedGroupKeysRef.current.add(row.key);
         }
       }
 
@@ -1185,7 +1184,9 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         if (messageListsEqual(prev, msgs)) return prev;
         return msgs;
       });
-      onMessageCountChange?.(countHighSignalMessages(msgs, eventPrefsRef.current, tempMutesRef.current));
+      if (!usesStrategicReadModelRef.current) {
+        onMessageCountChange?.(countHighSignalMessages(msgs, eventPrefsRef.current, tempMutesRef.current));
+      }
     } catch {
       if (isCurrentRequest()) addToastRef.current('Failed to load messages', 'error');
     } finally {
@@ -1315,7 +1316,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   // needs_operator count so the tab badge, StrategicContextRail, and in-panel
   // needs-action set all agree on a single authority.
   useEffect(() => {
-    if (conversationMode && usesStrategicReadModel) {
+    if (usesStrategicReadModel) {
       onMessageCountChange?.(attentionNeeds);
       return;
     }

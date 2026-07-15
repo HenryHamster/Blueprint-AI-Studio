@@ -41,6 +41,11 @@ from app.models import (
     VmContact,
 )
 from app.completion_debt import STATUS_OPEN as _DEBT_STATUS_OPEN, resolve_linked_task_statuses as _resolve_linked_task_statuses
+from app.message_audience import (
+    OPERATOR_ACTION_NEEDED,
+    PIPELINE_LOG,
+    STRATEGIST_INTERNAL,
+)
 from app.reaper_orphan_classify import _classify_orphan
 from app.release_version import current_open_version
 from app.routers.admin_runners import _runner_health
@@ -479,7 +484,7 @@ def _message_attention_item(message: ProjectMessage, *, unread: bool) -> dict[st
     message_type = _enum_value(message.message_type)
     severity = (
         "needs_operator"
-        if message.message_type in _NEEDS_OPERATOR_MESSAGE_TYPES
+        if _message_needs_operator_attention(message)
         else "watch"
     )
     label = {
@@ -509,6 +514,15 @@ def _message_attention_item(message: ProjectMessage, *, unread: bool) -> dict[st
             "action": "reply" if message.message_type == MessageType.QUESTION else "highlight",
         }),
     }
+
+
+def _message_needs_operator_attention(message: ProjectMessage) -> bool:
+    """Whether the canonical audience model marks this message actionable."""
+    context = message.context if isinstance(message.context, dict) else {}
+    return (
+        message.message_type in _NEEDS_OPERATOR_MESSAGE_TYPES
+        or context.get("audience") == OPERATOR_ACTION_NEEDED
+    )
 
 
 def _task_attention_item(task: Task, *, reason: str, severity: str) -> dict[str, Any]:
@@ -1769,13 +1783,22 @@ async def get_operator_message_counts(
                 }
 
     _hs_types = list(_HIGH_SIGNAL_MESSAGE_TYPES)
+    _operator_visible_message_filters = [
+        ProjectMessage.project_id == project_id,
+        ProjectMessage.status == OPEN_STATUS,
+        ProjectMessage.from_type != "user",
+        or_(
+            ProjectMessage.context["audience"].as_string().is_(None),
+            ProjectMessage.context["audience"].as_string().notin_(
+                [STRATEGIST_INTERNAL, PIPELINE_LOG]
+            ),
+        ),
+    ]
     count_rows = (
         await session.execute(
             select(ProjectMessage.message_type, func.count())
             .where(
-                ProjectMessage.project_id == project_id,
-                ProjectMessage.status == OPEN_STATUS,
-                ProjectMessage.from_type != "user",
+                *_operator_visible_message_filters,
                 ProjectMessage.message_type.in_(_hs_types),
             )
             .group_by(ProjectMessage.message_type)
@@ -1847,11 +1870,29 @@ async def get_operator_message_counts(
             or 0
         )
     # needs_operator here is the message-based component: open questions + blockers.
-    # This matches the message-derived subset of build_operator_attention's
-    # total_needs_operator so the lightweight badge-poll endpoint and the full
-    # attention model agree on what counts as needing the operator from messages.
+    # The audience-routed action rows are included too, so the lightweight badge
+    # endpoint and the full attention projection share the same authority.
+    action_message_count = int(
+        (
+            await session.execute(
+                select(func.count())
+                .select_from(ProjectMessage)
+                .where(
+                    *_operator_visible_message_filters,
+                    ProjectMessage.context["audience"].as_string()
+                    == OPERATOR_ACTION_NEEDED,
+                    ProjectMessage.message_type.notin_(
+                        list(_NEEDS_OPERATOR_MESSAGE_TYPES)
+                    ),
+                )
+            )
+        ).scalar()
+        or 0
+    )
     needs_operator = (
-        counts.get(MessageType.BLOCKER, 0) + counts.get(MessageType.QUESTION, 0)
+        counts.get(MessageType.BLOCKER, 0)
+        + counts.get(MessageType.QUESTION, 0)
+        + action_message_count
     )
     return {
         "blocker": counts.get(MessageType.BLOCKER, 0),
@@ -1889,6 +1930,12 @@ async def build_operator_attention(
         ProjectMessage.project_id == project.id,
         ProjectMessage.status == OPEN_STATUS,
         ProjectMessage.from_type != "user",
+        or_(
+            ProjectMessage.context["audience"].as_string().is_(None),
+            ProjectMessage.context["audience"].as_string().notin_(
+                [STRATEGIST_INTERNAL, PIPELINE_LOG]
+            ),
+        ),
     ]
     # UNION ALL with per-type LIMITs: one round-trip while preserving independent
     # per-priority caps so a burst of BUG_REPORT/FEEDBACK can't crowd out BLOCKERs.
@@ -1900,7 +1947,19 @@ async def build_operator_attention(
     )
     _question_q = (
         select(ProjectMessage)
-        .where(*_common_message_filters, ProjectMessage.message_type == MessageType.QUESTION)
+        .where(
+            *_common_message_filters,
+            or_(
+                ProjectMessage.message_type == MessageType.QUESTION,
+                and_(
+                    ProjectMessage.context["audience"].as_string()
+                    == OPERATOR_ACTION_NEEDED,
+                    ProjectMessage.message_type.notin_(
+                        list(_NEEDS_OPERATOR_MESSAGE_TYPES)
+                    ),
+                ),
+            ),
+        )
         .order_by(ProjectMessage.created_at.desc())
         .limit(_MESSAGE_QUESTION_PREVIEW_LIMIT)
     )
@@ -1941,6 +2000,23 @@ async def build_operator_attention(
     open_blocker_count = message_counts.get(MessageType.BLOCKER, 0)
     bug_report_count = message_counts.get(MessageType.BUG_REPORT, 0)
     feedback_count = message_counts.get(MessageType.FEEDBACK, 0)
+    open_action_message_count = int(
+        (
+            await session.execute(
+                select(func.count())
+                .select_from(ProjectMessage)
+                .where(
+                    *_common_message_filters,
+                    ProjectMessage.context["audience"].as_string()
+                    == OPERATOR_ACTION_NEEDED,
+                    ProjectMessage.message_type.notin_(
+                        list(_NEEDS_OPERATOR_MESSAGE_TYPES)
+                    ),
+                )
+            )
+        ).scalar()
+        or 0
+    )
     unread_count_filters: list[Any] = []
     if last_seen_at is not None:
         unread_count_filters.append(ProjectMessage.created_at > last_seen_at)
@@ -1975,6 +2051,12 @@ async def build_operator_attention(
         message
         for message in message_rows
         if message.message_type == MessageType.BLOCKER
+    ]
+    open_action_messages = [
+        message
+        for message in message_rows
+        if _message_needs_operator_attention(message)
+        and message.message_type not in _NEEDS_OPERATOR_MESSAGE_TYPES
     ]
     watch_messages = [
         message
@@ -2517,7 +2599,7 @@ async def build_operator_attention(
         item["_visible_priority"] = _attention_visible_priority(item)
         candidate_items.append(item)
 
-    for message in [*open_questions, *open_blockers]:
+    for message in [*open_questions, *open_blockers, *open_action_messages]:
         add_candidate(
             _message_attention_item(
                 message,
@@ -2618,6 +2700,7 @@ async def build_operator_attention(
     total_needs_operator = (
         open_question_count
         + open_blocker_count
+        + open_action_message_count
         + approval_count
         + handmerge_preserved_count
         + total_local_runner_hold_count
