@@ -3267,6 +3267,59 @@ async def test_spawn_wrapper_seeds_born_context_into_creating_insert(
 
 
 @pytest.mark.asyncio
+async def test_spawn_wrapper_recovers_born_resident_claimed_before_requery(
+    db_session, monkeypatch
+):
+    """A fast pinned runner may claim the task before the spawn wrapper re-reads it.
+
+    The task is no longer cadence-adoptable once ``started_at`` is set, but its
+    creating INSERT already carries the unique resident session id.  The wrapper
+    must return that running task so START can finalize the session blob instead
+    of returning a false 409 and orphaning a correctly routed resident agent.
+    """
+    import app.strategic_spawning as ss
+
+    project = await _make_project_with_member(db_session)
+    runner = await _make_live_local_runner(db_session, project)
+    session_id = "ss-claimed-before-requery"
+
+    async def fake_inner_spawn(proj, sess, *args, **kwargs):
+        task = Task(
+            project_id=proj.id,
+            title="already claimed born resident",
+            payloads=[{"type": "strategic_review"}],
+            status=TaskStatus.IN_PROGRESS,
+            vm_instance_id=f"runner:{runner.id}",
+            started_at=_utcnow(),
+            created_by="ORCHESTRATOR",
+            context={"strategic_cycle_id": "cyc-race", **kwargs["extra_context"]},
+        )
+        sess.add(task)
+        await sess.commit()
+        return True
+
+    monkeypatch.setattr(ss, "_spawn_strategic_review", fake_inner_spawn)
+
+    task = await srs._spawn_resident_strategic_task(
+        db_session,
+        project,
+        str(runner.id),
+        session_id=session_id,
+    )
+
+    assert task is not None
+    assert task.status == TaskStatus.IN_PROGRESS
+    assert task.started_at is not None
+    assert task.context.get("_resident_session") is True
+    assert task.context.get("strategic_session_id") == session_id
+    assert task.context.get("provider_preference") == [
+        "anthropic",
+        "zai",
+        "deepseek",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_born_context_unpinned_when_no_runner():
     """With no runner, born-context still constrains the resident protocol to
     Claude-compatible providers but carries no local-runner pin."""
