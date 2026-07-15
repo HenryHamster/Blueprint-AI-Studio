@@ -107,7 +107,7 @@
     "warm_pool_maintainer.py": 2650,
     "review_fix_lane_pilot.py": 2450,
     "routers/admin_projects.py": 2450,
-    "routers/admin_project_strategic_session.py": 2650,
+    "routers/admin_project_strategic_session.py": 3150,
     "recovery_evaluating.py": 2950,
     "recovery_evaluating_approval.py": 450,
     "recovery_evaluating_helpers.py": 1100,

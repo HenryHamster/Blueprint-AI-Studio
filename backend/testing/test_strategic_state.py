@@ -2938,14 +2938,15 @@ async def test_strategic_conversation_etag_revalidates_and_binds_pinned_message(
         project_id=project.id, message_type=MessageType.NOTE,
         from_type="strategic", content="pinned older", created_at=base_time,
     )
-    db_session.add_all([older, *[
+    recent_messages = [
         ProjectMessage(
             project_id=project.id, message_type=MessageType.NOTE,
             from_type="strategic", content=f"recent {i}",
             created_at=base_time + timedelta(minutes=i + 1),
         )
-        for i in range(5)
-    ]])
+        for i in range(25)
+    ]
+    db_session.add_all([older, *recent_messages])
     await db_session.commit()
 
     unpinned = await client.get(f"/api/admin/projects/{project.id}/strategic-conversation")
@@ -2968,6 +2969,42 @@ async def test_strategic_conversation_etag_revalidates_and_binds_pinned_message(
     assert pinned.status_code == 200
     assert pinned.headers.get("ETag") != etag
     assert pinned.json()["conversation"]["items"][0]["id"] == str(older.id)
+
+    # The same pin continues to validate while its selected, out-of-window
+    # message is unchanged, but changing that message must invalidate it.
+    pinned_etag = pinned.headers["ETag"]
+    pinned_unchanged = await client.get(
+        f"/api/admin/projects/{project.id}/strategic-conversation?include_message_id={older.id}",
+        headers={"If-None-Match": pinned_etag},
+    )
+    assert pinned_unchanged.status_code == 304
+    older.content = "pinned older, edited in place"
+    db_session.add(older)
+    await db_session.commit()
+    pinned_changed = await client.get(
+        f"/api/admin/projects/{project.id}/strategic-conversation?include_message_id={older.id}",
+        headers={"If-None-Match": pinned_etag},
+    )
+    assert pinned_changed.status_code == 200
+    assert pinned_changed.json()["conversation"]["items"][0]["content"] == "pinned older, edited in place"
+
+    # A pin for an already-visible message changes request context even though
+    # it produces the same rendered item list as the unpinned request.
+    visible = recent_messages[-1]
+    unpinned_after_edit = await client.get(
+        f"/api/admin/projects/{project.id}/strategic-conversation"
+    )
+    visible_pin = await client.get(
+        f"/api/admin/projects/{project.id}/strategic-conversation?include_message_id={visible.id}",
+        headers={"If-None-Match": unpinned_after_edit.headers["ETag"]},
+    )
+    assert visible_pin.status_code == 200
+    visible_etag = visible_pin.headers["ETag"]
+    visible_unchanged = await client.get(
+        f"/api/admin/projects/{project.id}/strategic-conversation?include_message_id={visible.id}",
+        headers={"If-None-Match": visible_etag},
+    )
+    assert visible_unchanged.status_code == 304
 
 
 @pytest.mark.asyncio
@@ -8262,6 +8299,58 @@ async def test_fingerprint_live_runner_count_flips_on_time_derived_staleness(
     assert fp_stale["runner_count"] == fp_live["runner_count"]
     assert fp_stale["runner_max_seen"] == fp_live["runner_max_seen"]
     assert fp_stale["live_runner_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_attention_fingerprints_cover_completion_debt_and_time_boundary(
+    db_session, mocker
+):
+    """Attention-only durable and clock changes must defeat a held revision.
+
+    Completion debt is not represented by the message/task fingerprints.  Its
+    24-hour stale threshold likewise changes attention without a database write,
+    so both must have a cheap Phase-1 fingerprint.
+    """
+    from app.routers.admin_project_strategic_session import (
+        _compute_strategic_state_fingerprints,
+    )
+
+    project = await _make_project(db_session)
+    now = _utcnow()
+    before = await _compute_strategic_state_fingerprints(
+        db_session, project.id, TEST_USER_ID
+    )
+    assert before["completion_debt_count"] == 0
+    assert before["attention_next_time_boundary"] is None
+
+    debt = CompletionDebtEntry(
+        project_id=project.id,
+        kind="retirement_residual",
+        title="Debt about to become operator attention",
+        status="open",
+        created_at=now - timedelta(hours=23, minutes=59),
+    )
+    db_session.add(debt)
+    await db_session.commit()
+    with_debt = await _compute_strategic_state_fingerprints(
+        db_session, project.id, TEST_USER_ID
+    )
+    assert with_debt["completion_debt_count"] == 1
+    assert with_debt["completion_debt_max_updated"] is not None
+    assert with_debt["attention_next_time_boundary"] is not None
+
+    # Crossing the debt's threshold leaves all durable rows untouched, but the
+    # upcoming-boundary stamp disappears so the state revision cannot 304.
+    mocker.patch(
+        "app.routers.admin_project_strategic_session._utcnow",
+        return_value=now + timedelta(minutes=2),
+    )
+    after_threshold = await _compute_strategic_state_fingerprints(
+        db_session, project.id, TEST_USER_ID
+    )
+    assert after_threshold["completion_debt_count"] == with_debt["completion_debt_count"]
+    assert after_threshold["completion_debt_max_updated"] == with_debt["completion_debt_max_updated"]
+    assert after_threshold["attention_next_time_boundary"] != with_debt["attention_next_time_boundary"]
 
 
 @pytest.mark.asyncio

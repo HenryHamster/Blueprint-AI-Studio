@@ -29,9 +29,11 @@ from app.shared_state import limiter
 from app.models import (
     MESSAGE_CONTENT_MAX,
     Alert,
+    CompletionDebtEntry,
     ComputeJob,
     ComputeJobStatus,
     Direction,
+    CriterionEvidence,
     LocalRunner,
     MessagesLastSeen,
     MessagesNoisePrefs,
@@ -1159,6 +1161,12 @@ async def _compute_strategic_state_fingerprints(
       ``criterion_keys`` / ``status`` feed model-integrity + criterion-links (these
       live on the Direction table, NOT the project.directions blob the narrow
       token folds in, so an integrity edit is invisible without this probe).
+    * ``completion_debt_count`` / ``completion_debt_max_updated`` — durable
+      completion-debt attention sources, which are not ProjectMessage rows.
+    * ``attention_next_time_boundary`` — the next known clock transition for
+      attention's ten-minute dependency queue, twenty-four-hour debt, or
+      six-hour experiment windows.  This remains stable between transitions,
+      unlike hashing ``now`` on every poll.
 
     A DB error here would silently over-suppress (a stale probe → false 304), so
     the caller runs this on the always-executed Phase-1 path where any failure
@@ -1244,6 +1252,89 @@ async def _compute_strategic_state_fingerprints(
             ReleaseVersion.status == "open",
         )
     )
+    completion_debt_row = (
+        await session.execute(
+            select(func.count(), func.max(CompletionDebtEntry.updated_at)).where(
+                or_(
+                    CompletionDebtEntry.project_id == project_id,
+                    CompletionDebtEntry.project_id.is_(None),
+                )
+            )
+        )
+    ).one()
+
+    # Attention has several clock-derived transitions.  Query only the nearest
+    # candidate timestamp for each window, then fingerprint that *boundary*;
+    # this keeps the early 304 fast path intact between actual transitions.
+    now = _utcnow()
+    next_dependency_created_at = await session.scalar(
+        select(func.min(Task.created_at)).where(
+            Task.project_id == project_id,
+            Task.archived.is_(False),
+            Task.status == TaskStatus.QUEUED,
+            Task.created_at > now - _dt.timedelta(minutes=10),
+        )
+    )
+    next_debt_created_at = await session.scalar(
+        select(func.min(CompletionDebtEntry.created_at)).where(
+            or_(
+                CompletionDebtEntry.project_id == project_id,
+                CompletionDebtEntry.project_id.is_(None),
+            ),
+            CompletionDebtEntry.status == "open",
+            CompletionDebtEntry.created_at > now - _dt.timedelta(hours=24),
+        )
+    )
+    next_experiment_completed_at = await session.scalar(
+        select(func.min(Task.completed_at)).where(
+            Task.project_id == project_id,
+            Task.archived.is_(False),
+            Task.status.in_((TaskStatus.COMPLETED, TaskStatus.FAILED)),
+            Task.completed_at.is_not(None),
+            Task.completed_at > now - _dt.timedelta(hours=6),
+        )
+    )
+    next_attestation_recorded_at = await session.scalar(
+        select(func.min(CriterionEvidence.recorded_at)).where(
+            CriterionEvidence.project_id == project_id,
+            CriterionEvidence.source_kind == "operator_attestation",
+            CriterionEvidence.recorded_at > now - _dt.timedelta(days=7),
+        )
+    )
+    boundaries = [
+        candidate
+        for candidate in (
+            (
+                next_dependency_created_at + _dt.timedelta(minutes=10)
+                if next_dependency_created_at
+                else None
+            ),
+            (
+                next_debt_created_at + _dt.timedelta(hours=24)
+                if next_debt_created_at
+                else None
+            ),
+            (
+                next_experiment_completed_at + _dt.timedelta(hours=6)
+                if next_experiment_completed_at
+                else None
+            ),
+            # An attestation first becomes a warning two days before its
+            # seven-day expiry, then changes again when it actually expires.
+            (
+                next_attestation_recorded_at + _dt.timedelta(days=5)
+                if next_attestation_recorded_at
+                else None
+            ),
+            (
+                next_attestation_recorded_at + _dt.timedelta(days=7)
+                if next_attestation_recorded_at
+                else None
+            ),
+        )
+        if candidate is not None and candidate > now
+    ]
+    attention_next_time_boundary = min(boundaries) if boundaries else None
     return {
         "workbench_updated_at": str(workbench_updated_at)
         if workbench_updated_at
@@ -1269,6 +1360,13 @@ async def _compute_strategic_state_fingerprints(
         "alert_max_at": str(alert_max_at) if alert_max_at else None,
         "open_version_updated_at": str(open_version_updated_at)
         if open_version_updated_at
+        else None,
+        "completion_debt_count": int(completion_debt_row[0] or 0),
+        "completion_debt_max_updated": str(completion_debt_row[1])
+        if completion_debt_row[1]
+        else None,
+        "attention_next_time_boundary": str(attention_next_time_boundary)
+        if attention_next_time_boundary
         else None,
     }
 
@@ -2050,10 +2148,15 @@ async def get_project_strategic_conversation(
         include_message_id=include_message_id,
     )
     result = {"conversation": conversation}
-    # The selected include_message_id changes the transcript itself, so hashing
-    # the complete envelope naturally binds a pinned-message request to its
-    # validator rather than accidentally reusing the unpinned transcript ETag.
-    etag = _compute_strategic_state_etag(result)
+    # A selected message can already be in the visible window, making the
+    # rendered transcript identical to the unpinned one.  Bind the validator
+    # to the requested pin independently so an unpinned 304 never suppresses
+    # the selected-target request.
+    etag_input = {
+        **result,
+        "selected_message_id": str(include_message_id) if include_message_id else None,
+    }
+    etag = _compute_strategic_state_etag(etag_input)
     if _if_none_match_hits(if_none_match, etag):
         return Response(status_code=304, headers={"ETag": _quote_etag(etag)})
     response.headers["ETag"] = _quote_etag(etag)
