@@ -1314,6 +1314,22 @@ def build_and_push(
     )
     build_args = dict(build_args or {})
 
+    # Security gate: reject build_args that carry platform credentials before
+    # passing them to `docker build --build-arg`.  A secret value in build_args
+    # flows through ARG/ENV into the image config.Env and would be caught by the
+    # post-build layer scan — but only after docker has already run and potentially
+    # cached the secret in a build layer.  Failing here closes that window: the
+    # secret never reaches the docker daemon at all.
+    _secret_arg_violations = [
+        k for k, v in build_args.items() if k in _SECRET_ENV_NAMES and v
+    ]
+    if _secret_arg_violations:
+        raise CredentialLeakError(
+            "build_args contains platform secret keys that must never be passed "
+            "as --build-arg (they would be baked into the image): "
+            + ", ".join(sorted(_secret_arg_violations))
+        )
+
     dockerfile_path = os.path.join(repo_dir, dockerfile)
     if not os.path.isfile(dockerfile_path):
         raise FileNotFoundError(f"Dockerfile not found: {dockerfile_path}")

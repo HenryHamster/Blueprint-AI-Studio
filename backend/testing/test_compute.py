@@ -17660,6 +17660,68 @@ def test_build_and_push_credential_leak_fails_before_push(tmp_path):
     assert not any("push" in c for c in cmds)
 
 
+def test_build_and_push_rejects_secret_build_args_before_build(tmp_path):
+    """A platform-secret key in build_args is rejected before docker build runs."""
+    repo = _write_repo(tmp_path)
+    cmds = []
+
+    def fake_run(cmd, **kw):
+        cmds.append(cmd)
+
+        class P:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        return P()
+
+    with pytest.raises(_bci.CredentialLeakError, match="build_args contains platform secret keys"):
+        _bci.build_and_push(
+            repo_dir=repo,
+            registry_repo="reg/repo",
+            image_name="img",
+            dockerfile=".blueprint/Dockerfile.compute",
+            dep_files=["requirements.txt"],
+            build_args={"ANTHROPIC_API_KEY": "sk-ant-secret"},
+            _run=fake_run,
+            _tag_exists=lambda *a, **k: False,
+        )
+    # Neither build nor push should have run.
+    flat = [" ".join(c) for c in cmds]
+    assert not any(c.startswith("docker build") for c in flat)
+    assert not any(c.startswith("docker push") for c in flat)
+
+
+def test_build_and_push_allows_clean_build_args(tmp_path):
+    """Build args that are not platform secrets pass through without error."""
+    repo = _write_repo(tmp_path)
+    cmds = []
+
+    def fake_run(cmd, **kw):
+        cmds.append(cmd)
+
+        class P:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        return P()
+
+    # A clean build arg (non-secret key, non-empty value) should not raise.
+    result = _bci.build_and_push(
+        repo_dir=repo,
+        registry_repo="reg/repo",
+        image_name="img",
+        dockerfile=".blueprint/Dockerfile.compute",
+        dep_files=["requirements.txt"],
+        build_args={"PYTHON_VERSION": "3.11"},
+        _run=fake_run,
+        _tag_exists=lambda *a, **k: False,
+        _scan_layers_fn=lambda *a, **k: [],
+    )
+    assert result.built is True
+    flat = [" ".join(c) for c in cmds]
+    assert any("--build-arg" in c and "PYTHON_VERSION=3.11" in c for c in flat)
+
+
 def test_build_and_push_layer_credential_leak_fails_before_push(tmp_path):
     """A credential in built image layers fails the push AFTER build but BEFORE push."""
     repo = _write_repo(tmp_path)
