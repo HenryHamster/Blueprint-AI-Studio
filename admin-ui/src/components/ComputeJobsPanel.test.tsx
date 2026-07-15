@@ -151,6 +151,26 @@ describe('ComputeJobsPanel helpers', () => {
     ).toBe('Killed: no progress');
   });
 
+  test('computeJobTerminalLabel recognizes legacy runner no-progress watchdog rows only', () => {
+    expect(
+      computeJobTerminalLabel(makeJob({
+        backend: 'runner-subprocess',
+        status: 'FAILED',
+        outcome: 'FAILURE',
+        terminal_reason: 'no_progress_timeout',
+        exit_code: 125,
+      })),
+    ).toBe('Killed: no progress');
+    expect(
+      computeJobTerminalLabel(makeJob({
+        backend: 'gcp_compute_engine',
+        status: 'FAILED',
+        outcome: 'FAILURE',
+        exit_code: 125,
+      })),
+    ).toBe('Failed');
+  });
+
   test('computeJobTerminalLabel returns Killed: deadline for TIMED_OUT with terminal_kind deadline', () => {
     expect(
       computeJobTerminalLabel(makeJob({ outcome: 'TIMED_OUT', terminal_kind: 'deadline' })),

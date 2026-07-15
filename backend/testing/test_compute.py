@@ -1843,8 +1843,8 @@ async def test_runner_report_exit_125_finalizes_no_progress_timeout_through_moni
     client, db_session
 ):
     """END-TO-END: a runner no-progress watchdog kill (exit 125) reported over the
-    HTTP /report endpoint is finalized by the monitor as a FAILURE whose durable
-    terminal_reason classifies to NO_PROGRESS_TIMEOUT — NOT CODE_ERROR.
+    HTTP /report endpoint is finalized by the monitor as the same intentional
+    no-progress timeout as a central plateau-watchdog cut — NOT a command failure.
 
     This is the full pipeline the unit test only samples at poll_status: the
     reserved exit code produced by scripts/local_runner.py's watchdog must survive
@@ -1877,8 +1877,9 @@ async def test_runner_report_exit_125_finalizes_no_progress_timeout_through_moni
     await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
 
     await db_session.refresh(job)
-    assert job.status == ComputeJobStatus.FAILED
-    assert job.outcome == ComputeJobOutcome.FAILURE
+    assert job.status == ComputeJobStatus.TIMED_OUT
+    assert job.outcome == ComputeJobOutcome.TIMED_OUT
+    assert (job.polling_metadata or {}).get("terminal_kind") == "no_progress"
     assert (job.polling_metadata or {}).get("exit_code") == 125
     assert job.terminal_reason == "no_progress_timeout"
     # 3) The classifier keys the terminal reason to a platform kill, not a defect.
@@ -1886,6 +1887,9 @@ async def test_runner_report_exit_125_finalizes_no_progress_timeout_through_moni
         classify_compute_terminal_reason(job.terminal_reason, None)
         == NO_PROGRESS_TIMEOUT
     )
+    result = json.loads(compute_jobs.build_compute_result_logs(job))
+    assert result["intentional_terminal"] is True
+    assert result["killed_by"] == "deadline"
 
 
 @pytest.mark.asyncio

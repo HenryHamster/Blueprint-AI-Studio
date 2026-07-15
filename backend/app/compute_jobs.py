@@ -43,6 +43,10 @@ from app.compute_backends import (
     run_preflight_smoke,
     validate_backend_name,
 )
+from app.failure_classification import (
+    NO_PROGRESS_TIMEOUT,
+    classify_compute_terminal_reason,
+)
 from app.resource_envelope import (
     resolve_project_hardware_policy,
     resolve_project_require_local_runner,
@@ -2796,12 +2800,17 @@ async def _process_single_compute_job(
             return
         accrued_cost_usd = max(float(job.accrued_cost_usd or 0.0), cost.total_cost_usd)
         timeout_like = _status_is_runtime_timeout(status)
+        no_progress_like = (
+            classify_compute_terminal_reason(status.message, None)
+            == NO_PROGRESS_TIMEOUT
+        )
+        intentional_timeout = timeout_like or no_progress_like
         # A backend-reported SUCCEEDED that nonetheless emitted a fatal
         # no-usable-GPU diagnostic is not a real success — the container never
         # had a supported GPU and could not produce its metric. Reclassify it as
         # a FAILURE so the GPU/image mismatch surfaces loudly.
         no_usable_gpu = (
-            not timeout_like
+            not intentional_timeout
             and status.status == ComputeJobStatus.SUCCEEDED
             and _status_reports_no_usable_gpu(status)
         )
@@ -2823,7 +2832,7 @@ async def _process_single_compute_job(
         # with no declared scalar metric (arms-only sweeps, criterion-only tasks)
         # keep the original coarse no-data check.
         no_data = (
-            not timeout_like
+            not intentional_timeout
             and not no_usable_gpu
             and status.status == ComputeJobStatus.SUCCEEDED
             and _status_has_no_reported_metrics(status)
@@ -2834,7 +2843,7 @@ async def _process_single_compute_job(
             )
             and await collect_terminal_artifact_reference(job) is None
         )
-        if timeout_like:
+        if intentional_timeout:
             outcome = ComputeJobOutcome.TIMED_OUT
         elif no_usable_gpu or no_data:
             outcome = ComputeJobOutcome.FAILURE
@@ -2851,7 +2860,7 @@ async def _process_single_compute_job(
             status=status,
             accrued_cost_usd=accrued_cost_usd,
             terminal_status=ComputeJobStatus.TIMED_OUT
-            if timeout_like
+            if intentional_timeout
             else status.status,
             outcome=outcome,
             terminal_reason=(
@@ -2870,6 +2879,9 @@ async def _process_single_compute_job(
                 )
             ),
             exit_code=status.exit_code,
+            terminal_kind=(
+                NO_PROGRESS_TERMINAL_REASON if no_progress_like else None
+            ),
         )
         return
 

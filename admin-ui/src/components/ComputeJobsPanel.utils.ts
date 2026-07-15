@@ -103,6 +103,13 @@ export function computeJobEvidenceTierRank(job: ComputeJob): number {
 /** Human-readable terminal reason for a finished job, distinguishing the three
  *  kill paths (operator / budget / deadline / no-progress) plus natural success/failure. */
 export function computeJobTerminalLabel(job: ComputeJob): string {
+  const legacyRunnerNoProgress =
+    job.outcome === 'FAILURE'
+    && job.backend === 'runner-subprocess'
+    && ((job.terminal_reason || '').toLowerCase().includes('no_progress_timeout')
+      || job.exit_code === 125);
+  if (legacyRunnerNoProgress) return 'Killed: no progress';
+
   switch (job.outcome) {
     case 'SPEND_CAP_EXCEEDED':
       return 'Killed: budget cap';

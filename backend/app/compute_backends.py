@@ -42,6 +42,7 @@ from google.cloud import storage as gcs_storage
 from app import compute
 from app import storage
 from app.compute_experiment_contract import ENV_KEY_RE
+from app.failure_classification import NO_PROGRESS_TIMEOUT_TERMINAL_REASON
 from app.models import ComputeJob, ComputeJobStatus, Project, ProjectComputeImage
 from app.vm_lifecycle import _ensure_vm_deleted
 
@@ -1293,14 +1294,19 @@ class RunnerSubprocessBackend:
                     ).replace(tzinfo=None)
                 except (ValueError, AttributeError):
                     pass
+            no_progress_timeout = exit_code == NO_PROGRESS_WATCHDOG_EXIT_CODE
             cjs = (
                 ComputeJobStatus.SUCCEEDED
                 if runner_exec_status == "succeeded"
-                else ComputeJobStatus.FAILED
+                else (
+                    ComputeJobStatus.TIMED_OUT
+                    if no_progress_timeout
+                    else ComputeJobStatus.FAILED
+                )
             )
             if cjs == ComputeJobStatus.SUCCEEDED:
                 message = "compute job succeeded"
-            elif exit_code == NO_PROGRESS_WATCHDOG_EXIT_CODE:
+            elif no_progress_timeout:
                 # No-progress watchdog kill on the runner. The runner /report
                 # endpoint carries only exec_status/exit_code (no reason field),
                 # so translate the reserved exit code here into a terminal reason
@@ -1308,7 +1314,7 @@ class RunnerSubprocessBackend:
                 # kill collapses to CODE_ERROR (burns retry budget, misattributes
                 # blame) instead of NO_PROGRESS_TIMEOUT — matching the GCP/local
                 # -subprocess paths which emit REASON=no_progress_timeout directly.
-                message = "no_progress_timeout"
+                message = NO_PROGRESS_TIMEOUT_TERMINAL_REASON
             else:
                 message = "compute job failed"
             return ComputeStatusResult(
