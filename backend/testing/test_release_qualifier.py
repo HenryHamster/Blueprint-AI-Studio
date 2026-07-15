@@ -19682,8 +19682,7 @@ class TestFinalizeInfraFailure:
 
     @pytest.mark.asyncio
     async def test_permanent_gate_incapacity_classification(self, db_session):
-        """3 consecutive same-signature migration_apply_check_unavailable errors
-        classify as permanent gate-incapacity and emit a force-promote message."""
+        """3 consecutive gate errors stay identical despite child diagnostics."""
         from app import release_qualifier_audit as rqa
 
         project, version = await _make_project_and_version(db_session)
@@ -19742,7 +19741,9 @@ class TestFinalizeInfraFailure:
         assert len(alerts) >= 1
         latest = alerts[-1]
         assert "persistently incapable" in latest.message
-        assert "force-promote" in latest.message
+        assert "hotfix scope" in latest.message
+        assert "promote/hotfix" in latest.message
+        assert "whole-tree force-promotion" in latest.message
         assert "agent VM" not in latest.message
         assert "clone pipeline" not in latest.message
 
