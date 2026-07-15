@@ -612,6 +612,10 @@ def _runner_view(runner: LocalRunner) -> Dict[str, Any]:
         ),
         "created_at": runner.created_at.isoformat() if runner.created_at else None,
         "token_age_days": token_age_days,
+        "current_token_heartbeat_confirmed": bool(
+            runner.last_heartbeat_token_generation > 0
+            and runner.last_heartbeat_token_generation == runner.token_generation
+        ),
     }
 
 
@@ -1194,7 +1198,9 @@ async def rotate_runner_token(
 
     token = create_runner_token(runner.id)
     runner.token_hash = hash_runner_token(token)
-    runner.token_created_at = _utcnow()
+    rotated_at = _utcnow()
+    runner.token_created_at = rotated_at
+    runner.token_generation = max(1, runner.token_generation) + 1
     summary_status = runner.status
     summary_hostname = runner.hostname
     session.add(runner)
@@ -1217,7 +1223,11 @@ async def rotate_runner_token(
             "hostname": summary_hostname,
         },
     )
-    return {"runner_id": str(runner_id), "token": token}
+    return {
+        "runner_id": str(runner_id),
+        "token": token,
+        "rotated_at": f"{rotated_at.isoformat()}Z",
+    }
 
 
 async def _release_unpulled_runner_pins(

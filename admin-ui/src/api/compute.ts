@@ -1951,18 +1951,31 @@ export interface FleetRunner {
   };
   last_seen_at: string | null;
   created_at: string | null;
+  // Server-side proof that a heartbeat authenticated with the current token
+  // generation. False immediately after rotation until the replacement token
+  // is actually used; immune to last_seen_at/rotation commit races.
+  current_token_heartbeat_confirmed?: boolean;
 }
 
 /** Register a new fleet runner for a project. Returns the one-time token.
  *
- * The backend (POST /projects/{id}/runners/register and .../rotate-token) returns
- * exactly `{runner_id, token}` — runner tokens do not expire, so there is no
- * expiry field here. A prior version of this type declared phantom
+ * The registration endpoint returns exactly `{runner_id, token}` — runner tokens
+ * do not expire, so there is no expiry field here. A prior version of this type
+ * declared phantom
  * `token_expires_at`/`expires_at`/`expiresAt` fields that the server never sent,
  * driving a dead "Token expires" affordance in the enroll dialog; both removed. */
 export interface FleetRunnerRegistrationResult {
   runner_id: string;
   token: string;
+}
+
+/** Rotate a fleet runner token and return its one-time replacement token.
+ * `rotated_at` remains optional for rolling-deployment compatibility and display;
+ * reconnect proof comes from FleetRunner.current_token_heartbeat_confirmed. */
+export interface FleetRunnerTokenRotationResult {
+  runner_id: string;
+  token: string;
+  rotated_at?: string;
 }
 
 export async function registerFleetRunner(
@@ -1990,7 +2003,7 @@ export async function registerFleetRunner(
 export async function rotateFleetRunnerToken(
   projectId: string,
   runnerId: string,
-): Promise<FleetRunnerRegistrationResult> {
+): Promise<FleetRunnerTokenRotationResult> {
   const res = await apiFetch(
     `/api/admin/projects/${encodeURIComponent(projectId)}/runners/${encodeURIComponent(runnerId)}/rotate-token`,
     { method: 'POST' },

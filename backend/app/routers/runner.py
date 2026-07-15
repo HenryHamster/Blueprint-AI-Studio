@@ -35,7 +35,7 @@ from typing import Any, Dict, List
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, StrictBool, StrictStr
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -1302,6 +1302,29 @@ async def decline_task(
     return {"ok": True, "decline_count": total_declines}
 
 
+async def _acknowledge_authenticated_token_generation(
+    session: AsyncSession,
+    *,
+    runner_id: uuid.UUID,
+    authenticated_generation: int,
+) -> None:
+    """CAS the heartbeat credential acknowledgement against the current row.
+
+    Rotation and heartbeat both update the runner row. The generation predicate
+    ensures a heartbeat authenticated before rotation cannot acknowledge the
+    replacement credential even if its handler reaches this write afterward.
+    """
+    await session.execute(
+        update(LocalRunner)
+        .where(
+            LocalRunner.id == runner_id,
+            LocalRunner.token_generation == authenticated_generation,
+        )
+        .values(last_heartbeat_token_generation=authenticated_generation)
+        .execution_options(synchronize_session=False)
+    )
+
+
 @router.post("/heartbeat")
 async def heartbeat(
     payload: HeartbeatRequest,
@@ -1318,6 +1341,10 @@ async def heartbeat(
     if not allowed:
         raise HTTPException(status_code=429, headers={"Retry-After": str(retry_after)})
 
+    # Capture the generation authenticated by get_current_runner. The final
+    # compare-and-set below acknowledges it only if rotation has not changed the
+    # row's current generation while this request was in flight.
+    authenticated_token_generation = runner.token_generation
     previous_status = runner.status
     previous_hostname = runner.hostname
     previous_version = runner.version
@@ -1528,6 +1555,12 @@ async def heartbeat(
         runner.version = new_version
     runner.capabilities = caps
     session.add(runner)
+    await session.flush()
+    await _acknowledge_authenticated_token_generation(
+        session,
+        runner_id=runner_id,
+        authenticated_generation=authenticated_token_generation,
+    )
     await session.commit()
     # Append one time-series snapshot of this heartbeat's telemetry. Best-effort
     # and AFTER the runner commit — the capabilities dict on the LocalRunner row

@@ -31,13 +31,54 @@ from app.models import (
     RunnerHeartbeatSnapshot,
     _utcnow,
 )
-from app.routers.runner import HeartbeatRequest, _persist_heartbeat_snapshot, heartbeat
+from app.routers.runner import (
+    HeartbeatRequest,
+    _acknowledge_authenticated_token_generation,
+    _persist_heartbeat_snapshot,
+    heartbeat,
+)
 from app.runner_health_monitors import (
     _RUNNER_DEGRADED_FAILURE_THRESHOLD,
     _RUNNER_LIVENESS_SECONDS,
     _check_post_update_silent_runners,
     _cleanup_stale_heartbeat_snapshots,
 )
+
+
+@pytest.mark.asyncio
+async def test_stale_in_flight_heartbeat_cannot_confirm_rotated_token(db_session):
+    """An old-token handler reaching its CAS after rotation must be ignored."""
+    project = Project(name="Token generation race", user_id="race-user")
+    db_session.add(project)
+    await db_session.flush()
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash="0" * 64,
+        token_generation=2,
+        last_heartbeat_token_generation=0,
+    )
+    db_session.add(runner)
+    await db_session.commit()
+
+    # Generation 1 authenticated before rotation, but arrives at the final
+    # acknowledgement after the row has advanced to generation 2.
+    await _acknowledge_authenticated_token_generation(
+        db_session,
+        runner_id=runner.id,
+        authenticated_generation=1,
+    )
+    await db_session.commit()
+    await db_session.refresh(runner)
+    assert runner.last_heartbeat_token_generation == 0
+
+    await _acknowledge_authenticated_token_generation(
+        db_session,
+        runner_id=runner.id,
+        authenticated_generation=2,
+    )
+    await db_session.commit()
+    await db_session.refresh(runner)
+    assert runner.last_heartbeat_token_generation == 2
 
 
 async def _make_runner(session, *, version="v1", capabilities=None, last_seen_at=None):

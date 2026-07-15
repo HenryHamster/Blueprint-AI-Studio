@@ -1,7 +1,10 @@
 import { beforeEach, describe, expect, test, vi } from 'vitest';
 
 const { getIdToken } = vi.hoisted(() => ({ getIdToken: vi.fn() }));
-vi.mock('./firebase', () => ({ getIdToken }));
+vi.mock('./firebase', async () => {
+  const { createFirebaseMock } = await import('./test/firebase-mock-complete');
+  return createFirebaseMock({ getIdToken });
+});
 
 import { currentUiSurface, reportUiLoadTiming } from './uiLoadTiming';
 

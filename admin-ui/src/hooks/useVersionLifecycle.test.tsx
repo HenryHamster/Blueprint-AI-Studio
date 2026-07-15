@@ -3,7 +3,10 @@ import { cleanup, renderHook, waitFor } from '@testing-library/react';
 import { apiFetch } from '../api';
 import { useVersionLifecycle } from './useVersionLifecycle';
 
-vi.mock('../api', () => ({ apiFetch: vi.fn() }));
+vi.mock('../api', async () => {
+  const { createApiMock } = await import('../test/api-mock-complete');
+  return createApiMock({ apiFetch: vi.fn() });
+});
 
 const mockApiFetch = vi.mocked(apiFetch);
 

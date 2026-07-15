@@ -26,6 +26,8 @@ const SAMPLE_RUNNERS: FleetRunner[] = [
   },
 ];
 
+const ROTATED_AT = new Date(Date.now() + 60_000).toISOString();
+
 // Distinct backend API base URL: the enroll snippet must point runners here (the
 // orchestrator API), NOT at the admin-UI hosting origin (window.location.origin,
 // which happy-dom serves at http://localhost). Firebase Hosting has no /api/** route,
@@ -64,7 +66,11 @@ vi.mock('../api', async () => {
     API_BASE_URL: 'https://blueprint-orchestrator-xyz.a.run.app',
     listFleetRunners: vi.fn(async () => SAMPLE_RUNNERS),
     registerFleetRunner: vi.fn(async () => ({ runner_id: 'runner-new', token: 'tok-secret-xyz' })),
-    rotateFleetRunnerToken: vi.fn(async () => ({ runner_id: 'runner-abc123', token: 'tok-rotated-xyz' })),
+    rotateFleetRunnerToken: vi.fn(async () => ({
+      runner_id: 'runner-abc123',
+      token: 'tok-rotated-xyz',
+      rotated_at: ROTATED_AT,
+    })),
     revokeFleetRunner: vi.fn(async () => {}),
     updateRunnerCapabilities: vi.fn(async () => SAMPLE_RUNNERS[0]),
     // Default allow-list: enrollment project only. Individual tests override.
@@ -602,40 +608,85 @@ describe('FleetRunnersPanel — behavioral', () => {
     expect(el.textContent).not.toContain('Runner token rotated');
   });
 
-  test('rotate dialog transitions to reconnected once last_seen_at advances past rotation time', async () => {
-    const el = await mount();
+  test('rotate confirmation requires the server current-token heartbeat marker', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const rotationMs = Date.parse(ROTATED_AT);
+      for (const browserNow of [rotationMs + 86_400_000, rotationMs - 86_400_000]) {
+        vi.setSystemTime(browserNow);
+        vi.mocked(listFleetRunners).mockResolvedValue([{
+          ...SAMPLE_RUNNERS[0],
+          last_seen_at: new Date(rotationMs - 1_000).toISOString(),
+          current_token_heartbeat_confirmed: false,
+        }]);
 
-    const rotateBtn = el.querySelector('button[title="Rotate runner token"]');
-    await act(async () => { (rotateBtn as HTMLButtonElement).click(); });
-    await act(async () => {});
+        const el = await mount();
+        const rotateBtn = el.querySelector('button[title="Rotate runner token"]');
+        await act(async () => { (rotateBtn as HTMLButtonElement).click(); });
+        await act(async () => {});
+        const confirmBtn = el.querySelector('[data-testid="confirm-dialog-confirm"]');
+        await act(async () => { (confirmBtn as HTMLButtonElement).click(); });
+        await act(async () => {});
 
-    const confirmBtn = el.querySelector('[data-testid="confirm-dialog-confirm"]');
-    await act(async () => { (confirmBtn as HTMLButtonElement).click(); });
-    await act(async () => {});
+        const status = () => el.querySelector('[data-testid="runner-connection-status"]');
+        expect(status()?.textContent).toContain('Waiting for runner to reconnect');
+        expect(status()?.textContent).not.toContain('Reconnected');
 
-    // Dialog shows the optimistic "Waiting" state initially.
-    const status = () => el.querySelector('[data-testid="runner-connection-status"]');
-    expect(status()?.textContent).toContain('Waiting for runner to reconnect');
-    expect(status()?.textContent).not.toContain('Reconnected');
+        vi.mocked(listFleetRunners).mockResolvedValue([{
+          ...SAMPLE_RUNNERS[0],
+          hostname: 'reconnected-host',
+          last_seen_at: new Date(rotationMs + 1_000).toISOString(),
+          current_token_heartbeat_confirmed: true,
+        }]);
+        const refreshBtn = el.querySelector('button[aria-label="Refresh runners"]');
+        await act(async () => { (refreshBtn as HTMLButtonElement).click(); });
+        await act(async () => {});
 
-    // Simulate the runner restarting with the new token: last_seen_at is set to a
-    // time clearly after rotation (Date.now() + 10_000 is definitively post-rotation).
-    vi.mocked(listFleetRunners).mockResolvedValue([
-      {
+        expect(status()?.textContent).toContain('Reconnected');
+        expect(status()?.textContent).toContain('reconnected-host');
+        expect(status()?.textContent).not.toContain('Waiting');
+
+        act(() => { root?.unmount(); });
+        root = null;
+        host?.remove();
+        host = null;
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test.each([
+    ['absent', undefined],
+    ['invalid', 'not-a-timestamp'],
+  ])('rotate dialog ignores an %s legacy rotated_at without current-token proof', async (_label, rotatedAt) => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      vi.mocked(rotateFleetRunnerToken).mockResolvedValueOnce({
+        runner_id: 'runner-abc123',
+        token: 'tok-rotated-xyz',
+        rotated_at: rotatedAt,
+      });
+      vi.mocked(listFleetRunners).mockResolvedValue([{
         ...SAMPLE_RUNNERS[0],
-        id: 'runner-abc123',
-        hostname: 'reconnected-host',
-        last_seen_at: new Date(Date.now() + 10_000).toISOString(),
-      },
-    ]);
-    const refreshBtn = el.querySelector('button[aria-label="Refresh runners"]');
-    await act(async () => { (refreshBtn as HTMLButtonElement).click(); });
-    await act(async () => {});
+        last_seen_at: new Date(Date.parse(ROTATED_AT) + 10_000).toISOString(),
+      }]);
+      const el = await mount();
+      const rotateBtn = el.querySelector('button[title="Rotate runner token"]');
+      await act(async () => { (rotateBtn as HTMLButtonElement).click(); });
+      await act(async () => {});
+      const confirmBtn = el.querySelector('[data-testid="confirm-dialog-confirm"]');
+      await act(async () => { (confirmBtn as HTMLButtonElement).click(); });
+      await act(async () => {});
 
-    expect(status()?.textContent).toContain('Reconnected');
-    expect(status()?.textContent).toContain('reconnected-host');
-    expect(status()?.textContent).not.toContain('Waiting');
-    expect(status()?.textContent).not.toContain('Not reconnected yet');
+      const status = () => el.querySelector('[data-testid="runner-connection-status"]');
+      expect(status()?.textContent).toContain('Waiting for runner to reconnect');
+      expect(status()?.textContent).not.toContain('Reconnected');
+      await act(async () => { await vi.advanceTimersByTimeAsync(95_000); });
+      expect(status()?.textContent).toContain('Not reconnected yet');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   test('rotate dialog falls back to honest not-reconnected state after connect timeout', async () => {
@@ -1187,7 +1238,7 @@ describe('FleetRunnersPanel — behavioral', () => {
     expect(el.textContent).not.toContain('agent blocked');
   });
 
-  test('active work summary includes active compute jobs when aggregate is absent', async () => {
+  test('capacity summary reports agent and compute pools separately for legacy telemetry', async () => {
     vi.mocked(listFleetRunners).mockResolvedValueOnce([
       {
         ...SAMPLE_RUNNERS[0],
@@ -1213,9 +1264,48 @@ describe('FleetRunnersPanel — behavioral', () => {
     ]);
     const el = await mount();
 
-    expect(el.querySelector('[data-testid="fleet-runner-work-capacity"]')?.textContent).toBe('2/3');
+    expect(el.querySelector('[data-testid="fleet-runner-work-capacity"]')?.textContent).toBe('1/3');
+    expect(el.querySelector('[data-testid="fleet-runner-compute-capacity"]')?.textContent).toBe('1/3');
     expect(el.textContent).toContain('2 active');
-    expect(el.textContent).toContain('1 slots free');
+    expect(el.querySelector('[data-testid="fleet-runner-work-capacity"]')?.parentElement?.textContent).toContain('2 free');
+    expect(el.querySelector('[data-testid="fleet-runner-compute-capacity"]')?.parentElement?.textContent).toContain('2 free');
+  });
+
+  test('agent-full fleet still reports dispatch capacity when the compute pool has free slots', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([
+      {
+        ...SAMPLE_RUNNERS[0],
+        capabilities: {
+          task_types: 'all',
+          has_gpu: true,
+          max_concurrent: 2,
+          max_concurrent_compute: 4,
+        },
+        health: {
+          device_status: 'connected',
+          device_status_reason: null,
+          is_live: true,
+          seconds_since_last_seen: 10,
+          active_task_count: 2,
+          active_compute_job_count: 1,
+          active_work_count: 3,
+          max_concurrent: 2,
+          max_concurrent_compute: 4,
+          available_slots: 0,
+          available_agent_slots: 0,
+          available_compute_slots: 3,
+          stale_reason: null,
+          agent_available: true,
+          liveness_window_seconds: 300,
+        },
+      },
+    ]);
+    const el = await mount();
+
+    expect(el.querySelector('[data-testid="fleet-runner-work-capacity"]')?.textContent).toBe('2/2');
+    expect(el.querySelector('[data-testid="fleet-runner-compute-capacity"]')?.textContent).toBe('1/4');
+    expect(el.querySelector('[data-testid="fleet-next-action"]')?.textContent).toContain('Fleet has dispatch capacity');
+    expect(el.querySelector('[data-testid="fleet-next-action"]')?.textContent).not.toContain('Capacity is full');
   });
 
   test('summary capacity ignores inactive runners even with recent health', async () => {
@@ -1709,6 +1799,32 @@ describe('FleetRunnersPanel — behavioral', () => {
     expect(badge?.textContent).not.toContain('rejected it or is stuck');
   });
 
+  test('fresh live generation-matched rejection is terminal immediately, not optimistically applying', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([
+      {
+        ...SAMPLE_RUNNERS[0],
+        last_seen_at: new Date(Date.now() - 30_000).toISOString(), // live
+        config: {
+          config_generation: 'gen-new',
+          applied_config_generation: 'gen-old',
+          config_pending: true,
+          // Within the normal optimistic window: a rejection must still win.
+          desired_changed_at: new Date(Date.now() - 10_000).toISOString(),
+          daemon_reports_applied: true,
+          apply_status: 'rejected',
+          apply_reason: 'gpus_per_job exceeds available GPUs',
+          rejected_config_generation: 'gen-new',
+        },
+      },
+    ]);
+    const el = await mount();
+
+    const badge = el.querySelector('[data-testid="fleet-runner-config-status"]');
+    expect(badge?.textContent).toContain('config rejected — gpus_per_job exceeds available GPUs');
+    expect(badge?.className).toContain('text-red-300');
+    expect(badge?.textContent).not.toContain('applying on next heartbeat');
+  });
+
   test('stuck config with NO reason keeps the generic ambiguous fallback', async () => {
     vi.mocked(listFleetRunners).mockResolvedValueOnce([
       {
@@ -2107,11 +2223,11 @@ describe('FleetRunnersPanel — behavioral', () => {
     vi.mocked(listFleetRunners).mockResolvedValue([
       {
         ...runnerBefore,
-        capabilities: { ...runnerBefore.capabilities, max_concurrent: 4 },
+        capabilities: { ...runnerBefore.capabilities, max_concurrent: 4, max_concurrent_compute: 64 },
         config: {
           ...runnerBefore.config,
           gpu_indices_allowed: [0, 1],
-          desired: { task_types: 'all', max_concurrent: 4 },
+          desired: { task_types: 'all', max_concurrent: 4, max_concurrent_compute: 64 },
         },
       },
     ]);
@@ -2124,6 +2240,7 @@ describe('FleetRunnersPanel — behavioral', () => {
 
     // 2. Every control carries a plain-language label — no source-reading needed.
     expect(panel.textContent).toContain('Max concurrent tasks');
+    expect(panel.textContent).toContain('Max concurrent compute jobs');
     expect(panel.textContent).toContain('Task types');
     expect(panel.textContent).toContain('GPU allowlist');
     expect(panel.textContent).toContain('GPUs per job');
@@ -2134,9 +2251,12 @@ describe('FleetRunnersPanel — behavioral', () => {
     expect(saveBtn.disabled).toBe(true);
     expect(el.querySelector('[data-testid="fleet-runner-config-feedback"]')?.textContent).toContain('No changes');
 
-    // 4. Operator raises concurrency and restricts GPUs, then saves once.
+    // 4. Operator raises both pool limits and restricts GPUs, then saves once.
     const concInput = el.querySelector('input[aria-label="Max concurrent tasks"]') as HTMLInputElement;
     await act(async () => { typeInto(concInput, '4'); });
+    const computeInput = el.querySelector('input[aria-label="Max concurrent compute jobs"]') as HTMLInputElement;
+    await act(async () => { typeInto(computeInput, '100'); });
+    expect(computeInput.value).toBe('64');
     const gpuAll = el.querySelector('input[aria-label="Allow all GPUs"]') as HTMLInputElement;
     await act(async () => { gpuAll.click(); });
     const gpuIdx = el.querySelector('input[aria-label="GPU indices allowed"]') as HTMLInputElement;
@@ -2148,10 +2268,11 @@ describe('FleetRunnersPanel — behavioral', () => {
 
     await saveConfig(el);
 
-    // 5. Exactly the two changed fields are sent in ONE request.
+    // 5. Exactly the three changed fields are sent in ONE request.
     expect(updateRunnerCapabilities).toHaveBeenCalledTimes(1);
     expect(updateRunnerCapabilities).toHaveBeenCalledWith('proj-test', 'runner-abc123', {
       max_concurrent: 4,
+      max_concurrent_compute: 64,
       gpu_indices_allowed: [0, 1],
     });
     // 6. The operator gets explicit save confirmation.
@@ -2197,6 +2318,7 @@ describe('FleetRunnersPanel — behavioral', () => {
     await openConfig(el);
     // No editable concurrency input; a read-only value + explanation instead.
     expect(el.querySelector('input[aria-label="Max concurrent tasks"]')).toBeNull();
+    expect(el.querySelector('input[aria-label="Max concurrent compute jobs"]')).not.toBeNull();
     expect(el.textContent).toContain('Pinned to 1 for strategic runners');
   });
 

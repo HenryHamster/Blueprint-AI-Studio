@@ -5119,6 +5119,18 @@ class LocalRunner(SQLModel, table=True):
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
+    # Monotonic credential generation. A heartbeat records the generation it
+    # authenticated with; the Fleet UI confirms token rotation only when that
+    # acknowledgement equals the current generation. This avoids inferring
+    # credential use from last_seen_at wall-clock ordering.
+    token_generation: int = Field(
+        default=1,
+        sa_column=Column(Integer, nullable=False, server_default=text("1")),
+    )
+    last_heartbeat_token_generation: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default=text("0")),
+    )
     created_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),

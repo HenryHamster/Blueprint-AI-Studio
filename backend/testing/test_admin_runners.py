@@ -1210,6 +1210,23 @@ class TestRunnerEnrollWalkthrough:
         assert "token" in rot
         new_token = rot["token"]
         assert new_token != token, "rotated token must differ from the original"
+        rotated_at = datetime.fromisoformat(rot["rotated_at"].replace("Z", "+00:00"))
+        assert rotated_at.tzinfo == timezone.utc
+        persisted_runner = await db_session.get(LocalRunner, uuid.UUID(runner_id))
+        assert persisted_runner is not None
+        await db_session.refresh(persisted_runner)
+        assert persisted_runner.token_created_at == rotated_at.replace(tzinfo=None)
+
+        # Rotation advances the credential generation, so the list contract
+        # must require a heartbeat authenticated by the replacement token.
+        rotated_list_resp = await client.get(
+            f"/api/admin/projects/{project.id}/runners"
+        )
+        assert rotated_list_resp.status_code == 200, rotated_list_resp.text
+        rotated_row = next(
+            r for r in rotated_list_resp.json() if r["id"] == runner_id
+        )
+        assert rotated_row["current_token_heartbeat_confirmed"] is False
 
         # Old token is now invalid — heartbeat with it must return 401/403.
         old_hb = await client.post(
@@ -1228,6 +1245,17 @@ class TestRunnerEnrollWalkthrough:
             headers={"Authorization": f"Bearer {new_token}"},
         )
         assert new_hb.status_code == 200, new_hb.text
+
+        # Read the endpoint-level proof back through _runner_view: this covers
+        # both heartbeat acknowledgement wiring and the admin DTO field.
+        confirmed_list_resp = await client.get(
+            f"/api/admin/projects/{project.id}/runners"
+        )
+        assert confirmed_list_resp.status_code == 200, confirmed_list_resp.text
+        confirmed_row = next(
+            r for r in confirmed_list_resp.json() if r["id"] == runner_id
+        )
+        assert confirmed_row["current_token_heartbeat_confirmed"] is True
 
         # ── Step 4: revoke — runner is deleted and absent from active list ────
         del_resp = await client.delete(

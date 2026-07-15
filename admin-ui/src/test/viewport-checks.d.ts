@@ -1,4 +1,5 @@
 export declare const ESLINT_VIEWPORT_PATTERN: string;
+export declare function isBenignPlaywrightRouteRace(error: unknown): boolean;
 export declare const EXEMPT_FROM_VIEWPORT_TEST: Set<string>;
 export declare function isBenignPlaywrightRouteRace(error: unknown): boolean;
 export declare function guardPlaywrightRouteHandler<TArgs extends unknown[], TResult>(
