@@ -19,6 +19,7 @@ from urllib.parse import quote
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
+from sqlmodel import select
 
 from app.database import get_session
 from app.shared_state import limiter
@@ -28,6 +29,7 @@ from app.models import (
     ProjectStatus,
     ProjectMessage,
     MessageType,
+    UserIntegration,
 )
 from app.auth import get_current_user
 from app.ci_resolution import compute_merge_verification_verdict
@@ -41,6 +43,74 @@ router = APIRouter(
     tags=["admin-onboard"],
     dependencies=[Depends(get_current_user)],
 )
+
+
+async def _require_caller_github_push_access(
+    session: AsyncSession, current_user: dict, owner: str, repo: str
+) -> None:
+    """Fail closed unless a non-admin caller can push to the requested repo.
+
+    An App installation token represents the App's access, not the current
+    Blueprint user's GitHub authority. This check intentionally happens before
+    that token is minted, using only a caller-scoped OAuth token (or registered
+    fine-grained PAT) from ``UserIntegration``.
+    """
+    if current_user.get("role") == "admin":
+        return
+
+    integration = (
+        await session.execute(
+            select(UserIntegration).where(
+                UserIntegration.user_id == current_user["user_id"]
+            )
+        )
+    ).scalars().first()
+    if not integration or not (
+        integration.github_oauth_token or integration.github_pat
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Link your GitHub account or ask an admin to onboard this repository.",
+        )
+
+    try:
+        from app.field_encryption import decrypt_field
+        from app.github import _github_request
+        from app.secrets_manager import get_user_secret
+
+        secret_ref = decrypt_field(
+            integration.github_oauth_token or integration.github_pat
+        )
+        if not secret_ref:
+            raise ValueError("linked GitHub credential reference is empty")
+        user_token = await get_user_secret(secret_ref)
+        response = await _github_request(
+            "GET",
+            f"https://api.github.com/repos/{owner}/{repo}",
+            {
+                "Authorization": f"Bearer {user_token}",
+                "Accept": "application/vnd.github.v3+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+        )
+        if response.status_code != 200:
+            raise ValueError(f"GitHub repository access check returned {response.status_code}")
+        permissions = response.json().get("permissions") or {}
+        if not (permissions.get("push") or permissions.get("admin")):
+            raise PermissionError("GitHub credential lacks push permission")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        # Do not expose GitHub response details and never proceed on a network,
+        # token, response-shape, or permission failure.
+        logger.warning(
+            "[ONBOARD] GitHub push-access check denied %s for %s/%s: %s",
+            current_user.get("user_id"), owner, repo, exc,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="GitHub push access is required to onboard this repository.",
+        ) from exc
 
 
 def _derive_task_branch_namespace(github_repo: str) -> str:
@@ -907,6 +977,10 @@ async def onboard_project(
         ensure_repo_initialized,
         get_repo_default_branch,
         get_repo_installation_token,
+    )
+
+    await _require_caller_github_push_access(
+        session, current_user, payload.github_owner, payload.github_repo
     )
 
     token = await get_repo_installation_token(payload.github_owner, payload.github_repo)

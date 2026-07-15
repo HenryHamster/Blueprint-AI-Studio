@@ -446,6 +446,11 @@ class UserIntegration(SQLModel, table=True):
     # GitHub Fine-Grained Personal Access Token (Alternative to App Installation)
     github_pat: str | None = None
 
+    # Caller-scoped OAuth token, stored as an encrypted Secret Manager reference.
+    # Unlike an App installation token, this can prove what the linked GitHub
+    # user is allowed to do to a repository during self-service onboarding.
+    github_oauth_token: str | None = None
+
     created_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False),

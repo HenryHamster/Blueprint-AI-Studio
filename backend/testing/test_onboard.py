@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 from httpx import AsyncClient
 
 from app.main import app
-from app.models import Project, ProjectMessage, ProjectStatus
+from app.models import Project, ProjectMessage, ProjectStatus, UserIntegration
 from app.auth import get_current_user, require_admin
 from app.routers.admin_onboard import (
     GREENFIELD_SOURCE_FILE_THRESHOLD,
@@ -192,15 +192,7 @@ def override_auth():
 
 
 class TestOnboardNonAdminOwnership:
-    """A freshly allowlisted non-admin user must be able to onboard its first project.
-
-    Regression guard for the first-run signup dead-end: newly added users default
-    to ``role="user"`` (see ``AllowedUser`` / ``_UserCreate``) and the WelcomeScreen
-    invites *any* authenticated user to "Create your first project". Onboarding used
-    to require ``require_admin`` and 403'd that action; the fix gates it on
-    ``get_current_user`` (allowlist membership) and records the caller as project
-    ``owner`` so ``GET /projects`` (membership-scoped) then surfaces it.
-    """
+    """Self-service onboarding requires caller-scoped GitHub write access."""
 
     @pytest.mark.asyncio
     async def test_non_admin_user_can_onboard_and_becomes_owner(
@@ -216,8 +208,27 @@ class TestOnboardNonAdminOwnership:
         # Override the autouse admin identity with a plain allowlisted user for
         # the duration of this request.
         app.dependency_overrides[get_current_user] = _plain_user
+        db_session.add(
+            UserIntegration(
+                user_id="fresh-user-999", github_oauth_token="oauth-secret-ref"
+            )
+        )
+        await db_session.commit()
+        repo_access = MagicMock()
+        repo_access.status_code = 200
+        repo_access.json.return_value = {"permissions": {"push": True}}
         try:
             with (
+                patch(
+                    "app.secrets_manager.get_user_secret",
+                    new_callable=AsyncMock,
+                    return_value="caller-oauth-token",
+                ),
+                patch(
+                    "app.github._github_request",
+                    new_callable=AsyncMock,
+                    return_value=repo_access,
+                ),
                 patch(
                     "app.routers.admin_onboard._detect_build_config",
                     new_callable=AsyncMock,
@@ -232,6 +243,11 @@ class TestOnboardNonAdminOwnership:
                     "app.github.get_repo_default_branch",
                     new_callable=AsyncMock,
                     return_value="main",
+                ),
+                patch(
+                    "app.github.ensure_repo_initialized",
+                    new_callable=AsyncMock,
+                    return_value=False,
                 ),
             ):
                 resp = await client.post(
@@ -262,6 +278,89 @@ class TestOnboardNonAdminOwnership:
         ).scalars().first()
         assert member is not None
         assert member.role == "owner"
+
+    @pytest.mark.asyncio
+    async def test_non_admin_without_linked_github_identity_is_forbidden_before_token_mint(
+        self, client: AsyncClient
+    ):
+        async def _plain_user():
+            return {"user_id": "no-github", "email": "user@example.com", "role": "user"}
+
+        app.dependency_overrides[get_current_user] = _plain_user
+        mint = AsyncMock(return_value="installation-token")
+        try:
+            with patch("app.github.get_repo_installation_token", mint):
+                resp = await client.post(
+                    "/api/admin/projects/onboard",
+                    json={"github_owner": "acme", "github_repo": "private-repo"},
+                )
+        finally:
+            app.dependency_overrides[get_current_user] = _restore_admin_override
+
+        assert resp.status_code == 403
+        assert "Link your GitHub account" in resp.json()["error"]["message"]
+        mint.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_non_admin_without_push_permission_is_forbidden_before_token_mint(
+        self, client: AsyncClient, db_session
+    ):
+        async def _plain_user():
+            return {"user_id": "read-only", "email": "user@example.com", "role": "user"}
+
+        db_session.add(UserIntegration(user_id="read-only", github_oauth_token="oauth-ref"))
+        await db_session.commit()
+        repo_access = MagicMock()
+        repo_access.status_code = 200
+        repo_access.json.return_value = {"permissions": {"pull": True, "push": False}}
+        app.dependency_overrides[get_current_user] = _plain_user
+        mint = AsyncMock(return_value="installation-token")
+        try:
+            with (
+                patch(
+                    "app.secrets_manager.get_user_secret",
+                    new_callable=AsyncMock,
+                    return_value="caller-oauth-token",
+                ),
+                patch("app.github._github_request", new_callable=AsyncMock, return_value=repo_access),
+                patch("app.github.get_repo_installation_token", mint),
+            ):
+                resp = await client.post(
+                    "/api/admin/projects/onboard",
+                    json={"github_owner": "acme", "github_repo": "private-repo"},
+                )
+        finally:
+            app.dependency_overrides[get_current_user] = _restore_admin_override
+
+        assert resp.status_code == 403
+        assert "push access" in resp.json()["error"]["message"]
+        mint.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_admin_bypasses_caller_github_identity_check(
+        self, client: AsyncClient
+    ):
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value={"language": "python"},
+            ),
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ) as installation_token,
+            patch("app.github.get_repo_default_branch", new_callable=AsyncMock, return_value="main"),
+            patch("app.github.ensure_repo_initialized", new_callable=AsyncMock, return_value=False),
+        ):
+            resp = await client.post(
+                "/api/admin/projects/onboard",
+                json={"github_owner": "acme", "github_repo": "admin-project"},
+            )
+
+        assert resp.status_code == 200, resp.text
+        installation_token.assert_any_await("acme", "admin-project")
 
 
 async def _restore_admin_override():
