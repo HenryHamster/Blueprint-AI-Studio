@@ -2167,6 +2167,7 @@ _VIEWABLE_CONTENT_TYPES = {
 _MAX_VIEWABLE_IMAGE_BYTES = 8 * 1024 * 1024  # 8 MiB (server caps images here)
 _MAX_VIEWABLE_VIDEO_BYTES = 512 * 1024 * 1024  # 512 MiB (server caps videos here)
 _MAX_VIEWABLE_FILE_COUNT = 25  # at most N individually-addressable objects/job
+_FINAL_VIEWABLE_DRAIN_SECONDS = 10.0
 
 
 def _report_retry_sleep(attempt: int) -> float:
@@ -4008,28 +4009,106 @@ def _scan_viewable_files(artifact_dir: str) -> list:
     return candidates
 
 
-def _read_viewable_bytes(path: str, cap: int) -> "bytes | None":
-    """Read up to ``cap`` bytes of a viewable file with ``O_NOFOLLOW``, or ``None``.
+_VIEWABLE_UPLOAD_CHUNK_BYTES = 1024 * 1024
 
-    TOCTOU guard mirroring ``app.compute_backends._read_viewable_file_nofollow``:
-    an entry that was a regular file at scan time but a symlink by read time is
-    refused by the kernel (``O_NOFOLLOW``), never dereferenced. Returns ``None``
-    on any error, on an empty read, or if the file grew past ``cap`` between scan
-    and read.
+
+def _multipart_viewable_chunks(
+    path: str,
+    expected_size: int,
+    cap: int,
+    boundary: str,
+    relpath: str,
+    content_type: str,
+):
+    """Yield one multipart viewable body without ever buffering its file part.
+
+    The descriptor is opened with ``O_NOFOLLOW`` in the uploader thread.  Its
+    size is revalidated before constructing the request so a file changed after
+    the scan is retried on the next heartbeat rather than sending a stale or
+    over-cap body.  ``remaining`` also prevents a concurrent append from
+    exceeding the advertised Content-Length/cap mid-transfer.
     """
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
         fd = os.open(path, flags)
     except OSError:
-        return None
+        return
     try:
         with os.fdopen(fd, "rb", closefd=True) as fh:
-            data = fh.read(cap + 1)
+            st = os.fstat(fh.fileno())
+            if not stat.S_ISREG(st.st_mode) or st.st_size != expected_size or not (
+                0 < expected_size <= cap
+            ):
+                return
+            bnd = boundary.encode("latin-1")
+            crlf = b"\r\n"
+            yield b"--" + bnd + crlf
+            yield b'Content-Disposition: form-data; name="filename"' + crlf + crlf
+            yield relpath.encode() + crlf
+            yield b"--" + bnd + crlf
+            yield (
+                f'Content-Disposition: form-data; name="file"; filename="{relpath}"'.encode()
+                + crlf
+            )
+            yield f"Content-Type: {content_type}".encode() + crlf + crlf
+            remaining = expected_size
+            while remaining:
+                chunk = fh.read(min(_VIEWABLE_UPLOAD_CHUNK_BYTES, remaining))
+                if not chunk:
+                    return
+                remaining -= len(chunk)
+                yield chunk
     except OSError:
-        return None
-    if not data or len(data) > cap:
-        return None
-    return data
+        return
+    yield crlf + b"--" + bnd + b"--" + crlf
+
+
+def _multipart_viewable_chunks_from_file(
+    fh, expected_size: int, boundary: str, relpath: str, content_type: str
+):
+    """Yield a multipart body from an already-open, size-checked descriptor."""
+    bnd = boundary.encode("latin-1")
+    crlf = b"\r\n"
+    yield b"--" + bnd + crlf
+    yield b'Content-Disposition: form-data; name="filename"' + crlf + crlf
+    yield relpath.encode() + crlf
+    yield b"--" + bnd + crlf
+    yield (
+        f'Content-Disposition: form-data; name="file"; filename="{relpath}"'.encode()
+        + crlf
+    )
+    yield f"Content-Type: {content_type}".encode() + crlf + crlf
+    remaining = expected_size
+    while remaining:
+        st = os.fstat(fh.fileno())
+        if not stat.S_ISREG(st.st_mode) or st.st_size != expected_size:
+            raise OSError("viewable artifact changed during upload")
+        chunk = fh.read(min(_VIEWABLE_UPLOAD_CHUNK_BYTES, remaining))
+        if not chunk:
+            raise OSError("viewable artifact truncated during upload")
+        remaining -= len(chunk)
+        yield chunk
+    st = os.fstat(fh.fileno())
+    if not stat.S_ISREG(st.st_mode) or st.st_size != expected_size:
+        raise OSError("viewable artifact changed during upload")
+    yield crlf + b"--" + bnd + b"--" + crlf
+
+
+def _viewable_multipart_length(boundary: str, relpath: str, size: int, content_type: str) -> int:
+    """Return the exact content length emitted by ``_multipart_viewable_chunks``."""
+    bnd = boundary.encode("latin-1")
+    crlf = b"\r\n"
+    headers = (
+        b"--" + bnd + crlf,
+        b'Content-Disposition: form-data; name="filename"' + crlf + crlf,
+        relpath.encode() + crlf,
+        b"--" + bnd + crlf,
+        f'Content-Disposition: form-data; name="file"; filename="{relpath}"'.encode()
+        + crlf,
+        f"Content-Type: {content_type}".encode() + crlf + crlf,
+        crlf + b"--" + bnd + b"--" + crlf,
+    )
+    return sum(map(len, headers)) + size
 
 
 class _ViewableStreamState:
@@ -4041,12 +4120,63 @@ class _ViewableStreamState:
     ``*_logged`` members keep the bounded skip notices to one line each.
     """
 
-    __slots__ = ("sent", "oversize_logged", "budget_logged")
+    __slots__ = ("sent", "oversize_logged", "budget_logged", "inflight", "completed", "lock", "thread")
 
     def __init__(self) -> None:
         self.sent: dict = {}
         self.oversize_logged: set = set()
         self.budget_logged = False
+        self.inflight: tuple | None = None
+        self.completed: tuple | None = None
+        self.lock = threading.Lock()
+        self.thread: threading.Thread | None = None
+
+    def reap(self) -> None:
+        """Commit only completed successful uploads on the heartbeat thread."""
+        with self.lock:
+            completed, self.completed = self.completed, None
+        if completed is None:
+            return
+        relpath, signature, status = completed
+        if status is not None and 200 <= status < 300:
+            self.sent[relpath] = signature
+
+    def start_upload(self, upload_args: tuple, relpath: str, signature: tuple) -> bool:
+        """Start at most one daemon delivery; never block the heartbeat loop."""
+        with self.lock:
+            if self.inflight is not None:
+                return False
+            self.inflight = (relpath, signature)
+
+        def _deliver() -> None:
+            try:
+                status = _upload_viewable(*upload_args)
+            except Exception as exc:  # pragma: no cover - defensive worker boundary
+                print(f"[compute] unexpected viewable uploader error: {exc}", flush=True)
+                status = None
+            with self.lock:
+                self.completed = (relpath, signature, status)
+                self.inflight = None
+
+        self.thread = threading.Thread(target=_deliver, daemon=True)
+        self.thread.start()
+        return True
+
+    def drain_upload(self, timeout: "float | None" = None) -> bool:
+        """Wait up to ``timeout`` for one delivery and commit it when complete.
+
+        Returns ``False`` while the daemon upload is still running.  Terminal
+        handoff uses that signal to abandon the remaining best-effort previews
+        instead of holding a compute runner until the transport timeout.
+        """
+        with self.lock:
+            thread = self.thread
+        if thread is not None:
+            thread.join(timeout=timeout)
+            if thread.is_alive():
+                return False
+        self.reap()
+        return True
 
 
 def _upload_viewable(
@@ -4054,33 +4184,47 @@ def _upload_viewable(
     token: str,
     job_id: str,
     relpath: str,
-    file_bytes: bytes,
+    path: str,
+    size: int,
     content_type: str,
 ) -> "int | None":
     """POST one viewable file to the mid-run endpoint. Returns HTTP status, or
     ``None`` on a network error. Never raises — mid-run streaming is strictly
     best-effort and must never stall or fail the compute job."""
-    body, ctype = _build_multipart_body(
-        fields={"filename": relpath},
-        file_field="file",
-        filename=relpath,
-        file_bytes=file_bytes,
-        file_content_type=content_type,
+    cap = (
+        _MAX_VIEWABLE_VIDEO_BYTES
+        if content_type.startswith("video/")
+        else _MAX_VIEWABLE_IMAGE_BYTES
     )
+    if not 0 < size <= cap:
+        return None
+    boundary = "----blueprintrunner" + os.urandom(16).hex()
+    ctype = f"multipart/form-data; boundary={boundary}"
     url = f"{orchestrator_url}/api/runner/compute-job/{job_id}/viewable"
-    req = urllib.request.Request(
-        url,
-        data=body,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": ctype,
-            "Accept": "application/json",
-        },
-        method="POST",
-    )
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            return resp.status
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        with os.fdopen(os.open(path, flags), "rb", closefd=True) as fh:
+            st = os.fstat(fh.fileno())
+            # Validate before Request/urlopen; stale scan results retry next heartbeat.
+            if not stat.S_ISREG(st.st_mode) or st.st_size != size:
+                return None
+            req = urllib.request.Request(
+                url,
+                data=_multipart_viewable_chunks_from_file(
+                    fh, size, boundary, relpath, content_type
+                ),
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": ctype,
+                    "Accept": "application/json",
+                    "Content-Length": str(
+                        _viewable_multipart_length(boundary, relpath, size, content_type)
+                    ),
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                return int(resp.status)
     except urllib.error.HTTPError as exc:
         return exc.code
     except Exception as exc:  # noqa: BLE001 — network blip/timeout is non-fatal
@@ -4098,6 +4242,8 @@ def _stream_viewable_files(
     job_id: str,
     artifact_dir: str,
     state: "_ViewableStreamState",
+    *,
+    drain: bool = False,
 ) -> None:
     """Best-effort mid-run push of NEW-or-CHANGED viewable files. NEVER raises.
 
@@ -4116,6 +4262,29 @@ def _stream_viewable_files(
         print(f"[compute] viewable scan error for job {job_id}: {exc}", flush=True)
         return
 
+    drain_deadline = (
+        time.monotonic() + _FINAL_VIEWABLE_DRAIN_SECONDS if drain else None
+    )
+
+    def _drain_within_deadline() -> bool:
+        if drain_deadline is None:
+            return True
+        remaining = max(0.0, drain_deadline - time.monotonic())
+        if state.drain_upload(timeout=remaining):
+            return True
+        print(
+            f"[compute] final viewable drain exceeded "
+            f"{_FINAL_VIEWABLE_DRAIN_SECONDS:g}s for job {job_id}; "
+            "continuing terminal handoff",
+            flush=True,
+        )
+        return False
+
+    if drain:
+        if not _drain_within_deadline():
+            return
+    else:
+        state.reap()
     for cand in candidates:
         relpath = cand["relpath"]
         kind = cand["kind"]
@@ -4149,18 +4318,33 @@ def _stream_viewable_files(
                 )
             continue
 
-        data = _read_viewable_bytes(cand["abspath"], cap)
-        if data is None:
+        # Slow preview uploads run outside the report/cancellation loop.  A single
+        # in-flight slot bounds memory and background I/O; subsequent candidates
+        # are considered next heartbeat.  ``sent`` is updated by ``reap`` only
+        # after the worker receives a definitive 2xx response.
+        if not state.start_upload(
+            (
+                orchestrator_url,
+                token,
+                job_id,
+                relpath,
+                cand["abspath"],
+                size,
+                cand["content_type"],
+            ),
+            relpath,
+            signature,
+        ):
+            if drain:
+                _drain_within_deadline()
+            return
+        if drain:
+            if not _drain_within_deadline():
+                return
             continue
-
-        status = _upload_viewable(
-            orchestrator_url, token, job_id, relpath, data, cand["content_type"]
-        )
-        # Record the signature only on a definitive 2xx so a failed upload retries
-        # next heartbeat. Any non-2xx (409 terminal / 413 oversize / 429 cap/rate /
-        # 5xx) or network error (status None) is swallowed and streaming continues.
-        if status is not None and 200 <= status < 300:
-            state.sent[relpath] = signature
+        # One scheduling decision per heartbeat, even if a tiny local upload
+        # completes before this loop reaches the next candidate.
+        return
 
 
 # Predecessor run-status files stripped from a hydrated resume bundle so they
@@ -5095,6 +5279,16 @@ def _run_compute_job(
         reader.join(timeout=5)
         _close_stdout()
         reader.join(timeout=1)
+
+        # A command can create its final plot or rollout video immediately before
+        # exiting, without waiting long enough to reach the next heartbeat. Flush
+        # once while the job is still RUNNING: the viewable endpoint rejects
+        # terminal jobs, and the durable artifact bundle may be skipped when it
+        # exceeds its much smaller upload cap. Reuse the live state so already
+        # uploaded files are not sent again.
+        _stream_viewable_files(
+            orchestrator_url, token, job_id, artifact_dir, viewable_state, drain=True
+        )
 
         result_metrics = _parse_result_metrics(result_file)
 
