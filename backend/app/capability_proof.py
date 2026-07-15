@@ -1351,6 +1351,123 @@ async def _read_file_at_head(path: str, repo_root: str = "/tmp/workspace") -> st
         return None
 
 
+async def _read_file_on_branch(
+    path: str,
+    *,
+    token: str,
+    owner: str,
+    repo: str,
+    branch: str,
+    project_id: str | None = None,
+) -> str | None:
+    """Return the contents of ``path`` on ``owner/repo@branch``, or ``None``.
+
+    GitHub-backed twin of :func:`_read_file_at_head` for a backend with no local
+    checkout (production runs under ``/app`` with no ``/tmp/workspace``). Reads
+    the file text from the project's real integration-branch tree via the cached
+    snapshot reader (:func:`app.github_repo_snapshot.file_text_on_branch`).
+
+    ``None`` on any indeterminacy — snapshot unavailable, path absent, or a
+    present-but-unreadable blob — so the caller degrades to a lower proof tier
+    exactly as it does when a local checkout is missing. Never raises.
+    """
+    if not path or not isinstance(path, str):
+        return None
+    try:
+        from app.github_repo_snapshot import file_text_on_branch
+
+        exists, text = await file_text_on_branch(
+            path,
+            token=token,
+            owner=owner,
+            repo=repo,
+            branch=branch,
+            project_id=project_id,
+        )
+    except Exception:  # noqa: BLE001 — discovery must degrade, never raise
+        logger.warning(
+            "[CAPABILITY_PROOF] failed to read %s on branch %s", path, branch,
+            exc_info=True,
+        )
+        return None
+    # exists is tri-state (True/False/None); only a definitely-present file with
+    # readable text yields content — absent/indeterminate/unreadable all degrade.
+    if exists is not True:
+        return None
+    return text
+
+
+async def _resolve_head_access(session: Any, project: Any):
+    """Return ``(verify_path, read_head)`` bound to the project's real source.
+
+    The capability-proof earn loop validates source references against HEAD. In
+    production the backend image runs under ``/app`` with no ``/tmp/workspace``
+    checkout, so the local-git helpers (:func:`_path_exists_at_head`,
+    :func:`_read_file_at_head`) resolve indeterminate and every earn attempt
+    stalls. When a ``session`` and ``project`` are available this resolves the
+    project's GitHub integration-branch context (the SAME
+    :func:`app.source_ref_validation.resolve_branch_verification_context` the
+    design-doc grounding path uses) and returns reader callables backed by the
+    cached branch-tree snapshot.
+
+    Falls back to the local-checkout helpers when no session/project is supplied
+    or the project's GitHub credentials do not resolve — preserving local
+    validation whenever a real checkout is explicitly available (the agent VM).
+    Both callables keep the tri-state ``True``/``False``/``None`` contract, so
+    an unavailable snapshot degrades conservatively and never over-claims proof.
+    """
+    from app.source_ref_validation import _path_exists_at_head
+
+    local = (_path_exists_at_head, _read_file_at_head)
+    if session is None or project is None:
+        return local
+
+    try:
+        from app.source_ref_validation import resolve_branch_verification_context
+
+        ctx = await resolve_branch_verification_context(session, project)
+    except Exception:  # noqa: BLE001 — advisory earn path must degrade, never raise
+        logger.warning(
+            "[CAPABILITY_PROOF] branch verification context resolution failed; "
+            "falling back to local HEAD",
+            exc_info=True,
+        )
+        return local
+
+    token = ctx.get("token")
+    owner = ctx.get("owner")
+    repo = ctx.get("repo")
+    branch = ctx.get("branch")
+    project_id = ctx.get("project_id")
+    if not (token and owner and repo and branch):
+        # No authorized repo credentials — fall back to local git HEAD.
+        return local
+
+    from app.source_ref_validation import _file_exists_in_repo_branch
+
+    async def _verify(path: str) -> bool | None:
+        return await _file_exists_in_repo_branch(
+            path,
+            token=token,
+            owner=owner,
+            repo=repo,
+            branch=branch,
+            project_id=project_id,
+        )
+
+    async def _read(path: str) -> str | None:
+        return await _read_file_on_branch(
+            path,
+            token=token,
+            owner=owner,
+            repo=repo,
+            branch=branch,
+            project_id=project_id,
+        )
+
+    return (_verify, _read)
+
+
 async def _named_tests_covering_paths(
     file_paths: list[str],
     *,
@@ -1640,8 +1757,18 @@ async def commission_proof_earn_loop(
         _path_exists_at_head,
     )
 
-    _verify = verify_path or _path_exists_at_head
-    _read_head = read_head or _read_file_at_head
+    # Resolve the HEAD readers. When the caller injects neither hook (the
+    # production path), bind them to the project's real source: GitHub
+    # integration branch when credentials resolve, else the local checkout.
+    # This lets a backend with no /tmp/workspace checkout (prod runs under
+    # /app) still validate source references. An explicitly-injected hook (unit
+    # tests) is always honoured verbatim and never triggers credential
+    # resolution.
+    if verify_path is None and read_head is None:
+        _verify, _read_head = await _resolve_head_access(session, project)
+    else:
+        _verify = verify_path or _path_exists_at_head
+        _read_head = read_head or _read_file_at_head
 
     # Step 1: compute the intersection.
     demanded_unproven = compute_unproven_demanded_capabilities(

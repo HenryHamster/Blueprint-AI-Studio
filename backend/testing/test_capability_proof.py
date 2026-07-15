@@ -4559,3 +4559,155 @@ class TestRecordCapabilityNamedTestExecutionProof:
         assert result is True
         assert "related-tests" in project.capability_proof_records
         assert "related_tests" not in project.capability_proof_records
+
+
+class TestResolveHeadAccess:
+    """_resolve_head_access: route HEAD validation through the GitHub reader.
+
+    Production runs the backend under ``/app`` with no ``/tmp/workspace``
+    checkout, so the local-git helpers resolve indeterminate. These tests prove
+    the resolver binds to the project's GitHub integration branch when
+    credentials resolve, and preserves the local-checkout helpers otherwise.
+    """
+
+    @pytest.mark.asyncio
+    async def test_no_session_returns_local_helpers(self):
+        from app.capability_proof import (
+            _read_file_at_head,
+            _resolve_head_access,
+        )
+        from app.source_ref_validation import _path_exists_at_head
+
+        verify, read_head = await _resolve_head_access(None, MagicMock())
+        assert verify is _path_exists_at_head
+        assert read_head is _read_file_at_head
+
+    @pytest.mark.asyncio
+    async def test_unresolved_credentials_returns_local_helpers(self):
+        from app.capability_proof import (
+            _read_file_at_head,
+            _resolve_head_access,
+        )
+        from app.source_ref_validation import _path_exists_at_head
+
+        # branch-only context (no token/owner/repo) → no authorized repo.
+        ctx = {"branch": "main", "project_id": "p1"}
+        with patch(
+            "app.source_ref_validation.resolve_branch_verification_context",
+            new=AsyncMock(return_value=ctx),
+        ):
+            verify, read_head = await _resolve_head_access(object(), MagicMock())
+        assert verify is _path_exists_at_head
+        assert read_head is _read_file_at_head
+
+    @pytest.mark.asyncio
+    async def test_github_context_binds_reader_without_checkout(self):
+        """With resolved credentials, verify/read route through the branch
+        snapshot — and succeed even though no /tmp/workspace checkout exists."""
+        from app.capability_proof import _resolve_head_access
+
+        ctx = {
+            "branch": "main",
+            "project_id": "p1",
+            "token": "t",
+            "owner": "o",
+            "repo": "r",
+        }
+        with patch(
+            "app.source_ref_validation.resolve_branch_verification_context",
+            new=AsyncMock(return_value=ctx),
+        ), patch(
+            "app.github_repo_snapshot.path_exists_on_branch",
+            new=AsyncMock(return_value=True),
+        ), patch(
+            "app.github_repo_snapshot.file_text_on_branch",
+            new=AsyncMock(return_value=(True, "import foo\n")),
+        ), patch(
+            # No local checkout exists in prod — the local-git branch must never
+            # be the thing that answers here.
+            "os.path.isdir",
+            return_value=False,
+        ):
+            verify, read_head = await _resolve_head_access(object(), MagicMock())
+            exists = await verify("backend/app/capability_proof.py")
+            text = await read_head("backend/app/capability_proof.py")
+
+        assert exists is True
+        assert text == "import foo\n"
+
+
+class TestEarnLoopWithoutCheckout:
+    """commission_proof_earn_loop earns proof with no /tmp/workspace checkout.
+
+    Regression for g-capability-proof-gating: the backend image runs under
+    ``/app`` and has no local git checkout, so HEAD validation must route
+    through the project-scoped GitHub reader. With neither ``verify_path`` nor
+    ``read_head`` injected, the earn loop resolves the project's integration
+    branch and validates a real source reference against the branch snapshot.
+    """
+
+    @pytest.mark.asyncio
+    async def test_earns_backing_path_proof_via_github_reader(self):
+        project = MagicMock()
+        project.capability_proof_records = {}
+        problem_model = {
+            "capabilities": [
+                {
+                    "name": "prod-cap",
+                    "status": "working",
+                    "backing_paths": ["backend/app/capability_proof.py"],
+                }
+            ]
+        }
+        project.problem_model = problem_model
+        demand_result = {
+            "total": 1,
+            "demands": [
+                {"kind": "capability", "ref": "prod-cap", "dependent_count": 3},
+            ],
+        }
+
+        ctx = {
+            "branch": "main",
+            "project_id": "p1",
+            "token": "t",
+            "owner": "o",
+            "repo": "r",
+        }
+
+        # Backing path present on the branch; no convention-named test discovered
+        # (glob/dir lookups return None) so the loop records the structural
+        # backing_path proof — all resolved via the GitHub snapshot, never a
+        # local checkout (os.path.isdir is False, mimicking the /app image).
+        async def _exists(path, **kwargs):
+            return path == "backend/app/capability_proof.py"
+
+        with patch(
+            "app.source_ref_validation.resolve_branch_verification_context",
+            new=AsyncMock(return_value=ctx),
+        ), patch(
+            "app.github_repo_snapshot.path_exists_on_branch",
+            new=AsyncMock(side_effect=_exists),
+        ), patch(
+            "app.github_repo_snapshot.glob_exists_on_branch",
+            new=AsyncMock(return_value=None),
+        ), patch(
+            "app.github_repo_snapshot.file_text_on_branch",
+            new=AsyncMock(return_value=(False, None)),
+        ), patch(
+            "os.path.isdir", return_value=False
+        ), patch(
+            "app.capability_proof.flag_modified"
+        ):
+            result = await commission_proof_earn_loop(
+                project,
+                demand_result=demand_result,
+                problem_model=problem_model,
+                session=object(),
+            )
+
+        assert result["earned"] == 1, (
+            "earn loop must validate the source ref via the GitHub reader with "
+            "no local checkout present"
+        )
+        assert "prod-cap" in project.capability_proof_records
