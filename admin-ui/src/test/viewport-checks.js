@@ -23,10 +23,11 @@ export const ESLINT_VIEWPORT_PATTERN = 'eslint-disable[^\\n]*viewport';
 
 /**
  * Identify Vitest browser-playwright's benign duplicate route-fulfill race.
- * Require both the exact message and provider provenance. Vitest sometimes
- * strips the stack before onUnhandledError but preserves Playwright's own
- * structured `log` array; accept either signal. Application code owns no
- * Playwright routes, and message-only objects still fail closed.
+ * This helper is wired only at the viewport browser-provider boundary, and
+ * application code owns no Playwright routes. Match the exact provider error
+ * message because onUnhandledError receives the raw object before Vitest adds
+ * the provider stack and serialized `log` provenance shown by its reporter.
+ * All other unhandled errors still fail closed.
  */
 export function isBenignPlaywrightRouteRace(error) {
   if (!error || typeof error !== 'object') return false;
@@ -36,10 +37,7 @@ export function isBenignPlaywrightRouteRace(error) {
   const isDuplicateFulfill =
     error.message === 'Route is already handled!' ||
     error.message === 'route.fulfill: Route is already handled!';
-  const hasProviderStack =
-    typeof error.stack === 'string' && error.stack.includes('@vitest/browser-playwright');
-  const hasPlaywrightLog = Array.isArray(error.log);
-  return isDuplicateFulfill && (hasProviderStack || hasPlaywrightLog);
+  return isDuplicateFulfill;
 }
 
 // Single source of truth for viewport-test exemptions: the committed JSON
