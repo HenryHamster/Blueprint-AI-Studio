@@ -818,3 +818,51 @@ def test_run_compute_job_drains_delayed_final_viewables_before_terminal_report()
     assert not worker.is_alive()
     assert uploads == ["a.png", "b.png"]
     assert reports[-1] == "succeeded"
+
+
+def test_run_compute_job_bounds_slow_final_viewable_drain():
+    """A stuck best-effort preview cannot hold the terminal report or runner slot."""
+    reports: list[str] = []
+    upload_started = threading.Event()
+    release_upload = threading.Event()
+
+    def fake_plan(**kwargs):
+        artifact_dir = kwargs["artifact_dir_host"]
+        script = (
+            "import os; "
+            "open(os.path.join(os.environ['ARTIFACT_DIR'], 'final.png'), 'wb').write(b'x')"
+        )
+        return type("Plan", (), {"declined": False, "backend": "test",
+            "argv": [sys.executable, "-c", script], "env": {**os.environ, "ARTIFACT_DIR": artifact_dir},
+            "container_name": "test-job"})()
+
+    def fake_upload(*_args):
+        upload_started.set()
+        release_upload.wait(2)
+        return 200
+
+    def fake_report(_orch, _token, _job_id, *, exec_status, **_kwargs):
+        reports.append(exec_status)
+        return False
+
+    try:
+        with mock.patch.object(local_runner.iso, "decide_compute_backend", return_value="test"), \
+             mock.patch.object(local_runner.iso, "plan_compute_execution", side_effect=fake_plan), \
+             mock.patch.object(local_runner, "_upload_viewable", side_effect=fake_upload), \
+             mock.patch.object(local_runner, "_upload_artifact"), \
+             mock.patch.object(local_runner, "_report_compute_job", side_effect=fake_report), \
+             mock.patch.object(local_runner, "_RUNNER_HEARTBEAT_INTERVAL", 0.1), \
+             mock.patch.object(local_runner, "_FINAL_VIEWABLE_DRAIN_SECONDS", 0.05):
+            worker = threading.Thread(target=local_runner._run_compute_job,
+                args=({"job_id": "bounded-final-viewable", "command": "unused", "env": {}},
+                      "http://orch", "tok", set(), threading.Lock()),
+                kwargs={"capabilities": type("Caps", (), {"has_gpu": False})()},
+            )
+            worker.start()
+            assert upload_started.wait(2)
+            worker.join(timeout=1)
+
+        assert not worker.is_alive()
+        assert reports[-1] == "succeeded"
+    finally:
+        release_upload.set()

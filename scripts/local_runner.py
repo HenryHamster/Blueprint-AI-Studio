@@ -2167,6 +2167,7 @@ _VIEWABLE_CONTENT_TYPES = {
 _MAX_VIEWABLE_IMAGE_BYTES = 8 * 1024 * 1024  # 8 MiB (server caps images here)
 _MAX_VIEWABLE_VIDEO_BYTES = 512 * 1024 * 1024  # 512 MiB (server caps videos here)
 _MAX_VIEWABLE_FILE_COUNT = 25  # at most N individually-addressable objects/job
+_FINAL_VIEWABLE_DRAIN_SECONDS = 10.0
 
 
 def _report_retry_sleep(attempt: int) -> float:
@@ -4161,13 +4162,21 @@ class _ViewableStreamState:
         self.thread.start()
         return True
 
-    def drain_upload(self) -> None:
-        """Wait for and commit the in-flight delivery at terminal handoff."""
+    def drain_upload(self, timeout: "float | None" = None) -> bool:
+        """Wait up to ``timeout`` for one delivery and commit it when complete.
+
+        Returns ``False`` while the daemon upload is still running.  Terminal
+        handoff uses that signal to abandon the remaining best-effort previews
+        instead of holding a compute runner until the transport timeout.
+        """
         with self.lock:
             thread = self.thread
         if thread is not None:
-            thread.join()
+            thread.join(timeout=timeout)
+            if thread.is_alive():
+                return False
         self.reap()
+        return True
 
 
 def _upload_viewable(
@@ -4253,8 +4262,27 @@ def _stream_viewable_files(
         print(f"[compute] viewable scan error for job {job_id}: {exc}", flush=True)
         return
 
+    drain_deadline = (
+        time.monotonic() + _FINAL_VIEWABLE_DRAIN_SECONDS if drain else None
+    )
+
+    def _drain_within_deadline() -> bool:
+        if drain_deadline is None:
+            return True
+        remaining = max(0.0, drain_deadline - time.monotonic())
+        if state.drain_upload(timeout=remaining):
+            return True
+        print(
+            f"[compute] final viewable drain exceeded "
+            f"{_FINAL_VIEWABLE_DRAIN_SECONDS:g}s for job {job_id}; "
+            "continuing terminal handoff",
+            flush=True,
+        )
+        return False
+
     if drain:
-        state.drain_upload()
+        if not _drain_within_deadline():
+            return
     else:
         state.reap()
     for cand in candidates:
@@ -4308,13 +4336,11 @@ def _stream_viewable_files(
             signature,
         ):
             if drain:
-                state.drain_upload()
-                return _stream_viewable_files(
-                    orchestrator_url, token, job_id, artifact_dir, state, drain=True
-                )
+                _drain_within_deadline()
             return
         if drain:
-            state.drain_upload()
+            if not _drain_within_deadline():
+                return
             continue
         # One scheduling decision per heartbeat, even if a tiny local upload
         # completes before this loop reaches the next candidate.
