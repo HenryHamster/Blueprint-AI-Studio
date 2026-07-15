@@ -9563,13 +9563,13 @@ def test_gpu_facts_do_not_leak_into_cpu_create_gate():
     from app import vm_cost_rates as vcr
 
     assert set(vcr.supported_machine_types()) == {
+        "c2d-standard-2",
         "e2-standard-2",
         "e2-standard-4",
         "e2-standard-8",
         "e2-standard-16",
         "e2-standard-32",
     }
-    assert all(mt.startswith("e2-") for mt in vcr.supported_machine_types())
     for gpu_mt in ("n1-standard-1", "g2-standard-4"):
         assert not vcr.is_supported_machine_type(gpu_mt)
         assert gpu_mt not in vcr.VM_COST_RATES
