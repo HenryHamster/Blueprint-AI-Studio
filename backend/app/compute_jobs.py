@@ -1954,7 +1954,11 @@ async def finalize_silent_compute_job(
     finalized only after successful VM deletion; failed deletes retain RUNNING
     state with a durable diagnostic for retry.
     """
-    live = await _lock_compute_job(session, job.id)
+    # Rollback expires every ORM instance in the session.  Keep the identifier
+    # as a plain scalar so the GCP terminate error path can persist its
+    # diagnostic without touching either ``job`` or ``live`` after rollback.
+    job_id = job.id
+    live = await _lock_compute_job(session, job_id)
     if live is None or live.status in _COMPUTE_JOB_TERMINAL_STATUSES:
         await session.commit()
         return False
@@ -2011,7 +2015,7 @@ async def finalize_silent_compute_job(
             await session.rollback()
             await _persist_compute_rpc_failure(
                 session,
-                job_id=job.id,
+                job_id=job_id,
                 operation="terminate",
                 exc=exc,
                 started_at=terminate_started_at,
