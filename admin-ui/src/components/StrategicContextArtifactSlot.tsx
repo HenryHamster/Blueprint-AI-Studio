@@ -727,6 +727,18 @@ function DescriptorCard({
         );
       })()}
 
+      {/* Omitted-files warning for compute-artifact media previews — mirrors
+          ComputeJobsPanel's wording and amber styling. Visible when any files
+          were dropped from the preview set (capped at 25 / 8 MiB each). */}
+      {(descriptor.kind === 'image' || descriptor.kind === 'video' || descriptor.kind === 'pdf') && descriptor.viewable_files_dropped != null && descriptor.viewable_files_dropped > 0 && (
+        <div
+          className="mt-2 text-ui-xs text-amber-400/90 font-mono"
+          data-testid="strategic-artifact-omitted-note"
+        >
+          {`${descriptor.viewable_files_dropped} file${descriptor.viewable_files_dropped === 1 ? '' : 's'} omitted (exceeds preview cap: 25 files / 8 MiB each)`}
+        </div>
+      )}
+
       {(descriptor.kind === 'chart' || descriptor.kind === 'plot') && (
         <div className="mt-2 space-y-1.5 rounded border border-neutral-800 bg-neutral-950/45 p-2">
           {chartPoints.length > 0 ? chartPoints.slice(0, 6).map(point => {
