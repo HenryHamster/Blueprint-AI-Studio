@@ -1,4 +1,4 @@
-import { getIdToken } from './firebase';
+import { getIdTokenAfterAuthRestore } from './firebase';
 
 export type UiLoadTimingSampleType = 'first_commit' | 'chat_data_ready' | 'board_data_ready';
 
@@ -12,7 +12,7 @@ export function reportUiLoadTiming(
   pageReadyMs: number,
   sampleType: UiLoadTimingSampleType,
 ): void {
-  getIdToken().then(token => {
+  getIdTokenAfterAuthRestore().then(token => {
     if (!token) return;
     return fetch('/api/admin/ui-load-timing', {
       method: 'POST',

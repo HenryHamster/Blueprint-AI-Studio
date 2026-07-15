@@ -5,6 +5,7 @@ export function createFirebaseMock(overrides: Record<string, unknown> = {}) {
     auth: { currentUser: null, onAuthStateChanged: () => () => {} },
     signInWithGoogle: vi.fn(),
     getIdToken: vi.fn(async () => 'test-token'),
+    getIdTokenAfterAuthRestore: vi.fn(async () => 'test-token'),
     onAuthChange: vi.fn(() => () => {}),
     signOut: vi.fn(),
   };
