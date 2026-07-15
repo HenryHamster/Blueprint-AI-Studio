@@ -225,4 +225,155 @@ describe('ComputeArtifactGallery', () => {
     expect(queryByTestId('drawer-artifact-thumbnail')).toBeNull();
     expect(getByTestId('drawer-artifact-placeholder').textContent).toContain('preview unavailable — retry');
   });
+
+  test('video onError flips a resolved video back to the retry placeholder', async () => {
+    resolveArtifactDownloadUrl.mockResolvedValue('https://signed/rollout.mp4');
+    const { getByTestId, queryByTestId } = render(
+      <ComputeArtifactGallery projectId="proj-1" job={makeJob({ viewable_artifacts: [videoArtifact] })} />,
+    );
+
+    await act(async () => {
+      fireEvent.click(getByTestId('drawer-artifact-gallery-toggle'));
+    });
+    await waitFor(() => {
+      expect(getByTestId('drawer-artifact-video')).toBeTruthy();
+    });
+
+    const video = getByTestId('drawer-artifact-video') as HTMLVideoElement;
+    await act(async () => {
+      fireEvent.error(video);
+    });
+    expect(queryByTestId('drawer-artifact-video')).toBeNull();
+    expect(getByTestId('drawer-artifact-placeholder').textContent).toContain('preview unavailable — retry');
+  });
+
+  test('pdf open failure shows "open failed — retry" and a second click re-resolves', async () => {
+    resolveArtifactDownloadUrl.mockRejectedValueOnce(new Error('storage unavailable'));
+    vi.spyOn(window, 'open').mockReturnValue(null);
+
+    const { getByTestId } = render(
+      <ComputeArtifactGallery projectId="proj-1" job={makeJob({ viewable_artifacts: [pdfArtifact] })} />,
+    );
+
+    await act(async () => {
+      fireEvent.click(getByTestId('drawer-artifact-gallery-toggle'));
+    });
+
+    const pdfButton = getByTestId('drawer-artifact-pdf');
+    expect(pdfButton.textContent).toContain('Open PDF');
+
+    // First click fails — shows error state.
+    await act(async () => {
+      fireEvent.click(pdfButton);
+    });
+    await waitFor(() => {
+      expect(pdfButton.textContent).toContain('open failed — retry');
+    });
+
+    // Second click succeeds.
+    resolveArtifactDownloadUrl.mockResolvedValueOnce('https://signed/report.pdf');
+    await act(async () => {
+      fireEvent.click(pdfButton);
+    });
+    await waitFor(() => {
+      expect(pdfButton.textContent).toContain('Open PDF');
+    });
+    expect(resolveArtifactDownloadUrl).toHaveBeenCalledTimes(2);
+  });
+
+  test('opening an image full-size when the cached URL is stale triggers re-resolution', async () => {
+    resolveArtifactDownloadUrl.mockResolvedValue('https://signed/plot-v1.png');
+    const openSpy = vi.spyOn(window, 'open').mockReturnValue(null);
+
+    const { getByTestId } = render(
+      <ComputeArtifactGallery projectId="proj-1" job={makeJob({ viewable_artifacts: [imageArtifact] })} />,
+    );
+
+    await act(async () => {
+      fireEvent.click(getByTestId('drawer-artifact-gallery-toggle'));
+    });
+    await waitFor(() => {
+      expect(getByTestId('drawer-artifact-thumbnail')).toBeTruthy();
+    });
+    expect(resolveArtifactDownloadUrl).toHaveBeenCalledTimes(1);
+
+    // Simulate the cached URL going stale by advancing system time.
+    const FRESH_MS = 50 * 60 * 1000; // mirrors SIGNED_PREVIEW_FRESH_MS in the component
+    vi.setSystemTime(Date.now() + FRESH_MS + 1000);
+
+    resolveArtifactDownloadUrl.mockResolvedValue('https://signed/plot-v2.png');
+    await act(async () => {
+      fireEvent.click(getByTestId('drawer-artifact-thumbnail'));
+    });
+    await waitFor(() => {
+      expect(resolveArtifactDownloadUrl).toHaveBeenCalledTimes(2);
+    });
+    expect(openSpy).toHaveBeenCalled();
+
+    vi.useRealTimers();
+  });
+
+  test('expanding gallery with image, video, and pdf resolves image+video but never pdf eagerly', async () => {
+    resolveArtifactDownloadUrl.mockImplementation(async (_p: string, uri: string) => `https://signed/${uri}`);
+    const { getByTestId, queryAllByTestId } = render(
+      <ComputeArtifactGallery
+        projectId="proj-1"
+        job={makeJob({ viewable_artifacts: [imageArtifact, videoArtifact, pdfArtifact] })}
+      />,
+    );
+
+    expect(getByTestId('drawer-artifact-gallery-toggle').textContent).toBe('Show previews (3)');
+
+    await act(async () => {
+      fireEvent.click(getByTestId('drawer-artifact-gallery-toggle'));
+    });
+    await waitFor(() => {
+      expect(getByTestId('drawer-artifact-thumbnail')).toBeTruthy();
+      expect(getByTestId('drawer-artifact-video')).toBeTruthy();
+    });
+
+    // PDF is never eagerly resolved — no signed URL call for it.
+    expect(resolveArtifactDownloadUrl).toHaveBeenCalledTimes(2);
+    expect(resolveArtifactDownloadUrl).toHaveBeenCalledWith('proj-1', imageArtifact.storage_uri);
+    expect(resolveArtifactDownloadUrl).toHaveBeenCalledWith('proj-1', videoArtifact.storage_uri);
+    expect(resolveArtifactDownloadUrl).not.toHaveBeenCalledWith('proj-1', pdfArtifact.storage_uri);
+
+    // All three artifact entries are rendered.
+    expect(queryAllByTestId('drawer-viewable-artifact')).toHaveLength(3);
+    // PDF button shows its standard label, not an error.
+    expect(getByTestId('drawer-artifact-pdf').textContent).toContain('Open PDF');
+  });
+
+  test('re-expanding a gallery after collapse does not re-resolve already-resolved URLs', async () => {
+    resolveArtifactDownloadUrl.mockImplementation(async (_p: string, uri: string) => `https://signed/${uri}`);
+    const { getByTestId } = render(
+      <ComputeArtifactGallery
+        projectId="proj-1"
+        job={makeJob({ viewable_artifacts: [imageArtifact, videoArtifact] })}
+      />,
+    );
+
+    // First expand: resolves both.
+    await act(async () => {
+      fireEvent.click(getByTestId('drawer-artifact-gallery-toggle'));
+    });
+    await waitFor(() => {
+      expect(getByTestId('drawer-artifact-thumbnail')).toBeTruthy();
+    });
+    expect(resolveArtifactDownloadUrl).toHaveBeenCalledTimes(2);
+
+    // Collapse.
+    await act(async () => {
+      fireEvent.click(getByTestId('drawer-artifact-gallery-toggle'));
+    });
+
+    // Re-expand: cached URLs are still fresh, no additional resolution calls.
+    await act(async () => {
+      fireEvent.click(getByTestId('drawer-artifact-gallery-toggle'));
+    });
+    await waitFor(() => {
+      expect(getByTestId('drawer-artifact-thumbnail')).toBeTruthy();
+    });
+    expect(resolveArtifactDownloadUrl).toHaveBeenCalledTimes(2);
+  });
 });

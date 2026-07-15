@@ -911,3 +911,213 @@ async def test_resolve_download_url_compute_job_media_file_wrong_job_404(
     )
     assert resp.status_code == 404
     sign.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Batch viewable-artifact authorization (extraction failure / retry)
+# ---------------------------------------------------------------------------
+
+
+async def _make_compute_job_with_viewable_manifest(
+    session, project, task, *, uris: list[str]
+) -> ComputeJob:
+    """Compute job whose polling_metadata viewable-files manifest contains
+    multiple URIs (the signed-URL batch case)."""
+    job = ComputeJob(
+        task_id=task.id,
+        project_id=project.id,
+        backend="gcp",
+        status=ComputeJobStatus.SUCCEEDED,
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+    )
+    session.add(job)
+    await session.flush()
+    entries = []
+    for uri in uris:
+        basename = uri.rsplit("/", 1)[-1]
+        entries.append(
+            {
+                "filename": basename,
+                "storage_uri": uri,
+                "content_type": "image/png",
+                "size_bytes": 512,
+                "kind": "image",
+            }
+        )
+    job.polling_metadata = {"viewable_files": entries}
+    session.add(job)
+    await session.commit()
+    await session.refresh(job)
+    return job
+
+
+@pytest.mark.asyncio
+async def test_resolve_download_url_viewable_artifact_via_compute_job_file_row(
+    client: AsyncClient, db_session, mocker
+):
+    """A viewable artifact stored under the /artifacts/viewable/ prefix is
+    signable when it is recorded as a ComputeJobFile row — the canonical path
+    taken after the single-pipeline persist pass."""
+    _mock_signing(mocker, url="https://signed.example/viewable-cjf-ok")
+    project = await _make_project(db_session)
+    await _add_member(db_session, project.id)
+    task = await _make_task(db_session, project)
+    job = await _make_compute_job(db_session, project, task)
+
+    # Use the canonical /artifacts/viewable/ prefix (not /artifacts/files/).
+    viewable_uri = (
+        f"gs://{BUCKET}/compute-jobs/{job.id}/artifacts/viewable/reward_curve.png"
+    )
+    cjf = ComputeJobFile(
+        compute_job_id=job.id,
+        safe_relpath="reward_curve.png",
+        media_type="image",
+        content_type="image/png",
+        storage_uri=viewable_uri,
+    )
+    db_session.add(cjf)
+    await db_session.commit()
+
+    resp = await client.get(
+        "/api/admin/artifacts/download-url",
+        params={"storage_uri": viewable_uri, "project_id": str(project.id)},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["url"] == "https://signed.example/viewable-cjf-ok"
+
+
+@pytest.mark.asyncio
+async def test_resolve_download_url_all_viewable_files_in_manifest_are_signable(
+    client: AsyncClient, db_session, mocker
+):
+    """All URIs recorded in a job's viewable-file manifest (the batch) can be
+    individually resolved via the download-url endpoint — each is authorized and
+    signed, not just the first one."""
+    _mock_signing(mocker, url="https://signed.example/batch-ok")
+    project = await _make_project(db_session)
+    await _add_member(db_session, project.id)
+    task = await _make_task(db_session, project)
+
+    # Create the job first so its id is available for building the URIs.
+    job = ComputeJob(
+        task_id=task.id,
+        project_id=project.id,
+        backend="gcp",
+        status=ComputeJobStatus.SUCCEEDED,
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+    )
+    db_session.add(job)
+    await db_session.flush()
+
+    plot_uri = f"gs://{BUCKET}/compute-jobs/{job.id}/artifacts/viewable/plot.png"
+    video_uri = f"gs://{BUCKET}/compute-jobs/{job.id}/artifacts/viewable/rollout.mp4"
+
+    job.polling_metadata = {
+        "viewable_files": [
+            {
+                "filename": "plot.png",
+                "storage_uri": plot_uri,
+                "content_type": "image/png",
+                "size_bytes": 512,
+                "kind": "image",
+            },
+            {
+                "filename": "rollout.mp4",
+                "storage_uri": video_uri,
+                "content_type": "video/mp4",
+                "size_bytes": 5_000_000,
+                "kind": "video",
+            },
+        ]
+    }
+    db_session.add(job)
+    await db_session.commit()
+
+    # Both URIs resolve independently.
+    for uri in (plot_uri, video_uri):
+        resp = await client.get(
+            "/api/admin/artifacts/download-url",
+            params={"storage_uri": uri, "project_id": str(project.id)},
+        )
+        assert resp.status_code == 200, f"expected 200 for {uri}"
+        assert resp.json()["url"] == "https://signed.example/batch-ok"
+
+
+@pytest.mark.asyncio
+async def test_resolve_download_url_extraction_failure_no_manifest_no_cjf_404(
+    client: AsyncClient, db_session, mocker
+):
+    """When viewable-artifact extraction failed (no polling_metadata manifest
+    entry AND no ComputeJobFile row), a viewable-prefix URI is rejected as 404.
+
+    This is the extraction-failure visibility case: the endpoint fails closed
+    rather than signing an unapproved object, so the UI can surface the error
+    and offer a retry path."""
+    sign = _mock_signing(mocker)
+    project = await _make_project(db_session)
+    await _add_member(db_session, project.id)
+    task = await _make_task(db_session, project)
+    job = await _make_compute_job(db_session, project, task)
+
+    # A URI under the viewable prefix that was never recorded anywhere
+    # (extraction failed — neither the manifest nor ComputeJobFile rows exist).
+    missing_viewable = (
+        f"gs://{BUCKET}/compute-jobs/{job.id}/artifacts/viewable/missing_plot.png"
+    )
+
+    resp = await client.get(
+        "/api/admin/artifacts/download-url",
+        params={"storage_uri": missing_viewable, "project_id": str(project.id)},
+    )
+    assert resp.status_code == 404
+    sign.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_resolve_download_url_viewable_manifest_and_cjf_both_authorize(
+    client: AsyncClient, db_session, mocker
+):
+    """A viewable URI recorded in BOTH the polling_metadata manifest AND as a
+    ComputeJobFile row resolves successfully — the manifest check passes first
+    and the endpoint returns 200 without requiring the ComputeJobFile fallback."""
+    _mock_signing(mocker, url="https://signed.example/dual-auth-ok")
+    project = await _make_project(db_session)
+    await _add_member(db_session, project.id)
+    task = await _make_task(db_session, project)
+    job = await _make_compute_job(db_session, project, task)
+
+    dual_uri = (
+        f"gs://{BUCKET}/compute-jobs/{job.id}/artifacts/viewable/dual_plot.png"
+    )
+    # Record in polling_metadata manifest.
+    job.polling_metadata = {
+        "viewable_files": [
+            {
+                "filename": "dual_plot.png",
+                "storage_uri": dual_uri,
+                "content_type": "image/png",
+                "size_bytes": 1024,
+                "kind": "image",
+            }
+        ]
+    }
+    db_session.add(job)
+    # Also record as a ComputeJobFile row.
+    cjf = ComputeJobFile(
+        compute_job_id=job.id,
+        safe_relpath="dual_plot.png",
+        media_type="image",
+        content_type="image/png",
+        storage_uri=dual_uri,
+    )
+    db_session.add(cjf)
+    await db_session.commit()
+
+    resp = await client.get(
+        "/api/admin/artifacts/download-url",
+        params={"storage_uri": dual_uri, "project_id": str(project.id)},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["url"] == "https://signed.example/dual-auth-ok"
