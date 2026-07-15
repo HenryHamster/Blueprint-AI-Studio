@@ -642,6 +642,7 @@ function buildBaseCliEnv(provider: ProviderName = PROVIDER): Record<string, stri
   };
   for (const key of [
     'CLAUDE_CODE_OAUTH_TOKEN',
+    'CLAUDE_CODE_EFFORT_LEVEL',
     'ANTHROPIC_API_KEY',
     'ANTHROPIC_AUTH_TOKEN',
     'ANTHROPIC_BASE_URL',
@@ -850,26 +851,40 @@ export function getProviderRunner(provider: ProviderName = PROVIDER, authMode: A
       let effectiveEffort = effort;
       let effectiveModel = model;
       if (LLM_CLI_TRANSLATION) {
-        args.push(...LLM_CLI_TRANSLATION.args);
-        const idx = LLM_CLI_TRANSLATION.args.indexOf('--effort');
-        if (idx >= 0 && idx + 1 < LLM_CLI_TRANSLATION.args.length) {
-          effectiveEffort = LLM_CLI_TRANSLATION.args[idx + 1];
+        // Older installed Claude Code binaries reject --effort even though
+        // current releases document it. CLAUDE_CODE_EFFORT_LEVEL is the
+        // supported, higher-precedence control and is safe for older binaries
+        // to ignore, so translate the generic flag into the environment.
+        const translatedArgs: string[] = [];
+        for (let i = 0; i < LLM_CLI_TRANSLATION.args.length; i += 1) {
+          if (LLM_CLI_TRANSLATION.args[i] === '--effort') {
+            if (i + 1 < LLM_CLI_TRANSLATION.args.length) {
+              effectiveEffort = LLM_CLI_TRANSLATION.args[i + 1];
+              i += 1;
+            }
+            continue;
+          }
+          translatedArgs.push(LLM_CLI_TRANSLATION.args[i]);
         }
+        args.push(...translatedArgs);
         const modelIdx = LLM_CLI_TRANSLATION.args.indexOf('--model');
         if (modelIdx >= 0 && modelIdx + 1 < LLM_CLI_TRANSLATION.args.length) {
           effectiveModel = LLM_CLI_TRANSLATION.args[modelIdx + 1];
         }
       } else {
         if (model) args.push('--model', model);
-        if (effort) args.push('--effort', effort);
       }
       if (disallowedTools && disallowedTools.length > 0) {
         for (const tool of disallowedTools) args.push('--disallowedTools', tool);
       }
+      const claudeEnv = { ...baseEnv };
+      if (effectiveEffort && !claudeEnv.CLAUDE_CODE_EFFORT_LEVEL) {
+        claudeEnv.CLAUDE_CODE_EFFORT_LEVEL = effectiveEffort;
+      }
       return {
         command: 'claude',
         args,
-        env: pinDeepSeekModel(baseEnv, isDeepSeek, effectiveModel),
+        env: pinDeepSeekModel(claudeEnv, isDeepSeek, effectiveModel),
         outputMode: 'claude-stream-json',
         timeoutMs: claudeTimeoutForEffort(effectiveEffort),
         promptInput: 'stdin-file',

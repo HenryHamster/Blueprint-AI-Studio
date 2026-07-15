@@ -2,7 +2,42 @@ import { defineConfig } from 'vitest/config';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
 import { playwright } from '@vitest/browser-playwright';
-import { isBenignPlaywrightRouteRace } from './src/test/viewport-checks.js';
+import type { BrowserContext } from 'playwright';
+import {
+  guardPlaywrightRouteHandler,
+  isBenignPlaywrightRouteRace,
+} from './src/test/viewport-checks.js';
+
+type RuntimePlaywrightProvider = {
+  createContext: (...args: unknown[]) => Promise<BrowserContext>;
+};
+
+function stablePlaywrightProvider() {
+  const provider = playwright();
+  const originalFactory = provider.providerFactory;
+
+  provider.providerFactory = async (...factoryArgs) => {
+    const runtimeProvider = await originalFactory(...factoryArgs);
+    const runtime = runtimeProvider as unknown as RuntimePlaywrightProvider;
+    const originalCreateContext = runtime.createContext.bind(runtime);
+    const guardedContexts = new WeakSet<BrowserContext>();
+
+    runtime.createContext = async (...contextArgs) => {
+      const context = await originalCreateContext(...contextArgs);
+      if (!guardedContexts.has(context)) {
+        const originalRoute = context.route.bind(context);
+        context.route = ((url, handler, options) =>
+          originalRoute(url, guardPlaywrightRouteHandler(handler), options)) as BrowserContext['route'];
+        guardedContexts.add(context);
+      }
+      return context;
+    };
+
+    return runtimeProvider;
+  };
+
+  return provider;
+}
 
 // Browser-mode runner used by `npm run test:viewport`. Kept separate from
 // vitest.config.ts so the existing jsdom suite (`npm run test:run`) is
@@ -23,11 +58,9 @@ export default defineConfig({
     // files prevents concurrent contexts from fulfilling the same internal
     // request twice ("Route is already handled") under CI load.
     fileParallelism: false,
-    // Vitest's Playwright module-mocking transport can race its own route
-    // teardown after every viewport assertion has completed, producing an
-    // unhandled `route.fulfill: Route is already handled!`. Filter only that
-    // exact provider-origin error; application errors and assertion failures
-    // remain fatal. viewport-coverage.test.ts asserts the fail-closed boundary.
+    // Keep a process-level backstop for the same exact provider rejection. The
+    // provider factory below catches it earlier at the route callback boundary;
+    // application errors and assertion failures remain fatal.
     onUnhandledError(error) {
       if (isBenignPlaywrightRouteRace(error)) return false;
     },
@@ -41,7 +74,7 @@ export default defineConfig({
     browser: {
       enabled: true,
       headless: true,
-      provider: playwright(),
+      provider: stablePlaywrightProvider(),
       instances: [{ browser: 'chromium' }],
       // Capture on failure so CI can upload the PNGs as artifacts —
       // overflow regressions are visual and a stack trace alone often

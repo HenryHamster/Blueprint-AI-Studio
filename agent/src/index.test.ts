@@ -135,6 +135,7 @@ beforeEach(() => {
   delete process.env.LLM_CLI_TRANSLATION;
   delete process.env.LLM_EXECUTION_MODE;
   delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  delete process.env.CLAUDE_CODE_EFFORT_LEVEL;
   delete process.env.ANTHROPIC_API_KEY;
   delete process.env.ANTHROPIC_AUTH_TOKEN;
   delete process.env.ANTHROPIC_BASE_URL;
@@ -1987,6 +1988,24 @@ describe('provider runner prompt transport', () => {
     expect(command.args).toContain('--verbose');
   });
 
+  it('uses the Claude effort environment control instead of the version-sensitive CLI flag', () => {
+    process.env.LLM_CLI_TRANSLATION = JSON.stringify({
+      args: ['--model', 'claude-sonnet-4-6', '--effort', 'high'],
+      env: {},
+      prompt_fragments: [],
+      unsupported: [],
+    });
+    refreshRuntimeState();
+
+    const runner = getProviderRunner('anthropic', 'oauth');
+    const command = runner.buildRunCommand('prompt body', 'claude-sonnet-4-6', 'high');
+
+    expect(command.args).toContain('--model');
+    expect(command.args).toContain('claude-sonnet-4-6');
+    expect(command.args).not.toContain('--effort');
+    expect(command.env.CLAUDE_CODE_EFFORT_LEVEL).toBe('high');
+  });
+
   it('detects whether the installed Claude CLI supports partial-message streaming', () => {
     expect(
       claudeHelpSupportsPartialMessages(
@@ -2018,8 +2037,8 @@ describe('provider runner prompt transport', () => {
     expect(command.displayName).toBe('Z.AI GLM (Claude compat)');
     expect(command.args).toContain('--model');
     expect(command.args).toContain('glm-5.2');
-    expect(command.args).toContain('--effort');
-    expect(command.args).toContain('high');
+    expect(command.args).not.toContain('--effort');
+    expect(command.env.CLAUDE_CODE_EFFORT_LEVEL).toBe('high');
     expect(command.env.ZAI_API_KEY).toBe('zai-test-key');
     expect(command.env.ANTHROPIC_API_KEY).toBe('zai-test-key');
     expect(command.env.ANTHROPIC_AUTH_TOKEN).toBe('zai-test-key');
@@ -2075,8 +2094,8 @@ describe('provider runner prompt transport', () => {
     expect(command.displayName).toBe('DeepSeek (Claude compat)');
     expect(command.args).toContain('--model');
     expect(command.args).toContain('deepseek-v4-flash');
-    expect(command.args).toContain('--effort');
-    expect(command.args).toContain('low');
+    expect(command.args).not.toContain('--effort');
+    expect(command.env.CLAUDE_CODE_EFFORT_LEVEL).toBe('low');
     expect(command.env.DEEPSEEK_API_KEY).toBe('deepseek-test-key');
     expect(command.env.ANTHROPIC_API_KEY).toBe('deepseek-test-key');
     expect(command.env.ANTHROPIC_AUTH_TOKEN).toBe('deepseek-test-key');

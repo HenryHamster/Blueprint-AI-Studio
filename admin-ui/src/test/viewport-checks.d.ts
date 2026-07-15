@@ -1,5 +1,9 @@
 export declare const ESLINT_VIEWPORT_PATTERN: string;
 export declare const EXEMPT_FROM_VIEWPORT_TEST: Set<string>;
+export declare function isBenignPlaywrightRouteRace(error: unknown): boolean;
+export declare function guardPlaywrightRouteHandler<TArgs extends unknown[], TResult>(
+  handler: (...args: TArgs) => TResult | Promise<TResult>,
+): (...args: TArgs) => Promise<TResult | undefined>;
 export declare function checkRequiredComponentAssertions(): string[];
 export declare function checkAllComponentsHaveTests(): string[];
 export declare function check375pxOverflow(): string[];
