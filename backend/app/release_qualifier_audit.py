@@ -905,6 +905,25 @@ async def _handle_infra_failure(
         "child_failures": child_failures,
     }
     attempt_history = [*prior_history, attempt_entry][-_INFRA_ATTEMPT_HISTORY_LIMIT:]
+
+    # Permanent gate-incapacity detection: count trailing same-signature entries
+    # in attempt_history.  When a migration_apply_check_unavailable error repeats
+    # with the exact same signature across _MIN_INFRA_ERROR_STREAK or more
+    # consecutive attempts, the condition is structural and will not self-resolve
+    # by retry — escalate with a different operator message.
+    is_permanent_gate_incapacity = False
+    same_signature_streak = 0
+    if infra_error.startswith("migration_apply"):
+        cur_sig = signature
+        for entry in reversed(attempt_history):
+            if entry.get("signature") == cur_sig:
+                same_signature_streak += 1
+            else:
+                break
+        is_permanent_gate_incapacity = (
+            same_signature_streak >= _MIN_INFRA_ERROR_STREAK
+        )
+
     infra_evidence = {
         "error": infra_error,
         "signature": signature,
@@ -912,6 +931,8 @@ async def _handle_infra_failure(
         "same_error_as_prior": same_error_as_prior,
         "same_error_different_candidate": same_error_different_candidate,
         "consecutive_infra_errors": current_streak,
+        "is_permanent_gate_incapacity": is_permanent_gate_incapacity,
+        "same_signature_streak": same_signature_streak,
         "attempt": attempt_entry,
         "attempt_history": attempt_history,
     }
@@ -1013,6 +1034,29 @@ async def _handle_infra_failure(
         current_streak >= _MIN_INFRA_ERROR_STREAK
         and current_streak % _MIN_INFRA_ERROR_STREAK == 0
     ):
+        if is_permanent_gate_incapacity:
+            alert_message = (
+                f"The migration-apply gate for v{version.version_number} is "
+                f"persistently incapable across {same_signature_streak} "
+                f"same-signature attempts ({infra_error!r}) — the underlying "
+                f"condition will not self-resolve by retry. Sanctioned "
+                f"remediation: use force-promote "
+                f"(POST /projects/{{id}}/promote/force) after manually "
+                f"verifying the migration chain against production's schema. "
+                f"Signature: {signature}."
+            )
+        else:
+            alert_message = (
+                f"The release qualifier for v{version.version_number} has "
+                f"failed {current_streak} consecutive time(s) due to "
+                f"infrastructure errors ({infra_error!r}) — the qualifier "
+                f"agent VM or clone pipeline is broken. This is NOT a "
+                f"quality finding about the release candidate. Inspect the "
+                f"release_audit / qualifier-smoketest agent infrastructure "
+                f"and re-queue to retry once the issue is resolved. "
+                f"Signature: {signature}; same as previous: "
+                f"{same_error_as_prior}."
+            )
         session.add(
             Alert(
                 project_id=version.project_id,
@@ -1021,17 +1065,7 @@ async def _handle_infra_failure(
                     f"Release qualifier v{version.version_number} infrastructure "
                     f"failure: {current_streak} consecutive errors"
                 ),
-                message=(
-                    f"The release qualifier for v{version.version_number} has "
-                    f"failed {current_streak} consecutive time(s) due to "
-                    f"infrastructure errors ({infra_error!r}) — the qualifier "
-                    f"agent VM or clone pipeline is broken. This is NOT a "
-                    f"quality finding about the release candidate. Inspect the "
-                    f"release_audit / qualifier-smoketest agent infrastructure "
-                    f"and re-queue to retry once the issue is resolved. "
-                    f"Signature: {signature}; same as previous: "
-                    f"{same_error_as_prior}."
-                ),
+                message=alert_message,
             )
         )
         logger.warning(
@@ -1043,17 +1077,28 @@ async def _handle_infra_failure(
         )
 
     rq = _release_qualifier_module()
-    await rq._notify_operator(
-        session,
-        version,
-        "release_infra_failure",
-        (
+    if is_permanent_gate_incapacity:
+        notify_message = (
+            f"v{version.version_number} migration-apply gate is persistently "
+            f"incapable across {same_signature_streak} same-signature attempts "
+            f"({infra_error.replace('_', ' ')}) — the underlying condition "
+            f"will not self-resolve by retry. Sanctioned remediation: use "
+            f"force-promote (POST /projects/{{id}}/promote/force) after manually "
+            f"verifying the migration chain against production's schema."
+        )
+    else:
+        notify_message = (
             f"v{version.version_number} qualifier infrastructure failure — "
             f"{infra_error.replace('_', ' ')} (agent VM / clone failure, "
             f"not a quality finding). Returned to stabilize for "
             f"re-qualification. Consecutive infra errors: {current_streak}. "
             f"Signature: {signature}; same as previous: {same_error_as_prior}."
-        ),
+        )
+    await rq._notify_operator(
+        session,
+        version,
+        "release_infra_failure",
+        notify_message,
         extra={
             "error": infra_error,
             "infra_failure_signature": signature,
@@ -1061,6 +1106,8 @@ async def _handle_infra_failure(
             "same_error_as_prior": same_error_as_prior,
             "same_error_different_candidate": same_error_different_candidate,
             "consecutive_infra_errors": current_streak,
+            "is_permanent_gate_incapacity": is_permanent_gate_incapacity,
+            "same_signature_streak": same_signature_streak,
         },
     )
 
@@ -1077,6 +1124,8 @@ async def _handle_infra_failure(
                 "same_error_as_prior": same_error_as_prior,
                 "same_error_different_candidate": same_error_different_candidate,
                 "consecutive_infra_errors": current_streak,
+                "is_permanent_gate_incapacity": is_permanent_gate_incapacity,
+                "same_signature_streak": same_signature_streak,
             },
         )
     )
@@ -1108,6 +1157,8 @@ async def _handle_infra_failure(
         "same_error_as_prior": same_error_as_prior,
         "same_error_different_candidate": same_error_different_candidate,
         "consecutive_infra_errors": current_streak,
+        "is_permanent_gate_incapacity": is_permanent_gate_incapacity,
+        "same_signature_streak": same_signature_streak,
         # Per-dimension isolation (Phase 1): which single dimension was marked
         # unavailable, and that dimension's own infra-error streak (distinct from
         # the attempt-level ``consecutive_infra_errors`` above).

@@ -19457,6 +19457,172 @@ class TestFinalizeInfraFailure:
         assert verdicts[0].terminal_status == "infra_failure"
 
 
+    @pytest.mark.asyncio
+    async def test_permanent_gate_incapacity_classification(self, db_session):
+        """3 consecutive same-signature migration_apply_check_unavailable errors
+        classify as permanent gate-incapacity and emit a force-promote message."""
+        from app import release_qualifier_audit as rqa
+
+        project, version = await _make_project_and_version(db_session)
+        sig = "migration_apply:unknown:migration_apply_check_unavailable"
+        same_entry = {
+            "finalized_at": "2026-07-10T00:00:00",
+            "error": "migration_apply_check_unavailable",
+            "signature": sig,
+            "candidate_sha": "dead" * 10,
+            "failing_leg": "migration_apply",
+            "child_failures": [],
+        }
+        version.last_qualification = {
+            "status": "pending",
+            "candidate_sha": "dead" * 10,
+            "ci_green": True,
+            "smoketest_enabled": False,
+            "started_at": "2026-07-10T00:00:00",
+            "audit_task_id": None,
+            "smoketest_task_id": None,
+            "prior_infra_streak": 2,
+            "infra_attempt_history": [
+                dict(same_entry, finalized_at="2026-07-10T00:00:00"),
+                dict(same_entry, finalized_at="2026-07-10T00:01:00"),
+            ],
+        }
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        result = await rqa._handle_infra_failure(
+            db_session,
+            version,
+            dict(version.last_qualification),
+            "migration_apply_check_unavailable",
+        )
+        await db_session.commit()
+
+        assert result["status"] == "infra_failure"
+        assert result["is_permanent_gate_incapacity"] is True
+        assert result["same_signature_streak"] == 3
+
+        await db_session.refresh(version)
+
+        # Verify a force-promote Alert was raised with the right message.
+        alerts = (
+            (await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.severity == "WARNING",
+                )
+            ))
+            .scalars()
+            .all()
+        )
+        assert len(alerts) >= 1
+        latest = alerts[-1]
+        assert "persistently incapable" in latest.message
+        assert "force-promote" in latest.message
+        assert "agent VM" not in latest.message
+        assert "clone pipeline" not in latest.message
+
+    @pytest.mark.asyncio
+    async def test_permanent_gate_incapacity_resets_on_different_signature(
+        self, db_session
+    ):
+        """2 same-signature then 1 different-signature migration_apply error
+        does NOT classify as permanent gate-incapacity."""
+        from app import release_qualifier_audit as rqa
+
+        project, version = await _make_project_and_version(db_session)
+        sig_a = "migration_apply:unknown:migration_apply_check_unavailable"
+        same_entry_a = {
+            "finalized_at": "2026-07-10T00:00:00",
+            "error": "migration_apply_check_unavailable",
+            "signature": sig_a,
+            "candidate_sha": "dead" * 10,
+            "failing_leg": "migration_apply",
+            "child_failures": [],
+        }
+        version.last_qualification = {
+            "status": "pending",
+            "candidate_sha": "dead" * 10,
+            "ci_green": True,
+            "smoketest_enabled": False,
+            "started_at": "2026-07-10T00:00:00",
+            "audit_task_id": None,
+            "smoketest_task_id": None,
+            "prior_infra_streak": 2,
+            "infra_attempt_history": [
+                dict(same_entry_a, finalized_at="2026-07-10T00:00:00"),
+                dict(same_entry_a, finalized_at="2026-07-10T00:01:00"),
+            ],
+        }
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        # The current call has a DIFFERENT error (carries a detail suffix) than the prior
+        # two entries, so the per-signature streak should reset to 1.
+        result = await rqa._handle_infra_failure(
+            db_session,
+            version,
+            dict(version.last_qualification),
+            "migration_apply_check_unavailable:unreachable",
+        )
+        await db_session.commit()
+
+        assert result["status"] == "infra_failure"
+        assert result["is_permanent_gate_incapacity"] is False
+        # The trailing same-signature count should be 1 (just current entry)
+        assert result["same_signature_streak"] == 1
+
+    @pytest.mark.asyncio
+    async def test_generic_infra_failure_not_classified_as_permanent(
+        self, db_session
+    ):
+        """A non-migration-apply error at streak 3+ does NOT get permanent
+        gate-incapacity classification."""
+        from app import release_qualifier_audit as rqa
+
+        project, version = await _make_project_and_version(db_session)
+        sig = "audit:PROVISION_FAILURE:audit_task_failed_provision_failure"
+        same_entry = {
+            "finalized_at": "2026-07-10T00:00:00",
+            "error": "audit_task_failed_provision_failure",
+            "signature": sig,
+            "candidate_sha": "dead" * 10,
+            "failing_leg": "audit",
+            "child_failures": [],
+        }
+        version.last_qualification = {
+            "status": "pending",
+            "candidate_sha": "dead" * 10,
+            "ci_green": True,
+            "smoketest_enabled": False,
+            "started_at": "2026-07-10T00:00:00",
+            "audit_task_id": None,
+            "smoketest_task_id": None,
+            "prior_infra_streak": 2,
+            "infra_attempt_history": [
+                dict(same_entry, finalized_at="2026-07-10T00:00:00"),
+                dict(same_entry, finalized_at="2026-07-10T00:01:00"),
+            ],
+        }
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        result = await rqa._handle_infra_failure(
+            db_session,
+            version,
+            dict(version.last_qualification),
+            "audit_task_failed_provision_failure",
+        )
+        await db_session.commit()
+
+        assert result["status"] == "infra_failure"
+        assert result["is_permanent_gate_incapacity"] is False
+        assert result["same_signature_streak"] == 0
+        assert result["consecutive_infra_errors"] == 3
+
 # ===========================================================================
 # _finalize_qualification — reaper-induced heartbeat timeout
 # ===========================================================================
