@@ -869,6 +869,200 @@ async def test_coverage_summary_no_phantom_when_prose_matches(db_session):
 
 
 @pytest.mark.asyncio
+async def test_coverage_summary_scopes_direction_references_by_lifecycle_and_version(
+    db_session,
+):
+    """Only active current context contributes drift, including prior-only keys.
+
+    The fixture carries every direction lifecycle state plus a current/prior key
+    collision. It proves that a prior-only key cited by current focus is a
+    dangling current-release reference, while inactive directions remain inert.
+    """
+    project = await _make_project(db_session)
+    prior = ReleaseVersion(project_id=project.id, version_number=1, status="promoted")
+    requested = ReleaseVersion(project_id=project.id, version_number=2, status="open")
+    db_session.add_all([prior, requested])
+    await db_session.commit()
+
+    current_active = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=requested.id,
+        criterion_key="c-11111111",
+        text="Current active criterion",
+    )
+    current_inactive = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=requested.id,
+        criterion_key="c-22222222",
+        text="Current retracted criterion",
+        status="retracted",
+    )
+    current_collision = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=requested.id,
+        criterion_key="c-44444444",
+        text="Current collision criterion",
+    )
+    prior_only = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=prior.id,
+        criterion_key="c-33333333",
+        text="Prior-version criterion",
+    )
+    prior_collision = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=prior.id,
+        criterion_key="c-44444444",
+        text="Prior collision criterion",
+    )
+    db_session.add_all(
+        [
+            current_active,
+            current_inactive,
+            current_collision,
+            prior_only,
+            prior_collision,
+        ]
+    )
+    project.problem_model = {
+        "intent": {
+            "current_focus": (
+                "Current c-11111111; inactive c-22222222; "
+                "prior c-33333333; collision c-44444444"
+            )
+        }
+    }
+    project.directions = [
+        {
+            "id": "d-active",
+            "status": "active",
+            "context": {"success_evidence": "dangling c-55555555"},
+        },
+        {
+            "id": "d-paused",
+            "status": "paused",
+            "context": {"success_evidence": "ignored c-66666666"},
+        },
+        {
+            "id": "d-staged",
+            "status": "staged",
+            "context": {"success_evidence": "ignored c-77777777"},
+        },
+        {
+            "id": "d-retired",
+            "status": "retired",
+            "context": {"success_evidence": "ignored c-88888888"},
+        },
+    ]
+    db_session.add(project)
+    await db_session.commit()
+
+    summary = await ac.get_version_coverage_summary(db_session, requested.id)
+    report = summary["phantom_bookkeeping"]
+
+    # Requested-version membership remains visible. Its active state determines
+    # whether it is registered; the current registration keeps the collision valid.
+    assert set(report["referenced_keys"]) == {
+        "c-11111111",
+        "c-22222222",
+        "c-33333333",
+        "c-44444444",
+        "c-55555555",
+    }
+    assert set(report["phantom_keys"]) == {
+        "c-22222222",
+        "c-33333333",
+        "c-55555555",
+    }
+    assert report["has_drift"] is True
+    assert report["registered_count"] == 2
+    assert "c-33333333" in report["phantom_keys"]
+    assert not {
+        "c-66666666",
+        "c-77777777",
+        "c-88888888",
+    } & set(report["referenced_keys"])
+
+    attention = await build_operator_attention(db_session, project, _TEST_USER_ID)
+    phantom_items = [
+        item
+        for item in attention["items"]
+        if item.get("reason") == "phantom_criterion_bookkeeping"
+    ]
+    assert len(phantom_items) == 1
+    assert "c-55555555" in phantom_items[0]["detail"]
+    assert "c-33333333" in phantom_items[0]["detail"]
+    assert attention["counts"]["phantom_criterion_bookkeeping"] == 1
+
+
+@pytest.mark.asyncio
+async def test_coverage_summary_does_not_apply_live_prose_to_promoted_version(
+    db_session,
+):
+    """A promoted release's summary is isolated from mutable current prose."""
+    project = await _make_project(db_session)
+    promoted = await _make_version(db_session, project)
+    promoted.status = "promoted"
+    open_version = ReleaseVersion(
+        project_id=project.id,
+        version_number=2,
+        status="open",
+    )
+    db_session.add(open_version)
+    project.problem_model = {
+        "intent": {"current_focus": "Current focus has dangling c-deadbeef"}
+    }
+    project.directions = [
+        {
+            "id": "d-active",
+            "status": "active",
+            "context": {"success_evidence": "Also current c-feedface"},
+        }
+    ]
+    db_session.add(project)
+    await db_session.commit()
+
+    summary = await ac.get_version_coverage_summary(db_session, promoted.id)
+    report = summary["phantom_bookkeeping"]
+    assert report["has_drift"] is False
+    assert report["referenced_keys"] == []
+    assert report["phantom_keys"] == []
+
+
+@pytest.mark.asyncio
+async def test_coverage_summary_applies_live_prose_only_to_selected_open_version(
+    db_session,
+):
+    """A stale open row in a multi-open anomaly is historical for live prose."""
+    project = await _make_project(db_session)
+    older = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        opened_at=_utcnow() - timedelta(hours=1),
+    )
+    newer = ReleaseVersion(
+        project_id=project.id,
+        version_number=2,
+        status="open",
+        opened_at=_utcnow(),
+    )
+    db_session.add_all([older, newer])
+    project.problem_model = {
+        "intent": {"current_focus": "Current focus has dangling c-deadbeef"}
+    }
+    db_session.add(project)
+    await db_session.commit()
+
+    older_summary = await ac.get_version_coverage_summary(db_session, older.id)
+    newer_summary = await ac.get_version_coverage_summary(db_session, newer.id)
+
+    assert older_summary["phantom_bookkeeping"]["has_drift"] is False
+    assert older_summary["phantom_bookkeeping"]["referenced_keys"] == []
+    assert newer_summary["phantom_bookkeeping"]["phantom_keys"] == ["c-deadbeef"]
+
+
+@pytest.mark.asyncio
 async def test_zero_registered_criteria_and_dangling_key_flagged(db_session):
     """End-to-end drift guard: an open version with ZERO registered criteria whose
     focus prose / direction success_evidence still reference criterion keys reads
