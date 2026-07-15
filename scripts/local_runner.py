@@ -5383,6 +5383,29 @@ def _safe_credential_path(fpath: str, workspace_root: str) -> str:
     return full_path
 
 
+_BWRAP_CREDENTIAL_PATH_ENV_KEYS = (
+    "CODEX_HOME",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+)
+
+
+def _relocate_bwrap_credential_env(llm_env: dict[str, str]) -> dict[str, str]:
+    """Point provider credential paths at their writable workspace copies.
+
+    The backend emits cloud-image paths such as ``/opt/agent/openai``.  A local
+    runner writes the corresponding file below its per-task workspace, which is
+    mounted at ``/workspace`` inside bwrap—not at the sandbox root.  Preserve
+    every non-path credential unchanged and relocate only known absolute path
+    variables so Codex/Gemini read the files the runner actually materialized.
+    """
+    relocated = dict(llm_env)
+    for key in _BWRAP_CREDENTIAL_PATH_ENV_KEYS:
+        value = relocated.get(key)
+        if isinstance(value, str) and value.startswith("/"):
+            relocated[key] = f"{iso.SANDBOX_WORKSPACE}/{value.lstrip('/')}"
+    return relocated
+
+
 def _spawn_agent_task(
     *,
     task_id: str,
@@ -5462,9 +5485,13 @@ def _spawn_agent_task(
     # bwrap-eligible task on a docker+image box still takes the bwrap path.
     plan_image = agent_image if backend == iso.BACKEND_DOCKER else None
 
+    effective_llm_env = dict(llm_env or {})
+    if backend == iso.BACKEND_BWRAP:
+        effective_llm_env = _relocate_bwrap_credential_env(effective_llm_env)
+
     # Write backend-supplied credential files into the agent's workspace
-    # (bind-mounted as / inside the bwrap sandbox; mounted at /agent-workdir
-    #  inside the docker sandbox). The LLM provider CLI (Claude, Codex,
+    # (mounted at /workspace inside the bwrap sandbox). The LLM provider CLI
+    # (Claude, Codex,
     # Gemini) reads config files from well-known paths;
     # the runner materializes them per-task so the agent finds exactly the
     # credential the pool assigned.
@@ -5503,8 +5530,8 @@ def _spawn_agent_task(
         "TASK_ID": task_id,
         "VM_INSTANCE_ID": vm_instance_id,
     }
-    if llm_env:
-        injected_env.update(llm_env)
+    if effective_llm_env:
+        injected_env.update(effective_llm_env)
     plan = iso.plan_agent_execution(
         caps=caps,
         agent_binary=agent_binary,

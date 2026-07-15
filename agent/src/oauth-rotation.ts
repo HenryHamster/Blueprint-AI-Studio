@@ -14,9 +14,11 @@ import { PROVIDER, AUTH_MODE, type ProviderName } from './providers/runners.js';
 // hashFileOrNull + the module-level `initialOAuthAuthHash` let us detect
 // the in-run mutation cheaply and skip the POST when nothing changed.
 
-const OAUTH_AUTH_PATH_BY_PROVIDER: Partial<Record<ProviderName, string>> = {
-  openai: '/opt/agent/openai/auth.json',
-};
+function oauthAuthPath(provider: ProviderName): string | undefined {
+  if (provider !== 'openai') return undefined;
+  const codexHome = process.env.CODEX_HOME?.trim().replace(/\/+$/, '');
+  return `${codexHome || '/opt/agent/openai'}/auth.json`;
+}
 
 function hashFileOrNull(path: string): string | null {
   try {
@@ -30,7 +32,7 @@ function hashFileOrNull(path: string): string | null {
 let initialOAuthAuthHash: string | null = null;
 
 export function recordInitialOAuthAuthHash(): void {
-  const path = OAUTH_AUTH_PATH_BY_PROVIDER[PROVIDER];
+  const path = oauthAuthPath(PROVIDER);
   if (!path || AUTH_MODE !== 'oauth') {
     initialOAuthAuthHash = null;
     return;
@@ -42,7 +44,7 @@ export async function rotateOAuthCredentialsIfChanged(
   taskId: string,
   apiPostFn: (path: string, body: Record<string, unknown>) => Promise<unknown>,
 ): Promise<void> {
-  const path = OAUTH_AUTH_PATH_BY_PROVIDER[PROVIDER];
+  const path = oauthAuthPath(PROVIDER);
   if (!path || AUTH_MODE !== 'oauth') return;
   if (!fs.existsSync(path)) return;
   const currentHash = hashFileOrNull(path);

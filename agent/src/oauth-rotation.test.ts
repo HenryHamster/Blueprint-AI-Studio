@@ -6,6 +6,7 @@ const { mockReadFileSync, mockWriteFileSync, mockExistsSync } = vi.hoisted(() =>
   const mockExistsSync = vi.fn().mockReturnValue(false);
   process.env.PROVIDER = 'openai';
   process.env.AUTH_MODE = 'oauth';
+  delete process.env.CODEX_HOME;
   return { mockReadFileSync, mockWriteFileSync, mockExistsSync };
 });
 
@@ -110,6 +111,31 @@ describe('rotateOAuthCredentialsIfChanged', () => {
 
     expect(mockWriteFileSync).toHaveBeenCalledWith(
       '/opt/agent/openai/auth.json',
+      'winner-token-data',
+      { encoding: 'utf-8', mode: 0o600 },
+    );
+  });
+
+  it('follows a runner-relocated CODEX_HOME for reads and replacement writes', async () => {
+    process.env.CODEX_HOME = '/workspace/opt/agent/openai';
+    mockReadFileSync.mockReturnValueOnce(Buffer.from('old-token-data'));
+    recordInitialOAuthAuthHash();
+    mockExistsSync.mockReturnValue(true);
+    mockReadFileSync
+      .mockReturnValueOnce(Buffer.from('losing-token-data'))
+      .mockReturnValueOnce('losing-token-data')
+      .mockReturnValueOnce(Buffer.from('winner-token-data'));
+    const apiPostFn = vi.fn().mockResolvedValue({
+      rotated: false,
+      reason: 'stale_credential',
+      secret: 'winner-token-data',
+    });
+
+    await rotateOAuthCredentialsIfChanged('task-relocated', apiPostFn);
+
+    expect(mockExistsSync).toHaveBeenCalledWith('/workspace/opt/agent/openai/auth.json');
+    expect(mockWriteFileSync).toHaveBeenCalledWith(
+      '/workspace/opt/agent/openai/auth.json',
       'winner-token-data',
       { encoding: 'utf-8', mode: 0o600 },
     );
