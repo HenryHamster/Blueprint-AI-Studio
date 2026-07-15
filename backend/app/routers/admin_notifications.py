@@ -40,7 +40,7 @@ from app.admin import (
 )
 from app.task_locking import lock_project_or_429
 from app.message_convergence import LINKED_STATUS, NEEDS_ACTION_MESSAGE_TYPES, RESOLVED_STATUS
-from app.message_audience import STRATEGIST_INTERNAL, PIPELINE_LOG
+from app.message_audience import operator_visible_audience_filter
 from app.project_message_creation import (
     create_operator_project_message,
     parse_operator_message_type,
@@ -271,14 +271,6 @@ HIGH_SIGNAL_NOTE_EVENT_TYPES: frozenset = frozenset(
 )
 
 
-# Audiences (from the unified message-audience registry) that must NEVER surface
-# on the operator's Messages panel. Rows tagged strategist-internal (or the
-# defensive pipeline-log case) are strategist-feed bookkeeping only; the ledger
-# read path filters them out here so the tagging done at write time
-# (notification_dispatch.post_event_message) actually closes the operator leak.
-_NON_OPERATOR_AUDIENCES = (STRATEGIST_INTERNAL, PIPELINE_LOG)
-
-
 def _operator_visible_audience():
     """SQLAlchemy predicate excluding rows tagged with a non-operator audience.
 
@@ -287,11 +279,7 @@ def _operator_visible_audience():
     resolve to NULL and are KEPT — the filter only drops rows that explicitly
     carry a strategist-internal / pipeline-log audience tag.
     """
-    audience_col = ProjectMessage.context["audience"].as_string()
-    return or_(
-        audience_col.is_(None),
-        audience_col.notin_(_NON_OPERATOR_AUDIENCES),
-    )
+    return operator_visible_audience_filter(ProjectMessage.context)
 
 
 # Reserved keys within MessagesNoisePrefs.prefs for temp-mutes and mute-window.

@@ -6152,6 +6152,96 @@ async def test_operator_attention_uses_routed_audience_for_action_messages(
 
 
 @pytest.mark.asyncio
+async def test_operator_attention_excludes_internal_messages_and_tasks_everywhere(
+    client: AsyncClient, db_session
+):
+    """Internal rows never affect previews, summaries, or attention counts."""
+    project = await _make_project(db_session)
+    internal_context = {"audience": "strategist-internal"}
+    internal_messages = [
+        ProjectMessage(
+            project_id=project.id,
+            message_type=message_type,
+            from_type="system",
+            content=f"internal {message_type.value}",
+            status="open",
+            context=internal_context,
+        )
+        for message_type in (MessageType.QUESTION, MessageType.BLOCKER, MessageType.NOTE)
+    ]
+    visible_question = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.QUESTION,
+        from_type="system",
+        content="legacy visible question",
+        status="open",
+    )
+    internal_approval = Task(
+        project_id=project.id,
+        title="internal approval",
+        status=TaskStatus.QUEUED,
+        requires_approval=True,
+        context=internal_context,
+    )
+    internal_blocked = Task(
+        project_id=project.id,
+        title="internal blocked",
+        status=TaskStatus.BLOCKED,
+        context=internal_context,
+    )
+    internal_parked = Task(
+        project_id=project.id,
+        title="internal parked",
+        status=TaskStatus.PARKED,
+        context=internal_context,
+    )
+    internal_failed = Task(
+        project_id=project.id,
+        title="internal failed",
+        status=TaskStatus.FAILED,
+        context=internal_context,
+    )
+    visible_failed = Task(
+        project_id=project.id,
+        title="legacy visible failure",
+        status=TaskStatus.FAILED,
+    )
+    db_session.add_all([
+        *internal_messages,
+        visible_question,
+        internal_approval,
+        internal_blocked,
+        internal_parked,
+        internal_failed,
+        visible_failed,
+    ])
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/operator-attention?project_id={project.id}")
+    assert resp.status_code == 200, resp.text
+    attention = resp.json()
+
+    assert attention["summary"] == "1 operator item need review"
+    assert attention["counts"]["questions"] == 1
+    assert attention["counts"]["blockers"] == 0
+    assert attention["counts"]["unread"] == 1
+    assert attention["counts"]["approvals"] == 0
+    assert attention["counts"]["blocked_tasks"] == 0
+    assert attention["counts"]["parked_tasks"] == 0
+    assert attention["counts"]["failed_tasks"] == 1
+    item_ids = {item["id"] for item in attention["items"]}
+    assert f"message:{visible_question.id}" in item_ids
+    assert f"task:{visible_failed.id}:failed_task" in item_ids
+    assert not {
+        *(f"message:{message.id}" for message in internal_messages),
+        f"task:{internal_approval.id}:approval_required",
+        f"task:{internal_blocked.id}:blocked_task",
+        f"task:{internal_parked.id}:parked_task",
+        f"task:{internal_failed.id}:failed_task",
+    } & item_ids
+
+
+@pytest.mark.asyncio
 async def test_operator_attention_same_priority_items_use_newest_tie_break(
     client: AsyncClient, db_session
 ):

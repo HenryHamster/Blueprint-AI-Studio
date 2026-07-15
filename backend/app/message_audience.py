@@ -12,6 +12,10 @@ registers it as ``operator-*``.
 
 from __future__ import annotations
 
+from typing import Any
+
+from sqlalchemy import or_
+
 # ── Audience constants ──────────────────────────────────────────────────
 
 OPERATOR_ACTION_NEEDED = "operator-action-needed"
@@ -171,6 +175,10 @@ _AUDIENCES_THAT_REACH_OPERATOR: frozenset[str] = frozenset(
     {OPERATOR_ACTION_NEEDED, OPERATOR_FYI}
 )
 
+_NON_OPERATOR_AUDIENCES: frozenset[str] = frozenset(
+    {STRATEGIST_INTERNAL, PIPELINE_LOG}
+)
+
 
 # ── Public API ──────────────────────────────────────────────────────────
 
@@ -194,6 +202,17 @@ def route_event(event_type: str, *, message_type: str | None = None) -> str:
 def is_operator_visible(audience: str) -> bool:
     """Return True when *audience* is operator-action-needed or operator-fyi."""
     return audience in _AUDIENCES_THAT_REACH_OPERATOR
+
+
+def operator_visible_audience_filter(context: Any) -> Any:
+    """Return the shared SQL filter for legacy and operator-visible rows.
+
+    Both message and task projections retain untagged legacy rows, while rows
+    explicitly marked strategist-internal or pipeline-log never contribute to
+    an operator-facing count, preview, or badge.
+    """
+    audience = context["audience"].as_string()
+    return or_(audience.is_(None), audience.notin_(_NON_OPERATOR_AUDIENCES))
 
 
 def stamp_message_audience(

@@ -43,8 +43,7 @@ from app.models import (
 from app.completion_debt import STATUS_OPEN as _DEBT_STATUS_OPEN, resolve_linked_task_statuses as _resolve_linked_task_statuses
 from app.message_audience import (
     OPERATOR_ACTION_NEEDED,
-    PIPELINE_LOG,
-    STRATEGIST_INTERNAL,
+    operator_visible_audience_filter,
 )
 from app.reaper_orphan_classify import _classify_orphan
 from app.release_version import current_open_version
@@ -1787,12 +1786,7 @@ async def get_operator_message_counts(
         ProjectMessage.project_id == project_id,
         ProjectMessage.status == OPEN_STATUS,
         ProjectMessage.from_type != "user",
-        or_(
-            ProjectMessage.context["audience"].as_string().is_(None),
-            ProjectMessage.context["audience"].as_string().notin_(
-                [STRATEGIST_INTERNAL, PIPELINE_LOG]
-            ),
-        ),
+        operator_visible_audience_filter(ProjectMessage.context),
     ]
     count_rows = (
         await session.execute(
@@ -1816,9 +1810,7 @@ async def get_operator_message_counts(
                     select(func.count())
                     .select_from(ProjectMessage)
                     .where(
-                        ProjectMessage.project_id == project_id,
-                        ProjectMessage.status == OPEN_STATUS,
-                        ProjectMessage.from_type != "user",
+                        *_operator_visible_message_filters,
                         ProjectMessage.message_type == MessageType.NOTE,
                         ProjectMessage.context.op("->>")(
                             "event_type"
@@ -1829,11 +1821,6 @@ async def get_operator_message_counts(
             or 0
         )
 
-    _base_unread = [
-        ProjectMessage.project_id == project_id,
-        ProjectMessage.status == OPEN_STATUS,
-        ProjectMessage.from_type != "user",
-    ]
     _ts_filter = (
         [ProjectMessage.created_at > last_seen_at] if last_seen_at is not None else []
     )
@@ -1843,7 +1830,7 @@ async def get_operator_message_counts(
                 select(func.count())
                 .select_from(ProjectMessage)
                 .where(
-                    *_base_unread,
+                    *_operator_visible_message_filters,
                     ProjectMessage.message_type.in_(_hs_types),
                     *_ts_filter,
                 )
@@ -1858,7 +1845,7 @@ async def get_operator_message_counts(
                     select(func.count())
                     .select_from(ProjectMessage)
                     .where(
-                        *_base_unread,
+                        *_operator_visible_message_filters,
                         ProjectMessage.message_type == MessageType.NOTE,
                         ProjectMessage.context.op("->>")(
                             "event_type"
@@ -1930,12 +1917,7 @@ async def build_operator_attention(
         ProjectMessage.project_id == project.id,
         ProjectMessage.status == OPEN_STATUS,
         ProjectMessage.from_type != "user",
-        or_(
-            ProjectMessage.context["audience"].as_string().is_(None),
-            ProjectMessage.context["audience"].as_string().notin_(
-                [STRATEGIST_INTERNAL, PIPELINE_LOG]
-            ),
-        ),
+        operator_visible_audience_filter(ProjectMessage.context),
     ]
     # UNION ALL with per-type LIMITs: one round-trip while preserving independent
     # per-priority caps so a burst of BUG_REPORT/FEEDBACK can't crowd out BLOCKERs.
@@ -1987,9 +1969,7 @@ async def build_operator_attention(
         await session.execute(
             select(ProjectMessage.message_type, func.count())
             .where(
-                ProjectMessage.project_id == project.id,
-                ProjectMessage.status == OPEN_STATUS,
-                ProjectMessage.from_type != "user",
+                *_common_message_filters,
                 ProjectMessage.message_type.in_(list(_HIGH_SIGNAL_MESSAGE_TYPES)),
             )
             .group_by(ProjectMessage.message_type)
@@ -2024,9 +2004,7 @@ async def build_operator_attention(
         (
             await session.execute(
                 select(func.count()).select_from(ProjectMessage).where(
-                    ProjectMessage.project_id == project.id,
-                    ProjectMessage.status == OPEN_STATUS,
-                    ProjectMessage.from_type != "user",
+                    *_common_message_filters,
                     ProjectMessage.message_type.in_(list(_HIGH_SIGNAL_MESSAGE_TYPES)),
                     *unread_count_filters,
                 )
@@ -2072,6 +2050,7 @@ async def build_operator_attention(
                         and_(
                             Task.requires_approval.is_(True),
                             Task.status.in_(list(_APPROVAL_TASK_STATUSES)),
+                            operator_visible_audience_filter(Task.context),
                         ),
                         1,
                     ),
@@ -2081,10 +2060,7 @@ async def build_operator_attention(
                     (
                         and_(
                             Task.status == TaskStatus.FAILED,
-                            not_(and_(
-                                Task.context["audience"].isnot(None),
-                                Task.context["audience"].as_string() == "strategist-internal",
-                            )),
+                            operator_visible_audience_filter(Task.context),
                         ),
                         1,
                     ),
@@ -2095,6 +2071,7 @@ async def build_operator_attention(
                         and_(
                             Task.status == TaskStatus.BLOCKED,
                             Task.requires_approval.is_not(True),
+                            operator_visible_audience_filter(Task.context),
                         ),
                         1,
                     ),
@@ -2105,6 +2082,7 @@ async def build_operator_attention(
                         and_(
                             Task.status == TaskStatus.PARKED,
                             Task.requires_approval.is_not(True),
+                            operator_visible_audience_filter(Task.context),
                         ),
                         1,
                     ),
@@ -2322,6 +2300,7 @@ async def build_operator_attention(
                     Task.archived.is_(False),
                     Task.requires_approval.is_(True),
                     Task.status.in_(list(_APPROVAL_TASK_STATUSES)),
+                    operator_visible_audience_filter(Task.context),
                 )
                 .order_by(Task.priority.asc(), Task.created_at.asc())
                 .limit(4)
@@ -2340,10 +2319,7 @@ async def build_operator_attention(
                     Task.archived.is_(False),
                     Task.status == TaskStatus.FAILED,
                     Task.context["pr_preserved_for_handmerge"].as_boolean().is_not(True),
-                    not_(and_(
-                        Task.context["audience"].isnot(None),
-                        Task.context["audience"].as_string() == "strategist-internal",
-                    )),
+                    operator_visible_audience_filter(Task.context),
                 )
                 .order_by(Task.updated_at.desc())
                 .limit(3)
@@ -2362,6 +2338,7 @@ async def build_operator_attention(
                     Task.archived.is_(False),
                     Task.status.in_([TaskStatus.BLOCKED, TaskStatus.PARKED]),
                     Task.requires_approval.is_not(True),
+                    operator_visible_audience_filter(Task.context),
                 )
                 .order_by(Task.updated_at.desc())
                 .limit(4)

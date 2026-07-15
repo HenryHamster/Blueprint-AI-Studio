@@ -7238,6 +7238,63 @@ class TestMessages:
         assert data["feedback"] == 0
 
     @pytest.mark.asyncio
+    async def test_get_message_counts_excludes_internal_rows_from_counts_and_unread(
+        self, client: AsyncClient, db_session
+    ):
+        """Internal high-signal rows cannot inflate the operator badge."""
+        from app.notification_dispatch import HIGH_SIGNAL_NOTE_EVENT_TYPES
+
+        project = await _make_project(db_session)
+        internal_context = {"audience": "strategist-internal"}
+        for message_type in (
+            MessageType.QUESTION,
+            MessageType.BLOCKER,
+            MessageType.BUG_REPORT,
+            MessageType.FEEDBACK,
+        ):
+            db_session.add(ProjectMessage(
+                project_id=project.id,
+                message_type=message_type,
+                from_type="system",
+                content=f"internal {message_type.value}",
+                status="open",
+                context=internal_context,
+            ))
+        db_session.add(ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.NOTE,
+            from_type="system",
+            content="internal high-signal note",
+            status="open",
+            context={
+                "audience": "strategist-internal",
+                "event_type": next(iter(HIGH_SIGNAL_NOTE_EVENT_TYPES)),
+            },
+        ))
+        visible_question = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.QUESTION,
+            from_type="system",
+            content="legacy visible question",
+            status="open",
+        )
+        db_session.add(visible_question)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/messages/counts?project_id={project.id}")
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data == {
+            "blocker": 0,
+            "question": 1,
+            "bug_report": 0,
+            "feedback": 0,
+            "high_signal_note": 0,
+            "unread": 1,
+            "needs_operator": 1,
+        }
+
+    @pytest.mark.asyncio
     async def test_get_message_counts_high_signal_note(self, client: AsyncClient, db_session):
         """NOTE messages with HIGH_SIGNAL_NOTE_EVENT_TYPES event_type are counted in high_signal_note."""
         from app.notification_dispatch import HIGH_SIGNAL_NOTE_EVENT_TYPES
