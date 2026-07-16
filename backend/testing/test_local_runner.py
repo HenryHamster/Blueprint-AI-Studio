@@ -11877,6 +11877,159 @@ async def test_capability_proof_trial_red_records_no_proof(db_session):
 
 
 @pytest.mark.asyncio
+async def test_capability_proof_trial_definitive_red_revokes_prior_green(db_session):
+    """A definitive RED trial (ran=True, passed=False, could_not_run=False) REVOKES
+    any stale executed-proof ledger entry so the capability cannot keep clearing the
+    enforce gate until the 30-day TTL expires.
+
+    Acceptance: 'a definitive red B blocks the capability'.
+    """
+    import json as _json
+
+    from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+
+    from app.capability_proof import record_capability_named_test_execution_proof
+    from app.capability_registry import working_capability_proof_status
+    from app.task_completion import _handle_capability_proof_trial_completion
+
+    cap = "repo-map-red-revoke"
+    test_refs = ["backend/testing/test_prompt.py"]
+    project = await _make_trial_project(db_session, cap)
+    task = _make_trial_task(project, cap, test_refs, head_sha="sha_b")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # First stamp a GREEN proof at sha_a (revision A).
+    record_capability_named_test_execution_proof(
+        project, cap, test_refs, head_sha="sha_a", suite_verifying=True
+    )
+    _flag_modified(project, "capability_proof_records")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Confirm the capability is now "proven" via the execution proof.
+    assert (project.capability_proof_records or {}).get(cap) or \
+        working_capability_proof_status(project.problem_model).get(cap) == "proven"
+
+    # A RED trial at sha_b (revision B) should revoke the sha_a proof.
+    red = {
+        "type": "capability_proof_trial",
+        "cap": cap,
+        "head_sha": "sha_b",
+        "test_refs": test_refs,
+        "ran": True,
+        "passed": False,
+        "could_not_run": False,
+    }
+    with _TrialFlag(True):
+        await _handle_capability_proof_trial_completion(task, _json.dumps(red), db_session)
+
+    await db_session.refresh(project)
+    await db_session.refresh(task)
+
+    # The named_test_exec ledger entry must be gone.
+    norm_cap = cap
+    records = project.capability_proof_records or {}
+    exec_entries = [
+        e for e in (records.get(norm_cap) or [])
+        if e.get("task_id") == f"named_test_exec:{norm_cap}"
+    ]
+    assert exec_entries == [], "definitive RED must revoke the stale execution proof"
+
+    # The contradiction is still surfaced.
+    contradiction = (task.context or {}).get("capability_proof_trial_contradiction")
+    assert contradiction is not None
+    assert contradiction["cap"] == cap
+    assert contradiction["passed"] is False
+    assert contradiction["proof_revoked"] is True
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_trial_indeterminate_result_leaves_proof(db_session):
+    """An indeterminate result (could_not_run=True) must NOT revoke existing proof.
+
+    Acceptance: 'an indeterminate B ... result cannot corrupt the current verdict'.
+    """
+    import json as _json
+
+    from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+
+    from app.capability_proof import record_capability_named_test_execution_proof
+    from app.task_completion import _handle_capability_proof_trial_completion
+
+    cap = "repo-map-infra-fail"
+    test_refs = ["backend/testing/test_prompt.py"]
+    project = await _make_trial_project(db_session, cap)
+    task = _make_trial_task(project, cap, test_refs, head_sha="sha_b")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Stamp a GREEN proof at sha_a.
+    record_capability_named_test_execution_proof(
+        project, cap, test_refs, head_sha="sha_a", suite_verifying=True
+    )
+    _flag_modified(project, "capability_proof_records")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Infrastructure failure: could_not_run — indeterminate, should NOT revoke.
+    indeterminate = {
+        "type": "capability_proof_trial",
+        "cap": cap,
+        "head_sha": "sha_b",
+        "test_refs": test_refs,
+        "ran": False,
+        "passed": False,
+        "could_not_run": True,
+    }
+    with _TrialFlag(True):
+        await _handle_capability_proof_trial_completion(
+            task, _json.dumps(indeterminate), db_session
+        )
+
+    await db_session.refresh(project)
+    records = project.capability_proof_records or {}
+    exec_entries = [
+        e for e in (records.get(cap) or [])
+        if e.get("task_id") == f"named_test_exec:{cap}"
+    ]
+    assert exec_entries, "indeterminate result must NOT revoke the existing proof"
+
+    contradiction = (task.context or {}).get("capability_proof_trial_contradiction")
+    assert contradiction is not None
+    assert contradiction.get("proof_revoked") is False
+
+
+@pytest.mark.asyncio
+async def test_enroll_capability_proof_trial_dedup_in_flight(db_session):
+    """enroll_capability_proof_trial returns None when a trial for the same
+    capability is already QUEUED/PROVISIONING/IN_PROGRESS — 'revision B commissions
+    exactly one re-verification'."""
+    from app.capability_proof import enroll_capability_proof_trial
+
+    project = await _make_trial_project(db_session, "dedup-cap")
+
+    # Enroll the first trial.
+    with _TrialFlag(True):
+        first = await enroll_capability_proof_trial(
+            db_session, project, "dedup-cap", ["backend/testing/test_a.py"], "sha1"
+        )
+    assert first is not None
+    assert first.status == TaskStatus.QUEUED
+
+    # A second enrollment attempt for the same capability must be a no-op.
+    with _TrialFlag(True):
+        second = await enroll_capability_proof_trial(
+            db_session, project, "dedup-cap", ["backend/testing/test_a.py"], "sha2"
+        )
+    assert second is None, "duplicate trial must be blocked by the dedup guard"
+
+
+@pytest.mark.asyncio
 async def test_capability_proof_trial_flag_off_records_nothing(db_session):
     """With the dark flag OFF, even a GREEN trial records nothing."""
     import json as _json
@@ -11887,7 +12040,7 @@ async def test_capability_proof_trial_flag_off_records_nothing(db_session):
     cap = "repo-map-darkoff"
     test_refs = ["backend/testing/test_prompt.py::test_x"]
     project = await _make_trial_project(db_session, cap)
-    task = _make_trial_task(project, cap, test_refs)
+    task = _make_trial_task(project, cap, test_refs, head_sha="abc")
     db_session.add(task)
     await db_session.commit()
     await db_session.refresh(task)
@@ -11915,7 +12068,7 @@ async def test_capability_proof_trial_skipped_suite_records_nothing(db_session):
 
     cap = "repo-map-skipped"
     project = await _make_trial_project(db_session, cap)
-    task = _make_trial_task(project, cap, ["backend/testing/test_prompt.py"])
+    task = _make_trial_task(project, cap, ["backend/testing/test_prompt.py"], head_sha="abc")
     db_session.add(task)
     await db_session.commit()
     await db_session.refresh(task)
@@ -11933,6 +12086,117 @@ async def test_capability_proof_trial_skipped_suite_records_nothing(db_session):
     await db_session.refresh(project)
     assert working_capability_proof_status(project.problem_model).get(cap) != "proven"
     assert cap not in (project.capability_proof_records or {})
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_trial_wrong_cap_rejected(db_session):
+    """A trial result whose cap does not match the enrollment contract records
+    no proof — the runner cannot mint proof for the wrong capability."""
+    import json as _json
+
+    from app.capability_registry import working_capability_proof_status
+    from app.task_completion import _handle_capability_proof_trial_completion
+
+    cap = "enrolled-capability"
+    test_refs = ["backend/testing/test_prompt.py"]
+    project = await _make_trial_project(db_session, cap)
+    # Enroll with cap "enrolled-capability"
+    task = _make_trial_task(project, cap, test_refs)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Agent reports a DIFFERENT cap than what was enrolled.
+    wrong = {
+        "type": "capability_proof_trial",
+        "cap": "different-capability",
+        "head_sha": "deadbeef",
+        "test_refs": test_refs,
+        "ran": True, "passed": True, "could_not_run": False,
+    }
+
+    with _TrialFlag(True):
+        await _handle_capability_proof_trial_completion(task, _json.dumps(wrong), db_session)
+
+    await db_session.refresh(project)
+    # No proof recorded for the wrong cap.
+    status_map = working_capability_proof_status(project.problem_model)
+    assert status_map.get("different-capability") != "proven"
+    assert "different-capability" not in (project.capability_proof_records or {})
+    # And no proof for the enrolled cap either.
+    assert status_map.get(cap) != "proven"
+    assert cap not in (project.capability_proof_records or {})
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_trial_extra_test_refs_rejected(db_session):
+    """A trial result with test_refs that were NOT in the enrollment must NOT
+    mint proof — the runner cannot claim green for refs it was never enrolled to run."""
+    import json as _json
+
+    from app.capability_registry import working_capability_proof_status
+    from app.task_completion import _handle_capability_proof_trial_completion
+
+    cap = "refs-guard-cap"
+    enrolled_refs = ["backend/testing/test_prompt.py"]
+    project = await _make_trial_project(db_session, cap)
+    # Enroll with a specific set of test_refs
+    task = _make_trial_task(project, cap, enrolled_refs)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Agent reports extra test_refs not in the enrollment.
+    extra_refs_report = enrolled_refs + ["backend/testing/test_extra.py"]
+    wrong = {
+        "type": "capability_proof_trial",
+        "cap": cap,
+        "head_sha": "deadbeef",
+        "test_refs": extra_refs_report,
+        "ran": True, "passed": True, "could_not_run": False,
+    }
+
+    with _TrialFlag(True):
+        await _handle_capability_proof_trial_completion(task, _json.dumps(wrong), db_session)
+
+    await db_session.refresh(project)
+    assert cap not in (project.capability_proof_records or {})
+    assert working_capability_proof_status(project.problem_model).get(cap) != "proven"
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_trial_mismatched_head_sha_rejected(db_session):
+    """A trial result whose head_sha differs from the enrollment must NOT mint
+    proof — the runner must execute the enrolled revision."""
+    import json as _json
+
+    from app.capability_registry import working_capability_proof_status
+    from app.task_completion import _handle_capability_proof_trial_completion
+
+    cap = "sha-guard-cap"
+    test_refs = ["backend/testing/test_prompt.py"]
+    project = await _make_trial_project(db_session, cap)
+    # Enroll with head_sha "abc123"
+    task = _make_trial_task(project, cap, test_refs, head_sha="abc123")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Agent reports a different sha.
+    wrong = {
+        "type": "capability_proof_trial",
+        "cap": cap,
+        "head_sha": "def456",
+        "test_refs": test_refs,
+        "ran": True, "passed": True, "could_not_run": False,
+    }
+
+    with _TrialFlag(True):
+        await _handle_capability_proof_trial_completion(task, _json.dumps(wrong), db_session)
+
+    await db_session.refresh(project)
+    assert cap not in (project.capability_proof_records or {})
+    assert working_capability_proof_status(project.problem_model).get(cap) != "proven"
 
 
 @pytest.mark.asyncio

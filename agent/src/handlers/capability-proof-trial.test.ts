@@ -17,11 +17,21 @@ vi.mock('../workspacePrep.js', () => ({
   prepareWorkspaceForRole: vi.fn().mockResolvedValue(undefined),
 }));
 
+vi.mock('../utils/test-runners.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../utils/test-runners.js')>();
+  return {
+    ...actual,
+    isDockerAvailable: vi.fn().mockReturnValue(false),
+  };
+});
+
 import {
   buildCapabilityProofTrialRunner,
   handleCapabilityProofTrial,
+  isRefSetTargetable,
   parseTrialSkippedSummary,
 } from './capability-proof-trial.js';
+import { isDockerAvailable } from '../utils/test-runners.js';
 import { execFileAsync, persistAndPostStatus } from '../index.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 
@@ -105,6 +115,35 @@ describe('buildCapabilityProofTrialRunner', () => {
   });
 });
 
+describe('isRefSetTargetable', () => {
+  it('returns true for a Python ref set', () => {
+    expect(isRefSetTargetable(['backend/testing/test_foo.py'])).toBe(true);
+    expect(isRefSetTargetable(['testing/test_a.py', 'testing/test_b.py'])).toBe(true);
+  });
+
+  it('returns true for TS refs within the same package', () => {
+    expect(isRefSetTargetable(['agent/src/a.test.ts', 'agent/src/b.test.ts'])).toBe(true);
+    expect(isRefSetTargetable(['admin-ui/src/c.test.tsx'])).toBe(true);
+  });
+
+  it('returns false for an empty ref set', () => {
+    expect(isRefSetTargetable([])).toBe(false);
+    expect(isRefSetTargetable(['', '   '])).toBe(false);
+  });
+
+  it('returns false for an unknown extension', () => {
+    expect(isRefSetTargetable(['docs/readme.md'])).toBe(false);
+  });
+
+  it('returns false for a mixed-language set', () => {
+    expect(isRefSetTargetable(['backend/testing/test_a.py', 'agent/src/b.test.ts'])).toBe(false);
+  });
+
+  it('returns false for cross-package TS refs', () => {
+    expect(isRefSetTargetable(['agent/src/a.test.ts', 'admin-ui/src/b.test.ts'])).toBe(false);
+  });
+});
+
 describe('parseTrialSkippedSummary', () => {
   it('parses passed/skipped/failed counts into total+skipped', () => {
     expect(parseTrialSkippedSummary('5 passed, 2 skipped in 1.2s')).toEqual({ total: 7, skipped: 2 });
@@ -114,6 +153,67 @@ describe('parseTrialSkippedSummary', () => {
   it('returns undefined when no counts are parseable (do not fabricate)', () => {
     expect(parseTrialSkippedSummary('')).toBeUndefined();
     expect(parseTrialSkippedSummary('some unrelated output')).toBeUndefined();
+  });
+});
+
+describe('handleCapabilityProofTrial Docker-flag propagation', () => {
+  const pyPayload = {
+    cap: 'repo-map',
+    head_sha: 'queued-sha',
+    test_refs: ['backend/testing/test_capability_proof.py'],
+  };
+  const statusRef = { value: '' };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(prepareWorkspaceForRole).mockResolvedValue(undefined);
+  });
+
+  it('passes --no-postgres to test-backend.sh when Docker is unavailable', async () => {
+    vi.mocked(isDockerAvailable).mockReturnValue(false);
+    vi.mocked(execFileAsync)
+      .mockResolvedValueOnce('executed-sha\n')
+      .mockResolvedValueOnce('1 passed\n');
+
+    await handleCapabilityProofTrial(
+      'task-docker-1', pyPayload, {}, 'token', 'owner', 'repo', null, statusRef,
+    );
+
+    const runnerCall = vi.mocked(execFileAsync).mock.calls[1];
+    expect(runnerCall[0]).toBe('bash');
+    expect(runnerCall[1]).toContain('--no-postgres');
+    expect(runnerCall[1]).not.toContain('--postgres');
+  });
+
+  it('passes --postgres to test-backend.sh when Docker is available', async () => {
+    vi.mocked(isDockerAvailable).mockReturnValue(true);
+    vi.mocked(execFileAsync)
+      .mockResolvedValueOnce('executed-sha\n')
+      .mockResolvedValueOnce('1 passed\n');
+
+    await handleCapabilityProofTrial(
+      'task-docker-2', pyPayload, {}, 'token', 'owner', 'repo', null, statusRef,
+    );
+
+    const runnerCall = vi.mocked(execFileAsync).mock.calls[1];
+    expect(runnerCall[0]).toBe('bash');
+    expect(runnerCall[1]).toContain('--postgres');
+    expect(runnerCall[1]).not.toContain('--no-postgres');
+  });
+
+  it('strips the backend/ prefix from Python refs in the runner args', async () => {
+    vi.mocked(isDockerAvailable).mockReturnValue(false);
+    vi.mocked(execFileAsync)
+      .mockResolvedValueOnce('executed-sha\n')
+      .mockResolvedValueOnce('1 passed\n');
+
+    await handleCapabilityProofTrial(
+      'task-docker-3', pyPayload, {}, 'token', 'owner', 'repo', null, statusRef,
+    );
+
+    const runnerCall = vi.mocked(execFileAsync).mock.calls[1];
+    expect(runnerCall[1]).toContain('testing/test_capability_proof.py');
+    expect(runnerCall[1].some(a => a.startsWith('backend/'))).toBe(false);
   });
 });
 

@@ -3824,22 +3824,96 @@ async def _handle_capability_proof_trial_completion(
             )
             return
 
+        # --- Validate agent-reported result against enrollment contract ---
+        # The enrollment (task.first_payload) is the orchestrator-authored contract
+        # written by enroll_capability_proof_trial. The agent must not be able to
+        # mint proof for a different cap, unenrolled test_refs, or a revision that
+        # was never enrolled. On ANY mismatch, record NO proof and surface the
+        # contradiction on the task context for strategist visibility (mirroring the
+        # non-green fail-open branch).
+        from app.capability_registry import normalize_capability_name as _norm_cap  # noqa: PLC0415
+
+        enrolled = task.first_payload
+        if not isinstance(enrolled, dict):
+            logger.warning(
+                "[CAP_TRIAL] no enrollment payload for task %s — ingesting nothing",
+                task.id,
+            )
+            return
+
+        cap_enrolled = _norm_cap(enrolled.get("cap"))
+        if not cap_enrolled:
+            logger.warning(
+                "[CAP_TRIAL] enrollment for task %s missing valid 'cap' — ingesting nothing",
+                task.id,
+            )
+            return
+
+        refs_enrolled = [
+            r for r in (enrolled.get("test_refs") or []) if isinstance(r, str) and r.strip()
+        ]
+        head_sha_enrolled = (
+            enrolled.get("head_sha") if isinstance(enrolled.get("head_sha"), str) else None
+        )
+
+        # (1) Capability name must normalize-equal the enrolled name.
+        cap_normalized = _norm_cap(cap)
+        if not cap_normalized or cap_normalized != cap_enrolled:
+            logger.warning(
+                "[CAP_TRIAL] capability mismatch for task %s — "
+                "reported=%r normalized=%r enrolled=%r — ingesting nothing",
+                task.id,
+                cap,
+                cap_normalized,
+                cap_enrolled,
+            )
+            return
+
+        # (2) Reported test_refs must be a subset of the enrolled test_refs so
+        #     the runner cannot claim green for refs that were never enrolled.
+        reported_refs_set = set(refs)
+        enrolled_refs_set = set(refs_enrolled)
+        if not reported_refs_set.issubset(enrolled_refs_set):
+            extra = sorted(reported_refs_set - enrolled_refs_set)
+            logger.warning(
+                "[CAP_TRIAL] test_refs mismatch for task %s — "
+                "extra unenrolled refs: %s — ingesting nothing",
+                task.id,
+                extra,
+            )
+            return
+
+        # (3) Reported head_sha must match the enrolled head_sha when the
+        #     enrollment specifies one (head_sha_enrolled=None == skip check).
+        reported_sha = head_sha if isinstance(head_sha, str) else None
+        if head_sha_enrolled and reported_sha and reported_sha != head_sha_enrolled:
+            logger.warning(
+                "[CAP_TRIAL] head_sha mismatch for task %s — "
+                "reported=%s, enrolled=%s — ingesting nothing",
+                task.id,
+                reported_sha,
+                head_sha_enrolled,
+            )
+            return
+
+        # --- Enrollment validated — use enrolled values for recording ---
         if capability_proof_trial_is_green(result):
             recorded = record_capability_named_test_execution_proof(
                 project,
-                cap,
-                refs,
-                head_sha if isinstance(head_sha, str) else None,
+                cap_enrolled,
+                refs_enrolled,
+                head_sha_enrolled,
                 suite_verifying=True,
             )
             if recorded:
                 await session.commit()
                 logger.info(
                     "[CAP_TRIAL] GREEN trial — recorded proven named_test proof for "
-                    "cap=%s (task %s, sha=%s)",
-                    cap,
+                    "cap=%s (task %s, sha=%s, refs=%s)",
+                    cap_enrolled,
                     task.id,
-                    head_sha,
+                    head_sha_enrolled,
+                    refs_enrolled,
                 )
                 # The proof is durable before waking waiters. The shared resolver
                 # locks a bounded project slice and resumes only all-needs-satisfied
@@ -3854,31 +3928,50 @@ async def _handle_capability_proof_trial_completion(
                 logger.info(
                     "[CAP_TRIAL] GREEN trial for cap=%s (task %s) but recorder minted "
                     "nothing (empty refs / unnormalizable / vacuous) — no proof",
-                    cap,
+                    cap_enrolled,
                     task.id,
                 )
             return
 
-        # Non-green: NEVER demote (design §7). Surface the contradiction on the
-        # task context for the strategist; the capability keeps its existing proof.
+        # Non-green: NEVER demote on ambiguity (design §7). Surface the
+        # contradiction on the task context for the strategist. A definitive RED
+        # (tests actually ran and failed, not an infrastructure failure) also
+        # REVOKES any stale executed-proof ledger entry so a capability known
+        # broken at HEAD cannot keep clearing the enforce gate until the 30-day
+        # TTL expires.
+        is_definitive_red = (
+            bool(result.get("ran"))
+            and not bool(result.get("could_not_run"))
+            and not bool(result.get("passed"))
+        )
+        revoked = False
+        if is_definitive_red:
+            from app.capability_proof import (
+                revoke_stale_execution_proof,
+            )
+            revoked = revoke_stale_execution_proof(project, cap_enrolled)
+
         ctx = dict(task.context or {})
         ctx["capability_proof_trial_contradiction"] = {
-            "cap": cap,
-            "head_sha": head_sha if isinstance(head_sha, str) else None,
-            "test_refs": refs,
+            "cap": cap_enrolled,
+            "head_sha": head_sha_enrolled,
+            "test_refs": refs_enrolled,
             "ran": bool(result.get("ran")),
             "passed": bool(result.get("passed")),
             "could_not_run": bool(result.get("could_not_run")),
+            "proof_revoked": revoked,
             "recorded_at": _utcnow().isoformat(),
         }
         task.context = ctx
         flag_modified(task, "context")
         await session.commit()
         logger.info(
-            "[CAP_TRIAL] non-green trial for cap=%s (task %s) — no proven proof "
-            "recorded, existing proof untouched",
-            cap,
+            "[CAP_TRIAL] non-green trial for cap=%s (task %s) — "
+            "definitive_red=%s proof_revoked=%s",
+            cap_enrolled,
             task.id,
+            is_definitive_red,
+            revoked,
         )
     except Exception:  # noqa: BLE001 — ingestion must fail open, never raise
         logger.warning(

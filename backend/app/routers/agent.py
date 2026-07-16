@@ -324,6 +324,11 @@ _AGENT_SPAWN_FORBIDDEN_CONTEXT_KEYS = frozenset(
         "warm_handoff_deadline",
         # Defense-in-depth — these are also orchestrator-internal:
         "_timing",
+        # Agent MUST NOT forge an acceptance verdict. record_code_acceptance_verdict
+        # no-ops on tasks that declared no acceptance evidence, so a self-authored
+        # verdict with proven=True and a recognized proof_kind (e.g. "named_test")
+        # would survive untouched and later mint a gate-clearing capability proof.
+        "code_acceptance_verdict",
     }
 )
 

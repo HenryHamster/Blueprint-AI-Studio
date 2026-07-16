@@ -179,6 +179,7 @@ def test_registry_contains_initial_checks():
         "criterion_evidence_count_integrity",
         "criterion_claim_reconciliation",
         "capability_proof_gate_gap",
+        "capability_proof_trial_stall",
     } <= names
 
 
@@ -5775,3 +5776,153 @@ async def test_observe_mode_unverified_resolution_aggregates_multiple_tasks(db):
     assert len(flagged) == 1
     assert flagged[0].delta == 3
     assert "cap-a" in flagged[0].detail
+
+
+# --- capability_proof_trial_stall ---------------------------------------------
+
+
+def _make_trial_task(project_id, cap, *, ran=False, passed=False, could_not_run=False):
+    """Helper: a COMPLETED capability_proof_trial task with a contradiction stamp."""
+    contradiction = {
+        "cap": cap,
+        "head_sha": "abc123",
+        "test_refs": [],
+        "ran": ran,
+        "passed": passed,
+        "could_not_run": could_not_run,
+        "proof_revoked": False,
+        "recorded_at": _utcnow().isoformat(),
+    }
+    return Task(
+        project_id=project_id,
+        payloads=[{"type": "capability_proof_trial", "cap": cap}],
+        status=TaskStatus.COMPLETED,
+        context={"capability_proof_trial_contradiction": contradiction},
+    )
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_trial_stall_flags_all_could_not_run(db):
+    """All trials could_not_run → FLAGGED with severity=warn."""
+    project = await _project(db)
+    now = _utcnow()
+
+    for _ in range(2):
+        db.add(_make_trial_task(project.id, "cap-a", could_not_run=True))
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=now, mode="observe", max_projects=25,
+        sample_limit=200, window_days=14,
+    )
+    results = await mis.check_capability_proof_trial_stall(ctx)
+
+    flagged = [r for r in results if r.status == CheckStatus.FLAGGED]
+    assert len(flagged) == 1
+    f = flagged[0]
+    assert f.subject == str(project.id)
+    assert f.severity == "warn"
+    assert f.delta == 2
+    assert f.ground_truth == 0
+    assert "could_not_run=2" in f.detail
+    assert "cap-a" in f.detail
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_trial_stall_flags_all_red(db):
+    """All trials ran + failed (red) → FLAGGED with severity=error."""
+    project = await _project(db)
+    now = _utcnow()
+
+    db.add(_make_trial_task(project.id, "cap-b", ran=True, passed=False))
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=now, mode="observe", max_projects=25,
+        sample_limit=200, window_days=14,
+    )
+    results = await mis.check_capability_proof_trial_stall(ctx)
+
+    flagged = [r for r in results if r.status == CheckStatus.FLAGGED]
+    assert len(flagged) == 1
+    f = flagged[0]
+    assert f.severity == "error"
+    assert f.delta == 1
+    assert "red=1" in f.detail
+    assert "cap-b" in f.detail
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_trial_stall_ok_when_any_green(db):
+    """A green trial (no contradiction stamp) means no non-green tasks in window → OK/SKIPPED."""
+    project = await _project(db)
+    now = _utcnow()
+
+    # Green trial: completed but NO contradiction stamp.
+    green_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "capability_proof_trial", "cap": "cap-c"}],
+        status=TaskStatus.COMPLETED,
+        context={},
+    )
+    db.add(green_task)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=now, mode="observe", max_projects=25,
+        sample_limit=200, window_days=14,
+    )
+    results = await mis.check_capability_proof_trial_stall(ctx)
+
+    assert not any(r.status == CheckStatus.FLAGGED for r in results)
+    ok_or_skipped = [
+        r for r in results if r.status in (CheckStatus.OK, CheckStatus.SKIPPED)
+    ]
+    assert ok_or_skipped
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_trial_stall_skips_empty(db):
+    """No trial tasks at all → SKIPPED / global OK (no FLAGGED)."""
+    project = await _project(db)
+    now = _utcnow()
+    db.add(Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        context={},
+    ))
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=now, mode="observe", max_projects=25,
+        sample_limit=200, window_days=14,
+    )
+    results = await mis.check_capability_proof_trial_stall(ctx)
+
+    assert not any(r.status == CheckStatus.FLAGGED for r in results)
+    skipped = [r for r in results if r.status == CheckStatus.SKIPPED]
+    assert skipped
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_trial_stall_mixed_caps(db):
+    """One cap all-red, another all-could_not_run → two FLAGGED results."""
+    project = await _project(db)
+    now = _utcnow()
+
+    db.add(_make_trial_task(project.id, "cap-alpha", ran=True, passed=False))
+    db.add(_make_trial_task(project.id, "cap-beta", could_not_run=True))
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=now, mode="observe", max_projects=25,
+        sample_limit=200, window_days=14,
+    )
+    results = await mis.check_capability_proof_trial_stall(ctx)
+
+    flagged = [r for r in results if r.status == CheckStatus.FLAGGED]
+    assert len(flagged) == 2
+    severities = {f.detail.split("cap=")[1].split("'")[1]: f.severity for f in flagged}
+    assert severities["cap-alpha"] == "error"
+    assert severities["cap-beta"] == "warn"

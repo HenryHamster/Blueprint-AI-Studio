@@ -1006,6 +1006,13 @@ def ledger_corroborated_proof_status(
     if not isinstance(proof_status_by_name, Mapping):
         return {}
     exempt = {n for n in exempt_names if isinstance(n, str)}
+    # Reverse alias map: survivor → [absorbed, ...] so a survivor name whose proof
+    # lives only under an absorbed alias key in the ledger (pre-rename record) is
+    # still corroborated. Built once per call, empty when alias_map is absent.
+    reverse_map: dict[str, list[str]] = {}
+    if alias_map:
+        for absorbed, survivor in alias_map.items():
+            reverse_map.setdefault(survivor, []).append(absorbed)
     out: dict[str, EvidenceStatus] = {}
     for name, status in proof_status_by_name.items():
         if (
@@ -1015,7 +1022,7 @@ def ledger_corroborated_proof_status(
         ):
             out[name] = status
             continue
-        # Alias retry: if this name was absorbed by a surviving capability,
+        # Forward alias retry: if this name was absorbed by a surviving capability,
         # check the survivor's ledger key instead of the alias's own (which
         # may not exist in the platform ledger).
         if alias_map and name in alias_map:
@@ -1023,6 +1030,14 @@ def ledger_corroborated_proof_status(
             if _ledger_proof_status(proof_records, survivor, now=now) == "proven":
                 out[name] = status
                 continue
+        # Reverse alias retry: if this name IS a survivor, also check its absorbed
+        # alias keys — proof recorded before a rename lives under the old name.
+        if reverse_map and name in reverse_map and any(
+            _ledger_proof_status(proof_records, absorbed, now=now) == "proven"
+            for absorbed in reverse_map[name]
+        ):
+            out[name] = status
+            continue
         out[name] = "unverified"
     return out
 
@@ -1148,6 +1163,10 @@ def consumer_gate_proof_status(
     problem_model-only derivation; here the caller ALWAYS supplies the project's
     column, so ``None`` genuinely means "this project has no recorded proofs".
     """
+    if now is None:
+        from app.time_utils import _utcnow
+
+        now = _utcnow()
     proof_map = working_capability_proof_status(
         problem_model, now=now, proof_records=proof_records
     )
@@ -1240,6 +1259,10 @@ def capability_proof_gate_release_status(
     if not problem_model:
         detail["error"] = "no problem_model"
         return False, detail
+    if now is None:
+        from app.time_utils import _utcnow
+
+        now = _utcnow()
     proof_map = working_capability_proof_status(
         problem_model, now=now, proof_records=proof_records
     )

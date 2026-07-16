@@ -48,6 +48,7 @@ __all__ = [
     "record_capability_proof",
     "record_capability_proof_from_trial",
     "record_gap_evidence",
+    "revoke_stale_execution_proof",
     "should_record_capability_proof",
 ]
 
@@ -844,6 +845,97 @@ def record_capability_named_test_execution_proof(
     return True
 
 
+def revoke_stale_execution_proof(project: Any, cap_name: str) -> bool:
+    """Remove the ``named_test_exec:<cap>`` ledger entry (and its evidence_ref) for
+    ``cap_name`` after a definitive RED trial proves the capability broken at HEAD.
+
+    Called from :func:`app.task_completion._handle_capability_proof_trial_completion`
+    when a trial ran to completion and failed (``ran=True``, ``passed=False``,
+    ``could_not_run=False``). Without this revocation the old green proof (written at
+    an earlier revision) keeps clearing the enforce gate until the 30-day TTL expires
+    — even though the capability is demonstrably broken at the current HEAD.
+
+    Non-raising: all errors are logged at WARNING level so a revocation failure can
+    never strand the surrounding commit or prevent the contradiction from being
+    recorded.
+
+    Returns ``True`` when the ledger entry was present and removed, ``False`` when
+    no entry existed (nothing to revoke) or on error.
+    """
+    norm = normalize_capability_name(cap_name)
+    if not norm:
+        return False
+
+    try:
+        if not isinstance(getattr(project, "capability_proof_records", None), dict):
+            return False
+
+        dedup_task_id = f"named_test_exec:{norm}"
+        existing = list(project.capability_proof_records.get(norm) or [])
+        pruned = [e for e in existing if not (isinstance(e, dict) and e.get("task_id") == dedup_task_id)]
+        if len(pruned) == len(existing):
+            # No executed-proof entry was present — nothing to revoke.
+            return False
+
+        project.capability_proof_records[norm] = pruned
+        try:
+            flag_modified(project, "capability_proof_records")
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "[CAPABILITY_PROOF] revoke: flag_modified failed for capability_proof_records",
+                exc_info=True,
+            )
+            return False
+
+        # Mirror the revocation into problem_model evidence_refs so the
+        # tier-1 proof_status no longer sees the executed-proof ref.
+        try:
+            pm = getattr(project, "problem_model", None)
+            if isinstance(pm, dict):
+                caps = pm.get("capabilities")
+                if isinstance(caps, list):
+                    ref_removed = False
+                    for cap in caps:
+                        if not isinstance(cap, dict):
+                            continue
+                        cap_nm = cap.get("name")
+                        if not isinstance(cap_nm, str):
+                            continue
+                        if normalize_capability_name(cap_nm) != norm:
+                            continue
+                        refs = cap.get("evidence_refs")
+                        if not isinstance(refs, list):
+                            continue
+                        new_refs = [
+                            r for r in refs
+                            if not (isinstance(r, dict) and r.get("source_id") == dedup_task_id)
+                        ]
+                        if len(new_refs) < len(refs):
+                            cap["evidence_refs"] = new_refs
+                            ref_removed = True
+                    if ref_removed:
+                        flag_modified(project, "problem_model")
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "[CAPABILITY_PROOF] revoke: failed to remove evidence_ref from problem_model",
+                exc_info=True,
+            )
+
+        logger.info(
+            "[CAPABILITY_PROOF] revoked stale execution proof for cap=%s (definitive RED)",
+            norm,
+        )
+        return True
+
+    except Exception:  # noqa: BLE001 — revocation must degrade, never raise
+        logger.warning(
+            "[CAPABILITY_PROOF] revoke_stale_execution_proof failed for cap=%r",
+            cap_name,
+            exc_info=True,
+        )
+        return False
+
+
 async def _default_read_head_sha() -> str | None:
     """Resolve the current verification-branch HEAD SHA (or ``None``).
 
@@ -886,15 +978,28 @@ def _fresh_executed_proof_covers_head(
     records = getattr(project, "capability_proof_records", None)
     if not isinstance(records, dict):
         return False
-    dedup_task_id = f"named_test_exec:{norm}"
+    exec_dedup_id = f"named_test_exec:{norm}"
     _now = now or _utcnow()
     for entry in records.get(norm) or []:
         if not isinstance(entry, dict):
             continue
-        if entry.get("task_id") != dedup_task_id:
+        task_id = entry.get("task_id", "")
+        proof_kind = entry.get("proof_kind", "")
+        commit_sha_val = entry.get("commit_sha", "")
+        # Accept a direct executed-proof entry OR a merge-gate named_test proof
+        # with a non-empty commit_sha — the latter avoids unnecessary trial
+        # enrollment when the capability was already proven at HEAD by the merge
+        # gate (record_capability_proof) and its commit_sha matches head_sha.
+        is_exec_entry = task_id == exec_dedup_id
+        is_merge_gate_proof = (
+            proof_kind == _PROOF_KIND_NAMED_TEST
+            and isinstance(commit_sha_val, str)
+            and bool(commit_sha_val)
+        )
+        if not (is_exec_entry or is_merge_gate_proof):
             continue
         if entry.get("commit_sha") != head_sha:
-            # Executed proof exists but for a DIFFERENT tree — re-verify.
+            # Proof exists but for a DIFFERENT tree — re-verify.
             continue
         if _ref_is_expired(entry, _now, PROOF_FRESHNESS_TTL):
             # Aged past the TTL — the genuine re-verification loop.
@@ -1016,7 +1121,45 @@ async def enroll_capability_proof_trial(
             return None
         refs = refs[:MAX_CAPABILITY_PROOF_TRIAL_TEST_FILES]
 
+        from sqlalchemy import select
+
         from app.models import Task, TaskStatus
+
+        # Dedup guard: if a trial for this capability is already QUEUED,
+        # PROVISIONING, IN_PROGRESS, or EVALUATING, do not enroll another.
+        # This ensures "revision B commissions exactly one re-verification" and
+        # prevents concurrent earn sweeps from creating duplicate trials that race
+        # to replace each other's proof.
+        project_id = getattr(project, "id", None)
+        in_flight_statuses = [
+            TaskStatus.QUEUED,
+            TaskStatus.PROVISIONING,
+            TaskStatus.IN_PROGRESS,
+            TaskStatus.EVALUATING,
+        ]
+        try:
+            existing_q = await session.execute(
+                select(Task.id).where(
+                    Task.project_id == project_id,
+                    Task.status.in_(in_flight_statuses),
+                    Task.payloads.contains(
+                        [{"type": "capability_proof_trial", "cap": norm}]
+                    ),
+                ).limit(1)
+            )
+            if existing_q.scalar_one_or_none() is not None:
+                logger.info(
+                    "[CAP_TRIAL] skipping duplicate enrollment for cap=%s — "
+                    "a trial is already in-flight",
+                    norm,
+                )
+                return None
+        except Exception:  # noqa: BLE001 — dedup failure is non-fatal; enroll anyway
+            logger.warning(
+                "[CAP_TRIAL] dedup check failed for cap=%s — proceeding with enroll",
+                norm,
+                exc_info=True,
+            )
 
         payload: dict[str, Any] = {
             "type": "capability_proof_trial",
