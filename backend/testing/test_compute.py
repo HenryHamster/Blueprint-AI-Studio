@@ -1869,7 +1869,7 @@ async def test_stranded_runner_subprocess_sweep_finalizes_only_dead_claimed_jobs
     now = _utcnow()
     project = await _make_project_owner(db_session, name="Stranded runner sweep")
     stale_runner = LocalRunner(project_id=project.id, token_hash="stale", last_seen_at=now - timedelta(seconds=_RUNNER_LIVENESS_SECONDS + 1))
-    inactive_runner = LocalRunner(project_id=project.id, token_hash="inactive", status="inactive", last_seen_at=now)
+    inactive_runner = LocalRunner(project_id=project.id, token_hash="inactive", status="inactive", last_seen_at=now - timedelta(seconds=_RUNNER_LIVENESS_SECONDS + 1))
     boundary_runner = LocalRunner(project_id=project.id, token_hash="boundary", last_seen_at=now - timedelta(seconds=_RUNNER_LIVENESS_SECONDS))
     task = Task(project_id=project.id, status=TaskStatus.PARKED)
     db_session.add_all([stale_runner, inactive_runner, boundary_runner, task])
@@ -1923,6 +1923,64 @@ async def test_stranded_runner_subprocess_sweep_finalizes_only_dead_claimed_jobs
         )
         == 0
     )
+
+
+@pytest.mark.asyncio
+async def test_stranded_runner_subprocess_sweep_protects_paused_draining_runners(db_session):
+    """Paused/draining runners with recent heartbeats keep in-flight jobs; stale ones get finalized."""
+    from app.reaper_sweeps import sweep_stranded_runner_subprocess_compute_jobs
+    from app.runner_health_monitors import _RUNNER_LIVENESS_SECONDS
+
+    now = _utcnow()
+    project = await _make_project_owner(db_session, name="Paused/Draining runner sweep")
+    # Paused/draining runners with RECENT heartbeats — still alive, should NOT lose jobs.
+    paused_alive = LocalRunner(project_id=project.id, token_hash="paused-alive", status="paused", last_seen_at=now)
+    draining_alive = LocalRunner(project_id=project.id, token_hash="draining-alive", status="draining", last_seen_at=now)
+    # Paused/draining runners with STALE heartbeats — truly dead, jobs SHOULD be finalized.
+    paused_dead = LocalRunner(project_id=project.id, token_hash="paused-dead", status="paused", last_seen_at=now - timedelta(seconds=_RUNNER_LIVENESS_SECONDS + 1))
+    draining_dead = LocalRunner(project_id=project.id, token_hash="draining-dead", status="draining", last_seen_at=now - timedelta(seconds=_RUNNER_LIVENESS_SECONDS + 1))
+    task = Task(project_id=project.id, status=TaskStatus.PARKED)
+    db_session.add_all([paused_alive, draining_alive, paused_dead, draining_dead, task])
+    await db_session.commit()
+
+    def job(status=ComputeJobStatus.RUNNING, **kwargs):
+        return ComputeJob(project_id=project.id, backend=RUNNER_SUBPROCESS_BACKEND_NAME, status=status, **kwargs)
+
+    paused_alive_job = job(ran_on_runner_id=paused_alive.id)
+    draining_alive_job = job(ran_on_runner_id=draining_alive.id)
+    paused_dead_job = job(ran_on_runner_id=paused_dead.id)
+    draining_dead_job = job(ran_on_runner_id=draining_dead.id)
+    db_session.add_all([paused_alive_job, draining_alive_job, paused_dead_job, draining_dead_job])
+    await db_session.flush()
+    wake = TaskWakeRegistration(
+        task_id=task.id, project_id=project.id,
+        wake_source_kind=compute_jobs.COMPUTE_JOB_TERMINAL_WAKE_KIND,
+        wake_source_ref=str(paused_dead_job.id), wake_action=WakeAction.FINALIZE,
+    )
+    db_session.add(wake)
+    await db_session.commit()
+
+    session_factory = async_sessionmaker(resolve_async_engine(db_session), expire_on_commit=False, class_=AsyncSession)
+    # Expected: 2 dead-runner jobs finalized, 2 alive-runner jobs survive.
+    assert (
+        await sweep_stranded_runner_subprocess_compute_jobs(
+            db_session, now, session_factory=session_factory
+        )
+        == 2
+    )
+
+    await db_session.refresh(paused_alive_job)
+    await db_session.refresh(draining_alive_job)
+    await db_session.refresh(paused_dead_job)
+    await db_session.refresh(draining_dead_job)
+    # Alive paused/draining: their jobs MUST survive (runner still heartbeating).
+    assert paused_alive_job.status == ComputeJobStatus.RUNNING
+    assert draining_alive_job.status == ComputeJobStatus.RUNNING
+    # Dead paused/draining: their jobs ARE finalized (runner truly gone).
+    assert paused_dead_job.status == ComputeJobStatus.FAILED
+    assert paused_dead_job.terminal_reason == "runner_subprocess_runner_dead"
+    assert draining_dead_job.status == ComputeJobStatus.FAILED
+    assert draining_dead_job.terminal_reason == "runner_subprocess_runner_dead"
 
 
 @pytest.mark.asyncio

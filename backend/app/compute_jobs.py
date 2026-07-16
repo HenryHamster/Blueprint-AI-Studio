@@ -3501,10 +3501,14 @@ async def finalize_runner_subprocess_job_for_dead_runner(
 
         runner = await session.get(LocalRunner, runner_id, with_for_update=True)
         if runner is None or (
-            runner.status == "active"
+            runner.status in ("active", "paused", "draining")
             and runner.last_seen_at is not None
             and runner.last_seen_at >= liveness_cutoff
         ):
+            # A paused or draining runner that is still heartbeating IS alive
+            # and will report its in-flight compute job result normally once
+            # the job completes. Only fail the job when the runner has truly
+            # stopped heartbeating (genuinely dead/hung).
             return False
 
         _finalize_terminal_job(

@@ -2841,7 +2841,6 @@ async def sweep_stranded_runner_subprocess_compute_jobs(
                     [ComputeJobStatus.STARTING, ComputeJobStatus.RUNNING]
                 ),
                 or_(
-                    LocalRunner.status != "active",
                     LocalRunner.last_seen_at.is_(None),
                     LocalRunner.last_seen_at < liveness_cutoff,
                 ),
