@@ -45,10 +45,16 @@ def test_extract_event_types_from_source():
         snapshot = json.load(f)
     snapshot_events = {et["name"] for et in snapshot["event_types"]}
 
-    # Extract event_type="..." from all source files using regex
-    # Find all event_type="..." patterns (both function args and dict keys)
-    # Matches: event_type="value" and "event_type": "value"
-    pattern = r'(?:event_type|"event_type")\s*[:=]\s*["\']([^"\']+)["\']'
+    # Extract event_type="..." from all source files using regex.
+    # Match keyword arguments, dict entries, and typed default parameters:
+    #   event_type="value"
+    #   "event_type": "value"
+    #   event_type: str = "value"
+    pattern = (
+        r'(?:event_type|"event_type")\s*'
+        r'(?:[:=]|:\s*[A-Za-z_][\w.\[\] |]*\s*=)\s*'
+        r'["\']([^"\']+)["\']'
+    )
     source_events: set[str] = set()
     for source_path in source_paths:
         with open(source_path) as f:
