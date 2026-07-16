@@ -3699,9 +3699,40 @@ async def test_enforce_gate_full_cycle_blocked_then_resumed(_spawn_db, mocker):
         {"kind": "capability", "ref": "container-runtime"}
     ], "Phase 1: blocked need must name the unproven capability"
 
-    # ── Phase 2: blocked-resume seam — proven cap routes need to completed_needs ──
-    # Simulate proof being recorded: the capability is now proven.
-    proven_proof_map = {"container-runtime": "proven"}
+    # ── Phase 2: provider acceptance records proof; resume releases consumer ──
+    # Exercise the real producer rather than substituting a prebuilt proof map:
+    # a completed provider advertises the capability and carries the platform's
+    # green named-test acceptance verdict.  The recorder writes both the durable
+    # ledger entry and the matching evidence ref on the registry capability.
+    from app.capability_proof import record_capability_proof
+    from app.capability_registry import consumer_gate_proof_status
+
+    provider = _T(
+        project_id=_project.id,
+        title="Provider: container runtime",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        payloads=[{"type": "create"}],
+        context={
+            "provides_capability": "container-runtime",
+            "code_acceptance_verdict": {
+                "proven": True,
+                "kind": "named_test",
+                "proof_ref": "backend/testing/test_container.py::test_runtime",
+            },
+        },
+    )
+    recorded = record_capability_proof(provider, _project)
+    assert recorded == ["container-runtime"]
+    assert _project.capability_proof_records["container-runtime"][0]["proof_kind"] == "named_test"
+
+    # This is the same ledger-aware map the blocked-resume sweep receives;
+    # it proves that acceptance recording, rather than a self-authored claim,
+    # releases the consumer under enforce mode.
+    proven_proof_map = consumer_gate_proof_status(
+        _project.problem_model, _project.capability_proof_records
+    )
+    assert proven_proof_map["container-runtime"] == "proven"
     disp = await _classify_capability_need_async(
         "container-runtime", proven_proof_map, proof_gate_mode="enforce"
     )
