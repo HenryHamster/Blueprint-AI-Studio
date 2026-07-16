@@ -4166,6 +4166,19 @@ async def test_capability_proof_gate_gap_triggers_self_heal(db):
     # so the observability snapshot / dashboards can report it machine-readably.
     assert ok[0].auto_resolved == 1
     assert ok[0].as_dict()["auto_resolved"] == 1
+    # This cap self-healed via the backing_path fallback tier (read_head is forced
+    # to None above so no covering test is discovered), so the structured tier
+    # breakdown must attribute the single auto-resolution to backing_path — NOT
+    # named_test_present — and the two tiers must sum to auto_resolved.
+    assert ok[0].auto_resolved_backing_path == 1
+    assert ok[0].auto_resolved_named_test_present == 0
+    d = ok[0].as_dict()
+    assert d["auto_resolved_backing_path"] == 1
+    assert d["auto_resolved_named_test_present"] == 0
+    assert (
+        d["auto_resolved_backing_path"] + d["auto_resolved_named_test_present"]
+        == d["auto_resolved"]
+    )
 
     # Proof must have been recorded in capability_proof_records.
     await db.refresh(project)
@@ -4188,6 +4201,80 @@ async def test_capability_proof_gate_gap_triggers_self_heal(db):
         e.get("proven") is True and e.get("kind") == "backing_path"
         for e in evidence_refs
     ), f"expected a proven backing_path evidence_ref, got {evidence_refs}"
+
+
+def test_record_tick_aggregates_auto_resolved_throughput():
+    """The observability aggregator must sum per-result ``auto_resolved`` (and its
+    tier split) into the tick summary and the cumulative snapshot totals so
+    self-heal throughput is machine-readable — it previously tracked only
+    flags/errors/enrolled, leaving self-heal invisible to operators.
+    """
+    mis._reset_observability_for_tests()
+    snap0 = get_metrics_integrity_observability()
+    assert snap0["auto_resolved_total"] == 0
+    assert snap0["auto_resolved_backing_path_total"] == 0
+    assert snap0["auto_resolved_named_test_present_total"] == 0
+
+    results = [
+        CheckResult(
+            check="capability_proof_gate_gap",
+            status=CheckStatus.OK,
+            subject="p1",
+            auto_resolved=3,
+            auto_resolved_backing_path=2,
+            auto_resolved_named_test_present=1,
+        ),
+        # A flagged result that still healed some caps this tick.
+        CheckResult(
+            check="capability_proof_gate_gap",
+            status=CheckStatus.FLAGGED,
+            severity="warn",
+            subject="p2",
+            delta=1,
+            auto_resolved=1,
+            auto_resolved_backing_path=1,
+            auto_resolved_named_test_present=0,
+        ),
+        # A non-mutating check contributes nothing (auto_resolved is None).
+        CheckResult(
+            check="landed_vs_reported",
+            status=CheckStatus.OK,
+            subject="global",
+        ),
+    ]
+    tick = mis._OBSERVABILITY.record_tick(
+        now=_utcnow(), mode="observe", results=results, enrolled=0
+    )
+    # Per-tick sums across all results.
+    assert tick["auto_resolved"] == 4
+    assert tick["auto_resolved_backing_path"] == 3
+    assert tick["auto_resolved_named_test_present"] == 1
+
+    snap1 = get_metrics_integrity_observability()
+    assert snap1["auto_resolved_total"] == 4
+    assert snap1["auto_resolved_backing_path_total"] == 3
+    assert snap1["auto_resolved_named_test_present_total"] == 1
+
+    # A second tick accumulates on top of the first (monotonic totals).
+    mis._OBSERVABILITY.record_tick(
+        now=_utcnow(),
+        mode="observe",
+        results=[
+            CheckResult(
+                check="capability_proof_gate_gap",
+                status=CheckStatus.OK,
+                subject="p3",
+                auto_resolved=2,
+                auto_resolved_backing_path=0,
+                auto_resolved_named_test_present=2,
+            )
+        ],
+        enrolled=0,
+    )
+    snap2 = get_metrics_integrity_observability()
+    assert snap2["auto_resolved_total"] == 6
+    assert snap2["auto_resolved_backing_path_total"] == 3
+    assert snap2["auto_resolved_named_test_present_total"] == 3
 
 
 @pytest.mark.asyncio

@@ -164,6 +164,16 @@ class CheckResult:
     # ``detail`` prose — so the observability snapshot and dashboards can report
     # self-heal throughput machine-readably.
     auto_resolved: int | None = None
+    # Breakdown of ``auto_resolved`` by the proof tier that closed each gap. Both
+    # tiers are structural (``path_proven``) and neither clears the enforce gate,
+    # but the split matters operationally: a fleet auto-resolving caps entirely via
+    # the weaker ``backing_path`` fallback looks healthy by ``auto_resolved`` count
+    # yet has earned no ``named_test_present`` coverage at all. Surfaced structured
+    # so the observability snapshot can report tier throughput without parsing the
+    # ``detail`` prose. Both are ``None`` for checks that never auto-resolve; when
+    # set they sum to ``auto_resolved``.
+    auto_resolved_backing_path: int | None = None
+    auto_resolved_named_test_present: int | None = None
 
     @property
     def flagged(self) -> bool:
@@ -180,6 +190,8 @@ class CheckResult:
             "subject": self.subject,
             "detail": self.detail,
             "auto_resolved": self.auto_resolved,
+            "auto_resolved_backing_path": self.auto_resolved_backing_path,
+            "auto_resolved_named_test_present": self.auto_resolved_named_test_present,
         }
 
     def finding_key(self) -> str:
@@ -249,6 +261,14 @@ class _MetricsIntegrityObservability:
     flags_total: int = 0
     errors_total: int = 0
     enrolled_total: int = 0
+    # Cumulative self-heal throughput across all ticks. Each CheckResult already
+    # carries per-result ``auto_resolved`` (and its tier split), but nothing
+    # aggregated it, so self-heal throughput was invisible to operators and
+    # dashboards. Summed per tick and exposed in ``snapshot()`` alongside the
+    # per-tick totals so the trend is machine-readable.
+    auto_resolved_total: int = 0
+    auto_resolved_backing_path_total: int = 0
+    auto_resolved_named_test_present_total: int = 0
     last_tick_at: str | None = None
     last_tick: Dict[str, Any] | None = None
     recent_ticks: Deque[Dict[str, Any]] = field(
@@ -268,11 +288,19 @@ class _MetricsIntegrityObservability:
     ) -> Dict[str, Any]:
         flagged = [r for r in results if r.flagged]
         errored = [r for r in results if r.status == CheckStatus.ERROR]
+        auto_resolved = sum(r.auto_resolved or 0 for r in results)
+        auto_resolved_bp = sum(r.auto_resolved_backing_path or 0 for r in results)
+        auto_resolved_nt = sum(
+            r.auto_resolved_named_test_present or 0 for r in results
+        )
         self.ticks += 1
         self.checks_run += len(results)
         self.flags_total += len(flagged)
         self.errors_total += len(errored)
         self.enrolled_total += enrolled
+        self.auto_resolved_total += auto_resolved
+        self.auto_resolved_backing_path_total += auto_resolved_bp
+        self.auto_resolved_named_test_present_total += auto_resolved_nt
         tick = {
             "at": now.isoformat(),
             "mode": mode,
@@ -280,6 +308,9 @@ class _MetricsIntegrityObservability:
             "flagged": len(flagged),
             "errors": len(errored),
             "enrolled": enrolled,
+            "auto_resolved": auto_resolved,
+            "auto_resolved_backing_path": auto_resolved_bp,
+            "auto_resolved_named_test_present": auto_resolved_nt,
             "flags": [r.as_dict() for r in flagged],
         }
         self.last_tick_at = str(tick["at"])
@@ -298,6 +329,11 @@ class _MetricsIntegrityObservability:
             "flags_total": self.flags_total,
             "errors_total": self.errors_total,
             "enrolled_total": self.enrolled_total,
+            "auto_resolved_total": self.auto_resolved_total,
+            "auto_resolved_backing_path_total": self.auto_resolved_backing_path_total,
+            "auto_resolved_named_test_present_total": (
+                self.auto_resolved_named_test_present_total
+            ),
             "last_tick_at": self.last_tick_at,
             "last_tick": dict(self.last_tick) if self.last_tick else None,
             "recent_ticks": list(self.recent_ticks),
@@ -4055,6 +4091,14 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
         # NOT machine-verified proof — they do not clear the enforce gate and
         # must not inflate ground_truth. Only caps with true 'proven' status count.
         new_proven = proven_count
+        # Tier split of the auto-resolutions this sweep: named_test_present caps
+        # were recorded from a statically-covered path set; the remainder fell
+        # back to the weaker structural backing_path tier. Both are path_proven,
+        # but the split is surfaced structured so operators can see whether the
+        # self-heal is minting any named_test_present coverage or only backing_path.
+        # (This is reporting only — it never feeds ground_truth above.)
+        auto_resolved_nt = len(named_test_present_resolved)
+        auto_resolved_bp = len(auto_resolved) - auto_resolved_nt
         # Caps with an enrolled execution trial are NOT yet proven — the trial
         # must run green first — so they still count as an unresolved gap this
         # sweep, but are reported distinctly (a real proof is en route) rather
@@ -4141,6 +4185,8 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
                     subject=pid,
                     detail=_detail,
                     auto_resolved=len(auto_resolved),
+                    auto_resolved_backing_path=auto_resolved_bp,
+                    auto_resolved_named_test_present=auto_resolved_nt,
                 )
             )
         else:
@@ -4177,6 +4223,8 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
                     subject=pid,
                     detail=_ok_detail,
                     auto_resolved=len(auto_resolved),
+                    auto_resolved_backing_path=auto_resolved_bp,
+                    auto_resolved_named_test_present=auto_resolved_nt,
                 )
             )
 
