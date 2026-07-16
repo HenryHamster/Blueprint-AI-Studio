@@ -233,7 +233,7 @@ RUNNER_SILENT_TIMEOUT_SECONDS = int(
 
 
 def append_progress_sample(
-    meta: dict, *, metric: str, value: float, t: str
+    meta: dict, *, metric: str, value: float, t: str, received_at: datetime | str | None = None
 ) -> dict:
     """Append a progress sample to the ring buffer in a polling_metadata dict.
 
@@ -242,6 +242,10 @@ def append_progress_sample(
     metric needed to enforce a long watchdog window.
     Silently ignores non-finite values, bad metric keys, or any other error
     so the caller never raises on malformed input.
+
+    ``received_at`` is the authenticated server receipt timestamp used by the
+    watchdog to evaluate progress windows.  Pass a ``datetime`` or ISO string.
+    When absent, falls back to ``t`` for backwards compatibility.
     """
     try:
         if not isinstance(metric, str) or not _PROGRESS_METRIC_KEY_RE.fullmatch(metric):
@@ -280,7 +284,14 @@ def append_progress_sample(
                 and int(parsed.timestamp()) // _PROGRESS_SAMPLE_BUCKET_SECONDS == bucket
             )
         ]
-        series.append({"t": t, "name": metric, "value": float_val})
+        received_at_str: str | None
+        if isinstance(received_at, datetime):
+            received_at_str = received_at.isoformat()
+        elif isinstance(received_at, str) and received_at:
+            received_at_str = received_at
+        else:
+            received_at_str = t
+        series.append({"t": t, "received_at": received_at_str, "name": metric, "value": float_val})
         metric_series = [item for item in series if item.get("name") == metric]
         if len(metric_series) > _PROGRESS_SERIES_MAX_SAMPLES_PER_METRIC:
             keep = {id(item) for item in metric_series[-_PROGRESS_SERIES_MAX_SAMPLES_PER_METRIC:]}
@@ -1407,27 +1418,43 @@ def _no_progress_stalled(job: ComputeJob, *, now: datetime) -> bool:
     return spread <= tolerance
 
 
-def derive_watchdog_protection_status(polling_metadata: dict | None) -> dict:
-    """Derive the four watchdog-protection status fields from a job's polling_metadata.
+def derive_watchdog_protection_status(
+    polling_metadata: dict | None,
+    *,
+    started_at: datetime | None = None,
+    now: datetime | None = None,
+) -> dict:
+    """Derive watchdog-protection status fields from a job's polling_metadata.
 
     Intended for inclusion in serialized compute-job response payloads.  The
     derivation mirrors ``_no_progress_stalled`` exactly so operators see the same
     effective timeout the watchdog would use — there is no forked definition.
 
     Returns a dict with:
-      watchdog_active (bool): True when the job has a declared progress metric
-          AND an effective non-progress window > 0.
+      watchdog_state (str): High-level state — one of 'protected', 'warming_up',
+          'insufficient_history', 'stale_telemetry', 'inert'.
+      watchdog_active (bool): True only when watchdog_state == 'protected'.
       no_progress_timeout_seconds (int|None): Effective timeout in seconds
           (per-job override if set, else global default). None when no metric declared.
       last_progress_at (str|None): ISO timestamp of the most recent
-          progress_series sample matching the declared metric, or None.
-      watchdog_inert_reason (str|None): Why the watchdog will not fire —
-          'no_declared_metric' or 'metric_name_mismatch'. None when active.
+          progress_series sample matching the declared metric (server receipt time),
+          or None.
+      watchdog_inert_reason (str|None): Granular reason the watchdog is not
+          firing. None when active.
     """
     from types import SimpleNamespace
 
+    _now = now if now is not None else _utcnow()
+
     meta = polling_metadata or {}
     _job = SimpleNamespace(polling_metadata=meta)
+
+    # Normalise started_at: accept datetime or ISO string from JSON-serialised payloads.
+    _started_at: datetime | None = None
+    if isinstance(started_at, datetime):
+        _started_at = started_at
+    elif isinstance(started_at, str) and started_at:
+        _started_at = _parse_naive_iso_datetime(started_at)
 
     # Resolve effective timeout — identical to the resolution in _no_progress_stalled.
     raw_per_job = meta.get("no_progress_timeout_seconds")
@@ -1440,11 +1467,15 @@ def derive_watchdog_protection_status(polling_metadata: dict | None) -> dict:
     effective_seconds = (
         per_job_seconds if per_job_seconds is not None else COMPUTE_JOB_NO_PROGRESS_WINDOW_SECONDS
     )
+    grace_seconds = (
+        per_job_seconds if per_job_seconds is not None else COMPUTE_JOB_NO_PROGRESS_GRACE_SECONDS
+    )
 
     metric = _declared_progress_metric(_job)
 
     if metric is None:
         return {
+            "watchdog_state": "inert",
             "watchdog_active": False,
             "no_progress_timeout_seconds": None,
             "last_progress_at": None,
@@ -1453,41 +1484,121 @@ def derive_watchdog_protection_status(polling_metadata: dict | None) -> dict:
 
     if effective_seconds <= 0:
         return {
+            "watchdog_state": "inert",
             "watchdog_active": False,
             "no_progress_timeout_seconds": int(effective_seconds),
             "last_progress_at": None,
             "watchdog_inert_reason": "timeout_disabled",
         }
 
-    # Find the most recent sample in progress_series matching the declared metric.
+    # Collect matching samples using server receipt time (received_at).
     series = meta.get("progress_series")
-    last_t: str | None = None
+    last_received_at: str | None = None
+    last_received_ts: datetime | None = None
+    has_any_sample = False
+    has_valid_received_at = False
+
     if isinstance(series, list):
-        last_ts: datetime | None = None
         for sample in series:
             if not isinstance(sample, dict) or sample.get("name") != metric:
                 continue
-            t_str = sample.get("t")
-            ts = _parse_naive_iso_datetime(t_str)
+            has_any_sample = True
+            recv_str = sample.get("received_at")
+            ts = _parse_naive_iso_datetime(recv_str)
             if ts is None:
                 continue
-            if last_ts is None or ts > last_ts:
-                last_ts = ts
-                last_t = t_str
+            has_valid_received_at = True
+            if last_received_ts is None or ts > last_received_ts:
+                last_received_ts = ts
+                last_received_at = recv_str
 
-    # A declared metric without a matching sample is not protected: once grace
-    # elapses it will be cut for missing telemetry.  Surface that honestly.
-    inert_reason: str | None = "no_progress_samples" if last_t is None else None
-    if last_t is None:
-        mismatch = _watchdog_metric_name_mismatch(_job)
-        if mismatch:
-            inert_reason = "metric_name_mismatch"
+    # Metric-name mismatch is deterministic: samples exist for OTHER metrics
+    # but none match the declared one.  Surface this before grace/start-time checks
+    # because it is always inert regardless of when the job started.
+    if not has_any_sample and _watchdog_metric_name_mismatch(_job):
+        return {
+            "watchdog_state": "inert",
+            "watchdog_active": False,
+            "no_progress_timeout_seconds": int(effective_seconds),
+            "last_progress_at": None,
+            "watchdog_inert_reason": "metric_name_mismatch",
+        }
+
+    # When started_at is absent we cannot evaluate the grace period — surface that
+    # honestly as insufficient_history/missing_start_time.
+    if _started_at is None:
+        return {
+            "watchdog_state": "insufficient_history",
+            "watchdog_active": False,
+            "no_progress_timeout_seconds": int(effective_seconds),
+            "last_progress_at": last_received_at,
+            "watchdog_inert_reason": "missing_start_time",
+        }
+    if (_now - _started_at).total_seconds() < grace_seconds:
+        return {
+            "watchdog_state": "warming_up",
+            "watchdog_active": False,
+            "no_progress_timeout_seconds": int(effective_seconds),
+            "last_progress_at": last_received_at,
+            "watchdog_inert_reason": None,
+        }
+
+    # No samples for the declared metric (and no mismatch detected above).
+    if not has_any_sample:
+        return {
+            "watchdog_state": "insufficient_history",
+            "watchdog_active": False,
+            "no_progress_timeout_seconds": int(effective_seconds),
+            "last_progress_at": None,
+            "watchdog_inert_reason": "no_telemetry",
+        }
+
+    # Samples exist for the declared metric but none have a valid received_at.
+    if not has_valid_received_at:
+        return {
+            "watchdog_state": "insufficient_history",
+            "watchdog_active": False,
+            "no_progress_timeout_seconds": int(effective_seconds),
+            "last_progress_at": None,
+            "watchdog_inert_reason": "malformed_history",
+        }
+
+    # All samples are older than the effective window — stale telemetry.
+    window_start = _now - timedelta(seconds=effective_seconds)
+    if last_received_ts is not None and last_received_ts < window_start:
+        return {
+            "watchdog_state": "stale_telemetry",
+            "watchdog_active": False,
+            "no_progress_timeout_seconds": int(effective_seconds),
+            "last_progress_at": last_received_at,
+            "watchdog_inert_reason": "stale_telemetry",
+        }
+
+    # Samples exist and are fresh — check whether we have a full window of history.
+    samples = _watched_progress_samples(_job, metric)
+    if len(samples) < COMPUTE_JOB_NO_PROGRESS_MIN_SAMPLES:
+        return {
+            "watchdog_state": "insufficient_history",
+            "watchdog_active": False,
+            "no_progress_timeout_seconds": int(effective_seconds),
+            "last_progress_at": last_received_at,
+            "watchdog_inert_reason": "insufficient_window",
+        }
+    if samples and ((_now - samples[0][0]).total_seconds() < effective_seconds):
+        return {
+            "watchdog_state": "insufficient_history",
+            "watchdog_active": False,
+            "no_progress_timeout_seconds": int(effective_seconds),
+            "last_progress_at": last_received_at,
+            "watchdog_inert_reason": "insufficient_window",
+        }
 
     return {
-        "watchdog_active": inert_reason is None,
+        "watchdog_state": "protected",
+        "watchdog_active": True,
         "no_progress_timeout_seconds": int(effective_seconds),
-        "last_progress_at": last_t,
-        "watchdog_inert_reason": inert_reason,
+        "last_progress_at": last_received_at,
+        "watchdog_inert_reason": None,
     }
 
 

@@ -2196,7 +2196,8 @@ async def report_compute_job(
                         # useful display data in `progress`, but watchdog timing
                         # must use the server receipt time so a job cannot extend
                         # or backdate its own protection window.
-                        t=now.isoformat(),
+                        t=rec.get("ts") or now.isoformat(),
+                        received_at=now,
                     )
         if payload.exec_status in ("succeeded", "failed"):
             meta["runner_finished_at"] = now.isoformat()

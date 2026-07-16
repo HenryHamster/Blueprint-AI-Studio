@@ -287,11 +287,13 @@ async def compute_job_vm_heartbeat(
     progress_sample = _parse_progress_sample(body_bytes)
     if progress_sample is not None:
         metric, value = progress_sample
+        _now = _utcnow()
         job.polling_metadata = append_progress_sample(
             dict(job.polling_metadata or {}),
             metric=metric,
             value=value,
-            t=_utcnow().isoformat(),
+            t=_now.isoformat(),
+            received_at=_now,
         )
     await session.commit()
     return Response(status_code=204)
