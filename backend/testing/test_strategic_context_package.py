@@ -1537,3 +1537,159 @@ async def test_running_job_viewable_files_dropped_stamped(
 
     descriptor = _artifact_descriptor(item)
     assert descriptor["viewable_files_dropped"] == 2
+
+
+# ── Viewable slot reservation (older viewable rows survive newer empty ones) ──
+
+
+@pytest.mark.asyncio
+async def test_running_job_preview_reserves_slot_for_viewable_older_job(
+    db_session, monkeypatch
+):
+    """With at least 4 newer running compute jobs whose polling_metadata carries
+    NO viewable_files, an older running job whose polling_metadata carries a PNG
+    still surfaces as a signed viewable_preview and reaches a renderable
+    (non-unsupported_reason) descriptor. Evidence stays bounded."""
+    project, task = await _make_project_task(db_session, name="RunningSlotReserve")
+
+    plot_uri = (
+        f"gs://{ARTIFACT_BUCKET_NAME}/compute-jobs/"
+        "55555555-5555-5555-5555-555555555555/artifacts/viewable/reward.png"
+    )
+    now = datetime.now(timezone.utc)
+
+    # 4 newest running jobs — no viewable_files manifest
+    for i in range(4):
+        db_session.add(
+            ComputeJob(
+                project_id=project.id,
+                task_id=task.id,
+                backend="local_process",
+                status=ComputeJobStatus.RUNNING,
+                polling_metadata={},
+                updated_at=now - timedelta(hours=i),
+            )
+        )
+
+    # 1 older running job — carries a PNG in its viewable_files manifest
+    old_job = ComputeJob(
+        project_id=project.id,
+        task_id=task.id,
+        backend="local_process",
+        status=ComputeJobStatus.RUNNING,
+        polling_metadata={
+            "viewable_files": [
+                {
+                    "filename": "reward.png",
+                    "storage_uri": plot_uri,
+                    "kind": "image",
+                    "content_type": "image/png",
+                    "size_bytes": 1024,
+                }
+            ]
+        },
+        updated_at=now - timedelta(hours=48),
+    )
+    db_session.add(old_job)
+    await db_session.commit()
+
+    async def fake_verify(*a):
+        return None
+
+    calls: list = []
+    monkeypatch.setattr(scp, "verify_artifact_project_ownership", fake_verify)
+    monkeypatch.setattr(scp, "generate_download_signed_url", _fake_signer(calls))
+
+    evidence = await load_strategic_context_evidence(db_session, project.id)
+    items = evidence["artifacts"]["items"]
+
+    # The old viewable-bearing job surfaces as an evidence item
+    assert len(items) == 1
+    item = items[0]
+    assert item["compute_job_running"] is True
+    assert item["viewable_previews"][0]["kind"] == "image"
+    assert item["viewable_previews"][0]["filename"] == "reward.png"
+
+    descriptor = _artifact_descriptor(item)
+    assert descriptor["kind"] == "image"
+    assert descriptor["image"]["url"] is not None
+    assert "unsupported_reason" not in descriptor
+
+    # Evidence stays bounded: running jobs cap + terminal artifact cap
+    assert len(items) <= scp._RUNNING_JOB_PREVIEW_LIMIT + scp._ARTIFACT_EVIDENCE_LIMIT
+
+
+@pytest.mark.asyncio
+async def test_terminal_artifact_reserves_slot_for_viewable_older_artifact(
+    db_session, monkeypatch
+):
+    """With at least 4 newer terminal artifacts that have no viewable manifest
+    (pr_url only), an older artifact whose logs carry a viewable_files manifest
+    still surfaces its signed preview and renderable descriptor. Evidence stays
+    bounded."""
+    project, task = await _make_project_task(db_session, name="ArtifactSlotReserve")
+
+    now = datetime.now(timezone.utc)
+
+    # 4 newest artifacts — pr_url only, no viewable_files manifest
+    for i in range(4):
+        db_session.add(
+            Artifact(
+                task_id=task.id,
+                artifact_type=ArtifactType.DEBUG_RESULT,
+                pr_url="https://github.com/owner/repo/pull/123",
+                created_at=now - timedelta(hours=i),
+            )
+        )
+
+    # 1 older artifact — carries a viewable_files manifest in logs
+    plot_uri = (
+        f"gs://{ARTIFACT_BUCKET_NAME}/compute-jobs/"
+        "66666666-6666-6666-6666-666666666666/artifacts/viewable/reward.png"
+    )
+    logs = {
+        "viewable_files": [
+            {
+                "filename": "reward.png",
+                "storage_uri": plot_uri,
+                "kind": "image",
+                "content_type": "image/png",
+            }
+        ]
+    }
+    db_session.add(
+        Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.DEBUG_RESULT,
+            storage_uri=f"gs://{ARTIFACT_BUCKET_NAME}/old/bundle.tar.gz",
+            logs=json.dumps(logs),
+            created_at=now - timedelta(hours=72),
+        )
+    )
+    await db_session.commit()
+
+    async def fake_verify(*a):
+        return None
+
+    calls: list = []
+    monkeypatch.setattr(scp, "verify_artifact_project_ownership", fake_verify)
+    monkeypatch.setattr(scp, "generate_download_signed_url", _fake_signer(calls))
+
+    evidence = await load_strategic_context_evidence(db_session, project.id)
+    items = evidence["artifacts"]["items"]
+
+    # The viewable-bearing terminal artifact is in the evidence items
+    viewable_items = [it for it in items if it.get("viewable_previews")]
+    assert len(viewable_items) >= 1
+    assert viewable_items[0]["viewable_previews"][0]["kind"] == "image"
+
+    # No running-job items mixed in
+    assert all(not it.get("compute_job_running") for it in items)
+
+    descriptor = _artifact_descriptor(viewable_items[0])
+    assert descriptor["kind"] == "image"
+    assert descriptor["image"]["url"] is not None
+    assert "unsupported_reason" not in descriptor
+
+    # Evidence stays bounded (4 terminal artifacts max after cap)
+    assert len(items) <= scp._ARTIFACT_EVIDENCE_LIMIT

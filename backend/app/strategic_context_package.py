@@ -650,6 +650,20 @@ _PREVIEW_SIGNED_URL_MINUTES = 5
 # load_strategic_context_evidence) so live previews win the descriptor cut.
 _RUNNING_JOB_PREVIEW_LIMIT = 4
 
+# How many non-terminal compute-job rows to FETCH from the DB before filtering
+# for viewable-bearing ones, so an older job with a manifest of mid-run plots
+# is not hidden behind newer media-less rows.
+_RUNNING_JOB_PREVIEW_FETCH = 20
+
+# How many terminal-artifact rows to fetch from the DB before sorting for
+# viewable-bearing ones and capping. Same goal: prevent newer non-viewable
+# artifacts from burying an older artifact that carries actual image/video data.
+_ARTIFACT_EVIDENCE_FETCH = 20
+
+# How many terminal-artifact evidence items to surface in the context package
+# (the final output cap — unchanged from the original implicit 4).
+_ARTIFACT_EVIDENCE_LIMIT = 4
+
 
 async def _sign_viewable_manifest(
     session: AsyncSession,
@@ -847,7 +861,7 @@ async def _running_job_preview_items(
                 ComputeJob.status.in_(_NON_TERMINAL_COMPUTE_JOB_STATUSES),
             )
             .order_by(ComputeJob.updated_at.desc())
-            .limit(_RUNNING_JOB_PREVIEW_LIMIT)
+            .limit(_RUNNING_JOB_PREVIEW_FETCH)
         )
     ).all()
 
@@ -894,7 +908,7 @@ async def _running_job_preview_items(
         if isinstance(dropped, int) and dropped > 0:
             item["viewable_files_dropped"] = dropped
         items.append(item)
-    return items
+    return items[:_RUNNING_JOB_PREVIEW_LIMIT]
 
 
 async def load_strategic_context_evidence(
@@ -1016,7 +1030,7 @@ async def load_strategic_context_evidence(
                 meaningful_artifact_filter,
             )
             .order_by(Artifact.created_at.desc())
-            .limit(4)
+            .limit(_ARTIFACT_EVIDENCE_FETCH)
         )
     ).all()
 
@@ -1182,6 +1196,15 @@ async def load_strategic_context_evidence(
             provenance = provenance_by_task.get(item.get("task_id") or "")
             if provenance:
                 item.update(provenance)
+
+    # Sort viewable-bearing terminal-artifact items first so the bounded
+    # descriptor cut (_strategic_context_descriptors slices items[:4]) retains
+    # an older artifact whose logs carry a viewable_files manifest even when
+    # newer non-viewable rows filled the original SQL limit. Running-job items
+    # are prepended below and win the first descriptor slots; this sort ensures
+    # the remaining slots are filled by terminal artifacts WITH previews.
+    artifact_items.sort(key=lambda i: 0 if i.get("viewable_previews") else 1)
+    artifact_items = artifact_items[:_ARTIFACT_EVIDENCE_LIMIT]
 
     # Prepend live previews for RUNNING compute jobs so the operator watching a
     # long run sees plots/videos accrue in the canvas before the job terminates.
