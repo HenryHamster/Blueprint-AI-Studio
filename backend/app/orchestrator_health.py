@@ -515,6 +515,17 @@ async def _effective_dep_task(dt: Task, session: AsyncSession) -> Task:
     return replacement or dt
 
 
+def _has_landed_cross_base_code_dep(dependent: Task, dep_tasks: list) -> bool:
+    """Compatibility predicate for integration-landed re-cut dependencies."""
+    return any(
+        (not _same_base_branch(dependent, dep))
+        and is_genuine_code_dependency(dependent, dep)
+        and dep.status == TaskStatus.COMPLETED
+        and has_landed_signal(dep)
+        for dep in dep_tasks
+    )
+
+
 async def _cross_base_recut_sources(
     dependent: Task, dep_tasks: list, project: Project, session: AsyncSession
 ) -> list[str]:

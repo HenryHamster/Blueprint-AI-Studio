@@ -774,6 +774,7 @@ async def _partition_completed_needs_base_safe(
     from app.blocked_need_resolution import completed_foundation_for_need
     from app.orchestrator_health import (
         _has_landed_cross_base_code_dep,
+        _shared_staging_dependency_source,
         ensure_dependent_base_recut,
     )
 
@@ -792,8 +793,9 @@ async def _partition_completed_needs_base_safe(
     base_safe: list = []
     recut_pending: list = []
     for need, foundation in resolved:
-        if foundation is not None and _has_landed_cross_base_code_dep(
-            task, [foundation]
+        if foundation is not None and (
+            _has_landed_cross_base_code_dep(task, [foundation])
+            or await _shared_staging_dependency_source(task, foundation, session)
         ):
             recut_pending.append(need)
         else:

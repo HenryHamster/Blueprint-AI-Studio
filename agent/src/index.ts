@@ -567,7 +567,7 @@ function parseSecretFileMode(raw: unknown): number {
   return 0o600;
 }
 
-export function normalizeClaudeConfigContent(
+function normalizeClaudeConfigContent(
   filePath: string,
   content: string,
   workspace = WORKSPACE,

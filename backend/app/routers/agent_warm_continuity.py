@@ -287,7 +287,7 @@ async def _prior_task_vm_boot(
     re-materialize credentials.
     """
     result = await session.execute(
-        select(Task.provider, Task.account_id, Task.model).where(
+        select(Task.provider, Task.account_id, Task.model, Task.context).where(
             Task.id == prior_task_id
         )
     )
@@ -298,6 +298,7 @@ async def _prior_task_vm_boot(
         "provider": prior_task.provider,
         "account_id": prior_task.account_id,
         "model": prior_task.model,
+        "auth_mode": (prior_task.context or {}).get("llm_auth_mode"),
     }
 
 
