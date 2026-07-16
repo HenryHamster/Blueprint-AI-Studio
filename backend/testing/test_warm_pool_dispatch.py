@@ -803,6 +803,59 @@ async def test_next_role_aborts_claim_when_retarget_manifest_unavailable(
         _clear_accounts()
 
 
+@pytest.mark.asyncio
+async def test_next_role_aborts_cross_provider_retarget_when_secret_unavailable(
+    db_session, client, warm_pool_retarget_on
+):
+    """A known target account with a missing live secret is still unusable.
+
+    Returning a manifest with empty credentials would re-exec the member onto
+    the requested provider/model but guarantee an immediate auth/model failure.
+    """
+    shared_state.runtime_config["warm_pool_cross_provider_retarget_enabled"] = True
+    project = await _make_project(db_session, name="RT Secret Missing")
+    await _make_idle_member(
+        db_session,
+        project,
+        vm_instance_id="vm-rt-secret-missing",
+        account_id="acct-boot",
+        provider="anthropic",
+        auth_mode="oauth",
+        model="claude-sonnet-4-6",
+    )
+    _seed_account("acct-boot", provider="anthropic", auth_mode="oauth")
+    run_acct = _seed_account(
+        "acct-run", provider="deepseek", auth_mode="api_key"
+    )
+    run_acct["runtime_secret"] = None
+    try:
+        task = await _make_queued_task(
+            db_session, project, model="deepseek-v4-flash"
+        )
+        leased = await _dispatch(
+            db_session,
+            task,
+            provider="deepseek",
+            model="deepseek-v4-flash",
+            account="acct-run",
+        )
+        await db_session.commit()
+        assert leased is not None
+
+        tok = create_vm_scoped_token("vm-rt-secret-missing", str(project.id))
+        resp = await client.post(
+            "/api/agent/next-role",
+            json={"vm_instance_id": "vm-rt-secret-missing"},
+            headers={"X-Agent-Token": tok},
+        )
+
+        assert resp.status_code == 204, resp.text
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.QUEUED
+    finally:
+        _clear_accounts()
+
+
 # ---------------------------------------------------------------------------
 # Cost-aware auto-drain guard gates the lease side (cluster 2/5)
 # ---------------------------------------------------------------------------
