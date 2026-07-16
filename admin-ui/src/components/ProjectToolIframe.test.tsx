@@ -60,7 +60,8 @@ describe('ProjectToolIframe — asset token refresh', () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(0); });
 
     expect(vi.mocked(fetchAssetToken)).toHaveBeenCalledTimes(1);
-    expect(currentSrc()).toContain('token=token-1');
+    expect(currentSrc()).toContain('/t/token-1/assets/');
+    expect(currentSrc()).not.toContain('?token=');
 
     // Just before the 5-minute TTL (refresh fires at TTL − 30s = 270s) nothing
     // has refreshed yet.
@@ -70,7 +71,7 @@ describe('ProjectToolIframe — asset token refresh', () => {
     // Cross the refresh threshold: a second token is minted and the src swaps.
     await act(async () => { await vi.advanceTimersByTimeAsync(20_000); });
     expect(vi.mocked(fetchAssetToken)).toHaveBeenCalledTimes(2);
-    expect(currentSrc()).toContain('token=token-2');
+    expect(currentSrc()).toContain('/t/token-2/assets/');
   });
 
   test('stops refreshing after unmount', async () => {

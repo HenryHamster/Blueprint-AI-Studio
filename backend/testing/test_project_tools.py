@@ -3104,3 +3104,197 @@ async def test_walkthrough_disable_enable_chain(client: AsyncClient, db_session)
         "re-enabled tool with content must appear in agent-facing content fetch"
     )
     assert "Walkthrough" in agent_tools_on["notes"]["text"]
+
+
+# ===========================================================================
+# Path-embedded token: subresource authentication fix (finding 37bc0b9c)
+# ===========================================================================
+#
+# Acceptance criteria (playbook: project-tool-iframe-token-propagation):
+#   1. A relative subresource path under the path-token prefix serves 200
+#      with a valid path token.
+#   2. The same request returns 401 with an invalid/expired path token.
+#   3. A multi-asset entry-HTML test (not just direct tokened URLs): the HTML
+#      entry point is served, and a relative subresource (JS) under the same
+#      path-token prefix is also served 200 — proving that a browser resolving
+#      `<script src="./app.js">` relative to the entry URL would authenticate.
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_path_token_route_serves_asset_with_valid_token(
+    client: AsyncClient, db_session,
+):
+    """A relative subresource path under the token prefix serves 200 with a valid path token."""
+    from unittest.mock import AsyncMock, patch
+
+    from app.routers.admin_project_tools import _create_tool_asset_token
+
+    project = await _make_project_member(db_session)
+    project.github_owner = "test-owner"
+    project.github_repo = "test-repo"
+    await db_session.commit()
+
+    token = _create_tool_asset_token(str(project.id), "my-tool")
+
+    with (
+        patch(
+            "app.github_auth.get_repo_installation_read_token",
+            AsyncMock(return_value="ghs_testtoken"),
+        ),
+        patch(
+            "app.github_refs.get_repo_default_branch",
+            AsyncMock(return_value="main"),
+        ),
+        patch(
+            "app.github.get_file_text_at_ref",
+            AsyncMock(return_value="console.log('app');"),
+        ),
+    ):
+        resp = await client.get(
+            f"{_BASE}/projects/{project.id}/tools/my-tool/t/{token}/assets/app.js"
+        )
+        assert resp.status_code == 200
+        assert "console.log" in resp.text
+
+
+@pytest.mark.asyncio
+async def test_path_token_route_rejects_invalid_token(
+    client: AsyncClient, db_session,
+):
+    """A relative subresource path under the token prefix returns 401 with an invalid token."""
+    project = await _make_project_member(db_session)
+    project.github_owner = "test-owner"
+    project.github_repo = "test-repo"
+    await db_session.commit()
+
+    resp = await client.get(
+        f"{_BASE}/projects/{project.id}/tools/my-tool/t/not-a-valid-jwt/assets/app.js"
+    )
+    assert resp.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_path_token_route_multi_asset_page(
+    client: AsyncClient, db_session,
+):
+    """Multi-asset acceptance: the HTML entry and a relative JS subresource both
+    serve 200 under the same path-token prefix, proving relative URL resolution
+    would authenticate `<script src='./app.js'>` inside a sandboxed iframe."""
+    from unittest.mock import AsyncMock, patch
+
+    from app.routers.admin_project_tools import _create_tool_asset_token
+
+    project = await _make_project_member(db_session)
+    project.github_owner = "test-owner"
+    project.github_repo = "test-repo"
+    await db_session.commit()
+
+    token = _create_tool_asset_token(str(project.id), "my-tool")
+
+    html_body = '<!DOCTYPE html><html><head><script src="./app.js"></script></head><body>Tool</body></html>'
+    js_body = "console.log('tool');"
+
+    def _mock_get_file(path, **_kwargs):
+        if path.endswith("index.html"):
+            return html_body
+        if path.endswith("app.js"):
+            return js_body
+        return None
+
+    with (
+        patch(
+            "app.github_auth.get_repo_installation_read_token",
+            AsyncMock(return_value="ghs_testtoken"),
+        ),
+        patch(
+            "app.github_refs.get_repo_default_branch",
+            AsyncMock(return_value="main"),
+        ),
+        patch(
+            "app.github.get_file_text_at_ref",
+            AsyncMock(side_effect=_mock_get_file),
+        ),
+    ):
+        html_resp = await client.get(
+            f"{_BASE}/projects/{project.id}/tools/my-tool/t/{token}/assets/index.html"
+        )
+        assert html_resp.status_code == 200, html_resp.text
+        assert "Tool" in html_resp.text
+        assert html_resp.headers["content-type"].startswith("text/html")
+
+        js_resp = await client.get(
+            f"{_BASE}/projects/{project.id}/tools/my-tool/t/{token}/assets/app.js"
+        )
+        assert js_resp.status_code == 200, js_resp.text
+        assert "console.log" in js_resp.text
+
+
+@pytest.mark.asyncio
+async def test_path_token_route_html_has_referrer_policy(
+    client: AsyncClient, db_session,
+):
+    """HTML served via the path-token route carries Referrer-Policy: no-referrer
+    to prevent the path-embedded token from leaking in Referer headers."""
+    from unittest.mock import AsyncMock, patch
+
+    from app.routers.admin_project_tools import _create_tool_asset_token
+
+    project = await _make_project_member(db_session)
+    project.github_owner = "test-owner"
+    project.github_repo = "test-repo"
+    await db_session.commit()
+
+    token = _create_tool_asset_token(str(project.id), "my-tool")
+
+    with (
+        patch(
+            "app.github_auth.get_repo_installation_read_token",
+            AsyncMock(return_value="ghs_testtoken"),
+        ),
+        patch(
+            "app.github_refs.get_repo_default_branch",
+            AsyncMock(return_value="main"),
+        ),
+        patch(
+            "app.github.get_file_text_at_ref",
+            AsyncMock(return_value="<html><body>Hi</body></html>"),
+        ),
+    ):
+        resp = await client.get(
+            f"{_BASE}/projects/{project.id}/tools/my-tool/t/{token}/assets/index.html"
+        )
+        assert resp.status_code == 200
+        assert resp.headers.get("referrer-policy") == "no-referrer"
+
+
+@pytest.mark.asyncio
+async def test_path_token_route_wrong_slug_rejected(
+    client: AsyncClient, db_session,
+):
+    """A token minted for slug A is rejected when used with slug B in the path route."""
+    from unittest.mock import AsyncMock, patch
+
+    from app.routers.admin_project_tools import _create_tool_asset_token
+
+    project = await _make_project_member(db_session)
+    project.github_owner = "test-owner"
+    project.github_repo = "test-repo"
+    await db_session.commit()
+
+    token = _create_tool_asset_token(str(project.id), "other-tool")
+
+    with (
+        patch(
+            "app.github_auth.get_repo_installation_read_token",
+            AsyncMock(return_value="ghs_testtoken"),
+        ),
+        patch(
+            "app.github_refs.get_repo_default_branch",
+            AsyncMock(return_value="main"),
+        ),
+    ):
+        resp = await client.get(
+            f"{_BASE}/projects/{project.id}/tools/my-tool/t/{token}/assets/index.html"
+        )
+        assert resp.status_code == 401
