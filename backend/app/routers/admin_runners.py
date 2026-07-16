@@ -35,6 +35,7 @@ from app.runner_project_binding import (
     add_binding,
     bound_project_ids,
     remove_binding,
+    runner_allowed_for_project,
 )
 from app.runner_config import (
     GPU_INDICES_ALL,
@@ -882,7 +883,7 @@ async def list_runners(
     query = (
         select(LocalRunner)
         .where(
-            LocalRunner.project_id == project_id,
+            runner_allowed_for_project(project_id),
             LocalRunner.status != "deleted",
         )
         .order_by(LocalRunner.created_at.desc())
@@ -925,13 +926,12 @@ async def runner_telemetry(
     await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "viewer"
     )
-    # 404 on a runner that is not this project's, so telemetry can't be read
-    # cross-project even though snapshots carry no project_id of their own.
+    # 404 if the runner is not reachable from this project (enrollment or allow-list).
     runner = (
         await session.execute(
             select(LocalRunner).where(
                 LocalRunner.id == runner_id,
-                LocalRunner.project_id == project_id,
+                runner_allowed_for_project(project_id),
             )
         )
     ).scalars().first()
@@ -983,7 +983,7 @@ async def runner_stats(
         await session.execute(
             select(LocalRunner).where(
                 LocalRunner.id == runner_id,
-                LocalRunner.project_id == project_id,
+                runner_allowed_for_project(project_id),
             )
         )
     ).scalars().first()
