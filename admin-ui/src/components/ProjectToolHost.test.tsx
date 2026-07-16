@@ -78,6 +78,12 @@ async function mount(node: React.ReactElement) {
   await act(async () => await new Promise(resolve => setTimeout(resolve, 30)));
 }
 
+async function rerender(node: React.ReactElement) {
+  if (!root) throw new Error('host not mounted');
+  await act(async () => { root?.render(node); });
+  await act(async () => await new Promise(resolve => setTimeout(resolve, 30)));
+}
+
 function h(): HTMLDivElement {
   if (!host) throw new Error('host not mounted');
   return host;
@@ -532,5 +538,52 @@ describe('ProjectToolHost — owner walkthrough (end-to-end chained flow)', () =
     await act(async () => { showHiddenBtn.click(); });
     expect(findButton('Hide')).toBeTruthy();
     expect(loadHiddenManifestSlugs('proj-walkthrough').size).toBe(0);
+  });
+});
+
+describe('ProjectToolHost — project-scoped async actions', () => {
+  beforeEach(() => {
+    vi.mocked(fetchProjectToolManifest).mockResolvedValue({ tools: [], skills: [], error: null });
+    vi.mocked(fetchToolKinds).mockResolvedValue(KINDS);
+    vi.mocked(fetchComputeImageStatus).mockResolvedValue({ status: 'no_compute_image_declared' });
+  });
+
+  afterEach(() => {
+    if (root) act(() => { root?.unmount(); });
+    root = null;
+    host?.remove();
+    host = null;
+    vi.clearAllMocks();
+  });
+
+  test('ignores a project-A toggle completion after switching to project B', async () => {
+    const projectATools: FetchProjectToolsResult = { tools: [TOOL], total_count: 1, next_offset: null };
+    const projectBTool: ProjectTool = { ...TOOL, id: 'tool-b', title: 'Project B Widget' };
+    const projectBTools: FetchProjectToolsResult = { tools: [projectBTool], total_count: 1, next_offset: null };
+    let rejectToggle!: (reason?: unknown) => void;
+
+    vi.mocked(fetchProjectTools).mockImplementation(projectId => Promise.resolve(
+      projectId === 'project-a' ? projectATools : projectBTools,
+    ));
+    vi.mocked(updateProjectTool).mockImplementation(
+      () => new Promise((_resolve, reject) => { rejectToggle = reject; }),
+    );
+
+    await mount(<ProjectToolHost projectId="project-a" myRole="owner" />);
+    await act(async () => { requireButton('Disable').click(); });
+    expect(vi.mocked(updateProjectTool)).toHaveBeenCalledWith('project-a', 'tool-1', { enabled: false });
+    expect(requireButton('Disabling…').disabled).toBe(true);
+
+    await rerender(<ProjectToolHost projectId="project-b" myRole="owner" />);
+    expect(h().textContent).toContain('Project B Widget');
+    expect(h().textContent).not.toContain('My Widget');
+    expect(requireButton('Disable').textContent).toBe('Disable');
+
+    await act(async () => { rejectToggle(new Error('project A update failed')); });
+    await act(async () => await new Promise(resolve => setTimeout(resolve, 30)));
+
+    expect(h().textContent).toContain('Project B Widget');
+    expect(h().textContent).not.toContain('project A update failed');
+    expect(vi.mocked(fetchProjectTools).mock.calls.map(([id]) => id)).toEqual(['project-a', 'project-b']);
   });
 });

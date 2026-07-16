@@ -20,6 +20,7 @@ from app.models import (
     LocalRunner,
     Project,
     ProjectMember,
+    RunnerProjectBinding,
 )
 from app.routers.admin_runners import _normalize_gpus_per_job, _runner_config_view
 from app.routers.runner import _sanitize_project_verification
@@ -91,6 +92,70 @@ async def _make_project(session, name="Runner Stats Project"):
 def _pin(runner_id) -> dict:
     """polling_metadata that pins a compute job to a runner (see runner_stats)."""
     return {"runner_target_id": str(runner_id)}
+
+
+@pytest.mark.asyncio
+async def test_bound_project_runner_is_visible_and_healthy(
+    client: AsyncClient, db_session
+):
+    """A healthy A-enrolled runner remains usable and observable from B."""
+    enrollment = await _make_project(db_session, "Enrollment project")
+    bound = await _make_project(db_session, "Bound project")
+    runner = LocalRunner(
+        project_id=enrollment.id,
+        token_hash="s" * 64,
+        hostname="shared-box",
+        status="active",
+        last_seen_at=_utcnow() - timedelta(seconds=10),
+        capabilities={"task_types": "all", "max_concurrent": 2},
+    )
+    db_session.add(runner)
+    await db_session.commit()
+    await db_session.refresh(runner)
+    db_session.add(RunnerProjectBinding(runner_id=runner.id, project_id=bound.id))
+    db_session.add_all(
+        [
+            ComputeJob(
+                project_id=bound.id,
+                backend="runner-subprocess",
+                status=ComputeJobStatus.SUCCEEDED,
+                polling_metadata=_pin(runner.id),
+            ),
+            ComputeJob(
+                project_id=enrollment.id,
+                backend="runner-subprocess",
+                status=ComputeJobStatus.SUCCEEDED,
+                polling_metadata=_pin(runner.id),
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    listed = await client.get(f"/api/admin/projects/{bound.id}/runners")
+    assert listed.status_code == 200, listed.text
+    visible = listed.json()
+    assert [row["id"] for row in visible] == [str(runner.id)]
+    assert visible[0]["enrollment_project_id"] == str(enrollment.id)
+    assert visible[0]["health"]["device_status"] == "connected"
+
+    stats = await client.get(
+        f"/api/admin/projects/{bound.id}/runners/{runner.id}/stats"
+    )
+    assert stats.status_code == 200, stats.text
+    assert stats.json()["jobs_run_count"] == 1
+
+    telemetry = await client.get(
+        f"/api/admin/projects/{bound.id}/runners/{runner.id}/telemetry"
+    )
+    assert telemetry.status_code == 200, telemetry.text
+
+    summary = await client.get("/api/admin/fleet/runners/health-summary")
+    assert summary.status_code == 200, summary.text
+    body = summary.json()
+    assert body["total"] == 1
+    by_project = {entry["project_id"]: entry for entry in body["per_project"]}
+    assert by_project[str(enrollment.id)]["total"] == 1
+    assert by_project[str(bound.id)]["connected"] == 1
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

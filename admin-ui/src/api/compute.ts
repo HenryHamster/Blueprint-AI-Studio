@@ -1815,6 +1815,9 @@ export async function revokeCapabilityProofExemption(
 
 export interface FleetRunner {
   id: string;
+  // Present on newer servers. Mutations remain scoped here; absence preserves
+  // rolling-deployment compatibility by falling back to the viewed project.
+  enrollment_project_id?: string;
   hostname: string | null;
   version: string | null;
   status: string;

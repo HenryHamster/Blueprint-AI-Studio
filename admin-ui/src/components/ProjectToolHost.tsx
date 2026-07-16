@@ -1,4 +1,4 @@
-import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react';
+import { type ReactNode, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
   fetchProjectTools,
   createProjectTool,
@@ -94,22 +94,33 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
   // UI gating only — the backend independently enforces owner on every mutation.
   const isOwner = myRole === undefined || myRole === 'owner';
   const [state, setState] = useState<FetchState>({ status: 'loading', projectId });
+  // Async mutations outlive a project switch. Keep the current identity in a
+  // ref so their continuations can discard state intended for the old project.
+  const currentProjectIdRef = useRef(projectId);
+  useLayoutEffect(() => {
+    currentProjectIdRef.current = projectId;
+  }, [projectId]);
   const [manifestState, setManifestState] = useState<ManifestState>({ status: 'loading' });
   const abortRef = useRef<AbortController | null>(null);
   const [computeImageState, setComputeImageState] = useState<ComputeImageFetchState>({ status: 'idle' });
   const [driftLoading, setDriftLoading] = useState(false);
+  const [actionProjectId, setActionProjectId] = useState<string | null>(null);
 
   // Management UI state
   const [showAddForm, setShowAddForm] = useState(false);
+  const [addFormProjectId, setAddFormProjectId] = useState<string | null>(null);
   const [toolKinds, setToolKinds] = useState<ToolKindConfig[] | null>(null);
   const [loadingKinds, setLoadingKinds] = useState(false);
+  const [loadingKindsProjectId, setLoadingKindsProjectId] = useState<string | null>(null);
   const [selectedKind, setSelectedKind] = useState('');
   const [newTitle, setNewTitle] = useState('');
   const [creating, setCreating] = useState(false);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [togglingId, setTogglingId] = useState<string | null>(null);
   const [lastCreatedSlug, setLastCreatedSlug] = useState<string | null>(null);
+  const [lastCreatedSlugProjectId, setLastCreatedSlugProjectId] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [actionErrorProjectId, setActionErrorProjectId] = useState<string | null>(null);
   const [seeding, setSeeding] = useState(false);
   // Hidden manifest-tool slugs are persisted per-project in localStorage so the
   // "Hide" control survives a reload instead of resetting on every mount.
@@ -133,8 +144,26 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
 
   // Per-tool configure/rename panel state
   const [configuringId, setConfiguringId] = useState<string | null>(null);
+  const [configuringProjectId, setConfiguringProjectId] = useState<string | null>(null);
   const [configDraft, setConfigDraft] = useState<ConfigDraft | null>(null);
   const [savingConfig, setSavingConfig] = useState(false);
+
+  const isCurrentProject = (requestedProjectId: string) =>
+    currentProjectIdRef.current === requestedProjectId;
+  const actionIsCurrent = actionProjectId === projectId;
+  const visibleActionError = actionErrorProjectId === projectId ? actionError : null;
+
+  function clearActionError(requestedProjectId: string) {
+    if (!isCurrentProject(requestedProjectId)) return;
+    setActionError(null);
+    setActionErrorProjectId(requestedProjectId);
+  }
+
+  function showActionError(requestedProjectId: string, message: string) {
+    if (!isCurrentProject(requestedProjectId)) return;
+    setActionError(message);
+    setActionErrorProjectId(requestedProjectId);
+  }
 
   // Fetch registered tools on mount / projectId change
   useEffect(() => {
@@ -165,7 +194,7 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
     async function loadManifest() {
       try {
         const data = await fetchProjectToolManifest(projectId, controller.signal);
-        if (controller.signal.aborted) return;
+        if (controller.signal.aborted || !isCurrentProject(projectId)) return;
         const skills = data.skills ?? [];
         if (data.error) {
           // Partial success: some tools loaded, but there's a validation warning.
@@ -174,7 +203,7 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
           setManifestState({ status: 'ok', tools: data.tools, skills });
         }
       } catch (err) {
-        if (controller.signal.aborted) return;
+        if (controller.signal.aborted || !isCurrentProject(projectId)) return;
         // Manifest failures are non-fatal — registered tools still render.
         setManifestState({
           status: 'error',
@@ -195,10 +224,10 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
     let cancelled = false;
     fetchComputeImageStatus(projectId)
       .then(data => {
-        if (!cancelled) setComputeImageState({ status: 'ok', data, hasDrift: false });
+        if (!cancelled && isCurrentProject(projectId)) setComputeImageState({ status: 'ok', data, hasDrift: false });
       })
       .catch(err => {
-        if (!cancelled) {
+        if (!cancelled && isCurrentProject(projectId)) {
           setComputeImageState({
             status: 'error',
             message: err instanceof Error ? err.message : 'Failed to fetch compute image status',
@@ -224,14 +253,16 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
     saveHiddenManifestSlugs(projectId, next);
   }
 
-  async function refresh() {
+  async function refresh(requestedProjectId = projectId) {
     try {
-      const result = await fetchProjectTools(projectId);
-      setState({ status: 'ok', projectId, tools: result.tools });
+      const result = await fetchProjectTools(requestedProjectId);
+      if (!isCurrentProject(requestedProjectId)) return;
+      setState({ status: 'ok', projectId: requestedProjectId, tools: result.tools });
     } catch (err) {
+      if (!isCurrentProject(requestedProjectId)) return;
       setState({
         status: 'error',
-        projectId,
+        projectId: requestedProjectId,
         message: err instanceof Error ? err.message : 'Failed to refresh',
       });
     }
@@ -239,28 +270,34 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
 
   // Lazy-load tool kinds (shared by the Add form and per-tool Configure panel).
   // Returns the loaded kinds, or [] on failure.
-  async function ensureToolKinds(): Promise<ToolKindConfig[]> {
+  async function ensureToolKinds(requestedProjectId = projectId): Promise<ToolKindConfig[]> {
     if (toolKinds !== null) return toolKinds;
     setLoadingKinds(true);
+    setLoadingKindsProjectId(requestedProjectId);
     try {
       const kinds = await fetchToolKinds();
       setToolKinds(kinds);
       return kinds;
     } catch (err) {
-      setActionError(err instanceof Error ? err.message : 'Failed to load tool kinds');
+      showActionError(requestedProjectId, err instanceof Error ? err.message : 'Failed to load tool kinds');
       setToolKinds([]);
       return [];
     } finally {
-      setLoadingKinds(false);
+      if (isCurrentProject(requestedProjectId)) setLoadingKinds(false);
     }
   }
 
   async function handleOpenAddForm() {
+    const requestedProjectId = projectId;
     setShowAddForm(true);
-    setActionError(null);
+    setAddFormProjectId(requestedProjectId);
+    setActionProjectId(requestedProjectId);
+    clearActionError(requestedProjectId);
     setLastCreatedSlug(null);
-    const kinds = await ensureToolKinds();
-    if (!selectedKind && kinds.length > 0) setSelectedKind(kinds[0].kind);
+    setLastCreatedSlugProjectId(requestedProjectId);
+    setNewTitle('');
+    const kinds = await ensureToolKinds(requestedProjectId);
+    if (isCurrentProject(requestedProjectId) && !selectedKind && kinds.length > 0) setSelectedKind(kinds[0].kind);
   }
 
   // Look up the config schema (JSON-Schema `properties`) declared for a kind.
@@ -272,14 +309,17 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
   }
 
   async function handleOpenConfigure(tool: ProjectTool) {
-    setActionError(null);
-    if (configuringId === tool.id) {
+    const requestedProjectId = projectId;
+    clearActionError(requestedProjectId);
+    if (configuringId === tool.id && configuringProjectId === requestedProjectId) {
       // Toggle closed.
       setConfiguringId(null);
       setConfigDraft(null);
+      setConfiguringProjectId(null);
       return;
     }
-    await ensureToolKinds();
+    await ensureToolKinds(requestedProjectId);
+    if (!isCurrentProject(requestedProjectId)) return;
     // Seed the draft config from the tool's existing config, stringifying
     // values so every schema field is editable as text.
     const existing = tool.config ?? {};
@@ -289,17 +329,20 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
     }
     setConfigDraft({ title: tool.title, placement: tool.placement, config });
     setConfiguringId(tool.id);
+    setConfiguringProjectId(requestedProjectId);
   }
 
   async function handleSaveConfig(tool: ProjectTool) {
+    const requestedProjectId = projectId;
     if (!configDraft) return;
     const title = configDraft.title.trim();
     if (!title) {
-      setActionError('Title must not be empty');
+      showActionError(requestedProjectId, 'Title must not be empty');
       return;
     }
     setSavingConfig(true);
-    setActionError(null);
+    setActionProjectId(requestedProjectId);
+    clearActionError(requestedProjectId);
     try {
       const config: Record<string, unknown> = {};
       for (const [key, spec] of schemaPropsForKind(tool.kind)) {
@@ -307,89 +350,108 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
         if (raw === undefined || raw === '') continue;
         config[key] = coerceConfigValue(raw, (spec as { type?: string }).type);
       }
-      await updateProjectToolApi(projectId, tool.id, {
+      await updateProjectToolApi(requestedProjectId, tool.id, {
         title,
         placement: configDraft.placement,
         ...(schemaPropsForKind(tool.kind).length > 0 ? { config } : {}),
       });
+      if (!isCurrentProject(requestedProjectId)) return;
       setConfiguringId(null);
       setConfigDraft(null);
-      void refresh();
+      setConfiguringProjectId(null);
+      void refresh(requestedProjectId);
     } catch (err) {
-      setActionError(err instanceof Error ? err.message : 'Failed to update tool');
+      showActionError(requestedProjectId, err instanceof Error ? err.message : 'Failed to update tool');
     } finally {
-      setSavingConfig(false);
+      if (isCurrentProject(requestedProjectId)) setSavingConfig(false);
     }
   }
 
   async function handleCreate() {
+    const requestedProjectId = projectId;
     if (!selectedKind || !newTitle.trim()) return;
     setCreating(true);
-    setActionError(null);
+    setActionProjectId(requestedProjectId);
+    clearActionError(requestedProjectId);
     try {
-      const tool = await createProjectTool(projectId, { kind: selectedKind, title: newTitle.trim() });
+      const tool = await createProjectTool(requestedProjectId, { kind: selectedKind, title: newTitle.trim() });
+      if (!isCurrentProject(requestedProjectId)) return;
       setShowAddForm(false);
       setNewTitle('');
       setLastCreatedSlug(tool.slug);
-      void refresh();
+      setLastCreatedSlugProjectId(requestedProjectId);
+      void refresh(requestedProjectId);
     } catch (err) {
-      setActionError(err instanceof Error ? err.message : 'Failed to create tool');
+      showActionError(requestedProjectId, err instanceof Error ? err.message : 'Failed to create tool');
     } finally {
-      setCreating(false);
+      if (isCurrentProject(requestedProjectId)) setCreating(false);
     }
   }
 
   async function handleDelete(toolId: string) {
+    const requestedProjectId = projectId;
     setDeletingId(toolId);
-    setActionError(null);
+    setActionProjectId(requestedProjectId);
+    clearActionError(requestedProjectId);
     try {
-      await deleteProjectToolApi(projectId, toolId);
-      void refresh();
+      await deleteProjectToolApi(requestedProjectId, toolId);
+      if (!isCurrentProject(requestedProjectId)) return;
+      void refresh(requestedProjectId);
     } catch (err) {
-      setActionError(err instanceof Error ? err.message : 'Failed to delete tool');
+      showActionError(requestedProjectId, err instanceof Error ? err.message : 'Failed to delete tool');
     } finally {
-      setDeletingId(null);
+      if (isCurrentProject(requestedProjectId)) setDeletingId(null);
     }
   }
 
   async function handleToggleEnabled(tool: ProjectTool) {
+    const requestedProjectId = projectId;
     setTogglingId(tool.id);
-    setActionError(null);
+    setActionProjectId(requestedProjectId);
+    clearActionError(requestedProjectId);
     try {
-      await updateProjectToolApi(projectId, tool.id, { enabled: !tool.enabled });
-      void refresh();
+      await updateProjectToolApi(requestedProjectId, tool.id, { enabled: !tool.enabled });
+      if (!isCurrentProject(requestedProjectId)) return;
+      void refresh(requestedProjectId);
     } catch (err) {
-      setActionError(err instanceof Error ? err.message : 'Failed to update tool');
+      showActionError(requestedProjectId, err instanceof Error ? err.message : 'Failed to update tool');
     } finally {
-      setTogglingId(null);
+      if (isCurrentProject(requestedProjectId)) setTogglingId(null);
     }
   }
 
   async function handleSeed() {
+    const requestedProjectId = projectId;
     setSeeding(true);
-    setActionError(null);
+    setActionProjectId(requestedProjectId);
+    clearActionError(requestedProjectId);
     try {
-      await seedProjectToolsApi(projectId);
-      void refresh();
+      await seedProjectToolsApi(requestedProjectId);
+      if (!isCurrentProject(requestedProjectId)) return;
+      void refresh(requestedProjectId);
     } catch (err) {
-      setActionError(err instanceof Error ? err.message : 'Failed to seed tools');
+      showActionError(requestedProjectId, err instanceof Error ? err.message : 'Failed to seed tools');
     } finally {
-      setSeeding(false);
+      if (isCurrentProject(requestedProjectId)) setSeeding(false);
     }
   }
 
   async function handleCheckDrift() {
+    const requestedProjectId = projectId;
     setDriftLoading(true);
+    setActionProjectId(requestedProjectId);
     try {
-      const data = await fetchComputeImageStatus(projectId, true);
+      const data = await fetchComputeImageStatus(requestedProjectId, true);
+      if (!isCurrentProject(requestedProjectId)) return;
       setComputeImageState({ status: 'ok', data, hasDrift: true });
     } catch (err) {
+      if (!isCurrentProject(requestedProjectId)) return;
       setComputeImageState({
         status: 'error',
         message: err instanceof Error ? err.message : 'Failed to check drift',
       });
     } finally {
-      setDriftLoading(false);
+      if (isCurrentProject(requestedProjectId)) setDriftLoading(false);
     }
   }
 
@@ -415,10 +477,10 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
           <button
             type="button"
             onClick={handleSeed}
-            disabled={seeding}
+            disabled={seeding && actionIsCurrent}
             className={`${actionBtn} border-neutral-700 bg-transparent text-neutral-400 hover:text-neutral-200 disabled:opacity-50`}
           >
-            {seeding ? 'Seeding…' : 'Seed defaults'}
+            {seeding && actionIsCurrent ? 'Seeding…' : 'Seed defaults'}
           </button>
         </div>
         )}
@@ -533,10 +595,10 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
             type="button"
             data-viewport-allow-small-target
             onClick={handleCheckDrift}
-            disabled={driftLoading}
+            disabled={driftLoading && actionIsCurrent}
             className={`${actionBtn} border-neutral-700 bg-transparent text-neutral-400 hover:text-neutral-200 disabled:opacity-50`}
           >
-            {driftLoading ? 'Checking…' : data.drift ? 'Re-check drift' : 'Check drift'}
+            {driftLoading && actionIsCurrent ? 'Checking…' : data.drift ? 'Re-check drift' : 'Check drift'}
           </button>
         </div>
       </div>
@@ -545,7 +607,7 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
 
   // Owner-only inline rename + placement + schema-driven config editor.
   function renderConfigPanel(tool: ProjectTool): ReactNode {
-    if (configuringId !== tool.id || !configDraft) return null;
+    if (configuringId !== tool.id || configuringProjectId !== projectId || !configDraft) return null;
     const schemaProps = schemaPropsForKind(tool.kind);
     return (
       <div className="workbench-card space-y-3 rounded-md border p-3">
@@ -596,10 +658,10 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
           <button
             type="button"
             onClick={() => handleSaveConfig(tool)}
-            disabled={savingConfig || !configDraft.title.trim()}
+            disabled={(savingConfig && actionIsCurrent) || !configDraft.title.trim()}
             className={`${actionBtn} border-indigo-600 bg-indigo-600 text-white hover:bg-indigo-500 disabled:opacity-50`}
           >
-            {savingConfig ? 'Saving…' : 'Save'}
+            {savingConfig && actionIsCurrent ? 'Saving…' : 'Save'}
           </button>
         </div>
       </div>
@@ -607,7 +669,7 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
   }
 
   function renderCreatedSlugNotice() {
-    if (!lastCreatedSlug) return null;
+    if (!lastCreatedSlug || lastCreatedSlugProjectId !== projectId) return null;
     return (
       <p className="text-xs text-neutral-400" data-testid="created-slug-notice">
         Tool created — slug: <code className="text-neutral-200">{lastCreatedSlug}</code>
@@ -616,10 +678,10 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
   }
 
   function renderAddForm() {
-    if (!showAddForm) return null;
+    if (!showAddForm || addFormProjectId !== projectId) return null;
     return (
       <div className="workbench-card space-y-3 rounded-md border p-3">
-        {loadingKinds ? (
+        {loadingKinds && loadingKindsProjectId === projectId ? (
           <p className="text-sm text-neutral-500">Loading tool kinds…</p>
         ) : toolKinds && toolKinds.length > 0 ? (
           <>
@@ -648,7 +710,7 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
             <div className="flex gap-2">
               <button
                 type="button"
-                onClick={() => { setShowAddForm(false); setActionError(null); }}
+                onClick={() => { setShowAddForm(false); setAddFormProjectId(null); clearActionError(projectId); }}
                 className={`${actionBtn} border-neutral-700 bg-transparent text-neutral-400 hover:text-neutral-200`}
               >
                 Cancel
@@ -656,10 +718,10 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
               <button
                 type="button"
                 onClick={handleCreate}
-                disabled={creating || !selectedKind || !newTitle.trim()}
+                disabled={(creating && actionIsCurrent) || !selectedKind || !newTitle.trim()}
                 className={`${actionBtn} border-indigo-600 bg-indigo-600 text-white hover:bg-indigo-500 disabled:opacity-50`}
               >
-                {creating ? 'Creating…' : 'Create'}
+                {creating && actionIsCurrent ? 'Creating…' : 'Create'}
               </button>
             </div>
           </>
@@ -780,23 +842,23 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
                       type="button"
                       data-viewport-allow-small-target
                       onClick={() => handleToggleEnabled(tool)}
-                      disabled={togglingId === tool.id}
+                      disabled={togglingId === tool.id && actionIsCurrent}
                       className="text-xs text-neutral-500 hover:text-neutral-300 disabled:opacity-50"
                     >
                       {/* Always "Disable" here: this list is filtered to enabled
                           tools. Disabled tools move to the "Disabled" section
                           below, which carries its own Enable control — so a
                           disabled tool is never stranded. */}
-                      {togglingId === tool.id ? 'Disabling…' : 'Disable'}
+                      {togglingId === tool.id && actionIsCurrent ? 'Disabling…' : 'Disable'}
                     </button>
                     <button
                       type="button"
                       data-viewport-allow-small-target
                       onClick={() => handleDelete(tool.id)}
-                      disabled={deletingId === tool.id}
+                      disabled={deletingId === tool.id && actionIsCurrent}
                       className="text-xs text-red-400 hover:text-red-300 disabled:opacity-50"
                     >
-                      {deletingId === tool.id ? 'Removing…' : 'Remove'}
+                      {deletingId === tool.id && actionIsCurrent ? 'Removing…' : 'Remove'}
                     </button>
                   </div>
                 )}
@@ -877,19 +939,19 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
                       type="button"
                       data-viewport-allow-small-target
                       onClick={() => handleToggleEnabled(tool)}
-                      disabled={togglingId === tool.id}
+                      disabled={togglingId === tool.id && actionIsCurrent}
                       className="text-xs text-neutral-400 hover:text-neutral-200 disabled:opacity-50"
                     >
-                      {togglingId === tool.id ? 'Enabling…' : 'Enable'}
+                      {togglingId === tool.id && actionIsCurrent ? 'Enabling…' : 'Enable'}
                     </button>
                     <button
                       type="button"
                       data-viewport-allow-small-target
                       onClick={() => handleDelete(tool.id)}
-                      disabled={deletingId === tool.id}
+                      disabled={deletingId === tool.id && actionIsCurrent}
                       className="text-xs text-red-400 hover:text-red-300 disabled:opacity-50"
                     >
-                      {deletingId === tool.id ? 'Removing…' : 'Remove'}
+                      {deletingId === tool.id && actionIsCurrent ? 'Removing…' : 'Remove'}
                     </button>
                   </div>
                 </div>
@@ -932,7 +994,7 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
   return (
     <div className="space-y-3">
       {renderManagementBar()}
-      {actionError && <p className="text-sm text-red-400">{actionError}</p>}
+      {visibleActionError && <p className="text-sm text-red-400">{visibleActionError}</p>}
       {renderComputeImagePanel()}
       {renderAddForm()}
       {renderCreatedSlugNotice()}

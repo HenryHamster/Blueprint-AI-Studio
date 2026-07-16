@@ -33,6 +33,7 @@ from app.models import (
 )
 from app.runner_project_binding import (
     add_binding,
+    allowed_project_ids_by_runner,
     bound_project_ids,
     remove_binding,
     runner_allowed_for_project,
@@ -602,6 +603,9 @@ def _runner_view(runner: LocalRunner) -> Dict[str, Any]:
     )
     return {
         "id": str(runner.id),
+        # Lifecycle and config mutations remain anchored to the enrollment
+        # project even when a bound project is displaying this runner.
+        "enrollment_project_id": str(runner.project_id),
         "hostname": runner.hostname,
         "version": runner.version,
         "status": runner.status,
@@ -1545,10 +1549,11 @@ async def fleet_runners_health_summary(
             _MAX_HEALTH_RUNNERS,
         )
 
+    memberships = await allowed_project_ids_by_runner(session, all_runners)
     per_project: Dict[str, List[LocalRunner]] = {}
     for runner in all_runners:
-        pid = str(runner.project_id)
-        per_project.setdefault(pid, []).append(runner)
+        for allowed_project_id in memberships[runner.id]:
+            per_project.setdefault(str(allowed_project_id), []).append(runner)
 
     fleet = {
         "total": 0,
@@ -1591,10 +1596,20 @@ async def fleet_runners_health_summary(
             if view["health"].get("memory_low"):
                 entry["low_memory"] += 1
 
-        for key in ("total", "connected", "degraded", "stale", "offline", "low_disk", "low_memory"):
-            fleet[key] += entry[key]
-
         per_project_entries.append(entry)
+
+    # Fleet totals count physical devices once; the project breakdown above
+    # intentionally includes a shared runner in every allowed project.
+    for runner in all_runners:
+        view = _runner_view(runner)
+        fleet["total"] += 1
+        status = view["health"]["device_status"]
+        if status in fleet:
+            fleet[status] += 1
+        if view["health"].get("disk_low"):
+            fleet["low_disk"] += 1
+        if view["health"].get("memory_low"):
+            fleet["low_memory"] += 1
 
     fleet["per_project"] = per_project_entries
     fleet["generated_at"] = now.isoformat()

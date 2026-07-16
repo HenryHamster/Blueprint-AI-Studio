@@ -79,6 +79,28 @@ async def allowed_project_ids(
     return allowed
 
 
+async def allowed_project_ids_by_runner(
+    session: AsyncSession, runners: list[LocalRunner]
+) -> dict[uuid.UUID, set[uuid.UUID]]:
+    """Resolve canonical allow-lists for many loaded runners in one query.
+
+    The enrollment project is always included, including for legacy runners
+    without a materialized binding row.  Callers which already loaded runners
+    should use this instead of issuing one binding query per runner.
+    """
+    allowed = {runner.id: {runner.project_id} for runner in runners}
+    if not allowed:
+        return allowed
+    rows = await session.execute(
+        select(RunnerProjectBinding.runner_id, RunnerProjectBinding.project_id).where(
+            RunnerProjectBinding.runner_id.in_(allowed)
+        )
+    )
+    for runner_id, project_id in rows.all():
+        allowed[runner_id].add(project_id)
+    return allowed
+
+
 async def add_binding(
     session: AsyncSession, runner_id: uuid.UUID, project_id: uuid.UUID
 ) -> RunnerProjectBinding:
