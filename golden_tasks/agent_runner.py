@@ -482,6 +482,21 @@ def _check_llm_credentials() -> list[str]:
     return missing
 
 
+def _has_required_llm_credentials(provider: str | None = None) -> bool:
+    """Return whether the selected provider has credentials for a real run.
+
+    Claude Code treats its OAuth token as the primary Anthropic credential;
+    an API key is only a fallback.
+    """
+    provider = (provider if provider is not None else os.environ.get("PROVIDER", "")).lower()
+    if provider in ("anthropic", ""):
+        return bool(
+            os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
+            or os.environ.get("ANTHROPIC_API_KEY", "").strip()
+        )
+    return True
+
+
 def run_single_task(
     payload: dict[str, Any],
     *,
@@ -527,8 +542,7 @@ def run_single_task(
         # Not all are required — e.g. if ANTHROPIC_API_KEY is set but
         # OPENAI_API_KEY is not, that's fine for Anthropic runs.
         # Only fail if ALL common credential vars are missing.
-        provider_env = os.environ.get("PROVIDER", "").lower()
-        if provider_env in ("anthropic", "") and not os.environ.get("ANTHROPIC_API_KEY", "").strip():
+        if not _has_required_llm_credentials():
             msg = (
                 "No LLM credentials found in environment. "
                 "Set ANTHROPIC_API_KEY (or OPENAI_API_KEY, CLAUDE_CODE_OAUTH_TOKEN) "
