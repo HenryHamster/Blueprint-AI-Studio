@@ -4,6 +4,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import WebSocket from 'ws';
+import { enforceNodeVersion } from './node-preflight.js';
 import { getLastWorkspacePrepOutcome, resetWorkspacePrepOutcome } from './workspacePrep.js';
 import { handlers, resolveHandler } from './handlers/index.js';
 import {
@@ -3535,6 +3536,10 @@ async function completeStartup(
 
 // ── Main ────────────────────────────────────────────────────────────────────
 export async function main() {
+  // Check Node version before anything else so an incompatible runtime fails
+  // with a clear, actionable message instead of an opaque startup error.
+  enforceNodeVersion();
+
   let _pendingExitCode = 0;
   // Start forensic instrumentation as early as possible. The lag monitor + exit
   // markers don't depend on auth or task claim, so we want them recording from
