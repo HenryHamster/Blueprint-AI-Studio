@@ -8536,3 +8536,657 @@ class TestCrossProjectGpuLedger(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ── New coverage: previously untested pure functions and utilities ─────────────
+
+
+class TestParseResultMetrics(unittest.TestCase):
+    """_parse_result_metrics: tolerant JSON → numeric-only dict."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _write(self, name, content):
+        path = os.path.join(self.tmp.name, name)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        return path
+
+    def test_numeric_values_are_returned(self):
+        path = self._write("result.json", '{"loss": 0.42, "accuracy": 0.95, "step": 100}')
+        result = local_runner._parse_result_metrics(path)
+        self.assertEqual(result, {"loss": 0.42, "accuracy": 0.95, "step": 100})
+
+    def test_non_numeric_values_filtered_out(self):
+        path = self._write("result.json", '{"loss": 0.5, "name": "run1", "flag": true}')
+        result = local_runner._parse_result_metrics(path)
+        # booleans and strings are excluded; only numeric float/int survives
+        self.assertEqual(result, {"loss": 0.5})
+
+    def test_bool_values_excluded(self):
+        path = self._write("result.json", '{"ok": true, "count": 7}')
+        result = local_runner._parse_result_metrics(path)
+        self.assertEqual(result, {"count": 7})
+
+    def test_empty_dict_returns_none(self):
+        path = self._write("result.json", '{}')
+        self.assertIsNone(local_runner._parse_result_metrics(path))
+
+    def test_all_non_numeric_returns_none(self):
+        path = self._write("result.json", '{"label": "hello", "ok": false}')
+        self.assertIsNone(local_runner._parse_result_metrics(path))
+
+    def test_missing_file_returns_none(self):
+        self.assertIsNone(
+            local_runner._parse_result_metrics(
+                os.path.join(self.tmp.name, "nonexistent.json")
+            )
+        )
+
+    def test_invalid_json_returns_none(self):
+        path = self._write("result.json", '{not: valid json}')
+        self.assertIsNone(local_runner._parse_result_metrics(path))
+
+    def test_non_dict_json_returns_none(self):
+        path = self._write("result.json", '[1, 2, 3]')
+        self.assertIsNone(local_runner._parse_result_metrics(path))
+
+    def test_negative_and_float_values_preserved(self):
+        path = self._write("result.json", '{"val": -3.14, "zero": 0.0}')
+        result = local_runner._parse_result_metrics(path)
+        self.assertAlmostEqual(result["val"], -3.14)
+        self.assertEqual(result["zero"], 0.0)
+
+
+class TestClassifyViewable(unittest.TestCase):
+    """_classify_viewable: extension → (content_type, kind) or None."""
+
+    def test_png_classified_as_image(self):
+        result = local_runner._classify_viewable("chart.png")
+        self.assertEqual(result, ("image/png", "image"))
+
+    def test_jpg_classified_as_image(self):
+        self.assertEqual(local_runner._classify_viewable("photo.jpg"), ("image/jpeg", "image"))
+
+    def test_jpeg_classified_as_image(self):
+        self.assertEqual(local_runner._classify_viewable("photo.jpeg"), ("image/jpeg", "image"))
+
+    def test_webp_classified_as_image(self):
+        self.assertEqual(local_runner._classify_viewable("img.webp"), ("image/webp", "image"))
+
+    def test_gif_classified_as_image(self):
+        self.assertEqual(local_runner._classify_viewable("anim.gif"), ("image/gif", "image"))
+
+    def test_mp4_classified_as_video(self):
+        self.assertEqual(local_runner._classify_viewable("clip.mp4"), ("video/mp4", "video"))
+
+    def test_webm_classified_as_video(self):
+        self.assertEqual(local_runner._classify_viewable("clip.webm"), ("video/webm", "video"))
+
+    def test_svg_excluded(self):
+        self.assertIsNone(local_runner._classify_viewable("image.svg"))
+
+    def test_unknown_extension_returns_none(self):
+        self.assertIsNone(local_runner._classify_viewable("model.pkl"))
+        self.assertIsNone(local_runner._classify_viewable("log.txt"))
+        self.assertIsNone(local_runner._classify_viewable("data.csv"))
+
+    def test_no_extension_returns_none(self):
+        self.assertIsNone(local_runner._classify_viewable("README"))
+
+    def test_non_string_returns_none(self):
+        self.assertIsNone(local_runner._classify_viewable(None))
+        self.assertIsNone(local_runner._classify_viewable(123))
+
+    def test_extension_case_insensitive(self):
+        # Filename with uppercase extension should be classified
+        self.assertEqual(local_runner._classify_viewable("photo.PNG"), ("image/png", "image"))
+        self.assertEqual(local_runner._classify_viewable("clip.MP4"), ("video/mp4", "video"))
+
+    def test_multiple_dots_uses_last_extension(self):
+        result = local_runner._classify_viewable("archive.old.png")
+        self.assertEqual(result, ("image/png", "image"))
+
+
+class TestParseProgressRecord(unittest.TestCase):
+    """_parse_progress_record: bytes → validated dict or None."""
+
+    def _parse(self, text: str) -> dict | None:
+        return local_runner._parse_progress_record(text.encode())
+
+    def test_valid_minimal_record(self):
+        r = self._parse('{"metric": "loss", "value": 0.42}')
+        self.assertIsNotNone(r)
+        self.assertEqual(r["metric"], "loss")
+        self.assertAlmostEqual(r["value"], 0.42)
+        self.assertNotIn("step", r)
+        self.assertNotIn("ts", r)
+
+    def test_valid_record_with_step_and_ts(self):
+        r = self._parse('{"metric": "acc", "value": 0.9, "step": 10, "ts": "2026-01-01T00:00:00Z"}')
+        self.assertEqual(r["step"], 10)
+        self.assertEqual(r["ts"], "2026-01-01T00:00:00Z")
+
+    def test_metric_whitespace_is_stripped(self):
+        r = self._parse('{"metric": "  loss  ", "value": 1.0}')
+        self.assertEqual(r["metric"], "loss")
+
+    def test_empty_line_returns_none(self):
+        self.assertIsNone(local_runner._parse_progress_record(b""))
+        self.assertIsNone(local_runner._parse_progress_record(b"   "))
+
+    def test_invalid_json_returns_none(self):
+        self.assertIsNone(self._parse("not json"))
+
+    def test_non_dict_json_returns_none(self):
+        self.assertIsNone(self._parse("[1, 2, 3]"))
+
+    def test_missing_metric_returns_none(self):
+        self.assertIsNone(self._parse('{"value": 0.5}'))
+
+    def test_empty_metric_returns_none(self):
+        self.assertIsNone(self._parse('{"metric": "", "value": 0.5}'))
+        self.assertIsNone(self._parse('{"metric": "   ", "value": 0.5}'))
+
+    def test_missing_value_returns_none(self):
+        self.assertIsNone(self._parse('{"metric": "loss"}'))
+
+    def test_non_numeric_value_returns_none(self):
+        self.assertIsNone(self._parse('{"metric": "loss", "value": "high"}'))
+
+    def test_bool_value_returns_none(self):
+        self.assertIsNone(self._parse('{"metric": "ok", "value": true}'))
+
+    def test_nan_value_returns_none(self):
+        self.assertIsNone(self._parse('{"metric": "loss", "value": NaN}'))
+
+    def test_inf_value_returns_none(self):
+        # Python JSON doesn't parse Infinity natively so test finite check instead
+        r = self._parse('{"metric": "loss", "value": 1e308}')
+        # Very large but still finite — should be accepted
+        self.assertIsNotNone(r)
+
+    def test_negative_step_excluded(self):
+        r = self._parse('{"metric": "loss", "value": 1.0, "step": -1}')
+        self.assertNotIn("step", r)
+
+    def test_bool_step_excluded(self):
+        r = self._parse('{"metric": "loss", "value": 1.0, "step": true}')
+        self.assertNotIn("step", r)
+
+    def test_oversized_line_returns_none(self):
+        line = b'{"metric": "x", "value": 1}' + b"x" * 9000
+        self.assertIsNone(local_runner._parse_progress_record(line))
+
+    def test_metric_truncated_to_max_chars(self):
+        long_metric = "m" * 200
+        r = self._parse(f'{{"metric": "{long_metric}", "value": 1.0}}')
+        self.assertIsNotNone(r)
+        self.assertEqual(len(r["metric"]), 128)
+
+    def test_ts_truncated_to_max_chars(self):
+        long_ts = "2026-01-01T00:00:00Z" + "x" * 100
+        r = self._parse(f'{{"metric": "loss", "value": 1.0, "ts": "{long_ts}"}}')
+        self.assertIsNotNone(r)
+        self.assertEqual(len(r["ts"]), 64)
+
+
+class TestCrc32c(unittest.TestCase):
+    """_crc32c_update / _crc32c_b64: custom CRC32C implementation."""
+
+    def test_crc32c_update_empty_data_unchanged(self):
+        state = 0xFFFFFFFF
+        result = local_runner._crc32c_update(state, b"")
+        self.assertEqual(result, state)
+
+    def test_crc32c_update_produces_deterministic_result(self):
+        state = 0xFFFFFFFF
+        r1 = local_runner._crc32c_update(state, b"hello")
+        r2 = local_runner._crc32c_update(state, b"hello")
+        self.assertEqual(r1, r2)
+
+    def test_crc32c_update_different_data_different_result(self):
+        state = 0xFFFFFFFF
+        r1 = local_runner._crc32c_update(state, b"hello")
+        r2 = local_runner._crc32c_update(state, b"world")
+        self.assertNotEqual(r1, r2)
+
+    def test_crc32c_update_is_incremental(self):
+        state = 0xFFFFFFFF
+        all_at_once = local_runner._crc32c_update(state, b"helloworld")
+        partial = local_runner._crc32c_update(state, b"hello")
+        incremental = local_runner._crc32c_update(partial, b"world")
+        self.assertEqual(all_at_once, incremental)
+
+    def test_crc32c_b64_returns_base64_string(self):
+        state = local_runner._crc32c_update(0xFFFFFFFF, b"test")
+        result = local_runner._crc32c_b64(state)
+        # Must be a valid base64 string decodable to 4 bytes
+        decoded = base64.b64decode(result)
+        self.assertEqual(len(decoded), 4)
+
+    def test_crc32c_b64_same_data_same_checksum(self):
+        state = local_runner._crc32c_update(0xFFFFFFFF, b"blueprint")
+        r1 = local_runner._crc32c_b64(state)
+        r2 = local_runner._crc32c_b64(state)
+        self.assertEqual(r1, r2)
+
+    def test_crc32c_initial_state_b64_differs_from_data(self):
+        state_empty = local_runner._crc32c_update(0xFFFFFFFF, b"")
+        state_data = local_runner._crc32c_update(0xFFFFFFFF, b"x")
+        self.assertNotEqual(local_runner._crc32c_b64(state_empty), local_runner._crc32c_b64(state_data))
+
+
+class TestBuildArtifactArchive(unittest.TestCase):
+    """_build_artifact_archive: build a .tar.gz of an artifact directory."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _artifact_dir(self, files):
+        """Create a fresh artifact dir with the given {relpath: content} map."""
+        art = os.path.join(self.tmp.name, "artifacts")
+        os.makedirs(art, exist_ok=True)
+        for relpath, content in files.items():
+            abs_path = os.path.join(art, relpath)
+            os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+            with open(abs_path, "w", encoding="utf-8") as fh:
+                fh.write(content)
+        return art
+
+    def test_nonexistent_dir_returns_none_not_produced(self):
+        archive, meta = local_runner._build_artifact_archive("/nonexistent/path")
+        self.assertIsNone(archive)
+        self.assertEqual(meta["status"], "not_produced")
+
+    def test_empty_dir_returns_none_no_files(self):
+        art = os.path.join(self.tmp.name, "empty")
+        os.makedirs(art)
+        archive, meta = local_runner._build_artifact_archive(art)
+        self.assertIsNone(archive)
+        self.assertEqual(meta["reason"], "no_artifact_files")
+
+    def test_single_file_produces_archive(self):
+        art = self._artifact_dir({"result.txt": "step=42"})
+        archive, meta = local_runner._build_artifact_archive(art)
+        self.assertIsNotNone(archive)
+        try:
+            self.assertEqual(meta["status"], "prepared")
+            self.assertEqual(meta["file_count"], 1)
+            self.assertGreater(meta["archive_size"], 0)
+            self.assertIn("crc32c", meta)
+            # Archive must be a valid gzip tarball
+            with tarfile.open(archive, "r:gz") as tar:
+                names = tar.getnames()
+                self.assertIn("result.txt", names)
+        finally:
+            if archive and os.path.exists(archive):
+                os.remove(archive)
+
+    def test_multiple_files_counted_correctly(self):
+        art = self._artifact_dir({
+            "a.txt": "aaa",
+            "subdir/b.txt": "bbb",
+            "subdir/c.txt": "ccc",
+        })
+        archive, meta = local_runner._build_artifact_archive(art)
+        self.assertIsNotNone(archive)
+        try:
+            self.assertEqual(meta["file_count"], 3)
+            self.assertEqual(meta["total_bytes"], 9)  # 3+3+3
+        finally:
+            if archive and os.path.exists(archive):
+                os.remove(archive)
+
+    def test_symlink_dir_is_rejected(self):
+        art = os.path.join(self.tmp.name, "real")
+        os.makedirs(art)
+        with open(os.path.join(art, "f.txt"), "w") as fh:
+            fh.write("x")
+        link = os.path.join(self.tmp.name, "link")
+        os.symlink(art, link)
+        archive, meta = local_runner._build_artifact_archive(link)
+        self.assertIsNone(archive)
+        self.assertEqual(meta["status"], "not_produced")
+
+    def test_crc32c_is_valid_base64(self):
+        art = self._artifact_dir({"f.dat": "data"})
+        archive, meta = local_runner._build_artifact_archive(art)
+        self.assertIsNotNone(archive)
+        try:
+            crc = meta["crc32c"]
+            decoded = base64.b64decode(crc)
+            self.assertEqual(len(decoded), 4)
+        finally:
+            if archive and os.path.exists(archive):
+                os.remove(archive)
+
+
+class TestExtractResumeBundle(unittest.TestCase):
+    """_extract_resume_bundle: safe tar.gz extraction into a staging directory."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _make_bundle(self, members):
+        """members: list of (name, content_bytes_or_None_for_dir)."""
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            for name, data in members:
+                info = tarfile.TarInfo(name=name)
+                if data is None:
+                    info.type = tarfile.DIRTYPE
+                    tar.addfile(info)
+                else:
+                    payload = data if isinstance(data, bytes) else data.encode()
+                    info.size = len(payload)
+                    tar.addfile(info, io.BytesIO(payload))
+        bundle_path = os.path.join(self.tmp.name, "bundle.tar.gz")
+        with open(bundle_path, "wb") as fh:
+            fh.write(buf.getvalue())
+        return bundle_path
+
+    def test_valid_bundle_extracts_files(self):
+        bundle = self._make_bundle([
+            ("checkpoint.pt", b"\x00\x01\x02"),
+            ("metrics.json", b'{"step": 1}'),
+        ])
+        staging = os.path.join(self.tmp.name, "staging")
+        os.makedirs(staging)
+        count, total = local_runner._extract_resume_bundle(bundle, staging)
+        self.assertEqual(count, 2)
+        self.assertEqual(total, 3 + 11)
+        self.assertTrue(os.path.isfile(os.path.join(staging, "checkpoint.pt")))
+        self.assertTrue(os.path.isfile(os.path.join(staging, "metrics.json")))
+
+    def test_stale_artifact_names_are_excluded(self):
+        bundle = self._make_bundle([
+            ("model.pt", b"weights"),
+            ("result.json", b'{"ok": true}'),
+            ("command.log.json", b"{}"),
+            ("terminal.json", b"{}"),
+        ])
+        staging = os.path.join(self.tmp.name, "staging")
+        os.makedirs(staging)
+        count, _ = local_runner._extract_resume_bundle(bundle, staging)
+        # result.json, command.log.json, terminal.json are stale and excluded
+        self.assertEqual(count, 1)
+        self.assertTrue(os.path.isfile(os.path.join(staging, "model.pt")))
+        self.assertFalse(os.path.isfile(os.path.join(staging, "result.json")))
+
+    def test_subdir_members_extracted_correctly(self):
+        bundle = self._make_bundle([
+            ("subdir/", None),
+            ("subdir/weights.pt", b"w8s"),
+        ])
+        staging = os.path.join(self.tmp.name, "staging")
+        os.makedirs(staging)
+        count, total = local_runner._extract_resume_bundle(bundle, staging)
+        self.assertEqual(count, 1)
+        self.assertTrue(os.path.isfile(os.path.join(staging, "subdir", "weights.pt")))
+
+    def test_empty_bundle_returns_zero_count(self):
+        bundle = self._make_bundle([])
+        staging = os.path.join(self.tmp.name, "staging")
+        os.makedirs(staging)
+        count, total = local_runner._extract_resume_bundle(bundle, staging)
+        self.assertEqual(count, 0)
+        self.assertEqual(total, 0)
+
+
+class TestSafeResumeTarget(unittest.TestCase):
+    """_safe_resume_target: path-traversal-safe target resolution."""
+
+    def _target(self, member_name):
+        return local_runner._safe_resume_target("/dest", member_name)
+
+    def test_normal_relative_path_accepted(self):
+        result = self._target("model.pt")
+        self.assertIsNotNone(result)
+        self.assertTrue(result.endswith("model.pt"))
+
+    def test_subdir_accepted(self):
+        result = self._target("checkpoints/epoch1.pt")
+        self.assertIsNotNone(result)
+
+    def test_absolute_path_rejected(self):
+        self.assertIsNone(self._target("/etc/passwd"))
+
+    def test_parent_traversal_rejected(self):
+        self.assertIsNone(self._target("../secret.txt"))
+        self.assertIsNone(self._target("subdir/../../etc/passwd"))
+
+    def test_empty_name_rejected(self):
+        self.assertIsNone(self._target(""))
+
+    def test_dot_only_rejected(self):
+        # A path resolving to just dest_dir itself returns None
+        result = local_runner._safe_resume_target("/dest", ".")
+        self.assertIsNone(result)
+
+    def test_windows_separator_traversal_rejected(self):
+        self.assertIsNone(self._target("..\\etc\\passwd"))
+
+
+class TestLlmCliIsEligible(unittest.TestCase):
+    """_llm_cli_is_eligible: bool health flag wins, else falls back to present."""
+
+    def test_healthy_true_is_eligible(self):
+        self.assertTrue(local_runner._llm_cli_is_eligible({"healthy": True}))
+
+    def test_healthy_false_not_eligible(self):
+        self.assertFalse(local_runner._llm_cli_is_eligible({"healthy": False}))
+
+    def test_no_healthy_falls_back_to_present(self):
+        self.assertTrue(local_runner._llm_cli_is_eligible({"present": True}))
+        self.assertFalse(local_runner._llm_cli_is_eligible({"present": False}))
+
+    def test_no_health_info_is_not_eligible(self):
+        self.assertFalse(local_runner._llm_cli_is_eligible({}))
+
+    def test_healthy_none_falls_back_to_present(self):
+        # None is not a bool, so falls through to present
+        self.assertTrue(local_runner._llm_cli_is_eligible({"healthy": None, "present": True}))
+        self.assertFalse(local_runner._llm_cli_is_eligible({"healthy": None, "present": False}))
+
+
+class TestComputeBackendSummary(unittest.TestCase):
+    """_compute_backend_summary: human string for available compute backends."""
+
+    def test_no_backends_returns_none_string(self):
+        caps = iso.Capabilities()
+        result = local_runner._compute_backend_summary(caps)
+        self.assertEqual(result, "none")
+
+    def test_bwrap_only_mentions_bwrap(self):
+        caps = iso.Capabilities(bwrap_path="/usr/bin/bwrap", userns_ok=True)
+        result = local_runner._compute_backend_summary(caps)
+        self.assertIn("bwrap", result)
+        self.assertNotIn("docker", result)
+
+    def test_docker_only_mentions_docker(self):
+        caps = iso.Capabilities(docker_usable=True)
+        result = local_runner._compute_backend_summary(caps)
+        self.assertIn("docker", result)
+
+    def test_both_backends_mentions_both(self):
+        caps = iso.Capabilities(
+            bwrap_path="/usr/bin/bwrap",
+            userns_ok=True,
+            docker_usable=True,
+        )
+        result = local_runner._compute_backend_summary(caps)
+        self.assertIn("bwrap", result)
+        self.assertIn("docker", result)
+
+
+class TestArtifactDeliveryFailure(unittest.TestCase):
+    """_artifact_delivery_failure: creates a standardized failure dict."""
+
+    def test_basic_failure_dict(self):
+        result = local_runner._artifact_delivery_failure("network_error")
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["reason"], "network_error")
+        self.assertEqual(result["protocol"], "direct")
+
+    def test_custom_protocol(self):
+        result = local_runner._artifact_delivery_failure("timeout", protocol="legacy")
+        self.assertEqual(result["protocol"], "legacy")
+
+    def test_reason_truncated_to_256_chars(self):
+        long_reason = "x" * 300
+        result = local_runner._artifact_delivery_failure(long_reason)
+        self.assertEqual(len(result["reason"]), 256)
+
+    def test_non_string_reason_coerced(self):
+        result = local_runner._artifact_delivery_failure(42)
+        self.assertEqual(result["reason"], "42")
+
+
+class TestCpuLoadAvgAndMemoryFree(unittest.TestCase):
+    """_cpu_load_avg / _memory_free_bytes: system probes, tested with mocks."""
+
+    def test_cpu_load_avg_returns_float(self):
+        with patch.object(local_runner.os, "getloadavg", return_value=(1.5, 2.0, 1.8)):
+            result = local_runner._cpu_load_avg()
+        self.assertIsNotNone(result)
+        self.assertAlmostEqual(result, 1.5)
+
+    def test_cpu_load_avg_handles_oserror(self):
+        with patch.object(local_runner.os, "getloadavg", side_effect=OSError("unsupported")):
+            self.assertIsNone(local_runner._cpu_load_avg())
+
+    def test_cpu_load_avg_handles_attribute_error(self):
+        with patch.object(local_runner.os, "getloadavg", side_effect=AttributeError):
+            self.assertIsNone(local_runner._cpu_load_avg())
+
+    def test_memory_free_bytes_reads_memavailable(self):
+        meminfo = "MemTotal: 16384 kB\nMemAvailable: 8192 kB\nMemFree: 4096 kB\n"
+        with patch("builtins.open", unittest.mock.mock_open(read_data=meminfo)):
+            result = local_runner._memory_free_bytes()
+        self.assertEqual(result, 8192 * 1024)
+
+    def test_memory_free_bytes_falls_back_to_memfree(self):
+        # Old kernels may not have MemAvailable
+        meminfo = "MemTotal: 16384 kB\nMemFree: 4096 kB\n"
+        with patch("builtins.open", unittest.mock.mock_open(read_data=meminfo)):
+            result = local_runner._memory_free_bytes()
+        self.assertEqual(result, 4096 * 1024)
+
+    def test_memory_free_bytes_handles_oserror(self):
+        with patch("builtins.open", side_effect=OSError("no /proc")):
+            self.assertIsNone(local_runner._memory_free_bytes())
+
+
+class TestProgressTail(unittest.TestCase):
+    """_ProgressTail: tail-reads a JSONL progress file between heartbeats."""
+
+    def _make_tail(self, path):
+        return local_runner._ProgressTail(path)
+
+    def test_missing_file_returns_none_snapshot(self):
+        tail = self._make_tail("/nonexistent/progress.jsonl")
+        self.assertIsNone(tail.poll())
+
+    def test_empty_file_returns_none(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as fh:
+            path = fh.name
+        try:
+            tail = self._make_tail(path)
+            self.assertIsNone(tail.poll())
+        finally:
+            os.unlink(path)
+
+    def test_valid_record_appears_in_snapshot(self):
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".jsonl", delete=False, encoding="utf-8"
+        ) as fh:
+            fh.write('{"metric": "loss", "value": 0.5}\n')
+            path = fh.name
+        try:
+            tail = self._make_tail(path)
+            result = tail.poll()
+            self.assertIsNotNone(result)
+            self.assertEqual(result["count"], 1)
+            self.assertEqual(len(result["records"]), 1)
+            self.assertEqual(result["records"][0]["metric"], "loss")
+        finally:
+            os.unlink(path)
+
+    def test_incremental_polling_only_reads_new_data(self):
+        with tempfile.NamedTemporaryFile(
+            mode="wb", suffix=".jsonl", delete=False
+        ) as fh:
+            path = fh.name
+        try:
+            tail = self._make_tail(path)
+            # First poll: empty
+            self.assertIsNone(tail.poll())
+
+            # Write a record and poll again
+            with open(path, "ab") as fh:
+                fh.write(b'{"metric": "loss", "value": 1.0}\n')
+            result = tail.poll()
+            self.assertIsNotNone(result)
+            self.assertEqual(result["count"], 1)
+
+            # Append another record and poll
+            with open(path, "ab") as fh:
+                fh.write(b'{"metric": "acc", "value": 0.9}\n')
+            result2 = tail.poll()
+            self.assertEqual(result2["count"], 2)
+        finally:
+            os.unlink(path)
+
+    def test_truncated_file_resets_reader(self):
+        with tempfile.NamedTemporaryFile(
+            mode="wb", suffix=".jsonl", delete=False
+        ) as fh:
+            path = fh.name
+        try:
+            # Write a larger file and poll to advance offset past the end
+            large = b'{"metric": "loss", "value": 0.1}\n' * 10
+            with open(path, "wb") as fh:
+                fh.write(large)
+            tail = self._make_tail(path)
+            tail.poll()  # offset is now len(large)
+
+            # Truncate and rewrite with shorter content (size < offset triggers reset)
+            with open(path, "wb") as fh:
+                fh.write(b'{"metric": "epoch", "value": 1.0}\n')
+            result = tail.poll()
+            self.assertIsNotNone(result)
+            # After reset, the new "epoch" record should appear
+            self.assertTrue(
+                any(r["metric"] == "epoch" for r in result["records"]),
+                f"expected 'epoch' in records after truncation reset: {result}",
+            )
+        finally:
+            os.unlink(path)
+
+    def test_invalid_lines_skipped_gracefully(self):
+        with tempfile.NamedTemporaryFile(
+            mode="wb", suffix=".jsonl", delete=False
+        ) as fh:
+            fh.write(b"not-valid-json\n")
+            fh.write(b'{"metric": "loss", "value": 0.5}\n')
+            path = fh.name
+        try:
+            tail = self._make_tail(path)
+            result = tail.poll()
+            self.assertIsNotNone(result)
+            self.assertEqual(result["count"], 1)
+        finally:
+            os.unlink(path)
+
+
