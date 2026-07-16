@@ -121,11 +121,11 @@ def decrypt_field(value: str | None) -> str | None:
         return value
     try:
         return f.decrypt(value.encode()).decode()
-    except InvalidToken:
-        # Value is either plaintext (pre-encryption) or corrupt — return as-is
-        # so callers can still use it.  A corrupt value will ultimately fail
-        # at the downstream secret-resolver (GCP Secret Manager).
-        return value
-    except Exception as e:
-        logger.error("Unexpected decryption error: %s", e)
+    except (InvalidToken, ValueError, TypeError) as e:
+        # InvalidToken: plaintext or corrupt value (pre-encryption backward compat).
+        # ValueError/TypeError: encoding failures (UnicodeEncodeError on value.encode(),
+        # UnicodeDecodeError on result .decode(), binascii.Error from malformed base64).
+        # All other exceptions propagate so library API changes or truly unexpected
+        # errors are not silently swallowed.
+        logger.debug("Decryption fallback (%s): %s", type(e).__name__, e)
         return value

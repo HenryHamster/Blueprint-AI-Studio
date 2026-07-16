@@ -400,6 +400,11 @@ def test_all_admin_routes_require_auth():
         "/api/admin/projects/{project_id}/tools/{tool_slug}/assets/{path:path}": (
             "JWT-based capability-token auth for opaque-origin iframe asset serving"
         ),
+        # GET /api/admin/projects/.../t/{token}/assets/{path:path} uses the same
+        # path-embedded capability JWT for relative subresources loaded by the iframe.
+        "/api/admin/projects/{project_id}/tools/{tool_slug}/t/{token}/assets/{path:path}": (
+            "path-embedded JWT capability token for iframe relative subresource serving"
+        ),
     }
 
     # get_metrics_reader is a narrowly scoped read-only dep that accepts agent

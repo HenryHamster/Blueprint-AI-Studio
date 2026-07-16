@@ -231,6 +231,55 @@ class TestMaxPlanAccountFieldEncryption:
         assert result == legacy_ref
 
 
+class TestUnexpectedDecryptionErrorPropagates:
+    """Errors outside (InvalidToken, ValueError, TypeError) must propagate."""
+
+    def test_unexpected_exception_propagates(self, monkeypatch):
+        """An AttributeError from f.decrypt() propagates instead of being swallowed."""
+        from unittest.mock import MagicMock, patch
+        from cryptography.fernet import Fernet as _Fernet
+
+        key = _Fernet.generate_key().decode()
+        monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", key)
+
+        mock_fernet = MagicMock()
+        mock_fernet.decrypt.side_effect = AttributeError("library API changed")
+
+        with patch("app.field_encryption._get_fernet", return_value=mock_fernet):
+            with pytest.raises(AttributeError, match="library API changed"):
+                decrypt_field("some_value")
+
+    def test_value_error_returns_unchanged(self, monkeypatch):
+        """A ValueError from encoding is caught and returns the value as-is."""
+        from unittest.mock import MagicMock, patch
+        from cryptography.fernet import Fernet as _Fernet
+
+        key = _Fernet.generate_key().decode()
+        monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", key)
+
+        mock_fernet = MagicMock()
+        mock_fernet.decrypt.side_effect = ValueError("bad encoding")
+
+        with patch("app.field_encryption._get_fernet", return_value=mock_fernet):
+            result = decrypt_field("some_value")
+            assert result == "some_value"
+
+    def test_type_error_returns_unchanged(self, monkeypatch):
+        """A TypeError is caught and returns the value as-is."""
+        from unittest.mock import MagicMock, patch
+        from cryptography.fernet import Fernet as _Fernet
+
+        key = _Fernet.generate_key().decode()
+        monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", key)
+
+        mock_fernet = MagicMock()
+        mock_fernet.decrypt.side_effect = TypeError("unexpected type")
+
+        with patch("app.field_encryption._get_fernet", return_value=mock_fernet):
+            result = decrypt_field("some_value")
+            assert result == "some_value"
+
+
 class TestIsEncryptionActive:
     """is_encryption_active reports whether encryption is properly configured."""
 
