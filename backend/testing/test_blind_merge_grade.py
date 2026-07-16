@@ -319,6 +319,7 @@ async def test_spawn_merge_grade_task_creates_queued_task(db_session):
 
     version_id = uuid.uuid4()
     candidate_sha = "abcd" * 10
+    attempt_id = uuid.uuid4()
     task = await _spawn_release_merge_grade_task(
         db_session,
         project.id,
@@ -326,6 +327,7 @@ async def test_spawn_merge_grade_task_creates_queued_task(db_session):
         base_branch="main",
         diff_range=f"main...{candidate_sha}",
         candidate_sha=candidate_sha,
+        qualification_attempt_id=attempt_id,
         version_goal=_GOOD_GOAL,
         merged_pr_numbers=[101, 102],
     )
@@ -338,6 +340,7 @@ async def test_spawn_merge_grade_task_creates_queued_task(db_session):
     assert payload["version_goal"] == _GOOD_GOAL
     assert payload["quality_tier"] == "opus"
     assert payload["candidate_sha"] == candidate_sha
+    assert payload["qualification_attempt_id"] == str(attempt_id)
     assert 101 in payload["merged_prs"]
     # Blindness contract: running_update must NOT appear in any payload key.
     assert not any("running_update" in str(k).lower() for k in payload)

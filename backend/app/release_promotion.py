@@ -29,6 +29,7 @@ unchanged.
 from __future__ import annotations
 
 import logging
+import uuid
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -422,6 +423,11 @@ async def _record_qualification_verdict(
         verdict = QualificationVerdict(
             project_id=version.project_id,
             release_version_id=version.id,
+            qualification_attempt_id=(
+                uuid.UUID(str(base_record["qualification_attempt_id"]))
+                if base_record.get("qualification_attempt_id")
+                else version.active_qualification_attempt_id
+            ),
             candidate_sha=base_record.get("candidate_sha"),
             confidence=(
                 float(confidence)

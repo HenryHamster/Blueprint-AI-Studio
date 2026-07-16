@@ -154,6 +154,18 @@ class ReleaseVersion(SQLModel, table=True):
         sa_column=Column(Integer, nullable=False, server_default=text("0")),
     )
 
+    # Lifecycle identity for the qualification projected in last_qualification.
+    active_qualification_attempt_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(GUID(), nullable=True, index=True),
+    )
+
+    # Bounded retry episode, distinct from the lifetime attempt count.
+    qualification_retry_episode: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default=text("0")),
+    )
+
     # Free-form reasoning text from the strategic agent explaining the latest
     # phase decision.
     phase_reasoning: str | None = Field(
@@ -680,6 +692,12 @@ class QualificationVerdict(SQLModel, table=True):
         ),
     )
 
+    # Nullable attempt identity; migration 0607 backfills historical rows.
+    qualification_attempt_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(GUID(), nullable=True, index=True),
+    )
+
     # The automain HEAD SHA that was scored.  Nullable per migration linter rules.
     candidate_sha: str | None = Field(
         default=None,
@@ -1089,6 +1107,21 @@ class QualificationDimensionResult(SQLModel, table=True):
         sa_column=Column(GUID(), nullable=True),
     )
 
+    # The attempt that actually measured/produced this candidate-scoped fact.
+    # Reuse never overwrites this provenance.
+    origin_attempt_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(GUID(), nullable=True, index=True),
+    )
+
+    # Attempt ids that explicitly reused this resolved fact.  JSONB is used
+    # because this is append-only provenance, not ownership; the fact remains
+    # uniquely keyed by release version, candidate SHA, and dimension.
+    reused_by_attempt_ids: Any | None = Field(
+        default=None,
+        sa_column=Column(JSONB, nullable=True),
+    )
+
     computed_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
@@ -1266,4 +1299,3 @@ class DimensionState(BaseModel):
     status: str  # "passed" | "failed" | "unavailable" | "not_applicable" | "pending"
     score: float | None = None
     reason: str | None = None
-

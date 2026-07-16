@@ -1009,7 +1009,9 @@ async def _auto_stale_not_promoted_findings(
 
         # Load the latest carried gating findings via the same resolution path
         # that compute_requalification_readiness uses.
-        findings, truncated = await _latest_carried_audit_findings(session, version)
+        findings, truncated, _provenance = await _latest_carried_audit_findings(
+            session, version
+        )
         if truncated:
             return 0
 

@@ -185,6 +185,7 @@ vi.mock('fs', async (importOriginal) => {
 });
 
 vi.mock('../index.js', () => ({
+  normalizeClaudeConfigContent: vi.fn((_path: string, content: string) => content),
   ...Object.fromEntries(INDEX_EXPORT_NAMES.map((name) => [name, vi.fn()])),
   WORKSPACE: '/tmp/workspace',
   sendLog: vi.fn(),

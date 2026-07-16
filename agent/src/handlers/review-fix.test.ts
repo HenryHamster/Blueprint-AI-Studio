@@ -18,6 +18,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 // directly with the review prompt — so the bulk of the existing handleReview
 // tests pass through unchanged.
 vi.mock('../index.js', () => ({
+  normalizeClaudeConfigContent: vi.fn((_path: string, content: string) => content),
   WORKSPACE: '/tmp/workspace',
   strVal: (v: unknown, fallback = '') => (typeof v === 'string' ? v : fallback),
   resolveBaseBranch: (payload: Record<string, unknown>, task: Record<string, unknown>, fallback = 'main') => {

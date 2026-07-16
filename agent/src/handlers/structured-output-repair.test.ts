@@ -5,6 +5,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // runClaudeCode + sendLog, so mocking it lets us drive both the first run
 // (passed in by the caller) and the bounded reopen run (invoked by the helper).
 vi.mock('../index.js', () => ({
+  normalizeClaudeConfigContent: vi.fn((_path: string, content: string) => content),
   sendLog: vi.fn(),
   runClaudeCode: vi.fn().mockResolvedValue({
     exitCode: 0, allOutput: '', lastResultText: '',

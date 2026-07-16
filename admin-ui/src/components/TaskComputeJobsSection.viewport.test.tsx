@@ -11,6 +11,7 @@ vi.mock('../firebase', () => ({
   signInWithGoogle: vi.fn(),
   signOut: vi.fn(),
   getIdToken: vi.fn(async () => 'test-token'),
+  getIdTokenAfterAuthRestore: vi.fn(async () => 'test-token'),
   onAuthChange: vi.fn(() => () => {}),
 }));
 

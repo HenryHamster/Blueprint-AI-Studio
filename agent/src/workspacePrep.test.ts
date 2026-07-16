@@ -35,6 +35,7 @@ const logMock = vi.hoisted(() => vi.fn());
 const registerSizeCapMergeDriverMock = vi.hoisted(() => vi.fn());
 
 vi.mock('./index.js', () => ({
+  normalizeClaudeConfigContent: vi.fn((_path: string, content: string) => content),
   cloneWithRetry: cloneWithRetryMock,
   log: logMock,
   GIT_REFERENCE_CACHE_ROOT: '/opt/agent-cache/git',

@@ -11,6 +11,7 @@ const { mockSendWsFrame, mockSendLog } = vi.hoisted(() => ({
 // importing strategic-resident.ts stays light. strategic-resident-lib.js (which
 // owns the pure FrameCoalescer) is left REAL so the queue policy is exercised.
 vi.mock('../index.js', () => ({
+  normalizeClaudeConfigContent: vi.fn((_path: string, content: string) => content),
   WORKSPACE: '',
   strVal: vi.fn((v: unknown) => (typeof v === 'string' ? v : '')),
   sanitize: vi.fn((s: string) => s),

@@ -24,6 +24,7 @@ vi.mock('fs', () => ({
 }));
 
 vi.mock('../index.js', () => ({
+  normalizeClaudeConfigContent: vi.fn((_path: string, content: string) => content),
   sendLog: vi.fn(),
   runClaudeCode: vi.fn().mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' }),
   persistAndPostStatus: vi.fn().mockResolvedValue(undefined),

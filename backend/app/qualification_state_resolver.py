@@ -46,6 +46,8 @@ backfills any they did not so the guarantee holds regardless of caller.
 from __future__ import annotations
 
 import logging
+import uuid
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Tuple, TYPE_CHECKING
 
@@ -58,6 +60,112 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from app.models import ReleaseVersion, Project
 
 logger = logging.getLogger("backend.app.qualification_state_resolver")
+
+
+@dataclass(frozen=True)
+class QualificationReadModel:
+    """Attempt-scoped qualification state shared by every operator surface."""
+
+    qualification_state: dict[str, Any] | None
+    disagreement: dict[str, Any] | None
+    provenance: dict[str, Any]
+    dimension_states: list[dict[str, Any]]
+    selected_verdict: QualificationVerdict | None
+
+
+def _attempt_uuid(value: Any) -> uuid.UUID | None:
+    if isinstance(value, uuid.UUID):
+        return value
+    if isinstance(value, str):
+        try:
+            return uuid.UUID(value)
+        except ValueError:
+            return None
+    return None
+
+
+def active_qualification_attempt_id(version: ReleaseVersion) -> uuid.UUID | None:
+    """Return the attempt projected as current, accepting partial backfills."""
+    qual = version.last_qualification if isinstance(version.last_qualification, dict) else {}
+    return _attempt_uuid(qual.get("qualification_attempt_id")) or _attempt_uuid(
+        getattr(version, "active_qualification_attempt_id", None)
+    )
+
+
+def _attempt_text(value: Any) -> str | None:
+    parsed = _attempt_uuid(value)
+    return str(parsed) if parsed is not None else None
+
+
+def qualification_read_provenance(
+    version: ReleaseVersion,
+    selected_verdict: QualificationVerdict | None,
+) -> dict[str, Any]:
+    """Describe which attempt produced each bounded qualification projection field."""
+    qual = version.last_qualification if isinstance(version.last_qualification, dict) else {}
+    active_attempt = active_qualification_attempt_id(version)
+    active_text = str(active_attempt) if active_attempt is not None else None
+    candidate_sha = qual.get("candidate_sha")
+    projection_currency = "current" if active_text else "legacy_unknown"
+    retry_raw = (
+        qual.get("retry_episode")
+        if qual.get("retry_episode") is not None
+        else getattr(version, "qualification_retry_episode", 0)
+    )
+    try:
+        if not isinstance(retry_raw, (int, str)) or isinstance(retry_raw, bool):
+            raise TypeError("retry episode is not an integer")
+        retry_count = max(0, int(retry_raw))
+    except (TypeError, ValueError):
+        retry_count = 0
+
+    verdict_attempt = _attempt_text(
+        getattr(selected_verdict, "qualification_attempt_id", None)
+    )
+    if selected_verdict is None:
+        verdict_currency = "none"
+    elif active_text is not None and verdict_attempt == active_text:
+        verdict_currency = "current"
+    elif active_text is None or verdict_attempt is None:
+        verdict_currency = "legacy_unknown"
+    else:
+        verdict_currency = "prior_attempt"
+
+    child_tasks: dict[str, dict[str, Any]] = {}
+    for child, field in (
+        ("audit", "audit_task_id"),
+        ("smoketest", "smoketest_task_id"),
+        ("challenge", "challenge_task_id"),
+        ("merge_grade", "merge_grade_task_id"),
+    ):
+        task_id = qual.get(field)
+        if task_id is None:
+            continue
+        child_tasks[child] = {
+            "task_id": str(task_id),
+            "attempt_id": active_text,
+            "candidate_sha": candidate_sha,
+            "currency": projection_currency,
+        }
+
+    return {
+        "active_projection": {
+            "attempt_id": active_text,
+            "candidate_sha": candidate_sha,
+            "currency": projection_currency,
+        },
+        "selected_verdict": {
+            "attempt_id": verdict_attempt,
+            "candidate_sha": getattr(selected_verdict, "candidate_sha", None),
+            "currency": verdict_currency,
+        },
+        "child_tasks": child_tasks,
+        "lifetime_attempts": int(getattr(version, "qualification_attempts", 0) or 0),
+        "retry_episode": {
+            "count": retry_count,
+            "cap": qual.get("retry_episode_cap"),
+        },
+    }
 
 
 def _parse_iso_naive(raw: Any) -> datetime | None:
@@ -89,6 +197,8 @@ FINALIZED_TERMINAL_STATUSES = frozenset(
 def apply_verdict_substitution(
     qual: dict[str, Any] | None,
     latest_verdict: QualificationVerdict | None,
+    *,
+    active_attempt_id: uuid.UUID | str | None = None,
 ) -> Tuple[dict[str, Any], dict[str, Any] | None]:
     """Substitute a finalized verdict's ``terminal_status`` for a stale pending record.
 
@@ -108,8 +218,21 @@ def apply_verdict_substitution(
     q = qual if isinstance(qual, dict) else {}
     candidate_sha = q.get("candidate_sha")
     promotion_pending = q.get("promotion_pending")
+    projected_attempt = _attempt_uuid(q.get("qualification_attempt_id")) or _attempt_uuid(
+        active_attempt_id
+    )
+    verdict_attempt = _attempt_uuid(
+        getattr(latest_verdict, "qualification_attempt_id", None)
+    )
+    # Durable identity requires an exact attempt match before substitution.
+    attempt_matches = (
+        projected_attempt is None and verdict_attempt is None
+    ) or (
+        projected_attempt is not None and verdict_attempt == projected_attempt
+    )
     if (
         latest_verdict is not None
+        and attempt_matches
         and q.get("status") == "pending"
         and isinstance(promotion_pending, dict)
         and isinstance(candidate_sha, str)
@@ -188,7 +311,11 @@ def resolve_effective_qualification_state(
         if isinstance(version.last_qualification, dict)
         else {}
     )
-    effective_qual, disagreement = apply_verdict_substitution(qual, latest_verdict)
+    effective_qual, disagreement = apply_verdict_substitution(
+        qual,
+        latest_verdict,
+        active_attempt_id=getattr(version, "active_qualification_attempt_id", None),
+    )
 
     state = summarize_qualification_state(
         effective_qual,
@@ -205,25 +332,30 @@ def resolve_effective_qualification_state(
 async def resolve_newest_qualification_verdict(
     session: AsyncSession,
     version: ReleaseVersion,
+    *,
+    require_audit_findings: bool = False,
 ) -> QualificationVerdict | None:
-    """Return the newest ``QualificationVerdict`` row for ``version``.
+    """Return the active attempt's verdict, or the newest legacy verdict.
 
-    This is the single canonical newest-verdict query used for finalized-verdict
-    substitution across every open-version read surface: scoped to the version
-    (``release_version_id == version.id``), ordered newest-first, limit 1, with
-    NO ``audit_findings`` filter (a finalized promotion verdict — e.g. an
-    ``infra_failure`` or ``promotion_failed`` outcome — may legitimately carry no
-    findings, and the substitution only cares about ``terminal_status``).
-    Reusing this one helper keeps the surfaces from re-inlining subtly-different
-    SELECTs.
+    This is the single canonical verdict query used across every read surface.
+    When the active projection has durable identity, only a row with that exact
+    ``qualification_attempt_id`` is eligible; a prior same-candidate verdict is
+    deliberately invisible until the active attempt finalizes. Legacy projections
+    without identity retain the newest-row fallback and are marked
+    ``legacy_unknown`` by :func:`qualification_read_provenance`.
     """
+    stmt = select(QualificationVerdict).where(
+        QualificationVerdict.release_version_id == version.id
+    )
+    attempt_id = active_qualification_attempt_id(version)
+    if attempt_id is not None:
+        stmt = stmt.where(QualificationVerdict.qualification_attempt_id == attempt_id)
+    if require_audit_findings:
+        stmt = stmt.where(QualificationVerdict.audit_findings.is_not(None))
     return (
         (
             await session.execute(
-                select(QualificationVerdict)
-                .where(QualificationVerdict.release_version_id == version.id)
-                .order_by(QualificationVerdict.created_at.desc())
-                .limit(1)
+                stmt.order_by(QualificationVerdict.created_at.desc()).limit(1)
             )
         )
         .scalars()
@@ -260,7 +392,11 @@ async def resolve_promotion_blocking_result(
         if isinstance(version.last_qualification, dict)
         else {}
     )
-    effective_qual, _ = apply_verdict_substitution(qual, latest_verdict)
+    effective_qual, _ = apply_verdict_substitution(
+        qual,
+        latest_verdict,
+        active_attempt_id=getattr(version, "active_qualification_attempt_id", None),
+    )
     qual_state = summarize_qualification_state(effective_qual)
     if qual_state and qual_state.get("state") in PROMOTION_BLOCKING_STATES:
         result: dict[str, Any] = {
@@ -653,6 +789,23 @@ async def resolve_dimension_states_from_ledger(
     if not rows:
         return resolve_dimension_states(version.last_qualification)
 
+    active_attempt = active_qualification_attempt_id(version)
+    active_text = str(active_attempt) if active_attempt else None
+    if active_text is not None:
+        rows = [
+            row
+            for row in rows
+            if _attempt_text(row.origin_attempt_id) == active_text
+            or active_text
+            in {
+                value
+                for raw in (row.reused_by_attempt_ids or [])
+                if (value := _attempt_text(raw)) is not None
+            }
+        ]
+        if not rows:
+            return resolve_dimension_states(version.last_qualification)
+
     # Start with the full blob-derived state (all 14 dimensions). Then overwrite
     # the 11 ledger-backed dimensions with ledger data. The 3 blob-only dimensions
     # (criterion_coverage, goal_alignment, env_preflight) are preserved from the blob.
@@ -667,6 +820,28 @@ async def resolve_dimension_states_from_ledger(
                 entry["status"] = _ledger_status_to_ui(row.status)
                 entry["score"] = row.sub_score
                 entry["reason"] = row.blocker
+                origin_attempt = _attempt_text(row.origin_attempt_id)
+                reused_by = {
+                    value
+                    for raw in (row.reused_by_attempt_ids or [])
+                    if (value := _attempt_text(raw)) is not None
+                }
+                if origin_attempt is None:
+                    currency = "legacy_unknown"
+                elif origin_attempt == active_text:
+                    currency = "current"
+                elif active_text in reused_by:
+                    currency = "reused"
+                else:
+                    currency = "prior_attempt"
+                entry["provenance"] = {
+                    "origin_attempt_id": origin_attempt,
+                    "candidate_sha": row.candidate_sha,
+                    "producing_task_id": (
+                        str(row.producing_task_id) if row.producing_task_id else None
+                    ),
+                    "currency": currency,
+                }
 
     return result
 
@@ -723,7 +898,7 @@ def patch_qualification_state_from_dimension_states(
     return result
 
 
-async def resolve_open_version_qualification_state(
+async def resolve_open_version_qualification_read_model(
     session: AsyncSession,
     version: ReleaseVersion,
     project: Project | None = None,
@@ -732,7 +907,7 @@ async def resolve_open_version_qualification_state(
     audit_child: Any = _UNSET,
     latest_verdict: Any = _UNSET,
     dimension_states: Any = _UNSET,
-) -> Tuple[dict[str, Any] | None, dict[str, Any] | None]:
+) -> QualificationReadModel:
     """Resolve an OPEN version's ``qualification_state`` with ALL enrichments.
 
     The single async seam every open-version read surface (strategic payload,
@@ -820,4 +995,34 @@ async def resolve_open_version_qualification_state(
             qual_state, dim_states
         )
 
-    return qual_state, disagreement
+    dim_states = dim_states or []
+    return QualificationReadModel(
+        qualification_state=qual_state,
+        disagreement=disagreement,
+        provenance=qualification_read_provenance(version, latest_verdict),
+        dimension_states=dim_states,
+        selected_verdict=latest_verdict,
+    )
+
+
+async def resolve_open_version_qualification_state(
+    session: AsyncSession,
+    version: ReleaseVersion,
+    project: Project | None = None,
+    *,
+    serving: Tuple[dict[str, Any], list[dict[str, Any]]] | None = None,
+    audit_child: Any = _UNSET,
+    latest_verdict: Any = _UNSET,
+    dimension_states: Any = _UNSET,
+) -> Tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Backward-compatible tuple view over the attempt-scoped read model."""
+    resolved = await resolve_open_version_qualification_read_model(
+        session,
+        version,
+        project,
+        serving=serving,
+        audit_child=audit_child,
+        latest_verdict=latest_verdict,
+        dimension_states=dimension_states,
+    )
+    return resolved.qualification_state, resolved.disagreement
