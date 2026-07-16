@@ -28,6 +28,111 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+CRITERION_RELEASE_VERSION_CONTEXT_KEY = "criterion_release_version_id"
+
+
+def criterion_release_version_id_from_context(
+    context: dict[str, Any] | None,
+) -> uuid.UUID | None:
+    """Return the persisted criterion-version binding, or ``None`` if invalid."""
+    raw = (context or {}).get(CRITERION_RELEASE_VERSION_CONTEXT_KEY)
+    if isinstance(raw, uuid.UUID):
+        return raw
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        return uuid.UUID(raw)
+    except ValueError:
+        return None
+
+
+def task_criterion_release_version_id(task: Any) -> uuid.UUID | None:
+    """Return the release version against which a task's criterion keys resolve."""
+    return criterion_release_version_id_from_context(
+        getattr(task, "context", None) or {}
+    )
+
+
+def task_matches_criterion_release_version(task: Any, release_version: Any) -> bool:
+    """Return whether a task can safely resolve keys against ``release_version``.
+
+    Persisted bindings are authoritative. Legacy rows without a binding are
+    accepted only when they were created inside the supplied version's open
+    window; this preserves same-version evidence while refusing an older task
+    after the next version opens.
+    """
+    bound_id = task_criterion_release_version_id(task)
+    if bound_id is not None:
+        release_version_id = getattr(release_version, "id", None)
+        return (
+            isinstance(release_version_id, uuid.UUID)
+            and bound_id == release_version_id
+        )
+    raw_created_at = getattr(task, "created_at", None)
+    raw_opened_at = getattr(release_version, "opened_at", None)
+    if not isinstance(raw_created_at, datetime) or not isinstance(
+        raw_opened_at, datetime
+    ):
+        return False
+    return bool(
+        _coerce_naive_utc(raw_created_at) >= _coerce_naive_utc(raw_opened_at)
+    )
+
+
+async def resolve_task_criterion_release_version_id(
+    session: AsyncSession,
+    task: Any,
+    project_id: uuid.UUID,
+) -> uuid.UUID | None:
+    """Resolve a task's explicit binding or a safe same-window legacy binding."""
+    bound_id = task_criterion_release_version_id(task)
+    if bound_id is not None:
+        return bound_id
+    from app.release_version import current_open_version
+
+    open_version = await current_open_version(session, project_id)
+    if open_version is None or not task_matches_criterion_release_version(
+        task, open_version
+    ):
+        return None
+    open_version_id = getattr(open_version, "id", None)
+    return open_version_id if isinstance(open_version_id, uuid.UUID) else None
+
+
+def direction_criterion_release_version_id(direction: Any) -> uuid.UUID | None:
+    """Return the release version against which a direction's keys resolve."""
+    data = direction if isinstance(direction, dict) else getattr(direction, "data", None)
+    return criterion_release_version_id_from_context(data or {})
+
+
+def direction_matches_criterion_release_version(
+    direction: Any, release_version: Any
+) -> bool:
+    """Return whether a direction's criterion keys belong to ``release_version``.
+
+    Explicit bindings (``criterion_release_version_id`` in the direction's data
+    blob, written by ``link_criteria_to_direction``) are authoritative.
+
+    For directions without an explicit binding the compatibility rule is:
+    match only if the requested version is currently open.  This is the only
+    safe delimitiation without actual provenance — Direction.created_at is not
+    mapping provenance (migration 0131 stamped all backfilled rows with NOW,
+    and a long-lived direction can receive keys during any version regardless
+    of when the row was first created).  Failing closed for promoted/abandoned
+    versions prevents backward contamination: an unbound direction created
+    during V2 cannot satisfy a historical V1 query.
+    """
+    bound_id = direction_criterion_release_version_id(direction)
+    release_version_id = getattr(release_version, "id", None)
+    if bound_id is not None:
+        return (
+            isinstance(release_version_id, uuid.UUID)
+            and bound_id == release_version_id
+        )
+    # No explicit binding: match only when the version is currently open so
+    # that historical summaries are never contaminated by later unbound rows.
+    return getattr(release_version, "status", None) == "open"
+
 # Mirror of research_direction_state.RETIRED_DIRECTION_STATUSES. Defined locally
 # (rather than imported at module load) because research_direction_state pulls in
 # heavy modules and acceptance_criteria is imported early by release_qualifier —
@@ -35,6 +140,10 @@ logger = logging.getLogger(__name__)
 _RETIRED_DIRECTION_STATUSES = frozenset(
     {"expired", "retired", "superseded", "completed"}
 )
+
+# The only direction status that means a direction is actively being worked on.
+# Paused, staged, proposed, etc. are not active and should not suppress stuck alerts.
+_ACTIVE_DIRECTION_STATUSES = frozenset({"active"})
 
 # ``created_by`` provenance values that mark a criterion as human/operator
 # authored. The autonomous loop must NOT retract these — an operator has to act.
@@ -59,6 +168,8 @@ class MergeEvidenceReason(str, enum.Enum):
     """The task's acceptance verdict is absent or ``proven`` is not ``True``."""
     no_open_version = "no_open_version"
     """``current_open_version`` returned ``None`` — no open release version exists."""
+    no_bound_version = "no_bound_version"
+    """The task has no valid persisted criterion release-version binding."""
     no_active_criteria = "no_active_criteria"
     """criterion_ids resolved to rows but all are inactive (retracted/superseded)."""
     all_evidence_already_present = "all_evidence_already_present"
@@ -439,17 +550,26 @@ def reconcile_criterion_key_references(
     }
 
 
-def _gather_referenced_criterion_keys(
-    project: Any,
+async def _gather_referenced_criterion_keys(
+    session: AsyncSession, project: Any, release_version: Any
 ) -> set[str]:
     """Collect criterion-key tokens referenced across a project's strategic prose.
 
-    Sources: ``problem_model.intent.current_focus`` (the forward-looking mission
-    statement) and each active direction's ``context.success_evidence``. Every
-    field is read defensively — a malformed blob contributes nothing rather than
-    raising.
+    Sources: ``problem_model.intent.current_focus`` (the requested version's
+    forward-looking mission statement) and each *active* direction's
+    ``context.success_evidence``. Paused, staged, retired, and unknown direction
+    states are deliberately inert: their historical prose must not contaminate
+    the open version's drift signal. Every field is read defensively — a
+    malformed blob contributes nothing rather than raising.
     """
     referenced: set[str] = set()
+
+    # Scan the version's frozen goal — qualification grades against this, so
+    # the drift report must include keys cited here even when current_focus
+    # has been updated to a different statement.
+    referenced |= extract_referenced_criterion_keys(
+        getattr(release_version, "goal", None)
+    )
 
     problem_model = getattr(project, "problem_model", None)
     if isinstance(problem_model, dict):
@@ -459,14 +579,33 @@ def _gather_referenced_criterion_keys(
                 intent.get("current_focus")
             )
 
-    directions = getattr(project, "directions", None)
-    if isinstance(directions, list):
-        for direction in directions:
-            if not isinstance(direction, dict):
-                continue
-            if direction.get("status") in _RETIRED_DIRECTION_STATUSES:
-                continue
-            ctx = direction.get("context")
+    result = await session.execute(
+        select(Direction).where(Direction.project_id == release_version.project_id)
+    )
+    normalized = list(result.scalars().all())
+    direction_sources: list[Any] = list(normalized)
+    normalized_keys = {row.direction_key for row in normalized}
+    blob_directions = getattr(project, "directions", None)
+    if isinstance(blob_directions, list):
+        direction_sources.extend(
+            direction
+            for direction in blob_directions
+            if isinstance(direction, dict)
+            and direction.get("id") not in normalized_keys
+        )
+    for direction in direction_sources:
+        if not direction_matches_criterion_release_version(direction, release_version):
+            continue
+        status = (
+            direction.get("status")
+            if isinstance(direction, dict)
+            else direction.status
+        )
+        if status != "active":
+            continue
+        data = direction if isinstance(direction, dict) else direction.data
+        if isinstance(data, dict):
+            ctx = data.get("context")
             if isinstance(ctx, dict):
                 referenced |= extract_referenced_criterion_keys(
                     ctx.get("success_evidence")
@@ -1032,6 +1171,8 @@ async def direction_owns_uncovered_criterion(
         open_ver = await current_open_version(session, project_id)
         if open_ver is None:
             return False
+        if not direction_matches_criterion_release_version(direction_row, open_ver):
+            return False
 
         criteria = await get_criteria_by_keys(
             session, project_id, keys, release_version_id=open_ver.id
@@ -1115,10 +1256,11 @@ def _reject_unproven_merge_evidence(
 async def _increment_merge_gap(
     session: AsyncSession,
     project_id: uuid.UUID,
+    release_version_id: uuid.UUID,
     reason: MergeEvidenceReason,
     unmatched_ids: list[str],
 ) -> None:
-    """Persist a cumulative merge-evidence gap counter on the open release version.
+    """Persist a cumulative merge-evidence gap counter on the bound release version.
 
     Updates the ``merge_evidence_gaps`` JSON column so the gap is visible
     through the coverage-summary API, not only in logs.
@@ -1127,12 +1269,17 @@ async def _increment_merge_gap(
     blocks merge finalization.
     """
     try:
-        from app.release_version import current_open_version as _cur_open_ver  # noqa: PLC0415
+        from app.models import ReleaseVersion
 
-        open_ver = await _cur_open_ver(session, project_id)
-        if open_ver is None:
+        bound_version = await session.scalar(
+            select(ReleaseVersion).where(
+                ReleaseVersion.id == release_version_id,
+                ReleaseVersion.project_id == project_id,
+            )
+        )
+        if bound_version is None:
             return
-        gaps: dict[str, Any] = dict(open_ver.merge_evidence_gaps or {})
+        gaps: dict[str, Any] = dict(bound_version.merge_evidence_gaps or {})
         reason_key = reason.value
         gaps[reason_key] = int(gaps.get(reason_key, 0)) + 1
         if unmatched_ids:
@@ -1141,7 +1288,7 @@ async def _increment_merge_gap(
                 if uid not in existing:
                     existing.append(uid)
             gaps["unmatched_criterion_ids"] = existing
-        open_ver.merge_evidence_gaps = gaps
+        bound_version.merge_evidence_gaps = gaps
         await session.commit()
     except Exception:
         logger.warning(
@@ -1169,8 +1316,10 @@ async def record_task_merge_evidence(
       ``criterion_keys`` are empty after the direction-fetch step.
     * ``verdict_not_proven`` — the task's acceptance verdict is absent or
       ``proven`` is not ``True``.
-    * ``no_open_version`` — ``current_open_version`` returned ``None`` (no open
-      release version exists).  **Previously undocumented.**
+    * ``no_open_version`` — a legacy task has no persisted version binding and
+      ``current_open_version`` returned ``None``.
+    * ``no_bound_version`` — a legacy task predates the current open version,
+      so its bare keys cannot be resolved safely.
     * ``no_active_criteria`` — all resolved criterion rows are inactive
       (retracted/superseded), or every evidence row already existed (idempotent
       duplicate skip); logged as ``all_evidence_already_present`` for the latter.
@@ -1181,21 +1330,60 @@ async def record_task_merge_evidence(
     ``reachability`` row.  Coverage flips to ``covered`` on either signal alone.
 
     Direction criterion_keys are fetched via the ``direction_id`` stored in
-    ``task.context`` at merge time, so criteria mapped to a direction *after*
-    the task was spawned are also captured.  This fetch is best-effort: if the
-    Direction row is missing or the query fails (``direction_fetch_failed``),
-    only ``task.criterion_ids`` is used.
+    ``task.context`` at merge time, so criteria mapped to a direction *later in
+    the same release version* are also captured.  A mapping bound to another
+    release version is ignored.  This fetch is best-effort: if the Direction row
+    is missing or the query fails (``direction_fetch_failed``), only
+    ``task.criterion_ids`` is used.
 
     ``preloaded_direction`` and ``preloaded_open_ver`` are optional batch
-    optimisation kwargs: callers that process many tasks for the same direction /
-    project can preload the shared objects once and pass them here to avoid one
-    DB round-trip each per task.  Falls back to individual queries when absent.
+    optimisation kwargs.  ``preloaded_open_ver`` is consulted only for an
+    unbound legacy task; an explicit task binding remains authoritative.
 
     Best-effort: errors are logged and not re-raised so a failure here never
     blocks merge finalization.
 
     Returns the number of evidence rows recorded.
     """
+    release_version_id = task_criterion_release_version_id(task)
+    has_explicit_version_binding = release_version_id is not None
+    if release_version_id is None:
+        try:
+            if preloaded_open_ver is not None:
+                open_version = preloaded_open_ver
+            else:
+                from app.release_version import current_open_version
+
+                open_version = await current_open_version(session, project_id)
+        except Exception:
+            open_version = None
+            logger.warning(
+                "record_task_merge_evidence: failed to resolve open version for "
+                "legacy task %s (project %s)",
+                getattr(task, "id", None),
+                project_id,
+                exc_info=True,
+            )
+        if open_version is None:
+            logger.warning(
+                "record_task_merge_evidence: no open version — reason=%s "
+                "task_id=%s project_id=%s",
+                MergeEvidenceReason.no_open_version,
+                getattr(task, "id", None),
+                project_id,
+            )
+            return 0
+        if not task_matches_criterion_release_version(task, open_version):
+            logger.warning(
+                "record_task_merge_evidence: legacy task predates the open "
+                "version — reason=%s task_id=%s project_id=%s",
+                MergeEvidenceReason.no_bound_version,
+                getattr(task, "id", None),
+                project_id,
+            )
+            return 0
+        release_version_id = open_version.id
+
     criterion_ids: list[str] = list(getattr(task, "criterion_ids", None) or [])
 
     # Best-effort: also pick up any criteria mapped to the direction at merge
@@ -1214,11 +1402,31 @@ async def record_task_merge_evidence(
                         Direction.direction_key == direction_id_key,
                     )
                 )
-            if direction_row is not None and direction_row.criterion_keys:
+            direction_version_id = direction_criterion_release_version_id(direction_row)
+            if (
+                direction_row is not None
+                and direction_row.criterion_keys
+                and (
+                    direction_version_id == release_version_id
+                    or (
+                        not has_explicit_version_binding
+                        and direction_version_id is None
+                    )
+                )
+            ):
                 merged_keys = list(
                     dict.fromkeys(criterion_ids + list(direction_row.criterion_keys))
                 )
                 criterion_ids = merged_keys
+            elif direction_row is not None and direction_row.criterion_keys:
+                logger.info(
+                    "record_task_merge_evidence: ignored direction %s keys bound "
+                    "to %s for task %s bound to %s",
+                    direction_id_key,
+                    direction_version_id,
+                    getattr(task, "id", None),
+                    release_version_id,
+                )
         except Exception:
             logger.warning(
                 "record_task_merge_evidence: failed to fetch direction %s "
@@ -1236,13 +1444,25 @@ async def record_task_merge_evidence(
             getattr(task, "id", None),
             project_id,
         )
-        await _increment_merge_gap(session, project_id, MergeEvidenceReason.no_criteria, [])
+        await _increment_merge_gap(
+            session,
+            project_id,
+            release_version_id,
+            MergeEvidenceReason.no_criteria,
+            [],
+        )
         return 0
     from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
 
     verdict = task_context.get(CODE_ACCEPTANCE_VERDICT_KEY)
     if _reject_unproven_merge_evidence(verdict, task, project_id, criterion_ids):
-        await _increment_merge_gap(session, project_id, MergeEvidenceReason.verdict_not_proven, criterion_ids)
+        await _increment_merge_gap(
+            session,
+            project_id,
+            release_version_id,
+            MergeEvidenceReason.verdict_not_proven,
+            criterion_ids,
+        )
         return 0
     # Extract provenance fields for the evidence detail dict so operators can
     # audit why a criterion counts as covered without resorting to SQL.
@@ -1293,35 +1513,8 @@ async def record_task_merge_evidence(
             exc_info=True,
         )
     try:
-        _release_version_id: uuid.UUID | None = None
-        try:
-            if preloaded_open_ver is not None:
-                _open_ver = preloaded_open_ver
-            else:
-                from app.release_version import current_open_version as _cur_open_ver
-                _open_ver = await _cur_open_ver(session, project_id)
-            if _open_ver is not None:
-                _release_version_id = _open_ver.id
-        except Exception:
-            logger.warning(
-                "record_task_merge_evidence: failed to resolve open version "
-                "for task %s (project %s); merge evidence not recorded",
-                getattr(task, "id", None),
-                project_id,
-                exc_info=True,
-            )
-        if _release_version_id is None:
-            logger.warning(
-                "record_task_merge_evidence: no open version — reason=%s "
-                "task_id=%s project_id=%s criterion_ids=%s",
-                MergeEvidenceReason.no_open_version,
-                getattr(task, "id", None),
-                project_id,
-                criterion_ids,
-            )
-            return 0
         all_rows = await get_criteria_by_keys(
-            session, project_id, criterion_ids, release_version_id=_release_version_id
+            session, project_id, criterion_ids, release_version_id=release_version_id
         )
         rows = [r for r in all_rows if r.status == "active"]
         task_id_str = str(getattr(task, "id", "") or "")
@@ -1336,7 +1529,11 @@ async def record_task_merge_evidence(
                 criterion_ids,
             )
             await _increment_merge_gap(
-                session, project_id, MergeEvidenceReason.no_active_criteria, criterion_ids
+                session,
+                project_id,
+                release_version_id,
+                MergeEvidenceReason.no_active_criteria,
+                criterion_ids,
             )
             return 0
         # Batch-load all evidence for active criteria in one query to avoid N+1.
@@ -1473,6 +1670,8 @@ async def backfill_direction_merge_evidence(
                 break
             offset += len(batch)
             for task in batch:
+                if not task_matches_criterion_release_version(task, open_version):
+                    continue
                 if not is_merged_completion(task):
                     continue
                 try:
@@ -1717,6 +1916,8 @@ async def backfill_unverified_merge_evidence(
             qualified: list[tuple] = []
             all_batch_criterion_ids: set[str] = set()
             for task in batch:
+                if not task_matches_criterion_release_version(task, open_version):
+                    continue
                 if not is_merged_completion(task):
                     continue
 
@@ -1839,6 +2040,7 @@ async def backfill_unverified_merge_evidence(
                 "unverified-merge backfill: named_test shipped in the PR's changed "
                 "files but the merge was not CI-verified",
                 spawned_by=UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND,
+                release_version_id=open_version.id,
             )
 
         if total:
@@ -2085,11 +2287,17 @@ async def _resolve_acceptance_window_criteria(
         if _names_acceptance_window_metric(crit.text):
             targets[crit.id] = crit
 
-    # Rule (b): the criterion is mapped to a direction whose text names the metric.
+    # Rule (b): the criterion is mapped to an ACTIVE direction whose text names the metric.
+    # Non-active directions (paused, staged, proposed, retired, etc.) are inert here:
+    # their historical prose must not trigger probe evidence on the open version.
     dir_result = await session.execute(
         select(Direction).where(Direction.project_id == version.project_id)
     )
     for direction in dir_result.scalars().all():
+        if not direction_matches_criterion_release_version(direction, version):
+            continue
+        if direction.status != "active":
+            continue
         direction_text = direction.text
         if not direction_text and isinstance(direction.data, dict):
             direction_text = direction.data.get("text")
@@ -2128,6 +2336,15 @@ async def record_acceptance_window_coverage_evidence(
     qualification path.
 
     Returns the number of evidence rows newly recorded.
+
+    **DEPLOYED-SIDE CONSTRAINT**: this function executes inside the deployed
+    orchestrator process at the deployed (main) SHA, called from
+    ``release_qualifier_sweep._reconcile_if_criterion_coverage_now_complete``.
+    A bug fix to this minting logic that lands on automain is INERT until the
+    fix is itself promoted and deployed.  The operator hotfix-deploy channel
+    (``POST /projects/{id}/promote/hotfix``, gated by
+    :data:`app.hotfix_policy.HOTFIX_ELIGIBLE_MODULES`) is the sanctioned
+    remediation path for fixes to this file.
     """
     try:
         from app import release_qualifier
@@ -2253,11 +2470,17 @@ async def _resolve_metrics_integrity_criteria(
         if _names_metrics_integrity_sweep(crit.text):
             targets[crit.id] = crit
 
-    # Rule (b): the criterion is mapped to a direction whose text names the signal.
+    # Rule (b): the criterion is mapped to an ACTIVE direction whose text names the signal.
+    # Non-active directions (paused, staged, proposed, retired, etc.) are inert here:
+    # their historical prose must not trigger probe evidence on the open version.
     dir_result = await session.execute(
         select(Direction).where(Direction.project_id == version.project_id)
     )
     for direction in dir_result.scalars().all():
+        if not direction_matches_criterion_release_version(direction, version):
+            continue
+        if direction.status != "active":
+            continue
         direction_text = direction.text
         if not direction_text and isinstance(direction.data, dict):
             direction_text = direction.data.get("text")
@@ -2499,18 +2722,23 @@ async def _classify_stuck_reasons(
     session: AsyncSession,
     project_id: uuid.UUID,
     uncovered_keys: list[str],
+    release_version: Any,
 ) -> dict[str, str | None]:
     """Diagnose WHY each uncovered criterion is uncovered.
 
     Returns a mapping ``criterion_key -> stuck_reason`` where ``stuck_reason`` is:
 
-      ``"no_mapping"``        — no Direction in the project lists this key in its
-                                ``criterion_keys``;
-      ``"direction_retired"`` — at least one Direction maps this key but *every*
-                                mapping Direction has a retired status
-                                (``expired``/``retired``/``superseded``/``completed``);
-      ``None``                — at least one *active* (non-retired) Direction maps
-                                this key, so the criterion is in-progress, not stuck.
+      ``"no_mapping"``          — no Direction in the project lists this key in its
+                                  ``criterion_keys``;
+      ``"direction_retired"``   — at least one Direction maps this key but *every*
+                                  mapping Direction has a retired status
+                                  (``expired``/``retired``/``superseded``/``completed``);
+      ``"direction_inactive"``  — at least one Direction maps this key but none is
+                                  ``active`` and not all are retired — i.e. every mapping
+                                  Direction is paused, staged, proposed, or another
+                                  non-active, non-retired state;
+      ``None``                  — at least one *active* Direction maps this key, so
+                                  the criterion is in-progress, not stuck.
 
     A single bulk query fetches every project Direction, then classification
     happens in Python — no N+1. The empty-``criterion_keys`` filter and the
@@ -2531,6 +2759,8 @@ async def _classify_stuck_reasons(
     # Directions with an empty criterion_keys list contribute nothing.
     key_statuses: dict[str, set[str]] = defaultdict(set)
     for direction in directions:
+        if not direction_matches_criterion_release_version(direction, release_version):
+            continue
         keys = direction.criterion_keys or []
         for key in keys:
             key_statuses[key].add(direction.status)
@@ -2540,11 +2770,53 @@ async def _classify_stuck_reasons(
         statuses = key_statuses.get(key)
         if not statuses:
             reasons[key] = "no_mapping"
+        elif statuses & _ACTIVE_DIRECTION_STATUSES:
+            reasons[key] = None
         elif statuses <= _RETIRED_DIRECTION_STATUSES:
             reasons[key] = "direction_retired"
         else:
-            reasons[key] = None
+            reasons[key] = "direction_inactive"
     return reasons
+
+
+async def get_unmapped_active_criterion_keys(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    release_version_id: uuid.UUID,
+) -> list[str]:
+    """Return criterion_keys of ACTIVE criteria not linked to any Direction.
+
+    An active criterion is unmapped when no Direction in the project lists its
+    key in ``Direction.criterion_keys``.  Unmapped criteria are structurally
+    guaranteed to never accumulate merge evidence via
+    :func:`record_task_merge_evidence` — that function only writes evidence for
+    criteria carried on the task itself or inherited from its direction's
+    ``criterion_keys``.  This helper surfaces the unmapped set so callers
+    (health sweeps, API endpoints, diagnostics) can flag the gap without going
+    through the full coverage-summary query.
+
+    Returns a sorted list of criterion_key strings (empty list when all active
+    criteria are mapped or when there are no active criteria).
+    """
+    key_result = await session.execute(
+        select(VersionAcceptanceCriterion.criterion_key).where(
+            VersionAcceptanceCriterion.release_version_id == release_version_id,
+            VersionAcceptanceCriterion.status == "active",
+        )
+    )
+    active_keys: set[str] = set(key_result.scalars().all())
+    if not active_keys:
+        return []
+
+    dir_result = await session.execute(
+        select(Direction).where(Direction.project_id == project_id)
+    )
+    mapped_keys: set[str] = set()
+    for direction in dir_result.scalars().all():
+        for k in direction.criterion_keys or []:
+            mapped_keys.add(k)
+
+    return sorted(active_keys - mapped_keys)
 
 
 async def get_version_coverage_summary(
@@ -2582,7 +2854,7 @@ async def get_version_coverage_summary(
                     'status': 'active' | 'retracted' | 'superseded',
                     'evidence_count': int,
                     'evidence_truncated': bool,
-                    'stuck_reason': 'no_mapping' | 'direction_retired' | None,
+                    'stuck_reason': 'no_mapping' | 'direction_retired' | 'direction_inactive' | None,
                     'evidence': [ ... ],  # capped provenance preview
                 },
                 ...
@@ -2666,7 +2938,9 @@ async def get_version_coverage_summary(
         counts.get("attested", 0) > 0 or counts.get("backfilled", 0) > 0
     ):
         failed_corroboration = await get_failed_corroboration_keys(
-            session, criteria_in_order[0].project_id
+            session,
+            criteria_in_order[0].project_id,
+            release_version_id=release_version_id,
         )
         if failed_corroboration:
             for criterion in criteria_in_order:
@@ -2681,6 +2955,10 @@ async def get_version_coverage_summary(
                     counts[co] -= 1
                     counts["partial"] = counts.get("partial", 0) + 1
 
+    from app.release_models import ReleaseVersion  # noqa: PLC0415
+
+    _rv = await session.get(ReleaseVersion, release_version_id)
+
     # Diagnose uncovered criteria: which ones are stuck (no active direction) vs.
     # merely in-progress. project_id is derived from a loaded criterion row —
     # every criterion carries it — so the public signature stays unchanged.
@@ -2690,9 +2968,9 @@ async def get_version_coverage_summary(
         if c.status == "active" and coverage_by_criterion[c.id] == "uncovered"
     ]
     stuck_reasons: dict[str, str | None] = {}
-    if uncovered_keys:
+    if uncovered_keys and _rv is not None:
         stuck_reasons = await _classify_stuck_reasons(
-            session, criteria_in_order[0].project_id, uncovered_keys
+            session, criteria_in_order[0].project_id, uncovered_keys, _rv
         )
 
     stuck_count = 0
@@ -2721,17 +2999,18 @@ async def get_version_coverage_summary(
             }
         )
 
-    from app.release_models import ReleaseVersion  # noqa: PLC0415
-
-    _rv = await session.get(ReleaseVersion, release_version_id)
     merge_evidence_gaps = _rv.merge_evidence_gaps if _rv is not None else None
 
-    # Drift guard: reconcile criterion keys referenced in strategic prose against
-    # the criteria actually registered on this version. A zero-criteria version
-    # (or prose citing never-registered keys) otherwise reads PASS at every gate
-    # with no warning — the "phantom bookkeeping" failure this surfaces loud.
-    # Reuses the already-loaded criteria rows (no extra query); registered =
-    # ACTIVE criterion keys, matching the count-clearing coverage gate.
+    # Drift guard: reconcile criterion keys referenced in eligible strategic prose
+    # against criteria registered on this version. A zero-criteria version (or
+    # prose citing never-registered keys) otherwise reads PASS at every gate with
+    # no warning — the "phantom bookkeeping" failure this surfaces loud.
+    # This consumes mutable project state, so it is meaningful only for the
+    # project's current open release. Historical summaries must remain stable
+    # when today's focus or directions change. Within the open release every
+    # eligible reference is reconciled against that release alone: a key that
+    # exists only on a prior release is still dangling current-release prose,
+    # not harmless history.
     phantom_bookkeeping = {
         "phantom_keys": [],
         "zero_registered": False,
@@ -2739,26 +3018,31 @@ async def get_version_coverage_summary(
         "referenced_keys": [],
         "registered_count": 0,
     }
-    if _rv is not None:
+    if _rv is not None and _rv.status == "open":
         try:
             from app.models import Project  # noqa: PLC0415 — avoid import cycle
+            from app.release_version import current_open_version  # noqa: PLC0415
 
-            _project = await session.get(Project, _rv.project_id)
-            registered_keys = {
-                c.criterion_key
-                for c in criteria_in_order
-                if c.status == "active"
-            }
-            referenced_keys = (
-                _gather_referenced_criterion_keys(_project)
-                if _project is not None
-                else set()
-            )
-            phantom_bookkeeping = reconcile_criterion_key_references(
-                registered_keys, referenced_keys
-            )
-            phantom_bookkeeping["referenced_keys"] = sorted(referenced_keys)
-            phantom_bookkeeping["registered_count"] = len(registered_keys)
+            current_version = await current_open_version(session, _rv.project_id)
+            if current_version is not None and current_version.id == _rv.id:
+                _project = await session.get(Project, _rv.project_id)
+                registered_keys = {
+                    c.criterion_key
+                    for c in criteria_in_order
+                    if c.status == "active"
+                }
+                referenced_keys = (
+                    await _gather_referenced_criterion_keys(
+                        session, _project, current_version
+                    )
+                    if _project is not None
+                    else set()
+                )
+                phantom_bookkeeping = reconcile_criterion_key_references(
+                    registered_keys, referenced_keys
+                )
+                phantom_bookkeeping["referenced_keys"] = sorted(referenced_keys)
+                phantom_bookkeeping["registered_count"] = len(registered_keys)
         except Exception:  # noqa: BLE001 — best-effort drift signal, never blocks
             logger.exception(
                 "phantom-bookkeeping drift guard failed for version %s",
@@ -2787,6 +3071,8 @@ async def get_version_coverage_summary(
 async def get_failed_corroboration_keys(
     session: AsyncSession,
     project_id: uuid.UUID,
+    *,
+    release_version_id: uuid.UUID | None = None,
 ) -> set[str]:
     """Return criterion_keys whose corroboration task has FAILED or been
     CANCELLED **and** no newer non-terminal task exists for the same key.
@@ -2794,8 +3080,8 @@ async def get_failed_corroboration_keys(
     A corroboration task is spawned for both lower-confidence coverage tiers —
     operator attestation and unverified-merge backfill (see
     :func:`spawn_corroboration_task`).  This function is provenance-agnostic: it
-    keys purely on ``context["corroboration_of"]``, so it returns keys for a
-    failed verification regardless of which tier spawned it.
+    keys on ``context["corroboration_of"]``. When ``release_version_id`` is
+    supplied, only tasks carrying that persisted version binding participate.
 
     When such a ``Verify: {criterion_key}`` task ends in FAILED or CANCELLED
     status, the lower-confidence coverage should no longer be fully trusted — the
@@ -2834,12 +3120,19 @@ async def get_failed_corroboration_keys(
     # being laundered into a key by the ``->>`` text cast.
     corroboration_key = Task.context["corroboration_of"]
     corroboration_key_text = corroboration_key.as_string()
+    version_conditions = []
+    if release_version_id is not None:
+        version_conditions.append(
+            Task.context[CRITERION_RELEASE_VERSION_CONTEXT_KEY].as_string()
+            == str(release_version_id)
+        )
 
     result = await session.execute(
         select(corroboration_key).where(
             Task.project_id == project_id,
             Task.status.in_([TaskStatus.FAILED, TaskStatus.CANCELLED]),
             corroboration_key_text.isnot(None),
+            *version_conditions,
         )
     )
     failed: set[str] = {key for (key,) in result.all() if isinstance(key, str)}
@@ -2857,6 +3150,7 @@ async def get_failed_corroboration_keys(
                     [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
                 ),
                 corroboration_key_text.isnot(None),
+                *version_conditions,
             )
         )
         for (key,) in active_result.all():
@@ -2873,6 +3167,8 @@ async def spawn_corroboration_task(
     criterion_text: str,
     reason: str,
     spawned_by: str = "operator_attestation",
+    *,
+    release_version_id: uuid.UUID,
 ) -> None:
     """Spawn a research task to investigate and earn real coverage for a criterion.
 
@@ -2911,6 +3207,8 @@ async def spawn_corroboration_task(
                 Task.status.not_in(
                     [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
                 ),
+                Task.context[CRITERION_RELEASE_VERSION_CONTEXT_KEY].as_string()
+                == str(release_version_id),
             )
         )
         if existing.scalars().first() is not None:
@@ -2945,7 +3243,11 @@ async def spawn_corroboration_task(
             project_id=project_id,
             title=f"Verify: {criterion_key}",
             criterion_ids=[criterion_key],
-            context={"corroboration_of": criterion_key, "spawned_by": spawned_by},
+            context={
+                "corroboration_of": criterion_key,
+                "spawned_by": spawned_by,
+                CRITERION_RELEASE_VERSION_CONTEXT_KEY: str(release_version_id),
+            },
             payloads=[
                 {
                     "type": "research",

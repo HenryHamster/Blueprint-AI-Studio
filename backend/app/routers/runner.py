@@ -25,17 +25,20 @@ registered runner (vm_instance_id='runner:{id}', context['runner_target_id']),
 and this endpoint hands those pinned tasks to the polling runner.
 """
 
+import asyncio
+import base64
+import binascii
 import logging
 import math
 import tempfile
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, StrictBool, StrictStr
-from sqlalchemy import select
+from pydantic import BaseModel, Field, StrictBool, StrictStr
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -89,6 +92,16 @@ _MAX_RUNNER_RESULT_METRICS_KEYS = 256
 _MAX_RUNNER_ARTIFACT_BYTES = 25 * 1024 * 1024  # 25 MiB
 # Allowance for multipart framing/headers when early-rejecting on Content-Length.
 _MULTIPART_BODY_MARGIN = 1 * 1024 * 1024  # 1 MiB
+# Non-file scalar field size cap in multipart forms.  Filenames and other
+# metadata are a few hundred bytes at most; 4 KiB is far beyond any legitimate
+# value and bounds the heap impact of a crafted oversized field.
+_MAX_MULTIPART_FIELD_BYTES = 4 * 1024  # 4 KiB
+# Hard upper bound on boundary markers in a multipart body.  A normal
+# viewable upload has 3 parts (filename scalar + file part + trailing
+# close-boundary); capping at 64 prevents a crafted body from growing the
+# offset list without bound.
+_MAX_MULTIPART_PARTS = 64
+_ARTIFACT_TRANSFER_TTL_SECONDS = 60 * 60
 # Interim live-output tail (running reports only). Stamped as
 # polling_metadata["live_output"] — the same key/shape the GCP live-tail path
 # writes (compute_jobs._apply_status_update + agent_compute_jobs heartbeat) and
@@ -116,6 +129,10 @@ _MAX_IMAGE_CACHE_PROJECTS = 64
 # 1 PiB per bucket — far beyond any real image cache, so an absurd runner-reported
 # integer can never poison the telemetry while every plausible value passes.
 _MAX_IMAGE_CACHE_BYTES = 1 << 50
+_PROJECT_VERIFICATION_VERSION = 1
+_MAX_PROJECT_VERIFICATION_REASON_CHARS = 500
+_PROJECT_VERIFICATION_BACKENDS = frozenset({"bwrap", "declined"})
+_PROJECT_VERIFICATION_BOUNDARY_CLASS = "agent"
 
 
 def _sanitize_image_cache_by_project(raw: Any) -> dict | None:
@@ -159,6 +176,92 @@ def _sanitize_image_cache_by_project(raw: Any) -> dict | None:
         "by_project": by_project,
         "unattributed_bytes": _clamp_bytes(raw.get("unattributed_bytes")),
         "unattributed_image_count": _clamp_count(raw.get("unattributed_image_count")),
+    }
+
+
+def _sanitize_project_verification(raw: Any) -> dict | None:
+    """Normalize untrusted versioned boundary proof; never trust aggregate ready."""
+    if not isinstance(raw, dict):
+        return None
+
+    raw_version = raw.get("version")
+    version = (
+        max(0, min(1_000_000, raw_version))
+        if isinstance(raw_version, int) and not isinstance(raw_version, bool)
+        else 0
+    )
+    raw_boundary = raw.get("boundary")
+    boundary_class = "unknown"
+    boundary_backend = "unknown"
+    if isinstance(raw_boundary, dict):
+        candidate_class = raw_boundary.get("class")
+        if candidate_class == _PROJECT_VERIFICATION_BOUNDARY_CLASS:
+            boundary_class = candidate_class
+        candidate = raw_boundary.get("backend")
+        if (
+            isinstance(candidate, str)
+            and candidate.strip() in _PROJECT_VERIFICATION_BACKENDS
+        ):
+            boundary_backend = candidate.strip()
+
+    raw_probes = raw.get("probes")
+    raw_probes = raw_probes if isinstance(raw_probes, dict) else {}
+
+    def _probe(name: str) -> dict:
+        value = raw_probes.get(name)
+        value = value if isinstance(value, dict) else {}
+        raw_exit = value.get("exit_code")
+        valid_exit_code = (
+            isinstance(raw_exit, int)
+            and not isinstance(raw_exit, bool)
+            and 0 <= raw_exit <= 255
+        )
+        exit_code = raw_exit if valid_exit_code else None
+        passed = value.get("ok") is True and exit_code == 0
+        raw_reason = value.get("reason")
+        reason = (
+            raw_reason.strip()[:_MAX_PROJECT_VERIFICATION_REASON_CHARS]
+            if isinstance(raw_reason, str) and raw_reason.strip()
+            else None
+        )
+        if not passed and reason is None:
+            reason = (
+                f"{name} probe reported an invalid exit code"
+                if raw_exit is not None and not valid_exit_code
+                else f"{name} probe did not provide zero-exit evidence"
+            )
+        return {"ok": passed, "exit_code": exit_code, "reason": reason}
+
+    ruff = _probe("ruff")
+    docker_postgres = _probe("docker_postgres")
+    ready = bool(
+        version == _PROJECT_VERIFICATION_VERSION
+        and boundary_class == _PROJECT_VERIFICATION_BOUNDARY_CLASS
+        and boundary_backend == "bwrap"
+        and ruff["ok"]
+        and docker_postgres["ok"]
+    )
+    reasons: list[str] = []
+    if version != _PROJECT_VERIFICATION_VERSION:
+        reasons.append(f"unsupported project verification version {version}")
+    if boundary_class != _PROJECT_VERIFICATION_BOUNDARY_CLASS:
+        reasons.append("write-agent boundary class was not agent")
+    if boundary_backend != "bwrap":
+        reasons.append("write-agent bwrap boundary was not available")
+    reasons.extend(
+        result["reason"]
+        for result in (ruff, docker_postgres)
+        if not result["ok"] and result["reason"]
+    )
+    aggregate_reason = "; ".join(dict.fromkeys(reasons))
+    return {
+        "version": version,
+        "boundary": {"class": boundary_class, "backend": boundary_backend},
+        "ready": ready,
+        "reason": None
+        if ready
+        else aggregate_reason[:_MAX_PROJECT_VERIFICATION_REASON_CHARS],
+        "probes": {"ruff": ruff, "docker_postgres": docker_postgres},
     }
 # _RUNNER_LIVENESS_SECONDS is imported from runner_health_monitors (SSOT) above.
 
@@ -467,6 +570,10 @@ class HeartbeatRequest(BaseModel):
     isolation_backends: dict | None = None
     agent_backend: str | None = None
     compute_backend: str | None = None
+    # Versioned functional evidence for project-authoring verification. Kept raw
+    # here so a future runner version cannot turn the whole liveness heartbeat
+    # into a 422; the handler normalizes known v1 fields and fails closed.
+    project_verification: Any = None
     # LLM CLI inventory: {"claude": {"present": bool, "version": str}, ...}
     # Probed and sent by the runner each heartbeat; persisted in capabilities JSONB
     # so the orchestrator can filter pool LLM runtimes to clis the runner has.
@@ -1302,6 +1409,29 @@ async def decline_task(
     return {"ok": True, "decline_count": total_declines}
 
 
+async def _acknowledge_authenticated_token_generation(
+    session: AsyncSession,
+    *,
+    runner_id: uuid.UUID,
+    authenticated_generation: int,
+) -> None:
+    """CAS the heartbeat credential acknowledgement against the current row.
+
+    Rotation and heartbeat both update the runner row. The generation predicate
+    ensures a heartbeat authenticated before rotation cannot acknowledge the
+    replacement credential even if its handler reaches this write afterward.
+    """
+    await session.execute(
+        update(LocalRunner)
+        .where(
+            LocalRunner.id == runner_id,
+            LocalRunner.token_generation == authenticated_generation,
+        )
+        .values(last_heartbeat_token_generation=authenticated_generation)
+        .execution_options(synchronize_session=False)
+    )
+
+
 @router.post("/heartbeat")
 async def heartbeat(
     payload: HeartbeatRequest,
@@ -1318,6 +1448,10 @@ async def heartbeat(
     if not allowed:
         raise HTTPException(status_code=429, headers={"Retry-After": str(retry_after)})
 
+    # Capture the generation authenticated by get_current_runner. The final
+    # compare-and-set below acknowledges it only if rotation has not changed the
+    # row's current generation while this request was in flight.
+    authenticated_token_generation = runner.token_generation
     previous_status = runner.status
     previous_hostname = runner.hostname
     previous_version = runner.version
@@ -1398,6 +1532,16 @@ async def heartbeat(
         caps["agent_backend"] = payload.agent_backend
     if payload.compute_backend is not None:
         caps["compute_backend"] = payload.compute_backend
+    sanitized_verification = _sanitize_project_verification(
+        payload.project_verification
+    )
+    if sanitized_verification is not None:
+        caps["project_verification"] = sanitized_verification
+    elif payload.active_work_report:
+        # A genuine daemon heartbeat without fresh evidence must not retain proof
+        # earned by a prior/newer runner binary. Old runners remain heartbeat-
+        # compatible but are verification-incapable until they report v1.
+        caps.pop("project_verification", None)
     if payload.has_gpu is not None:
         caps["has_gpu"] = payload.has_gpu
     if payload.gpu_count is not None:
@@ -1528,6 +1672,12 @@ async def heartbeat(
         runner.version = new_version
     runner.capabilities = caps
     session.add(runner)
+    await session.flush()
+    await _acknowledge_authenticated_token_generation(
+        session,
+        runner_id=runner_id,
+        authenticated_generation=authenticated_token_generation,
+    )
     await session.commit()
     # Append one time-series snapshot of this heartbeat's telemetry. Best-effort
     # and AFTER the runner commit — the capabilities dict on the LocalRunner row
@@ -1723,6 +1873,10 @@ class ComputeJobReportRequest(BaseModel):
     # operator can SEE the run resumed (and from where / how much), or that the
     # hydration failed — never claimed when it did not happen.
     resume_hydration: Dict[str, Any] | None = None
+    # Explicit durable-delivery outcome from new runners. The command's true
+    # exit outcome remains in runner_exec_status; this marker independently says
+    # whether its checkpoint bundle reached verified storage.
+    artifact_delivery: Dict[str, Any] | None = None
 
 
 @router.post("/next-compute-job")
@@ -1846,6 +2000,11 @@ async def next_compute_job(
                 job.id,
             )
 
+    task = await session.get(Task, job.task_id) if job.task_id is not None else None
+    require_durable_artifact = (
+        task is not None
+        and (task.first_payload or {}).get("require_durable_artifact") is True
+    )
     return {
         "job_id": str(job.id),
         # The job's OWNING project (not the runner's enrollment project — a
@@ -1870,6 +2029,7 @@ async def next_compute_job(
         # predecessor's durable bundle and extracts it into the artifact dir
         # before spawning the subprocess. Validated at create_compute_job time.
         "input_artifact_job_id": refreshed_meta.get("input_artifact_job_id"),
+        "require_durable_artifact": require_durable_artifact,
     }
 
 
@@ -2032,8 +2192,11 @@ async def report_compute_job(
                         meta,
                         metric=rec["metric"],
                         value=rec["value"],
-                        t=rec.get("ts") or now.isoformat(),
-                        received_at=now,
+                        # Runner payload timestamps are sandbox-authored.  They are
+                        # useful display data in `progress`, but watchdog timing
+                        # must use the server receipt time so a job cannot extend
+                        # or backdate its own protection window.
+                        t=now.isoformat(),
                     )
         if payload.exec_status in ("succeeded", "failed"):
             meta["runner_finished_at"] = now.isoformat()
@@ -2068,6 +2231,34 @@ async def report_compute_job(
             if provenance:
                 provenance["recorded_at"] = now.isoformat()
                 meta["resume_provenance"] = provenance
+        if (
+            payload.exec_status in ("succeeded", "failed")
+            and isinstance(payload.artifact_delivery, dict)
+        ):
+            raw_delivery = payload.artifact_delivery
+            delivery: Dict[str, Any] = {}
+            status_value = raw_delivery.get("status")
+            if status_value in ("delivered", "failed", "not_produced"):
+                delivery["status"] = status_value
+            protocol = raw_delivery.get("protocol")
+            if protocol in ("direct", "legacy", "none"):
+                delivery["protocol"] = protocol
+            command_status = raw_delivery.get("command_exec_status")
+            if command_status in ("succeeded", "failed"):
+                delivery["command_exec_status"] = command_status
+            if isinstance(raw_delivery.get("verified"), bool):
+                delivery["verified"] = raw_delivery["verified"]
+            for key in ("file_count", "total_bytes", "archive_size"):
+                value = raw_delivery.get(key)
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                    delivery[key] = value
+            for key, limit in (("reason", 256), ("crc32c", 16), ("generation", 128)):
+                value = raw_delivery.get(key)
+                if isinstance(value, str) and value.strip():
+                    delivery[key] = value.strip()[:limit]
+            if delivery:
+                delivery["recorded_at"] = now.isoformat()
+                meta["artifact_delivery"] = delivery
         job.polling_metadata = meta
         job.last_heartbeat_at = now
         job.updated_at = now
@@ -2133,6 +2324,10 @@ def _parse_multipart_form(body: bytes, content_type: str) -> tuple[dict, dict]:
         if filename is not None:
             files[name] = content
         else:
+            if len(content) > _MAX_MULTIPART_FIELD_BYTES:
+                raise ValueError(
+                    f"non-file field {name!r} exceeds {_MAX_MULTIPART_FIELD_BYTES} byte limit"
+                )
             fields[name] = content
     return fields, files
 
@@ -2167,6 +2362,8 @@ def _parse_multipart_form_stream(
     *,
     read_chunk: int = 1024 * 1024,
     header_window: int = 64 * 1024,
+    max_parts: int = _MAX_MULTIPART_PARTS,
+    max_field_bytes: int = _MAX_MULTIPART_FIELD_BYTES,
 ) -> tuple[dict, dict | None]:
     """Memory-bounded multipart parse over a SEEKABLE binary file.
 
@@ -2215,6 +2412,10 @@ def _parse_multipart_form_stream(
             if idx == -1:
                 break
             positions.append(base + idx)
+            if len(positions) > max_parts:
+                raise ValueError(
+                    f"multipart body contains more than {max_parts} boundary markers"
+                )
             search_from = idx + dlen
         keep = min(len(buf), overlap)
         base += len(buf) - keep
@@ -2262,10 +2463,273 @@ def _parse_multipart_form_stream(
                     "length": length,
                 }
         else:
+            if length > max_field_bytes:
+                raise ValueError(
+                    f"non-file field {name!r} exceeds {max_field_bytes} byte limit"
+                )
             fileobj.seek(content_start)
             fields[name] = fileobj.read(length)
 
     return fields, file_part
+
+
+class ArtifactTransferAuthorizeRequest(BaseModel):
+    archive_size: int = Field(gt=0)
+    crc32c: StrictStr
+    file_count: int = Field(ge=0)
+    total_bytes: int = Field(ge=0)
+
+
+class ArtifactTransferCompleteRequest(BaseModel):
+    transfer_id: uuid.UUID
+    generation: StrictStr
+
+
+async def _finalize_artifact_transfer_failure(
+    session: AsyncSession,
+    scope: tuple,
+    transfer_id: uuid.UUID,
+    reason: str,
+    *,
+    expected_status: str,
+) -> None:
+    """Fail a current transfer only from the state that initiated this operation."""
+    result = await session.execute(
+        select(ComputeJob)
+        .where(*scope)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    job = result.scalars().first()
+    if job is None:
+        return
+    meta = dict(job.polling_metadata or {})
+    current = meta.get("runner_artifact_transfer")
+    if (
+        not isinstance(current, dict)
+        or current.get("transfer_id") != str(transfer_id)
+        or current.get("status") != expected_status
+    ):
+        return
+    meta["runner_artifact_transfer"] = {
+        **current,
+        "status": "failed",
+        "failure_reason": reason,
+        "failed_at": _utcnow().isoformat(),
+    }
+    job.polling_metadata = meta
+    job.updated_at = _utcnow()
+    session.add(job)
+    await session.commit()
+
+
+@router.post("/compute-job/{job_id}/artifact-transfer")
+async def authorize_compute_job_artifact_upload(
+    job_id: uuid.UUID,
+    payload: ArtifactTransferAuthorizeRequest,
+    runner: LocalRunner = Depends(get_current_runner),
+    session: AsyncSession = Depends(get_session),
+):
+    """Authorize a large bundle to bypass Cloud Run and upload to exact GCS object."""
+    allowed, retry_after = await check_runner_rate_limit(
+        str(runner.id), "authorize_compute_job_artifact_upload"
+    )
+    if not allowed:
+        raise HTTPException(status_code=429, headers={"Retry-After": str(retry_after)})
+    checksum = payload.crc32c.strip()
+    try:
+        decoded_checksum = base64.b64decode(checksum, validate=True)
+    except (binascii.Error, ValueError):
+        decoded_checksum = b""
+    if len(decoded_checksum) != 4:
+        raise HTTPException(status_code=422, detail="crc32c must be a non-empty base64 checksum")
+
+    allowed_projects = await allowed_project_ids(session, runner)
+    scope = (
+        ComputeJob.id == job_id,
+        ComputeJob.project_id.in_(allowed_projects),
+        ComputeJob.backend == RUNNER_SUBPROCESS_BACKEND_NAME,
+        ComputeJob.polling_metadata["runner_target_id"].as_string() == str(runner.id),
+    )
+    result = await session.execute(select(ComputeJob).where(*scope).with_for_update())
+    job = result.scalars().first()
+    if job is None:
+        raise HTTPException(status_code=404, detail="compute job not found")
+    meta = dict(job.polling_metadata or {})
+    if job.status in _COMPUTE_JOB_TERMINAL_STATUSES and meta.get("runner_artifact") is not None:
+        raise HTTPException(status_code=409, detail="compute job is finalized — its artifact evidence is immutable")
+    transfer_id = uuid.uuid4()
+    expires_at = _utcnow() + timedelta(seconds=_ARTIFACT_TRANSFER_TTL_SECONDS)
+    meta["runner_artifact_transfer"] = {
+        "transfer_id": str(transfer_id),
+        "archive_size": payload.archive_size,
+        "crc32c": checksum,
+        "file_count": payload.file_count,
+        "total_bytes": payload.total_bytes,
+        "expires_at": expires_at.isoformat(),
+        "status": "authorizing",
+    }
+    job.polling_metadata = meta
+    job.updated_at = _utcnow()
+    session.add(job)
+    await session.commit()
+
+    # IAM credential refresh/signBlob can involve network I/O.  The attempt is
+    # reserved above, but no row lock or transaction is held while it runs.
+    try:
+        authorization = await app_storage.authorize_compute_job_artifact_transfer(
+            job_id, transfer_id, expires_at=expires_at
+        )
+    except Exception as exc:
+        logger.warning("Artifact transfer authorization failed for %s", job_id, exc_info=True)
+        await _finalize_artifact_transfer_failure(
+            session,
+            scope,
+            transfer_id,
+            "authorization_failed",
+            expected_status="authorizing",
+        )
+        raise HTTPException(status_code=503, detail="artifact persistence authorization failed") from exc
+
+    result = await session.execute(
+        select(ComputeJob)
+        .where(*scope)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    job = result.scalars().first()
+    if job is None:
+        raise HTTPException(status_code=404, detail="compute job not found")
+    meta = dict(job.polling_metadata or {})
+    current = meta.get("runner_artifact_transfer")
+    if not isinstance(current, dict) or current.get("transfer_id") != str(transfer_id):
+        raise HTTPException(status_code=409, detail="artifact transfer was superseded")
+    if job.status in _COMPUTE_JOB_TERMINAL_STATUSES and meta.get("runner_artifact") is not None:
+        meta["runner_artifact_transfer"] = {
+            **current,
+            "status": "failed",
+            "failure_reason": "evidence_finalized",
+            "failed_at": _utcnow().isoformat(),
+        }
+        job.polling_metadata = meta
+        job.updated_at = _utcnow()
+        session.add(job)
+        await session.commit()
+        raise HTTPException(status_code=409, detail="compute job is finalized — its artifact evidence is immutable")
+    meta["runner_artifact_transfer"] = {**current, "status": "authorized"}
+    job.polling_metadata = meta
+    job.updated_at = _utcnow()
+    session.add(job)
+    await session.commit()
+    return {"ok": True, "transfer_id": str(transfer_id), **authorization}
+
+
+@router.post("/compute-job/{job_id}/artifact-transfer/complete")
+async def complete_compute_job_artifact_upload(
+    job_id: uuid.UUID,
+    payload: ArtifactTransferCompleteRequest,
+    runner: LocalRunner = Depends(get_current_runner),
+    session: AsyncSession = Depends(get_session),
+):
+    """Verify direct-upload metadata before stamping durable runner evidence."""
+    allowed, retry_after = await check_runner_rate_limit(
+        str(runner.id), "complete_compute_job_artifact_upload"
+    )
+    if not allowed:
+        raise HTTPException(status_code=429, headers={"Retry-After": str(retry_after)})
+    allowed_projects = await allowed_project_ids(session, runner)
+    scope = (
+        ComputeJob.id == job_id,
+        ComputeJob.project_id.in_(allowed_projects),
+        ComputeJob.backend == RUNNER_SUBPROCESS_BACKEND_NAME,
+        ComputeJob.polling_metadata["runner_target_id"].as_string() == str(runner.id),
+    )
+    result = await session.execute(select(ComputeJob).where(*scope))
+    job = result.scalars().first()
+    if job is None:
+        raise HTTPException(status_code=404, detail="compute job not found")
+    pending = (job.polling_metadata or {}).get("runner_artifact_transfer")
+    if not isinstance(pending, dict) or pending.get("transfer_id") != str(payload.transfer_id):
+        raise HTTPException(status_code=409, detail="artifact transfer is not current")
+    existing = (job.polling_metadata or {}).get("runner_artifact")
+    if pending.get("status") == "verified" and isinstance(existing, dict):
+        if (
+            existing.get("transfer_id") == str(payload.transfer_id)
+            and existing.get("generation") == payload.generation
+        ):
+            return {"ok": True, "runner_artifact": existing}
+        raise HTTPException(status_code=409, detail="artifact evidence is immutable")
+    if pending.get("status") != "authorized":
+        raise HTTPException(status_code=409, detail="artifact transfer is not completable")
+    try:
+        verified = await app_storage.verify_compute_job_artifact_transfer(job_id, payload.transfer_id)
+    except Exception as exc:
+        logger.warning("Artifact transfer verification failed for %s", job_id, exc_info=True)
+        await _finalize_artifact_transfer_failure(
+            session,
+            scope,
+            payload.transfer_id,
+            "verification_unavailable",
+            expected_status="authorized",
+        )
+        raise HTTPException(status_code=503, detail="artifact persistence verification failed") from exc
+    if (
+        verified["size"] != pending.get("archive_size")
+        or verified.get("crc32c") != pending.get("crc32c")
+        or verified.get("generation") != payload.generation
+    ):
+        await _finalize_artifact_transfer_failure(
+            session,
+            scope,
+            payload.transfer_id,
+            "metadata_mismatch",
+            expected_status="authorized",
+        )
+        raise HTTPException(status_code=409, detail="artifact size, checksum, or generation verification failed")
+
+    result = await session.execute(
+        select(ComputeJob).where(*scope).with_for_update().execution_options(populate_existing=True)
+    )
+    job = result.scalars().first()
+    if job is None:
+        raise HTTPException(status_code=404, detail="compute job not found")
+    meta = dict(job.polling_metadata or {})
+    current = meta.get("runner_artifact_transfer")
+    if not isinstance(current, dict) or current.get("transfer_id") != str(payload.transfer_id):
+        raise HTTPException(status_code=409, detail="artifact transfer was superseded")
+    existing = meta.get("runner_artifact")
+    if current.get("status") == "verified" and isinstance(existing, dict):
+        if (
+            existing.get("transfer_id") == str(payload.transfer_id)
+            and existing.get("generation") == payload.generation
+        ):
+            return {"ok": True, "runner_artifact": existing}
+        raise HTTPException(status_code=409, detail="artifact evidence is immutable")
+    if current.get("status") != "authorized":
+        raise HTTPException(status_code=409, detail="artifact transfer is not completable")
+    if existing is not None:
+        if existing.get("generation") == verified["generation"] and existing.get("uri") == verified["uri"]:
+            return {"ok": True, "runner_artifact": existing}
+        raise HTTPException(status_code=409, detail="artifact evidence is immutable")
+    artifact_info = {
+        "kind": "runner_artifact",
+        "uri": verified["uri"],
+        "file_count": current["file_count"],
+        "total_bytes": current["total_bytes"],
+        "stored": True,
+        "verified": True,
+        "size": verified["size"],
+        "crc32c": verified["crc32c"],
+        "generation": verified["generation"],
+        "transfer_id": str(payload.transfer_id),
+    }
+    meta["runner_artifact"] = artifact_info
+    meta["runner_artifact_transfer"] = {**current, "status": "verified", "verified_at": _utcnow().isoformat()}
+    job.polling_metadata = meta
+    job.updated_at = _utcnow()
+    session.add(job)
+    await session.commit()
+    return {"ok": True, "runner_artifact": artifact_info}
 
 
 @router.post("/compute-job/{job_id}/artifact")
@@ -2389,6 +2853,8 @@ async def upload_compute_job_artifact(
     artifact_info = await store_runner_artifact(
         session, job, archive_bytes, file_count, total_bytes
     )
+    if not artifact_info.get("stored"):
+        raise HTTPException(status_code=503, detail="artifact persistence failed")
 
     # Brief lock: re-read the FRESH row, then stamp. populate_existing refreshes
     # the identity-map instance so the stamp merges over anything a concurrent
@@ -2440,6 +2906,7 @@ async def upload_compute_job_artifact(
 @router.get("/compute-job/{job_id}/input-artifact")
 async def download_compute_job_input_artifact(
     job_id: uuid.UUID,
+    direct: bool = False,
     runner: LocalRunner = Depends(get_current_runner),
     session: AsyncSession = Depends(get_session),
 ):
@@ -2491,12 +2958,43 @@ async def download_compute_job_input_artifact(
     # this runner's allow-list before we stream any bytes (launch-time validation
     # already enforced same-project, but re-check in case the row changed).
     source_job = await session.get(ComputeJob, source_id)
-    if source_job is None or source_job.project_id not in allowed_projects:
+    if source_job is None or source_job.project_id != job.project_id:
         raise HTTPException(status_code=404, detail="resume source not found")
 
     from app import storage
 
-    bundle = await storage.download_compute_job_artifact_bundle(source_id)
+    source_artifact = (source_job.polling_metadata or {}).get("runner_artifact")
+    artifact_uri = source_artifact.get("uri") if isinstance(source_artifact, dict) else None
+    if isinstance(artifact_uri, str) and storage.compute_job_id_for_artifact_uri(artifact_uri) != source_id:
+        # A stamped URI must resolve back to the exact predecessor row.  Never
+        # sign or proxy a malformed/cross-job reference, even within one project.
+        raise HTTPException(status_code=404, detail="resume source bundle not found")
+    if direct:
+        if not isinstance(source_artifact, dict) or not source_artifact.get("stored"):
+            raise HTTPException(status_code=404, detail="resume source bundle not found")
+        if not isinstance(artifact_uri, str):
+            raise HTTPException(status_code=404, detail="resume source bundle not found")
+        try:
+            download_url = await storage.generate_compute_job_artifact_uri_download_signed_url(
+                artifact_uri
+            )
+        except Exception as exc:
+            logger.warning("Direct artifact download authorization failed", exc_info=True)
+            raise HTTPException(status_code=503, detail="resume source authorization failed") from exc
+        return {
+            "download_url": download_url,
+            "expires_in_seconds": 3600,
+            "size": source_artifact.get("size"),
+            "crc32c": source_artifact.get("crc32c"),
+            "generation": source_artifact.get("generation"),
+        }
+
+    if isinstance(artifact_uri, str):
+        bundle = await storage.download_compute_job_artifact_uri(artifact_uri)
+    else:
+        # Older artifacts predate stamped exact-object URIs and use the fixed
+        # per-job bundle path.  Keep that authenticated compatibility path.
+        bundle = await storage.download_compute_job_artifact_bundle(source_id)
     if not bundle:
         raise HTTPException(status_code=404, detail="resume source bundle not found")
 
@@ -2548,11 +3046,17 @@ async def upload_compute_job_viewable(
     spool = tempfile.SpooledTemporaryFile(max_size=spool_threshold)
     try:
         received = 0
+        chunk_count = 0
         async for chunk in request.stream():
             received += len(chunk)
             if received > max_body_bytes:
                 raise HTTPException(status_code=413, detail="viewable file body exceeds upload cap")
             spool.write(chunk)
+            chunk_count += 1
+            # Yield the event loop every 64 chunks (~64 MiB at default chunk size)
+            # so a large video upload cannot monopolize it during body ingestion.
+            if chunk_count % 64 == 0:
+                await asyncio.sleep(0)
 
         req_content_type = request.headers.get("content-type", "")
 
@@ -2562,26 +3066,46 @@ async def upload_compute_job_viewable(
         # the file part so its bytes never re-enter the heap.
         stream_upload = received > spool_threshold
         file_part: dict | None = None
-        if stream_upload:
-            fields, file_part = _parse_multipart_form_stream(spool, req_content_type)
-            if file_part is None:
-                raise HTTPException(status_code=400, detail="missing 'file' field in multipart form")
-            file_bytes = None
-            file_length = file_part["length"]
-        else:
-            spool.seek(0)
-            raw = spool.read()
-            fields, files = _parse_multipart_form(raw, req_content_type)
-            file_bytes = files.get("file")
-            if file_bytes is None:
-                raise HTTPException(status_code=400, detail="missing 'file' field in multipart form")
-            file_length = len(file_bytes)
+        try:
+            if stream_upload:
+                # Run the synchronous disk-scan in a thread so the event loop
+                # remains responsive while scanning a multi-hundred-MiB body.
+                fields, file_part = await asyncio.to_thread(
+                    _parse_multipart_form_stream, spool, req_content_type
+                )
+                if file_part is None:
+                    raise HTTPException(
+                        status_code=400, detail="missing 'file' field in multipart form"
+                    )
+                file_bytes = None
+                file_length = file_part["length"]
+            else:
+                spool.seek(0)
+                raw = spool.read()
+                fields, files = _parse_multipart_form(raw, req_content_type)
+                file_bytes = files.get("file")
+                if file_bytes is None:
+                    raise HTTPException(
+                        status_code=400, detail="missing 'file' field in multipart form"
+                    )
+                file_length = len(file_bytes)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         if file_length == 0:
             raise HTTPException(status_code=400, detail="empty viewable file body")
 
         raw_filename = (fields.get("filename") or b"").decode("latin-1", "replace").strip()
         if not raw_filename:
             raise HTTPException(status_code=400, detail="missing or empty 'filename' field")
+
+        # New runners stamp one stable token per observed local-file generation
+        # in a header so a response-loss retry does not fabricate another
+        # revision. Legacy runners omit it; the server then creates a fresh token
+        # for every accepted upload, preserving backward compatibility.
+        raw_revision = request.headers.get("x-blueprint-viewable-revision")
+        requested_revision = app_storage.normalize_viewable_revision(raw_revision)
+        if raw_revision is not None and requested_revision is None:
+            raise HTTPException(status_code=422, detail="invalid viewable revision")
 
         # ── Extension-based classification (reuses the terminal path's policy) ──
         type_info = app_storage.viewable_content_type_for_filename(raw_filename)
@@ -2611,9 +3135,10 @@ async def upload_compute_job_viewable(
             )
 
         # ── Flat read: find the job, validate scope + pre-check caps ────────────
+        allowed_projects = await allowed_project_ids(session, runner)
         _job_scope = (
             ComputeJob.id == job_id,
-            ComputeJob.project_id == runner.project_id,
+            ComputeJob.project_id.in_(allowed_projects),
             ComputeJob.backend == RUNNER_SUBPROCESS_BACKEND_NAME,
             ComputeJob.polling_metadata["runner_target_id"].as_string() == str(runner.id),
         )
@@ -2661,21 +3186,26 @@ async def upload_compute_job_viewable(
                 detail=f"viewable file cap ({_MAX_VIEWABLE_FILE_COUNT}) reached for this job",
             )
 
-        # ── Slow GCS upload (no row lock held) ─────────────────────────────────
+        # ── Slow GCS upload to an unreferenced staging object (no row lock) ───
         # A rolled-to-disk video is STREAMED to GCS via a resumable upload (peak
         # memory bounded to the 8 MiB chunk window) rather than buffered whole;
-        # in-memory files use the in-memory upload seam.
+        # in-memory files use the in-memory upload seam.  The canonical URI is
+        # deterministic, so writing it here would let a slow live upload overwrite
+        # the terminal bundle after terminal reconciliation won the row lock.
+        # Promotion to that URI occurs only below, under the lock and after the
+        # terminal re-check.
+        staging_name = f".staging/{uuid.uuid4().hex}/{safe_name}"
         if stream_upload:
             uploaded_uri = await app_storage.upload_compute_job_viewable_stream(
                 job_id,
-                safe_name,
+                staging_name,
                 _FileRangeReader(spool, file_part["start"], file_length),
                 content_type,
                 size=file_length,
             )
         else:
             uploaded_uri = await app_storage.upload_compute_job_viewable_file(
-                job_id, safe_name, file_bytes, content_type,
+                job_id, staging_name, file_bytes, content_type,
             )
         if uploaded_uri is None:
             logger.warning(
@@ -2704,36 +3234,63 @@ async def upload_compute_job_viewable(
     if job.status in _COMPUTE_JOB_TERMINAL_STATUSES:
         logger.warning(
             "[RUNNERS] Compute job %s went terminal while viewable file %r "
-            "upload was in flight — discarding mid-run pointer (file is already "
-            "durable in GCS and will be reconciled by the terminal pass)",
+            "upload was in flight — discarding its unreferenced staging object",
             job_id,
             safe_name,
         )
+        await app_storage.delete_compute_job_viewable_file(job_id, staging_name)
         raise HTTPException(
             status_code=409,
-            detail="compute job went terminal during upload — the file is stored "
-            "and will be picked up by the terminal viewable pipeline",
+            detail="compute job went terminal during upload — live artifact was discarded",
         )
+
+    # The terminal transition cannot interleave this promotion: both paths hold
+    # the job row lock.  Preserve the old uploader seam for deployments/tests
+    # that return a canonical URI even when given a staging basename; production
+    # storage returns the staging URI and therefore takes the promotion branch.
+    expected_canonical_suffix = f"/artifacts/viewable/{safe_name}"
+    canonical_uri = (
+        uploaded_uri
+        if uploaded_uri.endswith(expected_canonical_suffix)
+        else await app_storage.promote_compute_job_viewable_file(
+            job_id, staging_name, safe_name
+        )
+    )
+    if canonical_uri is None:
+        await app_storage.delete_compute_job_viewable_file(job_id, staging_name)
+        raise HTTPException(status_code=502, detail="viewable file promotion to storage failed")
+    uploaded_uri = canonical_uri
 
     meta = dict(job.polling_metadata or {})
 
-    existing_list = meta.get("viewable_files") or []
-    if not isinstance(existing_list, list):
-        existing_list = []
+    raw_existing_list = meta.get("viewable_files") or []
+    if not isinstance(raw_existing_list, list):
+        raw_existing_list = []
+    # Detach nested JSON dicts from the ORM-owned polling_metadata value. A
+    # SAVEPOINT rollback while repairing a missing signing row may expire/restore
+    # the model attribute; mutating its shared list before that rollback would
+    # make the response advertise a new revision while the DB retained the old.
+    existing_list = [
+        dict(item) if isinstance(item, dict) else item
+        for item in raw_existing_list
+    ]
 
     # Dedup by storage_uri: if this relpath was already uploaded (e.g. an
     # overwritten reward_curve.png), update the existing entry in place.
     existing_entry = None
-    for entry in existing_list:
-        if isinstance(entry, dict) and entry.get("storage_uri") == uploaded_uri:
-            existing_entry = entry
+    for manifest_entry in existing_list:
+        if (
+            isinstance(manifest_entry, dict)
+            and manifest_entry.get("storage_uri") == uploaded_uri
+        ):
+            existing_entry = manifest_entry
             break
 
     # Count cap (definitive check under lock). A refresh of an ALREADY-registered
     # relpath updates its entry in place and does not grow the manifest, so it is
     # exempt from the cap — only a NEW file counts against it.
     if existing_entry is None and len(existing_list) >= _MAX_VIEWABLE_FILE_COUNT:
-        # The GCS object we just wrote for this genuinely-new relpath has no
+        # The staged GCS object we just promoted for this genuinely-new relpath has no
         # manifest entry and no ComputeJobFile row; the terminal pass reconciles
         # from the bundle tarball, not from stray viewable/ objects, so it would
         # be orphaned. Best-effort delete it before refusing so a lost cap race
@@ -2745,12 +3302,19 @@ async def upload_compute_job_viewable(
             detail=f"viewable file cap ({_MAX_VIEWABLE_FILE_COUNT}) reached for this job",
         )
 
+    # Reusing the runner's token makes transport retries idempotent. A legacy
+    # upload (no header), or a genuinely changed runner generation, gets a new
+    # identity even when storage_uri and byte size are unchanged.
+    revision = requested_revision or app_storage.new_viewable_revision()
+
     entry: dict[str, Any] = {
         "filename": safe_name,
         "storage_uri": uploaded_uri,
         "content_type": content_type,
         "size_bytes": file_length,
         "kind": kind,
+        "revision": revision,
+        "live": True,
     }
 
     if existing_entry is not None:
@@ -2759,32 +3323,44 @@ async def upload_compute_job_viewable(
         existing_entry.update(entry)
     else:
         existing_list.append(entry)
-        meta["viewable_files"] = existing_list
+    meta["viewable_files"] = existing_list
 
-    # ── Create ComputeJobFile row (idempotent via SAVEPOINT + UNIQUE) ──────
-    # Mirrors the pattern in compute_jobs._record_viewable_job_files: a UNIQUE
-    # (storage_uri) constraint means re-entering a file already registered by a
-    # prior mid-run upload — or later by the terminal pass — is a benign no-op.
-    try:
-        async with session.begin_nested():
-            cjf = ComputeJobFile(
-                compute_job_id=job.id,
-                safe_relpath=safe_name,
-                media_type=kind,
-                storage_uri=uploaded_uri,
-                content_type=content_type,
-                file_size_bytes=file_length,
-            )
-            session.add(cjf)
-            await session.flush()
-    except Exception:  # noqa: BLE001
-        logger.warning(
-            "[RUNNERS] ComputeJobFile insert failed for viewable file %r "
-            "in job=%s — continuing without DB row (file is durable in GCS)",
-            safe_name,
-            job.id,
-            exc_info=True,
+    # ── Create/update ComputeJobFile signing row ───────────────────────────
+    # Reconcile metadata in place for a deterministic URI. This avoids using an
+    # expected UNIQUE violation as control flow on every live refresh and keeps
+    # the row's size/content fields aligned with the latest stored generation.
+    file_row = (
+        await session.execute(
+            select(ComputeJobFile).where(ComputeJobFile.storage_uri == uploaded_uri)
         )
+    ).scalars().first()
+    if file_row is not None:
+        file_row.safe_relpath = safe_name
+        file_row.media_type = kind
+        file_row.content_type = content_type
+        file_row.file_size_bytes = file_length
+        session.add(file_row)
+    else:
+        try:
+            async with session.begin_nested():
+                cjf = ComputeJobFile(
+                    compute_job_id=job.id,
+                    safe_relpath=safe_name,
+                    media_type=kind,
+                    storage_uri=uploaded_uri,
+                    content_type=content_type,
+                    file_size_bytes=file_length,
+                )
+                session.add(cjf)
+                await session.flush()
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "[RUNNERS] ComputeJobFile insert failed for viewable file %r "
+                "in job=%s — continuing without DB row (file is durable in GCS)",
+                safe_name,
+                job.id,
+                exc_info=True,
+            )
 
     # NOTE: We intentionally do NOT set ``viewable_file_count`` in
     # polling_metadata. That key is the idempotency guard for the terminal

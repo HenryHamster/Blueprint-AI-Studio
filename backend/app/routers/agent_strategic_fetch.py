@@ -60,6 +60,9 @@ def _compact_last_qualification(qual: dict[str, Any] | None) -> dict[str, Any] |
 
     keys = (
         "status",
+        "qualification_attempt_id",
+        "retry_episode",
+        "retry_episode_cap",
         "candidate_sha",
         "confidence",
         "threshold",
@@ -165,6 +168,7 @@ def _compact_version_lifecycle(
     *,
     latest_verdict: "QualificationVerdict | None" = None,
     resolved_qualification: "tuple[dict[str, Any] | None, dict[str, Any] | None] | None" = None,
+    qualification_read: Any = None,
 ) -> dict[str, Any]:
     from app.qualification_state_resolver import resolve_effective_qualification_state
     from app.release_artifacts import version_serving_summary
@@ -185,7 +189,10 @@ def _compact_version_lifecycle(
     # without a DB query) and threads it in via ``resolved_qualification`` so the
     # open version agrees with the strategic payload / admin / system-state
     # surfaces. Closed rows keep the cheap sync path (verdict substitution only).
-    if resolved_qualification is not None:
+    if qualification_read is not None:
+        qualification_state = qualification_read.qualification_state
+        verdict_disagreement = qualification_read.disagreement
+    elif resolved_qualification is not None:
         qualification_state, verdict_disagreement = resolved_qualification
     else:
         qualification_state, verdict_disagreement = resolve_effective_qualification_state(
@@ -208,6 +215,14 @@ def _compact_version_lifecycle(
         "promoted_sha": version.promoted_sha,
         "goal_updated_at": _iso(version.goal_updated_at),
         "qualification_attempts": version.qualification_attempts,
+        "qualification_retry_episode": getattr(
+            version, "qualification_retry_episode", 0
+        ),
+        "active_qualification_attempt_id": (
+            str(version.active_qualification_attempt_id)
+            if getattr(version, "active_qualification_attempt_id", None)
+            else None
+        ),
         "active_candidate_sha": qual.get("candidate_sha"),
         "last_qualification": _compact_last_qualification(qual),
         "qualification_state": qualification_state,
@@ -221,6 +236,9 @@ def _compact_version_lifecycle(
         "artifacts": artifacts,
         "serving": _compose_serving_block(aggregate_serving, artifacts, version),
     }
+    if qualification_read is not None:
+        out["qualification_provenance"] = qualification_read.provenance
+        out["dimension_states"] = qualification_read.dimension_states
     if verdict_disagreement is not None:
         out["qualification_state_disagreement"] = verdict_disagreement
     return out
@@ -697,23 +715,41 @@ async def agent_fetch_qualification(
             project_id,
         )
 
-    verdict = (
-        (
-            await session.execute(
-                select(QualificationVerdict)
-                .where(
-                    QualificationVerdict.release_version_id == open_row.id,
-                    QualificationVerdict.audit_findings.is_not(None),
-                )
-                .order_by(QualificationVerdict.created_at.desc())
-                .limit(1)
-            )
-        )
-        .scalars()
-        .first()
+    from app.qualification_state_resolver import (
+        qualification_read_provenance,
+        resolve_dimension_states_from_ledger,
+        resolve_newest_qualification_verdict,
     )
 
+    selected_verdict = await resolve_newest_qualification_verdict(session, open_row)
+    evidence_verdict = (
+        selected_verdict
+        if selected_verdict is not None and selected_verdict.audit_findings is not None
+        else await resolve_newest_qualification_verdict(
+            session, open_row, require_audit_findings=True
+        )
+    )
+    verdict = selected_verdict or evidence_verdict
+    qualification_provenance = qualification_read_provenance(
+        open_row, selected_verdict
+    )
+    if qualification_trigger_state is not None:
+        qualification_trigger_state["qualification_provenance"] = (
+            qualification_provenance
+        )
+    try:
+        qualification_dimension_states = await resolve_dimension_states_from_ledger(
+            session, open_row
+        )
+    except Exception:
+        logger.exception(
+            "[AGENT_FETCH] qualification dimension provenance failed for project %s",
+            project_id,
+        )
+        qualification_dimension_states = []
+
     if verdict is not None:
+        status_verdict = selected_verdict or verdict
         # Identity fields (candidate_sha, status, finalized_at) come from the
         # Version Phase (last_qualification) when available — it is the
         # authoritative current record and may be newer than the verdict row
@@ -732,11 +768,17 @@ async def agent_fetch_qualification(
         # Detect (and record) the transient pending vs finalized-verdict
         # disagreement through the shared resolver primitive so the agent fetch
         # verb and the version-phase surface classify this window identically.
-        _, source_disagreement = apply_verdict_substitution(lq, verdict)
+        _, source_disagreement = apply_verdict_substitution(
+            lq,
+            status_verdict,
+            active_attempt_id=open_row.active_qualification_attempt_id,
+        )
         if source_disagreement is not None:
-            resolved_status = verdict.terminal_status
+            resolved_status = status_verdict.terminal_status
             resolved_finalized_at = (
-                verdict.finalized_at.isoformat() if verdict.finalized_at else None
+                status_verdict.finalized_at.isoformat()
+                if status_verdict.finalized_at
+                else None
             )
         else:
             resolved_status = lq_status or verdict.terminal_status
@@ -750,11 +792,26 @@ async def agent_fetch_qualification(
             "status": resolved_status,
             "confidence": verdict.confidence,
             "sub_scores": verdict.sub_scores,
-            "findings": get_latest_qualification_audit_findings(open_row, verdict),
-            "excluded_findings": verdict.excluded_audit_findings or [],
-            "challenger_refuted_findings": verdict.challenger_refuted_audit_findings
+            "findings": get_latest_qualification_audit_findings(
+                open_row, evidence_verdict
+            ),
+            "excluded_findings": (
+                evidence_verdict.excluded_audit_findings
+                if evidence_verdict is not None
+                else []
+            )
             or [],
-            "goal_alignment": verdict.goal_alignment,
+            "challenger_refuted_findings": (
+                evidence_verdict.challenger_refuted_audit_findings
+                if evidence_verdict is not None
+                else []
+            )
+            or [],
+            "goal_alignment": (
+                evidence_verdict.goal_alignment
+                if evidence_verdict is not None
+                else verdict.goal_alignment
+            ),
             "error": lq.get("error") or None,
             "detail": lq.get("detail") or None,
             "blocker": lq.get("blocker") or None,
@@ -770,6 +827,8 @@ async def agent_fetch_qualification(
             "source_disagreement": source_disagreement,
             "goal_coverage_drift": goal_coverage_drift,
             "qualification_trigger_state": qualification_trigger_state,
+            "qualification_provenance": qualification_provenance,
+            "dimension_states": qualification_dimension_states,
             "serving_sha": serving_sha,
             **requalification_extra,
         }
@@ -825,6 +884,8 @@ async def agent_fetch_qualification(
         "source": "last_qualification",
         "goal_coverage_drift": goal_coverage_drift,
         "qualification_trigger_state": qualification_trigger_state,
+        "qualification_provenance": qualification_provenance,
+        "dimension_states": qualification_dimension_states,
         "serving_sha": serving_sha,
         **requalification_extra,
     }
@@ -959,18 +1020,26 @@ async def agent_fetch_version_phase(
     # in the audit-crashed window while the operator panel already read
     # ``audit_crashed``. The helper resolves the canonical newest verdict itself.
     _open_resolved_qual: tuple[dict | None, dict | None] | None = None
+    _open_qualification_read: Any = None
     if open_row is not None:
         from app.qualification_state_resolver import (  # noqa: PLC0415
-            resolve_open_version_qualification_state,
+            resolve_open_version_qualification_read_model,
         )
 
-        _open_resolved_qual = await resolve_open_version_qualification_state(
+        _open_qualification_read = await resolve_open_version_qualification_read_model(
             session, open_row, project
+        )
+        _open_resolved_qual = (
+            _open_qualification_read.qualification_state,
+            _open_qualification_read.disagreement,
         )
 
     _current_version_data = (
         _compact_version_lifecycle(
-            open_row, project, resolved_qualification=_open_resolved_qual
+            open_row,
+            project,
+            resolved_qualification=_open_resolved_qual,
+            qualification_read=_open_qualification_read,
         )
         if open_row is not None
         else None

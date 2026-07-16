@@ -29,6 +29,7 @@ import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import {
   classifyAcceptanceTestRun, acceptanceTestRunPassed,
   matchesEnvironmentFailureSignature,
+  isDockerAvailable,
 } from '../utils/test-runners.js';
 
 // Default hard cap on covering test files per trial (mirrors the backend
@@ -49,6 +50,8 @@ export interface CapabilityProofTrialResult {
   type: 'capability_proof_trial';
   cap: string;
   head_sha: string | null;
+  /** The SHA queued when the trial was enrolled; retained for drift visibility. */
+  queued_head_sha: string | null;
   test_refs: string[];
   ran: boolean;
   passed: boolean;
@@ -79,20 +82,41 @@ function tsPackageDir(ref: string): string {
 }
 
 /**
+ * Returns true when the ref set can be targeted in a single invocation — no Docker
+ * probe, no workspace access. Used for pre-clone early-exit so the Docker check
+ * only runs when the workspace is actually ready and execution is imminent.
+ */
+export function isRefSetTargetable(testRefs: string[]): boolean {
+  const refs = testRefs.filter(r => typeof r === 'string' && r.trim()).map(r => r.trim());
+  if (refs.length === 0) return false;
+  const exts = [...new Set(refs.map(refExt))];
+  if (exts.every(e => e === 'py')) return true;
+  if (!exts.every(e => TS_JS_EXTS.has(e))) return false;
+  // TS/JS: all refs must live in the SAME package.
+  return new Set(refs.map(tsPackageDir)).size === 1;
+}
+
+/**
  * Build the TARGETED runner that runs ONLY the passed covering test refs, choosing
  * the command by test-ref extension (the same per-file targeting primitive the
  * verify-tests gate's `buildAcceptanceTestRunner` embodies):
- *   - Python (`.py`) refs → `bash scripts/test-backend.sh testing/test_<name>.py ...`
+ *   - Python (`.py`) refs → `bash scripts/test-backend.sh <pgFlag> testing/test_<name>.py ...`
  *     (paths normalized to the `backend/`-relative form the script expects).
+ *     pgFlag is `--postgres` when Docker is available, `--no-postgres` otherwise —
+ *     the same isDockerAvailable() fallback the verify-tests gate uses (test-runners.ts:445)
+ *     so trials on Docker-less VMs do not trip the env-failure signature.
  *   - TS/JS refs → `npx vitest run <file> ...` from the owning package dir.
  *
  * Returns `null` when the refs cannot be targeted cleanly in a SINGLE invocation:
  * empty, an unknown extension, or a mix of languages / vitest packages. The caller
  * then reports `could_not_run: true` and mints nothing.
+ *
+ * `checkDockerAvailable` is injectable for testing (defaults to `isDockerAvailable`).
  */
 export function buildCapabilityProofTrialRunner(
   testRefs: string[],
   workspace: string = WORKSPACE,
+  checkDockerAvailable: () => boolean = isDockerAvailable,
 ): { cmd: string; args: string[]; cwd: string } | null {
   const refs = testRefs.filter(r => typeof r === 'string' && r.trim()).map(r => r.trim());
   if (refs.length === 0) return null;
@@ -107,7 +131,11 @@ export function buildCapabilityProofTrialRunner(
   if (lang === 'py') {
     // scripts/test-backend.sh expects `backend/`-relative paths (e.g.
     // `testing/test_foo.py`); strip a leading `backend/` from each ref.
-    const args = ['scripts/test-backend.sh'];
+    // Pass --postgres when Docker is available so tests run against a real PG
+    // sidecar (matching CI); fall back to --no-postgres on Docker-less VMs so
+    // the trial does not trip the env-failure signature and mint nothing.
+    const pgFlag = checkDockerAvailable() ? '--postgres' : '--no-postgres';
+    const args = ['scripts/test-backend.sh', pgFlag];
     for (const ref of refs) {
       args.push(ref.startsWith('backend/') ? ref.slice('backend/'.length) : ref);
     }
@@ -179,13 +207,15 @@ export async function handleCapabilityProofTrial(
     });
   };
 
-  // A trial with no cap or no targetable refs is a no-op (mints nothing).
-  const runner = buildCapabilityProofTrialRunner(testRefs, WORKSPACE);
-  if (!cap || testRefs.length === 0 || runner === null) {
+  // Pre-clone targetability check (no Docker probe — isDockerAvailable() only runs
+  // when the workspace is ready and we are about to execute, not here).
+  if (!cap || testRefs.length === 0 || !isRefSetTargetable(testRefs)) {
     sendLog(ws, `Capability proof trial: ${!cap ? 'no capability' : testRefs.length === 0 ? 'no test refs' : 'refs not cleanly targetable'} — reporting could_not_run.\n`);
     await report({
       type: 'capability_proof_trial',
-      cap, head_sha: headSha, test_refs: testRefs,
+      // This path has no checkout, so it intentionally reports only the queued
+      // identity rather than claiming it was executed.
+      cap, head_sha: headSha, queued_head_sha: headSha, test_refs: testRefs,
       ran: false, passed: false, could_not_run: true,
     });
     return;
@@ -199,6 +229,33 @@ export async function handleCapabilityProofTrial(
     workspace: WORKSPACE, repoUrl: cloneUrl, githubToken: ghToken,
     branch: baseBranch, baseBranch, depth: DEFAULT_CLONE_DEPTH,
   });
+
+  // The base branch can advance after this trial is queued. Proof provenance
+  // must name the checkout that ran the tests, never the queued branch head.
+  // A failed identity lookup is indeterminate, not permission to echo the
+  // queued SHA; test execution and its classification still proceed normally.
+  let executedHeadSha: string | null = null;
+  try {
+    const resolved = await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: WORKSPACE });
+    executedHeadSha = resolved.trim() || null;
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    sendLog(ws, `Capability proof trial [${cap}]: could not resolve checkout SHA: ${message}\n`);
+  }
+
+  // Build the runner post-clone so the Docker probe reflects execution-time state.
+  const runner = buildCapabilityProofTrialRunner(testRefs, WORKSPACE);
+  if (runner === null) {
+    // Safety: isRefSetTargetable passed pre-clone but runner is null now — treat as
+    // untargetable to avoid a confusing could_not_run classification.
+    sendLog(ws, `Capability proof trial [${cap}]: runner unexpectedly null post-clone — reporting could_not_run.\n`);
+    await report({
+      type: 'capability_proof_trial',
+      cap, head_sha: executedHeadSha, queued_head_sha: headSha, test_refs: testRefs,
+      ran: false, passed: false, could_not_run: true,
+    });
+    return;
+  }
 
   statusRef.value = `Running covering tests for capability '${cap}'...`;
   sendLog(ws, `Capability proof trial [${cap}]: ${runner.cmd} ${runner.args.join(' ')} (cwd=${runner.cwd})\n`);
@@ -229,7 +286,7 @@ export async function handleCapabilityProofTrial(
 
   await report({
     type: 'capability_proof_trial',
-    cap, head_sha: headSha, test_refs: testRefs,
+    cap, head_sha: executedHeadSha, queued_head_sha: headSha, test_refs: testRefs,
     ran, passed, could_not_run: couldNotRun,
     ...(skippedSummary ? { skipped_summary: skippedSummary } : {}),
   });

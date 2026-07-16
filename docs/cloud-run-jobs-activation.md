@@ -12,7 +12,7 @@ until the steps below are completed.
 | Dispatch routing (`launch_agent_cloud_run_job`) | code (dark-gated) | `backend/app/compute_cloud_run.py` |
 | Allowlist gate (`cloud_run_task_type_allowlist`, empty by default) | code (dark-gated) | runtime settings |
 | Cloud Run Job resource + IAM | Terraform | `infra/terraform/cloud_run.tf` (`google_cloud_run_v2_job.blueprint_agent_job`) |
-| Build & push the agent image to the job | **operator** (or CI) | `agent/Dockerfile` → `gcloud builds submit` |
+| Build, push, and deploy the agent image | CI on `agent/**` changes | `.github/workflows/deploy.yml` → `agent/Dockerfile` |
 | `CLOUD_RUN_JOB_NAME` env on the orchestrator | **operator** | `backend/cloudbuild.yaml` `--set-env-vars` |
 | Enabling the allowlist | **operator** | `PATCH /api/admin/settings` |
 
@@ -44,21 +44,23 @@ until the steps below are completed.
    `google_cloud_run_v2_service.orchestrator` service. (A targeted apply was
    verified safe — it touches only the job + its new `agent-job-sa`.)
 
-3. **Build & push the agent image into the job.** The job is created with the
+3. **Deploy the agent image into the job.** The job is created with the
    `cloudrun/container/hello` placeholder (and `ignore_changes` on the image,
-   so Terraform will not revert your push). The image is built from
+   so Terraform will not revert a deployed image). Merging an `agent/**`
+   change to `main` builds a SHA-tagged image and updates the job through
+   `.github/workflows/deploy.yml`. The image is built from
    **`agent/Dockerfile`** — a deliberately **read-only-only** image (Node 20 +
    the LLM CLIs + the agent app; no docker/postgres/playwright/pytest). Do NOT
    route heavy/write types to it (see step 8). Consider pinning the LLM-CLI
-   versions to match the deployed VM image via `--build-arg`
-   (`CLAUDE_CODE_VERSION` / `CODEX_VERSION` / `GEMINI_VERSION`). Build and point
-   the job at it:
+   versions aligned with the deployed VM image
+   (`CLAUDE_CODE_VERSION` / `CODEX_VERSION` / `GEMINI_VERSION`). For an
+   emergency manual rollout, build and point the job at an immutable tag:
 
    ```bash
    gcloud builds submit agent \
-     --tag us-central1-docker.pkg.dev/$PROJECT_ID/blueprint-repo/blueprint-agent-job:latest
+     --tag us-central1-docker.pkg.dev/$PROJECT_ID/blueprint-repo/blueprint-agent-job:$GIT_SHA
    gcloud run jobs update blueprint-agent-job --region us-central1 \
-     --image us-central1-docker.pkg.dev/$PROJECT_ID/blueprint-repo/blueprint-agent-job:latest
+     --image us-central1-docker.pkg.dev/$PROJECT_ID/blueprint-repo/blueprint-agent-job:$GIT_SHA
    ```
 
    **Prerequisite:** the job's service account (`agent-job-sa`) must have

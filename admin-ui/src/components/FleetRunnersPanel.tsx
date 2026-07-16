@@ -98,15 +98,17 @@ function activeTaskCount(runner: FleetRunner): number {
   return Array.isArray(ids) ? ids.length : 0;
 }
 
+function activeComputeCount(runner: FleetRunner): number {
+  if (runner.health?.active_compute_job_count !== undefined) {
+    return runner.health.active_compute_job_count;
+  }
+  const ids = runner.capabilities.active_compute_job_ids;
+  return Array.isArray(ids) ? ids.length : 0;
+}
+
 function activeWorkCount(runner: FleetRunner): number {
   if (runner.health?.active_work_count !== undefined) return runner.health.active_work_count;
-  if (runner.health?.active_compute_job_count !== undefined) {
-    return activeTaskCount(runner) + runner.health.active_compute_job_count;
-  }
-  const activeCompute = Array.isArray(runner.capabilities.active_compute_job_ids)
-    ? runner.capabilities.active_compute_job_ids.length
-    : 0;
-  return activeTaskCount(runner) + activeCompute;
+  return activeTaskCount(runner) + activeComputeCount(runner);
 }
 
 function availableSlots(runner: FleetRunner): number | null {
@@ -114,35 +116,34 @@ function availableSlots(runner: FleetRunner): number | null {
     const health = runner.health;
     // Prefer the per-class agent slot count when available (per-class gating).
     if (typeof health.available_agent_slots === 'number') return health.available_agent_slots;
-    if (typeof health.available_slots === 'number') return health.available_slots;
-    if (health.available_slots === null) return null;
+    if (health.available_agent_slots === null || health.available_slots === null) return null;
     if (typeof health.max_concurrent === 'number') {
-      return Math.max(0, health.max_concurrent - activeWorkCount(runner));
+      return Math.max(0, health.max_concurrent - activeTaskCount(runner));
     }
+    // Preserve legacy combined slots when the per-class ceiling is unavailable.
+    if (typeof health.available_slots === 'number') return health.available_slots;
     return null;
   }
   const max = runner.capabilities.max_concurrent;
   if (typeof max !== 'number') return null;
-  return Math.max(0, max - activeWorkCount(runner));
+  return Math.max(0, max - activeTaskCount(runner));
 }
 
 function availableComputeSlots(runner: FleetRunner): number | null {
   if (runner.health) {
     const health = runner.health;
     if (typeof health.available_compute_slots === 'number') return health.available_compute_slots;
-    if (typeof health.available_slots === 'number') return health.available_slots;
-    if (health.available_slots === null) return null;
-    if (typeof health.max_concurrent === 'number') {
-      return Math.max(0, health.max_concurrent - activeWorkCount(runner));
+    if (health.available_compute_slots === null || health.available_slots === null) return null;
+    const max = health.max_concurrent_compute ?? health.max_concurrent;
+    if (typeof max === 'number') {
+      return Math.max(0, max - activeComputeCount(runner));
     }
+    if (typeof health.available_slots === 'number') return health.available_slots;
     return null;
   }
   const max = runner.capabilities.max_concurrent_compute ?? runner.capabilities.max_concurrent;
   if (typeof max !== 'number') return null;
-  const activeCompute = Array.isArray(runner.capabilities.active_compute_job_ids)
-    ? runner.capabilities.active_compute_job_ids.length
-    : 0;
-  return Math.max(0, max - activeCompute);
+  return Math.max(0, max - activeComputeCount(runner));
 }
 
 function maxSlotsForRunner(runner: FleetRunner): number | null {
@@ -150,9 +151,33 @@ function maxSlotsForRunner(runner: FleetRunner): number | null {
   return typeof max === 'number' ? max : null;
 }
 
+function maxComputeSlotsForRunner(runner: FleetRunner): number | null {
+  const max = runner.health?.max_concurrent_compute ?? runner.capabilities.max_concurrent_compute
+    ?? runner.health?.max_concurrent ?? runner.capabilities.max_concurrent;
+  return typeof max === 'number' ? max : null;
+}
+
+function summarizeCapacity(
+  runners: FleetRunner[], active: (runner: FleetRunner) => number,
+  available: (runner: FleetRunner) => number | null, maximum: (runner: FleetRunner) => number | null,
+) {
+  const freeSlots = runners.map(available);
+  return {
+    busy: runners.reduce((sum, runner) => sum + active(runner), 0),
+    max: runners.reduce((sum, runner) => sum + (maximum(runner) ?? 0), 0),
+    free: freeSlots.reduce<number>((sum, slots) => sum + (slots ?? 0), 0),
+    unknown: freeSlots.some(slots => slots == null),
+  };
+}
+
 function isComputeCapable(runner: FleetRunner): boolean {
   const taskTypes = runner.capabilities.task_types;
   return taskTypes === 'all' || (Array.isArray(taskTypes) && taskTypes.includes('compute_experiment'));
+}
+
+function isAgentCapable(runner: FleetRunner): boolean {
+  const taskTypes = runner.capabilities.task_types;
+  return taskTypes === 'all' || (Array.isArray(taskTypes) && taskTypes.some(type => type !== 'compute_experiment'));
 }
 
 function capsSummary(caps: FleetRunner['capabilities']): string {
@@ -216,6 +241,21 @@ function configStatus(
       cls: CONFIG_STATUS_CLS.idle,
       pending: true,
       tone: 'idle',
+    };
+  }
+
+  // A live daemon has explicitly rejected the generation we currently want.
+  // That is terminal as soon as the next heartbeat reports it; do not conceal
+  // it behind the otherwise-optimistic pending window.
+  if (
+    config.apply_status === 'rejected'
+    && config.rejected_config_generation === config.config_generation
+  ) {
+    return {
+      label: `config rejected — ${config.apply_reason ?? 'runner rejected this config'}`,
+      cls: CONFIG_STATUS_CLS.bad,
+      pending: false,
+      tone: 'bad',
     };
   }
 
@@ -352,7 +392,12 @@ interface RunnerReadiness {
   ready: boolean;
 }
 
-function runnerReadiness(runner: FleetRunner, runnerLive: boolean, slots: number | null): RunnerReadiness {
+function runnerReadiness(
+  runner: FleetRunner,
+  runnerLive: boolean,
+  slots: number | null,
+  workload: 'agent' | 'compute' = 'agent',
+): RunnerReadiness {
   const detail = runnerReadinessDetail(runner, runnerLive, slots);
   if (runner.status !== 'active') {
     return { label: 'inactive', detail, nextAction: 'Re-enroll or revoke this runner', tone: 'neutral', ready: false };
@@ -370,7 +415,7 @@ function runnerReadiness(runner: FleetRunner, runnerLive: boolean, slots: number
       ready: false,
     };
   }
-  if (runner.health?.agent_available === false) {
+  if (workload === 'agent' && runner.health?.agent_available === false) {
     const agentReason = runner.health?.agent_unavailable_reason;
     const nextAction = agentReason ?? 'Restart or inspect the local agent';
     return { label: 'agent unavailable', detail, nextAction, tone: 'bad', ready: false };
@@ -729,8 +774,8 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
     token: string;
     mode: TokenDialogMode;
     preset: RunnerSetupPreset;
-    /** Rotate mode only: epoch ms when the rotation API call resolved (token invalidated). */
-    rotatedAt?: number;
+    /** Rotate mode only: server-authored UTC marker for token invalidation. */
+    rotatedAt?: string;
   } | null>(null);
   // Bounded connect wait for the enroll dialog: after this elapses with no
   // heartbeat, the dialog drops the optimistic spinner for an honest
@@ -779,7 +824,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
       // per-runner failure resolves to null and simply omits that runner's
       // Projects section rather than failing the whole panel load.
       const lists = await Promise.all(
-        data.map(r => listRunnerProjects(projectId, r.id).catch(() => null)),
+        data.map(r => listRunnerProjects(r.enrollment_project_id ?? projectId, r.id).catch(() => null)),
       );
       if (mountedRef.current) {
         const map: Record<string, RunnerProjectAllowList> = {};
@@ -866,17 +911,13 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
 
   // ── Rotate-mode reconnect tracking ──────────────────────────────────────────
 
-  // Resolve the rotated runner and determine if a new-token heartbeat has arrived.
-  // Detection: last_seen_at > rotatedAt means a heartbeat arrived AFTER the rotation
-  // API call resolved (i.e. from the restarted process with the new token).
+  // Resolve the rotated runner and use the backend's credential-generation
+  // acknowledgement. last_seen_at ordering cannot prove which token authenticated
+  // an in-flight heartbeat that commits after rotation.
   const rotatedRunner = pendingToken?.mode === 'rotate'
     ? runners.find(r => r.id === pendingToken.runnerId)
     : undefined;
-  const rotateConnected = !!(
-    rotatedRunner?.last_seen_at &&
-    pendingToken?.rotatedAt != null &&
-    parseTimestamp(rotatedRunner.last_seen_at).getTime() > pendingToken.rotatedAt
-  );
+  const rotateConnected = rotatedRunner?.current_token_heartbeat_confirmed === true;
 
   // Fast-poll while waiting for the rotated runner to reconnect with its new token.
   useEffect(() => {
@@ -934,16 +975,13 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
     if (type === 'rotate') {
       setRotating(runner.id);
       try {
-        const result = await rotateFleetRunnerToken(projectId, runner.id);
-        // Capture rotation time BEFORE load() so any heartbeat older than this
-        // correctly shows "Waiting" instead of prematurely claiming reconnection.
-        const rotatedAt = Date.now();
+        const result = await rotateFleetRunnerToken(runner.enrollment_project_id ?? projectId, runner.id);
         setPendingToken({
           runnerId: result.runner_id,
           token: result.token,
           mode: 'rotate',
           preset: runner.capabilities.runner_preset === 'strategic_local' ? 'strategic_local' : 'default',
-          rotatedAt,
+          rotatedAt: result.rotated_at,
         });
         await load();
       } catch (e) {
@@ -954,7 +992,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
     } else {
       setRevoking(runner.id);
       try {
-        await revokeFleetRunner(projectId, runner.id);
+        await revokeFleetRunner(runner.enrollment_project_id ?? projectId, runner.id);
         await load();
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e));
@@ -967,7 +1005,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
   const handleAddRunnerProject = async (runner: FleetRunner, addProjectId: string) => {
     setMutatingProjects(runner.id);
     try {
-      await addRunnerProject(projectId, runner.id, addProjectId);
+      await addRunnerProject(runner.enrollment_project_id ?? projectId, runner.id, addProjectId);
       setAddingProjectFor(null);
       setAddProjectSelection('');
       await load();
@@ -981,7 +1019,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
   const handleRemoveRunnerProject = async (runner: FleetRunner, addedProjectId: string) => {
     setMutatingProjects(runner.id);
     try {
-      await removeRunnerProject(projectId, runner.id, addedProjectId);
+      await removeRunnerProject(runner.enrollment_project_id ?? projectId, runner.id, addedProjectId);
       await load();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -993,7 +1031,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
   const handleUpdateStatus = async (runner: FleetRunner, status: 'active' | 'paused' | 'draining') => {
     setUpdatingStatus(runner.id);
     try {
-      await patchRunnerStatus(projectId, runner.id, status);
+      await patchRunnerStatus(runner.enrollment_project_id ?? projectId, runner.id, status);
       await load();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -1020,48 +1058,50 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
     };
   }, [runners]);
 
-  const { readyRunners, eligibleStrategicRunners } = useMemo(() => {
-    const readiness = liveRunners.map(runner => runnerReadiness(runner, true, availableSlots(runner)));
+  const { readyAgentRunners, readyComputeRunners, eligibleStrategicRunners } = useMemo(() => {
+    const agentReadiness = liveRunners
+      .filter(isAgentCapable)
+      .map(runner => runnerReadiness(runner, true, availableSlots(runner), 'agent'));
+    const computeReadiness = liveComputeRunners
+      .map(runner => runnerReadiness(runner, true, availableComputeSlots(runner), 'compute'));
     const strategicReadiness = liveStrategicRunners.map(runner => runnerReadiness(runner, true, availableSlots(runner)));
     return {
-      readyRunners: readiness.filter(r => r.ready).length,
+      readyAgentRunners: agentReadiness.filter(r => r.ready).length,
+      readyComputeRunners: computeReadiness.filter(r => r.ready).length,
       eligibleStrategicRunners: strategicReadiness.filter(r => r.ready).length,
     };
-  }, [liveRunners, liveStrategicRunners]);
+  }, [liveRunners, liveComputeRunners, liveStrategicRunners]);
 
-  const { failingRunners, agentUnavailable, strategicAgentUnavailable, busyWork, maxSlots, knownFreeSlots, hasUnknownSlots, freeSlotsLabel, gpuCapacityLabel } = useMemo(() => {
-    const slotValues = liveRunners.map(availableSlots);
-    const knownFree = slotValues.reduce<number>((sum, slots) => sum + (slots ?? 0), 0);
-    const unknownSlots = slotValues.some(slots => slots == null);
-    const gpuSlotValues = liveGpuRunners.map(availableSlots);
+  const { failingRunners, agentUnavailable, strategicAgentUnavailable, agentCapacity, computeCapacity, gpuCapacityLabel } = useMemo(() => {
+    const gpuSlotValues = liveGpuRunners.map(availableComputeSlots);
     const knownGpuSlots = gpuSlotValues.reduce<number>((sum, slots) => sum + (slots ?? 0), 0);
     const unknownGpuSlots = gpuSlotValues.some(slots => slots == null);
     return {
       failingRunners: liveRunners.filter(isRunnerDegraded).length,
       agentUnavailable: liveRunners.filter(runner => runner.health?.agent_available === false).length,
       strategicAgentUnavailable: liveStrategicRunners.filter(runner => runner.health?.agent_available === false).length,
-      busyWork: liveRunners.reduce((sum, runner) => sum + activeWorkCount(runner), 0),
-      maxSlots: liveRunners.reduce((sum, runner) => sum + (maxSlotsForRunner(runner) ?? 0), 0),
-      knownFreeSlots: knownFree,
-      hasUnknownSlots: unknownSlots,
-      freeSlotsLabel: unknownSlots ? `${knownFree}+ known` : `${knownFree} free`,
+      agentCapacity: summarizeCapacity(liveRunners, activeTaskCount, availableSlots, maxSlotsForRunner),
+      computeCapacity: summarizeCapacity(liveComputeRunners, activeComputeCount, availableComputeSlots, maxComputeSlotsForRunner),
       gpuCapacityLabel: liveGpuRunners.length === 0
         ? 'offline'
         : unknownGpuSlots
           ? `${liveGpuRunners.length} connected`
           : `${knownGpuSlots} slots free`,
     };
-  }, [liveRunners, liveGpuRunners, liveStrategicRunners]);
+  }, [liveRunners, liveComputeRunners, liveGpuRunners, liveStrategicRunners]);
+  const knownFreeCapacity = agentCapacity.free + computeCapacity.free;
+  const hasUnknownCapacity = agentCapacity.unknown || computeCapacity.unknown;
   const localOnlyBlocked = requireLocalRunner && !loading && liveComputeRunners.length === 0;
   const nextAction = (() => {
     if (loading) return null;
     if (runners.length === 0) return 'Enroll a runner, then start it to send the first heartbeat.';
     if (localOnlyBlocked) return 'Start or enroll a connected compute-capable local runner.';
-    if (agentUnavailable > 0) return 'Inspect agent availability on the affected runner host.';
     if (failingRunners > 0) return 'A connected runner is failing its jobs; inspect the host logs before relying on it.';
     if (liveRunners.length === 0) return 'Check runner hosts; no active runner is connected.';
-    if (!hasUnknownSlots && knownFreeSlots === 0) return 'Capacity is full; wait for work to finish or enroll another runner.';
-    if (hasUnknownSlots && knownFreeSlots === 0) return 'Confirm runner slot telemetry; connected capacity is not reporting slots.';
+    if (agentCapacity.free === 0 && computeCapacity.free > 0) return 'Compute capacity is available; inspect agent availability or free an agent slot for agent work.';
+    if (agentUnavailable > 0 && computeCapacity.free === 0) return 'Inspect agent availability on the affected runner host.';
+    if (!hasUnknownCapacity && knownFreeCapacity === 0) return 'Capacity is full; wait for work to finish or enroll another runner.';
+    if (hasUnknownCapacity && knownFreeCapacity === 0) return 'Confirm runner slot telemetry; connected capacity is not reporting slots.';
     return 'Fleet has dispatch capacity.';
   })();
 
@@ -1109,8 +1149,9 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
         <div className="grid grid-cols-2 gap-2 text-xs lg:grid-cols-4">
           <div className="rounded-md border border-neutral-800 bg-[#0d1218] px-2.5 py-2">
             <div className="text-ui-md uppercase tracking-wide text-neutral-500">readiness</div>
-            <div className={`mt-0.5 font-mono ${readyRunners > 0 ? 'text-emerald-300' : 'text-amber-300'}`}>
-              {readyRunners}/{runners.length} ready
+            <div className={`mt-0.5 font-mono ${readyAgentRunners + readyComputeRunners > 0 ? 'text-emerald-300' : 'text-amber-300'}`}>
+              <span data-testid="fleet-runner-agent-readiness">{readyAgentRunners} agent</span>{' · '}
+              <span data-testid="fleet-runner-compute-readiness">{readyComputeRunners} compute</span>{' ready'}
             </div>
             <div className={`mt-0.5 truncate text-ui-sm ${failingRunners > 0 ? 'text-amber-300' : 'text-neutral-600'}`} data-testid="fleet-runner-connected-summary">
               {failingRunners > 0
@@ -1119,9 +1160,16 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
             </div>
           </div>
           <div className="rounded-md border border-neutral-800 bg-[#0d1218] px-2.5 py-2">
-            <div className="text-ui-md uppercase tracking-wide text-neutral-500">slots</div>
-            <div className="mt-0.5 font-mono text-neutral-100" data-testid="fleet-runner-work-capacity">{busyWork}/{maxSlots || '-'}</div>
-            <div className="mt-0.5 truncate text-ui-sm text-neutral-600">{freeSlotsLabel}</div>
+            <div className="text-ui-md uppercase tracking-wide text-neutral-500">capacity</div>
+            <div className="mt-0.5 truncate text-ui-sm text-neutral-500">
+              agents <span className="font-mono text-neutral-100" data-testid="fleet-runner-work-capacity">{agentCapacity.busy}/{agentCapacity.max || '-'}</span>
+              {' · '}{agentCapacity.unknown ? `${agentCapacity.free}+ known free` : `${agentCapacity.free} free`}
+            </div>
+            <div className="mt-0.5 truncate text-ui-sm text-neutral-500">
+              compute <span className="font-mono text-purple-300" data-testid="fleet-runner-compute-capacity">{computeCapacity.busy}/{computeCapacity.max || '-'}</span>
+              {' · '}{liveComputeRunners.length === 0 ? 'unavailable' : computeCapacity.unknown
+                ? `${computeCapacity.free}+ known free` : `${computeCapacity.free} free`}
+            </div>
           </div>
           <div className="rounded-md border border-neutral-800 bg-[#0d1218] px-2.5 py-2">
             <div className="text-ui-md uppercase tracking-wide text-neutral-500">gpu</div>
@@ -1185,8 +1233,14 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
             const hasPerClassCapacity = runner.health?.max_concurrent_compute != null
               && runner.health.max_concurrent_compute !== runner.health.max_concurrent;
             const strategicRunner = isStrategicRunner(runner);
-            const readiness = runnerReadiness(runner, runnerLive, slots);
-            const workday = workdayReadinessLine(readiness, strategicRunner);
+            const agentReadiness = isAgentCapable(runner)
+              ? runnerReadiness(runner, runnerLive, slots, 'agent')
+              : null;
+            const computeReadiness = isComputeCapable(runner)
+              ? runnerReadiness(runner, runnerLive, computeSlots, 'compute')
+              : null;
+            const readiness = agentReadiness ?? computeReadiness ?? runnerReadiness(runner, runnerLive, slots, 'agent');
+            const workday = workdayReadinessLine(agentReadiness ?? readiness, strategicRunner);
             const telemetry = telemetrySummary(runner);
             const configState = configStatus(runner);
             const backends = formatBackendInventory(runner.capabilities);
@@ -1223,6 +1277,11 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                     <span className="text-sm font-medium text-neutral-200 truncate">
                       {runner.hostname ?? runner.id.slice(0, 8)}
                     </span>
+                    {runner.enrollment_project_id && runner.enrollment_project_id !== projectId && (
+                      <span className="rounded border border-sky-500/30 bg-sky-500/10 px-1.5 py-0.5 text-xs text-sky-300" data-testid="fleet-runner-shared">
+                        shared runner
+                      </span>
+                    )}
                     {runner.version && (
                       <span className="text-xs text-neutral-500">{runner.version}</span>
                     )}
@@ -1329,6 +1388,11 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                     <span className={`rounded border px-1.5 py-0.5 text-xs font-medium ${readinessClasses(readiness.tone)}`}>
                       {readiness.label}
                     </span>
+                    {agentReadiness && computeReadiness && (
+                      <span className="text-ui-md text-neutral-500" data-testid="fleet-runner-workload-readiness">
+                        agent {agentReadiness.label} · compute {computeReadiness.label}
+                      </span>
+                    )}
                     {configState && (
                       <span
                         className={`inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-xs font-medium ${configState.cls}`}
@@ -1467,7 +1531,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
               {configOpen && (
                 <FleetRunnerConfigPanel
                   key={`config-${runner.id}`}
-                  projectId={projectId}
+                  projectId={runner.enrollment_project_id ?? projectId}
                   runner={runner}
                   onSaved={() => load()}
                 />
@@ -1565,6 +1629,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
               )}
               {telemetryOpen && (
                 <RunnerTelemetryDetail
+                  enrollmentProjectId={runner.enrollment_project_id ?? projectId}
                   projectId={projectId}
                   runnerId={runner.id}
                   onNavigateToTask={onNavigateToTask}
@@ -1662,10 +1727,12 @@ function Sparkline({
  *  over the last hour) + compute-job rollups. Lazy-loaded when the row expands. */
 function RunnerTelemetryDetail({
   projectId,
+  enrollmentProjectId,
   runnerId,
   onNavigateToTask,
 }: {
   projectId: string;
+  enrollmentProjectId: string;
   runnerId: string;
   onNavigateToTask?: (taskId: string) => void;
 }) {
@@ -1697,7 +1764,7 @@ function RunnerTelemetryDetail({
     return () => {
       cancelled = true;
     };
-  }, [projectId, runnerId]);
+  }, [projectId, enrollmentProjectId, runnerId]);
 
   if (loading) {
     return (

@@ -69,7 +69,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, resolveBaseBranch, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, registerSizeCapMergeDriver, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, matchesAuthFailure, matchesVmConfigMissing, VmConfigMissingError, missingVmProviderConfigFiles, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, snapshotLogBuffer, clearLogBuffer, replayLogBufferRateLimited, getProviderRunner, providerSupportsNativeSubagents, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, _consumePendingParkDirectiveForTesting, continueWarmContinuation, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, refreshRuntimeState, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, readAgentSourceSha, _setAgentSourceShaForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, _buildHeartbeatStatusForTesting, apiPost, apiGet, apiRequest, getAgentToken, ClaudeTimeoutError, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, _getJobModeForTesting, _setJobModeForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, performWarmRetarget, __setWarmRetargetDepsForTesting, MATERIALIZE_SCRIPT_PATH, _setAgentTokenForTesting, _resetCredentialStateForTesting, _captureBootCredentialSnapshotForTesting, _captureBootProviderConfigPresenceForTesting, _materializeClaimCredentialStateForTesting, _getActiveCredentialStateSourceForTesting, ensureTaskCapabilityContractLoaded, __resetTaskCapabilityContractLoadedForTesting, _crashReportForTesting, cloneWithRetry, main, resolveCredentialsFromSecretVersion, type SecretManifest, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, resolveBaseBranch, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, registerSizeCapMergeDriver, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, matchesAuthFailure, matchesVmConfigMissing, VmConfigMissingError, missingVmProviderConfigFiles, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, snapshotLogBuffer, clearLogBuffer, replayLogBufferRateLimited, getProviderRunner, providerSupportsNativeSubagents, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, _consumePendingParkDirectiveForTesting, continueWarmContinuation, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, refreshRuntimeState, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, readAgentSourceSha, _setAgentSourceShaForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, _buildHeartbeatStatusForTesting, apiPost, apiGet, apiRequest, getAgentToken, ClaudeTimeoutError, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, _getJobModeForTesting, _setJobModeForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, performWarmRetarget, __setWarmRetargetDepsForTesting, MATERIALIZE_SCRIPT_PATH, _setAgentTokenForTesting, _resetCredentialStateForTesting, _captureBootCredentialSnapshotForTesting, _captureBootProviderConfigPresenceForTesting, _materializeClaimCredentialStateForTesting, _getActiveCredentialStateSourceForTesting, ensureTaskCapabilityContractLoaded, __resetTaskCapabilityContractLoadedForTesting, _crashReportForTesting, cloneWithRetry, main, resolveCredentialsFromSecretVersion, WORKSPACE, type SecretManifest, type FailureCategory } from './index.js';
 import { prepareWorkspaceForRole, resetWorkspacePrepOutcome } from './workspacePrep.js';
 import { jaccardSimilarity } from './utils/diff-detection.js';
 import {
@@ -3942,6 +3942,27 @@ describe('park directives and warm continuation', () => {
     expect(process.env.TASK_ID).toBe('');
   });
 
+  it('declines warm polling after a clone-failed role leaves no git workspace', async () => {
+    const pollForNextRole = vi.fn();
+
+    const result = await continueWarmContinuation({
+      priorTaskId: 'clone-failed-task',
+      priorPrNumber: null,
+      baseBranch: 'main',
+    }, {
+      pollForNextRole,
+      resetForNextRole: vi.fn(),
+      activateClaimedRole: vi.fn(),
+      materializeClaimCredentialState: vi.fn(),
+      performWarmRetarget: vi.fn(),
+      resolveVmInstanceId: () => 'vm-clone-failed',
+      isWorkspaceValid: () => false,
+    });
+
+    expect(result).toEqual({ action: 'exit' });
+    expect(pollForNextRole).not.toHaveBeenCalled();
+  });
+
   it('falls back to the task JWT vm id and re-targets after reclaim', async () => {
     process.env.TASK_ID = 'task-park';
     delete process.env.VM_INSTANCE_ID;
@@ -4742,22 +4763,81 @@ describe('bootstrapPoolMode', () => {
           CLAUDE_CODE_OAUTH_TOKEN: 'sandbox-claude-token',
         },
         files: [
-          { path: '/home/agent/.claude.json', content: '{"hasCompletedOnboarding":true}', mode: '0600' },
+          {
+            path: '/home/agent/.claude.json',
+            content: JSON.stringify({
+              email: 'operator@example.com',
+              projects: {
+                '/other/project': { hasTrustDialogAccepted: false },
+                [WORKSPACE]: {
+                  hasTrustDialogAccepted: false,
+                  allowedTools: { Bash: true },
+                },
+              },
+            }),
+            mode: '0600',
+          },
         ],
         metadata: { retarget: true, provider: 'anthropic', auth_mode: 'oauth' },
       }, 'test: sandbox-reanchor');
 
       const writePaths = vi.mocked(fs.writeFileSync).mock.calls.map(c => c[0]);
+      const claudeWrite = vi.mocked(fs.writeFileSync).mock.calls.find(
+        c => c[0] === '/home/.claude.json',
+      );
       // Written where the CLI actually reads it…
-      expect(vi.mocked(fs.writeFileSync).mock.calls).toEqual(expect.arrayContaining([
-        ['/home/.claude.json', '{"hasCompletedOnboarding":true}', expect.objectContaining({ mode: 0o600 })],
-      ]));
+      expect(claudeWrite).toBeDefined();
+      expect(JSON.parse(claudeWrite?.[1] as string)).toMatchObject({
+        email: 'operator@example.com',
+        hasCompletedOnboarding: true,
+        projects: {
+          '/other/project': { hasTrustDialogAccepted: false },
+          [WORKSPACE]: {
+            hasTrustDialogAccepted: true,
+            allowedTools: [],
+          },
+        },
+      });
+      expect(claudeWrite?.[2]).toEqual(expect.objectContaining({ mode: 0o600 }));
       // …and NOT at the backend's hardcoded /home/agent path.
       expect(writePaths).not.toContain('/home/agent/.claude.json');
     } finally {
       if (savedHome !== undefined) process.env.HOME = savedHome; else delete process.env.HOME;
       if (savedVmId !== undefined) process.env.VM_INSTANCE_ID = savedVmId; else delete process.env.VM_INSTANCE_ID;
       vi.mocked(fs.existsSync).mockReturnValue(false);
+      _resetCredentialStateForTesting();
+    }
+  });
+
+  it('normalizes an omitted Claude config under sandbox HOME without adding credentials', () => {
+    const savedHome = process.env.HOME;
+    try {
+      _resetCredentialStateForTesting();
+      process.env.HOME = '/home';
+      vi.mocked(fs.writeFileSync).mockClear();
+
+      _materializeClaimCredentialStateForTesting({
+        env: { PROVIDER: 'anthropic', AUTH_MODE: 'oauth' },
+        files: [{ path: '/home/agent/.claude.json', content: '{}', mode: '0600' }],
+        metadata: { retarget: true, provider: 'anthropic', auth_mode: 'oauth' },
+      }, 'test: sandbox-minimal-claude-config');
+
+      const claudeWrite = vi.mocked(fs.writeFileSync).mock.calls.find(c => c[0] === '/home/.claude.json');
+      expect(claudeWrite).toBeDefined();
+      const config: unknown = JSON.parse(claudeWrite?.[1] as string);
+      expect(config).toEqual({
+        hasCompletedOnboarding: true,
+        projects: {
+          [WORKSPACE]: {
+            hasTrustDialogAccepted: true,
+            allowedTools: [],
+          },
+        },
+      });
+      expect(claudeWrite?.[1]).not.toContain('OAUTH_TOKEN');
+      expect(claudeWrite?.[1]).not.toContain('sk-ant');
+    } finally {
+      if (savedHome !== undefined) process.env.HOME = savedHome; else delete process.env.HOME;
       _resetCredentialStateForTesting();
     }
   });
@@ -4786,6 +4866,14 @@ describe('bootstrapPoolMode', () => {
       const writePaths = vi.mocked(fs.writeFileSync).mock.calls.map(c => c[0]);
       expect(writePaths).toContain('/home/agent/.claude.json');
       expect(writePaths).not.toContain('/home/.claude.json');
+      const claudeWrite = vi.mocked(fs.writeFileSync).mock.calls.find(
+        c => c[0] === '/home/agent/.claude.json',
+      );
+      const parsed = JSON.parse(claudeWrite?.[1] as string) as Record<string, unknown>;
+      expect((parsed.projects as Record<string, unknown>)[WORKSPACE]).toEqual({
+        hasTrustDialogAccepted: true,
+        allowedTools: [],
+      });
     } finally {
       if (savedHome !== undefined) process.env.HOME = savedHome; else delete process.env.HOME;
       if (savedVmId !== undefined) process.env.VM_INSTANCE_ID = savedVmId; else delete process.env.VM_INSTANCE_ID;

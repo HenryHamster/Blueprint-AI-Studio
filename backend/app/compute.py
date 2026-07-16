@@ -294,6 +294,26 @@ def _zone_blocked_until(
 _zone_lock = threading.RLock()
 MACHINE_TYPE = os.getenv("MACHINE_TYPE", "e2-standard-2")
 
+# Balanced Persistent Disk is the fast default for agent boot volumes, but its
+# regional SSD quota is intentionally small on new regions.  When that quota is
+# exhausted we can still provision from the same image on pd-standard, whose
+# capacity is charged to the much larger DISKS_TOTAL_GB quota.  Keep the match
+# narrow so CPU/instance/global quota failures retain their normal cooldown and
+# health semantics.
+_SSD_BOOT_DISK_QUOTA_MARKERS = (
+    "ssd_total_gb",
+    "ssd-total-gb",
+    "ssd_total_storage",
+    "persistent disk ssd",
+)
+
+
+def _is_ssd_boot_disk_quota_exhaustion(error: str) -> bool:
+    error_lower = (error or "").lower()
+    return "quota" in error_lower and any(
+        marker in error_lower for marker in _SSD_BOOT_DISK_QUOTA_MARKERS
+    )
+
 # Provisioning model: "STANDARD" (on-demand, full price, no termination) or
 # "SPOT" (60-91% cheaper, can be preempted with 30s notice). Default STANDARD
 # so local dev / tests don't accidentally request spot capacity. Cloud Run is
@@ -2086,6 +2106,46 @@ async def _provision_gcp(
         last_error = None
         skipped_cooldown = []
 
+        def _insert_with_boot_disk_fallback(zone: str):
+            """Insert once with pd-balanced, falling back only on SSD quota.
+
+            A regional SSD_TOTAL_GB rejection says nothing about VM inventory or
+            zone health.  Retrying the exact same instance with pd-standard keeps
+            runnable work flowing without marking the region unhealthy while a
+            quota increase is pending.  Other failures bubble unchanged into the
+            existing scope classifier.
+            """
+
+            operation = instance_client.insert(
+                project=GCP_PROJECT_ID,
+                zone=zone,
+                instance_resource=instance_config,
+            )
+            try:
+                operation.result(timeout=240)
+                return operation
+            except Exception as exc:
+                if is_gpu or not _is_ssd_boot_disk_quota_exhaustion(str(exc)):
+                    raise
+
+                logger.warning(
+                    "[PROVISION] %s hit SSD boot-disk quota in %s; retrying "
+                    "with pd-standard (DISKS_TOTAL_GB quota)",
+                    vm_instance_id,
+                    zone,
+                )
+                disk.initialize_params.disk_type = (
+                    f"zones/{zone}/diskTypes/pd-standard"
+                )
+                instance_config.disks = [disk]
+                fallback_operation = instance_client.insert(
+                    project=GCP_PROJECT_ID,
+                    zone=zone,
+                    instance_resource=instance_config,
+                )
+                fallback_operation.result(timeout=240)
+                return fallback_operation
+
         now_pre = datetime.now(timezone.utc)
         # Project-global quota cooldown: a CPUS/GPUS_ALL_REGIONS-style exhaustion
         # blocks EVERY zone identically, so cycling zones would only burn time
@@ -2214,12 +2274,11 @@ async def _provision_gcp(
                             f"Failed to clean stale VM {vm_instance_id} in {zone}: {e}"
                         )
 
-                operation = instance_client.insert(
-                    project=GCP_PROJECT_ID, zone=zone, instance_resource=instance_config
-                )
                 # Inner wait is bounded below the outer 420s wait_for so we
-                # don't routinely burn the full budget on a single zone.
-                operation.result(timeout=240)
+                # don't routinely burn the full budget on a single zone.  An
+                # SSD boot-disk quota rejection retries this same insert on
+                # pd-standard before quota scope/cooldown classification.
+                operation = _insert_with_boot_disk_fallback(zone)
 
                 with _zone_lock:
                     _vm_zones[vm_instance_id] = zone
@@ -2432,12 +2491,7 @@ async def _provision_gcp(
                     # Re-assign to ensure protobuf picks up the change
                     instance_config.network_interfaces = [network_interface]
                     instance_config.disks = [disk]
-                    operation = instance_client.insert(
-                        project=GCP_PROJECT_ID,
-                        zone=wait_zone,
-                        instance_resource=instance_config,
-                    )
-                    operation.result(timeout=240)
+                    operation = _insert_with_boot_disk_fallback(wait_zone)
                     with _zone_lock:
                         _vm_zones[vm_instance_id] = wait_zone
                         health = _active_zone_health.setdefault(wait_zone, {})

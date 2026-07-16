@@ -55,6 +55,34 @@ _VM_TTL_OVERRIDES_BY_TASK_TYPE: dict[str, int] = {
 }
 
 
+_PROJECT_VERIFICATION_BOOT_BLOCK = r"""
+    # Earn backend-authoring readiness in the same production user boundary as
+    # blueprint-agent.service. A baked marker, installed binary, cached image,
+    # or root-reachable daemon is not accepted as proof. The /run marker is
+    # ephemeral and is written atomically only after both probes exit zero.
+    PROJECT_VERIFICATION_MARKER=/run/blueprint-agent/project-verification-v1.ready
+    PROJECT_VERIFICATION_LOG=/tmp/project-verification-v1.log
+    rm -f "$PROJECT_VERIFICATION_MARKER" "$PROJECT_VERIFICATION_LOG"
+    if timeout --signal=TERM --kill-after=5s 120s \
+      sudo -u agent -H /opt/agent/bin/project-verification-probe.sh all \
+      >"$PROJECT_VERIFICATION_LOG" 2>&1; then
+      install -d -m 0755 /run/blueprint-agent
+      PROJECT_VERIFICATION_TMP="$PROJECT_VERIFICATION_MARKER.$$"
+      printf '%s\n' '{"version":1,"ruff":true,"docker_postgres":true}' \
+        >"$PROJECT_VERIFICATION_TMP"
+      chmod 0644 "$PROJECT_VERIFICATION_TMP"
+      mv -f "$PROJECT_VERIFICATION_TMP" "$PROJECT_VERIFICATION_MARKER"
+      echo "PROJECT_VERIFICATION_V1_READY"
+    else
+      PROJECT_VERIFICATION_EXIT=$?
+      LAST_STAGE_STDERR="project verification exit=$PROJECT_VERIFICATION_EXIT: $(tail -c 400 "$PROJECT_VERIFICATION_LOG" 2>/dev/null || echo 'no probe log')"
+      echo "PROJECT_VERIFICATION_V1_FAILED: $LAST_STAGE_STDERR" >&2
+      false
+    fi
+    rm -f "$PROJECT_VERIFICATION_LOG"
+"""
+
+
 def resolve_vm_ttl_seconds(task_type: str | None) -> int:
     """Resolve the VM self-destruct ceiling (seconds) for a task type.
 
@@ -268,6 +296,8 @@ def build_agent_startup_script(
     ls -la /opt/agent/src/handlers/ 2>/dev/null || echo "  (no handlers directory)"
     head -1 /opt/agent/src/index.ts 2>/dev/null || echo "  (index.ts missing)"
 
+{_PROJECT_VERIFICATION_BOOT_BLOCK}
+
     # 6. Start the systemd service
     echo "Starting blueprint-agent service..."
     # Beacon D — reached systemctl. If the 30s health check at line ~845 then
@@ -404,6 +434,7 @@ def build_pool_agent_startup_script(
     # Pool VMs are taskless: liveness + failure reports go to /api/agent/vm-heartbeat
     # (VM-scoped auth) keyed on vm_instance_id, NOT /api/agent/heartbeat (task-scoped).
     EARLY_TOKEN=""
+    LAST_STAGE_STDERR=""
     VM_INSTANCE_ID="{vm_instance_id}"
     _report_failure() {{
       local line=$1
@@ -421,7 +452,7 @@ def build_pool_agent_startup_script(
         curl -sf -X POST "$ORCH/api/agent/vm-heartbeat" \
           -H "Content-Type: application/json" \
           -H "X-Agent-Token: $TOKEN" \
-          -d "$(printf '{{"vm_instance_id": "%s"}}' "$VM_INSTANCE_ID")" \
+          -d "$(printf '{{"vm_instance_id": "%s", "pre_claim_failure": "startup contract failed"}}' "$VM_INSTANCE_ID")" \
           --connect-timeout 5 --max-time 10 || true
       fi
       poweroff
@@ -478,7 +509,6 @@ def build_pool_agent_startup_script(
       fi
     }}
     EARLY_TOKEN="$(printf '%s' "$CREDS" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("env",{{}}).get("AGENT_SECRET_TOKEN",""))' 2>/dev/null || true)"
-    _send_vm_beacon "$EARLY_TOKEN"
 
     # 3. Materialize manifest via the base64-embedded materialize_manifest.py.
     MANIFEST_PATH=/tmp/agent_secret_manifest.json
@@ -496,7 +526,6 @@ def build_pool_agent_startup_script(
     rm -f "$MANIFEST_PATH" "$PY_STDERR" "$MATERIALIZE_PY"
 
     AGENT_TOKEN="$(grep '^AGENT_SECRET_TOKEN=' /etc/agent.env | cut -d= -f2- | tr -d '"' || true)"
-    _send_vm_beacon "$AGENT_TOKEN"
 
     # 4a. Runtime dependency guard. jq is baked into the canonical Packer and
     # Cloud Run agent images; this repairs stale/custom images before generated
@@ -515,6 +544,8 @@ def build_pool_agent_startup_script(
     # 4b. Agent diagnostics — log baked-in code version for debugging.
     echo "Agent source files:"
     ls -la /opt/agent/src/handlers/ 2>/dev/null || echo "  (no handlers directory)"
+
+{_PROJECT_VERIFICATION_BOOT_BLOCK}
 
     # 5. Start the systemd service. The agent boots poll-first (BLUEPRINT_POOL_MODE
     # is in /etc/agent.env) and polls /api/agent/next-role for a lease.
@@ -536,6 +567,8 @@ def build_pool_agent_startup_script(
       echo "POOL_PROVISION_HEALTH_OK"
     else
       echo "Agent service did not stay healthy through the settle window" >&2
+      LAST_STAGE_STDERR="pool agent service did not stay healthy through settle window"
+      false
     fi
 
     # Wait for the service to finish (with TTL guard).

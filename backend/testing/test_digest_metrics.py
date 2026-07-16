@@ -36,6 +36,7 @@ from app.digest_metrics import (
     compute_scope_mismatch_summary,
     compute_task_type_cost_adherence,
     compute_trial_arm_accumulation,
+    compute_trial_arm_cost_delta,
 )
 from app.failure_classification import ALL_FAILURE_CLASSES
 from app.llm_cost_attribution import LLM_TOKEN_PRICING
@@ -54,6 +55,140 @@ def _priced_llm_cost(
 ) -> float:
     input_rate, output_rate = LLM_TOKEN_PRICING[(provider, model)]
     return input_tokens * input_rate + output_tokens * output_rate
+
+
+@pytest.mark.asyncio
+async def test_trial_arm_cost_uses_priced_denominator_above_coverage_threshold(
+    db_session,
+):
+    """A small unpriced minority is visible without suppressing the cost signal."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    provider, model = "deepseek", "deepseek-v4-flash"
+    input_tokens = 1_000_000
+    tasks = [
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            context={"_trial_arm": True},
+            provider=provider if index else "unknown-provider",
+            model=model if index else "unknown-model",
+            api_call_summary={"total_input_tokens": input_tokens},
+        )
+        for index in range(20)
+    ]
+    tasks.extend(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            context={"_trial_arm": False},
+            provider=provider,
+            model=model,
+            api_call_summary={"total_input_tokens": input_tokens},
+        )
+        for _ in range(20)
+    )
+    db_session.add_all(tasks)
+    await db_session.commit()
+
+    result = await compute_trial_arm_cost_delta(
+        db_session, project_id=project.id, context_key="_trial_arm"
+    )
+    expected = round(input_tokens * LLM_TOKEN_PRICING[(provider, model)][0], 6)
+
+    assert result["with_priced_task_count"] == 19
+    assert result["with_priced_coverage_fraction"] == pytest.approx(0.95)
+    assert result["with_avg_cost_usd"] == pytest.approx(expected)
+    assert result["without_avg_cost_usd"] == pytest.approx(expected)
+    assert result["cost_delta"] == pytest.approx(0.0)
+    assert result["unpriced_model_pairs"] == [
+        {"provider": "unknown-provider", "model": "unknown-model"}
+    ]
+@pytest.mark.asyncio
+async def test_trial_arm_cost_suppresses_average_below_priced_coverage_threshold(
+    db_session,
+):
+    """Low coverage suppresses the average but retains actionable missing pricing pairs."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    tasks = [
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            context={"_trial_arm": True},
+            provider="unknown-provider",
+            model="unknown-model",
+            api_call_summary={"total_input_tokens": 1},
+        )
+        for _ in range(11)
+    ]
+    tasks.extend(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            context={"_trial_arm": True},
+            provider="deepseek",
+            model="deepseek-v4-flash",
+            api_call_summary={"total_input_tokens": 1},
+        )
+        for _ in range(9)
+    )
+    db_session.add_all(tasks)
+    await db_session.commit()
+    result = await compute_trial_arm_cost_delta(
+        db_session, project_id=project.id, context_key="_trial_arm"
+    )
+
+    assert result["with_priced_task_count"] == 9
+    assert result["with_priced_coverage_fraction"] == pytest.approx(0.45)
+    assert result["with_avg_cost_usd"] is None
+    assert result["cost_delta"] is None
+    assert result["unpriced_model_pairs"] == [
+        {"provider": "unknown-provider", "model": "unknown-model"}
+    ]
+@pytest.mark.asyncio
+async def test_trial_arm_cost_matches_existing_average_when_every_task_is_priced(
+    db_session,
+):
+    """Fully priced arms retain the historical all-terminal-task average."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    provider, model = "deepseek", "deepseek-v4-flash"
+    input_tokens = 1_000_000
+    db_session.add_all(
+        [
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                context={"_trial_arm": True},
+                provider=provider,
+                model=model,
+                api_call_summary={"total_input_tokens": input_tokens},
+            ),
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                context={"_trial_arm": True},
+            ),
+        ]
+    )
+    await db_session.commit()
+    result = await compute_trial_arm_cost_delta(
+        db_session, project_id=project.id, context_key="_trial_arm"
+    )
+    expected = round(input_tokens * LLM_TOKEN_PRICING[(provider, model)][0] / 2, 6)
+
+    assert result["with_priced_task_count"] == 2
+    assert result["with_priced_coverage_fraction"] == 1.0
+    assert result["with_avg_cost_usd"] == pytest.approx(expected)
+    assert result["unpriced_model_pairs"] == []
 
 
 def test_compute_failure_grouping_respects_persisted_verdict():

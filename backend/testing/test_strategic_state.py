@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime, timedelta
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
@@ -23,11 +23,13 @@ from app.models import (
     KnowledgeDocument,
     LocalRunner,
     MessageType,
+    MessageSurface,
     MessagesLastSeen,
     MessagesNoisePrefs,
     Project,
     ProjectMember,
     ProjectMessage,
+    ProjectMessageAttachmentUpload,
     StrategicCycle,
     Task,
     TaskWakeRegistration,
@@ -40,6 +42,7 @@ from app.models import (
 )
 from app.messages_last_seen import naive_utc_to_epoch_ms
 from app.shared_state import runtime_config
+from app.storage import ARTIFACT_BUCKET_NAME
 from app.strategic_resident_session import (
     RESIDENT_SESSION_KEY,
     STATUS_ACTIVE,
@@ -2649,6 +2652,8 @@ async def test_strategic_session_conversation_marks_more_history(
     messages = [
         ProjectMessage(
             project_id=project.id,
+            sequence=index + 1,
+            surface=MessageSurface.CONVERSATION,
             message_type=MessageType.NOTE,
             from_type="user" if index % 2 == 0 else "strategic",
             content=f"session row {index:02d}",
@@ -2688,6 +2693,8 @@ async def test_strategic_session_includes_requested_older_message_once(
     newer_messages = [
         ProjectMessage(
             project_id=project.id,
+            sequence=index + 1,
+            surface=MessageSurface.CONVERSATION,
             message_type=MessageType.NOTE,
             from_type="user" if index % 2 == 0 else "strategic",
             content=f"newer session row {index:02d}",
@@ -2743,6 +2750,8 @@ async def test_strategic_session_conversation_filters_routine_before_limit(
     chat_messages = [
         ProjectMessage(
             project_id=project.id,
+            sequence=1,
+            surface=MessageSurface.CONVERSATION,
             message_type=MessageType.NOTE,
             from_type="user",
             content="operator asks about the workday",
@@ -2838,15 +2847,17 @@ async def test_strategic_session_conversation_resolves_message_selected_refs(
 
 
 @pytest.mark.asyncio
-async def test_strategic_conversation_endpoint_returns_conversation_envelope(
+async def test_strategic_conversation_endpoint_returns_cursor_page(
     client: AsyncClient, db_session
 ):
-    """GET /strategic-conversation wraps the transcript in {conversation: ...}."""
+    """GET /strategic-conversation returns a non-duplicated cursor page."""
     project = await _make_project(db_session)
     base_time = _utcnow() - timedelta(minutes=10)
     messages = [
         ProjectMessage(
             project_id=project.id,
+            sequence=i + 1,
+            surface=MessageSurface.CONVERSATION,
             message_type=MessageType.NOTE,
             from_type="user" if i % 2 == 0 else "strategic",
             content=f"conv row {i:02d}",
@@ -2861,11 +2872,148 @@ async def test_strategic_conversation_endpoint_returns_conversation_envelope(
 
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert "conversation" in body
-    conversation = body["conversation"]
-    assert "items" in conversation
-    contents = [item["content"] for item in conversation["items"]]
+    assert "conversation" not in body
+    contents = [item["content"] for item in body["items"]]
     assert contents == ["conv row 00", "conv row 01", "conv row 02"]
+
+
+@pytest.mark.asyncio
+async def test_strategic_conversation_cursor_is_sequence_stable_and_excludes_activity(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    rows = [
+        ProjectMessage(
+            project_id=project.id,
+            sequence=index,
+            surface=MessageSurface.CONVERSATION,
+            message_type=MessageType.NOTE,
+            from_type="user",
+            content=f"conversation {index}",
+        )
+        for index in range(1, 6)
+    ]
+    rows.append(
+        ProjectMessage(
+            project_id=project.id,
+            sequence=6,
+            surface=MessageSurface.ACTIVITY,
+            message_type=MessageType.QUESTION,
+            from_type="strategic",
+            content="routine activity must not leak",
+        )
+    )
+    db_session.add_all(rows)
+    await db_session.commit()
+
+    latest = await client.get(
+        f"/api/admin/projects/{project.id}/strategic-conversation?limit=2"
+    )
+    assert latest.status_code == 200, latest.text
+    assert "conversation" not in latest.json()
+    assert [item["sequence"] for item in latest.json()["items"]] == [4, 5]
+    assert latest.json()["next_before_sequence"] == 4
+    assert latest.json()["has_more"] is True
+
+    older = await client.get(
+        f"/api/admin/projects/{project.id}/strategic-conversation"
+        "?before_sequence=4&limit=2"
+    )
+    assert older.status_code == 200, older.text
+    assert [item["sequence"] for item in older.json()["items"]] == [2, 3]
+    assert older.json()["next_before_sequence"] == 2
+
+    searched = await client.get(
+        f"/api/admin/projects/{project.id}/strategic-conversation"
+        "?search=conversation%205&limit=2"
+    )
+    assert searched.status_code == 200, searched.text
+    assert [item["sequence"] for item in searched.json()["items"]] == [5]
+    activity_search = await client.get(
+        f"/api/admin/projects/{project.id}/strategic-conversation?search=routine"
+    )
+    assert activity_search.status_code == 200, activity_search.text
+    assert activity_search.json()["items"] == []
+
+
+@pytest.mark.asyncio
+async def test_strategic_conversation_after_sequence_closes_realtime_gap(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    db_session.add_all([
+        ProjectMessage(
+            project_id=project.id,
+            sequence=index,
+            surface=MessageSurface.CONVERSATION,
+            message_type=MessageType.NOTE,
+            from_type="strategic",
+            content=f"gap {index}",
+        )
+        for index in range(1, 6)
+    ])
+    await db_session.commit()
+
+    page = await client.get(
+        f"/api/admin/projects/{project.id}/strategic-conversation"
+        "?after_sequence=2&limit=2"
+    )
+    assert page.status_code == 200, page.text
+    assert [item["sequence"] for item in page.json()["items"]] == [3, 4]
+    assert page.json()["has_more"] is True
+    assert page.json()["next_after_sequence"] == 4
+
+    invalid = await client.get(
+        f"/api/admin/projects/{project.id}/strategic-conversation"
+        "?after_sequence=2&before_sequence=5"
+    )
+    assert invalid.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_strategic_conversation_target_and_identity_lookup_are_bounded(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    rows = [
+        ProjectMessage(
+            project_id=project.id,
+            sequence=index,
+            surface=MessageSurface.CONVERSATION,
+            message_type=MessageType.NOTE,
+            from_type="user",
+            content=f"conversation {index}",
+            idempotency_key="recover-me" if index == 3 else None,
+            context={"_resident_wakeup_state": "paused"} if index == 3 else {},
+        )
+        for index in range(1, 6)
+    ]
+    db_session.add_all(rows)
+    await db_session.commit()
+
+    targeted = await client.get(
+        f"/api/admin/projects/{project.id}/strategic-conversation"
+        f"?include_message_id={rows[2].id}&limit=3"
+    )
+    assert targeted.status_code == 200, targeted.text
+    assert [item["sequence"] for item in targeted.json()["items"]] == [2, 3, 4]
+
+    found = await client.get(
+        f"/api/admin/projects/{project.id}/strategic-conversation"
+        "?client_idempotency_key=recover-me&limit=1"
+    )
+    assert found.status_code == 200, found.text
+    assert found.json()["matched_message"]["id"] == str(rows[2].id)
+    assert found.json()["wakeup_state"] == "paused"
+    assert found.json()["items"] == []
+
+    missing = await client.get(
+        f"/api/admin/projects/{project.id}/strategic-conversation"
+        "?client_idempotency_key=absent&limit=1"
+    )
+    assert missing.status_code == 200, missing.text
+    assert missing.json()["matched_message"] is None
+    assert missing.json()["items"] == []
 
 
 @pytest.mark.asyncio
@@ -2898,6 +3046,8 @@ async def test_strategic_conversation_endpoint_passes_include_message_id(
     base_time = _utcnow() - timedelta(hours=2)
     older = ProjectMessage(
         project_id=project.id,
+        sequence=1,
+        surface=MessageSurface.CONVERSATION,
         message_type=MessageType.NOTE,
         from_type="strategic",
         content="older targeted message",
@@ -2906,6 +3056,8 @@ async def test_strategic_conversation_endpoint_passes_include_message_id(
     newer_messages = [
         ProjectMessage(
             project_id=project.id,
+            sequence=i + 2,
+            surface=MessageSurface.CONVERSATION,
             message_type=MessageType.NOTE,
             from_type="user" if i % 2 == 0 else "strategic",
             content=f"newer row {i:02d}",
@@ -2923,8 +3075,90 @@ async def test_strategic_conversation_endpoint_passes_include_message_id(
     )
 
     assert resp.status_code == 200, resp.text
-    ids = [item["id"] for item in resp.json()["conversation"]["items"]]
+    ids = [item["id"] for item in resp.json()["items"]]
     assert ids[0] == str(older.id)
+
+
+@pytest.mark.asyncio
+async def test_strategic_conversation_etag_revalidates_and_binds_pinned_message(
+    client: AsyncClient, db_session
+):
+    """A transcript ETag 304s only for the exact pinned transcript requested."""
+    project = await _make_project(db_session)
+    base_time = _utcnow() - timedelta(hours=2)
+    older = ProjectMessage(
+        project_id=project.id, sequence=1, surface=MessageSurface.CONVERSATION,
+        message_type=MessageType.NOTE,
+        from_type="strategic", content="pinned older", created_at=base_time,
+    )
+    recent_messages = [
+        ProjectMessage(
+            project_id=project.id, sequence=i + 2,
+            surface=MessageSurface.CONVERSATION, message_type=MessageType.NOTE,
+            from_type="strategic", content=f"recent {i}",
+            created_at=base_time + timedelta(minutes=i + 1),
+        )
+        for i in range(25)
+    ]
+    db_session.add_all([older, *recent_messages])
+    await db_session.commit()
+
+    unpinned = await client.get(f"/api/admin/projects/{project.id}/strategic-conversation")
+    assert unpinned.status_code == 200
+    etag = unpinned.headers.get("ETag")
+    assert etag and etag.startswith('"')
+
+    unchanged = await client.get(
+        f"/api/admin/projects/{project.id}/strategic-conversation",
+        headers={"If-None-Match": etag},
+    )
+    assert unchanged.status_code == 304
+    assert unchanged.headers.get("ETag") == etag
+    assert not unchanged.content
+
+    pinned = await client.get(
+        f"/api/admin/projects/{project.id}/strategic-conversation?include_message_id={older.id}",
+        headers={"If-None-Match": etag},
+    )
+    assert pinned.status_code == 200
+    assert pinned.headers.get("ETag") != etag
+    assert pinned.json()["items"][0]["id"] == str(older.id)
+
+    # The same pin continues to validate while its selected, out-of-window
+    # message is unchanged, but changing that message must invalidate it.
+    pinned_etag = pinned.headers["ETag"]
+    pinned_unchanged = await client.get(
+        f"/api/admin/projects/{project.id}/strategic-conversation?include_message_id={older.id}",
+        headers={"If-None-Match": pinned_etag},
+    )
+    assert pinned_unchanged.status_code == 304
+    older.content = "pinned older, edited in place"
+    db_session.add(older)
+    await db_session.commit()
+    pinned_changed = await client.get(
+        f"/api/admin/projects/{project.id}/strategic-conversation?include_message_id={older.id}",
+        headers={"If-None-Match": pinned_etag},
+    )
+    assert pinned_changed.status_code == 200
+    assert pinned_changed.json()["items"][0]["content"] == "pinned older, edited in place"
+
+    # A pin for an already-visible message changes request context even though
+    # it produces the same rendered item list as the unpinned request.
+    visible = recent_messages[-1]
+    unpinned_after_edit = await client.get(
+        f"/api/admin/projects/{project.id}/strategic-conversation"
+    )
+    visible_pin = await client.get(
+        f"/api/admin/projects/{project.id}/strategic-conversation?include_message_id={visible.id}",
+        headers={"If-None-Match": unpinned_after_edit.headers["ETag"]},
+    )
+    assert visible_pin.status_code == 200
+    visible_etag = visible_pin.headers["ETag"]
+    visible_unchanged = await client.get(
+        f"/api/admin/projects/{project.id}/strategic-conversation?include_message_id={visible.id}",
+        headers={"If-None-Match": visible_etag},
+    )
+    assert visible_unchanged.status_code == 304
 
 
 @pytest.mark.asyncio
@@ -3705,7 +3939,7 @@ async def test_strategic_session_malformed_owner_lease_does_not_pin_marker(
 
 
 @pytest.mark.asyncio
-async def test_strategic_session_message_refreshes_local_continuation_marker(
+async def test_strategic_session_message_does_not_refresh_local_continuation_marker(
     client: AsyncClient, db_session
 ):
     from app.workbench_state import (
@@ -3735,54 +3969,38 @@ async def test_strategic_session_message_refreshes_local_continuation_marker(
         json={
             "message_type": "FEEDBACK",
             "content": "Keep working locally while I continue this session.",
+            "idempotency_key": "strategic-session-local-continuation-1",
             "workbench_context": {
                 "interaction_mode": "continuous",
                 "active_surface": "strategic",
             },
         },
     )
-    state_resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
-
     assert resp.status_code == 200, resp.text
-    assert state_resp.status_code == 200, state_resp.text
     data = resp.json()
     assert data["status"] == "created"
-    assert data["session_status"] == "unavailable"
-    continuation = data["runtime"]["local_runner"]["continuation"]
-    assert continuation["enabled"] is True
-    assert continuation["fresh"] is True
-    assert continuation["last_seen_at"] != stale_at
-    assert data["session"]["runtime"]["continuation"] == continuation
-    assert state_resp.json()["runtime"]["local_runner"]["continuation"] == continuation
-
+    assert data["message"]["id"] == data["id"]
+    assert "runtime" not in data
+    assert "session" not in data
     await db_session.refresh(project)
     marker = (project.vision or {})[STRATEGIC_LOCAL_CONTINUATION_KEY]
     assert marker["operator_user_id"] == TEST_USER_ID
-    assert marker["last_seen_at"] != stale_at
+    assert marker["last_seen_at"] == stale_at
 
 
 @pytest.mark.asyncio
-async def test_strategic_session_message_records_operator_message_and_snapshot(
+async def test_strategic_session_message_records_operator_message_without_hidden_snapshot(
     client: AsyncClient, db_session
 ):
     project = await _make_project(db_session)
-    await client.post(
-        f"/api/admin/projects/{project.id}/strategic-session",
-        json={
-            "workbench": {
-                "interaction_mode": "continuous",
-                "active_surface": "pipeline",
-                "selected_refs": [
-                    {"kind": "task", "id": "task-9", "label": "Watch task"}
-                ],
-            }
-        },
-    )
-
     body = {
         "message_type": "FEEDBACK",
         "content": "Keep this session pinned to the local Strategic runner.",
         "idempotency_key": "strategic-session-message-1",
+        "operator_intent": {
+            "kind": "steer",
+            "summary": "Keep the local runner pinned",
+        },
         "workbench_context": {
             "interaction_mode": "continuous",
             "active_surface": "pipeline",
@@ -3840,17 +4058,8 @@ async def test_strategic_session_message_records_operator_message_and_snapshot(
     assert msg.from_type == "user"
     assert msg.message_type == MessageType.FEEDBACK
     assert msg.idempotency_key == "strategic-session-message-1"
-    session_snapshot = (msg.context or {})["strategic_session"]
-    assert session_snapshot["interaction_mode"] == "continuous"
-    assert session_snapshot["active_surface"] == "pipeline"
-    assert session_snapshot["selected_refs"] == [
-        {"kind": "task", "id": "task-9", "label": "Watch task"}
-    ]
-    assert session_snapshot["selected_ref_descriptors"][0]["target"] == {
-        "surface": "runtime",
-        "section": "devices",
-        "runner_id": "runner-ready",
-    }
+    assert "strategic_session" not in (msg.context or {})
+    assert (msg.context or {})["operator_intent"] == body["operator_intent"]
     count = await db_session.scalar(
         select(func.count())
         .select_from(ProjectMessage)
@@ -3871,6 +4080,12 @@ async def test_strategic_session_message_response_enriches_selected_refs(
         "message_type": "FEEDBACK",
         "content": long_content,
         "idempotency_key": "strategic-session-full-receipt",
+        "source_refs": [{
+            "kind": "canvas",
+            "id": f"strategic-canvas:{project.id}",
+            "label": "Strategic context map",
+            "revision": "canvas-rev-7",
+        }],
         "workbench_context": {
             "interaction_mode": "continuous",
             "active_surface": "project",
@@ -3896,33 +4111,13 @@ async def test_strategic_session_message_response_enriches_selected_refs(
     assert message["content"] == long_content
     assert duplicate.json()["status"] == "duplicate"
     assert duplicate_message["content"] == long_content
-    strategic_session = message["context"]["strategic_session"]
-    duplicate_session = duplicate_message["context"]["strategic_session"]
-    assert strategic_session["context_package_id"] == f"strategic-context:{project.id}"
-    assert duplicate_session["context_package_id"] == f"strategic-context:{project.id}"
-    descriptors = strategic_session["selected_ref_descriptors"]
-    duplicate_descriptors = duplicate_session["selected_ref_descriptors"]
-    assert len(descriptors) == 1
-    assert descriptors[0]["kind"] == "canvas"
-    assert descriptors[0]["id"] == f"strategic-canvas:{project.id}"
-    assert descriptors[0]["label"] == "Strategic context map"
-    assert descriptors[0]["summary"]
-    assert descriptors[0]["target"] == {
-        "surface": "project",
-        "section": "problem-model",
-    }
-    assert duplicate_descriptors == descriptors
-    assert resp.json()["session"]["mode"] == "continuous"
-    assert resp.json()["session_status"] == "unavailable"
-    assert any(
-        item["id"] == resp.json()["id"]
-        for item in resp.json()["conversation"]["items"]
-    )
+    assert message["context"]["source_refs"] == body["source_refs"]
+    assert duplicate_message["context"]["source_refs"] == body["source_refs"]
+    assert "strategic_session" not in message["context"]
     stored = await db_session.get(ProjectMessage, uuid.UUID(resp.json()["id"]))
     assert stored is not None
-    stored_session = (stored.context or {})["strategic_session"]
-    assert stored_session["context_package_id"] == f"strategic-context:{project.id}"
-    assert stored_session["selected_ref_descriptors"] == descriptors
+    assert (stored.context or {})["source_refs"] == body["source_refs"]
+    assert "strategic_session" not in (stored.context or {})
     prefs = (
         await db_session.execute(
             select(MessagesNoisePrefs).where(
@@ -3956,6 +4151,7 @@ async def test_strategic_session_message_does_not_persist_selected_message_body(
         json={
             "message_type": "FEEDBACK",
             "content": "Use the selected message only as a navigable pointer.",
+            "idempotency_key": "strategic-session-selected-pointer-1",
             "workbench_context": {
                 "interaction_mode": "continuous",
                 "active_surface": "messages",
@@ -3987,20 +4183,13 @@ async def test_strategic_session_message_does_not_persist_selected_message_body(
     )
 
     assert resp.status_code == 200, resp.text
-    descriptor = resp.json()["message"]["context"]["strategic_session"][
-        "selected_ref_descriptors"
-    ][0]
-    assert descriptor["kind"] == "message"
-    assert descriptor["label"] == "BLOCKER from user"
-    assert "summary" not in descriptor
-    assert descriptor["target"] == {
-        "surface": "messages",
-        "message_id": str(selected_message.id),
-    }
+    projected_context = resp.json()["message"]["context"]
+    assert "strategic_session" not in projected_context
 
     stored = await db_session.get(ProjectMessage, uuid.UUID(resp.json()["id"]))
     assert stored is not None
-    serialized = str((stored.context or {})["strategic_session"])
+    assert "strategic_session" not in (stored.context or {})
+    serialized = str(stored.context or {})
     assert "SECRET MESSAGE BODY" not in serialized
     assert "Hostile descriptor" not in serialized
     assert "SECRET STATUS BODY" not in serialized
@@ -4009,17 +4198,6 @@ async def test_strategic_session_message_does_not_persist_selected_message_body(
     assert "SECRET TARGET SURFACE" not in serialized
     assert "SECRET TARGET SECTION" not in serialized
     assert "SECRET TARGET LOG" not in serialized
-    stored_descriptor = (stored.context or {})["strategic_session"][
-        "selected_ref_descriptors"
-    ][0]
-    assert stored_descriptor == {
-        "kind": "message",
-        "id": f"message:{selected_message.id}",
-        "target": {
-            "surface": "messages",
-            "message_id": str(selected_message.id),
-        },
-    }
 
 
 @pytest.mark.asyncio
@@ -4041,6 +4219,7 @@ async def test_strategic_session_message_response_survives_arming_rollback(
             json={
                 "message_type": "FEEDBACK",
                 "content": "This should still return a durable message receipt.",
+                "idempotency_key": "strategic-session-arming-rollback-1",
             },
         )
 
@@ -4058,21 +4237,458 @@ async def test_strategic_session_note_message_is_passive(
 ):
     project = await _make_project(db_session)
 
+    body = {
+        "message_type": "NOTE",
+        "content": "Keep this note with the persistent Strategic session.",
+        "idempotency_key": "paused-note-retry",
+    }
     resp = await client.post(
         f"/api/admin/projects/{project.id}/strategic-session/messages",
-        json={
-            "message_type": "NOTE",
-            "content": "Keep this note with the persistent Strategic session.",
-        },
+        json=body,
+    )
+    duplicate = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session/messages",
+        json=body,
     )
 
     assert resp.status_code == 200, resp.text
     assert resp.json()["status"] == "created"
     assert resp.json()["arming"] == "passive_note"
+    assert resp.json()["wakeup_state"] == "paused"
+    assert duplicate.status_code == 200, duplicate.text
+    assert duplicate.json()["status"] == "duplicate"
+    assert duplicate.json()["wakeup_state"] == "paused"
     msg = await db_session.get(ProjectMessage, uuid.UUID(resp.json()["id"]))
     assert msg.from_type == "user"
     assert msg.message_type == MessageType.NOTE
+    assert msg.surface == MessageSurface.CONVERSATION
+    assert msg.actor_user_id == TEST_USER_ID
+    assert msg.sequence == 1
     assert msg.content == "Keep this note with the persistent Strategic session."
+
+
+@pytest.mark.asyncio
+async def test_strategic_conversation_requires_nonblank_client_identity(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+
+    missing = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session/messages",
+        json={"content": "This send cannot be recovered safely."},
+    )
+    blank = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session/messages",
+        json={
+            "content": "Whitespace is not an identity.",
+            "idempotency_key": "   ",
+        },
+    )
+
+    assert missing.status_code == 422
+    assert blank.status_code == 422
+    count = await db_session.scalar(
+        select(func.count())
+        .select_from(ProjectMessage)
+        .where(ProjectMessage.project_id == project.id)
+    )
+    assert count == 0
+
+
+@pytest.mark.asyncio
+async def test_sequence_allocator_scopes_short_postgres_lock_timeout():
+    from app.project_message_creation import lock_project_and_next_message_sequence
+
+    session = MagicMock()
+    session.bind.dialect.name = "postgresql"
+    session.execute = AsyncMock()
+    session.scalar = AsyncMock(return_value=42)
+
+    result = await lock_project_and_next_message_sequence(
+        session, uuid.uuid4(), lock_timeout_ms=1_500
+    )
+
+    assert result == 42
+    statements = [str(call.args[0]) for call in session.execute.await_args_list]
+    assert statements == [
+        "SET LOCAL lock_timeout = '1500ms'",
+        "SET LOCAL lock_timeout = DEFAULT",
+    ]
+    assert "projectmessagesequence" in str(session.scalar.await_args.args[0])
+
+
+@pytest.mark.asyncio
+async def test_sequence_allocator_reserves_one_contiguous_block():
+    from app.project_message_creation import reserve_project_message_sequences
+
+    session = MagicMock()
+    session.bind.dialect.name = "postgresql"
+    session.execute = AsyncMock()
+    session.scalar = AsyncMock(return_value=42)
+
+    result = await reserve_project_message_sequences(
+        session,
+        uuid.uuid4(),
+        count=3,
+        lock_timeout_ms=1_500,
+    )
+
+    assert result == [40, 41, 42]
+    assert session.scalar.await_args.args[1]["count"] == 3
+    statement = str(session.scalar.await_args.args[0])
+    assert "counter.last_sequence + :count" in statement
+    assert "max(message.sequence), 0) + :count" in statement
+
+
+@pytest.mark.asyncio
+async def test_sequence_allocator_reports_retryable_busy_without_accepting():
+    from sqlalchemy.exc import OperationalError
+    from app.project_message_creation import lock_project_and_next_message_sequence
+
+    session = MagicMock()
+    session.bind.dialect.name = "postgresql"
+    session.execute = AsyncMock()
+    session.scalar = AsyncMock(
+        side_effect=OperationalError("counter upsert", {}, RuntimeError("lock timeout"))
+    )
+    session.rollback = AsyncMock()
+
+    with pytest.raises(HTTPException) as exc_info:
+        await lock_project_and_next_message_sequence(
+            session, uuid.uuid4(), lock_timeout_ms=1_500
+        )
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.headers == {"Retry-After": "1"}
+    assert "not accepted" in str(exc_info.value.detail)
+    session.rollback.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_strategic_reply_post_is_idempotent_and_resolves_question_atomically(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    question = ProjectMessage(
+        project_id=project.id,
+        sequence=1,
+        surface=MessageSurface.CONVERSATION,
+        message_type=MessageType.QUESTION,
+        from_type="strategic",
+        content="Which rollout policy should I use?",
+        status="open",
+    )
+    db_session.add(question)
+    await db_session.commit()
+    await db_session.refresh(question)
+    attachment_id = uuid.uuid4()
+    attachment_uri = (
+        f"gs://{ARTIFACT_BUCKET_NAME}/message-attachments/"
+        f"{project.id}/{attachment_id}/policy.txt"
+    )
+    db_session.add(ProjectMessageAttachmentUpload(
+        attachment_id=attachment_id,
+        project_id=project.id,
+        actor_user_id=TEST_USER_ID,
+        storage_uri=attachment_uri,
+        filename="policy.txt",
+        content_type="text/plain",
+        expected_size_bytes=12,
+        expires_at=_utcnow() + timedelta(minutes=15),
+    ))
+    await db_session.commit()
+    body = {
+        "message_type": "NOTE",
+        "content": "Keep the rollout paused until checks pass.",
+        "idempotency_key": "reply-lost-response-1",
+        "reply_to_message_id": str(question.id),
+        "source_refs": [{"kind": "message", "id": f"message:{question.id}"}],
+        "context": {
+            "secret_instruction": "do not persist me",
+            "active_surface": "pipeline",
+            "nested_unknown": {"prompt": "hidden"},
+        },
+        "attachments": [{
+            "attachment_id": str(attachment_id),
+            "filename": "policy.txt",
+            "storage_uri": attachment_uri,
+            "size_bytes": 1,
+        }],
+    }
+
+    first = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session/messages", json=body
+    )
+    retry = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session/messages", json=body
+    )
+
+    assert first.status_code == 200, first.text
+    assert retry.status_code == 200, retry.text
+    assert retry.json()["id"] == first.json()["id"]
+    assert retry.json()["status"] == "duplicate"
+    assert retry.json()["wakeup_state"] == first.json()["wakeup_state"]
+    canonical = first.json()["message"]
+    assert canonical["reply_to_message_id"] == str(question.id)
+    assert canonical["context"]["source_refs"] == body["source_refs"]
+    assert canonical["context"]["attachments"] == [{
+        "attachment_id": str(attachment_id),
+        "filename": "policy.txt",
+        "name": "policy.txt",
+        "mime_type": "text/plain",
+        "size_bytes": 12,
+    }]
+    assert "secret_instruction" not in canonical["context"]
+    assert "active_surface" not in canonical["context"]
+    assert "nested_unknown" not in canonical["context"]
+    assert "strategic_session" not in canonical["context"]
+
+    await db_session.refresh(question)
+    assert question.status == "resolved"
+    assert question.handling_state == "responded"
+    assert question.resolution == body["content"]
+    reply_count = await db_session.scalar(
+        select(func.count())
+        .select_from(ProjectMessage)
+        .where(
+            ProjectMessage.project_id == project.id,
+            ProjectMessage.reply_to_message_id == question.id,
+        )
+    )
+    assert reply_count == 1
+    receipt = await db_session.get(ProjectMessageAttachmentUpload, attachment_id)
+    assert receipt is not None
+    assert receipt.message_id == uuid.UUID(first.json()["id"])
+    assert receipt.consumed_at is not None
+
+    with patch(
+        "app.routers.admin_project_strategic_session.generate_download_signed_url",
+        new=AsyncMock(return_value="https://storage.invalid/fresh-signed-url"),
+    ) as signer:
+        download = await client.get(
+            f"/api/admin/projects/{project.id}/strategic-conversation/"
+            f"{first.json()['id']}/attachments/{attachment_id}/download-url"
+        )
+    assert download.status_code == 200, download.text
+    assert download.json()["download_url"] == "https://storage.invalid/fresh-signed-url"
+    signer.assert_awaited_once()
+
+    missing = await client.get(
+        f"/api/admin/projects/{project.id}/strategic-conversation/"
+        f"{first.json()['id']}/attachments/{uuid.uuid4()}/download-url"
+    )
+    assert missing.status_code == 404
+
+    arbitrary = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session/messages",
+        json={
+            "content": "Invalid attachment",
+            "idempotency_key": "bad-attachment-1",
+            "attachments": [{
+                "attachment_id": str(uuid.uuid4()),
+                "filename": "bad.txt",
+                "storage_uri": "gs://attacker-bucket/message-attachments/bad.txt",
+            }],
+        },
+    )
+    assert arbitrary.status_code == 400
+
+    reused = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session/messages",
+        json={
+            "content": "Try to consume the same upload twice.",
+            "idempotency_key": "attachment-reuse-2",
+            "attachments": body["attachments"],
+        },
+    )
+    assert reused.status_code == 409
+    assert "consumed" in reused.json()["error"]["message"].lower()
+
+
+@pytest.mark.asyncio
+async def test_strategic_message_rejects_hidden_or_cross_project_source_refs(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    hidden = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session/messages",
+        json={
+            "content": "Do not attach hidden context.",
+            "idempotency_key": "hidden-ref-1",
+            "context": {
+                "source_refs": [{"kind": "canvas", "id": "strategic-canvas:other"}]
+            },
+            "source_refs": [],
+        },
+    )
+    assert hidden.status_code == 200, hidden.text
+    assert "source_refs" not in hidden.json()["message"]["context"]
+
+    cross_project = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session/messages",
+        json={
+            "content": "Reject a foreign canvas.",
+            "idempotency_key": "foreign-canvas-1",
+            "source_refs": [{"kind": "canvas", "id": "strategic-canvas:other"}],
+        },
+    )
+    assert cross_project.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_strategic_message_revalidates_source_ownership_before_commit(
+    client: AsyncClient, db_session
+):
+    from testing.factories import make_task
+
+    project = await _make_project(db_session)
+    other_project = await _make_project(db_session)
+    task = make_task(project_id=project.id, title="Movable source")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    async def _move_source_during_send(session, *_args, **_kwargs):
+        moving = await session.get(Task, task.id)
+        assert moving is not None
+        moving.project_id = other_project.id
+        session.add(moving)
+        await session.flush()
+        return "steering"
+
+    with patch(
+        "app.project_message_creation.maybe_arm_operator_refresh",
+        side_effect=_move_source_during_send,
+    ):
+        response = await client.post(
+            f"/api/admin/projects/{project.id}/strategic-session/messages",
+            json={
+                "content": "Use the exact task revision.",
+                "idempotency_key": "strategic-session-source-revalidate-1",
+                "source_refs": [{"kind": "task", "id": f"task:{task.id}"}],
+            },
+        )
+
+    assert response.status_code in {400, 409}
+    assert "reference" in response.json()["error"]["message"].lower()
+    stored = await db_session.scalar(
+        select(ProjectMessage).where(
+            ProjectMessage.project_id == project.id,
+            ProjectMessage.content == "Use the exact task revision.",
+        )
+    )
+    assert stored is None
+
+
+@pytest.mark.asyncio
+async def test_strategic_message_rejects_stale_source_revision(
+    client: AsyncClient, db_session
+):
+    from testing.factories import make_task
+
+    project = await _make_project(db_session)
+    task = make_task(project_id=project.id, title="Revisioned source")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    response = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session/messages",
+        json={
+            "content": "Use the stale task revision.",
+            "idempotency_key": "strategic-session-stale-source-1",
+            "source_refs": [{
+                "kind": "task",
+                "id": f"task:{task.id}",
+                "revision": "stale-revision",
+            }],
+        },
+    )
+
+    assert response.status_code == 409
+    assert "revision changed" in response.json()["error"]["message"].lower()
+
+
+@pytest.mark.asyncio
+async def test_strategic_message_rejects_duplicate_source_identity(
+    client: AsyncClient, db_session
+):
+    from testing.factories import make_task
+
+    project = await _make_project(db_session)
+    task = make_task(project_id=project.id, title="Duplicate source")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    response = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session/messages",
+        json={
+            "content": "Do not accept conflicting copies.",
+            "idempotency_key": "strategic-session-duplicate-source-1",
+            "source_refs": [
+                {
+                    "kind": "task",
+                    "id": f"task:{task.id}",
+                    "revision": "stale-revision",
+                },
+                {
+                    "kind": "task",
+                    "id": f"task:{task.id}",
+                    "revision": task.updated_at.isoformat(),
+                },
+            ],
+        },
+    )
+
+    assert response.status_code == 400
+    assert "duplicate task reference" in response.json()["error"]["message"].lower()
+    assert await db_session.scalar(
+        select(ProjectMessage).where(
+            ProjectMessage.project_id == project.id,
+            ProjectMessage.content == "Do not accept conflicting copies.",
+        )
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_strategic_message_idempotency_rejects_actor_or_chip_collision(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    key = "strict-identity-1"
+    first = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session/messages",
+        json={
+            "content": "Use this exact source.",
+            "idempotency_key": key,
+            "source_refs": [{"kind": "canvas", "id": f"strategic-canvas:{project.id}"}],
+        },
+    )
+    assert first.status_code == 200, first.text
+    changed = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session/messages",
+        json={"content": "Use this exact source.", "idempotency_key": key},
+    )
+    assert changed.status_code == 409
+
+    legacy_key = "legacy-null-actor-1"
+    db_session.add(ProjectMessage(
+        project_id=project.id,
+        sequence=99,
+        surface=MessageSurface.CONVERSATION,
+        message_type=MessageType.NOTE,
+        from_type="user",
+        actor_user_id=None,
+        content="Ambiguous legacy row",
+        idempotency_key=legacy_key,
+    ))
+    await db_session.commit()
+    ambiguous = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session/messages",
+        json={"content": "Ambiguous legacy row", "idempotency_key": legacy_key},
+    )
+    assert ambiguous.status_code == 409
 
 
 @pytest.mark.asyncio
@@ -4106,6 +4722,7 @@ async def test_strategic_session_message_touches_workbench_freshness(
         json={
             "message_type": "NOTE",
             "content": "Keep the persistent Strategic session alive.",
+            "idempotency_key": "strategic-session-workbench-freshness-1",
         },
     )
 
@@ -4125,7 +4742,7 @@ async def test_strategic_session_message_touches_workbench_freshness(
     assert workbench["selected_refs"] == [
         {"kind": "task", "id": "task-9", "label": "Watch task"}
     ]
-    assert datetime.fromisoformat(workbench["last_interaction_at"]) > datetime.fromisoformat(old_interaction_at)
+    assert workbench["last_interaction_at"] == old_interaction_at
 
 
 @pytest.mark.asyncio
@@ -6025,6 +6642,140 @@ async def test_operator_attention_surfaces_bug_and_feedback_as_watch_items(
     assert bug_lifecycle["acknowledge_effect"] == "clears_unread_only"
     assert feedback_lifecycle["mode"] == "message_lifecycle"
     assert feedback_lifecycle["acknowledgeable"] is True
+
+
+@pytest.mark.asyncio
+async def test_operator_attention_uses_routed_audience_for_action_messages(
+    client: AsyncClient, db_session
+):
+    """Only the canonical action audience reaches needs_operator attention."""
+    project = await _make_project(db_session)
+    action = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.NOTE,
+        from_type="system",
+        content="An operator decision is required.",
+        status="open",
+        context={"event_type": "criterion_retracted", "audience": "operator-action-needed"},
+    )
+    fyi = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.NOTE,
+        from_type="system",
+        content="An operator-visible FYI.",
+        status="open",
+        context={"event_type": "capability_proof_gate_graduated_observe", "audience": "operator-fyi"},
+    )
+    internal = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.NOTE,
+        from_type="system",
+        content="Strategist bookkeeping only.",
+        status="open",
+        context={"event_type": "pr_merged", "audience": "strategist-internal"},
+    )
+    db_session.add_all([action, fyi, internal])
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/operator-attention?project_id={project.id}")
+    assert resp.status_code == 200
+    attention = resp.json()
+
+    assert attention["counts"]["needs_operator"] == 1
+    items = {item["id"]: item for item in attention["items"]}
+    assert items[f"message:{action.id}"]["severity"] == "needs_operator"
+    assert f"message:{fyi.id}" not in items
+    assert f"message:{internal.id}" not in items
+
+
+@pytest.mark.asyncio
+async def test_operator_attention_excludes_internal_messages_and_tasks_everywhere(
+    client: AsyncClient, db_session
+):
+    """Internal rows never affect previews, summaries, or attention counts."""
+    project = await _make_project(db_session)
+    internal_context = {"audience": "strategist-internal"}
+    internal_messages = [
+        ProjectMessage(
+            project_id=project.id,
+            message_type=message_type,
+            from_type="system",
+            content=f"internal {message_type.value}",
+            status="open",
+            context=internal_context,
+        )
+        for message_type in (MessageType.QUESTION, MessageType.BLOCKER, MessageType.NOTE)
+    ]
+    visible_question = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.QUESTION,
+        from_type="system",
+        content="legacy visible question",
+        status="open",
+    )
+    internal_approval = Task(
+        project_id=project.id,
+        title="internal approval",
+        status=TaskStatus.QUEUED,
+        requires_approval=True,
+        context=internal_context,
+    )
+    internal_blocked = Task(
+        project_id=project.id,
+        title="internal blocked",
+        status=TaskStatus.BLOCKED,
+        context=internal_context,
+    )
+    internal_parked = Task(
+        project_id=project.id,
+        title="internal parked",
+        status=TaskStatus.PARKED,
+        context=internal_context,
+    )
+    internal_failed = Task(
+        project_id=project.id,
+        title="internal failed",
+        status=TaskStatus.FAILED,
+        context=internal_context,
+    )
+    visible_failed = Task(
+        project_id=project.id,
+        title="legacy visible failure",
+        status=TaskStatus.FAILED,
+    )
+    db_session.add_all([
+        *internal_messages,
+        visible_question,
+        internal_approval,
+        internal_blocked,
+        internal_parked,
+        internal_failed,
+        visible_failed,
+    ])
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/operator-attention?project_id={project.id}")
+    assert resp.status_code == 200, resp.text
+    attention = resp.json()
+
+    assert attention["summary"] == "1 operator item need review"
+    assert attention["counts"]["questions"] == 1
+    assert attention["counts"]["blockers"] == 0
+    assert attention["counts"]["unread"] == 1
+    assert attention["counts"]["approvals"] == 0
+    assert attention["counts"]["blocked_tasks"] == 0
+    assert attention["counts"]["parked_tasks"] == 0
+    assert attention["counts"]["failed_tasks"] == 1
+    item_ids = {item["id"] for item in attention["items"]}
+    assert f"message:{visible_question.id}" in item_ids
+    assert f"task:{visible_failed.id}:failed_task" in item_ids
+    assert not {
+        *(f"message:{message.id}" for message in internal_messages),
+        f"task:{internal_approval.id}:approval_required",
+        f"task:{internal_blocked.id}:blocked_task",
+        f"task:{internal_parked.id}:parked_task",
+        f"task:{internal_failed.id}:failed_task",
+    } & item_ids
 
 
 @pytest.mark.asyncio
@@ -7952,6 +8703,10 @@ async def test_strategic_state_matching_revision_returns_304_skips_assembly(
         "app.routers.admin_project_strategic_session.build_workbench_event_feed",
         new_callable=AsyncMock,
     )
+    attention_spy = mocker.patch(
+        "app.routers.admin_project_strategic_session.build_operator_attention",
+        new_callable=AsyncMock,
+    )
 
     # Second call WITH the matching revision token → 304, empty body.
     resp2 = await client.get(
@@ -7970,6 +8725,7 @@ async def test_strategic_state_matching_revision_returns_304_skips_assembly(
     runtime_spy.assert_not_called()
     workbench_spy.assert_not_called()
     events_spy.assert_not_called()
+    attention_spy.assert_not_called()
 
 
 # The visible response segments and the mutation that must flip the broad
@@ -8170,6 +8926,58 @@ async def test_fingerprint_live_runner_count_flips_on_time_derived_staleness(
     assert fp_stale["runner_count"] == fp_live["runner_count"]
     assert fp_stale["runner_max_seen"] == fp_live["runner_max_seen"]
     assert fp_stale["live_runner_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_attention_fingerprints_cover_completion_debt_and_time_boundary(
+    db_session, mocker
+):
+    """Attention-only durable and clock changes must defeat a held revision.
+
+    Completion debt is not represented by the message/task fingerprints.  Its
+    24-hour stale threshold likewise changes attention without a database write,
+    so both must have a cheap Phase-1 fingerprint.
+    """
+    from app.routers.admin_project_strategic_session import (
+        _compute_strategic_state_fingerprints,
+    )
+
+    project = await _make_project(db_session)
+    now = _utcnow()
+    before = await _compute_strategic_state_fingerprints(
+        db_session, project.id, TEST_USER_ID
+    )
+    assert before["completion_debt_count"] == 0
+    assert before["attention_next_time_boundary"] is None
+
+    debt = CompletionDebtEntry(
+        project_id=project.id,
+        kind="retirement_residual",
+        title="Debt about to become operator attention",
+        status="open",
+        created_at=now - timedelta(hours=23, minutes=59),
+    )
+    db_session.add(debt)
+    await db_session.commit()
+    with_debt = await _compute_strategic_state_fingerprints(
+        db_session, project.id, TEST_USER_ID
+    )
+    assert with_debt["completion_debt_count"] == 1
+    assert with_debt["completion_debt_max_updated"] is not None
+    assert with_debt["attention_next_time_boundary"] is not None
+
+    # Crossing the debt's threshold leaves all durable rows untouched, but the
+    # upcoming-boundary stamp disappears so the state revision cannot 304.
+    mocker.patch(
+        "app.routers.admin_project_strategic_session._utcnow",
+        return_value=now + timedelta(minutes=2),
+    )
+    after_threshold = await _compute_strategic_state_fingerprints(
+        db_session, project.id, TEST_USER_ID
+    )
+    assert after_threshold["completion_debt_count"] == with_debt["completion_debt_count"]
+    assert after_threshold["completion_debt_max_updated"] == with_debt["completion_debt_max_updated"]
+    assert after_threshold["attention_next_time_boundary"] != with_debt["attention_next_time_boundary"]
 
 
 @pytest.mark.asyncio

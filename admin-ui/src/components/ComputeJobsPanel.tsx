@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Cpu, Square, AlertTriangle, Clock, ExternalLink, Package, FileText, LayoutGrid, CheckCircle, XCircle, BookOpen, Search, List } from 'lucide-react';
 import { analyzeComputeJob, askComputeJob, fetchAwaitingLocalRunnerHolds, fetchComputeJobsPaged, fetchComputeJobsAggregateSummary, fetchComputeSweepGroups, fetchHeldComputeExperiments, fetchKnowledgeDocument, killComputeJob, rerunComputeExperiment, resolveArtifactDownloadUrl, type AwaitingLocalRunnerHold, type ComputeJob, type ComputeJobCommandLog, type ComputeJobLiveOutput, type ComputeJobsSummary, type ComputeSweepGroupsResponse, type ComputeSuccessOperator, type HeldComputeExperiment, type KnowledgeDocument } from '../api';
 import { type ComputeExperimentForm, defaultComputeExperimentForm } from '../hooks/useTaskModal';
@@ -37,6 +37,8 @@ const POLL_INTERVAL_MS = 10_000;
 // Signed artifact URLs expire after ~60 minutes; treat anything older than
 // 50 minutes as stale and re-resolve instead of handing out a dead link.
 const SIGNED_PREVIEW_FRESH_MS = 50 * 60 * 1000;
+const artifactCacheKey = (jobId: string, storageUri: string, revision: string | null) =>
+  `${jobId}:${revision ? `${storageUri}@${revision}` : storageUri}`;
 
 type PreviewResolution =
   | { state: 'resolving' }
@@ -1054,10 +1056,13 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
   const [knowledgeDocs, setKnowledgeDocs] = useState<Record<string, KnowledgeDocument>>({});
   const [sweepGroups, setSweepGroups] = useState<ComputeSweepGroupsResponse['sweep_groups']>({});
   const [expandedDocIds, setExpandedDocIds] = useState<Set<string>>(new Set());
-  // Signed preview URLs for viewable artifacts, keyed by `${jobId}:${storageUri}`.
+  // Signed preview URLs keyed by storage identity plus its revision. A runner may
+  // overwrite a durable URI while a gallery is open, so URI alone is not a
+  // preview generation.
   // Resolved lazily on gallery expand and cached for the session; entries are
   // re-resolved on click / media error once the signed URL goes stale.
   const [previewUrls, setPreviewUrls] = useState<Record<string, PreviewResolution>>({});
+  const previewRequestIds = useRef<Record<string, number>>({});
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [askState, setAskState] = usePersistedState<Record<string, AskStateValue>>(
     `compute-ask-state:${projectId}`,
@@ -1131,13 +1136,19 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
 
   const resolvePreviewUrl = useCallback(async (key: string, storageUri: string): Promise<string | null> => {
     if (!projectId) return null;
+    const requestId = (previewRequestIds.current[key] ?? 0) + 1;
+    previewRequestIds.current[key] = requestId;
     setPreviewUrls((prev) => ({ ...prev, [key]: { state: 'resolving' } }));
     try {
       const url = await resolveArtifactDownloadUrl(projectId, storageUri);
-      setPreviewUrls((prev) => ({ ...prev, [key]: { state: 'resolved', url, resolvedAt: Date.now() } }));
+      if (previewRequestIds.current[key] === requestId) {
+        setPreviewUrls((prev) => ({ ...prev, [key]: { state: 'resolved', url, resolvedAt: Date.now() } }));
+      }
       return url;
     } catch {
-      setPreviewUrls((prev) => ({ ...prev, [key]: { state: 'error' } }));
+      if (previewRequestIds.current[key] === requestId) {
+        setPreviewUrls((prev) => ({ ...prev, [key]: { state: 'error' } }));
+      }
       return null;
     }
   }, [projectId]);
@@ -1158,12 +1169,25 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
       // minted on click by openPreviewFullSize — don't waste a signing round-trip
       // eagerly on expand.
       if (art.kind === 'pdf') continue;
-      const key = `${job.id}:${art.storage_uri}`;
+      const key = artifactCacheKey(job.id, art.storage_uri, art.revision);
       const cached = previewUrls[key];
       if (cached?.state === 'resolving' || cached?.state === 'resolved') continue;
       void resolvePreviewUrl(key, art.storage_uri);
     }
   }, [expandedDocIds, toggleDocExpanded, previewUrls, resolvePreviewUrl]);
+
+  // Polling can replace a live artifact at the same URI. Keep an already-open
+  // gallery live by signing only the newly observed generation.
+  useEffect(() => {
+    for (const job of jobs) {
+      if (!expandedDocIds.has(`gallery-${job.id}`)) continue;
+      for (const art of computeJobViewableArtifacts(job)) {
+        if (art.kind === 'pdf') continue;
+        const key = artifactCacheKey(job.id, art.storage_uri, art.revision);
+        if (!previewUrls[key]) void resolvePreviewUrl(key, art.storage_uri);
+      }
+    }
+  }, [jobs, expandedDocIds, previewUrls, resolvePreviewUrl]);
 
   const openPreviewFullSize = useCallback(async (key: string, storageUri: string) => {
     const cached = previewUrls[key];
@@ -2425,7 +2449,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                     {galleryExpanded && (
                       <div className="flex flex-wrap gap-2">
                         {artifacts.map((art) => {
-                          const key = `${job.id}:${art.storage_uri}`;
+                          const key = artifactCacheKey(job.id, art.storage_uri, art.revision);
                           const resolution = previewUrls[key];
                           const sizeLabel = fmtBytes(art.bytes);
                           const caption = (

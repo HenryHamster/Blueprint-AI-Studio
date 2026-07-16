@@ -33,8 +33,10 @@ from app.models import (
 )
 from app.runner_project_binding import (
     add_binding,
+    allowed_project_ids_by_runner,
     bound_project_ids,
     remove_binding,
+    runner_allowed_for_project,
 )
 from app.runner_config import (
     GPU_INDICES_ALL,
@@ -601,6 +603,9 @@ def _runner_view(runner: LocalRunner) -> Dict[str, Any]:
     )
     return {
         "id": str(runner.id),
+        # Lifecycle and config mutations remain anchored to the enrollment
+        # project even when a bound project is displaying this runner.
+        "enrollment_project_id": str(runner.project_id),
         "hostname": runner.hostname,
         "version": runner.version,
         "status": runner.status,
@@ -612,6 +617,10 @@ def _runner_view(runner: LocalRunner) -> Dict[str, Any]:
         ),
         "created_at": runner.created_at.isoformat() if runner.created_at else None,
         "token_age_days": token_age_days,
+        "current_token_heartbeat_confirmed": bool(
+            runner.last_heartbeat_token_generation > 0
+            and runner.last_heartbeat_token_generation == runner.token_generation
+        ),
     }
 
 
@@ -878,7 +887,7 @@ async def list_runners(
     query = (
         select(LocalRunner)
         .where(
-            LocalRunner.project_id == project_id,
+            runner_allowed_for_project(project_id),
             LocalRunner.status != "deleted",
         )
         .order_by(LocalRunner.created_at.desc())
@@ -921,13 +930,12 @@ async def runner_telemetry(
     await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "viewer"
     )
-    # 404 on a runner that is not this project's, so telemetry can't be read
-    # cross-project even though snapshots carry no project_id of their own.
+    # 404 if the runner is not reachable from this project (enrollment or allow-list).
     runner = (
         await session.execute(
             select(LocalRunner).where(
                 LocalRunner.id == runner_id,
-                LocalRunner.project_id == project_id,
+                runner_allowed_for_project(project_id),
             )
         )
     ).scalars().first()
@@ -979,7 +987,7 @@ async def runner_stats(
         await session.execute(
             select(LocalRunner).where(
                 LocalRunner.id == runner_id,
-                LocalRunner.project_id == project_id,
+                runner_allowed_for_project(project_id),
             )
         )
     ).scalars().first()
@@ -1194,7 +1202,9 @@ async def rotate_runner_token(
 
     token = create_runner_token(runner.id)
     runner.token_hash = hash_runner_token(token)
-    runner.token_created_at = _utcnow()
+    rotated_at = _utcnow()
+    runner.token_created_at = rotated_at
+    runner.token_generation = max(1, runner.token_generation) + 1
     summary_status = runner.status
     summary_hostname = runner.hostname
     session.add(runner)
@@ -1217,7 +1227,11 @@ async def rotate_runner_token(
             "hostname": summary_hostname,
         },
     )
-    return {"runner_id": str(runner_id), "token": token}
+    return {
+        "runner_id": str(runner_id),
+        "token": token,
+        "rotated_at": f"{rotated_at.isoformat()}Z",
+    }
 
 
 async def _release_unpulled_runner_pins(
@@ -1535,10 +1549,11 @@ async def fleet_runners_health_summary(
             _MAX_HEALTH_RUNNERS,
         )
 
+    memberships = await allowed_project_ids_by_runner(session, all_runners)
     per_project: Dict[str, List[LocalRunner]] = {}
     for runner in all_runners:
-        pid = str(runner.project_id)
-        per_project.setdefault(pid, []).append(runner)
+        for allowed_project_id in memberships[runner.id]:
+            per_project.setdefault(str(allowed_project_id), []).append(runner)
 
     fleet = {
         "total": 0,
@@ -1581,10 +1596,20 @@ async def fleet_runners_health_summary(
             if view["health"].get("memory_low"):
                 entry["low_memory"] += 1
 
-        for key in ("total", "connected", "degraded", "stale", "offline", "low_disk", "low_memory"):
-            fleet[key] += entry[key]
-
         per_project_entries.append(entry)
+
+    # Fleet totals count physical devices once; the project breakdown above
+    # intentionally includes a shared runner in every allowed project.
+    for runner in all_runners:
+        view = _runner_view(runner)
+        fleet["total"] += 1
+        status = view["health"]["device_status"]
+        if status in fleet:
+            fleet[status] += 1
+        if view["health"].get("disk_low"):
+            fleet["low_disk"] += 1
+        if view["health"].get("memory_low"):
+            fleet["low_memory"] += 1
 
     fleet["per_project"] = per_project_entries
     fleet["generated_at"] = now.isoformat()

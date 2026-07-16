@@ -43,6 +43,7 @@ from app.capability_proof import (
     should_record_capability_proof,
 )
 from app.capability_registry import (
+    _alias_to_survivor_map,
     _ledger_proof_status,
     capability_need_blocked_by_proof_gate,
     ledger_corroborated_proof_status,
@@ -220,6 +221,29 @@ class TestRecordCapabilityProof:
 
         assert recorded == []
         assert project.capability_proof_records == {}
+
+    def test_proof_not_recorded_when_no_verdict_in_context(self):
+        """A task with capability marker but NO acceptance verdict must NOT mint a proof.
+
+        record_code_acceptance_verdict no-ops (returns None, writes nothing) on
+        tasks that declared no acceptance evidence. Without the spawn-level block
+        on "code_acceptance_verdict", a malicious agent could forge a verdict
+        directly into the spawned child's JSONB context. This test proves that
+        without the forged verdict key in context, record_capability_proof cannot
+        mint a proof — confirming the spawn-level block is the correct defense.
+        """
+        task = _make_task(
+            provides_capability="language-aware-repo-map",
+            # No verdict — the agent-forge scenario when the block is in place.
+        )
+        project = _make_project()
+
+        with patch("app.capability_proof.flag_modified") as mock_fm:
+            recorded = record_capability_proof(task, project)
+
+        assert recorded == []
+        assert project.capability_proof_records == {}
+        mock_fm.assert_not_called()
 
     def test_proof_capped_per_capability(self):
         cap = "language-aware-repo-map"
@@ -3548,6 +3572,159 @@ class TestEarnLoopExecutionTrialEnrollment:
         assert _kwargs.get("head_sha") == "newsha1111"
         assert result["named_test_executed"] == [self._CAP]
 
+    @pytest.mark.asyncio
+    async def test_merge_gate_proof_at_head_suppresses_reenroll(self):
+        """Cadence guard: a merge-gate named_test proof whose commit_sha matches
+        HEAD suppresses trial enrollment — we don't re-verify what the merge gate
+        already proved at this exact revision."""
+        from datetime import datetime
+
+        from app.capability_proof import _fresh_executed_proof_covers_head
+
+        now = datetime(2026, 7, 14, 0, 0, 0)
+        project = MagicMock()
+        project.capability_proof_records = {
+            "capability-proof-gate": [
+                {
+                    # Merge-gate proof: real task_id (not named_test_exec:), no
+                    # recorded_at, but has proof_kind=named_test and commit_sha.
+                    "task_id": "abc123-real-task-id",
+                    "proved_at": now.isoformat(),
+                    "proof_kind": "named_test",
+                    "commit_sha": "deadbeef",
+                }
+            ]
+        }
+        assert _fresh_executed_proof_covers_head(
+            project, "capability-proof-gate", "deadbeef", now=now
+        )
+
+    @pytest.mark.asyncio
+    async def test_merge_gate_proof_different_sha_still_reenrolls(self):
+        """A merge-gate proof for a DIFFERENT sha does not suppress enrollment
+        — HEAD moved so we need to re-verify at the new sha."""
+        from datetime import datetime
+
+        from app.capability_proof import _fresh_executed_proof_covers_head
+
+        now = datetime(2026, 7, 14, 0, 0, 0)
+        project = MagicMock()
+        project.capability_proof_records = {
+            "capability-proof-gate": [
+                {
+                    "task_id": "abc123-real-task-id",
+                    "proved_at": now.isoformat(),
+                    "proof_kind": "named_test",
+                    "commit_sha": "oldsha111",
+                }
+            ]
+        }
+        # HEAD moved to a new sha — merge-gate proof at old sha does not cover it.
+        assert not _fresh_executed_proof_covers_head(
+            project, "capability-proof-gate", "newsha222", now=now
+        )
+
+
+class TestRevokeStaleExecutionProof:
+    """revoke_stale_execution_proof removes the ledger entry and evidence_ref
+    for a capability after a definitive RED trial proves it broken at HEAD."""
+
+    def _project_with_exec_proof(self, cap_name: str):
+        """Return a project mock with a named_test_exec ledger entry."""
+        project = MagicMock()
+        norm = cap_name.lower().replace(" ", "-")
+        dedup_id = f"named_test_exec:{norm}"
+        project.capability_proof_records = {
+            norm: [
+                {
+                    "task_id": dedup_id,
+                    "proved_at": "2026-07-14T00:00:00",
+                    "recorded_at": "2026-07-14T00:00:00",
+                    "proof_kind": "named_test",
+                    "commit_sha": "deadbeef",
+                    "executed": True,
+                }
+            ]
+        }
+        project.problem_model = {
+            "capabilities": [
+                {
+                    "name": cap_name,
+                    "status": "working",
+                    "evidence_refs": [
+                        {
+                            "kind": "named_test",
+                            "proven": True,
+                            "source_id": dedup_id,
+                            "recorded_at": "2026-07-14T00:00:00",
+                        }
+                    ],
+                }
+            ]
+        }
+        return project
+
+    def test_revoke_removes_ledger_entry(self):
+        """A RED result removes the named_test_exec ledger entry."""
+        from app.capability_proof import revoke_stale_execution_proof
+
+        cap = "repo-map"
+        project = self._project_with_exec_proof(cap)
+        with patch("app.capability_proof.flag_modified"):
+            result = revoke_stale_execution_proof(project, cap)
+
+        assert result is True
+        entries = project.capability_proof_records.get("repo-map") or []
+        assert not any(e.get("task_id") == "named_test_exec:repo-map" for e in entries)
+
+    def test_revoke_removes_evidence_ref(self):
+        """Revocation also removes the matching evidence_ref from problem_model."""
+        from app.capability_proof import revoke_stale_execution_proof
+
+        cap = "repo-map"
+        project = self._project_with_exec_proof(cap)
+        with patch("app.capability_proof.flag_modified"):
+            revoke_stale_execution_proof(project, cap)
+
+        caps = project.problem_model.get("capabilities", [])
+        refs = caps[0].get("evidence_refs", []) if caps else []
+        assert not any(r.get("source_id") == "named_test_exec:repo-map" for r in refs)
+
+    def test_revoke_returns_false_when_no_entry(self):
+        """Returns False when no executed-proof entry exists (nothing to revoke)."""
+        from app.capability_proof import revoke_stale_execution_proof
+
+        project = MagicMock()
+        project.capability_proof_records = {"other-cap": []}
+        project.problem_model = {"capabilities": []}
+        with patch("app.capability_proof.flag_modified"):
+            result = revoke_stale_execution_proof(project, "repo-map")
+
+        assert result is False
+
+    def test_revoke_leaves_non_exec_entries(self):
+        """Revocation only removes the named_test_exec: entry; other proof
+        entries (e.g. merge-gate proofs) are left intact."""
+        from app.capability_proof import revoke_stale_execution_proof
+
+        cap = "repo-map"
+        project = self._project_with_exec_proof(cap)
+        # Add a merge-gate proof entry.
+        project.capability_proof_records["repo-map"].append(
+            {
+                "task_id": "merge-gate-task-id",
+                "proved_at": "2026-07-13T00:00:00",
+                "proof_kind": "named_test",
+                "commit_sha": "abc123",
+            }
+        )
+        with patch("app.capability_proof.flag_modified"):
+            revoke_stale_execution_proof(project, cap)
+
+        entries = project.capability_proof_records.get("repo-map") or []
+        assert len(entries) == 1
+        assert entries[0]["task_id"] == "merge-gate-task-id"
+
 
 class TestCapabilityProofFreshnessExpiry:
     """Capability proofs expire and force re-verification once stale.
@@ -3749,6 +3926,173 @@ class TestCapabilityProofFreshnessExpiry:
         assert folded_fresh["cap-a"] == "proven"
 
 
+class TestLedgerProofFreshness:
+    """``_ledger_proof_status`` evaluates ledger proof freshness when ``now`` is
+    supplied, so an expired historical proof does NOT corroborate a self-declared
+    ``proven`` claim at the enforce gate.
+
+    Without freshness (``now=None`` — legacy behaviour), a stale proof still grades
+    ``proven`` because the synthetic refs carry no timestamp the classifier expires.
+    The opt-in path carries each entry's ``proved_at`` as ``recorded_at`` and passes
+    ``now`` to ``classify_evidence_tiered``, which drops stale refs before tiering.
+    """
+
+    def _now(self):
+        from datetime import datetime
+
+        return datetime(2026, 7, 15, 12, 0, 0)
+
+    def _records(self, cap_name: str, proved_at: str) -> dict:
+        return {
+            cap_name: [{"proof_kind": "named_test", "proved_at": proved_at}]
+        }
+
+    def test_fresh_ledger_proof_grades_proven(self):
+        """A freshly-dated ledger entry corroborates a self-declared claim."""
+        from datetime import timedelta
+
+
+        now = self._now()
+        fresh = (now - timedelta(days=1)).isoformat()
+        records = self._records("real-cap", fresh)
+        # Fresh — with now supplied: grades proven.
+        assert _ledger_proof_status(records, "real-cap", now=now) == "proven"
+
+        # Same, via ledger_corroborated_proof_status with now supplied.
+        corroborated = ledger_corroborated_proof_status(
+            {"real-cap": "proven"}, records, now=now
+        )
+        assert corroborated["real-cap"] == "proven"
+
+    def test_stale_ledger_proof_does_not_grade_proven(self):
+        """A ledger proof older than PROOF_FRESHNESS_TTL demotes below 'proven'."""
+        from datetime import timedelta
+
+        from app.evidence_primitive import PROOF_FRESHNESS_TTL
+
+        now = self._now()
+        stale = (now - PROOF_FRESHNESS_TTL - timedelta(days=1)).isoformat()
+        records = self._records("real-cap", stale)
+        # With now supplied: stale → not proven.
+        assert _ledger_proof_status(records, "real-cap", now=now) != "proven"
+
+        # The stale ledger entry does NOT corroborate a self-declared proven claim.
+        corroborated = ledger_corroborated_proof_status(
+            {"real-cap": "proven"}, records, now=now
+        )
+        assert corroborated["real-cap"] != "proven"
+        assert corroborated["real-cap"] == "unverified"
+
+    def test_legacy_now_none_preserves_stale_proof(self):
+        """Without ``now``, a stale proof still grades 'proven' — legacy behaviour."""
+        from datetime import timedelta
+
+        from app.evidence_primitive import PROOF_FRESHNESS_TTL
+
+        now = self._now()
+        stale = (now - PROOF_FRESHNESS_TTL - timedelta(days=1)).isoformat()
+        records = self._records("real-cap", stale)
+        # No now → legacy: age is never checked.
+        assert _ledger_proof_status(records, "real-cap") == "proven"
+
+        # ledger_corroborated_proof_status without now: also preserves legacy.
+        corroborated = ledger_corroborated_proof_status(
+            {"real-cap": "proven"}, records
+        )
+        assert corroborated["real-cap"] == "proven"
+
+    def test_missing_proved_at_is_indeterminate(self):
+        """A ledger entry with no ``proved_at`` is never expired — indeterminate."""
+        records = {
+            "real-cap": [{"proof_kind": "named_test"}]
+        }
+        now = self._now()
+        assert _ledger_proof_status(records, "real-cap", now=now) == "proven"
+        corroborated = ledger_corroborated_proof_status(
+            {"real-cap": "proven"}, records, now=now
+        )
+        assert corroborated["real-cap"] == "proven"
+
+    def test_backing_path_stale_is_not_proven(self):
+        """A stale backing_path-only ledger entry does not corroborate."""
+        from datetime import timedelta
+
+        from app.evidence_primitive import PROOF_FRESHNESS_TTL
+
+        now = self._now()
+        stale = (now - PROOF_FRESHNESS_TTL - timedelta(days=1)).isoformat()
+        records = {
+            "structural-cap": [{"proof_kind": "backing_path", "proved_at": stale}]
+        }
+        assert _ledger_proof_status(records, "structural-cap", now=now) != "proven"
+        # A stale backing_path must not corroborate a self-declared proven claim.
+        corroborated = ledger_corroborated_proof_status(
+            {"structural-cap": "proven"}, records, now=now
+        )
+        assert corroborated["structural-cap"] != "proven"
+
+    def test_release_gate_rejects_stale_ledger_proof(self):
+        """``capability_proof_gate_release_status`` with ``now`` blocks on stale proof."""
+        from app.capability_registry import capability_proof_gate_release_status
+
+        from datetime import timedelta
+        from app.evidence_primitive import PROOF_FRESHNESS_TTL
+
+        now = self._now()
+        stale = (now - PROOF_FRESHNESS_TTL - timedelta(days=1)).isoformat()
+        model = {
+            "capabilities": [
+                {
+                    "name": "real-cap",
+                    "status": "working",
+                    "evidence_refs": [
+                        {"kind": "named_test", "ref": "t.py::x", "proven": True}
+                    ],
+                }
+            ]
+        }
+        records = {"real-cap": [{"proof_kind": "named_test", "proved_at": stale}]}
+        blocked, detail = capability_proof_gate_release_status(
+            model, "enforce", records, now=now
+        )
+        assert blocked is True
+        assert "real-cap" in detail["uncorroborated"]
+        assert detail["corroborated"] == []
+
+    def test_release_gate_rejects_stale_ledger_proof_without_explicit_now(self):
+        """``capability_proof_gate_release_status`` with no explicit ``now`` still
+        enforces freshness — a stale ledger proof does not clear the enforce gate.
+
+        Before the fix, the gate only checked freshness when ``now`` was explicitly
+        supplied; callers omitting it got unchecked legacy behaviour."""
+        from app.capability_registry import capability_proof_gate_release_status
+        from datetime import datetime, timedelta, timezone
+        from app.evidence_primitive import PROOF_FRESHNESS_TTL
+
+        stale = (
+            datetime.now(timezone.utc) - PROOF_FRESHNESS_TTL - timedelta(days=1)
+        ).isoformat()
+        model = {
+            "capabilities": [
+                {
+                    "name": "real-cap",
+                    "status": "working",
+                    "evidence_refs": [
+                        {"kind": "named_test", "ref": "t.py::x", "proven": True}
+                    ],
+                }
+            ]
+        }
+        records = {"real-cap": [{"proof_kind": "named_test", "proved_at": stale}]}
+        # No explicit now: freshness must still be evaluated.
+        blocked, detail = capability_proof_gate_release_status(
+            model, "enforce", records
+        )
+        assert blocked is True, "stale ledger proof must block promotion"
+        assert "real-cap" in detail["uncorroborated"]
+        assert detail["corroborated"] == []
+
+
 class TestReleaseGateLedgerCorroboration:
     """Finding #1: the release-qualifier enforce gate must clear a capability only
     from PLATFORM-verified proof (the durable capability_proof_records ledger),
@@ -3911,6 +4255,280 @@ class TestReleaseGateLedgerCorroboration:
         assert detail["unproven"] == ["legacy-cap"]
         assert detail["uncorroborated"] == ["legacy-cap"]
         assert detail["corroborated"] == []
+
+
+class TestLedgerCorroborationAliases:
+    """The ledger-corroboration pass resolves absorbed alias names through the
+    survivor's platform proof record, so a dependent blocked on an old name is
+    unblocked when the survivor has a ledger proof — while a forged claim on a
+    non-absorbed name is never accidentally corroborated.
+
+    The alias map (:func:`_alias_to_survivor_map`) maps each absorbed canonical
+    name to its survivor. ``ledger_corroborated_proof_status`` retries the
+    survivor's ledger key when a direct lookup fails and the name appears in the
+    alias map.
+    """
+
+    def test_absorbed_alias_corroborated_through_survivor(self):
+        """A blocked dependent that names an absorbed alias ``old-y`` clears when
+        the survivor ``survivor-x`` has a platform ledger proof — the alias is
+        retried against the survivor's ledger key."""
+        # ``working_capability_proof_status`` folds absorbed aliases, so
+        # ``old-y`` grades ``proven`` from the survivor's self-reported evidence_refs.
+        model = {
+            "capabilities": [
+                {
+                    "name": "survivor-x",
+                    "status": "working",
+                    "absorbs": ["old-y"],
+                    "evidence_refs": [
+                        {"kind": "named_test", "ref": "t.py::x", "proven": True}
+                    ],
+                }
+            ]
+        }
+        # The platform ledger stores proof only under the SURVIVOR's name.
+        records = {
+            "survivor-x": [
+                {"task_id": "T1", "proof_kind": "named_test", "proof_ref": "t.py::x"}
+            ]
+        }
+        alias_map = _alias_to_survivor_map(model)
+
+        # Without alias_map: ``old-y`` is demoted to unverified (no direct entry).
+        no_alias = ledger_corroborated_proof_status(
+            {"old-y": "proven"}, records
+        )
+        assert no_alias["old-y"] == "unverified", (
+            "without alias_map the absorbed alias must fail direct ledger lookup"
+        )
+
+        # WITH alias_map: ``old-y`` is retried against the survivor's ledger key.
+        with_alias = ledger_corroborated_proof_status(
+            {"old-y": "proven"}, records, alias_map=alias_map
+        )
+        assert with_alias["old-y"] == "proven", (
+            "the absorbed alias must be corroborated through the survivor's ledger key"
+        )
+
+    def test_survivor_corroborated_through_absorbed_alias_ledger_key(self):
+        """When a capability was renamed (survivor-x absorbs old-y) and the proof
+        was recorded under the OLD name (old-y) before the rename, the SURVIVOR
+        name must still be corroborated via the absorbed alias's ledger key.
+
+        This is the reverse direction: the alias_map is ``{old-y: survivor-x}``
+        and the name being looked up is ``survivor-x`` (not a key in the map).
+        Without the reverse lookup, the survivor is demoted to ``unverified`` even
+        though its platform proof exists under the absorbed key."""
+        alias_map = {"old-y": "survivor-x"}
+        # Proof recorded under the absorbed (old) name before the rename.
+        records = {
+            "old-y": [{"proof_kind": "named_test"}]
+        }
+        # Without the reverse lookup, direct lookup of "survivor-x" finds nothing.
+        no_reverse = ledger_corroborated_proof_status(
+            {"survivor-x": "proven"}, records
+        )
+        assert no_reverse["survivor-x"] == "unverified", (
+            "without alias_map the survivor with proof under an old key must fail direct lookup"
+        )
+
+        # WITH alias_map: "survivor-x" is a VALUE in alias_map, so we check
+        # its absorbed keys and find the pre-rename proof under "old-y".
+        with_reverse = ledger_corroborated_proof_status(
+            {"survivor-x": "proven"}, records, alias_map=alias_map
+        )
+        assert with_reverse["survivor-x"] == "proven", (
+            "the survivor must be corroborated through its absorbed alias's ledger key"
+        )
+
+    def test_self_declared_non_absorbed_not_corroborated(self):
+        """A self-declared ``proven`` claim on a name NOT in the alias map is never
+        accidentally corroborated — even if the name coincidentally resembles an
+        alias that happens to have a survivor with a ledger entry."""
+        model = {
+            "capabilities": [
+                {
+                    "name": "survivor-x",
+                    "status": "working",
+                    "absorbs": ["real-y"],
+                    "evidence_refs": [],
+                }
+            ]
+        }
+        # ``forged-x`` is NOT absorbed by any survivor — it is a wholly separate,
+        # self-declared capability.
+        records = {
+            "survivor-x": [
+                {"task_id": "T1", "proof_kind": "named_test", "proof_ref": "t.py::x"}
+            ]
+        }
+        alias_map = _alias_to_survivor_map(model)
+        corroborated = ledger_corroborated_proof_status(
+            {"forged-x": "proven"}, records, alias_map=alias_map
+        )
+        assert corroborated["forged-x"] != "proven", (
+            "a forged name outside the alias map must not be corroborated by "
+            "the survivor's ledger entry"
+        )
+        assert corroborated["forged-x"] == "unverified"
+
+    def test_alias_map_is_built_from_problem_model(self):
+        """``_alias_to_survivor_map`` correctly maps absorbed names to survivors."""
+        model = {
+            "capabilities": [
+                {
+                    "name": "alpha",
+                    "status": "working",
+                    "absorbs": ["old-alpha"],
+                },
+                {
+                    "name": "beta",
+                    "status": "working",
+                    "absorbs": ["old-beta-1", "old-beta-2"],
+                },
+                {
+                    "name": "gamma",
+                    "status": "working",
+                    # No absorbs.
+                },
+            ]
+        }
+        alias_map = _alias_to_survivor_map(model)
+        assert alias_map["old-alpha"] == "alpha"
+        assert alias_map["old-beta-1"] == "beta"
+        assert alias_map["old-beta-2"] == "beta"
+        assert "gamma" not in alias_map, "a survivor is not its own alias"
+
+    def test_alias_map_empty_for_no_absorbs(self):
+        """A model with no ``absorbs`` anywhere returns ``{}``."""
+        model = {
+            "capabilities": [
+                {"name": "cap-a", "status": "working"},
+                {"name": "cap-b", "status": "working"},
+            ]
+        }
+        assert _alias_to_survivor_map(model) == {}
+
+    def test_alias_map_empty_for_missing_model(self):
+        """A missing / empty model gracefully returns ``{}``."""
+        assert _alias_to_survivor_map({}) == {}
+        assert _alias_to_survivor_map(None) == {}
+        assert _alias_to_survivor_map({"capabilities": []}) == {}
+
+    def test_consumer_gate_wires_alias_map(self):
+        """``consumer_gate_proof_status`` uses the alias map so a consumer seam
+        does not strand an absorbed alias."""
+        from app.capability_registry import consumer_gate_proof_status
+
+        model = {
+            "capabilities": [
+                {
+                    "name": "survivor-x",
+                    "status": "working",
+                    "absorbs": ["old-y"],
+                }
+            ]
+        }
+        # Ledger has proof under the survivor's name, not the alias.
+        records = {
+            "survivor-x": [
+                {"task_id": "T1", "proof_kind": "named_test", "proof_ref": "t.py::x"}
+            ]
+        }
+        gate = consumer_gate_proof_status(model, records)
+        # The absorbed alias "old-y" must grade proven (survivor's ledger).
+        assert gate["old-y"] == "proven"
+        assert gate["survivor-x"] == "proven"
+
+
+class TestReleaseQualifierAliases:
+    """The release-qualifier enforce gate correctly handles absorbed aliases
+    through the alias-aware ledger corroboration — an absorbed old name is
+    unblocked by the survivor's proof, while a forged name on a non-absorbed
+    capability is never accidentally corroborated.
+    """
+
+    @staticmethod
+    def _status(problem_model, proof_records, **kw):
+        from app.capability_registry import capability_proof_gate_release_status
+
+        return capability_proof_gate_release_status(
+            problem_model, "enforce", proof_records, **kw
+        )
+
+    def test_absorbed_alias_not_uncorroborated(self):
+        """An absorbed old name must NOT appear in ``uncorroborated`` when the
+        survivor has a ledger proof — the alias is resolved through the survivor."""
+        model = {
+            "capabilities": [
+                {
+                    "name": "survivor-x",
+                    "status": "working",
+                    "absorbs": ["old-y"],
+                    "evidence_refs": [
+                        {"kind": "named_test", "ref": "t.py::x", "proven": True}
+                    ],
+                }
+            ]
+        }
+        records = {
+            "survivor-x": [
+                {"task_id": "T1", "proof_kind": "named_test", "proof_ref": "t.py::x"}
+            ]
+        }
+        blocked, detail = self._status(model, records)
+        assert blocked is False
+        assert detail["uncorroborated"] == [], (
+            "the absorbed alias must NOT be reported as uncorroborated: "
+            f"{detail['uncorroborated']}"
+        )
+        assert detail["corroborated"] == ["old-y", "survivor-x"]
+        assert detail["unproven"] == []
+
+    def test_forged_name_not_absorbed_still_blocks(self):
+        """A self-declared ``proven`` capability with a name that is NOT absorbed
+        still BLOCKS — even when a different survivor has a ledger entry.
+
+        The alias retry ONLY helps names that are actually absorbed (keys in the
+        alias map). A forged name sitting outside the absorbed set is never
+        accidentally corroborated."""
+        # ``real-cap`` absorbed ``old-y``. The forged name ``forged-cap`` is
+        # unrelated and sits outside the alias map entirely.
+        model = {
+            "capabilities": [
+                {
+                    "name": "real-cap",
+                    "status": "working",
+                    "absorbs": ["old-y"],
+                    "evidence_refs": [],
+                },
+                {
+                    "name": "forged-cap",
+                    "status": "working",
+                    "evidence_refs": [
+                        {"kind": "named_test", "ref": "forged.py", "proven": True}
+                    ],
+                },
+            ]
+        }
+        records = {
+            "real-cap": [
+                {"task_id": "T1", "proof_kind": "named_test", "proof_ref": "t.py::x"}
+            ]
+        }
+        blocked, detail = self._status(model, records)
+        assert blocked is True
+        # forged-cap is proven in the base map but the ledger has no entry for it.
+        assert "forged-cap" in detail["uncorroborated"], (
+            "a forged name outside the alias map must not be corroborated"
+        )
+        # real-cap and old-y are unproven in the base map (no evidence_refs) and
+        # NOT proven in the release gate (which does NOT fold ledger upgrades like
+        # consumer_gate_proof_status does), so they are in the unproven set only —
+        # they never reach the corroborated/uncorroborated distinction.
+        assert "real-cap" in detail["unproven"]
+        assert "old-y" in detail["unproven"]
 
 
 class TestAuthorizedExemptionLedgerCarveOut:
@@ -4167,6 +4785,74 @@ class TestAuthorizedExemptionLedgerCarveOut:
         assert detail["uncorroborated"] == []
 
 
+class TestTaskBackedCapabilityProofGate:
+    """The task-provider route has registry-equivalent proof and alias guarantees."""
+
+    @staticmethod
+    def _blocked(need, records, model=None, mode="enforce"):
+        from app.capability_registry import task_backed_capability_need_blocked_by_proof_gate
+
+        return task_backed_capability_need_blocked_by_proof_gate(
+            need, records, model or {"capabilities": []}, mode=mode
+        )
+
+    def test_non_capability_need_never_enters_task_backed_proof_gate(self):
+        assert not self._blocked(
+            {"kind": "task", "ref": "foundation-id"}, {}, mode="enforce"
+        )
+
+    def test_stale_task_backed_ledger_proof_does_not_clear_enforce(self):
+        from datetime import datetime, timedelta, timezone
+        from app.evidence_primitive import PROOF_FRESHNESS_TTL
+
+        stale = (
+            datetime.now(timezone.utc) - PROOF_FRESHNESS_TTL - timedelta(days=1)
+        ).isoformat()
+        records = {
+            "provider-cap": [{"proof_kind": "named_test", "proved_at": stale}]
+        }
+        assert self._blocked({"kind": "capability", "ref": "provider-cap"}, records)
+
+    def test_fresh_task_backed_ledger_proof_clears_enforce(self):
+        from datetime import datetime, timedelta, timezone
+
+        fresh = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        records = {
+            "provider-cap": [{"proof_kind": "named_test", "proved_at": fresh}]
+        }
+        assert not self._blocked({"kind": "capability", "ref": "provider-cap"}, records)
+
+    def test_absorbed_alias_uses_canonical_proof_and_exemption(self):
+        from datetime import datetime, timedelta, timezone
+        from app.capability_registry import build_operator_exemption_record
+
+        model = {
+            "capabilities": [
+                {
+                    "name": "surviving-cap",
+                    "status": "working",
+                    "absorbs": ["old-cap"],
+                }
+            ]
+        }
+        need = {"kind": "capability", "ref": "old-cap"}
+        fresh = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        assert not self._blocked(
+            need,
+            {"surviving-cap": [{"proof_kind": "named_test", "proved_at": fresh}]},
+            model,
+        )
+        assert not self._blocked(
+            need,
+            {
+                "surviving-cap": [
+                    build_operator_exemption_record("surviving-cap", "operator")
+                ]
+            },
+            model,
+        )
+
+
 class TestConsumerGateSharesTheReleaseRule:
     """Finding #4: the TWO CONSUMER seams — the spawn-time prerequisite resolver
     (``research_completion``) and the blocked-resume sweep
@@ -4306,6 +4992,40 @@ class TestConsumerGateSharesTheReleaseRule:
         RAISES the capability to ``proven``."""
         model = {"capabilities": [{"name": "ledger-only", "status": "working"}]}
         assert self._gate(model, self._ledger("ledger-only"))["ledger-only"] == "proven"
+
+    def test_stale_ledger_proof_does_not_corroborate_without_explicit_now(self):
+        """``consumer_gate_proof_status`` with no explicit ``now`` still enforces
+        freshness — a ledger proof older than PROOF_FRESHNESS_TTL is demoted to
+        ``unverified`` rather than corroborating the self-declared ``proven`` claim.
+
+        Before the fix, passing ``now=None`` left the timestamp unresolved and the
+        freshness check was skipped inside ``ledger_corroborated_proof_status``,
+        so an expired historical proof could corroborate a fresh agent-authored claim."""
+        from datetime import datetime, timedelta, timezone
+        from app.evidence_primitive import PROOF_FRESHNESS_TTL
+
+        stale = (
+            datetime.now(timezone.utc) - PROOF_FRESHNESS_TTL - timedelta(days=1)
+        ).isoformat()
+        model = {
+            "capabilities": [
+                {
+                    "name": "real-cap",
+                    "status": "working",
+                    "evidence_refs": [
+                        {"kind": "named_test", "ref": "t.py::x", "proven": True}
+                    ],
+                }
+            ]
+        }
+        records = {"real-cap": [{"proof_kind": "named_test", "proved_at": stale}]}
+        # No explicit now: the gate must still evaluate freshness and reject the stale proof.
+        gate = self._gate(model, records)
+        assert gate["real-cap"] != "proven", (
+            "a stale ledger proof must not corroborate a self-declared claim even "
+            "when consumer_gate_proof_status is called without an explicit now"
+        )
+        assert gate["real-cap"] == "unverified"
 
     def test_consumer_gate_matches_release_gate_verdict(self):
         """The consumer seams and the release seam must reach the SAME verdict on the

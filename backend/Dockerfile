@@ -1,11 +1,8 @@
-# Multi-stage. The `deps` stage holds everything that only changes when
-# requirements.txt (or this Dockerfile) changes — the apt + pip layers. The
-# final `app` stage adds the source. `docker build` with no --target builds the
-# last stage (`app`), so production / Deploy is unchanged. CI builds just the
-# `deps` stage (`--target deps`), caches it in GHCR keyed by a deps hash, and
-# runs tests by mounting the checked-out source over /app — so the ~8 backend
-# shards no longer each rebuild the image from scratch every run.
-FROM python:3.11-slim AS deps
+# Multi-stage. The `base` stage holds everything that only changes when
+# requirements.txt (or this Dockerfile) changes — the apt + pip layers. CI
+# adds test-only environment in `deps`, while the final production `app` stage
+# starts from `base` so test credentials can never leak into a deployed image.
+FROM python:3.11-slim AS base
 
 WORKDIR /app
 
@@ -21,8 +18,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends shellcheck && \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt uvicorn
 
-# ── Final image: deps + application source ──────────────────────────────────
-FROM deps AS app
+# CI builds and caches this target, then mounts the checked-out source over
+# /app. Migration 0609 fails closed without a Fernet key, so the full-chain
+# migration check needs an explicit, non-production test key in this image.
+FROM base AS deps
+ENV GITHUB_PAT_ENCRYPTION_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+
+# ── Final image: base + application source ──────────────────────────────────
+FROM base AS app
 
 # Copy application code
 COPY . .

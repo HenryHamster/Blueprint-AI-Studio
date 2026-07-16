@@ -35,7 +35,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Protocol, Sequence
+from typing import Any, Callable, Dict, Protocol, Sequence
 
 from google.cloud import storage as gcs_storage
 
@@ -194,53 +194,6 @@ def _safe_extract_artifact_bundle_path(path: str, dest_dir: str) -> int:
         return _extract_safe_members(tar, dest_dir)
 
 
-def _remove_path(path: str) -> None:
-    """Remove a file, symlink, or directory without following symlinks."""
-    if os.path.isdir(path) and not os.path.islink(path):
-        shutil.rmtree(path)
-    else:
-        try:
-            os.unlink(path)
-        except FileNotFoundError:
-            pass
-
-
-def _count_regular_files_in_tree(path: str) -> int:
-    """Count real regular files below ``path`` without following symlinks."""
-    total = 0
-    for root, _dirs, files in os.walk(path, followlinks=False):
-        for name in files:
-            candidate = os.path.join(root, name)
-            if os.path.isfile(candidate) and not os.path.islink(candidate):
-                total += 1
-    return total
-
-
-def _publish_staged_artifact_dir(stage_dir: str, dest_dir: str) -> None:
-    """Atomically publish a completely extracted predecessor artifact tree.
-
-    A prior destination is first renamed out of the collector-visible path. This
-    makes clearing an interrupted earlier attempt atomic too: a crash can leave
-    either the old complete path, no destination, or the new complete path, but
-    never a half-cleared/half-published tree at ``dest_dir``.
-    """
-    quarantine_path: str | None = None
-    if os.path.lexists(dest_dir):
-        quarantine_path = f"{dest_dir}.bp-incomplete-{uuid.uuid4().hex}"
-        os.replace(dest_dir, quarantine_path)
-    try:
-        os.replace(stage_dir, dest_dir)
-    except OSError:
-        # ``os.replace`` is atomic on the local filesystem. This cleanup is
-        # defensive for unusual filesystem implementations and keeps a mocked
-        # mid-publication failure from exposing a partial durable bundle.
-        if os.path.lexists(dest_dir):
-            _remove_path(dest_dir)
-        raise
-    finally:
-        if quarantine_path is not None and os.path.lexists(quarantine_path):
-            _remove_path(quarantine_path)
-
 
 async def _rehydrate_input_artifact_bundle(
     input_artifact_job_id: str, dest_dir: str
@@ -262,9 +215,9 @@ async def _rehydrate_input_artifact_bundle(
     """
     handle, tmp_path = tempfile.mkstemp(prefix="bp-resume-", suffix=".tar.gz")
     os.close(handle)
-    parent_dir = os.path.dirname(os.path.abspath(dest_dir))
-    os.makedirs(parent_dir, exist_ok=True)
-    stage_dir = tempfile.mkdtemp(prefix=".bp-resume-stage-", dir=parent_dir)
+    staging_dir = f"{dest_dir}.resume-staging"
+    shutil.rmtree(staging_dir, ignore_errors=True)
+    os.makedirs(staging_dir, exist_ok=True)
     try:
         try:
             downloaded = await asyncio.to_thread(
@@ -281,45 +234,35 @@ async def _rehydrate_input_artifact_bundle(
                 f"{input_artifact_job_id} has no durable artifact bundle to resume from"
             )
         try:
-            await asyncio.to_thread(
-                _safe_extract_artifact_bundle_path, tmp_path, stage_dir
+            file_count = await asyncio.to_thread(
+                _safe_extract_artifact_bundle_path, tmp_path, staging_dir
             )
         except (tarfile.TarError, OSError) as exc:
             raise RuntimeError(
                 "input_artifact_rehydration_failed: predecessor bundle for "
                 f"{input_artifact_job_id} could not be extracted: {exc}"
             ) from exc
-        for stale_name in _RESUME_STALE_ARTIFACT_FILENAMES:
-            await asyncio.to_thread(
-                _remove_path, os.path.join(stage_dir, stale_name)
-            )
-        file_count = await asyncio.to_thread(
-            _count_regular_files_in_tree, stage_dir
-        )
         if file_count <= 0:
             raise RuntimeError(
                 "input_artifact_rehydration_failed: predecessor bundle for "
-                f"{input_artifact_job_id} contains no resumable files"
+                f"{input_artifact_job_id} contained no checkpoint files"
             )
-        # ``dest_dir`` belongs solely to this not-yet-started local job. Publish
-        # the fully validated directory with one same-filesystem rename so the
-        # terminal collector can observe only an absent or complete tree.
         try:
-            await asyncio.to_thread(
-                _publish_staged_artifact_dir, stage_dir, dest_dir
-            )
+            shutil.rmtree(dest_dir, ignore_errors=True)
+            os.replace(staging_dir, dest_dir)
         except OSError as exc:
             raise RuntimeError(
-                "input_artifact_rehydration_failed: predecessor bundle for "
-                f"{input_artifact_job_id} could not be published: {exc}"
+                "input_artifact_rehydration_failed: extracted checkpoint could not "
+                f"be published: {exc}"
             ) from exc
         return file_count
     finally:
-        shutil.rmtree(stage_dir, ignore_errors=True)
         try:
             os.unlink(tmp_path)
         except OSError:
             pass
+        if os.path.exists(staging_dir):
+            shutil.rmtree(staging_dir, ignore_errors=True)
 
 _SERIAL_STATUS_PREFIX = "BLUEPRINT_COMPUTE_STATUS="
 _SERIAL_EXIT_PREFIX = "BLUEPRINT_COMPUTE_EXIT_CODE="
@@ -339,6 +282,16 @@ _SERIAL_RELEASE_ECHO_PREFIX = "BLUEPRINT_COMPUTE_RELEASE_ECHO="
 # can always tell whether a resumed job continued from its predecessor's
 # checkpoint or restarted from zero — the waste the direction exists to prevent.
 _SERIAL_RESUME_PREFIX = "BLUEPRINT_COMPUTE_RESUME="
+# Pre-computed base64-encoded resume-provenance payload for the fail-closed
+# branch of the startup-script resume block (hydration never started). Used in
+# ``_build_gcp_startup_script`` where the static string avoids on-VM base64
+# encoding overhead for a known-at-generation-time value.
+_SERIAL_RESUME_FAILED_B64: str = base64.b64encode(
+    json.dumps(
+        {"ok": False, "file_count": 0, "reason": "resume_hydration_failed"},
+        separators=(",", ":"),
+    ).encode()
+).decode()
 # Well-known env var pointing the launched command at a result file it may write
 # (a small flat JSON object of metric-name -> number). Absence = no metrics.
 RESULT_FILE_ENV = "BLUEPRINT_RESULT_FILE"
@@ -439,6 +392,12 @@ _MAX_RESULT_METRICS_DECODED_BYTES = 8192
 # rather than allowed to balloon the durable result or wedge teardown.
 _MAX_COMMAND_LOG_BYTES = 32768
 _MAX_COMMAND_LOG_DECODED_BYTES = 65536
+
+# How often the reaper's progress heartbeat fires during a compute-image build,
+# so the lifecycle watchdog (REAPER_HANG_SECONDS=300) does not cancel the reaper
+# while a multi-minute baked-image build is in progress. 60s is well under the
+# 300s stall threshold, giving 4 missed beats before the watchdog acts.
+_HEARTBEAT_INTERVAL = 60
 
 class ComputeLaunchSpecError(ValueError):
     """A launch spec is malformed in a way no retry can fix.
@@ -2382,6 +2341,8 @@ def _download_artifact_bundle_to_path(job_id, dest_path: str) -> bool:
 
 def _select_viewable_candidates_from_bundle_path(
     path: str,
+    *,
+    fail_soft: bool = True,
 ) -> tuple[list[ViewableArtifactCandidate], int]:
     """Select a bundle's viewable files from an ON-DISK archive, bounded memory.
 
@@ -2480,9 +2441,14 @@ def _select_viewable_candidates_from_bundle_path(
                     )
                 if len(out) == len(selected_refs):
                     break
-    except (tarfile.TarError, OSError, EOFError, ValueError):
+    except (tarfile.TarError, OSError, EOFError, ValueError) as exc:
         _unlink_temp_sources(tmp_video_paths)
+        if not fail_soft:
+            raise RuntimeError("viewable bundle enumeration failed") from exc
         return [], 0
+    if len(out) != len(selected_refs) and not fail_soft:
+        _unlink_temp_sources(tmp_video_paths)
+        raise RuntimeError("viewable bundle enumeration was incomplete")
     # Unlink any temp video that did NOT become a surviving candidate (e.g. a
     # post-extract stat failed) so it can't leak; the rest are unlinked by
     # persist_viewable_artifacts after upload.
@@ -2493,6 +2459,8 @@ def _select_viewable_candidates_from_bundle_path(
 
 async def _stream_viewable_candidates_from_bundle(
     job_id,
+    *,
+    fail_soft: bool = True,
 ) -> tuple[list[ViewableArtifactCandidate], int]:
     """Fetch + select a bundle-backed job's viewable files without ever holding
     the bundle in memory.
@@ -2509,9 +2477,13 @@ async def _stream_viewable_candidates_from_bundle(
             _download_artifact_bundle_to_path, job_id, tmp_path
         )
         if not downloaded:
+            if not fail_soft:
+                raise RuntimeError("durable viewable bundle is unavailable")
             return [], 0
         return await asyncio.to_thread(
-            _select_viewable_candidates_from_bundle_path, tmp_path
+            _select_viewable_candidates_from_bundle_path,
+            tmp_path,
+            fail_soft=fail_soft,
         )
     except Exception:
         logger.warning(
@@ -2520,6 +2492,8 @@ async def _stream_viewable_candidates_from_bundle(
             job_id,
             exc_info=True,
         )
+        if not fail_soft:
+            raise
         return [], 0
     finally:
         try:
@@ -2727,6 +2701,8 @@ def _collect_viewable_candidates_from_dir(
 
 async def _collect_viewable_artifact_candidates(
     job: ComputeJob,
+    *,
+    fail_soft: bool = True,
 ) -> tuple[list[ViewableArtifactCandidate], int]:
     """Backend-aware selection of a terminal job's viewable files.
 
@@ -2755,7 +2731,10 @@ async def _collect_viewable_artifact_candidates(
         # Already sorted + capped on disk (count cap applied BEFORE any member
         # bytes are read; size-cap omissions folded into the returned count), so
         # it returns the final (selected, dropped) directly.
-        return await _stream_viewable_candidates_from_bundle(job.id)
+        return await _stream_viewable_candidates_from_bundle(
+            job.id,
+            fail_soft=fail_soft,
+        )
     else:
         return [], 0
     all_candidates.sort(key=lambda c: c.filename)
@@ -2767,15 +2746,26 @@ async def _collect_viewable_artifact_candidates(
 async def persist_viewable_artifacts(
     job: ComputeJob,
 ) -> tuple[list[dict[str, Any]], int]:
+    """Compatibility wrapper returning the historical ``(manifest, dropped)``."""
+    manifest, dropped, _complete = (
+        await persist_viewable_artifacts_with_completeness(job)
+    )
+    return manifest, dropped
+
+
+async def persist_viewable_artifacts_with_completeness(
+    job: ComputeJob,
+) -> tuple[list[dict[str, Any]], int, bool]:
     """Persist a terminal job's viewable files as individually-addressable objects.
 
     Extracts the viewable files (png/jpg/jpeg/webp/gif/mp4/webm — NO svg, which
     can execute script when served from a signed URL) from the
     job's artifacts, uploads each under the allowlisted per-job prefix, and
-    returns ``(manifest, dropped)`` — a list of
+    returns ``(manifest, dropped, complete)`` — a list of
     ``{filename, storage_uri, content_type, size_bytes, kind}`` for durably stored
     files, and the count of qualifying files that exceeded ``_MAX_VIEWABLE_FILE_COUNT``
-    and were not persisted.
+    and were not persisted. ``complete`` is false when the durable bundle could
+    not be enumerated fully or any selected file failed to persist.
 
     Fail-soft by contract: an empty/corrupt bundle, a missing dir, or ANY
     extraction/upload error degrades to ``([], 0)`` and NEVER raises,
@@ -2784,17 +2774,21 @@ async def persist_viewable_artifacts(
     appear in the returned manifest.
     """
     try:
-        candidates, dropped = await _collect_viewable_artifact_candidates(job)
+        candidates, dropped = await _collect_viewable_artifact_candidates(
+            job,
+            fail_soft=False,
+        )
     except Exception:
         logger.warning(
             "Viewable-artifact extraction failed for compute job %s",
             getattr(job, "id", None),
             exc_info=True,
         )
-        return [], 0
+        return [], 0, False
     if not candidates:
-        return [], dropped
+        return [], dropped, True
     manifest: list[dict[str, Any]] = []
+    complete = True
     for candidate in candidates:
         try:
             uri = await _upload_viewable_candidate(job, candidate)
@@ -2812,6 +2806,7 @@ async def persist_viewable_artifacts(
             if candidate.source_is_temp and candidate.source_path:
                 _unlink_temp_sources([candidate.source_path])
         if not uri:
+            complete = False
             continue
         manifest.append(
             {
@@ -2820,9 +2815,14 @@ async def persist_viewable_artifacts(
                 "content_type": candidate.content_type,
                 "size_bytes": candidate.size_bytes,
                 "kind": candidate.kind,
+                # The object URI is deterministic and may have held a live
+                # generation already. Terminal persistence is an authoritative
+                # overwrite, so it receives a fresh cache identity.
+                "revision": storage.new_viewable_revision(),
+                "live": False,
             }
         )
-    return manifest, dropped
+    return manifest, dropped, complete
 
 
 def _open_viewable_source_nofollow(path: str, artifact_root: str | None):
@@ -3161,8 +3161,7 @@ def _build_gcp_startup_script(
             f'  echo "{_SERIAL_EXIT_PREFIX}1"\n'
             f"  python3 /tmp/blueprint_terminal_record.py "
             f"{artifact_dir} FAILED 1 repo_clone_failed:$CLONE_CLASS "
-            f'{result_file} {command_log_path} "$RESUME_PROVENANCE_B64" '
-            f">/dev/null 2>&1 || true\n"
+            f"{result_file} {command_log_path} >/dev/null 2>&1 || true\n"
             f"  upload_artifacts\n"
             f'  kill "$TTL_PID" "$_NP_WATCHDOG_PID" 2>/dev/null || true\n'
             f"  poweroff || shutdown -h now || true\n"
@@ -3203,8 +3202,7 @@ def _build_gcp_startup_script(
             f'  echo "{_SERIAL_EXIT_PREFIX}1"\n'
             f"  python3 /tmp/blueprint_terminal_record.py "
             f"{artifact_dir} FAILED 1 setup_step_failed "
-            f'{result_file} {command_log_path} "$RESUME_PROVENANCE_B64" '
-            f">/dev/null 2>&1 || true\n"
+            f"{result_file} {command_log_path} >/dev/null 2>&1 || true\n"
             f"  upload_artifacts\n"
             f'  kill "$TTL_PID" "$_NP_WATCHDOG_PID" 2>/dev/null || true\n'
             f"  poweroff || shutdown -h now || true\n"
@@ -3255,8 +3253,7 @@ def _build_gcp_startup_script(
             + f'  echo "{_SERIAL_EXIT_PREFIX}1"\n'
             + "  python3 /tmp/blueprint_terminal_record.py "
             + f"{artifact_dir} FAILED 1 container_image_pull_failed "
-            + f'{result_file} {command_log_path} "$RESUME_PROVENANCE_B64" '
-            + ">/dev/null 2>&1 || true\n"
+            + f"{result_file} {command_log_path} >/dev/null 2>&1 || true\n"
             + "  upload_artifacts\n"
             + '  kill "$TTL_PID" "$_NP_WATCHDOG_PID" 2>/dev/null || true\n'
             + "  poweroff || shutdown -h now || true\n"
@@ -3286,42 +3283,28 @@ def _build_gcp_startup_script(
     # so they cannot contaminate THIS run's terminal detection; the boot beacon
     # below then re-lays a fresh terminal.json.
     resume_block = ""
-    initial_resume_provenance_b64 = ""
     if input_artifact_download_url:
         _resume_url_q = shlex.quote(input_artifact_download_url)
         _resume_bundle_q = shlex.quote("/tmp/blueprint_resume_bundle.tar.gz")
-        _resume_stage_q = shlex.quote("/tmp/blueprint_resume_stage")
-        _resume_extract_python_q = shlex.quote(
-            "import os,sys,tarfile; b,d=sys.argv[1:]; root=os.path.abspath(d); "
-            "t=tarfile.open(b,'r:gz'); "
-            "[t.extract(m,d) for m in t.getmembers() if (m.isreg() or m.isdir()) "
-            "and (os.path.abspath(os.path.join(d,m.name)) == root or "
-            "os.path.abspath(os.path.join(d,m.name)).startswith(root+os.sep))]"
-        )
         _resume_ok_q = shlex.quote(
             os.path.join(_GCP_ARTIFACT_DIR_PATH, "resume_hydration.ok")
         )
         _resume_fail_q = shlex.quote(
             os.path.join(_GCP_ARTIFACT_DIR_PATH, "resume_hydration.failed")
         )
-        _resume_source_q = shlex.quote(str(spec.input_artifact_job_id or ""))
-        initial_resume_provenance_b64 = base64.b64encode(
-            json.dumps(
-                {
-                    "ok": False,
-                    "file_count": 0,
-                    "reason": "resume_hydration_failed",
-                    "resumed_from_job_id": str(spec.input_artifact_job_id or ""),
-                },
-                separators=(",", ":"),
-            ).encode("utf-8")
-        ).decode("ascii")
+        _resume_stage_q = shlex.quote(f"{_GCP_ARTIFACT_DIR_PATH}.resume-staging")
         _resume_stale = " ".join(
             shlex.quote(os.path.join(_GCP_ARTIFACT_DIR_PATH, _name))
-            for _name in _RESUME_STALE_ARTIFACT_FILENAMES
+            for _name in (
+                "result.json",
+                "command.log.json",
+                "terminal.json",
+                "live_tail.b64",
+            )
         )
         resume_block = (
-            f"rm -rf {_resume_stage_q}; rm -f {_resume_bundle_q}\n"
+            f"rm -f {_resume_bundle_q}\n"
+            f"rm -rf {_resume_stage_q} && mkdir -p {_resume_stage_q}\n"
             f"if timeout {upload_timeout} curl --fail --silent --show-error "
             f"--location --output {_resume_bundle_q} {_resume_url_q} "
             f">/dev/null 2>&1 || timeout {upload_timeout} python3 -c "
@@ -3333,61 +3316,38 @@ def _build_gcp_startup_script(
             f"  RESUME_DL=0\n"
             f"fi\n"
             f'if [ "$RESUME_DL" = 1 ] && [ -s {_resume_bundle_q} ] && '
-            f"mkdir -p {_resume_stage_q} && python3 -c {_resume_extract_python_q} "
-            f"{_resume_bundle_q} {_resume_stage_q} "
+            f"tar -C {_resume_stage_q} --no-same-owner -xzf {_resume_bundle_q} "
             f">/dev/null 2>&1; then\n"
-            f"  rm -f "
-            + " ".join(
-                shlex.quote(os.path.join("/tmp/blueprint_resume_stage", _name))
-                for _name in _RESUME_STALE_ARTIFACT_FILENAMES
-            )
-            + "\n"
-            f"  _BP_RESUME_STAGE_FC=$(find {_resume_stage_q} -type f 2>/dev/null | wc -l)\n"
-            f'  if [ "$_BP_RESUME_STAGE_FC" -gt 0 ] && rm -rf {artifact_dir} '
-            f"&& mkdir -p {artifact_dir} && "
-            f"cp -a {_resume_stage_q}/. {artifact_dir}/; then\n"
-            f"    _BP_RESUME_FC=$(find {artifact_dir} -type f 2>/dev/null | wc -l)\n"
-            f"  else\n"
-            f"    _BP_RESUME_FC=0\n"
-            f"  fi\n"
-            f"else\n"
-            f"  _BP_RESUME_FC=0\n"
-            f"fi\n"
-            f'if [ "$_BP_RESUME_FC" -gt 0 ]; then\n'
-            f"  rm -rf {_resume_stage_q}\n"
+            f"  rm -f {_resume_stale.replace(_GCP_ARTIFACT_DIR_PATH, _GCP_ARTIFACT_DIR_PATH + '.resume-staging')}\n"
+            f"  _BP_RESUME_FC=$(find {_resume_stage_q} -type f 2>/dev/null | wc -l)\n"
+            f"  if [ \"$_BP_RESUME_FC\" -lt 1 ]; then RESUME_DL=0; fi\n"
+            f"  if [ \"$RESUME_DL\" = 1 ]; then rm -rf {artifact_dir} && mv {_resume_stage_q} {artifact_dir} || RESUME_DL=0; fi\n"
             f"  __BP_RESUME_D=$(python3 -c 'import json,base64,sys; print("
             f"base64.b64encode(json.dumps({{"
-            f'"ok":True,"file_count":int(sys.argv[1]),'
-            f'"resumed_from_job_id":sys.argv[2],'
-            f'"recorded_at":__import__("datetime").datetime.now('
-            f'__import__("datetime").timezone.utc).isoformat()}}).encode()).decode())\' '
-            f'"$_BP_RESUME_FC" {_resume_source_q} 2>/dev/null || true)\n'
-            f'  if [ -n "$__BP_RESUME_D" ]; then RESUME_PROVENANCE_B64="$__BP_RESUME_D"; '
-            f'echo "{_SERIAL_RESUME_PREFIX}$RESUME_PROVENANCE_B64"; fi\n'
-            f"  echo resumed > {_resume_ok_q} 2>/dev/null || true\n"
-            f'  echo "[resume] hydrated predecessor checkpoint bundle into '
+            f'"ok":True,"file_count":int(sys.argv[1]),"resumed_from_job_id":{json.dumps(spec.input_artifact_job_id)} }}).encode()).decode())\' '
+            f"\"$_BP_RESUME_FC\" 2>/dev/null || true)\n"
+            f'  [ "$RESUME_DL" = 1 ] && [ -n "$__BP_RESUME_D" ] && echo "{_SERIAL_RESUME_PREFIX}$__BP_RESUME_D" || true\n'
+            f"  [ \"$RESUME_DL\" = 1 ] && echo resumed > {_resume_ok_q} 2>/dev/null || true\n"
+            f'  [ "$RESUME_DL" = 1 ] && echo "[resume] hydrated predecessor checkpoint bundle into '
             f'artifact dir"\n'
-            f"else\n"
-            # Do not let a partial tar extraction become this job's artifact
-            # bundle.  The terminal record below is bounded diagnostic evidence.
-            f"  rm -rf {_resume_stage_q} {artifact_dir}; mkdir -p {artifact_dir}\n"
+            f"fi\n"
+            f'if [ "$RESUME_DL" != 1 ]; then\n'
             f"  echo failed > {_resume_fail_q} 2>/dev/null || true\n"
             f'  echo "[resume] predecessor checkpoint hydration FAILED — aborting '
             f'run (fail-closed; refusing to run against an empty workspace)"\n'
             f'  echo "{_SERIAL_REASON_PREFIX}resume_hydration_failed"\n'
             f'  echo "{_SERIAL_STATUS_PREFIX}FAILED"\n'
             f'  echo "{_SERIAL_EXIT_PREFIX}1"\n'
-            f'  echo "{_SERIAL_RESUME_PREFIX}$RESUME_PROVENANCE_B64"\n'
+            f'  echo "{_SERIAL_RESUME_PREFIX}{_SERIAL_RESUME_FAILED_B64}"\n'
             f"  python3 /tmp/blueprint_terminal_record.py "
             f"{artifact_dir} FAILED 1 resume_hydration_failed "
-            f'{result_file} {command_log_path} "$RESUME_PROVENANCE_B64" '
-            f">/dev/null 2>&1 || true\n"
+            f"{result_file} {command_log_path} >/dev/null 2>&1 || true\n"
             f"  upload_artifacts\n"
             f'  kill "$TTL_PID" "$_NP_WATCHDOG_PID" 2>/dev/null || true\n'
             f"  poweroff || shutdown -h now || true\n"
             f"  exit 1\n"
             f"fi\n"
-            f"rm -rf {_resume_stage_q}; rm -f {_resume_bundle_q}"
+            f"rm -f {_resume_bundle_q}"
         )
     max_log_bytes = _MAX_COMMAND_LOG_BYTES
     command_runner_b64 = _COMMAND_RUNNER_B64
@@ -3415,7 +3375,6 @@ echo '{command_runner_b64}' | base64 -d > /tmp/blueprint_command_runner.py
 echo '{artifact_upload_b64}' | base64 -d > /tmp/blueprint_artifact_upload.py
 echo '{terminal_record_b64}' | base64 -d > /tmp/blueprint_terminal_record.py
 ARTIFACTS_UPLOADED=0
-RESUME_PROVENANCE_B64={shlex.quote(initial_resume_provenance_b64)}
 upload_artifacts() {{
   if [ "$ARTIFACTS_UPLOADED" -ne 0 ]; then
     return 0
@@ -3450,7 +3409,6 @@ trap upload_artifacts EXIT HUP INT TERM QUIT
   sleep "$TTL_SECONDS"
   python3 /tmp/blueprint_terminal_record.py \
     {artifact_dir} FAILED 124 runtime_ttl {result_file} {command_log_path} \
-    "$RESUME_PROVENANCE_B64" \
     >/dev/null 2>&1 || true
   echo "{_SERIAL_REASON_PREFIX}runtime_ttl"
   echo "{_SERIAL_STATUS_PREFIX}FAILED"
@@ -3500,7 +3458,6 @@ mkdir -p {artifact_dir}
 {resume_block}
 python3 /tmp/blueprint_terminal_record.py \
   {artifact_dir} FAILED 1 vm_terminated_before_completion {result_file} {command_log_path} \
-  "$RESUME_PROVENANCE_B64" \
   >/dev/null 2>&1 || true
 {repo_setup_block}
 {setup_step_block}
@@ -3521,7 +3478,6 @@ touch {progress_file} 2>/dev/null || true
       if [ "$_NP_NOW" = "$_NP_START" ]; then
         python3 /tmp/blueprint_terminal_record.py \
           {artifact_dir} FAILED 125 no_progress_timeout {result_file} {command_log_path} \
-          "$RESUME_PROVENANCE_B64" \
           >/dev/null 2>&1 || true
         echo "{_SERIAL_REASON_PREFIX}no_progress_timeout"
         echo "{_SERIAL_STATUS_PREFIX}FAILED"
@@ -3573,7 +3529,6 @@ if [ -n "${{BLUEPRINT_RELEASE_SHA:-}}" ]; then
 fi
 python3 /tmp/blueprint_terminal_record.py \
   {artifact_dir} "$STATUS" "$EXIT_CODE" "$REASON" {result_file} {command_log_path} \
-  "$RESUME_PROVENANCE_B64" \
   >/dev/null 2>&1 || true
 upload_artifacts
 kill "$TTL_PID" "$_HEARTBEAT_PID" "$_NP_WATCHDOG_PID" 2>/dev/null || true
@@ -4335,6 +4290,7 @@ async def refresh_project_compute_image(
     allow_build: bool = True,
     build_semaphore: "asyncio.Semaphore | None" = None,
     acquire_timeout: float = 1.0,
+    progress_cb: "Callable[[], None] | None" = None,
     _manifest_fn=None,
     _token_fn=None,
     _default_branch_fn=None,
@@ -4371,7 +4327,9 @@ async def refresh_project_compute_image(
     * **rebuild** — only when the tag is ABSENT, drive the existing pipeline
       (:func:`build_project_compute_image` -> :func:`record_project_compute_image_build`),
       honoring the process-wide build concurrency guard (*build_semaphore*) and a
-      caller-supplied build budget (*allow_build*).
+      caller-supplied build budget (*allow_build*). When *progress_cb* is provided,
+      the build runs as a background task with periodic heartbeats so the reaper's
+      lifecycle watchdog does not cancel the cycle during a multi-minute build.
 
     Returns a small structured result whose ``status`` is one of ``no_config`` /
     ``unchanged`` / ``rebuilt`` / ``deferred`` / ``error``. All hooks default to
@@ -4520,12 +4478,32 @@ async def refresh_project_compute_image(
                 }
 
         try:
-            result = await build_fn(
-                project,
-                registry_repo=registry_repo,
-                build_config=build_config,
-                ref=default_branch,
-            )
+            if progress_cb is not None:
+                # Run the build as a background task with periodic progress
+                # heartbeats so the reaper lifecycle watchdog
+                # (REAPER_HANG_SECONDS=300) does not cancel the cycle during
+                # a multi-minute baked-image build.
+                _build_task = asyncio.ensure_future(build_fn(
+                    project,
+                    registry_repo=registry_repo,
+                    build_config=build_config,
+                    ref=default_branch,
+                ))
+                while True:
+                    _done, _pending = await asyncio.wait(
+                        [_build_task], timeout=_HEARTBEAT_INTERVAL
+                    )
+                    if _done:
+                        result = _build_task.result()
+                        break
+                    progress_cb()
+            else:
+                result = await build_fn(
+                    project,
+                    registry_repo=registry_repo,
+                    build_config=build_config,
+                    ref=default_branch,
+                )
         finally:
             if acquired:
                 build_semaphore.release()

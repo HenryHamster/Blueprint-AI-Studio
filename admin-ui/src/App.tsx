@@ -27,7 +27,6 @@ import { apiFetch, API_BASE_URL } from './api/core';
 import { loadLastSeen, loadEventPrefs, loadTemporaryMutes, fetchServerNoisePrefs, fetchServerTempMutes, resolveNoisePrefs, resolveServerTempMutes, type EventPref, type TemporaryMutes } from './components/MessagesPanel.utils';
 const TaskDetailDrawer = lazy(() => import('./components/TaskDetailDrawer').then(m => ({ default: m.TaskDetailDrawer })));
 import { ToastContainer } from './components/Toasts';
-const AlertsPopover = lazy(() => import('./components/AlertsPopover').then(m => ({ default: m.AlertsPopover })));
 const FleetDetailDrawer = lazy(() => import('./components/FleetDetailDrawer').then(m => ({ default: m.FleetDetailDrawer })));
 import { HeaderBar, PrimaryTabNav } from './components/HeaderBar';
 import { SearchFilterBar, SingleSelectDropdown } from './components/SearchFilterBar';
@@ -75,6 +74,7 @@ import { normalizeStrategicInteractionMode, tabForWorkbenchSurface, workbenchSur
 import { pipelineTaskIdForAttentionItem } from './utils/strategicAttention';
 import { computeStrategicSessionActivity } from './utils/strategicSessionLive';
 import { STATUS_OPTIONS } from './constants';
+import { reportUiLoadTiming } from './uiLoadTiming';
 
 type PipelineDirectionOption = { id: string; text: string };
 const PIPELINE_SECTION_ORDER: readonly PipelineSection[] = ['flow', 'board', 'archive'];
@@ -110,6 +110,48 @@ function WorkspaceSkeleton() {
   );
 }
 
+function BoardDataReadyReporter({ activeTab, initialLoading, refreshing, fetchEpoch }: { activeTab: PrimaryTab; initialLoading: boolean; refreshing: boolean; fetchEpoch: number }) {
+  const navigationStartRef = useRef(0);
+  const reportedRef = useRef(false);
+  const targetEpochRef = useRef<number | null>(null);
+
+  // On tab switch away from 'chat', record the start time and the epoch
+  // we expect the next fetch to produce (current + 1). If a fetch completes
+  // after the switch, the downstream effect captures it with real timing.
+  useEffect(() => {
+    if (activeTab === 'chat') return;
+    navigationStartRef.current = performance.now();
+    reportedRef.current = false;
+    targetEpochRef.current = fetchEpoch + 1;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab]);
+
+  // Report when a task-fetch completes after the switch (epoch advances past
+  // target).  Otherwise fall back to rAF when nothing is currently loading.
+  useEffect(() => {
+    if (activeTab === 'chat' || reportedRef.current) return;
+
+    // Epoch advanced → a fetch completed since the tab switch → report.
+    if (targetEpochRef.current !== null && fetchEpoch >= targetEpochRef.current) {
+      reportedRef.current = true;
+      reportUiLoadTiming(activeTab, Math.round(performance.now() - navigationStartRef.current), 'board_data_ready');
+      return;
+    }
+
+    // Nothing loading → fall back to rAF (paint boundary).
+    if (!initialLoading && !refreshing) {
+      const frame = requestAnimationFrame(() => {
+        if (reportedRef.current) return;
+        reportedRef.current = true;
+        reportUiLoadTiming(activeTab, Math.round(performance.now() - navigationStartRef.current), 'board_data_ready');
+      });
+      return () => cancelAnimationFrame(frame);
+    }
+  }, [activeTab, fetchEpoch, initialLoading, refreshing]);
+
+  return null;
+}
+
 export default function App() {
   const refreshStrategicReadModelRef = useRef<() => void>(() => {});
   const refreshMessagesRef = useRef<() => void>(() => {});
@@ -137,6 +179,7 @@ export default function App() {
   }, [cycleCompletion, addToast]);
   const [openMessageCount, setOpenMessageCount] = useState(0);
   const [newSinceLastVisit, setNewSinceLastVisit] = useState(0);
+  const [activeAlerts, setActiveAlerts] = useState(0);
   const handleMessageCountChange = useCallback((count: number) => setOpenMessageCount(count), []);
 
   // Noise prefs for the closed-panel badge — loaded from localStorage on project change and
@@ -193,6 +236,12 @@ export default function App() {
   const selectedProjectId = s.selectedProjectId;
   const rawActiveTab = s.activeTab;
   const activeTab: PrimaryTab = normalizePrimaryTab(rawActiveTab);
+  const [visitedTabs, setVisitedTabs] = useState<ReadonlySet<PrimaryTab>>(() => new Set([activeTab]));
+  useEffect(() => {
+    setVisitedTabs(previous => previous.has(activeTab) ? previous : new Set([...previous, activeTab]));
+  }, [activeTab]);
+  const chatPollersEnabled = visitedTabs.has('chat');
+  const runtimePollersEnabled = visitedTabs.has('runtime');
   const messagesPanelOpen = activeTab === 'chat';
   const [directions, setDirections] = useState<PipelineDirectionOption[]>([]);
   useEffect(() => {
@@ -236,6 +285,7 @@ export default function App() {
     if (messagesPanelOpen) {
       setOpenMessageCount(0);
       setNewSinceLastVisit(0);
+      setActiveAlerts(0);
     }
   }, [messagesPanelOpen]);
   // Load noise prefs from localStorage when the project changes; refresh from server async.
@@ -284,6 +334,7 @@ export default function App() {
         // and the in-panel needs-action set.
         setOpenMessageCount(data.needs_operator ?? 0);
         setNewSinceLastVisit(data.unread ?? 0);
+        setActiveAlerts(data.active_alerts ?? 0);
       }
     } catch { /* ignore */ }
   }, {
@@ -416,16 +467,13 @@ export default function App() {
   }, [s.zoneHealth, dismissedZoneAlertIds]);
 
   const combinedAlerts = useMemo(() => [...zoneHealthAlerts, ...s.alerts], [zoneHealthAlerts, s.alerts]);
-  const alertMaxSeverity: 'ERROR' | 'WARNING' | 'INFO' | null = combinedAlerts.some(a => a.severity === 'ERROR') ? 'ERROR'
-    : combinedAlerts.some(a => a.severity === 'WARNING') ? 'WARNING'
-    : combinedAlerts.length > 0 ? 'INFO' : null;
 
-  const strategicReadModel = useStrategicReadModel(s.selectedProjectId, { pollerEnabled: activeTab === 'chat' });
+  const strategicReadModel = useStrategicReadModel(s.selectedProjectId, { pollerEnabled: chatPollersEnabled });
   // Fast mode + resident-session liveness probe: resolves the mode indicator and
   // active/dead chip on reload well before the heavy strategic-state fetch lands.
   // Once strategicReadModel.data hydrates, its values take precedence (fallback
   // in useStrategicSession), so there is no flicker when the full state arrives.
-  const strategicLiveness = useStrategicLiveness(s.selectedProjectId, { enabled: activeTab === 'chat' });
+  const strategicLiveness = useStrategicLiveness(s.selectedProjectId, { enabled: chatPollersEnabled });
   useEffect(() => {
     refreshStrategicReadModelRef.current = () => {
       void strategicReadModel.refresh();
@@ -629,7 +677,7 @@ export default function App() {
   const [projectManageSection, setProjectManageSection] = useState<ProjectManageSection>('overview');
   const [runtimeSection, setRuntimeSection] = useState<RuntimeSection>('health');
   const [runtimeConfigSection, setRuntimeConfigSection] = useState<RuntimeSettingsSection>('orchestrator');
-  const { versionLifecycle, versionLifecycleError, versionLifecycleLastSuccessAt, versionLifecycleRefreshing, refreshVersionLifecycle } = useVersionLifecycle(s.selectedProjectId);
+  const { versionLifecycle, versionLifecycleError, versionLifecycleLastSuccessAt, versionLifecycleRefreshing, refreshVersionLifecycle } = useVersionLifecycle(s.selectedProjectId, { pollerEnabled: runtimePollersEnabled });
   const hasVersionLifecycle = hasVersionLifecycleData(versionLifecycle);
   const { setActiveTab: setPrimaryTab, setShowArchive: setArchiveVisible, setViewMode: setTaskViewMode } = s;
   const applyPipelineSection = useCallback((section: PipelineSection) => {
@@ -943,7 +991,6 @@ export default function App() {
   const transientWorkbenchPanelOpen = Boolean(
     s.showResearchBrowser ||
     s.showKnowledgeBrowser ||
-    s.showAlertsPopover ||
     showActivityFeed,
   );
 
@@ -960,7 +1007,6 @@ export default function App() {
     setResearchBrowserDirectionId,
     setShortcutHelpOpen,
     setShowActivityFeed,
-    setShowAlertsPopover: s.setShowAlertsPopover,
     setShowKnowledgeBrowser: s.setShowKnowledgeBrowser,
     setShowResearchBrowser: s.setShowResearchBrowser,
     shortcutHelpOpen,
@@ -1134,10 +1180,6 @@ export default function App() {
         onToggleResearchBrowser={() => s.setShowResearchBrowser(prev => !prev)}
         showKnowledgeBrowser={s.showKnowledgeBrowser}
         onToggleKnowledgeBrowser={() => s.setShowKnowledgeBrowser(prev => !prev)}
-        alertCount={combinedAlerts.length}
-        alertMaxSeverity={alertMaxSeverity}
-        showAlertsPopover={s.showAlertsPopover}
-        onToggleAlertsPopover={() => s.setShowAlertsPopover(prev => !prev)}
         onOpenActivityFeed={() => setShowActivityFeed(true)}
         openMessageCount={openMessageCount}
         newSinceLastVisitCount={newSinceLastVisit}
@@ -1170,6 +1212,7 @@ export default function App() {
         ceilingDeferredProjectIds={s.ceilingDeferredProjectIds}
         gatedTaskTypes={s.gatedTaskTypes}
         costSectionAvailable={activeTab === 'runtime' && runtimeSection === 'analytics'}
+        activeAlerts={activeAlerts}
       />
       <Suspense fallback={null}><CommandPaletteHost open={commandPaletteOpen} commands={workbenchCommands} query={commandPaletteQuery} onQueryChange={setCommandPaletteQuery} setOpen={setCommandPaletteOpen} /></Suspense>
       <Suspense fallback={null}><KeyboardShortcutsOverlay open={shortcutHelpOpen} onClose={() => setShortcutHelpOpen(false)} /></Suspense>
@@ -1242,6 +1285,7 @@ export default function App() {
         </Suspense>
       ) : (
         <WorkbenchFrame>
+      <BoardDataReadyReporter activeTab={activeTab} initialLoading={s.initialLoading} refreshing={s.refreshing} fetchEpoch={s.fetchEpoch} />
       {s.showUserManagement && s.userRole === 'admin' ? (
         <Suspense fallback={null}>
         <UserManagement
@@ -1336,6 +1380,17 @@ export default function App() {
                 onStrategicInteraction={() => { void persistStrategicWorkbench({ active_surface: 'strategic' }); }}
                 onOpenCommandPalette={openCommandPalette}
                 onOpenStrategicContextWorkspace={openStrategicContextWorkspace}
+                alerts={combinedAlerts}
+                onDismissAlert={(id) => {
+                  if (id.startsWith('zone-')) setDismissedZoneAlertIds(prev => new Set([...prev, id]));
+                  else s.dismissAlert(id);
+                }}
+                onDismissAllAlerts={() => {
+                  setDismissedZoneAlertIds(prev => new Set([...prev, ...zoneHealthAlerts.map(a => a.id)]));
+                  s.dismissAllAlerts();
+                }}
+                onViewAlertTask={handleViewTask}
+                onOpenActivityFeed={() => setShowActivityFeed(true)}
               />
               </Suspense>
             )}
@@ -1582,6 +1637,7 @@ export default function App() {
         openMessageCount={openMessageCount}
         newSinceLastVisitCount={newSinceLastVisit}
         needsAttentionCount={pipelineAttentionCount}
+        activeAlerts={activeAlerts}
         placement="mobile"
         className="md:hidden"
       />
@@ -1806,25 +1862,6 @@ export default function App() {
       )}
 
       <ToastContainer toasts={s.toasts} onDismiss={s.dismissToast} />
-
-      {s.showAlertsPopover && combinedAlerts.length > 0 && (
-        <Suspense fallback={null}>
-        <AlertsPopover
-          alerts={combinedAlerts}
-          onDismiss={(id) => {
-            if (id.startsWith('zone-')) setDismissedZoneAlertIds(prev => new Set([...prev, id]));
-            else s.dismissAlert(id);
-          }}
-          onDismissAll={() => {
-            setDismissedZoneAlertIds(prev => new Set([...prev, ...zoneHealthAlerts.map(a => a.id)]));
-            s.dismissAllAlerts();
-          }}
-          onViewTask={handleViewTask}
-          projectId={s.selectedProjectId ?? undefined}
-          onClose={() => s.setShowAlertsPopover(false)}
-        />
-        </Suspense>
-      )}
 
       {s.showFleetDetail && (
         <Suspense fallback={null}>

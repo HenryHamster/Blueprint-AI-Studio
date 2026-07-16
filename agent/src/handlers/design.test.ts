@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
 vi.mock('../index.js', () => ({
+  normalizeClaudeConfigContent: vi.fn((_path: string, content: string) => content),
   WORKSPACE: '/tmp/workspace',
   sendLog: vi.fn(),
   runClaudeCode: vi.fn().mockResolvedValue({
@@ -33,6 +34,7 @@ vi.mock('../prompt.js', async (importOriginal) => {
     writePlaybookHelper: vi.fn(),
     writeMessagesHelper: vi.fn(),
     configureAgentPermissions: vi.fn().mockReturnValue(['Write', 'Edit', 'NotebookEdit']),
+    verifyCloneDelivered: vi.fn(),
   };
 });
 
@@ -80,7 +82,7 @@ vi.mock('../telemetry.js', async (importOriginal) => {
 import fs from 'fs';
 import { handleDesign, groundDesignCitations, buildCitationRepairPrompt } from './design.js';
 import { runClaudeCode, persistAndPostStatus, readHandlerOutput, apiGet } from '../index.js';
-import { configureAgentPermissions, writePlaybookHelper, writeMessagesHelper } from '../prompt.js';
+import { buildFileTree, configureAgentPermissions, verifyCloneDelivered, writePlaybookHelper, writeMessagesHelper } from '../prompt.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import { expectCalledWith } from '../utils/typed-mock-call.js';
 import { recordFormatMiss, recordFormatRepairAttempt, recordFormatRepairSuccess, getLlmTelemetry, resetLlmTelemetry } from '../telemetry.js';
@@ -110,6 +112,7 @@ describe('handleDesign', () => {
     vi.mocked(runClaudeCode).mockResolvedValue({
       exitCode: 0, allOutput: '', lastResultText: '',
     });
+    vi.mocked(verifyCloneDelivered).mockImplementation(() => undefined);
     vi.mocked(readHandlerOutput).mockReturnValue(null);
     // Citations ground by default so tests not targeting the grounding-repair
     // reopen never trigger it incidentally.
@@ -126,6 +129,11 @@ describe('handleDesign', () => {
 
     // requires_code: the design handler clones the repo (unlike web_research).
     expect(prepareWorkspaceForRole).toHaveBeenCalledTimes(1);
+    expect(verifyCloneDelivered).toHaveBeenCalledWith(BASE_TASK, 'main');
+    expect(vi.mocked(prepareWorkspaceForRole).mock.invocationCallOrder[0])
+      .toBeLessThan(vi.mocked(verifyCloneDelivered).mock.invocationCallOrder[0]);
+    expect(vi.mocked(verifyCloneDelivered).mock.invocationCallOrder[0])
+      .toBeLessThan(vi.mocked(runClaudeCode).mock.invocationCallOrder[0]);
 
     const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
     // Codebase-grounded, file-citation-first guidance.
@@ -140,6 +148,23 @@ describe('handleDesign', () => {
     }
     // Read-only: the agent must write via Bash because the Write tool is disabled.
     expect(prompt).toContain(`/tmp/design_document_${TASK_ID}.json`);
+  });
+
+  it('rejects_clone_disagreement_before_model_invocation', async () => {
+    const cloneFailure = Object.assign(
+      new Error('clone_failed: cloned tree disagrees with durable non-empty signal'),
+      { failureCategory: 'clone_failed' },
+    );
+    vi.mocked(verifyCloneDelivered).mockImplementation(() => { throw cloneFailure; });
+
+    await expect(handleDesign(
+      TASK_ID, { prompt: 'Design how X should work' },
+      { ...BASE_TASK, repo_is_empty: false }, 'tok', 'owner', 'repo', WS, STATUS_REF(),
+    )).rejects.toMatchObject({ message: cloneFailure.message, failureCategory: 'clone_failed' });
+
+    expect(verifyCloneDelivered).toHaveBeenCalledWith(expect.objectContaining({ repo_is_empty: false }), 'main');
+    expect(buildFileTree).not.toHaveBeenCalled();
+    expect(runClaudeCode).not.toHaveBeenCalled();
   });
 
   it('renders the operational playbook (with provenance caveats) into the prompt', async () => {

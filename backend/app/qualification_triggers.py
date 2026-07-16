@@ -12,9 +12,10 @@ The resolver implements the ordered rule table from the design doc (efbe4182):
                       blocker was the acceptance grade, once EITHER the ledger
                       reports the candidate fully met OR the candidate advanced
                       (new work to re-grade).  No pre-qualification coverage gate.
-    T2 error_redrive — transient/non-transient error under attempt cap
-    T3 post_dry_run_advance — dry_run + automain has advanced (+ CI-red gate)
-    T4 blockers_cleared — not_promoted readiness / promotion_failed / ci_unresolved
+    T2 rubric_redrive — frozen rubric changed or could not be reconstructed
+    T3 error_redrive — transient/non-transient error under attempt cap
+    T4 post_dry_run_advance — dry_run + automain has advanced (+ CI-red gate)
+    T5 blockers_cleared — not_promoted readiness / promotion_failed / ci_unresolved
 
 All paths call the same ``run_qualification`` chokepoint (which is self-defending via
 a FOR-UPDATE lock); this module only decides *whether* to call it.
@@ -44,7 +45,7 @@ class TriggerDecision:
         Whether a qualification run should be initiated.
     trigger:
         Which rule matched: "none" when fire=False.  One of
-        "none", "coverage_complete", "error_redrive",
+        "none", "coverage_complete", "rubric_redrive", "error_redrive",
         "post_dry_run_advance", "blockers_cleared".
     reason:
         Machine-readable code for the decision (e.g. "ci_red", "in_flight",
@@ -251,7 +252,17 @@ def resolve_qualification_trigger(
             ],
         )
 
-    # T2 — error_redrive: transient errors always eligible; non-transient errors
+    # T2 — rubric_redrive: these attempt-scoped outcomes prove no mutable
+    # contract, so a fresh snapshot/grade is always the recovery path.
+    if status in {"rubric_changed", "rubric_provenance_unknown"}:
+        return TriggerDecision(
+            fire=True,
+            trigger="rubric_redrive",
+            reason="armed",
+            blocking=[],
+        )
+
+    # T3 — error_redrive: transient errors always eligible; non-transient errors
     # eligible when requalification_ready is not False (i.e. True or None — unknown).
     #
     # The cap reads ``error_redrive_count`` — the PER-ERROR-EPISODE counter carried
@@ -285,7 +296,7 @@ def resolve_qualification_trigger(
                 blocking=[],
             )
 
-    # T3 — post_dry_run_advance: fire when the dry_run candidate SHA has been
+    # T4 — post_dry_run_advance: fire when the dry_run candidate SHA has been
     # superseded by a new automain HEAD.  Blocked when CI for the new SHA is
     # definitively red (i.e. automain_ci_state == "red").
     if (
@@ -311,7 +322,7 @@ def resolve_qualification_trigger(
             blocking=[],
         )
 
-    # T4 — blockers_cleared: existing re-drive conditions surfaced through the
+    # T5 — blockers_cleared: existing re-drive conditions surfaced through the
     # same decision shape for observability.  These mirror the existing bespoke
     # redrive functions and will remain as separate paths until Phase 1 folding.
     if status == "not_promoted" and blocker not in _T1_NOT_PROMOTED_BLOCKERS:
@@ -372,6 +383,7 @@ def explain_qualification_trigger(
     last_attempt: dict[str, Any] | None,
     knob: str,
     evaluated_at: str,
+    qualification_provenance: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return an operator-facing explanation of the qualification trigger state.
 
@@ -383,7 +395,8 @@ def explain_qualification_trigger(
           "last_attempt": {...},
           "next_expected_trigger": "<event>",
           "blocking": [...],
-          "attempts": {"count": N, "cap": 5},
+          "lifetime_qualification_attempts": N,
+          "error_retry_episode": {"count": M, "cap": 5},
           "knob": "on|observe|off",
           "evaluated_at": "...",
           "decision": {...}   # resolver output for debugging
@@ -449,16 +462,22 @@ def explain_qualification_trigger(
     }
     next_expected = reason_to_next.get(decision.reason, "operator_or_strategist_only")
 
-    return {
+    out = {
         "auto_trigger": auto_trigger,
         "last_attempt": last_attempt,
         "next_expected_trigger": next_expected,
         "blocking": decision.blocking,
-        "attempts": {
-            "count": qualification_attempts,
+        # These are deliberately separate: lifetime attempts are diagnostic
+        # history, while the cap applies only to retries in this error episode.
+        "lifetime_qualification_attempts": qualification_attempts,
+        "error_retry_episode": {
+            "count": error_redrive_count,
             "cap": _MAX_ERROR_REDRIVE_ATTEMPTS,
         },
         "knob": knob,
         "evaluated_at": evaluated_at,
         "decision": decision.as_dict(),
     }
+    if qualification_provenance is not None:
+        out["qualification_provenance"] = qualification_provenance
+    return out

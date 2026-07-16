@@ -2114,6 +2114,68 @@ def test_qual_state_infra_failure_forwards_detail():
     assert "executor OOM" in state["summary"]
 
 
+def test_qual_state_rubric_changed_is_recoverable_hold():
+    """status='rubric_changed' returns typed state ∈ vocab with recoverable hold summary."""
+    state = rv.summarize_qualification_state(
+        {
+            "status": "rubric_changed",
+            "blocker": "rubric_changed",
+            "rubric_drift": {"added": ["crit-a"], "removed": []},
+            "rubric_provenance_error": None,
+        }
+    )
+    assert state is not None
+    assert state["state"] == "rubric_changed"
+    assert state["state"] in rv.QUALIFICATION_STATE_VOCAB
+    # Summary must read as a recoverable hold, not a hard failure.
+    lowered = state["summary"].lower()
+    assert "recoverable" in lowered or "fresh" in lowered
+    assert "rubric" in lowered
+    # Context fields must be forwarded when present.
+    assert state["blocker"] == "rubric_changed"
+    assert state["rubric_drift"] == {"added": ["crit-a"], "removed": []}
+
+
+def test_qual_state_rubric_changed_absent_context_fields():
+    """rubric_drift / rubric_provenance_error absent on input → None in result."""
+    state = rv.summarize_qualification_state({"status": "rubric_changed"})
+    assert state is not None
+    assert state["state"] == "rubric_changed"
+    assert state["rubric_drift"] is None
+    assert state["rubric_provenance_error"] is None
+
+
+def test_qual_state_rubric_provenance_unknown_is_recoverable_hold():
+    """status='rubric_provenance_unknown' returns typed state ∈ vocab with recoverable hold summary."""
+    state = rv.summarize_qualification_state(
+        {
+            "status": "rubric_provenance_unknown",
+            "blocker": "rubric_provenance_unknown",
+            "rubric_provenance_error": "criteria snapshot missing from audit record",
+            "rubric_drift": None,
+        }
+    )
+    assert state is not None
+    assert state["state"] == "rubric_provenance_unknown"
+    assert state["state"] in rv.QUALIFICATION_STATE_VOCAB
+    # Summary must read as a recoverable hold, not a hard failure.
+    lowered = state["summary"].lower()
+    assert "recoverable" in lowered or "fresh" in lowered
+    assert "provenance" in lowered or "rubric" in lowered
+    # Context fields must be forwarded when present.
+    assert state["blocker"] == "rubric_provenance_unknown"
+    assert state["rubric_provenance_error"] == "criteria snapshot missing from audit record"
+
+
+def test_qual_state_rubric_provenance_unknown_absent_context_fields():
+    """rubric_drift / rubric_provenance_error absent on input → None in result."""
+    state = rv.summarize_qualification_state({"status": "rubric_provenance_unknown"})
+    assert state is not None
+    assert state["state"] == "rubric_provenance_unknown"
+    assert state["rubric_drift"] is None
+    assert state["rubric_provenance_error"] is None
+
+
 # ===========================================================================
 # TestQualificationStateVocab — pin QUALIFICATION_STATE_VOCAB contract
 # ===========================================================================
@@ -2129,7 +2191,7 @@ class TestQualificationStateVocab:
         assert vocab, "vocab must not be empty"
         assert all(isinstance(s, str) for s in vocab)
 
-    def test_contains_all_16_states(self):
+    def test_contains_all_states(self):
         fixture_path = (
             Path(__file__).parent / "__fixtures__" / "qualification_state_vocab.json"
         )

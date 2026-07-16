@@ -19,6 +19,7 @@ from sqlmodel import select
 
 from app.experiment_authoring_context import build_runner_devices
 from app.models import LocalRunner, Project
+from app.runner_project_binding import runner_allowed_for_project
 from app.time_utils import _utcnow
 from app.workbench_state import (
     STRATEGIC_LOCAL_CONTINUATION_KEY,
@@ -73,7 +74,7 @@ async def _load_local_runner_status(
     rows = (
         await session.execute(
             select(LocalRunner).where(
-                LocalRunner.project_id == project_id,
+                runner_allowed_for_project(project_id),
                 LocalRunner.status != "deleted",
             )
         )
@@ -104,7 +105,11 @@ async def _load_local_runner_status(
 def _agent_visible_vision(vision: dict[str, Any] | None) -> dict[str, Any]:
     """Return project vision without backend-only operator session metadata."""
 
-    visible = dict(vision or {})
+    visible = {
+        key: value
+        for key, value in (vision or {}).items()
+        if not key.startswith("_")
+    }
     visible.pop(STRATEGIC_LOCAL_CONTINUATION_KEY, None)
     return visible
 
@@ -149,7 +154,7 @@ async def _resolve_local_continuation_runner_affinity(
         await session.execute(
             select(LocalRunner)
             .where(
-                LocalRunner.project_id == project_id,
+                runner_allowed_for_project(project_id),
                 LocalRunner.status != "deleted",
             )
             .order_by(
@@ -217,4 +222,3 @@ async def _resolve_local_continuation_runner_intent(
     if preferred_runner_target_id:
         context["preferred_runner_target_id"] = preferred_runner_target_id
     return context
-

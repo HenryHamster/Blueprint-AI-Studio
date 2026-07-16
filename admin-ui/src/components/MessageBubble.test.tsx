@@ -32,7 +32,7 @@ function makeProps(overrides: Partial<MessageBubbleProps> = {}): MessageBubblePr
     msg: makeMsg(),
     faded: false,
     readOnly: false,
-    allMessages: [],
+    replyTarget: null,
     resolvingId: null,
     resolveInput: '',
     deletingIds: new Set(),
@@ -57,6 +57,21 @@ function makeProps(overrides: Partial<MessageBubbleProps> = {}): MessageBubblePr
 }
 
 describe('MessageBubble', () => {
+  test('renders one reply quote when durable and legacy reply metadata overlap', () => {
+    const replyTarget = makeMsg({ id: 'question-1', content: 'Which run should I inspect?' });
+    render(<MessageBubble {...makeProps({
+      msg: makeMsg({
+        reply_to_message_id: 'question-1',
+        context: {
+          reply_to: 'question-1',
+          reply_preview: 'Which run should I inspect?',
+          event_type: 'question_answer',
+        },
+      }),
+      replyTarget,
+    })} />);
+    expect(screen.getAllByText('Which run should I inspect?')).toHaveLength(1);
+  });
   beforeEach(() => {
     vi.clearAllMocks();
   });

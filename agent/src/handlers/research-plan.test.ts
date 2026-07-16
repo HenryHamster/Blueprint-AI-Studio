@@ -105,6 +105,7 @@ const {
     'matchesVmConfigMissing',
     'missingProviderConfigFiles',
     'missingVmProviderConfigFiles',
+    'normalizeClaudeConfigContent',
     'normalizePytestSelectorForRunner',
     'parseFailingTests',
     'parseFailingTestsFromVitestJson',
@@ -185,6 +186,7 @@ vi.mock('fs', async (importOriginal) => {
 });
 
 vi.mock('../index.js', () => ({
+  normalizeClaudeConfigContent: vi.fn((_path: string, content: string) => content),
   ...Object.fromEntries(INDEX_EXPORT_NAMES.map((name) => [name, vi.fn()])),
   WORKSPACE: '/tmp/workspace',
   sendLog: vi.fn(),
@@ -1663,6 +1665,29 @@ describe('formatCriteriaRubric', () => {
     )).join('\n');
     expect(out).toContain('No test cites this behavior.');
     expect(out).toContain('Nothing covers the rollback path.');
+  });
+
+  it('limits prior grade gaps to the current active rubric after criteria change', () => {
+    const out = formatCriteriaRubric(withCriteria(
+      [
+        { criterion_key: 'c-current', text: 'Current criterion.', status: 'active' },
+        { criterion_key: 'c-new', text: 'Newly active criterion.', status: 'active' },
+        { criterion_key: 'c-retracted', text: 'Retracted criterion.', status: 'retracted' },
+      ],
+      {
+        status: 'not_promoted',
+        category_verdicts: [
+          { category_key: 'c-current', status: 'not_met', gap: 'Current gap.' },
+          { category_key: 'c-retracted', status: 'not_met', gap: 'Retracted gap.' },
+        ],
+      },
+    )).join('\n');
+
+    expect(out).toContain('c-current');
+    expect(out).toContain('Current gap.');
+    expect(out).toContain('c-new');
+    expect(out).not.toContain('Retracted gap.');
+    expect(out).not.toContain('`c-retracted` (not_met)');
   });
 
   it('omits the gap block when the last grade met every category', () => {

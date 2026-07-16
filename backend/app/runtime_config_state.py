@@ -226,7 +226,7 @@ runtime_config: Dict = {
     ),
     # Max registered checks run per tick (backstop against an over-grown registry).
     "metrics_integrity_sweep_max_checks": int(
-        os.getenv("METRICS_INTEGRITY_SWEEP_MAX_CHECKS", "25")
+        os.getenv("METRICS_INTEGRITY_SWEEP_MAX_CHECKS", "30")
     ),
     # Max projects scanned per per-project check (bounds the scan fan-out).
     "metrics_integrity_sweep_max_projects": int(
@@ -332,13 +332,13 @@ runtime_config: Dict = {
             "CAPABILITY_PROOF_GATE_AUTO_GRADUATION_ENFORCE_THRESHOLD", "0.95"
         )
     ),
-    # Slice-1 DARK flag for the machine-verified capability-proof earn path
-    # (design 84021e2d): gates the executed-named_test trial dispatch/enrollment
-    # that later slices add. Default OFF — the executed-proof recorder and this
-    # flag ship dark; no caller reads it yet. Flip via PATCH /api/admin/settings
-    # (no deploy) once the trial-dispatch slice lands.
+    # Machine-verified capability-proof earn path: gates the bounded,
+    # executed-named_test trial dispatch/enrollment.  Default ON now that the
+    # complete path is wired (discovery -> targeted execution -> green-result
+    # ingestion -> proven evidence). Operators retain the PATCH/env kill switch
+    # for a fleet that needs to pause trial dispatch.
     "capability_proof_execution_trials_enabled": os.getenv(
-        "CAPABILITY_PROOF_EXECUTION_TRIALS_ENABLED", "false"
+        "CAPABILITY_PROOF_EXECUTION_TRIALS_ENABLED", "true"
     ).lower()
     in ("1", "true", "yes"),
     # Co-change auto-decomposition: split a medium research finding's files into
@@ -1515,6 +1515,11 @@ def _read_promotion_policy_file() -> dict | None:
                 )
             except (TypeError, ValueError):
                 pass
+        # Slice 3 (design 245212a4): seed the deployed-side env-preflight gate
+        # flag so _policy_from_runtime_config() carries it and the short-circuit
+        # path (runtime_config has promotion_threshold) does NOT silently drop it.
+        if "env_preflight_enabled" in parsed:
+            result["env_preflight_enabled"] = bool(parsed["env_preflight_enabled"])
         return result
     except Exception as exc:  # noqa: BLE001 — fall back on any failure, never raise
         logger.warning(
@@ -1551,6 +1556,8 @@ def _seed_promotion_policy() -> None:
         runtime_config["merge_grade_block_threshold"] = policy[
             "merge_grade_block_threshold"
         ]
+    if "env_preflight_enabled" in policy:
+        runtime_config["env_preflight_enabled"] = policy["env_preflight_enabled"]
 
 
 _seed_promotion_policy()

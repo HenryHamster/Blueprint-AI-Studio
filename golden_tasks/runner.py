@@ -84,6 +84,7 @@ VALID_TASK_TYPES: set[str] = {
     "design",
     "repo_bootstrap",
     "salvage_bundle",
+    "capability_proof_trial",
 }
 
 VALID_EFFORTS: set[str] = {"low", "medium", "high", "max"}
@@ -315,6 +316,9 @@ class RunMetrics:
         self.cache_creation_input_tokens: int = 0
         self.llm_call_count: int = 0
         self.num_turns: int = 0
+        # Simulated metrics are useful for dry runs, but must never be
+        # mistaken for a provider-backed cost baseline.
+        self.simulated: bool = False
 
     @property
     def wall_time_s(self) -> float | None:
@@ -344,6 +348,7 @@ class RunMetrics:
             "error": self.error,
             "llm_provider": self.llm_provider,
             "model_id": self.model_id,
+            "simulated": self.simulated,
         }
         if self.cache_read_input_tokens or self.cache_creation_input_tokens:
             d["cache_read_input_tokens"] = self.cache_read_input_tokens
@@ -368,6 +373,8 @@ class RunMetrics:
             "total_cost_usd": 0.0,
             "success_count": 0,
             "fail_count": 0,
+            "simulated_count": 0,
+            "real_count": 0,
             "total_cache_read_input_tokens": 0,
             "total_cache_creation_input_tokens": 0,
             "total_llm_call_count": 0,
@@ -378,6 +385,10 @@ class RunMetrics:
         failure_categories: dict[str, int] = {}
 
         for m in metrics_list:
+            if m.simulated:
+                totals["simulated_count"] += 1
+            else:
+                totals["real_count"] += 1
             if m.wall_time_s is not None:
                 totals["total_wall_time_s"] += m.wall_time_s
             totals["total_prompt_tokens"] += m.prompt_tokens
@@ -388,9 +399,11 @@ class RunMetrics:
             totals["total_cache_creation_input_tokens"] += m.cache_creation_input_tokens
             totals["total_llm_call_count"] += m.llm_call_count
             totals["total_num_turns"] += m.num_turns
-            if m.success is True:
+            # A fallback simulation is neither a real success nor a real
+            # failure, so it cannot distort a provider-run success rate.
+            if not m.simulated and m.success is True:
                 totals["success_count"] += 1
-            elif m.success is False:
+            elif not m.simulated and m.success is False:
                 totals["fail_count"] += 1
                 # Extract failure category from error string
                 if m.error and "failure_category=" in m.error:
@@ -405,7 +418,8 @@ class RunMetrics:
             totals["avg_wall_time_s"] = totals["total_wall_time_s"] / totals["count"]
             totals["avg_tokens"] = totals["total_tokens"] / totals["count"]
             totals["avg_cost_usd"] = totals["total_cost_usd"] / totals["count"]
-            totals["success_rate"] = totals["success_count"] / totals["count"]
+            if totals["real_count"] > 0:
+                totals["success_rate"] = totals["success_count"] / totals["real_count"]
             # Cache hit rate: cache_read / total_input across all specs
             total_input = totals["total_prompt_tokens"]
             if total_input > 0:
@@ -588,7 +602,12 @@ def _cmd_run(args: argparse.Namespace) -> int:
             _run_real(metrics, payload, args)
 
         all_metrics.append(metrics)
-        if metrics.success is True:
+        if metrics.simulated:
+            print(
+                f"  SIMULATED: {metrics.total_tokens} placeholder tokens, "
+                f"${metrics.cost_usd:.4f} (excluded from real success rate)"
+            )
+        elif metrics.success is True:
             cache_str = ""
             if metrics.cache_hit_rate is not None:
                 cache_str = f", cache_hit={metrics.cache_hit_rate:.1%}"
@@ -606,7 +625,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # Report
     summary = RunMetrics.aggregate(all_metrics)
     print(f"\nSummary ({summary['count']} specs):")
-    print(f"  Success rate: {summary['success_count']}/{summary['count']}")
+    print(f"  Success rate: {summary['success_count']}/{summary['real_count']} real specs")
+    if summary["simulated_count"]:
+        print(f"  Simulated specs: {summary['simulated_count']}")
     print(f"  Total tokens: {summary['total_tokens']}")
     print(f"  Total cost: ${summary['total_cost_usd']:.4f}")
     print(f"  Avg wall time: {summary['avg_wall_time_s']:.2f}s")
@@ -635,6 +656,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
 def _run_simulated(metrics: RunMetrics, args: argparse.Namespace) -> None:
     """Populate *metrics* with placeholder values (existing ``--dry-run`` behavior)."""
+    metrics.simulated = True
     time.sleep(0.05)  # simulate brief work
     metrics.prompt_tokens = 150
     metrics.completion_tokens = 450

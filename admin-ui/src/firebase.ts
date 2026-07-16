@@ -11,6 +11,7 @@
 export {
   auth,
   getIdToken,
+  getIdTokenAfterAuthRestore,
   onAuthChange,
   signInWithGoogle,
   signOut,

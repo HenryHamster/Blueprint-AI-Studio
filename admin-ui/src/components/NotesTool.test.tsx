@@ -1,6 +1,6 @@
 import { afterEach, beforeAll, beforeEach, describe, test, expect, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
-import { act } from 'react';
+import { act, StrictMode } from 'react';
 import { registerToolKind } from '../toolRegistry';
 
 vi.mock('../api/projectTools', async () => {
@@ -92,6 +92,105 @@ describe('NotesTool — autosave loop + conflict data-loss', () => {
     expect(saveToolContent).not.toHaveBeenCalled();
   });
 
+  test('StrictMode replay and unmount before load do not persist an empty document', async () => {
+    vi.mocked(fetchToolContent).mockImplementation(() => new Promise(() => {}));
+
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    root = createRoot(host);
+    await act(async () => {
+      root?.render(
+        <StrictMode>
+          <NotesTool projectId="proj-a" tool={SAMPLE_TOOL} />
+        </StrictMode>,
+      );
+    });
+    await act(async () => { root?.unmount(); });
+    root = null;
+
+    expect(saveToolContent).not.toHaveBeenCalled();
+  });
+
+  test('shows unsaved changes during debounce and Saved only after persistence', async () => {
+    vi.mocked(fetchToolContent).mockResolvedValue({ content: { text: 'loaded' }, content_revision: 2 });
+    vi.mocked(saveToolContent).mockResolvedValue({ content_revision: 3 });
+
+    const textarea = await mount();
+    await act(async () => { typeInto(textarea, 'edited'); });
+    expect(host!.textContent).toContain('Unsaved changes');
+    expect(host!.textContent).not.toContain('Saved');
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(1500); });
+    expect(saveToolContent).toHaveBeenCalledWith('proj-a', 'notes-1', { text: 'edited' }, 2);
+    expect(host!.textContent).toContain('Saved');
+  });
+
+  test('unmount flushes a debounced edit instead of dropping it', async () => {
+    vi.mocked(fetchToolContent).mockResolvedValue({ content: { text: 'loaded' }, content_revision: 2 });
+    vi.mocked(saveToolContent).mockResolvedValue({ content_revision: 3 });
+
+    const textarea = await mount();
+    await act(async () => { typeInto(textarea, 'save before leaving'); });
+    await act(async () => { root?.unmount(); await Promise.resolve(); });
+    root = null;
+
+    expect(saveToolContent).toHaveBeenCalledWith('proj-a', 'notes-1', { text: 'save before leaving' }, 2);
+  });
+
+  test('queues an edit made during a slow save against its returned revision', async () => {
+    vi.mocked(fetchToolContent).mockResolvedValue({ content: { text: 'loaded' }, content_revision: 2 });
+    let finishFirst!: (value: { content_revision: number }) => void;
+    vi.mocked(saveToolContent)
+      .mockImplementationOnce(() => new Promise(resolve => { finishFirst = resolve; }))
+      .mockResolvedValueOnce({ content_revision: 4 });
+
+    const textarea = await mount();
+    await act(async () => { typeInto(textarea, 'first edit'); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(1500); });
+    expect(saveToolContent).toHaveBeenCalledTimes(1);
+
+    await act(async () => { typeInto(textarea, 'second edit'); });
+    await act(async () => { finishFirst({ content_revision: 3 }); await Promise.resolve(); await Promise.resolve(); });
+
+    expect(saveToolContent).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(saveToolContent).mock.calls[1]).toEqual([
+      'proj-a', 'notes-1', { text: 'second edit' }, 3,
+    ]);
+  });
+
+  test('a slow save and queued edit stay bound to their original tool after an identity switch', async () => {
+    vi.mocked(fetchToolContent)
+      .mockResolvedValueOnce({ content: { text: 'tool A' }, content_revision: 2 })
+      .mockResolvedValueOnce({ content: { text: 'tool B' }, content_revision: 2 });
+    let finishFirst!: (value: { content_revision: number }) => void;
+    vi.mocked(saveToolContent)
+      .mockImplementationOnce(() => new Promise(resolve => { finishFirst = resolve; }))
+      .mockResolvedValueOnce({ content_revision: 4 });
+
+    const textareaA = await mount();
+    await act(async () => { typeInto(textareaA, 'A first edit'); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(1500); });
+    await act(async () => { typeInto(textareaA, 'A queued edit'); });
+
+    const toolB = { ...SAMPLE_TOOL, id: 'notes-2', slug: 'notes-2' };
+    await act(async () => { root?.render(<NotesTool projectId="proj-a" tool={toolB} />); });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    expect((host!.querySelector('textarea') as HTMLTextAreaElement).value).toBe('tool B');
+
+    await act(async () => {
+      finishFirst({ content_revision: 3 });
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(vi.mocked(saveToolContent).mock.calls).toEqual([
+      ['proj-a', 'notes-1', { text: 'A first edit' }, 2],
+      ['proj-a', 'notes-1', { text: 'A queued edit' }, 3],
+    ]);
+    expect((host!.querySelector('textarea') as HTMLTextAreaElement).value).toBe('tool B');
+    expect(host!.textContent).toContain('Saved');
+  });
+
   test('a 409 response does not drop local unsaved content', async () => {
     vi.mocked(fetchToolContent)
       .mockResolvedValueOnce({ content: { text: 'loaded' }, content_revision: 2 })
@@ -110,6 +209,46 @@ describe('NotesTool — autosave loop + conflict data-loss', () => {
     expect(textarea.value).not.toBe('server version');
     // Conflict is surfaced, not silent.
     expect(host!.textContent).toContain('Another viewer saved a newer version');
+  });
+
+  test('a failed conflict reload releases the gate so Retry can reconcile and save', async () => {
+    vi.mocked(fetchToolContent)
+      .mockResolvedValueOnce({ content: { text: 'loaded' }, content_revision: 2 })
+      .mockRejectedValueOnce(new Error('reload failed'))
+      .mockResolvedValueOnce({ content: { text: 'server version' }, content_revision: 9 });
+    vi.mocked(saveToolContent)
+      .mockRejectedValueOnce(new ConflictError())
+      .mockRejectedValueOnce(new ConflictError())
+      .mockResolvedValueOnce({ content_revision: 10 });
+
+    const textarea = await mount();
+    await act(async () => { typeInto(textarea, 'keep this local edit'); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(1500); });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+
+    expect(textarea.value).toBe('keep this local edit');
+    expect(host!.textContent).not.toContain('Another viewer saved a newer version');
+    const retryBtn = Array.from(host!.querySelectorAll('button')).find(
+      b => /^retry$/i.test(b.textContent || ''),
+    ) as HTMLButtonElement;
+    expect(retryBtn).toBeTruthy();
+
+    await act(async () => { retryBtn.click(); });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    expect(saveToolContent).toHaveBeenCalledTimes(2);
+    expect(host!.textContent).toContain('Another viewer saved a newer version');
+
+    const keepBtn = Array.from(host!.querySelectorAll('button')).find(
+      b => /keep mine/i.test(b.textContent || ''),
+    ) as HTMLButtonElement;
+    await act(async () => { keepBtn.click(); });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+
+    expect(saveToolContent).toHaveBeenCalledTimes(3);
+    expect(vi.mocked(saveToolContent).mock.calls[2]).toEqual([
+      'proj-a', 'notes-1', { text: 'keep this local edit' }, 9,
+    ]);
+    expect(host!.textContent).toContain('Saved');
   });
 
   test('"Keep mine" resolves the conflict by persisting local edits against the new base revision', async () => {
@@ -140,5 +279,31 @@ describe('NotesTool — autosave loop + conflict data-loss', () => {
     expect(secondCall[3]).toBe(9);
     // Banner cleared after resolution.
     expect(host!.textContent).not.toContain('Another viewer saved a newer version');
+  });
+
+  test.each([
+    ['non-empty', 'server version'],
+    ['empty', ''],
+  ])('"Discard mine" adopts the %s server baseline and clears dirty state', async (_label, serverText) => {
+    vi.mocked(fetchToolContent)
+      .mockResolvedValueOnce({ content: { text: 'loaded' }, content_revision: 2 })
+      .mockResolvedValueOnce({ content: { text: serverText }, content_revision: 9 });
+    vi.mocked(saveToolContent).mockRejectedValueOnce(new ConflictError());
+
+    const textarea = await mount();
+    await act(async () => { typeInto(textarea, 'discard this'); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(1500); });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+
+    const discardBtn = Array.from(host!.querySelectorAll('button')).find(
+      b => /discard mine/i.test(b.textContent || ''),
+    ) as HTMLButtonElement;
+    await act(async () => { discardBtn.click(); });
+
+    expect((host!.querySelector('textarea') as HTMLTextAreaElement).value).toBe(serverText);
+    expect(host!.textContent).toContain('Saved');
+    expect(host!.textContent).not.toContain('Unsaved changes');
+    await act(async () => { await vi.advanceTimersByTimeAsync(3000); });
+    expect(saveToolContent).toHaveBeenCalledTimes(1);
   });
 });

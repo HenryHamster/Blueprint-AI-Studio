@@ -1202,10 +1202,15 @@ describe('handleMigrate — stale-branch handling and runCodeChangeTask delegati
   });
 
   it('delegates to runCodeChangeTask with the right opts when prompt is provided', async () => {
+    const taskCapability = { agent_mode: 'write', run_shape: 'workflow', output_kind: 'pr' };
+    const buildConfig = {
+      directories: [{ path: 'backend', type: 'python' }],
+    };
+    vi.mocked(resolveBuildConfig).mockReturnValueOnce(buildConfig);
     await handleMigrate(
       TASK_ID,
       { ...BASE_PAYLOAD, prompt: 'Add user_role column' },
-      BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+      { ...BASE_TASK, task_capability: taskCapability }, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
     );
 
     expect(vi.mocked(runCodeChangeTask)).toHaveBeenCalledTimes(1);
@@ -1219,6 +1224,8 @@ describe('handleMigrate — stale-branch handling and runCodeChangeTask delegati
     expect(opts.workBranch).toBe('blueprint/migrate-taskabc1');
     expect(opts.baseCommit).toBe('abc1234567');
     expect(opts.noChangesMessage).toBe('No migration changes generated.');
+    expect(opts.buildConfig).toBe(buildConfig);
+    expect(opts.taskCapability).toBe(taskCapability);
   });
 
   it('prepends the acceptance-evidence block when declared', async () => {
@@ -1458,7 +1465,9 @@ describe('handleMigrate — stale-branch handling and runCodeChangeTask delegati
     const prompt = capturedMigratePrompt();
     expect(prompt).toContain('Reserved migration revision');
     expect(prompt).toContain('revision = "0153"');
-    expect(prompt).toContain('down_revision = "0151"');
+    expect(prompt).toContain('actual pre-new-migration chain head');
+    expect(prompt).toContain('advisory parent is `0151`; use it only if the actual head cannot be determined');
+    expect(prompt).not.toContain('down_revision = "0151"');
     expect(prompt).toContain('0153_<short_description>.py');
     expect(prompt).toContain('EXPECTED_SCHEMA_REVISION = "0153"');
   });

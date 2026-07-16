@@ -12,6 +12,7 @@ import {
   type EvergreenFillSettings,
   type CapabilityProofGateMode,
   type CapabilityProofGateCoverage,
+  type CapabilityProofTrialProjection,
 } from '../api';
 import { EvergreenFillObservabilityPanel } from './EvergreenFillObservabilityPanel';
 import { StructuralHealthObservabilityPanel } from './StructuralHealthObservabilityPanel';
@@ -198,6 +199,8 @@ export function SettingsOrchestratorSection({
   const [proofObserveThresholdInput, setProofObserveThresholdInput] = useState('0.5');
   const [proofEnforceThresholdInput, setProofEnforceThresholdInput] = useState('0.95');
   const [proofCoverage, setProofCoverage] = useState<CapabilityProofGateCoverage | null>(null);
+  const [proofTrialsEnabled, setProofTrialsEnabled] = useState(true);
+  const [proofTrialProjection, setProofTrialProjection] = useState<CapabilityProofTrialProjection | null>(null);
 
   const loadFillSettings = useCallback(async () => {
     try {
@@ -240,6 +243,13 @@ export function SettingsOrchestratorSection({
         setProofCoverage(
           cov && typeof cov === 'object'
             ? (cov as CapabilityProofGateCoverage)
+            : null,
+        );
+        setProofTrialsEnabled(Boolean(data?.capability_proof_execution_trials_enabled ?? true));
+        const proj = data?.capability_proof_trial_projection;
+        setProofTrialProjection(
+          proj && typeof proj === 'object'
+            ? (proj as CapabilityProofTrialProjection)
             : null,
         );
       }
@@ -291,6 +301,15 @@ export function SettingsOrchestratorSection({
     try {
       await patchCapabilityProofGateSettings({ capability_proof_gate_auto_graduation_enabled: enabled });
       setProofAutoGradEnabled(enabled);
+    } catch {
+      void loadAuditMode();
+    }
+  }, [loadAuditMode]);
+
+  const patchProofTrialsEnabled = useCallback(async (enabled: boolean) => {
+    try {
+      await patchCapabilityProofGateSettings({ capability_proof_execution_trials_enabled: enabled });
+      setProofTrialsEnabled(enabled);
     } catch {
       void loadAuditMode();
     }
@@ -877,20 +896,33 @@ export function SettingsOrchestratorSection({
             const enforcePct = Math.round(proofEnforceThreshold * 100);
             const observePct = Math.round(proofObserveThreshold * 100);
             return (
-              <div className="flex items-center gap-2">
-                <span className="text-xs text-neutral-500 shrink-0">Current fleet coverage</span>
-                <div className="flex-1 h-1.5 rounded-full bg-neutral-800 overflow-hidden min-w-[3rem] max-w-[10rem]">
-                  <div
-                    className={`h-full rounded-full ${pct >= enforcePct ? 'bg-emerald-500' : pct >= observePct ? 'bg-amber-500' : 'bg-neutral-600'}`}
-                    style={{ width: `${pct}%` }}
-                  />
+              <div className="space-y-1">
+                <div className="flex items-center gap-2">
+                  <span className="text-xs text-neutral-500 shrink-0">Current fleet coverage</span>
+                  <div className="flex-1 h-1.5 rounded-full bg-neutral-800 overflow-hidden min-w-[3rem] max-w-[10rem]">
+                    <div
+                      className={`h-full rounded-full ${pct >= enforcePct ? 'bg-emerald-500' : pct >= observePct ? 'bg-amber-500' : 'bg-neutral-600'}`}
+                      style={{ width: `${pct}%` }}
+                    />
+                  </div>
+                  <span className="text-xs font-mono text-neutral-400 shrink-0" data-testid="proof-gate-fleet-coverage-value">
+                    {cov.total_proven}/{cov.total_non_exempt_working} ({pct}%)
+                  </span>
                 </div>
-                <span className="text-xs font-mono text-neutral-400 shrink-0" data-testid="proof-gate-fleet-coverage-value">
-                  {cov.total_proven}/{cov.total_non_exempt_working} ({pct}%)
-                </span>
+                {(cov.trial_eligible_unproven ?? 0) > 0 && (
+                  <p className="text-xs text-neutral-600" data-testid="proof-gate-trial-eligible-hint">
+                    {cov.trial_eligible_unproven} unproven {cov.trial_eligible_unproven === 1 ? 'capability has' : 'capabilities have'} declared backing paths
+                    {!proofTrialsEnabled && ' — enable execution trials below to earn proof automatically'}
+                  </p>
+                )}
               </div>
             );
           })()}
+          {proofTrialProjection && proofTrialProjection.trial_eligible > 0 && !proofTrialsEnabled && (
+            <p className="text-xs text-amber-600 mt-1" data-testid="proof-gate-trial-projection">
+              Projection: enabling execution trials would make {proofTrialProjection.trial_eligible} of {proofTrialProjection.unproven_working} unproven {proofTrialProjection.unproven_working === 1 ? 'capability' : 'capabilities'} eligible for automated proof.
+            </p>
+          )}
         </div>
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
           <div className="md:col-span-2 lg:col-span-3">
@@ -914,9 +946,18 @@ export function SettingsOrchestratorSection({
           <div className="flex items-end">
             <div className="w-full">
               <label className="block text-xs font-medium text-neutral-400 mb-1.5">Auto-Graduation</label>
-              <div className="flex items-center gap-3 bg-neutral-950 border border-neutral-700 rounded-lg px-3 py-2">
+              <div className="flex items-center gap-3 bg-neutral-950 border border-neutral-700 rounded-lg px-3 py-2" data-testid="proof-gate-auto-graduation">
                 <Toggle enabled={proofAutoGradEnabled} onChange={v => void patchProofAutoGrad(v)} />
                 <span className="text-xs text-neutral-400">{proofAutoGradEnabled ? 'Enabled' : 'Disabled'}</span>
+              </div>
+            </div>
+          </div>
+          <div className="flex items-end">
+            <div className="w-full">
+              <label className="block text-xs font-medium text-neutral-400 mb-1.5">Execution Trials</label>
+              <div className="flex items-center gap-3 bg-neutral-950 border border-neutral-700 rounded-lg px-3 py-2" data-testid="proof-gate-execution-trials">
+                <Toggle enabled={proofTrialsEnabled} onChange={v => void patchProofTrialsEnabled(v)} />
+                <span className="text-xs text-neutral-400">{proofTrialsEnabled ? 'Enabled' : 'Disabled'}</span>
               </div>
             </div>
           </div>

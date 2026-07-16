@@ -345,7 +345,10 @@ class TestAgentSecretManifest:
         assert manifest["env"]["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-test"
         assert manifest["env"]["TASK_ID"] == str(task_id)
         assert manifest["metadata"]["task_type"] == "create"
-        assert manifest["files"] == []
+        # Anthropic always materializes ~/.claude.json (even without claude_config_json)
+        # so the CLI doesn't stall on the onboarding dialog.
+        assert len(manifest["files"]) == 1
+        assert manifest["files"][0]["path"] == "/home/agent/.claude.json"
 
     def test_build_agent_secret_manifest_materializes_file_based_provider_auth(self):
         task_id = uuid.uuid4()
@@ -473,6 +476,90 @@ class TestAgentSecretManifest:
         assert manifest["env"]["LLM_SETTINGS"] == "{}"
         assert "LLM_CLI_TRANSLATION" in manifest["env"]
         assert manifest["metadata"]["model"] == "claude-opus-4-8"
+
+    def test_anthropic_omitted_claude_config_json_materializes_minimal_file(self):
+        """Anthropic provider without claude_config_json still produces a
+        ~/.claude.json file entry so the CLI doesn't stall on onboarding."""
+        import json as _json
+        task_id = uuid.uuid4()
+        manifest = compute.build_agent_secret_manifest(
+            vm_instance_id="vm-no-config",
+            task_id=task_id,
+            oauth_token="sk-ant-oauth01-xyz",
+            task_type="create",
+            provider="anthropic",
+            auth_mode="oauth",
+        )
+        files = manifest["files"]
+        assert len(files) == 1
+        assert files[0]["path"] == "/home/agent/.claude.json"
+        # Content must not carry secrets — only the structural config shell
+        content = _json.loads(files[0]["content"])
+        assert "CLAUDE_CODE_OAUTH_TOKEN" not in files[0]["content"]
+        assert "sk-ant" not in files[0]["content"]
+        assert isinstance(content, dict)
+
+    def test_anthropic_supplied_claude_config_json_preserved(self):
+        """When claude_config_json is supplied, it is forwarded verbatim
+        (the VM-side normalizer merges hasTrustDialogAccepted on top)."""
+        import json as _json
+        operator_config = _json.dumps(
+            {"hasCompletedOnboarding": True, "email": "op@example.com"}
+        )
+        task_id = uuid.uuid4()
+        manifest = compute.build_agent_secret_manifest(
+            vm_instance_id="vm-with-config",
+            task_id=task_id,
+            oauth_token="sk-ant-oauth01-abc",
+            task_type="fix",
+            provider="anthropic",
+            auth_mode="oauth",
+            claude_config_json=operator_config,
+        )
+        files = manifest["files"]
+        assert len(files) == 1
+        assert files[0]["path"] == "/home/agent/.claude.json"
+        content = _json.loads(files[0]["content"])
+        assert content["hasCompletedOnboarding"] is True
+        assert content["email"] == "op@example.com"
+        # Operator fields preserved; trust injection happens in materialize_manifest.py
+        assert "sk-ant" not in files[0]["content"]
+
+    def test_anthropic_claude_json_path_is_home_anchored(self):
+        """The manifest path must use /home/agent so the agent runner can
+        re-anchor it to the live $HOME (e.g. /home inside a bwrap sandbox)."""
+        task_id = uuid.uuid4()
+        manifest = compute.build_agent_secret_manifest(
+            vm_instance_id="vm-home-anchor",
+            task_id=task_id,
+            oauth_token="sk-ant-oauth01-def",
+            task_type="create",
+            provider="anthropic",
+            auth_mode="oauth",
+        )
+        claude_file = next(
+            (f for f in manifest["files"] if f["path"].endswith(".claude.json")), None
+        )
+        assert claude_file is not None, "expected .claude.json in manifest files"
+        # Canonical home-agent path so re-anchoring logic matches '.claude.json' tail
+        assert claude_file["path"] == "/home/agent/.claude.json"
+
+    def test_non_anthropic_omitted_claude_config_json_no_file(self):
+        """Non-Anthropic providers without claude_config_json must NOT add a
+        .claude.json file — OpenAI/ZAI/DeepSeek/Gemini don't need the onboarding bypass."""
+        task_id = uuid.uuid4()
+        manifest = compute.build_agent_secret_manifest(
+            vm_instance_id="vm-openai-no-config",
+            task_id=task_id,
+            oauth_token='{"tokens":{"access_token":"abc"}}',
+            task_type="create",
+            provider="openai",
+            auth_mode="oauth",
+        )
+        claude_file = next(
+            (f for f in manifest["files"] if f["path"].endswith(".claude.json")), None
+        )
+        assert claude_file is None, "non-Anthropic provider must not add .claude.json"
 
 
 @pytest.mark.asyncio
@@ -1973,8 +2060,8 @@ async def test_runner_report_exit_125_finalizes_no_progress_timeout_through_moni
     client, db_session
 ):
     """END-TO-END: a runner no-progress watchdog kill (exit 125) reported over the
-    HTTP /report endpoint is finalized by the monitor as the same intentional
-    no-progress timeout as a central plateau-watchdog cut — NOT a command failure.
+    HTTP /report endpoint is finalized by the monitor as an intentional TIMED_OUT
+    no-progress cut whose durable terminal_reason classifies to NO_PROGRESS_TIMEOUT.
 
     This is the full pipeline the unit test only samples at poll_status: the
     reserved exit code produced by scripts/local_runner.py's watchdog must survive
@@ -2009,9 +2096,9 @@ async def test_runner_report_exit_125_finalizes_no_progress_timeout_through_moni
     await db_session.refresh(job)
     assert job.status == ComputeJobStatus.TIMED_OUT
     assert job.outcome == ComputeJobOutcome.TIMED_OUT
-    assert (job.polling_metadata or {}).get("terminal_kind") == "no_progress"
     assert (job.polling_metadata or {}).get("exit_code") == 125
     assert job.terminal_reason == "no_progress_timeout"
+    assert (job.polling_metadata or {}).get("terminal_kind") == "no_progress"
     # 3) The classifier keys the terminal reason to a platform kill, not a defect.
     assert (
         classify_compute_terminal_reason(job.terminal_reason, None)
@@ -4018,10 +4105,28 @@ def test_job_expects_data_variants():
     crit_task = Task(payloads=[{"success_criterion": {"metric": "acc"}}])
     assert compute_jobs._job_expects_data(empty_job, crit_task) is True
 
-    # Pure side-effect job: no declared metric, no arms, no criterion → no data.
+    # Pure side-effect job: no declared metric, no arms, no criterion → no data expected.
     side_effect_task = Task(payloads=[{"type": "research"}])
     assert compute_jobs._job_expects_data(empty_job, side_effect_task) is False
     assert compute_jobs._job_expects_data(empty_job, None) is False
+
+    # criterion-free compute_experiment: _job_expects_data returns False (it handles
+    # metric/arms only); the separate _is_criterion_free_experiment path catches this.
+    experiment_no_criterion = Task(payloads=[{"type": "compute_experiment"}])
+    assert compute_jobs._job_expects_data(empty_job, experiment_no_criterion) is False
+    assert compute_jobs._is_criterion_free_experiment(empty_job, experiment_no_criterion) is True
+
+    # compute_experiment WITH a stamped declared_metric in polling_metadata → not criterion-free.
+    job_with_metric = ComputeJob(polling_metadata={"declared_metric": "acc"})
+    assert compute_jobs._is_criterion_free_experiment(job_with_metric, experiment_no_criterion) is False
+
+    # compute_experiment WITH a success_criterion in payload → not criterion-free.
+    experiment_with_criterion = Task(payloads=[{"type": "compute_experiment", "success_criterion": {"metric": "acc"}}])
+    assert compute_jobs._is_criterion_free_experiment(empty_job, experiment_with_criterion) is False
+
+    # Non-experiment type (research) → never criterion-free.
+    assert compute_jobs._is_criterion_free_experiment(empty_job, side_effect_task) is False
+    assert compute_jobs._is_criterion_free_experiment(empty_job, None) is False
 
 
 async def _run_no_data_guard_job(
@@ -4065,6 +4170,15 @@ async def _run_no_data_guard_job(
     )
     meta = dict(job.polling_metadata or {})
     meta["preflight_smoke_done"] = True
+    declared_metric = task_payload.get("declared_metric")
+    criterion = task_payload.get("success_criterion")
+    if not declared_metric and isinstance(criterion, dict):
+        declared_metric = criterion.get("metric")
+    if isinstance(declared_metric, str) and declared_metric.strip():
+        # Production job creation stamps this launch-contract value. Mirror that
+        # durable declaration so the no-data harness exercises the precise
+        # terminal resolver rather than only task-payload fallback behavior.
+        meta["declared_metric"] = declared_metric.strip()
     job.polling_metadata = meta
     await db_session.commit()
 
@@ -4149,7 +4263,7 @@ async def test_process_compute_jobs_once_reclassifies_arms_no_data_as_failure(
         db_session,
         monkeypatch,
         task_payload={"type": "research", "arms": {"fp16": {"metric": "tflops"}}},
-        status_metrics=None,
+        status_metrics={"elapsed_seconds": 12.0},
         artifact_reference=None,
     )
     assert job.outcome == ComputeJobOutcome.FAILURE
@@ -4170,16 +4284,22 @@ async def test_no_data_guard_respects_reported_metrics(db_session, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_no_declared_metric_metricless_still_success(db_session, monkeypatch):
-    """A job that declares NO metric and writes none stays SUCCESS (no regression)."""
-    project = Project(name="No Metric Declared Success", user_id="test-user")
+async def test_compute_experiment_without_criterion_fails(db_session, monkeypatch):
+    """A compute_experiment that declares no metric and no success_criterion must FAIL.
+
+    compute_experiment is a measurement task by definition; a metric is mandatory.
+    The _job_expects_data carve-out was designed for pure side-effect commands (no
+    declared metric), not for experiments — this regression guard ensures a criterion-
+    free experiment is reclassified as FAILURE rather than recorded as clean SUCCESS.
+    """
+    project = Project(name="No Metric Declared Experiment", user_id="test-user")
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
     task = Task(
         project_id=project.id,
-        title="no declared metric experiment",
+        title="compute_experiment with no metric",
         status=TaskStatus.IN_PROGRESS,
         payloads=[{"type": "compute_experiment"}],
     )
@@ -4204,11 +4324,11 @@ async def test_no_declared_metric_metricless_still_success(db_session, monkeypat
 
     class FakeBackend:
         def external_id_for(self, persisted_job):
-            return "no-declared-metric-job"
+            return "no-criterion-experiment-job"
 
         async def launch(self, spec):
             return ComputeLaunchResult(
-                external_id="no-declared-metric-job",
+                external_id="no-criterion-experiment-job",
                 started_at=_utcnow() - timedelta(seconds=30),
                 cost_rate_per_second=0.0,
                 message="launched",
@@ -4242,12 +4362,31 @@ async def test_no_declared_metric_metricless_still_success(db_session, monkeypat
     await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
 
     await db_session.refresh(job)
+    assert job.outcome == ComputeJobOutcome.FAILURE
+    assert "compute_experiment declared no metric" in (job.terminal_reason or "")
+
+
+@pytest.mark.asyncio
+async def test_side_effect_job_no_metric_stays_success(db_session, monkeypatch):
+    """Side-effect jobs (non-experiment type) with no metric stay SUCCESS.
+
+    The _job_expects_data carve-out must remain intact for non-experiment task types
+    (research, plan, etc.) that legitimately have no declared metric.  Only
+    compute_experiment tasks are required to declare a criterion.
+    """
+    job = await _run_no_data_guard_job(
+        db_session,
+        monkeypatch,
+        task_payload={"type": "research"},
+        status_metrics=None,
+        artifact_reference=None,
+    )
     assert job.outcome == ComputeJobOutcome.SUCCESS
 
 
 @pytest.mark.asyncio
 async def test_no_data_guard_respects_durable_artifacts(db_session, monkeypatch):
-    """A metric-less job that left a durable artifact is NOT a no-data failure."""
+    """Incidental artifacts do not fulfill an unmeasured declared metric."""
     reference = TerminalArtifactReference(
         uri="file:///tmp/artifacts",
         backend="local",
@@ -4258,10 +4397,37 @@ async def test_no_data_guard_respects_durable_artifacts(db_session, monkeypatch)
         db_session,
         monkeypatch,
         task_payload={"type": "research", "declared_metric": "val/loss"},
-        status_metrics=None,
+        status_metrics={"elapsed_seconds": 12.0},
         artifact_reference=reference,
     )
-    assert job.outcome == ComputeJobOutcome.SUCCESS
+    assert job.outcome == ComputeJobOutcome.FAILURE
+    assert "never measured its declared result" in (job.terminal_reason or "")
+    assert "durable artifacts preserved" in (job.terminal_reason or "")
+    assert "uri=file:///tmp/artifacts" in (job.terminal_reason or "")
+    assert "file_count=3" in (job.terminal_reason or "")
+
+
+@pytest.mark.asyncio
+async def test_no_data_guard_reclassifies_arms_with_incidental_artifact(
+    db_session, monkeypatch
+):
+    """An arms job needs per-arm data; a stray artifact must not rescue SUCCESS."""
+    reference = TerminalArtifactReference(
+        uri="file:///tmp/arms-checkpoint",
+        backend="local",
+        file_count=1,
+        total_size_bytes=512,
+    )
+    job = await _run_no_data_guard_job(
+        db_session,
+        monkeypatch,
+        task_payload={"type": "research", "arms": {"fp16": {"metric": "tflops"}}},
+        status_metrics={"elapsed_seconds": 12.0},
+        artifact_reference=reference,
+    )
+    assert job.outcome == ComputeJobOutcome.FAILURE
+    assert "never measured its declared result" in (job.terminal_reason or "")
+    assert "uri=file:///tmp/arms-checkpoint" in (job.terminal_reason or "")
 
 
 @pytest.mark.asyncio
@@ -7931,6 +8097,65 @@ class TestBootDiskType:
         # Disk zone must track the machine-type zone (same insert target).
         assert f"zones/{captured['zone']}/" in captured["machine_type"]
 
+    async def test_ssd_quota_retries_same_zone_with_pd_standard(
+        self, monkeypatch, clean_zone_health
+    ):
+        inserts = []
+
+        def _capture_insert(*args, **kwargs):
+            inst = kwargs["instance_resource"]
+            inserts.append(
+                {
+                    "zone": kwargs["zone"],
+                    "disk_type": inst.disks[0].initialize_params.disk_type,
+                }
+            )
+            op = MagicMock()
+            op.name = f"op-disk-fallback-{len(inserts)}"
+            if len(inserts) == 1:
+                op.result.side_effect = Exception(
+                    "403 FORBIDDEN QUOTA_EXCEEDED: Quota 'SSD_TOTAL_GB' exceeded"
+                )
+            return op
+
+        async def _ok(*args, **kwargs):
+            return True
+
+        async def _noop(*args, **kwargs):
+            return None
+
+        monkeypatch.setattr(compute, "_acquire_provision_slot", _ok)
+        monkeypatch.setattr(compute, "_release_provision_slot", _noop)
+
+        with patch("google.cloud.compute_v1.InstancesClient") as mock_client:
+            mock_client.return_value.get.side_effect = Exception("404 was not found")
+            mock_client.return_value.insert.side_effect = _capture_insert
+
+            result = await compute._provision_gcp(
+                "vm-disktype-fallback-test",
+                uuid.uuid4(),
+                secret_version_name="projects/p/secrets/s/versions/1",
+            )
+
+        assert result is True
+        assert len(inserts) == 2
+        assert inserts[0]["zone"] == inserts[1]["zone"]
+        assert inserts[0]["disk_type"].endswith("/diskTypes/pd-balanced")
+        assert inserts[1]["disk_type"].endswith("/diskTypes/pd-standard")
+
+
+@pytest.mark.parametrize(
+    "message,expected",
+    [
+        ("Quota 'SSD_TOTAL_GB' exceeded", True),
+        ("quota SSD-TOTAL-GB exhausted", True),
+        ("Quota CPUS exceeded", False),
+        ("ZONE_RESOURCE_POOL_EXHAUSTED", False),
+    ],
+)
+def test_is_ssd_boot_disk_quota_exhaustion(message, expected):
+    assert compute._is_ssd_boot_disk_quota_exhaustion(message) is expected
+
 
 @pytest.mark.asyncio
 async def test_get_recent_terminal_compute_spend_terminal_only_and_windowed(db_session):
@@ -9791,6 +10016,7 @@ def test_gpu_facts_do_not_leak_into_cpu_create_gate():
 
     assert set(vcr.supported_machine_types()) == {
         "c2d-standard-2",
+        "n2-standard-2",
         "e2-standard-2",
         "e2-standard-4",
         "e2-standard-8",
@@ -13861,6 +14087,11 @@ async def test_compute_job_vm_heartbeat_bare_uuid_cannot_suppress_watchdog(
     )
     job.status = ComputeJobStatus.STARTING
     job.last_heartbeat_at = None
+    # The rollout boundary is exclusive: a VM created exactly when the HMAC
+    # rollout begins must not retain the guessable legacy credential.
+    job.created_at = datetime(2026, 7, 14, 7, 24, 41, tzinfo=timezone.utc).replace(
+        tzinfo=None
+    )
     await db_session.commit()
 
     progress_body = json.dumps({"progress": {"metric": "loss", "value": 0.5}}).encode()
@@ -13906,6 +14137,57 @@ async def test_compute_job_vm_heartbeat_bare_uuid_cannot_suppress_watchdog(
     series = (job.polling_metadata or {}).get("progress_series")
     assert series, "authenticated heartbeat must record the progress sample"
     assert series[-1]["name"] == "loss" and series[-1]["value"] == 0.5
+
+
+@pytest.mark.asyncio
+async def test_compute_job_vm_heartbeat_pre_rollout_uuid_keeps_vm_alive(
+    client, db_session, monkeypatch
+):
+    """A VM launched before the HMAC deploy may refresh its heartbeat with its UUID."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    project = Project(name="HB Flag-day Compatibility", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python3 train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        backend_name="local-subprocess",
+    )
+    job.status = ComputeJobStatus.RUNNING
+    job.created_at = datetime(2026, 7, 14, 7, 24, 40, tzinfo=timezone.utc).replace(
+        tzinfo=None
+    )
+    job.last_heartbeat_at = datetime(2026, 7, 14, 7, 20, tzinfo=timezone.utc).replace(
+        tzinfo=None
+    )
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/agent/compute-jobs/{job.id}/heartbeat",
+        headers={"Authorization": f"Bearer {job.id}"},
+    )
+
+    assert resp.status_code == 204
+    await db_session.refresh(job)
+    assert job.last_heartbeat_at is not None
+    assert job.last_heartbeat_at > datetime(
+        2026, 7, 14, 7, 20, tzinfo=timezone.utc
+    ).replace(tzinfo=None)
 
 
 @pytest.mark.asyncio
@@ -17965,6 +18247,65 @@ def test_build_and_push_builds_when_hash_new(tmp_path):
     assert result.pinned_ref == "reg/repo/img@sha256:" + "b" * 64
 
 
+def test_build_and_push_sanitizes_authenticated_git_metadata_from_context(tmp_path):
+    """A Dockerfile that encodes its whole context cannot recover Git credentials."""
+    repo = _write_repo(
+        tmp_path,
+        dockerfile=(
+            b"FROM scratch\nCOPY . /project\n"
+            b"RUN find /project -type f -exec base64 {} \\;\n"
+        ),
+    )
+    token = "ghs_abcdefghijklmnopqrstuvwxyz1234567890"
+    repo_path = tmp_path / "repo"
+    (repo_path / ".git").mkdir()
+    (repo_path / ".git" / "config").write_text(
+        f"[credential]\n\ttoken = {token}\n"
+    )
+    (repo_path / "vendor").mkdir()
+    (repo_path / "vendor" / ".git").mkdir()
+    (repo_path / "vendor" / ".git" / "config").write_text(token)
+    (repo_path / "project-source.txt").write_text("ordinary project source\n")
+    os.symlink("project-source.txt", repo_path / "project-source-link")
+    contexts = []
+
+    def fake_run(cmd, **kw):
+        if cmd[:2] == ["docker", "build"]:
+            context = cmd[-1]
+            contexts.append(context)
+            assert cmd[cmd.index("-f") + 1] == os.path.join(
+                context, ".blueprint", "Dockerfile.compute"
+            )
+            assert not os.path.exists(os.path.join(context, ".git"))
+            assert not os.path.exists(os.path.join(context, "vendor", ".git"))
+            with open(os.path.join(context, "project-source.txt"), "rb") as fh:
+                assert fh.read() == b"ordinary project source\n"
+            assert os.path.islink(os.path.join(context, "project-source-link"))
+            copied_files = []
+            for root, _dirs, files in os.walk(context):
+                for name in files:
+                    with open(os.path.join(root, name), "rb") as copied_file:
+                        copied_files.append(copied_file.read())
+            # This simulates the Dockerfile's base64 command over every copied file.
+            encoded_context = base64.b64encode(b"\0".join(copied_files))
+            assert token.encode() not in base64.b64decode(encoded_context)
+        return _ok_proc(stdout="reg/repo/img@sha256:" + "c" * 64)
+
+    _bci.build_and_push(
+        repo_dir=repo,
+        registry_repo="reg/repo",
+        image_name="img",
+        dockerfile=".blueprint/Dockerfile.compute",
+        dep_files=["requirements.txt"],
+        _run=fake_run,
+        _tag_exists=lambda *a, **k: False,
+        _scan_layers_fn=lambda *a, **k: [],
+    )
+
+    assert len(contexts) == 1
+    assert not os.path.exists(contexts[0]), "temporary Docker context was not cleaned up"
+
+
 def test_build_and_push_credential_leak_fails_before_push(tmp_path):
     """A leaked credential in the Dockerfile fails the build BEFORE any push."""
     repo = _write_repo(
@@ -20460,7 +20801,17 @@ async def test_persist_viewable_artifacts_returns_tuple_with_dropped_count(tmp_p
     assert dropped == 2
     # Each manifest entry has the required fields
     entry = manifest[0]
-    assert {"filename", "storage_uri", "content_type", "size_bytes", "kind"} <= entry.keys()
+    assert {
+        "filename",
+        "storage_uri",
+        "content_type",
+        "size_bytes",
+        "kind",
+        "revision",
+        "live",
+    } <= entry.keys()
+    assert isinstance(entry["revision"], str) and entry["revision"]
+    assert entry["live"] is False
 
 
 @pytest.mark.asyncio
@@ -21029,9 +21380,10 @@ async def test_viewable_pipeline_enforces_video_ceiling(db_session, monkeypatch)
     await db_session.commit()
 
     # Only the within-ceiling video is persisted; the oversized one is skipped
-    # (size rejections are not counted in the dropped/count-cap tally).
+    # and reported in the aggregate omission count, matching image-size and
+    # count-cap omissions.
     assert [m["filename"] for m in manifest] == ["ok_clip.mp4"]
-    assert dropped == 0
+    assert dropped == 1
     uploads = {u["basename"]: u for u in calls["uploads"]}
     assert set(uploads) == {"ok_clip.mp4"}
     assert uploads["ok_clip.mp4"]["streamed"] is True
@@ -21254,6 +21606,137 @@ async def test_viewable_pipeline_upload_failure_is_non_blocking(
     }
     # A file that never landed in storage must NOT be advertised as signable.
     assert not any("fail_me" in r.storage_uri for r in rows)
+    meta = job.polling_metadata or {}
+    assert meta.get("viewable_terminal_reconciliation_incomplete") is True
+    assert "viewable_file_count" not in meta
+
+
+@pytest.mark.asyncio
+async def test_terminal_viewable_total_failure_preserves_live_entries_and_retries(
+    db_session, monkeypatch
+):
+    """A corrupt/unavailable terminal bundle must not erase durable live previews.
+
+    The incomplete pass also must not stamp the idempotency marker: a later
+    healthy terminal pass retries and authoritatively reconciles the previews.
+    """
+    job = await _create_bundle_compute_job(db_session)
+    live_manifest = [
+        {
+            "filename": "plot.png",
+            "storage_uri": storage.compute_job_viewable_uri(job.id, "plot.png"),
+            "content_type": "image/png",
+            "size_bytes": 11,
+            "kind": "image",
+            "revision": "live-plot-revision",
+            "live": True,
+        },
+        {
+            "filename": "clip.mp4",
+            "storage_uri": storage.compute_job_viewable_uri(job.id, "clip.mp4"),
+            "content_type": "video/mp4",
+            "size_bytes": 12,
+            "kind": "video",
+            "revision": "live-clip-revision",
+            "live": True,
+        },
+    ]
+    job.polling_metadata = {"viewable_files": live_manifest}
+    db_session.add(job)
+    await db_session.commit()
+
+    failed_calls = _mock_viewable_storage(monkeypatch, b"not-a-tar")
+    preserved, dropped = await compute_jobs.persist_viewable_files_for_job(
+        db_session, job
+    )
+    await db_session.commit()
+
+    assert dropped == 0
+    assert failed_calls["uploads"] == []
+    assert {entry["filename"] for entry in preserved} == {"plot.png", "clip.mp4"}
+    assert all(entry["live"] is True for entry in preserved)
+    failed_meta = job.polling_metadata or {}
+    assert failed_meta.get("viewable_terminal_reconciliation_incomplete") is True
+    assert "viewable_file_count" not in failed_meta
+
+    healthy_bundle = _make_viewable_tar_bundle(
+        {
+            "./plot.png": b"\x89PNG terminal",
+            "./clip.mp4": b"\x00\x00\x00\x18ftypmp42 terminal",
+        }
+    )
+    healthy_calls = _mock_viewable_storage(monkeypatch, healthy_bundle)
+    reconciled, dropped = await compute_jobs.persist_viewable_files_for_job(
+        db_session, job
+    )
+    await db_session.commit()
+
+    assert dropped == 0
+    assert len(healthy_calls["uploads"]) == 2
+    assert {entry["filename"] for entry in reconciled} == {"plot.png", "clip.mp4"}
+    assert all(entry["live"] is False for entry in reconciled)
+    complete_meta = job.polling_metadata or {}
+    assert complete_meta.get("viewable_file_count") == 2
+    assert "viewable_terminal_reconciliation_incomplete" not in complete_meta
+
+
+@pytest.mark.asyncio
+async def test_terminal_viewable_partial_upload_preserves_unreconciled_live_entry(
+    db_session, monkeypatch
+):
+    """A partial terminal upload replaces successes but retains failed live files."""
+    job = await _create_bundle_compute_job(db_session)
+    failed_live_revision = "live-failed-file-revision"
+    job.polling_metadata = {
+        "viewable_files": [
+            {
+                "filename": "good.png",
+                "storage_uri": storage.compute_job_viewable_uri(job.id, "good.png"),
+                "content_type": "image/png",
+                "size_bytes": 8,
+                "kind": "image",
+                "revision": "old-good-revision",
+                "live": True,
+            },
+            {
+                "filename": "fail_me.png",
+                "storage_uri": storage.compute_job_viewable_uri(
+                    job.id, "fail_me.png"
+                ),
+                "content_type": "image/png",
+                "size_bytes": 9,
+                "kind": "image",
+                "revision": failed_live_revision,
+                "live": True,
+            },
+        ]
+    }
+    db_session.add(job)
+    await db_session.commit()
+
+    bundle = _make_viewable_tar_bundle(
+        {
+            "./good.png": b"\x89PNG good-terminal",
+            "./fail_me.png": b"\x89PNG failed-terminal",
+        }
+    )
+    _mock_viewable_storage(monkeypatch, bundle, fail_on="fail_me")
+
+    manifest, dropped = await compute_jobs.persist_viewable_files_for_job(
+        db_session, job
+    )
+    await db_session.commit()
+
+    assert dropped == 0
+    by_name = {entry["filename"]: entry for entry in manifest}
+    assert set(by_name) == {"good.png", "fail_me.png"}
+    assert by_name["good.png"]["live"] is False
+    assert by_name["good.png"]["revision"] != "old-good-revision"
+    assert by_name["fail_me.png"]["live"] is True
+    assert by_name["fail_me.png"]["revision"] == failed_live_revision
+    meta = job.polling_metadata or {}
+    assert meta.get("viewable_terminal_reconciliation_incomplete") is True
+    assert "viewable_file_count" not in meta
 
 
 @pytest.mark.asyncio
@@ -21277,6 +21760,8 @@ async def test_viewable_pipeline_is_idempotent_and_downloads_bundle_once(
     )
     await db_session.commit()
     assert len(manifest1) == 2
+    first_revisions = {e["filename"]: e["revision"] for e in manifest1}
+    assert all(e["live"] is False for e in manifest1)
     assert calls["downloads"] == 1
     assert len(calls["uploads"]) == 2
 
@@ -21292,6 +21777,7 @@ async def test_viewable_pipeline_is_idempotent_and_downloads_bundle_once(
     )
     assert len(calls["uploads"]) == 2, "re-entry must NOT re-upload any file"
     assert {e["filename"] for e in manifest2} == {e["filename"] for e in manifest1}
+    assert {e["filename"]: e["revision"] for e in manifest2} == first_revisions
 
     rows = await _job_files(db_session, job.id)
     assert len(rows) == 2, f"expected no duplicate rows on re-entry, got {len(rows)}"
@@ -21827,8 +22313,9 @@ async def test_compute_job_resume_hydrates_prior_bundle(client, db_session, monk
         machine_type="e2-standard-2",
         spend_cap_usd=1.0,
         deadline_seconds=300,
-        no_progress_timeout_seconds=60,
+        no_progress_timeout_seconds=120,
         input_artifact_job_id=str(predecessor.id),
+        declared_metric="loss",
     )
     assert job.backend == compute_backends_module.RUNNER_SUBPROCESS_BACKEND_NAME
     assert job.polling_metadata.get("input_artifact_job_id") == str(predecessor.id)
@@ -22027,90 +22514,33 @@ async def test_compute_job_resume_rejects_bundleless_input_artifact(
 
 
 @pytest.mark.asyncio
-async def test_compute_job_resume_rejects_failed_or_unverified_hydration_source(
-    db_session, monkeypatch
-):
-    """A chained checkpoint source needs exact affirmative hydration proof.
-
-    A durable bundle alone is not trustworthy when its producing job was itself
-    resumed: failed, missing, malformed, and source-mismatched provenance can
-    describe a partial predecessor extraction.  The launch precondition must
-    reject each one before it creates a successor row.
-    """
+async def test_compute_job_resume_rejects_failed_ancestor_hydration(db_session, monkeypatch):
+    """A bundle from a failed resume hydration is never lineage-eligible."""
     monkeypatch.setattr(compute, "LOCAL_MODE", True)
     task = await _make_compute_task(db_session)
-    original_source = uuid.uuid4()
-    cases = (
-        None,
-        {"ok": False, "resumed_from_job_id": str(original_source), "file_count": 1},
-        {"ok": True, "resumed_from_job_id": "not-a-uuid", "file_count": 1},
-        {
-            "ok": True,
-            "resumed_from_job_id": str(uuid.uuid4()),
-            "file_count": 1,
-            "recorded_at": _utcnow().isoformat(),
-        },
-    )
-    for provenance in cases:
-        predecessor = await _make_resume_predecessor_job(
-            db_session, project_id=task.project_id, with_bundle=True
-        )
-        predecessor.polling_metadata = {"input_artifact_job_id": str(original_source)}
-        if provenance is not None:
-            predecessor.polling_metadata["resume_provenance"] = provenance
-        db_session.add(predecessor)
-        await db_session.commit()
-
-        with pytest.raises(compute_jobs.ComputeLaunchPreconditionFailed) as exc:
-            await compute_jobs.create_compute_job(
-                db_session,
-                task,
-                command="python train.py --resume",
-                machine_type="e2-standard-2",
-                spend_cap_usd=1.0,
-                deadline_seconds=300,
-                no_progress_timeout_seconds=60,
-                input_artifact_job_id=str(predecessor.id),
-            )
-        assert exc.value.detail["error"] == "input_artifact_job_resume_provenance_invalid"
-        successors = (
-            await db_session.execute(
-                select(ComputeJob).where(
-                    ComputeJob.polling_metadata["input_artifact_job_id"].as_string()
-                    == str(predecessor.id)
-                )
-            )
-        ).scalars().all()
-        assert successors == []
-
-    # A source that completed hydration can still be FAILED: command failure
-    # must not discard its valid checkpoint bundle.
-    verified = await _make_resume_predecessor_job(
+    predecessor = await _make_resume_predecessor_job(
         db_session, project_id=task.project_id, with_bundle=True
     )
-    verified.status = ComputeJobStatus.FAILED
-    verified.polling_metadata = {
-        "input_artifact_job_id": str(original_source),
-        "resume_provenance": {
-            "ok": True,
-            "resumed_from_job_id": str(original_source),
-            "file_count": 1,
-            "recorded_at": _utcnow().isoformat(),
-        },
+    predecessor.polling_metadata = {
+        "input_artifact_job_id": str(uuid.uuid4()),
+        "resume_provenance": {"ok": False, "reason": "extract_error"},
     }
-    db_session.add(verified)
+    db_session.add(predecessor)
     await db_session.commit()
-    successor = await compute_jobs.create_compute_job(
-        db_session,
-        task,
-        command="python train.py --resume",
-        machine_type="e2-standard-2",
-        spend_cap_usd=1.0,
-        deadline_seconds=300,
-        no_progress_timeout_seconds=60,
-        input_artifact_job_id=str(verified.id),
-    )
-    assert successor.polling_metadata["input_artifact_job_id"] == str(verified.id)
+
+    with pytest.raises(compute_jobs.ComputeLaunchPreconditionFailed) as exc:
+        await compute_jobs.create_compute_job(
+            db_session,
+            task,
+            command="python train.py",
+            machine_type="e2-standard-2",
+            spend_cap_usd=1.0,
+            deadline_seconds=300,
+            input_artifact_job_id=str(predecessor.id),
+            declared_metric="loss",
+            no_progress_timeout_seconds=120,
+        )
+    assert exc.value.detail["error"] == "input_artifact_job_resume_provenance_invalid"
 
 
 @pytest.mark.asyncio

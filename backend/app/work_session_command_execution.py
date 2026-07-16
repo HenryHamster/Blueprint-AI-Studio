@@ -20,6 +20,7 @@ from app.messages_last_seen import (
 )
 from app.messages_noise_prefs_store import get_messages_noise_prefs_row
 from app.models import Alert, MESSAGE_CONTENT_MAX, MessageType, ProjectMessage, _utcnow
+from app.project_message_creation import build_project_message
 from app.strategic_trigger import (
     ARMING_NOT_ARMED,
     ARMING_STEERING,
@@ -453,7 +454,8 @@ async def _persist_failed_command_receipt(
     now = _utcnow()
     label = _command_label(command)
     receipt_result = _failed_command_result(exc)
-    receipt = ProjectMessage(
+    receipt = await build_project_message(
+        session,
         project_id=project_id,
         message_type=MessageType.NOTE,
         from_type="system",
@@ -576,7 +578,8 @@ async def execute_work_session_command(
     content = f"Command completed: {label}"
     if len(content) > MESSAGE_CONTENT_MAX:
         content = content[:MESSAGE_CONTENT_MAX]
-    receipt = ProjectMessage(
+    receipt = await build_project_message(
+        session,
         project_id=project_id,
         message_type=MessageType.NOTE,
         from_type="system",

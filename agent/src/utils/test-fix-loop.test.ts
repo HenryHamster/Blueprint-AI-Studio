@@ -10,6 +10,7 @@ const { execFileAsync, mockApiPost, mockReaddirSync } = vi.hoisted(() => ({
   mockReaddirSync: vi.fn<(path: fs.PathLike) => string[]>(),
 }));
 vi.mock('../index.js', () => ({
+  normalizeClaudeConfigContent: vi.fn((_path: string, content: string) => content),
   WORKSPACE: '/tmp/workspace',
   sendLog: vi.fn(),
   sendHeartbeatSync: vi.fn(),
@@ -22,6 +23,9 @@ vi.mock('../index.js', () => ({
 // runClaudeCode must never be invoked for maxFixAttempts:0 runs — stub anyway.
 vi.mock('../providers/runners.js', () => ({
   claudeHelpSupportsPartialMessages: vi.fn(() => true),
+  __resetClaudeCapabilityCacheForTesting: vi.fn(),
+  probeClaudeCapabilities: vi.fn(() => null),
+  stripUnsupportedClaudeOptionalArgs: vi.fn((args: readonly string[]) => [...args]),
   runClaudeCode: vi.fn().mockResolvedValue(undefined),
 }));
 

@@ -20,8 +20,10 @@ from app.models import (
     LocalRunner,
     Project,
     ProjectMember,
+    RunnerProjectBinding,
 )
 from app.routers.admin_runners import _normalize_gpus_per_job, _runner_config_view
+from app.routers.runner import _sanitize_project_verification
 from app.time_utils import _utcnow
 from app.runner_config import (
     GPUS_PER_JOB_MAX,
@@ -31,6 +33,48 @@ from app.runner_config import (
 )
 
 TEST_USER_ID = "test-user-123"
+
+
+class TestProjectVerificationHeartbeatSanitization:
+    def _passing_report(self) -> dict:
+        return {
+            "version": 1,
+            "boundary": {"class": "agent", "backend": "bwrap"},
+            "ready": True,
+            "probes": {
+                "ruff": {"ok": True, "exit_code": 0},
+                "docker_postgres": {"ok": True, "exit_code": 0},
+            },
+        }
+
+    def test_negative_exit_code_cannot_earn_readiness(self):
+        report = self._passing_report()
+        report["probes"]["ruff"]["exit_code"] = -9
+
+        sanitized = _sanitize_project_verification(report)
+
+        assert sanitized is not None
+        assert sanitized["ready"] is False
+        assert sanitized["probes"]["ruff"] == {
+            "ok": False,
+            "exit_code": None,
+            "reason": "ruff probe reported an invalid exit code",
+        }
+
+    @pytest.mark.parametrize("boundary_class", [None, "compute"])
+    def test_non_agent_boundary_cannot_earn_readiness(self, boundary_class):
+        report = self._passing_report()
+        if boundary_class is None:
+            report["boundary"].pop("class")
+        else:
+            report["boundary"]["class"] = boundary_class
+
+        sanitized = _sanitize_project_verification(report)
+
+        assert sanitized is not None
+        assert sanitized["ready"] is False
+        assert sanitized["boundary"]["class"] == "unknown"
+        assert "boundary class was not agent" in sanitized["reason"]
 
 
 async def _make_project(session, name="Runner Stats Project"):
@@ -48,6 +92,70 @@ async def _make_project(session, name="Runner Stats Project"):
 def _pin(runner_id) -> dict:
     """polling_metadata that pins a compute job to a runner (see runner_stats)."""
     return {"runner_target_id": str(runner_id)}
+
+
+@pytest.mark.asyncio
+async def test_bound_project_runner_is_visible_and_healthy(
+    client: AsyncClient, db_session
+):
+    """A healthy A-enrolled runner remains usable and observable from B."""
+    enrollment = await _make_project(db_session, "Enrollment project")
+    bound = await _make_project(db_session, "Bound project")
+    runner = LocalRunner(
+        project_id=enrollment.id,
+        token_hash="s" * 64,
+        hostname="shared-box",
+        status="active",
+        last_seen_at=_utcnow() - timedelta(seconds=10),
+        capabilities={"task_types": "all", "max_concurrent": 2},
+    )
+    db_session.add(runner)
+    await db_session.commit()
+    await db_session.refresh(runner)
+    db_session.add(RunnerProjectBinding(runner_id=runner.id, project_id=bound.id))
+    db_session.add_all(
+        [
+            ComputeJob(
+                project_id=bound.id,
+                backend="runner-subprocess",
+                status=ComputeJobStatus.SUCCEEDED,
+                polling_metadata=_pin(runner.id),
+            ),
+            ComputeJob(
+                project_id=enrollment.id,
+                backend="runner-subprocess",
+                status=ComputeJobStatus.SUCCEEDED,
+                polling_metadata=_pin(runner.id),
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    listed = await client.get(f"/api/admin/projects/{bound.id}/runners")
+    assert listed.status_code == 200, listed.text
+    visible = listed.json()
+    assert [row["id"] for row in visible] == [str(runner.id)]
+    assert visible[0]["enrollment_project_id"] == str(enrollment.id)
+    assert visible[0]["health"]["device_status"] == "connected"
+
+    stats = await client.get(
+        f"/api/admin/projects/{bound.id}/runners/{runner.id}/stats"
+    )
+    assert stats.status_code == 200, stats.text
+    assert stats.json()["jobs_run_count"] == 1
+
+    telemetry = await client.get(
+        f"/api/admin/projects/{bound.id}/runners/{runner.id}/telemetry"
+    )
+    assert telemetry.status_code == 200, telemetry.text
+
+    summary = await client.get("/api/admin/fleet/runners/health-summary")
+    assert summary.status_code == 200, summary.text
+    body = summary.json()
+    assert body["total"] == 1
+    by_project = {entry["project_id"]: entry for entry in body["per_project"]}
+    assert by_project[str(enrollment.id)]["total"] == 1
+    assert by_project[str(bound.id)]["connected"] == 1
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1185,7 +1293,19 @@ class TestRunnerEnrollWalkthrough:
         # ── Step 2: heartbeat — runner appears live ───────────────────────────
         hb_resp = await client.post(
             "/api/runner/heartbeat",
-            json={"active_task_ids": [], "active_work_report": True},
+            json={
+                "active_task_ids": [],
+                "active_work_report": True,
+                "project_verification": {
+                    "version": 1,
+                    "boundary": {"class": "agent", "backend": "bwrap"},
+                    "ready": True,
+                    "probes": {
+                        "ruff": {"ok": True, "exit_code": 0},
+                        "docker_postgres": {"ok": True, "exit_code": 0},
+                    },
+                },
+            },
             headers={"Authorization": f"Bearer {token}"},
         )
         assert hb_resp.status_code == 200, hb_resp.text
@@ -1199,6 +1319,10 @@ class TestRunnerEnrollWalkthrough:
         # Health should now show the runner as connected (recent heartbeat).
         health = row2.get("health") or {}
         assert health.get("device_status") == "connected"
+        verification = row2["capabilities"]["project_verification"]
+        assert verification["version"] == 1
+        assert verification["ready"] is True
+        assert verification["probes"]["docker_postgres"]["exit_code"] == 0
 
         # ── Step 3: rotate token — old token invalidated, new token minted ───
         rot_resp = await client.post(
@@ -1210,6 +1334,23 @@ class TestRunnerEnrollWalkthrough:
         assert "token" in rot
         new_token = rot["token"]
         assert new_token != token, "rotated token must differ from the original"
+        rotated_at = datetime.fromisoformat(rot["rotated_at"].replace("Z", "+00:00"))
+        assert rotated_at.tzinfo == timezone.utc
+        persisted_runner = await db_session.get(LocalRunner, uuid.UUID(runner_id))
+        assert persisted_runner is not None
+        await db_session.refresh(persisted_runner)
+        assert persisted_runner.token_created_at == rotated_at.replace(tzinfo=None)
+
+        # Rotation advances the credential generation, so the list contract
+        # must require a heartbeat authenticated by the replacement token.
+        rotated_list_resp = await client.get(
+            f"/api/admin/projects/{project.id}/runners"
+        )
+        assert rotated_list_resp.status_code == 200, rotated_list_resp.text
+        rotated_row = next(
+            r for r in rotated_list_resp.json() if r["id"] == runner_id
+        )
+        assert rotated_row["current_token_heartbeat_confirmed"] is False
 
         # Old token is now invalid — heartbeat with it must return 401/403.
         old_hb = await client.post(
@@ -1228,6 +1369,17 @@ class TestRunnerEnrollWalkthrough:
             headers={"Authorization": f"Bearer {new_token}"},
         )
         assert new_hb.status_code == 200, new_hb.text
+
+        # Read the endpoint-level proof back through _runner_view: this covers
+        # both heartbeat acknowledgement wiring and the admin DTO field.
+        confirmed_list_resp = await client.get(
+            f"/api/admin/projects/{project.id}/runners"
+        )
+        assert confirmed_list_resp.status_code == 200, confirmed_list_resp.text
+        confirmed_row = next(
+            r for r in confirmed_list_resp.json() if r["id"] == runner_id
+        )
+        assert confirmed_row["current_token_heartbeat_confirmed"] is True
 
         # ── Step 4: revoke — runner is deleted and absent from active list ────
         del_resp = await client.delete(
@@ -1251,3 +1403,159 @@ class TestRunnerEnrollWalkthrough:
         assert revoked_hb.status_code in (401, 403), (
             f"revoked runner token should be rejected, got {revoked_hb.status_code}"
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Allow-list visibility: runners must be discoverable from bound projects,
+# not only from their enrollment project.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestAllowlistedRunnerVisibleFromAddedProject:
+    """Verify that a runner enrolled on project A is visible from project B
+    when an explicit RunnerProjectBinding links them."""
+
+    async def _make_two_projects(self, session):
+        proj_a = Project(name="Project A", user_id=TEST_USER_ID)
+        proj_b = Project(name="Project B", user_id=TEST_USER_ID)
+        session.add_all([proj_a, proj_b])
+        await session.commit()
+        await session.refresh(proj_a)
+        await session.refresh(proj_b)
+        session.add_all([
+            ProjectMember(project_id=proj_a.id, user_id=TEST_USER_ID, role="owner"),
+            ProjectMember(project_id=proj_b.id, user_id=TEST_USER_ID, role="owner"),
+        ])
+        await session.commit()
+        return proj_a, proj_b
+
+    @pytest.mark.asyncio
+    async def test_allowlisted_runner_visible_from_added_project(
+        self, client: AsyncClient, db_session
+    ):
+        """Runner enrolled on proj_a appears in proj_b list when allow-listed there."""
+        from app.runner_project_binding import add_binding
+
+        proj_a, proj_b = await self._make_two_projects(db_session)
+        runner = LocalRunner(
+            project_id=proj_a.id,
+            token_hash="aa" * 32,
+            hostname="shared-host",
+            status="active",
+        )
+        db_session.add(runner)
+        await db_session.commit()
+        await db_session.refresh(runner)
+
+        # Not visible from proj_b yet.
+        resp_before = await client.get(
+            f"/api/admin/projects/{proj_b.id}/runners"
+        )
+        assert resp_before.status_code == 200
+        assert all(r["id"] != str(runner.id) for r in resp_before.json())
+
+        # Add allow-list binding and confirm visibility.
+        await add_binding(db_session, runner.id, proj_b.id)
+        await db_session.commit()
+
+        resp_after = await client.get(
+            f"/api/admin/projects/{proj_b.id}/runners"
+        )
+        assert resp_after.status_code == 200
+        ids = [r["id"] for r in resp_after.json()]
+        assert str(runner.id) in ids, "allow-listed runner must appear in bound project list"
+
+    @pytest.mark.asyncio
+    async def test_list_runners_excludes_unbound_runner(
+        self, client: AsyncClient, db_session
+    ):
+        """Runner enrolled on proj_a with no binding to proj_c is not listed there."""
+        proj_a, proj_c = await self._make_two_projects(db_session)
+        runner = LocalRunner(
+            project_id=proj_a.id,
+            token_hash="bb" * 32,
+            hostname="exclusive-host",
+            status="active",
+        )
+        db_session.add(runner)
+        await db_session.commit()
+        await db_session.refresh(runner)
+
+        resp = await client.get(f"/api/admin/projects/{proj_c.id}/runners")
+        assert resp.status_code == 200
+        assert all(r["id"] != str(runner.id) for r in resp.json())
+
+    @pytest.mark.asyncio
+    async def test_telemetry_visible_from_allowlisted_project(
+        self, client: AsyncClient, db_session
+    ):
+        """Telemetry endpoint returns 200 from the bound project."""
+        from app.runner_project_binding import add_binding
+
+        proj_a, proj_b = await self._make_two_projects(db_session)
+        runner = LocalRunner(
+            project_id=proj_a.id,
+            token_hash="cc" * 32,
+            hostname="telem-host",
+            status="active",
+        )
+        db_session.add(runner)
+        await db_session.commit()
+        await db_session.refresh(runner)
+
+        await add_binding(db_session, runner.id, proj_b.id)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{proj_b.id}/runners/{runner.id}/telemetry"
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["runner_id"] == str(runner.id)
+
+    @pytest.mark.asyncio
+    async def test_telemetry_404_from_unbound_project(
+        self, client: AsyncClient, db_session
+    ):
+        """Telemetry endpoint returns 404 when the runner has no binding to the project."""
+        proj_a, proj_c = await self._make_two_projects(db_session)
+        runner = LocalRunner(
+            project_id=proj_a.id,
+            token_hash="dd" * 32,
+            hostname="unbound-telem",
+            status="active",
+        )
+        db_session.add(runner)
+        await db_session.commit()
+        await db_session.refresh(runner)
+
+        resp = await client.get(
+            f"/api/admin/projects/{proj_c.id}/runners/{runner.id}/telemetry"
+        )
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_stats_visible_from_allowlisted_project(
+        self, client: AsyncClient, db_session
+    ):
+        """Stats endpoint returns 200 from the bound project."""
+        from app.runner_project_binding import add_binding
+
+        proj_a, proj_b = await self._make_two_projects(db_session)
+        runner = LocalRunner(
+            project_id=proj_a.id,
+            token_hash="ee" * 32,
+            hostname="stats-host",
+            status="active",
+        )
+        db_session.add(runner)
+        await db_session.commit()
+        await db_session.refresh(runner)
+
+        await add_binding(db_session, runner.id, proj_b.id)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{proj_b.id}/runners/{runner.id}/stats"
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["jobs_run_count"] == 0

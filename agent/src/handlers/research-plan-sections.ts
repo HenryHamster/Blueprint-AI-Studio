@@ -288,6 +288,8 @@ export const QUALIFICATION_STATE_VOCAB: ReadonlySet<string> = new Set([
   'protection_blocked_review',
   'qualifying',
   'required_check_failed',
+  'rubric_changed',
+  'rubric_provenance_unknown',
 ]);
 // Derived qualification states that mean an audit / promotion run is actively
 // in flight for the current candidate. When the effective status is any of
@@ -370,6 +372,7 @@ export function formatCriteriaRubric(versionPhase: Record<string, unknown>): str
     const stuck = typeof c.stuck_reason === 'string' && c.stuck_reason ? c.stuck_reason : null;
     parts.push(`- \`${key}\`: ${text}${stuck ? ` — **stuck: ${stuck}** (no work maps to this; retract or re-map it)` : ''}`);
   }
+  const activeKeys = new Set(active.map((criterion) => criterion.criterion_key as string));
 
   // WHY the last grade failed — the qualifier computes this per category and it was
   // being discarded here, leaving only an opaque blocker code.
@@ -381,7 +384,9 @@ export function formatCriteriaRubric(versionPhase: Record<string, unknown>): str
   const verdicts = Array.isArray(verdictsRaw) ? verdictsRaw : [];
   const unmet = verdicts.filter((v): v is Record<string, unknown> =>
     !!v && typeof v === 'object' && !Array.isArray(v)
-    && (v as Record<string, unknown>).status !== 'met');
+    && (v as Record<string, unknown>).status !== 'met'
+    && typeof (v as Record<string, unknown>).category_key === 'string'
+    && activeKeys.has((v as Record<string, unknown>).category_key as string));
   if (unmet.length > 0) {
     parts.push('Last grade — categories NOT met (with the grader\'s gap):');
     for (const v of unmet) {

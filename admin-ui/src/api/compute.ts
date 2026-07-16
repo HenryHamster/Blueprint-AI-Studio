@@ -745,6 +745,8 @@ export interface ViewableArtifact {
   content_type?: string | null;
   size_bytes?: number | null;
   kind: 'image' | 'video' | 'pdf' | null;
+  revision?: string | null;
+  live?: boolean | null;
 }
 
 export interface ComputeJob {
@@ -1736,6 +1738,14 @@ export interface CapabilityProofGateCoverage {
   total_non_exempt_working: number;
   projects_contributing: number;
   num_projects: number;
+  trial_eligible_unproven?: number;
+}
+
+export interface CapabilityProofTrialProjection {
+  trial_eligible: number;
+  unproven_working: number;
+  projects_contributing: number;
+  num_projects: number;
 }
 
 export interface CapabilityProofGateSettings {
@@ -1743,6 +1753,7 @@ export interface CapabilityProofGateSettings {
   capability_proof_gate_auto_graduation_enabled: boolean;
   capability_proof_gate_auto_graduation_observe_threshold: number;
   capability_proof_gate_auto_graduation_enforce_threshold: number;
+  capability_proof_execution_trials_enabled?: boolean;
 }
 
 // PATCHes any partial of the four capability-proof-gate config keys. The backend
@@ -1823,6 +1834,9 @@ export async function revokeCapabilityProofExemption(
 
 export interface FleetRunner {
   id: string;
+  // Present on newer servers. Mutations remain scoped here; absence preserves
+  // rolling-deployment compatibility by falling back to the viewed project.
+  enrollment_project_id?: string;
   hostname: string | null;
   version: string | null;
   status: string;
@@ -1961,18 +1975,31 @@ export interface FleetRunner {
   };
   last_seen_at: string | null;
   created_at: string | null;
+  // Server-side proof that a heartbeat authenticated with the current token
+  // generation. False immediately after rotation until the replacement token
+  // is actually used; immune to last_seen_at/rotation commit races.
+  current_token_heartbeat_confirmed?: boolean;
 }
 
 /** Register a new fleet runner for a project. Returns the one-time token.
  *
- * The backend (POST /projects/{id}/runners/register and .../rotate-token) returns
- * exactly `{runner_id, token}` — runner tokens do not expire, so there is no
- * expiry field here. A prior version of this type declared phantom
+ * The registration endpoint returns exactly `{runner_id, token}` — runner tokens
+ * do not expire, so there is no expiry field here. A prior version of this type
+ * declared phantom
  * `token_expires_at`/`expires_at`/`expiresAt` fields that the server never sent,
  * driving a dead "Token expires" affordance in the enroll dialog; both removed. */
 export interface FleetRunnerRegistrationResult {
   runner_id: string;
   token: string;
+}
+
+/** Rotate a fleet runner token and return its one-time replacement token.
+ * `rotated_at` remains optional for rolling-deployment compatibility and display;
+ * reconnect proof comes from FleetRunner.current_token_heartbeat_confirmed. */
+export interface FleetRunnerTokenRotationResult {
+  runner_id: string;
+  token: string;
+  rotated_at?: string;
 }
 
 export async function registerFleetRunner(
@@ -2000,7 +2027,7 @@ export async function registerFleetRunner(
 export async function rotateFleetRunnerToken(
   projectId: string,
   runnerId: string,
-): Promise<FleetRunnerRegistrationResult> {
+): Promise<FleetRunnerTokenRotationResult> {
   const res = await apiFetch(
     `/api/admin/projects/${encodeURIComponent(projectId)}/runners/${encodeURIComponent(runnerId)}/rotate-token`,
     { method: 'POST' },

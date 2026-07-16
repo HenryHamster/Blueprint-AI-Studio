@@ -4,6 +4,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import WebSocket from 'ws';
+import { enforceNodeVersion } from './node-preflight.js';
 import { getLastWorkspacePrepOutcome, resetWorkspacePrepOutcome } from './workspacePrep.js';
 import { handlers, resolveHandler } from './handlers/index.js';
 import {
@@ -567,6 +568,58 @@ function parseSecretFileMode(raw: unknown): number {
   return 0o600;
 }
 
+// The backend's VM-startup materializer applies the same normalization before
+// writing ~/.claude.json. Fleet runners materialize a returned credential
+// manifest in-process instead, so keep the invariant here as well: an omitted
+// config becomes a minimal non-secret onboarding/trust config, while a valid
+// operator-supplied object retains all of its other settings.
+function normalizeClaudeConfigContent(
+  filePath: string,
+  content: string,
+  workspace = WORKSPACE,
+): string {
+  if (path.basename(filePath) !== '.claude.json') return content;
+  try {
+    const parsed: unknown = JSON.parse(content || '{}');
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return content;
+    }
+    const normalizedConfig = parsed as Record<string, unknown>;
+    normalizedConfig.hasCompletedOnboarding = true;
+    const projects = normalizedConfig.projects;
+    const normalizedProjects =
+      projects && typeof projects === 'object' && !Array.isArray(projects)
+        ? projects as Record<string, unknown>
+        : {};
+    normalizedConfig.projects = normalizedProjects;
+    const workspaceConfig = normalizedProjects[workspace];
+    const normalizedWorkspace =
+      workspaceConfig &&
+      typeof workspaceConfig === 'object' &&
+      !Array.isArray(workspaceConfig)
+        ? workspaceConfig as Record<string, unknown>
+        : {};
+    normalizedProjects[workspace] = normalizedWorkspace;
+    normalizedWorkspace.hasTrustDialogAccepted = true;
+    // Claude Code 2.1.197 iterates projectSettings.allowedTools without
+    // guarding the legacy/missing shape. Account exports created before that
+    // field existed (or our trust bootstrap's newly-created workspace entry)
+    // otherwise crash before the first model call with:
+    //   TypeError: B.allowedTools is not iterable
+    // Preserve a real list, but replace every absent or malformed value with
+    // the least-privilege empty list. Runtime task permissions still arrive
+    // through --disallowedTools / --dangerously-skip-permissions.
+    if (!Array.isArray(normalizedWorkspace.allowedTools)) {
+      normalizedWorkspace.allowedTools = [];
+    }
+    return JSON.stringify(normalizedConfig);
+  } catch {
+    // Preserve malformed operator configuration exactly; replacing it would
+    // discard account-supplied state and hide its validation error.
+    return content;
+  }
+}
+
 function ensureParentDirectorySync(filePath: string): void {
   const parent = path.dirname(filePath);
   fs.mkdirSync(parent, { recursive: true, mode: 0o700 });
@@ -636,7 +689,11 @@ function materializeCredentialState(
       continue;
     }
     ensureParentDirectorySync(writePath);
-    writePrivateFileSync(writePath, file.content, file.mode);
+    writePrivateFileSync(
+      writePath,
+      normalizeClaudeConfigContent(writePath, file.content),
+      file.mode,
+    );
     materializedPaths.push(writePath);
   }
   for (const [key, value] of Object.entries(state.env)) {
@@ -3491,6 +3548,10 @@ async function completeStartup(
 
 // ── Main ────────────────────────────────────────────────────────────────────
 export async function main() {
+  // Check Node version before anything else so an incompatible runtime fails
+  // with a clear, actionable message instead of an opaque startup error.
+  enforceNodeVersion();
+
   let _pendingExitCode = 0;
   // Start forensic instrumentation as early as possible. The lag monitor + exit
   // markers don't depend on auth or task claim, so we want them recording from
@@ -3784,6 +3845,8 @@ interface WarmContinuationDeps {
   materializeClaimCredentialState: typeof materializeClaimCredentialState;
   performWarmRetarget: typeof performWarmRetarget;
   resolveVmInstanceId: (allowJwtFallback: boolean) => string | null;
+  /** Production-only pre-poll guard; injectable so unit tests need no disk. */
+  isWorkspaceValid?: () => boolean;
 }
 
 const warmContinuationDeps: WarmContinuationDeps = {
@@ -3797,6 +3860,7 @@ const warmContinuationDeps: WarmContinuationDeps = {
     if (vmInstanceId) return vmInstanceId;
     return allowJwtFallback ? decodeJwtVmInstanceId(AGENT_TOKEN) : null;
   },
+  isWorkspaceValid: () => fs.existsSync(path.join(WORKSPACE, '.git')),
 };
 
 function parkPollTimeoutMs(parkDirective: ParkDirective): number {
@@ -3813,6 +3877,13 @@ export async function continueWarmContinuation(
   },
   deps: WarmContinuationDeps = warmContinuationDeps,
 ): Promise<{ action: 'continue' | 'exit' }> {
+  // A failed clone removes WORKSPACE before its error is reported. Never let a
+  // later warm poll claim an unrelated task into that invalid handoff: it
+  // cannot survive resetForNextRole and should be cold-provisioned instead.
+  if (deps.isWorkspaceValid && !deps.isWorkspaceValid()) {
+    log(`Warm continuation declined: workspace is invalid (missing ${path.join(WORKSPACE, '.git')})`);
+    return { action: 'exit' };
+  }
   const vmInstanceId = deps.resolveVmInstanceId(!!opts.parkDirective);
   if (!vmInstanceId) {
     return { action: 'exit' };

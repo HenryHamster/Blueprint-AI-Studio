@@ -1,3 +1,4 @@
+import json
 import uuid
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch
@@ -6,13 +7,22 @@ import pytest
 from httpx import AsyncClient
 from sqlmodel import select
 
-from app.models import MessageType, Project, ProjectMember, ProjectMessage
+from app.models import (
+    MessageSurface,
+    MessageType,
+    Project,
+    ProjectMember,
+    ProjectMessage,
+)
 from app.project_message_projection import (
+    MESSAGE_CONTEXT_PROJECTION_MAX_BYTES,
+    MESSAGE_EVENT_MAX_BYTES,
     admin_message_dict,
     admin_message_list_dict,
     agent_fetch_message_dict,
     agent_thread_message_dict,
     legacy_direction_message_dict,
+    message_event_payload,
     message_preview_dict,
 )
 from testing.factories import make_task
@@ -58,15 +68,36 @@ def test_admin_message_dict_normalizes_enum_timestamp_and_empty_context():
     assert data["message_type"] == "BLOCKER"
     assert data["from_type"] == "system"
     assert data["from_task_id"] == str(msg.from_task_id)
+    assert data["actor_user_id"] is None
+    assert data["sequence"] is None
+    assert data["surface"] == "activity"
+    assert data["handling_state"] == "pending"
+    assert data["handled_by_task_id"] is None
+    assert data["reply_to_message_id"] is None
+    assert data["idempotency_key"] is None
     assert data["context"] == {}
     assert data["status"] == "linked"
     assert data["resolution"] == "Owned by direction d-1"
     assert data["created_at"] == "2026-01-01T03:04:05+00:00"
     assert data["resolved_at"] == "2026-01-02T03:04:05+00:00"
+    assert data["updated_at"] == msg.updated_at.isoformat()
 
 
 def test_compatibility_wrappers_keep_existing_public_aliases():
-    msg = _message(message_type=MessageType.FEEDBACK, from_type="user", status="open")
+    handled_by = uuid.UUID("44444444-4444-4444-8444-444444444444")
+    reply_to = uuid.UUID("55555555-5555-4555-8555-555555555555")
+    msg = _message(
+        message_type=MessageType.FEEDBACK,
+        from_type="user",
+        actor_user_id="operator-7",
+        sequence=17,
+        surface=MessageSurface.CONVERSATION,
+        handling_state="responded",
+        handled_by_task_id=handled_by,
+        reply_to_message_id=reply_to,
+        idempotency_key="client-send-17",
+        status="open",
+    )
 
     legacy = legacy_direction_message_dict(msg)
     thread = agent_thread_message_dict(msg)
@@ -83,6 +114,19 @@ def test_compatibility_wrappers_keep_existing_public_aliases():
 
     assert fetched["type"] == "FEEDBACK"
     assert fetched["from_type"] == "user"
+    assert fetched["project_id"] == str(msg.project_id)
+    assert fetched["from_task_id"] == str(msg.from_task_id)
+    assert fetched["actor_user_id"] == "operator-7"
+    assert fetched["sequence"] == 17
+    assert fetched["surface"] == "conversation"
+    assert fetched["handling_state"] == "responded"
+    assert fetched["handled_by_task_id"] == str(handled_by)
+    assert fetched["reply_to_message_id"] == str(reply_to)
+    assert fetched["idempotency_key"] == "client-send-17"
+    assert fetched["client_idempotency_key"] == "client-send-17"
+    assert fetched["updated_at"] == msg.updated_at.isoformat()
+    assert fetched["resolved_at"] == "2026-01-02T03:04:05+00:00"
+    assert "context" not in fetched
     assert fetched["convergence_link"] == {"kind": "task", "id": "t-1"}
 
 
@@ -146,6 +190,248 @@ def test_message_preview_preserves_bounded_strategic_session_snapshot():
     assert "storage_uri" not in session
 
 
+def test_message_preview_preserves_visible_sources_as_bounded_structured_data():
+    msg = _message(
+        context={
+            "attachments": [
+                {
+                    "id": "att-1",
+                    "type": "text/plain",
+                    "filename": "evidence.txt",
+                    "revision": 7,
+                }
+            ],
+            "source_refs": [
+                {"kind": "note", "id": "note-1", "revision": 4, "label": "Runbook"}
+            ],
+            "artifact_refs": [
+                {"kind": "whiteboard", "id": "board-1", "checksum": "abc123"}
+            ],
+            "operator_intent": {"kind": "verify", "lane_owner": "resident"},
+            "huge": "not returned",
+        }
+    )
+
+    data = message_preview_dict(msg)
+
+    assert data["context"]["attachments"][0]["filename"] == "evidence.txt"
+    assert data["context"]["attachments"][0]["type"] == "text/plain"
+    assert data["context"]["source_refs"][0]["revision"] == 4
+    assert data["context"]["artifact_refs"][0]["checksum"] == "abc123"
+    assert data["context"]["operator_intent"] == {
+        "kind": "verify",
+        "lane_owner": "resident",
+    }
+    assert "huge" not in data["context"]
+
+
+def test_visible_source_projection_strips_secrets_uris_and_unknown_metadata():
+    msg = _message(
+        context={
+            "attachments": [{
+                "id": "att-1",
+                "filename": "evidence.txt",
+                "storage_uri": "gs://private-bucket/object",
+                "signed_url": "https://signed.example/secret",
+                "url": "https://attachment.example/secret",
+                "thumbnail_url": "https://thumb.example/secret",
+                "access_token": "bearer-secret",
+                "metadata": {"credential": "nested-secret"},
+            }],
+            "source_refs": [{
+                "kind": "note",
+                "id": "note-1",
+                "revision": 4,
+                "download_url": "https://download.example/private",
+                "api_token": "token-secret",
+            }],
+            "artifact_refs": [{
+                "kind": "whiteboard",
+                "id": "board-1",
+                "checksum": "abc123",
+                "uri": "gs://private-board",
+                "credentials": "private",
+            }],
+            "operator_intent": {
+                "kind": "verify",
+                "lane_owner": "resident",
+                "authorization": "Bearer private",
+            },
+        }
+    )
+
+    serialized = json.dumps(message_preview_dict(msg), default=str)
+
+    assert "evidence.txt" in serialized
+    assert "abc123" in serialized
+    for forbidden in (
+        "private-bucket", "signed.example", "bearer-secret", "nested-secret",
+        "download.example", "token-secret", "private-board", "Bearer private",
+        "attachment.example", "thumb.example",
+    ):
+        assert forbidden not in serialized
+
+
+def test_all_full_and_agent_projections_strip_internal_receipts_and_typed_secrets():
+    msg = _message(
+        context={
+            "_message_request_fingerprint": "private-fingerprint",
+            "_resident_wakeup_state": "queued",
+            "attachments": [{
+                "attachment_id": "att-1",
+                "filename": "evidence.txt",
+                "storage_uri": "gs://private-bucket/object",
+                "url": "https://signed.example/secret",
+                "metadata": {"authorization": "nested-secret"},
+            }],
+            "operator_intent": {
+                "kind": "verify",
+                "target": {"authorization": "Bearer nested"},
+            },
+        },
+    )
+
+    for projection in (
+        admin_message_dict(msg),
+        admin_message_list_dict(msg),
+        agent_thread_message_dict(msg),
+        message_preview_dict(msg),
+        message_event_payload(msg)["message"],
+    ):
+        serialized = json.dumps(projection, separators=(",", ":"), default=str)
+        assert "private-fingerprint" not in serialized
+        assert "_resident_wakeup_state" not in serialized
+        assert "private-bucket" not in serialized
+        assert "signed.example" not in serialized
+        assert "nested-secret" not in serialized
+        assert "Bearer nested" not in serialized
+        assert projection["context"]["attachments"] == [{
+            "attachment_id": "att-1",
+            "filename": "evidence.txt",
+        }]
+        assert projection["context"]["operator_intent"] == {"kind": "verify"}
+
+
+def test_full_and_agent_context_projections_have_a_strict_total_byte_cap():
+    msg = _message(context={
+        "event_type": "operator_message",
+        "source_refs": [{"kind": "note", "id": "note-1", "label": "Visible"}],
+        **{f"legacy_{index}": "🙂" * 2_000 for index in range(200)},
+    })
+
+    for projection in (admin_message_dict(msg), agent_thread_message_dict(msg)):
+        encoded = json.dumps(
+            projection["context"], separators=(",", ":"), default=str
+        ).encode("utf-8")
+        assert len(encoded) <= MESSAGE_CONTEXT_PROJECTION_MAX_BYTES
+        assert projection["context"]["event_type"] == "operator_message"
+        assert projection["context"]["source_refs"][0]["id"] == "note-1"
+        assert projection["context"]["projection_truncated"] is True
+
+
+def test_message_event_omits_nested_objects_from_typed_scalar_fields():
+    msg = _message(
+        idempotency_key="nested-secret-probe",
+        context={
+            "attachments": [{
+                "id": "att-1",
+                "author": {
+                    "api_token": "NESTED-API-TOKEN",
+                    "storage_uri": "gs://nested-private-object",
+                },
+            }],
+            "operator_intent": {
+                "kind": "verify",
+                "target": {
+                    "authorization": "Bearer nested-private-token",
+                    "storage_uri": "gs://nested-private-target",
+                },
+            },
+        },
+    )
+
+    payload = message_event_payload(msg)
+    serialized = json.dumps(payload, separators=(",", ":"), default=str)
+
+    assert len(serialized.encode("utf-8")) <= MESSAGE_EVENT_MAX_BYTES
+    assert payload["message"]["id"] == str(msg.id)
+    assert payload["message"]["idempotency_key"] == "nested-secret-probe"
+    assert payload["message"]["context"]["attachments"] == [{"id": "att-1"}]
+    assert payload["message"]["context"]["operator_intent"] == {"kind": "verify"}
+    for forbidden in (
+        "NESTED-API-TOKEN",
+        "nested-private-object",
+        "nested-private-token",
+        "nested-private-target",
+    ):
+        assert forbidden not in serialized
+
+
+def test_message_event_carries_canonical_projection_for_gap_reconciliation():
+    msg = _message(
+        content="Canonical realtime message",
+        context={"source_refs": [{"kind": "note", "id": "note-1", "revision": 2}]},
+    )
+
+    payload = message_event_payload(msg)
+
+    assert payload["message"]["id"] == str(msg.id)
+    assert payload["message"]["content"] == "Canonical realtime message"
+    assert payload["message"]["sequence"] is None
+    assert payload["message"]["surface"] == "activity"
+    assert payload["message"]["handling_state"] == "pending"
+    assert payload["message"]["context"]["source_refs"][0]["revision"] == 2
+
+
+def test_message_event_enforces_hard_serialized_budget():
+    oversized_items = [
+        {
+            "id": f"item-{index}",
+            "kind": "note",
+            "label": "x" * 20_000,
+            "excerpt": "y" * 20_000,
+            "revision": index,
+        }
+        for index in range(12)
+    ]
+    msg = _message(
+        content="z" * 20_000,
+        resolution="r" * 200_000,
+        idempotency_key="client-send-123",
+        sequence=42,
+        surface="conversation",
+        reply_to_message_id=uuid.UUID("55555555-5555-4555-8555-555555555555"),
+        context={
+            "attachments": oversized_items,
+            "source_refs": oversized_items,
+            "artifact_refs": oversized_items,
+            "operator_intent": {"kind": "verify", "summary": "q" * 20_000},
+        },
+    )
+    # Legacy rows predate current enum/length checks; the transport budget must
+    # remain strict even when aliases are pathological.
+    msg.message_type = "M" * 200_000
+    msg.from_type = "F" * 200_000
+    msg.status = "S" * 200_000
+
+    payload = message_event_payload(msg)
+    encoded = json.dumps(payload, separators=(",", ":"), default=str).encode("utf-8")
+
+    assert len(encoded) <= MESSAGE_EVENT_MAX_BYTES
+    assert payload["message"]["projection_truncated"] is True
+    assert payload["canonical_refetch_required"] is True
+    assert payload["message"]["content_truncated"] is True
+    assert payload["message"]["resolution_truncated"] is True
+    assert payload["message"]["idempotency_key"] == "client-send-123"
+    assert payload["message"]["client_idempotency_key"] == "client-send-123"
+    assert payload["message"]["id"] == str(msg.id)
+    assert payload["message"]["sequence"] == 42
+    assert payload["message"]["surface"] == "conversation"
+    assert payload["message"]["reply_to_message_id"] == str(msg.reply_to_message_id)
+    assert len(payload["type"]) <= 64
+    assert len(payload["from"]) <= 32
+
+
 @pytest.mark.asyncio
 async def test_admin_messages_endpoint_keeps_full_message_contract(
     client: AsyncClient,
@@ -190,12 +476,20 @@ async def test_admin_messages_endpoint_keeps_full_message_contract(
         "message_type",
         "from_type",
         "from_task_id",
+        "actor_user_id",
+        "sequence",
+        "surface",
+        "handling_state",
+        "handled_by_task_id",
+        "reply_to_message_id",
+        "idempotency_key",
         "content",
         "context",
         "status",
         "resolution",
         "resolved_at",
         "created_at",
+        "updated_at",
     }
     assert item["message_type"] == "BUG_REPORT"
     assert item["from_type"] == "agent"
@@ -204,6 +498,39 @@ async def test_admin_messages_endpoint_keeps_full_message_contract(
     assert item["status"] == "linked"
     assert item["resolution"] == "Owned by task"
     assert item["resolved_at"].startswith("2026-02-03T04:05:06")
+
+
+@pytest.mark.asyncio
+async def test_activity_endpoint_excludes_conversation_projection(
+    client: AsyncClient,
+    db_session,
+):
+    project = await _make_project(db_session)
+    db_session.add_all([
+        ProjectMessage(
+            project_id=project.id,
+            sequence=1,
+            surface=MessageSurface.ACTIVITY,
+            content="activity only",
+        ),
+        ProjectMessage(
+            project_id=project.id,
+            sequence=2,
+            surface=MessageSurface.CONVERSATION,
+            from_type="user",
+            content="conversation only",
+        ),
+    ])
+    await db_session.commit()
+
+    response = await client.get(
+        f"/api/admin/messages?project_id={project.id}&status=all"
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["total"] == 1
+    assert [row["content"] for row in payload["messages"]] == ["activity only"]
 
 
 @pytest.mark.asyncio
@@ -351,25 +678,44 @@ async def test_strategic_open_message_payload_keeps_agent_aliases(db_session):
     from app.strategic_spawning import _fetch_open_messages
 
     project = await _make_project(db_session)
-    open_msg = ProjectMessage(
-        project_id=project.id,
-        message_type=MessageType.BLOCKER,
-        from_type="agent",
-        content="Open payload contract",
-        context=None,
-        status="open",
-        created_at=datetime(2026, 2, 1, 4, 5, 6, tzinfo=timezone.utc),
-    )
     linked_msg = ProjectMessage(
         project_id=project.id,
+        sequence=6,
+        surface=MessageSurface.CONVERSATION,
         message_type=MessageType.BUG_REPORT,
         from_type="agent",
         content="Already owned",
         status="linked",
         created_at=datetime(2026, 2, 1, 4, 6, 6, tzinfo=timezone.utc),
     )
-    db_session.add(open_msg)
     db_session.add(linked_msg)
+    await db_session.commit()
+    open_msg = ProjectMessage(
+        project_id=project.id,
+        actor_user_id="operator-7",
+        sequence=7,
+        surface=MessageSurface.CONVERSATION,
+        reply_to_message_id=linked_msg.id,
+        message_type=MessageType.BLOCKER,
+        from_type="user",
+        content="Open payload contract",
+        context={
+            "source_refs": [{
+                "kind": "task",
+                "id": "task:11111111-1111-4111-8111-111111111111",
+                "revision": "rev-7",
+            }],
+            "attachments": [{
+                "attachment_id": "22222222-2222-4222-8222-222222222222",
+                "filename": "evidence.txt",
+                "size_bytes": 12,
+                "storage_uri": "gs://must-not-reach-resident/private",
+            }],
+        },
+        status="open",
+        created_at=datetime(2026, 2, 1, 4, 5, 6, tzinfo=timezone.utc),
+    )
+    db_session.add(open_msg)
     await db_session.commit()
 
     payload = await _fetch_open_messages(db_session, project.id)
@@ -377,8 +723,21 @@ async def test_strategic_open_message_payload_keeps_agent_aliases(db_session):
     assert len(payload) == 1
     item = payload[0]
     assert item["type"] == "BLOCKER"
-    assert item["from"] == "agent"
-    assert item["context"] == {}
+    assert item["from"] == "user"
+    assert item["actor_user_id"] == "operator-7"
+    assert item["sequence"] == 7
+    assert item["surface"] == "conversation"
+    assert item["reply_to_message_id"] == str(linked_msg.id)
+    assert item["context"]["source_refs"] == [{
+        "kind": "task",
+        "id": "task:11111111-1111-4111-8111-111111111111",
+        "revision": "rev-7",
+    }]
+    assert item["context"]["attachments"] == [{
+        "attachment_id": "22222222-2222-4222-8222-222222222222",
+        "filename": "evidence.txt",
+        "size_bytes": 12,
+    }]
     assert item["status"] == "open"
     assert item["resolved_at"] is None
     assert "message_type" not in item
@@ -406,6 +765,22 @@ def test_admin_message_list_dict_returns_compact_context():
     assert data_with["message_type"] == "BLOCKER"
     assert data_with["from_type"] == "system"
     assert data_with["status"] == "linked"
+
+
+def test_admin_message_projection_strips_internal_request_fingerprint():
+    msg = _message(
+        context={
+            "event_type": "operator_message",
+            "_message_request_fingerprint": "server-only-secret",
+        }
+    )
+
+    projected = admin_message_dict(msg)
+    compact = admin_message_list_dict(msg)
+
+    assert msg.context["_message_request_fingerprint"] == "server-only-secret"
+    assert "_message_request_fingerprint" not in projected["context"]
+    assert "_message_request_fingerprint" not in compact["context"]
 
 
 @pytest.mark.asyncio

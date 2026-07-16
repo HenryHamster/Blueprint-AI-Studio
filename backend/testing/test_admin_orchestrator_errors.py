@@ -2,7 +2,7 @@
 
 from datetime import datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastapi import HTTPException
@@ -41,6 +41,32 @@ def _clear_errors_cache():
 
 
 class TestRecentOrchestratorErrors:
+    @pytest.mark.asyncio
+    async def test_cache_miss_offloads_logging_fetch_to_thread(
+        self, client: AsyncClient
+    ):
+        """A cache miss awaits the synchronous Cloud Logging fetch via a worker thread."""
+        now = _utcnow()
+        entries = [_make_entry(ATTR_TRACEBACK, now)]
+        with (
+            patch.object(
+                admin_orchestrator_errors,
+                "_fetch_orchestrator_error_entries",
+                return_value=entries,
+            ) as fetch,
+            patch.object(
+                admin_orchestrator_errors.asyncio,
+                "to_thread",
+                new_callable=AsyncMock,
+                return_value=entries,
+            ) as to_thread,
+        ):
+            resp = await client.get("/api/admin/recent-orchestrator-errors?hours=1")
+
+        assert resp.status_code == 200
+        assert resp.json()["total_entries_scanned"] == 1
+        to_thread.assert_awaited_once_with(fetch, 1)
+
     @pytest.mark.asyncio
     async def test_buckets_entries_by_exception_class_and_source(
         self, client: AsyncClient

@@ -55,6 +55,8 @@ from app.broadcast import broadcast_to_project, _sanitize_log
 from app.payload_schemas import read_acceptance_evidence, validate_internal_payload
 from app.review_pipeline import (
     REVIEW_FIX_GOAL_PREAMBLE,
+    SPAWN_REASON_DEFERRED,
+    SPAWN_REASON_KEY,
     _genuine_blocking_issue_exists,
     _spawn_pipeline_task,
     build_ci_failure_fix_prompt,
@@ -1492,7 +1494,9 @@ async def _process_post_commit(
     from app.strategic_completion import (
         _handle_strategic_completion,
         _record_strategic_task_failure,
+        strategic_completion_message_count,
     )
+    from app.project_message_creation import reserve_project_message_sequences
     from app.research_completion import _handle_research_completion
     from app.knowledge_completion import (
         _handle_design_completion,
@@ -1525,11 +1529,38 @@ async def _process_post_commit(
         # comes purely from Project-before-Task being universal, not from holding
         # the row across the whole unit.)
         _peek_row = (
-            await session.execute(select(Task.project_id).where(Task.id == task_id))
+            await session.execute(
+                select(Task.project_id, Task.payloads).where(Task.id == task_id)
+            )
         ).first()
         if _peek_row is None:
             return {"status": "accepted"}
         _peek_project_id = _peek_row[0]
+        _peek_payloads = _peek_row[1] if isinstance(_peek_row[1], list) else []
+        _peek_task_type = (
+            str((_peek_payloads[0] or {}).get("type") or "")
+            if _peek_payloads and isinstance(_peek_payloads[0], dict)
+            else ""
+        )
+        _peek_capability = get_task_capability(_peek_task_type)
+        _peek_completion_handler = (
+            _peek_capability.completion_handler if _peek_capability else None
+        )
+        preallocated_strategic_message_sequences: list[int] = []
+        if _peek_completion_handler == "strategic":
+            message_count = strategic_completion_message_count(payload.logs or "")
+            if message_count:
+                preallocated_strategic_message_sequences = (
+                    await reserve_project_message_sequences(
+                        session,
+                        _peek_project_id,
+                        count=message_count,
+                        lock_timeout_ms=1_500,
+                    )
+                )
+                # Reservation gaps are harmless. Commit immediately so the
+                # counter row is never held while acquiring Project -> Task.
+                await session.commit()
 
         # skip_locked + bounded retry: the row is typically only held briefly
         # (by the agent_status early-commit path that just released it, or by a
@@ -5719,6 +5750,11 @@ async def _process_post_commit(
                     from app import pause_clock
 
                     ci_loop = review_loop.copy()
+                    # Per-episode respawn budget: a fix completion starts a fresh
+                    # review-wait episode.  Reset the backstop's per-episode count
+                    # so a respawn consumed in an earlier episode (e.g. a superseded
+                    # review) does not permanently exhaust the budget.
+                    ci_loop.pop("review_wait_respawn_count", None)
                     ci_loop["ci_waiting"] = True
                     ci_loop["review_approved"] = True
                     ci_loop["ci_wait_started"] = _utcnow().isoformat()
@@ -5763,50 +5799,175 @@ async def _process_post_commit(
                             f"[REVIEW PIPELINE] Spawned review after fix for PR #{pr_number} → task {review_task.id}"
                         )
                     else:
-                        task.latest_status_message = f"Fix applied but review not spawned for PR #{pr_number} — iteration cap reached"
-                        task.requires_approval = True
-                        session.add(task)
-                        cap_alert_title = (
-                            f"PR #{pr_number} stalled — iteration cap reached"
-                        )
-                        existing_cap_alert = (
-                            (
-                                await session.execute(
-                                    select(Alert).where(
-                                        Alert.project_id == task.project_id,
-                                        Alert.severity == AlertSeverity.WARNING,
-                                        Alert.dismissed_at.is_(None),
-                                        Alert.title == cap_alert_title,
+                        # _spawn_pipeline_task may have rolled back + committed
+                        # (DEFERRED lock-contention path). Re-fetch the task for
+                        # a fresh un-expired instance.
+                        fresh_task = await session.get(Task, task.id)
+                        if fresh_task is None:
+                            await session.commit()
+                            return {"status": "accepted"}
+                        task = fresh_task
+
+                        # Read the precise spawn reason written by
+                        # _spawn_pipeline_task into the source task's context.
+                        _sr = (task.context or {}).get(SPAWN_REASON_KEY, "unknown")
+                        _is_transient = _sr == SPAWN_REASON_DEFERRED
+
+                        if _is_transient:
+                            # Transient deferral (e.g. in-flight peer holds the
+                            # spawn lock): create a specific alert and retry once.
+                            logger.warning(
+                                "[REVIEW PIPELINE] Review spawn after fix deferred "
+                                "for PR #%s (reason=%s) — retrying once",
+                                pr_number,
+                                _sr,
+                            )
+                            from app.alert_dispatch import _maybe_create_failure_alert
+
+                            await _maybe_create_failure_alert(
+                                task,
+                                session,
+                                f"Review spawn after fix for PR #{pr_number} "
+                                f"deferred ({_sr}) — retrying",
+                            )
+                            await asyncio.sleep(5)
+                            # Re-fetch the task in case the spawn call rolled back
+                            # the session and expired the ORM instance.
+                            _reloaded = await session.get(Task, task.id)
+                            if _reloaded is not None:
+                                task = _reloaded
+                            review_task, _ = await _spawn_pipeline_task(
+                                task,
+                                "review",
+                                session,
+                                pr_number,
+                                branch,
+                                base_branch,
+                                original_task_id=original_task_id,
+                            )
+                            if review_task:
+                                logger.info(
+                                    "[REVIEW PIPELINE] Spawned review after fix "
+                                    "(retry) for PR #%s → task %s",
+                                    pr_number,
+                                    review_task.id,
+                                )
+
+                        if not review_task:
+                            # Terminal failure: cap, stuck cycle, already merged,
+                            # or retry also failed. Escalate with accurate reason.
+                            task.latest_status_message = (
+                                f"Fix applied for PR #{pr_number} but review spawn "
+                                f"{'deferred (concurrent spawn)' if _is_transient else 'failed (' + _sr + ')'}"
+                            )
+                            if not _is_transient:
+                                task.requires_approval = True
+                            session.add(task)
+
+                            # Always create a WARNING alert with the specific spawn
+                            # reason so operators see the failure immediately, not
+                            # just a generic "iteration cap" message.
+                            _alert_reason_label = (
+                                "deferred" if _is_transient else _sr
+                            )
+                            alert_title = (
+                                f"PR #{pr_number} stalled — review spawn {_alert_reason_label}"
+                            )
+                            existing_alert = (
+                                (
+                                    await session.execute(
+                                        select(Alert).where(
+                                            Alert.project_id == task.project_id,
+                                            Alert.severity == AlertSeverity.WARNING,
+                                            Alert.dismissed_at.is_(None),
+                                            Alert.title == alert_title,
+                                        )
                                     )
                                 )
+                                .scalars()
+                                .first()
                             )
-                            .scalars()
-                            .first()
-                        )
-                        if not existing_cap_alert:
-                            alert = Alert(
-                                project_id=task.project_id,
-                                severity=AlertSeverity.WARNING,
-                                title=cap_alert_title,
-                                message=f"Fix was applied to PR #{pr_number} but the review iteration cap was reached. Manual intervention required.",
-                                task_id=task.id,
+                            if not existing_alert:
+                                _alert_msg = (
+                                    f"Fix was applied to PR #{pr_number} but the "
+                                    f"review spawn failed (reason: {_sr}). "
+                                    + (
+                                        "The spawn was deferred due to concurrent "
+                                        "activity; the next CI cycle will retry."
+                                        if _is_transient
+                                        else "Manual intervention may be required."
+                                    )
+                                )
+                                alert = Alert(
+                                    project_id=task.project_id,
+                                    severity=AlertSeverity.WARNING,
+                                    title=alert_title,
+                                    message=_alert_msg,
+                                    task_id=task.id,
+                                )
+                                session.add(alert)
+                                await session.commit()
+                                await broadcast_to_project(
+                                    str(task.project_id),
+                                    "alert_created",
+                                    {
+                                        "alert_id": str(alert.id),
+                                        "severity": "WARNING",
+                                        "title": alert.title,
+                                    },
+                                )
+                            else:
+                                await session.commit()
+
+                            logger.warning(
+                                "[REVIEW PIPELINE] Review spawn after fix returned None "
+                                "for PR #%s (reason: %s)%s",
+                                pr_number,
+                                _sr,
+                                " — transient, will retry" if _is_transient else "",
                             )
-                            session.add(alert)
+
+                        # For transient deferrals, mark the CI task so the next
+                        # backstop cycle detects this as a recent unresolved
+                        # spawn and accelerates retry.
+                        if _is_transient:
+                            from app.time_utils import _utcnow as _ut
+                            _now = _ut().isoformat()
+                            # Propagate the deferred marker to the original CI
+                            # task (not just the fix task) so handle_ci_completion
+                            # can read it when entering review-wait.
+                            if original_task_id:
+                                try:
+                                    _ci_task = await session.get(
+                                        Task, uuid.UUID(original_task_id)
+                                    )
+                                    if _ci_task:
+                                        _ci_ctx = dict(_ci_task.context or {})
+                                        _ci_rl = dict(
+                                            _ci_ctx.get("review_loop") or {}
+                                        )
+                                        _ci_rl["review_spawn_deferred_at"] = _now
+                                        _ci_ctx["review_loop"] = _ci_rl
+                                        _ci_task.context = _ci_ctx
+                                        flag_modified(_ci_task, "context")
+                                        session.add(_ci_task)
+                                except Exception:
+                                    logger.exception(
+                                        "[REVIEW PIPELINE] Failed to propagate "
+                                        "deferred-spawn marker to CI task %s",
+                                        original_task_id,
+                                    )
+                            # Also set on the fix task's own review_loop as a
+                            # fallback (used when the CI task lookup fails).
+                            rl = dict(task.context.get("review_loop") or {})
+                            rl["review_spawn_deferred_at"] = _now
+                            task.context = {
+                                **(task.context or {}),
+                                "review_loop": rl,
+                            }
+                            flag_modified(task, "context")
+                            session.add(task)
                             await session.commit()
-                            await broadcast_to_project(
-                                str(task.project_id),
-                                "alert_created",
-                                {
-                                    "alert_id": str(alert.id),
-                                    "severity": "WARNING",
-                                    "title": alert.title,
-                                },
-                            )
-                        else:
-                            await session.commit()
-                        logger.warning(
-                            f"[REVIEW PIPELINE] WARNING: Review spawn after fix returned None for PR #{pr_number}"
-                        )
 
             # Completion handlers — wrapped in try/except to prevent VM leak.
             # If a handler throws after the early commit, BackgroundTasks (including
@@ -5838,7 +5999,11 @@ async def _process_post_commit(
                     "repo_bootstrap": _handle_repo_bootstrap_completion,
                     "capability_proof_trial": _handle_capability_proof_trial_completion,
                 }
-                _capability = get_task_capability(task_type)
+                _capability = (
+                    _peek_capability
+                    if task_type == _peek_task_type
+                    else get_task_capability(task_type)
+                )
                 _handler_name = _capability.completion_handler if _capability else None
                 if _handler_name:
                     _handler = _completion_handlers[_handler_name]
@@ -5851,7 +6016,15 @@ async def _process_post_commit(
                     # docs/concurrency.md); passing it lets the handler skip its
                     # own re-acquisition. None propagates the legacy
                     # bounded-retry path inside the handler (defensive only).
-                    if _capability.completion_needs_locked_project:
+                    if _handler_name == "strategic":
+                        await _handler(
+                            task,
+                            _handler_logs,
+                            session,
+                            project=locked_project,
+                            message_sequences=preallocated_strategic_message_sequences,
+                        )
+                    elif _capability.completion_needs_locked_project:
                         await _handler(
                             task, _handler_logs, session, project=locked_project
                         )
@@ -6381,6 +6554,23 @@ async def close_orphan_pr_if_any(
     is independent of the DB transaction either way, and grouping them
     lets the caller bail cleanly if the GitHub call hangs.
     """
+    payload_types = {
+        str(payload.get("type") or "")
+        for payload in (task.payloads or [])
+        if isinstance(payload, dict)
+    }
+    if payload_types & {"review", "panel_review"}:
+        # Review tasks reference the PR they inspect; they do not own it.
+        # In particular, review_loop.pr_number is shared with create/fix
+        # tasks, so treating that reference as ownership lets cancelling a
+        # duplicate/stale reviewer close the implementation PR underneath the
+        # surviving review/fix lane.
+        logger.info(
+            "[CANCEL-PR-CLEANUP] Skipping PR close for non-owning review task "
+            f"{task.id} (reason={reason})"
+        )
+        return False
+
     ctx = task.context or {}
 
     # Resolve PR number from any recorded location.  The url-keyed context

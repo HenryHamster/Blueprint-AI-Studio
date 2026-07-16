@@ -105,6 +105,17 @@ async def _check_version_calcification(
         age_days = max(0, (_utcnow() - ref_time).days)
 
     blocker_label = rq._BLOCKER_LABELS.get(blocker, blocker)
+    # The env-preflight blocker carries specific missing var NAMES so the operator
+    # sees WHICH prerequisite to bind, not just the generic label.  Read from the
+    # last qualification's sub_scores — presence-only names, never values.
+    if blocker == "boot_prereq_missing":
+        _missing_names = (
+            (qual.get("sub_scores") or {}).get("env_preflight_missing") or []
+        )
+        if _missing_names:
+            blocker_label = (
+                f"{blocker_label} — missing: {', '.join(str(n) for n in _missing_names)}"
+            )
     # Tag the calcifying blocker with WHERE its check runs so the operator knows
     # whether resolving it needs a fix that lands in the candidate tree
     # (candidate-side) or is inert until this version itself promotes

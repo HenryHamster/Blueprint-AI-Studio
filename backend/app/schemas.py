@@ -890,6 +890,26 @@ class GitHubCreatePRRequest(BaseModel):
 # --- Build Config & Onboarding ---
 
 
+class ProjectVerificationConfig(BaseModel):
+    """Explicit opt-in to Blueprint's receipt-emitting verification protocol."""
+
+    model_config = ConfigDict(extra="forbid")
+    protocol: Literal["blueprint-v1"]
+    harness: str = Field(
+        ...,
+        min_length=1,
+        max_length=500,
+        pattern=r"^[A-Za-z0-9_./-]+$",
+    )
+
+    @field_validator("harness")
+    @classmethod
+    def _validate_harness_path(cls, v: str) -> str:
+        if v.startswith("/") or ".." in v or "\0" in v:
+            raise ValueError("harness must be a safe repository-relative path")
+        return v
+
+
 class BuildConfigDirectoryEntry(BaseModel):
     """A single directory entry within a project's build configuration."""
 
@@ -908,6 +928,14 @@ class BuildConfigDirectoryEntry(BaseModel):
     confirmed_install_cmd: str | None = None
     commands_confirmed_at: str | None = None  # ISO 8601 UTC timestamp
     confirming_task_id: str | None = None
+    project_verification: ProjectVerificationConfig | None = None
+
+    @field_validator("path")
+    @classmethod
+    def _canonicalize_path(cls, v: str) -> str:
+        normalized = v.strip()
+        normalized = normalized.rstrip("/")
+        return normalized or "."
 
 
 class DiscoveredBuildCommandEntry(BaseModel):

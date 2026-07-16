@@ -46,15 +46,24 @@ from app.blocked_task_unblock_sweeps import (
     _event_driven_unblock_project,
     event_driven_unblock_dependents,
     event_driven_unblock_on_knowledge,
+    event_driven_unblock_on_capability_proof,
 )
-from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
+from app.compute_backends import GCP_BACKEND_NAME, RUNNER_SUBPROCESS_BACKEND_NAME
 from app.compute_jobs import (
     RUNNER_SILENT_TIMEOUT_SECONDS,
-    finalize_orphan_runner_job,
+    finalize_silent_compute_job,
     finalize_runner_subprocess_job_for_dead_runner,
 )
 from app.database import AsyncSessionLocal
-from app.models import ComputeJob, ComputeJobStatus, LocalRunner, Task, TaskStatus
+from app.models import (
+    ComputeJob,
+    ComputeJobStatus,
+    LocalRunner,
+    ProjectMessageAttachmentUpload,
+    Task,
+    TaskStatus,
+)
+from app.storage import delete_storage_uri_best_effort
 from app.runner_health_monitors import _RUNNER_LIVENESS_SECONDS
 from app.time_utils import _is_cadence_due, _utcnow
 from app.reaper_fleet_health_sweeps import (
@@ -775,10 +784,11 @@ async def sweep_auto_clear_moot_pending_confirmations(session, now=None) -> int:
       :func:`app.problem_model._confirmation_is_moot`);
     - when uncertain, the item is left in place.
 
-    Iterates a bounded set of projects (default 25) with a non-empty pending
-    list, mutates the durable model via the pure
-    :func:`app.problem_model.auto_clear_resolved_confirmations` helper (same
-    revision-log / ``last_updated_by`` contract as the operator dismiss
+    Iterates ALL projects with a non-empty pending list via keyset pagination
+    (ordered by ``Project.id``, batches of 100) so every project is covered
+    deterministically regardless of fleet size. Mutates the durable model via
+    the pure :func:`app.problem_model.auto_clear_resolved_confirmations` helper
+    (same revision-log / ``last_updated_by`` contract as the operator dismiss
     endpoint), and persists per project. Hourly cadence-gated, idempotent, and
     wrapped so it can never crash the reaper cycle. Returns the total number of
     items cleared.
@@ -801,75 +811,83 @@ async def sweep_auto_clear_moot_pending_confirmations(session, now=None) -> int:
         return 0
     _last_moot_confirm_sweep = _now
 
-    max_projects = 25
-    rows = (
-        (
-            await session.execute(
-                select(Project)
-                .options(
-                    load_only(
-                        Project.id,
-                        Project.user_id,
-                        Project.problem_model,
-                        raiseload=True,
-                    )
-                )
-                .limit(max_projects)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    if not rows:
-        return 0
-
+    _BATCH = 100
+    last_id = None
     total_cleared = 0
-    for project in rows:
-        try:
-            pm = getattr(project, "problem_model", None)
-            if not isinstance(pm, dict):
-                continue
-            pending = pm.get("pending_user_confirmation")
-            if not isinstance(pending, list) or not pending:
-                continue
-            # Skip early unless there is at least one auto-eligible item, so the
-            # common case does no credential/token I/O.
-            if not any(
-                isinstance(p, dict)
-                and p.get("type") in ("credentials_needed", "access_needed")
-                for p in pending
-            ):
-                continue
 
+    while True:
+        query = (
+            select(Project)
+            .options(
+                load_only(
+                    Project.id,
+                    Project.user_id,
+                    Project.problem_model,
+                    raiseload=True,
+                )
+            )
+            .where(Project.problem_model.is_not(None))
+            .order_by(Project.id)
+            .limit(_BATCH)
+        )
+        if last_id is not None:
+            query = query.where(Project.id > last_id)
+
+        rows = (await session.execute(query)).scalars().all()
+        if not rows:
+            break
+
+        last_id = rows[-1].id
+
+        for project in rows:
             try:
-                model = parse_problem_model(pm)
-            except Exception:  # noqa: BLE001 — a malformed model must not block the sweep
-                continue
+                pm = getattr(project, "problem_model", None)
+                if not isinstance(pm, dict):
+                    continue
+                pending = pm.get("pending_user_confirmation")
+                if not isinstance(pending, list) or not pending:
+                    continue
+                # Skip early unless there is at least one auto-eligible item, so the
+                # common case does no credential/token I/O.
+                if not any(
+                    isinstance(p, dict)
+                    and p.get("type") in ("credentials_needed", "access_needed")
+                    for p in pending
+                ):
+                    continue
 
-            signals = ConfirmationResolutionSignals(
-                llm_credentials_ready=await _owner_llm_credentials_ready(
-                    session, getattr(project, "user_id", None)
-                ),
-                repo_access_ready=bool(get_cached_project_token(str(project.id))),
-            )
-            cleared = auto_clear_resolved_confirmations(
-                model, signals, _now.isoformat()
-            )
-            if cleared:
-                project.problem_model = model.model_dump()
-                flag_modified(project, "problem_model")
-                session.add(project)
-                await session.commit()
-                total_cleared += len(cleared)
+                try:
+                    model = parse_problem_model(pm)
+                except Exception:  # noqa: BLE001 — a malformed model must not block the sweep
+                    continue
 
-        except Exception:  # noqa: BLE001
-            logger.warning(
-                "[REAPER] Moot pending-confirmation sweep failed for project %s:",
-                getattr(project, "id", "?"),
-                exc_info=True,
-            )
-            with contextlib.suppress(Exception):
-                await session.rollback()
+                signals = ConfirmationResolutionSignals(
+                    llm_credentials_ready=await _owner_llm_credentials_ready(
+                        session, getattr(project, "user_id", None)
+                    ),
+                    repo_access_ready=bool(get_cached_project_token(str(project.id))),
+                )
+                cleared = auto_clear_resolved_confirmations(
+                    model, signals, _now.isoformat()
+                )
+                if cleared:
+                    project.problem_model = model.model_dump()
+                    flag_modified(project, "problem_model")
+                    session.add(project)
+                    await session.commit()
+                    total_cleared += len(cleared)
+
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "[REAPER] Moot pending-confirmation sweep failed for project %s:",
+                    getattr(project, "id", "?"),
+                    exc_info=True,
+                )
+                with contextlib.suppress(Exception):
+                    await session.rollback()
+
+        if len(rows) < _BATCH:
+            break
 
     if total_cleared:
         logger.info(
@@ -1066,6 +1084,60 @@ async def sweep_routine_message_retention(session, *, retention_days: int = 7) -
         await session.commit()
         logger.info(f"[REAPER] Purged {purged} stale routine message(s)")
     return purged
+
+
+async def sweep_expired_message_attachment_uploads(
+    session,
+    *,
+    batch_size: int = 32,
+    timeout_seconds: float = 5.0,
+) -> int:
+    """Delete a global bounded batch of expired, unconsumed upload receipts."""
+
+    receipts = (
+        await session.execute(
+            select(ProjectMessageAttachmentUpload)
+            .where(
+                ProjectMessageAttachmentUpload.consumed_at.is_(None),
+                ProjectMessageAttachmentUpload.message_id.is_(None),
+                ProjectMessageAttachmentUpload.expires_at <= _utcnow(),
+            )
+            .order_by(ProjectMessageAttachmentUpload.expires_at.asc())
+            .limit(max(1, min(int(batch_size), 100)))
+            .with_for_update(skip_locked=True)
+        )
+    ).scalars().all()
+    if not receipts:
+        return 0
+    try:
+        deleted = await asyncio.wait_for(
+            asyncio.gather(
+                *(
+                    delete_storage_uri_best_effort(receipt.storage_uri)
+                    for receipt in receipts
+                )
+            ),
+            timeout=max(0.1, float(timeout_seconds)),
+        )
+    except TimeoutError:
+        await session.rollback()
+        logger.warning("[REAPER] Expired message attachment cleanup timed out")
+        return 0
+
+    removed = 0
+    for receipt, object_deleted in zip(receipts, deleted, strict=True):
+        if object_deleted:
+            await session.delete(receipt)
+            removed += 1
+    if removed:
+        await session.commit()
+        logger.info(
+            "[REAPER] Deleted %d expired message attachment upload(s)",
+            removed,
+        )
+    else:
+        await session.rollback()
+    return removed
 
 
 async def sweep_evergreen_fill_decision_retention(
@@ -1860,6 +1932,7 @@ async def sweep_decay_stale_open_messages(
     Returns the number of messages auto-decayed.
     """
     from app.broadcast import broadcast_to_project as _bcast
+    from app.message_audience import OPERATOR_ACTION_NEEDED
     from app.models import ProjectMessage
     from app.message_convergence import (
         CONVERSATIONAL_DECAY_MESSAGE_TYPES,
@@ -1909,6 +1982,11 @@ async def sweep_decay_stale_open_messages(
         # (defensive — open items are normally unlinked, but a resurfaced link
         # can leave the stale forward pointer behind).
         if get_message_link(msg) is not None:
+            continue
+        # Never decay operator-action-needed NOTEs — they must survive until
+        # acted on (e.g. capability_proof_gate_graduated_enforce events).
+        ctx = msg.context or {}
+        if ctx.get("audience") == OPERATOR_ACTION_NEEDED:
             continue
         mark_message_resolved(msg, now, "auto-decayed (stale)")
         session.add(msg)
@@ -2550,6 +2628,7 @@ async def sweep_refresh_project_compute_images(
     _build_semaphore=None,
     max_projects: int = _COMPUTE_IMAGE_REFRESH_MAX_PROJECTS,
     max_builds_per_cycle: int = _COMPUTE_IMAGE_REFRESH_MAX_BUILDS_PER_CYCLE,
+    progress_cb=None,
 ) -> dict[str, int]:
     """Rebuild project baked compute images whose dependency manifest changed.
 
@@ -2565,6 +2644,10 @@ async def sweep_refresh_project_compute_images(
     ``deferred`` to the next hourly pass), and the driver is handed the same
     process-wide build concurrency guard the admin endpoint uses so a build
     already in flight defers rather than stampeding.
+
+    When *progress_cb* is provided, each build uses heartbeat-loop progress
+    reporting so the reaper's lifecycle watchdog does not cancel the cycle during
+    a multi-minute baked-image build.
 
     Cadence-gated to hourly on an independent timer. Returns a summary dict of
     per-status counts (``rebuilt``/``unchanged``/``no_config``/``deferred``/
@@ -2644,6 +2727,7 @@ async def sweep_refresh_project_compute_images(
                 project,
                 allow_build=(builds_done < max_builds_per_cycle),
                 build_semaphore=build_semaphore,
+                progress_cb=progress_cb,
             )
         except Exception:  # noqa: BLE001 — driver is best-effort; isolate anyway
             logger.warning(
@@ -2684,15 +2768,10 @@ async def sweep_refresh_project_compute_images(
 
 
 async def sweep_silent_runner_compute_jobs(session, now=None) -> int:
-    """Step 22f: Reap silent runner-subprocess compute jobs.
+    """Step 22f: Reap silent runner-subprocess and GCP compute jobs.
 
-    Finds RUNNING runner-subprocess jobs whose last_heartbeat_at has not
-    advanced past RUNNER_SILENT_TIMEOUT_SECONDS and finalizes each as
-    ``runner_died_silently`` via :func:`finalize_orphan_runner_job`,
-    freeing the project concurrency slot and spend ceiling.
-
-    Best-effort per job: a failure in one job (already terminal at lock
-    time, unexpected backend, any error) does not block the next.
+    GCP jobs delete their VM before finalization; runner jobs only finalize.
+    Best-effort per job so one failure does not block the next.
     Returns the number of jobs finalized.
     """
     _now = now or _utcnow()
@@ -2702,10 +2781,19 @@ async def sweep_silent_runner_compute_jobs(session, now=None) -> int:
         select(ComputeJob)
         .where(
             ComputeJob.status == ComputeJobStatus.RUNNING,
-            ComputeJob.backend == RUNNER_SUBPROCESS_BACKEND_NAME,
-            (ComputeJob.last_heartbeat_at.is_(None)
-             & (ComputeJob.started_at < stale_cutoff))
-            | (ComputeJob.last_heartbeat_at < stale_cutoff),
+            ComputeJob.backend.in_((RUNNER_SUBPROCESS_BACKEND_NAME, GCP_BACKEND_NAME)),
+            (
+                (ComputeJob.backend == RUNNER_SUBPROCESS_BACKEND_NAME)
+                & (
+                    (ComputeJob.last_heartbeat_at.is_(None)
+                     & (ComputeJob.started_at < stale_cutoff))
+                    | (ComputeJob.last_heartbeat_at < stale_cutoff)
+                )
+            )
+            | (
+                (ComputeJob.backend == GCP_BACKEND_NAME)
+                & (ComputeJob.last_heartbeat_at < stale_cutoff)
+            ),
         )
         .limit(50)
     )
@@ -2714,17 +2802,17 @@ async def sweep_silent_runner_compute_jobs(session, now=None) -> int:
     finalized = 0
     for job in rows:
         try:
-            ok = await finalize_orphan_runner_job(session, job, now=_now)
+            ok = await finalize_silent_compute_job(session, job, now=_now)
             if ok:
                 finalized += 1
         except Exception:
             logger.exception(
-                f"[REAPER] Failed to finalize silent runner job {job.id}"
+                f"[REAPER] Failed to finalize silent compute job {job.id}"
             )
             await session.rollback()
     if finalized:
         logger.info(
-            f"[REAPER] Finalized {finalized} silent runner compute job(s)"
+            f"[REAPER] Finalized {finalized} silent compute job(s)"
         )
     return finalized
 
@@ -2797,6 +2885,7 @@ __all__ = [
     "_event_driven_unblock_project",
     "event_driven_unblock_dependents",
     "event_driven_unblock_on_knowledge",
+    "event_driven_unblock_on_capability_proof",
     # Re-exported from app.blocked_task_unblock_sweeps (helpers)
     "_apply_needs_disposition",
     "_blocked_precondition_state",

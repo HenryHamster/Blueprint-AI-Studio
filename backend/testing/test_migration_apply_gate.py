@@ -27,13 +27,16 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.migration_apply_gate import (
+    MigrationApplyScratchPreflight,
     _create_database,
     _drop_database,
     _safe_tar_extractall,
     _validate_db_name,
     ephemeral_postgres_database,
+    preflight_migration_apply_scratch,
     run_migration_apply_gate,
 )
+from app.required_runtime_env import _verify_required_env
 
 # Same Postgres-vs-SQLite selection conftest uses. The scratch-DB cases need a
 # server we can CREATE DATABASE on (CI's `test` user is a superuser).
@@ -50,6 +53,30 @@ requires_postgres = pytest.mark.skipif(
 
 def _base_url():
     return make_url(os.environ["DATABASE_URL"])
+
+
+def test_scratch_prereq_is_typed_optional_and_boot_safe(monkeypatch):
+    monkeypatch.setenv("K_REVISION", "app-00042-abc")
+    monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", "test-presence-only")
+    monkeypatch.delenv("MIGRATION_APPLY_SCRATCH_DATABASE_URL", raising=False)
+
+    assert _verify_required_env() is None
+    result = preflight_migration_apply_scratch(None)
+    assert isinstance(result, MigrationApplyScratchPreflight)
+    assert result.status == "defer"
+    assert result.code == "scratch_database_url_missing"
+    assert "MIGRATION_APPLY_SCRATCH_DATABASE_URL" in (result.detail or "")
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["not a URL with secret-value", "sqlite:///secret-value", "postgresql://host"],
+)
+def test_scratch_preflight_rejects_invalid_values_without_leaking(raw):
+    result = preflight_migration_apply_scratch(raw)
+    assert result.status == "defer"
+    assert result.code == "scratch_database_url_invalid"
+    assert "secret-value" not in (result.detail or "")
 
 
 # --- Synthetic candidate migration chains ----------------------------------
@@ -166,6 +193,7 @@ async def test_renumber_skip_is_blocked_naming_missing_table():
             prod_engine=prod_engine,
             candidate_sources=_CANDIDATE_SOURCES,
             required_metadata=_required_metadata(),
+            scratch_db_url=_base_url(),
         )
 
     assert verdict == "block", detail
@@ -190,6 +218,7 @@ async def test_derived_reference_schema_blocks_renumber_skip_without_injected_me
         verdict, detail = await run_migration_apply_gate(
             prod_engine=prod_engine,
             candidate_sources=_CANDIDATE_SOURCES,
+            scratch_db_url=_base_url(),
             # required_metadata omitted on purpose — derived from candidate chain.
         )
 
@@ -211,6 +240,7 @@ async def test_clean_candidate_is_ok():
             prod_engine=prod_engine,
             candidate_sources=_CANDIDATE_SOURCES,
             required_metadata=_required_metadata(),
+            scratch_db_url=_base_url(),
         )
 
     assert verdict == "ok", detail
@@ -228,6 +258,7 @@ async def test_indeterminate_prod_state_defers():
             prod_engine=prod_engine,
             candidate_sources=_CANDIDATE_SOURCES,
             required_metadata=_required_metadata(),
+            scratch_db_url=_base_url(),
         )
 
     assert verdict == "defer", detail
@@ -248,6 +279,7 @@ async def test_scratch_db_is_isolated_from_prod(monkeypatch):
             prod_engine=prod_engine,
             candidate_sources=_CANDIDATE_SOURCES,
             required_metadata=_required_metadata(),
+            scratch_db_url=_base_url(),
         )
 
         def _tables(sync_conn):
@@ -286,6 +318,7 @@ async def test_fetch_failure_defers(monkeypatch):
             repo="r",
             candidate_ref="deadbeef",
             required_metadata=_required_metadata(),
+            scratch_db_url=_base_url(),
         )
 
     assert verdict == "defer", detail
@@ -354,6 +387,7 @@ async def test_transient_fetch_recovers_on_retry(monkeypatch):
             repo="r",
             candidate_ref="deadbeef",
             required_metadata=sa.MetaData(),
+            scratch_db_url="postgresql+asyncpg://scratch:p@localhost:5432/control",
         )
     finally:
         await engine.dispose()
@@ -409,6 +443,7 @@ async def test_transient_seed_recovers_on_retry(monkeypatch):
             prod_engine=engine,
             candidate_sources={"0001_init.py": "revision='0001'\ndown_revision=None\n"},
             required_metadata=sa.MetaData(),
+            scratch_db_url="postgresql+asyncpg://scratch:p@localhost:5432/control",
         )
     finally:
         await engine.dispose()
@@ -566,6 +601,7 @@ def downgrade():
             prod_engine=engine,
             candidate_sources=multi_head_sources,
             required_metadata=_required_metadata(),
+            scratch_db_url="postgresql+asyncpg://scratch:p@localhost:5432/control",
         )
     finally:
         await engine.dispose()
@@ -587,6 +623,7 @@ async def test_non_postgres_bind_defers():
             prod_engine=engine,
             candidate_sources=_CANDIDATE_SOURCES,
             required_metadata=_required_metadata(),
+            scratch_db_url="postgresql+asyncpg://scratch:p@localhost:5432/control",
         )
     finally:
         await engine.dispose()
@@ -607,6 +644,7 @@ async def test_missing_github_coords_defers():
             owner="o",
             # repo/candidate_ref missing
             required_metadata=_required_metadata(),
+            scratch_db_url="postgresql+asyncpg://scratch:p@localhost:5432/control",
         )
     finally:
         await engine.dispose()
@@ -694,6 +732,7 @@ async def test_required_metadata_derived_from_candidate_reference_not_live_metad
             candidate_ref="candidate-sha",
             project_id="p",
             candidate_sources={"0001_init.py": "revision = '0001'"},
+            scratch_db_url="postgresql+asyncpg://scratch:p@localhost:5432/control",
         )
     finally:
         await engine.dispose()
@@ -771,6 +810,7 @@ async def test_default_path_blocks_when_candidate_code_needs_missing_migration(
             candidate_ref="candidate-sha",
             project_id="p",
             candidate_sources={"0001_init.py": "revision = '0001'"},
+            scratch_db_url="postgresql+asyncpg://scratch:p@localhost:5432/control",
         )
     finally:
         await engine.dispose()
@@ -899,6 +939,213 @@ async def test_drop_database_rejects_invalid_name_without_connecting():
         await _drop_database(url, "my\"db")
 
 
+# --- Deterministic defect blocking (runs everywhere) -----------------------
+
+
+@pytest.mark.asyncio
+async def test_repeatable_candidate_migration_failure_blocks(monkeypatch):
+    """A migration with a deterministic Python defect (SyntaxError / ImportError)
+    must return ``('block', ...)`` instead of ``('defer', ...)`` as
+    ``migration_apply_check_unavailable``.
+
+    Repeatable defects cannot be resolved by retrying, so the gate must block
+    the candidate on the FIRST attempt without issuing any retry — call count
+    must be 1.  This is the primary acceptance test for the deterministic-defect
+    gate: it exercises ``run_migration_apply_gate``, ``_DeterministicMigrationDefect``,
+    the ``no_retry_types`` fast-exit in ``_with_transient_retry``, and the
+    ``except _DeterministicMigrationDefect`` handler that returns ``("block", ...)``.
+    """
+    import app.migration_apply_gate as gate_mod
+
+    monkeypatch.setattr(gate_mod, "_TRANSIENT_RETRY_BASE_DELAY", 0.001)
+    monkeypatch.setattr(gate_mod, "_TRANSIENT_RETRY_MAX_DELAY", 0.01)
+
+    prod_meta = sa.MetaData()
+    sa.Table("widget", prod_meta, sa.Column("id", sa.Integer, primary_key=True))
+    monkeypatch.setattr(
+        gate_mod,
+        "_read_prod_state",
+        AsyncMock(return_value=gate_mod._ProdState(revision="a01", metadata=prod_meta)),
+    )
+
+    @contextlib.asynccontextmanager
+    async def _fake_ephemeral(_base_url, db_name=None):
+        yield object(), "scratch-gate"
+
+    monkeypatch.setattr(gate_mod, "ephemeral_postgres_database", _fake_ephemeral)
+    monkeypatch.setattr(gate_mod, "_seed_scratch", AsyncMock())
+
+    apply_call_count = 0
+
+    async def _deterministic_defect_apply(scratch_engine, candidate_sources):
+        nonlocal apply_call_count
+        apply_call_count += 1
+        raise gate_mod._DeterministicMigrationDefect(
+            "candidate migration has a deterministic Python defect "
+            "(SyntaxError): invalid syntax (<migration_0001>, line 3)"
+        )
+
+    monkeypatch.setattr(gate_mod, "_apply_candidate_migrations", _deterministic_defect_apply)
+
+    engine = create_async_engine("postgresql+asyncpg://u:p@localhost:5432/nope")
+    try:
+        verdict, detail = await run_migration_apply_gate(
+            prod_engine=engine,
+            candidate_sources={"0001_bad.py": "revision='0001'\ndown_revision=None\n"},
+            required_metadata=sa.MetaData(),
+            scratch_db_url=(
+                "postgresql+asyncpg://scratch_user:scratch-secret@"
+                "scratch-db:5432/control"
+            ),
+        )
+    finally:
+        await engine.dispose()
+
+    assert verdict == "block", (
+        f"expected 'block' for deterministic defect, got {verdict!r}: {detail}"
+    )
+    assert detail is not None and "SyntaxError" in detail
+    assert apply_call_count == 1, (
+        f"deterministic defect retried {apply_call_count} time(s); must block on first attempt"
+    )
+
+
+@pytest.mark.asyncio
+async def test_apply_candidate_migrations_classifies_syntax_error(monkeypatch):
+    """``SyntaxError`` raised during Alembic migration import must be classified
+    as ``_DeterministicMigrationDefect``, not wrapped as ``_MigrationApplyError``."""
+    import app.migration_apply_gate as gate_mod
+
+    class _FakeConn:
+        async def run_sync(self, fn):
+            fn(self)  # propagates SyntaxError raised by the patched upgrader
+
+    @contextlib.asynccontextmanager
+    async def _fake_connect():
+        yield _FakeConn()
+
+    class _FakeEngine:
+        def connect(self):
+            return _fake_connect()
+
+    def _syntax_error_upgrade(sync_conn, script_location):
+        raise SyntaxError("invalid syntax", ("<migration_0001>", 3, 1, "def upgrade(\n"))
+
+    monkeypatch.setattr(gate_mod, "_reconcile_then_upgrade", _syntax_error_upgrade)
+
+    with pytest.raises(gate_mod._DeterministicMigrationDefect) as exc_info:
+        await gate_mod._apply_candidate_migrations(
+            _FakeEngine(),
+            {"0001_bad.py": "revision='0001'\ndown_revision=None\n"},
+        )
+
+    assert "SyntaxError" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_apply_candidate_migrations_classifies_import_error(monkeypatch):
+    """``ImportError`` raised during Alembic migration import must be classified
+    as ``_DeterministicMigrationDefect``."""
+    import app.migration_apply_gate as gate_mod
+
+    class _FakeConn:
+        async def run_sync(self, fn):
+            fn(self)
+
+    @contextlib.asynccontextmanager
+    async def _fake_connect():
+        yield _FakeConn()
+
+    class _FakeEngine:
+        def connect(self):
+            return _fake_connect()
+
+    def _import_error_upgrade(sync_conn, script_location):
+        raise ImportError("No module named 'nonexistent_dep_xyz'")
+
+    monkeypatch.setattr(gate_mod, "_reconcile_then_upgrade", _import_error_upgrade)
+
+    with pytest.raises(gate_mod._DeterministicMigrationDefect) as exc_info:
+        await gate_mod._apply_candidate_migrations(
+            _FakeEngine(),
+            {"0001_bad.py": "revision='0001'\ndown_revision=None\n"},
+        )
+
+    assert "ImportError" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_apply_candidate_migrations_classifies_class42_sql_error(monkeypatch):
+    """A class-42 ``ProgrammingError`` (SQL syntax / undefined table / invalid
+    schema) must be classified as ``_DeterministicMigrationDefect``."""
+    import app.migration_apply_gate as gate_mod
+
+    class _FakeConn:
+        async def run_sync(self, fn):
+            fn(self)
+
+    @contextlib.asynccontextmanager
+    async def _fake_connect():
+        yield _FakeConn()
+
+    class _FakeEngine:
+        def connect(self):
+            return _fake_connect()
+
+    class _FakeOrig(Exception):
+        pgcode = "42601"  # syntax_error
+
+    def _sql_error_upgrade(sync_conn, script_location):
+        orig = _FakeOrig("syntax error at or near 'BORK'")
+        raise sa.exc.ProgrammingError(
+            "syntax error at or near 'BORK'", {}, orig
+        )
+
+    monkeypatch.setattr(gate_mod, "_reconcile_then_upgrade", _sql_error_upgrade)
+
+    with pytest.raises(gate_mod._DeterministicMigrationDefect) as exc_info:
+        await gate_mod._apply_candidate_migrations(
+            _FakeEngine(),
+            {"0001_bad.py": "revision='0001'\ndown_revision=None\n"},
+        )
+
+    assert "42601" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_apply_candidate_migrations_non_class42_sql_error_defers(monkeypatch):
+    """A non-class-42 ``ProgrammingError`` (e.g. lock timeout, deadlock) must
+    remain a ``_MigrationApplyError`` so it defers (transient, may recover)."""
+    import app.migration_apply_gate as gate_mod
+
+    class _FakeConn:
+        async def run_sync(self, fn):
+            fn(self)
+
+    @contextlib.asynccontextmanager
+    async def _fake_connect():
+        yield _FakeConn()
+
+    class _FakeEngine:
+        def connect(self):
+            return _fake_connect()
+
+    class _FakeOrig(Exception):
+        pgcode = "40P01"  # deadlock_detected (class 40 — not deterministic)
+
+    def _deadlock_upgrade(sync_conn, script_location):
+        orig = _FakeOrig("deadlock detected")
+        raise sa.exc.ProgrammingError("deadlock detected", {}, orig)
+
+    monkeypatch.setattr(gate_mod, "_reconcile_then_upgrade", _deadlock_upgrade)
+
+    with pytest.raises(gate_mod._MigrationApplyError):
+        await gate_mod._apply_candidate_migrations(
+            _FakeEngine(),
+            {"0001_ok.py": "revision='0001'\ndown_revision=None\n"},
+        )
+
+
 # --- scratch_db_url routing -------------------------------------------------
 
 
@@ -1002,86 +1249,166 @@ async def test_scratch_db_url_routes_scratch_provisioning_to_dedicated_target(
 
 
 @pytest.mark.asyncio
-async def test_scratch_db_url_none_falls_back_to_prod_url(monkeypatch):
-    """When ``scratch_db_url`` is ``None`` (default), the gate must fall back
-    to the production engine's URL for scratch provisioning — the correct path
-    for dev/test environments where the Postgres user can CREATE DATABASE."""
+async def test_missing_scratch_url_defers_without_production_io(monkeypatch):
+    """Missing scratch config defers before production reads or any DDL."""
     import app.migration_apply_gate as gate_mod
-    from sqlalchemy.engine import make_url
 
-    prod_url = make_url("postgresql+asyncpg://prod_user:p@prod-db:5432/proddb")
+    read_prod = AsyncMock()
+    fetch_sources = AsyncMock()
+    provision = AsyncMock()
+    monkeypatch.setattr(gate_mod, "_read_prod_state", read_prod)
+    monkeypatch.setattr(gate_mod, "_fetch_candidate_sources_with_retry", fetch_sources)
+    monkeypatch.setattr(gate_mod, "_provision_seed_and_detect_drift", provision)
 
-    prod_meta = sa.MetaData()
-    sa.Table("widget", prod_meta, sa.Column("id", sa.Integer, primary_key=True))
-
-    monkeypatch.setattr(
-        gate_mod,
-        "_read_prod_state",
-        AsyncMock(return_value=gate_mod._ProdState(revision="a01", metadata=prod_meta)),
+    engine = create_async_engine(
+        "postgresql+asyncpg://prod_user:secret@prod-db:5432/proddb"
     )
-
-    observed: dict[str, object] = {}
-
-    async def _capture_build_candidate_reference_schema(
-        base_url, candidate_sources
-    ):
-        observed["build_reference_base_url"] = base_url
-        return prod_meta
-
-    async def _capture_provision_seed_and_detect_drift(
-        scratch_base_url, prod_state, candidate_sources, required_metadata
-    ):
-        observed["provision_base_url"] = scratch_base_url
-        return []
-
-    monkeypatch.setattr(
-        gate_mod,
-        "_build_candidate_reference_schema",
-        _capture_build_candidate_reference_schema,
-    )
-    monkeypatch.setattr(
-        gate_mod,
-        "_build_candidate_required_metadata",
-        AsyncMock(return_value=prod_meta),
-    )
-    monkeypatch.setattr(
-        gate_mod,
-        "_provision_seed_and_detect_drift",
-        _capture_provision_seed_and_detect_drift,
-    )
-
-    engine = create_async_engine(str(prod_url))
     try:
         verdict, detail = await run_migration_apply_gate(
             prod_engine=engine,
             candidate_sources={"0001_init.py": "revision='0001'\ndown_revision=None\n"},
-            # scratch_db_url omitted — should default to None
         )
     finally:
         await engine.dispose()
 
-    assert verdict == "ok", detail
+    assert verdict == "defer"
+    assert "scratch_database_url_missing" in (detail or "")
+    assert "secret" not in (detail or "")
+    read_prod.assert_not_awaited()
+    fetch_sources.assert_not_awaited()
+    provision.assert_not_awaited()
 
-    # With scratch_db_url=None, the gate must use the prod engine's URL.
-    # Compare host/database individually — str(URL) redacts passwords.
-    build_ref = observed.get("build_reference_base_url")
-    assert build_ref is not None, (
-        "_build_candidate_reference_schema was not called"
+
+@pytest.mark.asyncio
+async def test_unavailable_scratch_target_returns_sanitized_typed_defer(monkeypatch):
+    import app.migration_apply_gate as gate_mod
+
+    metadata = sa.MetaData()
+    monkeypatch.setattr(gate_mod, "_TRANSIENT_RETRY_BASE_DELAY", 0)
+    monkeypatch.setattr(gate_mod, "_TRANSIENT_RETRY_MAX_DELAY", 0)
+    monkeypatch.setattr(
+        gate_mod,
+        "_read_prod_state",
+        AsyncMock(return_value=gate_mod._ProdState(revision="a01", metadata=metadata)),
     )
-    assert build_ref.host == prod_url.host, (
-        f"_build_candidate_reference_schema host {build_ref.host!r} != {prod_url.host!r}"
-    )
-    assert build_ref.database == prod_url.database, (
-        f"_build_candidate_reference_schema database {build_ref.database!r} != {prod_url.database!r}"
+    monkeypatch.setattr(
+        gate_mod, "_provision_seed_and_detect_drift", AsyncMock(side_effect=OSError())
     )
 
-    provision_ref = observed.get("provision_base_url")
-    assert provision_ref is not None, (
-        "_provision_seed_and_detect_drift was not called"
+    engine = create_async_engine(
+        "postgresql+asyncpg://prod_user:prod-secret@prod-db:5432/proddb"
     )
-    assert provision_ref.host == prod_url.host, (
-        f"_provision_seed_and_detect_drift host {provision_ref.host!r} != {prod_url.host!r}"
+    try:
+        verdict, detail = await run_migration_apply_gate(
+            prod_engine=engine,
+            candidate_sources={"0001_init.py": "revision='0001'\ndown_revision=None\n"},
+            required_metadata=metadata,
+            scratch_db_url=(
+                "postgresql+asyncpg://scratch_user:scratch-secret@"
+                "scratch-db:5432/control"
+            ),
+        )
+    finally:
+        await engine.dispose()
+
+    assert verdict == "defer"
+    assert "scratch_database_unavailable" in (detail or "")
+    assert "MIGRATION_APPLY_SCRATCH_DATABASE_URL" in (detail or "")
+    assert "prod-secret" not in (detail or "")
+    assert "scratch-secret" not in (detail or "")
+
+
+@pytest.mark.asyncio
+async def test_reference_build_scratch_unavailable_returns_typed_defer(monkeypatch):
+    """_ScratchDatabaseUnavailable from the reference-build path must produce the
+    same typed, sanitized defer as the replay path — not the generic candidate-
+    reference message which does not name the prerequisite."""
+    import app.migration_apply_gate as gate_mod
+
+    metadata = sa.MetaData()
+    monkeypatch.setattr(gate_mod, "_TRANSIENT_RETRY_BASE_DELAY", 0)
+    monkeypatch.setattr(gate_mod, "_TRANSIENT_RETRY_MAX_DELAY", 0)
+    monkeypatch.setattr(
+        gate_mod,
+        "_read_prod_state",
+        AsyncMock(return_value=gate_mod._ProdState(revision="a01", metadata=metadata)),
     )
-    assert provision_ref.database == prod_url.database, (
-        f"_provision_seed_and_detect_drift database {provision_ref.database!r} != {prod_url.database!r}"
+    monkeypatch.setattr(
+        gate_mod,
+        "_build_candidate_reference_schema",
+        AsyncMock(side_effect=gate_mod._ScratchDatabaseUnavailable()),
     )
+
+    engine = create_async_engine(
+        "postgresql+asyncpg://prod_user:prod-secret@prod-db:5432/proddb"
+    )
+    try:
+        verdict, detail = await run_migration_apply_gate(
+            prod_engine=engine,
+            candidate_sources={"0001_init.py": "revision='0001'\ndown_revision=None\n"},
+            # required_metadata omitted → gate enters reference-build path
+            scratch_db_url=(
+                "postgresql+asyncpg://scratch_user:scratch-secret@"
+                "scratch-db:5432/control"
+            ),
+        )
+    finally:
+        await engine.dispose()
+
+    assert verdict == "defer"
+    assert "scratch_database_unavailable" in (detail or "")
+    assert "MIGRATION_APPLY_SCRATCH_DATABASE_URL" in (detail or "")
+    assert "prod-secret" not in (detail or "")
+    assert "scratch-secret" not in (detail or "")
+
+
+@pytest.mark.asyncio
+async def test_replay_seed_scratch_unavailable_returns_typed_defer(monkeypatch):
+    """_ScratchDatabaseUnavailable from _seed_scratch (the real wrapper, not a
+    direct mock of _provision_seed_and_detect_drift) must produce the typed defer.
+    Seeding failures are infra failures; raw details must not be returned."""
+    import contextlib
+
+    import app.migration_apply_gate as gate_mod
+
+    metadata = sa.MetaData()
+    monkeypatch.setattr(gate_mod, "_TRANSIENT_RETRY_BASE_DELAY", 0)
+    monkeypatch.setattr(gate_mod, "_TRANSIENT_RETRY_MAX_DELAY", 0)
+    monkeypatch.setattr(
+        gate_mod,
+        "_read_prod_state",
+        AsyncMock(return_value=gate_mod._ProdState(revision="a01", metadata=metadata)),
+    )
+
+    @contextlib.asynccontextmanager
+    async def _fake_ephemeral(_base_url, db_name=None):
+        yield object(), "scratch-replay"
+
+    monkeypatch.setattr(gate_mod, "ephemeral_postgres_database", _fake_ephemeral)
+    monkeypatch.setattr(
+        gate_mod,
+        "_seed_scratch",
+        AsyncMock(side_effect=gate_mod._ScratchDatabaseUnavailable()),
+    )
+
+    engine = create_async_engine(
+        "postgresql+asyncpg://prod_user:prod-secret@prod-db:5432/proddb"
+    )
+    try:
+        verdict, detail = await run_migration_apply_gate(
+            prod_engine=engine,
+            candidate_sources={"0001_init.py": "revision='0001'\ndown_revision=None\n"},
+            required_metadata=metadata,
+            scratch_db_url=(
+                "postgresql+asyncpg://scratch_user:scratch-secret@"
+                "scratch-db:5432/control"
+            ),
+        )
+    finally:
+        await engine.dispose()
+
+    assert verdict == "defer"
+    assert "scratch_database_unavailable" in (detail or "")
+    assert "MIGRATION_APPLY_SCRATCH_DATABASE_URL" in (detail or "")
+    assert "prod-secret" not in (detail or "")
+    assert "scratch-secret" not in (detail or "")

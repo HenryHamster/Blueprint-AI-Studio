@@ -195,6 +195,32 @@ export async function getIdToken(): Promise<string> {
   return user.getIdToken();
 }
 
+/**
+ * Get the active account token after Firebase has restored its persisted auth
+ * state. This is for best-effort startup work: normal API calls should still
+ * fail promptly when the user is signed out.
+ */
+export async function getIdTokenAfterAuthRestore(timeoutMs = 30_000): Promise<string> {
+  if (hasDashboardToken && dashboardToken) return dashboardToken;
+  const instance = activeAuth();
+  if (!instance) throw new Error(authInitError ?? firebaseUnavailableMessage);
+
+  await new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error('Authentication restore timed out')), timeoutMs);
+    instance.authStateReady().then(
+      () => {
+        clearTimeout(timeout);
+        resolve();
+      },
+      error => {
+        clearTimeout(timeout);
+        reject(error);
+      },
+    );
+  });
+  return getIdToken();
+}
+
 /** Subscribe to the active account's Firebase auth state. */
 export function onAuthChange(
   callback: (user: User | null) => void,

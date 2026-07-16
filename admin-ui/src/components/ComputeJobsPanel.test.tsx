@@ -4356,6 +4356,32 @@ describe('ComputeJobsPanel — viewable artifact gallery', () => {
     expect(gallery.textContent).toContain('rollout.mp4 · 2.3 MB');
   });
 
+  test('refreshes an open same-URI live preview when polling reaches its terminal revision', async () => {
+    vi.useFakeTimers();
+    try {
+      const live = { ...VIEWABLE[0], revision: 'v1', live: true };
+      const terminal = { ...live, revision: 'v2', live: false };
+      fetchComputeJobs
+        .mockResolvedValueOnce(wrapJobs([makeJob({ status: 'RUNNING', viewable_artifacts: [live] })]))
+        .mockResolvedValueOnce(wrapJobs([makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', viewable_artifacts: [terminal] })]));
+      resolveArtifactDownloadUrl
+        .mockResolvedValueOnce('https://signed.example/plot-v1.png')
+        .mockResolvedValueOnce('https://signed.example/plot-v2.png');
+      const { getByTestId, container } = render(<ComputeJobsPanel projectId="proj-1" />);
+      await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+      const toggle = getByTestId('compute-artifact-gallery-toggle');
+      await act(async () => { toggle.click(); await Promise.resolve(); await Promise.resolve(); });
+      expect(container.querySelector('img')?.getAttribute('src')).toBe('https://signed.example/plot-v1.png');
+
+      await act(async () => { vi.advanceTimersByTime(10_000); await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); });
+      expect(container.querySelector('img')?.getAttribute('src')).toBe('https://signed.example/plot-v2.png');
+      expect(toggle.textContent).toContain('Hide previews');
+      expect(resolveArtifactDownloadUrl).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test('resolution failure shows a quiet placeholder that can retry', async () => {
     fetchComputeJobs.mockResolvedValue(wrapJobs([makeGalleryJob()]));
     resolveArtifactDownloadUrl.mockRejectedValue(new Error('403'));

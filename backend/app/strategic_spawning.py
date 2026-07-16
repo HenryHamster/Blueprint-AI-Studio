@@ -287,14 +287,14 @@ async def _strategic_recent_version_entry(
     session, version, project=None
 ) -> dict[str, Any]:
     from app.qualification_state_resolver import (
-        resolve_open_version_qualification_state,
+        resolve_open_version_qualification_read_model,
     )
 
     aggregate, artifacts = _version_serving_summary(version, project)
     # Route through the shared seam so this surface's qualification_state carries
     # the ledger-backed per-dimension sub_score overlay instead of the mutable
     # last_qualification blob, matching the dimension_states shown elsewhere.
-    qualification_state, _ = await resolve_open_version_qualification_state(
+    qualification_read = await resolve_open_version_qualification_read_model(
         session, version, project, serving=(aggregate, artifacts)
     )
     return {
@@ -302,7 +302,9 @@ async def _strategic_recent_version_entry(
         "status": version.status,
         "phase": version.phase,
         "last_qualification": version.last_qualification,
-        "qualification_state": qualification_state,
+        "qualification_state": qualification_read.qualification_state,
+        "qualification_provenance": qualification_read.provenance,
+        "dimension_states": qualification_read.dimension_states,
         "serving_status": aggregate["serving_status"],
         "served_sha": (version.served_sha or "")[:12] or None,
         "deploy_failure_reason": aggregate["reason_code"],
@@ -1183,8 +1185,9 @@ def _build_cycle_start_reconciliation(
         framing across cycles.
       * ``qualification_surface_conflicts`` — disagreements between the payload's
         qualification narrative surfaces (``last_qualification``, derived
-        ``qualification_state``, ``criterion_coverage``, ``promotion_readiness``,
-        and candidate currency). Populated only when ``version_phase_block`` is
+        ``qualification_state``, ``promotion_readiness``, and candidate currency).
+        Criterion evidence coverage remains observational rather than release
+        truth. Populated only when ``version_phase_block`` is
         present (LTS split). Each conflict names the two surfaces, what each
         asserts, and a reason for the disagreement.
 
@@ -1572,7 +1575,6 @@ def _build_cycle_start_reconciliation(
     if isinstance(version_phase_block, dict):
         vpb_last_qual = version_phase_block.get("last_qualification")
         vpb_qual_state = version_phase_block.get("qualification_state")
-        vpb_criterion_cov = version_phase_block.get("criterion_coverage")
         vpb_promotion_ready = version_phase_block.get("promotion_readiness")
         vpb_candidate_currency = version_phase_block.get(
             "last_qualification_candidate_currency"
@@ -1642,36 +1644,7 @@ def _build_cycle_start_reconciliation(
                         }
                     )
 
-        # Disagreement 3: criterion_coverage unmapped vs confidence/threshold
-        if isinstance(vpb_criterion_cov, dict) and isinstance(vpb_last_qual, dict):
-            covered = int(vpb_criterion_cov.get("covered", 0) or 0)
-            total = int(vpb_criterion_cov.get("total", 0) or 0)
-            confidence = vpb_last_qual.get("confidence")
-            threshold = vpb_last_qual.get("threshold")
-            # When confidence meets threshold but NOT all criteria are covered,
-            # the two surfaces disagree on "ready to promote" assessment.
-            if (
-                total > 0
-                and covered < total
-                and confidence is not None
-                and threshold is not None
-                and isinstance(confidence, (int, float))
-                and isinstance(threshold, (int, float))
-                and confidence >= threshold
-            ):
-                qualification_surface_conflicts.append(
-                    {
-                        "conflict_type": "criterion_coverage_vs_confidence",
-                        "description": (
-                            f"Confidence {confidence:.2%} meets threshold "
-                            f"{threshold:.2%}, but only {covered}/{total} criteria "
-                            "are covered. The version is deemed ready by confidence "
-                            "but incomplete by criterion coverage."
-                        ),
-                    }
-                )
-
-        # Disagreement 4: promotion_readiness trend vs current qualification status
+        # Disagreement 3: promotion_readiness trend vs current qualification status
         if isinstance(vpb_promotion_ready, dict) and isinstance(vpb_last_qual, dict):
             ready_state = vpb_promotion_ready.get("ready")
             qual_status = vpb_last_qual.get("status")
@@ -6082,18 +6055,17 @@ async def _spawn_strategic_review(
                 # stale-pending window. The helper keeps audit resolution
                 # best-effort internally so a failed resolve never blocks assembly.
                 from app.qualification_state_resolver import (
-                    resolve_open_version_qualification_state,
+                    resolve_open_version_qualification_read_model,
                 )
 
-                (
-                    _open_qual_state,
-                    _open_qual_disagreement,
-                ) = await resolve_open_version_qualification_state(
+                _qualification_read = await resolve_open_version_qualification_read_model(
                     session,
                     _open_version,
                     project,
                     serving=(_open_aggregate, _open_artifacts),
                 )
+                _open_qual_state = _qualification_read.qualification_state
+                _open_qual_disagreement = _qualification_read.disagreement
                 _phase_block = to_phase_block(
                     _open_version,
                     aggregate_serving_status=_open_aggregate["serving_status"],
@@ -6115,6 +6087,16 @@ async def _spawn_strategic_review(
                     **_phase_block,
                     "tasks_merged_this_version": _tasks_merged,
                     "qualification_attempts": _open_version.qualification_attempts,
+                    "qualification_retry_episode": (
+                        _open_version.qualification_retry_episode
+                    ),
+                    "active_qualification_attempt_id": (
+                        str(_open_version.active_qualification_attempt_id)
+                        if _open_version.active_qualification_attempt_id
+                        else None
+                    ),
+                    "qualification_provenance": _qualification_read.provenance,
+                    "dimension_states": _qualification_read.dimension_states,
                     # Signals the strategist to author the objective this cycle.
                     # Absent once the goal is set (null goal → action needed).
                     **(

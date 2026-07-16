@@ -1150,14 +1150,18 @@ export async function handleFix(
     const baseFiles = git(['ls-tree', '-r', '--name-only', `origin/${baseBranch}`, versionsDir])
       .split('\n').map(s => s.trim()).filter(Boolean);
     const migrationConflict = detectMigrationConflict(prFiles, baseFiles, versionsDir);
-    if (migrationConflict.detected) {
+    const reservedMigration = extractReservedMigrationRevision(task);
+    // A reserved migration may have a stale advisory parent even when no
+    // filename conflict is visible. Repair it against the current base ref in
+    // either case; the PR migration itself must never be mistaken for that head.
+    if (migrationConflict.detected || (reservedMigration && migrationConflict.prMigrations.length > 0)) {
       const guidance = buildMigrationConflictGuidance(
         migrationConflict, versionsDir,
         migrationLayout.schemaRevisionFile, migrationLayout.schemaRevisionConst,
-        extractReservedMigrationRevision(task),
+        reservedMigration,
       );
       enrichedPrompt = `${guidance}${enrichedPrompt}`;
-      sendLog(ws, `Migration revision conflict detected: PR=${migrationConflict.prMigrations.join(',')} base-new=${migrationConflict.baseNewMigrations.join(',')}\n`);
+      sendLog(ws, `Migration revision repair guidance injected: PR=${migrationConflict.prMigrations.join(',')} base-new=${migrationConflict.baseNewMigrations.join(',')} reserved=${reservedMigration?.provisionalRevision ?? 'none'}\n`);
     }
   } catch { /* diff/ls-tree failures are non-fatal */ }
 
@@ -1548,6 +1552,7 @@ Maximum 5 responses per iteration.  Skip writing the file entirely if every issu
     disallowedTools: disallowedToolsFix,
     noChangesMessage: 'No file changes after review-fix iteration.',
     buildConfig: fixBuildConfig,
+    taskCapability: task.task_capability as Partial<Record<'agent_mode' | 'run_shape' | 'output_kind', unknown>> | undefined,
     // Close the ci_failure fix loop: thread the exact CI-failing selectors
     // into ./check so ./pr open can't push until they pass locally. Empty for
     // non-ci_failure fixes (ciFailureSelectors is [] unless fixReason ===

@@ -60,6 +60,7 @@ import tempfile
 import textwrap
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import Awaitable, Callable, cast, NamedTuple, TypeVar
 from urllib.parse import quote
 
@@ -106,6 +107,73 @@ def _safe_tar_extractall(tar: tarfile.TarFile, dest: str) -> None:
 
 # ('ok'|'block'|'defer', detail). Mirrors check_qualification_migration_identity.
 Verdict = tuple[str, str | None]
+
+MIGRATION_APPLY_SCRATCH_ENV = "MIGRATION_APPLY_SCRATCH_DATABASE_URL"
+
+
+@dataclass(frozen=True)
+class MigrationApplyScratchPreflight:
+    """Typed, value-safe result for the optional scratch prerequisite."""
+
+    status: str
+    code: str
+    target: URL | None
+    detail: str | None
+
+
+def preflight_migration_apply_scratch(
+    raw_url: str | URL | None,
+) -> MigrationApplyScratchPreflight:
+    """Validate scratch configuration without connecting or attempting DDL.
+
+    The raw value is deliberately absent from every diagnostic.  Availability
+    and CREATE/DROP permission are proven later by the existing isolated gate.
+    """
+    if raw_url is None or (isinstance(raw_url, str) and not raw_url.strip()):
+        return MigrationApplyScratchPreflight(
+            status="defer",
+            code="scratch_database_url_missing",
+            target=None,
+            detail=(
+                "scratch_database_url_missing: "
+                f"{MIGRATION_APPLY_SCRATCH_ENV} is not configured; bind a dedicated "
+                "PostgreSQL scratch target whose user can CREATE and DROP databases"
+            ),
+        )
+    try:
+        target = raw_url if isinstance(raw_url, URL) else make_url(raw_url.strip())
+    except Exception:  # noqa: BLE001 — sanitized typed configuration failure
+        return MigrationApplyScratchPreflight(
+            status="defer",
+            code="scratch_database_url_invalid",
+            target=None,
+            detail=(
+                "scratch_database_url_invalid: "
+                f"{MIGRATION_APPLY_SCRATCH_ENV} must be a valid PostgreSQL URL "
+                "for a dedicated scratch target"
+            ),
+        )
+
+    if not target.get_backend_name().startswith("postgresql") or not target.database:
+        return MigrationApplyScratchPreflight(
+            status="defer",
+            code="scratch_database_url_invalid",
+            target=None,
+            detail=(
+                "scratch_database_url_invalid: "
+                f"{MIGRATION_APPLY_SCRATCH_ENV} must name a PostgreSQL database "
+                "on a dedicated scratch target"
+            ),
+        )
+    if target.drivername == "postgresql":
+        target = target.set(drivername="postgresql+asyncpg")
+    return MigrationApplyScratchPreflight(
+        status="ready",
+        code="scratch_database_ready",
+        target=target,
+        detail=None,
+    )
+
 
 # Repo-relative directory holding the Alembic migration files, used to resolve a
 # bare basename (as returned by ``github.list_versions_at_ref``) to a full path
@@ -170,6 +238,7 @@ async def _with_transient_retry(
     coro_factory: Callable[[], Awaitable[_T]],
     *,
     label: str,
+    no_retry_types: tuple[type[Exception], ...] = (),
 ) -> _T:
     """Invoke *coro_factory* with bounded exponential backoff on exceptions.
 
@@ -195,17 +264,19 @@ async def _with_transient_retry(
             )
             logger.warning(
                 "[MIGRATION_APPLY_GATE] %s attempt %d/%d transient failure; "
-                "retrying in %.1fs: %s",
+                "retrying in %.1fs (%s)",
                 label,
                 attempt - 1,
                 _TRANSIENT_RETRY_MAX_ATTEMPTS,
                 delay,
-                last_exc,
+                type(last_exc).__name__,
             )
             await asyncio.sleep(delay)
         try:
             return await coro_factory()
-        except Exception as exc:  # noqa: BLE001 — retry on transient exceptions
+        except Exception as exc:
+            if isinstance(exc, no_retry_types):
+                raise  # deterministic — retry cannot help
             last_exc = exc
     # All attempts exhausted — re-raise the last exception.
     raise cast(Exception, last_exc)
@@ -227,6 +298,18 @@ class _MigrationApplyError(Exception):
     """A scratch-side seed/apply step failed. Always collapses to ``defer`` — an
     apply failure means we could not prove the candidate is safe, so the release
     must HOLD (never wave through, never hard-block on a possibly-fidelity issue)."""
+
+
+class _DeterministicMigrationDefect(Exception):
+    """A migration defect guaranteed to reproduce on every retry: Python
+    ``SyntaxError`` / ``ImportError`` during Alembic's migration import, or a
+    class-42 SQL error (syntax_error / invalid_schema_name / undefined_table /
+    etc.).  These must hard-block the candidate rather than loop as transient
+    infra failures — retrying cannot resolve them."""
+
+
+class _ScratchDatabaseUnavailable(Exception):
+    """The dedicated scratch server could not be reached or provision a DB."""
 
 
 def _metadata_from_shape(shape: dict[str, list[str]]) -> sa.MetaData:
@@ -351,6 +434,8 @@ async def _create_database(base_url: URL, name: str) -> None:
     try:
         async with engine.connect() as conn:
             await conn.execute(sa.text(f'CREATE DATABASE "{name}"'))
+    except Exception as exc:
+        raise _ScratchDatabaseUnavailable() from exc
     finally:
         await engine.dispose()
 
@@ -374,7 +459,9 @@ async def _drop_database(base_url: URL, name: str) -> None:
             await conn.execute(sa.text(f'DROP DATABASE IF EXISTS "{name}"'))
     except Exception as exc:  # noqa: BLE001 — teardown is best-effort
         logger.warning(
-            "[MIGRATION_APPLY_GATE] could not drop scratch database %r: %s", name, exc
+            "[MIGRATION_APPLY_GATE] could not drop scratch database %r (%s)",
+            name,
+            type(exc).__name__,
         )
     finally:
         await engine.dispose()
@@ -424,10 +511,7 @@ async def _seed_scratch(scratch_engine: AsyncEngine, prod_state: _ProdState) -> 
         async with scratch_engine.begin() as conn:
             await conn.run_sync(_seed)
     except Exception as exc:
-        raise _MigrationApplyError(
-            f"could not seed scratch DB with production's reflected schema "
-            f"(rev {prod_state.revision!r}): {type(exc).__name__}: {exc}"
-        ) from exc
+        raise _ScratchDatabaseUnavailable() from exc
 
 
 def _alembic_upgrade_head(sync_conn: sa.Connection, script_location: str) -> None:
@@ -529,6 +613,26 @@ async def _apply_candidate_migrations(
                 await conn.run_sync(
                     lambda sync_conn: _reconcile_then_upgrade(sync_conn, tmp)
                 )
+    except _DeterministicMigrationDefect:
+        raise  # already classified; propagate without re-wrapping
+    except (SyntaxError, ImportError) as exc:
+        raise _DeterministicMigrationDefect(
+            f"candidate migration has a deterministic Python defect "
+            f"({type(exc).__name__}): {exc}"
+        ) from exc
+    except sa.exc.ProgrammingError as exc:
+        pgcode = getattr(exc.orig, "pgcode", None) or getattr(
+            exc.orig, "sqlstate", None
+        )
+        if pgcode and str(pgcode).startswith("42"):
+            raise _DeterministicMigrationDefect(
+                f"candidate migration has a deterministic SQL defect "
+                f"(SQLSTATE {pgcode}): {exc}"
+            ) from exc
+        raise _MigrationApplyError(
+            f"candidate migration chain failed to apply against production's "
+            f"recorded state: {type(exc).__name__}: {exc}"
+        ) from exc
     except Exception as exc:
         raise _MigrationApplyError(
             f"candidate migration chain failed to apply against production's "
@@ -946,7 +1050,7 @@ async def run_migration_apply_gate(
     project_id: str | None = None,
     required_metadata: sa.MetaData | None = None,
     candidate_sources: dict[str, str] | None = None,
-    scratch_db_url: str | None = None,
+    scratch_db_url: str | URL | None = None,
 ) -> Verdict:
     """Pre-promotion scratch-DB migration-apply gate.
 
@@ -970,23 +1074,26 @@ async def run_migration_apply_gate(
     from a fresh apply of its own migration chain AND compares that to the
     candidate code's required schema so a forgotten migration still blocks.
 
-    *scratch_db_url* is an optional dedicated Postgres target for ephemeral
-    database provisioning (``CREATE DATABASE``). When provided, the gate creates
-    scratch/reference databases on this server instead of the production
-    Postgres connection. In the deployed environment the production connection
-    is typically a limited-role pool user that cannot ``CREATE DATABASE``, so
-    every candidate would defer with ``migration_apply_check_unavailable``.
-    Supplying a scratch-capable target unblocks the gate pre-promotion. When
-    ``None`` (default), the gate falls back to *prod_engine*'s URL — the
-    correct path for dev/test environments where the Postgres user can create
-    databases.
+    *scratch_db_url* is a qualification-only dedicated Postgres target for
+    ephemeral database provisioning (``CREATE DATABASE``). When provided, the
+    gate creates scratch/reference databases on this server instead of the
+    production Postgres connection. In the deployed environment the production
+    connection is typically a limited-role pool user that cannot
+    ``CREATE DATABASE``, so every candidate would defer with
+    ``migration_apply_check_unavailable``.
+    Supplying a scratch-capable target unblocks the gate pre-promotion. Missing
+    or malformed configuration returns a typed actionable defer before any
+    production read or DDL; the production pool URL is never a fallback.
 
     ISOLATION SAFETY: production is only ever read; the scratch database is a
     freshly-provisioned, separately-named Postgres database, and the orchestrator
     asserts its name differs from production's before any DDL.
     """
     prod_url = prod_engine.url
-    scratch_base_url = make_url(scratch_db_url) if scratch_db_url else prod_url
+    scratch_preflight = preflight_migration_apply_scratch(scratch_db_url)
+    if scratch_preflight.status != "ready" or scratch_preflight.target is None:
+        return ("defer", scratch_preflight.detail)
+    scratch_base_url = scratch_preflight.target
 
     if not prod_url.get_backend_name().startswith("postgresql"):
         # The renumber-skip class is a Postgres-deploy phenomenon; the gate needs
@@ -996,6 +1103,25 @@ async def run_migration_apply_gate(
             "defer",
             f"scratch-DB migration-apply gate requires a PostgreSQL production "
             f"bind; got {prod_url.get_backend_name()!r}",
+        )
+
+    prod_identity = (
+        prod_url.host,
+        prod_url.port,
+        prod_url.username,
+        prod_url.database,
+    )
+    scratch_identity = (
+        scratch_base_url.host,
+        scratch_base_url.port,
+        scratch_base_url.username,
+        scratch_base_url.database,
+    )
+    if scratch_identity == prod_identity:
+        return (
+            "defer",
+            "scratch_database_url_unsafe: MIGRATION_APPLY_SCRATCH_DATABASE_URL "
+            "must not resolve to the production pool target",
         )
 
     # 1. Candidate migration sources (fetched unless injected) — resolved BEFORE
@@ -1062,6 +1188,15 @@ async def run_migration_apply_gate(
                 candidate_ref=candidate_ref,
                 project_id=project_id,
             )
+        except _DeterministicMigrationDefect as exc:
+            return ("block", str(exc))
+        except _ScratchDatabaseUnavailable:
+            return (
+                "defer",
+                "scratch_database_unavailable: MIGRATION_APPLY_SCRATCH_DATABASE_URL "
+                "must reach dedicated PostgreSQL infrastructure whose user can CREATE "
+                "and DROP databases; restore that prerequisite and retry qualification",
+            )
         except _MigrationApplyError as exc:
             return ("defer", str(exc))
         except Exception as exc:  # noqa: BLE001 — reference-build failure HOLDS
@@ -1091,14 +1226,25 @@ async def run_migration_apply_gate(
                 scratch_base_url, prod_state, candidate_sources, required_metadata
             ),
             label="provision-seed-apply-drift",
+            no_retry_types=(_DeterministicMigrationDefect,),
+        )
+    except _DeterministicMigrationDefect as exc:
+        return ("block", str(exc))
+    except _ScratchDatabaseUnavailable:
+        return (
+            "defer",
+            "scratch_database_unavailable: MIGRATION_APPLY_SCRATCH_DATABASE_URL "
+            "must reach dedicated PostgreSQL infrastructure whose user can CREATE "
+            "and DROP databases; restore that prerequisite and retry qualification",
         )
     except _MigrationApplyError as exc:
         return ("defer", str(exc))
-    except Exception as exc:  # noqa: BLE001 — any provisioning failure HOLDS
+    except Exception:  # Any provisioning failure holds with a value-safe detail.
         return (
             "defer",
-            f"could not provision/run the isolated scratch database: "
-            f"{type(exc).__name__}: {exc}",
+            "scratch_database_unavailable: MIGRATION_APPLY_SCRATCH_DATABASE_URL "
+            "could not complete the isolated migration apply; verify dedicated "
+            "PostgreSQL availability and CREATE/DROP DATABASE permission",
         )
 
     if drift:

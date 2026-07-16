@@ -58,17 +58,62 @@ def _render_notes(content: dict) -> str:
 
 
 def _render_whiteboard(title: str, content: dict) -> str:
-    """Render a compact presence/summary line for a whiteboard.
+    """Render a compact summary for a whiteboard, including v2 node content.
 
-    NEVER dumps raw stroke JSON — only a human-readable summary (title + stroke
-    count). Returns an empty string when the board has no strokes.
+    For text nodes the operator-authored text is included verbatim (bounded by
+    _PER_TOOL_CHAR_CAP). Image and document nodes contribute only to a presence
+    count line — their raw data (dataUrl, etc.) is NEVER dumped. Stroke data is
+    also never dumped — only the count. Returns an empty string when the board
+    has no strokes and no nodes with content.
     """
     strokes = content.get("strokes")
-    if not isinstance(strokes, list) or len(strokes) == 0:
+    stroke_count = len(strokes) if isinstance(strokes, list) else 0
+
+    node_list = content.get("nodes")
+    node_list = node_list if isinstance(node_list, list) else []
+
+    text_nodes = [n for n in node_list if isinstance(n, dict) and n.get("type") == "text"]
+    image_nodes = [n for n in node_list if isinstance(n, dict) and n.get("type") == "image"]
+    doc_nodes = [n for n in node_list if isinstance(n, dict) and n.get("type") == "document"]
+
+    text_parts = []
+    for node in text_nodes:
+        raw_text = node.get("text")
+        if not isinstance(raw_text, str):
+            continue
+        text = raw_text.strip()
+        if text:
+            text_parts.append(text)
+
+    if stroke_count == 0 and not text_parts and not image_nodes and not doc_nodes:
         return ""
-    count = len(strokes)
-    noun = "stroke" if count == 1 else "strokes"
-    return f"Whiteboard '{title}' has {count} {noun} (visual canvas — not shown as text)."
+
+    summary_parts = []
+    if stroke_count:
+        noun = "stroke" if stroke_count == 1 else "strokes"
+        summary_parts.append(f"{stroke_count} {noun}")
+    if image_nodes:
+        n = len(image_nodes)
+        summary_parts.append(f"{n} {'image' if n == 1 else 'images'}")
+    if doc_nodes:
+        n = len(doc_nodes)
+        summary_parts.append(f"{n} {'document' if n == 1 else 'documents'}")
+
+    header = f"Whiteboard '{title}'"
+    if summary_parts:
+        header += f" has {', '.join(summary_parts)} (visual canvas — not shown as text)."
+    else:
+        header += " (visual canvas — not shown as text)."
+
+    parts = [header]
+    if text_parts:
+        parts.append("Text notes on whiteboard:")
+        parts.extend(text_parts)
+
+    result = "\n".join(parts)
+    if len(result) > _PER_TOOL_CHAR_CAP:
+        result = result[:_PER_TOOL_CHAR_CAP] + _TRUNCATION_MARKER
+    return result
 
 
 async def load_project_tool_context(

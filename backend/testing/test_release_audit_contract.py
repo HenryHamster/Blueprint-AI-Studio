@@ -464,6 +464,7 @@ async def test_spawn_release_audit_challenge_defaults_to_opus_quality_tier(db_se
     await db_session.refresh(project)
 
     candidate = "cafe0011" * 5  # 40-char placeholder SHA
+    attempt_id = uuid.uuid4()
     task = await rq._spawn_release_audit_challenge_task(
         db_session,
         project.id,
@@ -471,6 +472,7 @@ async def test_spawn_release_audit_challenge_defaults_to_opus_quality_tier(db_se
         base_branch="main",
         diff_range=f"main...{candidate}",
         candidate_sha=candidate,
+        qualification_attempt_id=attempt_id,
     )
     await db_session.commit()
     await db_session.refresh(task)
@@ -478,6 +480,13 @@ async def test_spawn_release_audit_challenge_defaults_to_opus_quality_tier(db_se
     assert (task.first_payload or {}).get("quality_tier") == "opus", (
         "Spawned release_audit_challenge must explicitly carry quality_tier='opus' "
         "— regression guard against silent downgrade"
+    )
+    # Provenance: qualification_attempt_id must propagate through payload + context.
+    assert task.first_payload.get("qualification_attempt_id") == str(attempt_id), (
+        "qualification_attempt_id must be propagated in the payload"
+    )
+    assert task.context.get("qualification_attempt_id") == str(attempt_id), (
+        "qualification_attempt_id must be propagated in the context"
     )
 
 
@@ -503,6 +512,7 @@ async def test_spawn_release_audit_task_defaults_to_opus_quality_tier(db_session
     await db_session.refresh(project)
 
     candidate = "dead1234" * 5  # 40-char placeholder SHA
+    attempt_id = uuid.uuid4()
     task = await rq._spawn_release_audit_task(
         db_session,
         project.id,
@@ -510,6 +520,7 @@ async def test_spawn_release_audit_task_defaults_to_opus_quality_tier(db_session
         base_branch="main",
         diff_range=f"main...{candidate}",
         candidate_sha=candidate,
+        qualification_attempt_id=attempt_id,
     )
     await db_session.commit()
     await db_session.refresh(task)
@@ -517,6 +528,13 @@ async def test_spawn_release_audit_task_defaults_to_opus_quality_tier(db_session
     assert (task.first_payload or {}).get("quality_tier") == "opus", (
         "Spawned release_audit must explicitly carry quality_tier='opus' "
         "— regression guard against silent downgrade"
+    )
+    # Provenance: qualification_attempt_id must propagate through payload + context.
+    assert task.first_payload.get("qualification_attempt_id") == str(attempt_id), (
+        "qualification_attempt_id must be propagated in the payload"
+    )
+    assert task.context.get("qualification_attempt_id") == str(attempt_id), (
+        "qualification_attempt_id must be propagated in the context"
     )
 
 
@@ -541,6 +559,7 @@ async def test_spawn_release_audit_challenge_pins_candidate(db_session):
 
     candidate = "abcdef12" * 5  # 40-char placeholder SHA
     version_id = uuid.uuid4()
+    attempt_id = uuid.uuid4()
     task = await rq._spawn_release_audit_challenge_task(
         db_session,
         project.id,
@@ -548,6 +567,7 @@ async def test_spawn_release_audit_challenge_pins_candidate(db_session):
         base_branch="main",
         diff_range=f"main...{candidate}",
         candidate_sha=candidate,
+        qualification_attempt_id=attempt_id,
     )
     await db_session.commit()
     await db_session.refresh(task)
@@ -556,9 +576,11 @@ async def test_spawn_release_audit_challenge_pins_candidate(db_session):
     assert task.first_payload["candidate_sha"] == candidate
     assert task.first_payload["base_branch"] == "main"
     assert task.first_payload["diff_range"] == f"main...{candidate}"
+    assert task.first_payload["qualification_attempt_id"] == str(attempt_id)
     # Context is scoped so the lookup helper can find it by candidate + version.
     assert task.context["candidate_sha"] == candidate
     assert task.context["release_version_id"] == str(version_id)
+    assert task.context["qualification_attempt_id"] == str(attempt_id)
 
 
 @pytest.mark.asyncio
@@ -588,6 +610,7 @@ async def test_get_latest_release_audit_challenge_scoped_by_sha(db_session):
         base_branch="main",
         diff_range=f"main...{candidate}",
         candidate_sha=candidate,
+        qualification_attempt_id=uuid.uuid4(),
     )
     await db_session.commit()
 
@@ -657,6 +680,7 @@ async def test_release_audit_resolves_to_opus_end_to_end(db_session):
     await db_session.refresh(project)
 
     candidate = "aabbccdd" * 5  # 40-char placeholder SHA
+    attempt_id = uuid.uuid4()
     task = await rq._spawn_release_audit_task(
         db_session,
         project.id,
@@ -664,6 +688,7 @@ async def test_release_audit_resolves_to_opus_end_to_end(db_session):
         base_branch="main",
         diff_range=f"main...{candidate}",
         candidate_sha=candidate,
+        qualification_attempt_id=attempt_id,
     )
     await db_session.commit()
     await db_session.refresh(task)
@@ -696,6 +721,7 @@ async def test_release_audit_challenge_resolves_to_opus_end_to_end(db_session):
     await db_session.refresh(project)
 
     candidate = "eeff0011" * 5  # 40-char placeholder SHA
+    attempt_id = uuid.uuid4()
     task = await rq._spawn_release_audit_challenge_task(
         db_session,
         project.id,
@@ -703,6 +729,7 @@ async def test_release_audit_challenge_resolves_to_opus_end_to_end(db_session):
         base_branch="main",
         diff_range=f"main...{candidate}",
         candidate_sha=candidate,
+        qualification_attempt_id=attempt_id,
     )
     await db_session.commit()
     await db_session.refresh(task)

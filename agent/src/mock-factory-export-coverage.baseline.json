@@ -97,6 +97,7 @@
       "matchesVmConfigMissing",
       "missingProviderConfigFiles",
       "missingVmProviderConfigFiles",
+      "normalizeClaudeConfigContent",
       "normalizePytestSelectorForRunner",
       "parseFailingTests",
       "parseFailingTestsFromVitestJson",
@@ -179,6 +180,14 @@
     ]
   },
   "handlers/audits.test.ts": {
+    "../workspacePrep.js": [
+      "getLastWorkspacePrepOutcome",
+      "listWorkspaceTopDirs",
+      "resetWorkspacePrepOutcome",
+      "resolveReferenceRepo"
+    ]
+  },
+  "handlers/capability-proof-trial.test.ts": {
     "../workspacePrep.js": [
       "getLastWorkspacePrepOutcome",
       "listWorkspaceTopDirs",
@@ -292,6 +301,7 @@
       "matchesVmConfigMissing",
       "missingProviderConfigFiles",
       "missingVmProviderConfigFiles",
+      "normalizeClaudeConfigContent",
       "normalizePytestSelectorForRunner",
       "parseFailingTests",
       "parseFailingTestsFromVitestJson",
@@ -445,6 +455,7 @@
       "matchesVmConfigMissing",
       "missingProviderConfigFiles",
       "missingVmProviderConfigFiles",
+      "normalizeClaudeConfigContent",
       "normalizePytestSelectorForRunner",
       "parseFailingTests",
       "parseFailingTestsFromVitestJson",
@@ -544,19 +555,19 @@
       "resetWorkspacePrepOutcome",
       "resolveReferenceRepo"
     ],
-    "./audit-challenge.js": [
-      "CHALLENGE_SEVERITIES_REQUIRING_VERDICT",
-      "CHALLENGE_VERDICTS",
-      "MIN_CHALLENGE_REASON_LEN",
-      "normalizeChallengeOutput",
-      "parsePrimaryFindings"
-    ],
     "./audits.js": [
       "designDocAdvertisement",
       "fetchCandidateCommitWithRetry",
       "isParallelAuditEnabled",
       "provisionAuditFetchHelpers",
       "resolveCandidateSha"
+    ],
+    "./audit-challenge.js": [
+      "CHALLENGE_SEVERITIES_REQUIRING_VERDICT",
+      "CHALLENGE_VERDICTS",
+      "MIN_CHALLENGE_REASON_LEN",
+      "normalizeChallengeOutput",
+      "parsePrimaryFindings"
     ]
   },
   "handlers/memo.test.ts": {
@@ -658,6 +669,7 @@
       "matchesVmConfigMissing",
       "missingProviderConfigFiles",
       "missingVmProviderConfigFiles",
+      "normalizeClaudeConfigContent",
       "normalizePytestSelectorForRunner",
       "parseFailingTests",
       "parseFailingTestsFromVitestJson",
@@ -816,6 +828,7 @@
       "matchesVmConfigMissing",
       "missingProviderConfigFiles",
       "missingVmProviderConfigFiles",
+      "normalizeClaudeConfigContent",
       "normalizePytestSelectorForRunner",
       "parseFailingTests",
       "parseFailingTestsFromVitestJson",
@@ -978,6 +991,7 @@
       "matchesVmConfigMissing",
       "missingProviderConfigFiles",
       "missingVmProviderConfigFiles",
+      "normalizeClaudeConfigContent",
       "normalizePytestSelectorForRunner",
       "parseFailingTests",
       "parseFailingTestsFromVitestJson",
@@ -1134,6 +1148,7 @@
       "matchesVmConfigMissing",
       "missingProviderConfigFiles",
       "missingVmProviderConfigFiles",
+      "normalizeClaudeConfigContent",
       "normalizePytestSelectorForRunner",
       "parseFailingTests",
       "parseFailingTestsFromVitestJson",
@@ -1284,6 +1299,7 @@
       "matchesVmConfigMissing",
       "missingProviderConfigFiles",
       "missingVmProviderConfigFiles",
+      "normalizeClaudeConfigContent",
       "normalizePytestSelectorForRunner",
       "parseFailingTests",
       "parseFailingTestsFromVitestJson",
@@ -1428,6 +1444,7 @@
       "matchesVmConfigMissing",
       "missingProviderConfigFiles",
       "missingVmProviderConfigFiles",
+      "normalizeClaudeConfigContent",
       "normalizePytestSelectorForRunner",
       "parseFailingTests",
       "parseFailingTestsFromVitestJson",
@@ -1490,6 +1507,16 @@
     ]
   },
   "handlers/specialized.test.ts": {
+    "../workspacePrep.js": [
+      "getLastWorkspacePrepOutcome",
+      "listWorkspaceTopDirs",
+      "resetWorkspacePrepOutcome",
+      "resolveReferenceRepo"
+    ],
+    "./code-change.js": [
+      "augmentSelfReview",
+      "maybeRunIncompleteReviewRecovery"
+    ],
     "../index.js": [
       "AUTH_MODE",
       "AuthFailureError",
@@ -1589,6 +1616,7 @@
       "matchesVmConfigMissing",
       "missingProviderConfigFiles",
       "missingVmProviderConfigFiles",
+      "normalizeClaudeConfigContent",
       "normalizePytestSelectorForRunner",
       "parseFailingTests",
       "parseFailingTestsFromVitestJson",
@@ -1644,6 +1672,12 @@
       "strVal",
       "testFixLoop",
       "validateBranchName"
+    ]
+  },
+  "handlers/standard.test.ts": {
+    "./code-change.js": [
+      "augmentSelfReview",
+      "maybeRunIncompleteReviewRecovery"
     ],
     "../workspacePrep.js": [
       "getLastWorkspacePrepOutcome",
@@ -1651,26 +1685,10 @@
       "resetWorkspacePrepOutcome",
       "resolveReferenceRepo"
     ],
-    "./code-change.js": [
-      "augmentSelfReview",
-      "maybeRunIncompleteReviewRecovery"
-    ]
-  },
-  "handlers/standard.test.ts": {
     "../prompts/diagnostics-after-edit-hook.js": [
       "DIAGNOSTICS_AFTER_EDIT_HOOK_MATCHER",
       "DIAGNOSTICS_AFTER_EDIT_HOOK_PATH",
       "buildDiagnosticsAfterEditHookScript"
-    ],
-    "../workspacePrep.js": [
-      "getLastWorkspacePrepOutcome",
-      "listWorkspaceTopDirs",
-      "resetWorkspacePrepOutcome",
-      "resolveReferenceRepo"
-    ],
-    "./code-change.js": [
-      "augmentSelfReview",
-      "maybeRunIncompleteReviewRecovery"
     ]
   },
   "handlers/strategic-resident.test.ts": {
@@ -1754,7 +1772,6 @@
       "getFormatComplianceTelemetry",
       "getLastProviderRunErrorReport",
       "getLlmTelemetry",
-      "getOperatorDecisionCaptureTelemetry",
       "getProviderRunner",
       "git",
       "gitAsync",
@@ -1769,6 +1786,7 @@
       "matchesVmConfigMissing",
       "missingProviderConfigFiles",
       "missingVmProviderConfigFiles",
+      "normalizeClaudeConfigContent",
       "normalizePytestSelectorForRunner",
       "parseFailingTests",
       "parseFailingTestsFromVitestJson",
@@ -1789,7 +1807,6 @@
       "recordLlmCallStart",
       "recordLlmTokens",
       "recordNumTurns",
-      "recordOperatorDecisionCapture",
       "recordProviderReportedUsage",
       "recordToolResultBytes",
       "recordToolUse",
@@ -1817,6 +1834,11 @@
       "staleResultBackoffMs",
       "testFixLoop",
       "validateBranchName"
+    ],
+    "../workspacePrep.js": [
+      "getLastWorkspacePrepOutcome",
+      "resetWorkspacePrepOutcome",
+      "resolveReferenceRepo"
     ],
     "../prompt.js": [
       "AGENT_HELPER_NAMES",
@@ -1851,6 +1873,7 @@
       "buildAnalysisPrompt",
       "buildCodeChangeHelperGuidance",
       "buildFileTree",
+      "buildGreenfieldCitationGuidance",
       "buildRepoMap",
       "buildRetryContext",
       "buildScopedLintOneliner",
@@ -1858,7 +1881,6 @@
       "codeChangeGuidanceVariant",
       "computePromptFingerprint",
       "countSourceFiles",
-      "buildGreenfieldCitationGuidance",
       "detectGreenfield",
       "detectLinterKind",
       "discoverAffectedConsumers",
@@ -1897,41 +1919,6 @@
       "writeViewportLiveHelper",
       "writeViewportSnapshotHelper"
     ],
-    "../providers/runners.js": [
-      "AUTH_MODE",
-      "AuthFailureError",
-      "LLM_CLI_TRANSLATION",
-      "LLM_EXECUTION_MODE",
-      "NoProgressTimeoutError",
-      "PROVIDER",
-      "RateLimitError",
-      "RuntimeUnavailableError",
-      "VmConfigMissingError",
-      "__setCommandExistsOverrideForSmoke",
-      "__setRunClaudeCodeOverrideForSmoke",
-      "_setLastProviderRunErrorReportForTesting",
-      "clearLastProviderRunErrorReport",
-      "codexStreamHasTurnCompleted",
-      "commandExistsOnPath",
-      "getLastProviderRunErrorReport",
-      "getProviderRunner",
-      "matchesAuthFailure",
-      "matchesRateLimit",
-      "matchesVmConfigMissing",
-      "missingProviderConfigFiles",
-      "parseLLMCliTranslation",
-      "providerAutoInjectsClaudeMd",
-      "providerSupportsNativeSubagents",
-      "refreshRuntimeState",
-      "requiredProviderConfigFiles",
-      "runClaudeCode",
-      "runProviderAgent"
-    ],
-    "../workspacePrep.js": [
-      "getLastWorkspacePrepOutcome",
-      "resetWorkspacePrepOutcome",
-      "resolveReferenceRepo"
-    ],
     "./strategic-helpers.js": [
       "DESIGN_DOC_FETCH_VERBS",
       "FETCH_VERB_HELP",
@@ -1946,6 +1933,39 @@
       "renderStrategicFetchVerbHelpLines",
       "runStrategicChallenge",
       "writeFetchHelper"
+    ],
+    "../providers/runners.js": [
+      "AUTH_MODE",
+      "AuthFailureError",
+      "LLM_CLI_TRANSLATION",
+      "LLM_EXECUTION_MODE",
+      "NoProgressTimeoutError",
+      "PROVIDER",
+      "RateLimitError",
+      "RuntimeUnavailableError",
+      "VmConfigMissingError",
+      "__resetClaudeCapabilityCacheForTesting",
+      "__setCommandExistsOverrideForSmoke",
+      "__setRunClaudeCodeOverrideForSmoke",
+      "_setLastProviderRunErrorReportForTesting",
+      "clearLastProviderRunErrorReport",
+      "codexStreamHasTurnCompleted",
+      "commandExistsOnPath",
+      "getLastProviderRunErrorReport",
+      "getProviderRunner",
+      "matchesAuthFailure",
+      "matchesRateLimit",
+      "matchesVmConfigMissing",
+      "missingProviderConfigFiles",
+      "parseLLMCliTranslation",
+      "probeClaudeCapabilities",
+      "providerAutoInjectsClaudeMd",
+      "providerSupportsNativeSubagents",
+      "refreshRuntimeState",
+      "requiredProviderConfigFiles",
+      "runClaudeCode",
+      "runProviderAgent",
+      "stripUnsupportedClaudeOptionalArgs"
     ],
     "./strategic-sections.js": [
       "buildCapabilityVerificationSection",
@@ -2067,6 +2087,7 @@
       "matchesVmConfigMissing",
       "missingProviderConfigFiles",
       "missingVmProviderConfigFiles",
+      "normalizeClaudeConfigContent",
       "normalizePytestSelectorForRunner",
       "parseFailingTests",
       "parseFailingTestsFromVitestJson",
@@ -2114,29 +2135,24 @@
       "testFixLoop",
       "validateBranchName"
     ],
-    "../telemetry.js": [
-      "computePromptFingerprint",
-      "errorFingerprint",
-      "estimateTokensFromChars",
-      "getOperatorDecisionCaptureTelemetry",
-      "getResidentTurnLatencyTelemetry",
-      "recordOperatorDecisionCapture",
-      "recordResidentTurnLatency",
-      "recordToolResultBytes",
-      "resetOperatorDecisionCaptureTelemetry",
-      "resetResidentTurnLatencyTelemetry"
+    "../workspacePrep.js": [
+      "getLastWorkspacePrepOutcome",
+      "listWorkspaceTopDirs",
+      "resetWorkspacePrepOutcome",
+      "resolveReferenceRepo"
+    ],
+    "./strategic-helpers.js": [
+      "buildFetchGuidance",
+      "buildStrategicChallengePrompt",
+      "parseStrategicChallengeRecord",
+      "portfolioOperationFingerprint",
+      "writeFetchHelper"
     ],
     "../utils/design-doc-presence.js": [
       "extractEntryPaths",
       "reconcileEntry",
       "reconcileMissingCapabilities",
       "reconcileSystemEntry"
-    ],
-    "../workspacePrep.js": [
-      "getLastWorkspacePrepOutcome",
-      "listWorkspaceTopDirs",
-      "resetWorkspacePrepOutcome",
-      "resolveReferenceRepo"
     ],
     "./research-plan.js": [
       "aggregateDirectionStats",
@@ -2159,17 +2175,22 @@
       "parseResearchContext",
       "runThinkerWithGate"
     ],
-    "./strategic-helpers.js": [
-      "buildFetchGuidance",
-      "buildStrategicChallengePrompt",
-      "parseStrategicChallengeRecord",
-      "portfolioOperationFingerprint",
-      "writeFetchHelper"
-    ],
     "./strategic-sections.js": [
       "buildCompletionDebtSection",
       "buildPendingFollowupsSection",
       "buildResidentExamLeadsSection"
+    ],
+    "../telemetry.js": [
+      "computePromptFingerprint",
+      "errorFingerprint",
+      "estimateTokensFromChars",
+      "getOperatorDecisionCaptureTelemetry",
+      "getResidentTurnLatencyTelemetry",
+      "recordOperatorDecisionCapture",
+      "recordResidentTurnLatency",
+      "recordToolResultBytes",
+      "resetOperatorDecisionCaptureTelemetry",
+      "resetResidentTurnLatencyTelemetry"
     ]
   },
   "handlers/structured-output-repair.test.ts": {
@@ -2272,6 +2293,7 @@
       "matchesVmConfigMissing",
       "missingProviderConfigFiles",
       "missingVmProviderConfigFiles",
+      "normalizeClaudeConfigContent",
       "normalizePytestSelectorForRunner",
       "parseFailingTests",
       "parseFailingTestsFromVitestJson",
@@ -2427,6 +2449,7 @@
       "matchesVmConfigMissing",
       "missingProviderConfigFiles",
       "missingVmProviderConfigFiles",
+      "normalizeClaudeConfigContent",
       "normalizePytestSelectorForRunner",
       "parseFailingTests",
       "parseFailingTestsFromVitestJson",
@@ -2481,6 +2504,34 @@
       "testFixLoop",
       "validateBranchName"
     ],
+    "../telemetry.js": [
+      "computePromptFingerprint",
+      "errorFingerprint",
+      "estimateTokensFromChars",
+      "getCurrentPromptFingerprint",
+      "getFormatComplianceTelemetry",
+      "getOperatorDecisionCaptureTelemetry",
+      "getResidentTurnLatencyTelemetry",
+      "recordFormatMiss",
+      "recordFormatRepairAttempt",
+      "recordFormatRepairInfraFailure",
+      "recordFormatRepairMiss",
+      "recordFormatRepairSuccess",
+      "recordLlmCallStart",
+      "recordLlmTokens",
+      "recordNumTurns",
+      "recordOperatorDecisionCapture",
+      "recordProviderReportedUsage",
+      "recordResidentTurnLatency",
+      "recordToolResultBytes",
+      "recordViewportScreenshotDownload",
+      "resetFormatComplianceTelemetry",
+      "resetLlmTelemetry",
+      "resetOperatorDecisionCaptureTelemetry",
+      "resetResidentTurnLatencyTelemetry",
+      "setCurrentPromptFingerprint",
+      "setPromptSizeTelemetry"
+    ],
     "../prompt.js": [
       "AGENT_HELPER_NAMES",
       "BEYOND_SCOPE_REPORTING",
@@ -2514,6 +2565,7 @@
       "buildCodeChangeHelperGuidance",
       "buildContextPrefix",
       "buildFileTree",
+      "buildGreenfieldCitationGuidance",
       "buildRepoMap",
       "buildRetryContext",
       "buildScopedLintOneliner",
@@ -2523,7 +2575,6 @@
       "configureAgentPermissions",
       "configureResidentAgentPermissions",
       "countSourceFiles",
-      "buildGreenfieldCitationGuidance",
       "detectGreenfield",
       "detectLinterKind",
       "discoverAffectedConsumers",
@@ -2563,34 +2614,6 @@
       "writeSymbolsHelper",
       "writeViewportLiveHelper",
       "writeViewportSnapshotHelper"
-    ],
-    "../telemetry.js": [
-      "computePromptFingerprint",
-      "errorFingerprint",
-      "estimateTokensFromChars",
-      "getCurrentPromptFingerprint",
-      "getFormatComplianceTelemetry",
-      "getOperatorDecisionCaptureTelemetry",
-      "getResidentTurnLatencyTelemetry",
-      "recordFormatMiss",
-      "recordFormatRepairAttempt",
-      "recordFormatRepairInfraFailure",
-      "recordFormatRepairMiss",
-      "recordFormatRepairSuccess",
-      "recordLlmCallStart",
-      "recordLlmTokens",
-      "recordNumTurns",
-      "recordOperatorDecisionCapture",
-      "recordProviderReportedUsage",
-      "recordResidentTurnLatency",
-      "recordToolResultBytes",
-      "recordViewportScreenshotDownload",
-      "resetFormatComplianceTelemetry",
-      "resetLlmTelemetry",
-      "resetOperatorDecisionCaptureTelemetry",
-      "resetResidentTurnLatencyTelemetry",
-      "setCurrentPromptFingerprint",
-      "setPromptSizeTelemetry"
     ]
   },
   "handlers/verify-tests.provision.test.ts": {
@@ -2723,6 +2746,7 @@
       "matchesVmConfigMissing",
       "missingProviderConfigFiles",
       "missingVmProviderConfigFiles",
+      "normalizeClaudeConfigContent",
       "normalizePytestSelectorForRunner",
       "parseFailingTests",
       "parseFailingTestsFromVitestJson",
@@ -2869,6 +2893,7 @@
       "matchesVmConfigMissing",
       "missingProviderConfigFiles",
       "missingVmProviderConfigFiles",
+      "normalizeClaudeConfigContent",
       "normalizePytestSelectorForRunner",
       "parseFailingTests",
       "parseFailingTestsFromVitestJson",
@@ -3024,6 +3049,7 @@
       "matchesVmConfigMissing",
       "missingProviderConfigFiles",
       "missingVmProviderConfigFiles",
+      "normalizeClaudeConfigContent",
       "normalizePytestSelectorForRunner",
       "parseFailingTests",
       "parseFailingTestsFromVitestJson",
@@ -3180,6 +3206,7 @@
       "matchesVmConfigMissing",
       "missingProviderConfigFiles",
       "missingVmProviderConfigFiles",
+      "normalizeClaudeConfigContent",
       "normalizePytestSelectorForRunner",
       "parseFailingTests",
       "parseFailingTestsFromVitestJson",
@@ -3234,71 +3261,6 @@
     ]
   },
   "providers/resident-session.test.ts": {
-    "../constants.js": [
-      "ANALYSIS_CONTEXT_CHAR_CAP",
-      "API_MAX_RETRIES",
-      "API_RETRY_BACKOFF_MAX_MS",
-      "API_TIMEOUT",
-      "BOOTSTRAP_CONFIRMATION_DELAY_MS",
-      "BOOTSTRAP_TOKEN_THRESHOLD_MS",
-      "CHECK_RUNAWAY_CONSECUTIVE_FAILURES",
-      "CHECK_RUNAWAY_MIN_INVOCATIONS",
-      "CLAUDE_RESULT_GRACE_MS",
-      "CLAUDE_STREAM_STALL_MS",
-      "CLAUDE_TIMEOUT_MS",
-      "CLAUDE_TIMEOUT_MS_BY_EFFORT",
-      "CLONE_MAX_RETRIES",
-      "CLONE_RETRY_BASE_DELAY",
-      "CONFLICT_CHECK_TIMEOUT",
-      "DECLARED_BUILD_TIMEOUT",
-      "DEFAULT_CLONE_DEPTH",
-      "FIX_LOOP_DIFF_REVERT_THRESHOLD",
-      "FIX_LOOP_JACCARD_THRESHOLD",
-      "FRONTEND_NPM_TIMEOUT",
-      "GENERIC_PROBE_TIMEOUT",
-      "GIT_CLONE_TIMEOUT",
-      "GREENFIELD_SOURCE_FILE_THRESHOLD",
-      "HEARTBEAT_API_MAX_RETRIES",
-      "HEARTBEAT_API_TIMEOUT",
-      "HEARTBEAT_INFLIGHT_DEADLINE",
-      "HEARTBEAT_INTERVAL",
-      "LLM_NO_PROGRESS_STALL_MS",
-      "LOGS_MAX_LENGTH",
-      "LOG_TAIL_BYTES",
-      "MAX_CLAUDE_CHECK_INVOCATIONS",
-      "MAX_LINT_FIX_ATTEMPTS",
-      "MAX_LOG_BUFFER",
-      "MAX_OUTPUT_BYTES",
-      "MAX_SELF_REVIEW_ATTEMPTS",
-      "MAX_TEST_FIX_ATTEMPTS",
-      "MEDIUM_ANALYSIS_PLAN_FILE_LIMIT",
-      "PARALLEL_FIX_THRESHOLDS",
-      "PARALLEL_REVIEW_THRESHOLDS",
-      "PUSH_FORCE_WITH_LEASE_MAX_RETRIES",
-      "PUSH_FORCE_WITH_LEASE_RETRY_DELAY",
-      "SCOPE_OVERFLOW_THRESHOLDS",
-      "STALE_RESULT_MAX_AGE_MS",
-      "STALE_RESULT_MAX_ATTEMPTS",
-      "STALE_RESULT_RETRY_BASE_MS",
-      "STALE_RESULT_RETRY_MAX_MS",
-      "STDERR_TAIL_BYTES",
-      "TEST_BASELINE_DOCKER_TIMEOUT",
-      "TEST_BASELINE_TIMEOUT",
-      "TEST_RUNNER_DOCKER_TIMEOUT",
-      "TEST_RUNNER_TIMEOUT",
-      "TOKEN_REFRESH_CEILING_MS",
-      "TOKEN_REFRESH_FLOOR_MS",
-      "TOKEN_REFRESH_FRACTION",
-      "TOOL_USE_STALL_TIMEOUT_MS",
-      "WITHIN_CHUNK_YIELD_LINES",
-      "WITHIN_CHUNK_YIELD_MS",
-      "WORKFLOW_TOOL_NAME_PATTERNS",
-      "WORKFLOW_TOOL_STALL_TIMEOUT_MS",
-      "claudeTimeoutForEffort",
-      "isWorkflowToolName",
-      "shouldFanOutFix",
-      "shouldFanOutReview"
-    ],
     "../index.js": [
       "AUTH_MODE",
       "AuthFailureError",
@@ -3395,6 +3357,7 @@
       "matchesVmConfigMissing",
       "missingProviderConfigFiles",
       "missingVmProviderConfigFiles",
+      "normalizeClaudeConfigContent",
       "normalizePytestSelectorForRunner",
       "parseFailingTests",
       "parseFailingTestsFromVitestJson",
@@ -3447,11 +3410,6 @@
       "testFixLoop",
       "validateBranchName"
     ],
-    "../processTracking.js": [
-      "_getRegisteredPids",
-      "clearPidRegistry",
-      "killAllChildren"
-    ],
     "../token-file.js": [
       "AGENT_TOKEN_FILE_ENV",
       "GITHUB_TOKEN_FILE_ENV",
@@ -3464,6 +3422,76 @@
       "jsonStrShellFn",
       "writeGithubTokenFile"
     ],
+    "../constants.js": [
+      "ANALYSIS_CONTEXT_CHAR_CAP",
+      "API_MAX_RETRIES",
+      "API_RETRY_BACKOFF_MAX_MS",
+      "API_TIMEOUT",
+      "BOOTSTRAP_CONFIRMATION_DELAY_MS",
+      "BOOTSTRAP_TOKEN_THRESHOLD_MS",
+      "CHECK_RUNAWAY_CONSECUTIVE_FAILURES",
+      "CHECK_RUNAWAY_MIN_INVOCATIONS",
+      "CLAUDE_RESULT_GRACE_MS",
+      "CLAUDE_STREAM_STALL_MS",
+      "CLAUDE_TIMEOUT_MS",
+      "CLAUDE_TIMEOUT_MS_BY_EFFORT",
+      "CLONE_MAX_RETRIES",
+      "CLONE_RETRY_BASE_DELAY",
+      "CONFLICT_CHECK_TIMEOUT",
+      "DECLARED_BUILD_TIMEOUT",
+      "DEFAULT_CLONE_DEPTH",
+      "FIX_LOOP_DIFF_REVERT_THRESHOLD",
+      "FIX_LOOP_JACCARD_THRESHOLD",
+      "FRONTEND_NPM_TIMEOUT",
+      "GENERIC_PROBE_TIMEOUT",
+      "GIT_CLONE_TIMEOUT",
+      "GREENFIELD_SOURCE_FILE_THRESHOLD",
+      "HEARTBEAT_API_MAX_RETRIES",
+      "HEARTBEAT_API_TIMEOUT",
+      "HEARTBEAT_INFLIGHT_DEADLINE",
+      "HEARTBEAT_INTERVAL",
+      "LLM_NO_PROGRESS_STALL_MS",
+      "LOGS_MAX_LENGTH",
+      "LOG_TAIL_BYTES",
+      "MAX_CLAUDE_CHECK_INVOCATIONS",
+      "MAX_LINT_FIX_ATTEMPTS",
+      "MAX_LOG_BUFFER",
+      "MAX_OUTPUT_BYTES",
+      "MAX_SELF_REVIEW_ATTEMPTS",
+      "MAX_TEST_FIX_ATTEMPTS",
+      "MEDIUM_ANALYSIS_PLAN_FILE_LIMIT",
+      "PARALLEL_FIX_THRESHOLDS",
+      "PARALLEL_REVIEW_THRESHOLDS",
+      "PUSH_FORCE_WITH_LEASE_MAX_RETRIES",
+      "PUSH_FORCE_WITH_LEASE_RETRY_DELAY",
+      "SCOPE_OVERFLOW_THRESHOLDS",
+      "STALE_RESULT_MAX_AGE_MS",
+      "STALE_RESULT_MAX_ATTEMPTS",
+      "STALE_RESULT_RETRY_BASE_MS",
+      "STALE_RESULT_RETRY_MAX_MS",
+      "STDERR_TAIL_BYTES",
+      "TEST_BASELINE_DOCKER_TIMEOUT",
+      "TEST_BASELINE_TIMEOUT",
+      "TEST_RUNNER_DOCKER_TIMEOUT",
+      "TEST_RUNNER_TIMEOUT",
+      "TOKEN_REFRESH_CEILING_MS",
+      "TOKEN_REFRESH_FLOOR_MS",
+      "TOKEN_REFRESH_FRACTION",
+      "TOOL_USE_STALL_TIMEOUT_MS",
+      "WITHIN_CHUNK_YIELD_LINES",
+      "WITHIN_CHUNK_YIELD_MS",
+      "WORKFLOW_TOOL_NAME_PATTERNS",
+      "WORKFLOW_TOOL_STALL_TIMEOUT_MS",
+      "claudeTimeoutForEffort",
+      "isWorkflowToolName",
+      "shouldFanOutFix",
+      "shouldFanOutReview"
+    ],
+    "../processTracking.js": [
+      "_getRegisteredPids",
+      "clearPidRegistry",
+      "killAllChildren"
+    ],
     "./runners.js": [
       "AUTH_MODE",
       "AuthFailureError",
@@ -3474,6 +3502,7 @@
       "RateLimitError",
       "RuntimeUnavailableError",
       "VmConfigMissingError",
+      "__resetClaudeCapabilityCacheForTesting",
       "__setCommandExistsOverrideForSmoke",
       "__setRunClaudeCodeOverrideForSmoke",
       "_setLastProviderRunErrorReportForTesting",
@@ -3486,27 +3515,18 @@
       "matchesVmConfigMissing",
       "missingProviderConfigFiles",
       "parseLLMCliTranslation",
+      "probeClaudeCapabilities",
       "providerAutoInjectsClaudeMd",
       "providerSupportsNativeSubagents",
       "provisionAmbientHelpers",
       "refreshRuntimeState",
       "requiredProviderConfigFiles",
       "runClaudeCode",
-      "runProviderAgent"
+      "runProviderAgent",
+      "stripUnsupportedClaudeOptionalArgs"
     ]
   },
   "providers/runners.test.ts": {
-    "../fix-loop-events.js": [
-      "_peekCheckOutcomesForTesting",
-      "_peekFixLoopEventBufferForTesting",
-      "_resetFixLoopEventStateForTesting",
-      "drainFixLoopEventBuffer",
-      "fingerprintHash",
-      "pushFixLoopEvent",
-      "requeueFixLoopEvents",
-      "resetCheckSynthesizerState",
-      "synthesizeCheckFixLoopEvents"
-    ],
     "../index.js": [
       "AUTH_MODE",
       "AuthFailureError",
@@ -3601,6 +3621,7 @@
       "matchesVmConfigMissing",
       "missingProviderConfigFiles",
       "missingVmProviderConfigFiles",
+      "normalizeClaudeConfigContent",
       "normalizePytestSelectorForRunner",
       "parseFailingTests",
       "parseFailingTestsFromVitestJson",
@@ -3648,6 +3669,17 @@
       "testFixLoop",
       "validateBranchName"
     ],
+    "../fix-loop-events.js": [
+      "_peekCheckOutcomesForTesting",
+      "_peekFixLoopEventBufferForTesting",
+      "_resetFixLoopEventStateForTesting",
+      "drainFixLoopEventBuffer",
+      "fingerprintHash",
+      "pushFixLoopEvent",
+      "requeueFixLoopEvents",
+      "resetCheckSynthesizerState",
+      "synthesizeCheckFixLoopEvents"
+    ],
     "../processTracking.js": [
       "_getRegisteredPids",
       "clearPidRegistry",
@@ -3687,6 +3719,7 @@
       "buildCodeChangeHelperGuidance",
       "buildContextPrefix",
       "buildFileTree",
+      "buildGreenfieldCitationGuidance",
       "buildRepoMap",
       "buildRetryContext",
       "buildScopedLintOneliner",
@@ -3696,7 +3729,6 @@
       "configureAgentPermissions",
       "configureResidentAgentPermissions",
       "countSourceFiles",
-      "buildGreenfieldCitationGuidance",
       "detectGreenfield",
       "detectLinterKind",
       "discoverAffectedConsumers",
@@ -3737,14 +3769,6 @@
     ]
   },
   "utils/agent-token.test.ts": {
-    "../git-credential.js": [
-      "GH_CREDENTIAL_HELPER_PATH_ENV",
-      "GH_READ_TOKEN_FILE_ENV",
-      "GIT_TOKEN_REFRESH_MS",
-      "ensureGitCredentialHelperScript",
-      "gitCredentialHelperPath",
-      "gitTokenFilePath"
-    ],
     "../token-file.js": [
       "AGENT_TOKEN_FILE_ENV",
       "GITHUB_TOKEN_FILE_ENV",
@@ -3756,21 +3780,17 @@
       "githubTokenShellFn",
       "jsonStrShellFn",
       "writeAgentTokenFile"
+    ],
+    "../git-credential.js": [
+      "GH_CREDENTIAL_HELPER_PATH_ENV",
+      "GH_READ_TOKEN_FILE_ENV",
+      "GIT_TOKEN_REFRESH_MS",
+      "ensureGitCredentialHelperScript",
+      "gitCredentialHelperPath",
+      "gitTokenFilePath"
     ]
   },
   "utils/test-fix-loop.test.ts": {
-    "../fix-loop-events.js": [
-      "_peekCheckOutcomesForTesting",
-      "_peekFixLoopEventBufferForTesting",
-      "_resetFixLoopEventStateForTesting",
-      "drainFixLoopEventBuffer",
-      "getCheckRunawayStatus",
-      "isCheckInvocation",
-      "recordCheckOutcome",
-      "requeueFixLoopEvents",
-      "resetCheckSynthesizerState",
-      "synthesizeCheckFixLoopEvents"
-    ],
     "../index.js": [
       "AUTH_MODE",
       "AuthFailureError",
@@ -3865,6 +3885,7 @@
       "matchesVmConfigMissing",
       "missingProviderConfigFiles",
       "missingVmProviderConfigFiles",
+      "normalizeClaudeConfigContent",
       "normalizePytestSelectorForRunner",
       "parseFailingTests",
       "parseFailingTestsFromVitestJson",
@@ -3929,6 +3950,7 @@
       "RateLimitError",
       "RuntimeUnavailableError",
       "VmConfigMissingError",
+      "__resetClaudeCapabilityCacheForTesting",
       "__setCommandExistsOverrideForSmoke",
       "__setRunClaudeCodeOverrideForSmoke",
       "_setLastProviderRunErrorReportForTesting",
@@ -3942,29 +3964,32 @@
       "matchesVmConfigMissing",
       "missingProviderConfigFiles",
       "parseLLMCliTranslation",
+      "probeClaudeCapabilities",
       "providerAutoInjectsClaudeMd",
       "providerSupportsNativeSubagents",
       "provisionAmbientHelpers",
       "refreshRuntimeState",
       "requiredProviderConfigFiles",
-      "runProviderAgent"
+      "runProviderAgent",
+      "stripUnsupportedClaudeOptionalArgs"
+    ],
+    "../fix-loop-events.js": [
+      "_peekCheckOutcomesForTesting",
+      "_peekFixLoopEventBufferForTesting",
+      "_resetFixLoopEventStateForTesting",
+      "drainFixLoopEventBuffer",
+      "getCheckRunawayStatus",
+      "isCheckInvocation",
+      "recordCheckOutcome",
+      "requeueFixLoopEvents",
+      "resetCheckSynthesizerState",
+      "synthesizeCheckFixLoopEvents"
     ],
     "./diff-detection.js": [
       "jaccardSimilarity"
     ]
   },
   "workspacePrep.test.ts": {
-    "../index.js": [
-      "getOperatorDecisionCaptureTelemetry",
-      "recordOperatorDecisionCapture",
-      "resetOperatorDecisionCaptureTelemetry"
-    ],
-    "./git-credential.js": [
-      "GH_CREDENTIAL_HELPER_PATH_ENV",
-      "GH_READ_TOKEN_FILE_ENV",
-      "GIT_TOKEN_REFRESH_MS",
-      "gitTokenFilePath"
-    ],
     "./index.js": [
       "AUTH_MODE",
       "AuthFailureError",
@@ -4061,6 +4086,7 @@
       "matchesVmConfigMissing",
       "missingProviderConfigFiles",
       "missingVmProviderConfigFiles",
+      "normalizeClaudeConfigContent",
       "normalizePytestSelectorForRunner",
       "parseFailingTests",
       "parseFailingTestsFromVitestJson",
@@ -4115,6 +4141,12 @@
       "strVal",
       "testFixLoop",
       "validateBranchName"
+    ],
+    "./git-credential.js": [
+      "GH_CREDENTIAL_HELPER_PATH_ENV",
+      "GH_READ_TOKEN_FILE_ENV",
+      "GIT_TOKEN_REFRESH_MS",
+      "gitTokenFilePath"
     ]
   }
 }

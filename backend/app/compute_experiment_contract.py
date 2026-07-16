@@ -376,14 +376,8 @@ def _validate_compute_launch_contract(
 
     input_artifact_job_id = contract.get("input_artifact_job_id")
     if input_artifact_job_id is not None:
-        if no_progress_timeout is None or npt <= 0:
-            return False, (
-                "input_artifact_job_id requires an explicit positive "
-                "no_progress_timeout_seconds watchdog"
-            )
-        # Shape check only — the orchestrator does the authoritative same-project +
-        # bundle-exists validation at create_compute_job time (needs the DB). Here we
-        # only reject an obviously-malformed UUID so a bad reference is caught early.
+        # Shape-check first so malformed direct-dispatch payloads retain their
+        # actionable UUID diagnostic rather than being masked by the resume guard.
         try:
             uuid.UUID(str(input_artifact_job_id))
         except (ValueError, AttributeError, TypeError):
@@ -392,6 +386,18 @@ def _validate_compute_launch_contract(
                 f"input_artifact_job_id must be a UUID string "
                 f"({input_artifact_job_id!r})",
             )
+        if no_progress_timeout is None:
+            return (
+                False,
+                "resumed compute experiments require no_progress_timeout_seconds",
+            )
+        if not (isinstance(declared_metric, str) and declared_metric.strip()):
+            return (
+                False,
+                "resumed compute experiments require a declared_metric for the watchdog",
+            )
+        # The orchestrator performs authoritative same-project + bundle-exists
+        # validation at create_compute_job time (it has the DB session).
 
     env = contract.get("env")
     if env is not None:
@@ -493,19 +499,20 @@ async def validate_compute_runner_target_enrollment(
     project_id: Any,
     runner_target: dict[str, Any],
 ) -> dict[str, Any] | None:
-    """Check a shape-valid ``runner_target`` against the project's enrolled runners.
+    """Check a shape-valid ``runner_target`` against the project's runner allow-list.
 
-    Returns ``None`` when the pinned runner exists AND is enrolled in
-    ``project_id``, else a machine-readable 422 detail dict::
+    Returns ``None`` when the pinned runner exists AND is on ``project_id``'s
+    allow-list (enrollment project or a secondary binding), else a machine-readable
+    422 detail dict::
 
         {"error": "runner_target_invalid", "reason_code": "not_found"|"not_enrolled",
          "runner_id": "<id>", "message": "..."}
 
-    Liveness is deliberately NOT checked here — an offline-but-enrolled runner
+    Liveness is deliberately NOT checked here — an offline-but-allowed runner
     is a valid authoring target (a soft pin falls through at dispatch; a strict
-    pin holds with an explicit reason until the runner comes back). Cross-project
-    runner ids are rejected at authoring time so a typo'd or stale id fails the
-    launch with a clear 422 instead of silently never dispatching.
+    pin holds with an explicit reason until the runner comes back). A runner not
+    on the project's allow-list is rejected at authoring time so a typo'd or stale
+    id fails the launch with a clear 422 instead of silently never dispatching.
     """
     from app.models import LocalRunner  # local import keeps this module neutral
 
@@ -521,14 +528,16 @@ async def validate_compute_runner_target_enrollment(
                 "registered runner"
             ),
         }
-    if runner.project_id != project_id:
+    from app.runner_project_binding import allowed_project_ids
+
+    if project_id not in await allowed_project_ids(session, runner):
         return {
             "error": "runner_target_invalid",
             "reason_code": "not_enrolled",
             "runner_id": runner_id,
             "message": (
-                f"runner {runner_id} is not enrolled in this project — "
-                "runner_target must name one of the project's enrolled runners"
+                f"runner {runner_id} is not on this project's allow-list — "
+                "runner_target must name one of the project's runners"
             ),
         }
     return None

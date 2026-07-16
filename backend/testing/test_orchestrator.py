@@ -702,6 +702,196 @@ def test_idle_runner_dispatch_rotates_across_ties():
     )
 
 
+def _passing_project_verification() -> dict:
+    return {
+        "version": 1,
+        "boundary": {"class": "agent", "backend": "bwrap"},
+        "ready": True,
+        "probes": {
+            "ruff": {"ok": True, "exit_code": 0},
+            "docker_postgres": {"ok": True, "exit_code": 0},
+        },
+    }
+
+
+_BACKEND_VERIFICATION_BUILD_CONFIG = {"directories": [{
+    "path": "backend", "type": "python", "lint_cmd": "ruff check .",
+    "test_cmd": "python3 -m pytest",
+    "project_verification": {
+        "protocol": "blueprint-v1", "harness": "scripts/test-backend.sh"
+    },
+}]}
+
+
+def test_project_verification_requirement_comes_from_capability_and_build_config():
+    from app.runner_eligibility import (
+        _project_backend_verification_directories,
+        _task_requires_project_verification,
+    )
+
+    config = _BACKEND_VERIFICATION_BUILD_CONFIG
+    assert _project_backend_verification_directories(config) == ("backend",)
+    assert _task_requires_project_verification("create", config) is True
+    assert _task_requires_project_verification("fix", config) is True
+    assert _task_requires_project_verification("research", config) is False
+    assert _task_requires_project_verification("compute_experiment", config) is False
+    canonicalized = {"directories": [{
+        **config["directories"][0],
+        "path": " backend/// ",
+    }]}
+    assert _project_backend_verification_directories(canonicalized) == ("backend",)
+    unsafe_harness = {"directories": [{
+        **config["directories"][0],
+        "project_verification": {
+            "protocol": "blueprint-v1", "harness": "scripts/test backend.sh",
+        },
+    }]}
+    assert _project_backend_verification_directories(unsafe_harness) == ()
+    without_pytest = {
+        "directories": [
+            {"path": "backend", "type": "python", "lint_cmd": "ruff check ."}
+        ]
+    }
+    assert _task_requires_project_verification("create", without_pytest) is False
+
+    for path in (".", "services/api", "service"):
+        ordinary_project = {"directories": [{
+            "path": path, "type": "python", "lint_cmd": "ruff check .",
+            "test_cmd": "pytest",
+        }]}
+        assert _project_backend_verification_directories(ordinary_project) == ()
+        assert _task_requires_project_verification("create", ordinary_project) is False
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda report: report.pop("probes"),
+        lambda report: report.update(version=0),
+        lambda report: report.update(version=True),
+        lambda report: report["boundary"].update(backend="declined"),
+        lambda report: report["probes"]["ruff"].update(exit_code=1),
+        lambda report: report["probes"]["docker_postgres"].update(ok=False),
+    ],
+)
+def test_runner_project_verification_rejects_old_malformed_or_failed_reports(
+    mutation,
+):
+    from app.runner_eligibility import (
+        RunnerDispatchSnapshot,
+        _runner_has_project_verification,
+    )
+
+    report = _passing_project_verification()
+    mutation(report)
+    runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        capabilities={"project_verification": report},
+    )
+    assert _runner_has_project_verification(runner) is False
+
+
+def test_select_eligible_runner_filters_only_when_project_verification_required():
+    from app.orchestrator_runner_dispatch import (
+        RunnerDispatchSnapshot,
+        _select_eligible_runner,
+    )
+
+    project_id = uuid.uuid4()
+    incapable = RunnerDispatchSnapshot(
+        uuid.uuid4(), project_id, {"task_types": "all"}
+    )
+    capable = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "project_verification": _passing_project_verification(),
+        },
+    )
+    cache = {project_id: [incapable, capable]}
+    selected = _select_eligible_runner(
+        cache,
+        project_id,
+        "create",
+        None,
+        {},
+        requires_project_verification=True,
+    )
+    assert selected is not None
+    assert selected.id == capable.id
+
+    for task_type in ("research", "compute_experiment"):
+        selected_legacy = _select_eligible_runner(
+            {project_id: [incapable]}, project_id, task_type, None, {}
+        )
+        assert selected_legacy is not None
+        assert selected_legacy.id == incapable.id
+
+
+@pytest.mark.asyncio
+async def test_strict_pin_diagnosis_names_missing_project_verification(db_session):
+    from app.orchestrator_runner_dispatch import (
+        RunnerDispatchSnapshot,
+        _diagnose_strict_runner_pin_hold,
+    )
+
+    project_id = uuid.uuid4()
+    runner = RunnerDispatchSnapshot(
+        uuid.uuid4(), project_id, {"task_types": "all", "max_concurrent": 1}
+    )
+    reason, detail = await _diagnose_strict_runner_pin_hold(
+        db_session,
+        {project_id: [runner]},
+        project_id,
+        str(runner.id),
+        "create",
+        None,
+        None,
+        {},
+        requires_project_verification=True,
+    )
+    assert reason == "missing_project_verification"
+    assert "python3 -m ruff" in detail
+    assert "Docker/Postgres" in detail
+
+
+@pytest.mark.asyncio
+async def test_try_runner_dispatch_falls_through_to_cloud_without_verification(
+    db_session,
+):
+    from app.orchestrator_runner_dispatch import (
+        RunnerDispatchSnapshot,
+        _try_runner_dispatch,
+    )
+
+    project = make_project(name="verified-authoring", user_id=_TEST_USER)
+    project.build_config = _BACKEND_VERIFICATION_BUILD_CONFIG
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create", "prompt": "author backend"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    incapable = RunnerDispatchSnapshot(
+        uuid.uuid4(), project.id, {"task_types": "all", "max_concurrent": 1}
+    )
+
+    dispatched = await _try_runner_dispatch(
+        db_session, task, {project.id: [incapable]}, {}
+    )
+
+    assert dispatched is False
+    assert task.status == TaskStatus.QUEUED
+    assert (task.context or {}).get("runner_target_id") is None
+
+
 # ── Container-capability gating in runner dispatch ─────────────────────────────
 
 
@@ -9857,6 +10047,63 @@ class TestCrossBaseDependencyGate:
         )
 
     @pytest.mark.asyncio
+    async def test_sibling_plan_dep_eligible_after_shared_research_rollup(
+        self, db_session
+    ):
+        """A sibling plan must not wait for the outer research rollup.
+
+        The dependency's plan parent has already merged into the exact research
+        branch both plans share. Waiting for integration would deadlock the
+        research parent on the still-queued sibling.
+        """
+        from app.orchestrator import _check_candidate_task_deps
+        from app.landed_signal import mark_unblocked_non_merge
+
+        project = make_project(name="SharedResearchBase", user_id="u1")
+        db_session.add(project)
+        await db_session.commit()
+
+        dep_plan = make_task(
+            project_id=project.id,
+            payloads=[{"type": "plan", "base_branch": "research/shared"}],
+            context={
+                "plan_branch": "plan/dep",
+                "parent_base": "research/shared",
+            },
+            status=TaskStatus.COMPLETED,
+        )
+        mark_unblocked_non_merge(
+            dep_plan, reason="merged_pr_non_integration_branch"
+        )
+        db_session.add(dep_plan)
+        await db_session.commit()
+
+        dep = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "plan/dep"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.COMPLETED,
+            parent_task_id=dep_plan.id,
+        )
+        mark_unblocked_non_merge(dep, reason="merged_pr_non_integration_branch")
+        dependent = make_task(
+            project_id=project.id,
+            payloads=[{"type": "fix", "base_branch": "plan/dependent"}],
+            context={
+                "related_files": ["backend/app/foo.py"],
+                "parent_base": "research/shared",
+            },
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add_all([dep, dependent])
+        await db_session.commit()
+
+        result, _ = await _check_candidate_task_deps(
+            dependent, [dep], [dep.id], db_session, self._verify_true
+        )
+        assert result == "eligible"
+
+    @pytest.mark.asyncio
     async def test_force_dropped_dep_held_even_when_lineage_parent_landed(
         self, db_session
     ):
@@ -10010,6 +10257,73 @@ class TestCrossBaseBaseRecut:
         _, kwargs = merge_mock.await_args
         assert kwargs.get("base") == "plan/bbb"
         assert kwargs.get("head") == "main"
+
+    @pytest.mark.asyncio
+    async def test_sibling_plan_base_merges_shared_research_branch(
+        self, db_session, mocker
+    ):
+        from app.orchestrator_health import ensure_dependent_base_recut
+        from app.landed_signal import mark_unblocked_non_merge
+
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("tok", "owner", "repo"),
+        )
+        merge_mock = mocker.patch(
+            "app.github.merge_branch",
+            new_callable=AsyncMock,
+            return_value={"merged": True, "already": False},
+        )
+        project = make_project(
+            name="SharedResearchRecut",
+            user_id="u1",
+            integration_branch="automain",
+        )
+        db_session.add(project)
+        await db_session.commit()
+
+        dep_plan = make_task(
+            project_id=project.id,
+            payloads=[{"type": "plan", "base_branch": "research/shared"}],
+            context={
+                "plan_branch": "plan/dep",
+                "parent_base": "research/shared",
+            },
+            status=TaskStatus.COMPLETED,
+        )
+        mark_unblocked_non_merge(
+            dep_plan, reason="merged_pr_non_integration_branch"
+        )
+        db_session.add(dep_plan)
+        await db_session.commit()
+
+        dep = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "plan/dep"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.COMPLETED,
+            parent_task_id=dep_plan.id,
+        )
+        mark_unblocked_non_merge(dep, reason="merged_pr_non_integration_branch")
+        dependent = make_task(
+            project_id=project.id,
+            payloads=[{"type": "fix", "base_branch": "plan/dependent"}],
+            context={
+                "related_files": ["backend/app/foo.py"],
+                "parent_base": "research/shared",
+            },
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add_all([dep, dependent])
+        await db_session.commit()
+
+        assert await ensure_dependent_base_recut(
+            dependent, [dep], db_session
+        ) is True
+        _, kwargs = merge_mock.await_args
+        assert kwargs["base"] == "plan/dependent"
+        assert kwargs["head"] == "research/shared"
 
     @pytest.mark.asyncio
     async def test_merge_conflict_holds_dependent(self, db_session, mocker):

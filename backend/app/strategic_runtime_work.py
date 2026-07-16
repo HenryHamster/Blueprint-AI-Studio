@@ -24,6 +24,7 @@ from app.models import (
     WakeDeliveryState,
 )
 from app.routers.admin_runners import _RUNNER_LIVENESS_SECONDS, _runner_health
+from app.runner_project_binding import runner_allowed_for_project
 from app.task_capabilities import STRATEGIC_TASK_TYPES
 from app.time_utils import _utcnow
 from app.workbench_state import (
@@ -713,7 +714,7 @@ async def build_strategic_runtime_summary(
         await session.execute(
             select(LocalRunner)
             .where(
-                LocalRunner.project_id == project_id,
+                runner_allowed_for_project(project_id),
                 LocalRunner.status != "deleted",
             )
             .order_by(

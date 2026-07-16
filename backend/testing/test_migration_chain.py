@@ -1,6 +1,8 @@
 """Tests for the DB-free Alembic migration-chain helpers and the rollup
 auto-merge guard that consumes them."""
 
+import ast
+from pathlib import Path
 from unittest.mock import patch
 
 from app.migration_chain import (
@@ -45,6 +47,41 @@ def _added_file_diff(path: str, revision: str, down_revision: str | None) -> str
     )
 
 
+def test_migration_files_do_not_import_app_modules():
+    """Candidate migrations run in the serving process during promotion checks."""
+    versions_dir = Path(__file__).resolve().parents[1] / "alembic" / "versions"
+    # These two older, applied data migrations predate the promotion apply gate.
+    # Keep the exception explicit: all new migration imports must be caught.
+    legacy_offenders = {
+        "0472_encrypt_oauth_token.py",
+        "0531_backfill_encrypted_columns.py",
+    }
+    offenders = [
+        path.name
+        for path in versions_dir.glob("*.py")
+        if path.name not in legacy_offenders
+        and any(
+            (
+                isinstance(node, ast.ImportFrom)
+                and node.module is not None
+                and (node.module == "app" or node.module.startswith("app."))
+            )
+            or (
+                isinstance(node, ast.Import)
+                and any(
+                    name.name == "app" or name.name.startswith("app.")
+                    for name in node.names
+                )
+            )
+            for node in ast.walk(ast.parse(path.read_text()))
+        )
+    ]
+    assert offenders == [], (
+        "Alembic migrations must not import app modules: the promotion apply gate "
+        "executes candidate migrations in the serving process, where app imports "
+        "resolve against the serving tree rather than the candidate. "
+        f"Offenders: {offenders}"
+    )
 # ── Pure helper ─────────────────────────────────────────────────────────────
 
 

@@ -894,6 +894,20 @@ _PACKER_MEMO_SMOKE = _AGENT_DIR / "src" / "handlers" / "memo-bake-smoke.ts"
 _PACKER_CODEX_SMOKE = _AGENT_DIR / "src" / "handlers" / "memo-bake-smoke-codex.ts"
 _PACKER_PRIMARY_SMOKE = _AGENT_DIR / "src" / "handlers" / "memo-bake-smoke-primary.ts"
 _PACKER_REOPEN_SMOKE = _AGENT_DIR / "src" / "handlers" / "memo-bake-smoke-reopen.ts"
+_PROJECT_VERIFICATION_PROBE = (
+    Path(__file__).resolve().parent.parent.parent
+    / "scripts"
+    / "project-verification-probe.sh"
+)
+_BLUEPRINT_ROOT = Path(__file__).resolve().parent.parent.parent
+if not (_BLUEPRINT_ROOT / "check").exists() and Path("/repo/check").exists():
+    _BLUEPRINT_ROOT = Path("/repo")
+_PROJECT_VERIFICATION_PROBE = _BLUEPRINT_ROOT / "scripts" / "project-verification-probe.sh"
+_BACKEND_TEST_HARNESS = _BLUEPRINT_ROOT / "scripts" / "test-backend.sh"
+_BACKEND_VERIFICATION_FRAGMENT = (
+    _BLUEPRINT_ROOT / "agent" / "src" / "prompts" / "check_backend_verification.sh"
+)
+_TRACKED_CHECK = _BLUEPRINT_ROOT / "check"
 
 
 def _read_packer_hcl() -> str:
@@ -923,6 +937,25 @@ def test_packer_requires_codex_cli_with_gpt_5_6_picker():
     assert "exit 1; }" in gate
 
 
+def test_packer_pins_claude_cli_with_version_gate():
+    hcl = _read_packer_hcl()
+    install = next(
+        line.strip()
+        for line in hcl.splitlines()
+        if "npm install -g" in line and "@anthropic-ai/claude-code" in line
+    )
+    assert "@anthropic-ai/claude-code@2.1.197" in install
+    gate = next(
+        line.strip()
+        for line in hcl.splitlines()
+        if "Claude Code 2.1.197 required for fleet config compatibility" in line
+    )
+    assert gate.startswith('"claude_version=$(claude --version | awk')
+    assert "awk '{print $1}'" in gate
+    assert 'test \\"$claude_version\\" = 2.1.197' in gate
+    assert "exit 1; }" in gate
+
+
 def test_agent_dockerfile_pins_and_starts_codex_native_binary():
     if not _AGENT_DOCKERFILE.exists():
         pytest.skip("agent/Dockerfile not present (backend-only Docker run)")
@@ -931,6 +964,9 @@ def test_agent_dockerfile_pins_and_starts_codex_native_binary():
     assert "npm install -g --include=optional" in dockerfile
     assert 'codex --version' in dockerfile
     assert 'test "${codex_version}" = "${CODEX_VERSION}"' in dockerfile
+    assert "ARG CLAUDE_CODE_VERSION=2.1.197" in dockerfile
+    assert 'claude --version' in dockerfile
+    assert 'test "${claude_version}" = "${CLAUDE_CODE_VERSION}"' in dockerfile
 
 
 def _read_packer_memo_smoke() -> str:
@@ -1827,6 +1863,98 @@ class TestPackerBackendDepsBake:
             assert sentinel in hcl, (
                 f"agent.pkr.hcl must emit {sentinel} after a successful deps bake."
             )
+
+
+class TestProjectVerificationRuntimeContract:
+    """The heavy GCE boundary earns readiness from live agent-user probes."""
+
+    def test_probe_runs_ruff_and_live_postgres_query(self):
+        probe = _PROJECT_VERIFICATION_PROBE.read_text(encoding="utf-8")
+        assert "python3 -m ruff check" in probe
+        assert 'POSTGRES_BIN="$(pg_config --bindir)"' in probe
+        assert '"$POSTGRES_BIN/initdb"' in probe
+        assert "-c listen_addresses=''" in probe
+        assert '"$POSTGRES_BIN/pg_isready"' in probe
+        assert '"$POSTGRES_BIN/psql"' in probe
+        assert "docker image inspect" not in probe
+        assert "command -v docker" not in probe
+        assert "/var/run/docker.sock" not in probe
+
+    def test_packer_runs_probe_as_agent_before_success_sentinel(self):
+        hcl = _read_packer_hcl()
+        assert "python3-venv postgresql" in hcl
+        assert "python3 -m venv /opt/blueprint-backend-venv" in hcl
+        assert (
+            "/opt/blueprint-backend-venv/bin/pip install --no-cache-dir "
+            "-r /tmp/backend-deps-ctx/requirements.txt"
+        ) in hcl
+        install_idx = hcl.find(
+            "project-verification-probe.sh /opt/agent/bin/project-verification-probe.sh"
+        )
+        run_text = (
+            "sudo -u agent -H timeout --signal=TERM --kill-after=5s 120s "
+            "/opt/agent/bin/project-verification-probe.sh all"
+        )
+        run_idx = hcl.find(run_text)
+        ready_idx = hcl.find("PACKER_PROJECT_VERIFICATION_V1_OK")
+        assert install_idx != -1
+        assert run_idx > install_idx
+        assert ready_idx > run_idx
+        final_block = hcl[hcl.rfind('provisioner "shell"', 0, run_idx) : ready_idx]
+        assert '"set -eu"' in final_block
+
+    def test_boot_probes_precede_service_and_stamp_only_after_success(self):
+        for script in (_render_compute_startup_script(), _render_pool_startup_script()):
+            probe_idx = script.find(
+                "sudo -u agent -H /opt/agent/bin/project-verification-probe.sh all"
+            )
+            marker_idx = script.find("PROJECT_VERIFICATION_V1_READY")
+            service_idx = script.find("systemctl restart blueprint-agent")
+            assert probe_idx != -1
+            assert probe_idx < marker_idx < service_idx
+            assert "PROJECT_VERIFICATION_V1_FAILED" in script
+            assert '"docker_postgres":true' in script
+
+    def test_pool_cannot_report_clean_readiness_before_probe(self):
+        script = _render_pool_startup_script()
+        probe_idx = script.find(
+            "sudo -u agent -H /opt/agent/bin/project-verification-probe.sh all"
+        )
+        assert probe_idx != -1
+        assert '_send_vm_beacon "$' not in script[:probe_idx]
+        assert '"pre_claim_failure": "startup contract failed"' in script
+        assert script.find('_send_vm_beacon "$AGENT_TOKEN"') > probe_idx
+
+    def test_targeted_harness_evidence_rejects_non_postgres_or_skipped_runs(self):
+        harness = _BACKEND_TEST_HARNESS.read_text(encoding="utf-8")
+        assert "BLUEPRINT_VERIFICATION_RESULT_FILE" in harness
+        assert 'USE_TEST_POSTGRES:-' in harness
+        assert 'testing/test_*.py|testing/test_*.py::*' in harness
+        assert 'verification_selector_count" -le 8' in harness
+        assert '--junitxml="$verification_junit"' in harness
+        assert "tests>0 and skipped<tests and failures==0" in harness
+        assert '"postgres_sidecar":True' in harness
+        assert "--sandbox-postgres" in harness
+        assert "listen_addresses=''" in harness
+        assert "/opt/blueprint-backend-venv/bin/python" in harness
+
+    def test_generated_fragment_and_tracked_check_share_fail_closed_contract(self):
+        fragment = _BACKEND_VERIFICATION_FRAGMENT.read_text(encoding="utf-8")
+        tracked = _TRACKED_CHECK.read_text(encoding="utf-8")
+        for required in (
+            "python3 -m ruff check --select E,F,W --ignore E501",
+            "USE_TEST_POSTGRES=true bash",
+            "--sandbox-postgres",
+            "pg_config --bindir",
+            "no impacted pytest file/node",
+            "project_verification_receipt_",
+            "postgres_sidecar",
+        ):
+            assert required in fragment, f"generated fragment missing {required}"
+            assert required in tracked, f"tracked check missing {required}"
+        for forbidden in ("--standalone --no-postgres", "GATE-ENVIRONMENT"):
+            required_start = fragment.index("required backend-authoring verification")
+            assert forbidden not in fragment[required_start:]
 
 
 class TestVmSelfDestructTtl:

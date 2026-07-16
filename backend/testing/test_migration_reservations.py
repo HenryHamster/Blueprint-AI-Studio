@@ -74,6 +74,110 @@ async def test_allocates_above_head_and_anchors_to_head(db_session):
 
 
 @pytest.mark.asyncio
+async def test_task_base_head_overrides_stale_runtime_image_anchor(db_session, monkeypatch):
+    """A deployed 0530 image must reserve above the task base's 0564 chain."""
+    project = await _make_project(db_session)
+    project.github_owner = "acme"
+    project.github_repo = "widget"
+    db_session.add(project)
+    await db_session.commit()
+    task = await _make_task(db_session, project.id)
+    task.first_payload = {"base_branch": "release/next"}
+    db_session.add(task)
+    await db_session.commit()
+    monkeypatch.setattr(
+        migration_reservations, "_current_merged_head", lambda _: "0530"
+    )
+    lock_held = False
+
+    class TrackingLock:
+        async def __aenter__(self):
+            nonlocal lock_held
+            lock_held = True
+
+        async def __aexit__(self, *_args):
+            nonlocal lock_held
+            lock_held = False
+
+    monkeypatch.setattr(
+        migration_reservations, "_project_lock", lambda _: TrackingLock()
+    )
+
+    async def token(owner, repo):
+        assert (owner, repo) == ("acme", "widget")
+        return "read-token"
+
+    async def versions(token_value, owner, repo, ref, **kwargs):
+        assert not lock_held
+        assert token_value == "read-token"
+        assert (owner, repo, ref) == ("acme", "widget", "release/next")
+        assert kwargs["versions_dir"] == "backend/alembic/versions/"
+        return ["0530_runtime.py", "0564_task_base.py"]
+
+    monkeypatch.setattr("app.github_auth.get_repo_installation_read_token", token)
+    monkeypatch.setattr("app.github.list_versions_at_ref", versions)
+
+    reservation = await allocate_migration_reservation(db_session, task)
+
+    assert reservation.provisional_down_revision == "0564"
+    assert reservation.provisional_revision == "0565"
+
+
+@pytest.mark.asyncio
+async def test_task_base_lookup_uses_custom_path_and_review_base(db_session, monkeypatch):
+    project = await _make_project(db_session)
+    project.github_owner = "acme"
+    project.github_repo = "widget"
+    project.build_config = {"alembic_versions_path": "services/api/migrations"}
+    db_session.add(project)
+    await db_session.commit()
+    task = await _make_task(db_session, project.id)
+    task.context = {"review_loop": {"base_branch": "release/custom"}}
+    db_session.add(task)
+    await db_session.commit()
+
+    async def token(*_args):
+        return "read-token"
+
+    async def versions(*_args, **kwargs):
+        assert _args[3] == "release/custom"
+        assert kwargs["versions_dir"] == "services/api/migrations"
+        return ["0777_custom.py"]
+
+    monkeypatch.setattr("app.github_auth.get_repo_installation_read_token", token)
+    monkeypatch.setattr("app.github.list_versions_at_ref", versions)
+
+    reservation = await allocate_migration_reservation(db_session, task)
+
+    assert reservation.provisional_down_revision == "0777"
+    assert reservation.provisional_revision == "0778"
+
+
+@pytest.mark.asyncio
+async def test_task_base_lookup_failure_falls_back_to_local_head(db_session, monkeypatch):
+    project = await _make_project(db_session)
+    project.github_owner = "acme"
+    project.github_repo = "widget"
+    db_session.add(project)
+    await db_session.commit()
+    task = await _make_task(db_session, project.id)
+
+    async def token(*_args):
+        return "read-token"
+
+    async def unavailable(*_args, **_kwargs):
+        raise RuntimeError("GitHub unavailable")
+
+    monkeypatch.setattr("app.github_auth.get_repo_installation_read_token", token)
+    monkeypatch.setattr("app.github.list_versions_at_ref", unavailable)
+
+    reservation = await allocate_migration_reservation(db_session, task)
+
+    assert reservation.provisional_down_revision == "0151"
+    assert reservation.provisional_revision == "0152"
+
+
+@pytest.mark.asyncio
 async def test_considers_active_reservations_for_monotonic_numbering(db_session):
     project = await _make_project(db_session)
     task_a = await _make_task(db_session, project.id)

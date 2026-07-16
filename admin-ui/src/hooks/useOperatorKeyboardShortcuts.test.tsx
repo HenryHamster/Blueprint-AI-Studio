@@ -33,7 +33,6 @@ function Harness({
   setCommandPaletteOpen,
   setShortcutHelpOpen,
   setShowActivityFeed = vi.fn(),
-  setShowAlertsPopover = vi.fn(),
   setShowKnowledgeBrowser = vi.fn(),
   setShowResearchBrowser = vi.fn(),
   shortcutHelpOpen = false,
@@ -49,7 +48,6 @@ function Harness({
   setCommandPaletteOpen: (open: boolean) => void;
   setShortcutHelpOpen?: (open: boolean) => void;
   setShowActivityFeed?: (show: boolean) => void;
-  setShowAlertsPopover?: (show: boolean) => void;
   setShowKnowledgeBrowser?: (show: boolean) => void;
   setShowResearchBrowser?: (show: boolean) => void;
   shortcutHelpOpen?: boolean;
@@ -73,7 +71,6 @@ function Harness({
     setResearchBrowserDirectionId: vi.fn(),
     setShortcutHelpOpen,
     setShowActivityFeed,
-    setShowAlertsPopover,
     setShowKnowledgeBrowser,
     setShowResearchBrowser,
     shortcutHelpOpen,
@@ -115,7 +112,6 @@ describe('useOperatorKeyboardShortcuts', () => {
       searchShortcutBlocked?: boolean;
       setShortcutHelpOpen?: (open: boolean) => void;
       setShowActivityFeed?: (show: boolean) => void;
-      setShowAlertsPopover?: (show: boolean) => void;
       setShowKnowledgeBrowser?: (show: boolean) => void;
       setShowResearchBrowser?: (show: boolean) => void;
       shortcutHelpOpen?: boolean;
@@ -140,7 +136,6 @@ describe('useOperatorKeyboardShortcuts', () => {
           setCommandPaletteOpen={setCommandPaletteOpen}
           setShortcutHelpOpen={options.setShortcutHelpOpen}
           setShowActivityFeed={options.setShowActivityFeed}
-          setShowAlertsPopover={options.setShowAlertsPopover}
           setShowKnowledgeBrowser={options.setShowKnowledgeBrowser}
           setShowResearchBrowser={options.setShowResearchBrowser}
           shortcutHelpOpen={options.shortcutHelpOpen}
@@ -324,12 +319,10 @@ describe('useOperatorKeyboardShortcuts', () => {
 
   test('closes transient workbench panels with Escape', () => {
     const setShowActivityFeed = vi.fn();
-    const setShowAlertsPopover = vi.fn();
     const setShowKnowledgeBrowser = vi.fn();
     const setShowResearchBrowser = vi.fn();
     mount(false, false, {
       setShowActivityFeed,
-      setShowAlertsPopover,
       setShowKnowledgeBrowser,
       setShowResearchBrowser,
       transientPanelOpen: true,
@@ -338,7 +331,6 @@ describe('useOperatorKeyboardShortcuts', () => {
     const event = dispatchShortcut(document, { key: 'Escape', ctrlKey: false });
 
     expect(setShowActivityFeed).toHaveBeenCalledWith(false);
-    expect(setShowAlertsPopover).toHaveBeenCalledWith(false);
     expect(setShowKnowledgeBrowser).toHaveBeenCalledWith(false);
     expect(setShowResearchBrowser).toHaveBeenCalledWith(false);
     expect(event.defaultPrevented).toBe(true);

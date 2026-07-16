@@ -49,6 +49,8 @@ from app.routers.admin_runners import (
 )
 from app.routers.runner import (
     _FileRangeReader,
+    _MAX_MULTIPART_FIELD_BYTES,
+    _MAX_MULTIPART_PARTS,
     _parse_heartbeat_timestamp,
     _parse_multipart_form,
     _parse_multipart_form_stream,
@@ -5668,6 +5670,95 @@ class TestMultipartStreamParser:
         assert fields == {} and file_part is None
 
 
+class TestMultipartParserHardening:
+    """Security hardening: oversized fields and excessive boundary counts are rejected."""
+
+    @staticmethod
+    def _spool(body: bytes):
+        import io
+
+        return io.BytesIO(body)
+
+    @staticmethod
+    def _build_viewable_multipart(filename: str, file_bytes: bytes, *, field_overrides=None):
+        """Build a viewable-endpoint multipart body (filename field + file part)."""
+        boundary = "----test-boundary-hardening"
+        crlf = b"\r\n"
+        extra_fields = field_overrides or {}
+        body = bytearray()
+        # optional extra scalar fields (used to inject oversized content)
+        for name, value in extra_fields.items():
+            body += b"--" + boundary.encode() + crlf
+            body += f'Content-Disposition: form-data; name="{name}"'.encode() + crlf + crlf
+            body += value + crlf
+        body += b"--" + boundary.encode() + crlf
+        body += b'Content-Disposition: form-data; name="filename"' + crlf + crlf
+        body += filename.encode() + crlf
+        body += b"--" + boundary.encode() + crlf
+        body += b'Content-Disposition: form-data; name="file"; filename="plot.png"' + crlf
+        body += b"Content-Type: image/png" + crlf + crlf
+        body += file_bytes + crlf
+        body += b"--" + boundary.encode() + b"--" + crlf
+        return bytes(body), f"multipart/form-data; boundary={boundary}"
+
+    def test_stream_parser_rejects_oversized_non_file_field(self):
+        """A non-file scalar field exceeding _MAX_MULTIPART_FIELD_BYTES raises ValueError."""
+        oversized_value = b"x" * (_MAX_MULTIPART_FIELD_BYTES + 1)
+        body, ct = self._build_viewable_multipart(
+            "plot.png", b"PNG_BYTES", field_overrides={"extra": oversized_value}
+        )
+        with pytest.raises(ValueError, match=r"non-file field.*exceeds"):
+            _parse_multipart_form_stream(self._spool(body), ct)
+
+    def test_in_memory_parser_rejects_oversized_non_file_field(self):
+        """_parse_multipart_form also rejects oversized scalar fields."""
+        oversized_value = b"y" * (_MAX_MULTIPART_FIELD_BYTES + 1)
+        body, ct = self._build_viewable_multipart(
+            "plot.png", b"PNG_BYTES", field_overrides={"extra": oversized_value}
+        )
+        with pytest.raises(ValueError, match=r"non-file field.*exceeds"):
+            _parse_multipart_form(body, ct)
+
+    def test_stream_parser_rejects_too_many_boundaries(self):
+        """A crafted body with more than _MAX_MULTIPART_PARTS boundary markers raises ValueError."""
+        boundary = "----crafted-boundary"
+        crlf = b"\r\n"
+        # Build a body whose boundary string appears far more than max_parts times
+        # without valid multipart structure — this exercises the Pass 1 counter.
+        delimiter = b"--" + boundary.encode()
+        # Each repetition is a minimal delimiter occurrence: delimiter + scalar field
+        body = bytearray()
+        for i in range(_MAX_MULTIPART_PARTS + 2):
+            body += delimiter + crlf
+            body += b'Content-Disposition: form-data; name="f"' + crlf + crlf
+            body += b"v" + crlf
+        body += delimiter + b"--" + crlf
+        ct = f"multipart/form-data; boundary={boundary}"
+        with pytest.raises(ValueError, match=r"more than.*boundary marker"):
+            _parse_multipart_form_stream(self._spool(bytes(body)), ct)
+
+    def test_stream_parser_normal_upload_still_succeeds(self):
+        """A well-formed viewable multipart body is still parsed correctly after hardening."""
+        file_bytes = b"FAKEPNG" * 16
+        body, ct = self._build_viewable_multipart("reward.png", file_bytes)
+        spool = self._spool(body)
+        fields, file_part = _parse_multipart_form_stream(spool, ct)
+        assert fields.get("filename") == b"reward.png"
+        assert file_part is not None
+        assert file_part["length"] == len(file_bytes)
+        # Verify actual file bytes round-trip correctly
+        spool.seek(file_part["start"])
+        assert spool.read(file_part["length"]) == file_bytes
+
+    def test_in_memory_parser_normal_upload_still_succeeds(self):
+        """_parse_multipart_form still works for a well-formed viewable body after hardening."""
+        file_bytes = b"FAKEPNG" * 8
+        body, ct = self._build_viewable_multipart("chart.png", file_bytes)
+        fields, files = _parse_multipart_form(body, ct)
+        assert fields.get("filename") == b"chart.png"
+        assert files.get("file") == file_bytes
+
+
 class TestArtifactUploadEndpoint:
     async def _make_runner_job(self, db_session, *, pinned_runner_id=None):
         project = await _make_project(db_session)
@@ -5683,6 +5774,392 @@ class TestArtifactUploadEndpoint:
         await db_session.commit()
         await db_session.refresh(job)
         return project, runner, token, job
+
+    @pytest.mark.asyncio
+    async def test_resumable_upload_completion_verifies_size_checksum_before_stamp(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        _project, _runner, token, job = await self._make_runner_job(db_session)
+
+        async def fake_authorize(job_id, transfer_id, *, expires_at):
+            return {
+                "upload_url": "https://storage.invalid/exact-object-signature",
+                "method": "PUT",
+                "headers": {"Content-Type": "application/gzip"},
+                "expires_at": expires_at.isoformat(),
+                "object_uri": f"gs://bucket/{job_id}/{transfer_id}",
+            }
+
+        monkeypatch.setattr(
+            "app.storage.authorize_compute_job_artifact_transfer", fake_authorize
+        )
+        authorize = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"archive_size": 123, "crc32c": "AAAAAA==", "file_count": 2, "total_bytes": 456},
+        )
+        assert authorize.status_code == 200, authorize.text
+        transfer_id = authorize.json()["transfer_id"]
+
+        async def fake_verify(job_id, received_transfer_id):
+            return {
+                "uri": f"gs://bucket/{job_id}/{received_transfer_id}",
+                "size": 122,
+                "crc32c": "AAAAAA==",
+                "generation": "7",
+            }
+
+        monkeypatch.setattr("app.storage.verify_compute_job_artifact_transfer", fake_verify)
+        mismatch = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer/complete",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"transfer_id": transfer_id, "generation": "7"},
+        )
+        assert mismatch.status_code == 409
+        await db_session.refresh(job)
+        assert "runner_artifact" not in (job.polling_metadata or {})
+        assert job.polling_metadata["runner_artifact_transfer"]["status"] == "failed"
+        assert job.polling_metadata["runner_artifact_transfer"]["failure_reason"] == "metadata_mismatch"
+
+        async def fake_verified(job_id, received_transfer_id):
+            result = await fake_verify(job_id, received_transfer_id)
+            result["size"] = 123
+            return result
+
+        monkeypatch.setattr("app.storage.verify_compute_job_artifact_transfer", fake_verified)
+        # Failed exact-object attempts are final: a fresh authorization is
+        # required because ifGenerationMatch=0 prevents repairing that object.
+        failed_retry = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer/complete",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"transfer_id": transfer_id, "generation": "7"},
+        )
+        assert failed_retry.status_code == 409
+
+        authorize = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"archive_size": 123, "crc32c": "AAAAAA==", "file_count": 2, "total_bytes": 456},
+        )
+        transfer_id = authorize.json()["transfer_id"]
+        completed = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer/complete",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"transfer_id": transfer_id, "generation": "7"},
+        )
+        assert completed.status_code == 200, completed.text
+        stamped = completed.json()["runner_artifact"]
+        assert stamped["stored"] is True
+        assert stamped["verified"] is True
+        assert stamped["size"] == 123
+        assert stamped["crc32c"] == "AAAAAA=="
+        assert stamped["generation"] == "7"
+
+        repeated = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer/complete",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"transfer_id": transfer_id, "generation": "7"},
+        )
+        assert repeated.status_code == 200
+        assert repeated.json()["runner_artifact"] == stamped
+
+    @pytest.mark.asyncio
+    async def test_transfer_authorization_failure_is_finalized_without_open_transaction(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        _project, _runner, token, job = await self._make_runner_job(db_session)
+
+        async def fake_authorize(*_args, **_kwargs):
+            assert not db_session.in_transaction()
+            raise RuntimeError("signBlob unavailable")
+
+        monkeypatch.setattr(
+            "app.storage.authorize_compute_job_artifact_transfer", fake_authorize
+        )
+        response = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"archive_size": 10, "crc32c": "AAAAAA==", "file_count": 1, "total_bytes": 10},
+        )
+        assert response.status_code == 503
+        await db_session.refresh(job)
+        transfer = job.polling_metadata["runner_artifact_transfer"]
+        assert transfer["status"] == "failed"
+        assert transfer["failure_reason"] == "authorization_failed"
+
+    @pytest.mark.asyncio
+    async def test_transfer_verification_reload_failure_is_finalized(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        _project, _runner, token, job = await self._make_runner_job(db_session)
+
+        async def fake_authorize(job_id, transfer_id, *, expires_at):
+            return {"upload_url": "https://storage.invalid", "expires_at": expires_at.isoformat()}
+
+        async def fake_verify(*_args):
+            raise RuntimeError("reload unavailable")
+
+        monkeypatch.setattr("app.storage.authorize_compute_job_artifact_transfer", fake_authorize)
+        monkeypatch.setattr("app.storage.verify_compute_job_artifact_transfer", fake_verify)
+        authorized = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"archive_size": 10, "crc32c": "AAAAAA==", "file_count": 1, "total_bytes": 10},
+        )
+        transfer_id = authorized.json()["transfer_id"]
+        response = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer/complete",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"transfer_id": transfer_id, "generation": "1"},
+        )
+        assert response.status_code == 503
+        await db_session.refresh(job)
+        assert job.polling_metadata["runner_artifact_transfer"]["status"] == "failed"
+        assert job.polling_metadata["runner_artifact_transfer"]["failure_reason"] == "verification_unavailable"
+
+    @pytest.mark.asyncio
+    async def test_delayed_verification_failure_cannot_overwrite_verified_transfer(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        _project, _runner, token, job = await self._make_runner_job(db_session)
+
+        async def fake_authorize(job_id, transfer_id, *, expires_at):
+            return {"upload_url": "https://storage.invalid", "expires_at": expires_at.isoformat()}
+
+        monkeypatch.setattr("app.storage.authorize_compute_job_artifact_transfer", fake_authorize)
+        authorized = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"archive_size": 10, "crc32c": "AAAAAA==", "file_count": 1, "total_bytes": 10},
+        )
+        transfer_id = authorized.json()["transfer_id"]
+
+        async def fake_verify(*_args):
+            await db_session.refresh(job)
+            artifact = {
+                "uri": f"gs://bucket/{job.id}/{transfer_id}",
+                "generation": "1",
+                "transfer_id": transfer_id,
+            }
+            job.polling_metadata = {
+                **job.polling_metadata,
+                "runner_artifact": artifact,
+                "runner_artifact_transfer": {
+                    **job.polling_metadata["runner_artifact_transfer"],
+                    "status": "verified",
+                },
+            }
+            await db_session.commit()
+            raise RuntimeError("delayed verification failure")
+
+        monkeypatch.setattr("app.storage.verify_compute_job_artifact_transfer", fake_verify)
+        response = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer/complete",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"transfer_id": transfer_id, "generation": "1"},
+        )
+        assert response.status_code == 503
+        await db_session.refresh(job)
+        assert job.polling_metadata["runner_artifact_transfer"]["status"] == "verified"
+
+    @pytest.mark.asyncio
+    async def test_delayed_verification_success_cannot_overwrite_failed_transfer(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        _project, _runner, token, job = await self._make_runner_job(db_session)
+
+        async def fake_authorize(job_id, transfer_id, *, expires_at):
+            return {"upload_url": "https://storage.invalid", "expires_at": expires_at.isoformat()}
+
+        monkeypatch.setattr("app.storage.authorize_compute_job_artifact_transfer", fake_authorize)
+        authorized = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"archive_size": 10, "crc32c": "AAAAAA==", "file_count": 1, "total_bytes": 10},
+        )
+        transfer_id = authorized.json()["transfer_id"]
+
+        async def fake_verify(job_id, received_transfer_id):
+            await db_session.refresh(job)
+            job.polling_metadata = {
+                **job.polling_metadata,
+                "runner_artifact_transfer": {
+                    **job.polling_metadata["runner_artifact_transfer"],
+                    "status": "failed",
+                    "failure_reason": "concurrent_failure",
+                },
+            }
+            await db_session.commit()
+            return {
+                "uri": f"gs://bucket/{job_id}/{received_transfer_id}",
+                "size": 10,
+                "crc32c": "AAAAAA==",
+                "generation": "1",
+            }
+
+        monkeypatch.setattr("app.storage.verify_compute_job_artifact_transfer", fake_verify)
+        response = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer/complete",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"transfer_id": transfer_id, "generation": "1"},
+        )
+        assert response.status_code == 409
+        await db_session.refresh(job)
+        assert "runner_artifact" not in job.polling_metadata
+        assert job.polling_metadata["runner_artifact_transfer"]["status"] == "failed"
+
+    @pytest.mark.asyncio
+    async def test_superseded_transfer_cannot_complete(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        _project, _runner, token, job = await self._make_runner_job(db_session)
+
+        async def fake_authorize(job_id, transfer_id, *, expires_at):
+            return {"upload_url": "https://storage.invalid", "expires_at": expires_at.isoformat()}
+
+        monkeypatch.setattr("app.storage.authorize_compute_job_artifact_transfer", fake_authorize)
+        ids = []
+        for size in (10, 11):
+            response = await client.post(
+                f"/api/runner/compute-job/{job.id}/artifact-transfer",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"archive_size": size, "crc32c": "AAAAAA==", "file_count": 1, "total_bytes": size},
+            )
+            ids.append(response.json()["transfer_id"])
+        response = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer/complete",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"transfer_id": ids[0], "generation": "1"},
+        )
+        assert response.status_code == 409
+        await db_session.refresh(job)
+        assert job.polling_metadata["runner_artifact_transfer"]["transfer_id"] == ids[1]
+
+    @pytest.mark.asyncio
+    async def test_wrong_pinned_runner_cannot_authorize_transfer(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        other_runner, _ = await _make_runner(db_session, project.id)
+        job = ComputeJob(
+            project_id=project.id,
+            backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+            status=ComputeJobStatus.RUNNING,
+            polling_metadata={"runner_target_id": str(other_runner.id)},
+        )
+        db_session.add(job)
+        await db_session.commit()
+        response = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"archive_size": 10, "crc32c": "AAAAAA==", "file_count": 1, "total_bytes": 10},
+        )
+        assert response.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_runner_cannot_authorize_transfer_in_another_project(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        other_project = await _make_project(db_session, owner_id="other-owner")
+        runner, token = await _make_runner(db_session, project.id)
+        job = ComputeJob(
+            project_id=other_project.id,
+            backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+            status=ComputeJobStatus.RUNNING,
+            polling_metadata={"runner_target_id": str(runner.id)},
+        )
+        db_session.add(job)
+        await db_session.commit()
+        response = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"archive_size": 10, "crc32c": "AAAAAA==", "file_count": 1, "total_bytes": 10},
+        )
+        assert response.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_preissued_transfer_cannot_overwrite_finalized_evidence(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        _project, _runner, token, job = await self._make_runner_job(db_session)
+        final_artifact = {
+            "kind": "runner_artifact",
+            "uri": f"gs://bucket/compute-jobs/{job.id}/artifacts/bundle.tar.gz",
+            "stored": True,
+        }
+
+        async def fake_authorize(job_id, transfer_id, *, expires_at):
+            current = await db_session.get(ComputeJob, job.id)
+            await db_session.refresh(current)
+            current.status = ComputeJobStatus.SUCCEEDED
+            current.polling_metadata = {
+                **current.polling_metadata,
+                "runner_artifact": final_artifact,
+            }
+            await db_session.commit()
+            return {"upload_url": "https://storage.invalid", "expires_at": expires_at.isoformat()}
+
+        monkeypatch.setattr("app.storage.authorize_compute_job_artifact_transfer", fake_authorize)
+        response = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"archive_size": 10, "crc32c": "AAAAAA==", "file_count": 1, "total_bytes": 10},
+        )
+        assert response.status_code == 409
+        await db_session.refresh(job)
+        assert job.polling_metadata["runner_artifact"] == final_artifact
+        assert job.polling_metadata["runner_artifact_transfer"]["status"] == "failed"
+        assert job.polling_metadata["runner_artifact_transfer"]["failure_reason"] == "evidence_finalized"
+
+    @pytest.mark.asyncio
+    async def test_preissued_transfer_completion_cannot_overwrite_finalized_evidence(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        _project, _runner, token, job = await self._make_runner_job(db_session)
+
+        async def fake_authorize(job_id, transfer_id, *, expires_at):
+            return {"upload_url": "https://storage.invalid", "expires_at": expires_at.isoformat()}
+
+        monkeypatch.setattr("app.storage.authorize_compute_job_artifact_transfer", fake_authorize)
+        authorized = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"archive_size": 10, "crc32c": "AAAAAA==", "file_count": 1, "total_bytes": 10},
+        )
+        transfer_id = authorized.json()["transfer_id"]
+        final_artifact = {
+            "kind": "runner_artifact",
+            "uri": f"gs://bucket/compute-jobs/{job.id}/artifacts/bundle.tar.gz",
+            "stored": True,
+        }
+        await db_session.refresh(job)
+        job.status = ComputeJobStatus.SUCCEEDED
+        job.polling_metadata = {
+            **job.polling_metadata,
+            "runner_artifact": final_artifact,
+        }
+        db_session.add(job)
+        await db_session.commit()
+
+        async def fake_verify(job_id, received_transfer_id):
+            return {
+                "uri": f"gs://bucket/compute-jobs/{job_id}/artifacts/transfers/{received_transfer_id}.tar.gz",
+                "size": 10,
+                "crc32c": "AAAAAA==",
+                "generation": "1",
+            }
+
+        monkeypatch.setattr("app.storage.verify_compute_job_artifact_transfer", fake_verify)
+        response = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer/complete",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"transfer_id": transfer_id, "generation": "1"},
+        )
+        assert response.status_code == 409
+        await db_session.refresh(job)
+        assert job.polling_metadata["runner_artifact"] == final_artifact
 
     @pytest.mark.asyncio
     async def test_upload_stores_artifact_and_links_metadata(
@@ -8485,6 +8962,88 @@ class TestInputArtifactDownloadEndpoint:
         assert resp.headers["content-type"] == "application/gzip"
 
     @pytest.mark.asyncio
+    async def test_streams_transfer_specific_predecessor_uri_for_legacy_client(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        from app import storage
+
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        predecessor = await self._make_pinned_job(db_session, project, runner, {})
+        transfer_id = uuid.uuid4()
+        artifact_uri = storage.compute_job_artifact_transfer_uri(predecessor.id, transfer_id)
+        predecessor.polling_metadata = {
+            "runner_target_id": str(runner.id),
+            "runner_artifact": {"stored": True, "verified": True, "uri": artifact_uri},
+        }
+        db_session.add(predecessor)
+        await db_session.commit()
+        job = await self._make_pinned_job(
+            db_session, project, runner,
+            {"input_artifact_job_id": str(predecessor.id)},
+        )
+
+        async def fake_download(uri):
+            assert uri == artifact_uri
+            return b"TRANSFER-BUNDLE"
+
+        monkeypatch.setattr(storage, "download_compute_job_artifact_uri", fake_download)
+        resp = await client.get(
+            f"/api/runner/compute-job/{job.id}/input-artifact",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        assert resp.content == b"TRANSFER-BUNDLE"
+
+    @pytest.mark.asyncio
+    async def test_direct_download_returns_verified_transfer_metadata(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        from app import storage
+
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        predecessor = await self._make_pinned_job(db_session, project, runner, {})
+        artifact_uri = storage.compute_job_artifact_transfer_uri(predecessor.id, uuid.uuid4())
+        predecessor.polling_metadata = {
+            "runner_target_id": str(runner.id),
+            "runner_artifact": {
+                "stored": True,
+                "verified": True,
+                "uri": artifact_uri,
+                "size": 987,
+                "crc32c": "AAAAAA==",
+                "generation": "42",
+            },
+        }
+        db_session.add(predecessor)
+        await db_session.commit()
+        job = await self._make_pinned_job(
+            db_session, project, runner,
+            {"input_artifact_job_id": str(predecessor.id)},
+        )
+
+        async def fake_sign(uri):
+            assert uri == artifact_uri
+            return "https://storage.invalid/signed-get"
+
+        monkeypatch.setattr(
+            storage, "generate_compute_job_artifact_uri_download_signed_url", fake_sign
+        )
+        resp = await client.get(
+            f"/api/runner/compute-job/{job.id}/input-artifact?direct=true",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "download_url": "https://storage.invalid/signed-get",
+            "expires_in_seconds": 3600,
+            "size": 987,
+            "crc32c": "AAAAAA==",
+            "generation": "42",
+        }
+
+    @pytest.mark.asyncio
     async def test_404_when_no_input_artifact_reference(
         self, client: AsyncClient, db_session
     ):
@@ -8569,7 +9128,20 @@ class TestInputArtifactDownloadEndpoint:
         project = await _make_project(db_session)
         runner, token = await _make_runner(db_session, project.id)
         predecessor_id = str(uuid.uuid4())
+        task = Task(
+            project_id=project.id,
+            payloads=[
+                {
+                    "type": "compute_experiment",
+                    "require_durable_artifact": True,
+                }
+            ],
+            status=TaskStatus.IN_PROGRESS,
+        )
+        db_session.add(task)
+        await db_session.flush()
         job = ComputeJob(
+            task_id=task.id,
             project_id=project.id,
             backend=RUNNER_SUBPROCESS_BACKEND_NAME,
             status=ComputeJobStatus.STARTING,
@@ -8588,6 +9160,7 @@ class TestInputArtifactDownloadEndpoint:
         )
         assert resp.status_code == 200, resp.text
         assert resp.json()["input_artifact_job_id"] == predecessor_id
+        assert resp.json()["require_durable_artifact"] is True
 
     @pytest.mark.asyncio
     async def test_next_compute_job_stamps_ran_on_runner_id(
@@ -8639,12 +9212,23 @@ class TestInputArtifactDownloadEndpoint:
 
         resp = await client.post(
             f"/api/runner/compute-job/{job.id}/report",
-            json={"exec_status": "running"},
+            json={
+                "exec_status": "succeeded",
+                "artifact_delivery": {
+                    "status": "failed",
+                    "protocol": "direct",
+                    "command_exec_status": "succeeded",
+                    "reason": "x" * 1000,
+                },
+            },
             headers={"Authorization": f"Bearer {token}"},
         )
         assert resp.status_code == 200, resp.text
         await db_session.refresh(job)
         assert job.ran_on_runner_id == runner.id
+        delivery = job.polling_metadata["artifact_delivery"]
+        assert delivery["command_exec_status"] == "succeeded"
+        assert len(delivery["reason"]) == 256
 
     @pytest.mark.asyncio
     async def test_report_compute_job_does_not_overwrite_ran_on_runner_id(
@@ -10600,6 +11184,56 @@ class TestMidRunViewableUpload:
         )
 
     @pytest.mark.asyncio
+    async def test_runner_generation_retry_keeps_revision(self, client, db_session):
+        """A response-loss retry for one runner generation is idempotent."""
+        _project, runner, token, job = await self._make_running_job(db_session)
+        safe_name = "reward.png"
+        fake_uri = self._fake_uri(job.id, safe_name)
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "X-Blueprint-Viewable-Revision": "runner-generation-1",
+        }
+
+        with patch(
+            "app.storage.upload_compute_job_viewable_file", return_value=fake_uri
+        ):
+            first = await client.post(
+                f"/api/runner/compute-job/{job.id}/viewable",
+                data={"filename": safe_name},
+                files={"file": (safe_name, b"same-bytes", "image/png")},
+                headers=headers,
+            )
+            retry = await client.post(
+                f"/api/runner/compute-job/{job.id}/viewable",
+                data={"filename": safe_name},
+                files={"file": (safe_name, b"same-bytes", "image/png")},
+                headers=headers,
+            )
+
+        assert first.status_code == 200
+        assert retry.status_code == 200
+        assert first.json()["entry"]["revision"] == "runner-generation-1"
+        assert retry.json()["entry"]["revision"] == "runner-generation-1"
+
+    @pytest.mark.asyncio
+    async def test_invalid_runner_revision_rejected_before_storage(
+        self, client, db_session
+    ):
+        _project, runner, token, job = await self._make_running_job(db_session)
+        with patch("app.storage.upload_compute_job_viewable_file") as upload:
+            response = await client.post(
+                f"/api/runner/compute-job/{job.id}/viewable",
+                data={"filename": "reward.png"},
+                files={"file": ("reward.png", b"bytes", "image/png")},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "X-Blueprint-Viewable-Revision": "bad revision/with spaces",
+                },
+            )
+        assert response.status_code == 422
+        upload.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_oversize_image_rejected(self, client, db_session):
         """Image exceeding the per-file byte cap → 413."""
         _project, runner, token, job = await self._make_running_job(db_session)
@@ -10649,6 +11283,59 @@ class TestMidRunViewableUpload:
         assert resp.status_code == 409, (
             f"Expected 409 for terminal job, got {resp.status_code}: {resp.text}"
         )
+
+    @pytest.mark.asyncio
+    async def test_terminal_winning_during_live_upload_keeps_terminal_object(
+        self, client, db_session
+    ):
+        """A late live upload must never overwrite terminal's canonical object.
+
+        The fake storage write models the precise ordering from the race report:
+        terminal reconciliation publishes its canonical bytes while the live
+        request is stalled, then the stalled write completes.  Staging means the
+        latter can only write an unreferenced object, and the locked re-check
+        returns 409 without promoting it.
+        """
+        from app import storage
+
+        _project, _runner, token, job = await self._make_running_job(db_session)
+        safe_name = "reward_curve.png"
+        objects: dict[str, bytes] = {}
+        deleted: list[str] = []
+
+        async def _late_live_upload(job_id, basename, data, content_type):
+            # Terminal owns the canonical generation before the slow live write
+            # returns.  This commit is observable by the endpoint's locked reread.
+            job.status = ComputeJobStatus.SUCCEEDED
+            db_session.add(job)
+            await db_session.commit()
+            objects[safe_name] = b"terminal-generation"
+            objects[basename] = data
+            return storage.compute_job_viewable_uri(job_id, basename)
+
+        async def _delete_staging(job_id, basename):
+            deleted.append(basename)
+            objects.pop(basename, None)
+            return True
+
+        with patch(
+            "app.storage.upload_compute_job_viewable_file", new=_late_live_upload
+        ), patch(
+            "app.storage.delete_compute_job_viewable_file", new=_delete_staging
+        ), patch(
+            "app.storage.promote_compute_job_viewable_file",
+            new=AsyncMock(side_effect=AssertionError("terminal upload must not promote")),
+        ):
+            response = await client.post(
+                f"/api/runner/compute-job/{job.id}/viewable",
+                data={"filename": safe_name},
+                files={"file": (safe_name, b"late-live-bytes", "image/png")},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        assert response.status_code == 409, response.text
+        assert objects[safe_name] == b"terminal-generation"
+        assert len(deleted) == 1 and deleted[0].startswith(".staging/")
 
     @pytest.mark.asyncio
     async def test_file_cap_enforced(self, client, db_session):
@@ -10755,7 +11442,8 @@ class TestMidRunViewableUpload:
         assert captured["read"] == video_bytes
         assert captured["size"] == len(video_bytes)
         assert captured["content_type"] == "video/mp4"
-        assert captured["basename"] == safe_name
+        assert captured["basename"].startswith(".staging/")
+        assert captured["basename"].endswith(f"/{safe_name}")
 
         # DB row + manifest recorded with the streamed size.
         await db_session.refresh(job)
@@ -10773,8 +11461,12 @@ class TestMidRunViewableUpload:
         assert rows[0].file_size_bytes == len(video_bytes)
 
     @pytest.mark.asyncio
-    async def test_reupload_same_relpath_dedup(self, client, db_session):
-        """Re-upload of the same relpath → single manifest entry, single DB row."""
+    async def test_reupload_same_relpath_advances_revision_and_terminal_reconciles(
+        self, client, db_session
+    ):
+        """Same URI/size advances live revision; terminal replaces it once."""
+        from app import compute_jobs as compute_jobs_mod
+
         _project, runner, token, job = await self._make_running_job(db_session)
         safe_name = "reward_curve.png"
         fake_uri = self._fake_uri(job.id, safe_name)
@@ -10783,14 +11475,15 @@ class TestMidRunViewableUpload:
             "app.storage.upload_compute_job_viewable_file",
             return_value=fake_uri,
         ):
-            # First upload
+            # Equal-size generations exercise the real defect: storage_uri and
+            # byte length cannot distinguish the overwritten bytes.
             resp1 = await client.post(
                 f"/api/runner/compute-job/{job.id}/viewable",
                 data={"filename": safe_name},
                 files={
                     "file": (
                         safe_name,
-                        b"v1-data",
+                        b"version-one",
                         "image/png",
                     )
                 },
@@ -10800,15 +11493,17 @@ class TestMidRunViewableUpload:
                 f"First upload failed: {resp1.status_code}: {resp1.text}"
             )
             assert resp1.json()["total_viewable_files"] == 1
+            first_revision = resp1.json()["entry"]["revision"]
+            assert resp1.json()["entry"]["live"] is True
 
-            # Second upload (same relpath, larger content)
+            # Second upload: same relpath, same deterministic URI, same size.
             resp2 = await client.post(
                 f"/api/runner/compute-job/{job.id}/viewable",
                 data={"filename": safe_name},
                 files={
                     "file": (
                         safe_name,
-                        b"v2-data-larger",
+                        b"version-two",
                         "image/png",
                     )
                 },
@@ -10820,6 +11515,9 @@ class TestMidRunViewableUpload:
             assert resp2.json()["total_viewable_files"] == 1, (
                 "Re-upload must not increase the manifest count"
             )
+            second_revision = resp2.json()["entry"]["revision"]
+            assert second_revision != first_revision
+            assert resp2.json()["entry"]["storage_uri"] == fake_uri
 
         # ── Only ONE ComputeJobFile row ──────────────────────────────────────
         rows = (
@@ -10841,6 +11539,49 @@ class TestMidRunViewableUpload:
         assert len(vf) == 1, (
             f"Expected 1 viewable_files entry after re-upload, got {len(vf)}"
         )
+        assert vf[0]["revision"] == second_revision
+        assert vf[0]["live"] is True
+
+        # The terminal bundle is authoritative. Its legacy-shaped result has no
+        # revision, so reconciliation must assign a final one, clear ``live``,
+        # replace the manifest in place, and preserve the single signing row.
+        job.status = ComputeJobStatus.SUCCEEDED
+        db_session.add(job)
+        await db_session.commit()
+        terminal_manifest = [
+            {
+                "filename": safe_name,
+                "storage_uri": fake_uri,
+                "content_type": "image/png",
+                "size_bytes": len(b"version-two"),
+                "kind": "image",
+            }
+        ]
+        with patch.object(
+            compute_jobs_mod,
+            "persist_viewable_artifacts",
+            new=AsyncMock(return_value=(terminal_manifest, 0)),
+        ):
+            final_manifest, dropped = (
+                await compute_jobs_mod.persist_viewable_files_for_job(db_session, job)
+            )
+        await db_session.commit()
+
+        assert dropped == 0
+        assert len(final_manifest) == 1
+        assert final_manifest[0]["revision"] != second_revision
+        assert final_manifest[0]["live"] is False
+        await db_session.refresh(job)
+        assert (job.polling_metadata or {})["viewable_files"] == final_manifest
+        final_rows = (
+            await db_session.execute(
+                select(ComputeJobFile).where(
+                    ComputeJobFile.compute_job_id == job.id,
+                    ComputeJobFile.storage_uri == fake_uri,
+                )
+            )
+        ).scalars().all()
+        assert len(final_rows) == 1
 
     @pytest.mark.asyncio
     async def test_no_filename_rejected(self, client, db_session):
@@ -11137,6 +11878,159 @@ async def test_capability_proof_trial_red_records_no_proof(db_session):
 
 
 @pytest.mark.asyncio
+async def test_capability_proof_trial_definitive_red_revokes_prior_green(db_session):
+    """A definitive RED trial (ran=True, passed=False, could_not_run=False) REVOKES
+    any stale executed-proof ledger entry so the capability cannot keep clearing the
+    enforce gate until the 30-day TTL expires.
+
+    Acceptance: 'a definitive red B blocks the capability'.
+    """
+    import json as _json
+
+    from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+
+    from app.capability_proof import record_capability_named_test_execution_proof
+    from app.capability_registry import working_capability_proof_status
+    from app.task_completion import _handle_capability_proof_trial_completion
+
+    cap = "repo-map-red-revoke"
+    test_refs = ["backend/testing/test_prompt.py"]
+    project = await _make_trial_project(db_session, cap)
+    task = _make_trial_task(project, cap, test_refs, head_sha="sha_b")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # First stamp a GREEN proof at sha_a (revision A).
+    record_capability_named_test_execution_proof(
+        project, cap, test_refs, head_sha="sha_a", suite_verifying=True
+    )
+    _flag_modified(project, "capability_proof_records")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Confirm the capability is now "proven" via the execution proof.
+    assert (project.capability_proof_records or {}).get(cap) or \
+        working_capability_proof_status(project.problem_model).get(cap) == "proven"
+
+    # A RED trial at sha_b (revision B) should revoke the sha_a proof.
+    red = {
+        "type": "capability_proof_trial",
+        "cap": cap,
+        "head_sha": "sha_b",
+        "test_refs": test_refs,
+        "ran": True,
+        "passed": False,
+        "could_not_run": False,
+    }
+    with _TrialFlag(True):
+        await _handle_capability_proof_trial_completion(task, _json.dumps(red), db_session)
+
+    await db_session.refresh(project)
+    await db_session.refresh(task)
+
+    # The named_test_exec ledger entry must be gone.
+    norm_cap = cap
+    records = project.capability_proof_records or {}
+    exec_entries = [
+        e for e in (records.get(norm_cap) or [])
+        if e.get("task_id") == f"named_test_exec:{norm_cap}"
+    ]
+    assert exec_entries == [], "definitive RED must revoke the stale execution proof"
+
+    # The contradiction is still surfaced.
+    contradiction = (task.context or {}).get("capability_proof_trial_contradiction")
+    assert contradiction is not None
+    assert contradiction["cap"] == cap
+    assert contradiction["passed"] is False
+    assert contradiction["proof_revoked"] is True
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_trial_indeterminate_result_leaves_proof(db_session):
+    """An indeterminate result (could_not_run=True) must NOT revoke existing proof.
+
+    Acceptance: 'an indeterminate B ... result cannot corrupt the current verdict'.
+    """
+    import json as _json
+
+    from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+
+    from app.capability_proof import record_capability_named_test_execution_proof
+    from app.task_completion import _handle_capability_proof_trial_completion
+
+    cap = "repo-map-infra-fail"
+    test_refs = ["backend/testing/test_prompt.py"]
+    project = await _make_trial_project(db_session, cap)
+    task = _make_trial_task(project, cap, test_refs, head_sha="sha_b")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Stamp a GREEN proof at sha_a.
+    record_capability_named_test_execution_proof(
+        project, cap, test_refs, head_sha="sha_a", suite_verifying=True
+    )
+    _flag_modified(project, "capability_proof_records")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Infrastructure failure: could_not_run — indeterminate, should NOT revoke.
+    indeterminate = {
+        "type": "capability_proof_trial",
+        "cap": cap,
+        "head_sha": "sha_b",
+        "test_refs": test_refs,
+        "ran": False,
+        "passed": False,
+        "could_not_run": True,
+    }
+    with _TrialFlag(True):
+        await _handle_capability_proof_trial_completion(
+            task, _json.dumps(indeterminate), db_session
+        )
+
+    await db_session.refresh(project)
+    records = project.capability_proof_records or {}
+    exec_entries = [
+        e for e in (records.get(cap) or [])
+        if e.get("task_id") == f"named_test_exec:{cap}"
+    ]
+    assert exec_entries, "indeterminate result must NOT revoke the existing proof"
+
+    contradiction = (task.context or {}).get("capability_proof_trial_contradiction")
+    assert contradiction is not None
+    assert contradiction.get("proof_revoked") is False
+
+
+@pytest.mark.asyncio
+async def test_enroll_capability_proof_trial_dedup_in_flight(db_session):
+    """enroll_capability_proof_trial returns None when a trial for the same
+    capability is already QUEUED/PROVISIONING/IN_PROGRESS — 'revision B commissions
+    exactly one re-verification'."""
+    from app.capability_proof import enroll_capability_proof_trial
+
+    project = await _make_trial_project(db_session, "dedup-cap")
+
+    # Enroll the first trial.
+    with _TrialFlag(True):
+        first = await enroll_capability_proof_trial(
+            db_session, project, "dedup-cap", ["backend/testing/test_a.py"], "sha1"
+        )
+    assert first is not None
+    assert first.status == TaskStatus.QUEUED
+
+    # A second enrollment attempt for the same capability must be a no-op.
+    with _TrialFlag(True):
+        second = await enroll_capability_proof_trial(
+            db_session, project, "dedup-cap", ["backend/testing/test_a.py"], "sha2"
+        )
+    assert second is None, "duplicate trial must be blocked by the dedup guard"
+
+
+@pytest.mark.asyncio
 async def test_capability_proof_trial_flag_off_records_nothing(db_session):
     """With the dark flag OFF, even a GREEN trial records nothing."""
     import json as _json
@@ -11147,7 +12041,7 @@ async def test_capability_proof_trial_flag_off_records_nothing(db_session):
     cap = "repo-map-darkoff"
     test_refs = ["backend/testing/test_prompt.py::test_x"]
     project = await _make_trial_project(db_session, cap)
-    task = _make_trial_task(project, cap, test_refs)
+    task = _make_trial_task(project, cap, test_refs, head_sha="abc")
     db_session.add(task)
     await db_session.commit()
     await db_session.refresh(task)
@@ -11175,7 +12069,7 @@ async def test_capability_proof_trial_skipped_suite_records_nothing(db_session):
 
     cap = "repo-map-skipped"
     project = await _make_trial_project(db_session, cap)
-    task = _make_trial_task(project, cap, ["backend/testing/test_prompt.py"])
+    task = _make_trial_task(project, cap, ["backend/testing/test_prompt.py"], head_sha="abc")
     db_session.add(task)
     await db_session.commit()
     await db_session.refresh(task)
@@ -11193,6 +12087,117 @@ async def test_capability_proof_trial_skipped_suite_records_nothing(db_session):
     await db_session.refresh(project)
     assert working_capability_proof_status(project.problem_model).get(cap) != "proven"
     assert cap not in (project.capability_proof_records or {})
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_trial_wrong_cap_rejected(db_session):
+    """A trial result whose cap does not match the enrollment contract records
+    no proof — the runner cannot mint proof for the wrong capability."""
+    import json as _json
+
+    from app.capability_registry import working_capability_proof_status
+    from app.task_completion import _handle_capability_proof_trial_completion
+
+    cap = "enrolled-capability"
+    test_refs = ["backend/testing/test_prompt.py"]
+    project = await _make_trial_project(db_session, cap)
+    # Enroll with cap "enrolled-capability"
+    task = _make_trial_task(project, cap, test_refs)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Agent reports a DIFFERENT cap than what was enrolled.
+    wrong = {
+        "type": "capability_proof_trial",
+        "cap": "different-capability",
+        "head_sha": "deadbeef",
+        "test_refs": test_refs,
+        "ran": True, "passed": True, "could_not_run": False,
+    }
+
+    with _TrialFlag(True):
+        await _handle_capability_proof_trial_completion(task, _json.dumps(wrong), db_session)
+
+    await db_session.refresh(project)
+    # No proof recorded for the wrong cap.
+    status_map = working_capability_proof_status(project.problem_model)
+    assert status_map.get("different-capability") != "proven"
+    assert "different-capability" not in (project.capability_proof_records or {})
+    # And no proof for the enrolled cap either.
+    assert status_map.get(cap) != "proven"
+    assert cap not in (project.capability_proof_records or {})
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_trial_extra_test_refs_rejected(db_session):
+    """A trial result with test_refs that were NOT in the enrollment must NOT
+    mint proof — the runner cannot claim green for refs it was never enrolled to run."""
+    import json as _json
+
+    from app.capability_registry import working_capability_proof_status
+    from app.task_completion import _handle_capability_proof_trial_completion
+
+    cap = "refs-guard-cap"
+    enrolled_refs = ["backend/testing/test_prompt.py"]
+    project = await _make_trial_project(db_session, cap)
+    # Enroll with a specific set of test_refs
+    task = _make_trial_task(project, cap, enrolled_refs)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Agent reports extra test_refs not in the enrollment.
+    extra_refs_report = enrolled_refs + ["backend/testing/test_extra.py"]
+    wrong = {
+        "type": "capability_proof_trial",
+        "cap": cap,
+        "head_sha": "deadbeef",
+        "test_refs": extra_refs_report,
+        "ran": True, "passed": True, "could_not_run": False,
+    }
+
+    with _TrialFlag(True):
+        await _handle_capability_proof_trial_completion(task, _json.dumps(wrong), db_session)
+
+    await db_session.refresh(project)
+    assert cap not in (project.capability_proof_records or {})
+    assert working_capability_proof_status(project.problem_model).get(cap) != "proven"
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_trial_mismatched_head_sha_rejected(db_session):
+    """A trial result whose head_sha differs from the enrollment must NOT mint
+    proof — the runner must execute the enrolled revision."""
+    import json as _json
+
+    from app.capability_registry import working_capability_proof_status
+    from app.task_completion import _handle_capability_proof_trial_completion
+
+    cap = "sha-guard-cap"
+    test_refs = ["backend/testing/test_prompt.py"]
+    project = await _make_trial_project(db_session, cap)
+    # Enroll with head_sha "abc123"
+    task = _make_trial_task(project, cap, test_refs, head_sha="abc123")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Agent reports a different sha.
+    wrong = {
+        "type": "capability_proof_trial",
+        "cap": cap,
+        "head_sha": "def456",
+        "test_refs": test_refs,
+        "ran": True, "passed": True, "could_not_run": False,
+    }
+
+    with _TrialFlag(True):
+        await _handle_capability_proof_trial_completion(task, _json.dumps(wrong), db_session)
+
+    await db_session.refresh(project)
+    assert cap not in (project.capability_proof_records or {})
+    assert working_capability_proof_status(project.problem_model).get(cap) != "proven"
 
 
 @pytest.mark.asyncio
@@ -11233,6 +12238,170 @@ async def test_enroll_capability_proof_trial_creates_bounded_task(db_session):
 
 
 # ── Cross-job resume fail-closed (scripts/local_runner.py) ───────────────────
+
+
+def test_large_checkpoint_round_trip_upload_bundle_resume(tmp_path, monkeypatch):
+    """A >25 MiB tree uses the direct contract and rehydrates byte-for-byte.
+
+    This exercises the dependency-free runner's production archive builder,
+    chunked direct upload, completion handshake, authorized direct download,
+    integrity check, safe extraction, and atomic workspace publication as one
+    seam. A second download with mismatched authoritative CRC32C must leave the
+    destination untouched.
+    """
+    import hashlib
+    import io
+    import json
+    import os
+    import random
+    import shutil
+    import sys
+    from pathlib import Path
+
+    script_candidates = (
+        Path(__file__).parents[2] / "scripts",
+        Path("/repo/scripts"),
+    )
+    scripts_dir = next(path for path in script_candidates if path.is_dir())
+    sys.path.insert(0, str(scripts_dir))
+    import local_runner
+
+    source = tmp_path / "source"
+    source.mkdir()
+    checkpoint = source / "checkpoints" / "epoch-0042.bin"
+    checkpoint.parent.mkdir()
+    rng = random.Random(20260715)
+    remaining = 27 * 1024 * 1024 + 137
+    with checkpoint.open("wb") as output:
+        while remaining:
+            chunk = rng.randbytes(min(1024 * 1024, remaining))
+            output.write(chunk)
+            remaining -= len(chunk)
+    (source / "notes.txt").write_text("resume-me\n", encoding="utf-8")
+
+    stored_bundle = tmp_path / "durable-transfer.tar.gz"
+    contract = {}
+
+    def crc32c_for(path):
+        state = 0xFFFFFFFF
+        with open(path, "rb") as stream:
+            while True:
+                chunk = stream.read(1024 * 1024)
+                if not chunk:
+                    break
+                state = local_runner._crc32c_update(state, chunk)
+        return local_runner._crc32c_b64(state)
+
+    def fake_post(url, _token, body):
+        if url.endswith("/artifact-transfer/complete"):
+            assert body == {"transfer_id": "transfer-large", "generation": "73"}
+            assert stored_bundle.stat().st_size == contract["archive_size"]
+            assert crc32c_for(stored_bundle) == contract["crc32c"]
+            return 200, {
+                "ok": True,
+                "runner_artifact": {
+                    "stored": True,
+                    "verified": True,
+                    "size": contract["archive_size"],
+                    "crc32c": contract["crc32c"],
+                    "generation": "73",
+                },
+            }
+        assert url.endswith("/artifact-transfer")
+        contract.update(body)
+        return 200, {
+            "ok": True,
+            "transfer_id": "transfer-large",
+            "upload_url": "https://storage.invalid/signed-put",
+            "method": "PUT",
+            "headers": {"Content-Type": "application/gzip"},
+        }
+
+    def fake_stream(url, method, headers, file_path, file_size):
+        assert url == "https://storage.invalid/signed-put"
+        assert method == "PUT"
+        assert headers["Content-Type"] == "application/gzip"
+        assert os.path.getsize(file_path) == file_size
+        shutil.copyfile(file_path, stored_bundle)
+        return 200, {"x-goog-generation": "73"}, b""
+
+    monkeypatch.setattr(local_runner, "_post", fake_post)
+    monkeypatch.setattr(local_runner, "_stream_http_file", fake_stream)
+    delivery = local_runner._upload_artifact(
+        "https://api.invalid", "runner-token", "job-large", str(source)
+    )
+    assert contract["total_bytes"] > 25 * 1024 * 1024
+    assert contract["archive_size"] > 25 * 1024 * 1024
+    assert delivery["status"] == "delivered"
+    assert delivery["verified"] is True
+    assert delivery["crc32c"] == crc32c_for(stored_bundle)
+
+    class Response:
+        def __init__(self, status, stream, content_type):
+            self.status = status
+            self._stream = stream
+            self.headers = {"Content-Type": content_type}
+
+        def read(self, size=-1):
+            return self._stream.read(size)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self._stream.close()
+            return False
+
+    expected_crc = contract["crc32c"]
+
+    def fake_urlopen(request, timeout=None):
+        assert timeout == 120
+        if request.full_url.endswith("input-artifact?direct=true"):
+            metadata = json.dumps(
+                {
+                    "download_url": "https://storage.invalid/signed-get",
+                    "size": stored_bundle.stat().st_size,
+                    "crc32c": expected_crc,
+                    "generation": "73",
+                }
+            ).encode()
+            return Response(200, io.BytesIO(metadata), "application/json")
+        assert request.full_url == "https://storage.invalid/signed-get"
+        return Response(200, stored_bundle.open("rb"), "application/gzip")
+
+    monkeypatch.setattr(local_runner.urllib.request, "urlopen", fake_urlopen)
+    resumed = tmp_path / "resumed"
+    resumed.mkdir()
+    provenance = local_runner._download_input_artifact(
+        "https://api.invalid", "runner-token", "job-successor", str(resumed)
+    )
+    assert provenance == {
+        "ok": True,
+        "file_count": 2,
+        "bytes": contract["total_bytes"],
+    }
+
+    def sha256(path):
+        digest = hashlib.sha256()
+        with open(path, "rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    assert sha256(checkpoint) == sha256(resumed / "checkpoints" / checkpoint.name)
+    assert (resumed / "notes.txt").read_text(encoding="utf-8") == "resume-me\n"
+
+    rejected = tmp_path / "rejected"
+    rejected.mkdir()
+    sentinel = rejected / "keep.txt"
+    sentinel.write_text("untouched", encoding="utf-8")
+    expected_crc = "AAAAAA=="
+    mismatch = local_runner._download_input_artifact(
+        "https://api.invalid", "runner-token", "job-successor", str(rejected)
+    )
+    assert mismatch == {"ok": False, "reason": "integrity_mismatch:crc32c"}
+    assert sentinel.read_text(encoding="utf-8") == "untouched"
+
 
 class TestRunnerResumeFail_Closed:
     """_run_compute_job fails closed when the input-artifact bundle is unavailable.

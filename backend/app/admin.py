@@ -78,6 +78,7 @@ from app.vm_cost_rates import (
     validate_compute_request,
 )
 from app.resource_envelope import resolve_project_hardware_policy
+from app.runner_project_binding import runner_allowed_for_project
 from app.schemas import (
     TaskEvaluationSummary,
     TaskEvaluationSummaryItem,
@@ -3074,11 +3075,11 @@ async def _resolve_forced_runner_target(
     """Resolve an operator runner target (UUID or hostname) to a LocalRunner UUID.
 
     The operator may pass either a LocalRunner UUID or a host name (e.g. ``dgx-1``).
-    Resolution is scoped to the project's own registered, non-deleted runners. A
-    runner that is currently OFFLINE still resolves — the operator may launch ahead
-    of the box coming up; only membership (belongs to this project) and non-deletion
-    are required. Returns the resolved runner UUID string. Raises HTTP 422 with a
-    clear message when the target does not resolve to a runner owned by this project.
+    Resolution is scoped to the project's allow-listed, non-deleted runners. A runner
+    that is currently OFFLINE still resolves — the operator may launch ahead of the
+    box coming up; only membership (enrollment or explicit secondary grant) and
+    non-deletion are required. Returns the resolved runner UUID string. Raises HTTP
+    422 when the target does not resolve to a runner allowed for this project.
     """
     target = (runner_target or "").strip()
     if not target:
@@ -3098,7 +3099,7 @@ async def _resolve_forced_runner_target(
                 await session.execute(
                     select(LocalRunner).where(
                         LocalRunner.id == parsed,
-                        LocalRunner.project_id == project_id,
+                        runner_allowed_for_project(project_id),
                         LocalRunner.status != "deleted",
                     )
                 )
@@ -3115,7 +3116,7 @@ async def _resolve_forced_runner_target(
             await session.execute(
                 select(LocalRunner)
                 .where(
-                    LocalRunner.project_id == project_id,
+                    runner_allowed_for_project(project_id),
                     LocalRunner.hostname == target,
                     LocalRunner.status != "deleted",
                 )
@@ -3133,7 +3134,7 @@ async def _resolve_forced_runner_target(
             "error": "forced_runner_not_found",
             "message": (
                 f"runner_target_id {target!r} does not resolve to a registered, "
-                "non-deleted runner belonging to this project"
+                "non-deleted runner allowed for this project"
             ),
             "requested": target,
         },
@@ -3191,7 +3192,7 @@ async def create_compute_experiment_task(
     await backfill_branch_columns(session, project_id=project.id)
 
     # Resolve an operator HARD runner pin (UUID or hostname) against this project's
-    # own registered runners BEFORE persisting the task. A 422 here means the target
+    # allow-listed runners BEFORE persisting the task. A 422 here means the target
     # is unknown/foreign — fail fast rather than create a task that can never run.
     forced_runner_id: str | None = None
     if payload.runner_target_id is not None and payload.runner_target_id.strip():
@@ -3247,8 +3248,8 @@ async def create_compute_experiment_task(
     if not ok:
         raise HTTPException(status_code=422, detail=reason)
 
-    # A runner pin must name one of THIS project's enrolled runners — reject
-    # unknown and cross-project runner ids at authoring time with a clear 422
+    # A runner pin must name one of THIS project's allow-listed runners — reject
+    # unknown and unauthorized runner ids at authoring time with a clear 422
     # instead of persisting a task that can never (strict) or silently won't
     # (soft) dispatch where the operator expects.
     if payload.runner_target is not None:
@@ -3441,8 +3442,8 @@ async def create_compute_experiment_task(
         task_context["preferred_runner_target_id"] = payload.runner_target.runner_id
     if forced_runner_id:
         # Operator HARD pin (runner_target_id): _resolve_forced_runner_target
-        # already validated this runner belongs to the project; dispatch refuses
-        # any other runner. Distinct from the soft preferred pin above.
+        # already validated this runner is allowed for the project; dispatch
+        # refuses any other runner. Distinct from the soft preferred pin above.
         task_context["forced_runner_target_id"] = forced_runner_id
     new_task = Task(
         project_id=project.id,

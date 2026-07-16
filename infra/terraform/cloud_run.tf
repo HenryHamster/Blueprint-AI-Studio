@@ -192,9 +192,9 @@ resource "google_service_account" "agent_job_sa" {
 #
 # DARK BY DEFAULT: the backend dispatch path is gated behind an empty
 # `cloud_run_task_type_allowlist` runtime setting. Applying this resource alone
-# changes no task routing — operators must (1) build/push the agent image to
-# this job, (2) set CLOUD_RUN_JOB_NAME in cloudbuild.yaml, and (3) populate the
-# allowlist. See docs/cloud-run-jobs-activation.md for the full action list.
+# changes no task routing — activation still requires (1) a successful agent
+# image deployment, (2) CLOUD_RUN_JOB_NAME in cloudbuild.yaml, and (3) a
+# populated allowlist. See docs/cloud-run-jobs-activation.md for the full list.
 #
 # The job MUST be named exactly "blueprint-agent-job" so that the documented
 # CLOUD_RUN_JOB_NAME value
@@ -227,10 +227,9 @@ resource "google_cloud_run_v2_job" "blueprint_agent_job" {
       timeout     = "14400s"
 
       containers {
-        # Placeholder image. No CI builds the agent container into this job
-        # yet — building/pushing blueprint-agent-job from agent/src is an
-        # operator action (see docs/cloud-run-jobs-activation.md). The
-        # ignore_changes below keeps terraform from reverting that push.
+        # Bootstrap placeholder. The main deploy workflow builds and rolls out
+        # agent/** changes; the ignore_changes below keeps Terraform from
+        # reverting that CI-owned image back to the placeholder.
         image = "us-docker.pkg.dev/cloudrun/container/hello"
 
         # Tier A3 default sizing: 1 vCPU / 2 GiB. Zero-checkout (Tier A1) types
@@ -289,8 +288,8 @@ resource "google_cloud_run_v2_job" "blueprint_agent_job" {
     }
   }
 
-  # Operators build & push the real agent image out-of-band; do not let
-  # terraform revert it back to the placeholder on the next apply.
+  # CI owns the live agent image; do not let Terraform revert it back to the
+  # bootstrap placeholder on the next apply.
   lifecycle {
     ignore_changes = [
       template[0].template[0].containers[0].image,

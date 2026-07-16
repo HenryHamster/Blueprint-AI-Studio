@@ -63,12 +63,11 @@ steps:
       # VM_PROVISIONING_MODEL=SPOT` if scale grows enough that the absolute
       # VM dollars matter again.
       #
-      # DISABLED_REGIONS — list of regions where multi-region NAT was dropped
-      # from terraform (vpc.tf). Orchestrator skips these zones at spawn time
-      # with an explicit "administratively disabled (no subnet)" log.
-      # Restore by re-enabling the multi-region NAT block in vpc.tf and
-      # setting DISABLED_REGIONS="" here.
-      - 'GCP_PROJECT_ID=$PROJECT_ID,GCP_ZONE=us-central1-a,VPC_NETWORK=agent-sandbox-vpc,VPC_SUBNET=agent-sandbox-subnet,AGENT_SERVICE_ACCOUNT_EMAIL=agent-naked-sa@$PROJECT_ID.iam.gserviceaccount.com,ARTIFACT_BUCKET_NAME=$PROJECT_ID-agent-artifacts,ALLOWED_ORIGINS=${_ALLOWED_ORIGINS},ORCHESTRATOR_URL=${_ORCHESTRATOR_URL},LOCAL_MODE=false,MAX_CONCURRENT_VMS=10,INITIAL_ADMIN_EMAIL=${_INITIAL_ADMIN_EMAIL},VM_PROVISIONING_MODEL=STANDARD,DISABLED_REGIONS=us-east1;us-east4;us-west1,CLOUD_RUN_JOB_NAME=projects/$PROJECT_ID/locations/us-central1/jobs/blueprint-agent-job'
+      # us-east1 is the active cross-region capacity fallback; east4/west1
+      # remain disabled until their subnet/router/NAT resources are restored.
+      # Serialize GCE inserts across Cloud Run instances so stockouts cannot
+      # create another thundering herd.
+      - 'GCP_PROJECT_ID=$PROJECT_ID,GCP_ZONE=us-central1-a,VPC_NETWORK=agent-sandbox-vpc,VPC_SUBNET=agent-sandbox-subnet,AGENT_SERVICE_ACCOUNT_EMAIL=agent-naked-sa@$PROJECT_ID.iam.gserviceaccount.com,ARTIFACT_BUCKET_NAME=$PROJECT_ID-agent-artifacts,ALLOWED_ORIGINS=${_ALLOWED_ORIGINS},ORCHESTRATOR_URL=${_ORCHESTRATOR_URL},LOCAL_MODE=false,MAX_CONCURRENT_VMS=10,MAX_PROVISION_SLOTS=2,MACHINE_TYPE=n2-standard-2,INITIAL_ADMIN_EMAIL=${_INITIAL_ADMIN_EMAIL},VM_PROVISIONING_MODEL=STANDARD,DISABLED_REGIONS=us-east4;us-west1,CLOUD_RUN_JOB_NAME=projects/$PROJECT_ID/locations/us-central1/jobs/blueprint-agent-job'
       - '--set-secrets'
       # ANTHROPIC_API_KEY is optional — only needed as fallback if not using Max plan auth on VM images
       # REDIS_URL removed 2026-05-02 — see redis_client.py:1-7, all consumers
@@ -77,7 +76,10 @@ steps:
       # in-memory IS the source of truth. Restore: re-add the secret binding
       # here AND restore archive/redis.tf.disabled (does not yet exist; if
       # restoring re-create from git history).
-      - 'DATABASE_URL=DATABASE_URL:latest,AGENT_JWT_SECRET=AGENT_JWT_SECRET:latest,WS_TICKET_SECRET=WS_TICKET_SECRET:latest,GITHUB_APP_ID=GITHUB_APP_ID:latest,GITHUB_CLIENT_ID=GITHUB_CLIENT_ID:latest,GITHUB_CLIENT_SECRET=GITHUB_CLIENT_SECRET:latest,GITHUB_PRIVATE_KEY=GITHUB_PRIVATE_KEY:latest,GITHUB_WEBHOOK_SECRET=GITHUB_WEBHOOK_SECRET:latest,ADMIN_API_KEY=ADMIN_API_KEY:latest,METRICS_TOKEN=METRICS_TOKEN:latest'
+      # --set-secrets replaces the complete service list. gcloud validates every
+      # named secret exists at deploy time, so a missing required secret fails
+      # here with its name instead of creating a revision that crashes at boot.
+      - 'DATABASE_URL=DATABASE_URL:latest,AGENT_JWT_SECRET=AGENT_JWT_SECRET:latest,WS_TICKET_SECRET=WS_TICKET_SECRET:latest,GITHUB_APP_ID=GITHUB_APP_ID:latest,GITHUB_CLIENT_ID=GITHUB_CLIENT_ID:latest,GITHUB_CLIENT_SECRET=GITHUB_CLIENT_SECRET:latest,GITHUB_PRIVATE_KEY=GITHUB_PRIVATE_KEY:latest,GITHUB_WEBHOOK_SECRET=GITHUB_WEBHOOK_SECRET:latest,ADMIN_API_KEY=ADMIN_API_KEY:latest,METRICS_TOKEN=METRICS_TOKEN:latest,GITHUB_PAT_ENCRYPTION_KEY=GITHUB_PAT_ENCRYPTION_KEY:latest'
       - '--no-cpu-throttling'
       - '--cpu-boost'
       - '--vpc-egress'
@@ -86,6 +88,47 @@ steps:
       - 'agent-sandbox-vpc'
       - '--subnet'
       - 'agent-sandbox-subnet'
+
+  # Bind GITHUB_PAT_ENCRYPTION_KEY to the migration job so migration 0609 can
+  # run when Cloud Build is the deploy entrypoint (setup.sh handles the
+  # create-time binding; this step handles the update-image-only path used by
+  # the GitHub Actions deploy workflow, which cannot bind secrets itself).
+  # --update-secrets is additive and does not touch other secret bindings.
+  # gcloud run jobs update --image alone preserves secrets, so this binding
+  # survives the subsequent image-only update in the GHA deploy step.
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: bash
+    args:
+      - '-c'
+      - |
+        if gcloud run jobs describe blueprint-migrate --region=us-central1 --project="$PROJECT_ID" >/dev/null 2>&1; then
+          gcloud run jobs update blueprint-migrate \
+            --region=us-central1 \
+            --project="$PROJECT_ID" \
+            --update-secrets=GITHUB_PAT_ENCRYPTION_KEY=GITHUB_PAT_ENCRYPTION_KEY:latest \
+            --quiet
+          echo "GITHUB_PAT_ENCRYPTION_KEY bound to blueprint-migrate."
+        else
+          echo "blueprint-migrate job not yet provisioned; setup.sh binds the secret at create time."
+        fi
+
+  # Qualification scratch infrastructure is optional and must not participate
+  # in the replace-all serving-secret contract above. Re-bind it additively
+  # after each deploy only when the separately managed secret exists.
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: bash
+    args:
+      - '-c'
+      - |
+        if gcloud secrets describe MIGRATION_APPLY_SCRATCH_DATABASE_URL --project="$PROJECT_ID" >/dev/null 2>&1; then
+          gcloud run services update blueprint-orchestrator \
+            --region=us-central1 \
+            --project="$PROJECT_ID" \
+            --update-secrets=MIGRATION_APPLY_SCRATCH_DATABASE_URL=MIGRATION_APPLY_SCRATCH_DATABASE_URL:latest \
+            --quiet
+        else
+          echo "Optional migration-apply scratch secret is not configured; serving remains available."
+        fi
 
 images:
   - 'us-central1-docker.pkg.dev/$PROJECT_ID/blueprint-repo/blueprint-orchestrator:latest'

@@ -65,6 +65,11 @@ class VersionSnapshot:
     in_flight_task_count: int
     qualification_state: dict[str, Any] | None
     serving: ServingSnapshot
+    qualification_provenance: dict[str, Any] = field(default_factory=dict)
+    dimension_states: list[dict[str, Any]] = field(default_factory=list)
+    qualification_attempts: int = 0
+    qualification_retry_episode: int = 0
+    active_qualification_attempt_id: str | None = None
 
 
 @dataclass
@@ -115,7 +120,7 @@ async def compute_system_state(
     from app import release_version as rv
     from app.release_artifacts import version_serving_summary as _version_serving_summary
     from app.qualification_state_resolver import (
-        resolve_open_version_qualification_state,
+        resolve_open_version_qualification_read_model,
     )
 
     now = _utcnow()
@@ -220,7 +225,7 @@ async def compute_system_state(
             # the snapshot alone told a ``qualifying`` story in the stale-pending
             # and audit-crashed windows while the others had resolved. The open
             # version is the only one that needs the full set here.
-            qual_state, _ = await resolve_open_version_qualification_state(
+            qualification_read = await resolve_open_version_qualification_read_model(
                 session,
                 version,
                 project,
@@ -241,7 +246,16 @@ async def compute_system_state(
                 goal=version.goal,
                 merged_task_count=merged_count,
                 in_flight_task_count=in_flight_count,
-                qualification_state=qual_state,
+                qualification_state=qualification_read.qualification_state,
+                qualification_provenance=qualification_read.provenance,
+                dimension_states=qualification_read.dimension_states,
+                qualification_attempts=version.qualification_attempts,
+                qualification_retry_episode=version.qualification_retry_episode,
+                active_qualification_attempt_id=(
+                    str(version.active_qualification_attempt_id)
+                    if version.active_qualification_attempt_id
+                    else None
+                ),
                 serving=serving_snap,
             )
 

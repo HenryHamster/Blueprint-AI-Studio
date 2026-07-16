@@ -7,14 +7,17 @@ import {
   clearDeployFailed,
   cutVersion,
   fetchQualificationVerdicts,
+  getHotfixPreview,
   linkCriteriaToDirection,
   patchAdminSettings,
   reinstateAcceptanceCriterion,
   setProjectPromotionEnabled,
   setVersionPhase,
   setVersionGoal,
+  triggerHotfixPromote,
   triggerQualify,
   type AgentServingShasResponse,
+  type HotfixPreviewResponse,
   type QualificationVerdictRecord,
   type CurrentVersion,
   type VersionLifecycleResponse,
@@ -75,6 +78,12 @@ function QualificationTriggerRow({ state }: { state: QualificationTriggerState }
       {state.next_expected_trigger && state.auto_trigger === 'waiting' && (
         <span className="text-neutral-600 italic">next: {state.next_expected_trigger.replace(/_/g, ' ')}</span>
       )}
+      <span className="text-neutral-600">
+        lifetime qualifications: {state.lifetime_qualification_attempts}
+      </span>
+      <span className="text-neutral-600">
+        error retry episode: {state.error_retry_episode.count}/{state.error_retry_episode.cap}
+      </span>
     </div>
   );
 }
@@ -147,6 +156,11 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
   const [promotionEnabledOverride, setPromotionEnabledOverride] = useState<boolean | null>(null);
   const [cuttingVersion, setCuttingVersion] = useState<boolean>(false);
   const [cutReason, setCutReason] = useState<string>('');
+  const [hotfixPanelOpen, setHotfixPanelOpen] = useState<boolean>(false);
+  const [hotfixPreview, setHotfixPreview] = useState<HotfixPreviewResponse | null>(null);
+  const [hotfixPreviewLoading, setHotfixPreviewLoading] = useState<boolean>(false);
+  const [hotfixReason, setHotfixReason] = useState<string>('');
+  const [hotfixAck, setHotfixAck] = useState<boolean>(false);
   const [expandedVersionId, setExpandedVersionId] = useState<string | null>(null);
   const [changelogExpanded, setChangelogExpanded] = useState<boolean>(false);
   // One idempotency key per confirmed cut: generated on confirm, reused across
@@ -611,7 +625,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
               <span className={`text-ui-sm font-semibold px-1.5 py-0.5 rounded border ${cv.phase === 'stabilize' ? 'bg-amber-500/10 border-amber-500/30 text-amber-400' : 'bg-blue-500/10 border-blue-500/30 text-blue-400'}`}>{cv.phase}</span>
               {cv.phase_changed_at && <span className="text-ui-sm text-neutral-500">{timeAgo(cv.phase_changed_at)}</span>}
               <span className="text-ui-sm text-neutral-500">{cv.merged_task_count} tasks merged</span>
-              {cv.qualification_attempts > 0 && <span className="text-ui-sm text-neutral-500">{cv.qualification_attempts} qual{cv.qualification_attempts !== 1 ? 's' : ''}</span>}
+              {cv.qualification_attempts > 0 && <span className="text-ui-sm text-neutral-500">{cv.qualification_attempts} lifetime qualification{cv.qualification_attempts !== 1 ? 's' : ''}</span>}
               {cv.active_candidate_sha && (
                 <span
                   data-testid="active-candidate-sha"
@@ -868,6 +882,132 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                       <span className="text-ui-sm px-1.5 py-0.5 rounded border bg-red-500/10 text-red-400 border-red-500/20">
                         {cv.last_qualification.error}
                       </span>
+                    )}
+                  </div>
+                )}
+                {cv.last_qualification.is_permanent_gate_incapacity && projectId && (
+                  <div className="mt-1 pl-2 border-l-2 border-red-500/40 space-y-2" data-testid="hotfix-remediation-panel">
+                    <p className="text-ui-sm text-red-400 font-medium">
+                      Permanent gate incapacity — the release is held by a structural gate failure.
+                      The operator hotfix-deploy channel may unblock it.
+                    </p>
+                    {!hotfixPanelOpen ? (
+                      <button
+                        onClick={() => {
+                          setHotfixPanelOpen(true);
+                          setHotfixPreviewLoading(true);
+                          getHotfixPreview(projectId, cv.active_candidate_sha)
+                            .then(r => { setHotfixPreview(r); })
+                            .catch(e => { setHotfixPreview({ status: 'error', eligible: false, changed_files: [], offending_files: [], reason: String(e?.message ?? e) }); })
+                            .finally(() => setHotfixPreviewLoading(false));
+                        }}
+                        className="text-ui-sm px-2 py-0.5 min-h-[44px] sm:min-h-0 rounded border border-red-500/40 text-red-400 hover:bg-red-500/10"
+                        data-testid="hotfix-open-btn"
+                      >
+                        Inspect hotfix eligibility
+                      </button>
+                    ) : (
+                      <div className="space-y-2">
+                        <div className="text-ui-sm space-y-1">
+                          <div className="flex gap-2 text-neutral-500">
+                            <span>Candidate:</span>
+                            <span className="font-mono text-neutral-400">{cv.active_candidate_sha?.slice(0, 12) ?? '—'}</span>
+                            {hotfixPreview?.prior_deployed_sha && (
+                              <>
+                                <span>Serving:</span>
+                                <span className="font-mono text-neutral-400">{hotfixPreview.prior_deployed_sha.slice(0, 12)}</span>
+                              </>
+                            )}
+                          </div>
+                          {hotfixPreviewLoading && <p className="text-neutral-500 italic">Loading scope preview…</p>}
+                          {hotfixPreview && !hotfixPreviewLoading && (
+                            <>
+                              <p className={`font-medium ${hotfixPreview.eligible ? 'text-emerald-400' : 'text-red-400'}`}>
+                                {hotfixPreview.eligible ? 'Eligible for hotfix-deploy' : 'Not eligible for hotfix-deploy'}
+                              </p>
+                              <p className="text-neutral-500">{hotfixPreview.reason}</p>
+                              {hotfixPreview.changed_files.length > 0 && (
+                                <div>
+                                  <p className="text-neutral-500">Changed files ({hotfixPreview.changed_files.length}):</p>
+                                  <ul className="pl-2 space-y-0.5">
+                                    {hotfixPreview.changed_files.map(f => (
+                                      <li key={f} className={`font-mono text-ui-xs ${hotfixPreview.offending_files.includes(f) ? 'text-red-400' : 'text-neutral-400'}`}>
+                                        {hotfixPreview.offending_files.includes(f) ? '✗ ' : '✓ '}{f}
+                                      </li>
+                                    ))}
+                                  </ul>
+                                </div>
+                              )}
+                              {hotfixPreview.eligible && (
+                                <div className="space-y-2 pt-1 border-t border-neutral-700/40">
+                                  <p className="text-neutral-400 text-ui-sm">
+                                    This will ship only the allowlisted release-machinery files. CI and
+                                    migration guards still apply. The fix is INERT until the deployment completes.
+                                  </p>
+                                  <div>
+                                    <label className="block text-ui-sm text-neutral-400 mb-0.5">Hotfix reason (required)</label>
+                                    <input
+                                      type="text"
+                                      value={hotfixReason}
+                                      onChange={e => setHotfixReason(e.target.value)}
+                                      placeholder="Describe what this hotfix fixes and why it is safe"
+                                      className="w-full bg-neutral-800 border border-neutral-600 rounded px-2 py-1 text-ui-sm text-neutral-200 placeholder:text-neutral-600"
+                                      data-testid="hotfix-reason-input"
+                                    />
+                                  </div>
+                                  <label className="flex items-start gap-2 text-ui-sm text-neutral-400 cursor-pointer">
+                                    <input
+                                      type="checkbox"
+                                      checked={hotfixAck}
+                                      onChange={e => setHotfixAck(e.target.checked)}
+                                      className="mt-0.5 shrink-0"
+                                      data-testid="hotfix-ack-checkbox"
+                                    />
+                                    I understand this fix is inert until the promoted content is deployed.
+                                  </label>
+                                  <button
+                                    disabled={!hotfixReason.trim() || !hotfixAck || actionLoading !== null}
+                                    onClick={async () => {
+                                      if (!hotfixReason.trim() || !hotfixAck) return;
+                                      setActionLoading('hotfix');
+                                      try {
+                                        await triggerHotfixPromote(
+                                          projectId,
+                                          hotfixReason.trim(),
+                                          hotfixPreview.changed_files,
+                                          true,
+                                          cv.active_candidate_sha,
+                                        );
+                                        setActionMsg('Hotfix-promote initiated.');
+                                        setHotfixPanelOpen(false);
+                                        setHotfixReason('');
+                                        setHotfixAck(false);
+                                        setHotfixPreview(null);
+                                        onRefresh?.();
+                                      } catch (e: unknown) {
+                                        setActionMsg(`Hotfix failed: ${(e as Error)?.message ?? String(e)}`);
+                                      } finally {
+                                        setActionLoading(null);
+                                      }
+                                    }}
+                                    className="text-ui-sm px-3 py-1 rounded border border-red-500/50 text-red-400 hover:bg-red-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                                    data-testid="hotfix-promote-btn"
+                                  >
+                                    {actionLoading === 'hotfix' ? '…' : 'Hotfix-promote'}
+                                  </button>
+                                </div>
+                              )}
+                            </>
+                          )}
+                        </div>
+                        <button
+                          onClick={() => { setHotfixPanelOpen(false); setHotfixPreview(null); }}
+                          className="text-ui-sm text-neutral-500 hover:text-neutral-300"
+                          data-testid="hotfix-close-btn"
+                        >
+                          Close
+                        </button>
+                      </div>
                     )}
                   </div>
                 )}

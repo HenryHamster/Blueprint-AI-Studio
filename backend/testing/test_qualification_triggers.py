@@ -174,6 +174,14 @@ class TestT1InitialFire:
 # T2 — error_redrive
 # ---------------------------------------------------------------------------
 
+
+@pytest.mark.parametrize("status", ["rubric_changed", "rubric_provenance_unknown"])
+def test_rubric_outcomes_redrive_with_a_fresh_snapshot(status):
+    d = _resolve(status=status)
+    assert d.fire
+    assert d.trigger == "rubric_redrive"
+
+
 class TestT2ErrorRedrive:
     # With the coverage gate retired, a version sitting at ``error`` no longer
     # short-circuits at T1 — it falls through to T2, which keeps the
@@ -515,7 +523,8 @@ class TestExplainQualificationTrigger:
         assert "last_attempt" in out
         assert "next_expected_trigger" in out
         assert "blocking" in out
-        assert "attempts" in out
+        assert "lifetime_qualification_attempts" in out
+        assert "error_retry_episode" in out
         assert "knob" in out
         assert "evaluated_at" in out
         assert "decision" in out
@@ -555,7 +564,29 @@ class TestExplainQualificationTrigger:
         )
         assert out["next_expected_trigger"] == "new_candidate_commit"
 
-    def test_attempts_counter(self):
-        out = self._explain(qualification_attempts=3)
-        assert out["attempts"]["count"] == 3
-        assert out["attempts"]["cap"] == _MAX_ERROR_REDRIVE_ATTEMPTS
+    def test_lifetime_attempts_and_error_episode_are_independent(self):
+        out = self._explain(
+            status="error",
+            error_code="sha_error",
+            qualification_attempts=11,
+            error_redrive_count=0,
+        )
+        assert out["lifetime_qualification_attempts"] == 11
+        assert out["error_retry_episode"] == {
+            "count": 0,
+            "cap": _MAX_ERROR_REDRIVE_ATTEMPTS,
+        }
+        assert out["auto_trigger"] != "capped"
+        assert out["decision"]["fire"] is True
+
+    def test_error_episode_rollover_uses_the_new_episode_count(self):
+        out = self._explain(
+            status="error",
+            error_code="sha_error",
+            qualification_attempts=12,
+            error_redrive_count=1,
+        )
+        assert out["lifetime_qualification_attempts"] == 12
+        assert out["error_retry_episode"]["count"] == 1
+        assert out["auto_trigger"] != "capped"
+        assert out["decision"]["fire"] is True

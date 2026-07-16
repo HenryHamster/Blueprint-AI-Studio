@@ -12,6 +12,10 @@ registers it as ``operator-*``.
 
 from __future__ import annotations
 
+from typing import Any
+
+from sqlalchemy import or_
+
 # ── Audience constants ──────────────────────────────────────────────────
 
 OPERATOR_ACTION_NEEDED = "operator-action-needed"
@@ -93,8 +97,17 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     "cost.spend_hold": OPERATOR_ACTION_NEEDED,
     "capacity.quota_exhausted": OPERATOR_ACTION_NEEDED,
     "capacity.all_accounts_blocked": OPERATOR_ACTION_NEEDED,
+    # Self-hosted fleet runner health incidents: operator-owned hardware needs
+    # operator remediation; idle GPU capacity is advisory only.
     "runner.deactivated": OPERATOR_ACTION_NEEDED,
     "runner.degraded": OPERATOR_FYI,
+    "runner.low_disk": OPERATOR_ACTION_NEEDED,
+    "runner.low_memory": OPERATOR_ACTION_NEEDED,
+    "runner.idle_gpu": OPERATOR_FYI,
+    "runner.token_stale": OPERATOR_ACTION_NEEDED,
+    "runner.fleet_no_healthy": OPERATOR_ACTION_NEEDED,
+    "runner.post_update_silent": OPERATOR_ACTION_NEEDED,
+    "runner.cross_project_access": OPERATOR_ACTION_NEEDED,
     # GCE task-VM proactive resource-health alerts (warm-pool monitoring parity):
     # surfaced to the operator so an OOM- or disk-bound VM is visible in the fleet
     # health summary BEFORE the VM is killed, not only via teardown forensics.
@@ -162,6 +175,10 @@ _AUDIENCES_THAT_REACH_OPERATOR: frozenset[str] = frozenset(
     {OPERATOR_ACTION_NEEDED, OPERATOR_FYI}
 )
 
+_NON_OPERATOR_AUDIENCES: frozenset[str] = frozenset(
+    {STRATEGIST_INTERNAL, PIPELINE_LOG}
+)
+
 
 # ── Public API ──────────────────────────────────────────────────────────
 
@@ -185,6 +202,17 @@ def route_event(event_type: str, *, message_type: str | None = None) -> str:
 def is_operator_visible(audience: str) -> bool:
     """Return True when *audience* is operator-action-needed or operator-fyi."""
     return audience in _AUDIENCES_THAT_REACH_OPERATOR
+
+
+def operator_visible_audience_filter(context: Any) -> Any:
+    """Return the shared SQL filter for legacy and operator-visible rows.
+
+    Both message and task projections retain untagged legacy rows, while rows
+    explicitly marked strategist-internal or pipeline-log never contribute to
+    an operator-facing count, preview, or badge.
+    """
+    audience = context["audience"].as_string()
+    return or_(audience.is_(None), audience.notin_(_NON_OPERATOR_AUDIENCES))
 
 
 def stamp_message_audience(
@@ -256,7 +284,7 @@ _WEBHOOK_EVENT_AUDIENCE: dict[str, str] = {
     "RUNNER_DEGRADED": OPERATOR_FYI,
     "RUNNER_DEGRADED_ESCALATED": OPERATOR_ACTION_NEEDED,
     "RUNNER_FLEET_OFFLINE": OPERATOR_ACTION_NEEDED,
-    "RUNNER_LOW_DISK": OPERATOR_FYI,
+    "RUNNER_LOW_DISK": OPERATOR_ACTION_NEEDED,
     "RUNNER_OUTAGE_ESCALATED": OPERATOR_ACTION_NEEDED,
     "RUNNER_LOCAL_HOLD": OPERATOR_ACTION_NEEDED,
     "RUNNER_CONTAINER_HOLD": OPERATOR_ACTION_NEEDED,
@@ -270,6 +298,43 @@ _WEBHOOK_EVENT_AUDIENCE: dict[str, str] = {
     "RESIDUAL_FIX_MERGED": STRATEGIST_INTERNAL,
     "RESIDUAL_FIX_UNSUSPENDED": STRATEGIST_INTERNAL,
 }
+
+
+# ── Logical event pair registry ──────────────────────────────────────────
+#
+# Many events appear in BOTH the internal-ledger registry (lowercase/dotted)
+# and the external-webhook registry (UPPERCASE_UNDERSCORE) under different
+# naming conventions, but represent the same logical operation.  Paired entries
+# MUST agree on audience classification.  This mapping is the single source of
+# truth for those equivalences; ``test_message_audience.py`` reads it and fails
+# CI when a pair drifts so silent inconsistencies are caught before shipping.
+#
+# Only register pairs that are genuinely the same logical event.  Events that
+# only exist in one registry (internal-only bookkeeping or webhook-only fields)
+# must NOT appear here.
+_LOGICAL_EVENT_PAIRS: dict[str, str] = {
+    # internal_key (lowercase/dotted): webhook_key (UPPERCASE_UNDERSCORE)
+    "pr_merged": "PR_MERGED",
+    "auto_fix_escalated": "AUTO_FIX_ESCALATED",
+    "auto_fix_spawned": "AUTO_FIX_SPAWNED",
+    "residual_fix_escalated": "RESIDUAL_FIX_ESCALATED",
+    "residual_fix_audit_deferred": "RESIDUAL_FIX_AUDIT_DEFERRED",
+    "residual_fix_spawned": "RESIDUAL_FIX_SPAWNED",
+    "residual_fix_unsuspended": "RESIDUAL_FIX_UNSUSPENDED",
+    "direction_burn_pause": "DIRECTION_BURN_PAUSE",
+    "remediation_escalated": "REMEDIATION_ESCALATED",
+    "merge.unverified": "MERGE_UNVERIFIED",
+    "task.failed": "TASK_FAILED",
+    "approval.needed": "APPROVAL_NEEDED",
+    "runner.deactivated": "RUNNER_DEACTIVATED",
+    "runner.degraded": "RUNNER_DEGRADED",
+    "runner.low_disk": "RUNNER_LOW_DISK",
+}
+
+
+def get_logical_event_pairs() -> dict[str, str]:
+    """Return the known internal→webhook event equivalences (testing hook)."""
+    return dict(_LOGICAL_EVENT_PAIRS)
 
 
 def route_external_webhook_event(webhook_event_type: str) -> str:

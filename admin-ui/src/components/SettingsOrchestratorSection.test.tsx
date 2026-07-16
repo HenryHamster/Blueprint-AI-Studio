@@ -411,7 +411,8 @@ describe('SettingsOrchestratorSection', () => {
     });
 
     // Auto-graduation toggle issues a partial PATCH of just the boolean key.
-    const toggle = within(section).getByRole('button', { name: '' });
+    const autoGradContainer = within(section).getByTestId('proof-gate-auto-graduation');
+    const toggle = within(autoGradContainer).getByRole('button', { name: '' });
     await user.click(toggle);
     await waitFor(() => {
       expect(patchCapabilityProofGateSettings).toHaveBeenCalledWith({ capability_proof_gate_auto_graduation_enabled: true });

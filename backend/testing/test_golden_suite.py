@@ -485,6 +485,18 @@ class TestSuiteIntegrity:
             f"golden_tasks/runner.py and update this inline copy."
         )
 
+    def test_runner_task_types_match_inline_copy_when_importable(self):
+        """The checkout runner constant must not drift from this Docker copy."""
+        try:
+            import golden_tasks.runner as runner  # noqa: PLC0415
+        except ImportError:
+            pytest.skip("golden_tasks.runner not importable (expected in Docker)")
+
+        from app.task_capabilities import ALL_TASK_TYPES as backend_types  # noqa: PLC0415
+
+        assert runner.VALID_TASK_TYPES >= backend_types
+        assert runner.VALID_TASK_TYPES == VALID_TASK_TYPES
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Per-spec field validation
@@ -856,6 +868,56 @@ class TestDryRunMetrics:
         assert metrics.cache_creation_input_tokens == 0
         assert metrics.llm_call_count == 0
         assert metrics.num_turns == 0
+
+    def test_simulated_runs_are_marked_and_excluded_from_real_success_rate(self):
+        """Fallback/dry-run metrics cannot become a real cost-baseline success."""
+        pytest.importorskip("golden_tasks.runner")
+        import golden_tasks.runner as runner  # noqa: PLC0415
+
+        real = runner.RunMetrics()
+        real.stop(success=True)
+        simulated = runner.RunMetrics()
+        runner._run_simulated(simulated, type("Args", (), {"model": None})())
+
+        assert simulated.to_dict()["simulated"] is True
+        summary = runner.RunMetrics.aggregate([real, simulated])
+        assert summary["simulated_count"] == 1
+        assert summary["real_count"] == 1
+        assert summary["success_count"] == 1
+        assert summary["success_rate"] == 1.0
+
+    def test_real_run_fallback_is_not_a_successful_real_run(self, monkeypatch):
+        """An unavailable agent produces marked simulation, not a fake success."""
+        pytest.importorskip("golden_tasks.runner")
+        import golden_tasks.runner as runner  # noqa: PLC0415
+
+        def unavailable(*_args, **_kwargs):
+            raise runner.AgentBinaryNotFound("agent unavailable")
+
+        monkeypatch.setattr(runner, "_AGENT_RUNNER_AVAILABLE", True)
+        monkeypatch.setattr(runner, "run_single_task", unavailable)
+        metrics = runner.RunMetrics()
+        args = type(
+            "Args", (), {"timeout": 1, "agent_path": None, "verbose": False, "model": None}
+        )()
+        runner._run_real(metrics, {"type": "research"}, args)
+
+        assert metrics.simulated is True
+        summary = runner.RunMetrics.aggregate([metrics])
+        assert summary["success_count"] == 0
+        assert summary["simulated_count"] == 1
+        assert summary["real_count"] == 0
+        assert "success_rate" not in summary
+
+    def test_oauth_token_is_sufficient_for_default_anthropic_provider(self, monkeypatch):
+        """OAuth-only fleet credentials must not trigger a simulated fallback."""
+        pytest.importorskip("golden_tasks.agent_runner")
+        import golden_tasks.agent_runner as agent_runner  # noqa: PLC0415
+
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-token")
+        monkeypatch.delenv("PROVIDER", raising=False)
+        assert agent_runner._has_required_llm_credentials() is True
 
     def test_aggregate_includes_new_telemetry_keys(self):
         """RunMetrics.aggregate() should include cache + provider/model breakdown keys."""

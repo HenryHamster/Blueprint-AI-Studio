@@ -183,6 +183,14 @@ _LIVE_TASK_STATUSES = frozenset(
 
 _RESIDENT_STRATEGIC_TASK_TYPE = "strategic_review"
 
+# The resident agent uses the Claude streaming/session protocol even when the
+# underlying model is served by a compatible third-party provider. OpenAI's
+# Codex JSONL transport cannot host that protocol, so resident tasks must carry
+# an explicit per-task routing constraint instead of inheriting the broader
+# strategic category preference (which may validly put OpenAI first for normal
+# one-shot strategic reviews).
+_RESIDENT_PROVIDER_PREFERENCE = ("anthropic", "zai", "deepseek")
+
 # A live strategic_review task is only *adoptable* into a resident session while
 # it has NOT yet begun executing. Handler dispatch — the one-shot
 # ``handleStrategic`` vs the streaming ``handleStrategicResident`` — is decided
@@ -729,6 +737,54 @@ async def _find_adoptable_strategic_review_task(
     return None
 
 
+async def _find_spawned_resident_strategic_task(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    session_id: str,
+) -> Task | None:
+    """Recover this start request's born-resident task after an immediate claim.
+
+    A pinned local runner can claim the task between the canonical spawn's commit
+    and :func:`_find_adoptable_strategic_review_task`.  At that point the task is
+    no longer adoptable (``started_at`` is set / status is ``IN_PROGRESS``), but
+    it is already safe to finalize because the creating INSERT carried both the
+    resident flag and this request's unique ``strategic_session_id``.  Refresh
+    rows from the database so an identity-map copy created by the spawn does not
+    hide a claim committed on the runner's connection.
+    """
+    rows = (
+        (
+            await session.execute(
+                select(Task)
+                .where(
+                    Task.project_id == project_id,
+                    Task.archived.is_(False),
+                    Task.status.in_(
+                        [
+                            TaskStatus.QUEUED,
+                            TaskStatus.PROVISIONING,
+                            TaskStatus.IN_PROGRESS,
+                        ]
+                    ),
+                )
+                .order_by(Task.created_at.desc())
+                .execution_options(populate_existing=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for task in rows:
+        context = task.context or {}
+        if (
+            context.get("_resident_session") is True
+            and str(context.get("strategic_session_id") or "") == str(session_id)
+            and (task.first_payload or {}).get("type") == _RESIDENT_STRATEGIC_TASK_TYPE
+        ):
+            return task
+    return None
+
+
 async def _spawn_resident_strategic_task(
     session: AsyncSession,
     project: Project,
@@ -799,7 +855,17 @@ async def _spawn_resident_strategic_task(
         # runner pin still ride in via ``extra_context``.
         resident_minimal=True,
     )
-    return await _find_adoptable_strategic_review_task(session, project.id)
+    task = await _find_adoptable_strategic_review_task(session, project.id)
+    if task is not None:
+        return task
+    # The hard-pinned runner may have claimed the born-resident task before the
+    # adoptable re-query.  Recover only the task stamped with THIS start's unique
+    # session id; an unrelated cadence task must still make the start fail closed.
+    return await _find_spawned_resident_strategic_task(
+        session,
+        project.id,
+        session_id,
+    )
 
 
 def _resident_runner_display_name(runner: Any) -> str:
@@ -841,20 +907,21 @@ def _resident_runner_is_available(runner: Any) -> bool:
 async def _load_resident_runner_rows(
     session: AsyncSession, project_id: uuid.UUID
 ) -> list[Any]:
-    """Load the project's non-deleted local runners, most-recently-seen first.
+    """Load the project's allow-listed local runners, most-recently-seen first.
 
     Shared query for auto-pick, the picker options, and override validation, so
     they all scan the same ordered device set (matching
     ``_resolve_local_continuation_runner_affinity``'s ordering).
     """
     from app.models import LocalRunner
+    from app.runner_project_binding import runner_allowed_for_project
 
     return list(
         (
             await session.execute(
                 select(LocalRunner)
                 .where(
-                    LocalRunner.project_id == project_id,
+                    runner_allowed_for_project(project_id),
                     LocalRunner.status != "deleted",
                 )
                 .order_by(
@@ -888,13 +955,13 @@ async def _auto_select_local_runner(
 async def _resolve_override_runner(
     session: AsyncSession, project_id: uuid.UUID, runner_id: str
 ) -> Any | None:
-    """Resolve an explicit override ``runner_id`` to a runner OF THIS PROJECT.
+    """Resolve an explicit override ``runner_id`` to a runner on this project's allow-list.
 
-    Returns the ``LocalRunner`` when it exists, belongs to *project_id*, and is not
-    deleted — else None (the caller raises a clear "device not found" error rather
-    than silently pinning to an unknown/foreign device). Availability is checked
-    separately by the caller so it can distinguish "not found" (404) from
-    "offline" (409 block).
+    Returns the ``LocalRunner`` when it exists, is on *project_id*'s allow-list
+    (enrollment project or a secondary binding), and is not deleted — else None
+    (the caller raises a clear "device not found" error rather than silently
+    pinning to an unknown/foreign device). Availability is checked separately by
+    the caller so it can distinguish "not found" (404) from "offline" (409 block).
     """
     from app.models import LocalRunner
 
@@ -905,9 +972,12 @@ async def _resolve_override_runner(
     runner = await session.get(LocalRunner, runner_uuid)
     if (
         runner is None
-        or str(runner.project_id) != str(project_id)
         or runner.status == "deleted"
     ):
+        return None
+    from app.runner_project_binding import allowed_project_ids
+
+    if project_id not in await allowed_project_ids(session, runner):
         return None
     return runner
 
@@ -981,6 +1051,7 @@ def _resident_born_context(
     context: dict[str, Any] = {
         "_resident_session": True,
         "strategic_session_id": session_id,
+        "provider_preference": list(_RESIDENT_PROVIDER_PREFERENCE),
     }
     if runner_id:
         context["preferred_runner_target_id"] = str(runner_id)
@@ -1056,6 +1127,7 @@ def _stamp_resident_context(
     context = dict(task.context or {})
     context["_resident_session"] = True
     context["strategic_session_id"] = session_id
+    context["provider_preference"] = list(_RESIDENT_PROVIDER_PREFERENCE)
     # Carry the persisted exam ledger forward (adopt-path twin of the born-context
     # seed) so an adopted cadence task continues the examination rotation across a
     # restart. Absent leaves the merged context unchanged.

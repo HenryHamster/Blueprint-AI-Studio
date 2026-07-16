@@ -1185,7 +1185,13 @@ BLOCKER_EXECUTION_SITE: dict[str, str] = {
     "smoketest_startup_failed": EXECUTION_SITE_CANDIDATE,
     "audit_missing": EXECUTION_SITE_CANDIDATE,
     "test_file_deleted": EXECUTION_SITE_CANDIDATE,
-    "criterion_coverage_incomplete": EXECUTION_SITE_CANDIDATE,
+    # Deployed-side: the category verdict ledger is composed and rendered by
+    # the deployed qualifier.  Its recovery/minting path (acceptance-window,
+    # unverified-merge, and metrics-integrity evidence) also imports and runs
+    # in that process.  A change to any of that machinery on automain is inert
+    # until deployed, so direct operators to the narrow hotfix lane rather
+    # than claiming that another candidate qualification can pick it up.
+    "criterion_coverage_incomplete": EXECUTION_SITE_DEPLOYED,
     "merge_grade_misses": EXECUTION_SITE_CANDIDATE,
     "capability_proof_gate_blocked": EXECUTION_SITE_CANDIDATE,
     # NOTE: ``uncorroborated_attestation`` is deliberately absent — the

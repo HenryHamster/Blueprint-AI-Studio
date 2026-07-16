@@ -1,12 +1,12 @@
 /* eslint-disable react-hooks/refs, react-hooks/set-state-in-effect */
 import { memo, useState, useEffect, useCallback, useRef, useMemo } from 'react';
-import { auth, getIdToken } from '../firebase';
+import { auth } from '../firebase';
+import { currentUiSurface, reportUiLoadTiming } from '../uiLoadTiming';
 import { apiFetch, API_BASE_URL, authHeaders, type StrategicRefreshMarker } from '../api';
 import type { StrategicCycleProgress, StrategicCycleCompletion, StrategicSessionDelta } from '../hooks/useLogViewer';
 import { parseTimestamp, timeAgo } from '../utils/time';
 import { type EventPref, saveEventPrefs, effectiveSignal, getToastSeverity, countHighSignalMessages } from './eventPrefs';
 import { type TemporaryMutes } from './temporaryMutes';
-import { groupRoutineMessages, outcomeBreakdown, isFailingGroup } from './messageGrouping';
 import { loadLastSeen, saveLastSeen } from './lastSeen';
 import { saveServerNoisePrefs } from './serverSync';
 import type { MessageAttachment, ProjectMessage } from '../types/messages';
@@ -17,11 +17,13 @@ import {
   countStrategicReplies,
   type StrategicLiveActivity,
 } from '../utils/strategicSessionLive';
-import { StrategicStreamingBubble, StrategicActivityStrip, StrategicResidentActivityWidget } from './StrategicLiveTurn';
+import { StrategicStreamingBubble, StrategicResidentActivityWidget } from './StrategicLiveTurn';
+import { AlertsBanner } from './AlertsBanner';
+import type { Alert } from '../types/alert';
 import { SaveViewDialog } from './SaveViewDialog';
 import { useMessageList } from './useMessageList';
 import { useMessagesPanelFilters } from './useMessagesPanelFilters';
-import { MessagesListView } from './MessagesListView';
+import { MessagesListView, type ConversationListImperativeApi } from './MessagesListView';
 import { MessagesPanelHeader, type MessagesPanelFilterChrome, type WebhookStats } from './MessagesPanelHeader';
 import { MessagesComposer, type PendingAttachment } from './MessagesComposer';
 import { armingToastCopy, parseArmingOutcome, type ArmingOutcome, WORKDAY_CAPABILITY_HINT, WORKDAY_STARTER_PROMPTS } from './messageArming';
@@ -30,30 +32,42 @@ import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
 import { generateIdempotencyKey } from '../utils/idempotencyKey';
 import { StrategicChallengeChip } from './StrategicChallengeChip';
 import { useDirectionForm } from '../hooks/useDirectionForm';
+import { useConversationSend } from '../hooks/useConversationSend';
+import { compareResidentMessages, useResidentConversation } from '../hooks/useResidentConversation';
 import { DirectionsAddForm } from './DirectionsAddForm';
 import {
   createStrategicSessionMessage,
-  fetchStrategicConversation,
-  getMessageAttachmentUploadUrl,
+  deleteMessageAttachmentUpload,
+  findStrategicMessageByClientIdentity,
+  StrategicSessionMessageCreateError,
   type StrategicContextPackageDescriptor,
   type StrategicMessageTarget,
   type StrategicStateResponse,
   type StrategicWorkbenchState,
 } from '../strategicStateApi';
 import { buildStrategicContextDescriptor, SESSION_IDLE_TTL_MS } from '../utils/strategicContextDescriptor';
-
+import { messageHasClientIdentity, mergeCanonicalConversationMessage } from '../utils/conversationMessageIdentity';
+import { clearComposerDraft, loadComposerDraft, saveComposerDraft } from '../utils/conversationDraftState';
+import { finalizeLastAttachmentRemoval, type ConversationComposerIntent, updateConversationComposerIntent } from '../utils/conversationAttachmentDraftFinalization';
+import { ComposerRequestOwnershipGuard } from '../utils/composerRequestOwnership';
+import { ConversationAttachmentUploadError, uploadConversationAttachments } from '../utils/conversationAttachmentUpload';
+import {
+  clearPendingAttachments as clearStoredPendingAttachments,
+  deletePendingAttachment as deleteStoredPendingAttachment,
+  listPendingAttachments as listStoredPendingAttachments,
+  putPendingAttachment as putStoredPendingAttachment,
+  retryPendingAttachmentCleanups,
+} from '../utils/pendingAttachmentStore';
 const DEFAULT_VIEW_ID = '__default__';
 const MESSAGE_CONTEXT_SELECTED_REF_DESCRIPTOR_LIMIT = 8;
 // Mirrors MAX_IMAGE_DOWNLOAD_BYTES in agent/src/handlers/strategic-resident-lib.ts.
 // Images above this threshold are uploaded but the agent silently skips them.
 const MAX_AGENT_IMAGE_BYTES = Math.floor(13_000_000 * 3 / 4);
-
 // Receipt shown for at most 2 hours after a steer fires, preventing stale "picked up"
 // messages that grow without bound, and blocking stale receipts from resurfacing after
 // an operator cancels a fresh steer.
 const STEER_RECEIPT_MAX_AGE_MS = 7_200_000;
 const OPTIMISTIC_STRATEGIC_REFRESH_MAX_AGE_MS = 45_000;
-
 function getCompletionReceiptTone(status?: string | null): {
   banner: string;
   dot: string;
@@ -97,7 +111,6 @@ function getCompletionReceiptTone(status?: string | null): {
     label: 'Cycle complete',
   };
 }
-
 function viewSummaryLine(query: string, prefs: Record<string, EventPref>, sort: 'importance' | 'recent', showResolved: boolean, showOnlyNew?: boolean): string {
   const parts: string[] = [];
   parts.push(query.trim() ? `Search: ${query.trim().slice(0, 40)}` : 'No search');
@@ -110,26 +123,22 @@ function viewSummaryLine(query: string, prefs: Record<string, EventPref>, sort: 
   parts.push(showResolved ? 'resolved shown' : 'resolved hidden');
   return parts.join(' · ');
 }
-
 function contextPackageTextTone(status?: string | null): string {
   if (status === 'building') return 'text-cyan-300';
   if (status === 'stale') return 'text-amber-300';
   return 'text-emerald-300';
 }
-
 function workbenchModeLabel(mode?: string | null): string {
   if (mode === 'check_in') return 'Check-in';
   if (mode === 'monitor') return 'Monitor';
   if (mode === 'continuous') return 'Workday';
   return 'Chat';
 }
-
 function attentionTextTone(level?: string | null): string {
   if (level === 'needs_operator') return 'text-amber-300';
   if (level === 'watch') return 'text-neutral-300';
   return 'text-emerald-300';
 }
-
 /** Human-readable label for an attention item's lifecycle.clears_when. */
 function lifecycleClearsLabel(clearsWhen?: string | null): string {
   if (!clearsWhen) return '';
@@ -161,7 +170,6 @@ function lifecycleClearsLabel(clearsWhen?: string | null): string {
   };
   return labels[clearsWhen] ?? `Clears: ${clearsWhen.replace(/_/g, ' ')}`;
 }
-
 function attentionItemIcon(kind?: string): string {
   if (kind === 'message') return '💬';
   if (kind === 'confirmation') return '✋';
@@ -171,7 +179,16 @@ function attentionItemIcon(kind?: string): string {
   if (kind === 'runner') return '🖥';
   return '📌';
 }
-
+function isMessageNeedingOperatorAttention(
+  message: ProjectMessage,
+  attention: StrategicStateResponse['attention'] | null | undefined,
+): boolean {
+  return attention?.items.some(item => (
+    item.kind === 'message'
+    && item.severity === 'needs_operator'
+    && item.ref?.id === message.id
+  )) ?? false;
+}
 function messageReplyFromLabel(msg: ProjectMessage): string {
   const fromType = (msg.from_type || '').toLowerCase();
   if (fromType === 'strategic' || fromType === 'strategist') return 'Strategic';
@@ -179,7 +196,6 @@ function messageReplyFromLabel(msg: ProjectMessage): string {
   if (fromType === 'system') return 'System';
   return 'Operator';
 }
-
 function canPrimeStrategicChatReply(msg: ProjectMessage): boolean {
   const fromType = (msg.from_type || '').toLowerCase();
   return (
@@ -187,7 +203,6 @@ function canPrimeStrategicChatReply(msg: ProjectMessage): boolean {
     && (fromType === 'agent' || fromType === 'strategic' || fromType === 'strategist')
   );
 }
-
 function isConversationMessage(
   msg: ProjectMessage,
   eventPrefs: Record<string, EventPref>,
@@ -202,7 +217,6 @@ function isConversationMessage(
   if (eventType === 'question_answer' || eventType === 'feedback_acknowledgment') return true;
   return effectiveSignal(msg, eventPrefs, tempMutes) === 'high';
 }
-
 function buildMessageWorkbenchContext(
   state?: StrategicStateResponse | null,
   workbenchOverride?: StrategicWorkbenchState | null,
@@ -264,7 +278,6 @@ function buildMessageWorkbenchContext(
     ...(contextPackageDescriptor ? { context_package_descriptor: contextPackageDescriptor } : {}),
   };
 }
-
 function strategicRefreshFromReadModel(
   state?: StrategicStateResponse | null,
 ): StrategicRefreshMarker | null {
@@ -282,10 +295,7 @@ function strategicRefreshFromReadModel(
   }
   return null;
 }
-
-
 export type MessagesPanelVariant = 'modal' | 'page';
-
 export interface MessagesPanelProps {
   selectedProjectId: string | null;
   githubRepo?: string | null;
@@ -333,6 +343,8 @@ export interface MessagesPanelProps {
   onOpenStrategicContextWorkspace?: () => void;
   /** Open the global command palette from the Strategic composer. */
   onOpenCommandPalette?: () => void;
+  /** Open the project Activity inbox from the calm Resident operation status. */
+  onOpenActivityFeed?: () => void;
   /** Backwards-compatible alias for older call sites. */
   onOpenStrategicContextCommands?: () => void;
   /** Legacy refresh callback kept for callers that still wire the old prop name. */
@@ -344,35 +356,12 @@ export interface MessagesPanelProps {
    * `from_type=strategic` ProjectMessage once it lands via the conversation refresh.
    */
   strategicSessionTranscript?: StrategicSessionDelta[];
+  /** Active alerts surfaced inline at the top of the panel, replacing the separate AlertsPopover. */
+  alerts?: Alert[];
+  onDismissAlert?: (id: string) => void;
+  onDismissAllAlerts?: () => void;
+  onViewAlertTask?: (taskId: string) => void;
 }
-
-
-function composerDraftKey(userId?: string | null, projectId?: string | null): string {
-  return `messages_composer_draft:${userId || 'anonymous'}:${projectId || 'unknown'}`;
-}
-
-function loadComposerDraft(userId?: string | null, projectId?: string | null): { type: string; content: string } | null {
-  try {
-    const raw = localStorage.getItem(composerDraftKey(userId, projectId));
-    if (!raw) return null;
-    const parsed = JSON.parse(raw) as { type?: unknown; content?: unknown };
-    if (typeof parsed.type !== 'string' || typeof parsed.content !== 'string') return null;
-    return { type: parsed.type, content: parsed.content };
-  } catch {
-    return null;
-  }
-}
-
-function saveComposerDraft(userId: string | null | undefined, projectId: string | null | undefined, draft: { type: string; content: string }): void {
-  if (!draft.content) return;
-  try { localStorage.setItem(composerDraftKey(userId, projectId), JSON.stringify(draft)); } catch { /* ignore */ }
-}
-
-function clearComposerDraft(userId: string | null | undefined, projectId: string | null | undefined): void {
-  try { localStorage.removeItem(composerDraftKey(userId, projectId)); } catch { /* ignore */ }
-}
-
-
 async function fetchBackendLastSeen(projectId: string): Promise<number | null> {
   try {
     const res = await apiFetch(`${API_BASE_URL}/api/admin/messages/last-seen?project_id=${encodeURIComponent(projectId)}`);
@@ -384,7 +373,6 @@ async function fetchBackendLastSeen(projectId: string): Promise<number | null> {
     return null;
   }
 }
-
 async function postBackendLastSeen(projectId: string, timestamp: number): Promise<void> {
   try {
     await apiFetch(`${API_BASE_URL}/api/admin/messages/last-seen`, {
@@ -393,7 +381,6 @@ async function postBackendLastSeen(projectId: string, timestamp: number): Promis
     });
   } catch { /* ignore — localStorage already saved */ }
 }
-
 function messagesEqual(a: ProjectMessage, b: ProjectMessage): boolean {
   return a.id === b.id
     && a.project_id === b.project_id
@@ -405,13 +392,20 @@ function messagesEqual(a: ProjectMessage, b: ProjectMessage): boolean {
     && a.resolution === b.resolution
     && a.resolved_at === b.resolved_at
     && a.created_at === b.created_at
+    && a.updated_at === b.updated_at
+    && a.actor_user_id === b.actor_user_id
+    && a.sequence === b.sequence
+    && a.surface === b.surface
+    && a.handling_state === b.handling_state
+    && a.handled_by_task_id === b.handled_by_task_id
+    && a.reply_to_message_id === b.reply_to_message_id
+    && a.client_idempotency_key === b.client_idempotency_key
+    && a.idempotency_key === b.idempotency_key
     && JSON.stringify(a.context ?? {}) === JSON.stringify(b.context ?? {});
 }
-
 function messageListsEqual(a: ProjectMessage[], b: ProjectMessage[]): boolean {
   return a.length === b.length && a.every((message, i) => messagesEqual(message, b[i]));
 }
-
 function revokePendingAttachmentPreviews(attachments: PendingAttachment[]): void {
   for (const attachment of attachments) {
     if (attachment.previewUrl && typeof URL.revokeObjectURL === 'function') {
@@ -419,7 +413,6 @@ function revokePendingAttachmentPreviews(attachments: PendingAttachment[]): void
     }
   }
 }
-
 // Build a local object-URL preview for image files small enough to render
 // inline; larger files and non-images get no preview (null).
 function makePendingPreviewUrl(file: File): string | null {
@@ -432,18 +425,20 @@ function makePendingPreviewUrl(file: File): string | null {
   }
   return null;
 }
-
-
-export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion, focusComposerSignal, realtimeRefreshSignal, contextPackage, strategicState, strategicWorkbenchState, targetMessage, onTargetMessageHandled, onStrategicStateRefresh, onStrategicInteraction, onOpenStrategicContextWorkspace, onOpenCommandPalette, onOpenStrategicContextCommands, onStrategicRefresh, strategicSessionTranscript }: MessagesPanelProps) {
+export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion, focusComposerSignal, realtimeRefreshSignal, contextPackage, strategicState, strategicWorkbenchState, targetMessage, onTargetMessageHandled, onStrategicStateRefresh, onStrategicInteraction, onOpenStrategicContextWorkspace, onOpenCommandPalette, onOpenActivityFeed, onOpenStrategicContextCommands, onStrategicRefresh, strategicSessionTranscript, alerts, onDismissAlert, onDismissAllAlerts, onViewAlertTask }: MessagesPanelProps) {
   const resolvedVariant = variant ?? (onClose ? 'modal' : 'page');
   const resolvedFilterChrome = filterChrome ?? (resolvedVariant === 'page' ? 'compact' : 'full');
   const resolvedShowCloseButton = showCloseButton ?? (resolvedVariant !== 'page' && Boolean(onClose));
   const conversationMode = resolvedFilterChrome === 'minimal';
+  const currentActorUserId = auth.currentUser?.uid ?? auth.currentUser?.email ?? null;
   const currentStrategicState = strategicState?.project_id === selectedProjectId ? strategicState : null;
   const usesStrategicReadModel = currentStrategicState != null;
   const effectiveContextPackage = contextPackage ?? currentStrategicState?.context_package ?? null;
   const workbenchState = strategicWorkbenchState ?? currentStrategicState?.workbench ?? null;
   const strategicAttention = currentStrategicState?.attention ?? null;
+  const strategicAttentionRef = useRef(strategicAttention);
+  // eslint-disable-next-line react-hooks/refs
+  strategicAttentionRef.current = strategicAttention;
   const refreshStrategicState = onStrategicStateRefresh ?? onStrategicRefresh;
   const recordStrategicInteraction = useCallback(() => {
     if (!onStrategicInteraction) return;
@@ -452,6 +447,8 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   const selectedProjectIdRef = useRef(selectedProjectId);
   // eslint-disable-next-line react-hooks/refs
   selectedProjectIdRef.current = selectedProjectId;
+  const currentActorUserIdRef = useRef(currentActorUserId);
+  currentActorUserIdRef.current = currentActorUserId;
   const conversationModeRef = useRef(conversationMode);
   // eslint-disable-next-line react-hooks/refs
   conversationModeRef.current = conversationMode;
@@ -471,10 +468,14 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     [strategicAttention?.items],
   );
   const [messages, setMessages] = useState<ProjectMessage[]>([]);
+  const messagesRef = useRef<ProjectMessage[]>([]);
+  messagesRef.current = messages;
   const [loading, setLoading] = useState(true);
   // Compose — initialized from the per-project draft (if any) so a reload restores it.
-  const [newType, setNewType] = useState(() => loadComposerDraft(auth.currentUser?.email, selectedProjectId)?.type ?? 'FEEDBACK');
-  const [newContent, setNewContent] = useState(() => loadComposerDraft(auth.currentUser?.email, selectedProjectId)?.content ?? '');
+  const [newType, setNewType] = useState(() => loadComposerDraft(currentActorUserId, selectedProjectId)?.type ?? 'FEEDBACK');
+  const [newContent, setNewContent] = useState(() => loadComposerDraft(currentActorUserId, selectedProjectId)?.content ?? '');
+  const [draftSourceRefs, setDraftSourceRefs] = useState<Array<Record<string, unknown>>>(() => loadComposerDraft(currentActorUserId, selectedProjectId)?.source_refs ?? []);
+  const [draftArtifactRefs, setDraftArtifactRefs] = useState<Array<Record<string, unknown>>>(() => loadComposerDraft(currentActorUserId, selectedProjectId)?.artifact_refs ?? []);
   const [submitting, setSubmitting] = useState(false);
   const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
   const pendingAttachmentsRef = useRef<PendingAttachment[]>([]);
@@ -492,8 +493,10 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   // at the very top of handleSubmit and cleared in its finally, closing that
   // race window so a burst collapses to a single POST on the client side (the
   // server idempotency key is the backstop for retries that do reach it).
-  const submittingRef = useRef(false);
-  const [replyTo, setReplyTo] = useState<{ id: string; content: string; from: string; message_type: string; status: string } | null>(null);
+  const submittingGuardRef = useRef(new ComposerRequestOwnershipGuard());
+  const attachmentMutationGuardRef = useRef(new ComposerRequestOwnershipGuard());
+  const [attachmentMutating, setAttachmentMutating] = useState(false);
+  const [replyTo, setReplyTo] = useState<{ id: string; content: string; from: string; message_type: string; status: string } | null>(() => loadComposerDraft(currentActorUserId, selectedProjectId)?.reply_to ?? null);
   const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(null);
   // INSTANT ACK — the operator's just-sent message, rendered optimistically at
   // the tail of the chat the moment they hit Send (before the POST round-trips),
@@ -501,24 +504,15 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   // resolve paths do not use it (those messages are the operator's answer to an
   // existing thread, not a new chat turn).
   // On mount, restore any in-flight optimistic bubble that was serialised to
-  // sessionStorage before a tab switch unmounted this component. The bubble
-  // survives the round-trip and is cleared once the durable message lands (see
-  // the useEffect below). Entries older than 60 s are treated as stale and
-  // discarded so they never ghost into a fresh session.
-  const [optimisticSend, setOptimisticSend] = useState<{
-    key: string; content: string; created_at: string; message_type: string;
-  } | null>(() => {
-    if (!selectedProjectId) return null;
-    try {
-      const raw = sessionStorage.getItem(`optimisticSend:${selectedProjectId}`);
-      if (!raw) return null;
-      const parsed = JSON.parse(raw) as { key: string; content: string; created_at: string; message_type: string };
-      const age = Date.now() - new Date(parsed.created_at).getTime();
-      return age < 60_000 ? parsed : null;
-    } catch {
-      return null;
-    }
-  });
+  // sessionStorage before a tab switch unmounted this component. It is retained
+  // until canonical acceptance so an unconfirmed send can be safely recovered.
+  const conversationSend = useConversationSend(
+    conversationMode ? selectedProjectId : null,
+    conversationMode ? currentActorUserId : null,
+  );
+  const optimisticSend = conversationSend.pending;
+  const sendState = conversationSend.sendState;
+  const sendWakeupState = conversationSend.wakeupState;
   // "Workday's on it" working state: set the instant the operator sends, cleared
   // when a fresh strategist reply lands (count vs baseline — clock-skew-proof), a
   // `done` lifecycle frame arrives, or a safety timeout. Drives the live activity
@@ -545,6 +539,40 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     }, 0);
   }, []);
   const effectiveNewType = conversationMode ? 'FEEDBACK' : newType;
+  const composerIntentRef = useRef<ConversationComposerIntent>({ type: effectiveNewType, content: newContent, reply_to: replyTo, source_refs: draftSourceRefs, artifact_refs: draftArtifactRefs, attachment_send_key: conversationSend.identity });
+  const updateComposerIntent = useCallback((patch: Partial<ConversationComposerIntent>) => (composerIntentRef.current = updateConversationComposerIntent(composerIntentRef.current, patch)), []);
+  const resetComposerIntent = useCallback(() => {
+    updateComposerIntent({ content: '', reply_to: null, source_refs: [], artifact_refs: [], attachment_send_key: null });
+    setNewContent(''); setDraftSourceRefs([]); setDraftArtifactRefs([]); setReplyTo(null);
+  }, [updateComposerIntent]);
+  const captureCurrentDraftRefs = useCallback(() => {
+    const workbenchContext = buildMessageWorkbenchContext(currentStrategicState, strategicWorkbenchState);
+    const sourceRefs = Array.isArray(workbenchContext?.selected_refs)
+      ? workbenchContext.selected_refs as Array<Record<string, unknown>>
+      : [];
+    return {
+      sourceRefs,
+      artifactRefs: sourceRefs.filter(ref => ref.kind === 'artifact'),
+    };
+  }, [currentStrategicState, strategicWorkbenchState]);
+  const persistComposerEnvelope = useCallback((overrides: {
+    content?: string;
+    type?: string;
+    replyTo?: typeof replyTo;
+    sourceRefs?: Array<Record<string, unknown>>;
+    artifactRefs?: Array<Record<string, unknown>>;
+    attachmentSendKey?: string | null;
+  } = {}) => {
+    if (!currentActorUserId || !selectedProjectId) return;
+    const current = composerIntentRef.current;
+    const next = updateComposerIntent({
+      type: overrides.type ?? current.type, content: overrides.content ?? current.content,
+      reply_to: overrides.replyTo === undefined ? current.reply_to : overrides.replyTo,
+      source_refs: overrides.sourceRefs ?? current.source_refs, artifact_refs: overrides.artifactRefs ?? current.artifact_refs,
+      attachment_send_key: overrides.attachmentSendKey === undefined ? current.attachment_send_key : overrides.attachmentSendKey,
+    });
+    saveComposerDraft(currentActorUserId, selectedProjectId, next);
+  }, [currentActorUserId, selectedProjectId, updateComposerIntent]);
   // Idempotency key for the in-flight draft. Generated once per draft and
   // reused across retries / a rapid double-submit so the backend collapses
   // them to one logical message; cleared after a successful send so the next
@@ -556,12 +584,10 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   // direction; cleared only after the message is resolved/created so a failed
   // attempt keeps its key for the retry.
   const directionIdempotencyKeysRef = useRef<Map<string, string>>(new Map());
-
   // Form instance for the convert-to-direction modal
   const convertForm = useDirectionForm();
   const [pendingConvertMsg, setPendingConvertMsg] = useState<ProjectMessage | null>(null);
   const [convertSubmitting, setConvertSubmitting] = useState(false);
-
   // Per-message action state
   const [resolvingId, setResolvingId] = useState<string | null>(null);
   const [resolveInput, setResolveInput] = useState('');
@@ -569,26 +595,24 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   const [creatingDirectionIds, setCreatingDirectionIds] = useState<Set<string>>(new Set());
   const [investigatingId, setInvestigatingId] = useState<string | null>(null);
   const [investigatingIds, setInvestigatingIds] = useState<Set<string>>(new Set());
-
   // Batch selection
   const [selectMode, setSelectMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [batchCreating, setBatchCreating] = useState(false);
-
   // Scroll state
   const scrollRef = useRef<HTMLDivElement>(null);
+  const conversationListRef = useRef<ConversationListImperativeApi | null>(null);
   const [showScrollDown, setShowScrollDown] = useState(false);
   const prevMessageCountRef = useRef(0);
   const fetchMessagesRequestSeqRef = useRef(0);
-  const lastStrategicSessionTargetFetchRef = useRef<string | null>(null);
   const lastRealtimeRefreshSignalRef = useRef<number | null>(null);
+  const lastStrategicSessionTargetFetchRef = useRef<string | null>(null);
   const getStrategicSessionIncludeMessageId = useCallback((projectId: string | null, currentTargetMessageId: string | null): string | null => {
     if (!projectId) return null;
     if (currentTargetMessageId) return currentTargetMessageId;
     const pinnedTarget = strategicSessionPinnedTargetRef.current;
     return pinnedTarget?.projectId === projectId ? pinnedTarget.messageId : null;
   }, []);
-
   const {
     showResolved, setShowResolved,
     routineExpanded, setRoutineExpanded,
@@ -630,17 +654,14 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   const completionReceiptTone = lastCycleCompletion ? getCompletionReceiptTone(lastCycleCompletion.status) : null;
   // In-flight guard for the "cancel armed steer" affordance on the pending badge.
   const [cancellingRefresh, setCancellingRefresh] = useState(false);
-
   const openMessageCommandSurface = useCallback(() => {
     focusComposerTextarea();
     if (conversationMode) onOpenCommandPalette?.();
   }, [conversationMode, focusComposerTextarea, onOpenCommandPalette]);
-
   // Last-seen tracking: dividerTime is the threshold; when operator scrolls past or timeout fires, we persist it
   const [dividerTime, setDividerTime] = useState<number | null>(null);
   const dividerTimeRef = useRef<number | null>(null);
   const dividerDismissedRef = useRef(false);
-
   const dismissDivider = useCallback(() => {
     if (!dividerDismissedRef.current && selectedProjectId) {
       const now = Date.now();
@@ -651,7 +672,6 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       dividerDismissedRef.current = true;
     }
   }, [selectedProjectId]);
-
   useEffect(() => {
     if (!usesStrategicReadModel) return;
     const readModelRefresh = strategicRefreshFromReadModel(currentStrategicState);
@@ -677,7 +697,6 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     }
     setStrategicRefresh(readModelRefresh);
   }, [currentStrategicState, usesStrategicReadModel]);
-
   useEffect(() => {
     const optimisticRefresh = optimisticStrategicRefreshRef.current;
     if (!optimisticRefresh?.requested_at || strategicRefresh !== optimisticRefresh) return;
@@ -702,7 +721,6 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     }, delayMs);
     return () => window.clearTimeout(timer);
   }, [currentStrategicState, strategicRefresh]);
-
   const handleShowOnlyNew = useCallback(() => {
     setShowOnlyNew(true);
     // Scroll to first new message on next render
@@ -713,11 +731,51 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       }
     }, 100);
   }, [setShowOnlyNew]);
-
   // Stable ref for addToast
   const addToastRef = useRef(addToast);
   // eslint-disable-next-line react-hooks/refs
   addToastRef.current = addToast;
+  const getCurrentMessages = useCallback(() => messagesRef.current, []);
+  const handleConversationError = useCallback((message: string) => {
+    addToastRef.current(message, 'error');
+  }, []);
+  const scrollConversationMessageIntoView = useCallback(async (messageId: string): Promise<boolean> => {
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      const existing = scrollRef.current?.querySelector(`[data-message-id="${messageId}"]`);
+      if (existing) {
+        existing.scrollIntoView({ block: 'center', behavior: 'smooth' });
+        return true;
+      }
+      if (!conversationModeRef.current) return false;
+      if (await (conversationListRef.current?.scrollToMessage(messageId) ?? Promise.resolve(false))) return true;
+      await new Promise<void>(resolve => window.setTimeout(resolve, 25));
+    }
+    return false;
+  }, []);
+  const conversationIncludeMessageId = getStrategicSessionIncludeMessageId(selectedProjectId, targetMessageId);
+  const handleConversationTargetFetched = useCallback((messageId: string) => {
+    lastStrategicSessionTargetFetchRef.current = messageId;
+    if (strategicSessionPinnedTargetRef.current?.messageId === messageId) {
+      strategicSessionPinnedTargetRef.current = null;
+    }
+  }, []);
+  const {
+    refresh: refreshResidentConversation,
+    loadOlder: loadOlderConversation,
+    hasMore: conversationHasMore,
+    loadingOlder: loadingOlderConversation,
+  } = useResidentConversation({
+    enabled: conversationMode,
+    projectId: selectedProjectId,
+    actorUserId: currentActorUserId,
+    includeMessageId: conversationIncludeMessageId,
+    realtimeRefreshSignal,
+    getMessages: getCurrentMessages,
+    setMessages,
+    onLoadingChange: setLoading,
+    onError: handleConversationError,
+    onTargetFetched: handleConversationTargetFetched,
+  });
   const notifyOnHighSignalMessageRef = useRef(notifyOnHighSignalMessage);
   // eslint-disable-next-line react-hooks/refs
   notifyOnHighSignalMessageRef.current = notifyOnHighSignalMessage;
@@ -726,18 +784,15 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   const convertFormRef = useRef(convertForm);
   // eslint-disable-next-line react-hooks/refs
   convertFormRef.current = convertForm;
-
   // Track seen messages to detect new arrivals and avoid initial-load toast spam
   const seenMessageIdsRef = useRef<Set<string>>(new Set());
   const hasInitiallyLoadedRef = useRef(false);
-  const seenPromotedGroupKeysRef = useRef<Set<string>>(new Set());
   const eventPrefsRef = useRef(eventPrefs);
   // eslint-disable-next-line react-hooks/refs
   eventPrefsRef.current = eventPrefs;
   const tempMutesRef = useRef(tempMutes);
   // eslint-disable-next-line react-hooks/refs
   tempMutesRef.current = tempMutes;
-
   // Reset per-component state when switching projects so that the next
   // fetch is treated as an initial load for the new project (avoids a flood
   // of toasts for project B's pre-existing open BLOCKER/BUG/FEEDBACK items).
@@ -745,12 +800,11 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   useEffect(() => {
     let active = true;
     seenMessageIdsRef.current = new Set();
-    seenPromotedGroupKeysRef.current = new Set();
     hasInitiallyLoadedRef.current = false;
     setWebhookStats(null);
     optimisticStrategicRefreshRef.current = null;
     if (!usesStrategicReadModelRef.current) setStrategicRefresh(null);
-    const lastSeen = loadLastSeen(auth.currentUser?.email, selectedProjectId);
+    const lastSeen = loadLastSeen(currentActorUserId, selectedProjectId);
     setDividerTime(lastSeen);
     dividerTimeRef.current = lastSeen;
     dividerDismissedRef.current = false;
@@ -769,31 +823,40 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
           const now = Date.now();
           setDividerTime(now);
           dividerTimeRef.current = now;
-          saveLastSeen(auth.currentUser?.email, selectedProjectId, now);
+          saveLastSeen(currentActorUserId, selectedProjectId, now);
           void postBackendLastSeen(selectedProjectId, now);
         }
       });
     }
     // Reload composer draft for the new project — drafts are scoped per-project
     // so switching projects shows that project's in-progress draft, not another's.
-    const draft = loadComposerDraft(auth.currentUser?.email, selectedProjectId);
+    const draft = loadComposerDraft(currentActorUserId, selectedProjectId);
+    const restoredReply = optimisticSend?.reply_to ?? draft?.reply_to ?? null;
+    updateComposerIntent({ type: draft?.type ?? 'FEEDBACK', content: draft?.content ?? '', reply_to: restoredReply, source_refs: draft?.source_refs ?? [], artifact_refs: draft?.artifact_refs ?? [], attachment_send_key: draft?.attachment_send_key ?? null });
     setNewContent(draft?.content ?? '');
     setNewType(draft?.type ?? 'FEEDBACK');
+    setDraftSourceRefs(draft?.source_refs ?? []);
+    setDraftArtifactRefs(draft?.artifact_refs ?? []);
+    setReplyTo(restoredReply);
+    conversationSend.adoptIdentity(draft?.attachment_send_key);
+    setMessages([]);
+    messagesRef.current = [];
     setPendingAttachments(prev => {
       revokePendingAttachmentPreviews(prev);
       pendingAttachmentsRef.current = [];
       return [];
     });
     setUploading(false);
+    setSubmitting(false);
+    submittingGuardRef.current.reset();
+    attachmentMutationGuardRef.current.reset();
+    setAttachmentMutating(false);
     return () => { active = false; };
-  }, [selectedProjectId]);
-
-
+  }, [currentActorUserId, selectedProjectId, updateComposerIntent]);
   useEffect(() => {
     if (!focusComposerSignal) return;
     focusComposerTextarea();
   }, [focusComposerSignal, focusComposerTextarea]);
-
   // Memoized message-list derivation: open/resolved split, high-signal vs routine,
   // pinned blockers/questions, auto-promoted failing groups, visible-resolved, and
   // new-message counts — all behind one pure hook so the panel stays focused on
@@ -831,23 +894,18 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     showOnlyNew,
     dividerTime,
   });
-
-  // Badge/tab-title count. Passes eventPrefs/tempMutes so muted types are excluded and
-  // surfaced types are included — matching App.tsx's closed-panel count exactly so the
-  // badge does not jump when the operator opens the panel.
+  // Legacy fallback when the canonical strategic attention read model is unavailable.
   const highSignalCount = useMemo(
     () => countHighSignalMessages(messages, eventPrefs, tempMutes),
     [messages, eventPrefs, tempMutes],
   );
   const conversationMessages = useMemo(() => {
     return messages
-      .filter(msg => isConversationMessage(msg, eventPrefs, tempMutes))
+      .filter(msg => msg.surface != null
+        ? msg.surface === 'conversation'
+        : isConversationMessage(msg, eventPrefs, tempMutes))
       .slice()
-      .sort((a, b) => {
-        const aTime = a.created_at ? parseTimestamp(a.created_at).getTime() : 0;
-        const bTime = b.created_at ? parseTimestamp(b.created_at).getTime() : 0;
-        return aTime - bTime;
-      });
+      .sort(compareResidentMessages);
   }, [messages, eventPrefs, tempMutes]);
   // Live streaming turn: the resident strategist's in-flight reply, previewed as a
   // "typing" bubble at the tail of the chat and reconciled into the durable
@@ -884,25 +942,12 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       : null),
     [conversationMode, strategicSessionTranscript, conversationMessages, residentSessionSnapshot, residentNowTick],
   );
-  // The activity strip is visible while any resident turn is in flight: operator
-  // turns (responding) or autonomous turns (working), but not after done.
-  // `workingSince` covers the optimistic-send period before the first lifecycle
-  // frame lands. `responding` drives the operator-waiting indicator; `working`
-  // drives the autonomous-advancing indicator — both show the strip.
-  const strategicTurnWorking = conversationMode && (
-    workingSince != null
-    || liveActivity.latestLifecycle === 'responding'
-    || liveActivity.latestLifecycle === 'working'
-  ) && liveActivity.latestLifecycle !== 'done';
-  // Render the operator's optimistic bubble until the durable copy lands — dedup
-  // against any already-present user message with the same content so there is
-  // never a duplicate flash between fetchMessages resolving and the clear.
+  // Render the operator's optimistic bubble until the durable copy lands. Client
+  // identity, never message content, is the reconciliation key: identical text
+  // sent intentionally must remain two distinct turns.
   const renderedConversationMessages = useMemo(() => {
     if (!conversationMode || !optimisticSend) return conversationMessages;
-    const alreadyDurable = conversationMessages.some(m => {
-      const ft = (m.from_type || '').toLowerCase();
-      return (ft === 'user' || ft === 'operator') && m.content === optimisticSend.content;
-    });
+    const alreadyDurable = conversationMessages.some(m => messageHasClientIdentity(m, optimisticSend.key));
     if (alreadyDurable) return conversationMessages;
     const optimisticMessage = {
       id: `optimistic:${optimisticSend.key}`,
@@ -911,16 +956,17 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       from_type: 'user' as ProjectMessage['from_type'],
       from_task_id: null,
       content: optimisticSend.content,
-      context: {},
+      context: optimisticSend.context ?? {},
       status: 'open' as ProjectMessage['status'],
       resolution: null,
       resolved_at: null,
       created_at: optimisticSend.created_at,
+      reply_to_message_id: optimisticSend.reply_to_message_id ?? null,
+      idempotency_key: optimisticSend.key,
     } satisfies ProjectMessage;
     return [...conversationMessages, optimisticMessage];
   }, [conversationMode, optimisticSend, conversationMessages, selectedProjectId]);
   const starterPrompts = conversationMode && !loading && conversationMessages.length === 0 ? WORKDAY_STARTER_PROMPTS : null;
-
   // Clear the working state once a FRESH strategist reply lands (compare reply
   // COUNT to the baseline captured at send time — robust to client/server clock
   // skew, unlike a timestamp compare).
@@ -928,8 +974,9 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     if (workingSince == null) return;
     if (countStrategicReplies(conversationMessages) > strategicReplyBaselineRef.current) {
       setWorkingSince(null);
+      conversationSend.clear();
     }
-  }, [workingSince, conversationMessages]);
+  }, [workingSince, conversationMessages, conversationSend]);
   // A `done` lifecycle frame ends the turn — clear the working state / strip even
   // before the durable reply is refetched (the streaming bubble keeps the final
   // reply text until it reconciles).
@@ -944,43 +991,108 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     const timer = window.setTimeout(() => setWorkingSince(null), 120_000);
     return () => window.clearTimeout(timer);
   }, [workingSince]);
-  // Reset instant-ack state on project switch so a prior project's pending turn
-  // never bleeds onto the newly-selected project. Skip the first run so a
-  // sessionStorage-restored optimistic bubble (from a same-project tab-switch)
-  // is not immediately cleared on mount.
-  const projectSwitchMountedRef = useRef(false);
+  // Working state is ephemeral and always scoped to the selected project. The
+  // durable pending-send hook independently restores that project's identity.
   useEffect(() => {
-    if (!projectSwitchMountedRef.current) {
-      projectSwitchMountedRef.current = true;
-      return;
-    }
-    setOptimisticSend(null);
     setWorkingSince(null);
   }, [selectedProjectId]);
-  // Mirror optimisticSend to sessionStorage so it survives a tab-switch unmount.
-  // Any setOptimisticSend call (set or clear) automatically keeps storage in sync.
+  const pendingAttachmentSendKey = conversationSend.identity ?? optimisticSend?.key ?? null;
   useEffect(() => {
-    if (!selectedProjectId) return;
-    const key = `optimisticSend:${selectedProjectId}`;
-    if (optimisticSend) {
-      try { sessionStorage.setItem(key, JSON.stringify(optimisticSend)); } catch { /* quota */ }
-    } else {
-      sessionStorage.removeItem(key);
-    }
-  }, [optimisticSend, selectedProjectId]);
-  // After a remount (e.g. the user switched tabs and came back), handleSubmit
-  // from the previous mount may have finished its POST without clearing the
-  // optimistic bubble. Clear it here once the durable message lands so there
-  // is no permanent ghost bubble.
+    if (!currentActorUserId || !selectedProjectId) return;
+    void retryPendingAttachmentCleanups(currentActorUserId, selectedProjectId).catch(() => undefined);
+  }, [currentActorUserId, selectedProjectId]);
+  useEffect(() => {
+    if (!conversationMode || !currentActorUserId || !selectedProjectId || !pendingAttachmentSendKey) return;
+    const actorUserId = currentActorUserId;
+    const projectId = selectedProjectId;
+    const sendKey = pendingAttachmentSendKey;
+    let cancelled = false;
+    void listStoredPendingAttachments(actorUserId, projectId, sendKey)
+      .then(stored => {
+        if (
+          cancelled
+          || selectedProjectIdRef.current !== projectId
+          || (conversationSend.identity ?? optimisticSend?.key ?? null) !== sendKey
+        ) return;
+        setPendingAttachments(previous => {
+          const previousById = new Map(previous.map(attachment => [attachment.id, attachment]));
+          const restored = stored.map(attachment => {
+            const existing = previousById.get(attachment.id);
+            return existing ?? {
+              ...attachment,
+              previewUrl: makePendingPreviewUrl(attachment.file),
+            };
+          });
+          revokePendingAttachmentPreviews(previous.filter(attachment => !restored.some(item => item.id === attachment.id)));
+          pendingAttachmentsRef.current = restored;
+          return restored;
+        });
+      })
+      .catch(() => {
+        if (!cancelled && selectedProjectIdRef.current === projectId) {
+          addToastRef.current('Could not restore pending attachments; retry before sending', 'error');
+        }
+      });
+    return () => { cancelled = true; };
+  }, [
+    conversationMode,
+    conversationSend.identity,
+    currentActorUserId,
+    optimisticSend?.key,
+    pendingAttachmentSendKey,
+    selectedProjectId,
+  ]);
+  // Retain a canonical wake receipt while the message is merely pending. Clear
+  // it only when handling advances to claim/reply/supersession.
   useEffect(() => {
     if (!optimisticSend) return;
-    const landed = conversationMessages.some(m => {
-      const ft = (m.from_type || '').toLowerCase();
-      return (ft === 'user' || ft === 'operator') && m.content === optimisticSend.content;
-    });
+    const landed = conversationMessages.find(m => messageHasClientIdentity(m, optimisticSend.key));
     // eslint-disable-next-line react-hooks/set-state-in-effect
-    if (landed) setOptimisticSend(null);
+    if (landed && ['claimed', 'responded', 'superseded'].includes(landed.handling_state ?? '')) {
+      conversationSend.clear();
+      if (currentActorUserId && selectedProjectId) {
+        void clearStoredPendingAttachments(currentActorUserId, selectedProjectId, optimisticSend.key);
+      }
+    }
   }, [conversationMessages, optimisticSend]);
+  const restoredSendRecoveryRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    if (!conversationMode || !currentActorUserId || !selectedProjectId || !optimisticSend || !conversationSend.restored) return;
+    const recoveryKeys = restoredSendRecoveryRef.current, recoveryKey = `${currentActorUserId}:${selectedProjectId}:${optimisticSend.key}`;
+    if (recoveryKeys.has(recoveryKey)) return;
+    recoveryKeys.add(recoveryKey);
+    let cancelled = false, settled = false;
+    void findStrategicMessageByClientIdentity(selectedProjectId, optimisticSend.key)
+      .then(receipt => {
+        if (cancelled || selectedProjectIdRef.current !== selectedProjectId || currentActorUserIdRef.current !== currentActorUserId) return;
+        settled = true;
+        if (!receipt) {
+          if (optimisticSend.state === 'sending') conversationSend.transition('needs_retry');
+          return;
+        }
+        const adopted = receipt.message;
+        setMessages(previous => mergeCanonicalConversationMessage(previous, adopted));
+        const wakeupState = receipt.wakeup_state ?? optimisticSend.wakeup_state ?? null;
+        const claimed = adopted.handling_state === 'claimed';
+        const terminal = claimed || adopted.handling_state === 'responded' || adopted.handling_state === 'superseded';
+        if (terminal) conversationSend.clear();
+        else conversationSend.transition(
+          wakeupState === 'paused' || wakeupState === 'waiting_for_capacity' ? 'waiting' : 'accepted',
+          wakeupState,
+        );
+        setWorkingSince(claimed || wakeupState === 'queued' || wakeupState === 'coalesced' ? Date.now() : null);
+        resetComposerIntent();
+        clearComposerDraft(currentActorUserId, selectedProjectId);
+        clearPendingAttachments(optimisticSend.key);
+        if (textareaRef.current) textareaRef.current.style.height = 'auto';
+        void refreshStrategicState?.();
+      })
+      .catch(() => {
+        settled = !cancelled;
+        if (!cancelled && selectedProjectIdRef.current === selectedProjectId && currentActorUserIdRef.current === currentActorUserId && optimisticSend.state === 'sending') conversationSend.transition('needs_retry');
+      });
+    return () => { cancelled = true; if (!settled) recoveryKeys.delete(recoveryKey); };
+  }, [conversationMode, currentActorUserId, optimisticSend, resetComposerIntent, selectedProjectId]);
   const showStrategicStatusStrip = conversationMode && Boolean(
     strategistActive
       || strategicRefresh
@@ -993,12 +1105,10 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       : null,
     [conversationMode, currentStrategicState, strategicWorkbenchState],
   );
-
   const mutedCount = useMemo(
     () => Object.values(eventPrefs).filter(v => v === 'mute').length,
     [eventPrefs],
   );
-
   useEffect(() => {
     if (!selectedProjectId) {
       strategicSessionPinnedTargetRef.current = null;
@@ -1013,13 +1123,13 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     }
     lastStrategicSessionTargetFetchRef.current = null;
   }, [selectedProjectId, targetMessageId]);
-
   useEffect(() => {
     if (!targetMessageId) return;
     if (!conversationMode) {
       onTargetMessageHandled?.();
       return;
     }
+    if (loading) return;
     const visibleTarget = conversationMessages.find(msg => msg.id === targetMessageId) ?? null;
     const target = visibleTarget ?? messages.find(msg => msg.id === targetMessageId) ?? null;
     if (!target) {
@@ -1028,23 +1138,34 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       }
       return;
     }
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setHighlightedMessageId(target.id);
-    const node = scrollRef.current?.querySelector(`[data-message-id="${target.id}"]`);
-    node?.scrollIntoView({ block: 'center', behavior: 'smooth' });
-    if (targetMessage?.action === 'reply' && visibleTarget && canPrimeStrategicChatReply(visibleTarget)) {
-      setReplyTo({
-        id: visibleTarget.id,
-        content: visibleTarget.content,
-        from: messageReplyFromLabel(visibleTarget),
-        message_type: visibleTarget.message_type,
-        status: visibleTarget.status,
-      });
-      textareaRef.current?.focus();
-    } else if (targetMessage?.action === 'reply') {
-      addToastRef.current('Reply not primed: target must be an open Agent or Strategic message.', 'info');
+    if (!visibleTarget) {
+      if (targetMessage?.action === 'reply') {
+        addToastRef.current('Reply not primed: target must be an open Agent or Strategic message.', 'info');
+      }
+      onTargetMessageHandled?.();
+      return;
     }
-    onTargetMessageHandled?.();
+    let cancelled = false;
+    void scrollConversationMessageIntoView(target.id).then(revealed => {
+      if (cancelled || !revealed) return;
+      setHighlightedMessageId(target.id);
+      if (targetMessage?.action === 'reply' && visibleTarget && canPrimeStrategicChatReply(visibleTarget)) {
+        const primedReply = {
+          id: visibleTarget.id,
+          content: visibleTarget.content,
+          from: messageReplyFromLabel(visibleTarget),
+          message_type: visibleTarget.message_type,
+          status: visibleTarget.status,
+        };
+        setReplyTo(primedReply);
+        persistComposerEnvelope({ replyTo: primedReply });
+        textareaRef.current?.focus();
+      } else if (targetMessage?.action === 'reply') {
+        addToastRef.current('Reply not primed: target must be an open Agent or Strategic message.', 'info');
+      }
+      onTargetMessageHandled?.();
+    });
+    return () => { cancelled = true; };
   }, [
     conversationMessages,
     conversationMode,
@@ -1053,16 +1174,24 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     onTargetMessageHandled,
     targetMessage?.action,
     targetMessageId,
+    scrollConversationMessageIntoView,
+    // `persistComposerEnvelope` changes when reply state changes; including it
+    // would re-prime the same externally-held target forever.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   ]);
-
   useEffect(() => {
     if (!highlightedMessageId) return;
+    const frame = window.requestAnimationFrame(() => {
+      scrollRef.current
+        ?.querySelector(`[data-message-id="${highlightedMessageId}"]`)
+        ?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    });
     const timer = window.setTimeout(() => setHighlightedMessageId(null), 4000);
-    return () => window.clearTimeout(timer);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.clearTimeout(timer);
+    };
   }, [highlightedMessageId]);
-
-
-
   const getTop3NoisyEventTypes = useCallback((): Array<[string, number]> => {
     if (routineOpen.length === 0) return [];
     const now = Date.now();
@@ -1076,9 +1205,6 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     }
     return Object.entries(eventTypeCounts).sort((a, b) => b[1] - a[1]).slice(0, 3);
   }, [routineOpen]);
-
-
-
   const fetchMessages = useCallback(async () => {
     const requestSeq = fetchMessagesRequestSeqRef.current + 1;
     fetchMessagesRequestSeqRef.current = requestSeq;
@@ -1092,27 +1218,10 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     );
     try {
       if (conversationMode) {
-        const includeMessageId = getStrategicSessionIncludeMessageId(selectedProjectId, targetMessageId);
-        const result = await fetchStrategicConversation(selectedProjectId, includeMessageId);
-        const currentIncludeMessageId = getStrategicSessionIncludeMessageId(
-          selectedProjectIdRef.current,
-          targetMessageIdRef.current,
-        );
-        if (
-          selectedProjectIdRef.current !== selectedProjectId
-          || !isCurrentRequest()
-          || currentIncludeMessageId !== includeMessageId
-        ) {
-          return;
-        }
-        lastStrategicSessionTargetFetchRef.current = includeMessageId;
-        const sessionMessages = result.conversation?.items ?? [];
-        sessionMessages.forEach(m => seenMessageIdsRef.current.add(m.id));
+        await refreshResidentConversation(false);
+        const sessionMessages = messagesRef.current;
+        sessionMessages.forEach(message => seenMessageIdsRef.current.add(message.id));
         hasInitiallyLoadedRef.current = true;
-        setMessages(prev => {
-          if (messageListsEqual(prev, sessionMessages)) return prev;
-          return sessionMessages;
-        });
         if (!usesStrategicReadModelRef.current) {
           onMessageCountChange?.(countHighSignalMessages(sessionMessages, eventPrefsRef.current, tempMutesRef.current));
         }
@@ -1125,56 +1234,40 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       const data = await res.json();
       if (!isCurrentRequest()) return;
       const msgs: ProjectMessage[] = data.messages ?? [];
-
       // Detect new high-signal messages for toast alerts
       if (hasInitiallyLoadedRef.current) {
-        const newHighSignal = msgs.filter(m =>
+        const newNeedsOperator = msgs.filter(m =>
           m.status === 'open' &&
-          effectiveSignal(m, eventPrefsRef.current, tempMutesRef.current) === 'high' &&
+          isMessageNeedingOperatorAttention(m, strategicAttentionRef.current) &&
+          effectiveSignal(m, eventPrefsRef.current, tempMutesRef.current) !== 'mute' &&
           !seenMessageIdsRef.current.has(m.id)
         );
-
-        if (newHighSignal.length > 0) {
-          const summary = newHighSignal.length === 1
-            ? `New ${newHighSignal[0].message_type === 'BLOCKER' ? 'BLOCKER' : newHighSignal[0].message_type === 'BUG_REPORT' ? 'BUG' : newHighSignal[0].message_type === 'FEEDBACK' ? 'FEEDBACK' : 'high-signal message'}: ${newHighSignal[0].content.slice(0, 80)}`
-            : `${newHighSignal.length} new high-signal messages`;
-
-          // Use the highest severity among the new messages
-          const toastSeverity = newHighSignal.some(m => getToastSeverity(m) === 'error') ? 'error' : 'info';
+        if (newNeedsOperator.length > 0) {
+          const summary = newNeedsOperator.length === 1
+            ? `New needs-action message: ${newNeedsOperator[0].content.slice(0, 80)}`
+            : `${newNeedsOperator.length} new needs-action messages`;
+          const toastSeverity = newNeedsOperator.some(m => getToastSeverity(m) === 'error') ? 'error' : 'info';
           addToastRef.current(summary, toastSeverity);
-
-          // Fire desktop notifications for each high-signal message when opted in
+          // Local settings may suppress or present canonical attention; they do
+          // not decide which server-routed messages are intrusive.
           if (notifyOnHighSignalMessageRef.current && 'Notification' in window && Notification.permission === 'granted') {
-            for (const msg of newHighSignal) {
+            for (const msg of newNeedsOperator) {
               new Notification(msg.message_type, { body: msg.content.slice(0, 100) });
             }
           }
         }
       }
-
-      // Detect + toast for newly promoted failing routine groups
-      const wasLoaded = hasInitiallyLoadedRef.current;
-      const routineMsgs = msgs.filter(m => m.status === 'open' && effectiveSignal(m, eventPrefsRef.current, tempMutesRef.current) === 'routine');
-      for (const row of groupRoutineMessages(routineMsgs)) {
-        if (row.kind === 'group' && isFailingGroup(row.msgs) && eventPrefsRef.current[row.event_type] !== 'mute') {
-          if (wasLoaded && !seenPromotedGroupKeysRef.current.has(row.key)) {
-            const bd = outcomeBreakdown(row.msgs);
-            addToastRef.current(`Failing group: ${row.msgs.length} ${row.label} ${bd}`, 'error');
-          }
-          seenPromotedGroupKeysRef.current.add(row.key);
-        }
-      }
-
       // Update tracking of seen message IDs
       msgs.forEach(m => seenMessageIdsRef.current.add(m.id));
       hasInitiallyLoadedRef.current = true;
-
       // Only update state if messages actually changed — prevents scroll jumps from polling
       setMessages(prev => {
         if (messageListsEqual(prev, msgs)) return prev;
         return msgs;
       });
-      onMessageCountChange?.(countHighSignalMessages(msgs, eventPrefsRef.current, tempMutesRef.current));
+      if (!usesStrategicReadModelRef.current) {
+        onMessageCountChange?.(countHighSignalMessages(msgs, eventPrefsRef.current, tempMutesRef.current));
+      }
     } catch {
       if (isCurrentRequest()) addToastRef.current('Failed to load messages', 'error');
     } finally {
@@ -1224,33 +1317,21 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
           }).catch(() => {});
       }
     }
-  }, [conversationMode, getStrategicSessionIncludeMessageId, selectedProjectId, onMessageCountChange, searchQuery, targetMessageId, usesStrategicReadModel]);
-
+  }, [conversationMode, selectedProjectId, onMessageCountChange, refreshResidentConversation, searchQuery, usesStrategicReadModel]);
   usePoller(fetchMessages, { intervalMs: DEFAULT_POLL_MS, deps: [fetchMessages] });
-
+  useEffect(() => {
+    if (conversationMode || !realtimeRefreshSignal || realtimeRefreshSignal === lastRealtimeRefreshSignalRef.current) return;
+    lastRealtimeRefreshSignalRef.current = realtimeRefreshSignal;
+    void fetchMessages();
+  }, [conversationMode, fetchMessages, realtimeRefreshSignal]);
   // Record chat data-ready timing when conversation messages first render (once per page load)
   const initialLoadDoneRef = useRef(false);
   useEffect(() => {
     if (loading || initialLoadDoneRef.current || !conversationMode) return;
     initialLoadDoneRef.current = true;
     const ms = Math.round(performance.now());
-    const surface = (window.location.hash.replace(/^#\/?/, '').split('/')[0] || 'chat').slice(0, 64);
-    getIdToken().then(token => {
-      if (!token) return;
-      fetch('/api/admin/ui-load-timing', {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ surface, page_ready_ms: ms, sample_type: 'chat_data_ready' }),
-      }).catch(() => {});
-    }).catch(() => {});
+    reportUiLoadTiming(currentUiSurface(), ms, 'chat_data_ready');
   }, [loading, conversationMode]);
-
-  useEffect(() => {
-    if (!realtimeRefreshSignal || realtimeRefreshSignal === lastRealtimeRefreshSignalRef.current) return;
-    lastRealtimeRefreshSignalRef.current = realtimeRefreshSignal;
-    void fetchMessages();
-  }, [fetchMessages, realtimeRefreshSignal]);
-
   // Auto-scroll to bottom on initial load, when the operator sends their own
   // message (optimistic send), or when a new message arrives while near bottom.
   // Uses renderedConversationMessages (includes the optimistic bubble) so the
@@ -1282,7 +1363,6 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     // Don't scroll at all on polling refresh with same count — preserves position
     prevMessageCountRef.current = currentCount;
   }, [conversationMode, renderedConversationMessages.length, highSignalOpen, routineOpen, targetMessageId, visibleResolved, optimisticSend]);
-
   // Keep the chat pinned to the live streaming preview as it grows — but only
   // when the operator is already near the bottom, so a deliberate scroll-up to
   // read history is never yanked back down mid-turn.
@@ -1298,19 +1378,17 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       requestAnimationFrame(() => el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' }));
     }
   }, [conversationMode, streamingText]);
-
-  // Update parent with the high-signal count for the tab-title badge. When the
-  // strategic read model carries the canonical attention model, report its
-  // needs_operator count so the tab badge, StrategicContextRail, and in-panel
-  // needs-action set all agree on a single authority.
+  // Update the tab-title badge from the canonical attention read model whenever
+  // available, including the full message-list view. This keeps it aligned with
+  // the closed-panel count; legacy callers without that model retain the
+  // high-signal fallback.
   useEffect(() => {
-    if (conversationMode && usesStrategicReadModel) {
+    if (usesStrategicReadModel) {
       onMessageCountChange?.(attentionNeeds);
       return;
     }
     onMessageCountChange?.(highSignalCount);
-  }, [conversationMode, highSignalCount, onMessageCountChange, usesStrategicReadModel, attentionNeeds]);
-
+  }, [highSignalCount, onMessageCountChange, usesStrategicReadModel, attentionNeeds]);
   // Track scroll position for "scroll to bottom" button
   useEffect(() => {
     const el = scrollRef.current;
@@ -1323,8 +1401,6 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     el.addEventListener('scroll', onScroll, { passive: true });
     return () => el.removeEventListener('scroll', onScroll);
   }, []);
-
-
   // Scroll-based divider dismissal: detect when user scrolls past the divider
   useEffect(() => {
     const el = scrollRef.current;
@@ -1342,13 +1418,18 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     el.addEventListener('scroll', onScroll, { passive: true });
     return () => el.removeEventListener('scroll', onScroll);
   }, [dividerTime, selectedProjectId, dismissDivider]);
-
   function scrollToBottom() {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
   }
-
-  function handleAddAttachment(file: File) {
-    if (submittingRef.current || uploading) return;
+  function beginAttachmentMutation() {
+    if (submittingGuardRef.current.active || attachmentMutationGuardRef.current.active || uploading || sendState === 'needs_retry' || !selectedProjectId) return null;
+    const scope = { actorUserId: currentActorUserId, projectId: selectedProjectId };
+    const owner = attachmentMutationGuardRef.current.begin(scope.actorUserId, scope.projectId);
+    setAttachmentMutating(true);
+    return { ...scope, owner };
+  }
+  function finishAttachmentMutation(owner: ReturnType<ComposerRequestOwnershipGuard['begin']>) { if (attachmentMutationGuardRef.current.finish(owner)) setAttachmentMutating(false); }
+  async function handleAddAttachment(file: File) {
     if (file.size > 50 * 1024 * 1024) {
       addToast('File exceeds the 50 MB size limit and was skipped', 'error');
       return;
@@ -1356,41 +1437,77 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     if (file.type?.startsWith('image/') && file.size > MAX_AGENT_IMAGE_BYTES) {
       addToast('This image exceeds ~9.75 MB and may not be visible to the strategist', 'info');
     }
+    if (conversationMode && !currentActorUserId) {
+      addToast('Sign in before attaching files', 'error');
+      return;
+    }
+    const mutation = beginAttachmentMutation();
+    if (!mutation) return;
     const id = `att_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    const previewUrl = makePendingPreviewUrl(file);
-    setPendingAttachments(prev => {
-      const next = [...prev, {
-        id,
-        file,
-        previewUrl,
-        mime_type: file.type || 'application/octet-stream',
-        name: file.name,
-        size_bytes: file.size,
-      }];
-      pendingAttachmentsRef.current = next;
-      return next;
-    });
-  }
-
-  function handleRemoveAttachment(id: string) {
-    if (submittingRef.current || uploading) return;
-    setPendingAttachments(prev => {
-      const att = prev.find(a => a.id === id);
-      if (att?.previewUrl && typeof URL.revokeObjectURL === 'function') {
-        URL.revokeObjectURL(att.previewUrl);
+    const storedAttachment = { id, file, mime_type: file.type || 'application/octet-stream', name: file.name, size_bytes: file.size };
+    const priorIdentity = conversationSend.identity, retainIdentityOnFailure = Boolean(priorIdentity || composerIntentRef.current.content.trim() || composerIntentRef.current.reply_to || pendingAttachmentsRef.current.length);
+    let sendKey: string | null = null, freshIdentityMinted = false;
+    try {
+      if (conversationMode && mutation.actorUserId) {
+        sendKey = conversationSend.ensureIdentity(generateIdempotencyKey);
+        freshIdentityMinted = priorIdentity == null;
+        await putStoredPendingAttachment(mutation.actorUserId, mutation.projectId, sendKey, storedAttachment);
+        if (currentActorUserIdRef.current !== mutation.actorUserId || selectedProjectIdRef.current !== mutation.projectId) return;
+        const captured = captureCurrentDraftRefs();
+        setDraftSourceRefs(captured.sourceRefs);
+        setDraftArtifactRefs(captured.artifactRefs);
+        persistComposerEnvelope({
+          sourceRefs: captured.sourceRefs,
+          artifactRefs: captured.artifactRefs,
+          attachmentSendKey: sendKey,
+        });
       }
-      const next = prev.filter(a => a.id !== id);
-      pendingAttachmentsRef.current = next;
-      return next;
-    });
+      if (currentActorUserIdRef.current !== mutation.actorUserId || selectedProjectIdRef.current !== mutation.projectId) return;
+      const previewUrl = makePendingPreviewUrl(file);
+      setPendingAttachments(prev => {
+        const next = [...prev, { ...storedAttachment, previewUrl }];
+        pendingAttachmentsRef.current = next;
+        return next;
+      });
+    } catch {
+      if (freshIdentityMinted && !retainIdentityOnFailure) conversationSend.clearIdentity();
+      if (currentActorUserIdRef.current === mutation.actorUserId && selectedProjectIdRef.current === mutation.projectId) {
+        addToast('Could not persist this attachment; it was not added', 'error');
+      }
+    } finally {
+      finishAttachmentMutation(mutation.owner);
+    }
   }
-
+  async function handleRemoveAttachment(id: string) {
+    const mutation = beginAttachmentMutation();
+    if (!mutation) return;
+    const sendKey = conversationSend.identity ?? optimisticSend?.key ?? null;
+    try {
+      if (conversationMode && mutation.actorUserId && sendKey) {
+        await deleteStoredPendingAttachment(mutation.actorUserId, mutation.projectId, sendKey, id);
+      }
+      if (currentActorUserIdRef.current !== mutation.actorUserId || selectedProjectIdRef.current !== mutation.projectId) return;
+      const next = pendingAttachmentsRef.current.filter(attachment => attachment.id !== id);
+      setPendingAttachments(prev => {
+        const att = prev.find(a => a.id === id);
+        if (att?.previewUrl && typeof URL.revokeObjectURL === 'function') URL.revokeObjectURL(att.previewUrl);
+        pendingAttachmentsRef.current = next;
+        return next;
+      });
+      if (next.length === 0 && mutation.actorUserId) finalizeLastAttachmentRemoval(mutation.actorUserId, mutation.projectId, updateComposerIntent({ attachment_send_key: null }), conversationSend.clearIdentity);
+    } catch {
+      if (currentActorUserIdRef.current === mutation.actorUserId && selectedProjectIdRef.current === mutation.projectId) {
+        addToast('Could not remove the persisted attachment', 'error');
+      }
+    } finally {
+      finishAttachmentMutation(mutation.owner);
+    }
+  }
   // Swap the File backing an existing pending attachment — used by the pre-send
   // preview for canvas-edited (rotate/crop) bytes and picker-based replace. The
   // old object-URL is revoked and a fresh one minted so the chip and any open
   // preview re-render from the new bytes.
-  function handleReplaceAttachmentFile(id: string, file: File) {
-    if (submittingRef.current || uploading) return;
+  async function handleReplaceAttachmentFile(id: string, file: File) {
     if (file.size > 50 * 1024 * 1024) {
       addToast('File exceeds the 50 MB size limit and was skipped', 'error');
       return;
@@ -1398,56 +1515,89 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     if (file.type?.startsWith('image/') && file.size > MAX_AGENT_IMAGE_BYTES) {
       addToast('This image exceeds ~9.75 MB and may not be visible to the strategist', 'info');
     }
-    const previewUrl = makePendingPreviewUrl(file);
-    setPendingAttachments(prev => {
-      const next = prev.map(att => {
-        if (att.id !== id) return att;
-        if (att.previewUrl && typeof URL.revokeObjectURL === 'function') {
-          URL.revokeObjectURL(att.previewUrl);
-        }
-        return {
-          ...att,
-          file,
-          previewUrl,
-          mime_type: file.type || 'application/octet-stream',
-          name: file.name,
-          size_bytes: file.size,
-        };
+    const sendKey = conversationSend.identity ?? optimisticSend?.key ?? null;
+    if (conversationMode && (!currentActorUserId || !sendKey)) {
+      addToast('Could not identify the pending attachment draft', 'error');
+      return;
+    }
+    const mutation = beginAttachmentMutation();
+    if (!mutation) return;
+    const storedAttachment = {
+      id,
+      file,
+      mime_type: file.type || 'application/octet-stream',
+      name: file.name,
+      size_bytes: file.size,
+    };
+    try {
+      if (conversationMode && mutation.actorUserId && sendKey) {
+        await putStoredPendingAttachment(mutation.actorUserId, mutation.projectId, sendKey, storedAttachment);
+      }
+      if (currentActorUserIdRef.current !== mutation.actorUserId || selectedProjectIdRef.current !== mutation.projectId) return;
+      const previewUrl = makePendingPreviewUrl(file);
+      setPendingAttachments(prev => {
+        const next = prev.map(att => {
+          if (att.id !== id) return att;
+          if (att.previewUrl && typeof URL.revokeObjectURL === 'function') URL.revokeObjectURL(att.previewUrl);
+          return { ...att, ...storedAttachment, previewUrl };
+        });
+        pendingAttachmentsRef.current = next;
+        return next;
       });
-      pendingAttachmentsRef.current = next;
-      return next;
-    });
+    } catch {
+      if (currentActorUserIdRef.current === mutation.actorUserId && selectedProjectIdRef.current === mutation.projectId) {
+        addToast('Could not persist the replacement attachment', 'error');
+      }
+    } finally {
+      finishAttachmentMutation(mutation.owner);
+    }
   }
-
-  function clearPendingAttachments() {
+  function clearPendingAttachments(sendKey?: string | null) {
     setPendingAttachments(prev => {
       revokePendingAttachmentPreviews(prev);
       pendingAttachmentsRef.current = [];
       return [];
     });
+    const durableSendKey = sendKey ?? conversationSend.identity ?? optimisticSend?.key ?? null;
+    if (conversationMode && currentActorUserId && selectedProjectId && durableSendKey) {
+      void clearStoredPendingAttachments(currentActorUserId, selectedProjectId, durableSendKey)
+        .catch(() => addToastRef.current('Message sent, but local attachment cleanup needs a retry', 'info'));
+    }
   }
-
   async function handleSubmit() {
+    const submitProjectId = selectedProjectId;
+    const submitActorUserId = currentActorUserId;
+    const submitReplyTo = replyTo ? { ...replyTo } : null;
+    const submitStillCurrent = () => (
+      selectedProjectIdRef.current === submitProjectId
+      && currentActorUserIdRef.current === submitActorUserId
+    );
     const submittedContent = newContent.trim();
     const attachmentsForSubmit = pendingAttachmentsRef.current;
-    if (!selectedProjectId || (!submittedContent && attachmentsForSubmit.length === 0)) return;
+    const retainedPayloadAttachments = optimisticSend?.payload?.attachments ?? [];
+    let attachmentUploadFailed = false;
+    if (!submitProjectId || (
+      !submittedContent
+      && attachmentsForSubmit.length === 0
+      && retainedPayloadAttachments.length === 0
+    )) return;
     // Synchronous guard first — reject re-entrant calls before the async
     // `setSubmitting` has a chance to re-render, so rapid double-Enter cannot
     // launch two requests.
-    if (submittingRef.current) return;
-    submittingRef.current = true;
+    if (submittingGuardRef.current.active || attachmentMutationGuardRef.current.active) return;
+    const submitOwner = submittingGuardRef.current.begin(submitActorUserId, submitProjectId);
     setSubmitting(true);
     try {
-      // When the operator types an answer to an open QUESTION, resolve the question
-      // via PATCH — the backend posts a question_answer NOTE (linked back to the
-      // question) and marks the question resolved so the strategist sees it answered.
-      if (replyTo && replyTo.message_type === 'QUESTION' && replyTo.status === 'open') {
+      // The activity inbox retains its legacy operational-resolution endpoint.
+      // Resident conversation replies always use the durable idempotent message
+      // POST below, whose reply contract resolves open questions atomically.
+      if (!conversationMode && submitReplyTo && submitReplyTo.message_type === 'QUESTION' && submitReplyTo.status === 'open') {
         if (attachmentsForSubmit.length > 0) {
           addToast('Remove attachments before answering a question', 'error');
           return;
         }
         const workbenchContext = buildMessageWorkbenchContext(currentStrategicState, strategicWorkbenchState);
-        const res = await apiFetch(`${API_BASE_URL}/api/admin/messages/${replyTo.id}`, {
+        const res = await apiFetch(`${API_BASE_URL}/api/admin/messages/${submitReplyTo.id}`, {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1456,10 +1606,10 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
           }),
         });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        if (!submitStillCurrent()) return;
         idempotencyKeyRef.current = null;
-        setNewContent('');
-        clearComposerDraft(auth.currentUser?.email, selectedProjectId);
-        setReplyTo(null);
+        resetComposerIntent();
+        clearComposerDraft(submitActorUserId, submitProjectId);
         setLastArming(null);
         if (textareaRef.current) textareaRef.current.style.height = 'auto';
         addToast('Question answered', 'success');
@@ -1468,84 +1618,241 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         await fetchMessages();
         return;
       }
-      // Upload pending attachments to GCS before sending the message.
-      const uploadedAttachments: MessageAttachment[] = [];
-      if (attachmentsForSubmit.length > 0) {
-        setUploading(true);
-        try {
-          for (const att of attachmentsForSubmit) {
-            try {
-              const { upload_url, download_url } = await getMessageAttachmentUploadUrl(
-                selectedProjectId,
-                att.name,
-                att.mime_type,
-              );
-              const uploadRes = await fetch(upload_url, {
-                method: 'PUT',
-                headers: { 'Content-Type': att.mime_type },
-                body: att.file,
-              });
-              if (!uploadRes.ok) throw new Error(`Upload failed: ${uploadRes.status}`);
-              uploadedAttachments.push({
-                type: att.mime_type?.startsWith('image/') ? 'image' : 'attachment',
-                mime_type: att.mime_type,
-                name: att.name,
-                size_bytes: att.size_bytes,
-                url: download_url,
-              });
-            } catch {
-              addToast(`Failed to upload ${att.name}`, 'error');
-              return;
-            }
-          }
-        } finally {
-          setUploading(false);
-        }
-      }
-
-      const context: Record<string, unknown> = {};
-      if (uploadedAttachments.length > 0) {
-        context.attachments = uploadedAttachments;
-      }
-      if (replyTo) {
-        context.reply_to = replyTo.id;
-        context.reply_preview = replyTo.content.slice(0, 120);
-      }
+      const isRetry = conversationMode && optimisticSend?.state === 'needs_retry';
+      const sendIdentity = conversationMode
+        ? (isRetry ? optimisticSend.key : conversationSend.ensureIdentity(generateIdempotencyKey))
+        : (idempotencyKeyRef.current ?? generateIdempotencyKey());
+      if (!conversationMode) idempotencyKeyRef.current = sendIdentity;
       const workbenchContext = buildMessageWorkbenchContext(currentStrategicState, strategicWorkbenchState);
-      // Reuse the draft's key across a double-submit / retry so the backend
-      // dedups; only mint a new one when the previous send fully succeeded.
-      if (!idempotencyKeyRef.current) {
-        idempotencyKeyRef.current = generateIdempotencyKey();
-      }
-      if (conversationMode) {
-        // INSTANT ACK: optimistically show the operator's message + working state
-        // the moment they Send, before the POST round-trips (zero dead time). The
-        // durable copy lands via fetchMessages below and the optimistic one is
-        // dropped; the working state persists until the strategist replies.
-        setOptimisticSend({
-          key: idempotencyKeyRef.current,
+      const initialSourceRefs = isRetry
+        ? (optimisticSend?.payload?.source_refs ?? [])
+        : (draftSourceRefs.length > 0
+            ? draftSourceRefs
+            : Array.isArray(workbenchContext?.selected_refs)
+              ? workbenchContext.selected_refs as Array<Record<string, unknown>>
+              : []);
+      const initialArtifactRefs = isRetry
+        ? (optimisticSend?.payload?.artifact_refs ?? [])
+        : (draftArtifactRefs.length > 0
+            ? draftArtifactRefs
+            : initialSourceRefs.filter(ref => ref.kind === 'artifact'));
+      if (conversationMode && !isRetry) {
+        const visibleAttachmentDescriptors: MessageAttachment[] = attachmentsForSubmit.map(att => ({
+          type: att.mime_type?.startsWith('image/') ? 'image' : 'attachment',
+          mime_type: att.mime_type,
+          name: att.name,
+          size_bytes: att.size_bytes,
+          ...(att.previewUrl ? { url: att.previewUrl } : {}),
+          _attachmentKey: att.id,
+        }));
+        conversationSend.begin({
+          key: sendIdentity,
           content: submittedContent,
           created_at: new Date().toISOString(),
           message_type: effectiveNewType,
+          state: 'sending',
+          wakeup_state: null,
+          reply_to_message_id: submitReplyTo?.id ?? null,
+          reply_to: submitReplyTo,
+          context: {
+            ...(visibleAttachmentDescriptors.length ? { attachments: visibleAttachmentDescriptors } : {}),
+            ...(submitReplyTo ? {
+              reply_to: submitReplyTo.id,
+              reply_preview: submitReplyTo.content.slice(0, 120),
+            } : {}),
+            source_refs: initialSourceRefs,
+            artifact_refs: initialArtifactRefs,
+            ...(workbenchContext ? { strategic_session: workbenchContext } : {}),
+          },
+          payload: {
+            message_type: effectiveNewType,
+            content: submittedContent,
+            idempotency_key: sendIdentity,
+            reply_to_message_id: submitReplyTo?.id ?? null,
+            source_refs: initialSourceRefs,
+            artifact_refs: initialArtifactRefs,
+            attachments: [],
+            ...(workbenchContext ? { workbench_context: workbenchContext } : {}),
+          },
         });
-        strategicReplyBaselineRef.current = countStrategicReplies(conversationMessages);
-        setWorkingSince(Date.now());
-        // Clear the composer immediately so the optimistic bubble reads as sent.
-        setNewContent('');
-        clearComposerDraft(auth.currentUser?.email, selectedProjectId);
-        if (textareaRef.current) textareaRef.current.style.height = 'auto';
-        const data = await createStrategicSessionMessage(selectedProjectId, {
-          message_type: effectiveNewType,
-          content: submittedContent,
-          idempotency_key: idempotencyKeyRef.current,
-          ...(Object.keys(context).length > 0 ? { context } : {}),
-          ...(workbenchContext ? { workbench_context: workbenchContext } : {}),
+      }
+      if (isRetry) {
+        const receipt = await findStrategicMessageByClientIdentity(submitProjectId, sendIdentity);
+        if (receipt) {
+          const adopted = receipt.message;
+          if (!submitStillCurrent()) return;
+          setMessages(previous => mergeCanonicalConversationMessage(previous, adopted));
+          const adoptedWorking = adopted.handling_state === 'claimed'
+            || receipt.wakeup_state === 'queued'
+            || receipt.wakeup_state === 'coalesced';
+          setWorkingSince(adoptedWorking ? Date.now() : null);
+          if (['claimed', 'responded', 'superseded'].includes(adopted.handling_state ?? '')) {
+            conversationSend.clear();
+          } else {
+            conversationSend.transition(
+              receipt.wakeup_state === 'paused' || receipt.wakeup_state === 'waiting_for_capacity' ? 'waiting' : 'accepted',
+              receipt.wakeup_state,
+            );
+          }
+          resetComposerIntent();
+          clearComposerDraft(submitActorUserId, submitProjectId);
+          clearPendingAttachments(sendIdentity);
+          if (textareaRef.current) textareaRef.current.style.height = 'auto';
+          addToast('Message accepted', 'success');
+          void fetchMessages().catch(() => undefined);
+          void refreshStrategicState?.();
+          recordStrategicInteraction();
+          return;
+        }
+      }
+      const retainedUploads = isRetry ? retainedPayloadAttachments : [];
+      const uploadedAttachments: MessageAttachment[] = [...retainedUploads];
+      const contextAttachments: MessageAttachment[] = isRetry && Array.isArray(optimisticSend?.context?.attachments)
+        ? optimisticSend.context.attachments as MessageAttachment[]
+        : [...retainedUploads];
+      if (attachmentsForSubmit.length > 0 && retainedUploads.length === 0) {
+        setUploading(true);
+        try {
+          const batch = await uploadConversationAttachments(submitProjectId, attachmentsForSubmit);
+          uploadedAttachments.push(...batch.uploaded);
+          contextAttachments.push(...batch.visible);
+        } catch (error) {
+          attachmentUploadFailed = true;
+          const name = error instanceof ConversationAttachmentUploadError ? error.attachmentName : 'attachment';
+          if (submitStillCurrent()) addToast(`Failed to upload ${name}`, 'error');
+          throw error;
+        } finally {
+          if (submitStillCurrent()) setUploading(false);
+        }
+      }
+      const context: Record<string, unknown> = {};
+      if (workbenchContext) context.strategic_session = workbenchContext;
+      if (contextAttachments.length > 0) {
+        context.attachments = contextAttachments;
+      }
+      if (submitReplyTo) {
+        context.reply_to = submitReplyTo.id;
+        context.reply_preview = submitReplyTo.content.slice(0, 120);
+      }
+      if (conversationMode) {
+        const sourceRefs = initialSourceRefs;
+        const artifactRefs = initialArtifactRefs;
+        let payload = isRetry && optimisticSend?.payload
+          ? (uploadedAttachments.length === (optimisticSend.payload.attachments?.length ?? 0)
+              ? optimisticSend.payload
+              : { ...optimisticSend.payload, attachments: uploadedAttachments })
+          : {
+              message_type: effectiveNewType,
+              content: submittedContent,
+              idempotency_key: sendIdentity,
+              reply_to_message_id: submitReplyTo?.id ?? null,
+              source_refs: sourceRefs,
+              artifact_refs: artifactRefs,
+              attachments: uploadedAttachments,
+              ...(workbenchContext ? { workbench_context: workbenchContext } : {}),
+            };
+        const pendingSend = isRetry && optimisticSend
+          ? optimisticSend
+          : {
+              key: sendIdentity,
+              content: submittedContent,
+              created_at: new Date().toISOString(),
+              message_type: effectiveNewType,
+              state: 'sending' as const,
+              wakeup_state: null,
+              reply_to_message_id: submitReplyTo?.id ?? null,
+              reply_to: submitReplyTo,
+              context: {
+                ...context,
+                source_refs: sourceRefs,
+                artifact_refs: artifactRefs,
+              },
+              payload,
+            };
+        conversationSend.replace({
+          ...pendingSend,
+          context: {
+            ...pendingSend.context,
+            ...context,
+            source_refs: sourceRefs,
+            artifact_refs: artifactRefs,
+          },
+          payload,
         });
+        // A retry reached here only after the identity lookup proved absence.
+        let data;
+        try {
+          data = await createStrategicSessionMessage(submitProjectId, payload);
+        } catch (error) {
+          const staleAttachmentReceipt = isRetry
+            && retainedUploads.length > 0
+            && error instanceof StrategicSessionMessageCreateError
+            && (error.status === 400 || error.status === 409)
+            && /attachment upload/i.test(error.message);
+          if (!staleAttachmentReceipt || !submitActorUserId) throw error;
+          const durableAttachments = await listStoredPendingAttachments(submitActorUserId, submitProjectId, sendIdentity);
+          if (durableAttachments.length === 0) {
+            if (submitStillCurrent()) addToast('Attachment upload expired and the local file is unavailable. Abandon this pending send to continue.', 'error');
+            throw error;
+          }
+          await Promise.allSettled(retainedUploads.flatMap(attachment => (
+            attachment.attachment_id
+              ? [deleteMessageAttachmentUpload(submitProjectId, attachment.attachment_id)]
+              : []
+          )));
+          setUploading(true);
+          let recovered;
+          try {
+            recovered = await uploadConversationAttachments(submitProjectId, durableAttachments);
+          } catch (recoveryError) {
+            attachmentUploadFailed = true;
+            throw recoveryError;
+          } finally {
+            if (submitStillCurrent()) setUploading(false);
+          }
+          payload = { ...payload, attachments: recovered.uploaded };
+          const recoveredContext = {
+            ...pendingSend.context,
+            ...context,
+            attachments: recovered.visible,
+            source_refs: sourceRefs,
+            artifact_refs: artifactRefs,
+          };
+          conversationSend.replace({ ...pendingSend, context: recoveredContext, payload });
+          data = await createStrategicSessionMessage(submitProjectId, payload);
+        }
+        const recoveredReceipt = data.message ? null : await findStrategicMessageByClientIdentity(submitProjectId, sendIdentity);
+        const canonicalMessage = data.message ?? recoveredReceipt?.message ?? null;
+        if (!canonicalMessage) throw new Error('Accepted message response omitted its canonical projection');
+        if (!submitStillCurrent()) {
+          const recoveredWakeup = data.wakeup_state ?? recoveredReceipt?.wakeup_state ?? null;
+          conversationSend.transition(
+            recoveredWakeup === 'paused' || recoveredWakeup === 'waiting_for_capacity' ? 'waiting' : 'accepted',
+            recoveredWakeup,
+          );
+          return;
+        }
+        setMessages(previous => mergeCanonicalConversationMessage(previous, canonicalMessage));
+        const wakeupState = data.wakeup_state ?? recoveredReceipt?.wakeup_state ?? null;
+        const acceptedState = wakeupState === 'paused' || wakeupState === 'waiting_for_capacity'
+          ? 'waiting'
+          : 'accepted' as const;
+        conversationSend.transition(acceptedState, wakeupState);
+        if (wakeupState === 'queued' || wakeupState === 'coalesced') {
+          strategicReplyBaselineRef.current = countStrategicReplies(conversationMessages);
+          setWorkingSince(Date.now());
+        } else {
+          setWorkingSince(null);
+        }
+
         const arming = parseArmingOutcome(data?.arming);
-        idempotencyKeyRef.current = null;
-        setReplyTo(null);
+        // Clear only after durable acceptance. A lost/failed response preserves
+        // text, reply, attachments, and source context for identity recovery.
+        resetComposerIntent();
+        clearComposerDraft(submitActorUserId, submitProjectId);
         setLastArming(arming);
-        clearPendingAttachments();
+        clearPendingAttachments(sendIdentity);
+        if (textareaRef.current) textareaRef.current.style.height = 'auto';
         addToast(armingToastCopy(arming), arming === 'not_armed' ? 'info' : 'success');
         let didRefreshStrategicState = false;
         if (arming === 'steering') {
@@ -1565,10 +1872,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
           void refreshStrategicState?.();
           didRefreshStrategicState = true;
         }
-        await fetchMessages();
-        // Durable operator message is now present — drop the optimistic bubble
-        // (renderedConversationMessages also dedups, so there is no flash).
-        setOptimisticSend(null);
+        await fetchMessages().catch(() => undefined);
         if (!didRefreshStrategicState) void refreshStrategicState?.();
         recordStrategicInteraction();
         return;
@@ -1586,21 +1890,22 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         }),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!submitStillCurrent()) return;
       // Read the server's real arming decision (additive, backward-compatible
       // field) so the toast and composer hint reflect what actually happened
       // rather than a type-only guess. Tolerate older responses without it.
       let arming: ArmingOutcome | null = null;
       try {
         const data = await res.json();
+        if (!submitStillCurrent()) return;
         arming = parseArmingOutcome(data?.arming);
       } catch {
         // No/invalid JSON body — fall back to generic confirmation copy.
       }
       // Sent cleanly — the next distinct message gets a fresh key.
       idempotencyKeyRef.current = null;
-      setNewContent('');
-      clearComposerDraft(auth.currentUser?.email, selectedProjectId);
-      setReplyTo(null);
+      resetComposerIntent();
+      clearComposerDraft(submitActorUserId, submitProjectId);
       setLastArming(arming);
       clearPendingAttachments();
       if (textareaRef.current) textareaRef.current.style.height = 'auto';
@@ -1630,15 +1935,22 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       if (!didRefreshStrategicState) void refreshStrategicState?.();
       recordStrategicInteraction();
     } catch {
-      // The send failed — drop the optimistic bubble + working state so the UI
-      // reflects reality (the server idempotency key covers a manual resend).
-      setOptimisticSend(null);
-      setWorkingSince(null);
-      addToast('Failed to send message', 'error');
+      // The draft and identity remain intact. The next manual retry first queries
+      // the canonical store, covering the response-lost-after-commit boundary.
+      if (conversationMode) {
+        conversationSend.transition('needs_retry');
+        if (submitStillCurrent()) {
+          setWorkingSince(null);
+          addToast('Send not confirmed — retry to recover or resend safely', 'error');
+        }
+      } else {
+        if (submitStillCurrent() && !attachmentUploadFailed) addToast('Failed to send message', 'error');
+      }
     } finally {
-      submittingRef.current = false;
-      setSubmitting(false);
-      setUploading(false);
+      if (submittingGuardRef.current.finish(submitOwner)) {
+        setSubmitting(false);
+        setUploading(false);
+      }
     }
   }
 
@@ -1899,8 +2211,12 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   const onCancelInvestigate = useCallback(() => setInvestigatingId(null), []);
   const onReply = useCallback((replyTo: { id: string; content: string; from: string; message_type: string; status: string }) => {
     setReplyTo(replyTo);
+    const captured = captureCurrentDraftRefs();
+    setDraftSourceRefs(captured.sourceRefs);
+    setDraftArtifactRefs(captured.artifactRefs);
+    persistComposerEnvelope({ replyTo, sourceRefs: captured.sourceRefs, artifactRefs: captured.artifactRefs });
     textareaRef.current?.focus();
-  }, []);
+  }, [captureCurrentDraftRefs, persistComposerEnvelope]);
 
   const bubbleProps = useMemo(() => ({
     actionMode: conversationMode ? 'reply-only' as const : 'full' as const,
@@ -1925,6 +2241,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     onCancelInvestigate,
     onReply,
     onOpenStrategicContext: conversationMode ? (onOpenStrategicContextWorkspace ?? onOpenStrategicContextCommands) : undefined,
+    currentActorUserId: auth.currentUser?.uid ?? null,
   }), [
     conversationMode,
     resolvingId,
@@ -1981,27 +2298,101 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   }, []);
 
   const handleChangeType = useCallback((value: string) => {
+    if (sendState === 'needs_retry') return;
+    updateComposerIntent({ type: value });
     setNewType(value);
     setLastArming(null);
-    if (newContent) saveComposerDraft(auth.currentUser?.email, selectedProjectId, { type: value, content: newContent });
-  }, [newContent, selectedProjectId]);
+    if (newContent || replyTo || pendingAttachmentsRef.current.length > 0) persistComposerEnvelope({ type: value });
+  }, [newContent, persistComposerEnvelope, replyTo, sendState, updateComposerIntent]);
 
   const handleChangeContent = useCallback((value: string) => {
+    // Do not silently abandon an unresolved identity: the original POST may
+    // already have committed. The operator must retry/recover it first.
+    if (sendState === 'needs_retry' && optimisticSend && value !== optimisticSend.content) return;
+    updateComposerIntent({ content: value });
     setNewContent(value);
     if (value) {
-      saveComposerDraft(auth.currentUser?.email, selectedProjectId, { type: effectiveNewType, content: value });
-    } else {
-      clearComposerDraft(auth.currentUser?.email, selectedProjectId);
-    }
-  }, [effectiveNewType, selectedProjectId]);
+      const captured = captureCurrentDraftRefs();
+      setDraftSourceRefs(captured.sourceRefs);
+      setDraftArtifactRefs(captured.artifactRefs);
+      persistComposerEnvelope({ content: value, sourceRefs: captured.sourceRefs, artifactRefs: captured.artifactRefs });
+    } else if (replyTo || pendingAttachmentsRef.current.length > 0) {
+      persistComposerEnvelope({ content: '' });
+    } else persistComposerEnvelope({ content: '' });
+  }, [captureCurrentDraftRefs, optimisticSend, persistComposerEnvelope, replyTo, sendState, updateComposerIntent]);
 
-  const handleCancelReply = useCallback(() => setReplyTo(null), []);
+  const handleCancelReply = useCallback(() => {
+    if (sendState !== 'needs_retry') {
+      setReplyTo(null);
+      persistComposerEnvelope({ replyTo: null });
+    }
+  }, [persistComposerEnvelope, sendState]);
+
+  async function handleAbandonPendingSend() {
+    if (!optimisticSend || optimisticSend.state !== 'needs_retry' || !selectedProjectId || !currentActorUserId || submittingGuardRef.current.active) return;
+    const projectId = selectedProjectId;
+    const actorUserId = currentActorUserId;
+    const identity = optimisticSend.key;
+    const submitOwner = submittingGuardRef.current.begin(actorUserId, projectId);
+    setSubmitting(true);
+    try {
+      const receipt = await findStrategicMessageByClientIdentity(projectId, identity);
+      if (selectedProjectIdRef.current !== projectId || currentActorUserIdRef.current !== actorUserId) return;
+      if (receipt) {
+        setMessages(previous => mergeCanonicalConversationMessage(previous, receipt.message));
+        if (['claimed', 'responded', 'superseded'].includes(receipt.message.handling_state ?? '')) {
+          conversationSend.clear();
+        } else {
+          conversationSend.transition(
+            receipt.wakeup_state === 'paused' || receipt.wakeup_state === 'waiting_for_capacity' ? 'waiting' : 'accepted',
+            receipt.wakeup_state,
+          );
+        }
+        clearPendingAttachments(identity);
+        resetComposerIntent();
+        clearComposerDraft(actorUserId, projectId);
+        addToast('Message was already accepted; recovered its canonical receipt.', 'success');
+        return;
+      }
+
+      await Promise.allSettled((optimisticSend.payload?.attachments ?? []).flatMap(attachment => (
+        attachment.attachment_id
+          ? [deleteMessageAttachmentUpload(projectId, attachment.attachment_id)]
+          : []
+      )));
+      try {
+        await clearStoredPendingAttachments(actorUserId, projectId, identity);
+      } catch {
+        // Cleanup intent is committed before deletion; the next composer mount retries it.
+      }
+      setPendingAttachments(previous => {
+        revokePendingAttachmentPreviews(previous);
+        pendingAttachmentsRef.current = [];
+        return [];
+      });
+      conversationSend.clear();
+      resetComposerIntent();
+      clearComposerDraft(actorUserId, projectId);
+      addToast('Pending message abandoned after confirming it was not accepted.', 'info');
+    } catch {
+      if (selectedProjectIdRef.current === projectId && currentActorUserIdRef.current === actorUserId) {
+        addToast('Could not confirm whether the message was accepted; it was not abandoned.', 'error');
+      }
+    } finally {
+      if (submittingGuardRef.current.finish(submitOwner)) {
+        setSubmitting(false);
+      }
+    }
+  }
 
   const handlePickStarterPrompt = useCallback((value: string) => {
     setNewContent(value);
-    saveComposerDraft(auth.currentUser?.email, selectedProjectId, { type: effectiveNewType, content: value });
+    const captured = captureCurrentDraftRefs();
+    setDraftSourceRefs(captured.sourceRefs);
+    setDraftArtifactRefs(captured.artifactRefs);
+    persistComposerEnvelope({ content: value, sourceRefs: captured.sourceRefs, artifactRefs: captured.artifactRefs });
     focusComposerTextarea();
-  }, [effectiveNewType, selectedProjectId, focusComposerTextarea]);
+  }, [captureCurrentDraftRefs, focusComposerTextarea, persistComposerEnvelope]);
 
   return (
     <div className="flex-1 overflow-hidden flex flex-col min-h-0">
@@ -2050,6 +2441,19 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         showCloseButton={resolvedShowCloseButton}
         filterChrome={resolvedFilterChrome}
       />
+
+      {/* Inline alerts — replaces the separate AlertsPopover bell-triggered surface */}
+      {alerts && alerts.length > 0 && (
+        <div className="shrink-0 border-b border-workbench-border px-3 py-2 md:px-4" data-testid="alerts-inline-banner">
+          <AlertsBanner
+            alerts={alerts}
+            onDismiss={onDismissAlert ?? (() => {})}
+            onDismissAll={onDismissAllAlerts}
+            onViewTask={onViewAlertTask}
+            projectId={selectedProjectId ?? undefined}
+          />
+        </div>
+      )}
 
       {showStrategicStatusStrip && (
         <div className="shrink-0 border-b border-workbench-border bg-workbench-base px-3 py-1.5 md:px-4" data-testid="strategic-context-package-strip">
@@ -2210,9 +2614,9 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
                 const messageId = isMessage ? item.ref?.id : null;
                 const handleClick = () => {
                   if (isMessage && messageId && conversationMode) {
-                    setHighlightedMessageId(messageId);
-                    const node = scrollRef.current?.querySelector(`[data-message-id="${messageId}"]`);
-                    node?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+                    void scrollConversationMessageIntoView(messageId).then(revealed => {
+                      if (revealed) setHighlightedMessageId(messageId);
+                    });
                   }
                 };
                 return (
@@ -2262,14 +2666,13 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       {/* Messages list — chat-style scroll area */}
       <MessagesListView
         presentation={conversationMode ? 'conversation' : 'triage'}
+        hasOlderConversationMessages={conversationMode && conversationHasMore}
+        loadingOlderConversationMessages={loadingOlderConversation}
+        onLoadOlderConversationMessages={() => loadOlderConversation()}
+        conversationListRef={conversationListRef}
         streamingBubble={streamingTurn ? <StrategicStreamingBubble key={streamingTurn.key} segments={streamingTurn.segments} /> : null}
-        activityStrip={residentActivity ? (
-          <div className="flex w-full flex-col gap-2">
-            <StrategicResidentActivityWidget state={residentActivity} />
-            {residentActivity.phase === 'executing' && strategicTurnWorking && liveActivity.items.length > 0 ? (
-              <StrategicActivityStrip items={liveActivity.items} latestLifecycle={liveActivity.latestLifecycle} />
-            ) : null}
-          </div>
+        operationItem={residentActivity ? (
+          <StrategicResidentActivityWidget state={residentActivity} onOpenActivity={onOpenActivityFeed} />
         ) : null}
         scrollRef={scrollRef}
         dividerDismissedRef={dividerDismissedRef}
@@ -2375,11 +2778,22 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         newType={effectiveNewType}
         newContent={newContent}
         submitting={submitting}
+        sendLocked={attachmentMutating}
+        attachmentLocked={attachmentMutating}
+        sendState={sendState}
+        wakeupState={sendWakeupState}
+        editingLocked={sendState === 'sending' || sendState === 'needs_retry'}
         replyTo={replyTo}
         lastArming={lastArming}
         strategistBusy={strategistActive}
         disabledReason={selectedProjectId ? null : 'Select a project to message Strategic'}
         pendingAttachments={pendingAttachments}
+        retainedAttachmentCount={sendState === 'needs_retry'
+          ? Math.max(
+              optimisticSend?.payload?.attachments?.length ?? 0,
+              Array.isArray(optimisticSend?.context?.attachments) ? optimisticSend.context.attachments.length : 0,
+            )
+          : 0}
         uploading={uploading}
         onAddAttachment={handleAddAttachment}
         onRemoveAttachment={handleRemoveAttachment}
@@ -2387,6 +2801,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         onChangeType={handleChangeType}
         onChangeContent={handleChangeContent}
         onCancelReply={handleCancelReply}
+        onAbandonPending={handleAbandonPendingSend}
         onSubmit={handleSubmit}
         starterPrompts={starterPrompts ?? undefined}
         capabilityHint={starterPrompts ? WORKDAY_CAPABILITY_HINT : undefined}

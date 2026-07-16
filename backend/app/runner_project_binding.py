@@ -23,10 +23,29 @@ from __future__ import annotations
 
 import uuid
 
+from sqlalchemy import or_
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.elements import ColumnElement
 from sqlmodel import select
 
 from app.models import LocalRunner, RunnerProjectBinding
+
+
+def runner_allowed_for_project(project_id: uuid.UUID) -> ColumnElement[bool]:
+    """SQL predicate selecting runners allowed to serve ``project_id``.
+
+    This is the query-side equivalent of :func:`allowed_project_ids`: the
+    enrollment project remains an implicit member, while explicit secondary
+    grants come from ``RunnerProjectBinding``.  Keeping this union in one helper
+    prevents discovery/read paths from drifting back to enrollment-only scope.
+    """
+    bound_runner_ids = select(RunnerProjectBinding.runner_id).where(
+        RunnerProjectBinding.project_id == project_id
+    )
+    return or_(
+        LocalRunner.project_id == project_id,
+        LocalRunner.id.in_(bound_runner_ids),
+    )
 
 
 async def bound_project_ids(
@@ -57,6 +76,28 @@ async def allowed_project_ids(
     """
     allowed = await bound_project_ids(session, runner.id)
     allowed.add(runner.project_id)
+    return allowed
+
+
+async def allowed_project_ids_by_runner(
+    session: AsyncSession, runners: list[LocalRunner]
+) -> dict[uuid.UUID, set[uuid.UUID]]:
+    """Resolve canonical allow-lists for many loaded runners in one query.
+
+    The enrollment project is always included, including for legacy runners
+    without a materialized binding row.  Callers which already loaded runners
+    should use this instead of issuing one binding query per runner.
+    """
+    allowed = {runner.id: {runner.project_id} for runner in runners}
+    if not allowed:
+        return allowed
+    rows = await session.execute(
+        select(RunnerProjectBinding.runner_id, RunnerProjectBinding.project_id).where(
+            RunnerProjectBinding.runner_id.in_(allowed)
+        )
+    )
+    for runner_id, project_id in rows.all():
+        allowed[runner_id].add(project_id)
     return allowed
 
 

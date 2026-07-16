@@ -27,6 +27,7 @@ from app.required_runtime_env import (
 )
 
 CLOUD_RUN_ENV = "K_REVISION"
+MIGRATION_APPLY_SCRATCH_DATABASE_URL = "MIGRATION_APPLY_SCRATCH_DATABASE_URL"
 
 
 def _clear_env(monkeypatch, *names):
@@ -70,6 +71,12 @@ def test_encryption_key_entry_uses_shared_constant():
     assert entry.name is ENCRYPTION_KEY_ENV
     assert entry.scope == "cloud_run"
     assert entry.reason, "entry must carry a human reason"
+
+
+def test_migration_apply_scratch_url_is_not_a_boot_requirement():
+    assert MIGRATION_APPLY_SCRATCH_DATABASE_URL not in {
+        requirement.name for requirement in REQUIRED_RUNTIME_ENV
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -123,6 +130,13 @@ def test_presence_only_empty_string_treated_absent(monkeypatch):
     monkeypatch.setenv(ENCRYPTION_KEY_ENV, "")
     with pytest.raises(RuntimeError):
         _verify_required_env()
+
+
+def test_cloud_run_missing_scratch_url_does_not_block_boot(monkeypatch):
+    monkeypatch.setenv(CLOUD_RUN_ENV, "app-00042-abc")
+    monkeypatch.setenv(ENCRYPTION_KEY_ENV, "any-non-empty-value")
+    _clear_env(monkeypatch, MIGRATION_APPLY_SCRATCH_DATABASE_URL)
+    assert _verify_required_env() is None
 
 
 # --------------------------------------------------------------------------- #

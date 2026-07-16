@@ -128,11 +128,12 @@ def _viewable_artifacts_descriptor(raw: Any) -> list[Dict[str, Any]]:
 
     Reads the ``viewable_files`` manifest stamped onto ``polling_metadata`` by
     ``_link_terminal_artifact`` and returns a sanitized, backward-compatible list
-    of ``{filename, storage_uri, content_type, size_bytes, kind}``. A signed
-    preview URL is resolved lazily via ``/api/admin/artifacts/download-url`` from
-    ``storage_uri`` (which lives inside the allowlisted compute-job prefix), so no
-    URL is minted here. Returns ``[]`` when a job produced no viewable files or
-    the manifest is malformed (absent/empty is the common, expected case).
+    of ``{filename, storage_uri, content_type, size_bytes, kind, revision, live}``.
+    A signed preview URL is resolved lazily via
+    ``/api/admin/artifacts/download-url`` from ``storage_uri`` (which lives inside
+    the allowlisted compute-job prefix), so no URL is minted here. Returns ``[]``
+    when a job produced no viewable files or the manifest is malformed
+    (absent/empty is the common, expected case).
     """
     if not isinstance(raw, list):
         return []
@@ -147,6 +148,8 @@ def _viewable_artifacts_descriptor(raw: Any) -> list[Dict[str, Any]]:
         content_type = entry.get("content_type")
         size_bytes = entry.get("size_bytes")
         kind = entry.get("kind")
+        revision = entry.get("revision")
+        live = entry.get("live")
         out.append(
             {
                 "filename": str(filename) if filename is not None else None,
@@ -158,6 +161,10 @@ def _viewable_artifacts_descriptor(raw: Any) -> list[Dict[str, Any]]:
                 if isinstance(size_bytes, int) and not isinstance(size_bytes, bool)
                 else None,
                 "kind": kind if kind in ("image", "video", "pdf") else None,
+                "revision": revision
+                if isinstance(revision, str) and revision
+                else None,
+                "live": live if isinstance(live, bool) else None,
             }
         )
     return out

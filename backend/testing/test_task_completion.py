@@ -2967,6 +2967,152 @@ class TestPlanSubtaskScopeAwareEffort:
         assert "subtasks" in task.plan_output
 
 
+class TestPlanPrerequisiteResolution:
+    """Plan spawn applies the same prerequisite contract as blocked resume."""
+
+    async def _setup_plan(self, db_session, mocker):
+        mocker.patch(
+            "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+        )
+        mocker.patch(
+            "app.plan_completion.broadcast_to_project", new_callable=AsyncMock
+        )
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(
+            project_id=project.id,
+            title="Parent plan",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "plan", "prompt": "plan", "base_branch": "main"}],
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+        mocker.patch(
+            "app.task_completion._ensure_branch", new_callable=AsyncMock, return_value=task
+        )
+        return project, task
+
+    async def _children(self, db_session, parent):
+        from sqlmodel import select
+
+        return (
+            (
+                await db_session.execute(select(Task).where(Task.parent_task_id == parent.id))
+            )
+            .scalars()
+            .all()
+        )
+
+    @pytest.mark.asyncio
+    async def test_shipped_completed_prerequisite_spawns_child_runnable(
+        self, db_session, mocker
+    ):
+        project, plan = await self._setup_plan(db_session, mocker)
+        foundation = make_task(
+            project_id=project.id,
+            title="Shipped foundation",
+            status=TaskStatus.COMPLETED,
+            context={"pr_merged": True},
+        )
+        db_session.add(foundation)
+        await db_session.commit()
+        logs = json.dumps(
+            {"subtasks": [{"title": "Dependent", "prompt": "work", "prerequisite": {"kind": "task", "ref": str(foundation.id)}}]}
+        )
+
+        await _handle_plan_completion(plan, logs, db_session)
+
+        child = (await self._children(db_session, plan))[0]
+        assert child.status == TaskStatus.QUEUED
+        assert child.context.get("unresolved_prerequisite") is None
+        assert child.context["_spawn_prereq_resolved"] == [
+            {"kind": "task", "ref": str(foundation.id)}
+        ]
+
+    @pytest.mark.asyncio
+    async def test_ghost_completed_prerequisite_with_unmerged_rollup_blocks_child(
+        self, db_session, mocker
+    ):
+        """A child merged only to an unmerged completed rollup is not shipped.
+
+        The dependent must remain BLOCKED rather than run against the integration
+        base, which does not contain the staging-only foundation.
+        """
+        project, plan = await self._setup_plan(db_session, mocker)
+        rollup = make_task(
+            project_id=project.id,
+            title="Completed but unmerged rollup",
+            status=TaskStatus.COMPLETED,
+        )
+        db_session.add(rollup)
+        await db_session.commit()
+        foundation = make_task(
+            project_id=project.id,
+            parent_task_id=rollup.id,
+            title="Staging-only foundation",
+            status=TaskStatus.COMPLETED,
+            context={"pr_merged": True},
+        )
+        db_session.add(foundation)
+        await db_session.commit()
+        logs = json.dumps(
+            {
+                "subtasks": [
+                    {
+                        "title": "Dependent",
+                        "prompt": "work",
+                        "prerequisite": {
+                            "kind": "task",
+                            "ref": str(foundation.id),
+                        },
+                    }
+                ]
+            }
+        )
+
+        await _handle_plan_completion(plan, logs, db_session)
+
+        child = (await self._children(db_session, plan))[0]
+        assert child.status == TaskStatus.BLOCKED
+        assert child.context.get("_spawn_prereq_resolved") is None
+        assert child.context["unresolved_prerequisite"] == [
+            {"kind": "task", "ref": str(foundation.id)}
+        ]
+
+    @pytest.mark.asyncio
+    async def test_parent_plan_cannot_become_child_prerequisite(self, db_session, mocker):
+        _, plan = await self._setup_plan(db_session, mocker)
+        logs = json.dumps(
+            {"subtasks": [{"title": "Dependent", "prompt": "work", "prerequisite": {"kind": "task", "ref": str(plan.id)}}]}
+        )
+
+        await _handle_plan_completion(plan, logs, db_session)
+
+        child = (await self._children(db_session, plan))[0]
+        assert child.status == TaskStatus.BLOCKED
+        assert str(plan.id) not in child.depends_on
+
+    @pytest.mark.asyncio
+    async def test_blocked_child_broadcasts_committed_status(self, db_session, mocker):
+        _, plan = await self._setup_plan(db_session, mocker)
+        broadcast = mocker.patch(
+            "app.plan_completion.broadcast_to_project", new_callable=AsyncMock
+        )
+        missing_foundation_id = _uuid_mod.uuid4()
+        logs = json.dumps(
+            {"subtasks": [{"title": "Blocked", "prompt": "work", "prerequisite": {"kind": "task", "ref": str(missing_foundation_id)}}]}
+        )
+
+        await _handle_plan_completion(plan, logs, db_session)
+
+        child = (await self._children(db_session, plan))[0]
+        assert child.status == TaskStatus.BLOCKED
+        assert broadcast.await_args.args[2]["status"] == TaskStatus.BLOCKED
+
+
 # ── _record_regression_signal_if_matching ──────────────────────────────────
 
 

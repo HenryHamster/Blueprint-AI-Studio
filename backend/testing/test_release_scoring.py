@@ -1037,6 +1037,19 @@ class TestBlockerExecutionSite:
             == rs.EXECUTION_SITE_DEPLOYED
         )
 
+    def test_criterion_coverage_gate_is_deployed_side(self):
+        """Coverage is rendered and its evidence is minted by deployed code.
+
+        The merge-grade child observes candidate content, but the hard blocker
+        is emitted only after the deployed qualifier composes the sha-keyed
+        category ledger.  Marking it candidate-side would tell an operator an
+        automain-only minter fix can take effect before it is deployed.
+        """
+        assert (
+            rs.blocker_execution_site("criterion_coverage_incomplete")
+            == rs.EXECUTION_SITE_DEPLOYED
+        )
+
     def test_candidate_side_blockers(self):
         # These all fire on candidate content — a fix on automain clears them on
         # the next qualification.
@@ -1053,7 +1066,6 @@ class TestBlockerExecutionSite:
             "smoketest_startup_failed",
             "audit_missing",
             "test_file_deleted",
-            "criterion_coverage_incomplete",
             "merge_grade_misses",
             "capability_proof_gate_blocked",
         ):

@@ -79,6 +79,7 @@ export interface CodeChangeTaskOpts {
    *  so the generated ./check runs the project's configured per-directory
    *  commands instead of the hardcoded Blueprint blocks. */
   buildConfig?: BuildConfig;
+  taskCapability?: Partial<Record<'agent_mode' | 'run_shape' | 'output_kind', unknown>>;
   /** Exact pytest node-id selectors CI reported failing (ci_failure fix only).
    *  Forwarded to writeCodeChangeHelpers so the generated ./check verifies
    *  these selectors pass LOCALLY before ./pr open can push — closing the
@@ -407,6 +408,7 @@ export async function runCodeChangeTask(opts: CodeChangeTaskOpts): Promise<void>
     promotionTarget: opts.promotionTarget,
     regressingCategories: opts.regressingCategories,
     buildConfig: opts.buildConfig,
+    taskCapability: opts.taskCapability,
     ciFailureSelectors: opts.ciFailureSelectors,
     mergeVerify: opts.mergeVerify,
     visualAcceptance: opts.visualAcceptance,

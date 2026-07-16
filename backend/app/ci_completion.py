@@ -1994,6 +1994,78 @@ async def handle_ci_completion(
             # can detect an orphaned review task.
             if not ci_loop.get("review_wait_started"):
                 ci_loop["review_wait_started"] = _utcnow().isoformat()
+                # Per-episode respawn budget: when a new review-wait episode
+                # begins AND a fix has been applied since the last episode,
+                # reset the backstop's per-episode count so a respawn consumed
+                # in an earlier episode does not permanently exhaust the budget.
+                if ci_loop.get("ci_fix_spawned"):
+                    ci_loop.pop("review_wait_respawn_count", None)
+
+            # Accelerated retry for deferred review spawns (Fix 1b): if
+            # a fix task's completion handler failed with a transient lock-
+            # contention deferral, it wrote ``review_spawn_deferred_at``
+            # on this CI task's review_loop. Attempt the review spawn
+            # immediately instead of waiting for the 60-minute backstop.
+            # Runs independently of whether review_wait_started was just
+            # set or is from a prior episode — each deferred marker fires
+            # the accelerated retry at most once (cleared after attempt).
+            _deferred_at = ci_loop.get("review_spawn_deferred_at")
+            if _deferred_at and not ci_loop.get("review_wait_escalated"):
+                try:
+                    from datetime import datetime as _ddt
+
+                    _dd = _ddt.fromisoformat(_deferred_at)
+                    if (_utcnow() - _dd).total_seconds() < 120:
+                        _orig_prompt = ci_payload.get("prompt", "") or (
+                            task.description or ""
+                        )
+                        _fr, _created = await _spawn_pipeline_task(
+                            task,
+                            "review",
+                            session,
+                            ci_pr_number,
+                            ci_branch,
+                            ci_base,
+                            original_prompt=_orig_prompt,
+                            original_task_id=ci_orig_id,
+                        )
+                        if _created and _fr is not None:
+                            ci_loop["review_wait_respawned"] = True
+                            ci_loop["review_wait_respawn_task_id"] = (
+                                str(_fr.id)
+                            )
+                            ci_loop["review_wait_respawn_count"] = 1
+                            # Clear the deferral marker so the normal
+                            # backstop does not re-enter this path.
+                            ci_loop.pop("review_spawn_deferred_at", None)
+                            task.latest_status_message = (
+                                f"CI passed on PR #{ci_pr_number} — "
+                                f"deferred review spawn retried: "
+                                f"task {_fr.id}"
+                            )
+                            _bcast_status = TaskStatus.EVALUATING
+                            logger.info(
+                                "[CI] PR #%s accelerated deferred retry — "
+                                "spawned review %s",
+                                ci_pr_number,
+                                _fr.id,
+                            )
+                        else:
+                            # Accelerated retry also failed — clear the
+                            # flag so the normal backstop handles it
+                            # without re-entering this path every ~30s.
+                            ci_loop.pop("review_spawn_deferred_at", None)
+                            logger.warning(
+                                "[CI] PR #%s accelerated deferred retry "
+                                "failed — falling back to normal backstop",
+                                ci_pr_number,
+                            )
+                except Exception as _acc_exc:
+                    logger.warning(
+                        "[CI] PR #%s accelerated deferred retry error: %s",
+                        ci_pr_number,
+                        _acc_exc,
+                    )
             # Orphan-review backstop: if a review task died without setting
             # review_approved, the PR parks here indefinitely. Rather than
             # gate a mergeable PR on a human immediately, RESPAWN a fresh
@@ -2024,6 +2096,48 @@ async def handle_ci_completion(
                         _respawn_cap = int(
                             _rt_cfg.get("review_wait_respawn_cap", 1)
                         )
+
+                        # Per-episode respawn budget: if the previously respawned
+                        # review was superseded (CANCELLED/FAILED) before reaching
+                        # a terminal verdict, it should not consume the current
+                        # episode's budget. This prevents one consumed respawn in
+                        # an earlier review-wait episode from permanently starving
+                        # a later episode after a fix has landed new changes.
+                        if (
+                            _respawn_count >= _respawn_cap
+                            and _respawn_count > 0
+                        ):
+                            _prev_id = ci_loop.get(
+                                "review_wait_respawn_task_id"
+                            )
+                            if _prev_id:
+                                try:
+                                    _prev = await session.get(
+                                        Task, uuid.UUID(_prev_id)
+                                    )
+                                except (ValueError, TypeError):
+                                    _prev = None
+                                if _prev and _prev.status in (
+                                    TaskStatus.CANCELLED,
+                                    TaskStatus.FAILED,
+                                ):
+                                    _respawn_count = max(
+                                        0, _respawn_count - 1
+                                    )
+                                    ci_loop[
+                                        "review_wait_respawn_count"
+                                    ] = _respawn_count
+                                    logger.info(
+                                        "[CI] PR #%s previous respawned review "
+                                        "%s was superseded (status=%s) — "
+                                        "resetting effective count to %d for "
+                                        "new review-wait episode",
+                                        ci_pr_number,
+                                        _prev_id[:8],
+                                        _prev.status.value,
+                                        _respawn_count,
+                                    )
+
                         if _auto_respawn and _respawn_count < _respawn_cap:
                             _orig_prompt = ci_payload.get("prompt", "") or (
                                 task.description or ""

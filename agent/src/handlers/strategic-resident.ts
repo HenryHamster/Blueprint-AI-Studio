@@ -864,7 +864,8 @@ export async function handleStrategicResident(
   // marker; when present we record it here BEFORE the operator-turn heartbeat so
   // it is serialized into task.context._decisions_reg on that same heartbeat.
   const recordOperatorDecision = (r: ResidentTurnResult): void => {
-    const note = parseOperatorDecision(r.resultText);
+    const note = parseOperatorDecision(r.resultText)
+      ?? parseOperatorDecision(r.accumulatedTurnText);
     const captured = note !== null;
     recordOperatorDecisionCapture(captured);
     if (!captured) {
@@ -1255,6 +1256,7 @@ export async function handleStrategicResident(
       // so the ledger captures the event without raising a false violation.
       const upd = classifyTickOutcome({
         resultText: r.resultText,
+        accumulatedTurnText: r.accumulatedTurnText,
         sawToolUse: r.sawToolUse,
         focus,
         atTick: examTick,
@@ -1273,7 +1275,8 @@ export async function handleStrategicResident(
       // autonomous<->operator boundary where interrupts cluster. They remain in
       // the exam ledger (examRecords) above; only the durable register skips them.
       if (isSettledDecisionVerdict(upd.record.verdict)) {
-        const fullTickVerdict = parseTickVerdict(r.resultText);
+        const fullTickVerdict = parseTickVerdict(r.resultText)
+          ?? parseTickVerdict(r.accumulatedTurnText);
         admitDecisionEntry(decisionsReg, {
           atTick: upd.record.atTick,
           at: upd.record.at,

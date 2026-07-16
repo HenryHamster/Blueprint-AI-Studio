@@ -64,6 +64,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import json
 import logging
 import os
 import uuid
@@ -91,10 +92,7 @@ from app.acceptance_gate import (
     classify_merged_acceptance_context,
     classify_undeclared_reason,
 )
-from app.acceptance_criteria import (
-    get_active_criteria_rubric,
-    get_version_coverage_summary,
-)
+from app.acceptance_criteria import get_criteria_for_version, get_version_coverage_summary
 
 # Per-(sha, category) goal-verdict ledger (goal-verification redesign).  A SIBLING
 # module owns this file; it may not be present in every checkout during the
@@ -261,9 +259,14 @@ from app.release_qualifier_sweep import (
     _redrive_deferred_unsynced_qualification,  # noqa: F401 — re-exported for tests
     _redrive_dry_run_candidate,  # noqa: F401 — re-exported for tests
     _redrive_not_promoted_qualification,  # noqa: F401 — re-exported for tests
+    _reconcile_hotfix_audit_trail,
     sweep_stuck_qualifications,  # noqa: F401 — re-exported for reaper + tests
 )
-from app.migration_apply_gate import run_migration_apply_gate
+from app.migration_apply_gate import (
+    MIGRATION_APPLY_SCRATCH_ENV,
+    preflight_migration_apply_scratch,
+    run_migration_apply_gate,
+)
 from app.env_preflight_evidence import sanitize_env_preflight_artifact
 from app.rollup_migration_validation import (
     check_qualification_migration_identity,
@@ -312,6 +315,214 @@ _NEVER_GRADED_GAP = (
     "non-contentless goal)."
 )
 
+_RUBRIC_PROVENANCE_VERSION = 1
+_MAX_RUBRIC_DIFF_KEYS = 20
+
+
+def _canonicalize_rubric(raw: Any) -> list[dict[str, str]]:
+    if not isinstance(raw, list):
+        return []
+    canonical: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("criterion_key") or item.get("category_key") or "").strip()
+        if not key or key in seen:
+            continue
+        text = " ".join(str(item.get("text") or "").split())
+        canonical.append({"criterion_key": key, "text": text})
+        seen.add(key)
+    return canonical
+
+
+def _rubric_fingerprint(snapshot: list[dict[str, str]]) -> str:
+    encoded = json.dumps(
+        _canonicalize_rubric(snapshot),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _qualification_attempt_id(
+    version: release_version.ReleaseVersion,
+    qual: dict[str, Any] | None = None,
+) -> str | None:
+    raw = (qual or {}).get("qualification_attempt_id")
+    if raw is None:
+        raw = (version.last_qualification or {}).get("qualification_attempt_id")
+    return str(raw) if raw not in (None, "") else None
+
+
+def _rubric_provenance(
+    snapshot: list[dict[str, str]],
+    *,
+    source: str,
+    qualification_attempt_id: str | None,
+) -> dict[str, Any]:
+    return {
+        "schema_version": _RUBRIC_PROVENANCE_VERSION,
+        "source": source,
+        "fingerprint": _rubric_fingerprint(snapshot),
+        "criteria": snapshot,
+        "qualification_attempt_id": qualification_attempt_id,
+    }
+
+
+def _rubric_detail_provenance(detail: Any) -> dict[str, Any] | None:
+    if not isinstance(detail, dict):
+        return None
+    nested = detail.get("rubric_provenance")
+    if isinstance(nested, dict):
+        return nested
+    if isinstance(detail.get("fingerprint"), str) and isinstance(
+        detail.get("criteria"), list
+    ):
+        return detail
+    return None
+
+
+def _rubric_dimension_reusable(
+    detail: Any,
+    *,
+    fingerprint: str,
+    qualification_attempt_id: str | None,
+) -> bool:
+    provenance = _rubric_detail_provenance(detail)
+    if provenance is None or provenance.get("fingerprint") != fingerprint:
+        return False
+    # A rubric-bound fact proves a particular qualification attempt, not merely
+    # a rubric's contents.  Older projections may not yet carry the first-class
+    # attempt id; fail closed in that rolling state rather than letting a
+    # same-SHA re-drive silently borrow a prior blind grade.
+    stored_attempt_id = provenance.get("qualification_attempt_id")
+    if qualification_attempt_id is None or stored_attempt_id in (None, ""):
+        return False
+    return stored_attempt_id == qualification_attempt_id
+
+
+async def _snapshot_qualification_rubric(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    rows = await get_criteria_for_version(session, version.id)
+    active = _canonicalize_rubric(
+        [
+            {"criterion_key": row.criterion_key, "text": row.text}
+            for row in rows
+            if row.status == "active"
+        ]
+    )
+    lifecycle = [
+        {
+            "criterion_key": str(row.criterion_key),
+            "status": str(row.status),
+        }
+        for row in rows
+        if row.criterion_key
+    ]
+    return active, lifecycle
+
+
+async def _resolve_launched_rubric(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+    qual: dict[str, Any],
+) -> tuple[list[dict[str, str]] | None, dict[str, Any] | None, str | None]:
+    if isinstance(qual.get("rubric_snapshot"), list):
+        snapshot = _canonicalize_rubric(qual["rubric_snapshot"])
+        fingerprint = _rubric_fingerprint(snapshot)
+        stored = qual.get("rubric_fingerprint")
+        if stored not in (None, fingerprint):
+            return None, None, "stored_rubric_fingerprint_mismatch"
+        return (
+            snapshot,
+            _rubric_provenance(
+                snapshot,
+                source="attempt_projection",
+                qualification_attempt_id=_qualification_attempt_id(version, qual),
+            ),
+            None,
+        )
+
+    task_id = qual.get("merge_grade_task_id")
+    if task_id:
+        try:
+            task = await session.get(Task, uuid.UUID(str(task_id)))
+        except (TypeError, ValueError, AttributeError):
+            task = None
+        payload = task.first_payload if task is not None else None
+        if isinstance(payload, dict) and isinstance(payload.get("categories"), list):
+            snapshot = _canonicalize_rubric(payload["categories"])
+            return (
+                snapshot,
+                _rubric_provenance(
+                    snapshot,
+                    source="legacy_merge_grade_task_payload",
+                    qualification_attempt_id=_qualification_attempt_id(version, qual),
+                ),
+                None,
+            )
+        return None, None, "merge_grade_task_payload_has_no_rubric"
+
+    return None, None, "pending_attempt_has_no_rubric_snapshot_or_grade_payload"
+
+
+def _bounded_rubric_drift(
+    launched: list[dict[str, str]],
+    live: list[dict[str, str]],
+    launched_lifecycle: Any,
+    live_lifecycle: list[dict[str, str]],
+) -> dict[str, Any] | None:
+    launched_by_key = {row["criterion_key"]: row["text"] for row in launched}
+    live_by_key = {row["criterion_key"]: row["text"] for row in live}
+    prior_status = {
+        str(row.get("criterion_key")): str(row.get("status"))
+        for row in (launched_lifecycle or [])
+        if isinstance(row, dict) and row.get("criterion_key")
+    }
+    live_status = {
+        str(row.get("criterion_key")): str(row.get("status"))
+        for row in live_lifecycle
+        if row.get("criterion_key")
+    }
+    added = [key for key in live_by_key if key not in launched_by_key]
+    removed = [key for key in launched_by_key if key not in live_by_key]
+    changed = [
+        key
+        for key in launched_by_key.keys() & live_by_key.keys()
+        if launched_by_key[key] != live_by_key[key]
+    ]
+    if not added and not removed and not changed:
+        return None
+    changes: list[dict[str, str]] = []
+    for key in added:
+        kind = (
+            "reinstated"
+            if prior_status.get(key) in {"retracted", "superseded"}
+            else "added"
+        )
+        changes.append({"criterion_key": key, "change": kind})
+    for key in removed:
+        status = live_status.get(key)
+        kind = status if status in {"retracted", "superseded"} else "removed"
+        changes.append({"criterion_key": key, "change": kind})
+    changes.extend(
+        {"criterion_key": key, "change": "changed"} for key in changed
+    )
+    bounded_changes = changes[:_MAX_RUBRIC_DIFF_KEYS]
+    return {
+        "added_keys": added[:_MAX_RUBRIC_DIFF_KEYS],
+        "removed_keys": removed[:_MAX_RUBRIC_DIFF_KEYS],
+        "changed_keys": changed[:_MAX_RUBRIC_DIFF_KEYS],
+        "changes": bounded_changes,
+        "total_changes": len(changes),
+        "truncated": len(changes) > len(bounded_changes),
+        "launched_fingerprint": _rubric_fingerprint(launched),
+        "live_fingerprint": _rubric_fingerprint(live),
+    }
+
 
 def _never_graded_category_verdicts(active_keys: set[str]) -> list[dict[str, Any]]:
     """Fail-CLOSED verdicts for a candidate that was NEVER graded.
@@ -357,6 +568,11 @@ def _coerce_ledger_category_verdict(v: Any) -> dict[str, Any]:
         "status": getattr(v, "status", None),
         "tier": getattr(v, "tier", "judged"),
         "gap": getattr(v, "gap", None),
+        "grader_run_id": (
+            str(getattr(v, "grader_run_id", ""))
+            if getattr(v, "grader_run_id", None)
+            else None
+        ),
     }
 
 
@@ -1040,43 +1256,60 @@ def _promotion_in_flight_result(
     return None
 
 
-async def _increment_qualification_attempts(
+def _coerce_qualification_attempt_id(value: Any) -> uuid.UUID | None:
+    """Return a UUID attempt identity, accepting legacy string projections."""
+    if value is None:
+        return None
+    try:
+        return uuid.UUID(str(value))
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def _qualification_attempt_for_record(
+    version: release_version.ReleaseVersion,
+    record: dict[str, Any],
+) -> uuid.UUID:
+    """Resolve identity, deriving a stable UUID5 for partial legacy backfills."""
+    explicit = _coerce_qualification_attempt_id(
+        record.get("qualification_attempt_id")
+    ) or _coerce_qualification_attempt_id(
+        getattr(version, "active_qualification_attempt_id", None)
+    )
+    if explicit is not None:
+        return explicit
+    legacy_key = ":".join(
+        (
+            str(version.id),
+            str(record.get("candidate_sha") or "unknown"),
+            str(record.get("started_at") or "unknown"),
+        )
+    )
+    return uuid.uuid5(uuid.NAMESPACE_URL, f"blueprint:qualification:{legacy_key}")
+
+
+async def _record_attempt_projection_atomic(
     session: AsyncSession,
     version_id: uuid.UUID,
+    *,
+    attempt_id: uuid.UUID,
+    retry_episode: int,
+    is_new_attempt: bool,
 ) -> None:
-    """Atomically bump ``qualification_attempts`` on a ReleaseVersion row.
-
-    Audit R4 MEDIUM — the ``no_credentials`` / ``sha_error`` early-return
-    paths in ``run_qualification`` run BEFORE the ``ReleaseVersion`` FOR UPDATE
-    lock is taken, so a read-modify-write
-    (``version.qualification_attempts = (version.qualification_attempts or 0) + 1``)
-    is vulnerable to a lost update: two concurrent callers (strategic
-    ``qualify_request`` + admin ``POST /qualify``) both read the same value and
-    write back the same ``+1``.
-
-    This issues a single atomic SQL ``UPDATE ... SET qualification_attempts =
-    qualification_attempts + 1`` — the increment happens in the database
-    relative to the row's current value, so concurrent callers can never lose
-    an increment.  ``COALESCE`` is used so a (defensively) NULL counter still
-    increments cleanly to 1.  Dialect-agnostic: works on both Postgres and the
-    SQLite test fixtures.
-
-    The caller's later ``session.commit()`` persists this; the in-memory
-    instance's ``qualification_attempts`` attribute is expired by the
-    ``update()`` statement's session synchronization and lazily reloads on next
-    access (the early-return callers do not read it back).
-    """
+    """Atomically publish identity and distinct lifetime/retry accounting."""
+    values: dict[str, Any] = {
+        "active_qualification_attempt_id": attempt_id,
+        "qualification_retry_episode": max(0, int(retry_episode)),
+    }
+    if is_new_attempt:
+        values["qualification_attempts"] = (
+            sa_func.coalesce(release_version.ReleaseVersion.qualification_attempts, 0)
+            + 1
+        )
     await session.execute(
         update(release_version.ReleaseVersion)
         .where(release_version.ReleaseVersion.id == version_id)
-        .values(
-            qualification_attempts=(
-                sa_func.coalesce(
-                    release_version.ReleaseVersion.qualification_attempts, 0
-                )
-                + 1
-            )
-        )
+        .values(**values)
     )
 
 
@@ -1719,6 +1952,9 @@ async def run_qualification(
     *,
     session_factory=None,
     allow_synchronous_reuse_promote: bool = False,
+    qualification_attempt_id: uuid.UUID | str | None = None,
+    retry_episode: int = 0,
+    retry_episode_cap: int | None = None,
 ) -> dict[str, Any]:
     """Kick off qualification for the open release ``version``.
 
@@ -1788,6 +2024,13 @@ async def run_qualification(
     ``"no_credentials"``, ``"sha_error"``, ``"spawn_failed"``).  The caller
     commits the session.
     """
+    continued_attempt_id = _coerce_qualification_attempt_id(
+        qualification_attempt_id
+    )
+    attempt_id = continued_attempt_id or uuid.uuid4()
+    is_new_attempt = continued_attempt_id is None
+    retry_episode = max(0, int(retry_episode or 0))
+
     # Guard 1: only qualify a stabilize-phase candidate.  Cheap, no I/O — do
     # it before resolving credentials so a wrong-phase call is a pure no-op.
     # The phase is re-checked under the row lock further down (after the
@@ -1851,6 +2094,9 @@ async def run_qualification(
             "status": "error",
             "error": "no_credentials",
             "started_at": _utcnow().isoformat(),
+            "qualification_attempt_id": str(attempt_id),
+            "retry_episode": retry_episode,
+            "retry_episode_cap": retry_episode_cap,
         }
         flag_modified(version, "last_qualification")
         session.add(version)
@@ -1860,8 +2106,18 @@ async def run_qualification(
         # (strategic qualify_request + admin POST /qualify) could otherwise
         # both read the same attempts value and write back the same +1,
         # losing one increment.
-        await _increment_qualification_attempts(session, version.id)
-        return {"status": "no_credentials"}
+        await _record_attempt_projection_atomic(
+            session,
+            version.id,
+            attempt_id=attempt_id,
+            retry_episode=retry_episode,
+            is_new_attempt=is_new_attempt,
+        )
+        return {
+            "status": "no_credentials",
+            "qualification_attempt_id": str(attempt_id),
+            "retry_episode": retry_episode,
+        }
     token, owner, repo = resolved
 
     # 2. Snapshot the candidate SHA — integration branch HEAD.  Audit C3: this
@@ -1885,14 +2141,27 @@ async def run_qualification(
             "error": "sha_error",
             "detail": f"{type(exc).__name__}: {exc}"[:300],
             "started_at": _utcnow().isoformat(),
+            "qualification_attempt_id": str(attempt_id),
+            "retry_episode": retry_episode,
+            "retry_episode_cap": retry_episode_cap,
         }
         flag_modified(version, "last_qualification")
         session.add(version)
         # Audit R4 MEDIUM: atomic SQL increment — see the no_credentials path
         # above.  This early return is also pre-lock, so a read-modify-write
         # would be vulnerable to a lost update under concurrent callers.
-        await _increment_qualification_attempts(session, version.id)
-        return {"status": "sha_error"}
+        await _record_attempt_projection_atomic(
+            session,
+            version.id,
+            attempt_id=attempt_id,
+            retry_episode=retry_episode,
+            is_new_attempt=is_new_attempt,
+        )
+        return {
+            "status": "sha_error",
+            "qualification_attempt_id": str(attempt_id),
+            "retry_episode": retry_episode,
+        }
 
     # 3. CI check on the candidate SHA (cheap, orchestrator-side).  Done before
     #    the row lock — it is read-only external I/O.  This resolves CI through
@@ -2145,6 +2414,28 @@ async def run_qualification(
     # shows the coverage gate would no longer fire (a retracted/superseded
     # criterion cleared the wedge) — the acceptance-contract safety valve.
     prior_qual = version.last_qualification or {}
+    if continued_attempt_id is not None:
+        projected_attempt_id = _coerce_qualification_attempt_id(
+            prior_qual.get("qualification_attempt_id")
+        ) or _coerce_qualification_attempt_id(
+            version.active_qualification_attempt_id
+        )
+        if (
+            projected_attempt_id is not None
+            and projected_attempt_id != continued_attempt_id
+        ):
+            logger.info(
+                "[RELEASE_QUALIFIER] refusing stale retry attempt %s for v%d; "
+                "active attempt is %s",
+                continued_attempt_id,
+                version.version_number,
+                projected_attempt_id,
+            )
+            return {
+                "status": "stale_qualification_attempt",
+                "qualification_attempt_id": str(continued_attempt_id),
+                "active_qualification_attempt_id": str(projected_attempt_id),
+            }
     prior_status = prior_qual.get("status")
     ci_unresolved_recovered_same_sha = (
         prior_status == "not_promoted"
@@ -2335,6 +2626,21 @@ async def run_qualification(
     # _finalize_qualification).  Contentless == empty for this purpose.
     version_goal = (version.goal or "").strip()
     _merge_grade_goal_usable = bool(version_goal) and not is_contentless_goal(version_goal)
+    # Freeze the exact ordered acceptance contract BEFORE consulting reusable
+    # facts or spawning the blind grader.
+    rubric_snapshot, rubric_lifecycle_snapshot = await _snapshot_qualification_rubric(
+        session, version
+    )
+    # An acceptance rubric and every fact derived from it belong to this exact
+    # launch, not just to a version or candidate SHA.  Use the durable attempt
+    # UUID established at the start of this run so finalization, task payloads,
+    # and ledger provenance all share one identity.
+    rubric_provenance = _rubric_provenance(
+        rubric_snapshot,
+        source="qualification_launch",
+        qualification_attempt_id=str(attempt_id),
+    )
+    rubric_fingerprint = rubric_provenance["fingerprint"]
     # Consult the per-dimension fact ledger before spawning children (Phase 1
     # ledger reuse).  On a re-drive at the same candidate_sha, dimensions that
     # already resolved (passed/failed/blocked) in a prior finalize are carried
@@ -2348,11 +2654,32 @@ async def run_qualification(
     resolved_dims: dict[str, dict[str, Any]] = {}
     for dim, row in prior_dim_results.items():
         if row.status in _LEDGER_RESOLVED_STATUSES:
+            if dim == "merge_grade" and not _rubric_dimension_reusable(
+                row.detail,
+                fingerprint=rubric_fingerprint,
+                qualification_attempt_id=str(attempt_id),
+            ):
+                logger.info(
+                    "[RELEASE_QUALIFIER] v%d candidate %s refusing merge-grade "
+                    "reuse: stored attempt/rubric provenance does not match "
+                    "the newly launched rubric %s",
+                    version.version_number,
+                    candidate_sha[:8],
+                    rubric_fingerprint[:12],
+                )
+                continue
             resolved_dims[dim] = {
                 "status": row.status,
                 "sub_score": row.sub_score,
                 "blocker": row.blocker,
                 "detail": row.detail,
+                "origin_attempt_id": (
+                    str(row.origin_attempt_id) if row.origin_attempt_id else None
+                ),
+                "reused_by_attempt_id": str(attempt_id),
+                "producing_task_id": (
+                    str(row.producing_task_id) if row.producing_task_id else None
+                ),
             }
     # Audit-challenge parity on reuse: a stored audit fact with status "failed"
     # carries a finding-driven DEDUCTION that is only trustworthy once the
@@ -2407,6 +2734,11 @@ async def run_qualification(
         )
         resolved_dims.pop("audit", None)
         resolved_dims.pop("test_erosion", None)
+    await _mark_dimensions_reused_by_attempt(
+        session,
+        [row for dim, row in prior_dim_results.items() if dim in resolved_dims],
+        attempt_id,
+    )
     # A child task is needed only when NOT ALL of its produced dimensions are
     # already resolved.  audit task → {audit, test_erosion}; smoketest task →
     # {smoketest}; merge_grade task → {merge_grade}.
@@ -2429,6 +2761,12 @@ async def run_qualification(
             _smoketest_needed,
             _merge_grade_needed,
         )
+    # The ReleaseVersion row is locked here, so lifetime/new-attempt accounting
+    # and the active projection advance atomically with the pending/error write.
+    version.active_qualification_attempt_id = attempt_id
+    version.qualification_retry_episode = retry_episode
+    if is_new_attempt:
+        version.qualification_attempts = (version.qualification_attempts or 0) + 1
     try:
         if _audit_needed:
             audit_task = await _spawn_release_audit_task(
@@ -2438,6 +2776,7 @@ async def run_qualification(
                 base_branch=promotion_target,
                 diff_range=diff_range,
                 candidate_sha=candidate_sha,
+                qualification_attempt_id=attempt_id,
                 audit_base_sha=_incremental_audit_base_sha(prior_qual, candidate_sha),
                 version_goal=version.goal,
             )
@@ -2448,10 +2787,9 @@ async def run_qualification(
             # diff per ACTIVE acceptance-criterion CATEGORY, so pass the rubric
             # (stable ``criterion_key`` + text) into the payload.  The agent keys
             # its per-category verdicts back on these keys.
-            _mg_criteria = await get_active_criteria_rubric(session, version.id)
             _mg_categories = [
                 {"category_key": c.get("criterion_key"), "text": c.get("text")}
-                for c in _mg_criteria
+                for c in rubric_snapshot
                 if c.get("criterion_key")
             ]
             merge_grade_task = await _spawn_release_merge_grade_task(
@@ -2461,9 +2799,11 @@ async def run_qualification(
                 base_branch=promotion_target,
                 diff_range=diff_range,
                 candidate_sha=candidate_sha,
+                qualification_attempt_id=attempt_id,
                 version_goal=version_goal,
                 merged_pr_numbers=merged_pr_numbers,
                 categories=_mg_categories,
+                rubric_fingerprint=rubric_fingerprint,
             )
             merge_grade_task_id = str(merge_grade_task.id)
         if _smoketest_needed:
@@ -2472,6 +2812,7 @@ async def run_qualification(
                 project_id,
                 version_id=version.id,
                 candidate_sha=candidate_sha,
+                qualification_attempt_id=attempt_id,
             )
             smoketest_task_id = str(smoketest_task.id)
     except Exception as exc:  # noqa: BLE001 — spawn failure must not raise out
@@ -2490,13 +2831,15 @@ async def run_qualification(
             "ci_green": ci_green,
             "ci_state": ci_state,
             "started_at": started_at,
+            "qualification_attempt_id": str(attempt_id),
+            "retry_episode": retry_episode,
+            "retry_episode_cap": retry_episode_cap,
         }
         # Read-modify-write is safe here (unlike the no_credentials / sha_error
         # early returns, which run pre-lock and use the atomic
-        # _increment_qualification_attempts): this site runs UNDER the
+        # _record_attempt_projection_atomic): this site runs UNDER the
         # ReleaseVersion FOR UPDATE row lock taken above, so no concurrent
         # caller can interleave a lost update.
-        version.qualification_attempts = (version.qualification_attempts or 0) + 1
         flag_modified(version, "last_qualification")
         session.add(version)
         return {"status": "spawn_failed"}
@@ -2511,6 +2854,9 @@ async def run_qualification(
     #    finalization was a quality verdict / dry-run / non-infra outcome).
     version.last_qualification = {
         "status": "pending",
+        "qualification_attempt_id": str(attempt_id),
+        "retry_episode": retry_episode,
+        "retry_episode_cap": retry_episode_cap,
         "candidate_sha": candidate_sha,
         "candidate_diff_hash": candidate_diff_hash,
         "audit_base_sha": _incremental_audit_base_sha(prior_qual, candidate_sha),
@@ -2528,6 +2874,10 @@ async def run_qualification(
         "audit_challenge_spawn_pending": audit_challenge_spawn_pending,
         "smoketest_task_id": smoketest_task_id,
         "merge_grade_task_id": merge_grade_task_id,
+        "rubric_snapshot": rubric_snapshot,
+        "rubric_fingerprint": rubric_fingerprint,
+        "rubric_lifecycle_snapshot": rubric_lifecycle_snapshot,
+        "rubric_provenance": rubric_provenance,
         "prior_infra_streak": prior_infra_streak,
         "previous_infra_failure_signature": prior_infra_failure_signature,
         "previous_infra_failure_candidate_sha": prior_infra_failure_candidate_sha,
@@ -2552,10 +2902,9 @@ async def run_qualification(
     }
     # Read-modify-write is safe here (unlike the no_credentials / sha_error
     # early returns, which run pre-lock and use the atomic
-    # _increment_qualification_attempts): this site runs UNDER the
+    # _record_attempt_projection_atomic): this site runs UNDER the
     # ReleaseVersion FOR UPDATE row lock taken above, so no concurrent caller
     # can interleave a lost update.
-    version.qualification_attempts = (version.qualification_attempts or 0) + 1
     flag_modified(version, "last_qualification")
     session.add(version)
 
@@ -2574,6 +2923,8 @@ async def run_qualification(
     )
     return {
         "status": "spawned",
+        "qualification_attempt_id": str(attempt_id),
+        "retry_episode": retry_episode,
         "candidate_sha": candidate_sha,
         "ci_green": ci_green,
         "ci_state": ci_state,
@@ -2612,6 +2963,21 @@ _AUDIT_CHALLENGE_BINDING_HOLDS: frozenset[str] = frozenset(
         "audit_challenge_empty_verdicts",
     }
 )
+
+
+def _advance_qualification_retry_episode(
+    version: release_version.ReleaseVersion,
+    record: dict[str, Any],
+    *,
+    cap: int,
+) -> dict[str, Any]:
+    episode = int(record.get("retry_episode") or 0) + 1
+    version.qualification_retry_episode = episode
+    return {
+        **record,
+        "retry_episode": episode,
+        "retry_episode_cap": cap,
+    }
 
 # Human-readable rendering of the compute_composite() hard-blocker codes.
 _BLOCKER_LABELS: dict[str, str] = {
@@ -2937,8 +3303,13 @@ async def _resolve_migration_apply_at_finalize(
         if resolved is None:
             return ("ok", None)
         token, owner, repo = resolved
+        scratch_preflight = preflight_migration_apply_scratch(
+            os.getenv(MIGRATION_APPLY_SCRATCH_ENV)
+        )
+        if scratch_preflight.status != "ready" or scratch_preflight.target is None:
+            return ("defer", scratch_preflight.detail)
         prod_engine = resolve_async_engine(session)
-        scratch_db_url = os.getenv("MIGRATION_APPLY_SCRATCH_DATABASE_URL")
+        scratch_db_url = scratch_preflight.target
         try:
             verdict, detail = await run_migration_apply_gate(
                 prod_engine=prod_engine,
@@ -3452,6 +3823,7 @@ async def _upsert_dimension_result(
     detail: Any | None = None,
     producing_task_id: Any | None = None,
     audited_surface_hash: str | None = None,
+    origin_attempt_id: uuid.UUID | str | None = None,
 ) -> None:
     """Best-effort UPSERT of ONE per-(candidate_sha, dimension) qualification fact.
 
@@ -3487,6 +3859,7 @@ async def _upsert_dimension_result(
     _sub_score: float | None = None
     if isinstance(sub_score, (int, float)) and not isinstance(sub_score, bool):
         _sub_score = float(sub_score)
+    _origin_uuid = _coerce_qualification_attempt_id(origin_attempt_id)
 
     try:
         async with session.begin_nested():
@@ -3500,6 +3873,17 @@ async def _upsert_dimension_result(
                 )
             ).scalar_one_or_none()
             if existing is not None:
+                # Preserve an older producer only when the start path explicitly
+                # marked this fact as reused by the active attempt.  Otherwise a
+                # resolved write is a genuine recomputation with a new origin.
+                if (
+                    existing.status in _LEDGER_RESOLVED_STATUSES
+                    and _origin_uuid is not None
+                    and existing.origin_attempt_id != _origin_uuid
+                    and str(_origin_uuid)
+                    in {str(value) for value in (existing.reused_by_attempt_ids or [])}
+                ):
+                    return
                 # Never downgrade a resolved fact (passed/failed/blocked) to a
                 # non-resolved status (e.g. "unavailable" from an infra failure
                 # in a different gate or a failed _load_prior_dimension_results).
@@ -3525,6 +3909,8 @@ async def _upsert_dimension_result(
                 existing.audited_surface_hash = audited_surface_hash
                 existing.detail = detail
                 existing.producing_task_id = _producing_uuid
+                if _origin_uuid is not None:
+                    existing.origin_attempt_id = _origin_uuid
                 existing.computed_at = _utcnow()
                 session.add(existing)
             else:
@@ -3540,6 +3926,7 @@ async def _upsert_dimension_result(
                         audited_surface_hash=audited_surface_hash,
                         detail=detail,
                         producing_task_id=_producing_uuid,
+                        origin_attempt_id=_origin_uuid,
                     )
                 )
             await session.flush()
@@ -3620,6 +4007,36 @@ async def _load_prior_dimension_results(
     return {r.dimension: r for r in rows}
 
 
+async def _mark_dimensions_reused_by_attempt(
+    session: AsyncSession,
+    rows: list[QualificationDimensionResult],
+    attempt_id: uuid.UUID,
+) -> None:
+    """Best-effort append reuse provenance without changing fact ownership."""
+    if not rows:
+        return
+    try:
+        async with session.begin_nested():
+            attempt_text = str(attempt_id)
+            for row in rows:
+                reused = [
+                    str(value)
+                    for value in (row.reused_by_attempt_ids or [])
+                    if _coerce_qualification_attempt_id(value) is not None
+                ]
+                if attempt_text not in reused:
+                    row.reused_by_attempt_ids = [*reused, attempt_text]
+                    session.add(row)
+            await session.flush()
+    except Exception as exc:  # noqa: BLE001 -- ledger provenance is failure-isolated
+        logger.warning(
+            "[RELEASE_QUALIFIER] failed to mark dimension reuse for attempt %s "
+            "(non-fatal -- additive ledger provenance only): %s",
+            attempt_id,
+            exc,
+        )
+
+
 async def _record_infra_dimension_unavailable(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
@@ -3628,6 +4045,7 @@ async def _record_infra_dimension_unavailable(
     *,
     infra_error: str,
     signature: str | None = None,
+    origin_attempt_id: uuid.UUID | str | None = None,
 ) -> int:
     """Mark ONE dimension 'unavailable' in the ledger on an infrastructure failure.
 
@@ -3693,6 +4111,7 @@ async def _record_infra_dimension_unavailable(
             "infra_failure_signature": signature,
             "consecutive_infra_errors": new_streak,
         },
+        origin_attempt_id=origin_attempt_id,
     )
     return new_streak
 
@@ -3989,6 +4408,7 @@ async def _dual_write_dimension_results(
             detail=_detail,
             producing_task_id=spec["producing_task_id"],
             audited_surface_hash=spec.get("audited_surface_hash"),
+            origin_attempt_id=base_record.get("qualification_attempt_id"),
         )
 
 
@@ -4020,6 +4440,105 @@ def _deployed_env_presence_snapshot(
                     names.add(name)
     # PRESENCE-ONLY: bool(...) — never the value itself.
     return {name: bool(os.getenv(name)) for name in names}
+
+
+async def _record_rubric_provenance_outcome(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+    qual: dict[str, Any],
+    *,
+    status: str,
+    rubric_provenance: dict[str, Any] | None,
+    rubric_drift: dict[str, Any] | None = None,
+    provenance_error: str | None = None,
+    policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Hold an attempt whose launched acceptance contract cannot finalize."""
+    finalized_at = _utcnow().isoformat()
+    verdict_status = "rubric_unknown" if status == "rubric_provenance_unknown" else status
+    record: dict[str, Any] = {
+        "status": status,
+        "candidate_sha": qual.get("candidate_sha"),
+        "candidate_diff_hash": qual.get("candidate_diff_hash"),
+        "qualification_attempt_id": qual.get("qualification_attempt_id"),
+        "confidence": 0.0,
+        "sub_scores": {},
+        "blocker": status,
+        "threshold": (policy or {}).get("threshold"),
+        "started_at": qual.get("started_at"),
+        "finalized_at": finalized_at,
+        "audit_task_id": qual.get("audit_task_id"),
+        "smoketest_task_id": qual.get("smoketest_task_id"),
+        "merge_grade_task_id": qual.get("merge_grade_task_id"),
+        "rubric_snapshot": (
+            rubric_provenance.get("criteria") if rubric_provenance else None
+        ),
+        "rubric_fingerprint": (
+            rubric_provenance.get("fingerprint") if rubric_provenance else None
+        ),
+        "rubric_provenance": rubric_provenance,
+        "rubric_drift": rubric_drift,
+        "rubric_provenance_error": provenance_error,
+        # Deliberately absent: this attempt never gates on live categories and
+        # never fabricates verdicts for categories outside its launched rubric.
+        "category_verdicts": None,
+        "residual_uncaptured_gap": None,
+        "merge_grade": {
+            "status": status,
+            "blocked": True,
+            "rubric_provenance": rubric_provenance,
+            "rubric_drift": rubric_drift,
+            "rubric_provenance_error": provenance_error,
+        },
+        "merge_grade_status": verdict_status,
+        "merge_grade_coverage": None,
+        "merge_grade_biggest_gap": None,
+    }
+    version.last_qualification = record
+    flag_modified(version, "last_qualification")
+    release_version.set_version_phase(
+        version,
+        "stabilize",
+        reasoning=(
+            f"qualification v{version.version_number}: acceptance rubric changed "
+            "while the blind grade was in flight; launch a fresh grade"
+            if status == "rubric_changed"
+            else f"qualification v{version.version_number}: launched rubric provenance unknown"
+        ),
+    )
+    session.add(version)
+    await _record_qualification_verdict(
+        session,
+        version,
+        record,
+        terminal_status=verdict_status,
+        would_promote=False,
+        promotion_enabled=resolve_project_promotion_enabled(version.project_id),
+    )
+    await _notify_operator(
+        session,
+        version,
+        "release_rubric_changed" if status == "rubric_changed" else "release_rubric_unknown",
+        (
+            f"v{version.version_number} was not promoted because its acceptance "
+            "rubric changed while the blind merge-grade was in flight. A fresh "
+            "grade will use the new rubric."
+            if status == "rubric_changed"
+            else f"v{version.version_number} was held because the pending grade's "
+            "rubric provenance could not be reconstructed. A fresh grade is required."
+        ),
+        extra={
+            "blocker": status,
+            "rubric_drift": rubric_drift,
+            "rubric_provenance_error": provenance_error,
+        },
+    )
+    return {
+        "status": status,
+        "blocker": status,
+        "rubric_drift": rubric_drift,
+        "rubric_provenance_error": provenance_error,
+    }
 
 
 async def _finalize_qualification(
@@ -4056,6 +4575,13 @@ async def _finalize_qualification(
     session afterwards.  Returns a result dict.
     """
     qual = dict(version.last_qualification or {})
+    attempt_id = _qualification_attempt_for_record(version, qual)
+    qual["qualification_attempt_id"] = str(attempt_id)
+    version.active_qualification_attempt_id = attempt_id
+    if "retry_episode" not in qual:
+        qual["retry_episode"] = int(
+            getattr(version, "qualification_retry_episode", 0) or 0
+        )
     candidate_sha = qual.get("candidate_sha")
     audit_task_id = qual.get("audit_task_id")
     challenge_task_id = qual.get("challenge_task_id")
@@ -4100,10 +4626,67 @@ async def _finalize_qualification(
             session, version, candidate_sha, "ci",
             status="passed" if ci_green else "blocked",
             detail=ci_resolution if isinstance(ci_resolution, dict) else None,
+            origin_attempt_id=attempt_id,
         )
 
     _policy_project = await session.get(Project, version.project_id)
     policy = _load_policy(_policy_project)
+
+    # Resolve the launch contract before checking child infrastructure state.
+    # Rubric drift is authoritative for this attempt: a lifecycle/text change
+    # must be recorded even if a required child also failed while it ran.
+    (
+        launched_rubric,
+        rubric_provenance,
+        rubric_provenance_error,
+    ) = await _resolve_launched_rubric(session, version, qual)
+    if launched_rubric is None or rubric_provenance is None:
+        return await _record_rubric_provenance_outcome(
+            session,
+            version,
+            qual,
+            status="rubric_provenance_unknown",
+            rubric_provenance=None,
+            provenance_error=rubric_provenance_error,
+            policy=policy,
+        )
+
+    live_criterion_rows = await get_criteria_for_version(session, version.id)
+    live_rubric = _canonicalize_rubric(
+        [
+            {"criterion_key": row.criterion_key, "text": row.text}
+            for row in live_criterion_rows
+            if row.status == "active"
+        ]
+    )
+    live_lifecycle = [
+        {"criterion_key": str(row.criterion_key), "status": str(row.status)}
+        for row in live_criterion_rows
+        if row.criterion_key
+    ]
+    rubric_drift = _bounded_rubric_drift(
+        launched_rubric,
+        live_rubric,
+        qual.get("rubric_lifecycle_snapshot"),
+        live_lifecycle,
+    )
+    if rubric_drift is not None:
+        logger.info(
+            "[RELEASE_QUALIFIER] v%d candidate %s rubric changed while the "
+            "blind merge-grade was in flight: %s",
+            version.version_number,
+            (candidate_sha or "")[:8],
+            rubric_drift,
+        )
+        return await _record_rubric_provenance_outcome(
+            session,
+            version,
+            qual,
+            status="rubric_changed",
+            rubric_provenance=rubric_provenance,
+            rubric_drift=rubric_drift,
+            policy=policy,
+        )
 
     # --- Infra-failure detection: check required child terminal statuses ------
     # A FAILED, CANCELLED, or BLOCKED required child means the qualifier pipeline
@@ -4149,6 +4732,7 @@ async def _finalize_qualification(
                         base_branch=new_base_branch,
                         diff_range=new_diff_range,
                         candidate_sha=candidate_sha,
+                        qualification_attempt_id=attempt_id,
                         version_goal=version.goal,
                     )
                     new_count = rl_respawn_count + 1
@@ -4157,6 +4741,9 @@ async def _finalize_qualification(
                         "audit_task_id": str(new_audit_task.id),
                         "audit_rl_respawn_count": new_count,
                     }
+                    updated_qual = _advance_qualification_retry_episode(
+                        version, updated_qual, cap=_MAX_AUDIT_RL_RESPAWNS
+                    )
                     version.last_qualification = updated_qual
                     flag_modified(version, "last_qualification")
                     session.add(version)
@@ -4204,6 +4791,7 @@ async def _finalize_qualification(
                         base_branch=new_base_branch,
                         diff_range=new_diff_range,
                         candidate_sha=candidate_sha,
+                        qualification_attempt_id=attempt_id,
                         version_goal=version.goal,
                     )
                     new_count = infra_respawn_count + 1
@@ -4220,6 +4808,9 @@ async def _finalize_qualification(
                         "audit_task_id": str(new_audit_task.id),
                         "audit_infra_respawn_count": new_count,
                     }
+                    updated_qual = _advance_qualification_retry_episode(
+                        version, updated_qual, cap=_MAX_AUDIT_RL_RESPAWNS
+                    )
                     version.last_qualification = updated_qual
                     flag_modified(version, "last_qualification")
                     session.add(version)
@@ -4440,6 +5031,7 @@ async def _finalize_qualification(
         status=_audit_status,
         sub_score=audit_score,
         producing_task_id=audit_task_id,
+        origin_attempt_id=attempt_id,
     )
     _te_status = "blocked" if test_erosion_score is None else "passed"
     await _upsert_dimension_result(
@@ -4447,6 +5039,7 @@ async def _finalize_qualification(
         status=_te_status,
         sub_score=test_erosion_score,
         producing_task_id=audit_task_id,
+        origin_attempt_id=attempt_id,
     )
 
     # --- Read the smoketest result -----------------------------------------
@@ -4581,6 +5174,7 @@ async def _finalize_qualification(
         status=_smoke_status,
         sub_score=smoketest_score,
         producing_task_id=smoketest_task_id,
+        origin_attempt_id=attempt_id,
     )
     primary_findings = _primary_findings_for_challenge_retry(audit_report)
 
@@ -4615,6 +5209,7 @@ async def _finalize_qualification(
                 base_branch=challenge_base_branch,
                 diff_range=challenge_diff_range,
                 candidate_sha=candidate_sha,
+                qualification_attempt_id=attempt_id,
                 primary_audit_task_id=audit_task_id,
                 primary_findings=primary_findings,
                 version_goal=version.goal,
@@ -4741,6 +5336,7 @@ async def _finalize_qualification(
                                         base_branch=_chal_base_branch,
                                         diff_range=_chal_diff_range,
                                         candidate_sha=candidate_sha,
+                                        qualification_attempt_id=attempt_id,
                                         primary_audit_task_id=audit_task_id,
                                         primary_findings=_chal_primary_findings,
                                         version_goal=version.goal,
@@ -4773,6 +5369,9 @@ async def _finalize_qualification(
                                     ),
                                     "challenge_infra_respawn_count": _chal_new_count,
                                 }
+                                version.last_qualification = _advance_qualification_retry_episode(
+                                    version, version.last_qualification, cap=_MAX_AUDIT_RL_RESPAWNS
+                                )
                                 flag_modified(version, "last_qualification")
                                 session.add(version)
                                 await session.flush()
@@ -4883,6 +5482,7 @@ async def _finalize_qualification(
                     base_branch=_early_base_branch,
                     diff_range=_early_diff_range,
                     candidate_sha=candidate_sha,
+                    qualification_attempt_id=attempt_id,
                     primary_audit_task_id=audit_task_id,
                     primary_findings=primary_findings,
                     version_goal=version.goal,
@@ -4909,6 +5509,9 @@ async def _finalize_qualification(
                         primary_findings
                     ),
                 }
+                version.last_qualification = _advance_qualification_retry_episode(
+                    version, version.last_qualification, cap=_MAX_AUDIT_CHALLENGE_BINDING_RESPAWNS
+                )
                 flag_modified(version, "last_qualification")
                 session.add(version)
                 await session.flush()
@@ -4994,6 +5597,7 @@ async def _finalize_qualification(
                         base_branch=retry_base_branch,
                         diff_range=retry_diff_range,
                         candidate_sha=candidate_sha,
+                        qualification_attempt_id=attempt_id,
                         primary_audit_task_id=audit_task_id,
                         primary_findings=primary_findings,
                         version_goal=version.goal,
@@ -5040,6 +5644,9 @@ async def _finalize_qualification(
                         else {}
                     ),
                 }
+                version.last_qualification = _advance_qualification_retry_episode(
+                    version, version.last_qualification, cap=_MAX_AUDIT_CHALLENGE_BINDING_RESPAWNS
+                )
                 flag_modified(version, "last_qualification")
                 session.add(version)
                 await session.flush()
@@ -5158,6 +5765,7 @@ async def _finalize_qualification(
             status=_reconciled_audit_status,
             sub_score=audit_score,
             producing_task_id=audit_task_id,
+            origin_attempt_id=attempt_id,
         )
     else:
         # audit+test_erosion resolved from ledger — reconciliation fields are
@@ -5184,7 +5792,23 @@ async def _finalize_qualification(
     # identity surfaces the same way as any other finalize-time infra failure
     # (no verdict recorded, returned to stabilize, retried by the next cycle).
     # Pre-computed by _finalize_locked_version pre-lock (SITE B lock-window fix).
-    if _pre_gates is not None:
+    # Phase 1b (read-side cutover): if a prior finalize already resolved this
+    # dimension at the same candidate_sha, reuse the stored verdict and skip the
+    # live GitHub fetch — only 'passed'/'blocked' rows appear in resolved_dims
+    # (_LEDGER_RESOLVED_STATUSES excludes 'unavailable'), so a prior defer never
+    # short-circuits the live gate.
+    if "migration_identity" in resolved_dims:
+        _mi_ledger = resolved_dims["migration_identity"]
+        migration_verdict = "block" if _mi_ledger["status"] == "blocked" else "pass"
+        migration_detail = (_mi_ledger.get("detail") or {}).get("detail")
+        logger.info(
+            "[RELEASE_QUALIFIER] v%d candidate %s reusing ledger "
+            "migration_identity=%s (skip live gate)",
+            version.version_number,
+            (candidate_sha or "")[:8],
+            _mi_ledger["status"],
+        )
+    elif _pre_gates is not None:
         migration_verdict = _pre_gates["migration_verdict"]
         migration_detail = _pre_gates["migration_detail"]
     else:
@@ -5204,6 +5828,23 @@ async def _finalize_qualification(
             else "migration_identity_check_unavailable",
         )
     migration_collision = migration_verdict == "block"
+    # Eager-write migration_identity so a later gate's infra failure cannot
+    # discard this verdict before _dual_write_dimension_results is reached.
+    await _upsert_dimension_result(
+        session,
+        version,
+        candidate_sha,
+        "migration_identity",
+        status="blocked" if migration_collision else "passed",
+        sub_score=None,
+        blocker="migration_identity_collision" if migration_collision else None,
+        detail={
+            "verdict": migration_verdict,
+            "detail": migration_detail,
+            "execution_site": "eager_write",
+        },
+        origin_attempt_id=attempt_id,
+    )
 
     # --- Deterministic scratch-DB migration-APPLY safety gate ---------------
     # Complementary to the filename-identity check above: replay the candidate's
@@ -5217,7 +5858,19 @@ async def _finalize_qualification(
     # Thread the exact SHA snapped into last_qualification through this gate;
     # do not re-derive it from any live checkout state.
     # Pre-computed by _finalize_locked_version pre-lock (SITE B lock-window fix).
-    if _pre_gates is not None:
+    # Phase 1b (read-side cutover): same pattern as migration_identity above.
+    if "migration_apply" in resolved_dims:
+        _ma_ledger = resolved_dims["migration_apply"]
+        apply_verdict = "block" if _ma_ledger["status"] == "blocked" else "pass"
+        apply_detail = (_ma_ledger.get("detail") or {}).get("detail")
+        logger.info(
+            "[RELEASE_QUALIFIER] v%d candidate %s reusing ledger "
+            "migration_apply=%s (skip live gate)",
+            version.version_number,
+            (candidate_sha or "")[:8],
+            _ma_ledger["status"],
+        )
+    elif _pre_gates is not None:
         apply_verdict = _pre_gates["apply_verdict"]
         apply_detail = _pre_gates["apply_detail"]
     else:
@@ -5234,17 +5887,30 @@ async def _finalize_qualification(
             else "migration_apply_check_unavailable",
         )
     migration_apply_blocked = apply_verdict == "block"
+    # Eager-write migration_apply so a later gate's infra failure cannot
+    # discard this verdict before _dual_write_dimension_results is reached.
+    await _upsert_dimension_result(
+        session,
+        version,
+        candidate_sha,
+        "migration_apply",
+        status="blocked" if migration_apply_blocked else "passed",
+        sub_score=None,
+        blocker="migration_apply_drift" if migration_apply_blocked else None,
+        detail={
+            "verdict": apply_verdict,
+            "detail": apply_detail,
+            "execution_site": "eager_write",
+        },
+        origin_attempt_id=attempt_id,
+    )
 
-    # Acceptance-criteria coverage summary + the ACTIVE-criteria rubric.  Computed
-    # once here (before the merge-grade block) so the rubric can be threaded into
-    # the per-category grade below.  ``criterion_coverage`` is still persisted for
-    # observability / back-compat; ``active_categories`` are the CATEGORIES the
-    # goal-verification redesign grades the merged diff against.
+    # Keep today's coverage summary for observability; gate on launched rubric.
     criterion_coverage = await get_version_coverage_summary(session, version.id)
     active_categories: list[dict[str, Any]] = [
         {"category_key": c.get("criterion_key"), "text": c.get("text")}
-        for c in (criterion_coverage.get("criteria") or [])
-        if c.get("status") == "active" and c.get("criterion_key")
+        for c in launched_rubric
+        if c.get("criterion_key")
     ]
 
     # --- Blind merge-grade artifact validation (dir d-c0fe439f) -------------
@@ -5356,6 +6022,11 @@ async def _finalize_qualification(
                 session, version, qual, "merge_grade_grader_lacks_category_verdicts"
             )
 
+    merge_grade_cert = {
+        **merge_grade_cert,
+        "rubric_provenance": rubric_provenance,
+    }
+
     ci_state = ci_resolution.get("state", _CI_RED)
     ci_required = True
     if _pre_gates is not None and "ci_required" in _pre_gates:
@@ -5414,7 +6085,9 @@ async def _finalize_qualification(
             session, version, candidate_sha, "merge_grade",
             status=_mg_ledger_status,
             sub_score=_mg_coverage if isinstance(_mg_coverage, (int, float)) and not isinstance(_mg_coverage, bool) else None,
+            detail=merge_grade_cert,
             producing_task_id=merge_grade_task_id,
+            origin_attempt_id=attempt_id,
         )
 
     # --- Goal-verification per-category ledger (redesign) -------------------
@@ -5465,8 +6138,12 @@ async def _finalize_qualification(
         # only guards the case where a grade DID run but its verdicts cannot be
         # trusted (absent for active keys, or the read raised).
         _merge_grade_ran = bool(merge_grade_task_id) or ("merge_grade" in resolved_dims)
+        _expected_grader_run_id = merge_grade_task_id or resolved_dims.get(
+            "merge_grade", {}
+        ).get("producing_task_id")
+        if _expected_grader_run_id is not None:
+            _expected_grader_run_id = str(_expected_grader_run_id)
         _fresh_category_verdicts = merge_grade_cert.get("category_verdicts")
-        _ledger_write_failed = False
         if _fresh_category_verdicts is not None:
             # Fresh grade this finalize: write each category verdict + the residual.
             try:
@@ -5489,7 +6166,6 @@ async def _finalize_qualification(
                     merge_grade_cert.get("residual_uncaptured_gap"),
                 )
             except Exception:  # noqa: BLE001 — ledger write failure must not crash finalize
-                _ledger_write_failed = True
                 logger.warning(
                     "[RELEASE_QUALIFIER] v%d failed to persist per-category "
                     "goal-verification verdicts to the ledger — gating on the "
@@ -5497,12 +6173,9 @@ async def _finalize_qualification(
                     "finalize",
                     version.version_number,
                 )
-        if _ledger_write_failed:
-            # FIX 2 — fail CLOSED.  Persistence hiccupped, so a ledger read-back
-            # would see stale/absent rows and (via a None gate input) SKIP the
-            # category gate entirely, letting a ``not_met`` candidate promote.  The
-            # freshly-computed in-memory grade is authoritative: feed it to the gate
-            # directly (filtered to the active keys, exactly like the read-back).
+        if _fresh_category_verdicts is not None:
+            # Gate on fresh evidence directly; this also fails closed if the
+            # best-effort ledger write hiccupped or older same-SHA rows exist.
             # Fail-open state 1/3: the write failed AND the freshly-computed
             # verdicts do not cover any currently-active criterion (e.g. the
             # grader only graded now-retracted categories).  Absent evidence for
@@ -5541,6 +6214,13 @@ async def _finalize_qualification(
                     for cv in (
                         _coerce_ledger_category_verdict(_v)
                         for _v in (_ledger_verdicts or [])
+                        if _expected_grader_run_id is None
+                        or str(
+                            _v.get("grader_run_id")
+                            if isinstance(_v, dict)
+                            else getattr(_v, "grader_run_id", None)
+                        )
+                        == _expected_grader_run_id
                     )
                     if cv.get("category_key") in _active_keys
                 ] or (
@@ -5829,6 +6509,12 @@ async def _finalize_qualification(
         "migration_apply_safety": apply_verdict,
         "migration_apply_safety_detail": apply_detail,
         "criterion_coverage": criterion_coverage,
+        # Attempt-scoped acceptance contract (coverage above remains live).
+        "qualification_attempt_id": qual.get("qualification_attempt_id"),
+        "rubric_snapshot": launched_rubric,
+        "rubric_fingerprint": rubric_provenance.get("fingerprint"),
+        "rubric_provenance": rubric_provenance,
+        "rubric_drift": None,
         # Goal-verification redesign: the per-category verdicts + residual that
         # drove the gate this finalize (sha-keyed; None when no rubric / ledger
         # absent / exempt).  Persisted so the CI-unresolved-recovery recompute in
@@ -6023,6 +6709,16 @@ async def _finalize_qualification(
             # would fail to create, not just the generic blocker label.
             if composite["blocker"] == "migration_apply_drift" and apply_detail:
                 blocker_label = f"{blocker_label} — {apply_detail}"
+            # The env-preflight blocker carries the specific missing var NAMES so
+            # the operator sees WHICH prerequisite is absent, not just the generic
+            # label.  Presence-only: names only, never values.
+            if (
+                composite["blocker"] == "boot_prereq_missing"
+                and env_preflight_missing
+            ):
+                blocker_label = (
+                    f"{blocker_label} — missing: {', '.join(env_preflight_missing)}"
+                )
             # Tag the blocker with WHERE its check runs so the operator sees
             # whether a fix on automain takes effect pre-promotion (candidate-side)
             # or is inert until this version itself promotes (deployed-side).
@@ -6315,6 +7011,37 @@ async def _required_children_terminal(
         else None
     )
 
+    # Strict matching begins once the JSON projection carries identity.  A
+    # partially-backfilled legacy pending row may have only the typed column
+    # while its already-running children have no attempt key; keep that window
+    # readable/finalizable until the projection backfill converges.
+    active_attempt_id = _coerce_qualification_attempt_id(
+        qual.get("qualification_attempt_id")
+    )
+    if active_attempt_id is not None:
+        for leg, task in (
+            ("audit", audit_task),
+            ("smoketest", smoketest_task),
+            ("challenge", challenge_task),
+            ("merge_grade", merge_grade_task),
+        ):
+            if task is None:
+                continue
+            child_attempt_id = _coerce_qualification_attempt_id(
+                (task.context or {}).get("qualification_attempt_id")
+            )
+            if child_attempt_id != active_attempt_id:
+                logger.warning(
+                    "[RELEASE_QUALIFIER] finalize-gate: v%d %s child %s belongs "
+                    "to attempt %s, active attempt is %s -- not ready",
+                    version.version_number,
+                    leg,
+                    task.id,
+                    child_attempt_id,
+                    active_attempt_id,
+                )
+                return False
+
     if (
         (not audit_resolved and audit_task is None)
         or (smoketest_required and not smoketest_resolved and smoketest_task is None)
@@ -6550,6 +7277,7 @@ async def _finalize_in_dedicated_session(
     *,
     session_factory=None,
     timeout_now: datetime | None = None,
+    expected_attempt_id: uuid.UUID | str | None = None,
 ) -> dict[str, Any] | None:
     """Run the finalize→promote chain for ``version_id`` on a DEDICATED session.
 
@@ -6612,7 +7340,12 @@ async def _finalize_in_dedicated_session(
     factory = session_factory or AsyncSessionLocal
     async with factory() as session:
         try:
-            result = await _finalize_locked_version(session, version_id, timeout_now)
+            result = await _finalize_locked_version(
+                session,
+                version_id,
+                timeout_now,
+                expected_attempt_id=expected_attempt_id,
+            )
         except Exception:
             # Roll back this dedicated session's partial work before unwinding.
             # In production each dedicated session is independent and the
@@ -6833,6 +7566,7 @@ _FORCE_PROMOTE_NOOP_STATUSES: frozenset[str] = frozenset(
         "version_not_found",
         "not_open",
         "promotion_in_flight",
+        "ci_not_green",
     }
 )
 
@@ -7006,6 +7740,23 @@ async def force_promote_current_version(
             token, owner, repo, candidate_sha, project_id=str(project_id)
         )
     )
+    # Explicitly resolve CI for the candidate before opening the promotion PR.
+    # Both bypass channels skip the AUDIT gate only, not CI; relying on branch
+    # protection alone fails open when protection is absent or misconfigured.
+    ci_green, ci_resolution = await _resolve_ci_at_finalize(session, version, candidate_sha)
+    ci_required = _ci_required_for_finalize(project, ci_resolution)
+    if ci_required and not ci_green:
+        logger.warning(
+            "[RELEASE_QUALIFIER] FORCE-PROMOTE blocked: project %s v%d candidate %s "
+            "CI is not green (state=%s) — actor=%s reason=%s",
+            project_id,
+            version.version_number,
+            candidate_sha[:8],
+            ci_resolution.get("state"),
+            actor,
+            reason,
+        )
+        return {"status": "ci_not_green", "ci_resolution": ci_resolution}
     logger.warning(
         "[RELEASE_QUALIFIER] FORCE-PROMOTE requested: project %s v%d candidate %s "
         "actor=%s reason=%s — SKIPPING the audit/qualify gate (CI still gates the "
@@ -7058,6 +7809,8 @@ async def _hotfix_promote_locked(
     actor: str | None,
     reason: str | None,
     scope_modules: list[str] | None,
+    diff_file_list: list[str],
+    prior_deployed_sha: str | None,
 ) -> dict[str, Any]:
     """Lock + HOTFIX-promote an open version on a dedicated session (no audit).
 
@@ -7105,6 +7858,10 @@ async def _hotfix_promote_locked(
         "hotfix_promote_at": now.isoformat(),
         "hotfix_promote_reason": reason,
         "hotfix_promote_scope_modules": _scope_modules,
+        # These are committed with the bypass itself so the sweep can recreate
+        # its promised audit trail if the request session dies after promotion.
+        "hotfix_promote_diff_file_list": list(diff_file_list),
+        "hotfix_promote_prior_deployed_sha": prior_deployed_sha,
         "started_at": now.isoformat(),
         "finalized_at": now.isoformat(),
     }
@@ -7137,6 +7894,8 @@ async def _hotfix_promote_in_dedicated_session(
     *,
     reason: str | None,
     scope_modules: list[str] | None,
+    diff_file_list: list[str],
+    prior_deployed_sha: str | None,
     session_factory=None,
 ) -> dict[str, Any]:
     """Run HOTFIX-promote on a DEDICATED session (mirrors the force-promote path).
@@ -7157,6 +7916,8 @@ async def _hotfix_promote_in_dedicated_session(
                 actor,
                 reason,
                 scope_modules,
+                diff_file_list,
+                prior_deployed_sha,
             )
         except Exception:
             try:
@@ -7189,6 +7950,8 @@ async def _record_hotfix_audit_trail(
     scope_modules: list[str] | None,
     diff_file_list: list[str] | None,
     prior_deployed_sha: str | None,
+    record_debt: bool = True,
+    record_alert: bool = True,
 ) -> None:
     """Durable, append-only audit trail for a hotfix promote that took effect.
 
@@ -7207,12 +7970,15 @@ async def _record_hotfix_audit_trail(
       * a WARNING :class:`Alert` so the operator sees the hotfix-deploy event.
 
     Best-effort: the completion-debt recorder never raises, and a failure to add
-    the Alert must not undo the (already-committed) promotion.  Both are staged
-    on the request ``session``; the caller commits.
+    the Alert must not undo the (already-committed) promotion.  The shared
+    request/sweep reconciliation caller owns the surrounding version lock and
+    commits this session.
     """
     from app.completion_debt import (
         KIND_HOTFIX_DEPLOY_PENDING_BACKFILL,
         arecord_completion_debt,
+        hotfix_deploy_alert_dedupe_key,
+        hotfix_deploy_debt_dedupe_key,
     )
     from app.models import Alert, AlertSeverity
 
@@ -7226,33 +7992,47 @@ async def _record_hotfix_audit_trail(
         "diff_file_list": _diff_files,
         "prior_deployed_sha": prior_deployed_sha,
     }
-    await arecord_completion_debt(
-        session,
-        dedupe_key=f"hotfix_deploy:{project_id}:{candidate_sha}",
-        kind=KIND_HOTFIX_DEPLOY_PENDING_BACKFILL,
-        title=(
-            f"Hotfix-deploy of release machinery at {candidate_sha[:8]} owes "
-            "normal-gate re-qualification"
-        ),
-        project_id=project_id,
-        source="hotfix_promote",
-        detail=detail,
-    )
-    try:
-        session.add(
-            Alert(
-                project_id=project_id,
-                severity=AlertSeverity.WARNING,
-                title=f"Hotfix-deploy: release machinery fast-tracked at {candidate_sha[:8]}",
-                message=(
-                    f"An OWNER hotfix-deploy fast-tracked candidate {candidate_sha[:8]} "
-                    "(release machinery only) ahead of the normal qualification gate. "
-                    f"Actor={actor} reason={reason!r}. This bypass is owed re-qualification "
-                    "by the normal gate (tracked as open completion debt)."
-                ),
-                source="hotfix_promote",
-            )
+    if record_debt:
+        await arecord_completion_debt(
+            session,
+            dedupe_key=hotfix_deploy_debt_dedupe_key(project_id, candidate_sha),
+            kind=KIND_HOTFIX_DEPLOY_PENDING_BACKFILL,
+            title=(
+                f"Hotfix-deploy of release machinery at {candidate_sha[:8]} owes "
+                "normal-gate re-qualification"
+            ),
+            project_id=project_id,
+            source="hotfix_promote",
+            detail=detail,
         )
+    if not record_alert:
+        return
+    try:
+        alert_key = hotfix_deploy_alert_dedupe_key(project_id, candidate_sha)
+        existing_alert = (
+            await session.execute(
+                select(Alert).where(
+                    Alert.project_id == project_id,
+                    Alert.dedupe_key == alert_key,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing_alert is None:
+            session.add(
+                Alert(
+                    project_id=project_id,
+                    severity=AlertSeverity.WARNING,
+                    title=f"Hotfix-deploy: release machinery fast-tracked at {candidate_sha[:8]}",
+                    message=(
+                        f"An OWNER hotfix-deploy fast-tracked candidate {candidate_sha[:8]} "
+                        "(release machinery only) ahead of the normal qualification gate. "
+                        f"Actor={actor} reason={reason!r}. This bypass is owed re-qualification "
+                        "by the normal gate (tracked as open completion debt)."
+                    ),
+                    source="hotfix_promote",
+                    dedupe_key=alert_key,
+                )
+            )
     except Exception:  # noqa: BLE001 — an Alert failure must not undo the promotion
         logger.warning(
             "[RELEASE_QUALIFIER] hotfix-promote: failed to stage operator Alert "
@@ -7366,6 +8146,21 @@ async def hotfix_promote_current_version(
             token, owner, repo, candidate_sha, project_id=str(project_id)
         )
     )
+    # Explicitly resolve CI before opening the PR — the bypass skips AUDIT only.
+    ci_green, ci_resolution = await _resolve_ci_at_finalize(session, version, candidate_sha)
+    ci_required = _ci_required_for_finalize(project, ci_resolution)
+    if ci_required and not ci_green:
+        logger.warning(
+            "[RELEASE_QUALIFIER] HOTFIX-PROMOTE blocked: project %s v%d candidate %s "
+            "CI is not green (state=%s) — actor=%s reason=%s",
+            project_id,
+            version.version_number,
+            candidate_sha[:8],
+            ci_resolution.get("state"),
+            actor,
+            reason,
+        )
+        return {"status": "ci_not_green", "ci_resolution": ci_resolution}
     logger.warning(
         "[RELEASE_QUALIFIER] HOTFIX-PROMOTE requested: project %s v%d candidate %s "
         "actor=%s reason=%s scope_modules=%s changed=%s — SKIPPING the audit/scoring "
@@ -7385,19 +8180,26 @@ async def hotfix_promote_current_version(
         actor,
         reason=reason,
         scope_modules=scope_modules,
+        diff_file_list=changed_files,
+        prior_deployed_sha=prior_deployed_sha,
         session_factory=session_factory,
     )
     if result.get("status") in _HOTFIX_PROMOTE_ATTEMPTED_STATUSES:
-        await _record_hotfix_audit_trail(
-            session,
-            project_id,
-            candidate_sha=candidate_sha,
-            actor=actor,
-            reason=reason,
-            scope_modules=scope_modules,
-            diff_file_list=changed_files,
-            prior_deployed_sha=prior_deployed_sha,
-        )
+        # Request completion and crash recovery use the same version-locked
+        # repair path.  This serializes their Alert check+insert and commits the
+        # audit independently of the caller's transaction.
+        try:
+            await _reconcile_hotfix_audit_trail(
+                version.id,
+                session_factory=session_factory,
+            )
+        except Exception:  # noqa: BLE001 — promotion already committed; sweep repairs
+            logger.warning(
+                "[RELEASE_QUALIFIER] hotfix-promote: immediate audit repair failed "
+                "for version %s; periodic recovery will retry",
+                version.id,
+                exc_info=True,
+            )
     return result
 
 
@@ -7520,6 +8322,8 @@ async def _finalize_locked_version(
     session: AsyncSession,
     version_id: uuid.UUID,
     timeout_now: datetime | None,
+    *,
+    expected_attempt_id: uuid.UUID | str | None = None,
 ) -> dict[str, Any] | None:
     """Lock + finalize one version within an already-open dedicated session.
 
@@ -7561,6 +8365,23 @@ async def _finalize_locked_version(
         return None
     peek_qual = peek.last_qualification or {}
     if peek_qual.get("status") != "pending":
+        return None
+    expected_attempt_uuid = _coerce_qualification_attempt_id(expected_attempt_id)
+    active_attempt_uuid = _coerce_qualification_attempt_id(
+        peek_qual.get("qualification_attempt_id")
+    ) or _coerce_qualification_attempt_id(peek.active_qualification_attempt_id)
+    if (
+        expected_attempt_uuid is not None
+        and active_attempt_uuid is not None
+        and expected_attempt_uuid != active_attempt_uuid
+    ):
+        logger.info(
+            "[RELEASE_QUALIFIER] finalize ignored completion from stale attempt "
+            "%s; v%d active attempt is %s",
+            expected_attempt_uuid,
+            peek.version_number,
+            active_attempt_uuid,
+        )
         return None
     peek_candidate_sha: str | None = peek_qual.get("candidate_sha")
     pre_timeout_age_seconds = (
@@ -7808,5 +8629,7 @@ async def maybe_finalize_qualification(
         return None
 
     return await _finalize_in_dedicated_session(
-        version_id, session_factory=session_factory
+        version_id,
+        session_factory=session_factory,
+        expected_attempt_id=context.get("qualification_attempt_id"),
     )

@@ -16,8 +16,15 @@
 #   scripts/test-backend.sh --no-testmon                 # ignore warm cache, run full suite
 #   scripts/test-backend.sh --require-testmon            # skip instead of running full suite when no warm cache exists
 #   scripts/test-backend.sh --postgres                   # accepted for back-compat; default is already on
+#   scripts/test-backend.sh --sandbox-postgres           # private local Postgres; no Docker socket required
 set -euo pipefail
 cd "$(dirname "$0")/../backend"
+
+# The real upgrade chain contains fail-closed encrypted-data migrations. Keep a
+# deterministic non-production Fernet key in the repo-owned harness so Alembic
+# proves the whole chain without weakening migration behavior or relying on the
+# pytest plaintext opt-in fixture (which runs only after migrations).
+TEST_ENCRYPTION_KEY="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 
 # --- Argument parsing ---
 # --postgres: kept as a no-op flag for callers that pass it explicitly.
@@ -27,10 +34,12 @@ cd "$(dirname "$0")/../backend"
 USE_POSTGRES=1
 USE_TESTMON=1
 REQUIRE_TESTMON=0
+SANDBOX_POSTGRES=0
 ARGS=()
 for arg in "$@"; do
   case "$arg" in
     --postgres) ;;  # default; no-op
+    --sandbox-postgres) SANDBOX_POSTGRES=1 ;;
     --no-postgres) USE_POSTGRES=0 ;;
     --no-testmon) USE_TESTMON=0 ;;
     --require-testmon) REQUIRE_TESTMON=1 ;;
@@ -103,10 +112,20 @@ fi
 # --- Cleanup: combined trap for CLAUDE.md copy + Postgres sidecar ---
 PG_CONTAINER=""
 PG_NETWORK=""
+PG_DATA=""
+PG_SOCKET=""
+PG_BIN=""
+VERIFICATION_OUTPUT_DIR=""
 cleanup() {
   rm -f CLAUDE.md
   [ -n "$PG_CONTAINER" ] && docker rm -f "$PG_CONTAINER" &>/dev/null || true
   [ -n "$PG_NETWORK" ] && docker network rm "$PG_NETWORK" &>/dev/null || true
+  if [ -n "$PG_BIN" ] && [ -n "$PG_DATA" ] && [ -d "$PG_DATA" ]; then
+    "$PG_BIN/pg_ctl" -D "$PG_DATA" -m immediate stop &>/dev/null || true
+  fi
+  [ -n "$PG_DATA" ] && rm -rf "$PG_DATA" || true
+  [ -n "$PG_SOCKET" ] && rm -rf "$PG_SOCKET" || true
+  [ -n "$VERIFICATION_OUTPUT_DIR" ] && rm -rf "$VERIFICATION_OUTPUT_DIR" || true
 }
 trap cleanup EXIT
 
@@ -118,8 +137,17 @@ if [ -f ../CLAUDE.md ]; then
   cp ../CLAUDE.md CLAUDE.md
 fi
 
-# --- Detect Docker; --postgres requires it ---
-if command -v docker &>/dev/null; then
+# --- Select the execution boundary. The authoring-verification path uses a
+# private PostgreSQL process plus a baked read-only venv inside bwrap, never the
+# host Docker socket. Ordinary developer/CI calls retain the Docker path. ---
+if [ "$SANDBOX_POSTGRES" = "1" ]; then
+  USE_DOCKER=0
+  PYTHON=/opt/blueprint-backend-venv/bin/python
+  [ -x "$PYTHON" ] || {
+    echo "ERROR: --sandbox-postgres requires $PYTHON" >&2
+    exit 2
+  }
+elif command -v docker &>/dev/null; then
   USE_DOCKER=1
 else
   USE_DOCKER=0
@@ -317,7 +345,17 @@ resolve_deps_image() {
 }
 
 # --- Configure DATABASE_URL / ENV_ARGS based on --postgres ---
-if [ "$USE_POSTGRES" = "1" ]; then
+if [ "$USE_POSTGRES" = "1" ] && [ "$SANDBOX_POSTGRES" = "1" ]; then
+  PG_BIN="$(pg_config --bindir)"
+  PG_DATA=$(mktemp -d /tmp/blueprint-test-pg.XXXXXX)
+  PG_SOCKET=$(mktemp -d /tmp/blueprint-test-pg-sock.XXXXXX)
+  "$PG_BIN/initdb" -D "$PG_DATA" -A trust --no-locale -U test >/dev/null
+  "$PG_BIN/pg_ctl" -D "$PG_DATA" \
+    -o "-F -c listen_addresses='' -k '$PG_SOCKET'" -w start >/dev/null
+  "$PG_BIN/createdb" -h "$PG_SOCKET" -U test test_blueprint
+  PG_DSN="postgresql+asyncpg://test@/test_blueprint?host=$PG_SOCKET"
+  ENV_ARGS=""
+elif [ "$USE_POSTGRES" = "1" ]; then
   PG_NETWORK="blueprint-test-net-$$"
   PG_CONTAINER="blueprint-test-pg-$$"
   PG_DSN="postgresql+asyncpg://test:test@${PG_CONTAINER}:5432/test_blueprint"
@@ -336,12 +374,14 @@ if [ "$USE_POSTGRES" = "1" ]; then
     -e USE_TEST_POSTGRES=true \
     -e GCP_PROJECT_ID=test-project \
     -e LOCAL_MODE=true \
+    -e GITHUB_PAT_ENCRYPTION_KEY=$TEST_ENCRYPTION_KEY \
     -e AGENT_JWT_SECRET=ci-test-secret-min-32-bytes-xxxxx \
     -e WS_TICKET_SECRET=ci-test-ws-secret-min-32-bytes-xx"
 else
   ENV_ARGS="-e DATABASE_URL=postgresql+asyncpg://x:x@localhost/x \
     -e GCP_PROJECT_ID=test-project \
     -e LOCAL_MODE=true \
+    -e GITHUB_PAT_ENCRYPTION_KEY=$TEST_ENCRYPTION_KEY \
     -e AGENT_JWT_SECRET=ci-test-secret-min-32-bytes-xxxxx \
     -e WS_TICKET_SECRET=ci-test-ws-secret-min-32-bytes-xx"
 fi
@@ -375,9 +415,11 @@ if [ "$USE_DOCKER" = "1" ] && [ -d .. ]; then
   ENV_ARGS="$ENV_ARGS -v ${REPO_HOST_PATH}:/repo:ro"
 fi
 
-ENV_VARS="DATABASE_URL=postgresql+asyncpg://x:x@localhost/x \
+ENV_VARS="DATABASE_URL=${PG_DSN:-postgresql+asyncpg://x:x@localhost/x} \
+  USE_TEST_POSTGRES=$([ "$USE_POSTGRES" = "1" ] && echo true || echo false) \
   GCP_PROJECT_ID=test-project \
   LOCAL_MODE=true \
+  GITHUB_PAT_ENCRYPTION_KEY=$TEST_ENCRYPTION_KEY \
   AGENT_JWT_SECRET=ci-test-secret-min-32-bytes-xxxxx \
   WS_TICKET_SECRET=ci-test-ws-secret-min-32-bytes-xx"
 
@@ -434,12 +476,16 @@ fi
 # --- Postgres needs migrations applied before tests ---
 if [ "$USE_POSTGRES" = "1" ]; then
   echo "=== Waiting for Postgres ==="
-  for _ in $(seq 1 30); do
-    if docker exec "$PG_CONTAINER" pg_isready -U test &>/dev/null; then break; fi
-    sleep 0.5
-  done
+  if [ "$SANDBOX_POSTGRES" = "1" ]; then
+    "$PG_BIN/pg_isready" -h "$PG_SOCKET" -U test
+  else
+    for _ in $(seq 1 30); do
+      if docker exec "$PG_CONTAINER" pg_isready -U test &>/dev/null; then break; fi
+      sleep 0.5
+    done
+  fi
   echo "=== Running alembic migrations ==="
-  _run alembic upgrade head
+  _run python3 -m alembic upgrade head
 fi
 
 echo "=== Verify app imports ==="
@@ -474,7 +520,52 @@ fi
 
 if [ $# -gt 0 ]; then
   echo "=== Running: pytest $* ==="
-  _run python3 -m pytest "$@"
+  if [ -n "${BLUEPRINT_VERIFICATION_RESULT_FILE:-}" ]; then
+    # Opt-in authoring evidence mode. The caller must select real test files or
+    # nodes, use Postgres, and explicitly attest USE_TEST_POSTGRES=true. JUnit
+    # proves that pytest collected and executed at least one non-skipped test;
+    # an exit-zero no-collection/all-skipped path cannot mint the result file.
+    [ "$USE_POSTGRES" = "1" ] || {
+      echo "ERROR: verification evidence requires the Postgres harness" >&2
+      exit 2
+    }
+    [ "$(printf '%s' "${USE_TEST_POSTGRES:-}" | tr '[:upper:]' '[:lower:]')" = "true" ] || {
+      echo "ERROR: verification evidence requires USE_TEST_POSTGRES=true" >&2
+      exit 2
+    }
+    verification_selector_count=0
+    for selector in "$@"; do
+      case "$selector" in
+        testing/test_*.py|testing/test_*.py::*) verification_selector_count=$((verification_selector_count + 1)) ;;
+        *)
+          echo "ERROR: unsupported verification pytest argument: $selector" >&2
+          exit 2
+          ;;
+      esac
+    done
+    [ "$verification_selector_count" -gt 0 ] || {
+      echo "ERROR: verification evidence requires a targeted testing/test_*.py file or node" >&2
+      exit 2
+    }
+    [ "$verification_selector_count" -le 8 ] || {
+      echo "ERROR: verification evidence is bounded to at most 8 targeted selectors" >&2
+      exit 2
+    }
+    rm -f "$BLUEPRINT_VERIFICATION_RESULT_FILE"
+    VERIFICATION_OUTPUT_DIR=$(mktemp -d /tmp/blueprint-backend-verification.XXXXXX)
+    if [ "$USE_DOCKER" = "1" ]; then
+      ENV_ARGS="$ENV_ARGS -v ${VERIFICATION_OUTPUT_DIR}:/verification-output"
+      verification_junit=/verification-output/junit.xml
+    else
+      verification_junit="$VERIFICATION_OUTPUT_DIR/junit.xml"
+    fi
+    _run python3 -m pytest "$@" --junitxml="$verification_junit"
+    verification_tmp="${BLUEPRINT_VERIFICATION_RESULT_FILE}.$$"
+    python3 -c 'import datetime,json,sys,xml.etree.ElementTree as ET; junit,out,*selectors=sys.argv[1:]; root=ET.parse(junit).getroot(); suites=[root] if root.tag.endswith("testsuite") else list(root); tests=sum(int(s.attrib.get("tests",0)) for s in suites); skipped=sum(int(s.attrib.get("skipped",0)) for s in suites); failures=sum(int(s.attrib.get("failures",0))+int(s.attrib.get("errors",0)) for s in suites); assert tests>0 and skipped<tests and failures==0, f"unacceptable pytest result tests={tests} skipped={skipped} failures={failures}"; payload={"version":1,"harness":"scripts/test-backend.sh","selectors":selectors,"targeted":True,"use_test_postgres":True,"postgres_sidecar":True,"tests":tests,"skipped":skipped,"failures":failures,"exit_code":0,"created_at":datetime.datetime.now(datetime.timezone.utc).isoformat()}; open(out,"w",encoding="utf-8").write(json.dumps(payload,sort_keys=True)+"\n")' "$VERIFICATION_OUTPUT_DIR/junit.xml" "$verification_tmp" "$@"
+    mv -f "$verification_tmp" "$BLUEPRINT_VERIFICATION_RESULT_FILE"
+  else
+    _run python3 -m pytest "$@"
+  fi
   exit 0
 fi
 

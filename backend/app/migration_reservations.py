@@ -39,7 +39,13 @@ from sqlmodel import select
 
 from app.database import resolve_dialect_name
 from app.migration_chain import build_migration_chain, find_heads, next_revision
-from app.models import MigrationReservation, MigrationReservationStatus, Task, TaskStatus
+from app.models import (
+    MigrationReservation,
+    MigrationReservationStatus,
+    Project,
+    Task,
+    TaskStatus,
+)
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
@@ -164,6 +170,67 @@ async def _active_reservations_for_project(
     return list(result.scalars().all())
 
 
+def _effective_task_base_branch(task: Task, project: Project) -> str:
+    """Resolve the branch whose merged migrations an agent will author against."""
+    from app.branch_resolution import get_project_integration_branch
+
+    context = task.context or {}
+    review_loop = context.get("review_loop") or {}
+    return (
+        review_loop.get("base_branch")
+        or (task.first_payload or {}).get("base_branch")
+        or get_project_integration_branch(project)
+    )
+
+
+def _head_from_migration_filenames(filenames: list[str]) -> str:
+    """Return the numeric migration-id floor advertised by a repository listing."""
+    revisions = [
+        name.split("_", 1)[0]
+        for name in filenames
+        if name.split("_", 1)[0].isdigit()
+    ]
+    return max(revisions, key=int) if revisions else "0000"
+
+
+async def _task_base_migration_head(session, task: Task) -> str | None:
+    """Best-effort remote migration head, deliberately before allocation locking.
+
+    The deployed API image can have a stale local Alembic chain.  Reservations
+    must instead follow the task's effective base branch when a read token and
+    project repository are available.  Callers retain the local fallback when
+    this optional read is unavailable.
+    """
+    project = await session.get(Project, task.project_id)
+    if project is None or not project.github_owner or not project.github_repo:
+        return None
+    try:
+        from app.github import list_versions_at_ref
+        from app.github_auth import get_repo_installation_read_token
+
+        token = await get_repo_installation_read_token(
+            project.github_owner, project.github_repo
+        )
+        if not token:
+            return None
+        filenames = await list_versions_at_ref(
+            token,
+            project.github_owner,
+            project.github_repo,
+            _effective_task_base_branch(task, project),
+            project_id=str(project.id),
+            versions_dir=project.alembic_versions_path,
+        )
+        return _head_from_migration_filenames(filenames)
+    except Exception:  # noqa: BLE001 - reservation sourcing must not block dispatch
+        logger.warning(
+            "unable to read task-base migration head for task %s; using local fallback",
+            task.id,
+            exc_info=True,
+        )
+        return None
+
+
 async def allocate_migration_reservation(
     session,
     task: Task,
@@ -175,9 +242,9 @@ async def allocate_migration_reservation(
     Idempotent: if the task already holds an ACTIVE reservation it is returned
     unchanged (retry / reclaim), so re-invoking after a reaped attempt does not
     burn a fresh revision id. Otherwise the next id strictly above both the
-    merged chain head and every still-ACTIVE reservation in the project is
-    allocated, the merged head is recorded as ``provisional_down_revision``, and
-    the row is committed and returned.
+    best-effort task-base chain head (or local fallback) and every still-ACTIVE
+    reservation in the project is allocated. ``provisional_revision`` is
+    verbatim; ``provisional_down_revision`` is an advisory authoring anchor.
 
     Concurrency is serialized per project by an in-process lock plus a Postgres
     advisory lock, so two concurrent allocators receive distinct monotonic ids.
@@ -185,6 +252,11 @@ async def allocate_migration_reservation(
     if task.id is None:
         raise ValueError("task must be persisted before reserving a revision")
     project_id = task.project_id
+
+    # Network I/O is intentionally completed before taking either allocator
+    # lock: a slow GitHub response must never hold a DB/advisory critical section.
+    remote_head = await _task_base_migration_head(session, task)
+    head = remote_head or _current_merged_head(versions_dir)
 
     async with _project_lock(project_id):
         # Cross-process serialization on Postgres; a no-op (skipped) on SQLite
@@ -207,7 +279,6 @@ async def allocate_migration_reservation(
         if existing is not None:
             return existing
 
-        head = _current_merged_head(versions_dir)
         active = await _active_reservations_for_project(
             session, project_id=project_id
         )

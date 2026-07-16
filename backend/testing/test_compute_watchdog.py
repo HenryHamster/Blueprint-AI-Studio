@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app import compute_jobs
 from app.compute_backends import (
+    GCP_BACKEND_NAME,
     PROGRESS_FILE_ENV,
     RUNNER_SUBPROCESS_BACKEND_NAME,
     _build_container_run_prefix,
@@ -141,67 +142,16 @@ def test_append_progress_sample_drops_bad_metric_key():
     assert append_progress_sample({}, metric="loss!", value=1.0, t="t0") == {}
 
 
-def test_append_progress_sample_compacts_long_interleaved_history_without_losing_watchdog():
-    now = datetime(2026, 1, 2, 12, 0, 0)
-    timeout = 24 * 60 * 60
-    meta: dict = {
-        "declared_metric": "loss",
-        "no_progress_timeout_seconds": timeout,
-    }
-    # More than 50 high-frequency declared samples interleaved with an unrelated
-    # metric. The old global ring retained only the final ~2 hours here.
-    for i in range(301):
-        receipt = now - timedelta(seconds=timeout) + timedelta(seconds=i * timeout / 300)
-        meta = append_progress_sample(
-            meta,
-            metric="loss",
-            value=1.0,
-            t="2099-01-01T00:00:00" if i % 2 else "1999-01-01T00:00:00",
-            received_at=receipt,
-        )
-        meta = append_progress_sample(
-            meta,
-            metric="throughput",
-            value=float(i),
-            t=receipt.isoformat(),
-            received_at=receipt,
-        )
+def test_append_progress_sample_history_is_bounded_per_metric():
+    meta: dict = {}
+    for i in range(compute_jobs._PROGRESS_SERIES_MAX_SAMPLES_PER_METRIC + 5):
+        meta = append_progress_sample(meta, metric="loss", value=float(i), t=f"t{i}")
     series = meta["progress_series"]
-    assert len(series) <= 296
-    assert sum(sample["name"] == "throughput" for sample in series) <= 32
-    job = SimpleNamespace(
-        polling_metadata=meta,
-        started_at=now - timedelta(seconds=timeout + 60),
+    assert len(series) == compute_jobs._PROGRESS_SERIES_MAX_SAMPLES_PER_METRIC
+    assert series[0]["value"] == pytest.approx(5.0), "oldest 5 samples dropped"
+    assert series[-1]["value"] == pytest.approx(
+        float(compute_jobs._PROGRESS_SERIES_MAX_SAMPLES_PER_METRIC + 4)
     )
-    assert _no_progress_stalled(job, now=now) is True
-
-
-def test_runner_timestamp_manipulation_cannot_trigger_or_evade_watchdog():
-    now = datetime(2026, 1, 2, 12, 0, 0)
-    timeout = 3600
-
-    def build(receipt_ages: list[int], runner_t: str):
-        meta = {
-            "declared_metric": "loss",
-            "no_progress_timeout_seconds": timeout,
-        }
-        for age in receipt_ages:
-            meta = append_progress_sample(
-                meta,
-                metric="loss",
-                value=1.0,
-                t=runner_t,
-                received_at=now - timedelta(seconds=age),
-            )
-        return SimpleNamespace(
-            polling_metadata=meta,
-            started_at=now - timedelta(seconds=timeout + 60),
-        )
-
-    future_authored = build([300, 200, 100, 0], "2099-01-01T00:00:00")
-    backdated_authored = build([3600, 2400, 1200, 0], "1999-01-01T00:00:00")
-    assert _no_progress_stalled(future_authored, now=now) is False
-    assert _no_progress_stalled(backdated_authored, now=now) is True
 
 
 def test_append_progress_sample_does_not_mutate_input():
@@ -406,6 +356,15 @@ def test_no_progress_stalled_false_without_declared_metric():
     assert _no_progress_stalled(job, now=now) is False
 
 
+def test_no_progress_stalled_true_when_declared_metric_never_arrives():
+    now = datetime(2026, 1, 2, 12, 0, 0)
+    job, _ = _make_stub_job(
+        metric="loss", samples=[], started_offset_seconds=4000,
+        extra_meta={"no_progress_timeout_seconds": 300},
+    )
+    assert _no_progress_stalled(job, now=now) is True
+
+
 def test_no_progress_stalled_false_during_grace_period():
     metric = "val/loss"
     # Job only started 10 minutes ago (well inside the 30-min grace)
@@ -422,7 +381,7 @@ def test_no_progress_stalled_false_with_insufficient_samples():
     # Only 1 flat sample — below MIN_SAMPLES floor
     job, now = _make_stub_job(
         metric=metric,
-        samples=[(2000, metric, 1.0)],
+        samples=[(0, metric, 1.0)],
         started_offset_seconds=int(COMPUTE_JOB_NO_PROGRESS_GRACE_SECONDS) + 3600,
     )
     assert _no_progress_stalled(job, now=now) is False
@@ -920,6 +879,24 @@ async def test_process_once_surfaces_metric_name_mismatch_without_killing(
 # ---------------------------------------------------------------------------
 
 
+async def _setup_running_gcp_job(db_session, *, heartbeat_age_seconds: int):
+    task = await _setup_task(db_session)
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python train.py",
+        spend_cap_usd=1.0,
+        deadline_seconds=86400,
+    )
+    now = _utcnow()
+    job.backend = GCP_BACKEND_NAME
+    job.status = ComputeJobStatus.RUNNING
+    job.started_at = now - timedelta(hours=2)
+    job.last_heartbeat_at = now - timedelta(seconds=heartbeat_age_seconds)
+    await db_session.commit()
+    return job, now
+
+
 @pytest.mark.asyncio
 async def test_sweep_reaps_runner_job_with_stale_heartbeat(db_session):
     """A RUNNING runner-subprocess job with stale last_heartbeat_at is
@@ -976,30 +953,114 @@ async def test_sweep_skips_recently_heartbeating_runner_job(db_session):
 
 
 @pytest.mark.asyncio
-async def test_sweep_skips_non_runner_backends(db_session):
-    """Non-runner-subprocess jobs (GCP, local) with stale heartbeats are
-    not touched by the sweep."""
-    task = await _setup_task(db_session)
-    job = await compute_jobs.create_compute_job(
+async def test_sweep_terminates_and_finalizes_gcp_job_with_stale_heartbeat(
+    db_session, monkeypatch
+):
+    """A stale RUNNING GCP job deletes its VM before becoming TIMED_OUT."""
+    job, now = await _setup_running_gcp_job(
         db_session,
-        task,
-        command="python train.py",
-        spend_cap_usd=1.0,
-        deadline_seconds=86400,
+        heartbeat_age_seconds=RUNNER_SILENT_TIMEOUT_SECONDS + 60,
     )
-    now = _utcnow()
-    # Set backend to something that is NOT runner-subprocess
-    job.backend = "gcp"
-    job.status = ComputeJobStatus.RUNNING
-    job.started_at = now - timedelta(hours=2)
-    job.last_heartbeat_at = now - timedelta(seconds=RUNNER_SILENT_TIMEOUT_SECONDS + 60)
+    job.external_compute_id = "stale-gcp-vm"
     await db_session.commit()
 
+    terminate_reasons: list[str] = []
+
+    class _GcpBackend:
+        async def terminate(self, persisted_job, *, reason):
+            assert persisted_job.id == job.id
+            terminate_reasons.append(reason)
+            return True
+
+    monkeypatch.setattr(compute_jobs, "get_compute_backend", lambda _: _GcpBackend())
+    finalized = await sweep_silent_runner_compute_jobs(db_session, now=now)
+
+    assert finalized == 1
+    assert terminate_reasons == ["heartbeat_stale"]
+    await db_session.refresh(job)
+    assert job.status == ComputeJobStatus.TIMED_OUT
+    assert job.outcome == ComputeJobOutcome.TIMED_OUT
+    assert (job.polling_metadata or {}).get("terminal_kind") == "vm_died_silently"
+    assert job.terminal_reason == "vm_died_silently"
+
+
+@pytest.mark.asyncio
+async def test_sweep_skips_gcp_job_with_fresh_heartbeat(db_session, monkeypatch):
+    """A recent GCP heartbeat neither deletes the VM nor changes the row."""
+    job, now = await _setup_running_gcp_job(
+        db_session,
+        heartbeat_age_seconds=60,
+    )
+
+    class _GcpBackend:
+        async def terminate(self, persisted_job, *, reason):
+            raise AssertionError(f"fresh GCP job must not terminate: {reason}")
+
+    monkeypatch.setattr(compute_jobs, "get_compute_backend", lambda _: _GcpBackend())
     finalized = await sweep_silent_runner_compute_jobs(db_session, now=now)
 
     assert finalized == 0
     await db_session.refresh(job)
     assert job.status == ComputeJobStatus.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_sweep_gcp_lock_time_fresh_heartbeat_wins_race(db_session, monkeypatch):
+    """A heartbeat committed after selection but before locked recheck prevents deletion."""
+    job, now = await _setup_running_gcp_job(
+        db_session,
+        heartbeat_age_seconds=RUNNER_SILENT_TIMEOUT_SECONDS + 60,
+    )
+
+    original_lock = compute_jobs._lock_compute_job
+
+    async def _heartbeat_before_locked_recheck(session, job_id):
+        live = await original_lock(session, job_id)
+        assert live is not None
+        live.last_heartbeat_at = now
+        await session.commit()
+        return await original_lock(session, job_id)
+
+    class _GcpBackend:
+        async def terminate(self, persisted_job, *, reason):
+            raise AssertionError(f"fresh lock-time heartbeat must win: {reason}")
+
+    monkeypatch.setattr(compute_jobs, "_lock_compute_job", _heartbeat_before_locked_recheck)
+    monkeypatch.setattr(compute_jobs, "get_compute_backend", lambda _: _GcpBackend())
+    finalized = await sweep_silent_runner_compute_jobs(db_session, now=now)
+
+    assert finalized == 0
+    await db_session.refresh(job)
+    assert job.status == ComputeJobStatus.RUNNING
+    assert job.last_heartbeat_at == now
+
+
+@pytest.mark.asyncio
+async def test_sweep_keeps_gcp_job_running_when_stale_heartbeat_terminate_fails(
+    db_session, monkeypatch
+):
+    """A failed GCP delete leaves the row live with a retryable diagnostic."""
+    job, now = await _setup_running_gcp_job(
+        db_session,
+        heartbeat_age_seconds=RUNNER_SILENT_TIMEOUT_SECONDS + 60,
+    )
+
+    class _GcpBackend:
+        async def terminate(self, persisted_job, *, reason):
+            assert reason == "heartbeat_stale"
+            raise OSError("GCP delete unavailable")
+
+    monkeypatch.setattr(compute_jobs, "get_compute_backend", lambda _: _GcpBackend())
+    finalized = await sweep_silent_runner_compute_jobs(db_session, now=now)
+
+    assert finalized == 0
+    await db_session.refresh(job)
+    assert job.status == ComputeJobStatus.RUNNING
+    diagnostic = (job.polling_metadata or {}).get("compute_rpc_diagnostic")
+    assert diagnostic is not None
+    assert diagnostic["operation"] == "terminate"
+    assert diagnostic["reason"] == "heartbeat_stale"
+    assert diagnostic["error_type"] == "OSError"
 
 
 @pytest.mark.asyncio

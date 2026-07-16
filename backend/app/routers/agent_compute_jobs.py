@@ -6,6 +6,7 @@ import hmac
 import json
 import logging
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Dict
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
@@ -31,9 +32,29 @@ from app.vm_cost_rates import resolve_compute_machine_type, supported_machine_ty
 
 _LIVE_TAIL_MAX_DECODED_BYTES = 20480
 _LIVE_TAIL_MAX_TEXT_CHARS = 10240
+# VMs started by the serving tree before this deploy still send their public job
+# UUID as the heartbeat bearer.  Keep that compatibility path narrowly scoped to
+# rows created before the HMAC rollout; rows at or after the boundary are HMAC-only.
+_COMPUTE_JOB_HEARTBEAT_HMAC_ROLLOUT_AT = datetime(
+    2026, 7, 14, 7, 24, 41, tzinfo=timezone.utc
+).replace(tzinfo=None)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/agent", tags=["agent"])
+
+
+def _accepts_legacy_compute_heartbeat(job: ComputeJob, bearer: str) -> bool:
+    """Whether a pre-HMAC VM may use its legacy UUID bearer.
+
+    This is intentionally fail-closed for rows without a creation timestamp and
+    for jobs created exactly at the rollout boundary, where the HMAC startup
+    script is already the required contract.
+    """
+    return (
+        job.created_at is not None
+        and job.created_at < _COMPUTE_JOB_HEARTBEAT_HMAC_ROLLOUT_AT
+        and hmac.compare_digest(bearer.encode("utf-8"), str(job.id).encode("ascii"))
+    )
 
 
 class LaunchComputeJobRequest(BaseModel):
@@ -211,7 +232,9 @@ async def compute_job_vm_heartbeat(
     a per-job secret derived by ``compute_job_heartbeat_secret`` (HMAC of the job
     id keyed by ``AGENT_JWT_SECRET``), embedded only in the encrypted startup
     script and never echoed by any API.  The endpoint recomputes it and does a
-    constant-time compare; a bare-UUID caller is rejected with 403.  The endpoint
+    constant-time compare. During the flag-day rollout only, pre-rollout jobs
+    accept their legacy UUID bearer so already-running VMs cannot be reaped
+    mid-job; jobs created at or after the boundary remain HMAC-only. The endpoint
     is also rate-limited and only mutates active (non-terminal) jobs.
     """
     auth = request.headers.get("Authorization", "")
@@ -219,10 +242,18 @@ async def compute_job_vm_heartbeat(
     expected = compute_job_heartbeat_secret(job_id)
     # Compare as bytes (constant-time): hmac.compare_digest raises on a str with
     # non-ASCII chars, so a hostile Authorization header must not 500 the endpoint.
-    if not hmac.compare_digest(bearer.encode("utf-8"), expected.encode("ascii")):
-        raise HTTPException(status_code=403, detail="Invalid compute job token")
+    hmac_valid = hmac.compare_digest(bearer.encode("utf-8"), expected.encode("ascii"))
+    job = None
+    if not hmac_valid:
+        # Fetch only when the primary secret failed: old VMs must keep their
+        # heartbeat lease through the deploy, while unknown UUIDs still receive
+        # the same generic 403 as other invalid credentials.
+        job = await session.get(ComputeJob, job_id)
+        if job is None or not _accepts_legacy_compute_heartbeat(job, bearer):
+            raise HTTPException(status_code=403, detail="Invalid compute job token")
 
-    job = await session.get(ComputeJob, job_id)
+    if job is None:
+        job = await session.get(ComputeJob, job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Compute job not found")
 

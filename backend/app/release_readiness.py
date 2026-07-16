@@ -936,7 +936,7 @@ async def apply_finding_resolution(
 async def _latest_carried_audit_findings(
     session: AsyncSession,
     version: ReleaseVersion,
-) -> tuple[list[dict[str, Any]], bool]:
+) -> tuple[list[dict[str, Any]], bool, dict[str, Any]]:
     """Resolve the open version's latest carried audit findings + truncation flag.
 
     Mirrors the agent qualification fetch: prefer the latest immutable
@@ -950,27 +950,25 @@ async def _latest_carried_audit_findings(
         get_latest_qualification_audit_findings,
     )
 
+    from app.qualification_state_resolver import (
+        qualification_read_provenance,
+        resolve_newest_qualification_verdict,
+    )
+
+    selected_verdict = await resolve_newest_qualification_verdict(session, version)
     verdict = (
-        (
-            await session.execute(
-                select(QualificationVerdict)
-                .where(
-                    QualificationVerdict.release_version_id == version.id,
-                    QualificationVerdict.audit_findings.is_not(None),
-                )
-                .order_by(QualificationVerdict.created_at.desc())
-                .limit(1)
-            )
+        selected_verdict
+        if selected_verdict is not None and selected_verdict.audit_findings is not None
+        else await resolve_newest_qualification_verdict(
+            session, version, require_audit_findings=True
         )
-        .scalars()
-        .first()
     )
     findings = get_latest_qualification_audit_findings(version, verdict)
     qual = version.last_qualification or {}
     truncated = (
         bool(qual.get("audit_findings_truncated")) if isinstance(qual, dict) else False
     )
-    return findings, truncated
+    return findings, truncated, qualification_read_provenance(version, selected_verdict)
 
 
 async def _has_active_promotion_ci_remediation(
@@ -1174,7 +1172,9 @@ async def compute_requalification_readiness(
             "findings": [],
         }
 
-    carried, truncated = await _latest_carried_audit_findings(session, version)
+    carried, truncated, provenance = await _latest_carried_audit_findings(
+        session, version
+    )
 
     # Load the ledger for this version once, keyed by finding_key.
     ledger_rows = list(
@@ -1190,9 +1190,11 @@ async def compute_requalification_readiness(
     )
     ledger_states: dict[str, str] = {row.finding_key: row.state for row in ledger_rows}
 
-    return _compute_requalification_decision(
+    result = _compute_requalification_decision(
         carried, truncated, ledger_states, str(version.id)
     )
+    result["qualification_provenance"] = provenance
+    return result
 
 
 # Gate-state vocabulary emitted by ``compute_promotion_ci_green_gate``.  Only
@@ -1425,6 +1427,14 @@ async def compute_qualification_trigger_state(
             "summary": "no open release version — nothing to qualify",
         }
 
+    from app.qualification_state_resolver import (
+        qualification_read_provenance,
+        resolve_newest_qualification_verdict,
+    )
+
+    selected_verdict = await resolve_newest_qualification_verdict(session, version)
+    provenance = qualification_read_provenance(version, selected_verdict)
+
     if version.phase != "stabilize":
         return {
             "trigger_state": "blocked",
@@ -1434,6 +1444,7 @@ async def compute_qualification_trigger_state(
                 f"version v{version.version_number} is in phase "
                 f"'{version.phase}', not 'stabilize'"
             ),
+            "qualification_provenance": provenance,
         }
 
     has_prior_attempt = (
@@ -1449,6 +1460,7 @@ async def compute_qualification_trigger_state(
                 f"version v{version.version_number} already has a qualification "
                 "attempt recorded — initial trigger does not re-fire"
             ),
+            "qualification_provenance": provenance,
         }
 
     return {
@@ -1460,6 +1472,7 @@ async def compute_qualification_trigger_state(
             "qualification attempt — initial trigger armed (acceptance contract "
             "is graded inside qualification)"
         ),
+        "qualification_provenance": provenance,
     }
 
 
@@ -1649,7 +1662,9 @@ async def backfill_v22_carried_findings_resolved(
     if version.version_number != _V22_BACKFILL_VERSION_NUMBER:
         return 0
 
-    findings, _truncated = await _latest_carried_audit_findings(session, version)
+    findings, _truncated, _provenance = await _latest_carried_audit_findings(
+        session, version
+    )
     if not findings:
         return 0
 

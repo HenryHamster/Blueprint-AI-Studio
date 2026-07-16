@@ -1,5 +1,6 @@
 """Orchestrator error aggregation and acknowledgement endpoints."""
 
+import asyncio
 import os
 import re
 import time
@@ -294,7 +295,7 @@ async def get_recent_orchestrator_errors(
         }
 
     try:
-        entries = _fetch_orchestrator_error_entries(hours)
+        entries = await asyncio.to_thread(_fetch_orchestrator_error_entries, hours)
     except Exception as exc:
         logger.exception("Failed to fetch orchestrator error logs from Cloud Logging")
         payload: Dict[str, Any] = {

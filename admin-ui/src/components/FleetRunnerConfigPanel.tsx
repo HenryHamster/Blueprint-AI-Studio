@@ -9,6 +9,7 @@ import {
   MAX_CONCURRENT_MAX,
   runnerPinsStrategicConfig,
   maxConcurrentValue,
+  maxConcurrentComputeValue,
   gpuAllowlistValue,
   parseGpuIndexList,
   gpusPerJobValue,
@@ -20,6 +21,7 @@ import {
 // actually changed are sent, so an unchanged field is never rewritten.
 interface CapabilityChanges {
   max_concurrent?: number;
+  max_concurrent_compute?: number;
   task_types?: 'all' | string[];
   gpu_indices_allowed?: 'all' | number[];
   gpus_per_job?: number;
@@ -51,7 +53,7 @@ interface Props {
  * on its next heartbeat — the field names and descriptions are written for an
  * operator who has never read the source.
  *
- * Concurrency and task-types are shown read-only for strategic runners, matching
+ * Agent concurrency and task-types are shown read-only for strategic runners, matching
  * the backend invariant that pins them (max_concurrent→1, task_types→strategic
  * set); editing them there would silently no-op, so we say so instead.
  */
@@ -62,6 +64,7 @@ export function FleetRunnerConfigPanel({ projectId, runner, onSaved }: Props) {
   const current = useMemo(
     () => ({
       maxConcurrent: maxConcurrentValue(runner),
+      maxConcurrentCompute: maxConcurrentComputeValue(runner),
       taskTypes: taskTypesValue(runner),
       gpuAllowlist: gpuAllowlistValue(runner),
       gpusPerJob: gpusPerJobValue(runner),
@@ -71,6 +74,7 @@ export function FleetRunnerConfigPanel({ projectId, runner, onSaved }: Props) {
 
   // Form state, seeded from the runner's current server-authoritative config.
   const [maxConcurrent, setMaxConcurrent] = useState<number>(current.maxConcurrent);
+  const [maxConcurrentCompute, setMaxConcurrentCompute] = useState<number>(current.maxConcurrentCompute);
   const [taskTypesAll, setTaskTypesAll] = useState<boolean>(current.taskTypes === 'all');
   const [taskTypesText, setTaskTypesText] = useState<string>(
     current.taskTypes === 'all' ? '' : current.taskTypes.join(', '),
@@ -94,13 +98,16 @@ export function FleetRunnerConfigPanel({ projectId, runner, onSaved }: Props) {
           })();
       if (!jsonEq(nextTaskTypes, current.taskTypes)) out.task_types = nextTaskTypes;
     }
+    if (maxConcurrentCompute !== current.maxConcurrentCompute) {
+      out.max_concurrent_compute = maxConcurrentCompute;
+    }
     if (hasGpu) {
       const nextGpu: 'all' | number[] = gpuAll ? 'all' : parseGpuIndexList(gpuText);
       if (!jsonEq(nextGpu, current.gpuAllowlist)) out.gpu_indices_allowed = nextGpu;
       if (gpusPerJob !== current.gpusPerJob) out.gpus_per_job = gpusPerJob;
     }
     return out;
-  }, [strategic, hasGpu, maxConcurrent, taskTypesAll, taskTypesText, gpuAll, gpuText, gpusPerJob, current]);
+  }, [strategic, hasGpu, maxConcurrent, maxConcurrentCompute, taskTypesAll, taskTypesText, gpuAll, gpuText, gpusPerJob, current]);
 
   const dirty = Object.keys(changes).length > 0;
 
@@ -109,6 +116,10 @@ export function FleetRunnerConfigPanel({ projectId, runner, onSaved }: Props) {
     setSave({ kind: 'saving' });
     try {
       await updateRunnerCapabilities(projectId, runner.id, changes);
+      if (changes.max_concurrent !== undefined && changes.max_concurrent_compute === undefined
+        && runner.capabilities.max_concurrent_compute == null) {
+        setMaxConcurrentCompute(changes.max_concurrent);
+      }
       setSave({ kind: 'saved' });
       await onSaved();
     } catch (e) {
@@ -155,6 +166,28 @@ export function FleetRunnerConfigPanel({ projectId, runner, onSaved }: Props) {
             className="w-20 rounded border border-neutral-700 bg-neutral-950 px-2 py-1 text-sm text-neutral-200 outline-none focus:border-neutral-500"
           />
         )}
+      </ConfigField>
+
+      <ConfigField
+        label="Max concurrent compute jobs"
+        description="How many compute jobs this runner works at the same time. This is a separate pool from agent tasks."
+      >
+        <input
+          type="number"
+          min={MAX_CONCURRENT_MIN}
+          max={MAX_CONCURRENT_MAX}
+          value={maxConcurrentCompute}
+          onChange={e =>
+            setMaxConcurrentCompute(
+              Math.max(
+                MAX_CONCURRENT_MIN,
+                Math.min(MAX_CONCURRENT_MAX, Math.trunc(Number(e.target.value) || MAX_CONCURRENT_MIN)),
+              ),
+            )
+          }
+          aria-label="Max concurrent compute jobs"
+          className="w-20 rounded border border-neutral-700 bg-neutral-950 px-2 py-1 text-sm text-neutral-200 outline-none focus:border-neutral-500"
+        />
       </ConfigField>
 
       {/* Task types */}
@@ -259,7 +292,7 @@ export function FleetRunnerConfigPanel({ projectId, runner, onSaved }: Props) {
           disabled={!dirty || save.kind === 'saving'}
           aria-label="Save runner configuration"
           data-testid="fleet-runner-config-save"
-          className="inline-flex min-h-9 items-center gap-1.5 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-3 text-sm font-semibold text-emerald-300 transition-colors hover:bg-emerald-500/15 disabled:cursor-not-allowed disabled:opacity-40"
+          className="inline-flex min-h-11 items-center gap-1.5 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-3 text-sm font-semibold text-emerald-300 transition-colors hover:bg-emerald-500/15 disabled:cursor-not-allowed disabled:opacity-40 md:min-h-9"
         >
           {save.kind === 'saving' ? (
             <Loader2 className="h-3.5 w-3.5 animate-spin" />

@@ -287,7 +287,7 @@ async def _prior_task_vm_boot(
     re-materialize credentials.
     """
     result = await session.execute(
-        select(Task.provider, Task.account_id, Task.model).where(
+        select(Task.provider, Task.account_id, Task.model, Task.context).where(
             Task.id == prior_task_id
         )
     )
@@ -298,6 +298,7 @@ async def _prior_task_vm_boot(
         "provider": prior_task.provider,
         "account_id": prior_task.account_id,
         "model": prior_task.model,
+        "auth_mode": (prior_task.context or {}).get("llm_auth_mode"),
     }
 
 
@@ -429,11 +430,23 @@ async def _resolve_retarget(
         )
 
         boot_account = _norm_account(vm_boot.get("account_id")) if vm_boot else None
-        if _norm_account(acquired_account_id) == boot_account:
+        boot_provider = (
+            str(vm_boot.get("provider") or "").strip().lower() if vm_boot else ""
+        )
+        boot_auth_mode = (
+            str(vm_boot.get("auth_mode") or "").strip().lower() if vm_boot else ""
+        )
+        resolved_provider = str(selection.provider or "").strip().lower()
+        resolved_auth_mode = str(selection.auth_mode or "").strip().lower()
+        if (
+            _norm_account(acquired_account_id) == boot_account
+            and resolved_provider == boot_provider
+            and resolved_auth_mode == boot_auth_mode
+        ):
             # Same account as the VM's boot manifest — the VM already holds the
-            # right credentials, so the response stays byte-identical (no
-            # manifest). The slot is still acquired/stamped so reconciliation and
-            # the completion-time release stay balanced for this account.
+            # right runtime and credentials, so no manifest is needed. Account
+            # id alone is insufficient because its provider/auth configuration
+            # can change while a VM is warm.
             return None, new_ctx, acquired_account_id
 
         manifest = build_agent_secret_manifest(

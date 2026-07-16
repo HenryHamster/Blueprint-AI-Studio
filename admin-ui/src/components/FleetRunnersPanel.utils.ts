@@ -202,6 +202,13 @@ export function maxConcurrentValue(runner: FleetRunner): number {
   return Math.max(MAX_CONCURRENT_MIN, Math.min(MAX_CONCURRENT_MAX, Math.trunc(raw)));
 }
 
+/** Effective compute concurrency; legacy runners fall back to the agent limit. */
+export function maxConcurrentComputeValue(runner: FleetRunner): number {
+  const raw = runner.config?.desired?.max_concurrent_compute ?? runner.capabilities?.max_concurrent_compute;
+  if (typeof raw !== 'number' || !Number.isFinite(raw)) return maxConcurrentValue(runner);
+  return Math.max(MAX_CONCURRENT_MIN, Math.min(MAX_CONCURRENT_MAX, Math.trunc(raw)));
+}
+
 /** Current GPU allowlist for a runner, from the server-authoritative desired
  *  config. Absent / "all" means no restriction (all visible GPUs eligible). */
 export function gpuAllowlistValue(runner: FleetRunner): 'all' | number[] {

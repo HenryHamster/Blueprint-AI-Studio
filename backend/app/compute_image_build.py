@@ -54,6 +54,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -1273,6 +1274,38 @@ class CredentialLeakError(RuntimeError):
     """Raised when the credential scanner flags build inputs before push."""
 
 
+def _ignore_git_metadata(_directory: str, names: List[str]) -> Set[str]:
+    """Exclude every Git metadata entry while copying a Docker build context.
+
+    A checkout can have a top-level ``.git`` directory, a worktree ``.git`` file,
+    or nested clone metadata.  None is source code and all can contain an
+    installation token, so exclude the name regardless of its file type or depth.
+    """
+    return {name for name in names if name == ".git"}
+
+
+@contextlib.contextmanager
+def sanitized_build_context(repo_dir: str):
+    """Yield a temporary Docker context containing the working tree, sans Git metadata.
+
+    ``copytree(..., symlinks=True)`` retains ordinary symlinks exactly as they
+    appear in the checkout.  The context is removed even when Docker, layer
+    scanning, or pushing fails.
+    """
+    context_dir = tempfile.mkdtemp(prefix="compute-image-build-")
+    try:
+        shutil.copytree(
+            repo_dir,
+            context_dir,
+            symlinks=True,
+            dirs_exist_ok=True,
+            ignore=_ignore_git_metadata,
+        )
+        yield context_dir
+    finally:
+        shutil.rmtree(context_dir, ignore_errors=True)
+
+
 def build_and_push(
     *,
     repo_dir: str,
@@ -1397,27 +1430,30 @@ def build_and_push(
     )
     assert_network(network, _run=_run)
 
-    # Build.
-    build_cmd = [
-        "docker",
-        "build",
-        f"--network={network}",
-        "-f",
-        dockerfile_path,
-        "-t",
-        f"{full_repo}:{dep_hash}",
-    ]
-    if parent:
-        build_args.setdefault("PARENT_IMAGE", parent)
-    for k, v in sorted(build_args.items()):
-        build_cmd.extend(["--build-arg", f"{k}={v}"])
-    build_cmd.append(repo_dir)
+    # Build from a separate context, never from the authenticated checkout.
+    # This is intentionally after the hash and pre-build gates: they inspect the
+    # original declared files, while Docker sees only the sanitized copy.
+    with sanitized_build_context(repo_dir) as build_context:
+        build_cmd = [
+            "docker",
+            "build",
+            f"--network={network}",
+            "-f",
+            os.path.join(build_context, dockerfile),
+            "-t",
+            f"{full_repo}:{dep_hash}",
+        ]
+        if parent:
+            build_args.setdefault("PARENT_IMAGE", parent)
+        for k, v in sorted(build_args.items()):
+            build_cmd.extend(["--build-arg", f"{k}={v}"])
+        build_cmd.append(build_context)
 
-    proc = _run(build_cmd, capture_output=True, text=True, timeout=3600)
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"docker build failed (exit {proc.returncode}): {(proc.stderr or '')[-2000:]}"
-        )
+        proc = _run(build_cmd, capture_output=True, text=True, timeout=3600)
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"docker build failed (exit {proc.returncode}): {(proc.stderr or '')[-2000:]}"
+            )
 
     # Security gate: scan built image layers for credentials BEFORE pushing.
     # This catches secrets baked in at build-time (e.g. via RUN curl or pip

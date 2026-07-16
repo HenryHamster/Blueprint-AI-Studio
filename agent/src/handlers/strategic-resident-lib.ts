@@ -1714,6 +1714,9 @@ export interface TickLedgerUpdate {
  */
 export function classifyTickOutcome(params: {
   resultText: string;
+  /** Streamed text retained separately from the authoritative terminal result.
+   *  Consult it only when a given marker is absent from resultText. */
+  accumulatedTurnText?: string;
   sawToolUse: boolean;
   focus: ExamSurface[];
   atTick: number;
@@ -1732,8 +1735,10 @@ export function classifyTickOutcome(params: {
     };
   }
 
-  const verdict = parseTickVerdict(params.resultText);
-  const agendaContinue = parseAgendaContinue(params.resultText);
+  const verdict = parseTickVerdict(params.resultText)
+    ?? parseTickVerdict(params.accumulatedTurnText ?? '');
+  const agendaContinue = parseAgendaContinue(params.resultText)
+    || parseAgendaContinue(params.accumulatedTurnText ?? '');
 
   if (!verdict) {
     return {

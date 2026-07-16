@@ -77,6 +77,33 @@ async def test_whiteboard_rendered_as_summary_not_raw_json(db_session):
 
 
 @pytest.mark.asyncio
+async def test_whiteboard_skips_malformed_non_string_text_nodes(db_session):
+    project = await _make_project(db_session)
+    db_session.add(
+        ProjectTool(
+            project_id=project.id,
+            kind="whiteboard",
+            slug="wb-malformed",
+            title="Malformed",
+            enabled=True,
+            content={
+                "nodes": [
+                    {"type": "text", "text": 1},
+                    {"type": "text", "text": {"nested": "bad"}},
+                    {"type": "text", "text": " valid note "},
+                ]
+            },
+        )
+    )
+    await db_session.commit()
+
+    out = await load_project_tool_context(db_session, project.id)
+    assert len(out) == 1
+    assert "valid note" in out[0]["text"]
+    assert "nested" not in out[0]["text"]
+
+
+@pytest.mark.asyncio
 async def test_single_stroke_uses_singular_noun(db_session):
     project = await _make_project(db_session)
     db_session.add(
@@ -173,3 +200,162 @@ async def test_empty_project_returns_empty_list(db_session):
     project = await _make_project(db_session)
     out = await load_project_tool_context(db_session, project.id)
     assert out == []
+
+
+# --- Whiteboard v2 node tests ---
+
+@pytest.mark.asyncio
+async def test_whiteboard_nodes_only_not_dropped(db_session):
+    """A board with only nodes (no strokes) must produce a non-empty entry."""
+    project = await _make_project(db_session)
+    db_session.add(
+        ProjectTool(
+            project_id=project.id,
+            kind="whiteboard",
+            slug="wb-nodes",
+            title="NodeBoard",
+            enabled=True,
+            content={"nodes": [{"type": "text", "text": "hello"}]},
+        )
+    )
+    await db_session.commit()
+
+    out = await load_project_tool_context(db_session, project.id)
+    assert len(out) == 1
+    assert out[0]["slug"] == "wb-nodes"
+
+
+@pytest.mark.asyncio
+async def test_whiteboard_text_node_content_included(db_session):
+    """Text node .text values must appear in the rendered output."""
+    project = await _make_project(db_session)
+    db_session.add(
+        ProjectTool(
+            project_id=project.id,
+            kind="whiteboard",
+            slug="wb-text",
+            title="TextBoard",
+            enabled=True,
+            content={"nodes": [
+                {"type": "text", "text": "First idea"},
+                {"type": "text", "text": "Second idea"},
+            ]},
+        )
+    )
+    await db_session.commit()
+
+    out = await load_project_tool_context(db_session, project.id)
+    assert len(out) == 1
+    text = out[0]["text"]
+    assert "First idea" in text
+    assert "Second idea" in text
+    # Raw node JSON must not be dumped.
+    assert "dataUrl" not in text
+
+
+@pytest.mark.asyncio
+async def test_whiteboard_image_and_doc_nodes_counted(db_session):
+    """Image and document nodes must appear as presence counts, not raw data."""
+    project = await _make_project(db_session)
+    db_session.add(
+        ProjectTool(
+            project_id=project.id,
+            kind="whiteboard",
+            slug="wb-media",
+            title="MediaBoard",
+            enabled=True,
+            content={"nodes": [
+                {"type": "image", "dataUrl": "data:image/png;base64,AAAA"},
+                {"type": "document", "name": "spec.pdf"},
+            ]},
+        )
+    )
+    await db_session.commit()
+
+    out = await load_project_tool_context(db_session, project.id)
+    assert len(out) == 1
+    text = out[0]["text"]
+    assert "1 image" in text
+    assert "1 document" in text
+    # Raw data must never appear.
+    assert "dataUrl" not in text
+    assert "base64" not in text
+
+
+@pytest.mark.asyncio
+async def test_whiteboard_mixed_strokes_and_nodes(db_session):
+    """A board with both strokes and nodes must render a combined summary."""
+    project = await _make_project(db_session)
+    db_session.add(
+        ProjectTool(
+            project_id=project.id,
+            kind="whiteboard",
+            slug="wb-mixed",
+            title="MixedBoard",
+            enabled=True,
+            content={
+                "strokes": [{"points": [0, 1]}, {"points": [2, 3]}],
+                "nodes": [
+                    {"type": "text", "text": "caption"},
+                    {"type": "image", "dataUrl": "data:image/png;base64,BBB"},
+                ],
+            },
+        )
+    )
+    await db_session.commit()
+
+    out = await load_project_tool_context(db_session, project.id)
+    assert len(out) == 1
+    text = out[0]["text"]
+    assert "2 strokes" in text
+    assert "1 image" in text
+    assert "caption" in text
+    assert "points" not in text
+    assert "dataUrl" not in text
+
+
+@pytest.mark.asyncio
+async def test_whiteboard_empty_text_nodes_still_empty(db_session):
+    """Blank text nodes alone must not produce output — board should be skipped."""
+    project = await _make_project(db_session)
+    db_session.add(
+        ProjectTool(
+            project_id=project.id,
+            kind="whiteboard",
+            slug="wb-blank-nodes",
+            title="BlankNodeBoard",
+            enabled=True,
+            content={"nodes": [{"type": "text", "text": "   "}]},
+        )
+    )
+    await db_session.commit()
+
+    out = await load_project_tool_context(db_session, project.id)
+    assert out == []
+
+
+@pytest.mark.asyncio
+async def test_whiteboard_summary_not_raw_json_with_nodes(db_session):
+    """Extend raw-JSON guard: node dataUrl must never appear in output."""
+    project = await _make_project(db_session)
+    db_session.add(
+        ProjectTool(
+            project_id=project.id,
+            kind="whiteboard",
+            slug="wb-guard",
+            title="GuardBoard",
+            enabled=True,
+            content={
+                "strokes": [{"points": [1, 2, 3]}],
+                "nodes": [{"type": "image", "dataUrl": "data:image/png;base64,XYZ"}],
+            },
+        )
+    )
+    await db_session.commit()
+
+    out = await load_project_tool_context(db_session, project.id)
+    assert len(out) == 1
+    text = out[0]["text"]
+    assert "GuardBoard" in text
+    assert "points" not in text
+    assert "dataUrl" not in text

@@ -8,6 +8,7 @@ install of bubblewrap.
 """
 
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -860,6 +861,8 @@ class TestAgentPlan(unittest.TestCase):
         # bind mountpoint itself) so the agent's rm -rf avoids EBUSY.
         self.assertEqual(plan.env["AGENT_WORKSPACE"], "/workspace/agent")
         self.assertIn("/tmp/ws/t1", plan.argv)
+        self.assertIn("--chdir", plan.argv)
+        self.assertEqual(plan.argv[plan.argv.index("--chdir") + 1], "/workspace")
 
     def test_agent_plan_docker_backend(self):
         plan = iso.plan_agent_execution(
@@ -1140,6 +1143,126 @@ class TestProbeDockerCdiGpu(unittest.TestCase):
             self.assertFalse(iso.probe_docker_cdi_gpu())
         with mock.patch.object(iso.subprocess, "run", side_effect=OSError("boom")):
             self.assertFalse(iso.probe_docker_cdi_gpu())
+
+
+# ── Project verification boundary probe ──────────────────────────────────────
+
+class TestProjectVerificationProbe(unittest.TestCase):
+    def _plan(self):
+        return iso.plan_agent_execution(
+            caps=_caps(
+                bwrap_path="/usr/bin/bwrap",
+                userns_ok=True,
+                docker_usable=True,
+            ),
+            agent_binary=["node", "/repo/agent/dist/index.js"],
+            workspace_host="/tmp/verification-workspace",
+            injected_env={"TASK_ID": "verification"},
+            source_env={"PATH": "/usr/bin:/bin"},
+            task_type="fix",
+            agent_image="registry/agent:latest",
+        )
+
+    def test_all_zero_exit_probes_earn_readiness(self):
+        plan = self._plan()
+        completed = subprocess.CompletedProcess([], 0, "PROJECT_VERIFICATION_V1_OK\n", "")
+        with mock.patch.object(iso.subprocess, "run", return_value=completed) as run:
+            report = iso.probe_project_verification(plan)
+
+        self.assertTrue(report["ready"])
+        self.assertEqual(report["version"], 1)
+        self.assertEqual(report["boundary"], {"class": "agent", "backend": "bwrap"})
+        self.assertEqual(report["probes"]["ruff"]["exit_code"], 0)
+        self.assertEqual(report["probes"]["docker_postgres"]["exit_code"], 0)
+        self.assertEqual(run.call_count, 2)
+        for call in run.call_args_list:
+            argv = call.args[0]
+            self.assertIn(iso.PROJECT_VERIFICATION_VENV, argv)
+            self.assertNotIn("/var/run/docker.sock", argv)
+            self.assertNotIn("/run/docker.sock", argv)
+
+    def test_real_probe_runs_live_sandbox_postgres_when_installed(self):
+        pg_config = shutil.which("pg_config")
+        ruff_available = subprocess.run(
+            [sys.executable, "-m", "ruff", "--version"],
+            capture_output=True,
+        ).returncode == 0
+        if not pg_config or not ruff_available:
+            self.skipTest("functional probe requires pg_config and Ruff")
+        bindir = subprocess.run(
+            [pg_config, "--bindir"], capture_output=True, text=True, check=True
+        ).stdout.strip()
+        if not os.path.isfile(os.path.join(bindir, "initdb")):
+            self.skipTest("functional probe requires the PostgreSQL server tools")
+
+        completed = subprocess.run(
+            [iso.PROJECT_VERIFICATION_PROBE_PATH, "all"],
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=(completed.stderr or "") + (completed.stdout or ""),
+        )
+        self.assertIn("PROJECT_VERIFICATION_V1_OK", completed.stdout)
+
+    def test_host_docker_does_not_make_daemonless_bwrap_ready(self):
+        plan = self._plan()
+        results = [
+            subprocess.CompletedProcess([], 0, "PROJECT_VERIFICATION_V1_OK\n", ""),
+            subprocess.CompletedProcess([], 127, "", "docker: command not found"),
+        ]
+        with mock.patch.object(iso.subprocess, "run", side_effect=results) as run:
+            report = iso.probe_project_verification(plan)
+
+        self.assertFalse(report["ready"])
+        self.assertTrue(report["probes"]["ruff"]["ok"])
+        self.assertFalse(report["probes"]["docker_postgres"]["ok"])
+        self.assertEqual(report["probes"]["docker_postgres"]["exit_code"], 127)
+        self.assertIn("docker: command not found", report["reason"])
+        for call in run.call_args_list:
+            argv = call.args[0]
+            self.assertEqual(argv[0], "/usr/bin/bwrap")
+            self.assertNotIn("/var/run/docker.sock", argv)
+            self.assertNotIn("/run/docker.sock", argv)
+            self.assertIn(iso.PROJECT_VERIFICATION_SANDBOX_PATH, argv)
+
+    def test_timeout_is_structured_failure(self):
+        plan = self._plan()
+        with mock.patch.object(
+            iso.subprocess,
+            "run",
+            side_effect=subprocess.TimeoutExpired(["bwrap"], 3),
+        ):
+            report = iso.probe_project_verification(
+                plan, ruff_timeout=3, docker_postgres_timeout=4
+            )
+
+        self.assertFalse(report["ready"])
+        self.assertIsNone(report["probes"]["ruff"]["exit_code"])
+        self.assertEqual(
+            report["probes"]["ruff"]["reason"], "ruff probe timed out after 3s"
+        )
+        self.assertEqual(
+            report["probes"]["docker_postgres"]["reason"],
+            "docker-postgres probe timed out after 4s",
+        )
+
+    def test_signal_terminated_probe_is_nonzero_failure_evidence(self):
+        plan = self._plan()
+        results = [
+            subprocess.CompletedProcess([], -9, "", "killed"),
+            subprocess.CompletedProcess([], 0, "PROJECT_VERIFICATION_V1_OK\n", ""),
+        ]
+        with mock.patch.object(iso.subprocess, "run", side_effect=results):
+            report = iso.probe_project_verification(plan)
+
+        self.assertFalse(report["ready"])
+        self.assertFalse(report["probes"]["ruff"]["ok"])
+        self.assertEqual(report["probes"]["ruff"]["exit_code"], 137)
+        self.assertIn("killed", report["probes"]["ruff"]["reason"])
 
 
 # ── Capabilities inventory (heartbeat backend-availability map) ────────────────

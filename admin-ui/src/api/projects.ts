@@ -291,6 +291,10 @@ export interface VersionQualification {
   // Infra-failure context (populated only when status=infra_failure).
   error?: string | null;
   consecutive_infra_errors?: number | null;
+  // True when the same migration-apply gate failure has repeated 3+ times with
+  // an identical infra-failure signature. The operator hotfix-deploy channel is
+  // the sanctioned remediation path for this permanent gate incapacity.
+  is_permanent_gate_incapacity?: boolean | null;
   // Audit observability: why the audit sub-score is missing/unscoreable.
   audit_missing_reason?: string | null;
   // Audit reconciliation: model vs findings-derived scores and excluded count.
@@ -392,7 +396,11 @@ export type QualificationStateValue =
   | 'promotion_confirmation_timed_out'
   | 'deferred_unsynced'
   | 'error'
-  | 'infra_failure';
+  | 'infra_failure'
+  // Recoverable rubric holds: the acceptance rubric changed mid-flight or
+  // provenance could not be reconstructed. A fresh grade resolves either.
+  | 'rubric_changed'
+  | 'rubric_provenance_unknown';
 
 export interface QualificationState {
   state: QualificationStateValue;
@@ -419,6 +427,10 @@ export interface QualificationState {
   check_snapshot?: ManagedCheckWaitSnapshot | null;
   ci_state?: string | null;
   blocker?: string | null;
+  // Rubric-hold context forwarded by the rubric_changed and
+  // rubric_provenance_unknown states. Absent for all other states.
+  rubric_drift?: Record<string, unknown> | null;
+  rubric_provenance_error?: string | null;
   // Post-promotion serving confirmation. A 'promoted' state is provisional:
   // serving_status is 'unconfirmed' while the deploy is still within its
   // confirmation window, 'serving_confirmed' once the promoted SHA is live, or
@@ -460,7 +472,7 @@ export interface CriterionCoverageEntry {
   coverage: 'covered' | 'attested' | 'backfilled' | 'probed' | 'partial' | 'uncovered';
   status?: 'active' | 'retracted' | 'superseded';
   evidence_count: number;
-  stuck_reason?: 'no_mapping' | 'direction_retired' | null;
+  stuck_reason?: 'no_mapping' | 'direction_retired' | 'direction_inactive' | null;
   /** ISO-8601 UTC timestamp when the operator attestation expires.
    *  Present only when coverage='attested' and the attestation carries a
    *  parseable attested_at timestamp. Null/absent for legacy (non-expiring)
@@ -468,6 +480,14 @@ export interface CriterionCoverageEntry {
   attestation_expires_at?: string | null;
   /** Per-evidence preview rows. Optional — absent on older backends. */
   evidence?: EvidencePreviewEntry[];
+}
+
+export interface PhantomBookkeeping {
+  phantom_keys: string[];
+  zero_registered: boolean;
+  has_drift: boolean;
+  referenced_keys?: string[];
+  registered_count?: number;
 }
 
 export interface VersionCriterionCoverage {
@@ -500,6 +520,9 @@ export interface VersionCriterionCoverage {
    *  (unmatched_criterion_ids). Null/undefined until the first gap is recorded. */
   merge_evidence_gaps?: Record<string, number | string[]> | null;
   criteria: CriterionCoverageEntry[];
+  /** Criterion-key drift guard. Present on the open version only. Absent on
+   *  historical versions and older backends — treat absence as no drift. */
+  phantom_bookkeeping?: PhantomBookkeeping | null;
 }
 
 /** Per-dimension qualification state derived from last_qualification.
@@ -622,7 +645,10 @@ export interface QualificationTriggerState {
   last_attempt: Record<string, unknown> | null;
   next_expected_trigger: string;
   blocking: string[];
-  attempts: { count: number; cap: number };
+  /** All qualification attempts recorded for this version; never capped. */
+  lifetime_qualification_attempts: number;
+  /** Retry attempts for the current transient-error episode only. */
+  error_retry_episode: { count: number; cap: number };
   knob: 'on' | 'observe' | 'off';
   evaluated_at: string;
   decision?: {
@@ -1608,6 +1634,81 @@ export async function acceptPendingConfirmation(
   );
   if (!res.ok) throw new Error(`Failed to accept pending confirmation: ${res.status}`);
   return res.json();
+}
+
+// ---------------------------------------------------------------------------
+// Operator hotfix-deploy channel
+// ---------------------------------------------------------------------------
+
+/** Result of the hotfix-scope preview endpoint. */
+export interface HotfixPreviewResponse {
+  status: 'eligible' | 'ineligible' | 'diff_unavailable' | string;
+  eligible: boolean;
+  changed_files: string[];
+  offending_files: string[];
+  reason: string;
+  candidate_sha?: string | null;
+  prior_deployed_sha?: string | null;
+}
+
+/** Result of the hotfix-promote endpoint. */
+export interface HotfixPromoteResponse {
+  status: string;
+  [key: string]: unknown;
+}
+
+/**
+ * Read-only preview: report whether the current open version's candidate diff
+ * is hotfix-eligible WITHOUT promoting.
+ */
+export async function getHotfixPreview(
+  projectId: string,
+  candidateSha?: string | null,
+): Promise<HotfixPreviewResponse> {
+  const params = candidateSha
+    ? `?candidate_sha=${encodeURIComponent(candidateSha)}`
+    : '';
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/promote/hotfix/preview${params}`,
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const detail = data?.detail || `Hotfix preview failed: ${res.status}`;
+    throw new Error(typeof detail === 'string' ? detail : JSON.stringify(detail));
+  }
+  return data as HotfixPreviewResponse;
+}
+
+/**
+ * Trigger a narrow hotfix-promote for the project's open version.
+ * Requires: non-empty `reason` and `ackInertUntilDeploy: true`.
+ */
+export async function triggerHotfixPromote(
+  projectId: string,
+  reason: string,
+  scopeModules: string[],
+  ackInertUntilDeploy: boolean,
+  candidateSha?: string | null,
+): Promise<HotfixPromoteResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/promote/hotfix`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        reason,
+        scope_modules: scopeModules,
+        ack_inert_until_deploy: ackInertUntilDeploy,
+        ...(candidateSha ? { candidate_sha: candidateSha } : {}),
+      }),
+    },
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const detail = data?.detail || `Hotfix promote failed: ${res.status}`;
+    throw new Error(typeof detail === 'string' ? detail : JSON.stringify(detail));
+  }
+  return data as HotfixPromoteResponse;
 }
 
 /** A pull-based fleet runner registered to a project. */

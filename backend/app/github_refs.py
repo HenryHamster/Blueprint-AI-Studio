@@ -19,6 +19,9 @@ _DATETIME = datetime
 
 _RECENT_COMMIT_MESSAGES_DEFAULT_LIMIT = 30
 _RECENT_COMMIT_MESSAGES_MAX_LIMIT = 50
+# GitHub's compare endpoint returns at most this many file entries.  It does
+# not provide a total-file count, so a response at this limit is ambiguous.
+_GITHUB_COMPARE_FILES_MAX = 300
 
 
 def _github_request(*args, **kwargs):
@@ -1027,12 +1030,34 @@ async def get_changed_files_with_patches_between_refs(
         )
         return None
     try:
-        files = response.json().get("files", [])
-        return [
+        payload = response.json()
+        files = payload["files"]
+        # GitHub caps the inline compare ``files`` collection.  Authorization
+        # callers must never mistake that prefix for the complete diff: a
+        # non-allowlisted path outside it could otherwise pass the hotfix gate.
+        # GitHub documents this collection as capped at 300 entries and does
+        # not return a total-file count.  A response at the cap could omit
+        # non-allowlisted files, so it is indeterminate for authorization.
+        parsed_files = [
             {"filename": f["filename"], "patch": f.get("patch")}
             for f in files
-            if "filename" in f
+            if isinstance(f, dict) and isinstance(f.get("filename"), str) and f["filename"]
         ]
+        if (
+            not isinstance(files, list)
+            or len(files) >= _GITHUB_COMPARE_FILES_MAX
+            or len(parsed_files) != len(files)
+        ):
+            logger.warning(
+                "[GITHUB] get_changed_files_with_patches_between_refs: incomplete "
+                "compare response for %s/%s (returned=%s) — "
+                "cannot authorize a partial diff",
+                owner,
+                repo,
+                len(parsed_files) if isinstance(files, list) else "non-list",
+            )
+            return None
+        return parsed_files
     except (ValueError, TypeError, KeyError) as exc:
         logger.warning(
             "[GITHUB] get_changed_files_with_patches_between_refs: unparseable "

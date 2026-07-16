@@ -1481,6 +1481,10 @@ async def test_post_feedback_acknowledgment(db_session):
     assert msg.context["event_type"] == "feedback_acknowledgment"
     assert msg.context["reply_to"] == str(original_msg_id)
     assert msg.context["resolution"] == "Fixed in latest PR"
+    assert msg.sequence == 1
+    assert msg.surface == "conversation"
+    assert msg.handling_state == "responded"
+    assert msg.reply_to_message_id == original_msg_id
     assert msg in db_session
 
 
@@ -1497,6 +1501,7 @@ async def test_post_feedback_acknowledgment_with_task_id(db_session):
         task_id=task_id,
     )
     assert msg.from_task_id == task_id
+    assert msg.handled_by_task_id == task_id
 
 
 # ---------------------------------------------------------------------------
@@ -2909,9 +2914,13 @@ class TestDeadLetterRouter:
         assert data["total"] == 2
         items = data["items"]
         assert len(items) == 2
-        # Newest first (evicted written second)
-        assert items[0]["reason"] == "evicted"
-        assert items[1]["reason"] == "exhausted"
+        # Newest first. Rows may receive the same database timestamp on
+        # platforms with coarse clock resolution, so tied rows have no defined
+        # insertion order.
+        assert [item["created_at"] for item in items] == sorted(
+            (item["created_at"] for item in items), reverse=True
+        )
+        assert {item["reason"] for item in items} == {"exhausted", "evicted"}
         # Admin user sees full webhook_url
         assert items[0]["webhook_url"] == "https://hooks.example.com/dl1"
 

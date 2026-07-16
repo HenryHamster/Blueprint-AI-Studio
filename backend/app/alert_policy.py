@@ -123,6 +123,15 @@ ALERT_EVENT_POLICIES: dict[str, AlertEventPolicy] = {
     # normally but fails every job it claims (connected but broken).
     "runner.deactivated": AlertEventPolicy("runner.deactivated"),
     "runner.degraded": AlertEventPolicy("runner.degraded"),
+    "runner.low_disk": AlertEventPolicy("runner.low_disk"),
+    "runner.low_memory": AlertEventPolicy("runner.low_memory"),
+    "runner.idle_gpu": AlertEventPolicy(
+        "runner.idle_gpu", action_required=False
+    ),
+    "runner.token_stale": AlertEventPolicy("runner.token_stale"),
+    "runner.fleet_no_healthy": AlertEventPolicy("runner.fleet_no_healthy"),
+    "runner.post_update_silent": AlertEventPolicy("runner.post_update_silent"),
+    "runner.cross_project_access": AlertEventPolicy("runner.cross_project_access"),
     "deployment.halted": AlertEventPolicy("deployment.halted"),
     "deployment.rollback_recommended": AlertEventPolicy(
         "deployment.rollback_recommended"
