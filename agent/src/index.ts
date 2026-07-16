@@ -3823,6 +3823,8 @@ interface WarmContinuationDeps {
   materializeClaimCredentialState: typeof materializeClaimCredentialState;
   performWarmRetarget: typeof performWarmRetarget;
   resolveVmInstanceId: (allowJwtFallback: boolean) => string | null;
+  /** Production-only pre-poll guard; injectable so unit tests need no disk. */
+  isWorkspaceValid?: () => boolean;
 }
 
 const warmContinuationDeps: WarmContinuationDeps = {
@@ -3836,6 +3838,7 @@ const warmContinuationDeps: WarmContinuationDeps = {
     if (vmInstanceId) return vmInstanceId;
     return allowJwtFallback ? decodeJwtVmInstanceId(AGENT_TOKEN) : null;
   },
+  isWorkspaceValid: () => fs.existsSync(path.join(WORKSPACE, '.git')),
 };
 
 function parkPollTimeoutMs(parkDirective: ParkDirective): number {
@@ -3852,6 +3855,13 @@ export async function continueWarmContinuation(
   },
   deps: WarmContinuationDeps = warmContinuationDeps,
 ): Promise<{ action: 'continue' | 'exit' }> {
+  // A failed clone removes WORKSPACE before its error is reported. Never let a
+  // later warm poll claim an unrelated task into that invalid handoff: it
+  // cannot survive resetForNextRole and should be cold-provisioned instead.
+  if (deps.isWorkspaceValid && !deps.isWorkspaceValid()) {
+    log(`Warm continuation declined: workspace is invalid (missing ${path.join(WORKSPACE, '.git')})`);
+    return { action: 'exit' };
+  }
   const vmInstanceId = deps.resolveVmInstanceId(!!opts.parkDirective);
   if (!vmInstanceId) {
     return { action: 'exit' };

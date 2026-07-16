@@ -3942,6 +3942,27 @@ describe('park directives and warm continuation', () => {
     expect(process.env.TASK_ID).toBe('');
   });
 
+  it('declines warm polling after a clone-failed role leaves no git workspace', async () => {
+    const pollForNextRole = vi.fn();
+
+    const result = await continueWarmContinuation({
+      priorTaskId: 'clone-failed-task',
+      priorPrNumber: null,
+      baseBranch: 'main',
+    }, {
+      pollForNextRole,
+      resetForNextRole: vi.fn(),
+      activateClaimedRole: vi.fn(),
+      materializeClaimCredentialState: vi.fn(),
+      performWarmRetarget: vi.fn(),
+      resolveVmInstanceId: () => 'vm-clone-failed',
+      isWorkspaceValid: () => false,
+    });
+
+    expect(result).toEqual({ action: 'exit' });
+    expect(pollForNextRole).not.toHaveBeenCalled();
+  });
+
   it('falls back to the task JWT vm id and re-targets after reclaim', async () => {
     process.env.TASK_ID = 'task-park';
     delete process.env.VM_INSTANCE_ID;
