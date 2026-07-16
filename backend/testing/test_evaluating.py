@@ -5031,6 +5031,116 @@ async def test_reaped_owner_markerless_merged_pr_fallback_reconciles(eval_db, mo
     )
 
 
+@pytest.mark.asyncio
+async def test_reaped_owner_markerless_open_pr_fallback_rearms_with_ancestor_children(
+    eval_db, mocker
+):
+    """Marker-less open owners recover even when review children live elsewhere."""
+    from app.models import Artifact, ArtifactType
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.services.broadcast_to_project", new_callable=AsyncMock, create=True
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "state": "open",
+                "merged": False,
+                "base": {"ref": "research/root"},
+            }
+        ),
+    )
+
+    project = Project(
+        name="Reaped Owner Markerless Open",
+        user_id="user-reaped-open-fallback",
+        integration_branch="automain",
+        promotion_target="main",
+    )
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    ancestor = Task(
+        project_id=project.id,
+        payloads=[{"type": "research"}],
+        status=TaskStatus.EVALUATING,
+        context={},
+    )
+    eval_db.add(ancestor)
+    await eval_db.commit()
+    await eval_db.refresh(ancestor)
+
+    owner = Task(
+        project_id=project.id,
+        parent_task_id=ancestor.id,
+        payloads=[{"type": "refactor", "prompt": "original work"}],
+        status=TaskStatus.EVALUATING,
+        context={"_lost_marker_checked_at": _naive_utc_ago(minutes=1).isoformat()},
+        vm_instance_id=None,
+        status_log=[
+            {
+                "t": _naive_utc_ago(hours=2).isoformat(),
+                "msg": "Status changed: IN_PROGRESS → TaskStatus.EVALUATING",
+            }
+        ],
+    )
+    eval_db.add(owner)
+    await eval_db.commit()
+    await eval_db.refresh(owner)
+    eval_db.add(
+        Artifact(
+            task_id=owner.id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/owner/repo/pull/15138",
+        )
+    )
+    # The review belongs to the ancestor, reproducing the live ownership shape.
+    eval_db.add(
+        Task(
+            project_id=project.id,
+            parent_task_id=ancestor.id,
+            payloads=[
+                {
+                    "type": "review",
+                    "pr_number": 15138,
+                    "original_task_id": str(owner.id),
+                }
+            ],
+            status=TaskStatus.COMPLETED,
+            context={"blueprint_review_verdict": "REQUEST_CHANGES"},
+        )
+    )
+    await eval_db.commit()
+
+    from app.recovery_evaluating_reaped_owner import (
+        _handle_reaped_owner_fallback,
+    )
+
+    handled = await _handle_reaped_owner_fallback(
+        owner,
+        dict(owner.context or {}),
+        eval_db,
+        _naive_utc_ago(),
+        7200,
+        AsyncMock(),
+        str(owner.id),
+        AsyncMock(),
+    )
+
+    await eval_db.refresh(owner)
+    assert handled is True
+    assert owner.status == TaskStatus.EVALUATING
+    assert (owner.context or {}).get("_pr_state_check_pending") is True
+    assert "re-armed" in (owner.latest_status_message or "")
+
+
 # ── Extracted approval-gate handler: direct dispositions + return contract ────
 
 
