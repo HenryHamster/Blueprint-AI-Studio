@@ -2393,6 +2393,10 @@ async def test_plan_subtask_with_cross_tree_prereq_inherits_base(
     )
     assert len(children) == 1
     child = children[0]
+    assert child.depends_on == [str(foundation.id)], (
+        "explicit cross-tree prerequisite must persist a dependency edge, not "
+        "only inherit the foundation base branch"
+    )
     assert (child.first_payload or {}).get("base_branch") == "main", (
         "plan subtask with cross-tree genuine code-dep prereq must inherit "
         "foundation base_branch 'main'"
@@ -2662,3 +2666,110 @@ async def test_fresh_plan_task_derives_branch_from_task_id(
         f"Fresh task must derive branch from task ID — expected '{expected_branch}', "
         f"got '{called_branch}'"
     )
+
+
+@pytest.mark.asyncio
+async def test_plan_subtask_unresolved_task_prerequisite_is_blocked(
+    db_session, mocker, _quiet_mocks
+):
+    """An absent external task foundation becomes a durable blocked need."""
+    missing_id = str(uuid.uuid4())
+    plan_logs = json.dumps(
+        {
+            "subtasks": [
+                {
+                    "title": "Dependent implementation",
+                    "prompt": "build on the external foundation",
+                    "prerequisite": {"kind": "task", "ref": missing_id},
+                }
+            ]
+        }
+    )
+    task = await _setup_plan_task(db_session, mocker, plan_logs)
+
+    await _handle_plan_completion(task, plan_logs, db_session)
+
+    child = (
+        await db_session.execute(select(Task).where(Task.parent_task_id == task.id))
+    ).scalars().one()
+    assert child.status == TaskStatus.BLOCKED
+    assert child.context["blocker"]["needs"] == [
+        {"kind": "task", "ref": missing_id}
+    ]
+    assert child.context["unresolved_prerequisite"] == [
+        {"kind": "task", "ref": missing_id}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_plan_capability_prerequisite_obeys_enforced_proof_gate(
+    db_session, mocker, _quiet_mocks
+):
+    """Only a ledger-backed proven working capability leaves a child queued."""
+    project = make_project(
+        name="PlanCapabilityProofGate",
+        problem_model={
+            "capabilities": [{"name": "repo-map", "status": "working"}]
+        },
+        capability_proof_records={},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    mocker.patch.dict(
+        "app.plan_completion._runtime_config",
+        {"capability_proof_gate_mode": "enforce"},
+    )
+
+    async def spawn_child(title):
+        plan_logs = json.dumps(
+            {
+                "subtasks": [
+                    {
+                        "title": title,
+                        "prompt": "use the repository map",
+                        "prerequisite": {"kind": "capability", "ref": "repo-map"},
+                    }
+                ]
+            }
+        )
+        plan = make_task(
+            project_id=project.id,
+            title=f"Plan: {title}",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "plan", "prompt": title, "base_branch": "main"}],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+        db_session.add(plan)
+        await db_session.commit()
+        await db_session.refresh(plan)
+        mocker.patch(
+            "app.task_completion._ensure_branch", new_callable=AsyncMock, return_value=plan
+        )
+        await _handle_plan_completion(plan, plan_logs, db_session)
+        return (
+            await db_session.execute(select(Task).where(Task.parent_task_id == plan.id))
+        ).scalars().one()
+
+    unproven = await spawn_child("Unproven capability consumer")
+    assert unproven.status == TaskStatus.BLOCKED
+    assert unproven.context["blocker"]["needs"] == [
+        {"kind": "capability", "ref": "repo-map"}
+    ]
+
+    project.capability_proof_records = {
+        "repo-map": [
+            {
+                "proven": True,
+                "satisfied": True,
+                "kind": "named_test",
+                "proof_ref": "testing/test_repo_map.py::test_map",
+            }
+        ]
+    }
+    db_session.add(project)
+    await db_session.commit()
+
+    proven = await spawn_child("Proven capability consumer")
+    assert proven.status == TaskStatus.QUEUED
+    assert "blocker" not in (proven.context or {})

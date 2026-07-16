@@ -26,7 +26,7 @@ from app.compute_experiment_contract import (
     resolve_compute_spend_approval,
 )
 from app.depends_on_provenance import remember_structural_depends_on
-from app.finding_deduplication import normalize_prerequisite
+from app.finding_deduplication import normalize_prerequisite, resolve_prerequisite_task
 from app.models import Project, Task, TaskHistory, TaskStatus
 from app.payload_schemas import (
     parse_acceptance_evidence,
@@ -1175,11 +1175,22 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     from sqlmodel import select as _select_tasks
     from sqlalchemy.orm.attributes import flag_modified as _flag_modified
 
+    # A prerequisite must never attach a newly spawned child to this plan (or an
+    # enclosing plan): those parents remain EVALUATING until their children
+    # finish, so such an edge would deadlock even though it is not a graph cycle.
+    _plan_ancestor_ids = {task.id}
+    _ancestor_id = task.parent_task_id
+    while _ancestor_id is not None and _ancestor_id not in _plan_ancestor_ids:
+        _plan_ancestor_ids.add(_ancestor_id)
+        _ancestor = await session.get(Task, _ancestor_id)
+        _ancestor_id = _ancestor.parent_task_id if _ancestor is not None else None
+
     _existing_prereq_candidates = list(
         (
             await session.execute(
                 _select_tasks(Task).where(
                     Task.project_id == task.project_id,
+                    Task.id.notin_(_plan_ancestor_ids),
                     Task.status.in_(
                         [
                             TaskStatus.QUEUED,
@@ -1269,23 +1280,165 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
                 _maybe_inherit_base(child_tasks[i], child_tasks[j])
         session.add(child_tasks[i])
 
-    # Explicit {kind: task} prerequisites on plan subtasks: inherit the
-    # foundation's base_branch when it is a genuine cross-tree code-dep
-    # (mirrors research_completion explicit-prereq path).
-    from app.finding_deduplication import resolve_prerequisite_task
+    # Explicit prerequisites are resolved before the atomic commit, matching the
+    # research finding lifecycle: active/sibling task foundations become durable
+    # dependency edges; working registry capabilities satisfy only when their
+    # proof status permits it; everything else is parked with a structured need
+    # for the normal blocked-need resolver to resume later.
+    from app.blocked_need_resolution import _would_create_cycle
+    from app.blocked_need_resolution import (
+        completed_foundation_for_need,
+        knowledge_substance_satisfies_need,
+    )
+    from app.capability_registry import (
+        capability_need_blocked_by_proof_gate,
+        capability_need_proof_status,
+        consumer_gate_proof_status,
+        registry_satisfies_capability_need,
+        working_capability_names,
+    )
+    from app.task_blocked import build_need, enter_blocked_state
+    from app.knowledge_query import fetch_knowledge_substance_index
 
     _all_prereq_candidates = _existing_prereq_candidates + [
         ct for ct in child_tasks if ct is not None
     ]
+    # The live candidate set above deliberately excludes terminal work, but a
+    # task prerequisite may already be fulfilled by shipped completed work or a
+    # durable knowledge document. Resolve those rungs now instead of needlessly
+    # parking a runnable child until the blocked-need sweep runs.
+    _completed_foundations = list(
+        (
+            await session.execute(
+                _select_tasks(Task).where(
+                    Task.project_id == task.project_id,
+                    Task.status == TaskStatus.COMPLETED,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    _potential_ghost_parent_ids = {
+        completed.parent_task_id
+        for completed in _completed_foundations
+        if completed.parent_task_id
+        and (completed.context or {}).get("pr_merged") is True
+    }
+    _failed_parent_ids = set()
+    if _potential_ghost_parent_ids:
+        _potential_ghost_parents = (
+            (
+                await session.execute(
+                    _select_tasks(Task).where(Task.id.in_(_potential_ghost_parent_ids))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        _failed_parent_ids = {
+            parent.id
+            for parent in _potential_ghost_parents
+            if parent.status in (TaskStatus.FAILED, TaskStatus.CANCELLED)
+            or (
+                parent.status == TaskStatus.COMPLETED
+                and not (parent.context or {}).get("pr_merged")
+            )
+        }
+    _knowledge_substance_index = await fetch_knowledge_substance_index(
+        session, task.project_id
+    )
+    _working_registry_caps = working_capability_names(
+        getattr(project, "problem_model", None)
+    )
+    _working_registry_proof = consumer_gate_proof_status(
+        getattr(project, "problem_model", None),
+        getattr(project, "capability_proof_records", None),
+    )
+    _proof_gate_mode = str(
+        _runtime_config.get("capability_proof_gate_mode", "off") or "off"
+    )
     for ct in child_tasks:
         if ct is None:
             continue
         _prereq = (ct.context or {}).get("prerequisite")
-        if not isinstance(_prereq, dict) or _prereq.get("kind") != "task":
+        if not isinstance(_prereq, dict):
             continue
         foundation = resolve_prerequisite_task(_prereq, _all_prereq_candidates)
         if foundation is not None and foundation.id != ct.id:
-            _maybe_inherit_base(ct, foundation)
+            if _would_create_cycle(ct, foundation, _all_prereq_candidates):
+                logger.warning(
+                    "[PLAN] Subtask '%s' prerequisite %s:%s would create a "
+                    "dependency cycle; leaving it unresolved",
+                    ct.title,
+                    _prereq.get("kind"),
+                    _prereq.get("ref"),
+                )
+            else:
+                foundation_id = str(foundation.id)
+                depends_on = list(ct.depends_on or [])
+                if foundation_id not in depends_on:
+                    depends_on.append(foundation_id)
+                    ct.depends_on = depends_on
+                    remember_structural_depends_on(ct, foundation_id)
+                _maybe_inherit_base(ct, foundation)
+                session.add(ct)
+                continue
+
+        need = build_need(
+            _prereq.get("kind"), _prereq.get("ref"), label=_prereq.get("label")
+        )
+        if need is None:
+            continue
+        if completed_foundation_for_need(
+            ct, need, _completed_foundations, _failed_parent_ids
+        ) is not None or knowledge_substance_satisfies_need(
+            need, _knowledge_substance_index
+        ):
+            context = dict(ct.context or {})
+            context["_spawn_prereq_resolved"] = [
+                *list(context.get("_spawn_prereq_resolved") or []),
+                {"kind": need["kind"], "ref": need["ref"]},
+            ]
+            ct.context = context
+            session.add(ct)
+            continue
+        if registry_satisfies_capability_need(need, _working_registry_caps):
+            proof_status = capability_need_proof_status(need, _working_registry_proof)
+            if not capability_need_blocked_by_proof_gate(
+                need, _working_registry_proof, mode=_proof_gate_mode
+            ):
+                if proof_status is not None and proof_status != "proven":
+                    context = dict(ct.context or {})
+                    context["unverified_capability_prerequisites"] = [
+                        *list(context.get("unverified_capability_prerequisites") or []),
+                        {
+                            "kind": need["kind"],
+                            "ref": need["ref"],
+                            "proof_status": proof_status,
+                        },
+                    ]
+                    ct.context = context
+                    session.add(ct)
+                continue
+
+        context = dict(ct.context or {})
+        context["unresolved_prerequisite"] = [
+            *list(context.get("unresolved_prerequisite") or []), _prereq
+        ]
+        ct.context = context
+        enter_blocked_state(
+            ct,
+            waiting_on=f"foundation {need['kind']}:{need['ref']}",
+            reason=(
+                f"Plan subtask '{ct.title}' declared prerequisite "
+                f"{need['kind']}:{need['ref']} not satisfied this cycle."
+            ),
+            source="plan_prerequisite",
+            blocker_kind="upstream_dependency",
+            needs=[need],
+        )
+        session.add(ct)
 
     _log_file_overlaps(subtasks, "PLAN")
 
@@ -1314,7 +1467,7 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
         await broadcast_to_project(
             str(task.project_id),
             "task_updated",
-            {"task_id": str(ct.id), "status": TaskStatus.QUEUED},
+            {"task_id": str(ct.id), "status": ct.status},
         )
 
     spawned_count = sum(1 for ct in child_tasks if ct is not None)
