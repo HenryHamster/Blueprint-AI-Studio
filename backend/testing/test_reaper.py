@@ -13658,6 +13658,47 @@ async def test_decay_stale_open_leaves_recent_and_live_types(reaper_db):
         assert m.status == "open"
 
 
+@pytest.mark.asyncio
+async def test_decay_stale_open_skips_operator_action_needed_note(reaper_db):
+    """An operator-action-needed NOTE older than 14 days survives the decay sweep."""
+    from app.message_audience import OPERATOR_ACTION_NEEDED
+
+    project = await _make_project(reaper_db)
+    old = _utcnow() - timedelta(days=STALE_OPEN_DECAY_DAYS + 1)
+    ctx = {"audience": OPERATOR_ACTION_NEEDED}
+    msg = await _make_conversational_message(
+        reaper_db, project, msg_type=MessageType.NOTE, created_at=old, context=ctx,
+    )
+
+    acted = await sweep_decay_stale_open_messages(reaper_db, _utcnow())
+
+    assert acted == 0
+    await reaper_db.refresh(msg)
+    assert msg.status == "open"
+    assert msg.resolution is None
+
+
+@pytest.mark.asyncio
+async def test_decay_stale_open_resolves_ordinary_note_with_operator_fyi(reaper_db):
+    """An ordinary NOTE with operator-fyi audience still decays — only
+    operator-action-needed blocks auto-resolution."""
+    from app.message_audience import OPERATOR_FYI
+
+    project = await _make_project(reaper_db)
+    old = _utcnow() - timedelta(days=STALE_OPEN_DECAY_DAYS + 1)
+    ctx = {"audience": OPERATOR_FYI}
+    msg = await _make_conversational_message(
+        reaper_db, project, msg_type=MessageType.NOTE, created_at=old, context=ctx,
+    )
+
+    acted = await sweep_decay_stale_open_messages(reaper_db, _utcnow())
+
+    assert acted == 1
+    await reaper_db.refresh(msg)
+    assert msg.status == "resolved"
+    assert msg.resolution == "auto-decayed (stale)"
+
+
 # ── Step 16: converge duplicate foundations ───────────────────────────────
 
 

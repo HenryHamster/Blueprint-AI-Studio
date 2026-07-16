@@ -1932,6 +1932,7 @@ async def sweep_decay_stale_open_messages(
     Returns the number of messages auto-decayed.
     """
     from app.broadcast import broadcast_to_project as _bcast
+    from app.message_audience import OPERATOR_ACTION_NEEDED
     from app.models import ProjectMessage
     from app.message_convergence import (
         CONVERSATIONAL_DECAY_MESSAGE_TYPES,
@@ -1981,6 +1982,11 @@ async def sweep_decay_stale_open_messages(
         # (defensive — open items are normally unlinked, but a resurfaced link
         # can leave the stale forward pointer behind).
         if get_message_link(msg) is not None:
+            continue
+        # Never decay operator-action-needed NOTEs — they must survive until
+        # acted on (e.g. capability_proof_gate_graduated_enforce events).
+        ctx = msg.context or {}
+        if ctx.get("audience") == OPERATOR_ACTION_NEEDED:
             continue
         mark_message_resolved(msg, now, "auto-decayed (stale)")
         session.add(msg)
