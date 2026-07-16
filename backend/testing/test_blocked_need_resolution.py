@@ -499,7 +499,9 @@ def test_proof_aware_resolver_no_match_cases_return_none():
 
 
 def test_proof_aware_resolver_alias_absorbs_returns_survivor_status():
-    """An absorbed old capability name resolves to the surviving cap's proof status."""
+    """A GENUINELY-absorbed old capability name resolves to the surviving cap's proof
+    status — via the platform-recorded consolidation forwarding marker, NOT the
+    agent-writable ``absorbs`` field."""
     from app.capability_registry import (
         capability_need_proof_status,
         working_capability_proof_status,
@@ -515,7 +517,19 @@ def test_proof_aware_resolver_alias_absorbs_returns_survivor_status():
             )
         ]
     )
-    proof = working_capability_proof_status(model)
+    # The platform ledger records the genuine consolidation of the old name with a
+    # forwarding marker; only this (never raw ``absorbs``) folds the old name in.
+    proof_records = {
+        "old-harness-name": [
+            {
+                "task_id": "absorbed_into:old-harness-name",
+                "proof_kind": "absorbed_into",
+                "survivor": "unified-harness",
+                "absorbed": "old-harness-name",
+            }
+        ]
+    }
+    proof = working_capability_proof_status(model, proof_records=proof_records)
 
     # Both the survivor name and the absorbed alias carry the survivor's status.
     assert (
@@ -530,6 +544,34 @@ def test_proof_aware_resolver_alias_absorbs_returns_survivor_status():
         )
         == "proven"
     )
+
+
+def test_proof_aware_resolver_declared_absorbs_without_marker_is_not_folded():
+    """SECURITY: an agent-declared ``absorbs`` with NO platform forwarding marker
+    does NOT fold the old name into the survivor's proof map — the old name is
+    simply absent (no-match), so it cannot inherit the survivor's status."""
+    from app.capability_registry import (
+        capability_need_proof_status,
+        working_capability_proof_status,
+    )
+
+    model = ProblemModel(
+        capabilities=[
+            Capability(
+                name="Unified harness",
+                status="working",
+                absorbs=["Old harness name"],
+                evidence_refs=[_proven_ref()],
+            )
+        ]
+    )
+    proof = working_capability_proof_status(model)  # no ledger, no marker
+    assert (
+        capability_need_proof_status(
+            {"kind": "capability", "ref": "old-harness-name"}, proof
+        )
+        is None
+    ), "a declared-only absorb must not fold the old name into the survivor's proof map"
 
 
 def test_working_capability_proof_status_accepts_dict_form_problem_model():

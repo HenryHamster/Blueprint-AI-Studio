@@ -1295,6 +1295,35 @@ def record_gap_evidence(task: Any, project: Any) -> None:
         )
 
 
+def _absorption_forward_marker(
+    survivor_norm: str, abs_norm: str, proved_at: str
+) -> dict[str, Any]:
+    """Build the durable, PLATFORM-authored forwarding marker left under an absorbed
+    capability's ledger key after its real proof/exemption entries are moved onto
+    the survivor's key by :func:`carry_proof_records_for_consolidation`.
+
+    This marker is the trustworthy record of a GENUINE rename: it is written only
+    from the model-write consolidation path (which required the absorbed capability
+    to actually be deleted), never by an agent editing ``problem_model``. It carries
+    :data:`~app.capability_registry.CAPABILITY_ABSORPTION_FORWARD_PROOF_KIND`, so every
+    machine-proof and exemption pass filters it out — it never itself becomes proof or
+    an exemption — and :func:`~app.capability_registry.platform_recorded_alias_map`
+    reads it to reconstruct the absorbed→survivor relationship the authority seams use
+    in place of the agent-writable ``absorbs`` field.
+    """
+    from app.capability_registry import CAPABILITY_ABSORPTION_FORWARD_PROOF_KIND
+
+    return {
+        "task_id": f"absorbed_into:{abs_norm}",
+        "proof_kind": CAPABILITY_ABSORPTION_FORWARD_PROOF_KIND,
+        "survivor": survivor_norm,
+        "absorbed": abs_norm,
+        "proof_ref": survivor_norm,
+        "proved_at": proved_at,
+        "commit_sha": "",
+    }
+
+
 def carry_proof_records_for_consolidation(
     capabilities_consolidated: list[dict[str, Any]],
     proof_records: dict[str, Any],
@@ -1303,14 +1332,30 @@ def carry_proof_records_for_consolidation(
 
     For each {survivor, absorbed[...]} consolidation event, all proof entries
     keyed under absorbed names are merged into the survivor's list, deduped by
-    task_id, capped at _MAX_PROOF_ENTRIES_PER_CAPABILITY (oldest evicted), and
-    the absorbed keys are removed.
+    task_id, capped at _MAX_PROOF_ENTRIES_PER_CAPABILITY (oldest evicted). Each
+    absorbed key is then REPLACED with a single platform-authored FORWARDING marker
+    (:func:`_absorption_forward_marker`) recording the survivor it merged into —
+    rather than being popped empty. Because this carry runs ONLY from the genuine,
+    destructive model-write consolidation path (the ``capabilities_consolidated``
+    diff, emitted only when a survivor's ``absorbs`` names a JUST-DELETED
+    capability), the marker is a trustworthy record of a real rename. The authority
+    seams read it via :func:`~app.capability_registry.platform_recorded_alias_map`
+    instead of the agent-writable ``problem_model.absorbs`` list, so a survivor's
+    proof/exemption forwards to the old name only after a genuine consolidation —
+    never because an agent merely declares ``absorbs: [proven-or-exempt-name]``.
+
+    A pre-existing forwarding marker under an absorbed key is NOT carried onto the
+    survivor as proof (it is not evidence of anything); only real proof/exemption
+    entries move.
 
     Returns a NEW dict — does not mutate the input.  Callers are responsible for
     flag_modified on the JSONB column after assigning the result.
     """
     if not capabilities_consolidated or not isinstance(proof_records, dict):
         return proof_records
+
+    from app.capability_registry import _entry_is_absorption_forward
+    from app.time_utils import _utcnow
 
     result = dict(proof_records)
     for event in capabilities_consolidated:
@@ -1326,19 +1371,32 @@ def carry_proof_records_for_consolidation(
 
         merged: list[dict[str, Any]] = list(result.get(survivor_norm) or [])
         seen_task_ids: set[str] = {e.get("task_id", "") for e in merged}
+        proved_at = _utcnow().isoformat()
 
         for abs_name in absorbed_names:
             abs_norm = normalize_capability_name(abs_name)
-            if not abs_norm:
+            # A self-referential absorb (survivor absorbs its own name) would corrupt
+            # the survivor's own ledger — skip it and never mark the survivor as
+            # forwarding to itself.
+            if not abs_norm or abs_norm == survivor_norm:
                 continue
             for entry in result.get(abs_norm) or []:
                 if not isinstance(entry, dict):
+                    continue
+                # A prior consolidation's forwarding marker is a pointer, not proof;
+                # do not launder it onto the survivor as an evidence entry.
+                if _entry_is_absorption_forward(entry):
                     continue
                 tid = entry.get("task_id", "")
                 if tid not in seen_task_ids:
                     merged.append(entry)
                     seen_task_ids.add(tid)
-            result.pop(abs_norm, None)
+            # Leave a durable forwarding marker under the absorbed key instead of
+            # popping it, so the platform-recorded alias map can resolve a dependent
+            # naming the old absorbed capability to the survivor's moved proof.
+            result[abs_norm] = [
+                _absorption_forward_marker(survivor_norm, abs_norm, proved_at)
+            ]
 
         if len(merged) > _MAX_PROOF_ENTRIES_PER_CAPABILITY:
             merged = merged[-_MAX_PROOF_ENTRIES_PER_CAPABILITY:]
