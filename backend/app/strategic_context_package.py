@@ -1561,6 +1561,39 @@ def _artifact_descriptor(artifact: Dict[str, Any]) -> Dict[str, Any] | None:
     viewable_files_dropped = artifact.get("viewable_files_dropped")
     if isinstance(viewable_files_dropped, int) and viewable_files_dropped > 0:
         descriptor["viewable_files_dropped"] = viewable_files_dropped
+    image_previews = [p for p in previews if p.get("kind") == "image"]
+    video_previews = [p for p in previews if p.get("kind") == "video"]
+    pdf_previews = [p for p in previews if p.get("kind") == "pdf"]
+
+    def add_preview_group(
+        field: str, grouped_previews: list[Dict[str, Any]]
+    ) -> bool:
+        if not grouped_previews:
+            return False
+        primary = grouped_previews[0]
+        descriptor[field] = {
+            "url": primary.get("url"),
+            "alt": title,
+            "storage_uri": primary.get("storage_uri"),
+        }
+        descriptor[f"{field}s"] = [
+            {
+                "url": preview.get("url"),
+                "alt": preview.get("filename") or title,
+                "filename": preview.get("filename"),
+                "storage_uri": preview.get("storage_uri"),
+            }
+            for preview in grouped_previews
+        ]
+        return True
+
+    # Retain every preview type on a mixed-media artifact. ``kind`` remains a
+    # primary tile classification for older consumers, but must not discard a
+    # rollout video or PDF merely because an image has precedence.
+    has_images = add_preview_group("image", image_previews)
+    has_videos = add_preview_group("video", video_previews)
+    has_pdfs = add_preview_group("pdf", pdf_previews)
+
     if kind == "markdown":
         descriptor["body"] = (
             descriptor["summary"] or "Read-only artifact metadata is available."
@@ -1571,69 +1604,36 @@ def _artifact_descriptor(artifact: Dict[str, Any]) -> Dict[str, Any] | None:
             descriptor["summary"] or "Read-only log metadata is available."
         )
         descriptor["language"] = "text"
-    elif kind == "image":
+    elif kind == "image" and not has_images:
         # OUR filter wins: ``previews`` (top of function) is already restricted
         # to signed-URL previews (svg/kind-mismatch dropped by
         # _resolve_viewable_previews). Adopt engine's multi-image gallery list,
         # built from that filtered set — emits url/alt/filename only, never a
         # raw storage_uri.
-        image_previews = [p for p in previews if p.get("kind") == "image"] or previews
-        url = image_url or (image_previews[0].get("url") if image_previews else None)
-        primary_storage_uri = image_previews[0].get("storage_uri") if image_previews else None
-        descriptor["image"] = {"url": url, "alt": title, "storage_uri": primary_storage_uri}
-        descriptor["images"] = [
-            {
-                "url": p.get("url"),
-                "alt": p.get("filename") or title,
-                "filename": p.get("filename"),
-                "storage_uri": p.get("storage_uri"),
-            }
-            for p in image_previews
-        ]
-        if not url and not primary_storage_uri:
+        if not add_preview_group("image", previews):
+            descriptor["image"] = {"url": None, "alt": title, "storage_uri": None}
+            descriptor["images"] = []
             descriptor[
                 "unsupported_reason"
             ] = "Image artifact previews require a signed preview URL."
-    elif kind == "video":
+    elif kind == "video" and not has_videos:
         # OUR filtered ``previews`` (signed-URL-only) + engine's multi-video
         # gallery list; url/alt/filename only, never a raw storage_uri.
-        video_previews = [p for p in previews if p.get("kind") == "video"] or previews
-        url = video_url or (video_previews[0].get("url") if video_previews else None)
-        primary_storage_uri = video_previews[0].get("storage_uri") if video_previews else None
-        descriptor["video"] = {"url": url, "alt": title, "storage_uri": primary_storage_uri}
-        descriptor["videos"] = [
-            {
-                "url": p.get("url"),
-                "alt": p.get("filename") or title,
-                "filename": p.get("filename"),
-                "storage_uri": p.get("storage_uri"),
-            }
-            for p in video_previews
-        ]
-        if not url and not primary_storage_uri:
+        if not add_preview_group("video", previews):
+            descriptor["video"] = {"url": None, "alt": title, "storage_uri": None}
+            descriptor["videos"] = []
             descriptor[
                 "unsupported_reason"
             ] = "Video artifact previews require a signed preview URL."
-    elif kind == "pdf":
+    elif kind == "pdf" and not has_pdfs:
         # OUR filtered ``previews`` (signed-URL-only) + a parallel gallery list
         # for multiple pdfs. A PDF is opened as a top-level new-tab navigation
         # (never an inline app-origin iframe), so it renders in the browser's
         # sandboxed PDF viewer on the storage origin. url/alt/filename only,
         # never a raw storage_uri in the gallery entries.
-        pdf_previews = [p for p in previews if p.get("kind") == "pdf"] or previews
-        url = pdf_url or (pdf_previews[0].get("url") if pdf_previews else None)
-        primary_storage_uri = pdf_previews[0].get("storage_uri") if pdf_previews else None
-        descriptor["pdf"] = {"url": url, "alt": title, "storage_uri": primary_storage_uri}
-        descriptor["pdfs"] = [
-            {
-                "url": p.get("url"),
-                "alt": p.get("filename") or title,
-                "filename": p.get("filename"),
-                "storage_uri": p.get("storage_uri"),
-            }
-            for p in pdf_previews
-        ]
-        if not url and not primary_storage_uri:
+        if not add_preview_group("pdf", previews):
+            descriptor["pdf"] = {"url": None, "alt": title, "storage_uri": None}
+            descriptor["pdfs"] = []
             descriptor[
                 "unsupported_reason"
             ] = "PDF artifact previews require a signed preview URL."

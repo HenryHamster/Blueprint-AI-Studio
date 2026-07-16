@@ -312,6 +312,28 @@ describe('StrategicContextArtifactSlot — lazy signed-URL resolution', () => {
     expect(host!.querySelectorAll('img').length).toBe(2);
   });
 
+  test('renders every mixed-media group when image remains the primary descriptor kind', async () => {
+    const pkg = makePackage({
+      descriptors: [
+        imageDescriptor({
+          videos: [
+            { url: null, alt: 'rollout.mp4', filename: 'rollout.mp4', storage_uri: 'gs://bucket/proj/rollout.mp4' },
+          ],
+          pdfs: [
+            { url: null, alt: 'report.pdf', filename: 'report.pdf', storage_uri: 'gs://bucket/proj/report.pdf' },
+          ],
+        }),
+      ],
+    });
+    await render(pkg, 'proj-1');
+
+    expect(host!.querySelector('[data-testid="strategic-artifact-image"]')).not.toBeNull();
+    expect(host!.querySelector('[data-testid="strategic-artifact-video"]')).not.toBeNull();
+    const pdfButton = host!.querySelector('[data-testid="strategic-context-pdf-open"]');
+    expect(pdfButton).not.toBeNull();
+    expect(pdfButton!.textContent).toContain('report.pdf');
+  });
+
   test('renders an image that has only a storage_uri (expired/absent baked URL)', async () => {
     const pkg = makePackage({
       descriptors: [

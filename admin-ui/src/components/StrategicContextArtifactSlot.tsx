@@ -453,7 +453,7 @@ function ImageDescriptorBlock({
         : [];
 
   return (
-    <div className="mt-2 overflow-hidden rounded border border-neutral-800 bg-neutral-950/45">
+    <div className="mt-2 overflow-hidden rounded border border-neutral-800 bg-neutral-950/45" data-testid="strategic-context-image-block">
       {items.length > 1 ? (
         <div className="flex gap-1 overflow-x-auto p-1 custom-scrollbar">
           {items.map((img, i) => (
@@ -504,7 +504,7 @@ function VideoDescriptorBlock({
         : [];
 
   return (
-    <div className="mt-2 overflow-hidden rounded border border-neutral-800 bg-neutral-950/45">
+    <div className="mt-2 overflow-hidden rounded border border-neutral-800 bg-neutral-950/45" data-testid="strategic-context-video-block">
       {items.length > 1 ? (
         <div className="flex gap-1 overflow-x-auto p-1 custom-scrollbar">
           {items.map((v, i) => (
@@ -687,11 +687,15 @@ function DescriptorCard({
         )
       )}
 
-      {descriptor.kind === 'image' && <ImageDescriptorBlock descriptor={descriptor} projectId={projectId} />}
+      {(descriptor.kind === 'image' || descriptor.image || (descriptor.images?.length ?? 0) > 0) && (
+        <ImageDescriptorBlock descriptor={descriptor} projectId={projectId} />
+      )}
 
-      {descriptor.kind === 'video' && <VideoDescriptorBlock descriptor={descriptor} projectId={projectId} />}
+      {(descriptor.kind === 'video' || descriptor.video || (descriptor.videos?.length ?? 0) > 0) && (
+        <VideoDescriptorBlock descriptor={descriptor} projectId={projectId} />
+      )}
 
-      {descriptor.kind === 'pdf' && (() => {
+      {(descriptor.kind === 'pdf' || descriptor.pdf || (descriptor.pdfs?.length ?? 0) > 0) && (() => {
         // A pdf tile is renderable from EITHER a baked url or a re-resolvable
         // storage_uri — never filter on url alone, or an expired baked url would
         // drop a still-resolvable document.
@@ -704,7 +708,7 @@ function DescriptorCard({
               ? [{ url: fallback.url, alt: fallback.alt, filename: null, storage_uri: fallback.storage_uri }]
               : [];
         return (
-          <div className="mt-2 rounded border border-neutral-800 bg-neutral-950/45 p-1">
+          <div className="mt-2 rounded border border-neutral-800 bg-neutral-950/45 p-1" data-testid="strategic-context-pdf-block">
             {items.length > 0 ? (
               <div className="flex flex-col gap-1">
                 {items.map((doc, i) => (
@@ -730,7 +734,7 @@ function DescriptorCard({
       {/* Omitted-files warning for compute-artifact media previews — mirrors
           ComputeJobsPanel's wording and amber styling. Visible when any files
           were dropped from the preview set (capped at 25 / 8 MiB each). */}
-      {(descriptor.kind === 'image' || descriptor.kind === 'video' || descriptor.kind === 'pdf') && descriptor.viewable_files_dropped != null && descriptor.viewable_files_dropped > 0 && (
+      {(descriptor.kind === 'image' || descriptor.kind === 'video' || descriptor.kind === 'pdf' || descriptor.image || descriptor.video || descriptor.pdf || (descriptor.images?.length ?? 0) > 0 || (descriptor.videos?.length ?? 0) > 0 || (descriptor.pdfs?.length ?? 0) > 0) && descriptor.viewable_files_dropped != null && descriptor.viewable_files_dropped > 0 && (
         <div
           className="mt-2 text-ui-xs text-amber-400/90 font-mono"
           data-testid="strategic-artifact-omitted-note"

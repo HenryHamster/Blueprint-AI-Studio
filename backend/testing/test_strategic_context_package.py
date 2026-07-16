@@ -1,7 +1,7 @@
 """Tests for strategic_context_package.py read-model functions."""
 
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import pytest
@@ -192,7 +192,7 @@ async def test_load_strategic_context_evidence_staleness_reflects_oldest_pending
     await db_session.commit()
     await db_session.refresh(task)
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     # Create a doc from 72 hours ago — should be the oldest.
     old_doc = KnowledgeDocument(
         project_id=project.id,
@@ -913,6 +913,29 @@ def test_artifact_descriptor_multi_video_populates_videos_list():
     assert desc["videos"][0]["url"] == "https://signed.example.com/clip0.mp4?sig=v1"
     assert desc["videos"][1]["url"] == "https://signed.example.com/clip1.mp4?sig=v2"
     assert desc["videos"][0]["filename"] == "clip0.mp4"
+
+
+def test_artifact_descriptor_preserves_all_mixed_media_preview_groups():
+    """Image precedence identifies the tile without dropping video or PDF evidence."""
+    item = {
+        "id": "art-mixed-media",
+        "artifact_type": "COMPUTE_RESULT",
+        "logical_key": "results/",
+        "label": "Training results",
+        "viewable_previews": [
+            {"url": "https://signed.example.com/reward.png", "kind": "image", "filename": "reward.png"},
+            {"url": "https://signed.example.com/rollout.mp4", "kind": "video", "filename": "rollout.mp4"},
+            {"url": "https://signed.example.com/report.pdf", "kind": "pdf", "filename": "report.pdf"},
+        ],
+    }
+
+    desc = _artifact_descriptor(item)
+
+    assert desc is not None
+    assert desc["kind"] == "image"
+    assert desc["images"][0]["filename"] == "reward.png"
+    assert desc["videos"][0]["filename"] == "rollout.mp4"
+    assert desc["pdfs"][0]["filename"] == "report.pdf"
 
 
 def test_artifact_descriptor_image_carries_storage_uri_for_lazy_resolution():
