@@ -574,17 +574,18 @@ function normalizeClaudeConfigContent(
 ): string {
   if (path.basename(filePath) !== '.claude.json') return content;
   try {
-    const parsed = JSON.parse(content || '{}') as Record<string, unknown>;
+    const parsed: unknown = JSON.parse(content || '{}');
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
       return content;
     }
-    parsed.hasCompletedOnboarding = true;
-    const projects = parsed.projects;
+    const normalizedConfig = parsed as Record<string, unknown>;
+    normalizedConfig.hasCompletedOnboarding = true;
+    const projects = normalizedConfig.projects;
     const normalizedProjects =
       projects && typeof projects === 'object' && !Array.isArray(projects)
         ? projects as Record<string, unknown>
         : {};
-    parsed.projects = normalizedProjects;
+    normalizedConfig.projects = normalizedProjects;
     const workspaceConfig = normalizedProjects[workspace];
     const normalizedWorkspace =
       workspaceConfig &&
@@ -594,7 +595,18 @@ function normalizeClaudeConfigContent(
         : {};
     normalizedProjects[workspace] = normalizedWorkspace;
     normalizedWorkspace.hasTrustDialogAccepted = true;
-    return JSON.stringify(parsed);
+    // Claude Code 2.1.197 iterates projectSettings.allowedTools without
+    // guarding the legacy/missing shape. Account exports created before that
+    // field existed (or our trust bootstrap's newly-created workspace entry)
+    // otherwise crash before the first model call with:
+    //   TypeError: B.allowedTools is not iterable
+    // Preserve a real list, but replace every absent or malformed value with
+    // the least-privilege empty list. Runtime task permissions still arrive
+    // through --disallowedTools / --dangerously-skip-permissions.
+    if (!Array.isArray(normalizedWorkspace.allowedTools)) {
+      normalizedWorkspace.allowedTools = [];
+    }
+    return JSON.stringify(normalizedConfig);
   } catch {
     return content;
   }
