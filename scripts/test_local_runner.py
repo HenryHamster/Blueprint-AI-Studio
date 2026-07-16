@@ -1274,7 +1274,9 @@ class TestLiveRunnerConfig(unittest.TestCase):
             "config_generation": "gen-B",
         })
         self.assertFalse(applied)
-        self.assertEqual(holder.max_concurrent(), 7)  # known field still applied
+        # Atomic reject: the whole block is refused, so the known field is NOT
+        # mutated either — the runner's live state is still generation gen-A.
+        self.assertEqual(holder.max_concurrent(), 4)  # unchanged from gen-A
         self.assertEqual(holder.report()["applied_config_generation"], "gen-A")  # not advanced
 
     def test_malformed_block_is_noop(self):
@@ -1305,6 +1307,8 @@ class TestLiveRunnerConfig(unittest.TestCase):
             "config_generation": "gen-B",
         })
         self.assertFalse(applied)
+        # Atomic reject: the co-delivered known field must NOT have been applied.
+        self.assertEqual(holder.max_concurrent(), 2)  # prior default, untouched
         report = holder.report()
         self.assertEqual(report["config_apply_status"], "rejected")
         self.assertEqual(report["config_rejected_fields"], ["retries"])
@@ -1365,7 +1369,8 @@ class TestLiveRunnerConfig(unittest.TestCase):
             "config_generation": "g1",
         })
         self.assertFalse(applied)
-        self.assertEqual(holder.max_concurrent(), 6)  # known field still clamped/applied
+        # Atomic reject: the known field is NOT applied — live state stays at g0.
+        self.assertEqual(holder.max_concurrent(), 3)  # unchanged from g0
         rep = holder.report()
         self.assertEqual(rep["config_apply_status"], "rejected")
         # Reason names the specific unrecognized field(s), sorted for determinism.
@@ -1384,6 +1389,144 @@ class TestLiveRunnerConfig(unittest.TestCase):
         self.assertIsNone(rep["config_apply_reason"])
         self.assertIsNone(rep["config_rejected_generation"])
         self.assertEqual(rep["applied_config_generation"], "g2")
+
+    def test_rejected_generation_mutates_no_recognized_field(self):
+        # A rejected block (mix of known + unrecognized fields) must leave EVERY
+        # recognized field at its prior value — max_concurrent, task_types, and
+        # both GPU-scheduling settings — so the 'rejected' verdict is honest.
+        holder, gpu_state = self._holder(gpu_indices=(0, 1, 2, 3))
+        # Establish a known-good baseline generation first.
+        self.assertTrue(holder.apply({
+            "max_concurrent": 5,
+            "task_types": ["fix"],
+            "gpu_indices_allowed": [0, 1],
+            "gpus_per_job": 2,
+            "config_generation": "base",
+        }))
+        self.assertEqual(holder.max_concurrent(), 5)
+        self.assertEqual(gpu_state["allowed"], [0, 1])
+        self.assertEqual(gpu_state["per_job"], 2)
+        # A later block flips every recognized field BUT carries an unrecognized
+        # one, so it must be rejected atomically — none of the flips take effect.
+        self.assertFalse(holder.apply({
+            "max_concurrent": 9,
+            "task_types": ["create"],
+            "gpu_indices_allowed": [2, 3],
+            "gpus_per_job": 4,
+            "surprise_field": True,
+            "config_generation": "reject",
+        }))
+        self.assertEqual(holder.max_concurrent(), 5)
+        self.assertEqual(holder.report()["applied_task_types"], ["fix"])
+        self.assertEqual(gpu_state["allowed"], [0, 1])
+        self.assertEqual(gpu_state["per_job"], 2)
+        self.assertEqual(holder.report()["applied_config_generation"], "base")
+
+    def test_malformed_max_concurrent_rejects_generation(self):
+        # A recognized field with an unparseable value used to be silently
+        # clamped to the MIN default while the generation was called applied.
+        # It must now reject the generation and leave the value untouched.
+        holder, _ = self._holder()
+        self.assertTrue(holder.apply({"max_concurrent": 6, "config_generation": "ok"}))
+        self.assertFalse(
+            holder.apply({"max_concurrent": "abc", "config_generation": "bad"})
+        )
+        report = holder.report()
+        self.assertEqual(report["config_apply_status"], "rejected")
+        self.assertIn("max_concurrent", report["config_rejected_fields"])
+        self.assertEqual(report["config_rejected_generation"], "bad")
+        # Value untouched (NOT silently clamped to MIN_CONCURRENT).
+        self.assertEqual(holder.max_concurrent(), 6)
+        self.assertEqual(report["applied_config_generation"], "ok")
+
+    def test_malformed_task_types_rejects_generation(self):
+        # A non-list, non-"all" task_types was silently ignored while the
+        # generation advanced; it must now reject.
+        holder, _ = self._holder()
+        self.assertTrue(
+            holder.apply({"task_types": ["fix"], "config_generation": "ok"})
+        )
+        self.assertFalse(
+            holder.apply({"task_types": 42, "config_generation": "bad"})
+        )
+        report = holder.report()
+        self.assertEqual(report["config_apply_status"], "rejected")
+        self.assertIn("task_types", report["config_rejected_fields"])
+        # Prior value untouched.
+        self.assertEqual(report["applied_task_types"], ["fix"])
+        self.assertEqual(report["applied_config_generation"], "ok")
+
+    def test_malformed_gpu_indices_rejects_generation(self):
+        # gpu_indices_allowed must be "all" or a list; a bare int was silently
+        # ignored. It must now reject the generation.
+        holder, gpu_state = self._holder(gpu_indices=(0, 1, 2, 3))
+        self.assertFalse(
+            holder.apply({"gpu_indices_allowed": 7, "config_generation": "bad"})
+        )
+        report = holder.report()
+        self.assertEqual(report["config_apply_status"], "rejected")
+        self.assertIn("gpu_indices_allowed", report["config_rejected_fields"])
+        # Scheduling set untouched (starts as every detected index).
+        self.assertEqual(sorted(gpu_state["allowed"]), [0, 1, 2, 3])
+
+    def test_malformed_gpus_per_job_rejects_generation(self):
+        # gpus_per_job with an unparseable value was silently ignored; reject.
+        holder, gpu_state = self._holder(gpu_indices=(0, 1, 2, 3))
+        self.assertTrue(holder.apply({"gpus_per_job": 3, "config_generation": "ok"}))
+        self.assertEqual(gpu_state["per_job"], 3)
+        self.assertFalse(
+            holder.apply({"gpus_per_job": "x", "config_generation": "bad"})
+        )
+        report = holder.report()
+        self.assertEqual(report["config_apply_status"], "rejected")
+        self.assertIn("gpus_per_job", report["config_rejected_fields"])
+        # Value untouched (NOT silently ignored-while-applied).
+        self.assertEqual(gpu_state["per_job"], 3)
+        self.assertEqual(report["applied_config_generation"], "ok")
+
+    def test_malformed_field_reason_names_field(self):
+        # The human reason string names the malformed field(s), distinct from
+        # the unrecognized-field wording, so the operator can tell them apart.
+        holder, _ = self._holder()
+        self.assertFalse(
+            holder.apply({"max_concurrent": [1, 2], "config_generation": "bad"})
+        )
+        reason = holder.report()["config_apply_reason"]
+        self.assertIn("malformed config field(s): max_concurrent", reason)
+
+    def test_out_of_range_int_still_applies_not_malformed(self):
+        # A well-typed but out-of-range clamp field is a VALID value the daemon
+        # clamps — it must still apply fully (regression guard for the malformed
+        # classification not over-reaching into the clamp contract).
+        holder, _ = self._holder()
+        self.assertTrue(
+            holder.apply({"max_concurrent": 999, "config_generation": "big"})
+        )
+        report = holder.report()
+        self.assertEqual(report["config_apply_status"], "applied")
+        self.assertEqual(
+            holder.max_concurrent(), local_runner._LiveRunnerConfig.MAX_CONCURRENT
+        )
+        self.assertEqual(report["applied_config_generation"], "big")
+
+    def test_mixed_unrecognized_and_malformed_reason_lists_both(self):
+        # When a block carries BOTH an unrecognized field and a malformed
+        # recognized field, the reason names both categories and the field list
+        # is the sorted union.
+        holder, _ = self._holder()
+        self.assertFalse(holder.apply({
+            "max_concurrent": "nope",
+            "mystery": 1,
+            "config_generation": "bad",
+        }))
+        report = holder.report()
+        self.assertEqual(
+            report["config_rejected_fields"], ["max_concurrent", "mystery"]
+        )
+        self.assertIn("unrecognized config field(s): mystery", report["config_apply_reason"])
+        self.assertIn(
+            "malformed config field(s): max_concurrent", report["config_apply_reason"]
+        )
 
 
 class TestComputePollLoopLiveConfig(unittest.TestCase):
