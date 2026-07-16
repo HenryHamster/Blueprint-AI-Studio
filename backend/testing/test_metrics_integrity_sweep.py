@@ -4158,7 +4158,9 @@ async def test_capability_proof_gate_gap_triggers_self_heal(db):
     ok = [r for r in results if r.subject == pid and r.status == CheckStatus.OK]
     assert len(ok) == 1, f"expected 1 OK result, got {results}"
     assert ok[0].delta == 0
-    assert ok[0].ground_truth == 1  # auto-resolved from 0 proven to 1
+    # path_proven self-heals do NOT count as machine-verified proof — ground_truth
+    # reflects only true 'proven' caps, so it remains 0 here.
+    assert ok[0].ground_truth == 0
     assert "auto-resolved" in ok[0].detail
     # Self-heal throughput is surfaced structured (not just in the detail prose)
     # so the observability snapshot / dashboards can report it machine-readably.
@@ -4913,6 +4915,90 @@ async def test_capability_proof_gate_gap_observe_does_not_enroll(db):
     # repo-map remains an unresolved gap (needs_backing_paths), so still flagged.
     assert len(flagged) == 1
     assert "repo-map" in flagged[0].detail
+
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_gate_gap_path_proven_not_counted_as_proven(db):
+    """A working capability auto-resolved to the ``path_proven`` tier (via
+    backing_path or static named_test_present self-heal) must NOT appear in
+    ``ground_truth`` — that counter is reserved for true machine-verified
+    ``proven`` status earned by a real green merge-test verdict.
+
+    Scenario: one working cap with a present backing_path is self-healed to
+    ``path_proven``.  A second working cap already carries a real ``proven``
+    evidence_ref.  After the check runs:
+      - ground_truth == 1 (only the truly proven cap)
+      - auto_resolved == 1 (the path_proven self-heal is counted as throughput)
+    """
+    from unittest.mock import AsyncMock, patch
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = await _project(db)
+    project.problem_model = {
+        "capabilities": [
+            {
+                "name": "path-healed-cap",
+                "status": "working",
+                # No proof yet — will be auto-resolved to path_proven tier.
+                "evidence_refs": [],
+                "backing_paths": ["backend/app/models.py"],
+            },
+            {
+                "name": "truly-proven-cap",
+                "status": "working",
+                # A real proven evidence_ref so working_capability_proof_status
+                # returns "proven" for this capability.
+                "evidence_refs": [
+                    {"kind": "named_test", "ref": "test_foo", "proven": True}
+                ],
+            },
+        ]
+    }
+    # Seed a real proof record so working_capability_proof_status grades it proven.
+    project.capability_proof_records = {
+        "truly-proven-cap": [
+            {"proof_kind": "named_test", "proven": True}
+        ]
+    }
+    flag_modified(project, "problem_model")
+    flag_modified(project, "capability_proof_records")
+    db.add(project)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db,
+        now=_utcnow(),
+        mode="observe",
+        max_projects=25,
+        sample_limit=200,
+        window_days=14,
+    )
+
+    with patch(
+        "app.source_ref_validation._path_exists_at_head",
+        new=AsyncMock(return_value=True),
+    ), patch(
+        "app.capability_proof._read_file_at_head",
+        new=AsyncMock(return_value=None),
+    ):
+        results = await mis.check_capability_proof_gate_gap(ctx)
+
+    pid = str(project.id)
+    proj_results = [r for r in results if r.subject == pid]
+    assert proj_results, f"expected a result for project {pid}, got {results}"
+    r = proj_results[0]
+
+    # path_proven self-heals must NOT inflate ground_truth — only the one truly
+    # proven cap contributes to the machine-verified coverage counter.
+    assert r.ground_truth == 1, (
+        f"ground_truth should be 1 (only truly-proven-cap), got {r.ground_truth}; "
+        "path_proven self-heals must not be counted as proven"
+    )
+    # The self-heal throughput counter (auto_resolved) is still reported correctly.
+    assert r.auto_resolved == 1, (
+        f"auto_resolved should be 1 (path-healed-cap), got {r.auto_resolved}"
+    )
 
 
 # --- Check: capability_proof_gate_auto_graduation ----------------------------

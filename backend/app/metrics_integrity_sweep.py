@@ -3623,9 +3623,10 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
     commit for one project is logged and rolled back without aborting the check.
 
     * ``self_reported`` = total ``working`` capabilities in the project.
-    * ``ground_truth``  = caps with recorded proof (pre-existing ``proven`` plus
-      newly auto-recorded ``path_proven`` self-heal tiers); it counts recorded
-      evidence, not enforce-gate-clearing ``proven`` status specifically.
+    * ``ground_truth``  = caps with a true machine-verified ``proven`` status only;
+      ``path_proven`` self-heal tiers (structural backing-path or static
+      named_test_present checks) are NOT counted here because they do not clear
+      the enforce gate and do not represent an executed green merge-test verdict.
     * ``delta``         = unresolved gap: needs_backing_paths + backing_paths that
       failed HEAD verification + caps that already carry only a path_proven proof.
 
@@ -4050,7 +4051,10 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
                     with contextlib.suppress(Exception):
                         await ctx.session.rollback()
 
-        new_proven = proven_count + len(auto_resolved)
+        # path_proven self-heals (backing_path / static named_test_present) are
+        # NOT machine-verified proof — they do not clear the enforce gate and
+        # must not inflate ground_truth. Only caps with true 'proven' status count.
+        new_proven = proven_count
         # Caps with an enrolled execution trial are NOT yet proven — the trial
         # must run green first — so they still count as an unresolved gap this
         # sweep, but are reported distinctly (a real proof is en route) rather
