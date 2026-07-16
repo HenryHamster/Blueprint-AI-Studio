@@ -2390,17 +2390,29 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
               )}
               {(() => {
                 const artifacts = computeJobViewableArtifacts(job);
-                const droppedCount = job.viewable_artifacts_dropped_count ?? 0;
-                if (artifacts.length === 0 && droppedCount <= 0) return null;
+                const jobIsRunning = job.status === 'RUNNING' || job.status === 'STARTING';
+                const liveOm = jobIsRunning ? job.viewable_artifacts_live_omissions : null;
+                const liveOmTotal = (liveOm?.size_cap ?? 0) + (liveOm?.count_cap ?? 0);
+                const terminalDropped = job.viewable_artifacts_dropped_count ?? 0;
+                const omissionCount = jobIsRunning ? liveOmTotal : terminalDropped;
+                if (artifacts.length === 0 && omissionCount <= 0) return null;
                 const galleryKey = `gallery-${job.id}`;
                 const galleryExpanded = expandedDocIds.has(galleryKey);
+                let omissionDetail: string;
+                if (liveOm && (liveOm.size_cap ?? 0) > 0 && !(liveOm.count_cap ?? 0)) {
+                  omissionDetail = 'exceeded per-file size limit (8 MiB/image · 512 MiB/video)';
+                } else if (liveOm && (liveOm.count_cap ?? 0) > 0 && !(liveOm.size_cap ?? 0)) {
+                  omissionDetail = '25-file count limit reached';
+                } else {
+                  omissionDetail = 'preview cap: 25 files · 8 MiB/image · 512 MiB/video';
+                }
                 const omittedNote =
-                  droppedCount > 0 ? (
+                  omissionCount > 0 ? (
                     <div
                       className="text-ui-xs text-amber-400/90 font-mono"
                       data-testid="compute-artifact-omitted-note"
                     >
-                      {`${droppedCount} file${droppedCount === 1 ? '' : 's'} omitted (exceeds preview cap: 25 files / 8 MiB each)`}
+                      {`${omissionCount} file${omissionCount === 1 ? '' : 's'} omitted (${omissionDetail})`}
                     </div>
                   ) : null;
                 if (artifacts.length === 0) {

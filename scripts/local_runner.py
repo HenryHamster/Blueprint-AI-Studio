@@ -2169,6 +2169,7 @@ _VIEWABLE_CONTENT_TYPES = {
     "gif": ("image/gif", "image"),
     "mp4": ("video/mp4", "video"),
     "webm": ("video/webm", "video"),
+    "pdf": ("application/pdf", "pdf"),
 }
 _MAX_VIEWABLE_IMAGE_BYTES = 8 * 1024 * 1024  # 8 MiB (server caps images here)
 _MAX_VIEWABLE_VIDEO_BYTES = 512 * 1024 * 1024  # 512 MiB (server caps videos here)
@@ -3912,6 +3913,7 @@ def _report_compute_job(
     progress: dict | None = None,
     resume_hydration: dict | None = None,
     artifact_delivery: dict | None = None,
+    viewable_omissions: dict | None = None,
 ) -> bool:
     """POST a status report for a compute job. Returns cancel_requested.
 
@@ -3940,6 +3942,8 @@ def _report_compute_job(
         body["resume_hydration"] = resume_hydration
     if artifact_delivery is not None:
         body["artifact_delivery"] = artifact_delivery
+    if viewable_omissions is not None:
+        body["viewable_omissions"] = viewable_omissions
 
     durable = exec_status in _REPORT_TERMINAL_STATUSES
     max_attempts = (_REPORT_MAX_RETRIES + 1) if durable else 1
@@ -4246,6 +4250,8 @@ class _ViewableStreamState:
         "revisions",
         "oversize_logged",
         "budget_logged",
+        "oversize_relpaths",
+        "count_cap_relpaths",
         "inflight",
         "completed",
         "lock",
@@ -4259,6 +4265,12 @@ class _ViewableStreamState:
         self.revisions: dict = {}
         self.oversize_logged: set = set()
         self.budget_logged = False
+        # Deduplicated sets of relpaths skipped due to per-kind size cap or the
+        # 25-file count cap. Set membership prevents repeated scans from inflating
+        # counts. Reported to the backend on each running heartbeat so the operator
+        # can see live omissions before the job reaches a terminal state.
+        self.oversize_relpaths: set = set()
+        self.count_cap_relpaths: set = set()
         self.inflight: tuple | None = None
         self.completed: tuple | None = None
         self.lock = threading.Lock()
@@ -4447,6 +4459,7 @@ def _stream_viewable_files(
                     f"{cap}-byte {kind} cap for job {job_id}; skipping live preview",
                     flush=True,
                 )
+            state.oversize_relpaths.add(relpath)
             continue
 
         # Nanosecond mtime + ctime detects same-size overwrites while remaining
@@ -4467,6 +4480,7 @@ def _stream_viewable_files(
                     f"for job {job_id}; further new live previews skipped",
                     flush=True,
                 )
+            state.count_cap_relpaths.add(relpath)
             continue
 
         # Slow preview uploads run outside the report/cancellation loop.  A single
@@ -5803,11 +5817,17 @@ def _run_compute_job(
                 )
                 return
 
+            _omissions: dict = {}
+            if viewable_state.oversize_relpaths:
+                _omissions["size_cap"] = len(viewable_state.oversize_relpaths)
+            if viewable_state.count_cap_relpaths:
+                _omissions["count_cap"] = len(viewable_state.count_cap_relpaths)
             cancel = _report_compute_job(
                 orchestrator_url, token, job_id,
                 exec_status="running",
                 command_log=_interim_log_tail(),
                 progress=progress_tail.poll(),
+                viewable_omissions=_omissions or None,
             )
             if cancel:
                 _teardown()

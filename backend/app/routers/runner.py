@@ -1877,6 +1877,12 @@ class ComputeJobReportRequest(BaseModel):
     # exit outcome remains in runner_exec_status; this marker independently says
     # whether its checkpoint bundle reached verified storage.
     artifact_delivery: Dict[str, Any] | None = None
+    # Live omission telemetry from the runner's mid-run viewable scan. Typed
+    # ``Any`` on purpose: tolerance contract validated inline (garbage is dropped).
+    # Shape: {"size_cap": int, "count_cap": int} — counts of unique relpaths skipped
+    # due to per-kind size cap or 25-file count cap. Only meaningful on "running"
+    # reports; ignored on terminal ones.
+    viewable_omissions: Any = None
 
 
 @router.post("/next-compute-job")
@@ -2198,6 +2204,14 @@ async def report_compute_job(
                         # or backdate its own protection window.
                         t=now.isoformat(),
                     )
+        if payload.exec_status == "running" and isinstance(payload.viewable_omissions, dict):
+            omissions: Dict[str, Any] = {}
+            for key in ("size_cap", "count_cap"):
+                val = payload.viewable_omissions.get(key)
+                if isinstance(val, int) and not isinstance(val, bool) and 0 <= val <= 10000:
+                    omissions[key] = val
+            if omissions:
+                meta["viewable_live_omissions"] = omissions
         if payload.exec_status in ("succeeded", "failed"):
             meta["runner_finished_at"] = now.isoformat()
         if isinstance(payload.resume_hydration, dict):
@@ -3101,7 +3115,7 @@ async def upload_compute_job_viewable(
             raise HTTPException(
                 status_code=422,
                 detail=f"file type not viewable: {raw_filename!r} — "
-                f"supported: png/jpg/jpeg/webp/gif/mp4/webm",
+                f"supported: png/jpg/jpeg/webp/gif/mp4/webm/pdf",
             )
         content_type, kind = type_info
 

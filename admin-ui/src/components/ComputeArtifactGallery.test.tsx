@@ -83,7 +83,7 @@ describe('ComputeArtifactGallery', () => {
     );
     expect(getByTestId('drawer-artifact-gallery')).toBeTruthy();
     expect(getByTestId('drawer-artifact-omitted-note').textContent).toBe(
-      '3 files omitted (exceeds preview cap: 25 files / 8 MiB each)',
+      '3 files omitted (preview cap: 25 files · 8 MiB/image · 512 MiB/video)',
     );
     // No previews to toggle when everything was dropped.
     expect(queryByTestId('drawer-artifact-gallery-toggle')).toBeNull();
@@ -97,7 +97,39 @@ describe('ComputeArtifactGallery', () => {
       />,
     );
     expect(getByTestId('drawer-artifact-omitted-note').textContent).toBe(
-      '1 file omitted (exceeds preview cap: 25 files / 8 MiB each)',
+      '1 file omitted (preview cap: 25 files · 8 MiB/image · 512 MiB/video)',
+    );
+  });
+
+  test('renders live omission note with count-cap wording for RUNNING job', () => {
+    const { getByTestId } = render(
+      <ComputeArtifactGallery
+        projectId="proj-1"
+        job={makeJob({
+          status: 'RUNNING',
+          viewable_artifacts: [],
+          viewable_artifacts_live_omissions: { count_cap: 4 },
+        })}
+      />,
+    );
+    expect(getByTestId('drawer-artifact-omitted-note').textContent).toBe(
+      '4 files omitted (25-file count limit reached)',
+    );
+  });
+
+  test('renders live omission note with size-cap wording for RUNNING job', () => {
+    const { getByTestId } = render(
+      <ComputeArtifactGallery
+        projectId="proj-1"
+        job={makeJob({
+          status: 'RUNNING',
+          viewable_artifacts: [],
+          viewable_artifacts_live_omissions: { size_cap: 2 },
+        })}
+      />,
+    );
+    expect(getByTestId('drawer-artifact-omitted-note').textContent).toBe(
+      '2 files omitted (exceeded per-file size limit (8 MiB/image · 8 MiB/PDF · 512 MiB/video))',
     );
   });
 
