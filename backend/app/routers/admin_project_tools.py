@@ -32,6 +32,7 @@ import json as _json
 import logging
 import mimetypes
 import os
+import pathlib
 import re
 import time as _time
 import uuid
@@ -144,6 +145,57 @@ def _prune_manifest_cache() -> None:
         sorted_keys = sorted(_manifest_cache, key=lambda k: _manifest_cache[k][0])
         for k in sorted_keys[: len(_manifest_cache) - _MANIFEST_CACHE_MAX]:
             _manifest_cache.pop(k, None)
+
+
+# ── Local-source fallback ─────────────────────────────────────────────────────
+#
+# When a project has no GitHub connection (or the GitHub fetch fails), the
+# manifest and assets can be loaded from a directory on the local filesystem.
+# Set BLUEPRINT_LOCAL_TOOLS_ROOT to a directory that mirrors the repo layout:
+#   <root>/.blueprint/tools.json           — the manifest
+#   <root>/.blueprint/tools/<slug>/<path>  — individual tool assets
+#
+# This is intentionally gated on the env var so production deployments without
+# a configured local path are unaffected.
+
+_BLUEPRINT_LOCAL_TOOLS_ROOT_ENV = "BLUEPRINT_LOCAL_TOOLS_ROOT"
+
+
+def _get_local_tools_root() -> pathlib.Path | None:
+    """Return the configured local tools root path, or None if not set."""
+    raw = os.environ.get(_BLUEPRINT_LOCAL_TOOLS_ROOT_ENV, "").strip()
+    if not raw:
+        return None
+    return pathlib.Path(raw)
+
+
+def _read_local_manifest() -> str | None:
+    """Read .blueprint/tools.json from the local tools root; returns None if absent."""
+    root = _get_local_tools_root()
+    if root is None:
+        return None
+    manifest_path = root / ".blueprint" / "tools.json"
+    try:
+        return manifest_path.read_text(encoding="utf-8")
+    except (FileNotFoundError, IsADirectoryError, PermissionError):
+        return None
+
+
+def _read_local_asset(tool_slug: str, asset_path: str) -> bytes | None:
+    """Read a tool asset from the local tools root; returns None if absent."""
+    root = _get_local_tools_root()
+    if root is None:
+        return None
+    # Resolve under the local root to prevent path traversal.
+    asset_file = root / ".blueprint" / "tools" / tool_slug / asset_path
+    try:
+        resolved = asset_file.resolve()
+        root_resolved = root.resolve()
+        if not str(resolved).startswith(str(root_resolved)):
+            return None
+        return resolved.read_bytes()
+    except (FileNotFoundError, IsADirectoryError, PermissionError, ValueError):
+        return None
 
 
 # ── Manifest schema ──────────────────────────────────────────────────────────
@@ -362,6 +414,100 @@ def _normalize_manifest_skill(entry: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
+def _parse_manifest_text(manifest_text: str, source_label: str) -> Dict[str, Any]:
+    """Parse and validate a manifest JSON string into the standard result dict.
+
+    *source_label* is used only in log messages (e.g. ``"local"`` or ``"github"``).
+    """
+    try:
+        manifest = _json.loads(manifest_text)
+    except _json.JSONDecodeError as e:
+        error_msg = f"Invalid JSON in .blueprint/tools.json: {e}"
+        logger.warning("[project-tools] %s (%s)", error_msg, source_label)
+        return {"tools": [], "skills": [], "compute": {"image": None}, "error": error_msg}
+
+    if not isinstance(manifest, dict):
+        return {
+            "tools": [],
+            "skills": [],
+            "compute": {"image": None},
+            "error": ".blueprint/tools.json must be a JSON object with a 'tools' array",
+        }
+
+    raw_tools = manifest.get("tools")
+    if raw_tools is None:
+        raw_tools = []
+    elif not isinstance(raw_tools, list):
+        return {
+            "tools": [],
+            "skills": [],
+            "compute": {"image": None},
+            "error": ".blueprint/tools.json 'tools' field must be an array",
+        }
+
+    tools: List[Dict[str, Any]] = []
+    errors: List[str] = []
+    seen_slugs: set[str] = set()
+    for i, entry in enumerate(raw_tools):
+        err = _validate_manifest_tool(entry, i)
+        if err:
+            errors.append(err)
+            continue
+        slug = entry["slug"]
+        if slug in seen_slugs:
+            errors.append(f"tools[{i}]: duplicate slug '{slug}'")
+            continue
+        seen_slugs.add(slug)
+        tools.append(_normalize_manifest_tool(entry))
+
+    raw_skills = manifest.get("skills")
+    skills: List[Dict[str, Any]] = []
+    if isinstance(raw_skills, list):
+        seen_skill_slugs: set[str] = set()
+        for i, entry in enumerate(raw_skills):
+            err = _validate_manifest_skill(entry, i)
+            if err:
+                errors.append(err)
+                continue
+            slug = entry["slug"]
+            if slug in seen_skill_slugs:
+                errors.append(f"skills[{i}]: duplicate slug '{slug}'")
+                continue
+            seen_skill_slugs.add(slug)
+            skills.append(_normalize_manifest_skill(entry))
+
+    compute_image: Dict[str, Any] | None = None
+    raw_compute = manifest.get("compute")
+    if isinstance(raw_compute, dict):
+        raw_compute_image = raw_compute.get("image")
+        if raw_compute_image is not None:
+            err = _validate_manifest_compute_image(raw_compute_image)
+            if err:
+                errors.append(err)
+            else:
+                compute_image = _normalize_manifest_compute_image(raw_compute_image)
+
+    if errors:
+        error_msg = "Manifest validation errors: " + "; ".join(errors)
+        logger.warning("[project-tools] %s (%s)", error_msg, source_label)
+        return {"tools": tools, "skills": skills, "compute": {"image": compute_image}, "error": error_msg}
+
+    return {"tools": tools, "skills": skills, "compute": {"image": compute_image}, "error": None}
+
+
+def _discover_manifest_tools_local() -> Dict[str, Any]:
+    """Load and parse the manifest from the local filesystem fallback.
+
+    Returns the same shape as ``_discover_manifest_tools``.  When no local root is
+    configured or the manifest file is absent, returns empty lists with no error.
+    """
+    manifest_text = _read_local_manifest()
+    if manifest_text is None:
+        return {"tools": [], "skills": [], "compute": {"image": None}, "error": None}
+    logger.debug("[project-tools] Loading manifest from local fallback (BLUEPRINT_LOCAL_TOOLS_ROOT)")
+    return _parse_manifest_text(manifest_text, "local")
+
+
 async def _discover_manifest_tools(
     project: Project,
 ) -> Dict[str, Any]:
@@ -378,7 +524,7 @@ async def _discover_manifest_tools(
     project_id_str = str(project.id)
 
     if not owner or not repo_name:
-        return {"tools": [], "skills": [], "compute": {"image": None}, "error": None}
+        return _discover_manifest_tools_local()
 
     cache_key = f"{owner}/{repo_name}"
 
@@ -419,83 +565,9 @@ async def _discover_manifest_tools(
             _manifest_cache[cache_key] = (_time.monotonic() + _MANIFEST_CACHE_TTL_OK, result)
             return result
 
-        try:
-            manifest = _json.loads(manifest_text)
-        except _json.JSONDecodeError as e:
-            error_msg = f"Invalid JSON in .blueprint/tools.json: {e}"
-            logger.warning("[project-tools] %s for %s", error_msg, cache_key)
-            result = {"tools": [], "skills": [], "compute": {"image": None}, "error": error_msg}
-            _manifest_cache[cache_key] = (_time.monotonic() + _MANIFEST_CACHE_TTL_FAIL, result)
-            return result
-
-        if not isinstance(manifest, dict):
-            error_msg = ".blueprint/tools.json must be a JSON object with a 'tools' array"
-            result = {"tools": [], "skills": [], "compute": {"image": None}, "error": error_msg}
-            _manifest_cache[cache_key] = (_time.monotonic() + _MANIFEST_CACHE_TTL_FAIL, result)
-            return result
-
-        raw_tools = manifest.get("tools")
-        if raw_tools is None:
-            raw_tools = []
-        elif not isinstance(raw_tools, list):
-            error_msg = ".blueprint/tools.json 'tools' field must be an array"
-            result = {"tools": [], "skills": [], "compute": {"image": None}, "error": error_msg}
-            _manifest_cache[cache_key] = (_time.monotonic() + _MANIFEST_CACHE_TTL_FAIL, result)
-            return result
-
-        tools: List[Dict[str, Any]] = []
-        errors: List[str] = []
-        seen_slugs: set[str] = set()
-        for i, entry in enumerate(raw_tools):
-            err = _validate_manifest_tool(entry, i)
-            if err:
-                errors.append(err)
-                continue
-            slug = entry["slug"]
-            if slug in seen_slugs:
-                errors.append(f"tools[{i}]: duplicate slug '{slug}'")
-                continue
-            seen_slugs.add(slug)
-            tools.append(_normalize_manifest_tool(entry))
-
-        # Parse optional skills array alongside tools.
-        raw_skills = manifest.get("skills")
-        skills: List[Dict[str, Any]] = []
-        if isinstance(raw_skills, list):
-            seen_skill_slugs: set[str] = set()
-            for i, entry in enumerate(raw_skills):
-                err = _validate_manifest_skill(entry, i)
-                if err:
-                    errors.append(err)
-                    continue
-                slug = entry["slug"]
-                if slug in seen_skill_slugs:
-                    errors.append(f"skills[{i}]: duplicate slug '{slug}'")
-                    continue
-                seen_skill_slugs.add(slug)
-                skills.append(_normalize_manifest_skill(entry))
-
-        # Parse optional compute section alongside tools and skills.
-        compute_image: Dict[str, Any] | None = None
-        raw_compute = manifest.get("compute")
-        if isinstance(raw_compute, dict):
-            raw_compute_image = raw_compute.get("image")
-            if raw_compute_image is not None:
-                err = _validate_manifest_compute_image(raw_compute_image)
-                if err:
-                    errors.append(err)
-                else:
-                    compute_image = _normalize_manifest_compute_image(raw_compute_image)
-
-        if errors:
-            error_msg = "Manifest validation errors: " + "; ".join(errors)
-            logger.warning("[project-tools] %s for %s", error_msg, cache_key)
-            result = {"tools": tools, "skills": skills, "compute": {"image": compute_image}, "error": error_msg}
-            _manifest_cache[cache_key] = (_time.monotonic() + _MANIFEST_CACHE_TTL_FAIL, result)
-            return result
-
-        result = {"tools": tools, "skills": skills, "compute": {"image": compute_image}, "error": None}
-        _manifest_cache[cache_key] = (_time.monotonic() + _MANIFEST_CACHE_TTL_OK, result)
+        result = _parse_manifest_text(manifest_text, cache_key)
+        ttl = _MANIFEST_CACHE_TTL_FAIL if result.get("error") else _MANIFEST_CACHE_TTL_OK
+        _manifest_cache[cache_key] = (_time.monotonic() + ttl, result)
         return result
 
     except Exception as e:  # noqa: BLE001 — manifest fetch must never crash the endpoint
@@ -1114,65 +1186,71 @@ async def _serve_tool_asset_impl(
         raise HTTPException(status_code=404, detail="Project not found")
     owner = (project.github_owner or "").strip()
     repo_name = (project.github_repo or "").strip()
-    if not owner or not repo_name:
-        raise HTTPException(status_code=404, detail="Project has no connected repo")
-
-    # 4. Fetch the file from GitHub.
-    repo_file_path = f".blueprint/tools/{tool_slug}/{path}"
-
-    from app.github_auth import get_repo_installation_read_token
-    from app.github_refs import get_repo_default_branch
-
-    gh_token = await get_repo_installation_read_token(owner, repo_name)
-    if not gh_token:
-        raise HTTPException(
-            status_code=502,
-            detail="Unable to obtain GitHub token for repo access",
-        )
-
-    default_branch = await get_repo_default_branch(gh_token, owner, repo_name)
 
     content_type = _content_type_for_path(path)
-    ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
-    is_text = f".{ext}" in _TEXT_EXTENSIONS if ext else True
 
-    try:
-        if is_text:
-            from app.github import get_file_text_at_ref
+    if not owner or not repo_name:
+        # No GitHub connection — try local filesystem fallback.
+        local_body = _read_local_asset(tool_slug, path)
+        if local_body is None:
+            raise HTTPException(status_code=404, detail="Asset not found (no connected repo and no local fallback)")
+        body: bytes = local_body
+    else:
+        # 4. Fetch the file from GitHub.
+        repo_file_path = f".blueprint/tools/{tool_slug}/{path}"
 
-            text = await get_file_text_at_ref(
-                repo_file_path,
-                token=gh_token,
-                owner=owner,
-                repo=repo_name,
-                ref=default_branch,
-                project_id=str(project_id),
+        from app.github_auth import get_repo_installation_read_token
+        from app.github_refs import get_repo_default_branch
+
+        gh_token = await get_repo_installation_read_token(owner, repo_name)
+        if not gh_token:
+            raise HTTPException(
+                status_code=502,
+                detail="Unable to obtain GitHub token for repo access",
             )
-            if text is None:
-                raise HTTPException(status_code=404, detail="File not found")
-            body: bytes = text.encode("utf-8")
-        else:
-            from app.github import get_file_bytes_at_ref
 
-            raw = await get_file_bytes_at_ref(
-                repo_file_path,
-                token=gh_token,
-                owner=owner,
-                repo=repo_name,
-                ref=default_branch,
-                project_id=str(project_id),
+        default_branch = await get_repo_default_branch(gh_token, owner, repo_name)
+
+        ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+        is_text = f".{ext}" in _TEXT_EXTENSIONS if ext else True
+
+        try:
+            if is_text:
+                from app.github import get_file_text_at_ref
+
+                text = await get_file_text_at_ref(
+                    repo_file_path,
+                    token=gh_token,
+                    owner=owner,
+                    repo=repo_name,
+                    ref=default_branch,
+                    project_id=str(project_id),
+                )
+                if text is None:
+                    raise HTTPException(status_code=404, detail="File not found")
+                body = text.encode("utf-8")
+            else:
+                from app.github import get_file_bytes_at_ref
+
+                raw = await get_file_bytes_at_ref(
+                    repo_file_path,
+                    token=gh_token,
+                    owner=owner,
+                    repo=repo_name,
+                    ref=default_branch,
+                    project_id=str(project_id),
+                )
+                if raw is None:
+                    raise HTTPException(status_code=404, detail="File not found")
+                body = raw
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.warning(
+                "[project-tools] Asset fetch error %s/%s/%s: %s",
+                owner, repo_name, repo_file_path, e,
             )
-            if raw is None:
-                raise HTTPException(status_code=404, detail="File not found")
-            body = raw
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.warning(
-            "[project-tools] Asset fetch error %s/%s/%s: %s",
-            owner, repo_name, repo_file_path, e,
-        )
-        raise HTTPException(status_code=502, detail=f"Failed to fetch asset: {e}")
+            raise HTTPException(status_code=502, detail=f"Failed to fetch asset: {e}")
 
     headers = {
         "Cache-Control": "public, max-age=300",
