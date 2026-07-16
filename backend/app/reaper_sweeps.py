@@ -784,10 +784,11 @@ async def sweep_auto_clear_moot_pending_confirmations(session, now=None) -> int:
       :func:`app.problem_model._confirmation_is_moot`);
     - when uncertain, the item is left in place.
 
-    Iterates a bounded set of projects (default 25) with a non-empty pending
-    list, mutates the durable model via the pure
-    :func:`app.problem_model.auto_clear_resolved_confirmations` helper (same
-    revision-log / ``last_updated_by`` contract as the operator dismiss
+    Iterates ALL projects with a non-empty pending list via keyset pagination
+    (ordered by ``Project.id``, batches of 100) so every project is covered
+    deterministically regardless of fleet size. Mutates the durable model via
+    the pure :func:`app.problem_model.auto_clear_resolved_confirmations` helper
+    (same revision-log / ``last_updated_by`` contract as the operator dismiss
     endpoint), and persists per project. Hourly cadence-gated, idempotent, and
     wrapped so it can never crash the reaper cycle. Returns the total number of
     items cleared.
@@ -810,75 +811,83 @@ async def sweep_auto_clear_moot_pending_confirmations(session, now=None) -> int:
         return 0
     _last_moot_confirm_sweep = _now
 
-    max_projects = 25
-    rows = (
-        (
-            await session.execute(
-                select(Project)
-                .options(
-                    load_only(
-                        Project.id,
-                        Project.user_id,
-                        Project.problem_model,
-                        raiseload=True,
-                    )
-                )
-                .limit(max_projects)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    if not rows:
-        return 0
-
+    _BATCH = 100
+    last_id = None
     total_cleared = 0
-    for project in rows:
-        try:
-            pm = getattr(project, "problem_model", None)
-            if not isinstance(pm, dict):
-                continue
-            pending = pm.get("pending_user_confirmation")
-            if not isinstance(pending, list) or not pending:
-                continue
-            # Skip early unless there is at least one auto-eligible item, so the
-            # common case does no credential/token I/O.
-            if not any(
-                isinstance(p, dict)
-                and p.get("type") in ("credentials_needed", "access_needed")
-                for p in pending
-            ):
-                continue
 
+    while True:
+        query = (
+            select(Project)
+            .options(
+                load_only(
+                    Project.id,
+                    Project.user_id,
+                    Project.problem_model,
+                    raiseload=True,
+                )
+            )
+            .where(Project.problem_model.is_not(None))
+            .order_by(Project.id)
+            .limit(_BATCH)
+        )
+        if last_id is not None:
+            query = query.where(Project.id > last_id)
+
+        rows = (await session.execute(query)).scalars().all()
+        if not rows:
+            break
+
+        last_id = rows[-1].id
+
+        for project in rows:
             try:
-                model = parse_problem_model(pm)
-            except Exception:  # noqa: BLE001 — a malformed model must not block the sweep
-                continue
+                pm = getattr(project, "problem_model", None)
+                if not isinstance(pm, dict):
+                    continue
+                pending = pm.get("pending_user_confirmation")
+                if not isinstance(pending, list) or not pending:
+                    continue
+                # Skip early unless there is at least one auto-eligible item, so the
+                # common case does no credential/token I/O.
+                if not any(
+                    isinstance(p, dict)
+                    and p.get("type") in ("credentials_needed", "access_needed")
+                    for p in pending
+                ):
+                    continue
 
-            signals = ConfirmationResolutionSignals(
-                llm_credentials_ready=await _owner_llm_credentials_ready(
-                    session, getattr(project, "user_id", None)
-                ),
-                repo_access_ready=bool(get_cached_project_token(str(project.id))),
-            )
-            cleared = auto_clear_resolved_confirmations(
-                model, signals, _now.isoformat()
-            )
-            if cleared:
-                project.problem_model = model.model_dump()
-                flag_modified(project, "problem_model")
-                session.add(project)
-                await session.commit()
-                total_cleared += len(cleared)
+                try:
+                    model = parse_problem_model(pm)
+                except Exception:  # noqa: BLE001 — a malformed model must not block the sweep
+                    continue
 
-        except Exception:  # noqa: BLE001
-            logger.warning(
-                "[REAPER] Moot pending-confirmation sweep failed for project %s:",
-                getattr(project, "id", "?"),
-                exc_info=True,
-            )
-            with contextlib.suppress(Exception):
-                await session.rollback()
+                signals = ConfirmationResolutionSignals(
+                    llm_credentials_ready=await _owner_llm_credentials_ready(
+                        session, getattr(project, "user_id", None)
+                    ),
+                    repo_access_ready=bool(get_cached_project_token(str(project.id))),
+                )
+                cleared = auto_clear_resolved_confirmations(
+                    model, signals, _now.isoformat()
+                )
+                if cleared:
+                    project.problem_model = model.model_dump()
+                    flag_modified(project, "problem_model")
+                    session.add(project)
+                    await session.commit()
+                    total_cleared += len(cleared)
+
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "[REAPER] Moot pending-confirmation sweep failed for project %s:",
+                    getattr(project, "id", "?"),
+                    exc_info=True,
+                )
+                with contextlib.suppress(Exception):
+                    await session.rollback()
+
+        if len(rows) < _BATCH:
+            break
 
     if total_cleared:
         logger.info(
