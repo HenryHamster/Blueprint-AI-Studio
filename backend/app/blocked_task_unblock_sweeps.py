@@ -10,8 +10,10 @@ import logging
 import uuid
 from datetime import datetime, timedelta
 
+from sqlalchemy import or_
 from sqlmodel import select
 
+from app.gate_revalidation import GATE_REVALIDATION_QUERY_MARKERS
 from app.models import Task, TaskStatus
 from app.time_utils import _utcnow
 
@@ -1233,7 +1235,36 @@ async def sweep_unblock_blocked_tasks(
         .order_by(Task.recheck_after.asc().nullsfirst())
         .limit(batch_size)
     )
-    due_ids = (await session.execute(due_id_stmt)).scalars().all()
+    regular_due_ids = (await session.execute(due_id_stmt)).scalars().all()
+
+    # Repository-wide gate failures are event-sensitive: when integration HEAD
+    # changes, their old exponential backoff should not delay recovery for up to
+    # an hour. Pull a bounded priority set regardless of recheck_after; the
+    # in-loop SHA equality check and per-project GitHub cache keep this cheap and
+    # prevent repeated requeues on the same HEAD. Projects that intentionally
+    # skip GitHub CI on their integration branch may requeue to execute their
+    # real task gate on a fresh base; pending/red/API-error CI remains closed.
+    gate_text_predicates = []
+    for marker in GATE_REVALIDATION_QUERY_MARKERS:
+        pattern = f"%{marker}%"
+        gate_text_predicates.extend(
+            [
+                Task.blocked_reason.ilike(pattern),
+                Task.latest_status_message.ilike(pattern),
+            ]
+        )
+    gate_id_stmt = (
+        select(Task.id)
+        .where(
+            Task.status == TaskStatus.BLOCKED,
+            or_(*gate_text_predicates),
+        )
+        .order_by(Task.blocked_at.asc().nullsfirst())
+        .limit(batch_size)
+    )
+    gate_ids = (await session.execute(gate_id_stmt)).scalars().all()
+    gate_id_set = set(gate_ids)
+    due_ids = list(dict.fromkeys([*gate_ids, *regular_due_ids]))[:batch_size]
     if not due_ids:
         return 0
 
@@ -1336,14 +1367,18 @@ async def sweep_unblock_blocked_tasks(
         # 120s).  The per-row commit then releases it before the next task's
         # I/O starts, keeping the locked window narrow enough that agent
         # heartbeats are never starved.
+        task_filters = [
+            Task.id == task_id,
+            Task.status == TaskStatus.BLOCKED,
+        ]
+        if task_id not in gate_id_set:
+            task_filters.append(
+                (Task.recheck_after.is_(None)) | (Task.recheck_after <= now)
+            )
         task = (
             await session.scalars(
                 select(Task)
-                .where(
-                    Task.id == task_id,
-                    Task.status == TaskStatus.BLOCKED,
-                    (Task.recheck_after.is_(None)) | (Task.recheck_after <= now),
-                )
+                .where(*task_filters)
                 .with_for_update(skip_locked=True)
                 .execution_options(populate_existing=True)
             )
@@ -1363,6 +1398,7 @@ async def sweep_unblock_blocked_tasks(
         if _gfb(task):
             from app.gate_revalidation import (
                 has_live_respawn,
+                head_advanced_since_gate_failure,
                 resolve_gate_state,
             )
 
@@ -1375,38 +1411,56 @@ async def sweep_unblock_blocked_tasks(
                     github_info_cache=_github_cache,
                 )
                 _gate_cache[_pid_key] = _gs or {}
-            if _gs and _gs.get("green_at_head"):
-                if not await has_live_respawn(task, session):
-                    from sqlalchemy.orm.attributes import flag_modified
+            if (
+                _gs
+                and _gs.get(
+                    "revalidation_ready",
+                    _gs.get("green_at_head", False),
+                )
+                and head_advanced_since_gate_failure(
+                    task,
+                    _gs.get("head_sha"),
+                    head_committed_at=_gs.get("head_committed_at"),
+                )
+                and not await has_live_respawn(task, session)
+            ):
+                from sqlalchemy.orm.attributes import flag_modified
 
-                    _clear_blocked_fields(task, preserve_first_blocked=False)
-                    task.status = TaskStatus.QUEUED
+                _clear_blocked_fields(task, preserve_first_blocked=False)
+                task.status = TaskStatus.QUEUED
+                if _gs.get("green_at_head"):
                     task.latest_status_message = (
                         "Unblocked — repo-wide gate resolved at integration HEAD "
                         f"({_gs['head_sha'][:12]}), requeued on fresh base"
                     )
-                    ctx = task.context or {}
-                    ctx["_gate_revalidated_at"] = _gs["checked_at_utc"]
-                    ctx["_gate_revalidated_head"] = _gs["head_sha"]
-                    task.context = ctx
-                    flag_modified(task, "context")
-                    session.add(task)
-                    requeued += 1
-                    pending_broadcasts.append(
-                        (
-                            str(task.project_id),
-                            {
-                                "task_id": str(task.id),
-                                "status": "QUEUED",
-                                "message": task.latest_status_message,
-                            },
-                        )
+                else:
+                    task.latest_status_message = (
+                        "Unblocked — integration HEAD advanced "
+                        f"({_gs['head_sha'][:12]}); requeued to rerun the "
+                        "repository gate on a fresh base"
                     )
-                    await _commit_task_row(_bc_start)
-                    continue
-                # else: live respawn exists → DON'T unblock; fall through
-                # to the existing blocker machinery so the respawn completes
-                # instead of racing the recovered original.
+                ctx = task.context or {}
+                ctx["_gate_revalidated_at"] = _gs["checked_at_utc"]
+                ctx["_gate_revalidated_head"] = _gs["head_sha"]
+                task.context = ctx
+                flag_modified(task, "context")
+                session.add(task)
+                requeued += 1
+                pending_broadcasts.append(
+                    (
+                        str(task.project_id),
+                        {
+                            "task_id": str(task.id),
+                            "status": "QUEUED",
+                            "message": task.latest_status_message,
+                        },
+                    )
+                )
+                await _commit_task_row(_bc_start)
+                continue
+            # A live same-scope respawn means DON'T unblock; fall through to the
+            # existing blocker machinery so the respawn completes instead of
+            # racing the recovered original.
 
         ctx = task.context or {}
         # Multi-need classification (shared by the parked and live paths): a
