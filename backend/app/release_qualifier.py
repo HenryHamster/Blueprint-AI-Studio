@@ -3942,16 +3942,45 @@ async def _upsert_dimension_result(
 
 # Per-dimension ledger status vocabulary (design doc "From Batch Attempts to a
 # Per-Dimension Fact Ledger", section 3).  A dimension is RESOLVED when its gate
-# reached a real pass/fail/blocked outcome; it is TERMINAL (for the same-tree
-# promotion invariant) when it additionally reached a legitimate not-applicable
-# 'unavailable' (e.g. smoketest disabled, merge-grade exempt).  'pending' and a
-# missing row are neither.  An infra failure records 'unavailable' — RESOLVED is
-# deliberately narrower than TERMINAL so a re-finalize RE-RUNS an infra-held
-# dimension while REUSING the ones that already truly passed/failed/blocked.
+# reached a real pass/fail/blocked outcome.  ``unavailable`` is deliberately
+# ambiguous at the storage layer: it can mean an explicitly non-applicable gate
+# or a transient infrastructure failure.  Promotion therefore must not treat the
+# status alone as terminal; it may accept only a known explicit exemption.
+# Re-finalize still RE-RUNS infra-held dimensions while REUSING the ones that
+# already truly passed/failed/blocked.
 _LEDGER_RESOLVED_STATUSES: frozenset[str] = frozenset({"passed", "failed", "blocked"})
-_LEDGER_TERMINAL_STATUSES: frozenset[str] = frozenset(
-    {"passed", "failed", "blocked", "unavailable"}
-)
+
+_PROMOTION_EXPLICIT_NON_APPLICABLE_STATUSES: dict[str, frozenset[str]] = {
+    # With no gradeable goal there is no merge-grade gate.  The two exemption
+    # statuses are also explicit, durable evidence that the holistic grade is
+    # not applicable to promotion for this candidate.
+    "merge_grade": frozenset(
+        {"not_applicable", "superseded_exempt", "already_on_main_exempt"}
+    ),
+}
+
+
+def _ledger_fact_satisfies_promotion(
+    dimension: str,
+    row: QualificationDimensionResult,
+) -> bool:
+    """Whether one ledger row is durable terminal proof for promotion.
+
+    A transient infra hold is recorded as ``status="unavailable"`` with details
+    such as ``infra_error`` or a migration ``verdict="defer"``.  Those facts
+    remain incomplete.  Only a dimension-specific, explicit non-applicable
+    marker may satisfy the same-tree invariant without a pass/fail/blocked
+    outcome.
+    """
+    if row.status in _LEDGER_RESOLVED_STATUSES:
+        return True
+    if row.status != "unavailable" or not isinstance(row.detail, dict):
+        return False
+    explicit_status = row.detail.get("status")
+    return explicit_status in _PROMOTION_EXPLICIT_NON_APPLICABLE_STATUSES.get(
+        dimension, frozenset()
+    )
+
 
 # Gates that must every one have a terminal fact at the SAME candidate_sha before
 # a promotion may compose from the ledger — the informational dimensions
@@ -4123,14 +4152,15 @@ async def _promotion_dimension_ledger_complete(
     *,
     smoketest_enabled: bool = True,
 ) -> tuple[bool, list[str]]:
-    """Is there a full set of terminal dimension facts at ONE candidate_sha?
+    """Is there a full set of durable terminal facts at ONE candidate_sha?
 
     The batch model's invariant — every gate scored the SAME candidate tree —
     carried onto the per-dimension ledger: a promotion may only compose from the
-    ledger when every required gating dimension has a TERMINAL row (not pending,
-    not missing) at ``candidate_sha``.  A required dimension whose only fact is at
-    a DIFFERENT candidate_sha does not count (``_load_prior_dimension_results`` is
-    already sha-scoped).  Returns ``(complete, missing_dimensions)``.
+    ledger when every required gating dimension has a real outcome or an explicit
+    non-applicable fact (not transiently unavailable, pending, or missing) at
+    ``candidate_sha``.  A required dimension whose only fact is at a DIFFERENT
+    candidate_sha does not count (``_load_prior_dimension_results`` is already
+    sha-scoped).  Returns ``(complete, missing_dimensions)``.
     """
     required = list(_PROMOTION_REQUIRED_DIMENSIONS)
     if smoketest_enabled:
@@ -4139,7 +4169,7 @@ async def _promotion_dimension_ledger_complete(
     missing = [
         dim
         for dim in required
-        if dim not in prior or prior[dim].status not in _LEDGER_TERMINAL_STATUSES
+        if dim not in prior or not _ledger_fact_satisfies_promotion(dim, prior[dim])
     ]
     return (not missing, missing)
 
@@ -6828,15 +6858,15 @@ async def _finalize_qualification(
 
     # Same-tree promotion invariant (Phase 1): a promotion composes from the
     # per-dimension ledger only when every required gating dimension has a
-    # TERMINAL fact at THIS candidate_sha — the batch model's "everything scored
-    # the same tree" guarantee carried onto the ledger.  The dual-write above
+    # durable terminal fact at THIS candidate_sha — the batch model's "everything
+    # scored the same tree" guarantee carried onto the ledger.  The dual-write above
     # populated exactly these rows for the candidate moments ago, so the common
     # path is complete; a populated-but-incomplete ledger (a required dimension
     # missing or stranded at a different sha) means the facts do NOT agree on one
     # tree, so HOLD as an infra failure rather than promote on a split verdict.
-    # Fail OPEN when the ledger is entirely empty for this candidate (the
-    # best-effort dual-write did not land) so a transient ledger-write failure
-    # never blocks an otherwise-qualified promotion.
+    # An entirely empty ledger is also incomplete.  Promotion must fail closed on
+    # every attempt: otherwise suppressing all first-attempt writes bypasses the
+    # same-tree invariant precisely when there is no durable proof at all.
     _ledger_complete, _missing_dims = await _promotion_dimension_ledger_complete(
         session, version, candidate_sha, smoketest_enabled=smoketest_enabled
     )
@@ -6856,30 +6886,16 @@ async def _finalize_qualification(
             return await _handle_infra_failure(
                 session, version, qual, "qualification_dimension_ledger_incomplete"
             )
-        # Completely empty ledger.  Distinguish first qualification from a re-drive
-        # using qualification_attempts: on a re-drive (attempts > 1) the ledger was
-        # populated on a prior successful finalize but is now empty — the current
-        # _dual_write_dimension_results silently failed (SAVEPOINT swallowed the
-        # write).  Hold rather than fail-open so the same-tree invariant is not
-        # silently bypassed on a re-check.
-        if (version.qualification_attempts or 0) > 1:
-            logger.warning(
-                "[RELEASE_QUALIFIER] v%d per-dimension ledger empty at promote "
-                "(candidate=%s, attempts=%d) — dual-write silently failed; "
-                "holding rather than promoting on the live composite",
-                version.version_number,
-                (candidate_sha or "")[:8],
-                version.qualification_attempts,
-            )
-            return await _handle_infra_failure(
-                session, version, qual, "qualification_dimension_ledger_empty"
-            )
         logger.warning(
             "[RELEASE_QUALIFIER] v%d per-dimension ledger empty at promote "
-            "(candidate=%s) — best-effort dual-write did not land; promoting on "
-            "the live composite (fail-open)",
+            "(candidate=%s, attempts=%d) — dual-write did not land; holding "
+            "rather than promoting without durable same-tree facts",
             version.version_number,
             (candidate_sha or "")[:8],
+            version.qualification_attempts or 0,
+        )
+        return await _handle_infra_failure(
+            session, version, qual, "qualification_dimension_ledger_empty"
         )
 
     # Delegate to promote().  Credentials are NOT pre-resolved here on purpose

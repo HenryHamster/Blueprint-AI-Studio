@@ -11425,6 +11425,75 @@ async def test_promotion_dimension_ledger_incomplete_when_dimension_missing(
 
 
 @pytest.mark.asyncio
+async def test_promotion_dimension_ledger_incomplete_when_required_fact_unavailable(
+    db_session,
+):
+    """A transient unavailable fact is not durable terminal proof for a required
+    dimension, even though the ledger row exists at the correct candidate SHA."""
+    project, version = await _make_project_and_version(db_session)
+
+    for dim in [
+        "ci",
+        "audit",
+        "test_erosion",
+        "migration_identity",
+        "merge_grade",
+    ]:
+        await _seed_dimension_row(db_session, project, version, dim, status="passed")
+    await _seed_dimension_row(
+        db_session,
+        project,
+        version,
+        "migration_apply",
+        status="unavailable",
+        detail={
+            "infra_error": "migration_apply_check_unavailable",
+            "verdict": "defer",
+        },
+    )
+    await db_session.commit()
+
+    complete, missing = await rq._promotion_dimension_ledger_complete(
+        db_session, version, _LEDGER_SHA_A, smoketest_enabled=False
+    )
+    assert complete is False
+    assert missing == ["migration_apply"]
+
+
+@pytest.mark.asyncio
+async def test_promotion_dimension_ledger_accepts_explicit_non_applicable_fact(
+    db_session,
+):
+    """An explicitly non-applicable merge-grade fact remains valid terminal
+    evidence when there is no gradeable release goal."""
+    project, version = await _make_project_and_version(db_session)
+
+    for dim in [
+        "ci",
+        "audit",
+        "test_erosion",
+        "migration_identity",
+        "migration_apply",
+    ]:
+        await _seed_dimension_row(db_session, project, version, dim, status="passed")
+    await _seed_dimension_row(
+        db_session,
+        project,
+        version,
+        "merge_grade",
+        status="unavailable",
+        detail={"status": "not_applicable"},
+    )
+    await db_session.commit()
+
+    complete, missing = await rq._promotion_dimension_ledger_complete(
+        db_session, version, _LEDGER_SHA_A, smoketest_enabled=False
+    )
+    assert complete is True
+    assert missing == []
+
+
+@pytest.mark.asyncio
 async def test_finalize_holds_when_ledger_incomplete_at_promote(db_session, mocker):
     """Integration: a clean candidate that would promote is HELD as an infra
     failure — promote() is NOT called — when the per-dimension ledger is
@@ -11455,22 +11524,25 @@ async def test_finalize_holds_when_ledger_incomplete_at_promote(db_session, mock
         },
     )
 
-    # Simulate a ledger that lost a required gating dimension: the dual-write
-    # writes every dimension EXCEPT migration_apply for this candidate tree.
-    async def _incomplete_dual_write(session, ver, base_record, composite):
-        sha = base_record.get("candidate_sha")
-        # Flush the caller's staged mutations first so each upsert's savepoint
-        # isolates only the ledger write (mirrors the real dual-write).
-        await session.flush()
-        for dim in ("ci", "audit", "test_erosion", "migration_identity",
-                    "smoketest", "merge_grade"):
-            await rq._upsert_dimension_result(
-                session, ver, sha, dim, status="passed"
-            )
+    # Simulate a ledger that loses one required gate across both the eager and
+    # final writers.  Patching only the final dual-write is insufficient now that
+    # migration gates are durably recorded as soon as they resolve.
+    real_upsert = rq._upsert_dimension_result
+
+    async def _drop_migration_apply(
+        session,
+        ver,
+        sha,
+        dimension,
+        **kwargs,
+    ):
+        if dimension == "migration_apply":
+            return
+        await real_upsert(session, ver, sha, dimension, **kwargs)
 
     mocker.patch(
-        "app.release_qualifier._dual_write_dimension_results",
-        new=_incomplete_dual_write,
+        "app.release_qualifier._upsert_dimension_result",
+        new=_drop_migration_apply,
     )
     promote_spy = mocker.patch(
         "app.release_qualifier.promote",
@@ -11749,11 +11821,11 @@ async def test_finalize_holds_when_ledger_empty_on_redrive(db_session, mocker):
 
 
 @pytest.mark.asyncio
-async def test_finalize_fails_open_on_empty_ledger_first_attempt(db_session, mocker):
+async def test_finalize_holds_on_empty_ledger_first_attempt(db_session, mocker):
     """When the per-dimension ledger is completely empty at the promotion gate
-    on the FIRST qualification (qualification_attempts == 1), the promotion
-    still fail-opens on the live composite -- a transient ledger-write failure
-    on the first qualification must not block an otherwise-qualified promotion."""
+    on the FIRST qualification (qualification_attempts == 1), promotion fails
+    closed.  A candidate with no durable same-tree facts must never promote from
+    only the mutable live composite."""
     from app import shared_state
 
     shared_state.runtime_config["promotion_enabled"] = True
@@ -11795,9 +11867,10 @@ async def test_finalize_fails_open_on_empty_ledger_first_attempt(db_session, moc
     result = await rq._finalize_qualification(db_session, version)
     await db_session.commit()
 
-    # Fail-open: promoted despite empty ledger (first qualification).
-    assert result["status"] == "promoted"
-    promote_spy.assert_called_once()
+    # Held, not promoted -- empty ledger fails closed on the first attempt too.
+    assert result["status"] == "infra_failure"
+    assert result["error"] == "qualification_dimension_ledger_empty"
+    promote_spy.assert_not_called()
 
 
 # Fully-controlled gate inputs for finalize reuse-path tests: CI green, both
