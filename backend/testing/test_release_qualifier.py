@@ -17774,6 +17774,16 @@ def test_evaluate_hotfix_scope_pure_predicate():
     v = hotfix_policy.evaluate_hotfix_scope(["backend/app/hotfix_policy.py"])
     assert v.eligible is True
 
+    # The hotfix endpoint router must also be hotfixable so the delivery path
+    # can be repaired through the same channel it exposes.
+    v = hotfix_policy.evaluate_hotfix_scope(
+        ["backend/app/routers/admin_operator_triggers.py"]
+    )
+    assert v.eligible is True, (
+        "admin_operator_triggers.py must be in HOTFIX_ELIGIBLE_MODULES so the "
+        "hotfix endpoint itself can be repaired through the hotfix channel"
+    )
+
     # Product file → ineligible.
     v = hotfix_policy.evaluate_hotfix_scope(
         ["backend/app/release_scoring.py", "backend/app/compute_jobs.py"]

@@ -25,7 +25,6 @@ from app.models import (
     ArtifactType,
     MessageType,
     Project,
-    ProjectMessage,
     Task,
     TaskStatus,
 )

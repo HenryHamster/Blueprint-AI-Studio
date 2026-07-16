@@ -794,7 +794,7 @@ async def raise_capability_verdict_notice(
     fires a new notice while repeated re-evaluations of the same standing decided
     verdict are silent.
     """
-    from app.models import MessageType, ProjectMessage
+    from app.models import MessageType
     from app.project_message_creation import build_project_message
 
     dedupe_key = f"capability_verdict_decided_{cap_name}_{new_verdict}"
@@ -1207,7 +1207,7 @@ async def raise_stalled_trial_notice(
 
     Returns True when a new notice was written, False when the dedupe key already existed.
     """
-    from app.models import MessageType, ProjectMessage
+    from app.models import MessageType
     from app.project_message_creation import build_project_message
 
     dedupe_key = f"capability_trial_stalled_{cap_name}"
@@ -1361,7 +1361,7 @@ async def raise_ambiguous_lift_escalation_notice(
 
     Returns True when a new notice was written, False when the dedupe key already existed.
     """
-    from app.models import MessageType, ProjectMessage
+    from app.models import MessageType
     from app.project_message_creation import build_project_message
 
     dedupe_key = f"capability_trial_ambiguous_lift_escalation_{cap_name}"

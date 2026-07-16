@@ -2336,6 +2336,15 @@ async def record_acceptance_window_coverage_evidence(
     qualification path.
 
     Returns the number of evidence rows newly recorded.
+
+    **DEPLOYED-SIDE CONSTRAINT**: this function executes inside the deployed
+    orchestrator process at the deployed (main) SHA, called from
+    ``release_qualifier_sweep._reconcile_if_criterion_coverage_now_complete``.
+    A bug fix to this minting logic that lands on automain is INERT until the
+    fix is itself promoted and deployed.  The operator hotfix-deploy channel
+    (``POST /projects/{id}/promote/hotfix``, gated by
+    :data:`app.hotfix_policy.HOTFIX_ELIGIBLE_MODULES`) is the sanctioned
+    remediation path for fixes to this file.
     """
     try:
         from app import release_qualifier
