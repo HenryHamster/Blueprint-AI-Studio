@@ -13861,6 +13861,11 @@ async def test_compute_job_vm_heartbeat_bare_uuid_cannot_suppress_watchdog(
     )
     job.status = ComputeJobStatus.STARTING
     job.last_heartbeat_at = None
+    # The rollout boundary is exclusive: a VM created exactly when the HMAC
+    # rollout begins must not retain the guessable legacy credential.
+    job.created_at = datetime(2026, 7, 14, 7, 24, 41, tzinfo=timezone.utc).replace(
+        tzinfo=None
+    )
     await db_session.commit()
 
     progress_body = json.dumps({"progress": {"metric": "loss", "value": 0.5}}).encode()
@@ -13906,6 +13911,57 @@ async def test_compute_job_vm_heartbeat_bare_uuid_cannot_suppress_watchdog(
     series = (job.polling_metadata or {}).get("progress_series")
     assert series, "authenticated heartbeat must record the progress sample"
     assert series[-1]["name"] == "loss" and series[-1]["value"] == 0.5
+
+
+@pytest.mark.asyncio
+async def test_compute_job_vm_heartbeat_pre_rollout_uuid_keeps_vm_alive(
+    client, db_session, monkeypatch
+):
+    """A VM launched before the HMAC deploy may refresh its heartbeat with its UUID."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    project = Project(name="HB Flag-day Compatibility", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python3 train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        backend_name="local-subprocess",
+    )
+    job.status = ComputeJobStatus.RUNNING
+    job.created_at = datetime(2026, 7, 14, 7, 24, 40, tzinfo=timezone.utc).replace(
+        tzinfo=None
+    )
+    job.last_heartbeat_at = datetime(2026, 7, 14, 7, 20, tzinfo=timezone.utc).replace(
+        tzinfo=None
+    )
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/agent/compute-jobs/{job.id}/heartbeat",
+        headers={"Authorization": f"Bearer {job.id}"},
+    )
+
+    assert resp.status_code == 204
+    await db_session.refresh(job)
+    assert job.last_heartbeat_at is not None
+    assert job.last_heartbeat_at > datetime(
+        2026, 7, 14, 7, 20, tzinfo=timezone.utc
+    ).replace(tzinfo=None)
 
 
 @pytest.mark.asyncio
