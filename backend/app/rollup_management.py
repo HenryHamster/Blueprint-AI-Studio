@@ -1555,8 +1555,36 @@ async def _check_and_trigger_rollup(
         session, _pipeline_children
     )
     pipeline_active = False
+    pipeline_recovery_pending = False
+    # The infra-recovery sweep can resurrect a recent FAILED leaf exactly once.
+    # Treat an eligible review/fix failure as active until that bounded recovery
+    # window closes. Otherwise rollup can observe the direct work child as
+    # CANCELLED, mark the parent FAILED ("All N subtasks were cancelled"), and
+    # then watch the review child auto-resurrect seconds later — leaving live
+    # recovery work underneath a terminal parent.
+    from app.failure_classification import INFRA_CLASSES
+
+    _infra_resurrection_cutoff = _utcnow() - timedelta(hours=2)
     for c in all_children:
         if (c.first_payload).get("type") not in ("review", "fix"):
+            continue
+        if c.status == TaskStatus.FAILED:
+            ctx = c.context or {}
+            failure_category = ctx.get("failure_category")
+            resurrection_pending = (
+                failure_category in INFRA_CLASSES
+                and int(ctx.get("_resurrection_count", 0)) < 1
+                and c.updated_at is not None
+                and c.updated_at >= _infra_resurrection_cutoff
+                and ctx.get("timeout_subtype") != "oom"
+                and ctx.get("pr_closed_unmerged") is not True
+                and ctx.get("pr_closed_empty") is not True
+                and ctx.get("pr_rejected") is not True
+            )
+            if resurrection_pending:
+                pipeline_active = True
+                pipeline_recovery_pending = True
+                break
             continue
         if c.status not in (
             TaskStatus.QUEUED,
@@ -1644,7 +1672,14 @@ async def _check_and_trigger_rollup(
 
     # Don't rollup if there are still active tasks or active review/fix pipeline
     if active_count > 0 or pipeline_active:
-        if pipeline_active and (parent.latest_status_message or "").startswith(
+        if pipeline_recovery_pending:
+            parent.latest_status_message = (
+                "Recovering: infrastructure-failed review/fix task is eligible "
+                "for auto-resurrection"
+            )
+            session.add(parent)
+            await session.commit()
+        elif pipeline_active and (parent.latest_status_message or "").startswith(
             "Blocked:"
         ):
             parent.latest_status_message = (
