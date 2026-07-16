@@ -7255,6 +7255,7 @@ _FORCE_PROMOTE_NOOP_STATUSES: frozenset[str] = frozenset(
         "version_not_found",
         "not_open",
         "promotion_in_flight",
+        "ci_not_green",
     }
 )
 
@@ -7428,6 +7429,23 @@ async def force_promote_current_version(
             token, owner, repo, candidate_sha, project_id=str(project_id)
         )
     )
+    # Explicitly resolve CI for the candidate before opening the promotion PR.
+    # Both bypass channels skip the AUDIT gate only, not CI; relying on branch
+    # protection alone fails open when protection is absent or misconfigured.
+    ci_green, ci_resolution = await _resolve_ci_at_finalize(session, version, candidate_sha)
+    ci_required = _ci_required_for_finalize(project, ci_resolution)
+    if ci_required and not ci_green:
+        logger.warning(
+            "[RELEASE_QUALIFIER] FORCE-PROMOTE blocked: project %s v%d candidate %s "
+            "CI is not green (state=%s) — actor=%s reason=%s",
+            project_id,
+            version.version_number,
+            candidate_sha[:8],
+            ci_resolution.get("state"),
+            actor,
+            reason,
+        )
+        return {"status": "ci_not_green", "ci_resolution": ci_resolution}
     logger.warning(
         "[RELEASE_QUALIFIER] FORCE-PROMOTE requested: project %s v%d candidate %s "
         "actor=%s reason=%s — SKIPPING the audit/qualify gate (CI still gates the "
@@ -7817,6 +7835,21 @@ async def hotfix_promote_current_version(
             token, owner, repo, candidate_sha, project_id=str(project_id)
         )
     )
+    # Explicitly resolve CI before opening the PR — the bypass skips AUDIT only.
+    ci_green, ci_resolution = await _resolve_ci_at_finalize(session, version, candidate_sha)
+    ci_required = _ci_required_for_finalize(project, ci_resolution)
+    if ci_required and not ci_green:
+        logger.warning(
+            "[RELEASE_QUALIFIER] HOTFIX-PROMOTE blocked: project %s v%d candidate %s "
+            "CI is not green (state=%s) — actor=%s reason=%s",
+            project_id,
+            version.version_number,
+            candidate_sha[:8],
+            ci_resolution.get("state"),
+            actor,
+            reason,
+        )
+        return {"status": "ci_not_green", "ci_resolution": ci_resolution}
     logger.warning(
         "[RELEASE_QUALIFIER] HOTFIX-PROMOTE requested: project %s v%d candidate %s "
         "actor=%s reason=%s scope_modules=%s changed=%s — SKIPPING the audit/scoring "

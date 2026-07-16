@@ -50,6 +50,7 @@ from sqlalchemy import select
 from app import release_qualifier as rq
 from app import release_scoring as rs
 from app import release_version as rv
+from app import github_refs
 from app.models import (
     Alert,
     Artifact,
@@ -16588,6 +16589,11 @@ async def test_force_promote_current_version_skips_audit_and_promotes(
     spawn_mock = mocker.patch(
         "app.release_qualifier._spawn_release_audit_task", new=AsyncMock()
     )
+    mocker.patch.object(
+        rq,
+        "_resolve_ci_at_finalize",
+        new=AsyncMock(return_value=(True, {"state": "green", "resolved_sha": candidate, "detail": "ci green for test"})),
+    )
 
     result = await rq.force_promote_current_version(
         db_session,
@@ -16643,6 +16649,11 @@ async def test_force_promote_records_operator_reason(db_session, mocker):
     mocker.patch(
         "app.release_qualifier._spawn_release_audit_task", new=AsyncMock()
     )
+    mocker.patch.object(
+        rq,
+        "_resolve_ci_at_finalize",
+        new=AsyncMock(return_value=(True, {"state": "green", "resolved_sha": candidate, "detail": "ci green for test"})),
+    )
 
     result = await rq.force_promote_current_version(
         db_session,
@@ -16696,6 +16707,11 @@ async def test_force_promote_reason_defaults_to_none(db_session, mocker):
     )
     mocker.patch(
         "app.release_qualifier._spawn_release_audit_task", new=AsyncMock()
+    )
+    mocker.patch.object(
+        rq,
+        "_resolve_ci_at_finalize",
+        new=AsyncMock(return_value=(True, {"state": "green", "resolved_sha": candidate, "detail": "ci green for test"})),
     )
 
     result = await rq.force_promote_current_version(
@@ -16767,6 +16783,13 @@ def _patch_hotfix_promote_github(mocker, *, changed_files):
         new=AsyncMock(return_value={"merged": True, "message": "Merged"}),
     )
     mocker.patch("app.release_qualifier._spawn_release_audit_task", new=AsyncMock())
+    mocker.patch.object(
+        rq,
+        "_resolve_ci_at_finalize",
+        new=AsyncMock(
+            return_value=(True, {"state": "green", "resolved_sha": candidate, "detail": "ci green for test"})
+        ),
+    )
     return create_branch_mock, create_pr_mock
 
 
@@ -16796,6 +16819,52 @@ async def test_hotfix_promote_rejects_non_allowlisted_file(db_session, mocker):
     assert result["status"] == "scope_rejected"
     assert "backend/app/compute_jobs.py" in result["offending_files"]
     # No branch cut, no PR opened — the lane refused before promoting.
+    create_branch_mock.assert_not_called()
+    create_pr_mock.assert_not_called()
+    await db_session.refresh(version)
+    assert version.status == "open"
+
+
+@pytest.mark.asyncio
+async def test_hotfix_scope_rejects_incomplete_compare(db_session, mocker):
+    """A capped GitHub compare cannot authorize a machinery-only hotfix.
+
+    This exercises the real compare helper through the promotion seam: GitHub
+    returns its documented 300-file cap, so the helper returns its
+    indeterminate sentinel and promotion declines before any branch or PR side
+    effect.
+    """
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    real_compare_helper = github_refs.get_changed_files_with_patches_between_refs
+    create_branch_mock, create_pr_mock = _patch_hotfix_promote_github(
+        mocker,
+        changed_files=[("backend/app/release_qualifier.py", "@@ -1 +1 @@\n-x\n+y\n")],
+    )
+    compare_response = MagicMock(status_code=200)
+    compare_response.json.return_value = {
+        "files": [
+            {"filename": "backend/app/release_qualifier.py", "patch": None}
+            for _ in range(300)
+        ],
+    }
+    # Override the helper mock installed by the ordinary hotfix fixture: this
+    # assertion must exercise github_refs' actual completeness check.
+    mocker.patch("app.github._github_request", new=AsyncMock(return_value=compare_response))
+    mocker.patch(
+        "app.github_refs.get_changed_files_with_patches_between_refs",
+        new=real_compare_helper,
+    )
+
+    result = await rq.hotfix_promote_current_version(
+        db_session,
+        project.id,
+        actor="operator-1",
+        reason="candidate diff must be complete",
+        session_factory=_shared_session_factory(db_session),
+    )
+
+    assert result["status"] == "scope_rejected"
+    assert "could not resolve the candidate diff" in result["reason"]
     create_branch_mock.assert_not_called()
     create_pr_mock.assert_not_called()
     await db_session.refresh(version)
@@ -16874,12 +16943,34 @@ async def test_hotfix_promote_accepts_machinery_diff_and_writes_audit_trail(
     hotfix_deploy_pending_backfill completion-debt entry with the expected detail
     fields, plus an operator Alert."""
     project, version = await _make_project_and_version(db_session, phase="stabilize")
+    real_compare_helper = github_refs.get_changed_files_with_patches_between_refs
     _, create_pr_mock = _patch_hotfix_promote_github(
         mocker,
         changed_files=[
             ("backend/app/release_scoring.py", "@@ -1 +1 @@\n-x\n+y\n"),
             ("backend/app/release_qualifier.py", "@@ -1 +1 @@\n-a\n+b\n"),
         ],
+    )
+    # This is a normal GitHub compare response shape: the API has ``files``
+    # and ``total_commits``, but no ``total_files`` field.
+    compare_response = MagicMock(status_code=200)
+    compare_response.json.return_value = {
+        "total_commits": 2,
+        "files": [
+            {
+                "filename": "backend/app/release_scoring.py",
+                "patch": "@@ -1 +1 @@\n-x\n+y\n",
+            },
+            {
+                "filename": "backend/app/release_qualifier.py",
+                "patch": "@@ -1 +1 @@\n-a\n+b\n",
+            },
+        ],
+    }
+    mocker.patch("app.github._github_request", new=AsyncMock(return_value=compare_response))
+    mocker.patch(
+        "app.github_refs.get_changed_files_with_patches_between_refs",
+        new=real_compare_helper,
     )
 
     result = await rq.hotfix_promote_current_version(
@@ -17481,6 +17572,11 @@ async def test_force_promote_refuses_when_promotion_in_flight(db_session, mocker
         ),
     )
     create_mock = mocker.patch("app.github.create_pull_request", new=AsyncMock())
+    mocker.patch.object(
+        rq,
+        "_resolve_ci_at_finalize",
+        new=AsyncMock(return_value=(True, {"state": "green", "resolved_sha": "facec0de" * 5, "detail": "ci green for test"})),
+    )
 
     result = await rq.force_promote_current_version(
         db_session,
@@ -17539,6 +17635,11 @@ async def test_force_promote_proceeds_when_verdict_finalized(db_session, mocker)
         ),
     )
     mocker.patch("app.github.create_pull_request", new=AsyncMock())
+    mocker.patch.object(
+        rq,
+        "_resolve_ci_at_finalize",
+        new=AsyncMock(return_value=(True, {"state": "green", "resolved_sha": "facec0de" * 5, "detail": "ci green for test"})),
+    )
 
     result = await rq.force_promote_current_version(
         db_session,
@@ -17550,6 +17651,91 @@ async def test_force_promote_proceeds_when_verdict_finalized(db_session, mocker)
     # Must NOT refuse with promotion_in_flight — verdict already resolved.
     assert result["status"] != "promotion_in_flight", (
         "stale-pending+finalized-verdict should not block force_promote"
+    )
+
+
+@pytest.mark.asyncio
+async def test_operator_bypasses_require_candidate_ci(db_session, mocker):
+    """force_promote and hotfix_promote both gate on CI being green for the
+    candidate commit.
+
+    Both bypass channels skip the AUDIT/scoring gate but must not skip CI: when
+    CI is not green the bypass returns ``{"status": "ci_not_green"}`` without
+    cutting any branch or opening a PR.  This is the seam the acceptance criterion
+    for direction d-ae60ffe3 requires: operator bypasses must resolve exact-candidate
+    CI rather than relying on branch protection alone.
+    """
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    candidate = "facec0de" * 5
+
+    # Baseline GitHub mocks shared by both bypass paths.
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain=candidate, main="mainnew" * 5 + "00000"),
+    )
+    mocker.patch(
+        "app.github.list_repo_tree_paths_at_ref",
+        new=AsyncMock(
+            return_value=[{"path": "backend/app/main.py", "size": 10, "sha": "b1"}]
+        ),
+    )
+    promote_mock = mocker.patch(
+        "app.release_qualifier.promote",
+        new=AsyncMock(return_value={"status": "promoted"}),
+    )
+
+    # --- CI not green: force_promote is blocked ---
+    mocker.patch.object(
+        rq,
+        "_resolve_ci_at_finalize",
+        new=AsyncMock(
+            return_value=(False, {"state": rq._CI_RED, "resolved_sha": candidate, "detail": "ci red for test"})
+        ),
+    )
+
+    force_result = await rq.force_promote_current_version(
+        db_session,
+        project.id,
+        actor="op",
+        reason="prod incident — must ship",
+        session_factory=_shared_session_factory(db_session),
+    )
+
+    assert force_result["status"] == "ci_not_green", (
+        f"force_promote must return ci_not_green when CI is red; got {force_result['status']!r}"
+    )
+    promote_mock.assert_not_called()
+
+    # --- CI not green: hotfix_promote is blocked (even after scope passes) ---
+    mocker.patch(
+        "app.github_refs.get_changed_files_with_patches_between_refs",
+        new=_hotfix_changed_files_mock(
+            [("backend/app/release_scoring.py", "@@ -1 +1 @@\n-a\n+b\n")]
+        ),
+    )
+
+    hotfix_result = await rq.hotfix_promote_current_version(
+        db_session,
+        project.id,
+        actor="op",
+        reason="machinery fix",
+        scope_modules=["backend/app/release_scoring.py"],
+        session_factory=_shared_session_factory(db_session),
+    )
+
+    assert hotfix_result["status"] == "ci_not_green", (
+        f"hotfix_promote must return ci_not_green when CI is red; got {hotfix_result['status']!r}"
+    )
+    promote_mock.assert_not_called()
+
+    # Version remains open — no branch was cut, no PR was opened.
+    await db_session.refresh(version)
+    assert version.status == "open", (
+        "version must remain open when operator bypass is blocked by CI"
     )
 
 
