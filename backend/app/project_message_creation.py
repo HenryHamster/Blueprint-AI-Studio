@@ -15,6 +15,7 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
+from app.database import resolve_dialect_name
 from app.models import (
     MESSAGE_CONTENT_MAX,
     MessageHandlingState,
@@ -25,7 +26,6 @@ from app.models import (
     ProjectMessageSequence,
     _utcnow,
 )
-from app.database import resolve_dialect_name
 from app.project_message_projection import message_event_payload
 from app.strategic_trigger import (
     ARMING_NOT_ARMED,

@@ -223,6 +223,7 @@ WEBSOCKET_EMITTER_INVENTORY = {
         "backend/app/runner_health_alerts.py",
         "backend/app/runner_pull_skip.py",
         "backend/app/services.py",
+        "backend/app/strategic_completion.py",
         "backend/app/strategic_events.py",
         "backend/app/task_completion.py",
         "backend/app/task_completion_self_audit.py",
