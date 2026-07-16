@@ -923,6 +923,25 @@ def test_packer_requires_codex_cli_with_gpt_5_6_picker():
     assert "exit 1; }" in gate
 
 
+def test_packer_pins_claude_cli_with_version_gate():
+    hcl = _read_packer_hcl()
+    install = next(
+        line.strip()
+        for line in hcl.splitlines()
+        if "npm install -g" in line and "@anthropic-ai/claude-code" in line
+    )
+    assert "@anthropic-ai/claude-code@2.1.197" in install
+    gate = next(
+        line.strip()
+        for line in hcl.splitlines()
+        if "Claude Code 2.1.197 required for fleet config compatibility" in line
+    )
+    assert gate.startswith('"claude_version=$(claude --version | awk')
+    assert "awk '{print $1}'" in gate
+    assert 'test \\"$claude_version\\" = 2.1.197' in gate
+    assert "exit 1; }" in gate
+
+
 def test_agent_dockerfile_pins_and_starts_codex_native_binary():
     if not _AGENT_DOCKERFILE.exists():
         pytest.skip("agent/Dockerfile not present (backend-only Docker run)")
@@ -931,6 +950,9 @@ def test_agent_dockerfile_pins_and_starts_codex_native_binary():
     assert "npm install -g --include=optional" in dockerfile
     assert 'codex --version' in dockerfile
     assert 'test "${codex_version}" = "${CODEX_VERSION}"' in dockerfile
+    assert "ARG CLAUDE_CODE_VERSION=2.1.197" in dockerfile
+    assert 'claude --version' in dockerfile
+    assert 'test "${claude_version}" = "${CLAUDE_CODE_VERSION}"' in dockerfile
 
 
 def _read_packer_memo_smoke() -> str:

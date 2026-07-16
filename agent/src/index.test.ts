@@ -4708,7 +4708,19 @@ describe('bootstrapPoolMode', () => {
           CLAUDE_CODE_OAUTH_TOKEN: 'sandbox-claude-token',
         },
         files: [
-          { path: '/home/agent/.claude.json', content: '{"hasCompletedOnboarding":true}', mode: '0600' },
+          {
+            path: '/home/agent/.claude.json',
+            content: JSON.stringify({
+              hasCompletedOnboarding: true,
+              projects: {
+                [WORKSPACE]: {
+                  hasTrustDialogAccepted: false,
+                  allowedTools: { Bash: true },
+                },
+              },
+            }),
+            mode: '0600',
+          },
         ],
         metadata: { retarget: true, provider: 'anthropic', auth_mode: 'oauth' },
       }, 'test: sandbox-reanchor');
@@ -4722,7 +4734,10 @@ describe('bootstrapPoolMode', () => {
       expect(JSON.parse(claudeWrite?.[1] as string)).toEqual({
         hasCompletedOnboarding: true,
         projects: {
-          [WORKSPACE]: { hasTrustDialogAccepted: true },
+          [WORKSPACE]: {
+            hasTrustDialogAccepted: true,
+            allowedTools: [],
+          },
         },
       });
       expect(claudeWrite?.[2]).toEqual(expect.objectContaining({ mode: 0o600 }));
@@ -4763,8 +4778,12 @@ describe('bootstrapPoolMode', () => {
       const claudeWrite = vi.mocked(fs.writeFileSync).mock.calls.find(
         c => c[0] === '/home/agent/.claude.json',
       );
-      expect(JSON.parse(claudeWrite?.[1] as string).projects[WORKSPACE]).toEqual({
+      const writtenConfig = JSON.parse(claudeWrite?.[1] as string) as {
+        projects: Record<string, unknown>;
+      };
+      expect(writtenConfig.projects[WORKSPACE]).toEqual({
         hasTrustDialogAccepted: true,
+        allowedTools: [],
       });
     } finally {
       if (savedHome !== undefined) process.env.HOME = savedHome; else delete process.env.HOME;
