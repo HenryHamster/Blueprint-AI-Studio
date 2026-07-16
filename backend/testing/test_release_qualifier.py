@@ -11514,6 +11514,22 @@ async def test_finalize_holds_when_ledger_incomplete_at_promote(db_session, mock
 
     # Simulate a ledger that lost a required gating dimension: the dual-write
     # writes every dimension EXCEPT migration_apply for this candidate tree.
+    # Also intercept _upsert_dimension_result to skip migration_apply: Phase 1b
+    # added an eager-write for migration_apply inside _finalize_qualification
+    # (before _dual_write_dimension_results), so we must suppress it here too to
+    # faithfully reproduce a scenario where that eager-write's savepoint rolled back.
+    _orig_upsert = rq._upsert_dimension_result
+
+    async def _skip_migration_apply_upsert(session, ver, sha, dim, **kw):
+        if dim == "migration_apply":
+            return
+        return await _orig_upsert(session, ver, sha, dim, **kw)
+
+    mocker.patch(
+        "app.release_qualifier._upsert_dimension_result",
+        side_effect=_skip_migration_apply_upsert,
+    )
+
     async def _incomplete_dual_write(session, ver, base_record, composite):
         sha = base_record.get("candidate_sha")
         # Flush the caller's staged mutations first so each upsert's savepoint
@@ -11521,9 +11537,7 @@ async def test_finalize_holds_when_ledger_incomplete_at_promote(db_session, mock
         await session.flush()
         for dim in ("ci", "audit", "test_erosion", "migration_identity",
                     "smoketest", "merge_grade"):
-            await rq._upsert_dimension_result(
-                session, ver, sha, dim, status="passed"
-            )
+            await _orig_upsert(session, ver, sha, dim, status="passed")
 
     mocker.patch(
         "app.release_qualifier._dual_write_dimension_results",

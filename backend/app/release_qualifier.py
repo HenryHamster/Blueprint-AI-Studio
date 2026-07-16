@@ -2942,6 +2942,7 @@ async def run_qualification(
         "ci_green": ci_green,
         "ci_state": ci_state,
         "smoketest_enabled": smoketest_enabled,
+        "env_preflight_enabled": env_preflight_enabled,
         "audit_task_id": audit_task_id,
         "challenge_task_id": challenge_task_id,
         "audit_challenge_task_id": audit_challenge_task_id,
