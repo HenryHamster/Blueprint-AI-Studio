@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import { FileText } from 'lucide-react';
 import { resolveArtifactDownloadUrl, type ComputeJob } from '../api';
 import { computeJobViewableArtifacts, fmtBytes } from './ComputeJobsPanel.utils';
@@ -13,8 +13,11 @@ type PreviewResolution =
   | { state: 'resolved'; url: string; resolvedAt: number }
   | { state: 'error' };
 
+const artifactCacheKey = (storageUri: string, revision: string | null) =>
+  revision ? `${storageUri}@${revision}` : storageUri;
+
 /** Self-contained viewable-artifact gallery for a single compute job. Owns its
- *  own signed-preview-URL state (keyed by `storage_uri`), resolves lazily when
+ *  own signed-preview-URL state (keyed by storage identity plus revision), resolves lazily when
  *  the operator expands the gallery, opens images full-size in a new tab, and
  *  re-resolves on click / media error once a signed URL goes stale.
  *
@@ -24,51 +27,55 @@ type PreviewResolution =
 export function ComputeArtifactGallery({ projectId, job }: { projectId: string; job: ComputeJob }) {
   const [expanded, setExpanded] = useState(false);
   const [previewUrls, setPreviewUrls] = useState<Record<string, PreviewResolution>>({});
+  const previewRequestIds = useRef<Record<string, number>>({});
 
   const artifacts = computeJobViewableArtifacts(job);
 
   const resolvePreviewUrl = useCallback(
-    async (storageUri: string): Promise<string | null> => {
+    async (key: string, storageUri: string): Promise<string | null> => {
       if (!projectId) return null;
-      setPreviewUrls((prev) => ({ ...prev, [storageUri]: { state: 'resolving' } }));
+      const requestId = (previewRequestIds.current[key] ?? 0) + 1;
+      previewRequestIds.current[key] = requestId;
+      setPreviewUrls((prev) => ({ ...prev, [key]: { state: 'resolving' } }));
       try {
         const url = await resolveArtifactDownloadUrl(projectId, storageUri);
-        setPreviewUrls((prev) => ({ ...prev, [storageUri]: { state: 'resolved', url, resolvedAt: Date.now() } }));
+        if (previewRequestIds.current[key] === requestId) {
+          setPreviewUrls((prev) => ({ ...prev, [key]: { state: 'resolved', url, resolvedAt: Date.now() } }));
+        }
         return url;
       } catch {
-        setPreviewUrls((prev) => ({ ...prev, [storageUri]: { state: 'error' } }));
+        if (previewRequestIds.current[key] === requestId) {
+          setPreviewUrls((prev) => ({ ...prev, [key]: { state: 'error' } }));
+        }
         return null;
       }
     },
     [projectId],
   );
 
-  const markPreviewError = useCallback((storageUri: string) => {
-    setPreviewUrls((prev) => ({ ...prev, [storageUri]: { state: 'error' } }));
+  const markPreviewError = useCallback((key: string) => {
+    setPreviewUrls((prev) => ({ ...prev, [key]: { state: 'error' } }));
   }, []);
 
-  const toggleGallery = useCallback(() => {
-    setExpanded((wasExpanded) => {
-      if (!wasExpanded) {
-        // Lazy resolution: sign URLs only on expand, skipping entries already
-        // resolving or resolved.
-        for (const art of artifacts) {
-          // PDFs are click-to-open (never rendered inline), so their signed URL
-          // is minted on click by openPreviewFullSize — don't waste a signing
-          // round-trip eagerly on expand.
-          if (art.kind === 'pdf') continue;
-          const cached = previewUrls[art.storage_uri];
-          if (cached?.state === 'resolving' || cached?.state === 'resolved') continue;
-          void resolvePreviewUrl(art.storage_uri);
-        }
-      }
-      return !wasExpanded;
+  useEffect(() => {
+    if (!expanded) return;
+    const pending = artifacts.filter((art) => {
+      if (art.kind === 'pdf') return false;
+      const key = artifactCacheKey(art.storage_uri, art.revision);
+      return !previewUrls[key];
     });
-  }, [artifacts, previewUrls, resolvePreviewUrl]);
+    if (pending.length === 0) return;
+    const timer = window.setTimeout(() => {
+      for (const art of pending) {
+        void resolvePreviewUrl(artifactCacheKey(art.storage_uri, art.revision), art.storage_uri);
+      }
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [artifacts, expanded, previewUrls, resolvePreviewUrl]);
 
   const openPreviewFullSize = useCallback(
-    async (storageUri: string) => {
-      const cached = previewUrls[storageUri];
+    async (key: string, storageUri: string) => {
+      const cached = previewUrls[key];
       if (cached?.state === 'resolved' && Date.now() - cached.resolvedAt < SIGNED_PREVIEW_FRESH_MS) {
         window.open(cached.url, '_blank', 'noopener,noreferrer');
         return;
@@ -76,7 +83,7 @@ export function ComputeArtifactGallery({ projectId, job }: { projectId: string; 
       // Stale or errored cache — re-resolve, keeping a pending tab open across
       // the async gap so popup blockers don't eat the navigation.
       const pendingTab = window.open('', '_blank');
-      const url = await resolvePreviewUrl(storageUri);
+      const url = await resolvePreviewUrl(key, storageUri);
       if (!url) {
         pendingTab?.close();
         return;
@@ -122,7 +129,7 @@ export function ComputeArtifactGallery({ projectId, job }: { projectId: string; 
         <span>Artifacts</span>
         <button
           type="button"
-          onClick={toggleGallery}
+          onClick={() => setExpanded((value) => !value)}
           className="min-h-[44px] rounded border border-neutral-700 bg-neutral-800 px-1 py-0.5 text-ui-xs text-sky-400 hover:text-sky-300"
           data-testid="drawer-artifact-gallery-toggle"
         >
@@ -133,7 +140,8 @@ export function ComputeArtifactGallery({ projectId, job }: { projectId: string; 
       {expanded && (
         <div className="flex flex-wrap gap-2">
           {artifacts.map((art) => {
-            const resolution = previewUrls[art.storage_uri];
+            const key = artifactCacheKey(art.storage_uri, art.revision);
+            const resolution = previewUrls[key];
             const sizeLabel = fmtBytes(art.bytes);
             const caption = (
               <div className="max-w-[10rem] truncate text-ui-xs text-neutral-500 font-mono" title={art.name}>
@@ -146,10 +154,10 @@ export function ComputeArtifactGallery({ projectId, job }: { projectId: string; 
               // openPreviewFullSize resolves a fresh signed URL and opens it in
               // a new tab.
               return (
-                <div key={art.storage_uri} className="flex flex-col gap-0.5" data-testid="drawer-viewable-artifact">
+                <div key={key} className="flex flex-col gap-0.5" data-testid="drawer-viewable-artifact">
                   <button
                     type="button"
-                    onClick={() => { void openPreviewFullSize(art.storage_uri); }}
+                    onClick={() => { void openPreviewFullSize(key, art.storage_uri); }}
                     disabled={resolution?.state === 'resolving'}
                     title={`Open ${art.name} in a new tab`}
                     className="flex h-24 w-32 flex-col items-center justify-center gap-1 rounded border border-neutral-800 bg-neutral-950 px-1 text-center text-ui-xs text-neutral-400 hover:border-sky-500/50 disabled:opacity-70"
@@ -170,20 +178,20 @@ export function ComputeArtifactGallery({ projectId, job }: { projectId: string; 
             }
             if (resolution?.state === 'resolved') {
               return (
-                <div key={art.storage_uri} className="flex flex-col gap-0.5" data-testid="drawer-viewable-artifact">
+                <div key={key} className="flex flex-col gap-0.5" data-testid="drawer-viewable-artifact">
                   {art.kind === 'video' ? (
                     <video
                       controls
                       preload="metadata"
                       src={resolution.url}
-                      onError={() => markPreviewError(art.storage_uri)}
+                      onError={() => markPreviewError(key)}
                       className="h-24 max-w-[16rem] rounded border border-neutral-800 bg-neutral-950"
                       data-testid="drawer-artifact-video"
                     />
                   ) : (
                     <button
                       type="button"
-                      onClick={() => { void openPreviewFullSize(art.storage_uri); }}
+                      onClick={() => { void openPreviewFullSize(key, art.storage_uri); }}
                       title={`Open ${art.name} full-size in a new tab`}
                       className="rounded border border-neutral-800 bg-neutral-950 hover:border-sky-500/50"
                       data-testid="drawer-artifact-thumbnail"
@@ -192,7 +200,7 @@ export function ComputeArtifactGallery({ projectId, job }: { projectId: string; 
                         src={resolution.url}
                         alt={art.name}
                         loading="lazy"
-                        onError={() => markPreviewError(art.storage_uri)}
+                        onError={() => markPreviewError(key)}
                         className="h-24 w-auto max-w-[16rem] rounded object-contain"
                       />
                     </button>
@@ -202,10 +210,10 @@ export function ComputeArtifactGallery({ projectId, job }: { projectId: string; 
               );
             }
             return (
-              <div key={art.storage_uri} className="flex flex-col gap-0.5" data-testid="drawer-viewable-artifact">
+              <div key={key} className="flex flex-col gap-0.5" data-testid="drawer-viewable-artifact">
                 <button
                   type="button"
-                  onClick={() => { void resolvePreviewUrl(art.storage_uri); }}
+                  onClick={() => { void resolvePreviewUrl(key, art.storage_uri); }}
                   disabled={resolution?.state === 'resolving'}
                   className="flex h-24 w-32 items-center justify-center rounded border border-neutral-800 bg-neutral-950 px-1 text-center text-ui-xs text-neutral-500 hover:border-sky-500/50 disabled:opacity-70"
                   data-testid="drawer-artifact-placeholder"

@@ -2718,6 +2718,11 @@ async def persist_viewable_artifacts(
                 "content_type": candidate.content_type,
                 "size_bytes": candidate.size_bytes,
                 "kind": candidate.kind,
+                # The object URI is deterministic and may have held a live
+                # generation already. Terminal persistence is an authoritative
+                # overwrite, so it receives a fresh cache identity.
+                "revision": storage.new_viewable_revision(),
+                "live": False,
             }
         )
     return manifest, dropped

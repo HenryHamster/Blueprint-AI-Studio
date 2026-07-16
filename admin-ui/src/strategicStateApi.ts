@@ -190,24 +190,32 @@ export interface StrategicContextRenderableDescriptor {
     width?: number | null;
     height?: number | null;
     storage_uri?: string | null;
+    revision?: string | null;
+    live?: boolean | null;
   } | null;
   video?: {
     url?: string | null;
     alt?: string | null;
     storage_uri?: string | null;
     mime_type?: string | null;
+    revision?: string | null;
+    live?: boolean | null;
   } | null;
   images?: Array<{
     url?: string | null;
     alt?: string | null;
     filename?: string | null;
     storage_uri?: string | null;
+    revision?: string | null;
+    live?: boolean | null;
   }> | null;
   videos?: Array<{
     url?: string | null;
     alt?: string | null;
     filename?: string | null;
     storage_uri?: string | null;
+    revision?: string | null;
+    live?: boolean | null;
   }> | null;
   // PDFs are never rendered inline on the app origin — the descriptor carries a
   // storage_uri (and/or a baked signed url) that the frontend resolves fresh and
@@ -217,12 +225,16 @@ export interface StrategicContextRenderableDescriptor {
     url?: string | null;
     alt?: string | null;
     storage_uri?: string | null;
+    revision?: string | null;
+    live?: boolean | null;
   } | null;
   pdfs?: Array<{
     url?: string | null;
     alt?: string | null;
     filename?: string | null;
     storage_uri?: string | null;
+    revision?: string | null;
+    live?: boolean | null;
   }> | null;
   chart?: {
     kind?: 'bar' | 'line' | string;
@@ -278,6 +290,8 @@ export interface StrategicContextArtifactViewablePreview {
   filename?: string | null;
   /** Stable gs:// ref for lazy re-resolution when the baked signed URL expires. */
   storage_uri?: string | null;
+  revision?: string | null;
+  live?: boolean | null;
 }
 
 export interface StrategicContextArtifactEvidence {

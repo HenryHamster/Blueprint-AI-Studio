@@ -377,6 +377,56 @@ async def test_bundle_artifact_resolves_manifest_viewable_video(
 
 
 @pytest.mark.asyncio
+async def test_viewable_revision_reaches_signed_preview_and_descriptor(
+    db_session, monkeypatch
+):
+    """Revision/live metadata survives signing without changing the media URI."""
+    project, task = await _make_project_task(db_session, name="RevisionPreview")
+    plot_uri = (
+        f"gs://{ARTIFACT_BUCKET_NAME}/compute-jobs/"
+        "11111111-1111-1111-1111-111111111111/artifacts/viewable/reward.png"
+    )
+    db_session.add(
+        Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.DEBUG_RESULT,
+            storage_uri=(
+                f"gs://{ARTIFACT_BUCKET_NAME}/compute-jobs/"
+                "11111111-1111-1111-1111-111111111111/artifacts/bundle.tar.gz"
+            ),
+            logs=json.dumps(
+                {
+                    "viewable_files": [
+                        {
+                            "filename": "reward.png",
+                            "storage_uri": plot_uri,
+                            "kind": "image",
+                            "revision": "terminal-revision-9",
+                            "live": False,
+                        }
+                    ]
+                }
+            ),
+        )
+    )
+    await db_session.commit()
+
+    async def fake_verify(storage_uri, project_id, session):
+        assert storage_uri == plot_uri
+
+    monkeypatch.setattr(scp, "verify_artifact_project_ownership", fake_verify)
+    monkeypatch.setattr(scp, "generate_download_signed_url", _fake_signer([]))
+
+    evidence = await load_strategic_context_evidence(db_session, project.id)
+    preview = evidence["artifacts"]["items"][0]["viewable_previews"][0]
+    assert preview["revision"] == "terminal-revision-9"
+    assert preview["live"] is False
+    descriptor = _artifact_descriptor(evidence["artifacts"]["items"][0])
+    assert descriptor["image"]["revision"] == "terminal-revision-9"
+    assert descriptor["images"][0]["live"] is False
+
+
+@pytest.mark.asyncio
 async def test_signing_failure_falls_back_to_stub(db_session, monkeypatch):
     """Fail-soft: a signing error yields the pre-existing metadata-only stub."""
     project, task = await _make_project_task(db_session, name="PreviewFail")

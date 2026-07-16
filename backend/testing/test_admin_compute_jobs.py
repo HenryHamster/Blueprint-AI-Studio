@@ -3157,6 +3157,8 @@ def test_viewable_artifacts_descriptor_preserves_pdf_kind():
                 "content_type": "application/pdf",
                 "size_bytes": 2048,
                 "kind": "pdf",
+                "revision": "terminal-rev-7",
+                "live": False,
             },
             {
                 "filename": "plot.png",
@@ -3177,6 +3179,9 @@ def test_viewable_artifacts_descriptor_preserves_pdf_kind():
     by_name = {e["filename"]: e for e in out}
     assert by_name["report.pdf"]["kind"] == "pdf"
     assert by_name["report.pdf"]["content_type"] == "application/pdf"
+    assert by_name["report.pdf"]["revision"] == "terminal-rev-7"
+    assert by_name["report.pdf"]["live"] is False
     assert by_name["plot.png"]["kind"] == "image"
+    assert by_name["plot.png"]["revision"] is None
     # An svg (or any non-allowlisted kind) is coerced to None fail-closed.
     assert by_name["diagram.svg"]["kind"] is None

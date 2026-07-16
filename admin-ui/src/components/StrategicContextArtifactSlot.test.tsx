@@ -95,6 +95,30 @@ describe('StrategicContextArtifactSlot — lazy signed-URL resolution', () => {
     expect(img!.getAttribute('src')).not.toContain('sig=stale');
   });
 
+  test('refreshes a mounted same-URI canvas preview when its revision changes', async () => {
+    const { resolveArtifactDownloadUrl } = await import('../api');
+    vi.mocked(resolveArtifactDownloadUrl)
+      .mockResolvedValueOnce('https://fresh.example.com/plot-v1.png')
+      .mockResolvedValueOnce('https://fresh.example.com/plot-v2.png');
+    const descriptor = imageDescriptor({
+      image: { url: 'https://baked.example/plot-v1.png', alt: 'Reward plot', storage_uri: 'gs://bucket/proj/plot.png', revision: 'v1', live: true },
+      images: [{ url: 'https://baked.example/plot-v1.png', alt: 'plot.png', filename: 'plot.png', storage_uri: 'gs://bucket/proj/plot.png', revision: 'v1', live: true }],
+    });
+    await render(makePackage({ descriptors: [descriptor] }), 'proj-1');
+    expect(host!.querySelector('img')?.getAttribute('src')).toBe('https://fresh.example.com/plot-v1.png');
+
+    await act(async () => {
+      root!.render(<StrategicContextArtifactSlot contextPackage={makePackage({ descriptors: [{
+        ...descriptor,
+        image: { ...descriptor.image!, url: 'https://baked.example/plot-v2.png', revision: 'v2', live: false },
+        images: [{ ...descriptor.images![0], url: 'https://baked.example/plot-v2.png', revision: 'v2', live: false }],
+      }] })} projectId="proj-1" />);
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    });
+    expect(host!.querySelector('img')?.getAttribute('src')).toBe('https://fresh.example.com/plot-v2.png');
+    expect(vi.mocked(resolveArtifactDownloadUrl)).toHaveBeenCalledTimes(2);
+  });
+
   test('falls back to the baked URL when no projectId is available', async () => {
     const { resolveArtifactDownloadUrl } = await import('../api');
     const pkg = makePackage({

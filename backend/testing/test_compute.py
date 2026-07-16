@@ -20433,7 +20433,17 @@ async def test_persist_viewable_artifacts_returns_tuple_with_dropped_count(tmp_p
     assert dropped == 2
     # Each manifest entry has the required fields
     entry = manifest[0]
-    assert {"filename", "storage_uri", "content_type", "size_bytes", "kind"} <= entry.keys()
+    assert {
+        "filename",
+        "storage_uri",
+        "content_type",
+        "size_bytes",
+        "kind",
+        "revision",
+        "live",
+    } <= entry.keys()
+    assert isinstance(entry["revision"], str) and entry["revision"]
+    assert entry["live"] is False
 
 
 @pytest.mark.asyncio
@@ -21002,9 +21012,10 @@ async def test_viewable_pipeline_enforces_video_ceiling(db_session, monkeypatch)
     await db_session.commit()
 
     # Only the within-ceiling video is persisted; the oversized one is skipped
-    # (size rejections are not counted in the dropped/count-cap tally).
+    # and reported in the aggregate omission count, matching image-size and
+    # count-cap omissions.
     assert [m["filename"] for m in manifest] == ["ok_clip.mp4"]
-    assert dropped == 0
+    assert dropped == 1
     uploads = {u["basename"]: u for u in calls["uploads"]}
     assert set(uploads) == {"ok_clip.mp4"}
     assert uploads["ok_clip.mp4"]["streamed"] is True
@@ -21250,6 +21261,8 @@ async def test_viewable_pipeline_is_idempotent_and_downloads_bundle_once(
     )
     await db_session.commit()
     assert len(manifest1) == 2
+    first_revisions = {e["filename"]: e["revision"] for e in manifest1}
+    assert all(e["live"] is False for e in manifest1)
     assert calls["downloads"] == 1
     assert len(calls["uploads"]) == 2
 
@@ -21265,6 +21278,7 @@ async def test_viewable_pipeline_is_idempotent_and_downloads_bundle_once(
     )
     assert len(calls["uploads"]) == 2, "re-entry must NOT re-upload any file"
     assert {e["filename"] for e in manifest2} == {e["filename"] for e in manifest1}
+    assert {e["filename"]: e["revision"] for e in manifest2} == first_revisions
 
     rows = await _job_files(db_session, job.id)
     assert len(rows) == 2, f"expected no duplicate rows on re-entry, got {len(rows)}"

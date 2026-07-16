@@ -3999,6 +3999,8 @@ def _scan_viewable_files(artifact_dir: str) -> list:
                         "abspath": abspath,
                         "size": st.st_size,
                         "mtime": st.st_mtime,
+                        "mtime_ns": st.st_mtime_ns,
+                        "ctime_ns": st.st_ctime_ns,
                         "kind": kind,
                         "content_type": content_type,
                     }
@@ -4114,22 +4116,42 @@ def _viewable_multipart_length(boundary: str, relpath: str, size: int, content_t
 class _ViewableStreamState:
     """Cross-heartbeat state for mid-run viewable streaming of ONE compute job.
 
-    ``sent`` maps an uploaded ``relpath`` to its last-uploaded ``(mtime, size)``
+    ``sent`` maps an uploaded ``relpath`` to its last-uploaded nanosecond stat
     signature so an unchanged file is not re-sent every cycle while an overwritten
     one (e.g. ``reward_curve.png`` rewritten each eval step) IS re-sent. The
     ``*_logged`` members keep the bounded skip notices to one line each.
     """
 
-    __slots__ = ("sent", "oversize_logged", "budget_logged", "inflight", "completed", "lock", "thread")
+    __slots__ = (
+        "sent",
+        "revisions",
+        "oversize_logged",
+        "budget_logged",
+        "inflight",
+        "completed",
+        "lock",
+        "thread",
+    )
 
     def __init__(self) -> None:
         self.sent: dict = {}
+        # relpath -> (stat signature, opaque generation token). A failed upload
+        # retries with the SAME token; a changed stat signature gets a new one.
+        self.revisions: dict = {}
         self.oversize_logged: set = set()
         self.budget_logged = False
         self.inflight: tuple | None = None
         self.completed: tuple | None = None
         self.lock = threading.Lock()
         self.thread: threading.Thread | None = None
+
+    def revision_for(self, relpath: str, signature: tuple) -> str:
+        """Return a stable token for this observed local-file generation."""
+        current = self.revisions.get(relpath)
+        if current is None or current[0] != signature:
+            current = (signature, secrets.token_hex(16))
+            self.revisions[relpath] = current
+        return current[1]
 
     def reap(self) -> None:
         """Commit only completed successful uploads on the heartbeat thread."""
@@ -4187,6 +4209,7 @@ def _upload_viewable(
     path: str,
     size: int,
     content_type: str,
+    revision: "str | None" = None,
 ) -> "int | None":
     """POST one viewable file to the mid-run endpoint. Returns HTTP status, or
     ``None`` on a network error. Never raises — mid-run streaming is strictly
@@ -4220,6 +4243,11 @@ def _upload_viewable(
                     "Content-Length": str(
                         _viewable_multipart_length(boundary, relpath, size, content_type)
                     ),
+                    **(
+                        {"X-Blueprint-Viewable-Revision": revision}
+                        if revision
+                        else {}
+                    ),
                 },
                 method="POST",
             )
@@ -4248,7 +4276,7 @@ def _stream_viewable_files(
     """Best-effort mid-run push of NEW-or-CHANGED viewable files. NEVER raises.
 
     Invoked on the heartbeat cadence from ``_run_compute_job``. Uploads each
-    viewable file whose ``(mtime, size)`` signature changed since its last upload
+    viewable file whose nanosecond stat signature changed since its last upload
     (so an overwritten ``reward_curve.png`` re-uploads to refresh the live preview
     but a stable file is not re-sent every cycle), enforcing the same per-kind
     size cap and 25-distinct-file budget the server enforces — oversize/over-budget
@@ -4302,7 +4330,11 @@ def _stream_viewable_files(
                 )
             continue
 
-        signature = (cand["mtime"], size)
+        # Nanosecond mtime + ctime detects same-size overwrites while remaining
+        # cheap enough for heartbeat scans (hashing a 512 MiB rollout every poll
+        # would violate the bounded preview path). The generated token below is
+        # stable across retries for this exact observed generation.
+        signature = (cand["mtime_ns"], cand["ctime_ns"], size)
         if state.sent.get(relpath) == signature:
             continue  # unchanged since last upload — don't re-send
 
@@ -4331,6 +4363,7 @@ def _stream_viewable_files(
                 cand["abspath"],
                 size,
                 cand["content_type"],
+                state.revision_for(relpath, signature),
             ),
             relpath,
             signature,

@@ -115,12 +115,14 @@ interface FreshMedia {
 function useFreshMediaUrl(
   projectId: string | null | undefined,
   storageUri: string | null | undefined,
+  revision: string | null | undefined,
   bakedUrl: string | null | undefined,
 ): FreshMedia {
-  // Key the resolved URL by the ref it was minted for, so a stale resolution
-  // from a previous storage_uri is ignored once the ref changes (rather than
+  const generation = storageUri ? (revision ? `${storageUri}@${revision}` : storageUri) : null;
+  // Key the resolved URL by the storage generation, so a stale resolution
+  // from a previous revision or storage_uri is ignored once it changes (rather than
   // resetting state synchronously inside the effect, which cascades renders).
-  const [resolved, setResolved] = useState<{ uri: string; url: string } | null>(null);
+  const [resolved, setResolved] = useState<{ generation: string; url: string } | null>(null);
   // Records the terminal result of the sign attempt, keyed by the attempt it
   // belongs to. Derived (rather than a synchronous `resolving` flag set inside
   // the effect) so the effect only mutates state from its async callbacks.
@@ -140,7 +142,7 @@ function useFreshMediaUrl(
     resolveArtifactDownloadUrl(projectId, storageUri, controller.signal)
       .then(url => {
         if (cancelled) return;
-        setResolved({ uri: storageUri, url });
+        setResolved({ generation: generation!, url });
         // A fresh URL supersedes any prior element-load failure.
         setLoadError(false);
         setOutcome({ attempt: thisAttempt, failed: false });
@@ -151,9 +153,9 @@ function useFreshMediaUrl(
         setOutcome({ attempt: thisAttempt, failed: true });
       });
     return () => { cancelled = true; controller.abort(); };
-  }, [projectId, storageUri, attempt]);
+  }, [projectId, storageUri, generation, attempt]);
 
-  const fresh = resolved && storageUri && resolved.uri === storageUri ? resolved.url : null;
+  const fresh = resolved && generation && resolved.generation === generation ? resolved.url : null;
   const url = safeImageUrl(fresh) ?? safeImageUrl(bakedUrl);
 
   // The current sign attempt is still in flight until an outcome is recorded
@@ -264,6 +266,7 @@ function MediaRetry({ label, onRetry }: { label: string; onRetry: () => void }) 
 function ResolvedImage({
   projectId,
   storageUri,
+  revision,
   bakedUrl,
   alt,
   className,
@@ -271,12 +274,13 @@ function ResolvedImage({
 }: {
   projectId?: string | null;
   storageUri?: string | null;
+  revision?: string | null;
   bakedUrl?: string | null;
   alt: string;
   className: string;
   onExpand: (url: string, alt: string) => void;
 }) {
-  const { url, status, retry, onMediaError } = useFreshMediaUrl(projectId, storageUri, bakedUrl);
+  const { url, status, retry, onMediaError } = useFreshMediaUrl(projectId, storageUri, revision, bakedUrl);
   if (status === 'loading') return <MediaSkeleton className={className} />;
   if (status === 'error' || !url) return <MediaRetry label="Image preview unavailable" onRetry={retry} />;
   return (
@@ -302,17 +306,19 @@ function ResolvedImage({
 function ResolvedVideo({
   projectId,
   storageUri,
+  revision,
   bakedUrl,
   ariaLabel,
   className,
 }: {
   projectId?: string | null;
   storageUri?: string | null;
+  revision?: string | null;
   bakedUrl?: string | null;
   ariaLabel: string;
   className: string;
 }) {
-  const { url, status, retry, onMediaError } = useFreshMediaUrl(projectId, storageUri, bakedUrl);
+  const { url, status, retry, onMediaError } = useFreshMediaUrl(projectId, storageUri, revision, bakedUrl);
   if (status === 'loading') return <MediaSkeleton className={className} />;
   if (status === 'error' || !url) return <MediaRetry label="Video preview unavailable" onRetry={retry} />;
   // Bind the URL directly to <video src> (not a nested <source>) so `onError`
@@ -327,12 +333,14 @@ function ResolvedVideo({
 function ResolvedPdf({
   projectId,
   storageUri,
+  revision,
   bakedUrl,
   label,
   className,
 }: {
   projectId?: string | null;
   storageUri?: string | null;
+  revision?: string | null;
   bakedUrl?: string | null;
   label: string;
   className: string;
@@ -341,7 +349,7 @@ function ResolvedPdf({
   // (re-minted from storage_uri, falling back to the baked url) and open it in a
   // new tab so the browser renders it in its own sandboxed viewer on the storage
   // origin.
-  const { url, status, retry } = useFreshMediaUrl(projectId, storageUri, bakedUrl);
+  const { url, status, retry } = useFreshMediaUrl(projectId, storageUri, revision, bakedUrl);
   if (status === 'loading') return <MediaSkeleton className={className} />;
   if (status === 'error' || !url) return <MediaRetry label="PDF preview unavailable" onRetry={retry} />;
   return (
@@ -401,9 +409,10 @@ export function ArtifactViewablePreviews({
         if (preview.kind === 'video') {
           return (
             <ResolvedVideo
-              key={preview.storage_uri || preview.url || i}
+              key={preview.revision ? `${preview.storage_uri || preview.url}@${preview.revision}` : preview.storage_uri || preview.url || i}
               projectId={projectId}
               storageUri={preview.storage_uri}
+              revision={preview.revision}
               bakedUrl={preview.url}
               ariaLabel={alt}
               className="h-20 w-auto flex-shrink-0"
@@ -412,9 +421,10 @@ export function ArtifactViewablePreviews({
         }
         return (
           <ResolvedImage
-            key={preview.storage_uri || preview.url || i}
+            key={preview.revision ? `${preview.storage_uri || preview.url}@${preview.revision}` : preview.storage_uri || preview.url || i}
             projectId={projectId}
             storageUri={preview.storage_uri}
+            revision={preview.revision}
             bakedUrl={preview.url}
             alt={alt}
             className="h-20 w-auto flex-shrink-0 object-contain"
@@ -427,7 +437,7 @@ export function ArtifactViewablePreviews({
   );
 }
 
-type MediaItem = { url?: string | null; alt?: string | null; filename?: string | null; storage_uri?: string | null };
+type MediaItem = { url?: string | null; alt?: string | null; filename?: string | null; storage_uri?: string | null; revision?: string | null; live?: boolean | null };
 
 function ImageDescriptorBlock({
   descriptor,
@@ -449,7 +459,7 @@ function ImageDescriptorBlock({
     listed.length > 0
       ? listed
       : fallback && (fallback.url || fallback.storage_uri)
-        ? [{ url: fallback.url, alt: fallback.alt, filename: null, storage_uri: fallback.storage_uri }]
+        ? [{ url: fallback.url, alt: fallback.alt, filename: null, storage_uri: fallback.storage_uri, revision: fallback.revision, live: fallback.live }]
         : [];
 
   return (
@@ -458,9 +468,10 @@ function ImageDescriptorBlock({
         <div className="flex gap-1 overflow-x-auto p-1 custom-scrollbar">
           {items.map((img, i) => (
             <ResolvedImage
-              key={img.storage_uri || img.url || i}
+              key={img.revision ? `${img.storage_uri || img.url}@${img.revision}` : img.storage_uri || img.url || i}
               projectId={projectId}
               storageUri={img.storage_uri}
+              revision={img.revision}
               bakedUrl={img.url}
               alt={img.alt || img.filename || `${descriptor.title} ${i + 1}`}
               className="h-40 w-auto flex-shrink-0 object-contain"
@@ -472,6 +483,7 @@ function ImageDescriptorBlock({
         <ResolvedImage
           projectId={projectId}
           storageUri={items[0].storage_uri}
+          revision={items[0].revision}
           bakedUrl={items[0].url}
           alt={descriptor.image?.alt || items[0].alt || descriptor.title}
           className="max-h-80 w-full object-contain"
@@ -500,7 +512,7 @@ function VideoDescriptorBlock({
     listed.length > 0
       ? listed
       : fallback && (fallback.url || fallback.storage_uri)
-        ? [{ url: fallback.url, alt: fallback.alt, filename: null, storage_uri: fallback.storage_uri }]
+        ? [{ url: fallback.url, alt: fallback.alt, filename: null, storage_uri: fallback.storage_uri, revision: fallback.revision, live: fallback.live }]
         : [];
 
   return (
@@ -509,9 +521,10 @@ function VideoDescriptorBlock({
         <div className="flex gap-1 overflow-x-auto p-1 custom-scrollbar">
           {items.map((v, i) => (
             <ResolvedVideo
-              key={v.storage_uri || v.url || i}
+              key={v.revision ? `${v.storage_uri || v.url}@${v.revision}` : v.storage_uri || v.url || i}
               projectId={projectId}
               storageUri={v.storage_uri}
+              revision={v.revision}
               bakedUrl={v.url}
               ariaLabel={v.alt || v.filename || `${descriptor.title} ${i + 1}`}
               className="h-40 w-auto flex-shrink-0"
@@ -522,6 +535,7 @@ function VideoDescriptorBlock({
         <ResolvedVideo
           projectId={projectId}
           storageUri={items[0].storage_uri}
+          revision={items[0].revision}
           bakedUrl={items[0].url}
           ariaLabel={descriptor.video?.alt || items[0].alt || descriptor.title}
           className="max-h-80 w-full"
@@ -701,11 +715,11 @@ function DescriptorCard({
         // drop a still-resolvable document.
         const listed = (descriptor.pdfs ?? []).filter(d => d.url || d.storage_uri);
         const fallback = descriptor.pdf;
-        const items: Array<{ url?: string | null; alt?: string | null; filename?: string | null; storage_uri?: string | null }> =
+        const items: MediaItem[] =
           listed.length > 0
             ? listed
             : fallback && (fallback.url || fallback.storage_uri)
-              ? [{ url: fallback.url, alt: fallback.alt, filename: null, storage_uri: fallback.storage_uri }]
+              ? [{ url: fallback.url, alt: fallback.alt, filename: null, storage_uri: fallback.storage_uri, revision: fallback.revision, live: fallback.live }]
               : [];
         return (
           <div className="mt-2 rounded border border-neutral-800 bg-neutral-950/45 p-1" data-testid="strategic-context-pdf-block">
@@ -713,9 +727,10 @@ function DescriptorCard({
               <div className="flex flex-col gap-1">
                 {items.map((doc, i) => (
                   <ResolvedPdf
-                    key={doc.storage_uri || doc.url || i}
+                    key={doc.revision ? `${doc.storage_uri || doc.url}@${doc.revision}` : doc.storage_uri || doc.url || i}
                     projectId={projectId}
                     storageUri={doc.storage_uri}
+                    revision={doc.revision}
                     bakedUrl={doc.url}
                     label={doc.alt || doc.filename || (items.length > 1 ? `${descriptor.title} ${i + 1}` : descriptor.title)}
                     className="flex min-h-11 w-full items-center gap-2 rounded border border-neutral-800 bg-neutral-950/45 px-2 py-1.5 text-left text-sm text-neutral-200 transition-colors hover:border-sky-500/50 hover:bg-neutral-900"

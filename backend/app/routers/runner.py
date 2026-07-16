@@ -2607,6 +2607,15 @@ async def upload_compute_job_viewable(
         if not raw_filename:
             raise HTTPException(status_code=400, detail="missing or empty 'filename' field")
 
+        # New runners stamp one stable token per observed local-file generation
+        # in a header so a response-loss retry does not fabricate another
+        # revision. Legacy runners omit it; the server then creates a fresh token
+        # for every accepted upload, preserving backward compatibility.
+        raw_revision = request.headers.get("x-blueprint-viewable-revision")
+        requested_revision = app_storage.normalize_viewable_revision(raw_revision)
+        if raw_revision is not None and requested_revision is None:
+            raise HTTPException(status_code=422, detail="invalid viewable revision")
+
         # ── Extension-based classification (reuses the terminal path's policy) ──
         type_info = app_storage.viewable_content_type_for_filename(raw_filename)
         if type_info is None:
@@ -2685,21 +2694,26 @@ async def upload_compute_job_viewable(
                 detail=f"viewable file cap ({_MAX_VIEWABLE_FILE_COUNT}) reached for this job",
             )
 
-        # ── Slow GCS upload (no row lock held) ─────────────────────────────────
+        # ── Slow GCS upload to an unreferenced staging object (no row lock) ───
         # A rolled-to-disk video is STREAMED to GCS via a resumable upload (peak
         # memory bounded to the 8 MiB chunk window) rather than buffered whole;
-        # in-memory files use the in-memory upload seam.
+        # in-memory files use the in-memory upload seam.  The canonical URI is
+        # deterministic, so writing it here would let a slow live upload overwrite
+        # the terminal bundle after terminal reconciliation won the row lock.
+        # Promotion to that URI occurs only below, under the lock and after the
+        # terminal re-check.
+        staging_name = f".staging/{uuid.uuid4().hex}/{safe_name}"
         if stream_upload:
             uploaded_uri = await app_storage.upload_compute_job_viewable_stream(
                 job_id,
-                safe_name,
+                staging_name,
                 _FileRangeReader(spool, file_part["start"], file_length),
                 content_type,
                 size=file_length,
             )
         else:
             uploaded_uri = await app_storage.upload_compute_job_viewable_file(
-                job_id, safe_name, file_bytes, content_type,
+                job_id, staging_name, file_bytes, content_type,
             )
         if uploaded_uri is None:
             logger.warning(
@@ -2728,36 +2742,63 @@ async def upload_compute_job_viewable(
     if job.status in _COMPUTE_JOB_TERMINAL_STATUSES:
         logger.warning(
             "[RUNNERS] Compute job %s went terminal while viewable file %r "
-            "upload was in flight — discarding mid-run pointer (file is already "
-            "durable in GCS and will be reconciled by the terminal pass)",
+            "upload was in flight — discarding its unreferenced staging object",
             job_id,
             safe_name,
         )
+        await app_storage.delete_compute_job_viewable_file(job_id, staging_name)
         raise HTTPException(
             status_code=409,
-            detail="compute job went terminal during upload — the file is stored "
-            "and will be picked up by the terminal viewable pipeline",
+            detail="compute job went terminal during upload — live artifact was discarded",
         )
+
+    # The terminal transition cannot interleave this promotion: both paths hold
+    # the job row lock.  Preserve the old uploader seam for deployments/tests
+    # that return a canonical URI even when given a staging basename; production
+    # storage returns the staging URI and therefore takes the promotion branch.
+    expected_canonical_suffix = f"/artifacts/viewable/{safe_name}"
+    canonical_uri = (
+        uploaded_uri
+        if uploaded_uri.endswith(expected_canonical_suffix)
+        else await app_storage.promote_compute_job_viewable_file(
+            job_id, staging_name, safe_name
+        )
+    )
+    if canonical_uri is None:
+        await app_storage.delete_compute_job_viewable_file(job_id, staging_name)
+        raise HTTPException(status_code=502, detail="viewable file promotion to storage failed")
+    uploaded_uri = canonical_uri
 
     meta = dict(job.polling_metadata or {})
 
-    existing_list = meta.get("viewable_files") or []
-    if not isinstance(existing_list, list):
-        existing_list = []
+    raw_existing_list = meta.get("viewable_files") or []
+    if not isinstance(raw_existing_list, list):
+        raw_existing_list = []
+    # Detach nested JSON dicts from the ORM-owned polling_metadata value. A
+    # SAVEPOINT rollback while repairing a missing signing row may expire/restore
+    # the model attribute; mutating its shared list before that rollback would
+    # make the response advertise a new revision while the DB retained the old.
+    existing_list = [
+        dict(item) if isinstance(item, dict) else item
+        for item in raw_existing_list
+    ]
 
     # Dedup by storage_uri: if this relpath was already uploaded (e.g. an
     # overwritten reward_curve.png), update the existing entry in place.
     existing_entry = None
-    for entry in existing_list:
-        if isinstance(entry, dict) and entry.get("storage_uri") == uploaded_uri:
-            existing_entry = entry
+    for manifest_entry in existing_list:
+        if (
+            isinstance(manifest_entry, dict)
+            and manifest_entry.get("storage_uri") == uploaded_uri
+        ):
+            existing_entry = manifest_entry
             break
 
     # Count cap (definitive check under lock). A refresh of an ALREADY-registered
     # relpath updates its entry in place and does not grow the manifest, so it is
     # exempt from the cap — only a NEW file counts against it.
     if existing_entry is None and len(existing_list) >= _MAX_VIEWABLE_FILE_COUNT:
-        # The GCS object we just wrote for this genuinely-new relpath has no
+        # The staged GCS object we just promoted for this genuinely-new relpath has no
         # manifest entry and no ComputeJobFile row; the terminal pass reconciles
         # from the bundle tarball, not from stray viewable/ objects, so it would
         # be orphaned. Best-effort delete it before refusing so a lost cap race
@@ -2769,12 +2810,19 @@ async def upload_compute_job_viewable(
             detail=f"viewable file cap ({_MAX_VIEWABLE_FILE_COUNT}) reached for this job",
         )
 
+    # Reusing the runner's token makes transport retries idempotent. A legacy
+    # upload (no header), or a genuinely changed runner generation, gets a new
+    # identity even when storage_uri and byte size are unchanged.
+    revision = requested_revision or app_storage.new_viewable_revision()
+
     entry: dict[str, Any] = {
         "filename": safe_name,
         "storage_uri": uploaded_uri,
         "content_type": content_type,
         "size_bytes": file_length,
         "kind": kind,
+        "revision": revision,
+        "live": True,
     }
 
     if existing_entry is not None:
@@ -2783,32 +2831,44 @@ async def upload_compute_job_viewable(
         existing_entry.update(entry)
     else:
         existing_list.append(entry)
-        meta["viewable_files"] = existing_list
+    meta["viewable_files"] = existing_list
 
-    # ── Create ComputeJobFile row (idempotent via SAVEPOINT + UNIQUE) ──────
-    # Mirrors the pattern in compute_jobs._record_viewable_job_files: a UNIQUE
-    # (storage_uri) constraint means re-entering a file already registered by a
-    # prior mid-run upload — or later by the terminal pass — is a benign no-op.
-    try:
-        async with session.begin_nested():
-            cjf = ComputeJobFile(
-                compute_job_id=job.id,
-                safe_relpath=safe_name,
-                media_type=kind,
-                storage_uri=uploaded_uri,
-                content_type=content_type,
-                file_size_bytes=file_length,
-            )
-            session.add(cjf)
-            await session.flush()
-    except Exception:  # noqa: BLE001
-        logger.warning(
-            "[RUNNERS] ComputeJobFile insert failed for viewable file %r "
-            "in job=%s — continuing without DB row (file is durable in GCS)",
-            safe_name,
-            job.id,
-            exc_info=True,
+    # ── Create/update ComputeJobFile signing row ───────────────────────────
+    # Reconcile metadata in place for a deterministic URI. This avoids using an
+    # expected UNIQUE violation as control flow on every live refresh and keeps
+    # the row's size/content fields aligned with the latest stored generation.
+    file_row = (
+        await session.execute(
+            select(ComputeJobFile).where(ComputeJobFile.storage_uri == uploaded_uri)
         )
+    ).scalars().first()
+    if file_row is not None:
+        file_row.safe_relpath = safe_name
+        file_row.media_type = kind
+        file_row.content_type = content_type
+        file_row.file_size_bytes = file_length
+        session.add(file_row)
+    else:
+        try:
+            async with session.begin_nested():
+                cjf = ComputeJobFile(
+                    compute_job_id=job.id,
+                    safe_relpath=safe_name,
+                    media_type=kind,
+                    storage_uri=uploaded_uri,
+                    content_type=content_type,
+                    file_size_bytes=file_length,
+                )
+                session.add(cjf)
+                await session.flush()
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "[RUNNERS] ComputeJobFile insert failed for viewable file %r "
+                "in job=%s — continuing without DB row (file is durable in GCS)",
+                safe_name,
+                job.id,
+                exc_info=True,
+            )
 
     # NOTE: We intentionally do NOT set ``viewable_file_count`` in
     # polling_metadata. That key is the idempotency guard for the terminal

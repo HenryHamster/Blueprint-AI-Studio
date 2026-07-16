@@ -697,14 +697,17 @@ async def _sign_viewable_manifest(
                 vf_storage_uri,
                 expiration_minutes=_PREVIEW_SIGNED_URL_MINUTES,
             )
-            previews.append(
-                {
-                    "url": signed_url,
-                    "storage_uri": vf_storage_uri,
-                    "kind": vf_kind,
-                    "filename": vf_filename,
-                }
-            )
+            preview: Dict[str, Any] = {
+                "url": signed_url,
+                "storage_uri": vf_storage_uri,
+                "kind": vf_kind,
+                "filename": vf_filename,
+            }
+            if isinstance(vf.get("revision"), str) and vf["revision"]:
+                preview["revision"] = vf["revision"]
+            if isinstance(vf.get("live"), bool):
+                preview["live"] = vf["live"]
+            previews.append(preview)
         except Exception:  # noqa: BLE001 — ownership violation or signing
             # failure — skip this file so it degrades gracefully rather
             # than breaking the whole evidence package.
@@ -1575,6 +1578,8 @@ def _artifact_descriptor(artifact: Dict[str, Any]) -> Dict[str, Any] | None:
             "url": primary.get("url"),
             "alt": title,
             "storage_uri": primary.get("storage_uri"),
+            **({"revision": primary.get("revision")} if "revision" in primary else {}),
+            **({"live": primary.get("live")} if "live" in primary else {}),
         }
         descriptor[f"{field}s"] = [
             {
@@ -1582,6 +1587,12 @@ def _artifact_descriptor(artifact: Dict[str, Any]) -> Dict[str, Any] | None:
                 "alt": preview.get("filename") or title,
                 "filename": preview.get("filename"),
                 "storage_uri": preview.get("storage_uri"),
+                **(
+                    {"revision": preview.get("revision")}
+                    if "revision" in preview
+                    else {}
+                ),
+                **({"live": preview.get("live")} if "live" in preview else {}),
             }
             for preview in grouped_previews
         ]

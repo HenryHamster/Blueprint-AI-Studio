@@ -745,6 +745,8 @@ export interface ViewableArtifact {
   content_type?: string | null;
   size_bytes?: number | null;
   kind: 'image' | 'video' | 'pdf' | null;
+  revision?: string | null;
+  live?: boolean | null;
 }
 
 export interface ComputeJob {
