@@ -14,6 +14,7 @@
 const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { execSync } = require('child_process');
 
 // ── Configuration ─────────────────────────────────────────────────────────────
@@ -22,6 +23,7 @@ const ADMIN_TOKEN = process.env.WALKTHROUGH_ADMIN_TOKEN ?? 'walkthrough-admin-to
 const BACKEND_URL = process.env.WALKTHROUGH_BACKEND_URL ?? 'http://127.0.0.1:8080';
 const FRONTEND_URL = process.env.WALKTHROUGH_FRONTEND_URL ?? 'http://localhost:3001';
 const PROJECT_ID = process.env.WALKTHROUGH_PROJECT_ID ?? '00000000-0000-4000-8000-000000000001';
+const WALKTHROUGH_PROJECT_NAME = 'v26 Walkthrough Test Project';
 
 const REPO_ROOT = path.resolve(__dirname, '../..');
 const SCREENSHOT_DIR = path.join(REPO_ROOT, 'docs', 'walkthroughs', 'screenshots');
@@ -91,6 +93,126 @@ function step(name, verdict, notes, screenshotPath) {
   (notes || []).forEach(n => console.log(`   ${n}`));
 }
 
+// ── UI navigation helpers ─────────────────────────────────────────────────────
+
+/**
+ * Select the seeded walkthrough project in the project-switcher dropdown.
+ * The dropdown button has aria-haspopup="listbox"; project options have role="option".
+ */
+async function selectWalkthroughProject(page) {
+  // Open the project-switcher dropdown
+  await page.locator('button[aria-haspopup="listbox"]').click();
+  // Wait for the listbox options to appear
+  await page.waitForSelector('[role="option"]', { timeout: 6000 });
+  // Click the walkthrough project option
+  await page.locator('[role="option"]').filter({ hasText: WALKTHROUGH_PROJECT_NAME }).click();
+  // Brief settle time for React state update
+  await page.waitForTimeout(800);
+}
+
+/**
+ * Navigate to the Project → Tools surface.
+ * Clicks the "Project" primary tab, then the "Tools" sub-tab, and waits
+ * for a surface-specific selector before returning.
+ */
+async function navigateToProjectTools(page) {
+  // Click the "Project" tab in the primary tab-nav
+  await page.locator('[data-testid="primary-tab-nav"] button').filter({ hasText: 'Project' }).click();
+  // Wait for the Project sections sub-nav to appear
+  await page.waitForSelector('nav[aria-label="Project sections"]', { timeout: 8000 });
+  // Click the "Tools" sub-tab
+  await page.locator('nav[aria-label="Project sections"] button').filter({ hasText: 'Tools' }).click();
+  // Wait for a surface-specific element: either the empty-state text or a tool-related element
+  await Promise.race([
+    page.waitForSelector('text="No tools registered for this project."', { timeout: 8000 }),
+    page.waitForSelector('[data-testid="created-slug-notice"]', { timeout: 8000 }),
+    page.waitForSelector('button:has-text("Add tool"), button:has-text("Seed tools")', { timeout: 8000 }),
+  ]).catch(() => {
+    // Tolerate timeout — screenshot will reveal actual state
+  });
+}
+
+/**
+ * Navigate to the Chat (MessagesPanel) surface.
+ * Clicks the "Chat" primary tab and waits for a MessagesPanel-specific selector.
+ */
+async function navigateToMessages(page) {
+  // Click the "Chat" tab in the primary tab-nav
+  await page.locator('[data-testid="primary-tab-nav"] button').filter({ hasText: 'Chat' }).click();
+  // Wait for a MessagesPanel-specific element
+  await Promise.race([
+    page.waitForSelector('textarea[placeholder="Type a message..."]', { timeout: 8000 }),
+    page.waitForSelector('[data-testid="alerts-inline-banner"]', { timeout: 8000 }),
+    page.waitForSelector('[data-message-id]', { timeout: 8000 }),
+  ]).catch(() => {
+    // Tolerate timeout — screenshot will reveal actual state
+  });
+}
+
+// ── Screenshot integrity check ────────────────────────────────────────────────
+
+/**
+ * After all screenshots are captured, hash every screenshot and downgrade any
+ * step that shares a byte-identical screenshot with another step from PASS to
+ * DEAD_END with an explanatory reason. Returns a summary object.
+ */
+function enforceScreenshotIntegrity() {
+  const screenshotSteps = results.filter(r => r.screenshot);
+  if (screenshotSteps.length < 2) return { duplicates: [] };
+
+  // Compute MD5 for each screenshot file
+  const hashMap = new Map(); // stepName -> { hash, file }
+  for (const r of screenshotSteps) {
+    const fullPath = path.join(SCREENSHOT_DIR, path.basename(r.screenshot));
+    try {
+      const buf = fs.readFileSync(fullPath);
+      const hash = crypto.createHash('md5').update(buf).digest('hex');
+      hashMap.set(r.name, { hash, file: path.basename(r.screenshot) });
+    } catch (_) {
+      // Can't read — skip
+    }
+  }
+
+  // Group steps by hash
+  const byHash = new Map(); // hash -> [stepName, ...]
+  for (const [name, { hash }] of hashMap) {
+    if (!byHash.has(hash)) byHash.set(hash, []);
+    byHash.get(hash).push(name);
+  }
+
+  const duplicateGroups = [];
+  for (const [hash, names] of byHash) {
+    if (names.length < 2) continue;
+    duplicateGroups.push({ hash, names });
+    // Downgrade every PASS in this group to DEAD_END
+    for (const name of names) {
+      const r = results.find(rx => rx.name === name);
+      if (!r) continue;
+      const peers = names.filter(n => n !== name).map(n => hashMap.get(n)?.file).join(', ');
+      const msg = `DUPLICATE_SCREENSHOT (md5:${hash.slice(0, 16)}…): byte-identical to [${peers}] — screenshot does not represent the claimed surface; navigation did not reach the target page`;
+      if (r.verdict === 'PASS') {
+        r.verdict = 'DEAD_END';
+        r.notes = [msg, ...r.notes];
+        console.log(`\n⚠️  [INTEGRITY] Downgraded "${name}" from PASS → DEAD_END: ${msg}`);
+      } else {
+        // Already non-PASS — just prepend the note
+        r.notes = [msg, ...r.notes];
+        console.log(`\n⚠️  [INTEGRITY] "${name}" (${r.verdict}): ${msg}`);
+      }
+    }
+  }
+
+  // Log hashes for all screenshots in the report
+  const hashSummary = [];
+  for (const [name, { hash, file }] of hashMap) {
+    hashSummary.push(`  ${hash.slice(0, 16)}…  ${file}  (step: ${name})`);
+  }
+  console.log('\n[INTEGRITY] Screenshot hashes:');
+  hashSummary.forEach(s => console.log(s));
+
+  return { duplicates: duplicateGroups, hashSummary };
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -113,7 +235,7 @@ async function main() {
       `HTTP status: ${health.status}`,
       'Cannot proceed without live backend',
     ]);
-    writeReport(startTs);
+    writeReport(startTs, { duplicates: [] });
     return;
   }
   step('Backend health check', 'PASS', [
@@ -138,6 +260,8 @@ async function main() {
       networkErrors.push(`${resp.status()} ${resp.url()}`);
     }
   });
+
+  let integrityResult = { duplicates: [] };
 
   try {
     // ── FLOW 0: UI loads with dashboard token ──────────────────────────────
@@ -283,8 +407,6 @@ async function main() {
     ]);
 
     // 2e. Network evidence: verify subresource relative URL chain
-    // Without a real GitHub project we can't serve real files, but we can verify
-    // that the URL structure is correct by checking how ProjectToolIframe constructs the src.
     step('2e. iframe src URL construction (PR #15163 contract)', 'PASS', [
       'Source: admin-ui/src/components/ProjectToolIframe.tsx',
       'Pattern: /api/admin/projects/{pid}/tools/{slug}/t/{token}/assets/{entry}',
@@ -295,12 +417,33 @@ async function main() {
       'file:line evidence: backend/app/routers/admin_project_tools.py:1210 (path-token route)',
     ]);
 
-    // 2f. UI: navigate to check project tools section exists
-    await page.goto(FRONTEND_URL, { waitUntil: 'domcontentloaded', timeout: 20000 });
-    await page.waitForTimeout(2500);
+    // 2f. UI: navigate to project tools surface
+    console.log('\n[FLOW 2f] Navigating to project → tools surface...');
+    let toolsNavError = null;
+    try {
+      // Select the seeded walkthrough project in the project switcher
+      await selectWalkthroughProject(page);
+      // Navigate to Project tab → Tools sub-tab, wait for surface-specific selector
+      await navigateToProjectTools(page);
+    } catch (navErr) {
+      toolsNavError = String(navErr);
+      console.log(`   [WARN] Tools navigation error: ${toolsNavError}`);
+    }
+    const toolsBodyText = await page.locator('body').innerText().catch(() => '');
     const toolsScreenshot = await takeScreenshot(page, 'flow2-ui-project-tools');
-    step('2f. UI state for project tools', 'PASS', [
-      'Screenshot captured of UI with live backend',
+    // Verify we are actually on the Tools surface (not the landing/home page)
+    const onToolsSurface = (
+      // The Tools sub-tab is pressed
+      await page.locator('nav[aria-label="Project sections"] button[aria-pressed="true"]')
+        .filter({ hasText: 'Tools' }).count().catch(() => 0) > 0
+    ) || /no tools registered|add tool|seed tools/i.test(toolsBodyText);
+
+    step('2f. UI state for project tools', onToolsSurface ? 'PASS' : 'DEAD_END', [
+      onToolsSurface
+        ? `Navigated to Project → Tools surface; project "${WALKTHROUGH_PROJECT_NAME}" selected`
+        : 'Navigation to project tools surface unsuccessful — screenshot may not represent the claimed surface',
+      toolsNavError ? `Navigation error: ${toolsNavError}` : 'Navigation completed without error',
+      `Body excerpt (first 300 chars): ${toolsBodyText.slice(0, 300).replace(/\n/g, ' ')}`,
     ], toolsScreenshot);
 
     // ── FLOW 3: Chat/Messages + Notifications (c-042d6fbc) ─────────────────
@@ -353,29 +496,40 @@ async function main() {
       step('3d. Resolved message removed from open list', 'DEAD_END', ['No messages to test with']);
     }
 
-    // 3e. UI: MessagesPanel rendering
-    await page.goto(FRONTEND_URL, { waitUntil: 'domcontentloaded', timeout: 20000 });
-    await page.waitForTimeout(3000);
-    const uiText = await page.locator('body').innerText().catch(() => '');
-    const msgsScreenshot = await takeScreenshot(page, 'flow3-messages-ui');
-
-    // Try clicking on any "messages" related item in the nav
-    const msgNavEl = page.locator('a[href*="message"], button[aria-label*="essage"], [data-testid*="message"]').first();
-    const msgNavCount = await msgNavEl.count();
-    if (msgNavCount > 0) {
-      await msgNavEl.click().catch(() => {});
-      await page.waitForTimeout(1500);
+    // 3e. UI: MessagesPanel rendering — navigate to Chat surface
+    console.log('\n[FLOW 3e] Navigating to chat/messages surface...');
+    let msgsNavError = null;
+    try {
+      // Ensure project is still selected (may have changed state)
+      await selectWalkthroughProject(page);
+      // Click the Chat tab and wait for MessagesPanel-specific content
+      await navigateToMessages(page);
+    } catch (navErr) {
+      msgsNavError = String(navErr);
+      console.log(`   [WARN] Messages navigation error: ${msgsNavError}`);
     }
-    const afterNavText = await page.locator('body').innerText().catch(() => '');
-    const hasMessagesUI = /message|notification|note|alert/i.test(afterNavText);
-    const finalMsgsScreenshot = await takeScreenshot(page, 'flow3-messages-ui-after-nav');
 
-    step('3e. MessagesPanel renders in UI', hasMessagesUI ? 'PASS' : 'DEAD_END', [
-      `"Message/notification" content found in UI: ${hasMessagesUI}`,
-      `UI body length: ${afterNavText.length} chars`,
-      'MessagesPanel (#15151 inline surface) requires project selection in the live UI',
-      `Navigation element found: ${msgNavCount > 0}`,
-    ], finalMsgsScreenshot);
+    const msgsBodyText = await page.locator('body').innerText().catch(() => '');
+    const msgsScreenshot = await takeScreenshot(page, 'flow3-messages-ui');
+    // Verify we are on the Chat surface (MessagesPanel-specific indicators)
+    const composerVisible = await page.locator('textarea[placeholder="Type a message..."]')
+      .count().catch(() => 0) > 0;
+    const alertsBannerVisible = await page.locator('[data-testid="alerts-inline-banner"]')
+      .count().catch(() => 0) > 0;
+    const messageBubbleVisible = await page.locator('[data-message-id]')
+      .count().catch(() => 0) > 0;
+    const onMessagesSurface = composerVisible || alertsBannerVisible || messageBubbleVisible;
+
+    step('3e. MessagesPanel renders in UI', onMessagesSurface ? 'PASS' : 'DEAD_END', [
+      onMessagesSurface
+        ? `MessagesPanel surface reached; project "${WALKTHROUGH_PROJECT_NAME}" selected`
+        : 'MessagesPanel surface not confirmed — screenshot may not represent the claimed surface',
+      msgsNavError ? `Navigation error: ${msgsNavError}` : 'Navigation completed without error',
+      `Composer textarea visible: ${composerVisible}`,
+      `Alerts banner visible: ${alertsBannerVisible}`,
+      `Message bubbles visible: ${messageBubbleVisible}`,
+      `Body excerpt (first 300 chars): ${msgsBodyText.slice(0, 300).replace(/\n/g, ' ')}`,
+    ], msgsScreenshot);
 
   } catch (err) {
     step('Walkthrough execution error', 'FAIL', [
@@ -387,6 +541,15 @@ async function main() {
     console.log('\n[BROWSER] Closed');
   }
 
+  // ── Screenshot integrity check ──────────────────────────────────────────
+  console.log('\n[INTEGRITY] Verifying screenshot uniqueness...');
+  integrityResult = enforceScreenshotIntegrity();
+  if (integrityResult.duplicates.length > 0) {
+    console.log(`[INTEGRITY] ⚠️  Found ${integrityResult.duplicates.length} duplicate screenshot group(s); affected steps downgraded`);
+  } else {
+    console.log('[INTEGRITY] ✓ All screenshots are distinct');
+  }
+
   // Summary
   const pass = results.filter(r => r.verdict === 'PASS').length;
   const fail = results.filter(r => r.verdict === 'FAIL').length;
@@ -395,12 +558,12 @@ async function main() {
   console.log(`WALKTHROUGH COMPLETE: ${pass} PASS, ${fail} FAIL, ${dead} DEAD_END`);
   console.log('='.repeat(70));
 
-  writeReport(startTs);
+  writeReport(startTs, integrityResult);
 }
 
 // ── Report writer ─────────────────────────────────────────────────────────────
 
-function writeReport(startTs) {
+function writeReport(startTs, integrityResult) {
   const pass = results.filter(r => r.verdict === 'PASS').length;
   const fail = results.filter(r => r.verdict === 'FAIL').length;
   const dead = results.filter(r => r.verdict === 'DEAD_END').length;
@@ -432,11 +595,38 @@ function writeReport(startTs) {
     `| ❌ FAIL | ${fail} |`,
     `| ⚠️ DEAD_END | ${dead} |`,
     '',
-    '---',
-    '',
-    '## Flow 1 — Runner Enrollment (c-dfdc9d82)',
-    '',
   ];
+
+  // Screenshot integrity section
+  if (integrityResult && integrityResult.duplicates && integrityResult.duplicates.length > 0) {
+    lines.push('## ⚠️ Screenshot Integrity Failures');
+    lines.push('');
+    lines.push('The following screenshot groups were byte-identical (duplicate evidence). Affected PASS steps were downgraded to DEAD_END:');
+    lines.push('');
+    for (const g of integrityResult.duplicates) {
+      lines.push(`- **md5:${g.hash.slice(0, 16)}…** — identical files: ${g.names.join(', ')}`);
+    }
+    lines.push('');
+  } else {
+    lines.push('## Screenshot Integrity');
+    lines.push('');
+    lines.push('✓ All screenshots are byte-distinct — no duplicate evidence detected.');
+    lines.push('');
+  }
+
+  if (integrityResult && integrityResult.hashSummary) {
+    lines.push('### Screenshot Hashes (md5)');
+    lines.push('');
+    lines.push('```');
+    (integrityResult.hashSummary || []).forEach(s => lines.push(s));
+    lines.push('```');
+    lines.push('');
+  }
+
+  lines.push('---');
+  lines.push('');
+  lines.push('## Flow 1 — Runner Enrollment (c-dfdc9d82)');
+  lines.push('');
 
   // Render each result
   for (const r of results) {
