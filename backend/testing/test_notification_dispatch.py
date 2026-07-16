@@ -687,6 +687,8 @@ async def test_exhausted_or_evicted_notification_writes_dead_letter(db_session):
     in-memory queue must leave a durable, re-drivable NotificationDeadLetter
     row instead of silently vanishing."""
 
+    from app.field_encryption import decrypt_field
+
     _reset_stats()
     pid = uuid.uuid4()
 
@@ -725,7 +727,8 @@ async def test_exhausted_or_evicted_notification_writes_dead_letter(db_session):
     assert row.last_status == 503
     assert row.attempts == len(_RETRY_DELAYS)  # attempts+1, all attempts used
     assert row.payload == {"k": "v"}
-    assert row.webhook_url == "https://dest.example.com/hook"
+    assert row.webhook_url != "https://dest.example.com/hook"
+    assert decrypt_field(row.webhook_url) == "https://dest.example.com/hook"
     assert len(nd._retry_queue) == 0  # exhausted entry not re-queued
 
     # --- Evicted path: overflowing the bounded queue drops the oldest entry ---

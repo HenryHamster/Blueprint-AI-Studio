@@ -298,7 +298,16 @@ def test_interim_running_report_carries_progress_and_log_tail():
         )
         if status == "running" and "progress" in kwargs and "command_log" in kwargs:
             running_with_progress += 1
-        if status != "running" and "progress" in kwargs:
+
+    for node in ast.walk(run_job):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_report_terminal"
+        ):
+            continue
+        kwargs = {kw.arg for kw in node.keywords}
+        if "progress" in kwargs:
             terminal_with_progress += 1
     assert running_with_progress >= 1, (
         "the periodic running report must carry progress + command_log tail"

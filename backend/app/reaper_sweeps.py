@@ -2701,10 +2701,10 @@ async def sweep_refresh_project_compute_images(
     else:
         build_semaphore = _build_semaphore
 
-    rows = (
+    project_ids = (
         (
             await session.execute(
-                select(Project)
+                select(Project.id)
                 .where(
                     Project.github_owner.is_not(None),
                     Project.github_repo.is_not(None),
@@ -2726,9 +2726,17 @@ async def sweep_refresh_project_compute_images(
         "skipped_cadence": 0,
     }
     builds_done = 0
-    for project in rows:
+    for project_id in project_ids:
         summary["projects"] += 1
         try:
+            # A prior project's failed driver may roll back the shared session,
+            # expiring every loaded ORM instance. Load each project only when it
+            # is about to run so one rollback cannot make the remaining loop
+            # trigger synchronous lazy I/O (MissingGreenlet).
+            project = await session.get(Project, project_id)
+            if project is None:
+                summary["errors"] += 1
+                continue
             result = await refresh_fn(
                 session,
                 project,
@@ -2739,7 +2747,7 @@ async def sweep_refresh_project_compute_images(
         except Exception:  # noqa: BLE001 — driver is best-effort; isolate anyway
             logger.warning(
                 "[REAPER] compute-image auto-refresh raised for project %s",
-                getattr(project, "id", "?"),
+                project_id,
                 exc_info=True,
             )
             with contextlib.suppress(Exception):
