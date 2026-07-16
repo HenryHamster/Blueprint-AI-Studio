@@ -795,8 +795,33 @@ def capability_need_blocked_by_proof_gate(
     return proof_status != "proven"
 
 
+def _alias_to_survivor_map(problem_model: object) -> dict[str, str]:
+    """Build ``{absorbed_name: survivor_name}`` from the problem_model's capabilities.
+
+    Reads each capability's ``absorbs`` list and maps every absorbed canonical
+    name to its survivor. Used by the alias-aware ledger corroboration pass so a
+    blocked dependent that names an absorbed alias is verified against the
+    survivor's platform proof record — not a missing ledger key for the alias
+    itself — and so a self-declared ``proven`` claim on a non-absorbed name
+    is never accidentally corroborated by a coincidentally-named survivor entry.
+
+    Returns ``{}`` for a missing / empty / malformed model — alias-aware callers
+    fall through to direct ledger lookups, preserving the legacy behaviour.
+    """
+    alias_map: dict[str, str] = {}
+    for raw_name, _status, absorbs in _iter_capability_entries(problem_model):
+        survivor = normalize_capability_name(raw_name)
+        if not survivor:
+            continue
+        for absorbed in _normalized_absorbed_names(absorbs):
+            if absorbed not in alias_map:
+                alias_map[absorbed] = survivor
+    return alias_map
+
+
 def _ledger_proof_status(
-    proof_records: object, cap_name: str
+    proof_records: object, cap_name: str,
+    now: datetime | None = None,
 ) -> EvidenceStatus:
     """Classify a capability's PLATFORM-recorded proof ledger into an EvidenceStatus.
 
@@ -811,6 +836,13 @@ def _ledger_proof_status(
     platform-verified proof from an agent's self-reported ``evidence_refs`` /
     ``proof_exempt`` claim on the problem_model.
 
+    **Freshness.** When ``now`` is supplied, each ledger entry's ``proved_at``
+    is carried into the synthetic ref as ``recorded_at`` so ``classify_evidence_tiered``
+    drops stale proofs before grading. A ref with a missing/unparseable
+    ``proved_at`` is treated as indeterminate and never expires, so every legacy
+    ledger entry that predates timestamped proof records classifies as it always
+    did.
+
     Operator-exemption records are EXCLUDED (:func:`_ledger_machine_proof_entries`):
     an exemption authorizes clearing the gate *without* machine proof and must never
     be laundered into machine proof. A capability whose ledger holds only an
@@ -819,18 +851,24 @@ def _ledger_proof_status(
     ``exempt_cleared`` audit buckets stay honest about WHY each capability cleared.
     """
     synthetic = [
-        {"kind": e.get("proof_kind"), "proven": True}
+        {
+            "kind": e.get("proof_kind"),
+            "proven": True,
+            "recorded_at": e.get("proved_at"),
+        }
         for e in _ledger_machine_proof_entries(proof_records, cap_name)
     ]
     if not synthetic:
         return "unproven"
-    return classify_evidence_tiered(synthetic)
+    return classify_evidence_tiered(synthetic, now=now)
 
 
 def ledger_corroborated_proof_status(
     proof_status_by_name: Mapping[str, EvidenceStatus] | dict,
     proof_records: object,
     exempt_names: Iterable[str] = (),
+    now: datetime | None = None,
+    alias_map: dict[str, str] | None = None,
 ) -> dict[str, EvidenceStatus]:
     """Demote every ``proven`` capability the PLATFORM ledger does not corroborate.
 
@@ -860,6 +898,20 @@ def ledger_corroborated_proof_status(
       any tier other than ``proven``, it blocks
       :func:`capability_need_blocked_by_proof_gate` exactly as an unproven claim does.
 
+    **Freshness.** ``now`` is threaded to :func:`_ledger_proof_status` so a stale
+    ledger proof older than :data:`~app.evidence_primitive.PROOF_FRESHNESS_TTL` no
+    longer corroborates a self-declared ``proven`` claim at the enforce gate. A
+    missing ``now`` means no freshness evaluation — the stored-flag-only behaviour
+    unchanged from the legacy corroboration pass.
+
+    **Alias-aware.** When ``alias_map`` is provided and a name fails direct ledger
+    corroboration, the pass checks whether the name was absorbed by a surviving
+    capability and retries the survivor's ledger key. This prevents a dependent
+    blocked on an absorbed old name from being stranded by a ledger that stores
+    proof only under the survivor's canonical name, while a self-declared
+    ``proven`` claim on a non-absorbed name is never accidentally corroborated
+    by a coincidentally-named ledger entry.
+
     Shared verbatim by all THREE gate seams (the release qualifier via
     :func:`capability_proof_gate_release_status`, the spawn-time prerequisite
     resolver in :mod:`app.research_completion`, and the blocked-resume sweep in
@@ -878,10 +930,18 @@ def ledger_corroborated_proof_status(
         if (
             status != "proven"
             or name in exempt
-            or _ledger_proof_status(proof_records, name) == "proven"
+            or _ledger_proof_status(proof_records, name, now=now) == "proven"
         ):
             out[name] = status
             continue
+        # Alias retry: if this name was absorbed by a surviving capability,
+        # check the survivor's ledger key instead of the alias's own (which
+        # may not exist in the platform ledger).
+        if alias_map and name in alias_map:
+            survivor = alias_map[name]
+            if _ledger_proof_status(proof_records, survivor, now=now) == "proven":
+                out[name] = status
+                continue
         out[name] = "unverified"
     return out
 
@@ -890,6 +950,7 @@ def fold_ledger_proof_upgrades(
     proof_status_by_name: Mapping[str, EvidenceStatus] | dict,
     proof_records: object,
     now: datetime | None = None,
+    alias_map: dict[str, str] | None = None,
 ) -> dict[str, EvidenceStatus]:
     """Upgrade an ``evidence_refs``-derived proof map with the durable proof ledger.
 
@@ -906,6 +967,13 @@ def fold_ledger_proof_upgrades(
     ``working``), and a tier-2 status is applied only when it is strictly stronger
     than the tier-1 status, so a ledger proof never REGRESSES a capability the
     evidence_refs classify more highly.
+
+    **Alias-aware.** When ``alias_map`` is provided, an absorbed alias name whose
+    own ledger key has no proof entries is retried against the survivor's ledger
+    key. This keeps the fold pass in sync with the alias-aware corroboration pass
+    in :func:`ledger_corroborated_proof_status`, so a ledger-only proof (tier-1
+    append was lost) on the survivor also upgrades the alias — preventing a
+    dependent blocked on the old name from staying gated.
 
     Freshness parity with tier-1: each record's ``proved_at`` is carried into the
     synthetic ref as ``recorded_at`` and ``now`` is threaded into the tiered
@@ -936,13 +1004,17 @@ def fold_ledger_proof_upgrades(
             continue
         # Operator-exemption records are not machine proof and must not upgrade a
         # capability here (an exemption clears only via the exemption carve-out).
+        # Determine the ledger key to check: for an absorbed alias, use the
+        # survivor's ledger key so a ledger-only proof on the survivor also
+        # upgrades the alias.
+        ledger_key = alias_map.get(name, name) if alias_map else name
         synthetic = [
             {
                 "kind": e.get("proof_kind"),
                 "proven": True,
                 "recorded_at": e.get("proved_at"),
             }
-            for e in _ledger_machine_proof_entries(proof_records, name)
+            for e in _ledger_machine_proof_entries(proof_records, ledger_key)
         ]
         if not synthetic:
             continue
@@ -998,11 +1070,14 @@ def consumer_gate_proof_status(
     proof_map = working_capability_proof_status(
         problem_model, now=now, proof_records=proof_records
     )
-    proof_map = fold_ledger_proof_upgrades(proof_map, proof_records, now=now)
+    alias_map = _alias_to_survivor_map(problem_model)
+    proof_map = fold_ledger_proof_upgrades(proof_map, proof_records, now=now, alias_map=alias_map)
     return ledger_corroborated_proof_status(
         proof_map,
         proof_records,
         exempt_capability_names(problem_model, proof_records),
+        now=now,
+        alias_map=alias_map,
     )
 
 
@@ -1010,6 +1085,7 @@ def capability_proof_gate_release_status(
     problem_model: object,
     mode: str | None,
     proof_records: object = None,
+    now: datetime | None = None,
 ) -> tuple[bool, dict]:
     """Derive the release-qualifier capability-proof dimension: ``(blocked, detail)``.
 
@@ -1084,7 +1160,7 @@ def capability_proof_gate_release_status(
         detail["error"] = "no problem_model"
         return False, detail
     proof_map = working_capability_proof_status(
-        problem_model, proof_records=proof_records
+        problem_model, now=now, proof_records=proof_records
     )
     # The carve-out set: PLATFORM-recorded operator exemptions only (finding #9).
     # An agent-declared proof_exempt/source never lands here, so it cannot skip the
@@ -1112,8 +1188,9 @@ def capability_proof_gate_release_status(
     # the two CONSUMER seams also call (via consumer_gate_proof_status) — one
     # implementation, so this seam and they cannot drift apart. A "proven" capability
     # the ledger refuses comes back demoted; that demotion IS the uncorroborated set.
+    alias_map = _alias_to_survivor_map(problem_model)
     corroborated_map = ledger_corroborated_proof_status(
-        proof_map, proof_records, exempt_set
+        proof_map, proof_records, exempt_set, now=now, alias_map=alias_map
     )
     uncorroborated: list[str] = [
         name
