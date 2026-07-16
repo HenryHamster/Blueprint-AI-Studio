@@ -153,7 +153,7 @@ def test_validate_contract_rejects_unguarded_resume():
         require_smoke=False,
     )
     assert ok is False
-    assert "no_progress_timeout_seconds" in reason
+    assert "declared_metric" in reason
 
 
 def test_validate_contract_rejects_input_artifact_without_watchdog():
@@ -168,7 +168,7 @@ def test_validate_contract_rejects_input_artifact_without_watchdog():
     )
 
     assert ok is False
-    assert "input_artifact_job_id requires" in reason
+    assert "resumed compute experiments require" in reason
     assert "no_progress_timeout_seconds" in reason
 
 

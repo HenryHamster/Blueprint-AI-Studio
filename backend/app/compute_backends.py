@@ -244,7 +244,10 @@ async def _rehydrate_input_artifact_bundle(
     """
     handle, tmp_path = tempfile.mkstemp(prefix="bp-resume-", suffix=".tar.gz")
     os.close(handle)
-    staging_dir = f"{dest_dir}.resume-staging"
+    staging_dir = os.path.join(
+        os.path.dirname(dest_dir),
+        f".bp-resume-stage-{os.path.basename(dest_dir)}",
+    )
     shutil.rmtree(staging_dir, ignore_errors=True)
     os.makedirs(staging_dir, exist_ok=True)
     try:
@@ -274,12 +277,13 @@ async def _rehydrate_input_artifact_bundle(
         if file_count <= 0:
             raise RuntimeError(
                 "input_artifact_rehydration_failed: predecessor bundle for "
-                f"{input_artifact_job_id} contained no checkpoint files"
+                f"{input_artifact_job_id} contains no resumable files"
             )
         try:
             shutil.rmtree(dest_dir, ignore_errors=True)
             os.replace(staging_dir, dest_dir)
         except OSError as exc:
+            shutil.rmtree(dest_dir, ignore_errors=True)
             raise RuntimeError(
                 "input_artifact_rehydration_failed: extracted checkpoint could not "
                 f"be published: {exc}"

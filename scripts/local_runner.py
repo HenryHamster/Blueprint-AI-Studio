@@ -5341,6 +5341,7 @@ def _run_compute_job(
         # Never pre-created — appending code creates it, absence means no progress.
         progress_file = os.path.join(tmpdir, "progress.jsonl")
         os.makedirs(artifact_dir, exist_ok=True)
+        resume_hydration: dict | None = None
 
         # Cross-job checkpoint resume: hydrate the predecessor's durable bundle
         # into the artifact dir BEFORE any command runs (mirrors the repo-clone
@@ -5361,6 +5362,7 @@ def _run_compute_job(
                     f"{provenance.get('bytes')} bytes hydrated)",
                     flush=True,
                 )
+                resume_hydration = provenance
                 _report_compute_job(
                     orchestrator_url,
                     token,
@@ -5376,6 +5378,9 @@ def _run_compute_job(
                     flush=True,
                 )
                 outcome = "failure"
+                # Suppress artifact upload — predecessor fragments must not be
+                # reported as a durable delivery for a job that never ran.
+                artifact_dir = None
                 _report_terminal(
                     exec_status="failed",
                     exit_code=1,
@@ -5416,6 +5421,7 @@ def _run_compute_job(
                         f"failed (exit={clone_rc}); command never started",
                         "truncated": False,
                     },
+                    resume_hydration=resume_hydration,
                 )
                 return
             if not cwd:
