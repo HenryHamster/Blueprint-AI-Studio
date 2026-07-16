@@ -4588,6 +4588,16 @@ async def test_artifact_delivery_record_durable_uri_stamped(
     job.final_cost_usd = 0.37
     job.terminal_reason = "compute job finished"
     job.completed_at = _utcnow()
+    job.polling_metadata = {
+        **(job.polling_metadata or {}),
+        "runner_artifact": {
+            "stored": True,
+            "verified": True,
+            "size": 123,
+            "crc32c": "AAAAAA==",
+            "generation": "7",
+        },
+    }
     db_session.add(job)
     await db_session.commit()
 
@@ -4604,6 +4614,11 @@ async def test_artifact_delivery_record_durable_uri_stamped(
     assert delivery["delivered"] is True
     assert delivery["durability"] == "durable"
     assert delivery["result_reference"] == gs_uri
+    assert delivery["transfer_status"] == "verified"
+    assert delivery["verified"] is True
+    assert delivery["size"] == 123
+    assert delivery["crc32c"] == "AAAAAA=="
+    assert delivery["generation"] == "7"
     # No logical_key in payload means no Artifact row is created, so artifact_id is absent.
     assert "artifact_id" not in delivery
 
@@ -4662,6 +4677,50 @@ async def test_artifact_delivery_record_absent_stamped(db_session, _quiet_comput
     delivery = task.plan_output["compute_result"]["artifact_delivery"]
     assert delivery["delivered"] is False
     assert delivery["durability"] == "none"
+
+
+@pytest.mark.asyncio
+async def test_artifact_delivery_record_failed_transfer_stamped(
+    db_session, _quiet_compute_io
+):
+    """A finalized direct-transfer failure is distinguishable from no attempt."""
+    task = await _make_compute_task(db_session)
+    task.status = TaskStatus.IN_PROGRESS
+    db_session.add(task)
+    await db_session.commit()
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo hi",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    job.status = ComputeJobStatus.SUCCEEDED
+    job.outcome = ComputeJobOutcome.SUCCESS
+    job.polling_metadata = {
+        **(job.polling_metadata or {}),
+        "runner_artifact_transfer": {
+            "transfer_id": str(uuid.uuid4()),
+            "status": "failed",
+            "failure_reason": "metadata_mismatch",
+        },
+    }
+    db_session.add(job)
+    await db_session.commit()
+
+    await _handle_compute_experiment_completion(
+        task,
+        _result_artifact(job_id=str(job.id)),
+        db_session,
+    )
+
+    await db_session.refresh(task)
+    delivery = task.plan_output["compute_result"]["artifact_delivery"]
+    assert delivery["delivered"] is False
+    assert delivery["durability"] == "none"
+    assert delivery["transfer_status"] == "failed"
+    assert delivery["verified"] is False
 
 
 # ── require_durable_artifact Tier 2 gate ───────────────────────────────────

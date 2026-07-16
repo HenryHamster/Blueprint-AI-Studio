@@ -96,6 +96,8 @@ it MUST be under a process supervisor, or wrapped so it comes back:
 ``--check`` reports whether a supervisor was detected and warns if not.
 """
 
+import base64
+import http.client
 import io
 import json
 import typing
@@ -105,6 +107,7 @@ import shutil
 import signal
 import socket
 import stat
+import struct
 import subprocess
 import sys
 import tarfile
@@ -114,6 +117,7 @@ import random
 import secrets
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import deque
 from datetime import datetime, timedelta, timezone
@@ -2113,9 +2117,11 @@ _RUNNER_HEARTBEAT_INTERVAL = 30.0
 # reached, the runner pauses claiming new agent tasks for this many seconds.
 # A successful task clears the failure count and resumes normal claiming.
 _FAILURE_PAUSE_SECONDS = 60.0
-# v1 cap on durable artifact uploads. The runner skips (does not fail) any run
-# whose artifact dir exceeds this; the backend mirrors the cap and 413s.
+# Compatibility ceiling for the legacy orchestrator-proxied multipart route.
+# Production-size bundles use the direct transfer broker and have no runner cap.
 _RUNNER_ARTIFACT_MAX_BYTES = 25 * 1024 * 1024  # 25 MiB
+_ARTIFACT_TRANSFER_CHUNK_BYTES = 1024 * 1024
+_ARTIFACT_DELIVERY_REASON_MAX_CHARS = 256
 
 # Durable-retry policy for TERMINAL compute-job reports and artifact uploads.
 # These POSTs carry the measured result_metrics / final exec_status and the run's
@@ -3840,6 +3846,7 @@ def _report_compute_job(
     command_log: dict | None = None,
     progress: dict | None = None,
     resume_hydration: dict | None = None,
+    artifact_delivery: dict | None = None,
 ) -> bool:
     """POST a status report for a compute job. Returns cancel_requested.
 
@@ -3866,6 +3873,8 @@ def _report_compute_job(
         body["progress"] = progress
     if resume_hydration is not None:
         body["resume_hydration"] = resume_hydration
+    if artifact_delivery is not None:
+        body["artifact_delivery"] = artifact_delivery
 
     durable = exec_status in _REPORT_TERMINAL_STATUSES
     max_attempts = (_REPORT_MAX_RETRIES + 1) if durable else 1
@@ -3896,6 +3905,51 @@ def _report_compute_job(
             )
         time.sleep(_report_retry_sleep(attempt))
     return False
+
+
+class _ComputeJobReportHeartbeat:
+    """Keep a claimed compute job live while runner-side I/O can take minutes.
+
+    Artifact archiving/upload and checkpoint hydration happen outside the command
+    polling loop, so they do not otherwise emit compute-job reports.  The backend
+    uses those reports as the liveness lease for runner-subprocess jobs.
+    """
+
+    def __init__(self, orchestrator_url: str, token: str, job_id: str):
+        self._orchestrator_url = orchestrator_url
+        self._token = token
+        self._job_id = job_id
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def _send(self) -> None:
+        try:
+            _report_compute_job(
+                self._orchestrator_url, self._token, self._job_id,
+                exec_status="running",
+            )
+        except Exception:  # noqa: BLE001 -- liveness is best-effort
+            pass
+
+    def _run(self) -> None:
+        while not self._stop.wait(_RUNNER_HEARTBEAT_INTERVAL):
+            self._send()
+
+    def __enter__(self):
+        # Send before starting expensive I/O: a resumed multi-GB download must
+        # not wait for its first heartbeat interval before acquiring its lease.
+        self._send()
+        self._thread = threading.Thread(
+            target=self._run, name=f"compute-report-{self._job_id}", daemon=True
+        )
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            # Do not delay terminal reporting behind a stalled best-effort report.
+            self._thread.join(timeout=1)
 
 
 def _build_multipart_body(
@@ -4379,206 +4433,575 @@ def _safe_resume_members(tar: "tarfile.TarFile", dest_dir: str) -> list:
     return safe
 
 
-def _download_input_artifact(
-    orchestrator_url: str, token: str, job_id: str, artifact_dir: str
-) -> dict:
-    """Cross-job checkpoint resume: fetch + extract the predecessor bundle.
-
-    GETs the predecessor's durable bundle from
-    ``/api/runner/compute-job/{job_id}/input-artifact`` (the server resolves the
-    validated predecessor id from the pinned job — the runner cannot request an
-    arbitrary bundle), extracts it INTO *artifact_dir* so the resumed command sees
-    the prior checkpoint already present, then strips predecessor run-status files
-    so they cannot contaminate this run.
-
-    Returns a provenance dict (``ok`` plus ``file_count`` / ``bytes`` on success,
-    or ``reason`` on failure) describing what actually happened. NEVER raises —
-    failures are signalled via ``ok=False`` so the caller can fail-close the job
-    rather than silently restarting from scratch.
-    """
-    url = f"{orchestrator_url}/api/runner/compute-job/{job_id}/input-artifact"
-    req = urllib.request.Request(
+def _download_legacy_resume_bundle(
+    url: str, token: str, bundle_path: str
+) -> str | None:
+    """Download an old proxied bundle within the historical compatibility cap."""
+    request = urllib.request.Request(
         url,
         headers={"Authorization": f"Bearer {token}", "Accept": "application/gzip"},
         method="GET",
     )
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            if resp.status not in (200, 201):
-                return {"ok": False, "reason": f"http_{resp.status}"}
-            payload = resp.read()
+        with urllib.request.urlopen(request, timeout=120) as response:
+            if response.status not in (200, 201):
+                return f"http_{response.status}"
+            size, _crc = _stream_response_to_file(
+                response, bundle_path, max_bytes=_RUNNER_ARTIFACT_MAX_BYTES
+            )
     except urllib.error.HTTPError as exc:
-        return {"ok": False, "reason": f"http_{exc.code}"}
-    except Exception as exc:  # noqa: BLE001 — resume is strictly best-effort
-        return {"ok": False, "reason": f"download_error:{type(exc).__name__}"}
-
-    if not payload:
-        return {"ok": False, "reason": "empty_bundle"}
-    if len(payload) > _RUNNER_ARTIFACT_MAX_BYTES:
-        return {"ok": False, "reason": "bundle_too_large"}
-
-    # Extract into a sibling staging directory first.  A corrupt/partial bundle
-    # must never leave files in the final artifact workspace, because finally
-    # uploads that workspace even when this job fails.
-    staging_dir = f"{artifact_dir}.resume-staging"
-    shutil.rmtree(staging_dir, ignore_errors=True)
-    os.makedirs(staging_dir, exist_ok=True)
-    try:
-        with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as tar:
-            tar.extractall(staging_dir, members=_safe_resume_members(tar, staging_dir))
+        return f"http_{exc.code}"
     except Exception as exc:  # noqa: BLE001
-        shutil.rmtree(staging_dir, ignore_errors=True)
-        return {"ok": False, "reason": f"extract_error:{type(exc).__name__}"}
+        return f"download_error:{type(exc).__name__}"
+    if size == 0:
+        return "empty_bundle"
+    if size > _RUNNER_ARTIFACT_MAX_BYTES:
+        return "legacy_bundle_too_large"
+    return None
 
-    # Strip predecessor run-status files anywhere in the staged tree so they
-    # are not mistaken for THIS run's outputs.
-    for root, _dirs, names in os.walk(staging_dir):
-        for name in names:
-            if name in _RESUME_STALE_ARTIFACT_NAMES:
+
+def _download_input_artifact(
+    orchestrator_url: str, token: str, job_id: str, artifact_dir: str
+) -> dict:
+    """Download, verify, safely extract, and atomically publish a checkpoint.
+
+    New backends return a signed direct-download URL plus authoritative size and
+    CRC32C metadata. The bundle is streamed to disk and verified before a single
+    member is extracted. Older backends return gzip bytes directly; that
+    compatibility path remains bounded by the historical 25 MiB ceiling.
+    """
+    parent = os.path.dirname(os.path.abspath(artifact_dir))
+    os.makedirs(parent, exist_ok=True)
+    fd, bundle_path = tempfile.mkstemp(prefix=".bp-resume-", suffix=".tar.gz", dir=parent)
+    os.close(fd)
+    broker_url = (
+        f"{orchestrator_url}/api/runner/compute-job/{job_id}/input-artifact?direct=true"
+    )
+    legacy_url = f"{orchestrator_url}/api/runner/compute-job/{job_id}/input-artifact"
+    try:
+        req = urllib.request.Request(
+            broker_url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json, application/gzip",
+            },
+            method="GET",
+        )
+        legacy_downloaded = False
+        try:
+            response = urllib.request.urlopen(req, timeout=120)
+        except urllib.error.HTTPError as exc:
+            if exc.code != 404:
+                return {"ok": False, "reason": f"http_{exc.code}"}
+            legacy_failure = _download_legacy_resume_bundle(
+                legacy_url, token, bundle_path
+            )
+            if legacy_failure is not None:
+                return {"ok": False, "reason": legacy_failure}
+            legacy_downloaded = True
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "reason": f"download_error:{type(exc).__name__}"}
+
+        metadata = None
+        if not legacy_downloaded:
+            with response as resp:
+                if resp.status not in (200, 201):
+                    return {"ok": False, "reason": f"http_{resp.status}"}
+                headers = getattr(resp, "headers", None)
+                content_type = headers.get("Content-Type", "") if headers is not None else ""
+                if "json" in content_type.lower():
+                    raw = resp.read(64 * 1024 + 1)
+                    if len(raw) > 64 * 1024:
+                        return {"ok": False, "reason": "invalid_transfer_metadata"}
+                    try:
+                        metadata = json.loads(raw)
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        return {"ok": False, "reason": "invalid_transfer_metadata"}
+                    if not isinstance(metadata, dict):
+                        return {"ok": False, "reason": "invalid_transfer_metadata"}
+                else:
+                    size, _crc = _stream_response_to_file(
+                        resp, bundle_path, max_bytes=_RUNNER_ARTIFACT_MAX_BYTES
+                    )
+                    if size == 0:
+                        return {"ok": False, "reason": "empty_bundle"}
+                    if size > _RUNNER_ARTIFACT_MAX_BYTES:
+                        return {"ok": False, "reason": "legacy_bundle_too_large"}
+
+        if metadata is not None:
+            download_url = metadata.get("download_url")
+            expected_crc = _valid_crc32c(metadata.get("crc32c"))
+            try:
+                expected_size = int(metadata.get("size"))
+            except (TypeError, ValueError):
+                expected_size = 0
+            if not isinstance(download_url, str) or not download_url or expected_size <= 0 or expected_crc is None:
+                legacy_failure = _download_legacy_resume_bundle(
+                    legacy_url, token, bundle_path
+                )
+                if legacy_failure is not None:
+                    return {"ok": False, "reason": legacy_failure}
+                metadata = None
+
+            download_error = "download_failed"
+            for attempt in range(_REPORT_MAX_RETRIES + 1) if metadata is not None else ():
+                last = attempt == _REPORT_MAX_RETRIES
+                signed_req = urllib.request.Request(
+                    download_url, headers={"Accept": "application/gzip"}, method="GET"
+                )
                 try:
-                    os.remove(os.path.join(root, name))
-                except OSError:
-                    pass
+                    with urllib.request.urlopen(signed_req, timeout=120) as signed_resp:
+                        if signed_resp.status not in (200, 201):
+                            download_error = f"download_http_{signed_resp.status}"
+                        else:
+                            received_size, received_crc = _stream_response_to_file(
+                                signed_resp, bundle_path, max_bytes=expected_size
+                            )
+                            if received_size != expected_size:
+                                return {"ok": False, "reason": "integrity_mismatch:size"}
+                            if received_crc != expected_crc:
+                                return {"ok": False, "reason": "integrity_mismatch:crc32c"}
+                            break
+                except urllib.error.HTTPError as exc:
+                    download_error = f"download_http_{exc.code}"
+                    if exc.code < 500 and exc.code != 429:
+                        return {"ok": False, "reason": download_error}
+                except Exception as exc:  # noqa: BLE001
+                    download_error = f"download_error:{type(exc).__name__}"
+                if last:
+                    return {"ok": False, "reason": download_error}
+                time.sleep(_report_retry_sleep(attempt))
 
-    file_count = 0
-    total_bytes = 0
-    for root, _dirs, names in os.walk(staging_dir):
+        staging_dir = f"{artifact_dir}.resume-staging"
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        os.makedirs(staging_dir, exist_ok=True)
+        try:
+            file_count, total_bytes = _extract_resume_bundle(bundle_path, staging_dir)
+        except Exception as exc:  # noqa: BLE001
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            return {"ok": False, "reason": f"extract_error:{type(exc).__name__}"}
+        if file_count == 0:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            return {"ok": False, "reason": "no_files_after_extract"}
+        try:
+            os.replace(staging_dir, artifact_dir)
+        except OSError as exc:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            return {"ok": False, "reason": f"publish_error:{type(exc).__name__}"}
+        return {"ok": True, "file_count": file_count, "bytes": total_bytes}
+    finally:
+        try:
+            os.remove(bundle_path)
+        except OSError:
+            pass
+
+
+def _crc32c_table() -> tuple[int, ...]:
+    table: list[int] = []
+    for value in range(256):
+        crc = value
+        for _ in range(8):
+            crc = (crc >> 1) ^ (0x82F63B78 if crc & 1 else 0)
+        table.append(crc & 0xFFFFFFFF)
+    return tuple(table)
+
+
+_CRC32C_TABLE = _crc32c_table()
+
+
+def _crc32c_update(state: int, data: bytes) -> int:
+    for value in data:
+        state = _CRC32C_TABLE[(state ^ value) & 0xFF] ^ (state >> 8)
+    return state & 0xFFFFFFFF
+
+
+def _crc32c_b64(state: int) -> str:
+    value = state ^ 0xFFFFFFFF
+    return base64.b64encode(struct.pack(">I", value)).decode("ascii")
+
+
+def _valid_crc32c(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except (ValueError, TypeError):
+        return None
+    return value if len(decoded) == 4 else None
+
+
+class _ChecksummedWriter:
+    """File wrapper that counts and CRC32C-hashes compressed archive writes."""
+
+    def __init__(self, fileobj):
+        self.fileobj = fileobj
+        self.size = 0
+        self.crc_state = 0xFFFFFFFF
+
+    def write(self, data: bytes) -> int:
+        written = self.fileobj.write(data)
+        chunk = data[:written]
+        self.size += written
+        self.crc_state = _crc32c_update(self.crc_state, chunk)
+        return written
+
+    def tell(self) -> int:
+        return self.fileobj.tell()
+
+    def flush(self) -> None:
+        self.fileobj.flush()
+
+
+def _build_artifact_archive(artifact_dir: str) -> tuple[str | None, dict]:
+    if not os.path.isdir(artifact_dir) or os.path.islink(artifact_dir):
+        return None, {"status": "not_produced", "reason": "artifact_dir_unavailable"}
+    files: list[tuple[str, str, int]] = []
+    for root, dirs, names in os.walk(artifact_dir, followlinks=False):
+        dirs[:] = [name for name in dirs if not os.path.islink(os.path.join(root, name))]
         for name in names:
             path = os.path.join(root, name)
-            if os.path.isfile(path):
-                file_count += 1
-                try:
-                    total_bytes += os.path.getsize(path)
-                except OSError:
-                    pass
-    if file_count == 0:
-        shutil.rmtree(staging_dir, ignore_errors=True)
-        return {"ok": False, "reason": "no_files_after_extract"}
-    # Publish only a complete, verified checkpoint workspace.
-    try:
-        shutil.rmtree(artifact_dir, ignore_errors=True)
-        os.replace(staging_dir, artifact_dir)
-    except OSError as exc:
-        shutil.rmtree(staging_dir, ignore_errors=True)
-        return {"ok": False, "reason": f"publish_error:{type(exc).__name__}"}
-    return {"ok": True, "file_count": file_count, "bytes": total_bytes}
-
-
-def _upload_artifact(orchestrator_url: str, token: str, job_id: str, artifact_dir: str) -> None:
-    """Best-effort upload of a run's durable artifacts to the orchestrator.
-
-    Tarballs (gzip) the contents of *artifact_dir* and POSTs it to
-    ``/api/runner/compute-job/{job_id}/artifact`` as multipart/form-data (file
-    field ``archive`` + form fields ``file_count`` and ``total_bytes``).  Skips
-    silently when the dir is empty, and skips (without failing the job) when the
-    uncompressed total exceeds the 25 MiB v1 cap.
-
-    ALL failures are non-fatal: the metric report has already been sent by the
-    time this runs, so a failed upload must never fail the job.
-    """
-    try:
-        if not os.path.isdir(artifact_dir):
-            return
-
-        file_paths: list[str] = []
-        for root, _dirs, names in os.walk(artifact_dir):
-            for name in names:
-                path = os.path.join(root, name)
-                if os.path.isfile(path):
-                    file_paths.append(path)
-        if not file_paths:
-            return  # nothing produced — nothing to upload
-
-        file_count = len(file_paths)
-        total_bytes = 0
-        for path in file_paths:
             try:
-                total_bytes += os.path.getsize(path)
+                st = os.lstat(path)
             except OSError:
-                pass
+                continue
+            if not stat.S_ISREG(st.st_mode):
+                continue
+            relpath = os.path.relpath(path, artifact_dir).replace(os.sep, "/")
+            files.append((relpath, path, int(st.st_size)))
+    if not files:
+        return None, {"status": "not_produced", "reason": "no_artifact_files"}
+    files.sort()
+    fd, archive_path = tempfile.mkstemp(prefix=".bp-artifact-", suffix=".tar.gz")
+    os.close(fd)
+    try:
+        with open(archive_path, "wb") as raw:
+            writer = _ChecksummedWriter(raw)
+            with tarfile.open(
+                fileobj=typing.cast(typing.BinaryIO, writer), mode="w|gz"
+            ) as tar:
+                for relpath, path, _size in files:
+                    tar.add(path, arcname=relpath, recursive=False)
+            writer.flush()
+        return archive_path, {
+            "status": "prepared",
+            "file_count": len(files),
+            "total_bytes": sum(item[2] for item in files),
+            "archive_size": writer.size,
+            "crc32c": _crc32c_b64(writer.crc_state),
+        }
+    except Exception:
+        try:
+            os.remove(archive_path)
+        except OSError:
+            pass
+        raise
 
-        cap_mib = _RUNNER_ARTIFACT_MAX_BYTES // (1024 * 1024)
-        if total_bytes > _RUNNER_ARTIFACT_MAX_BYTES:
-            print(
-                f"[compute] artifact {total_bytes / (1024 * 1024):.1f} MiB exceeds "
-                f"{cap_mib} MiB v1 upload cap, skipping upload for job {job_id}",
-                flush=True,
+
+def _stream_http_file(
+    url: str, method: str, headers: dict, file_path: str, file_size: int
+) -> tuple[int, dict, bytes]:
+    """Send a file with bounded memory and return status, headers, small body."""
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError("unsupported transfer URL")
+    connection_cls = (
+        http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
+    )
+    connection = connection_cls(parsed.hostname, parsed.port, timeout=120)
+    target = parsed.path or "/"
+    if parsed.query:
+        target += "?" + parsed.query
+    try:
+        connection.putrequest(method.upper(), target)
+        for name, value in headers.items():
+            if name.lower() != "content-length":
+                connection.putheader(str(name), str(value))
+        connection.putheader("Content-Length", str(file_size))
+        connection.endheaders()
+        with open(file_path, "rb") as source:
+            while True:
+                chunk = source.read(_ARTIFACT_TRANSFER_CHUNK_BYTES)
+                if not chunk:
+                    break
+                connection.send(chunk)
+        response = connection.getresponse()
+        response_headers = {name.lower(): value for name, value in response.getheaders()}
+        body = response.read(64 * 1024)
+        return response.status, response_headers, body
+    finally:
+        connection.close()
+
+
+def _stream_response_to_file(response, path: str, *, max_bytes: int) -> tuple[int, str]:
+    size = 0
+    crc_state = 0xFFFFFFFF
+    with open(path, "wb") as output:
+        while True:
+            chunk = response.read(_ARTIFACT_TRANSFER_CHUNK_BYTES)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > max_bytes:
+                return size, _crc32c_b64(crc_state)
+            output.write(chunk)
+            crc_state = _crc32c_update(crc_state, chunk)
+    return size, _crc32c_b64(crc_state)
+
+
+def _safe_resume_target(dest_dir: str, member_name: str) -> str | None:
+    normalized = member_name.replace("\\", "/")
+    if not normalized or normalized.startswith("/"):
+        return None
+    parts = [part for part in normalized.split("/") if part not in ("", ".")]
+    if not parts or any(part == ".." for part in parts):
+        return None
+    dest_abs = os.path.abspath(dest_dir)
+    target = os.path.abspath(os.path.join(dest_abs, *parts))
+    if target != dest_abs and not target.startswith(dest_abs + os.sep):
+        return None
+    return target
+
+
+def _extract_resume_bundle(bundle_path: str, staging_dir: str) -> tuple[int, int]:
+    file_count = 0
+    total_bytes = 0
+    with tarfile.open(bundle_path, mode="r|gz") as tar:
+        for member in tar:
+            target = _safe_resume_target(staging_dir, member.name)
+            if target is None or not (member.isdir() or member.isreg()):
+                continue
+            if member.isdir():
+                os.makedirs(target, exist_ok=True)
+                continue
+            if os.path.basename(target) in _RESUME_STALE_ARTIFACT_NAMES:
+                continue
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            source = tar.extractfile(member)
+            if source is None:
+                raise tarfile.ExtractError("regular member has no data")
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(target, flags, member.mode & 0o777 or 0o600)
+            written = 0
+            try:
+                with os.fdopen(fd, "wb", closefd=True) as output:
+                    while True:
+                        chunk = source.read(_ARTIFACT_TRANSFER_CHUNK_BYTES)
+                        if not chunk:
+                            break
+                        output.write(chunk)
+                        written += len(chunk)
+            finally:
+                source.close()
+            if written != member.size:
+                raise tarfile.ExtractError("truncated regular member")
+            file_count += 1
+            total_bytes += written
+    return file_count, total_bytes
+
+
+def _artifact_delivery_failure(reason: str, *, protocol: str = "direct") -> dict:
+    return {
+        "status": "failed",
+        "protocol": protocol,
+        "reason": str(reason)[:_ARTIFACT_DELIVERY_REASON_MAX_CHARS],
+    }
+
+
+def _legacy_upload_artifact(
+    orchestrator_url: str,
+    token: str,
+    job_id: str,
+    archive_path: str,
+    prepared: dict,
+) -> dict:
+    boundary = "----blueprintrunner" + os.urandom(16).hex()
+    fd, body_path = tempfile.mkstemp(prefix=".bp-artifact-multipart-")
+    os.close(fd)
+    try:
+        with open(body_path, "wb") as body:
+            for name in ("file_count", "total_bytes"):
+                body.write(f"--{boundary}\r\n".encode())
+                body.write(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode())
+                body.write(str(prepared[name]).encode() + b"\r\n")
+            body.write(f"--{boundary}\r\n".encode())
+            body.write(
+                b'Content-Disposition: form-data; name="archive"; '
+                b'filename="artifacts.tar.gz"\r\nContent-Type: application/gzip\r\n\r\n'
             )
-            return
-
-        # Build the gzip tarball in memory (paths relative to the artifact root).
-        buf = io.BytesIO()
-        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-            tar.add(artifact_dir, arcname=".")
-        archive_bytes = buf.getvalue()
-
-        body, content_type = _build_multipart_body(
-            fields={"file_count": file_count, "total_bytes": total_bytes},
-            file_field="archive",
-            filename="artifacts.tar.gz",
-            file_bytes=archive_bytes,
-            file_content_type="application/gzip",
-        )
+            with open(archive_path, "rb") as archive:
+                shutil.copyfileobj(archive, body, _ARTIFACT_TRANSFER_CHUNK_BYTES)
+            body.write(f"\r\n--{boundary}--\r\n".encode())
+        body_size = os.path.getsize(body_path)
         url = f"{orchestrator_url}/api/runner/compute-job/{job_id}/artifact"
-        # Retry transient failures (network errors, 5xx) with the same capped
-        # backoff as the terminal report — a blip here otherwise drops the run's
-        # debugging artifacts even though the job succeeded.
+        for attempt in range(_REPORT_MAX_RETRIES + 1):
+            try:
+                status, _headers, _body = _stream_http_file(
+                    url,
+                    "POST",
+                    {
+                        "Authorization": f"Bearer {token}",
+                        "Content-Type": f"multipart/form-data; boundary={boundary}",
+                        "Accept": "application/json",
+                    },
+                    body_path,
+                    body_size,
+                )
+            except Exception as exc:  # noqa: BLE001
+                status = 0
+                reason = f"legacy_network_error:{type(exc).__name__}"
+            else:
+                reason = f"legacy_http_{status}"
+            if 200 <= status < 300:
+                return {**prepared, "status": "delivered", "protocol": "legacy", "verified": False}
+            if attempt < _REPORT_MAX_RETRIES and (status == 0 or status == 429 or status >= 500):
+                time.sleep(_report_retry_sleep(attempt))
+                continue
+            return _artifact_delivery_failure(reason, protocol="legacy")
+        return _artifact_delivery_failure("legacy_upload_failed", protocol="legacy")
+    finally:
+        try:
+            os.remove(body_path)
+        except OSError:
+            pass
+
+
+def _upload_artifact(
+    orchestrator_url: str, token: str, job_id: str, artifact_dir: str
+) -> dict:
+    """Persist a disk-backed artifact bundle and return an explicit outcome."""
+    archive_path: str | None = None
+    try:
+        archive_path, prepared = _build_artifact_archive(artifact_dir)
+        if archive_path is None:
+            return prepared
+        authorize_url = (
+            f"{orchestrator_url}/api/runner/compute-job/{job_id}/artifact-transfer"
+        )
         for attempt in range(_REPORT_MAX_RETRIES + 1):
             last = attempt == _REPORT_MAX_RETRIES
-            req = urllib.request.Request(
-                url,
-                data=body,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": content_type,
-                    "Accept": "application/json",
-                },
-                method="POST",
-            )
             try:
-                with urllib.request.urlopen(req, timeout=120) as resp:
-                    if resp.status in (200, 201, 204):
-                        print(
-                            f"[compute] uploaded {file_count} artifact file(s) "
-                            f"({total_bytes} bytes) for job {job_id}",
-                            flush=True,
-                        )
-                    else:
-                        print(
-                            f"[compute] artifact upload warning: HTTP {resp.status} for job {job_id}",
-                            flush=True,
-                        )
-                return
-            except urllib.error.HTTPError as exc:
-                if exc.code >= 500 and not last:
-                    print(
-                        f"[compute] artifact upload HTTP {exc.code} for job {job_id}; "
-                        f"retry {attempt + 1}/{_REPORT_MAX_RETRIES}",
-                        flush=True,
+                auth_status, authorization = _post(
+                    authorize_url,
+                    token,
+                    {
+                        "archive_size": prepared["archive_size"],
+                        "crc32c": prepared["crc32c"],
+                        "file_count": prepared["file_count"],
+                        "total_bytes": prepared["total_bytes"],
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001
+                auth_status = 0
+                authorization = None
+                failure_reason = f"authorization_error:{type(exc).__name__}"
+            else:
+                failure_reason = f"authorization_http_{auth_status}"
+
+            if auth_status in (404, 405):
+                if (
+                    prepared["total_bytes"] <= _RUNNER_ARTIFACT_MAX_BYTES
+                    and prepared["archive_size"] <= _RUNNER_ARTIFACT_MAX_BYTES
+                ):
+                    return _legacy_upload_artifact(
+                        orchestrator_url, token, job_id, archive_path, prepared
                     )
+                return _artifact_delivery_failure("direct_transfer_unsupported")
+            if not (200 <= auth_status < 300) or not isinstance(authorization, dict):
+                if not last and (auth_status == 0 or auth_status == 429 or auth_status >= 500):
                     time.sleep(_report_retry_sleep(attempt))
                     continue
-                print(
-                    f"[compute] artifact upload failed (HTTP {exc.code}) for job {job_id}",
-                    flush=True,
+                return _artifact_delivery_failure(failure_reason)
+
+            upload_url = authorization.get("upload_url")
+            transfer_id = authorization.get("transfer_id")
+            method = str(authorization.get("method") or "PUT")
+            upload_headers = authorization.get("headers") or {"Content-Type": "application/gzip"}
+            if not isinstance(upload_url, str) or not isinstance(transfer_id, str) or not isinstance(upload_headers, dict):
+                return _artifact_delivery_failure("invalid_authorization_response")
+            try:
+                put_status, put_headers, _put_body = _stream_http_file(
+                    upload_url,
+                    method,
+                    upload_headers,
+                    archive_path,
+                    prepared["archive_size"],
                 )
-                return
-            except Exception as exc:
-                if not last:
-                    print(
-                        f"[compute] artifact upload network error for job {job_id}: {exc}; "
-                        f"retry {attempt + 1}/{_REPORT_MAX_RETRIES}",
-                        flush=True,
-                    )
+            except Exception as exc:  # noqa: BLE001
+                put_status = 0
+                put_headers = {}
+                failure_reason = f"upload_error:{type(exc).__name__}"
+            else:
+                failure_reason = f"upload_http_{put_status}"
+            generation = put_headers.get("x-goog-generation")
+            if not (200 <= put_status < 300) or not generation:
+                if not last and (put_status == 0 or put_status == 429 or put_status >= 500 or not generation):
                     time.sleep(_report_retry_sleep(attempt))
                     continue
-                print(
-                    f"[compute] artifact upload network error for job {job_id}: {exc}",
-                    flush=True,
+                return _artifact_delivery_failure(
+                    "upload_missing_generation" if 200 <= put_status < 300 else failure_reason
                 )
-                return
-    except Exception as exc:  # noqa: BLE001 — upload is strictly best-effort
+
+            complete_url = authorize_url + "/complete"
+            complete_status = 0
+            completed = None
+            retry_with_new_transfer = False
+            for complete_attempt in range(_REPORT_MAX_RETRIES + 1):
+                try:
+                    complete_status, completed = _post(
+                        complete_url,
+                        token,
+                        {"transfer_id": transfer_id, "generation": str(generation)},
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    complete_status = 0
+                    failure_reason = f"completion_error:{type(exc).__name__}"
+                else:
+                    failure_reason = f"completion_http_{complete_status}"
+                if 200 <= complete_status < 300 and isinstance(completed, dict):
+                    artifact = completed.get("runner_artifact")
+                    if isinstance(artifact, dict) and artifact.get("verified") is True:
+                        print(
+                            f"[compute] uploaded {prepared['file_count']} artifact file(s) "
+                            f"({prepared['total_bytes']} bytes) for job {job_id}",
+                            flush=True,
+                        )
+                        return {
+                            **prepared,
+                            "status": "delivered",
+                            "protocol": "direct",
+                            "verified": True,
+                            "generation": str(generation),
+                        }
+                    return _artifact_delivery_failure("completion_unverified")
+                # Transport failures and rate-limit rejections are ambiguous or
+                # non-finalizing: the server may have verified this transfer, and
+                # its 429 guard leaves the authorized transfer untouched. Retry the
+                # idempotent completion request. A received 5xx can instead mean the
+                # server finalized it as failed (notably verification_unavailable),
+                # in which case completing the same transfer will only produce a
+                # permanent 409. Re-authorize and upload a fresh exact object via
+                # the outer retry loop.
+                if complete_attempt < _REPORT_MAX_RETRIES and complete_status in (0, 429):
+                    time.sleep(_report_retry_sleep(complete_attempt))
+                    continue
+                if complete_status >= 500 and not last:
+                    retry_with_new_transfer = True
+                    break
+                return _artifact_delivery_failure(failure_reason)
+            if retry_with_new_transfer:
+                time.sleep(_report_retry_sleep(attempt))
+                continue
+        return _artifact_delivery_failure("transfer_retries_exhausted")
+    except Exception as exc:  # noqa: BLE001 — delivery outcome, never runner crash
+        reason = f"unexpected_error:{type(exc).__name__}"
         print(f"[compute] artifact upload unexpected error for job {job_id}: {exc}", flush=True)
+        return _artifact_delivery_failure(reason)
+    finally:
+        if archive_path:
+            try:
+                os.remove(archive_path)
+            except OSError:
+                pass
 
 
 def _is_safe_tar_member(name: str) -> bool:
@@ -4721,6 +5144,7 @@ def _run_compute_job(
     if no_progress_timeout_seconds is not None:
         no_progress_timeout_seconds = max(60, int(no_progress_timeout_seconds))
     input_artifact_job_id = job_body.get("input_artifact_job_id") or None
+    require_durable_artifact = job_body.get("require_durable_artifact") is True
 
     caps = capabilities if capabilities is not None else _get_capabilities()
     cpu_limit = os.environ.get("BLUEPRINT_RUNNER_CPU_LIMIT") or None
@@ -4737,14 +5161,60 @@ def _run_compute_job(
     # consecutive-failure counter; None (cancel, graceful shutdown) is neutral —
     # operator-initiated stops are not a runner-health signal. Recorded in finally.
     outcome: str | None = None
+    artifact_delivery_attempted = False
+
+    def _report_terminal(
+        *,
+        exec_status: str,
+        exit_code: int | None = None,
+        result_metrics: dict | None = None,
+        command_log: dict | None = None,
+        progress: dict | None = None,
+        resume_hydration: dict | None = None,
+    ) -> bool:
+        """Persist artifacts before exposing a terminal execution report."""
+        nonlocal artifact_delivery_attempted
+        if artifact_dir:
+            with _ComputeJobReportHeartbeat(orchestrator_url, token, job_id):
+                delivery = _upload_artifact(
+                    orchestrator_url, token, job_id, artifact_dir
+                )
+        else:
+            delivery = {
+                "status": "not_produced",
+                "protocol": "none",
+                "reason": "artifact_dir_unavailable",
+            }
+        artifact_delivery_attempted = True
+        delivery = {**delivery, "command_exec_status": exec_status}
+        reported_status = exec_status
+        if require_durable_artifact and delivery.get("status") != "delivered":
+            reported_status = "failed"
+            print(
+                f"[compute] job {job_id}: require_durable_artifact unmet "
+                f"({delivery.get('reason', delivery.get('status'))})",
+                flush=True,
+            )
+        return _report_compute_job(
+            orchestrator_url,
+            token,
+            job_id,
+            exec_status=reported_status,
+            exit_code=exit_code,
+            result_metrics=result_metrics,
+            command_log=command_log,
+            progress=progress,
+            resume_hydration=resume_hydration,
+            artifact_delivery=delivery,
+        )
+
     try:
         # ── Fail-closed gate: refuse anything we cannot sandbox, before any work.
         if iso.decide_compute_backend(caps, has_image, allow_host_fallback=allow_host_fallback) == iso.DECLINE:
             reason = iso.compute_decline_reason(caps, has_image, allow_host_fallback=allow_host_fallback) or "no isolation boundary"
             print(f"[compute] DECLINED job {job_id} (fail-closed): {reason}", flush=True)
             outcome = "failure"
-            _report_compute_job(
-                orchestrator_url, token, job_id,
+            _report_terminal(
                 exec_status="failed", exit_code=1,
                 command_log={
                     "text": f"Runner declined job (fail-closed isolation): {reason}",
@@ -4754,8 +5224,7 @@ def _run_compute_job(
             return
 
         if cancel_requested:
-            _report_compute_job(
-                orchestrator_url, token, job_id,
+            _report_terminal(
                 exec_status="failed", exit_code=1,
                 command_log={
                     "text": "[runner] job was cancel-requested at claim; "
@@ -4781,9 +5250,10 @@ def _run_compute_job(
         # silently restarting from scratch (which would discard weeks of progress
         # and burn a full deadline on an unintended from-scratch run).
         if input_artifact_job_id:
-            provenance = _download_input_artifact(
-                orchestrator_url, token, job_id, artifact_dir
-            )
+            with _ComputeJobReportHeartbeat(orchestrator_url, token, job_id):
+                provenance = _download_input_artifact(
+                    orchestrator_url, token, job_id, artifact_dir
+                )
             provenance["resumed_from_job_id"] = str(input_artifact_job_id)
             if provenance.get("ok"):
                 print(
@@ -4807,10 +5277,7 @@ def _run_compute_job(
                     flush=True,
                 )
                 outcome = "failure"
-                _report_compute_job(
-                    orchestrator_url,
-                    token,
-                    job_id,
+                _report_terminal(
                     exec_status="failed",
                     exit_code=1,
                     command_log={
@@ -4843,8 +5310,7 @@ def _run_compute_job(
             if not ok:
                 print(f"[compute] git clone failed for job {job_id} (exit={clone_rc})", flush=True)
                 outcome = "failure"
-                _report_compute_job(
-                    orchestrator_url, token, job_id,
+                _report_terminal(
                     exec_status="failed", exit_code=clone_rc,
                     command_log={
                         "text": f"[runner] git clone of {owner}/{repo}@{ref} "
@@ -4865,8 +5331,7 @@ def _run_compute_job(
             and not _docker_login(container_registry_auth, container_image=container_image)
         ):
             outcome = "failure"
-            _report_compute_job(
-                orchestrator_url, token, job_id,
+            _report_terminal(
                 exec_status="failed", exit_code=1,
                 command_log={
                     "text": "[runner] docker login to the container registry "
@@ -4922,8 +5387,7 @@ def _run_compute_job(
         if plan.declined:
             print(f"[compute] DECLINED job {job_id} (fail-closed): {plan.decline_reason}", flush=True)
             outcome = "failure"
-            _report_compute_job(
-                orchestrator_url, token, job_id,
+            _report_terminal(
                 exec_status="failed", exit_code=1,
                 command_log={
                     "text": f"Runner declined job (fail-closed isolation): {plan.decline_reason}",
@@ -5001,8 +5465,7 @@ def _run_compute_job(
                     )
                     print(f"[compute] ABORT job {job_id}: {terminal_reason}", flush=True)
                     outcome = "failure"
-                    _report_compute_job(
-                        orchestrator_url, token, job_id,
+                    _report_terminal(
                         exec_status="failed", exit_code=1,
                         command_log={
                             "text": terminal_reason,
@@ -5058,8 +5521,7 @@ def _run_compute_job(
         except Exception as exc:
             print(f"[compute] failed to start job {job_id}: {exc}", flush=True)
             outcome = "failure"
-            _report_compute_job(
-                orchestrator_url, token, job_id,
+            _report_terminal(
                 exec_status="failed", exit_code=1,
                 command_log={
                     "text": f"[runner] failed to start command: {exc}",
@@ -5192,8 +5654,7 @@ def _run_compute_job(
             if deadline is not None and now >= deadline:
                 _teardown()
                 outcome = "failure"
-                _report_compute_job(
-                    orchestrator_url, token, job_id,
+                _report_terminal(
                     exec_status="failed", exit_code=124,
                     command_log=_terminal_command_log(
                         "killed by runner: runtime deadline "
@@ -5222,8 +5683,7 @@ def _run_compute_job(
                 if now - _np_last_progress >= no_progress_timeout_seconds:
                     _teardown()
                     outcome = "failure"
-                    _report_compute_job(
-                        orchestrator_url, token, job_id,
+                    _report_terminal(
                         exec_status="failed", exit_code=125,
                         command_log=_terminal_command_log(
                             "killed by runner: no-progress watchdog "
@@ -5236,8 +5696,7 @@ def _run_compute_job(
 
             if _shutdown_event.is_set():
                 _teardown()
-                _report_compute_job(
-                    orchestrator_url, token, job_id,
+                _report_terminal(
                     exec_status="failed", exit_code=1,
                     command_log=_terminal_command_log(
                         "killed by runner: runner shutting down"
@@ -5254,8 +5713,7 @@ def _run_compute_job(
             )
             if cancel:
                 _teardown()
-                _report_compute_job(
-                    orchestrator_url, token, job_id,
+                _report_terminal(
                     exec_status="failed", exit_code=1,
                     command_log=_terminal_command_log(
                         "killed by runner: cancel requested by orchestrator"
@@ -5297,15 +5755,14 @@ def _run_compute_job(
         succeeded = exit_code_val == 0
         outcome = "success" if succeeded else "failure"
         exec_status_final = "succeeded" if succeeded else "failed"
-        _report_compute_job(
-            orchestrator_url, token, job_id,
+        _report_terminal(
             exec_status=exec_status_final,
             exit_code=exit_code_val,
             result_metrics=result_metrics,
             command_log=command_log,
             progress=progress_tail.poll(),
         )
-        print(f"[compute] job {job_id} {exec_status_final} (exit={exit_code_val})",
+        print(f"[compute] job {job_id} command {exec_status_final} (exit={exit_code_val})",
               flush=True)
 
     except Exception as exc:
@@ -5322,9 +5779,9 @@ def _run_compute_job(
                     "text": f"[runner] unexpected runner error: {exc}",
                     "truncated": False,
                 }
-            _report_compute_job(orchestrator_url, token, job_id,
-                                 exec_status="failed", exit_code=1,
-                                 command_log=crash_log)
+            _report_terminal(
+                exec_status="failed", exit_code=1, command_log=crash_log
+            )
         except Exception:
             pass
     finally:
@@ -5334,9 +5791,15 @@ def _run_compute_job(
                 telemetry.record_success()
             elif outcome == "failure":
                 telemetry.record_failure()
-        # Upload durable artifacts BEFORE tearing down tmpdir (every terminal path).
-        if artifact_dir:
-            _upload_artifact(orchestrator_url, token, job_id, artifact_dir)
+        # A terminal report always calls _report_terminal first. If execution
+        # escaped without one, retain the bundle locally until cleanup but do not
+        # create unreported durable evidence here.
+        if artifact_dir and not artifact_delivery_attempted:
+            print(
+                f"[compute] job {job_id}: terminal report was not reached; "
+                "artifact delivery was not attempted",
+                flush=True,
+            )
         _release_gpus(gpu_state, assigned_gpus)
         with lock:
             active_jobs.discard(job_id)

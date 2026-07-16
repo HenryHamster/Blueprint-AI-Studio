@@ -239,6 +239,21 @@ async def _stamp_compute_result_resource(
         return resource
     if job.result_reference:
         resource["result_reference"] = job.result_reference
+    runner_artifact = (job.polling_metadata or {}).get("runner_artifact")
+    transfer = (job.polling_metadata or {}).get("runner_artifact_transfer")
+    if isinstance(runner_artifact, dict):
+        resource["artifact_delivery_report"] = {
+            "status": "verified" if runner_artifact.get("verified") is True else "legacy",
+            "verified": runner_artifact.get("verified") is True,
+            "size": runner_artifact.get("size"),
+            "crc32c": runner_artifact.get("crc32c"),
+            "generation": runner_artifact.get("generation"),
+        }
+    elif isinstance(transfer, dict):
+        resource["artifact_delivery_report"] = {
+            "status": transfer.get("status", "attempted"),
+            "verified": False,
+        }
     if job.artifact_id is None:
         return resource
 
@@ -429,6 +444,13 @@ def _derive_artifact_delivery_record(resource: dict) -> dict:
         record["artifact_id"] = artifact_id
     if result_reference is not None:
         record["result_reference"] = result_reference
+    report = resource.get("artifact_delivery_report")
+    if isinstance(report, dict):
+        record["transfer_status"] = report.get("status")
+        record["verified"] = report.get("verified") is True
+        for key in ("size", "crc32c", "generation"):
+            if report.get(key) is not None:
+                record[key] = report[key]
     return record
 
 

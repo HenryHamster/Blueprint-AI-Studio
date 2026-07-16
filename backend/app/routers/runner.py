@@ -25,16 +25,18 @@ registered runner (vm_instance_id='runner:{id}', context['runner_target_id']),
 and this endpoint hands those pinned tasks to the polling runner.
 """
 
+import base64
+import binascii
 import logging
 import math
 import tempfile
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, StrictBool, StrictStr
+from pydantic import BaseModel, Field, StrictBool, StrictStr
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
@@ -89,6 +91,7 @@ _MAX_RUNNER_RESULT_METRICS_KEYS = 256
 _MAX_RUNNER_ARTIFACT_BYTES = 25 * 1024 * 1024  # 25 MiB
 # Allowance for multipart framing/headers when early-rejecting on Content-Length.
 _MULTIPART_BODY_MARGIN = 1 * 1024 * 1024  # 1 MiB
+_ARTIFACT_TRANSFER_TTL_SECONDS = 60 * 60
 # Interim live-output tail (running reports only). Stamped as
 # polling_metadata["live_output"] — the same key/shape the GCP live-tail path
 # writes (compute_jobs._apply_status_update + agent_compute_jobs heartbeat) and
@@ -1756,6 +1759,10 @@ class ComputeJobReportRequest(BaseModel):
     # operator can SEE the run resumed (and from where / how much), or that the
     # hydration failed — never claimed when it did not happen.
     resume_hydration: Dict[str, Any] | None = None
+    # Explicit durable-delivery outcome from new runners. The command's true
+    # exit outcome remains in runner_exec_status; this marker independently says
+    # whether its checkpoint bundle reached verified storage.
+    artifact_delivery: Dict[str, Any] | None = None
 
 
 @router.post("/next-compute-job")
@@ -1879,6 +1886,11 @@ async def next_compute_job(
                 job.id,
             )
 
+    task = await session.get(Task, job.task_id) if job.task_id is not None else None
+    require_durable_artifact = (
+        task is not None
+        and (task.first_payload or {}).get("require_durable_artifact") is True
+    )
     return {
         "job_id": str(job.id),
         # The job's OWNING project (not the runner's enrollment project — a
@@ -1903,6 +1915,7 @@ async def next_compute_job(
         # predecessor's durable bundle and extracts it into the artifact dir
         # before spawning the subprocess. Validated at create_compute_job time.
         "input_artifact_job_id": refreshed_meta.get("input_artifact_job_id"),
+        "require_durable_artifact": require_durable_artifact,
     }
 
 
@@ -2092,6 +2105,34 @@ async def report_compute_job(
             if provenance:
                 provenance["recorded_at"] = now.isoformat()
                 meta["resume_provenance"] = provenance
+        if (
+            payload.exec_status in ("succeeded", "failed")
+            and isinstance(payload.artifact_delivery, dict)
+        ):
+            raw_delivery = payload.artifact_delivery
+            delivery: Dict[str, Any] = {}
+            status_value = raw_delivery.get("status")
+            if status_value in ("delivered", "failed", "not_produced"):
+                delivery["status"] = status_value
+            protocol = raw_delivery.get("protocol")
+            if protocol in ("direct", "legacy", "none"):
+                delivery["protocol"] = protocol
+            command_status = raw_delivery.get("command_exec_status")
+            if command_status in ("succeeded", "failed"):
+                delivery["command_exec_status"] = command_status
+            if isinstance(raw_delivery.get("verified"), bool):
+                delivery["verified"] = raw_delivery["verified"]
+            for key in ("file_count", "total_bytes", "archive_size"):
+                value = raw_delivery.get(key)
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                    delivery[key] = value
+            for key, limit in (("reason", 256), ("crc32c", 16), ("generation", 128)):
+                value = raw_delivery.get(key)
+                if isinstance(value, str) and value.strip():
+                    delivery[key] = value.strip()[:limit]
+            if delivery:
+                delivery["recorded_at"] = now.isoformat()
+                meta["artifact_delivery"] = delivery
         job.polling_metadata = meta
         job.last_heartbeat_at = now
         job.updated_at = now
@@ -2292,6 +2333,265 @@ def _parse_multipart_form_stream(
     return fields, file_part
 
 
+class ArtifactTransferAuthorizeRequest(BaseModel):
+    archive_size: int = Field(gt=0)
+    crc32c: StrictStr
+    file_count: int = Field(ge=0)
+    total_bytes: int = Field(ge=0)
+
+
+class ArtifactTransferCompleteRequest(BaseModel):
+    transfer_id: uuid.UUID
+    generation: StrictStr
+
+
+async def _finalize_artifact_transfer_failure(
+    session: AsyncSession,
+    scope: tuple,
+    transfer_id: uuid.UUID,
+    reason: str,
+    *,
+    expected_status: str,
+) -> None:
+    """Fail a current transfer only from the state that initiated this operation."""
+    result = await session.execute(
+        select(ComputeJob)
+        .where(*scope)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    job = result.scalars().first()
+    if job is None:
+        return
+    meta = dict(job.polling_metadata or {})
+    current = meta.get("runner_artifact_transfer")
+    if (
+        not isinstance(current, dict)
+        or current.get("transfer_id") != str(transfer_id)
+        or current.get("status") != expected_status
+    ):
+        return
+    meta["runner_artifact_transfer"] = {
+        **current,
+        "status": "failed",
+        "failure_reason": reason,
+        "failed_at": _utcnow().isoformat(),
+    }
+    job.polling_metadata = meta
+    job.updated_at = _utcnow()
+    session.add(job)
+    await session.commit()
+
+
+@router.post("/compute-job/{job_id}/artifact-transfer")
+async def authorize_compute_job_artifact_upload(
+    job_id: uuid.UUID,
+    payload: ArtifactTransferAuthorizeRequest,
+    runner: LocalRunner = Depends(get_current_runner),
+    session: AsyncSession = Depends(get_session),
+):
+    """Authorize a large bundle to bypass Cloud Run and upload to exact GCS object."""
+    allowed, retry_after = await check_runner_rate_limit(
+        str(runner.id), "authorize_compute_job_artifact_upload"
+    )
+    if not allowed:
+        raise HTTPException(status_code=429, headers={"Retry-After": str(retry_after)})
+    checksum = payload.crc32c.strip()
+    try:
+        decoded_checksum = base64.b64decode(checksum, validate=True)
+    except (binascii.Error, ValueError):
+        decoded_checksum = b""
+    if len(decoded_checksum) != 4:
+        raise HTTPException(status_code=422, detail="crc32c must be a non-empty base64 checksum")
+
+    allowed_projects = await allowed_project_ids(session, runner)
+    scope = (
+        ComputeJob.id == job_id,
+        ComputeJob.project_id.in_(allowed_projects),
+        ComputeJob.backend == RUNNER_SUBPROCESS_BACKEND_NAME,
+        ComputeJob.polling_metadata["runner_target_id"].as_string() == str(runner.id),
+    )
+    result = await session.execute(select(ComputeJob).where(*scope).with_for_update())
+    job = result.scalars().first()
+    if job is None:
+        raise HTTPException(status_code=404, detail="compute job not found")
+    meta = dict(job.polling_metadata or {})
+    if job.status in _COMPUTE_JOB_TERMINAL_STATUSES and meta.get("runner_artifact") is not None:
+        raise HTTPException(status_code=409, detail="compute job is finalized — its artifact evidence is immutable")
+    transfer_id = uuid.uuid4()
+    expires_at = _utcnow() + timedelta(seconds=_ARTIFACT_TRANSFER_TTL_SECONDS)
+    meta["runner_artifact_transfer"] = {
+        "transfer_id": str(transfer_id),
+        "archive_size": payload.archive_size,
+        "crc32c": checksum,
+        "file_count": payload.file_count,
+        "total_bytes": payload.total_bytes,
+        "expires_at": expires_at.isoformat(),
+        "status": "authorizing",
+    }
+    job.polling_metadata = meta
+    job.updated_at = _utcnow()
+    session.add(job)
+    await session.commit()
+
+    # IAM credential refresh/signBlob can involve network I/O.  The attempt is
+    # reserved above, but no row lock or transaction is held while it runs.
+    try:
+        authorization = await app_storage.authorize_compute_job_artifact_transfer(
+            job_id, transfer_id, expires_at=expires_at
+        )
+    except Exception as exc:
+        logger.warning("Artifact transfer authorization failed for %s", job_id, exc_info=True)
+        await _finalize_artifact_transfer_failure(
+            session,
+            scope,
+            transfer_id,
+            "authorization_failed",
+            expected_status="authorizing",
+        )
+        raise HTTPException(status_code=503, detail="artifact persistence authorization failed") from exc
+
+    result = await session.execute(
+        select(ComputeJob)
+        .where(*scope)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    job = result.scalars().first()
+    if job is None:
+        raise HTTPException(status_code=404, detail="compute job not found")
+    meta = dict(job.polling_metadata or {})
+    current = meta.get("runner_artifact_transfer")
+    if not isinstance(current, dict) or current.get("transfer_id") != str(transfer_id):
+        raise HTTPException(status_code=409, detail="artifact transfer was superseded")
+    if job.status in _COMPUTE_JOB_TERMINAL_STATUSES and meta.get("runner_artifact") is not None:
+        meta["runner_artifact_transfer"] = {
+            **current,
+            "status": "failed",
+            "failure_reason": "evidence_finalized",
+            "failed_at": _utcnow().isoformat(),
+        }
+        job.polling_metadata = meta
+        job.updated_at = _utcnow()
+        session.add(job)
+        await session.commit()
+        raise HTTPException(status_code=409, detail="compute job is finalized — its artifact evidence is immutable")
+    meta["runner_artifact_transfer"] = {**current, "status": "authorized"}
+    job.polling_metadata = meta
+    job.updated_at = _utcnow()
+    session.add(job)
+    await session.commit()
+    return {"ok": True, "transfer_id": str(transfer_id), **authorization}
+
+
+@router.post("/compute-job/{job_id}/artifact-transfer/complete")
+async def complete_compute_job_artifact_upload(
+    job_id: uuid.UUID,
+    payload: ArtifactTransferCompleteRequest,
+    runner: LocalRunner = Depends(get_current_runner),
+    session: AsyncSession = Depends(get_session),
+):
+    """Verify direct-upload metadata before stamping durable runner evidence."""
+    allowed, retry_after = await check_runner_rate_limit(
+        str(runner.id), "complete_compute_job_artifact_upload"
+    )
+    if not allowed:
+        raise HTTPException(status_code=429, headers={"Retry-After": str(retry_after)})
+    allowed_projects = await allowed_project_ids(session, runner)
+    scope = (
+        ComputeJob.id == job_id,
+        ComputeJob.project_id.in_(allowed_projects),
+        ComputeJob.backend == RUNNER_SUBPROCESS_BACKEND_NAME,
+        ComputeJob.polling_metadata["runner_target_id"].as_string() == str(runner.id),
+    )
+    result = await session.execute(select(ComputeJob).where(*scope))
+    job = result.scalars().first()
+    if job is None:
+        raise HTTPException(status_code=404, detail="compute job not found")
+    pending = (job.polling_metadata or {}).get("runner_artifact_transfer")
+    if not isinstance(pending, dict) or pending.get("transfer_id") != str(payload.transfer_id):
+        raise HTTPException(status_code=409, detail="artifact transfer is not current")
+    existing = (job.polling_metadata or {}).get("runner_artifact")
+    if pending.get("status") == "verified" and isinstance(existing, dict):
+        if (
+            existing.get("transfer_id") == str(payload.transfer_id)
+            and existing.get("generation") == payload.generation
+        ):
+            return {"ok": True, "runner_artifact": existing}
+        raise HTTPException(status_code=409, detail="artifact evidence is immutable")
+    if pending.get("status") != "authorized":
+        raise HTTPException(status_code=409, detail="artifact transfer is not completable")
+    try:
+        verified = await app_storage.verify_compute_job_artifact_transfer(job_id, payload.transfer_id)
+    except Exception as exc:
+        logger.warning("Artifact transfer verification failed for %s", job_id, exc_info=True)
+        await _finalize_artifact_transfer_failure(
+            session,
+            scope,
+            payload.transfer_id,
+            "verification_unavailable",
+            expected_status="authorized",
+        )
+        raise HTTPException(status_code=503, detail="artifact persistence verification failed") from exc
+    if (
+        verified["size"] != pending.get("archive_size")
+        or verified.get("crc32c") != pending.get("crc32c")
+        or verified.get("generation") != payload.generation
+    ):
+        await _finalize_artifact_transfer_failure(
+            session,
+            scope,
+            payload.transfer_id,
+            "metadata_mismatch",
+            expected_status="authorized",
+        )
+        raise HTTPException(status_code=409, detail="artifact size, checksum, or generation verification failed")
+
+    result = await session.execute(
+        select(ComputeJob).where(*scope).with_for_update().execution_options(populate_existing=True)
+    )
+    job = result.scalars().first()
+    if job is None:
+        raise HTTPException(status_code=404, detail="compute job not found")
+    meta = dict(job.polling_metadata or {})
+    current = meta.get("runner_artifact_transfer")
+    if not isinstance(current, dict) or current.get("transfer_id") != str(payload.transfer_id):
+        raise HTTPException(status_code=409, detail="artifact transfer was superseded")
+    existing = meta.get("runner_artifact")
+    if current.get("status") == "verified" and isinstance(existing, dict):
+        if (
+            existing.get("transfer_id") == str(payload.transfer_id)
+            and existing.get("generation") == payload.generation
+        ):
+            return {"ok": True, "runner_artifact": existing}
+        raise HTTPException(status_code=409, detail="artifact evidence is immutable")
+    if current.get("status") != "authorized":
+        raise HTTPException(status_code=409, detail="artifact transfer is not completable")
+    if existing is not None:
+        if existing.get("generation") == verified["generation"] and existing.get("uri") == verified["uri"]:
+            return {"ok": True, "runner_artifact": existing}
+        raise HTTPException(status_code=409, detail="artifact evidence is immutable")
+    artifact_info = {
+        "kind": "runner_artifact",
+        "uri": verified["uri"],
+        "file_count": current["file_count"],
+        "total_bytes": current["total_bytes"],
+        "stored": True,
+        "verified": True,
+        "size": verified["size"],
+        "crc32c": verified["crc32c"],
+        "generation": verified["generation"],
+        "transfer_id": str(payload.transfer_id),
+    }
+    meta["runner_artifact"] = artifact_info
+    meta["runner_artifact_transfer"] = {**current, "status": "verified", "verified_at": _utcnow().isoformat()}
+    job.polling_metadata = meta
+    job.updated_at = _utcnow()
+    session.add(job)
+    await session.commit()
+    return {"ok": True, "runner_artifact": artifact_info}
+
+
 @router.post("/compute-job/{job_id}/artifact")
 async def upload_compute_job_artifact(
     job_id: uuid.UUID,
@@ -2413,6 +2713,8 @@ async def upload_compute_job_artifact(
     artifact_info = await store_runner_artifact(
         session, job, archive_bytes, file_count, total_bytes
     )
+    if not artifact_info.get("stored"):
+        raise HTTPException(status_code=503, detail="artifact persistence failed")
 
     # Brief lock: re-read the FRESH row, then stamp. populate_existing refreshes
     # the identity-map instance so the stamp merges over anything a concurrent
@@ -2464,6 +2766,7 @@ async def upload_compute_job_artifact(
 @router.get("/compute-job/{job_id}/input-artifact")
 async def download_compute_job_input_artifact(
     job_id: uuid.UUID,
+    direct: bool = False,
     runner: LocalRunner = Depends(get_current_runner),
     session: AsyncSession = Depends(get_session),
 ):
@@ -2515,12 +2818,43 @@ async def download_compute_job_input_artifact(
     # this runner's allow-list before we stream any bytes (launch-time validation
     # already enforced same-project, but re-check in case the row changed).
     source_job = await session.get(ComputeJob, source_id)
-    if source_job is None or source_job.project_id not in allowed_projects:
+    if source_job is None or source_job.project_id != job.project_id:
         raise HTTPException(status_code=404, detail="resume source not found")
 
     from app import storage
 
-    bundle = await storage.download_compute_job_artifact_bundle(source_id)
+    source_artifact = (source_job.polling_metadata or {}).get("runner_artifact")
+    artifact_uri = source_artifact.get("uri") if isinstance(source_artifact, dict) else None
+    if isinstance(artifact_uri, str) and storage.compute_job_id_for_artifact_uri(artifact_uri) != source_id:
+        # A stamped URI must resolve back to the exact predecessor row.  Never
+        # sign or proxy a malformed/cross-job reference, even within one project.
+        raise HTTPException(status_code=404, detail="resume source bundle not found")
+    if direct:
+        if not isinstance(source_artifact, dict) or not source_artifact.get("stored"):
+            raise HTTPException(status_code=404, detail="resume source bundle not found")
+        if not isinstance(artifact_uri, str):
+            raise HTTPException(status_code=404, detail="resume source bundle not found")
+        try:
+            download_url = await storage.generate_compute_job_artifact_uri_download_signed_url(
+                artifact_uri
+            )
+        except Exception as exc:
+            logger.warning("Direct artifact download authorization failed", exc_info=True)
+            raise HTTPException(status_code=503, detail="resume source authorization failed") from exc
+        return {
+            "download_url": download_url,
+            "expires_in_seconds": 3600,
+            "size": source_artifact.get("size"),
+            "crc32c": source_artifact.get("crc32c"),
+            "generation": source_artifact.get("generation"),
+        }
+
+    if isinstance(artifact_uri, str):
+        bundle = await storage.download_compute_job_artifact_uri(artifact_uri)
+    else:
+        # Older artifacts predate stamped exact-object URIs and use the fixed
+        # per-job bundle path.  Keep that authenticated compatibility path.
+        bundle = await storage.download_compute_job_artifact_bundle(source_id)
     if not bundle:
         raise HTTPException(status_code=404, detail="resume source bundle not found")
 

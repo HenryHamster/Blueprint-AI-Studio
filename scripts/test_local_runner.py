@@ -1,6 +1,7 @@
 """Tests for scripts/local_runner.py."""
 
 import contextlib
+import base64
 import io
 import json
 import os
@@ -2412,7 +2413,7 @@ class TestRunComputeJob(unittest.TestCase):
         reports = []
 
         def fake_report(orch_url, token, job_id, *, exec_status, exit_code=None,
-                        result_metrics=None, command_log=None, progress=None):
+                        result_metrics=None, command_log=None, progress=None, **_kw):
             reports.append({"exec_status": exec_status, "exit_code": exit_code})
             return False
 
@@ -2451,7 +2452,7 @@ class TestRunComputeJob(unittest.TestCase):
         reports = []
 
         def fake_report(orch_url, token, job_id, *, exec_status, exit_code=None,
-                        result_metrics=None, command_log=None, progress=None):
+                        result_metrics=None, command_log=None, progress=None, **_kw):
             reports.append({
                 "exec_status": exec_status,
                 "exit_code": exit_code,
@@ -2482,12 +2483,67 @@ class TestRunComputeJob(unittest.TestCase):
         # job_id removed from active_jobs after completion
         self.assertNotIn("test-job-001", active_jobs)
 
+    @unittest.skipUnless(os.name == "posix", "requires the POSIX test execution plan")
+    def test_required_artifact_failure_reports_after_delivery_attempt(self):
+        events = []
+        terminal = []
+
+        def fake_upload(*_args):
+            events.append("upload")
+            return {
+                "status": "failed",
+                "protocol": "direct",
+                "reason": "completion_http_503",
+            }
+
+        def fake_report(_url, _token, _job_id, *, exec_status, **kwargs):
+            if exec_status in ("succeeded", "failed"):
+                events.append("report")
+                terminal.append({"exec_status": exec_status, **kwargs})
+            return False
+
+        job = self._make_job(
+            command="exit 0",
+            require_durable_artifact=True,
+        )
+        with patch.object(local_runner, "_upload_artifact", side_effect=fake_upload), \
+             patch.object(local_runner, "_report_compute_job", side_effect=fake_report), \
+             patch.object(local_runner.iso, "plan_compute_execution", _bare_plan_factory()):
+            local_runner._run_compute_job(
+                job,
+                "https://api.example.com",
+                "tok",
+                {"test-job-001"},
+                threading.Lock(),
+                capabilities=_bwrap_caps(),
+            )
+
+        self.assertEqual(events, ["upload", "report"])
+        self.assertEqual(terminal[-1]["exec_status"], "failed")
+        self.assertEqual(terminal[-1]["exit_code"], 0)
+        delivery = terminal[-1]["artifact_delivery"]
+        self.assertEqual(delivery["status"], "failed")
+        self.assertEqual(delivery["command_exec_status"], "succeeded")
+        self.assertEqual(delivery["reason"], "completion_http_503")
+
+        job = self._make_job(command="exit 0", require_durable_artifact="false")
+        with patch.object(local_runner, "_upload_artifact", side_effect=fake_upload), \
+             patch.object(local_runner, "_report_compute_job", side_effect=fake_report), \
+             patch.object(local_runner.iso, "plan_compute_execution", _bare_plan_factory()):
+            local_runner._run_compute_job(
+                job, "https://api.example.com", "tok", {"test-job-001"},
+                threading.Lock(), capabilities=_bwrap_caps(),
+            )
+
+        self.assertEqual(terminal[-1]["exec_status"], "succeeded")
+        self.assertEqual(terminal[-1]["artifact_delivery"]["status"], "failed")
+
     def test_failed_command_reports_failed(self):
         """A command that exits non-zero → failed report."""
         reports = []
 
         def fake_report(orch_url, token, job_id, *, exec_status, exit_code=None,
-                        result_metrics=None, command_log=None, progress=None):
+                        result_metrics=None, command_log=None, progress=None, **_kw):
             reports.append({"exec_status": exec_status, "exit_code": exit_code})
             return False
 
@@ -2520,7 +2576,7 @@ class TestRunComputeJob(unittest.TestCase):
         captured: dict = {}
 
         def fake_report(orch_url, token, job_id, *, exec_status, exit_code=None,
-                        result_metrics=None, command_log=None, progress=None):
+                        result_metrics=None, command_log=None, progress=None, **_kw):
             reports.append({"exec_status": exec_status, "exit_code": exit_code})
             return False
 
@@ -2573,7 +2629,7 @@ class TestRunComputeJob(unittest.TestCase):
         reports = []
 
         def fake_report(orch_url, token, job_id, *, exec_status, exit_code=None,
-                        result_metrics=None, command_log=None, progress=None):
+                        result_metrics=None, command_log=None, progress=None, **_kw):
             reports.append(exec_status)
             return False
 
@@ -2724,6 +2780,59 @@ class TestRunComputeJob(unittest.TestCase):
 
         self.assertTrue(proc_terminated, "Expected the process group to be torn down")
         self.assertIn("failed", report_statuses)
+
+    def test_resume_hydration_emits_liveness_reports_before_execution(self):
+        """A long predecessor download keeps the claimed job alive before Popen."""
+        reports = []
+
+        def fake_report(_url, _token, _job_id, *, exec_status, **_kwargs):
+            reports.append(exec_status)
+            return False
+
+        def slow_hydration(*_args):
+            # Compressed time: this spans multiple heartbeat windows, standing in
+            # for a transfer longer than the backend's 600-second silent reaper.
+            time.sleep(0.02)
+            return {"ok": False, "reason": "simulated_download_failure"}
+
+        job = self._make_job(input_artifact_job_id="predecessor-1")
+        with patch.object(local_runner, "_report_compute_job", side_effect=fake_report), \
+                patch.object(local_runner, "_download_input_artifact", side_effect=slow_hydration), \
+                patch.object(local_runner, "_RUNNER_HEARTBEAT_INTERVAL", 0.001), \
+                patch("subprocess.Popen") as popen:
+            local_runner._run_compute_job(
+                job, "https://api.example.com", "tok", {"test-job-001"},
+                threading.Lock(), capabilities=_bwrap_caps(),
+            )
+
+        popen.assert_not_called()
+        self.assertGreaterEqual(reports.count("running"), 3)
+        self.assertEqual(reports[-1], "failed")
+
+    @unittest.skipUnless(os.name == "posix", "requires the POSIX test execution plan")
+    def test_artifact_delivery_emits_liveness_reports_before_terminal(self):
+        """A slow archive/upload cannot let the runner-subprocess lease expire."""
+        reports = []
+
+        def fake_report(_url, _token, _job_id, *, exec_status, **_kwargs):
+            reports.append(exec_status)
+            return False
+
+        def slow_upload(*_args):
+            time.sleep(0.02)
+            return {"status": "delivered", "protocol": "direct", "verified": True}
+
+        with patch.object(local_runner, "_report_compute_job", side_effect=fake_report), \
+                patch.object(local_runner, "_upload_artifact", side_effect=slow_upload), \
+                patch.object(local_runner, "_RUNNER_HEARTBEAT_INTERVAL", 0.001), \
+                patch.object(local_runner.iso, "plan_compute_execution", _bare_plan_factory()):
+            local_runner._run_compute_job(
+                self._make_job(command="exit 0"), "https://api.example.com", "tok",
+                {"test-job-001"}, threading.Lock(), capabilities=_bwrap_caps(),
+            )
+
+        self.assertGreaterEqual(reports.count("running"), 3)
+        self.assertEqual(reports[-1], "succeeded")
 
 
 # ── Compute poll loop ─────────────────────────────────────────────────────────
@@ -2882,7 +2991,7 @@ class TestComputePollLoop(unittest.TestCase):
             }
 
         def fake_report(orch_url, token, job_id, *, exec_status, exit_code=None,
-                        result_metrics=None, command_log=None, progress=None):
+                        result_metrics=None, command_log=None, progress=None, **_kw):
             reports.append({
                 "job_id": job_id,
                 "exec_status": exec_status,
@@ -3787,138 +3896,245 @@ class TestArtifactUpload(unittest.TestCase):
         return path
 
     def test_empty_dir_skips_upload(self):
-        import tempfile
         with tempfile.TemporaryDirectory() as art:
-            with patch("urllib.request.urlopen") as mock_urlopen:
-                local_runner._upload_artifact("https://api.example.com", "tok", "job-1", art)
-            mock_urlopen.assert_not_called()
-
-    def test_missing_dir_skips_upload(self):
-        with patch("urllib.request.urlopen") as mock_urlopen:
-            local_runner._upload_artifact(
-                "https://api.example.com", "tok", "job-1", "/no/such/dir"
-            )
-        mock_urlopen.assert_not_called()
-
-    def test_over_cap_skips_upload(self):
-        import tempfile
-        with tempfile.TemporaryDirectory() as art:
-            self._write(art, "checkpoint.bin", b"x" * 4096)
-            with patch.object(local_runner, "_RUNNER_ARTIFACT_MAX_BYTES", 1024), \
-                 patch("urllib.request.urlopen") as mock_urlopen:
-                local_runner._upload_artifact(
+            with patch.object(local_runner, "_post") as mock_post:
+                result = local_runner._upload_artifact(
                     "https://api.example.com", "tok", "job-1", art
                 )
-            mock_urlopen.assert_not_called()
+            mock_post.assert_not_called()
+        self.assertEqual(result["status"], "not_produced")
 
-    def test_successful_upload_posts_multipart_with_counts(self):
-        import tempfile
-        captured = {}
+    def test_missing_dir_skips_upload(self):
+        with patch.object(local_runner, "_post") as mock_post:
+            result = local_runner._upload_artifact(
+                "https://api.example.com", "tok", "job-1", "/no/such/dir"
+            )
+        mock_post.assert_not_called()
+        self.assertEqual(result["reason"], "artifact_dir_unavailable")
 
-        class _Resp:
-            status = 200
+    def test_over_legacy_cap_uses_direct_transfer(self):
+        with tempfile.TemporaryDirectory() as art:
+            self._write(art, "checkpoint.bin", b"x" * 4096)
+            post_calls = []
 
-            def __enter__(self):
-                return self
+            def fake_post(url, _token, body):
+                post_calls.append((url, body))
+                if url.endswith("/complete"):
+                    return 200, {"runner_artifact": {"verified": True}}
+                return 200, {
+                    "upload_url": "https://storage.invalid/object",
+                    "transfer_id": "transfer-1",
+                    "method": "PUT",
+                    "headers": {"Content-Type": "application/gzip"},
+                }
 
-            def __exit__(self, *a):
-                return False
+            with patch.object(local_runner, "_RUNNER_ARTIFACT_MAX_BYTES", 1024), \
+                 patch.object(local_runner, "_post", side_effect=fake_post), \
+                 patch.object(
+                     local_runner,
+                     "_stream_http_file",
+                     return_value=(200, {"x-goog-generation": "7"}, b""),
+                 ):
+                result = local_runner._upload_artifact(
+                    "https://api.example.com", "tok", "job-1", art
+                )
+        self.assertEqual(result["status"], "delivered")
+        self.assertEqual(result["protocol"], "direct")
+        self.assertGreater(post_calls[0][1]["archive_size"], 0)
+        self.assertEqual(post_calls[0][1]["file_count"], 1)
 
-        def fake_urlopen(req, timeout=None):
-            captured["url"] = req.full_url
-            captured["headers"] = dict(req.header_items())
-            captured["body"] = req.data
-            return _Resp()
+    def test_successful_direct_upload_posts_integrity_and_counts(self):
+        captured = {"posts": [], "puts": []}
+
+        def fake_post(url, _token, body):
+            captured["posts"].append((url, body))
+            if url.endswith("/complete"):
+                self.assertEqual(body["generation"], "42")
+                return 200, {"runner_artifact": {"verified": True}}
+            return 200, {
+                "upload_url": "https://storage.invalid/signed-put",
+                "transfer_id": "transfer-42",
+                "method": "PUT",
+                "headers": {"Content-Type": "application/gzip"},
+            }
+
+        def fake_stream(url, method, headers, path, size):
+            captured["puts"].append((url, method, headers, path, size))
+            self.assertEqual(size, os.path.getsize(path))
+            return 200, {"x-goog-generation": "42"}, b""
 
         with tempfile.TemporaryDirectory() as art:
             self._write(art, "plots/loss.png", b"PNGDATA")
             self._write(art, "ckpt.pt", b"WEIGHTS123")
-            with patch("urllib.request.urlopen", side_effect=fake_urlopen):
-                local_runner._upload_artifact(
+            with patch.object(local_runner, "_post", side_effect=fake_post), \
+                 patch.object(local_runner, "_stream_http_file", side_effect=fake_stream):
+                result = local_runner._upload_artifact(
                     "https://api.example.com", "tok", "job-xyz", art
                 )
 
-        self.assertIn("/api/runner/compute-job/job-xyz/artifact", captured["url"])
-        # Content-Type is multipart with a boundary; auth header carried through.
-        ct = captured["headers"].get("Content-type") or captured["headers"].get("Content-Type")
-        self.assertIn("multipart/form-data; boundary=", ct)
-        auth = captured["headers"].get("Authorization")
-        self.assertEqual(auth, "Bearer tok")
-        body = captured["body"]
-        # Form fields present with correct values (2 files, 17 total bytes).
-        self.assertIn(b'name="archive"; filename="artifacts.tar.gz"', body)
-        self.assertIn(b'name="file_count"', body)
-        self.assertIn(b"\r\n\r\n2\r\n", body)  # file_count == 2
-        self.assertIn(b'name="total_bytes"', body)
-        self.assertIn(b"\r\n\r\n17\r\n", body)  # 7 + 10 bytes
+        authorize = captured["posts"][0][1]
+        self.assertEqual(authorize["file_count"], 2)
+        self.assertEqual(authorize["total_bytes"], 17)
+        self.assertEqual(len(base64.b64decode(authorize["crc32c"])), 4)
+        self.assertEqual(captured["puts"][0][1], "PUT")
+        self.assertEqual(result["status"], "delivered")
+        self.assertTrue(result["verified"])
 
     def test_upload_http_error_is_non_fatal(self):
-        import tempfile
-        import urllib.error
-
         with tempfile.TemporaryDirectory() as art:
             self._write(art, "f.txt", b"data")
-            with patch(
-                "urllib.request.urlopen",
-                side_effect=urllib.error.HTTPError("u", 500, "err", {}, None),
+            with patch.object(
+                local_runner, "_post", return_value=(503, {"detail": "down"})
             ), patch("time.sleep"):
-                # Must NOT raise even after exhausting retries.
-                local_runner._upload_artifact(
+                result = local_runner._upload_artifact(
                     "https://api.example.com", "tok", "job-1", art
                 )
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["reason"], "authorization_http_503")
 
     def test_upload_retries_5xx_up_to_cap(self):
         """A 5xx artifact upload is retried up to the cap before giving up."""
-        import tempfile
-        import urllib.error
-
         with tempfile.TemporaryDirectory() as art:
             self._write(art, "f.txt", b"data")
-            with patch(
-                "urllib.request.urlopen",
-                side_effect=urllib.error.HTTPError("u", 503, "err", {}, None),
-            ) as mock_urlopen, patch("time.sleep") as mock_sleep:
-                local_runner._upload_artifact(
+            with patch.object(
+                local_runner, "_post", return_value=(503, None)
+            ) as mock_post, patch("time.sleep") as mock_sleep:
+                result = local_runner._upload_artifact(
                     "https://api.example.com", "tok", "job-1", art
                 )
 
         self.assertEqual(
-            mock_urlopen.call_count, local_runner._REPORT_MAX_RETRIES + 1
+            mock_post.call_count, local_runner._REPORT_MAX_RETRIES + 1
         )
         self.assertEqual(mock_sleep.call_count, local_runner._REPORT_MAX_RETRIES)
+        self.assertEqual(result["status"], "failed")
 
     def test_upload_retries_network_error_then_succeeds(self):
         """A transient network blip on upload is retried instead of dropping artifacts."""
-        import tempfile
-        import urllib.error
+        calls = {"put": 0}
 
-        class _Resp:
-            status = 200
+        def fake_post(url, _token, _body):
+            if url.endswith("/complete"):
+                return 200, {"runner_artifact": {"verified": True}}
+            return 200, {
+                "upload_url": "https://storage.invalid/signed-put",
+                "transfer_id": f"transfer-{calls['put']}",
+                "headers": {"Content-Type": "application/gzip"},
+            }
 
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *a):
-                return False
-
-        calls = {"n": 0}
-
-        def fake_urlopen(req, timeout=None):
-            calls["n"] += 1
-            if calls["n"] < 2:
-                raise urllib.error.URLError("conn reset")
-            return _Resp()
+        def fake_stream(*_args):
+            calls["put"] += 1
+            if calls["put"] == 1:
+                raise OSError("conn reset")
+            return 200, {"x-goog-generation": "2"}, b""
 
         with tempfile.TemporaryDirectory() as art:
             self._write(art, "f.txt", b"data")
-            with patch("urllib.request.urlopen", side_effect=fake_urlopen), \
+            with patch.object(local_runner, "_post", side_effect=fake_post), \
+                    patch.object(local_runner, "_stream_http_file", side_effect=fake_stream), \
                     patch("time.sleep") as mock_sleep:
-                local_runner._upload_artifact(
+                result = local_runner._upload_artifact(
                     "https://api.example.com", "tok", "job-1", art
                 )
 
-        self.assertEqual(calls["n"], 2)  # failed once, uploaded on retry
+        self.assertEqual(calls["put"], 2)
         self.assertEqual(mock_sleep.call_count, 1)
+        self.assertEqual(result["status"], "delivered")
+
+    def test_completion_503_reauthorizes_and_uploads_fresh_transfer(self):
+        """A finalized verification outage must not retry its now-dead transfer."""
+        authorizations = []
+        uploads = []
+
+        def fake_post(url, _token, _body):
+            if url.endswith("/complete"):
+                if len(authorizations) == 1:
+                    return 503, {"detail": "verification unavailable"}
+                return 200, {"runner_artifact": {"verified": True}}
+            transfer_id = f"transfer-{len(authorizations) + 1}"
+            authorizations.append(transfer_id)
+            return 200, {
+                "upload_url": f"https://storage.invalid/{transfer_id}",
+                "transfer_id": transfer_id,
+                "headers": {"Content-Type": "application/gzip"},
+            }
+
+        def fake_stream(url, *_args):
+            uploads.append(url)
+            return 200, {"x-goog-generation": "2"}, b""
+
+        with tempfile.TemporaryDirectory() as art:
+            self._write(art, "f.txt", b"data")
+            with patch.object(local_runner, "_post", side_effect=fake_post), \
+                    patch.object(local_runner, "_stream_http_file", side_effect=fake_stream), \
+                    patch("time.sleep"):
+                result = local_runner._upload_artifact(
+                    "https://api.example.com", "tok", "job-1", art
+                )
+
+        self.assertEqual(authorizations, ["transfer-1", "transfer-2"])
+        self.assertEqual(len(uploads), 2)
+        self.assertEqual(result["status"], "delivered")
+
+    def test_completion_429_retries_same_authorized_transfer(self):
+        """Rate limiting leaves the transfer authorized for idempotent completion."""
+        authorizations = []
+        completion_requests = []
+
+        def fake_post(url, _token, body):
+            if url.endswith("/complete"):
+                completion_requests.append(body)
+                if len(completion_requests) == 1:
+                    return 429, {"detail": "rate limited"}
+                return 200, {"runner_artifact": {"verified": True}}
+            authorizations.append(body)
+            return 200, {
+                "upload_url": "https://storage.invalid/transfer-1",
+                "transfer_id": "transfer-1",
+                "headers": {"Content-Type": "application/gzip"},
+            }
+
+        with tempfile.TemporaryDirectory() as art:
+            self._write(art, "f.txt", b"data")
+            with patch.object(local_runner, "_post", side_effect=fake_post), \
+                    patch.object(
+                        local_runner,
+                        "_stream_http_file",
+                        return_value=(200, {"x-goog-generation": "2"}, b""),
+                    ), \
+                    patch("time.sleep") as mock_sleep:
+                result = local_runner._upload_artifact(
+                    "https://api.example.com", "tok", "job-1", art
+                )
+
+        self.assertEqual(len(authorizations), 1)
+        self.assertEqual(
+            completion_requests,
+            [
+                {"transfer_id": "transfer-1", "generation": "2"},
+                {"transfer_id": "transfer-1", "generation": "2"},
+            ],
+        )
+        mock_sleep.assert_called_once()
+        self.assertEqual(result["status"], "delivered")
+
+    def test_liveness_reports_continue_during_long_artifact_transfer(self):
+        """Periodic reports keep the 600s server liveness lease refreshed."""
+        reports = []
+
+        def fake_report(*_args, **kwargs):
+            reports.append(kwargs["exec_status"])
+            return False
+
+        # A millisecond stands in for the production 30-second cadence; the
+        # work interval spans many such cadence windows without sleeping 600s.
+        with patch.object(local_runner, "_report_compute_job", side_effect=fake_report), \
+                patch.object(local_runner, "_RUNNER_HEARTBEAT_INTERVAL", 0.001):
+            with local_runner._ComputeJobReportHeartbeat("http://orch", "tok", "job-1"):
+                time.sleep(0.02)
+
+        self.assertGreaterEqual(len(reports), 3)
+        self.assertTrue(all(status == "running" for status in reports))
 
 
 class TestBoundedDedupLog(unittest.TestCase):
@@ -4294,7 +4510,7 @@ class TestComputeJobTelemetry(unittest.TestCase):
         reports = []
 
         def fake_report(orch, token, job_id, *, exec_status, exit_code=None,
-                        result_metrics=None, command_log=None, progress=None):
+                        result_metrics=None, command_log=None, progress=None, **_kw):
             reports.append({"exec_status": exec_status, "command_log": command_log})
             return False
 
@@ -7728,9 +7944,11 @@ class TestDockerImageCacheAccounting(unittest.TestCase):
 class _FakeResp:
     """Minimal context-manager HTTP response for mocking urlopen."""
 
-    def __init__(self, status, body):
+    def __init__(self, status, body=None):
         self.status = status
-        self._body = body
+        payload = json.dumps(body).encode() if isinstance(body, dict) else (body or b"")
+        self._stream = io.BytesIO(payload)
+        self.headers = {}
 
     def __enter__(self):
         return self
@@ -7738,8 +7956,8 @@ class _FakeResp:
     def __exit__(self, *exc):
         return False
 
-    def read(self):
-        return self._body
+    def read(self, size=-1):
+        return self._stream.read(size)
 
 
 def _make_bundle(members):
@@ -7837,6 +8055,28 @@ class DownloadInputArtifactTests(unittest.TestCase):
         # Only the safe member landed; no escape above the artifact dir.
         self.assertTrue(os.path.isfile(os.path.join(self.artifact_dir, "ok.txt")))
         self.assertFalse(os.path.exists(os.path.join(self.tmpdir, "escape.txt")))
+
+    def test_publish_failure_retains_existing_workspace(self):
+        """A failed atomic replace cannot erase the previously published tree."""
+        with open(os.path.join(self.artifact_dir, "previous.ckpt"), "wb") as fh:
+            fh.write(b"OLD")
+        bundle = _make_bundle({"checkpoint/new.pt": b"NEW"})
+        real_replace = os.replace
+
+        def fail_destination_replace(source, destination):
+            if destination == self.artifact_dir:
+                raise OSError("simulated publish failure")
+            return real_replace(source, destination)
+
+        with patch("local_runner.urllib.request.urlopen", return_value=_FakeResp(200, bundle)), \
+                patch("local_runner.os.replace", side_effect=fail_destination_replace):
+            prov = local_runner._download_input_artifact(
+                "http://orch", "tok", "job-1", self.artifact_dir
+            )
+
+        self.assertFalse(prov["ok"])
+        self.assertTrue(os.path.isfile(os.path.join(self.artifact_dir, "previous.ckpt")))
+        self.assertFalse(os.path.exists(os.path.join(self.artifact_dir, "checkpoint", "new.pt")))
 
 
 class SupervisorDetectionTests(unittest.TestCase):

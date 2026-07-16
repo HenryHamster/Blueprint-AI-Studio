@@ -5684,6 +5684,392 @@ class TestArtifactUploadEndpoint:
         return project, runner, token, job
 
     @pytest.mark.asyncio
+    async def test_resumable_upload_completion_verifies_size_checksum_before_stamp(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        _project, _runner, token, job = await self._make_runner_job(db_session)
+
+        async def fake_authorize(job_id, transfer_id, *, expires_at):
+            return {
+                "upload_url": "https://storage.invalid/exact-object-signature",
+                "method": "PUT",
+                "headers": {"Content-Type": "application/gzip"},
+                "expires_at": expires_at.isoformat(),
+                "object_uri": f"gs://bucket/{job_id}/{transfer_id}",
+            }
+
+        monkeypatch.setattr(
+            "app.storage.authorize_compute_job_artifact_transfer", fake_authorize
+        )
+        authorize = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"archive_size": 123, "crc32c": "AAAAAA==", "file_count": 2, "total_bytes": 456},
+        )
+        assert authorize.status_code == 200, authorize.text
+        transfer_id = authorize.json()["transfer_id"]
+
+        async def fake_verify(job_id, received_transfer_id):
+            return {
+                "uri": f"gs://bucket/{job_id}/{received_transfer_id}",
+                "size": 122,
+                "crc32c": "AAAAAA==",
+                "generation": "7",
+            }
+
+        monkeypatch.setattr("app.storage.verify_compute_job_artifact_transfer", fake_verify)
+        mismatch = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer/complete",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"transfer_id": transfer_id, "generation": "7"},
+        )
+        assert mismatch.status_code == 409
+        await db_session.refresh(job)
+        assert "runner_artifact" not in (job.polling_metadata or {})
+        assert job.polling_metadata["runner_artifact_transfer"]["status"] == "failed"
+        assert job.polling_metadata["runner_artifact_transfer"]["failure_reason"] == "metadata_mismatch"
+
+        async def fake_verified(job_id, received_transfer_id):
+            result = await fake_verify(job_id, received_transfer_id)
+            result["size"] = 123
+            return result
+
+        monkeypatch.setattr("app.storage.verify_compute_job_artifact_transfer", fake_verified)
+        # Failed exact-object attempts are final: a fresh authorization is
+        # required because ifGenerationMatch=0 prevents repairing that object.
+        failed_retry = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer/complete",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"transfer_id": transfer_id, "generation": "7"},
+        )
+        assert failed_retry.status_code == 409
+
+        authorize = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"archive_size": 123, "crc32c": "AAAAAA==", "file_count": 2, "total_bytes": 456},
+        )
+        transfer_id = authorize.json()["transfer_id"]
+        completed = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer/complete",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"transfer_id": transfer_id, "generation": "7"},
+        )
+        assert completed.status_code == 200, completed.text
+        stamped = completed.json()["runner_artifact"]
+        assert stamped["stored"] is True
+        assert stamped["verified"] is True
+        assert stamped["size"] == 123
+        assert stamped["crc32c"] == "AAAAAA=="
+        assert stamped["generation"] == "7"
+
+        repeated = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer/complete",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"transfer_id": transfer_id, "generation": "7"},
+        )
+        assert repeated.status_code == 200
+        assert repeated.json()["runner_artifact"] == stamped
+
+    @pytest.mark.asyncio
+    async def test_transfer_authorization_failure_is_finalized_without_open_transaction(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        _project, _runner, token, job = await self._make_runner_job(db_session)
+
+        async def fake_authorize(*_args, **_kwargs):
+            assert not db_session.in_transaction()
+            raise RuntimeError("signBlob unavailable")
+
+        monkeypatch.setattr(
+            "app.storage.authorize_compute_job_artifact_transfer", fake_authorize
+        )
+        response = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"archive_size": 10, "crc32c": "AAAAAA==", "file_count": 1, "total_bytes": 10},
+        )
+        assert response.status_code == 503
+        await db_session.refresh(job)
+        transfer = job.polling_metadata["runner_artifact_transfer"]
+        assert transfer["status"] == "failed"
+        assert transfer["failure_reason"] == "authorization_failed"
+
+    @pytest.mark.asyncio
+    async def test_transfer_verification_reload_failure_is_finalized(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        _project, _runner, token, job = await self._make_runner_job(db_session)
+
+        async def fake_authorize(job_id, transfer_id, *, expires_at):
+            return {"upload_url": "https://storage.invalid", "expires_at": expires_at.isoformat()}
+
+        async def fake_verify(*_args):
+            raise RuntimeError("reload unavailable")
+
+        monkeypatch.setattr("app.storage.authorize_compute_job_artifact_transfer", fake_authorize)
+        monkeypatch.setattr("app.storage.verify_compute_job_artifact_transfer", fake_verify)
+        authorized = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"archive_size": 10, "crc32c": "AAAAAA==", "file_count": 1, "total_bytes": 10},
+        )
+        transfer_id = authorized.json()["transfer_id"]
+        response = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer/complete",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"transfer_id": transfer_id, "generation": "1"},
+        )
+        assert response.status_code == 503
+        await db_session.refresh(job)
+        assert job.polling_metadata["runner_artifact_transfer"]["status"] == "failed"
+        assert job.polling_metadata["runner_artifact_transfer"]["failure_reason"] == "verification_unavailable"
+
+    @pytest.mark.asyncio
+    async def test_delayed_verification_failure_cannot_overwrite_verified_transfer(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        _project, _runner, token, job = await self._make_runner_job(db_session)
+
+        async def fake_authorize(job_id, transfer_id, *, expires_at):
+            return {"upload_url": "https://storage.invalid", "expires_at": expires_at.isoformat()}
+
+        monkeypatch.setattr("app.storage.authorize_compute_job_artifact_transfer", fake_authorize)
+        authorized = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"archive_size": 10, "crc32c": "AAAAAA==", "file_count": 1, "total_bytes": 10},
+        )
+        transfer_id = authorized.json()["transfer_id"]
+
+        async def fake_verify(*_args):
+            await db_session.refresh(job)
+            artifact = {
+                "uri": f"gs://bucket/{job.id}/{transfer_id}",
+                "generation": "1",
+                "transfer_id": transfer_id,
+            }
+            job.polling_metadata = {
+                **job.polling_metadata,
+                "runner_artifact": artifact,
+                "runner_artifact_transfer": {
+                    **job.polling_metadata["runner_artifact_transfer"],
+                    "status": "verified",
+                },
+            }
+            await db_session.commit()
+            raise RuntimeError("delayed verification failure")
+
+        monkeypatch.setattr("app.storage.verify_compute_job_artifact_transfer", fake_verify)
+        response = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer/complete",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"transfer_id": transfer_id, "generation": "1"},
+        )
+        assert response.status_code == 503
+        await db_session.refresh(job)
+        assert job.polling_metadata["runner_artifact_transfer"]["status"] == "verified"
+
+    @pytest.mark.asyncio
+    async def test_delayed_verification_success_cannot_overwrite_failed_transfer(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        _project, _runner, token, job = await self._make_runner_job(db_session)
+
+        async def fake_authorize(job_id, transfer_id, *, expires_at):
+            return {"upload_url": "https://storage.invalid", "expires_at": expires_at.isoformat()}
+
+        monkeypatch.setattr("app.storage.authorize_compute_job_artifact_transfer", fake_authorize)
+        authorized = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"archive_size": 10, "crc32c": "AAAAAA==", "file_count": 1, "total_bytes": 10},
+        )
+        transfer_id = authorized.json()["transfer_id"]
+
+        async def fake_verify(job_id, received_transfer_id):
+            await db_session.refresh(job)
+            job.polling_metadata = {
+                **job.polling_metadata,
+                "runner_artifact_transfer": {
+                    **job.polling_metadata["runner_artifact_transfer"],
+                    "status": "failed",
+                    "failure_reason": "concurrent_failure",
+                },
+            }
+            await db_session.commit()
+            return {
+                "uri": f"gs://bucket/{job_id}/{received_transfer_id}",
+                "size": 10,
+                "crc32c": "AAAAAA==",
+                "generation": "1",
+            }
+
+        monkeypatch.setattr("app.storage.verify_compute_job_artifact_transfer", fake_verify)
+        response = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer/complete",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"transfer_id": transfer_id, "generation": "1"},
+        )
+        assert response.status_code == 409
+        await db_session.refresh(job)
+        assert "runner_artifact" not in job.polling_metadata
+        assert job.polling_metadata["runner_artifact_transfer"]["status"] == "failed"
+
+    @pytest.mark.asyncio
+    async def test_superseded_transfer_cannot_complete(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        _project, _runner, token, job = await self._make_runner_job(db_session)
+
+        async def fake_authorize(job_id, transfer_id, *, expires_at):
+            return {"upload_url": "https://storage.invalid", "expires_at": expires_at.isoformat()}
+
+        monkeypatch.setattr("app.storage.authorize_compute_job_artifact_transfer", fake_authorize)
+        ids = []
+        for size in (10, 11):
+            response = await client.post(
+                f"/api/runner/compute-job/{job.id}/artifact-transfer",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"archive_size": size, "crc32c": "AAAAAA==", "file_count": 1, "total_bytes": size},
+            )
+            ids.append(response.json()["transfer_id"])
+        response = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer/complete",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"transfer_id": ids[0], "generation": "1"},
+        )
+        assert response.status_code == 409
+        await db_session.refresh(job)
+        assert job.polling_metadata["runner_artifact_transfer"]["transfer_id"] == ids[1]
+
+    @pytest.mark.asyncio
+    async def test_wrong_pinned_runner_cannot_authorize_transfer(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        other_runner, _ = await _make_runner(db_session, project.id)
+        job = ComputeJob(
+            project_id=project.id,
+            backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+            status=ComputeJobStatus.RUNNING,
+            polling_metadata={"runner_target_id": str(other_runner.id)},
+        )
+        db_session.add(job)
+        await db_session.commit()
+        response = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"archive_size": 10, "crc32c": "AAAAAA==", "file_count": 1, "total_bytes": 10},
+        )
+        assert response.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_runner_cannot_authorize_transfer_in_another_project(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        other_project = await _make_project(db_session, owner_id="other-owner")
+        runner, token = await _make_runner(db_session, project.id)
+        job = ComputeJob(
+            project_id=other_project.id,
+            backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+            status=ComputeJobStatus.RUNNING,
+            polling_metadata={"runner_target_id": str(runner.id)},
+        )
+        db_session.add(job)
+        await db_session.commit()
+        response = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"archive_size": 10, "crc32c": "AAAAAA==", "file_count": 1, "total_bytes": 10},
+        )
+        assert response.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_preissued_transfer_cannot_overwrite_finalized_evidence(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        _project, _runner, token, job = await self._make_runner_job(db_session)
+        final_artifact = {
+            "kind": "runner_artifact",
+            "uri": f"gs://bucket/compute-jobs/{job.id}/artifacts/bundle.tar.gz",
+            "stored": True,
+        }
+
+        async def fake_authorize(job_id, transfer_id, *, expires_at):
+            current = await db_session.get(ComputeJob, job.id)
+            await db_session.refresh(current)
+            current.status = ComputeJobStatus.SUCCEEDED
+            current.polling_metadata = {
+                **current.polling_metadata,
+                "runner_artifact": final_artifact,
+            }
+            await db_session.commit()
+            return {"upload_url": "https://storage.invalid", "expires_at": expires_at.isoformat()}
+
+        monkeypatch.setattr("app.storage.authorize_compute_job_artifact_transfer", fake_authorize)
+        response = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"archive_size": 10, "crc32c": "AAAAAA==", "file_count": 1, "total_bytes": 10},
+        )
+        assert response.status_code == 409
+        await db_session.refresh(job)
+        assert job.polling_metadata["runner_artifact"] == final_artifact
+        assert job.polling_metadata["runner_artifact_transfer"]["status"] == "failed"
+        assert job.polling_metadata["runner_artifact_transfer"]["failure_reason"] == "evidence_finalized"
+
+    @pytest.mark.asyncio
+    async def test_preissued_transfer_completion_cannot_overwrite_finalized_evidence(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        _project, _runner, token, job = await self._make_runner_job(db_session)
+
+        async def fake_authorize(job_id, transfer_id, *, expires_at):
+            return {"upload_url": "https://storage.invalid", "expires_at": expires_at.isoformat()}
+
+        monkeypatch.setattr("app.storage.authorize_compute_job_artifact_transfer", fake_authorize)
+        authorized = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"archive_size": 10, "crc32c": "AAAAAA==", "file_count": 1, "total_bytes": 10},
+        )
+        transfer_id = authorized.json()["transfer_id"]
+        final_artifact = {
+            "kind": "runner_artifact",
+            "uri": f"gs://bucket/compute-jobs/{job.id}/artifacts/bundle.tar.gz",
+            "stored": True,
+        }
+        await db_session.refresh(job)
+        job.status = ComputeJobStatus.SUCCEEDED
+        job.polling_metadata = {
+            **job.polling_metadata,
+            "runner_artifact": final_artifact,
+        }
+        db_session.add(job)
+        await db_session.commit()
+
+        async def fake_verify(job_id, received_transfer_id):
+            return {
+                "uri": f"gs://bucket/compute-jobs/{job_id}/artifacts/transfers/{received_transfer_id}.tar.gz",
+                "size": 10,
+                "crc32c": "AAAAAA==",
+                "generation": "1",
+            }
+
+        monkeypatch.setattr("app.storage.verify_compute_job_artifact_transfer", fake_verify)
+        response = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer/complete",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"transfer_id": transfer_id, "generation": "1"},
+        )
+        assert response.status_code == 409
+        await db_session.refresh(job)
+        assert job.polling_metadata["runner_artifact"] == final_artifact
+
+    @pytest.mark.asyncio
     async def test_upload_stores_artifact_and_links_metadata(
         self, client: AsyncClient, db_session, monkeypatch
     ):
@@ -8484,6 +8870,88 @@ class TestInputArtifactDownloadEndpoint:
         assert resp.headers["content-type"] == "application/gzip"
 
     @pytest.mark.asyncio
+    async def test_streams_transfer_specific_predecessor_uri_for_legacy_client(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        from app import storage
+
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        predecessor = await self._make_pinned_job(db_session, project, runner, {})
+        transfer_id = uuid.uuid4()
+        artifact_uri = storage.compute_job_artifact_transfer_uri(predecessor.id, transfer_id)
+        predecessor.polling_metadata = {
+            "runner_target_id": str(runner.id),
+            "runner_artifact": {"stored": True, "verified": True, "uri": artifact_uri},
+        }
+        db_session.add(predecessor)
+        await db_session.commit()
+        job = await self._make_pinned_job(
+            db_session, project, runner,
+            {"input_artifact_job_id": str(predecessor.id)},
+        )
+
+        async def fake_download(uri):
+            assert uri == artifact_uri
+            return b"TRANSFER-BUNDLE"
+
+        monkeypatch.setattr(storage, "download_compute_job_artifact_uri", fake_download)
+        resp = await client.get(
+            f"/api/runner/compute-job/{job.id}/input-artifact",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        assert resp.content == b"TRANSFER-BUNDLE"
+
+    @pytest.mark.asyncio
+    async def test_direct_download_returns_verified_transfer_metadata(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        from app import storage
+
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        predecessor = await self._make_pinned_job(db_session, project, runner, {})
+        artifact_uri = storage.compute_job_artifact_transfer_uri(predecessor.id, uuid.uuid4())
+        predecessor.polling_metadata = {
+            "runner_target_id": str(runner.id),
+            "runner_artifact": {
+                "stored": True,
+                "verified": True,
+                "uri": artifact_uri,
+                "size": 987,
+                "crc32c": "AAAAAA==",
+                "generation": "42",
+            },
+        }
+        db_session.add(predecessor)
+        await db_session.commit()
+        job = await self._make_pinned_job(
+            db_session, project, runner,
+            {"input_artifact_job_id": str(predecessor.id)},
+        )
+
+        async def fake_sign(uri):
+            assert uri == artifact_uri
+            return "https://storage.invalid/signed-get"
+
+        monkeypatch.setattr(
+            storage, "generate_compute_job_artifact_uri_download_signed_url", fake_sign
+        )
+        resp = await client.get(
+            f"/api/runner/compute-job/{job.id}/input-artifact?direct=true",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "download_url": "https://storage.invalid/signed-get",
+            "expires_in_seconds": 3600,
+            "size": 987,
+            "crc32c": "AAAAAA==",
+            "generation": "42",
+        }
+
+    @pytest.mark.asyncio
     async def test_404_when_no_input_artifact_reference(
         self, client: AsyncClient, db_session
     ):
@@ -8568,7 +9036,20 @@ class TestInputArtifactDownloadEndpoint:
         project = await _make_project(db_session)
         runner, token = await _make_runner(db_session, project.id)
         predecessor_id = str(uuid.uuid4())
+        task = Task(
+            project_id=project.id,
+            payloads=[
+                {
+                    "type": "compute_experiment",
+                    "require_durable_artifact": True,
+                }
+            ],
+            status=TaskStatus.IN_PROGRESS,
+        )
+        db_session.add(task)
+        await db_session.flush()
         job = ComputeJob(
+            task_id=task.id,
             project_id=project.id,
             backend=RUNNER_SUBPROCESS_BACKEND_NAME,
             status=ComputeJobStatus.STARTING,
@@ -8587,6 +9068,7 @@ class TestInputArtifactDownloadEndpoint:
         )
         assert resp.status_code == 200, resp.text
         assert resp.json()["input_artifact_job_id"] == predecessor_id
+        assert resp.json()["require_durable_artifact"] is True
 
     @pytest.mark.asyncio
     async def test_next_compute_job_stamps_ran_on_runner_id(
@@ -8638,12 +9120,23 @@ class TestInputArtifactDownloadEndpoint:
 
         resp = await client.post(
             f"/api/runner/compute-job/{job.id}/report",
-            json={"exec_status": "running"},
+            json={
+                "exec_status": "succeeded",
+                "artifact_delivery": {
+                    "status": "failed",
+                    "protocol": "direct",
+                    "command_exec_status": "succeeded",
+                    "reason": "x" * 1000,
+                },
+            },
             headers={"Authorization": f"Bearer {token}"},
         )
         assert resp.status_code == 200, resp.text
         await db_session.refresh(job)
         assert job.ran_on_runner_id == runner.id
+        delivery = job.polling_metadata["artifact_delivery"]
+        assert delivery["command_exec_status"] == "succeeded"
+        assert len(delivery["reason"]) == 256
 
     @pytest.mark.asyncio
     async def test_report_compute_job_does_not_overwrite_ran_on_runner_id(
@@ -11232,6 +11725,170 @@ async def test_enroll_capability_proof_trial_creates_bounded_task(db_session):
 
 
 # ── Cross-job resume fail-closed (scripts/local_runner.py) ───────────────────
+
+
+def test_large_checkpoint_round_trip_upload_bundle_resume(tmp_path, monkeypatch):
+    """A >25 MiB tree uses the direct contract and rehydrates byte-for-byte.
+
+    This exercises the dependency-free runner's production archive builder,
+    chunked direct upload, completion handshake, authorized direct download,
+    integrity check, safe extraction, and atomic workspace publication as one
+    seam. A second download with mismatched authoritative CRC32C must leave the
+    destination untouched.
+    """
+    import hashlib
+    import io
+    import json
+    import os
+    import random
+    import shutil
+    import sys
+    from pathlib import Path
+
+    script_candidates = (
+        Path(__file__).parents[2] / "scripts",
+        Path("/repo/scripts"),
+    )
+    scripts_dir = next(path for path in script_candidates if path.is_dir())
+    sys.path.insert(0, str(scripts_dir))
+    import local_runner
+
+    source = tmp_path / "source"
+    source.mkdir()
+    checkpoint = source / "checkpoints" / "epoch-0042.bin"
+    checkpoint.parent.mkdir()
+    rng = random.Random(20260715)
+    remaining = 27 * 1024 * 1024 + 137
+    with checkpoint.open("wb") as output:
+        while remaining:
+            chunk = rng.randbytes(min(1024 * 1024, remaining))
+            output.write(chunk)
+            remaining -= len(chunk)
+    (source / "notes.txt").write_text("resume-me\n", encoding="utf-8")
+
+    stored_bundle = tmp_path / "durable-transfer.tar.gz"
+    contract = {}
+
+    def crc32c_for(path):
+        state = 0xFFFFFFFF
+        with open(path, "rb") as stream:
+            while True:
+                chunk = stream.read(1024 * 1024)
+                if not chunk:
+                    break
+                state = local_runner._crc32c_update(state, chunk)
+        return local_runner._crc32c_b64(state)
+
+    def fake_post(url, _token, body):
+        if url.endswith("/artifact-transfer/complete"):
+            assert body == {"transfer_id": "transfer-large", "generation": "73"}
+            assert stored_bundle.stat().st_size == contract["archive_size"]
+            assert crc32c_for(stored_bundle) == contract["crc32c"]
+            return 200, {
+                "ok": True,
+                "runner_artifact": {
+                    "stored": True,
+                    "verified": True,
+                    "size": contract["archive_size"],
+                    "crc32c": contract["crc32c"],
+                    "generation": "73",
+                },
+            }
+        assert url.endswith("/artifact-transfer")
+        contract.update(body)
+        return 200, {
+            "ok": True,
+            "transfer_id": "transfer-large",
+            "upload_url": "https://storage.invalid/signed-put",
+            "method": "PUT",
+            "headers": {"Content-Type": "application/gzip"},
+        }
+
+    def fake_stream(url, method, headers, file_path, file_size):
+        assert url == "https://storage.invalid/signed-put"
+        assert method == "PUT"
+        assert headers["Content-Type"] == "application/gzip"
+        assert os.path.getsize(file_path) == file_size
+        shutil.copyfile(file_path, stored_bundle)
+        return 200, {"x-goog-generation": "73"}, b""
+
+    monkeypatch.setattr(local_runner, "_post", fake_post)
+    monkeypatch.setattr(local_runner, "_stream_http_file", fake_stream)
+    delivery = local_runner._upload_artifact(
+        "https://api.invalid", "runner-token", "job-large", str(source)
+    )
+    assert contract["total_bytes"] > 25 * 1024 * 1024
+    assert contract["archive_size"] > 25 * 1024 * 1024
+    assert delivery["status"] == "delivered"
+    assert delivery["verified"] is True
+    assert delivery["crc32c"] == crc32c_for(stored_bundle)
+
+    class Response:
+        def __init__(self, status, stream, content_type):
+            self.status = status
+            self._stream = stream
+            self.headers = {"Content-Type": content_type}
+
+        def read(self, size=-1):
+            return self._stream.read(size)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self._stream.close()
+            return False
+
+    expected_crc = contract["crc32c"]
+
+    def fake_urlopen(request, timeout=None):
+        assert timeout == 120
+        if request.full_url.endswith("input-artifact?direct=true"):
+            metadata = json.dumps(
+                {
+                    "download_url": "https://storage.invalid/signed-get",
+                    "size": stored_bundle.stat().st_size,
+                    "crc32c": expected_crc,
+                    "generation": "73",
+                }
+            ).encode()
+            return Response(200, io.BytesIO(metadata), "application/json")
+        assert request.full_url == "https://storage.invalid/signed-get"
+        return Response(200, stored_bundle.open("rb"), "application/gzip")
+
+    monkeypatch.setattr(local_runner.urllib.request, "urlopen", fake_urlopen)
+    resumed = tmp_path / "resumed"
+    resumed.mkdir()
+    provenance = local_runner._download_input_artifact(
+        "https://api.invalid", "runner-token", "job-successor", str(resumed)
+    )
+    assert provenance == {
+        "ok": True,
+        "file_count": 2,
+        "bytes": contract["total_bytes"],
+    }
+
+    def sha256(path):
+        digest = hashlib.sha256()
+        with open(path, "rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    assert sha256(checkpoint) == sha256(resumed / "checkpoints" / checkpoint.name)
+    assert (resumed / "notes.txt").read_text(encoding="utf-8") == "resume-me\n"
+
+    rejected = tmp_path / "rejected"
+    rejected.mkdir()
+    sentinel = rejected / "keep.txt"
+    sentinel.write_text("untouched", encoding="utf-8")
+    expected_crc = "AAAAAA=="
+    mismatch = local_runner._download_input_artifact(
+        "https://api.invalid", "runner-token", "job-successor", str(rejected)
+    )
+    assert mismatch == {"ok": False, "reason": "integrity_mismatch:crc32c"}
+    assert sentinel.read_text(encoding="utf-8") == "untouched"
+
 
 class TestRunnerResumeFail_Closed:
     """_run_compute_job fails closed when the input-artifact bundle is unavailable.

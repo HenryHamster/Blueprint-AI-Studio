@@ -286,6 +286,98 @@ def compute_job_artifact_uri(job_id) -> str:
     return f"gs://{ARTIFACT_BUCKET_NAME}/{compute_job_artifact_object_name(job_id)}"
 
 
+def compute_job_artifact_transfer_object_name(job_id, transfer_id) -> str:
+    """Unique immutable object used by a runner direct-transfer attempt."""
+    return f"{compute_job_artifact_object_prefix(job_id)}/transfers/{transfer_id}.tar.gz"
+
+
+def compute_job_artifact_transfer_uri(job_id, transfer_id) -> str:
+    return f"gs://{ARTIFACT_BUCKET_NAME}/{compute_job_artifact_transfer_object_name(job_id, transfer_id)}"
+
+
+async def authorize_compute_job_artifact_transfer(
+    job_id, transfer_id, *, expires_at: datetime.datetime
+) -> dict:
+    """Mint an exact-object upload URL that may only create, never overwrite."""
+    object_name = compute_job_artifact_transfer_object_name(job_id, transfer_id)
+
+    def _generate() -> str:
+        blob = storage.Client(project=GCP_PROJECT_ID).bucket(ARTIFACT_BUCKET_NAME).blob(object_name)
+        return _generate_v4_signed_url(
+            blob,
+            version="v4",
+            expiration=expires_at,
+            method="PUT",
+            content_type="application/gzip",
+            query_parameters={"ifGenerationMatch": "0"},
+        )
+
+    return {
+        "upload_url": await asyncio.to_thread(_generate),
+        "method": "PUT",
+        "headers": {"Content-Type": "application/gzip"},
+        "expires_at": expires_at.isoformat(),
+        "object_uri": compute_job_artifact_transfer_uri(job_id, transfer_id),
+    }
+
+
+async def verify_compute_job_artifact_transfer(job_id, transfer_id) -> dict:
+    """Load authoritative object metadata used before evidence is stamped."""
+    object_name = compute_job_artifact_transfer_object_name(job_id, transfer_id)
+
+    def _verify() -> dict:
+        blob = storage.Client(project=GCP_PROJECT_ID).bucket(ARTIFACT_BUCKET_NAME).blob(object_name)
+        blob.reload()
+        return {
+            "uri": compute_job_artifact_transfer_uri(job_id, transfer_id),
+            "size": int(blob.size or 0),
+            "crc32c": blob.crc32c,
+            "generation": str(blob.generation),
+        }
+
+    return await asyncio.to_thread(_verify)
+
+
+async def generate_compute_job_artifact_uri_download_signed_url(
+    artifact_uri: str, *, expires_at: datetime.datetime | None = None
+) -> str:
+    """Mint a direct GET URL after validating the URI is in our artifact bucket."""
+    bucket_name, object_name = parse_artifact_uri(artifact_uri)
+
+    def _generate() -> str:
+        blob = storage.Client(project=GCP_PROJECT_ID).bucket(bucket_name).blob(object_name)
+        return _generate_v4_signed_url(
+            blob,
+            version="v4",
+            expiration=expires_at or datetime.timedelta(hours=1),
+            method="GET",
+        )
+
+    return await asyncio.to_thread(_generate)
+
+
+async def download_compute_job_artifact_uri(artifact_uri: str) -> bytes | None:
+    """Best-effort proxy download of one validated artifact object URI.
+
+    The caller must bind the URI's embedded compute-job id to the authorized
+    database row before calling.  This helper only enforces the configured
+    bucket/path allow-list and performs the blocking object read off-loop.
+    """
+    bucket_name, object_name = parse_artifact_uri(artifact_uri)
+
+    def _download() -> bytes | None:
+        blob = storage.Client(project=GCP_PROJECT_ID).bucket(bucket_name).blob(object_name)
+        if not blob.exists():
+            return None
+        return blob.download_as_bytes()
+
+    try:
+        return await asyncio.to_thread(_download)
+    except Exception:
+        logger.warning("Failed to download compute-job artifact URI", exc_info=True)
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Per-file viewable-artifact substrate.
 #
