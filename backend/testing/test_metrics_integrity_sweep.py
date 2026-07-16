@@ -5613,3 +5613,102 @@ async def test_auto_graduation_advances_by_one_step_per_run(db):
     assert _rc.get("capability_proof_gate_mode") == "enforce"
     assert "observe" in results2[0].detail
     assert "enforce" in results2[0].detail
+
+
+# --- observe_mode_unverified_resolution ---------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_observe_mode_unverified_resolution_flags_stamped_tasks(db):
+    """Tasks carrying SPAWN_CAPABILITY_PROOF_UNVERIFIED_KEY are surfaced as FLAGGED."""
+    from app.research_completion import SPAWN_CAPABILITY_PROOF_UNVERIFIED_KEY
+
+    project = await _project(db)
+    now = _utcnow()
+
+    stamps = [
+        {"kind": "capability", "ref": "test-runner", "proof_status": "unverified"},
+        {"kind": "capability", "ref": "test-runner", "proof_status": "unverified"},
+    ]
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        context={SPAWN_CAPABILITY_PROOF_UNVERIFIED_KEY: stamps},
+    )
+    db.add(t)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=now, mode="observe", max_projects=25,
+        sample_limit=200, window_days=14,
+    )
+    results = await mis.check_observe_mode_unverified_resolution(ctx)
+
+    flagged = [r for r in results if r.status == CheckStatus.FLAGGED]
+    assert len(flagged) == 1
+    assert flagged[0].subject == str(project.id)
+    assert flagged[0].delta == 1
+    assert flagged[0].self_reported == 1
+    assert flagged[0].ground_truth == 0
+    assert "test-runner" in flagged[0].detail
+
+
+@pytest.mark.asyncio
+async def test_observe_mode_unverified_resolution_skipped_when_no_stamps(db):
+    """No stamped tasks → all projects SKIPPED and a global OK summary."""
+    project = await _project(db)
+    now = _utcnow()
+
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        context={"some_other_key": "value"},
+    )
+    db.add(t)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=now, mode="observe", max_projects=25,
+        sample_limit=200, window_days=14,
+    )
+    results = await mis.check_observe_mode_unverified_resolution(ctx)
+
+    assert not any(r.status == CheckStatus.FLAGGED for r in results)
+    ok_or_skipped = [r for r in results if r.status in (CheckStatus.OK, CheckStatus.SKIPPED)]
+    assert ok_or_skipped
+
+
+@pytest.mark.asyncio
+async def test_observe_mode_unverified_resolution_aggregates_multiple_tasks(db):
+    """Multiple stamped tasks in the same project increment delta correctly."""
+    from app.research_completion import SPAWN_CAPABILITY_PROOF_UNVERIFIED_KEY
+
+    project = await _project(db)
+    now = _utcnow()
+
+    for ref in ("cap-a", "cap-b", "cap-a"):
+        t = Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.COMPLETED,
+            context={
+                SPAWN_CAPABILITY_PROOF_UNVERIFIED_KEY: [
+                    {"kind": "capability", "ref": ref, "proof_status": "unverified"}
+                ]
+            },
+        )
+        db.add(t)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=now, mode="observe", max_projects=25,
+        sample_limit=200, window_days=14,
+    )
+    results = await mis.check_observe_mode_unverified_resolution(ctx)
+
+    flagged = [r for r in results if r.status == CheckStatus.FLAGGED]
+    assert len(flagged) == 1
+    assert flagged[0].delta == 3
+    assert "cap-a" in flagged[0].detail

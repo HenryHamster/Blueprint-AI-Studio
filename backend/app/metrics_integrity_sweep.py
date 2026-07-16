@@ -4578,3 +4578,141 @@ async def check_capability_proof_gate_auto_graduation(
             ),
         )
     ]
+
+
+@register_check(
+    "observe_mode_unverified_resolution",
+    "Aggregate SPAWN_CAPABILITY_PROOF_UNVERIFIED_KEY stamps from tasks spawned "
+    "while the capability proof gate was in observe (or off) mode. Per-project "
+    "counts show how many dependents resolved against an unproven 'working' "
+    "capability — the operational evidence that the gate needs before the operator "
+    "can safely advance observe→enforce.",
+)
+async def check_observe_mode_unverified_resolution(
+    ctx: SweepContext,
+) -> List[CheckResult]:
+    """Surface per-project counts of observe-mode unverified-resolution stamps.
+
+    The spawn resolver (``research_completion.py``) writes
+    ``SPAWN_CAPABILITY_PROOF_UNVERIFIED_KEY`` into every dependent task's context
+    when a prerequisite resolves as satisfied-by-the-codebase but the backing
+    capability is ``working`` without a ``proven`` status. Those stamps are durable
+    but were never read back — this check aggregates them so the operator has
+    visibility into how many in-flight and recent tasks relied on an unproven
+    capability foundation.
+
+    * ``self_reported`` = total tasks carrying the stamp (our own write, so this
+      is both source and recompute — the check surfaces the accumulated count,
+      not a divergence from a separate counter).
+    * ``ground_truth``  = 0 (no task should resolve against an unproven cap once
+      the gate is in enforce mode; this signals the outstanding debt).
+    * ``delta``         = count of stamped tasks, i.e. the unresolved observe-mode
+      obligation.
+
+    Bounded to ``ctx.max_projects`` projects; within each project at most
+    ``ctx.sample_limit`` recently-created tasks are scanned.
+    """
+    from app.database import resolve_dialect_name
+    from app.models import Project, Task
+    from app.research_completion import SPAWN_CAPABILITY_PROOF_UNVERIFIED_KEY
+
+    cutoff = ctx.now.replace(tzinfo=None) - timedelta(days=ctx.window_days)
+
+    projects = (
+        await ctx.session.execute(select(Project.id).limit(ctx.max_projects))
+    ).all()
+
+    if not projects:
+        return [
+            CheckResult(
+                check="observe_mode_unverified_resolution",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no projects to audit",
+            )
+        ]
+
+    # ``has_key`` compiles to the Postgres-only JSONB ``?`` operator — fails
+    # on the SQLite smoke gate. Branch to ``func.json_extract`` for SQLite.
+    if resolve_dialect_name(ctx.session) == "sqlite":
+        stamp_predicate = func.json_extract(
+            Task.context, f"$.{SPAWN_CAPABILITY_PROOF_UNVERIFIED_KEY}"
+        ).is_not(None)
+    else:
+        stamp_predicate = Task.context.has_key(SPAWN_CAPABILITY_PROOF_UNVERIFIED_KEY)
+
+    results: List[CheckResult] = []
+    any_stamped = False
+
+    for (project_id,) in projects:
+        pid = str(project_id)
+        stamped_tasks = (
+            await ctx.session.execute(
+                select(Task)
+                .where(
+                    Task.project_id == project_id,
+                    Task.created_at >= cutoff,
+                    stamp_predicate,
+                )
+                .order_by(Task.created_at.desc())
+                .limit(ctx.sample_limit)
+            )
+        ).scalars().all()
+
+        if not stamped_tasks:
+            results.append(
+                CheckResult(
+                    check="observe_mode_unverified_resolution",
+                    status=CheckStatus.SKIPPED,
+                    subject=pid,
+                    detail="no tasks with unverified-resolution stamps in window",
+                )
+            )
+            continue
+
+        any_stamped = True
+        count = len(stamped_tasks)
+
+        # Aggregate distinct capability refs across all stamped tasks.
+        cap_refs: dict[str, int] = {}
+        for t in stamped_tasks:
+            for entry in (t.context or {}).get(SPAWN_CAPABILITY_PROOF_UNVERIFIED_KEY) or []:
+                ref = entry.get("ref") if isinstance(entry, dict) else None
+                if ref:
+                    cap_refs[ref] = cap_refs.get(ref, 0) + 1
+
+        top_refs = sorted(cap_refs, key=lambda r: -cap_refs[r])[:5]
+        ref_summary = ", ".join(
+            f"{r}({cap_refs[r]})" for r in top_refs
+        ) if top_refs else "unknown"
+        truncated = f"+{len(cap_refs) - 5} more" if len(cap_refs) > 5 else ""
+
+        results.append(
+            CheckResult(
+                check="observe_mode_unverified_resolution",
+                status=CheckStatus.FLAGGED,
+                self_reported=count,
+                ground_truth=0,
+                delta=count,
+                severity="warn",
+                subject=pid,
+                detail=(
+                    f"{count} task(s) in window resolved against an unproven "
+                    f"'working' capability (observe/off mode stamp); "
+                    f"top refs by count: {ref_summary}"
+                    + (f" {truncated}" if truncated else "")
+                ),
+            )
+        )
+
+    if not any_stamped:
+        results.append(
+            CheckResult(
+                check="observe_mode_unverified_resolution",
+                status=CheckStatus.OK,
+                subject="global",
+                detail="no observe-mode unverified-resolution stamps found in window",
+            )
+        )
+
+    return results
