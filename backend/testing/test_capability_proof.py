@@ -34,6 +34,7 @@ from app.capability_proof import (
     carry_proof_records_for_consolidation,
     commission_proof_earn_loop,
     enrich_problem_model_capability_proofs,
+    resolve_no_backing_paths_gap,
     record_capability_backing_path_proof,
     record_capability_named_test_execution_proof,
     record_capability_named_test_proof,
@@ -5431,3 +5432,205 @@ class TestEarnLoopWithoutCheckout:
             "no local checkout present"
         )
         assert "prod-cap" in project.capability_proof_records
+
+
+# ── resolve_no_backing_paths_gap ──────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_resolve_gap_without_discovery():
+    """A cap with no discoverable backing_paths returns unresolved."""
+    from unittest.mock import MagicMock, patch
+
+    project = MagicMock()
+    project.capability_proof_records = {}
+
+    async def _no_candidates(*_a, **_kw):
+        return []
+
+    with patch(
+        "app.capability_proof._discover_candidate_backing_paths",
+        new=_no_candidates,
+    ):
+        result = await resolve_no_backing_paths_gap(
+            "no-backing-cap", project=project,
+        )
+
+    assert result["resolved"] is False
+    assert result["proof_kind"] is None
+    assert result["trial_enrolled"] is False
+    assert result["named_test_earned"] is False
+    assert result["discovery_suggestions"] == []
+
+
+@pytest.mark.asyncio
+async def test_resolve_gap_with_discovery_backing_path():
+    """A cap with discoverable candidates but no covering test records a
+    backing_path proof."""
+    from unittest.mock import MagicMock, patch
+
+    project = MagicMock()
+    project.capability_proof_records = {}
+
+    async def _discover(*_a, **_kw):
+        return ["backend/app/discovered_cap.py"]
+
+    async def _no_test(*_a, **_kw):
+        return []
+
+    with patch(
+        "app.capability_proof._discover_candidate_backing_paths",
+        new=_discover,
+    ), patch(
+        "app.capability_proof._named_tests_covering_paths",
+        new=_no_test,
+    ), patch(
+        "app.capability_proof.flag_modified",
+    ), patch(
+        "app.capability_proof.record_capability_backing_path_proof",
+        return_value=True,
+    ):
+        result = await resolve_no_backing_paths_gap(
+            "discovered-cap", project=project,
+        )
+
+    assert result["resolved"] is True
+    assert result["proof_kind"] == _PROOF_KIND_BACKING_PATH
+    assert result["named_test_earned"] is False
+    assert result["discovery_suggestions"] == ["backend/app/discovered_cap.py"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_gap_with_named_test_present():
+    """A cap with discoverable candidates that are test-covered records a
+    named_test_present proof."""
+    from unittest.mock import MagicMock, patch
+
+    project = MagicMock()
+    project.capability_proof_records = {}
+
+    async def _discover(*_a, **_kw):
+        return ["backend/app/discovered_cap.py"]
+
+    async def _has_test(*_a, **_kw):
+        return ["backend/testing/test_discovered_cap.py"]
+
+    with patch(
+        "app.capability_proof._discover_candidate_backing_paths",
+        new=_discover,
+    ), patch(
+        "app.capability_proof._named_tests_covering_paths",
+        new=_has_test,
+    ), patch(
+        "app.capability_proof._maybe_enroll_proof_trial",
+        return_value=None,
+    ), patch(
+        "app.capability_proof.flag_modified",
+    ), patch(
+        "app.capability_proof.record_capability_named_test_proof",
+        return_value=True,
+    ):
+        result = await resolve_no_backing_paths_gap(
+            "discovered-cap", project=project,
+        )
+
+    assert result["resolved"] is True
+    assert result["proof_kind"] == _PROOF_KIND_NAMED_TEST_PRESENT
+    assert result["named_test_earned"] is True
+    assert result["discovery_suggestions"] == ["backend/app/discovered_cap.py"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_gap_trial_enrolled():
+    """A cap whose covering tests trigger trial enrollment returns
+    trial_enrolled=True."""
+    from unittest.mock import MagicMock, patch
+
+    project = MagicMock()
+    project.capability_proof_records = {}
+
+    async def _discover(*_a, **_kw):
+        return ["backend/app/discovered_cap.py"]
+
+    async def _has_test(*_a, **_kw):
+        return ["backend/testing/test_discovered_cap.py"]
+
+    with patch(
+        "app.capability_proof._discover_candidate_backing_paths",
+        new=_discover,
+    ), patch(
+        "app.capability_proof._named_tests_covering_paths",
+        new=_has_test,
+    ), patch(
+        "app.capability_proof._maybe_enroll_proof_trial",
+        return_value="enrolled",
+    ), patch(
+        "app.capability_proof.flag_modified",
+    ):
+        result = await resolve_no_backing_paths_gap(
+            "discovered-cap", project=project,
+        )
+
+    assert result["resolved"] is True
+    assert result["trial_enrolled"] is True
+    assert result["proof_kind"] is None
+    assert result["named_test_earned"] is False
+
+
+@pytest.mark.asyncio
+async def test_resolve_gap_trial_fresh():
+    """A cap with a fresh executed proof already at HEAD returns trial_fresh."""
+    from unittest.mock import MagicMock, patch
+
+    project = MagicMock()
+    project.capability_proof_records = {}
+
+    async def _discover(*_a, **_kw):
+        return ["backend/app/discovered_cap.py"]
+
+    async def _has_test(*_a, **_kw):
+        return ["backend/testing/test_discovered_cap.py"]
+
+    with patch(
+        "app.capability_proof._discover_candidate_backing_paths",
+        new=_discover,
+    ), patch(
+        "app.capability_proof._named_tests_covering_paths",
+        new=_has_test,
+    ), patch(
+        "app.capability_proof._maybe_enroll_proof_trial",
+        return_value="fresh",
+    ), patch(
+        "app.capability_proof.flag_modified",
+    ):
+        result = await resolve_no_backing_paths_gap(
+            "discovered-cap", project=project,
+        )
+
+    assert result["resolved"] is True
+    assert result["trial_fresh"] is True
+    assert result["trial_enrolled"] is False
+
+
+@pytest.mark.asyncio
+async def test_resolve_gap_discovery_degrades_gracefully():
+    """A discovery failure degrades to unresolved (never raises)."""
+    from unittest.mock import MagicMock, patch
+
+    project = MagicMock()
+    project.capability_proof_records = {}
+
+    async def _raise_error(*_a, **_kw):
+        raise RuntimeError("transient discovery failure")
+
+    with patch(
+        "app.capability_proof._discover_candidate_backing_paths",
+        new=_raise_error,
+    ):
+        result = await resolve_no_backing_paths_gap(
+            "failing-cap", project=project,
+        )
+
+    assert result["resolved"] is False
+    assert result["proof_kind"] is None
+    assert result["discovery_suggestions"] == []

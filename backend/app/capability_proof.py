@@ -48,6 +48,7 @@ __all__ = [
     "record_capability_proof",
     "record_capability_proof_from_trial",
     "record_gap_evidence",
+    "resolve_no_backing_paths_gap",
     "revoke_stale_execution_proof",
     "should_record_capability_proof",
 ]
@@ -1799,6 +1800,156 @@ async def _discover_candidate_backing_paths(
     return verified
 
 
+async def resolve_no_backing_paths_gap(
+    cap_name: str,
+    *,
+    raw_name: str | None = None,
+    verify_path=None,
+    read_head=None,
+    session: Any = None,
+    read_head_sha=None,
+    now: Any = None,
+    project: Any = None,
+) -> dict[str, Any]:
+    """Attempt to resolve a proof gap for a working capability with no backing_paths.
+
+    Performs automated discovery of candidate backing paths by deriving search
+    tokens from the capability name and scanning the HEAD file tree. When
+    candidates are found:
+
+    * If a convention-named test file for EVERY candidate exists at HEAD and
+      imports it, a ``named_test_present`` proof is recorded (``path_proven``
+      tier).  Under the execution-trials flag an actual trial is enrolled instead,
+      earning the eventual ``proven`` tier.
+    * Otherwise, if candidates exist at HEAD but lack test coverage, a
+      ``backing_path`` proof is recorded (``path_proven`` tier).
+
+    When no candidates are found at all, returns ``resolved=False`` so the caller
+    can report the cap as needing manual backing-path assignment.
+
+    All IO callables are injectable so the function is unit-testable without a
+    git checkout. Never raises: any error degrades to ``{"resolved": False}``.
+
+    Returns
+    -------
+    A dict with the following keys:
+        resolved (bool): True when a proof was recorded (or trial enrolled).
+        proof_kind (str | None): ``"named_test_present"``, ``"backing_path"``,
+            or ``None`` when unresolved.
+        trial_enrolled (bool): True when an execution trial was enrolled.
+        named_test_earned (bool): True when a ``named_test_present`` proof was
+            recorded (as opposed to the ``backing_path`` fallback).
+        trial_fresh (bool): True when a fresh executed proof already covers HEAD.
+        discovery_suggestions (list[str]): Candidate paths discovered, if any.
+    """
+    from app.source_ref_validation import _path_exists_at_head
+
+    _verify = verify_path or _path_exists_at_head
+    _read_head = read_head or _read_file_at_head
+
+    try:
+        candidates = await _discover_candidate_backing_paths(
+            cap_name, verify_path=_verify,
+        )
+    except Exception:  # noqa: BLE001 — discovery must degrade, never raise
+        logger.warning(
+            "[CAPABILITY_PROOF] resolve_no_backing_paths_gap: discovery "
+            "failed for cap=%s",
+            cap_name,
+            exc_info=True,
+        )
+        candidates = []
+
+    if not candidates:
+        return {
+            "resolved": False,
+            "proof_kind": None,
+            "trial_enrolled": False,
+            "named_test_earned": False,
+            "trial_fresh": False,
+            "discovery_suggestions": [],
+        }
+
+    try:
+        test_refs = await _named_tests_covering_paths(
+            candidates, verify_path=_verify, read_head=_read_head
+        )
+    except Exception:  # noqa: BLE001 — test discovery failure is non-fatal
+        logger.warning(
+            "[CAPABILITY_PROOF] resolve_no_backing_paths_gap: named-test "
+            "discovery failed for cap=%s",
+            cap_name,
+            exc_info=True,
+        )
+        test_refs = []
+
+    if test_refs:
+        trial_outcome = await _maybe_enroll_proof_trial(
+            session,
+            project,
+            raw_name or cap_name,
+            cap_name,
+            test_refs,
+            read_head_sha=read_head_sha,
+            now=now,
+        )
+        if trial_outcome == "enrolled":
+            return {
+                "resolved": True,
+                "proof_kind": None,
+                "trial_enrolled": True,
+                "named_test_earned": False,
+                "trial_fresh": False,
+                "discovery_suggestions": candidates,
+            }
+        if trial_outcome == "fresh":
+            return {
+                "resolved": True,
+                "proof_kind": None,
+                "trial_enrolled": False,
+                "named_test_earned": False,
+                "trial_fresh": True,
+                "discovery_suggestions": candidates,
+            }
+
+        recorded = record_capability_named_test_proof(
+            project, raw_name or cap_name, test_refs
+        )
+        if recorded:
+            return {
+                "resolved": True,
+                "proof_kind": _PROOF_KIND_NAMED_TEST_PRESENT,
+                "trial_enrolled": False,
+                "named_test_earned": True,
+                "trial_fresh": False,
+                "discovery_suggestions": candidates,
+            }
+
+    # Fallback: backing_path proof when candidates exist but no covering test.
+    recorded = record_capability_backing_path_proof(
+        project, raw_name or cap_name
+    )
+    if recorded:
+        return {
+            "resolved": True,
+            "proof_kind": _PROOF_KIND_BACKING_PATH,
+            "trial_enrolled": False,
+            "named_test_earned": False,
+            "trial_fresh": False,
+            "discovery_suggestions": candidates,
+        }
+
+    # Dedup or recording failure — cap stays unresolved but suggestions exist.
+    return {
+        "resolved": False,
+        "proof_kind": None,
+        "trial_enrolled": False,
+        "named_test_earned": False,
+        "trial_fresh": False,
+        "discovery_suggestions": candidates,
+    }
+
+
 async def commission_proof_earn_loop(
     project: Any,
     demand_result: dict[str, Any],
@@ -1837,9 +1988,14 @@ async def commission_proof_earn_loop(
        (:func:`record_capability_backing_path_proof`, also ``path_proven``).
 
     3. For each demanded unproven capability that has NO ``backing_paths``:
-       no automated verification is possible — the gap is reported in the
-       return summary so callers (reaper sweeps, advisory hint builders) can
-       surface it.
+       automated discovery is attempted via :func:`resolve_no_backing_paths_gap`:
+       search tokens derived from the capability name locate candidate files at
+       HEAD; when candidates are found and a covering test exists, a
+       ``named_test_present`` (path_proven) proof is recorded (or an execution
+       trial enrolled); when candidates exist but lack test coverage, a
+       ``backing_path`` (path_proven) proof is recorded.  Caps that cannot be
+       auto-resolved (no discoverable candidates) are reported in the return
+       summary so callers can surface the gap.
 
     Parameters
     ----------
@@ -1982,7 +2138,25 @@ async def commission_proof_earn_loop(
 
         raw_name, backing_paths = cap_backing.get(canonical, (None, []))
         if not backing_paths:
-            no_backing_paths.append(canonical)
+            # Try automated discovery + auto-resolve for caps without backing_paths.
+            gap_result = await resolve_no_backing_paths_gap(
+                canonical,
+                raw_name=raw_name or canonical,
+                verify_path=_verify,
+                read_head=_read_head,
+                session=session,
+                read_head_sha=read_head_sha,
+                now=now,
+                project=project,
+            )
+            if gap_result.get("resolved"):
+                earned_names.append(canonical)
+                if gap_result.get("named_test_earned"):
+                    named_test_earned.append(canonical)
+                if gap_result.get("trial_enrolled"):
+                    named_test_executed.append(canonical)
+            else:
+                no_backing_paths.append(canonical)
             continue
 
         # Filter to file-like paths.
@@ -1991,7 +2165,26 @@ async def commission_proof_earn_loop(
             if isinstance(p, str) and _looks_like_file_path(p)
         ]
         if not file_paths:
-            no_backing_paths.append(canonical)
+            # Same discovery + auto-resolve for caps whose declared paths are
+            # not file-like (no automated verification possible from them).
+            gap_result = await resolve_no_backing_paths_gap(
+                canonical,
+                raw_name=raw_name or canonical,
+                verify_path=_verify,
+                read_head=_read_head,
+                session=session,
+                read_head_sha=read_head_sha,
+                now=now,
+                project=project,
+            )
+            if gap_result.get("resolved"):
+                earned_names.append(canonical)
+                if gap_result.get("named_test_earned"):
+                    named_test_earned.append(canonical)
+                if gap_result.get("trial_enrolled"):
+                    named_test_executed.append(canonical)
+            else:
+                no_backing_paths.append(canonical)
             continue
 
         # Verify every path at HEAD.  A single None (indeterminate) or False
