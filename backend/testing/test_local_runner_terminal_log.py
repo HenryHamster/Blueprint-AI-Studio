@@ -93,29 +93,36 @@ def test_all_terminal_compute_reports_carry_command_log():
     run_job = _find_function(tree, "_run_compute_job")
     assert run_job is not None, "_run_compute_job not found in local_runner.py"
 
+    report_terminal = _find_function(run_job, "_report_terminal")
+    assert report_terminal is not None, "_report_terminal helper not found"
+
+    helper_reports = [
+        node
+        for node in ast.walk(report_terminal)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_report_compute_job"
+    ]
+    assert len(helper_reports) == 1, (
+        "_report_terminal must have one authoritative _report_compute_job call"
+    )
+    assert _keyword(helper_reports[0], "command_log") is not None, (
+        "_report_terminal does not forward command_log to _report_compute_job"
+    )
+
     terminal_calls = []
     violations = []
     for node in ast.walk(run_job):
         if not (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
-            and node.func.id == "_report_compute_job"
+            and node.func.id == "_report_terminal"
         ):
             continue
-        exec_status = _keyword(node, "exec_status")
-        if exec_status is None or not isinstance(exec_status.value, ast.Constant):
-            # exec_status via variable (the shared success/fail terminal report)
-            # — still terminal; require command_log for it too.
-            status_value = None if exec_status is None else "<dynamic>"
-        else:
-            status_value = exec_status.value.value
-        if status_value == "running":
-            continue  # interim heartbeat — log not required
         terminal_calls.append(node)
         if _keyword(node, "command_log") is None:
             violations.append(
-                f"line {node.lineno}: terminal _report_compute_job "
-                f"(exec_status={status_value!r}) has no command_log"
+                f"line {node.lineno}: _report_terminal has no command_log"
             )
 
     # Sanity floor so a refactor that renames the reporter cannot make this
@@ -123,7 +130,7 @@ def test_all_terminal_compute_reports_carry_command_log():
     # probe-abort, start-failure, deadline, shutdown, cancel, the shared final
     # report, and the crash handler.
     assert len(terminal_calls) >= 8, (
-        f"expected >=8 terminal _report_compute_job calls in _run_compute_job, "
+        f"expected >=8 _report_terminal calls in _run_compute_job, "
         f"found {len(terminal_calls)} — reporter renamed/moved? update this test"
     )
     assert not violations, (

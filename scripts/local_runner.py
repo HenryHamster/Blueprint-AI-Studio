@@ -3989,16 +3989,23 @@ class _ComputeJobReportHeartbeat:
         self._token = token
         self._job_id = job_id
         self._stop = threading.Event()
+        self._cancel_requested = threading.Event()
         self._thread: threading.Thread | None = None
 
     def _send(self) -> None:
         try:
-            _report_compute_job(
+            if _report_compute_job(
                 self._orchestrator_url, self._token, self._job_id,
                 exec_status="running",
-            )
+            ):
+                self._cancel_requested.set()
         except Exception:  # noqa: BLE001 -- liveness is best-effort
             pass
+
+    @property
+    def cancel_requested(self) -> bool:
+        """Whether any liveness report observed an orchestrator cancellation."""
+        return self._cancel_requested.is_set()
 
     def _run(self) -> None:
         while not self._stop.wait(_RUNNER_HEARTBEAT_INTERVAL):
@@ -5862,9 +5869,28 @@ def _run_compute_job(
         # terminal jobs, and the durable artifact bundle may be skipped when it
         # exceeds its much smaller upload cap. Reuse the live state so already
         # uploaded files are not sent again.
-        _stream_viewable_files(
-            orchestrator_url, token, job_id, artifact_dir, viewable_state, drain=True
-        )
+        with _ComputeJobReportHeartbeat(
+            orchestrator_url, token, job_id
+        ) as final_viewable_heartbeat:
+            _stream_viewable_files(
+                orchestrator_url,
+                token,
+                job_id,
+                artifact_dir,
+                viewable_state,
+                drain=True,
+            )
+        if final_viewable_heartbeat.cancel_requested:
+            outcome = None
+            _report_terminal(
+                exec_status="failed",
+                exit_code=1,
+                command_log=_terminal_command_log(
+                    "cancel requested by orchestrator during final viewable upload"
+                ),
+                progress=progress_tail.poll(),
+            )
+            return
 
         result_metrics = _parse_result_metrics(result_file)
 

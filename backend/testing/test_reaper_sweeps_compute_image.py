@@ -1467,13 +1467,14 @@ async def test_sweep_only_visits_connected_repo_projects(db):
 async def test_sweep_per_project_failure_is_isolated(db):
     """One project's driver raising does not abort the sweep for the others."""
     p1 = await _make_repo_project(db, name="p1")
+    p1_id = p1.id
     await _make_repo_project(db, name="p2")
 
     seen: list = []
 
     async def _refresh(session, project, **kwargs):
         seen.append(project.name)
-        if project.id == p1.id:
+        if project.id == p1_id:
             raise RuntimeError("boom")
         return {"status": "unchanged"}
 

@@ -1478,7 +1478,7 @@ async def remove_runner_project(
     """Remove a project from a runner's allow-list (owner-gated).
 
     The enrollment project (``LocalRunner.project_id``) is the anchor member and
-    may NOT be removed — attempting to remove it is rejected 400. Removing a
+    may NOT be removed — attempting to remove it is rejected 409. Removing a
     project that is not currently bound is an idempotent no-op. Requires owner on
     the enrollment project (owner of the runner).
     """

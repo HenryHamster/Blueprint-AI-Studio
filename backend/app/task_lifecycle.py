@@ -5861,9 +5861,10 @@ async def _process_post_commit(
                         if not review_task:
                             # Terminal failure: cap, stuck cycle, already merged,
                             # or retry also failed. Escalate with accurate reason.
+                            _spawn_reason_label = _sr.replace("_", " ").title()
                             task.latest_status_message = (
                                 f"Fix applied for PR #{pr_number} but review spawn "
-                                f"{'deferred (concurrent spawn)' if _is_transient else 'failed (' + _sr + ')'}"
+                                f"{'deferred (concurrent spawn)' if _is_transient else 'failed (' + _spawn_reason_label + ')'}"
                             )
                             if not _is_transient:
                                 task.requires_approval = True
@@ -5873,7 +5874,7 @@ async def _process_post_commit(
                             # reason so operators see the failure immediately, not
                             # just a generic "iteration cap" message.
                             _alert_reason_label = (
-                                "deferred" if _is_transient else _sr
+                                "deferred" if _is_transient else _spawn_reason_label
                             )
                             alert_title = (
                                 f"PR #{pr_number} stalled — review spawn {_alert_reason_label}"
