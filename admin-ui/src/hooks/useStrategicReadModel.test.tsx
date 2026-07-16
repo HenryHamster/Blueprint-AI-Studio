@@ -24,6 +24,13 @@ vi.mock('../strategicStateApi', async () => {
   startStrategicSession: vi.fn(),
   stopStrategicSession: vi.fn(),
   getMessageAttachmentUploadUrl: vi.fn(),
+  deleteMessageAttachmentUpload: vi.fn(),
+  getMessageAttachmentDownloadUrl: vi.fn(),
+  invalidateMessageAttachmentDownloadUrl: vi.fn(),
+  findStrategicMessageByClientIdentity: vi.fn(),
+  StrategicSessionMessageCreateError: class StrategicSessionMessageCreateError extends Error {
+    readonly status = 500;
+  },
   fetchStrategicState: vi.fn(),
   fetchStrategicLiveness: vi.fn(),
   };

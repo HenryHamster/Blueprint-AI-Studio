@@ -4767,7 +4767,13 @@ describe('bootstrapPoolMode', () => {
             path: '/home/agent/.claude.json',
             content: JSON.stringify({
               email: 'operator@example.com',
-              projects: { '/other/project': { hasTrustDialogAccepted: false } },
+              projects: {
+                '/other/project': { hasTrustDialogAccepted: false },
+                [WORKSPACE]: {
+                  hasTrustDialogAccepted: false,
+                  allowedTools: { Bash: true },
+                },
+              },
             }),
             mode: '0600',
           },
@@ -4782,9 +4788,14 @@ describe('bootstrapPoolMode', () => {
       // Written where the CLI actually reads it…
       expect(claudeWrite).toBeDefined();
       expect(JSON.parse(claudeWrite?.[1] as string)).toMatchObject({
+        email: 'operator@example.com',
         hasCompletedOnboarding: true,
         projects: {
-          [WORKSPACE]: { hasTrustDialogAccepted: true },
+          '/other/project': { hasTrustDialogAccepted: false },
+          [WORKSPACE]: {
+            hasTrustDialogAccepted: true,
+            allowedTools: [],
+          },
         },
       });
       expect(claudeWrite?.[2]).toEqual(expect.objectContaining({ mode: 0o600 }));
@@ -4816,7 +4827,12 @@ describe('bootstrapPoolMode', () => {
       const config: unknown = JSON.parse(claudeWrite?.[1] as string);
       expect(config).toEqual({
         hasCompletedOnboarding: true,
-        projects: { [WORKSPACE]: { hasTrustDialogAccepted: true } },
+        projects: {
+          [WORKSPACE]: {
+            hasTrustDialogAccepted: true,
+            allowedTools: [],
+          },
+        },
       });
       expect(claudeWrite?.[1]).not.toContain('OAUTH_TOKEN');
       expect(claudeWrite?.[1]).not.toContain('sk-ant');
@@ -4856,6 +4872,7 @@ describe('bootstrapPoolMode', () => {
       const parsed = JSON.parse(claudeWrite?.[1] as string) as Record<string, unknown>;
       expect((parsed.projects as Record<string, unknown>)[WORKSPACE]).toEqual({
         hasTrustDialogAccepted: true,
+        allowedTools: [],
       });
     } finally {
       if (savedHome !== undefined) process.env.HOME = savedHome; else delete process.env.HOME;

@@ -5568,7 +5568,7 @@ async def test_compute_job_captures_bounded_log_artifact(db_session, monkeypatch
         project_id=project.id,
         title="compute parent",
         status=TaskStatus.IN_PROGRESS,
-        payloads=[{"type": "compute_experiment"}],
+        payloads=[{"type": "compute_experiment", "success_criterion": "artifact_produced"}],
     )
     db_session.add(task)
     await db_session.commit()
@@ -8114,7 +8114,7 @@ async def test_compute_job_terminal_wakes_parked_task_once(db_session, monkeypat
         project_id=project.id,
         title="compute_experiment: parked job",
         status=TaskStatus.IN_PROGRESS,
-        payloads=[{"type": "compute_experiment", "base_branch": "main"}],
+        payloads=[{"type": "compute_experiment", "base_branch": "main", "success_criterion": "artifact_produced"}],
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:12]}",
     )
     db_session.add(task)
@@ -8272,7 +8272,7 @@ async def test_compute_job_terminal_before_park_still_finalizes_once(
         project_id=project.id,
         title="compute_experiment: terminal before park",
         status=TaskStatus.IN_PROGRESS,
-        payloads=[{"type": "compute_experiment", "base_branch": "main"}],
+        payloads=[{"type": "compute_experiment", "base_branch": "main", "success_criterion": "artifact_produced"}],
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:12]}",
     )
     db_session.add(task)
@@ -10639,7 +10639,7 @@ async def test_compute_monitor_does_not_hold_row_lock_across_backend_rpcs(
         project_id=project.id,
         title="compute_experiment: lock release",
         status=TaskStatus.IN_PROGRESS,
-        payloads=[{"type": "compute_experiment", "base_branch": "main"}],
+        payloads=[{"type": "compute_experiment", "base_branch": "main", "success_criterion": "artifact_produced"}],
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:12]}",
     )
     db_session.add(task)
@@ -10728,7 +10728,7 @@ async def test_compute_monitor_does_not_hold_row_lock_across_backend_rpcs(
         project_id=project2.id,
         title="compute_experiment: terminal wake",
         status=TaskStatus.IN_PROGRESS,
-        payloads=[{"type": "compute_experiment", "base_branch": "main"}],
+        payloads=[{"type": "compute_experiment", "base_branch": "main", "success_criterion": "artifact_produced"}],
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:12]}",
     )
     db_session.add(task2)
@@ -13923,6 +13923,11 @@ async def test_compute_job_vm_heartbeat_bare_uuid_cannot_suppress_watchdog(
     )
     job.status = ComputeJobStatus.STARTING
     job.last_heartbeat_at = None
+    # The rollout boundary is exclusive: a VM created exactly when the HMAC
+    # rollout begins must not retain the guessable legacy credential.
+    job.created_at = datetime(2026, 7, 14, 7, 24, 41, tzinfo=timezone.utc).replace(
+        tzinfo=None
+    )
     await db_session.commit()
 
     progress_body = json.dumps({"progress": {"metric": "loss", "value": 0.5}}).encode()
@@ -13968,6 +13973,57 @@ async def test_compute_job_vm_heartbeat_bare_uuid_cannot_suppress_watchdog(
     series = (job.polling_metadata or {}).get("progress_series")
     assert series, "authenticated heartbeat must record the progress sample"
     assert series[-1]["name"] == "loss" and series[-1]["value"] == 0.5
+
+
+@pytest.mark.asyncio
+async def test_compute_job_vm_heartbeat_pre_rollout_uuid_keeps_vm_alive(
+    client, db_session, monkeypatch
+):
+    """A VM launched before the HMAC deploy may refresh its heartbeat with its UUID."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    project = Project(name="HB Flag-day Compatibility", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python3 train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        backend_name="local-subprocess",
+    )
+    job.status = ComputeJobStatus.RUNNING
+    job.created_at = datetime(2026, 7, 14, 7, 24, 40, tzinfo=timezone.utc).replace(
+        tzinfo=None
+    )
+    job.last_heartbeat_at = datetime(2026, 7, 14, 7, 20, tzinfo=timezone.utc).replace(
+        tzinfo=None
+    )
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/agent/compute-jobs/{job.id}/heartbeat",
+        headers={"Authorization": f"Bearer {job.id}"},
+    )
+
+    assert resp.status_code == 204
+    await db_session.refresh(job)
+    assert job.last_heartbeat_at is not None
+    assert job.last_heartbeat_at > datetime(
+        2026, 7, 14, 7, 20, tzinfo=timezone.utc
+    ).replace(tzinfo=None)
 
 
 @pytest.mark.asyncio
@@ -17103,15 +17159,22 @@ def test_append_progress_sample_non_finite_value():
 
 
 def test_append_progress_sample_ring_buffer_cap():
-    """After 55 samples only the last 50 are retained (drop-oldest)."""
+    """Each unique minute bucket for a metric is retained as one sample.
+
+    Samples in the same 60-second bucket are deduplicated (latest wins).
+    The per-metric cap is _PROGRESS_SERIES_MAX_SAMPLES_PER_METRIC (1500).
+    Here 55 samples in distinct 1-minute buckets are all retained.
+    """
     from app.compute_jobs import append_progress_sample
 
     meta: dict = {}
     for i in range(55):
-        meta = append_progress_sample(meta, metric="step", value=float(i), t=f"t{i}")
+        # One sample per minute — each lands in a distinct 60-second bucket.
+        t = f"2026-01-01T00:{i:02d}:00"
+        meta = append_progress_sample(meta, metric="step", value=float(i), t=t)
     series = meta["progress_series"]
-    assert len(series) == 50
-    assert series[0]["value"] == 5.0, "oldest 5 samples should have been dropped"
+    assert len(series) == 55, "55 distinct-bucket samples must all be retained"
+    assert series[0]["value"] == 0.0
     assert series[-1]["value"] == 54.0
 
 
@@ -17140,7 +17203,8 @@ def test_merge_progress_report_bridges_new_records_to_progress_series():
     raw = {
         "records": [
             {"metric": "reward", "value": 1.0, "ts": "2026-01-01T00:00:00"},
-            {"metric": "reward", "value": 2.0, "ts": "2026-01-01T00:00:01"},
+            # Second sample is >60 s later so it lands in a distinct bucket.
+            {"metric": "reward", "value": 2.0, "ts": "2026-01-01T00:01:01"},
         ],
         "count": 2,
     }
@@ -22278,16 +22342,16 @@ def test_no_progress_stalled_requires_window_of_history():
     assert compute_jobs._no_progress_stalled(job, now=now) is False
 
 
-def test_no_progress_stalled_ignores_stale_buffer():
+def test_no_progress_stalled_fires_on_stale_buffer():
     metric = "val/loss"
-    # A flat buffer whose newest sample predates the trailing window entirely
-    # (the job stopped reporting long ago). The window slice is empty → no fire;
-    # a genuinely dead VM is handled by the poll-failure kills, not the watchdog.
+    # A buffer whose newest sample predates the trailing window (job stopped
+    # reporting). The watchdog fires immediately — samples[-1][0] < window_start —
+    # because a job that stopped emitting is indistinguishable from a stuck one.
     samples = [(3600 - i * 300, metric, 1.0) for i in range(6)]  # ages 3600..2100
     job, now = _progress_job(
         metric=metric, samples=samples, started_offset_seconds=7200
     )
-    assert compute_jobs._no_progress_stalled(job, now=now) is False
+    assert compute_jobs._no_progress_stalled(job, now=now) is True
 
 
 def test_no_progress_stalled_respects_grace_period():
@@ -22949,10 +23013,11 @@ async def test_gcp_startup_script_hydrates_input_artifact_bundle(monkeypatch):
 
     assert download_calls == [str(predecessor_id)]
     script = provision_calls[0]
-    # Downloads the predecessor bundle and extracts it into the artifact dir.
+    # Downloads the predecessor bundle and extracts it into the staging dir first,
+    # then moves it into the artifact dir (so partial extracts never corrupt it).
     assert "https://storage.example.com/predecessor-bundle" in script
     assert (
-        f"tar -C {shlex.quote(compute_backends_module._GCP_ARTIFACT_DIR_PATH)} "
+        f"tar -C {shlex.quote(compute_backends_module._GCP_ARTIFACT_DIR_PATH + '.resume-staging')} "
         f"--no-same-owner -xzf" in script
     )
     assert "resume_hydration.ok" in script

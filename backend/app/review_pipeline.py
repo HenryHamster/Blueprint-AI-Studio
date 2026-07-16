@@ -948,7 +948,7 @@ async def _post_repeat_fingerprint_blocker_message(
     with ``from_type="system"`` and ``message_type=BLOCKER`` so it sorts
     correctly in the strategic agent's context block.
     """
-    from app.models import MessageType, ProjectMessage
+    from app.models import MessageType
     from app.project_message_creation import build_project_message
 
     body = (

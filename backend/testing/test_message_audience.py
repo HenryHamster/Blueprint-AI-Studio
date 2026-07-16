@@ -22,6 +22,7 @@ from app.message_audience import (
     OPERATOR_FYI,
     STRATEGIST_INTERNAL,
     PIPELINE_LOG,
+    get_logical_event_pairs,
     get_operator_visible_webhook_events,
     get_registered_event_types,
     is_external_webhook_operator_visible,
@@ -271,6 +272,63 @@ def test_operator_visible_webhook_events_excludes_internal():
     assert "AUTO_FIX_ESCALATED" in visible
     assert "PR_MERGED" not in visible
     assert "DIRECTION_MILESTONE" not in visible
+
+
+def test_logical_event_pairs_have_consistent_audiences():
+    """Every logically-paired (internal, webhook) event resolves to the same audience.
+
+    Drift between _EVENT_AUDIENCE_REGISTRY (lowercase/dotted keys) and
+    _WEBHOOK_EVENT_AUDIENCE (UPPERCASE keys) for events that represent the
+    same logical operation is a silent routing bug.  This test is the
+    cross-check that fails CI when a pair diverges, so an edit to one table
+    that forgets to update the other is caught before shipping.
+    """
+    pairs = get_logical_event_pairs()
+    assert pairs, "Expected at least one logical event pair to be registered"
+    mismatched: list[str] = []
+    for internal_key, webhook_key in pairs.items():
+        internal_audience = route_event(internal_key)
+        webhook_audience = route_external_webhook_event(webhook_key)
+        if internal_audience != webhook_audience:
+            mismatched.append(
+                f"  {internal_key!r} → {internal_audience!r}  vs  "
+                f"{webhook_key!r} → {webhook_audience!r}"
+            )
+    assert not mismatched, (
+        "Logical event pairs have inconsistent audience classifications between "
+        "_EVENT_AUDIENCE_REGISTRY and _WEBHOOK_EVENT_AUDIENCE:\n"
+        + "\n".join(mismatched)
+        + "\n\nFix by aligning the audience in one or both registries in "
+        "backend/app/message_audience.py, then update _LOGICAL_EVENT_PAIRS if "
+        "the events are no longer equivalent."
+    )
+
+
+def test_logical_event_pairs_are_registered_in_their_respective_tables():
+    """Every pair entry has both its internal and webhook keys in their registries.
+
+    Catches typos or stale entries in _LOGICAL_EVENT_PAIRS that reference a key
+    that was renamed or removed from one of the tables.
+    """
+    pairs = get_logical_event_pairs()
+    internal_registry = get_registered_event_types()
+    webhook_keys = _get_all_webhook_event_keys()
+    unknown: list[str] = []
+    for internal_key, webhook_key in pairs.items():
+        if internal_key not in internal_registry:
+            unknown.append(f"  internal key {internal_key!r} not in _EVENT_AUDIENCE_REGISTRY")
+        if webhook_key not in webhook_keys:
+            unknown.append(f"  webhook key {webhook_key!r} not in _WEBHOOK_EVENT_AUDIENCE")
+    assert not unknown, (
+        "_LOGICAL_EVENT_PAIRS references keys absent from their registry:\n"
+        + "\n".join(unknown)
+    )
+
+
+def _get_all_webhook_event_keys() -> set[str]:
+    """Return all registered webhook event keys (test-only helper)."""
+    from app import message_audience as _ma
+    return set(getattr(_ma, "_WEBHOOK_EVENT_AUDIENCE", {}).keys())
 
 
 # ── post_event_message audience gating (via notification_dispatch) ──────

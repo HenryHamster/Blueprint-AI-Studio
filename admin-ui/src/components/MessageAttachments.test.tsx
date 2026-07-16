@@ -6,7 +6,10 @@ const { getMessageAttachmentDownloadUrl, invalidateMessageAttachmentDownloadUrl 
   getMessageAttachmentDownloadUrl: vi.fn(),
   invalidateMessageAttachmentDownloadUrl: vi.fn(),
 }));
-vi.mock('../strategicStateApi', () => ({ getMessageAttachmentDownloadUrl, invalidateMessageAttachmentDownloadUrl }));
+vi.mock('../strategicStateApi', async () => {
+  const { createStrategicStateApiMock } = await import('../test/strategic-state-api-mock-complete');
+  return createStrategicStateApiMock({ getMessageAttachmentDownloadUrl, invalidateMessageAttachmentDownloadUrl });
+});
 
 describe('MessageAttachments lazy resolution', () => {
   afterEach(() => { cleanup(); vi.clearAllMocks(); });

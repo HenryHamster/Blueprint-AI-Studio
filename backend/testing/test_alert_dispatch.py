@@ -67,7 +67,7 @@ async def _payoff_alerts(db_session, project_id):
 
 
 @pytest.mark.asyncio
-async def test_pool_payoff_alert_creates_and_broadcasts(db_session, mocker):
+async def test_pool_payoff_alert_is_suppressed_for_strategist_internal_audience(db_session, mocker):
     bcast = mocker.patch(
         "app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock
     )
@@ -86,16 +86,13 @@ async def test_pool_payoff_alert_creates_and_broadcasts(db_session, mocker):
     )
 
     alerts = await _payoff_alerts(db_session, project.id)
-    assert len(alerts) == 1
-    assert alerts[0].severity == AlertSeverity.WARNING
-    assert "COST_REGRESSION" in alerts[0].title
-    assert "Reduce the pool target or disable." in alerts[0].message
-    bcast.assert_awaited_once()
+    assert alerts == []
+    bcast.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_pool_payoff_alert_embeds_supporting_numbers(db_session, mocker):
-    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+async def test_pool_payoff_alert_with_supporting_numbers_is_suppressed(db_session, mocker):
+    bcast = mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
     project = make_warm_pool_project()
     db_session.add(project)
     await db_session.commit()
@@ -108,18 +105,13 @@ async def test_pool_payoff_alert_embeds_supporting_numbers(db_session, mocker):
         supporting=_SUPPORTING,
         recommended_action="Reduce the pool target or disable.",
     )
-    msg = (await _payoff_alerts(db_session, project.id))[0].message
-    assert "0.4" in msg  # pool hit rate
-    assert "0.5" in msg  # pool-origin share
-    assert "8 warm starts" in msg
-    assert "50 pool dispatches" in msg
-    assert "20.00%" in msg  # idle-inclusive cost drift
-    assert "12" in msg and "10" in msg  # current vs baseline cost
+    assert await _payoff_alerts(db_session, project.id) == []
+    bcast.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_pool_payoff_alert_dedups_same_verdict(db_session, mocker):
-    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+async def test_pool_payoff_alert_repeated_verdict_remains_suppressed(db_session, mocker):
+    bcast = mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
     project = make_warm_pool_project()
     db_session.add(project)
     await db_session.commit()
@@ -134,12 +126,13 @@ async def test_pool_payoff_alert_dedups_same_verdict(db_session, mocker):
             recommended_action="Reduce the pool target or disable.",
         )
     alerts = await _payoff_alerts(db_session, project.id)
-    assert len(alerts) == 1  # second call deduped on (project_id, title)
+    assert alerts == []
+    bcast.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_pool_payoff_alert_distinct_verdict_creates_separate(db_session, mocker):
-    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+async def test_pool_payoff_alert_distinct_verdicts_remain_suppressed(db_session, mocker):
+    bcast = mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
     project = make_warm_pool_project()
     db_session.add(project)
     await db_session.commit()
@@ -162,9 +155,8 @@ async def test_pool_payoff_alert_distinct_verdict_creates_separate(db_session, m
         severity=AlertSeverity.WARNING,
     )
     alerts = await _payoff_alerts(db_session, project.id)
-    assert len(alerts) == 2
-    states = {a.title.split(":")[1].split(" on ")[0].strip() for a in alerts}
-    assert states == {"COST_REGRESSION", "PROVEN"}
+    assert alerts == []
+    bcast.assert_not_awaited()
 
 
 # ── _maybe_create_blocked_escalation_alert (terminal BLOCKED escalation) ──────
@@ -1286,6 +1278,69 @@ async def test_fleet_no_healthy_runner_check_integration(db_session, mocker):
 
     await db_session.refresh(alerts[0])
     assert alerts[0].dismissed_at is not None, "fleet alert must auto-resolve when healthy runner appears"
+
+
+@pytest.mark.asyncio
+async def test_fleet_no_healthy_runner_alert_resolves_on_binding_removal(db_session, mocker):
+    """Fleet-no-healthy alert resolves when the runner binding to a project is removed.
+
+    A bound project that loses its last runner binding disappears from
+    projects_with_runners, so neither the create loop nor the healthy-resolve loop
+    touches it. The monitor must still dismiss the open alert so it does not stay
+    permanently open after the binding is removed.
+    """
+    from datetime import timedelta
+
+    from app.models import LocalRunner, RunnerProjectBinding
+    from app.orchestrator_runner_dispatch import _check_degraded_runners
+    from app.time_utils import _utcnow
+
+    mocker.patch("app.runner_health_alerts.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    enrollment = make_project()
+    bound = make_project()
+    db_session.add(enrollment)
+    db_session.add(bound)
+    await db_session.commit()
+    await db_session.refresh(enrollment)
+    await db_session.refresh(bound)
+
+    # Runner enrolled in enrollment project, bound to the bound project.
+    runner = LocalRunner(
+        project_id=enrollment.id,
+        token_hash="hash-shared-offline",
+        status="inactive",
+        last_seen_at=_utcnow() - timedelta(hours=2),
+        capabilities={},
+    )
+    db_session.add(runner)
+    await db_session.commit()
+    await db_session.refresh(runner)
+
+    binding = RunnerProjectBinding(runner_id=runner.id, project_id=bound.id)
+    db_session.add(binding)
+    await db_session.commit()
+
+    # Sweep → fleet alert fires for the bound project (sole runner is offline).
+    await _check_degraded_runners(db_session)
+    alerts = await _fleet_no_healthy_alerts(db_session, bound.id)
+    assert len(alerts) == 1
+    assert alerts[0].dismissed_at is None
+
+    # Remove the binding so the bound project has no runners at all.
+    await db_session.delete(binding)
+    await db_session.commit()
+
+    # Sweep again → alert must be dismissed now that the binding is gone.
+    await _check_degraded_runners(db_session)
+    await db_session.refresh(alerts[0])
+    assert alerts[0].dismissed_at is not None, (
+        "fleet alert must auto-resolve when the runner binding to a project is removed"
+    )
 
 
 # ── local-runner hold alert external notification dispatch ────────────────────

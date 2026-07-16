@@ -54,9 +54,9 @@ variable "source_git_sha" {
 #   on main; this rebuild bakes these fixes into the deployed agent image.
 # Rebuild trigger 2026-05-27: redeploy after memo task c461ab10 failed on stale handler — ensure PR #5792 / #5921 / #6138 are in active VM image.
 # Rebuild trigger 2026-05-28: pipeline default Opus bumped claude-opus-4-7 -> claude-opus-4-8.
-# The @anthropic-ai/claude-code install below is unpinned, so this rebuild bakes the current
-# CLI that recognizes `--model claude-opus-4-8`. Bake + deploy this image BEFORE flipping the
-# live runtime_config to opus-4-8 — otherwise every Anthropic task fails on an unknown --model.
+# Claude Code is pinned at the fleet-proven 2.1.197. Upgrades must coordinate
+# config-schema compatibility and a bake smoke; an unpinned rebuild previously
+# made the runtime depend on whichever npm metadata/cache happened to win.
 # Rebuild trigger 2026-06-21: pin baked pytest to 7.4.3 (was unpinned -> drifted to 9.1.1).
 # The unpinned `sudo pip3 install ... pytest ...` below (added #6902, latent since May 30) let a
 # rebuild bake pytest 9.1.1, whose console script imports the privatized `_console_main` that the
@@ -107,7 +107,8 @@ build {
       "# Pre-pull python:3.11-slim (base image for backend Docker build) to eliminate",
       "# the cold-pull on the fallback docker-build path (~1-2 min on a fresh VM).",
       "sudo docker pull python:3.11-slim",
-      "sudo npm install -g --include=optional @anthropic-ai/claude-code @openai/codex@0.144.1 @google/gemini-cli",
+      "sudo npm install -g --include=optional @anthropic-ai/claude-code@2.1.197 @openai/codex@0.144.1 @google/gemini-cli",
+      "claude_version=$(claude --version | awk '{print $1}'); test \"$claude_version\" = 2.1.197 || { echo \"Claude Code 2.1.197 required for fleet config compatibility; got $claude_version\" >&2; exit 1; }",
       "codex_version=$(codex --version | awk '{print $NF}'); test \"$codex_version\" = 0.144.1 || { echo \"Codex CLI 0.144.1 required for GPT-5.6 models; got $codex_version\" >&2; exit 1; }",
       "sudo apt-get install -y python3-pip python3-venv postgresql",
       "# Pin the baked system pytest stack to EXACTLY backend/requirements.txt's versions.",

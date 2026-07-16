@@ -2750,7 +2750,7 @@ async def test_strategic_session_conversation_filters_routine_before_limit(
     chat_messages = [
         ProjectMessage(
             project_id=project.id,
-            sequence=i + 1,
+            sequence=1,
             surface=MessageSurface.CONVERSATION,
             message_type=MessageType.NOTE,
             from_type="user",

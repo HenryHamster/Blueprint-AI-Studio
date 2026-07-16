@@ -11112,6 +11112,213 @@ async def test_infra_failure_streak_is_per_dimension(db_session):
 
 
 @pytest.mark.asyncio
+async def test_finalize_reuses_migration_identity_from_ledger(db_session, mocker):
+    """Phase 1b read-side cutover: when resolved_dims already carries a terminal
+    migration_identity fact (loaded from the ledger by run_qualification), the
+    live _resolve_migration_identity_at_finalize gate is SKIPPED and finalize
+    composes from the stored result instead of re-running the GitHub fetch."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    # Simulate what run_qualification would have stored after loading a prior
+    # migration_identity=passed fact from the ledger.
+    qual = dict(version.last_qualification)
+    qual["resolved_dimensions"] = {
+        "migration_identity": {
+            "status": "passed",
+            "sub_score": None,
+            "blocker": None,
+            "detail": {"verdict": "ok", "detail": None},
+        }
+    }
+    version.last_qualification = qual
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Patch the live identity gate to return "defer" — if the ledger-first check
+    # were skipped and this gate were called, _handle_infra_failure would run and
+    # result["status"] would be "infra_failure", which the assertion below catches.
+    identity_gate = mocker.patch(
+        "app.release_qualifier._resolve_migration_identity_at_finalize",
+        new=AsyncMock(return_value=("defer", "sentinel-must-not-reach-live-gate")),
+    )
+    # Let the apply gate succeed so finalize can proceed past both gates.
+    mocker.patch(
+        "app.release_qualifier._resolve_migration_apply_at_finalize",
+        new=AsyncMock(return_value=("pass", None)),
+    )
+    mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    # Finalize must NOT have gone through _handle_infra_failure.
+    assert result.get("status") != "infra_failure", (
+        f"live migration_identity gate was called (ledger-first check missed): {result.get('error')}"
+    )
+    # The live gate was never called.
+    identity_gate.assert_not_called()
+    # The eager write from Phase 1b must have written migration_identity to the
+    # ledger (or the existing resolved row is preserved).
+    by_dim = await _dimension_rows_by_dim(db_session, version)
+    assert "migration_identity" in by_dim
+    assert by_dim["migration_identity"].status == "passed"
+
+
+@pytest.mark.asyncio
+async def test_finalize_reuses_migration_apply_from_ledger(db_session, mocker):
+    """Phase 1b read-side cutover: when resolved_dims already carries a terminal
+    migration_apply fact (loaded from the ledger by run_qualification), the live
+    _resolve_migration_apply_at_finalize gate is SKIPPED."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    # Simulate run_qualification having stored both migration gate facts from a
+    # prior finalize — identity resolves via ledger AND apply resolves via ledger.
+    qual = dict(version.last_qualification)
+    qual["resolved_dimensions"] = {
+        "migration_apply": {
+            "status": "passed",
+            "sub_score": None,
+            "blocker": None,
+            "detail": {"verdict": "pass", "detail": None},
+        }
+    }
+    version.last_qualification = qual
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Let the identity gate succeed (it has no ledger entry here).
+    mocker.patch(
+        "app.release_qualifier._resolve_migration_identity_at_finalize",
+        new=AsyncMock(return_value=("ok", None)),
+    )
+    # Patch the live apply gate to return "defer" — if ledger-first were skipped,
+    # _handle_infra_failure would run and result["status"] would be "infra_failure".
+    apply_gate = mocker.patch(
+        "app.release_qualifier._resolve_migration_apply_at_finalize",
+        new=AsyncMock(return_value=("defer", "sentinel-must-not-reach-live-gate")),
+    )
+    mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    assert result.get("status") != "infra_failure", (
+        f"live migration_apply gate was called (ledger-first check missed): {result.get('error')}"
+    )
+    apply_gate.assert_not_called()
+    by_dim = await _dimension_rows_by_dim(db_session, version)
+    assert "migration_apply" in by_dim
+    assert by_dim["migration_apply"].status == "passed"
+
+
+@pytest.mark.asyncio
+async def test_migration_gates_eagerly_persisted_before_dual_write(db_session, mocker):
+    """migration_identity and migration_apply are eagerly written to the ledger
+    right after their verdicts are computed — a later gate's infra failure cannot
+    discard them before _dual_write_dimension_results is reached."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    mocker.patch(
+        "app.release_qualifier._resolve_migration_identity_at_finalize",
+        new=AsyncMock(return_value=("ok", None)),
+    )
+    mocker.patch(
+        "app.release_qualifier._resolve_migration_apply_at_finalize",
+        new=AsyncMock(return_value=("pass", None)),
+    )
+    # Suppress the end-of-finalize dual-write so only eager writes can populate
+    # the ledger for these dimensions.
+    mocker.patch(
+        "app.release_qualifier._dual_write_dimension_results",
+        new=AsyncMock(),
+    )
+    mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    by_dim = await _dimension_rows_by_dim(db_session, version)
+
+    assert "migration_identity" in by_dim, (
+        "migration_identity ledger row missing — eager write not called"
+    )
+    assert by_dim["migration_identity"].status == "passed"
+
+    assert "migration_apply" in by_dim, (
+        "migration_apply ledger row missing — eager write not called"
+    )
+    assert by_dim["migration_apply"].status == "passed"
+
+
+@pytest.mark.asyncio
 async def test_dual_write_reuses_already_resolved_dimension(db_session):
     """Read-side composition: a re-finalize for the SAME candidate_sha reuses a
     dimension that already reached a resolved (passed) fact — its stored row is
@@ -17566,6 +17773,16 @@ def test_evaluate_hotfix_scope_pure_predicate():
     # The scope validator must be able to repair its own allowlist.
     v = hotfix_policy.evaluate_hotfix_scope(["backend/app/hotfix_policy.py"])
     assert v.eligible is True
+
+    # The hotfix endpoint router must also be hotfixable so the delivery path
+    # can be repaired through the same channel it exposes.
+    v = hotfix_policy.evaluate_hotfix_scope(
+        ["backend/app/routers/admin_operator_triggers.py"]
+    )
+    assert v.eligible is True, (
+        "admin_operator_triggers.py must be in HOTFIX_ELIGIBLE_MODULES so the "
+        "hotfix endpoint itself can be repaired through the hotfix channel"
+    )
 
     # Product file → ineligible.
     v = hotfix_policy.evaluate_hotfix_scope(

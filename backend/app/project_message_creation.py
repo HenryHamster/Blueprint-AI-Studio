@@ -25,6 +25,7 @@ from app.models import (
     ProjectMessageSequence,
     _utcnow,
 )
+from app.database import resolve_dialect_name
 from app.project_message_projection import message_event_payload
 from app.strategic_trigger import (
     ARMING_NOT_ARMED,
@@ -33,7 +34,6 @@ from app.strategic_trigger import (
     maybe_arm_operator_refresh,
     strategic_refresh_pending,
 )
-from app.database import resolve_dialect_name
 from app.workbench_state import (
     build_message_strategic_session_snapshot,
     persist_strategic_workbench_update,

@@ -4250,28 +4250,22 @@ def build_account_retarget_manifest(
 ) -> dict | None:
     """Build a credential re-target secret manifest for ``account_id``.
 
-    Shared warm-claim credential re-target machinery: given a RESOLVED LLM
-    account id (the account a warm claim will actually run on), look up that
-    account's live credentials in the in-memory pool, resolve the task's
-    provider settings bag, and produce the transient ``secret_manifest`` the
-    agent re-materializes before running the role. Used by the warm-pool claim
-    path (and reusable by the chain / backlog-reuse re-target paths) so a warm
-    VM whose frozen boot account differs from the claimed task's resolved
-    account runs on the CORRECT credentials instead of the boot ones.
-
-    ``provider`` / ``auth_mode`` / ``model`` are the resolved runtime identity
-    (from the pinned task context); each falls back to the account's own value
-    when not supplied. Provider settings are resolved from ``task`` +
-    ``runtime_config`` when both are given.
-
-    Returns None when ``account_id`` is unknown to the in-memory pool (e.g. a
-    local / test VM, or the pool has not loaded) — the caller then leaves the
-    VM on its frozen boot credentials and does NOT relax the lease.
+    Resolves live account credentials and optional task provider settings.
+    Returns None for unknown accounts or unavailable live credentials so the
+    caller aborts rather than reexecing a VM onto a guaranteed-bad runtime.
     """
     if not account_id:
         return None
     acct = _account_by_id.get(str(account_id))
     if acct is None:
+        return None
+    live_secret = acct.get("runtime_secret") or acct.get("oauth_token")
+    if not isinstance(live_secret, str) or not live_secret.strip():
+        logger.warning(
+            "[WARM-POOL] Cannot build re-target manifest for account=%s: "
+            "live credential unavailable",
+            account_id,
+        )
         return None
     resolved_provider = provider or acct.get("provider")
     resolved_auth_mode = auth_mode or acct.get("auth_mode")
@@ -4298,7 +4292,7 @@ def build_account_retarget_manifest(
         provider=resolved_provider,
         auth_mode=resolved_auth_mode,
         model=model,
-        oauth_token=acct.get("runtime_secret") or acct.get("oauth_token"),
+        oauth_token=live_secret,
         claude_config_json=acct.get("claude_config_json"),
         provider_metadata=acct.get("provider_metadata") or {},
         provider_settings=settings,

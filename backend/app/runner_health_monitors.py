@@ -33,6 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from app.models import LocalRunner, Task, TaskStatus
+from app.runner_project_binding import allowed_project_ids_by_runner
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
 
@@ -871,42 +872,41 @@ async def _check_fleet_no_healthy_runner(
         _maybe_create_fleet_no_healthy_runner_alert,
         _resolve_fleet_no_healthy_runner_alert,
     )
+    from app.models import Alert
+    from app.runner_health_alerts import _FLEET_NO_HEALTHY_RUNNER_EVENT_TYPE
 
     now = _utcnow()
     cutoff = now - timedelta(seconds=_RUNNER_LIVENESS_SECONDS)
 
     # Single pass over all registered runners to classify per-project health.
-    all_rows = (
-        await session.execute(
-            select(
-                LocalRunner.id,
-                LocalRunner.project_id,
-                LocalRunner.status,
-                LocalRunner.last_seen_at,
-            )
-        )
-    ).all()
+    all_rows = (await session.execute(select(LocalRunner))).scalars().all()
+    memberships = await allowed_project_ids_by_runner(session, all_rows)
 
     projects_with_runners: set[uuid.UUID] = set()
     projects_with_healthy: set[uuid.UUID] = set()
     offline_by_project: dict[uuid.UUID, int] = {}
     degraded_by_project: dict[uuid.UUID, int] = {}
 
-    for runner_id, project_id, status, last_seen_at in all_rows:
-        projects_with_runners.add(project_id)
+    for runner in all_rows:
+        runner_id = runner.id
         is_live = (
-            status == "active"
-            and last_seen_at is not None
-            and last_seen_at > cutoff
+            runner.status == "active"
+            and runner.last_seen_at is not None
+            and runner.last_seen_at > cutoff
         )
-        if is_live and runner_id not in degraded_runner_ids:
-            projects_with_healthy.add(project_id)
-        elif is_live:
-            degraded_by_project[project_id] = degraded_by_project.get(project_id, 0) + 1
-        else:
-            offline_by_project[project_id] = offline_by_project.get(project_id, 0) + 1
+        for project_id in memberships[runner_id]:
+            projects_with_runners.add(project_id)
+            if is_live and runner_id not in degraded_runner_ids:
+                projects_with_healthy.add(project_id)
+            elif is_live:
+                degraded_by_project[project_id] = degraded_by_project.get(project_id, 0) + 1
+            else:
+                offline_by_project[project_id] = offline_by_project.get(project_id, 0) + 1
 
-    for project_id in projects_with_runners - projects_with_healthy:
+    # The set of projects that currently warrant an open alert.
+    currently_unhealthy = projects_with_runners - projects_with_healthy
+
+    for project_id in currently_unhealthy:
         try:
             await _maybe_create_fleet_no_healthy_runner_alert(
                 session,
@@ -927,7 +927,19 @@ async def _check_fleet_no_healthy_runner(
                     project_id,
                 )
 
-    for project_id in projects_with_healthy:
+    # Resolve alerts for projects that are now healthy OR have lost all runner
+    # bindings (project removed from projects_with_runners), so the alert doesn't
+    # stay permanently open after a binding removal.
+    open_fleet_alerts = (
+        await session.execute(
+            select(Alert.project_id).where(
+                Alert.event_type == _FLEET_NO_HEALTHY_RUNNER_EVENT_TYPE,
+                Alert.dismissed_at.is_(None),
+            )
+        )
+    ).scalars().all()
+    projects_to_resolve = {pid for pid in open_fleet_alerts if pid not in currently_unhealthy}
+    for project_id in projects_to_resolve:
         try:
             await _resolve_fleet_no_healthy_runner_alert(session, project_id)
         except Exception:

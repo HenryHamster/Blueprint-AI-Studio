@@ -187,6 +187,10 @@ def _format_qualification(qual: Dict[str, Any]) -> Dict[str, Any]:
             # Infra-failure context (populated only when status=infra_failure).
             "error": qual.get("error"),
             "consecutive_infra_errors": qual.get("consecutive_infra_errors"),
+            # True when the same migration-apply gate failure has repeated
+            # _MIN_INFRA_ERROR_STREAK+ times with an identical signature —
+            # the operator hotfix-deploy channel is the sanctioned remedy.
+            "is_permanent_gate_incapacity": qual.get("is_permanent_gate_incapacity"),
             # Audit observability: why the audit sub-score is missing/unscoreable.
             "audit_missing_reason": qual.get("audit_missing_reason"),
             # Audit reconciliation: model-reported vs findings-derived score delta

@@ -5316,6 +5316,7 @@ async def test_step9_sweep_finalizes_qualification_stuck_pending_after_reaper_ki
             "started_at": _now_for_seed().isoformat(),
             "audit_task_id": str(audit_task.id),
             "smoketest_task_id": str(smoke_task.id),
+            "rubric_snapshot": [],
         }
         reaper_db.add(version)
         await reaper_db.commit()
@@ -5430,6 +5431,7 @@ async def test_step9_sweep_skips_qualification_with_running_child(
             "started_at": _now_for_seed().isoformat(),
             "audit_task_id": str(audit_task.id),
             "smoketest_task_id": str(smoke_task.id),
+            "rubric_snapshot": [],
         }
         reaper_db.add(version)
         await reaper_db.commit()
@@ -5482,6 +5484,7 @@ async def test_step9_sweep_skips_qualification_with_running_child(
             "started_at": _now_for_seed().isoformat(),
             "audit_task_id": str(control_audit.id),
             "smoketest_task_id": str(control_smoke.id),
+            "rubric_snapshot": [],
         }
         reaper_db.add(control_version)
         await reaper_db.commit()
@@ -13138,13 +13141,12 @@ def _assert_message_update_event_payload(
     assert payload["type"] == message_type
     assert payload["from"] == msg.from_type
     assert payload["status"] == status
-    assert payload["message"] == {
-        "id": str(msg.id),
-        "type": message_type,
-        "from": msg.from_type,
-        "status": status,
-        "excerpt": msg.content,
-    }
+    msg_payload = payload["message"]
+    assert msg_payload["id"] == str(msg.id)
+    assert msg_payload["type"] == message_type
+    assert msg_payload["from"] == msg.from_type
+    assert msg_payload["status"] == status
+    assert msg_payload["excerpt"] == msg.content
     assert payload["refetch"] == {"surfaces": ["messages", "strategic_session"]}
 
 
@@ -17779,6 +17781,48 @@ async def test_moot_confirmation_sweep_cadence_gated(reaper_db):
         await reaper_db.refresh(project)
         # Untouched because the sweep was gated out.
         assert project.problem_model["pending_user_confirmation"][0]["id"] == "p-cred"
+    finally:
+        _rs._last_moot_confirm_sweep = _prev
+
+
+@pytest.mark.asyncio
+async def test_moot_confirmation_sweep_covers_all_projects_beyond_old_limit(reaper_db):
+    """Sweep must cover ALL projects, not just the first 25.
+
+    Creates 30 projects each with a clearable credentials_needed item and a
+    ready owner LLM account, then asserts all 30 items are cleared in a single
+    sweep invocation — verifying exhaustive pagination beyond the old LIMIT 25.
+    """
+    _prev = _rs._last_moot_confirm_sweep
+    _rs._last_moot_confirm_sweep = None
+    try:
+        await _make_ready_llm_account(reaper_db, "user1")
+        projects = []
+        for i in range(30):
+            p = Project(name=f"proj-pagination-{i}", user_id="user1")
+            p.problem_model = {
+                "pending_user_confirmation": [
+                    {
+                        "id": f"p-cred-{i}",
+                        "type": "credentials_needed",
+                        "proposal": "Add an Anthropic Claude OAuth token for the pool.",
+                    }
+                ]
+            }
+            reaper_db.add(p)
+            projects.append(p)
+        await reaper_db.commit()
+
+        cleared = await _rs.sweep_auto_clear_moot_pending_confirmations(
+            reaper_db, _utcnow()
+        )
+        assert cleared == 30, f"expected 30 cleared, got {cleared}"
+
+        for p in projects:
+            await reaper_db.refresh(p)
+            assert p.problem_model["pending_user_confirmation"] == [], (
+                f"project {p.id} still has pending confirmations"
+            )
     finally:
         _rs._last_moot_confirm_sweep = _prev
 

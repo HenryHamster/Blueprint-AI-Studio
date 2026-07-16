@@ -117,6 +117,13 @@ def _normalize_materialized_file_content(
         workspace = {}
         projects[workspace_path] = workspace
     workspace["hasTrustDialogAccepted"] = True
+    # Claude Code 2.1.197 assumes projectSettings.allowedTools is iterable once
+    # OAuth authentication succeeds. Legacy account exports and a newly-created
+    # trust entry may omit it (or carry an old non-list shape), which crashes
+    # before the first model call. Preserve valid lists and fail closed to an
+    # empty permission list for every other shape.
+    if not isinstance(workspace.get("allowedTools"), list):
+        workspace["allowedTools"] = []
     return json.dumps(parsed, separators=(",", ":"))
 
 

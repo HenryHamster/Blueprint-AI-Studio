@@ -65,3 +65,61 @@ describe('checkNodeVersion', () => {
     expect(msg).toContain('16.0.0');
   });
 });
+
+describe('checkNodeVersion — guidance path completeness (preflight actionability)', () => {
+  it('rejects Node 17.x (boundary just below 18) with actionable nvm instructions', () => {
+    const msg = checkNodeVersion('v17.9.1');
+    expect(msg).not.toBeNull();
+    expect(msg).toContain('v17.9.1');
+    expect(msg).toContain(SUPPORTED_NODE_RANGE);
+    expect(msg).toContain(`nvm install ${RECOMMENDED_NODE_MAJOR}`);
+    expect(msg).toContain(`nvm use ${RECOMMENDED_NODE_MAJOR}`);
+    expect(msg).toContain('npm start');
+  });
+
+  it('accepts Node 21.x (above 18, below recommended)', () => {
+    expect(checkNodeVersion('v21.0.0')).toBeNull();
+    expect(checkNodeVersion('v21.7.3')).toBeNull();
+  });
+
+  it('accepts Node 23.x (newer than recommended)', () => {
+    expect(checkNodeVersion('v23.0.0')).toBeNull();
+    expect(checkNodeVersion('v23.1.0')).toBeNull();
+  });
+
+  it('unparseable version guidance includes both nvm install and nvm use', () => {
+    const msg = checkNodeVersion('garbage-string');
+    expect(msg).not.toBeNull();
+    expect(msg).toContain(`nvm install ${RECOMMENDED_NODE_MAJOR}`);
+    expect(msg).toContain(`nvm use ${RECOMMENDED_NODE_MAJOR}`);
+  });
+
+  it('too-old version message names recommended version clearly', () => {
+    const msg = checkNodeVersion('v10.0.0');
+    expect(msg).not.toBeNull();
+    expect(msg).toContain(`v${RECOMMENDED_NODE_MAJOR}.x`);
+    expect(msg).toContain(`nvm install ${RECOMMENDED_NODE_MAJOR}`);
+    expect(msg).toContain(`nvm use ${RECOMMENDED_NODE_MAJOR}`);
+    expect(msg).toContain('npm start');
+  });
+
+  it('accepts Node 18.0.0 exactly (lower boundary)', () => {
+    expect(checkNodeVersion('v18.0.0')).toBeNull();
+  });
+
+  it('rejects Node 17.x regardless of patch version', () => {
+    expect(checkNodeVersion('v17.0.0')).not.toBeNull();
+    expect(checkNodeVersion('v17.99.99')).not.toBeNull();
+  });
+
+  it('version string with build metadata parses major correctly', () => {
+    // v20.0.0-alpine should extract major 20 and pass
+    expect(checkNodeVersion('v20.0.0-alpine')).toBeNull();
+  });
+
+  it('error message includes supported range string', () => {
+    const msg = checkNodeVersion('v15.14.0');
+    expect(msg).toContain(SUPPORTED_NODE_RANGE);
+    expect(msg).toContain('v15.14.0');
+  });
+});

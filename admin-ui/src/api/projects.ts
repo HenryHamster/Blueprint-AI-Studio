@@ -291,6 +291,10 @@ export interface VersionQualification {
   // Infra-failure context (populated only when status=infra_failure).
   error?: string | null;
   consecutive_infra_errors?: number | null;
+  // True when the same migration-apply gate failure has repeated 3+ times with
+  // an identical infra-failure signature. The operator hotfix-deploy channel is
+  // the sanctioned remediation path for this permanent gate incapacity.
+  is_permanent_gate_incapacity?: boolean | null;
   // Audit observability: why the audit sub-score is missing/unscoreable.
   audit_missing_reason?: string | null;
   // Audit reconciliation: model vs findings-derived scores and excluded count.
@@ -1630,6 +1634,81 @@ export async function acceptPendingConfirmation(
   );
   if (!res.ok) throw new Error(`Failed to accept pending confirmation: ${res.status}`);
   return res.json();
+}
+
+// ---------------------------------------------------------------------------
+// Operator hotfix-deploy channel
+// ---------------------------------------------------------------------------
+
+/** Result of the hotfix-scope preview endpoint. */
+export interface HotfixPreviewResponse {
+  status: 'eligible' | 'ineligible' | 'diff_unavailable' | string;
+  eligible: boolean;
+  changed_files: string[];
+  offending_files: string[];
+  reason: string;
+  candidate_sha?: string | null;
+  prior_deployed_sha?: string | null;
+}
+
+/** Result of the hotfix-promote endpoint. */
+export interface HotfixPromoteResponse {
+  status: string;
+  [key: string]: unknown;
+}
+
+/**
+ * Read-only preview: report whether the current open version's candidate diff
+ * is hotfix-eligible WITHOUT promoting.
+ */
+export async function getHotfixPreview(
+  projectId: string,
+  candidateSha?: string | null,
+): Promise<HotfixPreviewResponse> {
+  const params = candidateSha
+    ? `?candidate_sha=${encodeURIComponent(candidateSha)}`
+    : '';
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/promote/hotfix/preview${params}`,
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const detail = data?.detail || `Hotfix preview failed: ${res.status}`;
+    throw new Error(typeof detail === 'string' ? detail : JSON.stringify(detail));
+  }
+  return data as HotfixPreviewResponse;
+}
+
+/**
+ * Trigger a narrow hotfix-promote for the project's open version.
+ * Requires: non-empty `reason` and `ackInertUntilDeploy: true`.
+ */
+export async function triggerHotfixPromote(
+  projectId: string,
+  reason: string,
+  scopeModules: string[],
+  ackInertUntilDeploy: boolean,
+  candidateSha?: string | null,
+): Promise<HotfixPromoteResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/promote/hotfix`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        reason,
+        scope_modules: scopeModules,
+        ack_inert_until_deploy: ackInertUntilDeploy,
+        ...(candidateSha ? { candidate_sha: candidateSha } : {}),
+      }),
+    },
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const detail = data?.detail || `Hotfix promote failed: ${res.status}`;
+    throw new Error(typeof detail === 'string' ? detail : JSON.stringify(detail));
+  }
+  return data as HotfixPromoteResponse;
 }
 
 /** A pull-based fleet runner registered to a project. */

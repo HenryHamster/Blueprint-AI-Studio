@@ -67,9 +67,8 @@ from app.messages_last_seen import (
 )
 from app.workbench_state import (
     WORKBENCH_STATE_KEY, WORKBENCH_STATE_MAX_BYTES,
-    build_message_strategic_session_snapshot, get_strategic_workbench_state,
+    get_strategic_workbench_state,
     persist_strategic_workbench_update,
-    workbench_context_for_strategic_session_snapshot,
     workbench_state_exceeds_max_bytes, workbench_state_size_bytes,
 )
 from app.workbench_events import (
@@ -79,7 +78,6 @@ from app.workbench_events import (
     emit_workbench_refetch,
 )
 from app.strategic_trigger import (
-    ARMING_STEERING,
     maybe_arm_operator_refresh,
     strategic_refresh_pending,
 )

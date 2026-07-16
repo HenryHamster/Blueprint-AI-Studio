@@ -6554,6 +6554,23 @@ async def close_orphan_pr_if_any(
     is independent of the DB transaction either way, and grouping them
     lets the caller bail cleanly if the GitHub call hangs.
     """
+    payload_types = {
+        str(payload.get("type") or "")
+        for payload in (task.payloads or [])
+        if isinstance(payload, dict)
+    }
+    if payload_types & {"review", "panel_review"}:
+        # Review tasks reference the PR they inspect; they do not own it.
+        # In particular, review_loop.pr_number is shared with create/fix
+        # tasks, so treating that reference as ownership lets cancelling a
+        # duplicate/stale reviewer close the implementation PR underneath the
+        # surviving review/fix lane.
+        logger.info(
+            "[CANCEL-PR-CLEANUP] Skipping PR close for non-owning review task "
+            f"{task.id} (reason={reason})"
+        )
+        return False
+
     ctx = task.context or {}
 
     # Resolve PR number from any recorded location.  The url-keyed context
