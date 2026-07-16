@@ -3941,3 +3941,110 @@ async def test_capability_proof_trial_green_wakes_blocked_dependents(_spawn_db, 
         _rc.pop("capability_proof_execution_trials_enabled", None)
 
 
+# ---------------------------------------------------------------------------
+# Capability proof gate enforcement cycle — end-to-end integration test
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_gate_enforcement_full_lifecycle(_grad_db):
+    """ACCEPTANCE EVIDENCE. Full capability proof gate enforcement life cycle:
+
+    1. Create a project with an unproven 'my-cap' working capability.
+    2. Set capability_proof_gate_mode to 'enforce'.
+    3. Verify the proof map shows 'my-cap' as unproven — the gate holds (a
+       consumer blocked on this capability would stay BLOCKED).
+    4. Simulate a provider task completing with a green named_test verdict via
+       record_capability_proof (the real platform proof recorder).
+    5. Verify the proof map now shows 'my-cap' as 'proven' — the gate releases
+       (the consumer would be unblocked by the resume sweep).
+
+    This exercises the intersection of:
+      - working_capability_proof_status (reads problem_model capabilities)
+      - ledger_corroborated_proof_status (corroborates with capability_proof_records)
+      - capability_need_blocked_by_proof_gate (enforce predicate)
+      - record_capability_proof (the platform proof recorder from acceptance gate)
+    """
+    from app.capability_proof import record_capability_proof
+    from app.capability_registry import (
+        capability_need_blocked_by_proof_gate,
+        consumer_gate_proof_status,
+    )
+    from app.models import Project, Task as _T, TaskStatus
+    from app.shared_state import runtime_config as _rc
+
+    cap_name = "my-cap"
+    need = {"kind": "capability", "ref": cap_name}
+
+    _rc["capability_proof_gate_mode"] = "enforce"
+    try:
+        # Step 1: create project with unproven 'my-cap' working capability.
+        project = Project(
+            name="enforcement-lifecycle-test",
+            user_id="u1",
+            problem_model={"capabilities": [{"name": cap_name, "status": "working"}]},
+            capability_proof_records={},
+        )
+        _grad_db.add(project)
+        await _grad_db.commit()
+        await _grad_db.refresh(project)
+
+        # Step 2: mode is 'enforce' (set above).
+
+        # Step 3: verify the gate holds — my-cap is unproven, so a consumer blocked
+        # on it should stay BLOCKED.
+        proof_map = consumer_gate_proof_status(
+            project.problem_model, project.capability_proof_records
+        )
+        assert proof_map.get(cap_name) != "proven", (
+            "my-cap must be unproven before any proof is recorded"
+        )
+        assert capability_need_blocked_by_proof_gate(need, proof_map, mode="enforce") is True, (
+            "enforce mode + unproven cap must block the consumer"
+        )
+
+        # Step 4: simulate the provider task completing with a green named_test verdict.
+        provider = _T(
+            project_id=project.id,
+            title="feat: implement my-cap",
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            requires_approval=False,
+            payloads=[{"type": "create"}],
+            status_log=[],
+            depends_on=[],
+            context={
+                "provides_capability": cap_name,
+                "code_acceptance_verdict": {
+                    "proven": True,
+                    "kind": "named_test",
+                    "proof_ref": "backend/testing/test_my_cap.py::test_my_cap",
+                },
+            },
+        )
+        _grad_db.add(provider)
+        await _grad_db.commit()
+        await _grad_db.refresh(provider)
+
+        recorded = record_capability_proof(provider, project)
+        assert recorded == [cap_name], (
+            "record_capability_proof must stamp proof on the capability"
+        )
+        await _grad_db.commit()
+        await _grad_db.refresh(project)
+
+        # Step 5: verify the gate releases — my-cap is now proven, so the consumer
+        # would be unblocked by the resume sweep.
+        updated_proof_map = consumer_gate_proof_status(
+            project.problem_model, project.capability_proof_records
+        )
+        assert updated_proof_map.get(cap_name) == "proven", (
+            "my-cap must be proven after record_capability_proof"
+        )
+        assert capability_need_blocked_by_proof_gate(need, updated_proof_map, mode="enforce") is False, (
+            "enforce mode + proven cap must NOT block the consumer — gate releases"
+        )
+
+    finally:
+        _rc.pop("capability_proof_gate_mode", None)
+
