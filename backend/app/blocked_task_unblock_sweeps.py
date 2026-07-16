@@ -10,8 +10,10 @@ import logging
 import uuid
 from datetime import datetime, timedelta
 
+from sqlalchemy import or_
 from sqlmodel import select
 
+from app.gate_revalidation import GATE_REVALIDATION_QUERY_MARKERS
 from app.models import Task, TaskStatus
 from app.time_utils import _utcnow
 
@@ -1209,7 +1211,34 @@ async def sweep_unblock_blocked_tasks(
         .order_by(Task.recheck_after.asc().nullsfirst())
         .limit(batch_size)
     )
-    due_ids = (await session.execute(due_id_stmt)).scalars().all()
+    regular_due_ids = (await session.execute(due_id_stmt)).scalars().all()
+
+    # Repository-wide gate failures are event-sensitive: when integration HEAD
+    # changes, their old exponential backoff should not delay recovery for up to
+    # an hour. Pull a bounded priority set regardless of recheck_after; the
+    # in-loop SHA equality check and per-project GitHub cache keep this cheap and
+    # prevent repeated requeues on the same HEAD.
+    gate_text_predicates = []
+    for marker in GATE_REVALIDATION_QUERY_MARKERS:
+        pattern = f"%{marker}%"
+        gate_text_predicates.extend(
+            [
+                Task.blocked_reason.ilike(pattern),
+                Task.latest_status_message.ilike(pattern),
+            ]
+        )
+    gate_id_stmt = (
+        select(Task.id)
+        .where(
+            Task.status == TaskStatus.BLOCKED,
+            or_(*gate_text_predicates),
+        )
+        .order_by(Task.blocked_at.asc().nullsfirst())
+        .limit(batch_size)
+    )
+    gate_ids = (await session.execute(gate_id_stmt)).scalars().all()
+    gate_id_set = set(gate_ids)
+    due_ids = list(dict.fromkeys([*gate_ids, *regular_due_ids]))[:batch_size]
     if not due_ids:
         return 0
 
@@ -1312,14 +1341,18 @@ async def sweep_unblock_blocked_tasks(
         # 120s).  The per-row commit then releases it before the next task's
         # I/O starts, keeping the locked window narrow enough that agent
         # heartbeats are never starved.
+        task_filters = [
+            Task.id == task_id,
+            Task.status == TaskStatus.BLOCKED,
+        ]
+        if task_id not in gate_id_set:
+            task_filters.append(
+                (Task.recheck_after.is_(None)) | (Task.recheck_after <= now)
+            )
         task = (
             await session.scalars(
                 select(Task)
-                .where(
-                    Task.id == task_id,
-                    Task.status == TaskStatus.BLOCKED,
-                    (Task.recheck_after.is_(None)) | (Task.recheck_after <= now),
-                )
+                .where(*task_filters)
                 .with_for_update(skip_locked=True)
                 .execution_options(populate_existing=True)
             )

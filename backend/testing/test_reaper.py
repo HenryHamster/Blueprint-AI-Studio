@@ -9427,6 +9427,49 @@ async def test_unblock_sweep_revalidates_repo_gate_only_after_head_advances(
 
 
 @pytest.mark.asyncio
+async def test_unblock_sweep_prioritizes_gate_blocker_before_backoff_is_due(
+    reaper_db, mocker
+):
+    """A HEAD advance bypasses stale backoff without bypassing SHA/CI guards."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.gate_revalidation.resolve_gate_state",
+        new_callable=AsyncMock,
+        return_value={
+            "head_sha": "b" * 40,
+            "green_at_head": True,
+            "checked_at_utc": _utcnow().isoformat(),
+        },
+    )
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    task = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="precondition",
+        blocked_reason=(
+            "BLOCKER: ./pr open failed on pre-existing repo-wide standalone "
+            "smoke failures in untouched tests"
+        ),
+        recheck_after=now + timedelta(hours=1),
+        context={
+            "generated_head_sha": "a" * 40,
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "precondition",
+            },
+        },
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 1
+    await reaper_db.refresh(task)
+    assert task.status == TaskStatus.QUEUED
+    assert task.context["_gate_revalidated_head"] == "b" * 40
+
+
+@pytest.mark.asyncio
 async def test_unblock_sweep_does_not_revalidate_same_green_head(
     reaper_db, mocker
 ):
