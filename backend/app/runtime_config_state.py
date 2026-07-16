@@ -1515,6 +1515,11 @@ def _read_promotion_policy_file() -> dict | None:
                 )
             except (TypeError, ValueError):
                 pass
+        # Slice 3 (design 245212a4): seed the deployed-side env-preflight gate
+        # flag so _policy_from_runtime_config() carries it and the short-circuit
+        # path (runtime_config has promotion_threshold) does NOT silently drop it.
+        if "env_preflight_enabled" in parsed:
+            result["env_preflight_enabled"] = bool(parsed["env_preflight_enabled"])
         return result
     except Exception as exc:  # noqa: BLE001 — fall back on any failure, never raise
         logger.warning(
@@ -1551,6 +1556,8 @@ def _seed_promotion_policy() -> None:
         runtime_config["merge_grade_block_threshold"] = policy[
             "merge_grade_block_threshold"
         ]
+    if "env_preflight_enabled" in policy:
+        runtime_config["env_preflight_enabled"] = policy["env_preflight_enabled"]
 
 
 _seed_promotion_policy()

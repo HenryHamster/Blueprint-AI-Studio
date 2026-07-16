@@ -6445,6 +6445,16 @@ async def _finalize_qualification(
             # would fail to create, not just the generic blocker label.
             if composite["blocker"] == "migration_apply_drift" and apply_detail:
                 blocker_label = f"{blocker_label} — {apply_detail}"
+            # The env-preflight blocker carries the specific missing var NAMES so
+            # the operator sees WHICH prerequisite is absent, not just the generic
+            # label.  Presence-only: names only, never values.
+            if (
+                composite["blocker"] == "boot_prereq_missing"
+                and env_preflight_missing
+            ):
+                blocker_label = (
+                    f"{blocker_label} — missing: {', '.join(env_preflight_missing)}"
+                )
             # Tag the blocker with WHERE its check runs so the operator sees
             # whether a fix on automain takes effect pre-promotion (candidate-side)
             # or is inert until this version itself promotes (deployed-side).

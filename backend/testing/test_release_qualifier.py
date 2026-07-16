@@ -21579,6 +21579,24 @@ async def _finalize_with_smoketest_logs(db_session, smoke_logs: dict):
         db_session, project, version,
         audit_status=TaskStatus.COMPLETED, smoke_status=TaskStatus.COMPLETED,
     )
+
+    # _resolve_launched_rubric returns early (no env_preflight written) when
+    # last_qualification has no rubric_snapshot. Patch the fields in so
+    # finalization runs the full path, mirroring _seed_qualification_children.
+    rubric_snapshot, rubric_lifecycle = await rq._snapshot_qualification_rubric(
+        db_session, version
+    )
+    rubric_fingerprint = rq._rubric_fingerprint(rubric_snapshot)
+    version.last_qualification = {
+        **version.last_qualification,
+        "rubric_snapshot": rubric_snapshot,
+        "rubric_fingerprint": rubric_fingerprint,
+        "rubric_lifecycle_snapshot": rubric_lifecycle,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
     db_session.add(
         Artifact(
             task_id=audit_task.id,
@@ -21664,6 +21682,281 @@ async def test_finalize_surfaces_env_preflight_evidence_without_gating(db_sessio
         with_qual["blocker"]
         == without_qual["blocker"]
     )
+
+
+def test_policy_env_preflight_enabled_default_on():
+    """promotion_policy.yaml must ship with env_preflight_enabled: true.
+
+    The Slice-3 deployed-side env-preflight gate was initially shipped dark
+    (env_preflight_enabled: false).  This test pins the ENABLED default so a
+    future yaml edit does not silently re-disable it.
+    """
+    import yaml
+    from pathlib import Path
+
+    policy_path = Path(__file__).resolve().parent.parent / "promotion_policy.yaml"
+    with open(policy_path) as f:
+        policy = yaml.safe_load(f)
+    assert policy.get("env_preflight_enabled") is True, (
+        "promotion_policy.yaml must have env_preflight_enabled: true — "
+        "the env-preflight gate must be enabled by default (Slice-3, design 245212a4)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_env_preflight_gate_fires_and_names_missing_var(db_session, monkeypatch):
+    """Slice-3 acceptance: when env_preflight_enabled is true in the policy
+    and a required 'always'-scope var is absent from the deployed env, the
+    gate blocks with boot_prereq_missing AND names the missing var in
+    sub_scores and the operator notification message.
+
+    This is the v22 lesson: a deterministic, actionable blocker that names the
+    exact missing prerequisite rather than degrading into a vague retry loop.
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+    # Ensure the test var is absent from os.environ so the gate fires.
+    _ABSENT_VAR = "BLUEPRINT_PREFLIGHT_TEST_ABSENT_VAR_SHOULD_NOT_EXIST"
+    monkeypatch.delenv(_ABSENT_VAR, raising=False)
+    # K_REVISION absent → deploy_target_scope = "always", so scope:"always" vars are in scope.
+    monkeypatch.delenv("K_REVISION", raising=False)
+
+    smoke_logs = {
+        "passed": True,
+        "tests": [{"name": "startup_check", "status": "pass"}],
+        "suites": {"startup": {"passed": True}},
+        "env_preflight": {
+            "required_env": [
+                # scope "always" → evaluated in every deploy target (cloud_run AND non-cloud_run).
+                {"name": _ABSENT_VAR, "scope": "always"},
+            ],
+            "startup_check_names": [],
+            "manifest_source": "backend/app/required_runtime_env.py",
+        },
+    }
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 1,
+                "test_count_delta": 0,
+            },
+        },
+        smoke_logs=smoke_logs,
+    )
+
+    await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    qual = version.last_qualification
+    # The gate must fire with boot_prereq_missing when the flag is on in the policy.
+    assert qual["blocker"] == "boot_prereq_missing", (
+        f"Expected boot_prereq_missing, got {qual['blocker']!r} — "
+        "env_preflight gate must block when a required var is absent"
+    )
+    # The specific missing var name must appear in sub_scores — not just a generic message.
+    missing = qual["sub_scores"].get("env_preflight_missing", [])
+    assert _ABSENT_VAR in missing, (
+        f"Expected {_ABSENT_VAR!r} in env_preflight_missing, got {missing!r} — "
+        "actionable blocker must name the exact missing prerequisite"
+    )
+    # The candidate was not promoted — gate is deterministic, not a retry loop.
+    assert qual["status"] == "not_promoted"
+    assert qual["confidence"] == 0.0
+
+    # The operator notification must also name the missing var — deterministic message.
+    msgs = await _messages_for(db_session, project.id, "release_blocked")
+    assert len(msgs) >= 1
+    blocked_msg = msgs[-1]
+    assert _ABSENT_VAR in blocked_msg.content, (
+        f"Operator notification must name the missing var {_ABSENT_VAR!r}; "
+        f"got: {blocked_msg.content!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_env_preflight_gate_inert_when_no_artifact(db_session):
+    """When env_preflight_enabled is true but no env_preflight artifact was
+    produced by the smoketest (no manifest), the gate is inert — no
+    boot_prereq_missing block, and promotion proceeds normally.
+
+    This distinguishes 'no declared requirements' (pass through) from 'declared
+    but absent' (hard block).
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 1,
+                "test_count_delta": 0,
+            },
+        },
+        # No env_preflight key in smoke_logs — candidate declared no requirements.
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    qual = version.last_qualification
+    # Gate is inert when no artifact — no boot_prereq_missing.
+    assert qual["blocker"] != "boot_prereq_missing", (
+        "boot_prereq_missing must NOT fire when no env_preflight artifact was produced"
+    )
+    # Promotion proceeds (dry_run since promotion_enabled=False).
+    assert qual["status"] == "dry_run"
+    assert qual["would_promote"] is True
+
+
+@pytest.mark.asyncio
+async def test_env_preflight_gate_inert_for_cloud_run_only_var_in_non_cloud_run_env(
+    db_session, monkeypatch
+):
+    """A required var with scope 'cloud_run' does NOT block in a non-Cloud-Run
+    deploy target (K_REVISION absent).  The scope-gate prevents false positives
+    on developer and CI environments that legitimately lack cloud-run-only secrets.
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    _CLOUD_RUN_VAR = "GITHUB_PAT_ENCRYPTION_KEY"
+    # K_REVISION absent → deploy_target_scope = "always"; cloud_run-scoped vars are out of scope.
+    monkeypatch.delenv("K_REVISION", raising=False)
+
+    smoke_logs = {
+        "passed": True,
+        "tests": [{"name": "a", "status": "pass"}],
+        "suites": {"startup": {"passed": True}},
+        "env_preflight": {
+            "required_env": [
+                {"name": _CLOUD_RUN_VAR, "scope": "cloud_run"},
+            ],
+            "startup_check_names": [],
+            "manifest_source": "backend/app/required_runtime_env.py",
+        },
+    }
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 1,
+                "test_count_delta": 0,
+            },
+        },
+        smoke_logs=smoke_logs,
+    )
+
+    await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    qual = version.last_qualification
+    # cloud_run-scoped var must NOT block a non-Cloud-Run deployment.
+    assert qual["blocker"] != "boot_prereq_missing", (
+        "cloud_run-scoped var must not block in a non-Cloud-Run environment"
+    )
+    assert qual["status"] == "dry_run"
+    assert qual["would_promote"] is True
+
+
+@pytest.mark.asyncio
+async def test_env_preflight_gate_inert_with_ack_override(db_session, monkeypatch):
+    """The owner-armed Slice-4 ack suppresses the boot_prereq_missing block
+    exactly once when the operator acknowledges that the missing var will be
+    bound in the same deploy (ack_env_will_be_bound).
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    _ABSENT_VAR = "BLUEPRINT_PREFLIGHT_ACK_TEST_VAR"
+    monkeypatch.delenv(_ABSENT_VAR, raising=False)
+    monkeypatch.delenv("K_REVISION", raising=False)
+
+    smoke_logs = {
+        "passed": True,
+        "tests": [{"name": "a", "status": "pass"}],
+        "suites": {"startup": {"passed": True}},
+        "env_preflight": {
+            "required_env": [{"name": _ABSENT_VAR, "scope": "always"}],
+            "startup_check_names": [],
+            "manifest_source": "backend/app/required_runtime_env.py",
+        },
+    }
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 1,
+                "test_count_delta": 0,
+            },
+        },
+        smoke_logs=smoke_logs,
+    )
+    # Arm the Slice-4 one-shot ack.
+    version.last_qualification = {
+        **version.last_qualification,
+        "ack_env_will_be_bound": {
+            "actor": "test-operator",
+            "acknowledged_at": "2026-07-16T00:00:00",
+        },
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    qual = version.last_qualification
+    # Ack suppresses the boot_prereq_missing block.
+    assert qual["blocker"] != "boot_prereq_missing", (
+        "Slice-4 ack must suppress boot_prereq_missing block"
+    )
+    # The ack-applied record is auditable.
+    assert qual.get("env_preflight_ack_applied") is not None
+    assert qual["env_preflight_ack_applied"]["overridden_blocker"] == "boot_prereq_missing"
+    # Missing names still recorded for audit (presence-only, names never values).
+    assert _ABSENT_VAR in qual["env_preflight_ack_applied"]["missing"]
+    # Dry-run promotion proceeds.
+    assert qual["status"] == "dry_run"
+    assert qual["would_promote"] is True
 
 
 @pytest.mark.asyncio
