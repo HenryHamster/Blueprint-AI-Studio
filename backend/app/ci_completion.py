@@ -1994,6 +1994,12 @@ async def handle_ci_completion(
             # can detect an orphaned review task.
             if not ci_loop.get("review_wait_started"):
                 ci_loop["review_wait_started"] = _utcnow().isoformat()
+                # Per-episode respawn budget: when a new review-wait episode
+                # begins AND a fix has been applied since the last episode,
+                # reset the backstop's per-episode count so a respawn consumed
+                # in an earlier episode does not permanently exhaust the budget.
+                if ci_loop.get("ci_fix_spawned"):
+                    ci_loop.pop("review_wait_respawn_count", None)
             # Orphan-review backstop: if a review task died without setting
             # review_approved, the PR parks here indefinitely. Rather than
             # gate a mergeable PR on a human immediately, RESPAWN a fresh

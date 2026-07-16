@@ -55,6 +55,8 @@ from app.broadcast import broadcast_to_project, _sanitize_log
 from app.payload_schemas import read_acceptance_evidence, validate_internal_payload
 from app.review_pipeline import (
     REVIEW_FIX_GOAL_PREAMBLE,
+    SPAWN_REASON_DEFERRED,
+    SPAWN_REASON_KEY,
     _genuine_blocking_issue_exists,
     _spawn_pipeline_task,
     build_ci_failure_fix_prompt,
@@ -5748,6 +5750,11 @@ async def _process_post_commit(
                     from app import pause_clock
 
                     ci_loop = review_loop.copy()
+                    # Per-episode respawn budget: a fix completion starts a fresh
+                    # review-wait episode.  Reset the backstop's per-episode count
+                    # so a respawn consumed in an earlier episode (e.g. a superseded
+                    # review) does not permanently exhaust the budget.
+                    ci_loop.pop("review_wait_respawn_count", None)
                     ci_loop["ci_waiting"] = True
                     ci_loop["review_approved"] = True
                     ci_loop["ci_wait_started"] = _utcnow().isoformat()
@@ -5792,50 +5799,116 @@ async def _process_post_commit(
                             f"[REVIEW PIPELINE] Spawned review after fix for PR #{pr_number} → task {review_task.id}"
                         )
                     else:
-                        task.latest_status_message = f"Fix applied but review not spawned for PR #{pr_number} — iteration cap reached"
-                        task.requires_approval = True
-                        session.add(task)
-                        cap_alert_title = (
-                            f"PR #{pr_number} stalled — iteration cap reached"
-                        )
-                        existing_cap_alert = (
-                            (
-                                await session.execute(
-                                    select(Alert).where(
-                                        Alert.project_id == task.project_id,
-                                        Alert.severity == AlertSeverity.WARNING,
-                                        Alert.dismissed_at.is_(None),
-                                        Alert.title == cap_alert_title,
+                        _spawn_reason = (task.context or {}).get(SPAWN_REASON_KEY, "")
+                        _transient_reasons = {
+                            SPAWN_REASON_DEFERRED,
+                        }
+                        _is_transient = _spawn_reason in _transient_reasons
+                        if _is_transient:
+                            # Transient deferral (e.g. in-flight peer holds the
+                            # spawn lock): create a specific alert and retry once.
+                            _retry_spawn_reason = _spawn_reason
+                            logger.warning(
+                                "[REVIEW PIPELINE] Review spawn after fix deferred "
+                                "for PR #%s (reason=%s) — retrying once",
+                                pr_number,
+                                _retry_spawn_reason or "unknown",
+                            )
+                            # Need to import _maybe_create_failure_alert here
+                            # because it's only imported locally at other call sites.
+                            from app.alert_dispatch import _maybe_create_failure_alert
+
+                            await _maybe_create_failure_alert(
+                                task,
+                                session,
+                                f"Review spawn after fix for PR #{pr_number} "
+                                f"deferred ({_retry_spawn_reason or 'unknown'}) — retrying",
+                            )
+                            await asyncio.sleep(5)
+                            # Re-fetch the task in case the spawn call rolled back
+                            # the session and expired the ORM instance.
+                            _reloaded = await session.get(Task, task.id)
+                            if _reloaded is not None:
+                                task = _reloaded
+                            review_task_retry, _ = await _spawn_pipeline_task(
+                                task,
+                                "review",
+                                session,
+                                pr_number,
+                                branch,
+                                base_branch,
+                                original_task_id=original_task_id,
+                            )
+                            if review_task_retry:
+                                logger.info(
+                                    "[REVIEW PIPELINE] Spawned review after fix "
+                                    "(retry) for PR #%s → task %s",
+                                    pr_number,
+                                    review_task_retry.id,
+                                )
+                                review_task = review_task_retry
+                        if not review_task:
+                            # Terminal failure: cap, stuck cycle, already merged,
+                            # or retry also failed. Escalate with accurate reason.
+                            _reason_label = (
+                                _spawn_reason.replace("_", " ").title()
+                                if _spawn_reason
+                                else "iteration cap"
+                            )
+                            task.latest_status_message = (
+                                f"Fix applied but review not spawned for PR "
+                                f"#{pr_number} — {_reason_label}"
+                            )
+                            task.requires_approval = True
+                            session.add(task)
+                            cap_alert_title = (
+                                f"PR #{pr_number} stalled — {_reason_label}"
+                            )
+                            existing_cap_alert = (
+                                (
+                                    await session.execute(
+                                        select(Alert).where(
+                                            Alert.project_id == task.project_id,
+                                            Alert.severity == AlertSeverity.WARNING,
+                                            Alert.dismissed_at.is_(None),
+                                            Alert.title == cap_alert_title,
+                                        )
                                     )
                                 )
+                                .scalars()
+                                .first()
                             )
-                            .scalars()
-                            .first()
-                        )
-                        if not existing_cap_alert:
-                            alert = Alert(
-                                project_id=task.project_id,
-                                severity=AlertSeverity.WARNING,
-                                title=cap_alert_title,
-                                message=f"Fix was applied to PR #{pr_number} but the review iteration cap was reached. Manual intervention required.",
-                                task_id=task.id,
+                            if not existing_cap_alert:
+                                alert = Alert(
+                                    project_id=task.project_id,
+                                    severity=AlertSeverity.WARNING,
+                                    title=cap_alert_title,
+                                    message=(
+                                        f"Fix was applied to PR #{pr_number} but "
+                                        f"review spawn failed ({_reason_label}). "
+                                        "Manual intervention required."
+                                    ),
+                                    task_id=task.id,
+                                )
+                                session.add(alert)
+                                await session.commit()
+                                await broadcast_to_project(
+                                    str(task.project_id),
+                                    "alert_created",
+                                    {
+                                        "alert_id": str(alert.id),
+                                        "severity": "WARNING",
+                                        "title": alert.title,
+                                    },
+                                )
+                            else:
+                                await session.commit()
+                            logger.warning(
+                                "[REVIEW PIPELINE] Review spawn after fix "
+                                "returned None for PR #%s (reason=%s)",
+                                pr_number,
+                                _spawn_reason or "iteration cap",
                             )
-                            session.add(alert)
-                            await session.commit()
-                            await broadcast_to_project(
-                                str(task.project_id),
-                                "alert_created",
-                                {
-                                    "alert_id": str(alert.id),
-                                    "severity": "WARNING",
-                                    "title": alert.title,
-                                },
-                            )
-                        else:
-                            await session.commit()
-                        logger.warning(
-                            f"[REVIEW PIPELINE] WARNING: Review spawn after fix returned None for PR #{pr_number}"
-                        )
 
             # Completion handlers — wrapped in try/except to prevent VM leak.
             # If a handler throws after the early commit, BackgroundTasks (including
