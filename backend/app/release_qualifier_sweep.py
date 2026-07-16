@@ -30,6 +30,8 @@ from app.models import (
     AuditFindingResolution,
     Project,
     ReleaseDeployArtifact,
+    Task,
+    TaskStatus,
 )
 from app.release_artifacts import required_release_artifact_kinds
 from app.release_promotion import _notify_operator, _resolve_github_with_session
@@ -54,6 +56,7 @@ from app.release_stall_alerts import (
     _check_version_stabilize_stall,
 )
 from app.time_utils import _utcnow
+from app.vm_lifecycle import fire_and_forget_vm_delete
 from app.release_qualifier_redrive import (
     _MAX_ERROR_REDRIVE_ATTEMPTS,  # noqa: F401 — re-exported for tests
     _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS,  # noqa: F401 — re-exported for tests
@@ -291,6 +294,56 @@ def _parse_started_at(qual: dict[str, Any]) -> datetime | None:
         return None
 
 
+async def _cancel_qualifier_children(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+) -> None:
+    """Best-effort cancel of all qualifier child tasks for a force-finalized version.
+
+    Reads ``audit_task_id``, ``smoketest_task_id``, ``challenge_task_id``, and
+    ``merge_grade_task_id`` from ``version.last_qualification``, marks each
+    non-terminal task as ``CANCELLED`` with ``vm_stopped_at`` set to now, and
+    fire-and-forgets VM teardown.  Best-effort per child: a failure on one
+    child (missing row, DB error, etc.) does not prevent cancelling the others
+    or writing the force-finalize record.
+    """
+    qual = version.last_qualification or {}
+    child_keys = [
+        "audit_task_id",
+        "smoketest_task_id",
+        "challenge_task_id",
+        "merge_grade_task_id",
+    ]
+    now = _utcnow()
+
+    for child_key in child_keys:
+        child_id = qual.get(child_key)
+        if not child_id or not isinstance(child_id, str):
+            continue
+        try:
+            task = await session.get(Task, child_id)
+            if task is None:
+                continue
+            if task.status in (
+                TaskStatus.COMPLETED,
+                TaskStatus.FAILED,
+                TaskStatus.CANCELLED,
+                TaskStatus.BLOCKED,
+            ):
+                continue
+            task.status = TaskStatus.CANCELLED
+            task.vm_stopped_at = now
+            session.add(task)
+            fire_and_forget_vm_delete(task)
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] sweep: failed to cancel child task %s "
+                "for version %s",
+                child_id,
+                version.id,
+            )
+
+
 async def _force_finalize_timed_out_qualification(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
@@ -319,6 +372,9 @@ async def _force_finalize_timed_out_qualification(
     ``qualification_timeout`` blocker (never fabricates a supersession).  The
     caller commits the session.
     """
+    # Cancel any running child tasks before force-finalizing (best-effort).
+    await _cancel_qualifier_children(session, version)
+
     qual = dict(version.last_qualification or {})
     age_minutes = age_seconds / 60.0
     candidate_sha: str | None = qual.get("candidate_sha")
@@ -427,6 +483,9 @@ async def _force_finalize_sweep_crash_loop(
     raises an Alert, and notifies the operator.  The caller commits the session.
     """
     qual = dict(version.last_qualification or {})
+    # Cancel any running child tasks before force-finalizing (best-effort).
+    await _cancel_qualifier_children(session, version)
+
     record = {
         **qual,
         "status": "infra_failure",

@@ -25581,7 +25581,8 @@ async def test_sweep_force_finalizes_timed_out_qualification(db_session, mocker)
     """Audit H2: a qualification pending longer than the qualification-timeout
     is force-finalized as a blocked one (blocker=qualification_timeout) EVEN
     when a child is still non-terminal — the escape hatch for a child that
-    heartbeats-but-hangs."""
+    heartbeats-but-hangs.  Running children are CANCELLED and their VMs
+    scheduled for teardown."""
     # Isolate this sweep/timeout test from the post-commit strategic re-trigger
     # (covered by its own tests); a resolved verdict would otherwise spawn a
     # real strategic_review whose branch-resolution emits extra alerts.
@@ -25595,6 +25596,10 @@ async def test_sweep_force_finalizes_timed_out_qualification(db_session, mocker)
         "app.release_qualifier_sweep._redrive_infra_failure_qualification",
         new=AsyncMock(return_value=False),
     )
+    # Prevent actual GCP VM teardown in test.
+    mocker.patch(
+        "app.release_qualifier_sweep.fire_and_forget_vm_delete",
+    )
     from datetime import timedelta
 
     from app.time_utils import _utcnow
@@ -25607,7 +25612,7 @@ async def test_sweep_force_finalizes_timed_out_qualification(db_session, mocker)
     old_started = (
         _utcnow() - timedelta(seconds=rq._MAX_QUALIFICATION_DURATION_SECONDS + 3600)
     ).isoformat()
-    await _seed_pending_qualification(
+    audit_task, smoke_task = await _seed_pending_qualification(
         db_session,
         project,
         version,
@@ -25631,6 +25636,16 @@ async def test_sweep_force_finalizes_timed_out_qualification(db_session, mocker)
     assert version.status == "open"
     assert version.phase == "stabilize"
 
+    # The running smoke child was cancelled and its VM teardown scheduled.
+    await db_session.refresh(smoke_task)
+    assert smoke_task.status == TaskStatus.CANCELLED
+    assert smoke_task.vm_stopped_at is not None
+
+    # The already-completed audit child is untouched.
+    await db_session.refresh(audit_task)
+    assert audit_task.status == TaskStatus.COMPLETED
+    assert audit_task.vm_stopped_at is None  # never set — task was already done
+
     # An operator-visible Alert was raised.
     alerts = (
         (await db_session.execute(_select(Alert).where(Alert.project_id == project.id)))
@@ -25639,6 +25654,182 @@ async def test_sweep_force_finalizes_timed_out_qualification(db_session, mocker)
     )
     assert len(alerts) == 1
     assert "timed out" in alerts[0].title.lower()
+
+
+@pytest.mark.asyncio
+async def test_sweep_timeout_terminalizes_abandoned_children(db_session, mocker):
+    """A qualification that times out with running children (audit, smoketest,
+    challenge — and by extension merge_grade) cancels those children so the
+    sweep can spawn a replacement without abandoned children consuming
+    resources or completing against superseded attempt state."""
+    mocker.patch(
+        "app.release_qualifier._maybe_trigger_strategic_after_qualification",
+        new=AsyncMock(return_value=None),
+    )
+    mocker.patch(
+        "app.release_qualifier_sweep._redrive_infra_failure_qualification",
+        new=AsyncMock(return_value=False),
+    )
+    mocker.patch(
+        "app.release_qualifier_sweep.fire_and_forget_vm_delete",
+    )
+    from datetime import timedelta
+
+    from app.time_utils import _utcnow
+
+    project, version = await _make_project_and_version(db_session)
+
+    old_started = (
+        _utcnow() - timedelta(seconds=rq._MAX_QUALIFICATION_DURATION_SECONDS + 3600)
+    ).isoformat()
+
+    # Seed with audit, smoke, and challenge all IN_PROGRESS.
+    audit_task, smoke_task, challenge_task = await _seed_pending_qualification_with_challenge(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.IN_PROGRESS,
+        smoke_status=TaskStatus.IN_PROGRESS,
+        challenge_status=TaskStatus.IN_PROGRESS,
+        started_at=old_started,
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert count == 1
+
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "infra_failure"
+    assert version.last_qualification["blocker"] == "qualification_timeout"
+
+    # Every running child was cancelled.
+    await db_session.refresh(audit_task)
+    assert audit_task.status == TaskStatus.CANCELLED
+    assert audit_task.vm_stopped_at is not None
+
+    await db_session.refresh(smoke_task)
+    assert smoke_task.status == TaskStatus.CANCELLED
+    assert smoke_task.vm_stopped_at is not None
+
+    await db_session.refresh(challenge_task)
+    assert challenge_task.status == TaskStatus.CANCELLED
+    assert challenge_task.vm_stopped_at is not None
+
+
+@pytest.mark.asyncio
+async def test_sweep_timeout_partial_children_cancellation(db_session, mocker):
+    """When some children are already terminal and others are running, only
+    the running children are cancelled during force-finalize."""
+    mocker.patch(
+        "app.release_qualifier._maybe_trigger_strategic_after_qualification",
+        new=AsyncMock(return_value=None),
+    )
+    mocker.patch(
+        "app.release_qualifier_sweep._redrive_infra_failure_qualification",
+        new=AsyncMock(return_value=False),
+    )
+    mocker.patch(
+        "app.release_qualifier_sweep.fire_and_forget_vm_delete",
+    )
+    from datetime import timedelta
+
+    from app.time_utils import _utcnow
+
+    project, version = await _make_project_and_version(db_session)
+
+    old_started = (
+        _utcnow() - timedelta(seconds=rq._MAX_QUALIFICATION_DURATION_SECONDS + 3600)
+    ).isoformat()
+
+    # Audit already COMPLETED, smoke IN_PROGRESS, challenge IN_PROGRESS.
+    audit_task, smoke_task, challenge_task = await _seed_pending_qualification_with_challenge(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.COMPLETED,
+        smoke_status=TaskStatus.IN_PROGRESS,
+        challenge_status=TaskStatus.IN_PROGRESS,
+        started_at=old_started,
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert count == 1
+
+    # Running children (smoke, challenge) were cancelled.
+    await db_session.refresh(smoke_task)
+    assert smoke_task.status == TaskStatus.CANCELLED
+    assert smoke_task.vm_stopped_at is not None
+
+    await db_session.refresh(challenge_task)
+    assert challenge_task.status == TaskStatus.CANCELLED
+    assert challenge_task.vm_stopped_at is not None
+
+    # Already-completed audit child is untouched.
+    await db_session.refresh(audit_task)
+    assert audit_task.status == TaskStatus.COMPLETED
+    assert audit_task.vm_stopped_at is None
+
+
+@pytest.mark.asyncio
+async def test_sweep_crash_loop_cancels_children(db_session, mocker):
+    """When the finalize path crash-loops past the threshold, the
+    force-finalize cancels running children before stamping infra_failure."""
+    mocker.patch(
+        "app.release_qualifier._maybe_trigger_strategic_after_qualification",
+        new=AsyncMock(return_value=None),
+    )
+    # Prevent the infra_failure redrive loop from re-spawning after
+    # the crash-loop force-finalize in the same sweep cycle.
+    mocker.patch(
+        "app.release_qualifier_sweep._redrive_infra_failure_qualification",
+        new=AsyncMock(return_value=False),
+    )
+    mocker.patch(
+        "app.release_qualifier_sweep.fire_and_forget_vm_delete",
+    )
+
+    project, version = await _make_project_and_version(db_session)
+
+    # Seed a pending qual that an immediate crash (below) will force-finalize.
+    audit_task, smoke_task = await _seed_pending_qualification(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.COMPLETED,
+        smoke_status=TaskStatus.IN_PROGRESS,
+    )
+
+    # Make _finalize_in_dedicated_session raise so the crash-streak logic
+    # engages and, after _MAX_SWEEP_CRASH_STREAK attempts, force-finalizes.
+    mocker.patch(
+        "app.release_qualifier._finalize_in_dedicated_session",
+        new=AsyncMock(side_effect=RuntimeError("simulated crash")),
+    )
+
+    for _ in range(rq._MAX_SWEEP_CRASH_STREAK):
+        await rq.sweep_stuck_qualifications(
+            db_session, session_factory=_shared_session_factory(db_session)
+        )
+
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "infra_failure"
+    assert version.last_qualification["blocker"] == "sweep_finalize_crash_loop"
+    assert version.phase == "stabilize"
+
+    # The running smoke child was cancelled.
+    await db_session.refresh(smoke_task)
+    assert smoke_task.status == TaskStatus.CANCELLED
+    assert smoke_task.vm_stopped_at is not None
+
+    # The already-completed audit child is untouched.
+    await db_session.refresh(audit_task)
+    assert audit_task.status == TaskStatus.COMPLETED
+    assert audit_task.vm_stopped_at is None
 
 
 @pytest.mark.asyncio
@@ -25654,6 +25845,9 @@ async def test_timed_out_already_promoted_uses_qualification_superseded(db_sessi
     mocker.patch(
         "app.release_qualifier_sweep._redrive_infra_failure_qualification",
         new=AsyncMock(return_value=False),
+    )
+    mocker.patch(
+        "app.release_qualifier_sweep.fire_and_forget_vm_delete",
     )
     from datetime import timedelta
 

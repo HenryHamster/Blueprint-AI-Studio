@@ -170,6 +170,7 @@ async def _with_transient_retry(
     coro_factory: Callable[[], Awaitable[_T]],
     *,
     label: str,
+    no_retry_types: tuple[type[Exception], ...] = (),
 ) -> _T:
     """Invoke *coro_factory* with bounded exponential backoff on exceptions.
 
@@ -205,7 +206,9 @@ async def _with_transient_retry(
             await asyncio.sleep(delay)
         try:
             return await coro_factory()
-        except Exception as exc:  # noqa: BLE001 — retry on transient exceptions
+        except Exception as exc:
+            if isinstance(exc, no_retry_types):
+                raise  # deterministic — retry cannot help
             last_exc = exc
     # All attempts exhausted — re-raise the last exception.
     raise cast(Exception, last_exc)
@@ -227,6 +230,14 @@ class _MigrationApplyError(Exception):
     """A scratch-side seed/apply step failed. Always collapses to ``defer`` — an
     apply failure means we could not prove the candidate is safe, so the release
     must HOLD (never wave through, never hard-block on a possibly-fidelity issue)."""
+
+
+class _DeterministicMigrationDefect(Exception):
+    """A migration defect guaranteed to reproduce on every retry: Python
+    ``SyntaxError`` / ``ImportError`` during Alembic's migration import, or a
+    class-42 SQL error (syntax_error / invalid_schema_name / undefined_table /
+    etc.).  These must hard-block the candidate rather than loop as transient
+    infra failures — retrying cannot resolve them."""
 
 
 def _metadata_from_shape(shape: dict[str, list[str]]) -> sa.MetaData:
@@ -529,6 +540,26 @@ async def _apply_candidate_migrations(
                 await conn.run_sync(
                     lambda sync_conn: _reconcile_then_upgrade(sync_conn, tmp)
                 )
+    except _DeterministicMigrationDefect:
+        raise  # already classified; propagate without re-wrapping
+    except (SyntaxError, ImportError) as exc:
+        raise _DeterministicMigrationDefect(
+            f"candidate migration has a deterministic Python defect "
+            f"({type(exc).__name__}): {exc}"
+        ) from exc
+    except sa.exc.ProgrammingError as exc:
+        pgcode = getattr(exc.orig, "pgcode", None) or getattr(
+            exc.orig, "sqlstate", None
+        )
+        if pgcode and str(pgcode).startswith("42"):
+            raise _DeterministicMigrationDefect(
+                f"candidate migration has a deterministic SQL defect "
+                f"(SQLSTATE {pgcode}): {exc}"
+            ) from exc
+        raise _MigrationApplyError(
+            f"candidate migration chain failed to apply against production's "
+            f"recorded state: {type(exc).__name__}: {exc}"
+        ) from exc
     except Exception as exc:
         raise _MigrationApplyError(
             f"candidate migration chain failed to apply against production's "
@@ -1062,6 +1093,8 @@ async def run_migration_apply_gate(
                 candidate_ref=candidate_ref,
                 project_id=project_id,
             )
+        except _DeterministicMigrationDefect as exc:
+            return ("block", str(exc))
         except _MigrationApplyError as exc:
             return ("defer", str(exc))
         except Exception as exc:  # noqa: BLE001 — reference-build failure HOLDS
@@ -1091,7 +1124,10 @@ async def run_migration_apply_gate(
                 scratch_base_url, prod_state, candidate_sources, required_metadata
             ),
             label="provision-seed-apply-drift",
+            no_retry_types=(_DeterministicMigrationDefect,),
         )
+    except _DeterministicMigrationDefect as exc:
+        return ("block", str(exc))
     except _MigrationApplyError as exc:
         return ("defer", str(exc))
     except Exception as exc:  # noqa: BLE001 — any provisioning failure HOLDS

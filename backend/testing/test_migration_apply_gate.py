@@ -920,6 +920,209 @@ async def test_drop_database_rejects_invalid_name_without_connecting():
         await _drop_database(url, "my\"db")
 
 
+# --- Deterministic defect blocking (runs everywhere) -----------------------
+
+
+@pytest.mark.asyncio
+async def test_repeatable_candidate_migration_failure_blocks(monkeypatch):
+    """A migration with a deterministic Python defect (SyntaxError / ImportError)
+    must return ``('block', ...)`` instead of ``('defer', ...)`` as
+    ``migration_apply_check_unavailable``.
+
+    Repeatable defects cannot be resolved by retrying, so the gate must block
+    the candidate on the FIRST attempt without issuing any retry — call count
+    must be 1.  This is the primary acceptance test for the deterministic-defect
+    gate: it exercises ``run_migration_apply_gate``, ``_DeterministicMigrationDefect``,
+    the ``no_retry_types`` fast-exit in ``_with_transient_retry``, and the
+    ``except _DeterministicMigrationDefect`` handler that returns ``("block", ...)``.
+    """
+    import app.migration_apply_gate as gate_mod
+
+    monkeypatch.setattr(gate_mod, "_TRANSIENT_RETRY_BASE_DELAY", 0.001)
+    monkeypatch.setattr(gate_mod, "_TRANSIENT_RETRY_MAX_DELAY", 0.01)
+
+    prod_meta = sa.MetaData()
+    sa.Table("widget", prod_meta, sa.Column("id", sa.Integer, primary_key=True))
+    monkeypatch.setattr(
+        gate_mod,
+        "_read_prod_state",
+        AsyncMock(return_value=gate_mod._ProdState(revision="a01", metadata=prod_meta)),
+    )
+
+    @contextlib.asynccontextmanager
+    async def _fake_ephemeral(_base_url, db_name=None):
+        yield object(), "scratch-gate"
+
+    monkeypatch.setattr(gate_mod, "ephemeral_postgres_database", _fake_ephemeral)
+    monkeypatch.setattr(gate_mod, "_seed_scratch", AsyncMock())
+
+    apply_call_count = 0
+
+    async def _deterministic_defect_apply(scratch_engine, candidate_sources):
+        nonlocal apply_call_count
+        apply_call_count += 1
+        raise gate_mod._DeterministicMigrationDefect(
+            "candidate migration has a deterministic Python defect "
+            "(SyntaxError): invalid syntax (<migration_0001>, line 3)"
+        )
+
+    monkeypatch.setattr(gate_mod, "_apply_candidate_migrations", _deterministic_defect_apply)
+
+    engine = create_async_engine("postgresql+asyncpg://u:p@localhost:5432/nope")
+    try:
+        verdict, detail = await run_migration_apply_gate(
+            prod_engine=engine,
+            candidate_sources={"0001_bad.py": "revision='0001'\ndown_revision=None\n"},
+            required_metadata=sa.MetaData(),
+        )
+    finally:
+        await engine.dispose()
+
+    assert verdict == "block", (
+        f"expected 'block' for deterministic defect, got {verdict!r}: {detail}"
+    )
+    assert detail is not None and "SyntaxError" in detail
+    assert apply_call_count == 1, (
+        f"deterministic defect retried {apply_call_count} time(s); must block on first attempt"
+    )
+
+
+@pytest.mark.asyncio
+async def test_apply_candidate_migrations_classifies_syntax_error(monkeypatch):
+    """``SyntaxError`` raised during Alembic migration import must be classified
+    as ``_DeterministicMigrationDefect``, not wrapped as ``_MigrationApplyError``."""
+    import app.migration_apply_gate as gate_mod
+
+    class _FakeConn:
+        async def run_sync(self, fn):
+            fn(self)  # propagates SyntaxError raised by the patched upgrader
+
+    @contextlib.asynccontextmanager
+    async def _fake_connect():
+        yield _FakeConn()
+
+    class _FakeEngine:
+        def connect(self):
+            return _fake_connect()
+
+    def _syntax_error_upgrade(sync_conn, script_location):
+        raise SyntaxError("invalid syntax", ("<migration_0001>", 3, 1, "def upgrade(\n"))
+
+    monkeypatch.setattr(gate_mod, "_reconcile_then_upgrade", _syntax_error_upgrade)
+
+    with pytest.raises(gate_mod._DeterministicMigrationDefect) as exc_info:
+        await gate_mod._apply_candidate_migrations(
+            _FakeEngine(),
+            {"0001_bad.py": "revision='0001'\ndown_revision=None\n"},
+        )
+
+    assert "SyntaxError" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_apply_candidate_migrations_classifies_import_error(monkeypatch):
+    """``ImportError`` raised during Alembic migration import must be classified
+    as ``_DeterministicMigrationDefect``."""
+    import app.migration_apply_gate as gate_mod
+
+    class _FakeConn:
+        async def run_sync(self, fn):
+            fn(self)
+
+    @contextlib.asynccontextmanager
+    async def _fake_connect():
+        yield _FakeConn()
+
+    class _FakeEngine:
+        def connect(self):
+            return _fake_connect()
+
+    def _import_error_upgrade(sync_conn, script_location):
+        raise ImportError("No module named 'nonexistent_dep_xyz'")
+
+    monkeypatch.setattr(gate_mod, "_reconcile_then_upgrade", _import_error_upgrade)
+
+    with pytest.raises(gate_mod._DeterministicMigrationDefect) as exc_info:
+        await gate_mod._apply_candidate_migrations(
+            _FakeEngine(),
+            {"0001_bad.py": "revision='0001'\ndown_revision=None\n"},
+        )
+
+    assert "ImportError" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_apply_candidate_migrations_classifies_class42_sql_error(monkeypatch):
+    """A class-42 ``ProgrammingError`` (SQL syntax / undefined table / invalid
+    schema) must be classified as ``_DeterministicMigrationDefect``."""
+    import app.migration_apply_gate as gate_mod
+
+    class _FakeConn:
+        async def run_sync(self, fn):
+            fn(self)
+
+    @contextlib.asynccontextmanager
+    async def _fake_connect():
+        yield _FakeConn()
+
+    class _FakeEngine:
+        def connect(self):
+            return _fake_connect()
+
+    class _FakeOrig(Exception):
+        pgcode = "42601"  # syntax_error
+
+    def _sql_error_upgrade(sync_conn, script_location):
+        orig = _FakeOrig("syntax error at or near 'BORK'")
+        raise sa.exc.ProgrammingError(
+            "syntax error at or near 'BORK'", {}, orig
+        )
+
+    monkeypatch.setattr(gate_mod, "_reconcile_then_upgrade", _sql_error_upgrade)
+
+    with pytest.raises(gate_mod._DeterministicMigrationDefect) as exc_info:
+        await gate_mod._apply_candidate_migrations(
+            _FakeEngine(),
+            {"0001_bad.py": "revision='0001'\ndown_revision=None\n"},
+        )
+
+    assert "42601" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_apply_candidate_migrations_non_class42_sql_error_defers(monkeypatch):
+    """A non-class-42 ``ProgrammingError`` (e.g. lock timeout, deadlock) must
+    remain a ``_MigrationApplyError`` so it defers (transient, may recover)."""
+    import app.migration_apply_gate as gate_mod
+
+    class _FakeConn:
+        async def run_sync(self, fn):
+            fn(self)
+
+    @contextlib.asynccontextmanager
+    async def _fake_connect():
+        yield _FakeConn()
+
+    class _FakeEngine:
+        def connect(self):
+            return _fake_connect()
+
+    class _FakeOrig(Exception):
+        pgcode = "40P01"  # deadlock_detected (class 40 — not deterministic)
+
+    def _deadlock_upgrade(sync_conn, script_location):
+        orig = _FakeOrig("deadlock detected")
+        raise sa.exc.ProgrammingError("deadlock detected", {}, orig)
+
+    monkeypatch.setattr(gate_mod, "_reconcile_then_upgrade", _deadlock_upgrade)
+
+    with pytest.raises(gate_mod._MigrationApplyError):
+        await gate_mod._apply_candidate_migrations(
+            _FakeEngine(),
+            {"0001_ok.py": "revision='0001'\ndown_revision=None\n"},
+        )
+
+
 # --- scratch_db_url routing -------------------------------------------------
 
 
