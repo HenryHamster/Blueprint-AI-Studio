@@ -467,6 +467,17 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     () => strategicAttention?.items.filter(item => item.severity === 'needs_operator') ?? [],
     [strategicAttention?.items],
   );
+  // Set of message IDs that the server marks needs_operator. Used to converge
+  // the list high-signal split onto the same canonical source as the badge and
+  // toast surfaces so all four surfaces agree without client-side re-derivation.
+  const needsOperatorMessageIds = useMemo(
+    () => new Set(
+      attentionNeedsActionItems
+        .filter(item => item.kind === 'message')
+        .map(item => item.ref.id),
+    ),
+    [attentionNeedsActionItems],
+  );
   const [messages, setMessages] = useState<ProjectMessage[]>([]);
   const messagesRef = useRef<ProjectMessage[]>([]);
   messagesRef.current = messages;
@@ -893,6 +904,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     showResolved,
     showOnlyNew,
     dividerTime,
+    needsOperatorIds: needsOperatorMessageIds,
   });
   // Legacy fallback when the canonical strategic attention read model is unavailable.
   const highSignalCount = useMemo(
@@ -1234,12 +1246,14 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       const data = await res.json();
       if (!isCurrentRequest()) return;
       const msgs: ProjectMessage[] = data.messages ?? [];
-      // Detect new high-signal messages for toast alerts
+      // Detect new needs-action messages for toast alerts. The canonical
+      // attention model (not local mute prefs) is the exclusive gate: if the
+      // server marks a message needs_operator it must trigger a toast regardless
+      // of any locally-muted event_type so all four notification surfaces agree.
       if (hasInitiallyLoadedRef.current) {
         const newNeedsOperator = msgs.filter(m =>
           m.status === 'open' &&
           isMessageNeedingOperatorAttention(m, strategicAttentionRef.current) &&
-          effectiveSignal(m, eventPrefsRef.current, tempMutesRef.current) !== 'mute' &&
           !seenMessageIdsRef.current.has(m.id)
         );
         if (newNeedsOperator.length > 0) {
@@ -1248,8 +1262,6 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
             : `${newNeedsOperator.length} new needs-action messages`;
           const toastSeverity = newNeedsOperator.some(m => getToastSeverity(m) === 'error') ? 'error' : 'info';
           addToastRef.current(summary, toastSeverity);
-          // Local settings may suppress or present canonical attention; they do
-          // not decide which server-routed messages are intrusive.
           if (notifyOnHighSignalMessageRef.current && 'Notification' in window && Notification.permission === 'granted') {
             for (const msg of newNeedsOperator) {
               new Notification(msg.message_type, { body: msg.content.slice(0, 100) });
