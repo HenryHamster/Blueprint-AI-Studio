@@ -400,6 +400,15 @@ def test_all_admin_routes_require_auth():
         "/api/admin/projects/{project_id}/tools/{tool_slug}/assets/{path:path}": (
             "JWT-based capability-token auth for opaque-origin iframe asset serving"
         ),
+        # GET /api/admin/projects/{project_id}/tools/{tool_slug}/t/{token}/assets/{path:path}
+        # is the path-embedded-token variant of the above. The token sits in the
+        # URL path so that relative subresource requests (e.g. <script src="./app.js">)
+        # inherit authentication automatically — a query-string token is dropped on
+        # relative resolution inside sandboxed (opaque-origin) iframes. Auth is
+        # performed identically via _verify_tool_asset_token (scope: "tool-asset").
+        "/api/admin/projects/{project_id}/tools/{tool_slug}/t/{token}/assets/{path:path}": (
+            "JWT-based path-embedded capability-token auth for opaque-origin iframe subresources"
+        ),
     }
 
     # get_metrics_reader is a narrowly scoped read-only dep that accepts agent
