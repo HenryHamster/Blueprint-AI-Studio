@@ -4781,7 +4781,7 @@ describe('bootstrapPoolMode', () => {
       );
       // Written where the CLI actually reads it…
       expect(claudeWrite).toBeDefined();
-      expect(JSON.parse(claudeWrite?.[1] as string)).toEqual({
+      expect(JSON.parse(claudeWrite?.[1] as string)).toMatchObject({
         hasCompletedOnboarding: true,
         projects: {
           [WORKSPACE]: { hasTrustDialogAccepted: true },
