@@ -35,7 +35,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Protocol, Sequence
+from typing import Any, Callable, Dict, Protocol, Sequence
 
 from google.cloud import storage as gcs_storage
 
@@ -384,6 +384,12 @@ _MAX_RESULT_METRICS_DECODED_BYTES = 8192
 # rather than allowed to balloon the durable result or wedge teardown.
 _MAX_COMMAND_LOG_BYTES = 32768
 _MAX_COMMAND_LOG_DECODED_BYTES = 65536
+
+# How often the reaper's progress heartbeat fires during a compute-image build,
+# so the lifecycle watchdog (REAPER_HANG_SECONDS=300) does not cancel the reaper
+# while a multi-minute baked-image build is in progress. 60s is well under the
+# 300s stall threshold, giving 4 missed beats before the watchdog acts.
+_HEARTBEAT_INTERVAL = 60
 
 class ComputeLaunchSpecError(ValueError):
     """A launch spec is malformed in a way no retry can fix.
@@ -4190,6 +4196,7 @@ async def refresh_project_compute_image(
     allow_build: bool = True,
     build_semaphore: "asyncio.Semaphore | None" = None,
     acquire_timeout: float = 1.0,
+    progress_cb: "Callable[[], None] | None" = None,
     _manifest_fn=None,
     _token_fn=None,
     _default_branch_fn=None,
@@ -4226,7 +4233,9 @@ async def refresh_project_compute_image(
     * **rebuild** — only when the tag is ABSENT, drive the existing pipeline
       (:func:`build_project_compute_image` -> :func:`record_project_compute_image_build`),
       honoring the process-wide build concurrency guard (*build_semaphore*) and a
-      caller-supplied build budget (*allow_build*).
+      caller-supplied build budget (*allow_build*). When *progress_cb* is provided,
+      the build runs as a background task with periodic heartbeats so the reaper's
+      lifecycle watchdog does not cancel the cycle during a multi-minute build.
 
     Returns a small structured result whose ``status`` is one of ``no_config`` /
     ``unchanged`` / ``rebuilt`` / ``deferred`` / ``error``. All hooks default to
@@ -4375,12 +4384,32 @@ async def refresh_project_compute_image(
                 }
 
         try:
-            result = await build_fn(
-                project,
-                registry_repo=registry_repo,
-                build_config=build_config,
-                ref=default_branch,
-            )
+            if progress_cb is not None:
+                # Run the build as a background task with periodic progress
+                # heartbeats so the reaper lifecycle watchdog
+                # (REAPER_HANG_SECONDS=300) does not cancel the cycle during
+                # a multi-minute baked-image build.
+                _build_task = asyncio.ensure_future(build_fn(
+                    project,
+                    registry_repo=registry_repo,
+                    build_config=build_config,
+                    ref=default_branch,
+                ))
+                while True:
+                    _done, _pending = await asyncio.wait(
+                        [_build_task], timeout=_HEARTBEAT_INTERVAL
+                    )
+                    if _done:
+                        result = _build_task.result()
+                        break
+                    progress_cb()
+            else:
+                result = await build_fn(
+                    project,
+                    registry_repo=registry_repo,
+                    build_config=build_config,
+                    ref=default_branch,
+                )
         finally:
             if acquired:
                 build_semaphore.release()

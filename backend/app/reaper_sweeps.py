@@ -2613,6 +2613,7 @@ async def sweep_refresh_project_compute_images(
     _build_semaphore=None,
     max_projects: int = _COMPUTE_IMAGE_REFRESH_MAX_PROJECTS,
     max_builds_per_cycle: int = _COMPUTE_IMAGE_REFRESH_MAX_BUILDS_PER_CYCLE,
+    progress_cb=None,
 ) -> dict[str, int]:
     """Rebuild project baked compute images whose dependency manifest changed.
 
@@ -2628,6 +2629,10 @@ async def sweep_refresh_project_compute_images(
     ``deferred`` to the next hourly pass), and the driver is handed the same
     process-wide build concurrency guard the admin endpoint uses so a build
     already in flight defers rather than stampeding.
+
+    When *progress_cb* is provided, each build uses heartbeat-loop progress
+    reporting so the reaper's lifecycle watchdog does not cancel the cycle during
+    a multi-minute baked-image build.
 
     Cadence-gated to hourly on an independent timer. Returns a summary dict of
     per-status counts (``rebuilt``/``unchanged``/``no_config``/``deferred``/
@@ -2707,6 +2712,7 @@ async def sweep_refresh_project_compute_images(
                 project,
                 allow_build=(builds_done < max_builds_per_cycle),
                 build_semaphore=build_semaphore,
+                progress_cb=progress_cb,
             )
         except Exception:  # noqa: BLE001 — driver is best-effort; isolate anyway
             logger.warning(

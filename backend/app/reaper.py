@@ -3233,9 +3233,13 @@ async def reaper_service():
                 # clone, no build) when the manifest is unchanged; hourly cadence-
                 # gated on an independent timer. Wrapped so it can never crash the
                 # cycle; the per-project driver is itself best-effort.
+                # Pass _mark_reaper_progress as progress_cb so each multi-minute
+                # build keeps the lifecycle watchdog alive via periodic heartbeats.
                 _mark_reaper_progress()
                 try:
-                    await sweep_refresh_project_compute_images(session, now)
+                    await sweep_refresh_project_compute_images(
+                        session, now, progress_cb=_mark_reaper_progress
+                    )
                 except Exception as e:
                     logger.error(
                         f"[REAPER] Compute-image auto-refresh sweep error: {e}",
