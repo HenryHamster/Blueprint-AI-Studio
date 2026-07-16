@@ -260,6 +260,35 @@ async def generate_download_signed_url(
         raise
 
 
+async def delete_storage_uri_best_effort(storage_uri: str) -> bool:
+    """Delete one validated in-bucket object without masking caller errors."""
+
+    try:
+        bucket_name, object_name = parse_artifact_uri(storage_uri)
+    except Exception:
+        return False
+
+    def _delete() -> None:
+        from google.api_core import exceptions as _gexc
+
+        blob = (
+            storage.Client(project=GCP_PROJECT_ID)
+            .bucket(bucket_name)
+            .blob(object_name)
+        )
+        try:
+            blob.delete()
+        except _gexc.NotFound:
+            pass
+
+    try:
+        await asyncio.to_thread(_delete)
+    except Exception:
+        logger.warning("Failed to delete storage object %s", object_name, exc_info=True)
+        return False
+    return True
+
+
 # Object-name root under the shared artifact bucket where each compute job's
 # durable outputs live. Each job uploads one durable bundle under
 # ``<root>/<job_id>/artifacts/``; the prefix is the storage layout, not an IAM

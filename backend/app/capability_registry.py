@@ -795,6 +795,74 @@ def capability_need_blocked_by_proof_gate(
     return proof_status != "proven"
 
 
+def task_backed_capability_need_blocked_by_proof_gate(
+    need: Mapping,
+    proof_records: object,
+    problem_model: object,
+    *,
+    mode: _GateMode = "off",
+) -> bool:
+    """Gate an exact task-backed capability provider on platform proof only."""
+    if (
+        mode != "enforce"
+        or not isinstance(need, Mapping)
+        or need.get("kind") != "capability"
+    ):
+        return False
+    name = normalize_capability_name(need.get("ref"))
+    if not name:
+        return False
+    names = _capability_alias_cluster(problem_model, name)
+    if names & platform_exempt_capability_names(proof_records):
+        return False
+    from app.time_utils import _utcnow
+
+    return _ledger_proof_status_for_names(proof_records, names, now=_utcnow()) != "proven"
+
+
+def _capability_alias_cluster(problem_model: object, name: str) -> set[str]:
+    """Return a capability and all canonical/absorbed aliases connected to it."""
+    cluster = {name}
+    entries: list[set[str]] = []
+    for raw_name, _status, absorbs in _iter_capability_entries(problem_model):
+        aliases = {
+            normalized
+            for normalized in (
+                normalize_capability_name(raw_name),
+                *_normalized_absorbed_names(absorbs),
+            )
+            if normalized
+        }
+        if aliases:
+            entries.append(aliases)
+    changed = True
+    while changed:
+        changed = False
+        for aliases in entries:
+            if cluster & aliases and not aliases <= cluster:
+                cluster.update(aliases)
+                changed = True
+    return cluster
+
+
+def _ledger_proof_status_for_names(
+    proof_records: object, names: Iterable[str], *, now: datetime | None = None
+) -> EvidenceStatus:
+    """Grade machine proofs across one canonical/absorbed namespace."""
+    synthetic = [
+        {
+            "kind": entry.get("proof_kind"),
+            "proven": True,
+            "recorded_at": entry.get("proved_at"),
+        }
+        for name in names
+        for entry in _ledger_machine_proof_entries(proof_records, name)
+    ]
+    if not synthetic:
+        return "unproven"
+    return classify_evidence_tiered(synthetic, now=now)
+
+
 def _alias_to_survivor_map(problem_model: object) -> dict[str, str]:
     """Build ``{absorbed_name: survivor_name}`` from the problem_model's capabilities.
 

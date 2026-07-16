@@ -122,7 +122,7 @@ def classify_operator_arming(
     and the operator supplied it.
     """
     if message_type is MessageType.NOTE:
-        if event_type == "question_answer":
+        if event_type in {"question_answer", "feedback_reply"}:
             return ARMING_STEERING
         return ARMING_PASSIVE_NOTE
     if event_type:
@@ -282,6 +282,12 @@ async def request_strategic_refresh(
         logger.exception(
             "[STRATEGIC] request_strategic_refresh failed for project %s", project_id
         )
+        # Database errors can leave the transaction unusable even though this
+        # helper intentionally reports a best-effort miss. Roll back before
+        # returning so callers can truthfully persist the accepted message as
+        # waiting (and re-apply any small staged state they own).
+        with contextlib.suppress(Exception):
+            await session.rollback()
         return False
 
 

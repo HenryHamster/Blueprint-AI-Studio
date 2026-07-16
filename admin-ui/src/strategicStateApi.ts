@@ -1,5 +1,6 @@
 import { apiFetch, type StrategicRefreshMarker } from './api';
 import type { ProjectMessagePreview } from './types/messages';
+import type { MessageAttachment } from './types/messages';
 import type { WorkbenchEventEnvelopeV1 } from './types/workbenchEvents';
 
 export interface StrategicStateCycle {
@@ -702,6 +703,7 @@ export interface StrategicWorkSession {
 export interface StrategicSessionConversation {
   limit: number;
   has_more?: boolean;
+  next_before_sequence?: number | null;
   order?: 'oldest_first' | 'newest_first' | string;
   items: StrategicStateMessage[];
 }
@@ -750,6 +752,10 @@ export interface StrategicSessionMessageCreate {
   context?: Record<string, unknown>;
   workbench_context?: Record<string, unknown>;
   idempotency_key?: string;
+  reply_to_message_id?: string | null;
+  source_refs?: Array<Record<string, unknown>>;
+  artifact_refs?: Array<Record<string, unknown>>;
+  attachments?: MessageAttachment[];
 }
 
 export interface StrategicSessionCheckInCreate {
@@ -791,6 +797,21 @@ export interface StrategicSessionMessageResponse {
   recent_outputs?: StrategicSessionOutput[];
   arming?: string | null;
   message?: StrategicStateMessage;
+  wakeup_state?: StrategicMessageWakeupState;
+}
+
+export type StrategicMessageWakeupState =
+  | 'queued'
+  | 'coalesced'
+  | 'paused'
+  | 'waiting_for_capacity';
+
+export interface StrategicConversationQuery {
+  afterSequence?: number | null;
+  beforeSequence?: number | null;
+  limit?: number;
+  includeMessageId?: string | null;
+  idempotencyKey?: string | null;
 }
 
 /**
@@ -1278,12 +1299,16 @@ export async function fetchStrategicSession(
 
 export async function fetchStrategicConversation(
   projectId: string,
-  includeMessageId?: string | null,
+  queryOptions: StrategicConversationQuery = {},
   signal?: AbortSignal,
   etag?: string | null,
-): Promise<{ conversation: StrategicSessionConversation; etag?: string } | StrategicConversationNotModified> {
+): Promise<{ conversation: StrategicSessionConversation; matched_message?: StrategicStateMessage | null; wakeup_state?: StrategicMessageWakeupState | null; etag?: string } | StrategicConversationNotModified> {
   const params = new URLSearchParams();
-  if (includeMessageId) params.set('include_message_id', includeMessageId);
+  if (queryOptions.afterSequence != null) params.set('after_sequence', String(queryOptions.afterSequence));
+  if (queryOptions.beforeSequence != null) params.set('before_sequence', String(queryOptions.beforeSequence));
+  if (queryOptions.limit != null) params.set('limit', String(queryOptions.limit));
+  if (queryOptions.includeMessageId) params.set('include_message_id', queryOptions.includeMessageId);
+  if (queryOptions.idempotencyKey) params.set('idempotency_key', queryOptions.idempotencyKey);
   const query = params.toString();
   const res = await apiFetch(
     `/api/admin/projects/${encodeURIComponent(projectId)}/strategic-conversation${query ? `?${query}` : ''}`,
@@ -1294,9 +1319,43 @@ export async function fetchStrategicConversation(
   );
   if (res.status === 304) return STRATEGIC_CONVERSATION_NOT_MODIFIED;
   if (!res.ok) throw new Error(`Failed to fetch Strategic conversation: ${res.status}`);
-  const body = await res.json() as { conversation: StrategicSessionConversation };
+  const body = await res.json() as (StrategicSessionConversation & {
+    matched_message?: StrategicStateMessage | null;
+    wakeup_state?: StrategicMessageWakeupState | null;
+  }) | {
+    conversation: StrategicSessionConversation;
+    matched_message?: StrategicStateMessage | null;
+    wakeup_state?: StrategicMessageWakeupState | null;
+  };
+  const conversation = 'conversation' in body ? body.conversation : body;
+  const matchedMessage = body.matched_message;
+  const wakeupState = body.wakeup_state;
   const responseEtag = res.headers.get('ETag');
-  return responseEtag ? { ...body, etag: responseEtag } : body;
+  return {
+    conversation,
+    ...(matchedMessage !== undefined ? { matched_message: matchedMessage } : {}),
+    ...(wakeupState !== undefined ? { wakeup_state: wakeupState } : {}),
+    ...(responseEtag ? { etag: responseEtag } : {}),
+  };
+}
+
+export interface StrategicMessageIdentityReceipt {
+  message: StrategicStateMessage;
+  wakeup_state: StrategicMessageWakeupState | null;
+}
+
+export async function findStrategicMessageByClientIdentity(
+  projectId: string,
+  idempotencyKey: string,
+  signal?: AbortSignal,
+): Promise<StrategicMessageIdentityReceipt | null> {
+  const result = await fetchStrategicConversation(projectId, { idempotencyKey, limit: 1 }, signal);
+  if (isStrategicConversationNotModified(result)) return null;
+  const message = result.matched_message ?? result.conversation.items.find(message => (
+    message.client_idempotency_key === idempotencyKey
+    || message.idempotency_key === idempotencyKey
+  )) ?? null;
+  return message ? { message, wakeup_state: result.wakeup_state ?? null } : null;
 }
 
 /** Empty transcript-poll response: callers retain their existing conversation. */
@@ -1318,8 +1377,25 @@ export async function createStrategicSessionMessage(
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   });
-  if (!res.ok) throw new Error(`Failed to create Strategic session message: ${res.status}`);
+  if (!res.ok) {
+    let detail = `Failed to create Strategic session message: ${res.status}`;
+    try {
+      const body = await res.json() as { detail?: unknown };
+      if (typeof body.detail === 'string' && body.detail.trim()) detail = body.detail.trim();
+    } catch { /* retain status fallback */ }
+    throw new StrategicSessionMessageCreateError(res.status, detail);
+  }
   return res.json() as Promise<StrategicSessionMessageResponse>;
+}
+
+export class StrategicSessionMessageCreateError extends Error {
+  readonly status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = 'StrategicSessionMessageCreateError';
+    this.status = status;
+  }
 }
 
 export async function checkInStrategicSession(
@@ -1422,19 +1498,22 @@ export interface MessageAttachmentUploadUrlResponse {
   download_url: string;
   storage_uri: string;
   attachment_id: string;
+  size_bytes: number;
+  expires_in_seconds?: number;
 }
 
 export async function getMessageAttachmentUploadUrl(
   projectId: string,
   filename: string,
-  contentType?: string,
+  contentType: string | undefined,
+  sizeBytes: number,
 ): Promise<MessageAttachmentUploadUrlResponse> {
   const res = await apiFetch(
     `/api/admin/projects/${encodeURIComponent(projectId)}/messages/attachment-upload-url`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ filename, content_type: contentType }),
+      body: JSON.stringify({ filename, content_type: contentType, size_bytes: sizeBytes }),
     },
   );
   if (!res.ok) {
@@ -1442,4 +1521,83 @@ export async function getMessageAttachmentUploadUrl(
     throw new Error((detail as { detail?: string }).detail || `Failed to get upload URL: ${res.status}`);
   }
   return res.json() as Promise<MessageAttachmentUploadUrlResponse>;
+}
+
+export async function deleteMessageAttachmentUpload(
+  projectId: string,
+  attachmentId: string,
+): Promise<void> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/messages/attachment-uploads/${encodeURIComponent(attachmentId)}`,
+    { method: 'DELETE' },
+  );
+  if (!res.ok && res.status !== 404) {
+    throw new Error(`Failed to delete pending attachment upload: ${res.status}`);
+  }
+}
+
+interface AttachmentDownloadUrlCacheEntry {
+  expiresAt: number;
+  promise: Promise<MessageAttachmentDownloadUrl>;
+}
+
+export interface MessageAttachmentDownloadUrl {
+  downloadUrl: string;
+  expiresAt: number;
+}
+
+const MAX_ATTACHMENT_DOWNLOAD_URLS = 128;
+const attachmentDownloadUrlCache = new Map<string, AttachmentDownloadUrlCacheEntry>();
+
+function trimAttachmentDownloadUrlCache(): void {
+  while (attachmentDownloadUrlCache.size > MAX_ATTACHMENT_DOWNLOAD_URLS) {
+    const oldestKey = attachmentDownloadUrlCache.keys().next().value as string | undefined;
+    if (!oldestKey) break;
+    attachmentDownloadUrlCache.delete(oldestKey);
+  }
+}
+
+export function invalidateMessageAttachmentDownloadUrl(
+  projectId: string,
+  messageId: string,
+  attachmentId: string,
+): void {
+  attachmentDownloadUrlCache.delete(`${projectId}:${messageId}:${attachmentId}`);
+}
+
+export function getMessageAttachmentDownloadUrl(
+  projectId: string,
+  messageId: string,
+  attachmentId: string,
+): Promise<MessageAttachmentDownloadUrl> {
+  const key = `${projectId}:${messageId}:${attachmentId}`;
+  const cached = attachmentDownloadUrlCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) {
+    attachmentDownloadUrlCache.delete(key);
+    attachmentDownloadUrlCache.set(key, cached);
+    return cached.promise;
+  }
+  if (cached) attachmentDownloadUrlCache.delete(key);
+  const entry: AttachmentDownloadUrlCacheEntry = {
+    expiresAt: Number.POSITIVE_INFINITY,
+    promise: Promise.resolve({ downloadUrl: '', expiresAt: 0 }),
+  };
+  const request = apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/strategic-conversation/${encodeURIComponent(messageId)}/attachments/${encodeURIComponent(attachmentId)}/download-url`,
+  ).then(async res => {
+    if (!res.ok) throw new Error(`Failed to get attachment download URL: ${res.status}`);
+    const body = await res.json() as { download_url: string; expires_in_seconds?: number };
+    const lifetimeSeconds = Math.max(1, (body.expires_in_seconds ?? 900) - 30);
+    entry.expiresAt = Date.now() + lifetimeSeconds * 1_000;
+    return { downloadUrl: body.download_url, expiresAt: entry.expiresAt };
+  }).catch(error => {
+    if (attachmentDownloadUrlCache.get(key) === entry) {
+      attachmentDownloadUrlCache.delete(key);
+    }
+    throw error;
+  });
+  entry.promise = request;
+  attachmentDownloadUrlCache.set(key, entry);
+  trimAttachmentDownloadUrlCache();
+  return request;
 }

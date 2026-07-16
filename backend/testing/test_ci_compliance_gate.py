@@ -613,3 +613,244 @@ def test_capped_backend_modules_within_cap_on_disk():
         + ". Run `python3 backend/testing/check_size_limits.py --fix` and commit "
         "the updated module_size_limits.json."
     )
+
+
+def _resolve_admin_ui_src_root() -> str | None:
+    """Resolve the admin-ui/src tree, mirroring resolve_section_root's candidates.
+
+    The dev checkout lives at <repo>/admin-ui/src (testing/../../admin-ui/src);
+    the backend Docker test harness mounts it read-only at /admin-ui/src (see
+    scripts/test-backend.sh). Returns the first that exists, else None so the
+    caller skips when the admin-ui tree is absent (e.g. CI's backend-only Docker
+    build context that mounts neither).
+    """
+    candidates = [
+        os.path.normpath(
+            os.path.join(os.path.dirname(__file__), "..", "..", "admin-ui", "src")
+        ),
+        os.path.join(os.sep, "admin-ui", "src"),
+    ]
+    for candidate in candidates:
+        if os.path.isdir(candidate):
+            return candidate
+    return None
+
+
+def test_cap_bump_resolves_models_py_breach():
+    """After bumping caps via check_size_limits --fix, backend/models.py must be
+    within its new cap on the real file tree.
+
+    This is a breach the 2026-07-16 ci-compliance remediation targets: automain
+    HEAD 516a94a2 reported backend/models.py at 5588 lines over its old cap of
+    5550. The fix bumps that cap to 6450 in module_size_limits.json; this
+    merge-test gate proves the bumped JSON is consistent with the actual file
+    size on disk, so the test fails if the cap is reverted (or the file grows
+    past the new cap) before the CI invariant suite runs.
+    """
+    json_path = os.path.join(os.path.dirname(__file__), "module_size_limits.json")
+    data = csl.load_limits(json_path)
+    backend_caps = data.get("backend", {})
+
+    target_rel = "models.py"
+    assert target_rel in backend_caps, (
+        f"{target_rel} must have a cap entry in module_size_limits.json"
+    )
+
+    # Resolve app/ as testing/'s sibling, matching the Docker harness layout.
+    backend_root = os.path.normpath(
+        os.path.join(os.path.dirname(__file__), "..", "app")
+    )
+    assert os.path.isdir(backend_root), "backend app/ must exist next to testing/"
+
+    target_path = os.path.join(backend_root, target_rel)
+    assert os.path.isfile(target_path), f"{target_path} must exist on disk"
+
+    actual_count = csl.count_lines(target_path)
+    cap = backend_caps[target_rel]
+    result = csl.classify_size_record(
+        target_rel, actual_count, cap, "backend", with_verdict=False
+    )
+
+    assert not result["breach"], (
+        f"{target_rel} has {actual_count} lines which exceeds its cap of {cap}. "
+        "Run `python3 backend/testing/check_size_limits.py --fix` and commit "
+        "the updated module_size_limits.json."
+    )
+
+
+def test_cap_bump_resolves_admin_project_strategic_session_breach():
+    """After bumping caps via check_size_limits --fix,
+    routers/admin_project_strategic_session.py must be within its new cap on the
+    real file tree.
+
+    This is a breach the 2026-07-16 ci-compliance remediation targets: automain
+    HEAD 516a94a2 reported routers/admin_project_strategic_session.py at 3500
+    lines over its old cap of 3150. The fix bumps that cap to 4050 in
+    module_size_limits.json; this merge-test gate proves the bumped JSON is
+    consistent with the actual file size on disk, so the test fails if the cap
+    is reverted (or the file grows past the new cap) before the CI invariant
+    suite runs.
+    """
+    json_path = os.path.join(os.path.dirname(__file__), "module_size_limits.json")
+    data = csl.load_limits(json_path)
+    backend_caps = data.get("backend", {})
+
+    target_rel = "routers/admin_project_strategic_session.py"
+    assert target_rel in backend_caps, (
+        f"{target_rel} must have a cap entry in module_size_limits.json"
+    )
+
+    backend_root = os.path.normpath(
+        os.path.join(os.path.dirname(__file__), "..", "app")
+    )
+    assert os.path.isdir(backend_root), "backend app/ must exist next to testing/"
+
+    target_path = os.path.join(backend_root, target_rel)
+    assert os.path.isfile(target_path), f"{target_path} must exist on disk"
+
+    actual_count = csl.count_lines(target_path)
+    cap = backend_caps[target_rel]
+    result = csl.classify_size_record(
+        target_rel, actual_count, cap, "backend", with_verdict=False
+    )
+
+    assert not result["breach"], (
+        f"{target_rel} has {actual_count} lines which exceeds its cap of {cap}. "
+        "Run `python3 backend/testing/check_size_limits.py --fix` and commit "
+        "the updated module_size_limits.json."
+    )
+
+
+def test_cap_bump_resolves_admin_notifications_breach():
+    """After bumping caps via check_size_limits --fix,
+    routers/admin_notifications.py must be within its new cap on the real file
+    tree.
+
+    This is a breach the 2026-07-16 ci-compliance remediation targets: automain
+    HEAD 516a94a2 reported routers/admin_notifications.py at 1866 lines over its
+    old cap of 1850. The fix bumps that cap to 2150 in module_size_limits.json;
+    this merge-test gate proves the bumped JSON is consistent with the actual
+    file size on disk, so the test fails if the cap is reverted (or the file
+    grows past the new cap) before the CI invariant suite runs.
+    """
+    json_path = os.path.join(os.path.dirname(__file__), "module_size_limits.json")
+    data = csl.load_limits(json_path)
+    backend_caps = data.get("backend", {})
+
+    target_rel = "routers/admin_notifications.py"
+    assert target_rel in backend_caps, (
+        f"{target_rel} must have a cap entry in module_size_limits.json"
+    )
+
+    backend_root = os.path.normpath(
+        os.path.join(os.path.dirname(__file__), "..", "app")
+    )
+    assert os.path.isdir(backend_root), "backend app/ must exist next to testing/"
+
+    target_path = os.path.join(backend_root, target_rel)
+    assert os.path.isfile(target_path), f"{target_path} must exist on disk"
+
+    actual_count = csl.count_lines(target_path)
+    cap = backend_caps[target_rel]
+    result = csl.classify_size_record(
+        target_rel, actual_count, cap, "backend", with_verdict=False
+    )
+
+    assert not result["breach"], (
+        f"{target_rel} has {actual_count} lines which exceeds its cap of {cap}. "
+        "Run `python3 backend/testing/check_size_limits.py --fix` and commit "
+        "the updated module_size_limits.json."
+    )
+
+
+def test_cap_bump_resolves_messages_panel_tsx_breach():
+    """After bumping caps via check_size_limits --fix,
+    frontend/components/MessagesPanel.tsx must be within its new cap on the real
+    file tree.
+
+    This is a breach the 2026-07-16 ci-compliance remediation targets: automain
+    HEAD 516a94a2 reported frontend/components/MessagesPanel.tsx at 2816 lines
+    over its old cap of 2800. The fix bumps that cap to 3250 in
+    module_size_limits.json; this merge-test gate proves the bumped JSON is
+    consistent with the actual file size on disk, so the test fails if the cap
+    is reverted (or the file grows past the new cap) before the CI invariant
+    suite runs.
+
+    Skips when admin-ui/src is absent (CI's backend-only Docker build context
+    that mounts neither /admin-ui/src nor the repo), mirroring the frontend-skip
+    in test_invariants.
+    """
+    admin_root = _resolve_admin_ui_src_root()
+    if admin_root is None:
+        pytest.skip("admin-ui/src not available in this test environment")
+
+    json_path = os.path.join(os.path.dirname(__file__), "module_size_limits.json")
+    data = csl.load_limits(json_path)
+    frontend_caps = data.get("frontend", {})
+
+    target_rel = "components/MessagesPanel.tsx"
+    assert target_rel in frontend_caps, (
+        f"{target_rel} must have a cap entry in the frontend section of "
+        "module_size_limits.json"
+    )
+
+    target_path = os.path.join(admin_root, target_rel)
+    assert os.path.isfile(target_path), f"{target_path} must exist on disk"
+
+    actual_count = csl.count_lines(target_path)
+    cap = frontend_caps[target_rel]
+    result = csl.classify_size_record(
+        target_rel, actual_count, cap, "frontend", with_verdict=False
+    )
+
+    assert not result["breach"], (
+        f"{target_rel} has {actual_count} lines which exceeds its cap of {cap}. "
+        "Run `python3 backend/testing/check_size_limits.py --fix` and commit "
+        "the updated module_size_limits.json."
+    )
+
+
+def test_cap_bump_resolves_strategic_state_api_breach():
+    """After bumping caps via check_size_limits --fix,
+    frontend/strategicStateApi.ts must be within its new cap on the real file
+    tree.
+
+    This is a breach the 2026-07-16 ci-compliance remediation targets: automain
+    HEAD 516a94a2 reported frontend/strategicStateApi.ts at 1603 lines with no
+    prior cap. The fix adds a cap of 1850 in module_size_limits.json; this
+    merge-test gate proves the new cap is consistent with the actual file size
+    on disk, so the test fails if the cap is reverted (or the file grows past
+    the new cap) before the CI invariant suite runs.
+
+    Skips when admin-ui/src is absent (CI's backend-only Docker build context
+    that mounts neither /admin-ui/src nor the repo), mirroring the frontend-skip
+    in test_invariants.
+    """
+    admin_root = _resolve_admin_ui_src_root()
+    if admin_root is None:
+        pytest.skip("admin-ui/src not available in this test environment")
+
+    json_path = os.path.join(os.path.dirname(__file__), "module_size_limits.json")
+    data = csl.load_limits(json_path)
+    frontend_caps = data.get("frontend", {})
+
+    target_rel = "strategicStateApi.ts"
+    assert target_rel in frontend_caps, (
+        f"{target_rel} must have a cap entry in the frontend section of "
+        "module_size_limits.json"
+    )
+
+    target_path = os.path.join(admin_root, target_rel)
+    assert os.path.isfile(target_path), f"{target_path} must exist on disk"
+
+    actual_count = csl.count_lines(target_path)
+    cap = frontend_caps[target_rel]
+    result = csl.classify_size_record(
+        target_rel, actual_count, cap, "frontend", with_verdict=False
+    )
+
+    assert not result["breach"], (
+        f"{target_rel} has {actual_count} lines which exceeds its cap of {cap}. "
+        "Run `python3 backend/testing/check_size_limits.py --fix` and commit "
+        "the updated module_size_limits.json."
+    )

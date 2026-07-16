@@ -6652,7 +6652,7 @@ def _patch_promote_github_defaults(mocker, *, already_on_main: bool = False):
 
 
 @pytest.fixture(autouse=True)
-def _qualifier_ci_resolves_green(mocker):
+def _qualifier_ci_resolves_green(mocker, monkeypatch):
     """Default the qualifier's CI resolution to a real completed green build.
 
     Both ``run_qualification`` and ``_finalize_qualification`` resolve CI for
@@ -6669,6 +6669,10 @@ def _qualifier_ci_resolves_green(mocker):
     the test body; the later patch wins.  Pure-function tests (compute_composite
     etc.) never reach these helpers, so the patches are harmless there.
     """
+    monkeypatch.setenv(
+        "MIGRATION_APPLY_SCRATCH_DATABASE_URL",
+        "postgresql+asyncpg://scratch-user@localhost/scratch-control",
+    )
     mocker.patch(
         "app.github.get_repo_installation_token",
         new=AsyncMock(return_value="gh-token"),
@@ -15131,6 +15135,47 @@ async def test_finalize_holds_when_migration_apply_gate_defers(db_session, mocke
     assert version.last_qualification["status"] == "infra_failure"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scratch_value", "expected_code"),
+    [
+        (None, "scratch_database_url_missing"),
+        ("malformed://secret-value", "scratch_database_url_invalid"),
+    ],
+)
+async def test_migration_apply_preflight_holds_without_prod_io(
+    db_session, mocker, monkeypatch, scratch_value, expected_code
+):
+    _project, version = await _make_project_and_version(
+        db_session, phase="stabilize"
+    )
+    candidate_sha = "abc1234" * 5 + "abcd1234"
+    if scratch_value is None:
+        monkeypatch.delenv("MIGRATION_APPLY_SCRATCH_DATABASE_URL", raising=False)
+    else:
+        monkeypatch.setenv("MIGRATION_APPLY_SCRATCH_DATABASE_URL", scratch_value)
+
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        return_value=("token", "acme", "widget"),
+    )
+    resolve_engine = mocker.patch("app.release_qualifier.resolve_async_engine")
+    apply_gate = mocker.patch(
+        "app.release_qualifier.run_migration_apply_gate", new=AsyncMock()
+    )
+
+    verdict, detail = await rq._resolve_migration_apply_at_finalize(
+        db_session, version, candidate_sha
+    )
+
+    assert verdict == "defer"
+    assert expected_code in (detail or "")
+    assert "MIGRATION_APPLY_SCRATCH_DATABASE_URL" in (detail or "")
+    assert "secret-value" not in (detail or "")
+    resolve_engine.assert_not_called()
+    apply_gate.assert_not_awaited()
+
+
 # ===========================================================================
 # Retry-on-defer: migration identity and apply gates retry once with a fresh
 # GitHub token before propagating the defer (covers token-expiry mid-run).
@@ -15316,6 +15361,7 @@ async def test_apply_gate_defer_with_duplicate_revision_blocks_instead_of_infra_
         verdict, detail = await run_migration_apply_gate(
             prod_engine=engine,
             candidate_sources=dup_sources,
+            scratch_db_url="postgresql+asyncpg://scratch:p@localhost/control",
         )
     finally:
         await engine.dispose()
@@ -15363,6 +15409,7 @@ async def test_apply_gate_defer_with_broken_chain_blocks_instead_of_infra_retry(
         verdict, detail = await run_migration_apply_gate(
             prod_engine=engine,
             candidate_sources=broken_sources,
+            scratch_db_url="postgresql+asyncpg://scratch:p@localhost/control",
         )
     finally:
         await engine.dispose()
@@ -15394,6 +15441,7 @@ async def test_apply_gate_defer_with_broken_chain_blocks_instead_of_infra_retry(
         verdict2, detail2 = await run_migration_apply_gate(
             prod_engine=engine2,
             candidate_sources=cyclic_sources,
+            scratch_db_url="postgresql+asyncpg://scratch:p@localhost/control",
         )
     finally:
         await engine2.dispose()

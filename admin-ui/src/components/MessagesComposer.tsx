@@ -22,6 +22,12 @@ export interface MessagesComposerProps {
   newType: string;
   newContent: string;
   submitting: boolean;
+  sendLocked?: boolean;
+  attachmentLocked?: boolean;
+  sendState?: 'sending' | 'accepted' | 'waiting' | 'needs_retry' | null;
+  wakeupState?: 'queued' | 'coalesced' | 'paused' | 'waiting_for_capacity' | null;
+  /** Freeze the pending payload while its durable outcome is unresolved. */
+  editingLocked?: boolean;
   replyTo: { id: string; content: string; from: string; message_type: string; status: string } | null;
   /** Outcome the server reported for the last send, or null before any send. */
   lastArming?: ArmingOutcome | null;
@@ -32,6 +38,7 @@ export interface MessagesComposerProps {
   capabilityHint?: string | null;
   disabledReason?: string | null;
   pendingAttachments?: PendingAttachment[];
+  retainedAttachmentCount?: number;
   uploading?: boolean;
   onPickStarterPrompt?: (value: string) => void;
   onOpenStrategicContext?: () => void;
@@ -39,8 +46,9 @@ export interface MessagesComposerProps {
   onChangeType: (value: string) => void;
   onChangeContent: (value: string) => void;
   onCancelReply: () => void;
+  onAbandonPending?: () => void;
   onSubmit: () => void;
-  onAddAttachment?: (file: File) => void;
+  onAddAttachment?: (file: File) => void | Promise<void>;
   onRemoveAttachment?: (id: string) => void;
   /**
    * Swap the File backing a pending attachment — used by the pre-send preview
@@ -64,6 +72,11 @@ export const MessagesComposer = memo(function MessagesComposer({
   newType,
   newContent,
   submitting,
+  sendLocked = false,
+  attachmentLocked = false,
+  sendState,
+  wakeupState,
+  editingLocked,
   replyTo,
   lastArming,
   strategistBusy,
@@ -72,12 +85,14 @@ export const MessagesComposer = memo(function MessagesComposer({
   capabilityHint,
   disabledReason,
   pendingAttachments,
+  retainedAttachmentCount = 0,
   uploading,
   onOpenStrategicContext,
   onOpenCommandPalette,
   onChangeType,
   onChangeContent,
   onCancelReply,
+  onAbandonPending,
   onSubmit,
   onPickStarterPrompt,
   onAddAttachment,
@@ -111,8 +126,17 @@ export const MessagesComposer = memo(function MessagesComposer({
   const composerDisabled = Boolean(disabledReason);
   const hintArming = minimal && strategistBusy && lastArming !== 'not_armed' ? null : lastArming;
   const hintText = composerHintCopy(newType, hintArming, strategistBusy);
-  const showHint = Boolean(disabledReason) || !minimal || Boolean(strategistBusy) || lastArming === 'not_armed';
-  const hasAttachments = pendingAttachments != null && pendingAttachments.length > 0;
+  const showHint = Boolean(disabledReason) || !minimal || Boolean(strategistBusy) || lastArming === 'not_armed' || sendState != null;
+  const sendStateHint = sendState === 'sending'
+    ? 'Sending…'
+    : sendState === 'needs_retry'
+      ? 'Send not confirmed. Retry will first check whether it was accepted.'
+      : sendState === 'waiting'
+        ? (wakeupState === 'paused' ? 'Message accepted. Resident is paused.' : 'Message accepted. Resident is waiting for capacity.')
+        : sendState === 'accepted'
+          ? 'Message accepted.'
+          : null;
+  const hasAttachments = (pendingAttachments?.length ?? 0) > 0 || retainedAttachmentCount > 0;
 
   // The pending attachment whose full-size preview is open (if any). If it was
   // removed while open, this resolves to undefined and the modal unmounts.
@@ -133,10 +157,10 @@ export const MessagesComposer = memo(function MessagesComposer({
     : null;
 
   // ── File handlers ──────────────────────────────────────────────────────────
-  function handleFileChange(e: React.ChangeEvent<HTMLInputElement>) {
+  async function handleFileChange(e: React.ChangeEvent<HTMLInputElement>) {
     const files = e.target.files;
-    if (!files || !onAddAttachment) return;
-    for (let i = 0; i < files.length; i++) onAddAttachment(files[i]);
+    if (!files || !onAddAttachment || attachmentLocked) return;
+    for (let i = 0; i < files.length; i++) await onAddAttachment(files[i]);
     e.target.value = '';
   }
 
@@ -150,22 +174,21 @@ export const MessagesComposer = memo(function MessagesComposer({
     e.target.value = '';
   }
 
-  function handlePaste(e: React.ClipboardEvent<HTMLTextAreaElement>) {
-    if (!onAddAttachment) return;
+  async function handlePaste(e: React.ClipboardEvent<HTMLTextAreaElement>) {
+    if (!onAddAttachment || attachmentLocked) return;
     const items = e.clipboardData?.items;
     if (!items) return;
-    let addedFile = false;
+    const files: File[] = [];
     for (let i = 0; i < items.length; i++) {
       const item = items[i];
       if (item.kind === 'file') {
         const file = item.getAsFile();
-        if (file) {
-          onAddAttachment(file);
-          addedFile = true;
-        }
+        if (file) files.push(file);
       }
     }
-    if (addedFile) e.preventDefault();
+    if (files.length === 0) return;
+    e.preventDefault();
+    for (const file of files) await onAddAttachment(file);
   }
 
   function handleDragOver(e: React.DragEvent) {
@@ -179,14 +202,14 @@ export const MessagesComposer = memo(function MessagesComposer({
     if (e.currentTarget.contains(e.relatedTarget as Node)) return;
     setDragOver(false);
   }
-  function handleDrop(e: React.DragEvent) {
+  async function handleDrop(e: React.DragEvent) {
     e.preventDefault();
     e.stopPropagation();
     setDragOver(false);
-    if (!onAddAttachment) return;
+    if (!onAddAttachment || attachmentLocked) return;
     const files = e.dataTransfer?.files;
     if (!files) return;
-    for (let i = 0; i < files.length; i++) onAddAttachment(files[i]);
+    for (let i = 0; i < files.length; i++) await onAddAttachment(files[i]);
   }
 
   const attHasPreview = (att: PendingAttachment): string | null =>
@@ -201,7 +224,7 @@ export const MessagesComposer = memo(function MessagesComposer({
       {minimal && strategicContext && (
         <StrategicContextDescriptor model={strategicContext} onOpen={onOpenStrategicContext} />
       )}
-      {minimal && starterPrompts && starterPrompts.length > 0 && !newContent && (
+      {minimal && starterPrompts && starterPrompts.length > 0 && !newContent && !editingLocked && (
         <div className={`${minimalColumnClass} mb-1.5 flex flex-wrap gap-1.5 px-1`}>
           {starterPrompts.map(prompt => (
             <button
@@ -227,7 +250,13 @@ export const MessagesComposer = memo(function MessagesComposer({
           <span className="text-xs text-neutral-400 truncate flex-1">
             Replying to <span className="text-neutral-300">{replyTo.from}</span>: {replyTo.content.slice(0, 80)}{replyTo.content.length > 80 ? '...' : ''}
           </span>
-          <button onClick={onCancelReply} className="text-neutral-500 hover:text-neutral-300 p-0.5 shrink-0 min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center">
+          <button
+            type="button"
+            onClick={onCancelReply}
+            disabled={editingLocked}
+            aria-label="Cancel reply"
+            className="text-neutral-500 hover:text-neutral-300 p-0.5 shrink-0 min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center disabled:opacity-40"
+          >
             <X className="w-3 h-3" />
           </button>
         </div>
@@ -256,7 +285,7 @@ export const MessagesComposer = memo(function MessagesComposer({
           open
           attachment={previewMessageAttachment as MessageAttachment}
           onClose={() => setPreviewId(null)}
-          edit={onReplaceAttachmentFile ? {
+          edit={onReplaceAttachmentFile && !attachmentLocked ? {
             sourceFile: previewAttachment.file,
             onApply: file => onReplaceAttachmentFile(previewAttachment.id, file),
             onRemove: () => { onRemoveAttachment?.(previewAttachment.id); setPreviewId(null); },
@@ -301,6 +330,7 @@ export const MessagesComposer = memo(function MessagesComposer({
                 <button
                   type="button"
                   onClick={() => onRemoveAttachment?.(att.id)}
+                  disabled={editingLocked || attachmentLocked}
                   className="absolute right-0 top-1/2 flex min-h-[44px] min-w-[44px] -translate-y-1/2 items-center justify-center rounded text-neutral-500 opacity-0 transition-opacity hover:text-neutral-200 focus-visible:opacity-100 group-hover:opacity-100"
                   aria-label={`Remove ${att.name}`}
                 >
@@ -341,7 +371,7 @@ export const MessagesComposer = memo(function MessagesComposer({
             <button
               type="button"
               onClick={() => fileInputRef.current?.click()}
-              disabled={composerDisabled}
+              disabled={composerDisabled || editingLocked || attachmentLocked}
               title="Attach file"
               aria-label="Attach file"
               className="flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded-md border border-neutral-800/80 bg-neutral-950/35 px-2 text-neutral-500 transition-colors hover:border-neutral-700 hover:bg-neutral-900/80 hover:text-neutral-300 disabled:opacity-40"
@@ -354,7 +384,7 @@ export const MessagesComposer = memo(function MessagesComposer({
           <button
             type="button"
             onClick={() => fileInputRef.current?.click()}
-            disabled={composerDisabled}
+            disabled={composerDisabled || editingLocked || attachmentLocked}
             title="Attach file"
             aria-label="Attach file"
             className="flex shrink-0 items-center justify-center rounded-xl bg-neutral-900/50 border border-neutral-800/50 p-2.5 text-neutral-500 transition-colors hover:bg-neutral-800 hover:text-neutral-300 disabled:opacity-40 min-h-[44px] min-w-[44px]"
@@ -369,11 +399,14 @@ export const MessagesComposer = memo(function MessagesComposer({
             onChange={e => { onChangeContent(e.target.value); handleTextareaInput(); }}
             onPaste={handlePaste}
             onKeyDown={e => {
-              if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (!composerDisabled && !overLimit) onSubmit(); }
+              if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (!composerDisabled && !sendLocked && !overLimit) onSubmit(); }
             }}
             placeholder={disabledReason ?? (minimal ? 'Message Strategic' : 'Type a message...')}
             rows={1}
             disabled={composerDisabled}
+            readOnly={editingLocked}
+            aria-readonly={editingLocked || undefined}
+            aria-describedby={sendState ? 'message-send-status' : undefined}
             className={minimal
               ? 'min-h-[44px] w-full resize-none rounded border-0 bg-transparent px-3 py-2 text-sm leading-relaxed text-neutral-100 outline-none placeholder:text-neutral-600 disabled:cursor-not-allowed disabled:text-neutral-500 md:min-h-8 md:py-1.5'
               : 'w-full bg-neutral-900/50 border border-neutral-800/50 text-neutral-100 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 placeholder-neutral-600 resize-none min-h-[44px] leading-relaxed disabled:cursor-not-allowed disabled:text-neutral-500'
@@ -383,9 +416,10 @@ export const MessagesComposer = memo(function MessagesComposer({
         <button
           type="button"
           onClick={onSubmit}
-          disabled={composerDisabled || submitting || uploading || (!newContent.trim() && !hasAttachments) || overLimit}
-          aria-label="Send message"
-          title="Send message"
+          disabled={composerDisabled || submitting || sendLocked || uploading || (!newContent.trim() && !hasAttachments) || overLimit}
+          aria-label={sendState === 'needs_retry' ? 'Retry message' : 'Send message'}
+          title={sendState === 'needs_retry' ? 'Retry message' : 'Send message'}
+          data-send-state={sendState ?? undefined}
           className={minimal
             ? 'flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded-md bg-emerald-500 text-neutral-950 transition-colors hover:bg-emerald-400 disabled:bg-neutral-800 disabled:text-neutral-500 disabled:opacity-100'
             : 'bg-blue-600 hover:bg-blue-500 text-white p-2.5 rounded-xl text-xs font-medium transition-colors disabled:opacity-40 shrink-0 min-h-[44px] min-w-[44px] flex items-center justify-center'
@@ -399,9 +433,24 @@ export const MessagesComposer = memo(function MessagesComposer({
       {(showHint || nearLimit) && (
         <div className={minimal ? `${minimalColumnClass} mt-1.5 px-1` : ''}>
           {showHint && (
-            <p className={`${minimal ? 'text-ui-md text-neutral-600' : 'text-ui-md text-neutral-500'} leading-snug ${minimal ? '' : 'mt-1.5 px-0.5'}`}>
-              {disabledReason ?? hintText}
+            <p
+              id={sendState ? 'message-send-status' : undefined}
+              role={sendState ? 'status' : undefined}
+              aria-live={sendState ? 'polite' : undefined}
+              className={`${minimal ? 'text-ui-md text-neutral-600' : 'text-ui-md text-neutral-500'} leading-snug ${minimal ? '' : 'mt-1.5 px-0.5'}`}
+            >
+              {disabledReason ?? sendStateHint ?? hintText}
             </p>
+          )}
+          {sendState === 'needs_retry' && onAbandonPending && (
+            <button
+              type="button"
+              onClick={onAbandonPending}
+              disabled={submitting || uploading}
+              className="mt-1 min-h-11 rounded px-2 text-ui-md text-neutral-500 underline decoration-neutral-700 underline-offset-2 hover:text-neutral-300 disabled:opacity-40"
+            >
+              Abandon pending message
+            </button>
           )}
           {nearLimit && (
             <p className={`text-right text-xs leading-snug ${minimal ? '' : 'px-0.5'} ${showHint ? 'mt-0.5' : (minimal ? '' : 'mt-1.5')} ${overLimit ? 'text-red-400' : 'text-amber-500'}`}>

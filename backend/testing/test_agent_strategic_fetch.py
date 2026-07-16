@@ -3788,10 +3788,10 @@ async def test_strategic_resolve_question_posts_answer_note(
 
 
 @pytest.mark.asyncio
-async def test_strategic_resolve_question_reply_commit_failure_does_not_broadcast_reply(
+async def test_strategic_resolve_question_commit_failure_is_atomic(
     client: AsyncClient, db_session, mocker
 ):
-    """A failed optional reply write must not emit a phantom reply-created event."""
+    """A failed commit persists neither the resolution nor its canonical reply."""
     from unittest.mock import AsyncMock
 
     project, task = await _make_project_task(db_session)
@@ -3812,15 +3812,8 @@ async def test_strategic_resolve_question_reply_commit_failure_does_not_broadcas
     )
     from sqlalchemy.ext.asyncio import AsyncSession as _AsyncSession
 
-    real_commit = _AsyncSession.commit
-    commit_count = 0
-
     async def _commit_reply_failure(session, *args, **kwargs):
-        nonlocal commit_count
-        commit_count += 1
-        if commit_count == 2:
-            raise RuntimeError("reply commit failed")
-        return await real_commit(session, *args, **kwargs)
+        raise RuntimeError("atomic resolve commit failed")
 
     mocker.patch.object(
         _AsyncSession,
@@ -3829,36 +3822,24 @@ async def test_strategic_resolve_question_reply_commit_failure_does_not_broadcas
         side_effect=_commit_reply_failure,
     )
 
-    res = await client.post(
-        "/api/agent/strategic",
-        headers={"x-agent-token": token},
-        json={
-            "task_id": str(task.id),
-            "op": "resolve_message",
-            "data": {
-                "message_id": str(msg.id),
-                "resolution": "Resolved, but reply persistence failed.",
+    with pytest.raises(RuntimeError, match="atomic resolve commit failed"):
+        await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(task.id),
+                "op": "resolve_message",
+                "data": {
+                    "message_id": str(msg.id),
+                    "resolution": "Resolved, but reply persistence failed.",
+                },
             },
-        },
-    )
+        )
 
-    assert res.status_code == 200, res.text
-    assert res.json()["status"] == "ok"
+    await db_session.rollback()
     await db_session.refresh(msg)
-    assert msg.status == "resolved"
-    assert broadcast.await_count == 1
-    project_id, event, payload = broadcast.await_args.args
-    assert project_id == str(project.id)
-    assert event == "message_updated"
-    assert payload["message_id"] == str(msg.id)
-    assert payload["message"]["status"] == "resolved"
-    _assert_project_message_event_payload(
-        payload,
-        project=project,
-        msg=msg,
-        action="resolved",
-        status="resolved",
-    )
+    assert msg.status == "open"
+    assert broadcast.await_count == 0
     notes = (
         await db_session.execute(
             select(ProjectMessage).where(
@@ -3868,6 +3849,58 @@ async def test_strategic_resolve_question_reply_commit_failure_does_not_broadcas
         )
     ).scalars().all()
     assert notes == []
+
+
+@pytest.mark.asyncio
+async def test_strategic_resolve_question_retry_reconciles_missing_reply(
+    client: AsyncClient, db_session
+):
+    project, task = await _make_project_task(db_session)
+    msg = await _add_message(
+        db_session,
+        project,
+        message_type=MessageType.QUESTION,
+        from_type="user",
+        content="Was this already answered?",
+        status="resolved",
+        resolution="The durable answer.",
+    )
+    token = create_agent_token(
+        str(task.id), task.vm_instance_id, task_type="strategic_review"
+    )
+    request = {
+        "task_id": str(task.id),
+        "op": "resolve_message",
+        "data": {
+            "message_id": str(msg.id),
+            "resolution": "The durable answer.",
+        },
+    }
+
+    first = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json=request,
+    )
+    second = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json=request,
+    )
+
+    assert first.status_code == 200, first.text
+    assert first.json()["status"] == "already_resolved"
+    assert second.status_code == 200, second.text
+    replies = (
+        await db_session.execute(
+            select(ProjectMessage).where(
+                ProjectMessage.project_id == project.id,
+                ProjectMessage.reply_to_message_id == msg.id,
+            )
+        )
+    ).scalars().all()
+    assert len(replies) == 1
+    assert replies[0].sequence is not None
 
 
 @pytest.mark.asyncio
@@ -3907,11 +3940,11 @@ async def test_strategic_resolve_feedback_posts_acknowledgment_note(
 
     notes = (
         await db_session.execute(
-            select(ProjectMessage).where(
-                ProjectMessage.project_id == project.id,
-                ProjectMessage.message_type == MessageType.NOTE,
-                ProjectMessage.from_type == "system",
-            )
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project.id,
+                    ProjectMessage.message_type == MessageType.NOTE,
+                    ProjectMessage.from_type == "strategic",
+                )
         )
     ).scalars().all()
     matching = [

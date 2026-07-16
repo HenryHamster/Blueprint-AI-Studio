@@ -81,6 +81,7 @@ export function useTasksState(deps: UseTasksStateDeps) {
   const [scopedQueuedCount, setScopedQueuedCount] = useState<number | null>(null);
   const [initialLoading, setInitialLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  const [fetchEpoch, setFetchEpoch] = useState(0);
   const [page, setPage] = useState(1);
   const [rawLimit, setLimit] = usePersistedState<number>('pageSize', 50);
   // Backend supports up to 500 rows, but the UI caps at 200 — stale
@@ -220,6 +221,7 @@ export function useTasksState(deps: UseTasksStateDeps) {
     } finally {
       setInitialLoading(false);
       setRefreshing(false);
+      setFetchEpoch(epoch => epoch + 1);
     }
   };
   fetchTasksRef.current = fetchTasks;
@@ -571,7 +573,7 @@ export function useTasksState(deps: UseTasksStateDeps) {
     tasks, setTasks, totalTasks,
     globalActiveCount, globalEvaluatingCount, globalQueuedCount,
     scopedActiveCount, scopedEvaluatingCount, scopedQueuedCount,
-    initialLoading, refreshing,
+    initialLoading, refreshing, fetchEpoch,
     page, setPage, limit, setLimit, refreshInterval, setRefreshInterval,
     actionLoadingMap,
     lastRefresh, apiHealthy, lastFetchTime,

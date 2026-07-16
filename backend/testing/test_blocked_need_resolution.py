@@ -3820,11 +3820,13 @@ async def test_capability_proof_trial_green_wakes_blocked_dependents(_spawn_db, 
 
     Phase 1: a task is BLOCKED on an unproven capability (enforce mode).
     Phase 2: ``_handle_capability_proof_trial_completion`` runs with a GREEN result,
-    commits the proof, and immediately calls ``event_driven_unblock_on_proof``.
+    commits the proof, and immediately calls
+    ``event_driven_unblock_on_capability_proof``.
     Phase 3: the dependent's status transitions to QUEUED without any periodic sweep.
 
     This pins the event-driven unblock trigger in ``task_completion.py`` against the
-    full pipeline: proof commit → ``event_driven_unblock_on_proof`` → QUEUED.
+    full pipeline: proof commit → ``event_driven_unblock_on_capability_proof`` →
+    QUEUED.
     """
     import json as _json
     from datetime import timedelta
@@ -3922,7 +3924,7 @@ async def test_capability_proof_trial_green_wakes_blocked_dependents(_spawn_db, 
         await _spawn_db.refresh(blocked)
         assert blocked.status == TaskStatus.QUEUED, (
             "GREEN capability_proof_trial must immediately wake BLOCKED dependents "
-            f"via event_driven_unblock_on_proof — got {blocked.status}"
+            f"via event_driven_unblock_on_capability_proof — got {blocked.status}"
         )
 
         # Confirm the proof was actually recorded (not just a status flip).

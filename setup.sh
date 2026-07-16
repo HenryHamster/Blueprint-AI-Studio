@@ -407,6 +407,51 @@ prompt_secret_or_skip() {
   # Wave F4 M2: per-secret IAM binding removed (project-wide grant covers).
 }
 
+is_valid_fernet_key() {
+  python3 -c 'import base64, sys
+raw = sys.stdin.buffer.read().strip()
+try:
+    decoded = base64.b64decode(raw, altchars=b"-_", validate=True)
+except Exception:
+    raise SystemExit(1)
+raise SystemExit(0 if len(decoded) == 32 else 1)' >/dev/null 2>&1
+}
+
+ensure_fernet_encryption_key() {
+  local key=""
+  local exists=false
+  if gcloud secrets describe GITHUB_PAT_ENCRYPTION_KEY --project="$PROJECT_ID" &>/dev/null; then
+    exists=true
+    key=$(gcloud secrets versions access latest --secret=GITHUB_PAT_ENCRYPTION_KEY --project="$PROJECT_ID" 2>/dev/null || true)
+    if printf '%s' "$key" | is_valid_fernet_key; then
+      echo "  GITHUB_PAT_ENCRYPTION_KEY already contains a valid Fernet key, preserving it"
+      unset key
+      return 0
+    fi
+    warn "Existing GITHUB_PAT_ENCRYPTION_KEY is missing or invalid; migration 0609 will refuse to stamp."
+  fi
+
+  echo
+  echo -e "  ${DIM}Stable Fernet key used by both the service and blueprint-migrate job.${NC}"
+  read -r -s -p "  GITHUB_PAT_ENCRYPTION_KEY (Enter to generate for a new install): " key
+  echo
+  if [[ -z "$key" && "$exists" == "false" ]]; then
+    key=$(python3 -c 'import base64, os; print(base64.urlsafe_b64encode(os.urandom(32)).decode())')
+  elif [[ -z "$key" ]]; then
+    fail "A valid existing live Fernet key is required; refusing to replace it implicitly"
+  fi
+  if ! printf '%s' "$key" | is_valid_fernet_key; then
+    fail "GITHUB_PAT_ENCRYPTION_KEY must be a Fernet key (32 url-safe base64 bytes)"
+  fi
+  if [[ "$exists" == "true" ]]; then
+    printf '%s' "$key" | gcloud secrets versions add GITHUB_PAT_ENCRYPTION_KEY --data-file=- --project="$PROJECT_ID" --quiet
+  else
+    printf '%s' "$key" | gcloud secrets create GITHUB_PAT_ENCRYPTION_KEY --data-file=- --project="$PROJECT_ID" --quiet
+  fi
+  unset key
+  echo "  GITHUB_PAT_ENCRYPTION_KEY is valid and ready for serving plus migrations"
+}
+
 echo
 echo -e "${DIM}── GitHub secrets (optional now; required before GitHub features work) ──${NC}"
 echo -e "${DIM}Press Enter at any prompt to skip; Phase 2 (./setup.sh --phase2) sets them all.${NC}"
@@ -415,11 +460,8 @@ prompt_secret_or_skip "GITHUB_CLIENT_ID"      "GitHub OAuth client ID (from App 
 prompt_secret_or_skip "GITHUB_CLIENT_SECRET"  "GitHub OAuth client secret (Generate a client secret)" "true"
 prompt_secret_or_skip "GITHUB_PRIVATE_KEY"    "GitHub App private key (paste full PEM contents)" "true"
 prompt_secret_or_skip "GITHUB_WEBHOOK_SECRET" "GitHub webhook secret (the value you set on the App)" "true"
-# These boot-required secrets use the same placeholder path so Cloud Run's
-# --set-secrets validation fails at deploy time only for a missing secret name.
-# Replace placeholders with the real values before relying on the service.
-prompt_secret_or_skip "GITHUB_PAT_ENCRYPTION_KEY" "Fernet key used to encrypt GitHub PATs" "true"
-prompt_secret_or_skip "MIGRATION_APPLY_SCRATCH_DATABASE_URL" "Dedicated scratch Postgres URL for migration qualification" "true"
+# Encryption is a serving and migration prerequisite, never a placeholder.
+ensure_fernet_encryption_key
 
 # ─── Build → Migrate → Deploy ───────────────────────────────────────────────
 #
@@ -452,12 +494,15 @@ ok "Image built: $IMAGE_TAG"
 
 info "Running database migrations (region: $REGION)..."
 if gcloud run jobs describe blueprint-migrate --region="$REGION" --project="$PROJECT_ID" &>/dev/null; then
-  gcloud run jobs update blueprint-migrate --image="$IMAGE_TAG" --region="$REGION" --project="$PROJECT_ID" --quiet
+  gcloud run jobs update blueprint-migrate \
+    --image="$IMAGE_TAG" \
+    --update-secrets="GITHUB_PAT_ENCRYPTION_KEY=GITHUB_PAT_ENCRYPTION_KEY:latest" \
+    --region="$REGION" --project="$PROJECT_ID" --quiet
 else
   gcloud run jobs create blueprint-migrate \
     --image="$IMAGE_TAG" --region="$REGION" \
     --service-account="$ORCHESTRATOR_SA" \
-    --set-secrets="DATABASE_URL=DATABASE_URL:latest" \
+    --set-secrets="DATABASE_URL=DATABASE_URL:latest,GITHUB_PAT_ENCRYPTION_KEY=GITHUB_PAT_ENCRYPTION_KEY:latest" \
     --vpc-egress=all-traffic --network=agent-sandbox-vpc --subnet=agent-sandbox-subnet \
     --command=alembic --args="upgrade,head" \
     --project="$PROJECT_ID" --quiet
@@ -475,11 +520,23 @@ gcloud run deploy blueprint-orchestrator \
   --region="$REGION" \
   --service-account="$ORCHESTRATOR_SA" \
   --set-env-vars="GCP_PROJECT_ID=$PROJECT_ID,GCP_ZONE=${ZONE},VPC_NETWORK=agent-sandbox-vpc,VPC_SUBNET=agent-sandbox-subnet,AGENT_SERVICE_ACCOUNT_EMAIL=agent-naked-sa@${PROJECT_ID}.iam.gserviceaccount.com,ARTIFACT_BUCKET_NAME=${PROJECT_ID}-agent-artifacts,ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-http://localhost:3000},ORCHESTRATOR_URL=${ORCHESTRATOR_URL},LOCAL_MODE=false,MAX_CONCURRENT_VMS=10,MAX_PROVISION_SLOTS=2,MACHINE_TYPE=n2-standard-2,INITIAL_ADMIN_EMAIL=${ADMIN_EMAIL:-},VM_PROVISIONING_MODEL=STANDARD,DISABLED_REGIONS=us-east4;us-west1,CLOUD_RUN_JOB_NAME=projects/${PROJECT_ID}/locations/${REGION}/jobs/blueprint-agent-job" \
-  --set-secrets="DATABASE_URL=DATABASE_URL:latest,AGENT_JWT_SECRET=AGENT_JWT_SECRET:latest,WS_TICKET_SECRET=WS_TICKET_SECRET:latest,GITHUB_APP_ID=GITHUB_APP_ID:latest,GITHUB_CLIENT_ID=GITHUB_CLIENT_ID:latest,GITHUB_CLIENT_SECRET=GITHUB_CLIENT_SECRET:latest,GITHUB_PRIVATE_KEY=GITHUB_PRIVATE_KEY:latest,GITHUB_WEBHOOK_SECRET=GITHUB_WEBHOOK_SECRET:latest,ADMIN_API_KEY=ADMIN_API_KEY:latest,METRICS_TOKEN=METRICS_TOKEN:latest,GITHUB_PAT_ENCRYPTION_KEY=GITHUB_PAT_ENCRYPTION_KEY:latest,MIGRATION_APPLY_SCRATCH_DATABASE_URL=MIGRATION_APPLY_SCRATCH_DATABASE_URL:latest" \
+  --set-secrets="DATABASE_URL=DATABASE_URL:latest,AGENT_JWT_SECRET=AGENT_JWT_SECRET:latest,WS_TICKET_SECRET=WS_TICKET_SECRET:latest,GITHUB_APP_ID=GITHUB_APP_ID:latest,GITHUB_CLIENT_ID=GITHUB_CLIENT_ID:latest,GITHUB_CLIENT_SECRET=GITHUB_CLIENT_SECRET:latest,GITHUB_PRIVATE_KEY=GITHUB_PRIVATE_KEY:latest,GITHUB_WEBHOOK_SECRET=GITHUB_WEBHOOK_SECRET:latest,ADMIN_API_KEY=ADMIN_API_KEY:latest,METRICS_TOKEN=METRICS_TOKEN:latest,GITHUB_PAT_ENCRYPTION_KEY=GITHUB_PAT_ENCRYPTION_KEY:latest" \
   --no-cpu-throttling --cpu-boost \
   --vpc-egress=all-traffic --network=agent-sandbox-vpc --subnet=agent-sandbox-subnet \
   --project="$PROJECT_ID" --quiet
 ok "Backend deployed"
+
+# The scratch target belongs only to release qualification. Bind it additively
+# when present; absence must not block deployment or FastAPI startup.
+if gcloud secrets describe MIGRATION_APPLY_SCRATCH_DATABASE_URL --project="$PROJECT_ID" &>/dev/null; then
+  gcloud run services update blueprint-orchestrator \
+    --region="$REGION" --project="$PROJECT_ID" \
+    --update-secrets="MIGRATION_APPLY_SCRATCH_DATABASE_URL=MIGRATION_APPLY_SCRATCH_DATABASE_URL:latest" \
+    --quiet
+  ok "Optional migration-apply scratch target bound for qualification"
+else
+  info "Optional MIGRATION_APPLY_SCRATCH_DATABASE_URL not configured; qualification will hold actionably while serving stays available"
+fi
 
 # ─── Packer Agent Image ────────────────────────────────────────────────────
 

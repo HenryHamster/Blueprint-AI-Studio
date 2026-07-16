@@ -857,6 +857,7 @@ async def test_coverage_summary_no_phantom_when_prose_matches(db_session):
         {
             "id": "d-1",
             "status": "active",
+            ac.CRITERION_RELEASE_VERSION_CONTEXT_KEY: str(version.id),
             "context": {"success_evidence": f"criterion {c1.criterion_key} covered"},
         }
     ]
@@ -936,6 +937,7 @@ async def test_coverage_summary_scopes_direction_references_by_lifecycle_and_ver
         {
             "id": "d-active",
             "status": "active",
+            ac.CRITERION_RELEASE_VERSION_CONTEXT_KEY: str(requested.id),
             "context": {"success_evidence": "dangling c-55555555"},
         },
         {
@@ -1030,6 +1032,62 @@ async def test_coverage_summary_does_not_apply_live_prose_to_promoted_version(
 
 
 @pytest.mark.asyncio
+async def test_phantom_bookkeeping_uses_normalized_current_binding_and_ignores_prior(
+    db_session,
+):
+    project = await _make_project(db_session)
+    prior = ReleaseVersion(project_id=project.id, version_number=1, status="promoted")
+    current = ReleaseVersion(project_id=project.id, version_number=2, status="open")
+    db_session.add_all([prior, current])
+    await db_session.commit()
+    db_session.add_all(
+        [
+            Direction(
+                project_id=project.id,
+                direction_key="d-prior",
+                status="active",
+                data={
+                    "id": "d-prior",
+                    "status": "active",
+                    ac.CRITERION_RELEASE_VERSION_CONTEXT_KEY: str(prior.id),
+                    "context": {"success_evidence": "old c-deadbeef"},
+                },
+                criterion_keys=["c-deadbeef"],
+            ),
+            Direction(
+                project_id=project.id,
+                direction_key="d-current",
+                status="active",
+                data={
+                    "id": "d-current",
+                    "status": "active",
+                    ac.CRITERION_RELEASE_VERSION_CONTEXT_KEY: str(current.id),
+                    "context": {"success_evidence": "new c-feedface"},
+                },
+                criterion_keys=["c-feedface"],
+            ),
+        ]
+    )
+    # A stale blob copy of the old active direction must not override its row.
+    project.directions = [
+        {
+            "id": "d-prior",
+            "status": "active",
+            "context": {"success_evidence": "old c-deadbeef"},
+        }
+    ]
+    db_session.add(project)
+    await db_session.commit()
+
+    report = (await ac.get_version_coverage_summary(db_session, current.id))[
+        "phantom_bookkeeping"
+    ]
+    assert report["referenced_keys"] == ["c-feedface"]
+    assert report["phantom_keys"] == ["c-feedface"]
+    assert report["zero_registered"] is True
+
+
+@pytest.mark.asyncio
 async def test_coverage_summary_applies_live_prose_only_to_selected_open_version(
     db_session,
 ):
@@ -1087,6 +1145,7 @@ async def test_zero_registered_criteria_and_dangling_key_flagged(db_session):
         {
             "id": "d-a5940d77",
             "status": "active",
+            ac.CRITERION_RELEASE_VERSION_CONTEXT_KEY: str(version.id),
             "context": {"success_evidence": "attestation tiering c-bbf215e3 verified"},
         },
         # retired direction references are ignored (must not add drift on their own)
@@ -1195,6 +1254,129 @@ async def test_stuck_reason_none_when_active_direction(db_session):
     assert by_key[c1.criterion_key]["coverage"] == "uncovered"
     assert by_key[c1.criterion_key]["stuck_reason"] is None
     assert summary["stuck_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_reused_key_prior_direction_is_inert_for_all_current_consumers(db_session):
+    """A prior binding cannot own, map, classify, or probe a reused current key."""
+    project = await _make_project(db_session)
+    prior = ReleaseVersion(project_id=project.id, version_number=1, status="promoted")
+    current = ReleaseVersion(project_id=project.id, version_number=2, status="open")
+    db_session.add_all([prior, current])
+    await db_session.commit()
+    criterion = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=current.id,
+        criterion_key="c-11111111",
+        text="Generic current outcome",
+    )
+    direction = Direction(
+        project_id=project.id,
+        direction_key="d-prior",
+        data={
+            "id": "d-prior",
+            "text": "acceptance_window and metrics_integrity_sweep",
+            ac.CRITERION_RELEASE_VERSION_CONTEXT_KEY: str(prior.id),
+        },
+        text="acceptance_window and metrics_integrity_sweep",
+        status="active",
+        criterion_keys=[criterion.criterion_key],
+    )
+    db_session.add_all([criterion, direction])
+    await db_session.commit()
+
+    assert await ac._resolve_acceptance_window_criteria(db_session, current) == []
+    assert await ac._resolve_metrics_integrity_criteria(db_session, current) == []
+    assert not await ac.direction_owns_uncovered_criterion(
+        db_session, project.id, direction.direction_key
+    )
+    summary = await ac.get_version_coverage_summary(db_session, current.id)
+    assert summary["criteria"][0]["stuck_reason"] == "no_mapping"
+    assert summary["stuck_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_current_mapping_on_pre_existing_direction_matches_via_explicit_binding(
+    db_session,
+):
+    """A direction created before the current release still matches when its
+    criterion_release_version_id is explicitly bound to the current version.
+
+    Regression: created_at < opened_at must never veto an explicit binding.
+    The admin link endpoint writes the explicit binding; that is the sole
+    authoritative source of mapping provenance.
+    """
+    from datetime import timedelta
+
+    project = await _make_project(db_session)
+    current = ReleaseVersion(project_id=project.id, version_number=1, status="open")
+    db_session.add(current)
+    await db_session.commit()
+
+    # Simulate a pre-existing direction: stamp created_at in the past so it
+    # pre-dates the version's opened_at (testing the independence of created_at
+    # from criterion_release_version_id).
+    pre_existing = Direction(
+        project_id=project.id,
+        direction_key="d-pre",
+        status="active",
+        data={
+            "id": "d-pre",
+            "status": "active",
+            # Explicit binding to current version — set by link_criteria_to_direction.
+            ac.CRITERION_RELEASE_VERSION_CONTEXT_KEY: str(current.id),
+        },
+        criterion_keys=["c-pre-1111"],
+    )
+    db_session.add(pre_existing)
+    await db_session.commit()
+    # Back-date created_at to confirm it is NOT used for version resolution.
+    await db_session.execute(
+        __import__("sqlalchemy", fromlist=["text"]).text(
+            "UPDATE direction SET created_at = :ts WHERE direction_key = 'd-pre'"
+        ),
+        {"ts": current.opened_at - timedelta(days=30)},
+    )
+    await db_session.commit()
+    await db_session.refresh(pre_existing)
+
+    # Even with created_at well before opened_at, the explicit binding wins.
+    assert ac.direction_matches_criterion_release_version(pre_existing, current)
+
+
+@pytest.mark.asyncio
+async def test_later_unbound_direction_does_not_match_historical_version(db_session):
+    """An unbound direction created during a later release must not match a
+    promoted historical version.
+
+    Regression: the one-sided ``created_at >= opened_at`` check allowed any
+    direction created after V1 opened (including those from V2, V3, …) to
+    satisfy a V1 historical query, contaminating promoted-version summaries.
+    The compatibility rule must be fail-closed for non-open versions.
+    """
+    project = await _make_project(db_session)
+    historical = ReleaseVersion(
+        project_id=project.id, version_number=1, status="promoted"
+    )
+    db_session.add(historical)
+    await db_session.commit()
+
+    # Unbound direction (no criterion_release_version_id) — simulates a direction
+    # that exists without an explicit version assignment.
+    later_unbound = Direction(
+        project_id=project.id,
+        direction_key="d-later",
+        status="active",
+        data={"id": "d-later", "status": "active"},
+        criterion_keys=["c-later-2222"],
+    )
+    db_session.add(later_unbound)
+    await db_session.commit()
+
+    # created_at is naturally after historical.opened_at (direction created in
+    # the same test run), but the direction must still NOT match the historical
+    # promoted version — the compatibility rule fails closed for non-open versions.
+    assert not ac.direction_matches_criterion_release_version(later_unbound, historical)
 
 
 @pytest.mark.asyncio
@@ -2195,7 +2377,12 @@ async def test_task_merge_evidence_covers_late_mapped_direction_criteria(db_sess
     direction_row = Direction(
         project_id=project.id,
         direction_key="d-latemap1",
-        data={"id": "d-latemap1", "text": "Late mapping direction", "status": "active"},
+        data={
+            "id": "d-latemap1",
+            "text": "Late mapping direction",
+            "status": "active",
+            ac.CRITERION_RELEASE_VERSION_CONTEXT_KEY: str(version.id),
+        },
         status="active",
         criterion_keys=[late_criterion.criterion_key],
     )
@@ -2209,6 +2396,7 @@ async def test_task_merge_evidence_covers_late_mapped_direction_criteria(db_sess
         payloads=[{"type": "create", "prompt": "implement late mapped"}],
         context={
             "direction_id": "d-latemap1",
+            ac.CRITERION_RELEASE_VERSION_CONTEXT_KEY: str(version.id),
             CODE_ACCEPTANCE_VERDICT_KEY: {
                 "satisfied": True,
                 "proven": True,
@@ -2241,6 +2429,89 @@ async def test_task_merge_evidence_covers_late_mapped_direction_criteria(db_sess
 
     coverage = ac.compute_criterion_coverage(evidence)
     assert coverage == "covered"
+
+
+@pytest.mark.asyncio
+async def test_prior_version_task_cannot_mutate_next_version_evidence_or_gaps(
+    db_session,
+):
+    """A persisted task binding wins after a version cut and direction remap."""
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+
+    project = await _make_project(db_session, "VersionBoundMergeEvidence")
+    version_one = await _make_version(db_session, project)
+    shared_key = "c-deadbeef"
+    criterion_one = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version_one.id,
+        criterion_key=shared_key,
+        text="Version one outcome",
+    )
+    db_session.add(criterion_one)
+    await db_session.commit()
+
+    proven_context = {
+        "direction_id": "d-versioned",
+        ac.CRITERION_RELEASE_VERSION_CONTEXT_KEY: str(version_one.id),
+        CODE_ACCEPTANCE_VERDICT_KEY: {
+            "satisfied": True,
+            "proven": True,
+            "kind": "named_test",
+        },
+    }
+    credit_task = Task(
+        project_id=project.id,
+        context=proven_context,
+        payloads=[{"type": "create", "prompt": "finish v1"}],
+        criterion_ids=[shared_key],
+    )
+    gap_task = Task(
+        project_id=project.id,
+        context=proven_context,
+        payloads=[{"type": "create", "prompt": "finish unmatched v1 work"}],
+        criterion_ids=["c-00000000"],
+    )
+    db_session.add_all([credit_task, gap_task])
+    await db_session.commit()
+
+    version_one.status = "promoted"
+    version_two = ReleaseVersion(project_id=project.id, version_number=2)
+    db_session.add(version_two)
+    await db_session.commit()
+    await db_session.refresh(version_two)
+    criterion_two = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version_two.id,
+        criterion_key=shared_key,
+        text="Version two outcome with reused bare key",
+    )
+    direction = Direction(
+        project_id=project.id,
+        direction_key="d-versioned",
+        data={
+            "id": "d-versioned",
+            "status": "active",
+            ac.CRITERION_RELEASE_VERSION_CONTEXT_KEY: str(version_two.id),
+        },
+        status="active",
+        criterion_keys=[shared_key],
+    )
+    db_session.add_all([criterion_two, direction])
+    await db_session.commit()
+
+    assert await ac.record_task_merge_evidence(
+        db_session, credit_task, project.id
+    ) == 2
+    assert await ac.record_task_merge_evidence(
+        db_session, gap_task, project.id
+    ) == 0
+    assert len(await ac.get_evidence_for_criterion(db_session, criterion_one.id)) == 2
+    assert await ac.get_evidence_for_criterion(db_session, criterion_two.id) == []
+
+    await db_session.refresh(version_one)
+    await db_session.refresh(version_two)
+    assert version_one.merge_evidence_gaps["no_active_criteria"] == 1
+    assert version_two.merge_evidence_gaps is None
 
 
 @pytest.mark.asyncio
@@ -3347,6 +3618,7 @@ async def test_spawn_task_endpoint_propagates_criterion_ids(
     assert child.criterion_ids == [c1.criterion_key], (
         f"criterion_ids must exclude inactive keys; got {child.criterion_ids}"
     )
+    assert child.context[ac.CRITERION_RELEASE_VERSION_CONTEXT_KEY] == str(version.id)
 
 
 # ---------------------------------------------------------------------------
@@ -5048,6 +5320,7 @@ async def test_record_task_merge_evidence_logs_no_criteria(db_session, caplog):
     from app.acceptance_criteria import MergeEvidenceReason
 
     project = await _make_project(db_session, "LogNoCriteria")
+    await _make_version(db_session, project)
 
     task = Task(
         project_id=project.id,
@@ -5336,6 +5609,7 @@ async def test_record_task_merge_evidence_direction_empty_criterion_keys_produce
     from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
 
     project = await _make_project(db_session, "EmptyCriterionKeys")
+    await _make_version(db_session, project)
 
     # Direction exists but has NO criterion_keys.
     direction_row = Direction(
@@ -5394,6 +5668,7 @@ async def test_record_task_merge_evidence_direction_missing_from_db_with_no_task
     from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
 
     project = await _make_project(db_session, "MissingDirection")
+    await _make_version(db_session, project)
 
     # No direction row is created in the DB.
     task = Task(
@@ -5443,6 +5718,7 @@ async def test_record_task_merge_evidence_no_direction_id_no_criterion_ids_produ
     from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
 
     project = await _make_project(db_session, "NoPropagation")
+    await _make_version(db_session, project)
 
     task = Task(
         project_id=project.id,
@@ -7713,6 +7989,7 @@ async def test_failed_corroboration_surfaces_and_downgrades_trust(db_session):
         context={
             "corroboration_of": criterion.criterion_key,
             "spawned_by": "operator_attestation",
+            ac.CRITERION_RELEASE_VERSION_CONTEXT_KEY: str(version.id),
         },
         payloads=[{"type": "research", "prompt": "Verify this criterion"}],
         created_by="SYSTEM_AUTO_REVIEW",
@@ -7808,6 +8085,7 @@ async def test_reattest_after_failed_corroboration_restores_attested(
         context={
             "corroboration_of": criterion.criterion_key,
             "spawned_by": "operator_attestation",
+            ac.CRITERION_RELEASE_VERSION_CONTEXT_KEY: str(version.id),
         },
         payloads=[{"type": "research", "prompt": "Verify this criterion"}],
         created_by="SYSTEM_AUTO_REVIEW",
@@ -7856,6 +8134,7 @@ async def test_reattest_after_failed_corroboration_restores_attested(
         context={
             "corroboration_of": criterion.criterion_key,
             "spawned_by": "operator_attestation",
+            ac.CRITERION_RELEASE_VERSION_CONTEXT_KEY: str(version.id),
         },
         payloads=[{"type": "research", "prompt": "Verify this criterion"}],
         created_by="SYSTEM_AUTO_REVIEW",
@@ -8325,6 +8604,7 @@ async def test_reattempt_after_failed_backfill_restores_backfilled(db_session):
         context={
             "corroboration_of": criterion.criterion_key,
             "spawned_by": ac.UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND,
+            ac.CRITERION_RELEASE_VERSION_CONTEXT_KEY: str(version.id),
         },
         payloads=[{"type": "research", "prompt": "re-verify"}],
         created_by="SYSTEM_AUTO_REVIEW",

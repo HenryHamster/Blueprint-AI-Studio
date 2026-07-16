@@ -35,6 +35,8 @@ from app.message_audience import (
 )
 
 from app.models import (
+    MessageHandlingState,
+    MessageSurface,
     MessageType,
     NotificationDeadLetter,
     Project,
@@ -43,6 +45,10 @@ from app.models import (
     ResidualRemediationCase,
     Task,
     _utcnow,
+)
+from app.project_message_creation import (
+    build_project_message,
+    lock_project_and_next_message_sequence,
 )
 
 logger = logging.getLogger(__name__)
@@ -687,7 +693,8 @@ async def post_event_message(
     # non-operator (strategist-internal) rows. Canonical value wins over any
     # audience the caller may have placed in ``context``.
     ctx["audience"] = audience
-    msg = ProjectMessage(
+    msg = await build_project_message(
+        session,
         project_id=project_id,
         message_type=MessageType.NOTE,
         from_type="system",
@@ -1490,7 +1497,8 @@ async def post_auto_fix_escalation_message(
         "dedupe_key": dedupe_key,
     }
     ctx = stamp_message_audience(ctx, "auto_fix_escalated")
-    msg = ProjectMessage(
+    msg = await build_project_message(
+        session,
         project_id=project_id,
         message_type=MessageType.BLOCKER,
         from_type="system",
@@ -1797,7 +1805,8 @@ async def post_residual_fix_escalation_message(
         "dedupe_key": dedupe_key,
     }
     ctx = stamp_message_audience(ctx, "residual_fix_escalated")
-    msg = ProjectMessage(
+    msg = await build_project_message(
+        session,
         project_id=project_id,
         message_type=MessageType.BLOCKER,
         from_type="system",
@@ -1949,7 +1958,8 @@ async def post_residual_fix_audit_deferred_escalation_message(
         "threshold": threshold,
     }
     ctx = stamp_message_audience(ctx, "residual_fix_audit_deferred")
-    msg = ProjectMessage(
+    msg = await build_project_message(
+        session,
         project_id=project_id,
         message_type=MessageType.BLOCKER,
         from_type="system",
@@ -2036,7 +2046,8 @@ async def post_remediation_escalation_message(
         "remediation_summary": remediation_summary[:240],
     }
     ctx = stamp_message_audience(ctx, "remediation_escalated")
-    msg = ProjectMessage(
+    msg = await build_project_message(
+        session,
         project_id=project_id,
         message_type=MessageType.BLOCKER,
         from_type="system",
@@ -2114,7 +2125,8 @@ async def post_direction_burn_pause_message(
         ctx["dedupe_key"] = dedupe_key
     if evidence:
         ctx["evidence"] = evidence
-    msg = ProjectMessage(
+    msg = await build_project_message(
+        session,
         project_id=project_id,
         message_type=MessageType.BLOCKER,
         from_type="system",
@@ -2191,7 +2203,8 @@ async def post_direction_churn_pause_message(
         ctx["dedupe_key"] = dedupe_key
     if evidence:
         ctx["evidence"] = evidence
-    msg = ProjectMessage(
+    msg = await build_project_message(
+        session,
         project_id=project_id,
         message_type=MessageType.BLOCKER,
         from_type="system",
@@ -2311,7 +2324,8 @@ async def post_direction_outcome_scaffolding_escalation_message(
     ctx = stamp_message_audience(ctx, "direction_outcome_scaffolding_escalation")
     if evidence:
         ctx["evidence"] = evidence
-    msg = ProjectMessage(
+    msg = await build_project_message(
+        session,
         project_id=project_id,
         message_type=MessageType.BLOCKER,
         from_type="system",
@@ -2414,17 +2428,42 @@ async def post_feedback_acknowledgment(
     original_msg_id: uuid.UUID,
     resolution: str,
     task_id: Optional[uuid.UUID] = None,
+    *,
+    from_type: str = "strategic",
+    actor_user_id: Optional[str] = None,
+    event_type: str = "feedback_acknowledgment",
+    content_override: str | None = None,
+    sequence: int | None = None,
 ) -> ProjectMessage:
     """Create a reply message acknowledging a resolved FEEDBACK message."""
-    summary = f"Feedback addressed: {resolution}"
-    return await post_event_message(
-        session,
-        project_id,
-        event_type="feedback_acknowledgment",
-        summary=summary,
-        context={"reply_to": str(original_msg_id), "resolution": resolution},
-        task_id=task_id,
+    summary = content_override if content_override is not None else f"Feedback addressed: {resolution}"
+    if sequence is None:
+        sequence = await lock_project_and_next_message_sequence(session, project_id)
+    context = stamp_message_audience(
+        {
+            "event_type": event_type,
+            "reply_to": str(original_msg_id),
+            "resolution": resolution,
+        },
+        event_type,
     )
+    msg = await build_project_message(
+        session,
+        project_id=project_id,
+        sequence=sequence,
+        surface=MessageSurface.CONVERSATION,
+        handling_state=MessageHandlingState.RESPONDED,
+        handled_by_task_id=task_id,
+        reply_to_message_id=original_msg_id,
+        message_type=MessageType.NOTE,
+        from_type=from_type,
+        actor_user_id=actor_user_id,
+        from_task_id=task_id,
+        content=summary,
+        context=context,
+    )
+    session.add(msg)
+    return msg
 
 
 async def post_question_answer(
@@ -2435,6 +2474,9 @@ async def post_question_answer(
     task_id: Optional[uuid.UUID] = None,
     from_type: str = "strategic",
     resident_session_id: Optional[str] = None,
+    actor_user_id: Optional[str] = None,
+    content_override: str | None = None,
+    sequence: int | None = None,
 ) -> ProjectMessage:
     """Create a reply message answering a resolved QUESTION message.
 
@@ -2461,12 +2503,21 @@ async def post_question_answer(
         },
         "question_answer",
     )
-    msg = ProjectMessage(
+    if sequence is None:
+        sequence = await lock_project_and_next_message_sequence(session, project_id)
+    msg = await build_project_message(
+        session,
         project_id=project_id,
+        sequence=sequence,
+        surface=MessageSurface.CONVERSATION,
+        handling_state=MessageHandlingState.RESPONDED,
+        handled_by_task_id=task_id,
+        reply_to_message_id=original_msg_id,
         message_type=MessageType.NOTE,
         from_type=from_type,
+        actor_user_id=actor_user_id,
         from_task_id=task_id,
-        content=f"Answer: {answer}",
+        content=content_override if content_override is not None else f"Answer: {answer}",
         context=context,
         resident_session_id=resident_session_id,
     )

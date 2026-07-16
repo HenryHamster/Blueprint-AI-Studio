@@ -276,6 +276,12 @@ async def link_criteria_to_direction(
         raise HTTPException(status_code=404, detail="Direction not found")
 
     row.criterion_keys = deduped_keys
+    row_data = dict(row.data or {})
+    if deduped_keys:
+        row_data[ac.CRITERION_RELEASE_VERSION_CONTEXT_KEY] = str(open_version.id)
+    else:
+        row_data.pop(ac.CRITERION_RELEASE_VERSION_CONTEXT_KEY, None)
+    row.data = row_data
     session.add(row)
     await session.commit()
     logger.info(
@@ -345,6 +351,7 @@ async def attest_criterion(
     open_version = await current_open_version(session, project_id)
     if open_version is None:
         raise HTTPException(status_code=409, detail="No open release version")
+    open_version_id = open_version.id
 
     if not body.reason or not body.reason.strip():
         raise HTTPException(status_code=400, detail="reason must not be empty")
@@ -353,7 +360,7 @@ async def attest_criterion(
         session,
         project_id,
         [criterion_key],
-        release_version_id=open_version.id,
+        release_version_id=open_version_id,
     )
     if not existing:
         raise HTTPException(
@@ -421,7 +428,12 @@ async def attest_criterion(
         # Best-effort: spawn a fresh corroboration task on re-attestation so the
         # system keeps trying to earn real coverage, not just extending the waiver.
         await ac.spawn_corroboration_task(
-            session, project_id, criterion_key, criterion_text, body.reason
+            session,
+            project_id,
+            criterion_key,
+            criterion_text,
+            body.reason,
+            release_version_id=open_version_id,
         )
 
         return {"status": "ok", "criterion_key": criterion_key, "coverage": "attested"}
@@ -431,7 +443,12 @@ async def attest_criterion(
     # 'attested' to 'covered') rather than relying solely on the time-bounded
     # waiver. Failure here never blocks the attestation itself.
     await ac.spawn_corroboration_task(
-        session, project_id, criterion_key, criterion_text, body.reason
+        session,
+        project_id,
+        criterion_key,
+        criterion_text,
+        body.reason,
+        release_version_id=open_version_id,
     )
 
     logger.info(

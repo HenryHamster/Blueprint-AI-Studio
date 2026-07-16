@@ -9,7 +9,7 @@ events.
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -277,12 +277,16 @@ def test_operator_visible_webhook_events_excludes_internal():
 
 
 @pytest.mark.asyncio
-async def test_post_event_message_creates_for_operator_fyi():
+async def test_post_event_message_creates_for_operator_fyi(monkeypatch):
     """post_event_message creates a ProjectMessage for operator-fyi events."""
     from app.notification_dispatch import post_event_message
 
     mock_session = AsyncMock()
-    mock_session.add = AsyncMock()
+    mock_session.add = MagicMock()
+    monkeypatch.setattr(
+        "app.project_message_creation.lock_project_and_next_message_sequence",
+        AsyncMock(return_value=1),
+    )
 
     msg = await post_event_message(
         mock_session,
@@ -297,7 +301,7 @@ async def test_post_event_message_creates_for_operator_fyi():
 
 
 @pytest.mark.asyncio
-async def test_post_event_message_tags_strategist_internal_as_non_operator():
+async def test_post_event_message_tags_strategist_internal_as_non_operator(monkeypatch):
     """Strategist-internal events create a non-operator strategist-feed row.
 
     Per the design, ``strategist-internal`` bookkeeping still lands as a row the
@@ -307,7 +311,11 @@ async def test_post_event_message_tags_strategist_internal_as_non_operator():
     from app.notification_dispatch import post_event_message
 
     mock_session = AsyncMock()
-    mock_session.add = AsyncMock()
+    mock_session.add = MagicMock()
+    monkeypatch.setattr(
+        "app.project_message_creation.lock_project_and_next_message_sequence",
+        AsyncMock(return_value=1),
+    )
 
     msg = await post_event_message(
         mock_session,
@@ -321,12 +329,16 @@ async def test_post_event_message_tags_strategist_internal_as_non_operator():
 
 
 @pytest.mark.asyncio
-async def test_post_event_message_unknown_event_fails_closed_to_internal():
+async def test_post_event_message_unknown_event_fails_closed_to_internal(monkeypatch):
     """Unregistered event types fail closed to strategist-internal (never operator-visible)."""
     from app.notification_dispatch import post_event_message
 
     mock_session = AsyncMock()
-    mock_session.add = AsyncMock()
+    mock_session.add = MagicMock()
+    monkeypatch.setattr(
+        "app.project_message_creation.lock_project_and_next_message_sequence",
+        AsyncMock(return_value=1),
+    )
 
     msg = await post_event_message(
         mock_session,
@@ -342,12 +354,16 @@ async def test_post_event_message_unknown_event_fails_closed_to_internal():
 
 
 @pytest.mark.asyncio
-async def test_post_event_message_creates_for_operator_action_needed():
+async def test_post_event_message_creates_for_operator_action_needed(monkeypatch):
     """post_event_message creates a ProjectMessage for operator-action-needed events."""
     from app.notification_dispatch import post_event_message
 
     mock_session = AsyncMock()
-    mock_session.add = AsyncMock()
+    mock_session.add = MagicMock()
+    monkeypatch.setattr(
+        "app.project_message_creation.lock_project_and_next_message_sequence",
+        AsyncMock(return_value=1),
+    )
 
     msg = await post_event_message(
         mock_session,
@@ -373,7 +389,7 @@ async def test_post_event_message_skips_row_for_pipeline_log(monkeypatch):
     monkeypatch.setattr(nd, "route_event", lambda *a, **k: PIPELINE_LOG)
 
     mock_session = AsyncMock()
-    mock_session.add = AsyncMock()
+    mock_session.add = MagicMock()
 
     msg = await nd.post_event_message(
         mock_session,
@@ -832,7 +848,11 @@ async def test_auto_fix_escalation_message_stamps_operator_action_needed(monkeyp
         nd, "open_system_bug_or_blocker_exists", AsyncMock(return_value=None)
     )
     mock_session = AsyncMock()
-    mock_session.add = AsyncMock()
+    mock_session.add = MagicMock()
+    monkeypatch.setattr(
+        "app.project_message_creation.lock_project_and_next_message_sequence",
+        AsyncMock(return_value=1),
+    )
 
     msg = await nd.post_auto_fix_escalation_message(
         mock_session,
@@ -856,7 +876,11 @@ async def test_residual_fix_escalation_message_stamps_operator_action_needed(
         nd, "open_system_bug_or_blocker_exists", AsyncMock(return_value=None)
     )
     mock_session = AsyncMock()
-    mock_session.add = AsyncMock()
+    mock_session.add = MagicMock()
+    monkeypatch.setattr(
+        "app.project_message_creation.lock_project_and_next_message_sequence",
+        AsyncMock(return_value=1),
+    )
 
     msg = await nd.post_residual_fix_escalation_message(
         mock_session,
@@ -880,7 +904,16 @@ async def test_question_answer_stamps_audience_default_from_type(monkeypatch):
     import app.notification_dispatch as nd
 
     mock_session = AsyncMock()
-    mock_session.add = AsyncMock()
+    mock_session.add = MagicMock()
+    monkeypatch.setattr(
+        "app.project_message_creation.lock_project_and_next_message_sequence",
+        AsyncMock(return_value=1),
+    )
+    monkeypatch.setattr(
+        nd,
+        "lock_project_and_next_message_sequence",
+        AsyncMock(return_value=1),
+    )
 
     orig_id = _uuid.uuid4()
     msg = await nd.post_question_answer(
@@ -894,4 +927,8 @@ async def test_question_answer_stamps_audience_default_from_type(monkeypatch):
     assert msg.context["event_type"] == "question_answer"
     assert msg.context["audience"] == OPERATOR_FYI
     assert msg.context["reply_to"] == str(orig_id)
+    assert msg.sequence == 1
+    assert msg.surface == "conversation"
+    assert msg.handling_state == "responded"
+    assert msg.reply_to_message_id == orig_id
     mock_session.add.assert_called_once()

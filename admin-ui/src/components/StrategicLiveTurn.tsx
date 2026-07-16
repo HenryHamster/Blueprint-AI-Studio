@@ -152,16 +152,16 @@ export function StrategicActivityStrip({
 
 /**
  * The PERSISTENT, truthful resident live-activity widget shown in the chat view
- * whenever a resident session exists. Unlike the ephemeral {@link StrategicActivityStrip}
- * (which only appears mid-turn), this widget is always present and shows one of three
+ * whenever a resident session exists. This compact item is always present, links to
+ * the separate Activity inbox for details, and shows one of three
  * visually-distinct, feed-driven states:
- *   - `executing` — cyan pulse + the running command + a LIVE elapsed timer;
+ *   - `executing` — cyan pulse + a calm operation label + elapsed timer;
  *   - `idle`      — neutral steady dot, "Waiting for direction", NO ticking timer;
  *   - `dead`      — muted/red dot, "Session ended", timer frozen/hidden.
  * The timer only ever runs in `executing`, so it can never tick for a finished or
  * dead session.
  */
-export function StrategicResidentActivityWidget({ state }: { state: ResidentActivityState }) {
+export function StrategicResidentActivityWidget({ state, onOpenActivity }: { state: ResidentActivityState; onOpenActivity?: () => void }) {
   const base =
     'group flex scroll-mt-24 justify-start rounded-md';
   const inner =
@@ -174,12 +174,13 @@ export function StrategicResidentActivityWidget({ state }: { state: ResidentActi
           <div className="flex w-full min-w-0 items-center gap-1.5 rounded-md border border-cyan-900/50 bg-neutral-950/60 px-2 py-1.5 text-ui-md text-neutral-300">
             <span className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-cyan-400" aria-hidden="true" />
             <span className="shrink-0 font-medium text-cyan-300">{state.label}</span>
-            {state.commandText && (
-              <span className="min-w-0 flex-1 truncate font-mono text-ui-sm text-neutral-400">
-                {state.commandText}
-              </span>
-            )}
+            <span className="min-w-0 flex-1" />
             <InFlightCounter startMs={state.startMs} />
+            {onOpenActivity && (
+              <button type="button" onClick={onOpenActivity} className="min-h-11 shrink-0 rounded px-2 text-neutral-400 hover:text-neutral-200">
+                Activity
+              </button>
+            )}
           </div>
         </div>
       </div>
@@ -193,6 +194,11 @@ export function StrategicResidentActivityWidget({ state }: { state: ResidentActi
           <div className="flex w-full min-w-0 items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950/40 px-2 py-1.5 text-ui-md text-neutral-400">
             <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-500/70" aria-hidden="true" />
             <span className="min-w-0 truncate font-medium text-neutral-400">{state.label}</span>
+            {onOpenActivity && (
+              <button type="button" onClick={onOpenActivity} className="ml-auto min-h-11 shrink-0 rounded px-2 text-neutral-500 hover:text-neutral-200">
+                Activity
+              </button>
+            )}
           </div>
         </div>
       </div>
@@ -206,6 +212,11 @@ export function StrategicResidentActivityWidget({ state }: { state: ResidentActi
         <div className="flex w-full min-w-0 items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950/40 px-2 py-1.5 text-ui-md text-neutral-500">
           <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-rose-500/70" aria-hidden="true" />
           <span className="min-w-0 truncate font-medium text-neutral-500">{state.label}</span>
+          {onOpenActivity && (
+            <button type="button" onClick={onOpenActivity} className="ml-auto min-h-11 shrink-0 rounded px-2 text-neutral-500 hover:text-neutral-200">
+              Activity
+            </button>
+          )}
         </div>
       </div>
     </div>

@@ -11,10 +11,12 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-import pytest
 import yaml  # type: ignore[import-untyped]
 
 from app.required_runtime_env import REQUIRED_RUNTIME_ENV
+
+SCRATCH_ENV = "MIGRATION_APPLY_SCRATCH_DATABASE_URL"
+ENCRYPTION_ENV = "GITHUB_PAT_ENCRYPTION_KEY"
 
 
 def _binding_names(argument: str) -> set[str]:
@@ -26,9 +28,14 @@ def _required_cloud_run_names() -> set[str]:
     return {req.name for req in REQUIRED_RUNTIME_ENV if req.scope == "cloud_run"}
 
 
+def _repo_file(name: str) -> Path:
+    candidates = (Path(__file__).parents[2] / name, Path("/repo") / name)
+    return next(path for path in candidates if path.exists())
+
+
 def _cloudbuild_deploy_bindings() -> tuple[set[str], set[str]]:
     config_path = Path(__file__).parents[1] / "cloudbuild.yaml"
-    config = yaml.safe_load(config_path.read_text())
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     deploy_step = next(
         step
         for step in config["steps"]
@@ -42,7 +49,7 @@ def _cloudbuild_deploy_bindings() -> tuple[set[str], set[str]]:
 
 
 def _setup_deploy_bindings(setup_path: Path) -> tuple[set[str], set[str]]:
-    text = setup_path.read_text()
+    text = setup_path.read_text(encoding="utf-8")
     deploy = re.search(
         r"gcloud run deploy blueprint-orchestrator \\\n(?P<body>.*?)(?:\n  --project=)",
         text,
@@ -64,12 +71,12 @@ def test_cloudbuild_deploy_supplies_every_cloud_run_required_env():
         "cloudbuild.yaml's replace-all deploy bindings omit required Cloud Run env "
         f"variables: {sorted(missing)}"
     )
+    assert SCRATCH_ENV not in env_names | secret_names
+    assert ENCRYPTION_ENV in secret_names
 
 
 def test_setup_deploy_mirror_supplies_every_cloud_run_required_env():
-    setup_path = Path(__file__).parents[2] / "setup.sh"
-    if not setup_path.exists():
-        pytest.skip("setup.sh is not included in this backend test context")
+    setup_path = _repo_file("setup.sh")
 
     env_names, secret_names = _setup_deploy_bindings(setup_path)
     missing = _required_cloud_run_names() - env_names - secret_names
@@ -77,20 +84,51 @@ def test_setup_deploy_mirror_supplies_every_cloud_run_required_env():
         "setup.sh's replace-all deploy bindings omit required Cloud Run env "
         f"variables: {sorted(missing)}"
     )
+    assert SCRATCH_ENV not in env_names | secret_names
+    assert ENCRYPTION_ENV in secret_names
 
 
-def test_setup_creates_placeholder_secrets_for_cloud_run_requirements():
-    setup_path = Path(__file__).parents[2] / "setup.sh"
-    if not setup_path.exists():
-        pytest.skip("setup.sh is not included in this backend test context")
+def test_setup_provisions_real_encryption_key_without_scratch_placeholder():
+    setup_path = _repo_file("setup.sh")
 
-    setup = setup_path.read_text()
-    missing = {
-        name
-        for name in _required_cloud_run_names()
-        if f'prompt_secret_or_skip "{name}"' not in setup
-    }
-    assert not missing, (
-        "setup.sh must create placeholder secrets so gcloud can validate the "
-        f"required deploy bindings: {sorted(missing)}"
+    setup = setup_path.read_text(encoding="utf-8")
+    assert "ensure_fernet_encryption_key" in setup
+    assert f'prompt_secret_or_skip "{ENCRYPTION_ENV}"' not in setup
+    assert f'prompt_secret_or_skip "{SCRATCH_ENV}"' not in setup
+
+
+def test_optional_scratch_binding_is_conditional_and_additive():
+    setup_path = _repo_file("setup.sh")
+    cloudbuild_path = Path(__file__).parents[1] / "cloudbuild.yaml"
+
+    for source in (
+        setup_path.read_text(encoding="utf-8"),
+        cloudbuild_path.read_text(encoding="utf-8"),
+    ):
+        assert f"gcloud secrets describe {SCRATCH_ENV}" in source
+        assert f"--update-secrets={SCRATCH_ENV}={SCRATCH_ENV}:latest" in source or (
+            f'--update-secrets="{SCRATCH_ENV}={SCRATCH_ENV}:latest"' in source
+        )
+
+
+def test_setup_binds_encryption_key_to_existing_and_new_migration_jobs():
+    setup_path = _repo_file("setup.sh")
+    setup = setup_path.read_text(encoding="utf-8")
+
+    existing_job = re.search(
+        r"if gcloud run jobs describe blueprint-migrate(?P<body>.*?)\nelse",
+        setup,
+        flags=re.DOTALL,
+    )
+    new_job = re.search(
+        r"else\n(?P<body>\s+gcloud run jobs create blueprint-migrate.*?)\nfi",
+        setup,
+        flags=re.DOTALL,
+    )
+    assert (
+        existing_job
+        and f"{ENCRYPTION_ENV}={ENCRYPTION_ENV}:latest" in existing_job.group("body")
+    )
+    assert new_job and f"{ENCRYPTION_ENV}={ENCRYPTION_ENV}:latest" in new_job.group(
+        "body"
     )

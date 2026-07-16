@@ -93,6 +93,7 @@ async def _guard_explicit_criterion_keys(
     project_id: uuid.UUID,
     direction_key: str,
     criterion_keys,
+    release_version_id: uuid.UUID | None,
 ):
     if criterion_keys is _MISSING_CRITERION_KEYS or not criterion_keys:
         return criterion_keys
@@ -100,19 +101,21 @@ async def _guard_explicit_criterion_keys(
         check_criterion_key_write,
         load_version_criterion_key_sets,
     )
-    from app.release_version import current_open_version
+    if release_version_id is None:
+        from app.release_version import current_open_version
 
-    open_version = await current_open_version(session, project_id)
-    if open_version is None:
-        logger.warning(
-            "[directions_repo] preserving existing criterion_keys for direction %s: "
-            "no open release version to validate explicit keys",
-            direction_key,
-        )
-        return _MISSING_CRITERION_KEYS
+        open_version = await current_open_version(session, project_id)
+        if open_version is None:
+            logger.warning(
+                "[directions_repo] preserving existing criterion_keys for direction %s: "
+                "no release version to validate explicit keys",
+                direction_key,
+            )
+            return _MISSING_CRITERION_KEYS
+        release_version_id = open_version.id
 
     active_keys, inactive_keys = await load_version_criterion_key_sets(
-        session, project_id, open_version.id
+        session, project_id, release_version_id
     )
     valid: list[str] = []
     rejected: dict[str, list[str]] = {}
@@ -249,22 +252,44 @@ async def upsert_direction(
     ).scalar_one_or_none()
     # Snapshot status before any mutation so the event trail sees the old value.
     prior_status_snapshot = existing.status if existing is not None else None
+    from app.acceptance_criteria import (
+        CRITERION_RELEASE_VERSION_CONTEXT_KEY,
+        direction_criterion_release_version_id,
+    )
+
+    direction_data = dict(direction)
+    release_version_id = direction_criterion_release_version_id(direction_data)
     criterion_keys = _coerce_criterion_keys(direction)
     criterion_keys = await _guard_explicit_criterion_keys(
-        session, pid, str(direction_key), criterion_keys
+        session, pid, str(direction_key), criterion_keys, release_version_id
     )
+    if (
+        existing is not None
+        and release_version_id is None
+        and (
+            criterion_keys is _MISSING_CRITERION_KEYS
+            or criterion_keys == list(existing.criterion_keys or [])
+        )
+    ):
+        existing_version_id = direction_criterion_release_version_id(existing)
+        if existing_version_id is not None:
+            direction_data[CRITERION_RELEASE_VERSION_CONTEXT_KEY] = str(
+                existing_version_id
+            )
+    if criterion_keys == []:
+        direction_data.pop(CRITERION_RELEASE_VERSION_CONTEXT_KEY, None)
     if existing is None:
         row_kwargs = dict(
             project_id=pid,
             direction_key=str(direction_key)[:128],
-            data=dict(direction),
+            data=direction_data,
             **promoted,
         )
         if criterion_keys is not _MISSING_CRITERION_KEYS:
             row_kwargs["criterion_keys"] = criterion_keys
         session.add(Direction(**row_kwargs))
     else:
-        existing.data = dict(direction)
+        existing.data = direction_data
         existing.status = promoted["status"]
         existing.priority = promoted["priority"]
         existing.text = promoted["text"]

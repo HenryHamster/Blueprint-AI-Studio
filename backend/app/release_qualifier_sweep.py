@@ -573,6 +573,7 @@ async def _reconcile_if_criterion_coverage_now_complete(
     from app import github, release_qualifier
     from app.acceptance_criteria import (
         backfill_direction_merge_evidence,
+        direction_matches_criterion_release_version,
         get_version_coverage_summary,
         record_acceptance_window_coverage_evidence,
         record_metrics_integrity_coverage_evidence,
@@ -635,6 +636,10 @@ async def _reconcile_if_criterion_coverage_now_complete(
                     active_directions = list(result.scalars().all())
                     keys_to_backfill: set[str] = set()
                     for direction in active_directions:
+                        if not direction_matches_criterion_release_version(
+                            direction, version
+                        ):
+                            continue
                         dkeys = set(direction.criterion_keys or [])
                         if dkeys & set(uncovered_with_mapping):
                             keys_to_backfill.add(direction.direction_key)

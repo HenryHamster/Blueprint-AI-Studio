@@ -44,7 +44,20 @@ from app.direction_lifecycle import (
     direction_has_churn_retirement_recommendation,
     reactivate_paused_direction,
 )
-from app.models import KnowledgeDocument, MessageType, Project, ProjectMessage, Task, TaskStatus
+from app.models import (
+    KnowledgeDocument,
+    MessageHandlingState,
+    MessageSurface,
+    MessageType,
+    Project,
+    ProjectMessage,
+    Task,
+    TaskStatus,
+)
+from app.project_message_creation import (
+    build_project_message,
+    lock_project_and_next_message_sequence,
+)
 from app.payload_schemas import (
     ALL_TASK_TYPES as _VALID_TASK_TYPES,
     validate_internal_payload as _validate_internal_payload,
@@ -888,7 +901,8 @@ async def agent_annotate(
             if warning:
                 ctx = {**ctx, "_provenance_warnings": warning}
 
-    msg = ProjectMessage(
+    msg = await build_project_message(
+        session,
         project_id=task.project_id,
         message_type=msg_type,
         from_type="agent",
@@ -988,6 +1002,19 @@ async def strategic_operation(
     task = await session.get(Task, payload.task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
+
+    # Message mutations use the canonical counter-first lock order. Allocate
+    # before the Project/Task authority locks below; an unused sequence gap is
+    # safe for idempotent retries and avoids send/resolve deadlocks.
+    preallocated_message_sequence: int | None = None
+    if payload.op in MESSAGE_OPS:
+        preallocated_message_sequence = (
+            await lock_project_and_next_message_sequence(
+                session,
+                task.project_id,
+                lock_timeout_ms=1_500,
+            )
+        )
 
     # Lock project for atomic update (skip_locked + 429 avoids lock_timeout cascade)
     project = await _lock_project_or_429(session, task.project_id)
@@ -1345,6 +1372,14 @@ async def strategic_operation(
             if criterion_keys_supplied
             else []
         )
+        create_criterion_release_version_id: uuid.UUID | None = None
+        if criterion_keys:
+            from app.release_version import current_open_version as _criterion_open_version
+
+            _criterion_version = await _criterion_open_version(session, project.id)
+            create_criterion_release_version_id = (
+                _criterion_version.id if _criterion_version is not None else None
+            )
         new_dir: dict = {
             "id": f"d-{uuid.uuid4().hex[:8]}",
             "text": text,
@@ -1395,6 +1430,10 @@ async def strategic_operation(
         }
         if criterion_keys_supplied:
             new_dir["criterion_keys"] = criterion_keys
+            if create_criterion_release_version_id is not None:
+                new_dir["criterion_release_version_id"] = str(
+                    create_criterion_release_version_id
+                )
         if staged_create:
             new_dir["staged_for_version"] = staged_for_version
             new_dir["staged_at"] = _utcnow().isoformat()
@@ -1577,6 +1616,14 @@ async def strategic_operation(
             if criterion_keys_supplied
             else []
         )
+        update_criterion_release_version_id: uuid.UUID | None = None
+        if criterion_keys:
+            from app.release_version import current_open_version as _criterion_open_version
+
+            _criterion_version = await _criterion_open_version(session, project.id)
+            update_criterion_release_version_id = (
+                _criterion_version.id if _criterion_version is not None else None
+            )
         directions = list(project.directions or [])
         updated = False
         # Re-ground reconciliation: capture the direction's prior gap_id BEFORE
@@ -1717,6 +1764,12 @@ async def strategic_operation(
                         )
                 if criterion_keys_supplied:
                     d["criterion_keys"] = criterion_keys
+                    if update_criterion_release_version_id is not None:
+                        d["criterion_release_version_id"] = str(
+                            update_criterion_release_version_id
+                        )
+                    else:
+                        d.pop("criterion_release_version_id", None)
                 # Handle success_evidence and retirement_condition in context
                 _DIR_FIELD_MAX = 500
                 if "success_evidence" in changes or "retirement_condition" in changes:
@@ -2117,6 +2170,9 @@ async def strategic_operation(
         if _retire_dir_row is not None and _retire_dir_row.criterion_keys:
             _cleared_keys = list(_retire_dir_row.criterion_keys)
             _retire_dir_row.criterion_keys = []
+            _retire_data = dict(_retire_dir_row.data or {})
+            _retire_data.pop("criterion_release_version_id", None)
+            _retire_dir_row.data = _retire_data
             session.add(_retire_dir_row)
             warnings.append(
                 f"Retired direction {dir_id} had {len(_cleared_keys)} criterion "
@@ -2857,7 +2913,39 @@ async def strategic_operation(
         # the server already committed. Accept an optional idempotency_key from
         # the agent and short-circuit if a matching row already exists.
         raw_idem = str(data.get("idempotency_key") or "").strip()
-        idem_key: str | None = raw_idem[:255] if raw_idem else None
+        if len(raw_idem) > 255:
+            raise HTTPException(
+                status_code=400,
+                detail="idempotency_key exceeds 255 characters",
+            )
+        idem_key: str | None = raw_idem or None
+        from app.routers.admin_notifications import ROUTINE_EVENT_TYPES
+
+        event_type = str(msg_ctx.get("event_type") or "").strip() or None
+        is_routine = event_type in ROUTINE_EVENT_TYPES
+        reply_to_message_id: uuid.UUID | None = None
+        raw_reply_to = msg_ctx.get("reply_to")
+        if raw_reply_to is not None:
+            try:
+                reply_to_message_id = uuid.UUID(str(raw_reply_to))
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="Invalid reply_to message") from None
+            reply_target = (
+                await session.execute(
+                    select(ProjectMessage)
+                    .where(
+                        ProjectMessage.id == reply_to_message_id,
+                        ProjectMessage.project_id == project.id,
+                    )
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if reply_target is None:
+                raise HTTPException(status_code=400, detail="Invalid reply_to message")
+            reply_target.handling_state = MessageHandlingState.RESPONDED
+            reply_target.handled_by_task_id = task.id
+            reply_target.updated_at = _utcnow()
+            session.add(reply_target)
         if idem_key:
             existing = (
                 await session.execute(
@@ -2868,6 +2956,23 @@ async def strategic_operation(
                 )
             ).scalar_one_or_none()
             if existing is not None:
+                if not (
+                    existing.from_type == "strategic"
+                    and existing.from_task_id == task.id
+                    and existing.message_type == msg_type
+                    and existing.content == content
+                    and existing.reply_to_message_id == reply_to_message_id
+                    and existing.surface
+                    == (
+                        MessageSurface.ACTIVITY
+                        if is_routine
+                        else MessageSurface.CONVERSATION
+                    )
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="idempotency_key already belongs to a different message",
+                    )
                 return _resp(
                     {
                         "status": "ok",
@@ -2890,8 +2995,25 @@ async def strategic_operation(
             if isinstance(_resident_blob, dict) and resident_session_is_active(_resident_blob)
             else None
         )
-        new_msg = ProjectMessage(
+        next_sequence = preallocated_message_sequence
+        if next_sequence is None:
+            raise HTTPException(status_code=500, detail="Message sequence was not allocated")
+        new_msg = await build_project_message(
+            session,
             project_id=project.id,
+            sequence=next_sequence,
+            surface=(
+                MessageSurface.ACTIVITY
+                if is_routine
+                else MessageSurface.CONVERSATION
+            ),
+            handling_state=(
+                MessageHandlingState.PENDING
+                if is_routine
+                else MessageHandlingState.RESPONDED
+            ),
+            handled_by_task_id=task.id if not is_routine else None,
+            reply_to_message_id=reply_to_message_id,
             message_type=msg_type,
             from_type="strategic",
             from_task_id=task.id,
@@ -2921,6 +3043,23 @@ async def strategic_operation(
                     )
                 ).scalar_one_or_none()
                 if existing is not None:
+                    if not (
+                        existing.from_type == "strategic"
+                        and existing.from_task_id == task.id
+                        and existing.message_type == msg_type
+                        and existing.content == content
+                        and existing.reply_to_message_id == reply_to_message_id
+                        and existing.surface
+                        == (
+                            MessageSurface.ACTIVITY
+                            if is_routine
+                            else MessageSurface.CONVERSATION
+                        )
+                    ):
+                        raise HTTPException(
+                            status_code=409,
+                            detail="idempotency_key already belongs to a different message",
+                        )
                     return _resp(
                         {
                             "status": "ok",
@@ -2950,7 +3089,11 @@ async def strategic_operation(
         from app.message_convergence import resolve_message_ref as _resolve_message_ref
 
         msg = await _resolve_message_ref(session, project.id, str(msg_id))
-        if msg.status == "resolved":
+        was_resolved = msg.status == "resolved"
+        if was_resolved and msg.message_type not in (
+            MessageType.QUESTION,
+            MessageType.FEEDBACK,
+        ):
             return _resp({"status": "already_resolved"})
         owned_by_direction = data.get("owned_by_direction")
         owned_by_task_id = data.get("owned_by_task")
@@ -2959,7 +3102,11 @@ async def strategic_operation(
             link_message_to_outcome as _link_message_to_outcome,
         )
 
-        if _is_bug_class(msg) and (owned_by_direction or owned_by_task_id):
+        if (
+            not was_resolved
+            and _is_bug_class(msg)
+            and (owned_by_direction or owned_by_task_id)
+        ):
             # Bug-class message with ownership info: record forward link and move
             # to 'linked' state. Terminal 'resolved' happens when outcome lands.
             kind = "direction" if owned_by_direction else "task"
@@ -2986,64 +3133,99 @@ async def strategic_operation(
                     "linked_to": {"kind": kind, "id": str(identifier)},
                 }
             )
-        msg.status = "resolved"
-        resolution_raw = data.get("resolution", "Addressed by strategic review")
-        msg.resolution = _cap_str(
-            resolution_raw, STRATEGIC_RESOLUTION_MAX, "resolution", warnings
-        )
-        msg.resolved_at = _utcnow()
-        session.add(msg)
-        await session.commit()
+        if not was_resolved:
+            msg.status = "resolved"
+            resolution_raw = data.get("resolution", "Addressed by strategic review")
+            msg.resolution = _cap_str(
+                resolution_raw, STRATEGIC_RESOLUTION_MAX, "resolution", warnings
+            )
+            msg.resolved_at = _utcnow()
+            msg.updated_at = msg.resolved_at
+            msg.handling_state = MessageHandlingState.RESPONDED
+            msg.handled_by_task_id = task.id
+            session.add(msg)
         message_id_str = str(msg.id)
-        message_update_event = message_updated_event_payload(msg)
-        # Snapshot project.id too: the reply-post except below rolls back the
-        # session (expiring `project`), and the unconditional broadcast that
-        # follows reads project.id — a sync lazy-load there would MissingGreenlet.
         _project_id_str = str(project.id)
         reply_msg: ProjectMessage | None = None
+        reply_created = False
         if msg.message_type in (MessageType.QUESTION, MessageType.FEEDBACK):
-            try:
+            reply_msg = (
+                await session.execute(
+                    select(ProjectMessage)
+                    .where(
+                        ProjectMessage.project_id == project.id,
+                        ProjectMessage.reply_to_message_id == msg.id,
+                    )
+                    .order_by(ProjectMessage.created_at.asc(), ProjectMessage.id.asc())
+                    .limit(1)
+                )
+            ).scalars().first()
+            if reply_msg is None:
                 from app.notification_dispatch import (
                     post_feedback_acknowledgment as _post_feedback_ack,
                     post_question_answer as _post_qa,
                 )
 
                 resolution = msg.resolution or "Addressed by strategic review"
-                if msg.message_type == MessageType.QUESTION:
-                    pending_reply_msg = await _post_qa(
-                        session, project.id, msg.id, resolution, task.id
+                if preallocated_message_sequence is None:
+                    raise HTTPException(
+                        status_code=500,
+                        detail="Message sequence was not allocated",
                     )
-                else:
-                    pending_reply_msg = await _post_feedback_ack(
+                if msg.message_type == MessageType.QUESTION:
+                    reply_msg = await _post_qa(
                         session,
                         project.id,
                         msg.id,
                         resolution,
                         task.id,
+                        sequence=preallocated_message_sequence,
                     )
-                await session.commit()
-                reply_msg = pending_reply_msg
-            except Exception:
-                await session.rollback()
-                reply_msg = None
-                logger.warning(
-                    "post resolution reply failed for message %s",
-                    message_id_str,
-                    exc_info=True,
-                )
-        await broadcast_to_project(
-            _project_id_str,
-            "message_updated",
-            message_update_event,
+                else:
+                    reply_msg = await _post_feedback_ack(
+                        session,
+                        project.id,
+                        msg.id,
+                        resolution,
+                        task.id,
+                        sequence=preallocated_message_sequence,
+                    )
+                reply_created = True
+
+        await session.flush()
+        message_update_event = (
+            message_updated_event_payload(msg) if not was_resolved else None
         )
-        if reply_msg is not None:
+        reply_event = (
+            message_event_payload(reply_msg)
+            if reply_created and reply_msg is not None
+            else None
+        )
+        await session.commit()
+
+        if message_update_event is not None:
+            await broadcast_to_project(
+                _project_id_str,
+                "message_updated",
+                message_update_event,
+            )
+        if reply_event is not None:
             await broadcast_to_project(
                 _project_id_str,
                 "message_created",
-                message_event_payload(reply_msg),
+                reply_event,
             )
         return _resp(
-            {"status": "ok", "op": "resolve_message", "message_id": message_id_str}
+            {
+                "status": "already_resolved" if was_resolved else "ok",
+                "op": "resolve_message",
+                "message_id": message_id_str,
+                **(
+                    {"reply_message_id": str(reply_msg.id)}
+                    if reply_msg is not None
+                    else {}
+                ),
+            }
         )
 
     elif payload.op == "spawn_task":
@@ -3351,6 +3533,17 @@ async def strategic_operation(
         if direction_id:
             new_task_ctx["direction_id"] = direction_id
 
+        _task_criterion_release_version_id: uuid.UUID | None = None
+        if direction_id or raw_explicit_criterion_ids is not None:
+            from app.release_version import current_open_version as _current_open_version
+
+            _open_version = await _current_open_version(session, project.id)
+            if _open_version is not None:
+                _task_criterion_release_version_id = _open_version.id
+                new_task_ctx["criterion_release_version_id"] = str(
+                    _open_version.id
+                )
+
         # Resolve criterion_keys from two sources: the direction row (when
         # direction_id is set) and any explicit criterion_ids the strategist
         # passed. Both are merged and filtered to active keys on the open
@@ -3361,7 +3554,19 @@ async def strategic_operation(
             from app.directions_repo import get_direction_row as _get_direction_row
 
             _dir_row = await _get_direction_row(session, project.id, direction_id)
-            if _dir_row is not None and _dir_row.criterion_keys:
+            from app.acceptance_criteria import (
+                direction_criterion_release_version_id as _direction_criterion_version,
+            )
+
+            _direction_version_id = _direction_criterion_version(_dir_row)
+            if (
+                _dir_row is not None
+                and _dir_row.criterion_keys
+                and (
+                    _direction_version_id == _task_criterion_release_version_id
+                    or _direction_version_id is None
+                )
+            ):
                 # Merge: explicit keys first, then direction-derived; deduplicate.
                 _keys_to_filter = list(
                     dict.fromkeys(_keys_to_filter + list(_dir_row.criterion_keys))
@@ -3370,15 +3575,13 @@ async def strategic_operation(
             from app.acceptance_criteria import (
                 filter_active_criterion_keys as _filter_active_crit,
             )
-            from app.release_version import current_open_version as _current_open_version
-
-            _open_version = await _current_open_version(session, project.id)
-            _task_criterion_ids = await _filter_active_crit(
-                session,
-                project.id,
-                _keys_to_filter,
-                release_version_id=_open_version.id if _open_version is not None else None,
-            )
+            if _task_criterion_release_version_id is not None:
+                _task_criterion_ids = await _filter_active_crit(
+                    session,
+                    project.id,
+                    _keys_to_filter,
+                    release_version_id=_task_criterion_release_version_id,
+                )
 
         # Cross-field guard: criterion_ids (explicit or direction-derived)
         # require named_test acceptance evidence so the acceptance pipeline can
@@ -4917,6 +5120,9 @@ async def strategic_operation(
                         f"removed: {sorted(_scrubbed)}"
                     )
                 dir_row.criterion_keys = merged
+                _dir_data = dict(dir_row.data or {})
+                _dir_data["criterion_release_version_id"] = str(open_version.id)
+                dir_row.data = _dir_data
                 session.add(dir_row)
                 mapped_keys.append(dk)
 

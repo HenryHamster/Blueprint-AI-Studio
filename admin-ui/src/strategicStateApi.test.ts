@@ -5,6 +5,11 @@ import {
   executeStrategicWorkSessionCommand,
   fetchStrategicStateWithRevision,
   fetchStrategicConversation,
+  findStrategicMessageByClientIdentity,
+  deleteMessageAttachmentUpload,
+  getMessageAttachmentUploadUrl,
+  getMessageAttachmentDownloadUrl,
+  invalidateMessageAttachmentDownloadUrl,
   isStrategicConversationNotModified,
   isStrategicStateNotModified,
   STRATEGIC_STATE_NOT_MODIFIED,
@@ -40,15 +45,139 @@ describe('fetchStrategicConversation', () => {
   test('sends the held ETag and returns a sentinel for a 304 transcript poll', async () => {
     apiFetchMock.mockResolvedValue(new Response(null, { status: 304 }));
 
-    const result = await fetchStrategicConversation('proj-1', 'pinned-1', undefined, '"conversation-1"');
+    const result = await fetchStrategicConversation(
+      'proj-1',
+      { includeMessageId: 'pinned-1', limit: 40 },
+      undefined,
+      '"conversation-1"',
+    );
 
     expect(isStrategicConversationNotModified(result)).toBe(true);
     expect(apiFetchMock).toHaveBeenCalledWith(
-      '/api/admin/projects/proj-1/strategic-conversation?include_message_id=pinned-1',
+      '/api/admin/projects/proj-1/strategic-conversation?limit=40&include_message_id=pinned-1',
       { headers: { 'If-None-Match': '"conversation-1"' } },
       2,
       30000,
       undefined,
+    );
+  });
+
+  test('consumes the direct cursor page contract', async () => {
+    apiFetchMock.mockResolvedValue(jsonResponse({
+      items: [{ id: 'm-9', sequence: 9 }],
+      limit: 25,
+      next_before_sequence: 9,
+      has_more: true,
+    }));
+
+    const result = await fetchStrategicConversation('proj-1', { beforeSequence: 20, limit: 25 });
+
+    if (isStrategicConversationNotModified(result)) throw new Error('unreachable');
+    expect(result.conversation).toMatchObject({ next_before_sequence: 9, has_more: true });
+    expect(apiFetchMock).toHaveBeenCalledWith(
+      '/api/admin/projects/proj-1/strategic-conversation?before_sequence=20&limit=25',
+      undefined,
+      2,
+      30000,
+      undefined,
+    );
+  });
+
+  test('requests forward pages from the last received sequence', async () => {
+    apiFetchMock.mockResolvedValue(jsonResponse({ items: [], limit: 100, has_more: false }));
+    await fetchStrategicConversation('proj-1', { afterSequence: 1_000, limit: 100 });
+    expect(apiFetchMock).toHaveBeenCalledWith(
+      '/api/admin/projects/proj-1/strategic-conversation?after_sequence=1000&limit=100',
+      undefined,
+      2,
+      30000,
+      undefined,
+    );
+  });
+
+  test('identity recovery adopts only an exact canonical match', async () => {
+    apiFetchMock.mockResolvedValueOnce(jsonResponse({
+      items: [{ id: 'fallback', idempotency_key: 'send-1' }],
+      matched_message: { id: 'mine', idempotency_key: 'send-1' },
+      wakeup_state: 'paused',
+      limit: 1,
+      has_more: false,
+    }));
+    await expect(findStrategicMessageByClientIdentity('proj-1', 'send-1')).resolves.toMatchObject({
+      message: { id: 'mine' },
+      wakeup_state: 'paused',
+    });
+
+    apiFetchMock.mockResolvedValueOnce(jsonResponse({
+      items: [{ id: 'someone-else', idempotency_key: 'send-2' }], limit: 1, has_more: false,
+    }));
+    await expect(findStrategicMessageByClientIdentity('proj-1', 'send-1')).resolves.toBeNull();
+  });
+
+  test.each(['queued', 'coalesced', 'paused', 'waiting_for_capacity'] as const)(
+    'preserves the %s wake receipt during identity recovery',
+    async wakeupState => {
+      apiFetchMock.mockResolvedValueOnce(jsonResponse({
+        items: [],
+        matched_message: { id: `message-${wakeupState}`, idempotency_key: 'send-1' },
+        wakeup_state: wakeupState,
+        limit: 1,
+        has_more: false,
+      }));
+      await expect(findStrategicMessageByClientIdentity('proj-1', 'send-1')).resolves.toMatchObject({
+        wakeup_state: wakeupState,
+      });
+    },
+  );
+});
+
+describe('message attachment download URL cache', () => {
+  beforeEach(() => { apiFetchMock.mockReset(); vi.useFakeTimers(); vi.setSystemTime(new Date('2026-07-15T00:00:00Z')); });
+  afterEach(() => { invalidateMessageAttachmentDownloadUrl('proj-cache', 'message-cache', 'attachment-cache'); vi.useRealTimers(); });
+
+  test('deduplicates valid URLs and re-resolves after their bounded expiry', async () => {
+    apiFetchMock
+      .mockResolvedValueOnce(jsonResponse({ download_url: 'https://signed.example/one', expires_in_seconds: 31 }))
+      .mockResolvedValueOnce(jsonResponse({ download_url: 'https://signed.example/two', expires_in_seconds: 31 }));
+    const first = await getMessageAttachmentDownloadUrl('proj-cache', 'message-cache', 'attachment-cache');
+    const cached = await getMessageAttachmentDownloadUrl('proj-cache', 'message-cache', 'attachment-cache');
+    expect(cached).toEqual(first);
+    expect(apiFetchMock).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(1_001);
+    await expect(getMessageAttachmentDownloadUrl('proj-cache', 'message-cache', 'attachment-cache'))
+      .resolves.toMatchObject({ downloadUrl: 'https://signed.example/two' });
+    expect(apiFetchMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('message attachment upload contract', () => {
+  beforeEach(() => apiFetchMock.mockReset());
+
+  test('binds the signed upload receipt to the exact byte size', async () => {
+    apiFetchMock.mockResolvedValue(jsonResponse({
+      upload_url: 'https://signed.example/upload',
+      download_url: 'https://signed.example/download',
+      storage_uri: 'gs://bucket/object',
+      attachment_id: 'attachment-1',
+      size_bytes: 17,
+      expires_in_seconds: 900,
+    }));
+    await getMessageAttachmentUploadUrl('project-1', 'run.txt', 'text/plain', 17);
+    expect(apiFetchMock).toHaveBeenCalledWith(
+      '/api/admin/projects/project-1/messages/attachment-upload-url',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ filename: 'run.txt', content_type: 'text/plain', size_bytes: 17 }),
+      }),
+    );
+  });
+
+  test('deletes an unconsumed upload receipt by project and attachment identity', async () => {
+    apiFetchMock.mockResolvedValue(new Response(null, { status: 204 }));
+    await deleteMessageAttachmentUpload('project-1', 'attachment-1');
+    expect(apiFetchMock).toHaveBeenCalledWith(
+      '/api/admin/projects/project-1/messages/attachment-uploads/attachment-1',
+      { method: 'DELETE' },
     );
   });
 });

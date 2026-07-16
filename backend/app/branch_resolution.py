@@ -360,6 +360,7 @@ async def signal_unsafe_branch_configuration(
     from sqlmodel import select
 
     from app.models import Alert, AlertSeverity, MessageType, ProjectMessage
+    from app.project_message_creation import build_project_message
 
     project_id = getattr(project, "id", None)
     logger.error("[BRANCH_RESOLVER] %s", detail)
@@ -399,7 +400,8 @@ async def signal_unsafe_branch_configuration(
     already_posted = _blocker_result.scalar() is not None
     if not already_posted:
         session.add(
-            ProjectMessage(
+            await build_project_message(
+                session,
                 project_id=project_id,
                 message_type=MessageType.BLOCKER,
                 from_type="system",

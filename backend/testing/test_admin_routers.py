@@ -39,6 +39,8 @@ from app.models import (
     TaskWakeRegistration,
     Alert,
     ProjectMessage,
+    MessageHandlingState,
+    MessageSurface,
     MessageType,
     MessagesLastSeen,
     MessagesNoisePrefs,
@@ -114,7 +116,7 @@ def _assert_message_event_payload(
     assert payload["message"]["status"] == status
     if excerpt is not None:
         assert payload["message"]["excerpt"] == excerpt
-    assert len(json.dumps(payload, default=str).encode("utf-8")) < 800
+    assert len(json.dumps(payload, default=str).encode("utf-8")) < 16_384
 
 
 async def _make_project(session, owner_id=TEST_USER_ID, name="Test Project", role="owner"):
@@ -5186,6 +5188,28 @@ class TestMessages:
         assert rows == []
 
     @pytest.mark.asyncio
+    async def test_create_message_context_limit_counts_utf8_bytes(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        context = {"operator_note": "🙂" * 13_000}
+        assert len(json.dumps(context, ensure_ascii=False)) < 50_000
+        assert len(json.dumps(context, ensure_ascii=False).encode("utf-8")) > 50_000
+
+        resp = await client.post(
+            "/api/admin/messages",
+            json={
+                "project_id": str(project.id),
+                "message_type": "NOTE",
+                "content": "Reject a multibyte context over the byte budget.",
+                "context": context,
+            },
+        )
+
+        assert resp.status_code == 400
+        assert "Context too large" in resp.json()["error"]["message"]
+
+    @pytest.mark.asyncio
     async def test_create_message_empty_content_returns_400(
         self, client: AsyncClient, db_session
     ):
@@ -5711,6 +5735,9 @@ class TestMessages:
         assert first.json()["status"] == "created"
         assert second.json()["status"] == "duplicate"
         assert first.json()["id"] == second.json()["id"]
+        assert first.json()["wakeup_state"] == second.json()["wakeup_state"]
+        assert "_message_request_fingerprint" not in first.json()["message"]["context"]
+        assert "_message_request_fingerprint" not in second.json()["message"]["context"]
 
         rows = (
             (
@@ -5726,6 +5753,7 @@ class TestMessages:
         assert len(rows) == 1
         assert str(rows[0].id) == first.json()["id"]
         assert rows[0].idempotency_key == key
+        assert (rows[0].context or {}).get("_message_request_fingerprint")
 
     @pytest.mark.asyncio
     async def test_idempotent_duplicate_arming_coalesces(
@@ -5888,15 +5916,15 @@ class TestMessages:
         assert rows[0].context.get("user_event_type") == "pr_merged"
 
     @pytest.mark.asyncio
-    async def test_idempotent_concurrent_insert_recovers_to_200(
+    async def test_idempotent_concurrent_insert_rejects_mismatched_winner(
         self, client: AsyncClient, db_session
     ):
         """TOCTOU: a competitor commits the same-key row AFTER this request's
         idempotency pre-check passed but BEFORE its own commit, so the INSERT
         trips ux_projectmessage_project_idempotency_key. The handler must
-        recover — roll back, re-select the winner, and return the idempotent 200 pointing at
-        the already-committed row — instead of surfacing the IntegrityError as
-        a 500.
+        recover by re-selecting the winner, then reject it because its actor and
+        request fingerprint do not match this request. A reused key must never
+        silently adopt an unrelated committed message.
 
         Patch AsyncSession.commit to inject a winning row just before the route
         commits its pending message, exactly modelling an in-flight duplicate.
@@ -5948,9 +5976,7 @@ class TestMessages:
                 },
             )
 
-        # Recovered to an idempotent 200, not a 500.
-        assert resp.status_code == 200, resp.text
-        assert resp.json()["status"] == "duplicate"
+        assert resp.status_code == 409, resp.text
 
         # Exactly one row survived, and the response points at the winner.
         rows = (
@@ -5967,7 +5993,6 @@ class TestMessages:
         )
         assert len(rows) == 1
         assert rows[0].content == "winner of the race"
-        assert resp.json()["id"] == str(rows[0].id)
 
     @pytest.mark.asyncio
     async def test_resolve_message(self, client: AsyncClient, db_session):
@@ -6034,6 +6059,10 @@ class TestMessages:
             status="resolved",
             excerpt="Close me everywhere.",
         )
+        canonical = broadcast.await_args.args[2]["message"]
+        assert canonical["handling_state"] == "responded"
+        assert canonical["resolution"] == "Done."
+        assert canonical["updated_at"]
 
     @pytest.mark.asyncio
     async def test_resolve_linked_message(self, client: AsyncClient, db_session):
@@ -6213,6 +6242,45 @@ class TestMessages:
             assert body["message"]["resolution"] == msg.resolution
 
     @pytest.mark.asyncio
+    async def test_resolve_reconciles_legacy_resolved_question_missing_reply(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        question = ProjectMessage(
+            project_id=project.id,
+            sequence=1,
+            surface=MessageSurface.CONVERSATION,
+            message_type=MessageType.QUESTION,
+            from_type="system",
+            content="Which path?",
+            status="resolved",
+            resolution="Take path A.",
+            resolved_at=_utcnow(),
+        )
+        db_session.add(question)
+        await db_session.commit()
+
+        first = await client.patch(f"/api/admin/messages/{question.id}", json={})
+        second = await client.patch(f"/api/admin/messages/{question.id}", json={})
+        assert first.status_code == 200, first.text
+        assert second.status_code == 200, second.text
+        assert first.json()["reply_message_id"] == second.json()["reply_message_id"]
+        assert first.json()["wakeup_state"] == second.json()["wakeup_state"]
+        replies = (
+            await db_session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.reply_to_message_id == question.id
+                )
+            )
+        ).scalars().all()
+        assert len(replies) == 1
+        assert replies[0].content == "Take path A."
+        assert (
+            replies[0].context["_resident_wakeup_state"]
+            == first.json()["wakeup_state"]
+        )
+
+    @pytest.mark.asyncio
     async def test_resolve_message_retried_request_is_safe(
         self, client: AsyncClient, db_session
     ):
@@ -6278,6 +6346,7 @@ class TestMessages:
         body = resp.json()
         assert body["status"] == "resolved"
         assert body["arming"] == "steering"
+        assert body["wakeup_state"] == "queued"
         assert body["message"]["id"] == str(question.id)
         assert body["message"]["status"] == "resolved"
         assert body["message"]["resolution"] == "Do X instead."
@@ -6318,7 +6387,6 @@ class TestMessages:
         a question_answer NOTE linked back to it so the strategist sees it answered.
         """
         from sqlmodel import select
-        from app.workbench_state import STRATEGIC_LOCAL_CONTINUATION_KEY
 
         project = await _make_project(db_session)
         question = ProjectMessage(
@@ -6404,48 +6472,12 @@ class TestMessages:
         assert note.context.get("event_type") == "question_answer"
         assert note.context.get("reply_to") == str(question.id)
         assert note.context.get("answer") == "Use approach A."
-        session = note.context.get("strategic_session")
-        assert session["interaction_mode"] == "continuous"
-        assert session["context_package_id"] == "strategic-context:test"
-        assert session["selected_ref_descriptors"] == [
-            {
-                "kind": "knowledge_document",
-                "id": "knowledge:kdoc-1",
-                "label": "Operator notes",
-                "summary": "Decision notes from the current review.",
-                "target": {
-                    "surface": "project",
-                    "section": "problem-model",
-                    "document_id": "kdoc-1",
-                },
-            }
-        ]
-        assert session["context_package_descriptor"] == {
-            "kind": "context_package",
-            "id": "strategic-context:test",
-            "label": "Current session context",
-            "target": {
-                "surface": "project",
-                "section": "problem-model",
-            },
-        }
-        assert session["selected_refs"] == [
-            {
-                "kind": "knowledge_document",
-                "id": "knowledge:kdoc-1",
-                "label": "Operator notes",
-            }
-        ]
+        assert note.context.get("_resident_wakeup_state") == body["wakeup_state"]
+        assert "strategic_session" not in note.context
         assert body["reply_message_id"] == str(note.id)
         assert body["reply_message"]["id"] == str(note.id)
         assert body["reply_message"]["message_type"] == "NOTE"
-        assert body["reply_message"]["context"]["strategic_session"]["selected_refs"] == [
-            {
-                "kind": "knowledge_document",
-                "id": "knowledge:kdoc-1",
-                "label": "Operator notes",
-            }
-        ]
+        assert "strategic_session" not in body["reply_message"]["context"]
         prefs_row = (
             await db_session.execute(
                 select(MessagesNoisePrefs).where(
@@ -6465,10 +6497,6 @@ class TestMessages:
             }
         ]
         assert "context_package_id" not in stored_workbench
-        await db_session.refresh(project)
-        marker = (project.vision or {})[STRATEGIC_LOCAL_CONTINUATION_KEY]
-        assert marker["operator_user_id"] == TEST_USER_ID
-        assert marker["active"] is True
         assert broadcast.await_count == 2
         events = [
             (call.args[1], call.args[2])
@@ -6493,15 +6521,14 @@ class TestMessages:
             message_type="NOTE",
             from_type="user",
             action="created",
-            excerpt="Answer: Use approach A.",
+            excerpt="Use approach A.",
         )
 
     @pytest.mark.asyncio
-    async def test_operator_question_answer_survives_arming_rollback(
+    async def test_operator_question_answer_rolls_back_atomically_when_arming_rolls_back(
         self, client: AsyncClient, db_session
     ):
-        """A contended Strategic wake must not erase a committed operator answer."""
-        from app.strategic_trigger import strategic_refresh_pending
+        """A poisoned wake transaction leaves no partial answer and is retryable."""
 
         project = await _make_project(db_session)
         question = ProjectMessage(
@@ -6528,17 +6555,11 @@ class TestMessages:
                 json={"resolution": "Take the simpler path."},
             )
 
-        assert resp.status_code == 200, resp.text
-        body = resp.json()
-        assert body["status"] == "resolved"
-        assert body["arming"] == "not_armed"
-        assert isinstance(body["reply_message_id"], str)
-        assert body["message"]["id"] == str(question.id)
-        assert body["message"]["status"] == "resolved"
-        assert body["message"]["resolution"] == "Take the simpler path."
+        assert resp.status_code == 503, resp.text
 
         await db_session.refresh(question)
-        assert question.status == "resolved"
+        assert question.status == "open"
+        assert question.resolution is None
         notes = (
             await db_session.execute(
                 select(ProjectMessage).where(
@@ -6548,17 +6569,18 @@ class TestMessages:
                 )
             )
         ).scalars().all()
-        assert len(notes) == 1
-        assert notes[0].context.get("event_type") == "question_answer"
-        assert notes[0].context.get("answer") == "Take the simpler path."
-        assert body["reply_message_id"] == str(notes[0].id)
-        assert body["reply_message"]["id"] == str(notes[0].id)
-        assert body["reply_message"]["context"]["event_type"] == "question_answer"
-        vision = await self._reload_vision(db_session, project.id)
-        assert strategic_refresh_pending(vision) is False
+        assert notes == []
+
+        retry = await client.patch(
+            f"/api/admin/messages/{question.id}",
+            json={"resolution": "Take the simpler path."},
+        )
+        assert retry.status_code == 200, retry.text
+        assert retry.json()["status"] == "resolved"
+        assert retry.json()["wakeup_state"] == "queued"
 
     @pytest.mark.asyncio
-    async def test_resolve_feedback_posts_feedback_acknowledgment_note(
+    async def test_resolve_feedback_posts_operator_reply_note(
         self, client: AsyncClient, db_session
     ):
         """Resolving FEEDBACK creates a durable acknowledgment linked to the original."""
@@ -6595,7 +6617,8 @@ class TestMessages:
         assert resp.status_code == 200, resp.text
         body = resp.json()
         assert body["status"] == "resolved"
-        assert body["arming"] == "passive_note"
+        assert body["arming"] == "steering"
+        assert body["wakeup_state"] == "queued"
         assert body["message"]["id"] == str(feedback.id)
         assert body["message"]["status"] == "resolved"
         assert body["message"]["resolution"] == "Deploy summary now cites the active release."
@@ -6608,28 +6631,26 @@ class TestMessages:
                 select(ProjectMessage).where(
                     ProjectMessage.project_id == project.id,
                     ProjectMessage.message_type == MessageType.NOTE,
-                    ProjectMessage.from_type == "system",
+                    ProjectMessage.from_type == "user",
                 )
             )
         ).scalars().all()
         assert len(notes) == 1
         note = notes[0]
-        assert note.context.get("event_type") == "feedback_acknowledgment"
+        assert note.actor_user_id == TEST_USER_ID
+        assert note.context.get("event_type") == "feedback_reply"
+        assert note.context.get("_resident_wakeup_state") == body["wakeup_state"]
         assert note.context.get("reply_to") == str(feedback.id)
         assert (
             note.context.get("resolution")
             == "Deploy summary now cites the active release."
         )
-        session = note.context.get("strategic_session")
-        assert session["interaction_mode"] == "continuous"
-        assert session["active_surface"] == "pipeline"
-        assert session["selected_refs"] == [
-            {"kind": "release", "id": "release:v2", "label": "v2 release"}
-        ]
+        assert "strategic_session" not in note.context
         assert body["reply_message_id"] == str(note.id)
         assert body["reply_message"]["id"] == str(note.id)
         assert body["reply_message"]["message_type"] == "NOTE"
-        assert body["reply_message"]["context"]["event_type"] == "feedback_acknowledgment"
+        assert body["reply_message"]["context"]["event_type"] == "feedback_reply"
+        assert body["reply_message"]["content"] == "Deploy summary now cites the active release."
 
     @pytest.mark.asyncio
     async def test_delete_message(self, client: AsyncClient, db_session):
@@ -7059,7 +7080,7 @@ class TestMessages:
     async def test_strategic_session_message_persists_workbench_snapshot_and_arms(
         self, client: AsyncClient, db_session
     ):
-        """Strategic-session messages share workbench snapshot and arming behavior."""
+        """Strategic messages persist workbench state without hiding it in chat."""
         project = await _make_project(db_session)
         resp = await client.post(
             f"/api/admin/projects/{project.id}/strategic-session/messages",
@@ -7087,25 +7108,15 @@ class TestMessages:
         assert body["arming"] == "steering"
         assert body["message"]["id"] == body["id"]
         assert body["message"]["message_type"] == "FEEDBACK"
-        assert body["message"]["context"]["strategic_session"]["selected_refs"] == [
-            {"kind": "task", "id": "task-1", "label": "Release blocker"}
-        ]
+        assert "strategic_session" not in body["message"]["context"]
 
         msg = await db_session.get(ProjectMessage, uuid.UUID(body["id"]))
         assert msg is not None
         context = msg.context or {}
-        assert context["reply_to"] == "m-1"
-        assert context["user_event_type"] == "operator_supplied"
+        assert "reply_to" not in context
+        assert "user_event_type" not in context
         assert "event_type" not in context
-        session = context["strategic_session"]
-        assert session["interaction_mode"] == "continuous"
-        assert session["active_surface"] == "pipeline"
-        assert session["session_started_at"] == "2026-06-29T12:00:00Z"
-        assert session["context_package_id"] == "strategic-context:test"
-        assert session["selected_refs"] == [
-            {"kind": "task", "id": "task-1", "label": "Release blocker"}
-        ]
-        assert session["captured_at"]
+        assert "strategic_session" not in context
 
         prefs_row = (
             await db_session.execute(
@@ -7134,19 +7145,33 @@ class TestMessages:
         self, client: AsyncClient, db_session
     ):
         """Attachment-only strategic chat turns persist with a small placeholder."""
+        from app.models import ProjectMessageAttachmentUpload
         from app.project_message_projection import project_message_base
 
         project = await _make_project(db_session)
+        attachment_id = uuid.uuid4()
         attachment = {
+            "attachment_id": str(attachment_id),
             "type": "image",
             "mime_type": "image/png",
             "name": "screenshot.png",
             "size_bytes": 4,
-            "url": (
-                "https://storage.googleapis.com/blueprint-agent-artifacts/"
-                "message-attachments/project/att/screenshot.png?X-Goog-Signature=abc"
+            "storage_uri": (
+                "gs://blueprint-agent-artifacts/message-attachments/"
+                f"{project.id}/{attachment_id}/screenshot.png"
             ),
         }
+        db_session.add(ProjectMessageAttachmentUpload(
+            attachment_id=attachment_id,
+            project_id=project.id,
+            actor_user_id=TEST_USER_ID,
+            storage_uri=attachment["storage_uri"],
+            filename="screenshot.png",
+            content_type="image/png",
+            expected_size_bytes=4,
+            expires_at=_utcnow() + timedelta(minutes=15),
+        ))
+        await db_session.commit()
 
         async def _preview(_session, _project_id, _state_response, message):
             return project_message_base(message)
@@ -7192,7 +7217,7 @@ class TestMessages:
                 json={
                     "message_type": "NOTE",
                     "content": "",
-                    "context": {"attachments": [attachment]},
+                    "attachments": [attachment],
                     "idempotency_key": "strategic-session-message-attachment-only-1",
                 },
             )
@@ -7201,12 +7226,22 @@ class TestMessages:
         body = resp.json()
         assert body["status"] == "created"
         assert body["message"]["content"] == "Sent attachment."
-        assert body["message"]["context"]["attachments"] == [attachment]
+        assert body["message"]["context"]["attachments"] == [{
+            "attachment_id": str(attachment_id),
+            "type": "image",
+            "mime_type": "image/png",
+            "name": "screenshot.png",
+            "filename": "screenshot.png",
+            "size_bytes": 4,
+        }]
 
         msg = await db_session.get(ProjectMessage, uuid.UUID(body["id"]))
         assert msg is not None
         assert msg.content == "Sent attachment."
-        assert (msg.context or {})["attachments"] == [attachment]
+        assert (msg.context or {})["attachments"] == [{
+            **attachment,
+            "filename": "screenshot.png",
+        }]
 
     @pytest.mark.asyncio
     async def test_create_message_stamps_resident_session_id_when_active(
@@ -22746,6 +22781,93 @@ async def test_agent_create_message_idempotency_dedupes(
     assert len(rows) == 1, f"Expected 1 message row, got {len(rows)}"
     assert rows[0].idempotency_key == "agent-idem-test-key-abc123"
 
+    changed = {
+        **body,
+        "data": {**body["data"], "content": "Different content with the same key."},
+    }
+    collision = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json=changed,
+    )
+    assert collision.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_agent_create_message_separates_routine_activity_and_promotes_reply(
+    client: AsyncClient, db_session
+):
+    from app.auth import create_agent_token
+
+    project = Project(name="Agent Message Projection", user_id=TEST_USER_ID)
+    db_session.add(project)
+    await db_session.commit()
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-agent-msg-projection",
+        payloads=[{"type": "strategic_review", "prompt": "review"}],
+    )
+    question = ProjectMessage(
+        project_id=project.id,
+        sequence=1,
+        surface=MessageSurface.CONVERSATION,
+        message_type=MessageType.QUESTION,
+        from_type="user",
+        content="What did you decide?",
+    )
+    db_session.add_all([task, question])
+    await db_session.commit()
+    token = create_agent_token(
+        str(task.id),
+        "vm-agent-msg-projection",
+        task_type="strategic_review",
+    )
+
+    routine = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "create_message",
+            "data": {
+                "type": "NOTE",
+                "content": "PR merged.",
+                "context": {"event_type": "pr_merged"},
+                "idempotency_key": "agent-routine-1",
+            },
+        },
+    )
+    assert routine.status_code == 200, routine.text
+    routine_row = await db_session.get(
+        ProjectMessage, uuid.UUID(routine.json()["message_id"])
+    )
+    assert routine_row.surface == MessageSurface.ACTIVITY
+    assert isinstance(routine_row.sequence, int)
+    assert routine_row.sequence > 0
+
+    reply = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "create_message",
+            "data": {
+                "type": "NOTE",
+                "content": "I chose the safer rollout.",
+                "context": {"reply_to": str(question.id)},
+                "idempotency_key": "agent-reply-1",
+            },
+        },
+    )
+    assert reply.status_code == 200, reply.text
+    reply_row = await db_session.get(ProjectMessage, uuid.UUID(reply.json()["message_id"]))
+    assert reply_row.surface == MessageSurface.CONVERSATION
+    assert reply_row.reply_to_message_id == question.id
+    await db_session.refresh(question)
+    assert question.handling_state == MessageHandlingState.RESPONDED
+    assert question.handled_by_task_id == task.id
+
 
 class TestTriggerSelfAudit:
     @pytest.mark.asyncio
@@ -30806,7 +30928,7 @@ async def test_get_message_attachment_upload_url_success(
     with patch.object(_app_storage.storage, "Client", return_value=mock_client):
         resp = await client.post(
             f"/api/admin/projects/{project.id}/messages/attachment-upload-url",
-            json={"filename": "test-image.png", "content_type": "image/png"},
+            json={"filename": "test-image.png", "content_type": "image/png", "size_bytes": 1234},
         )
 
     assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
@@ -30817,13 +30939,22 @@ async def test_get_message_attachment_upload_url_success(
     assert "gs://" in data["storage_uri"]
     assert "message-attachments/" in data["storage_uri"]
     assert data["content_type"] == "image/png"
+    assert data["size_bytes"] == 1234
     assert data["attachment_id"] is not None
     assert len(data["attachment_id"]) > 0
     assert mock_blob.generate_signed_url.call_args_list[0].kwargs["method"] == "PUT"
     assert mock_blob.generate_signed_url.call_args_list[0].kwargs["content_type"] == "image/png"
+    assert mock_blob.generate_signed_url.call_args_list[0].kwargs["headers"] == {"Content-Length": "1234"}
     assert mock_blob.generate_signed_url.call_args_list[0].kwargs["expiration"].total_seconds() == 900
     assert mock_blob.generate_signed_url.call_args_list[1].kwargs["method"] == "GET"
     assert mock_blob.generate_signed_url.call_args_list[1].kwargs["expiration"].total_seconds() == 3600
+    from app.models import ProjectMessageAttachmentUpload
+    receipt = await db_session.get(
+        ProjectMessageAttachmentUpload, uuid.UUID(data["attachment_id"])
+    )
+    assert receipt is not None
+    assert receipt.expected_size_bytes == 1234
+    assert receipt.actor_user_id == TEST_USER_ID
 
 
 @pytest.mark.asyncio
@@ -30853,7 +30984,7 @@ async def test_get_message_attachment_upload_url_sanitizes_filename_and_content_
     with patch.object(_app_storage.storage, "Client", return_value=mock_client):
         resp = await client.post(
             f"/api/admin/projects/{project.id}/messages/attachment-upload-url",
-            json={"filename": "../../nested\\evil file!!.png"},
+            json={"filename": "../../nested\\evil file!!.png", "size_bytes": 9},
         )
 
     assert resp.status_code == 200, resp.text
@@ -30909,7 +31040,7 @@ async def test_get_message_attachment_upload_url_auth_failure(
             ) as anon:
                 resp = await anon.post(
                     f"/api/admin/projects/{project.id}/messages/attachment-upload-url",
-                    json={"filename": "test.png", "content_type": "image/png"},
+                    json={"filename": "test.png", "content_type": "image/png", "size_bytes": 9},
                 )
     finally:
         app.dependency_overrides.pop(get_current_user, None)
@@ -30936,7 +31067,7 @@ async def test_get_message_attachment_upload_url_nonmember_rejected_before_signi
     with patch.object(_app_storage.storage, "Client", return_value=mock_client):
         resp = await client.post(
             f"/api/admin/projects/{project.id}/messages/attachment-upload-url",
-            json={"filename": "test.png", "content_type": "image/png"},
+            json={"filename": "test.png", "content_type": "image/png", "size_bytes": 9},
         )
 
     assert resp.status_code == 404, resp.text
@@ -30965,7 +31096,7 @@ async def test_get_message_attachment_upload_url_rejects_invalid_content_type(
     with patch.object(_app_storage.storage, "Client", return_value=mock_client):
         resp = await client.post(
             f"/api/admin/projects/{project.id}/messages/attachment-upload-url",
-            json={"filename": "test.png", "content_type": "image/png\r\nx: y"},
+            json={"filename": "test.png", "content_type": "image/png\r\nx: y", "size_bytes": 9},
         )
 
     assert resp.status_code == 400, resp.text
@@ -30999,10 +31130,113 @@ async def test_get_message_attachment_upload_url_storage_unavailable(
     with patch.object(_app_storage.storage, "Client", return_value=mock_client):
         resp = await client.post(
             f"/api/admin/projects/{project.id}/messages/attachment-upload-url",
-            json={"filename": "test.png", "content_type": "image/png"},
+            json={"filename": "test.png", "content_type": "image/png", "size_bytes": 9},
         )
 
     assert resp.status_code == 503, f"Expected 503, got {resp.status_code}: {resp.text}"
+
+
+@pytest.mark.asyncio
+async def test_get_message_attachment_upload_url_rejects_oversized_declared_body(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    response = await client.post(
+        f"/api/admin/projects/{project.id}/messages/attachment-upload-url",
+        json={
+            "filename": "too-large.bin",
+            "content_type": "application/octet-stream",
+            "size_bytes": 50 * 1024 * 1024 + 1,
+        },
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_delete_message_attachment_upload_cleans_unconsumed_object(
+    client: AsyncClient, db_session
+):
+    from app.models import ProjectMessageAttachmentUpload
+
+    project = await _make_project(db_session)
+    attachment_id = uuid.uuid4()
+    storage_uri = (
+        f"gs://bucket/message-attachments/{project.id}/{attachment_id}/orphan.bin"
+    )
+    db_session.add(ProjectMessageAttachmentUpload(
+        attachment_id=attachment_id,
+        project_id=project.id,
+        actor_user_id=TEST_USER_ID,
+        storage_uri=storage_uri,
+        filename="orphan.bin",
+        content_type="application/octet-stream",
+        expected_size_bytes=10,
+        expires_at=_utcnow() + timedelta(minutes=15),
+    ))
+    await db_session.commit()
+
+    with patch(
+        "app.routers.admin_project_strategic_session.delete_storage_uri_best_effort",
+        new=AsyncMock(return_value=True),
+    ) as cleanup:
+        response = await client.delete(
+            f"/api/admin/projects/{project.id}/messages/attachment-uploads/{attachment_id}"
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"status": "deleted", "deleted": True}
+    cleanup.assert_awaited_once_with(storage_uri)
+    assert await db_session.get(ProjectMessageAttachmentUpload, attachment_id) is None
+
+
+@pytest.mark.asyncio
+async def test_upload_url_opportunistically_cleans_bounded_expired_receipts(
+    client: AsyncClient, db_session
+):
+    from unittest.mock import MagicMock
+    from app.models import ProjectMessageAttachmentUpload
+    from app import storage as _app_storage
+
+    project = await _make_project(db_session)
+    expired_id = uuid.uuid4()
+    expired_uri = (
+        f"gs://bucket/message-attachments/{project.id}/{expired_id}/expired.bin"
+    )
+    db_session.add(ProjectMessageAttachmentUpload(
+        attachment_id=expired_id,
+        project_id=project.id,
+        actor_user_id=TEST_USER_ID,
+        storage_uri=expired_uri,
+        filename="expired.bin",
+        content_type="application/octet-stream",
+        expected_size_bytes=10,
+        created_at=_utcnow() - timedelta(minutes=16),
+        expires_at=_utcnow() - timedelta(minutes=1),
+    ))
+    await db_session.commit()
+
+    blob = MagicMock()
+    blob.generate_signed_url.return_value = "https://storage.invalid/signed"
+    bucket = MagicMock()
+    bucket.blob.return_value = blob
+    storage_client = MagicMock()
+    storage_client.bucket.return_value = bucket
+    with (
+        patch.object(_app_storage.storage, "Client", return_value=storage_client),
+        patch(
+            "app.routers.admin_project_strategic_session.delete_storage_uri_best_effort",
+            new=AsyncMock(return_value=True),
+        ) as cleanup,
+    ):
+        response = await client.post(
+            f"/api/admin/projects/{project.id}/messages/attachment-upload-url",
+            json={"filename": "fresh.bin", "size_bytes": 10},
+        )
+
+    assert response.status_code == 200, response.text
+    cleanup.assert_any_await(expired_uri)
+    db_session.expire_all()
+    assert await db_session.get(ProjectMessageAttachmentUpload, expired_id) is None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
