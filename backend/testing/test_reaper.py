@@ -9470,6 +9470,55 @@ async def test_unblock_sweep_prioritizes_gate_blocker_before_backoff_is_due(
 
 
 @pytest.mark.asyncio
+async def test_unblock_sweep_retries_tests_gated_legacy_task_after_new_commit(
+    reaper_db, mocker
+):
+    """No-checks integration branches recover legacy rows without spawn SHAs."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    now = _utcnow()
+    mocker.patch(
+        "app.gate_revalidation.resolve_gate_state",
+        new_callable=AsyncMock,
+        return_value={
+            "head_sha": "b" * 40,
+            "green_at_head": False,
+            "no_checks_allowed": True,
+            "revalidation_ready": True,
+            "head_committed_at": now + timedelta(minutes=1),
+            "checked_at_utc": now.isoformat(),
+        },
+    )
+    project = await _make_project(reaper_db)
+    task = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="precondition",
+        blocked_reason=(
+            "BLOCKER: ./pr open is blocked by standalone smoke failures in "
+            "untouched backend/testing/test_invariants.py"
+        ),
+        recheck_after=now + timedelta(hours=1),
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "precondition",
+            },
+        },
+    )
+    task.blocked_at = now
+    reaper_db.add(task)
+    await reaper_db.commit()
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 1
+    await reaper_db.refresh(task)
+    assert task.status == TaskStatus.QUEUED
+    assert task.context["_gate_revalidated_head"] == "b" * 40
+    assert "rerun the repository gate" in (task.latest_status_message or "")
+
+
+@pytest.mark.asyncio
 async def test_unblock_sweep_does_not_revalidate_same_green_head(
     reaper_db, mocker
 ):

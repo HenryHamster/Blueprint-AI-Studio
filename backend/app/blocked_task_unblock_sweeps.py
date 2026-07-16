@@ -1217,7 +1217,9 @@ async def sweep_unblock_blocked_tasks(
     # changes, their old exponential backoff should not delay recovery for up to
     # an hour. Pull a bounded priority set regardless of recheck_after; the
     # in-loop SHA equality check and per-project GitHub cache keep this cheap and
-    # prevent repeated requeues on the same HEAD.
+    # prevent repeated requeues on the same HEAD. Projects that intentionally
+    # skip GitHub CI on their integration branch may requeue to execute their
+    # real task gate on a fresh base; pending/red/API-error CI remains closed.
     gate_text_predicates = []
     for marker in GATE_REVALIDATION_QUERY_MARKERS:
         pattern = f"%{marker}%"
@@ -1387,18 +1389,32 @@ async def sweep_unblock_blocked_tasks(
                 _gate_cache[_pid_key] = _gs or {}
             if (
                 _gs
-                and _gs.get("green_at_head")
-                and head_advanced_since_gate_failure(task, _gs.get("head_sha"))
+                and _gs.get(
+                    "revalidation_ready",
+                    _gs.get("green_at_head", False),
+                )
+                and head_advanced_since_gate_failure(
+                    task,
+                    _gs.get("head_sha"),
+                    head_committed_at=_gs.get("head_committed_at"),
+                )
                 and not await has_live_respawn(task, session)
             ):
                 from sqlalchemy.orm.attributes import flag_modified
 
                 _clear_blocked_fields(task, preserve_first_blocked=False)
                 task.status = TaskStatus.QUEUED
-                task.latest_status_message = (
-                    "Unblocked — repo-wide gate resolved at integration HEAD "
-                    f"({_gs['head_sha'][:12]}), requeued on fresh base"
-                )
+                if _gs.get("green_at_head"):
+                    task.latest_status_message = (
+                        "Unblocked — repo-wide gate resolved at integration HEAD "
+                        f"({_gs['head_sha'][:12]}), requeued on fresh base"
+                    )
+                else:
+                    task.latest_status_message = (
+                        "Unblocked — integration HEAD advanced "
+                        f"({_gs['head_sha'][:12]}); requeued to rerun the "
+                        "repository gate on a fresh base"
+                    )
                 ctx = task.context or {}
                 ctx["_gate_revalidated_at"] = _gs["checked_at_utc"]
                 ctx["_gate_revalidated_head"] = _gs["head_sha"]

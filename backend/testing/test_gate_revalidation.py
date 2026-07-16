@@ -10,6 +10,7 @@ Covers:
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -214,9 +215,24 @@ def test_revalidated_head_prevents_repeat_on_same_head():
     assert head_advanced_since_gate_failure(task, "c" * 40) is True
 
 
-def test_missing_generation_sha_fails_closed():
+def test_missing_generation_sha_fails_closed_without_commit_time():
     task = _blocked_task()
     assert head_advanced_since_gate_failure(task, "b" * 40) is False
+
+
+def test_missing_generation_sha_uses_commit_newer_than_blocker():
+    task = _blocked_task()
+    task.blocked_at = datetime(2026, 7, 16, 12, 0, tzinfo=timezone.utc)
+    assert head_advanced_since_gate_failure(
+        task,
+        "b" * 40,
+        head_committed_at=task.blocked_at + timedelta(minutes=1),
+    ) is True
+    assert head_advanced_since_gate_failure(
+        task,
+        "b" * 40,
+        head_committed_at=task.blocked_at,
+    ) is False
 
 
 # ── resolve_gate_state ───────────────────────────────────────────────────
@@ -280,9 +296,12 @@ async def test_resolve_gate_state_green_at_head():
     project.id = project_id
     project.github_owner = "owner"
     project.github_repo = "repo"
+    project.build_config = {"has_ci": True, "requires_ci_checks": False}
+    project.is_staging_branch.return_value = False
     session.get.return_value = project
 
     fake_sha = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+    committed_at = datetime(2026, 7, 16, 12, 0, tzinfo=timezone.utc)
 
     with (
         patch("app.github.get_repo_installation_token",
@@ -295,13 +314,99 @@ async def test_resolve_gate_state_green_at_head():
               AsyncMock(return_value={"status": "completed",
                                       "conclusion": "success",
                                       "details": []})),
+        patch("app.github.get_commit_date",
+              AsyncMock(return_value=committed_at)),
     ):
         result = await resolve_gate_state(session, project_id)
 
     assert result is not None
     assert result["head_sha"] == fake_sha
     assert result["green_at_head"] is True
+    assert result["revalidation_ready"] is True
+    assert result["head_committed_at"] == committed_at
     assert "checked_at_utc" in result
+
+
+@pytest.mark.asyncio
+async def test_resolve_gate_state_allows_no_checks_on_tests_gated_integration():
+    """Explicit no-integration-CI policy requeues to rerun the real task gate."""
+    session = AsyncMock()
+    project_id = uuid.uuid4()
+    project = MagicMock()
+    project.id = project_id
+    project.github_owner = "owner"
+    project.github_repo = "repo"
+    project.build_config = {"has_ci": True, "requires_ci_checks": False}
+    project.is_staging_branch.return_value = False
+    session.get.return_value = project
+    committed_at = datetime(2026, 7, 16, 12, 0, tzinfo=timezone.utc)
+
+    with (
+        patch("app.github.get_repo_installation_token",
+              AsyncMock(return_value="fake-token")),
+        patch("app.github.get_branch_sha",
+              AsyncMock(return_value="deadbeef" * 5)),
+        patch("app.branch_resolution.get_project_integration_branch",
+              return_value="automain"),
+        patch("app.github.get_check_runs_cached",
+              AsyncMock(return_value={"status": "no_checks",
+                                      "conclusion": None,
+                                      "details": []})),
+        patch("app.github.get_commit_date",
+              AsyncMock(return_value=committed_at)),
+    ):
+        result = await resolve_gate_state(session, project_id)
+
+    assert result is not None
+    assert result["green_at_head"] is False
+    assert result["no_checks_allowed"] is True
+    assert result["revalidation_ready"] is True
+    assert result["head_committed_at"] == committed_at
+
+
+@pytest.mark.asyncio
+async def test_resolve_gate_state_keeps_required_branch_no_checks_closed():
+    """A CI-capable required branch cannot advance on absent check-runs."""
+    session = AsyncMock()
+    project_id = uuid.uuid4()
+    project = MagicMock()
+    project.id = project_id
+    project.github_owner = "owner"
+    project.github_repo = "repo"
+    project.build_config = {"has_ci": True, "requires_ci_checks": False}
+    project.is_staging_branch.return_value = False
+    session.get.return_value = project
+
+    with (
+        patch(
+            "app.github.get_repo_installation_token",
+            AsyncMock(return_value="fake-token"),
+        ),
+        patch(
+            "app.github.get_branch_sha",
+            AsyncMock(return_value="deadbeef" * 5),
+        ),
+        patch(
+            "app.branch_resolution.get_project_integration_branch",
+            return_value="main",
+        ),
+        patch(
+            "app.github.get_check_runs_cached",
+            AsyncMock(
+                return_value={
+                    "status": "no_checks",
+                    "conclusion": None,
+                    "details": [],
+                }
+            ),
+        ),
+        patch("app.github.get_commit_date", AsyncMock(return_value=None)),
+    ):
+        result = await resolve_gate_state(session, project_id)
+
+    assert result is not None
+    assert result["no_checks_allowed"] is False
+    assert result["revalidation_ready"] is False
 
 
 @pytest.mark.asyncio
@@ -313,6 +418,8 @@ async def test_resolve_gate_state_red_at_head():
     project.id = project_id
     project.github_owner = "owner"
     project.github_repo = "repo"
+    project.build_config = {"has_ci": True, "requires_ci_checks": False}
+    project.is_staging_branch.return_value = False
     session.get.return_value = project
 
     with (
@@ -326,11 +433,14 @@ async def test_resolve_gate_state_red_at_head():
               AsyncMock(return_value={"status": "completed",
                                       "conclusion": "failure",
                                       "details": []})),
+        patch("app.github.get_commit_date",
+              AsyncMock(return_value=None)),
     ):
         result = await resolve_gate_state(session, project_id)
 
     assert result is not None
     assert result["green_at_head"] is False
+    assert result["revalidation_ready"] is False
 
 
 @pytest.mark.asyncio
@@ -342,6 +452,8 @@ async def test_resolve_gate_state_caches_token():
     project.id = project_id
     project.github_owner = "owner"
     project.github_repo = "repo"
+    project.build_config = {"has_ci": True, "requires_ci_checks": False}
+    project.is_staging_branch.return_value = False
     session.get.return_value = project
 
     cache: dict[str, str] = {}
@@ -356,6 +468,8 @@ async def test_resolve_gate_state_caches_token():
               AsyncMock(return_value={"status": "completed",
                                       "conclusion": "success",
                                       "details": []})),
+        patch("app.github.get_commit_date",
+              AsyncMock(return_value=None)),
     ):
         result1 = await resolve_gate_state(session, project_id,
                                            github_info_cache=cache)

@@ -11,6 +11,7 @@ does not replace it.
 """
 
 import logging
+from datetime import datetime, timezone
 
 from sqlmodel import select
 
@@ -78,20 +79,46 @@ def _same_sha(left: str, right: str) -> bool:
     return left.startswith(right) or right.startswith(left)
 
 
-def head_advanced_since_gate_failure(task: Task, head_sha: object) -> bool:
+def _as_utc(value: object) -> datetime | None:
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def head_advanced_since_gate_failure(
+    task: Task,
+    head_sha: object,
+    *,
+    head_committed_at: object = None,
+) -> bool:
     """Return True only when integration HEAD differs from the task baseline.
 
     ``generated_head_sha`` is the branch point recorded when research spawned
     the task. After an automatic revalidation, ``_gate_revalidated_head`` takes
     precedence so the same green HEAD cannot repeatedly unblock a task that
     blocks again without any repository change.
+
+    Legacy/direct-fix tasks may predate branch-point capture. For those rows,
+    an integration commit strictly newer than ``blocked_at`` is equivalent
+    advancement proof: the repository changed after the gate failure occurred.
+    The caller still separately requires either explicit green CI or the
+    project's explicit tests-gated/no-integration-CI policy.
     """
     head = _normalize_sha(head_sha)
     ctx = _task_context(task)
     baseline = _normalize_sha(
         ctx.get("_gate_revalidated_head") or ctx.get("generated_head_sha")
     )
-    return bool(head and baseline and not _same_sha(head, baseline))
+    if not head:
+        return False
+    if baseline:
+        return not _same_sha(head, baseline)
+
+    blocked_at = _as_utc(task.blocked_at)
+    committed_at = _as_utc(head_committed_at)
+    return bool(blocked_at and committed_at and committed_at > blocked_at)
 
 
 def is_gate_failure_blocked(task: Task) -> bool:
@@ -194,7 +221,7 @@ async def resolve_gate_state(
         return None
 
     # 4 ── Check CI state at HEAD.
-    from app.github import get_check_runs_cached
+    from app.github import get_check_runs_cached, get_commit_date
 
     ci_result = await get_check_runs_cached(
         token,
@@ -207,9 +234,28 @@ async def resolve_gate_state(
     )
 
     green = _ci_conclusion_is_green(ci_result)
+    # Blueprint intentionally skips GitHub CI on its high-churn integration
+    # branch and executes real tests in the task PR helper instead. Respect the
+    # same explicit policy used by the merge monitor: a definitive no-checks
+    # result is revalidation-ready only when this branch is configured to
+    # proceed without GitHub checks. Pending, red, and API-error results remain
+    # fail-closed.
+    from app.ci_resolution import proceed_on_no_checks
+
+    no_checks_allowed = (
+        ci_result.get("status") == "no_checks"
+        and proceed_on_no_checks(project, branch)
+    )
+    try:
+        head_committed_at = await get_commit_date(token, owner, repo, head_sha)
+    except Exception:  # noqa: BLE001
+        head_committed_at = None
     return {
         "head_sha": head_sha,
         "green_at_head": green,
+        "no_checks_allowed": no_checks_allowed,
+        "revalidation_ready": green or no_checks_allowed,
+        "head_committed_at": head_committed_at,
         "checked_at_utc": _utcnow().isoformat(),
     }
 
