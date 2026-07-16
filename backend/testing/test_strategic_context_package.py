@@ -1693,3 +1693,144 @@ async def test_terminal_artifact_reserves_slot_for_viewable_older_artifact(
 
     # Evidence stays bounded (4 terminal artifacts max after cap)
     assert len(items) <= scp._ARTIFACT_EVIDENCE_LIMIT
+
+
+# ── Parallel signing (Finding 1 & 2 performance) ──────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_viewable_previews_not_signed_sequentially_per_file(
+    db_session, monkeypatch
+):
+    """_sign_viewable_manifest gathers all GCS signing calls in parallel.
+
+    With N viewable files, generate_download_signed_url must be invoked via
+    asyncio.gather (not awaited one-by-one), so all N GCS round-trips run
+    concurrently. The test spies on asyncio.gather inside the module to confirm
+    it is called with multiple coroutines, and also verifies that every file in
+    the manifest resolves to a signed preview (functional correctness).
+    """
+    import asyncio as _asyncio
+
+    project, _task = await _make_project_task(db_session, name="ParallelSignPerFile")
+    uris = [
+        f"gs://{ARTIFACT_BUCKET_NAME}/compute-jobs/"
+        f"aaaaaaaa-aaaa-aaaa-aaaa-{str(i).zfill(12)}/artifacts/viewable/plot{i}.png"
+        for i in range(3)
+    ]
+    viewable_files = [
+        {
+            "filename": f"plot{i}.png",
+            "storage_uri": uri,
+            "kind": "image",
+            "content_type": "image/png",
+        }
+        for i, uri in enumerate(uris)
+    ]
+
+    async def fake_verify(*a):
+        return None
+
+    signed_uris: list = []
+
+    async def fake_sign(uri, expiration_minutes=60):
+        signed_uris.append(uri)
+        return f"https://signed.example/{uri.rsplit('/', 1)[-1]}"
+
+    monkeypatch.setattr(scp, "verify_artifact_project_ownership", fake_verify)
+    monkeypatch.setattr(scp, "generate_download_signed_url", fake_sign)
+
+    gather_calls: list = []
+    real_gather = _asyncio.gather
+
+    async def spy_gather(*coros, **kwargs):
+        gather_calls.append(len(coros))
+        return await real_gather(*coros, **kwargs)
+
+    with patch.object(_asyncio, "gather", new=spy_gather):
+        previews = await scp._sign_viewable_manifest(
+            db_session, project.id, viewable_files
+        )
+
+    # All 3 files must resolve
+    assert len(previews) == 3
+    assert all(p["url"].startswith("https://") for p in previews)
+    assert {p["filename"] for p in previews} == {"plot0.png", "plot1.png", "plot2.png"}
+
+    # asyncio.gather must have been called with all 3 signing coroutines at once
+    assert gather_calls, "asyncio.gather was never called"
+    assert max(gather_calls) == 3, (
+        f"Expected gather with 3 coroutines, got: {gather_calls}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_running_job_previews_signed_concurrently_across_jobs(
+    db_session, monkeypatch
+):
+    """_running_job_preview_items fans out signing across all jobs in one gather.
+
+    With 2 running jobs each carrying 2 viewable files, all 4 GCS signing calls
+    must be issued in a single asyncio.gather (not one per job), so total signing
+    latency is O(1) parallel batches rather than O(jobs) sequential calls.
+    """
+    import asyncio as _asyncio
+
+    project, task = await _make_project_task(db_session, name="ParallelSignAcrossJobs")
+    now = datetime.now(timezone.utc)
+
+    def _make_viewable(basename: str, job_slot: int) -> dict:
+        uri = (
+            f"gs://{ARTIFACT_BUCKET_NAME}/compute-jobs/"
+            f"{job_slot:08x}-0000-0000-0000-000000000000"
+            f"/artifacts/viewable/{basename}"
+        )
+        return {"filename": basename, "storage_uri": uri, "kind": "image", "content_type": "image/png"}
+
+    for slot in range(2):
+        db_session.add(
+            ComputeJob(
+                project_id=project.id,
+                task_id=task.id,
+                backend="local_process",
+                status=ComputeJobStatus.RUNNING,
+                polling_metadata={
+                    "viewable_files": [
+                        _make_viewable(f"plot{slot}a.png", slot),
+                        _make_viewable(f"plot{slot}b.png", slot),
+                    ]
+                },
+                updated_at=now - timedelta(hours=slot),
+            )
+        )
+    await db_session.commit()
+
+    async def fake_verify(*a):
+        return None
+
+    async def fake_sign(uri, expiration_minutes=60):
+        return f"https://signed.example/{uri.rsplit('/', 1)[-1]}"
+
+    monkeypatch.setattr(scp, "verify_artifact_project_ownership", fake_verify)
+    monkeypatch.setattr(scp, "generate_download_signed_url", fake_sign)
+
+    gather_calls: list = []
+    real_gather = _asyncio.gather
+
+    async def spy_gather(*coros, **kwargs):
+        gather_calls.append(len(coros))
+        return await real_gather(*coros, **kwargs)
+
+    with patch.object(_asyncio, "gather", new=spy_gather):
+        items = await scp._running_job_preview_items(db_session, project.id)
+
+    # Both jobs must surface with their previews
+    assert len(items) == 2
+    assert all(len(it["viewable_previews"]) == 2 for it in items)
+    assert all(it["compute_job_running"] is True for it in items)
+
+    # All 4 signing calls must have been issued in a single gather (not 2 x 2)
+    assert gather_calls, "asyncio.gather was never called"
+    assert max(gather_calls) == 4, (
+        f"Expected one gather with 4 coroutines (2 jobs x 2 files), got: {gather_calls}"
+    )

@@ -266,7 +266,12 @@ def _load_local_runner_tree() -> ast.Module:
 
 def test_interim_running_report_carries_progress_and_log_tail():
     """The in-loop interim report must send progress + live log tail; the
-    terminal kill paths must send progress alongside their command_log."""
+    terminal kill paths must send progress alongside their command_log.
+
+    Terminal reports flow through the nested _report_terminal wrapper which
+    forwards all kwargs to _report_compute_job; this test counts both the
+    direct running-report call sites and the wrapper call sites with progress.
+    """
     tree = _load_local_runner_tree()
     run_job = next(
         (
@@ -278,33 +283,60 @@ def test_interim_running_report_carries_progress_and_log_tail():
     )
     assert run_job is not None
 
+    # Find the nested _report_terminal wrapper so we can verify it forwards progress.
+    report_terminal_def = next(
+        (
+            node
+            for node in ast.walk(run_job)
+            if isinstance(node, ast.FunctionDef) and node.name == "_report_terminal"
+        ),
+        None,
+    )
+
     running_with_progress = 0
     terminal_with_progress = 0
     for node in ast.walk(run_job):
-        if not (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "_report_compute_job"
-        ):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)):
             continue
         kwargs = {kw.arg for kw in node.keywords}
-        status_kw = next(
-            (kw for kw in node.keywords if kw.arg == "exec_status"), None
-        )
-        status = (
-            status_kw.value.value
-            if status_kw is not None and isinstance(status_kw.value, ast.Constant)
-            else None
-        )
-        if status == "running" and "progress" in kwargs and "command_log" in kwargs:
-            running_with_progress += 1
-        if status != "running" and "progress" in kwargs:
+        func_name = node.func.id
+
+        if func_name == "_report_compute_job":
+            status_kw = next(
+                (kw for kw in node.keywords if kw.arg == "exec_status"), None
+            )
+            status = (
+                status_kw.value.value
+                if status_kw is not None and isinstance(status_kw.value, ast.Constant)
+                else None
+            )
+            if status == "running" and "progress" in kwargs and "command_log" in kwargs:
+                running_with_progress += 1
+
+        elif func_name == "_report_terminal" and "progress" in kwargs:
+            # Terminal kill paths now delegate to the _report_terminal wrapper;
+            # count wrapper call sites that carry progress.
             terminal_with_progress += 1
+
     assert running_with_progress >= 1, (
         "the periodic running report must carry progress + command_log tail"
     )
     assert terminal_with_progress >= 3, (
         "deadline/shutdown/cancel + final terminal reports must carry progress"
+    )
+    # Verify the wrapper itself forwards progress through to _report_compute_job.
+    assert report_terminal_def is not None, (
+        "_report_terminal wrapper not found inside _run_compute_job"
+    )
+    wrapper_forwards_progress = any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_report_compute_job"
+        and "progress" in {kw.arg for kw in node.keywords}
+        for node in ast.walk(report_terminal_def)
+    )
+    assert wrapper_forwards_progress, (
+        "_report_terminal wrapper does not forward progress to _report_compute_job"
     )
 
 

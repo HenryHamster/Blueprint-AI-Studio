@@ -757,6 +757,31 @@ def _concurrently_txn_escape_violations(source: str, revision: str) -> list[str]
         commits: list[tuple[int, int]] = []
         concurrentlies: list[tuple[int, int]] = []
 
+        # Collect line ranges of autocommit_block() with-statements: any
+        # CONCURRENTLY inside op.get_context().autocommit_block() already
+        # escapes the per-migration transaction and must not be flagged.
+        autocommit_ranges: list[tuple[int, int]] = []
+        for node in ast.walk(func):
+            if (
+                isinstance(node, ast.With)
+                and node.items
+                and isinstance(node.items[0].context_expr, ast.Call)
+            ):
+                ctx = node.items[0].context_expr
+                if (
+                    isinstance(ctx.func, ast.Attribute)
+                    and ctx.func.attr == "autocommit_block"
+                ):
+                    # Record start/end lines of this with-block.
+                    body_end = max(
+                        (getattr(n, "end_lineno", node.lineno) for n in ast.walk(node)),
+                        default=node.lineno,
+                    )
+                    autocommit_ranges.append((node.lineno, body_end))
+
+        def _in_autocommit_block(lineno: int) -> bool:
+            return any(start <= lineno <= end for start, end in autocommit_ranges)
+
         for node in ast.walk(func):
             if not isinstance(node, ast.Call) or not isinstance(
                 node.func, ast.Attribute
@@ -770,7 +795,8 @@ def _concurrently_txn_escape_violations(source: str, revision: str) -> list[str]
                 if text.strip().upper() == "COMMIT":
                     commits.append(pos)
                 elif _CONCURRENTLY_DDL_RE.search(text):
-                    concurrentlies.append(pos)
+                    if not _in_autocommit_block(node.lineno):
+                        concurrentlies.append(pos)
             elif attr in ("create_index", "drop_index"):
                 for kw in node.keywords:
                     if (
@@ -778,7 +804,8 @@ def _concurrently_txn_escape_violations(source: str, revision: str) -> list[str]
                         and isinstance(kw.value, ast.Constant)
                         and kw.value.value is True
                     ):
-                        concurrentlies.append(pos)
+                        if not _in_autocommit_block(node.lineno):
+                            concurrentlies.append(pos)
 
         if not concurrentlies:
             continue
@@ -1496,20 +1523,47 @@ class TestSchemaRevisionSync:
         add_col_re = re.compile(
             r"add_column\(\s*['\"](\w+)['\"]\s*,\s*sa\.Column\(\s*['\"](\w+)['\"]"
         )
-        create_table_re = re.compile(r"create_table\(\s*['\"](\w+)['\"]", re.MULTILINE)
+        # Same as add_col_re but with comment-stripped content; handles cases where
+        # Python comment lines appear between the table arg and sa.Column(…).
+        add_col_nocomment_re = re.compile(
+            r"add_column\(\s*['\"](\w+)['\"]\s*,\s*sa\.Column\(\s*['\"](\w+)['\"]"
+        )
+        # create_table accepts either a quoted literal OR a bare Python constant
+        # (e.g. _SEQUENCE_TABLE = "projectmessagesequence").
+        create_table_re = re.compile(
+            r"create_table\(\s*(?:['\"](\w+)['\"]|(\w+))\s*[,)]",
+            re.MULTILINE,
+        )
         col_in_create_re = re.compile(r"sa\.Column\(\s*['\"](\w+)['\"]")
         # Renames: alter_column('table', 'old', new_column_name='new') → new column exists
         rename_re = re.compile(
             r"alter_column\(\s*['\"](\w+)['\"]\s*,\s*['\"](\w+)['\"].*?new_column_name\s*=\s*['\"](\w+)['\"]",
             re.DOTALL,
         )
+        # Module-level string constants: _NAME = "value" (used as table names).
+        file_const_re = re.compile(r"^(_\w+)\s*=\s*['\"](\w+)['\"]", re.MULTILINE)
+
+        def _strip_py_comments(src: str) -> str:
+            """Remove Python # comment lines (preserving line count for positions)."""
+            lines = src.splitlines(keepends=True)
+            out = []
+            for line in lines:
+                stripped = line.lstrip()
+                out.append("\n" if stripped.startswith("#") else line)
+            return "".join(out)
 
         for path in files:
             with open(path) as f:
                 content = f.read()
 
+            # Resolve module-level string constants for create_table constant names.
+            consts = dict(file_const_re.findall(content))
+
+            # Strip comment lines so add_column regex bridges comments between args.
+            stripped = _strip_py_comments(content)
+
             # add_column('table', sa.Column('name', ...))
-            for m in add_col_re.finditer(content):
+            for m in add_col_nocomment_re.finditer(stripped):
                 migration_columns.add((m.group(1), m.group(2)))
 
             # alter_column('table', 'old_name', new_column_name='new_name', ...)
@@ -1517,10 +1571,22 @@ class TestSchemaRevisionSync:
                 migration_columns.add((m.group(1), m.group(3)))
 
             # create_table('table', sa.Column('name', ...), ...)
+            # Also handle create_table(CONSTANT, ...) where the table name is a var.
             for ct in create_table_re.finditer(content):
-                table = ct.group(1)
+                literal_name = ct.group(1)
+                const_name = ct.group(2)
+                if literal_name:
+                    table = literal_name
+                elif const_name:
+                    table = consts.get(const_name, "")
+                else:
+                    continue
+                if not table:
+                    continue
                 # Find the matching closing paren for this create_table call
-                start = ct.end()
+                start = ct.end() - 1  # back to just after the table arg
+                # Re-scan from the actual start of the arg list
+                start = content.index("(", ct.start()) + 1
                 depth = 1
                 end = start
                 while end < len(content) and depth > 0:
@@ -1736,7 +1802,7 @@ class TestSchemaRevisionSync:
             r"CREATE\s+INDEX" + _GLUE + r"\s*(?:CONCURRENTLY" + _GLUE + r"\s*)?"
             r"(?:IF\s+NOT\s+EXISTS" + _GLUE + r"\s*)?"
             r"\{?(\w+)\}?"                        # name, or {_PY_CONST} interpolation
-            + _GLUE + r"\s*ON\s+(\w+)"            # table
+            + _GLUE + r"\s*ON\s+\{?(\w+)\}?"     # table, or {_PY_CONST} interpolation
             + _GLUE + r"\s*(?:USING\s+\w+)?"      # optional access method
             + _GLUE + r"\s*\(([^)]*)\)",          # column expression list
             re.IGNORECASE | re.DOTALL,
@@ -1785,17 +1851,21 @@ class TestSchemaRevisionSync:
                     effective.add(entry)
 
             # Raw-SQL creates (CONCURRENTLY etc.) — see raw_create_idx_re above.
+            _word_re = re.compile(r"\b(\w+)\b")
             for m in raw_create_idx_re.finditer(content):
                 name = consts.get(m.group(1), m.group(1))
-                table, cols_raw = m.group(2), m.group(3)
+                raw_table = m.group(2)
+                table = consts.get(raw_table, raw_table)
+                cols_raw = m.group(3)
                 # The expression list carries operator classes / functions alongside
                 # the columns (e.g. "title gin_trgm_ops").  Keep only tokens that are
                 # REAL columns of that table, so an opclass can never masquerade as one.
+                # Raw SQL uses bare identifiers (not quoted), so use word-token extraction.
                 sa_table = SQLModel.metadata.tables.get(table)
                 if sa_table is None:
                     continue
                 real_cols = {c.name for c in sa_table.columns}
-                cols = frozenset(t for t in str_re.findall(cols_raw) if t in real_cols)
+                cols = frozenset(t for t in _word_re.findall(cols_raw) if t in real_cols)
                 if cols:
                     entry = (table, cols)
                     if name:

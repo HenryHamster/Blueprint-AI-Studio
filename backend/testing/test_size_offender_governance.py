@@ -213,7 +213,10 @@ async def test_chronic_offender_escalates_not_silently_bumped(db_session, mocker
         _record(4050, 4500, CHRONIC_WINDOW_DAYS - 60),
         _record(4500, 4700, 30),
     ]
-    with patch("app.hotfix_backmerge.parse_bump_history", return_value=chronic_history):
+    # Bypass the audience gate: size violations are strategist-internal, but
+    # these DB-level tests verify escalation/dedup logic independent of routing.
+    with patch("app.hotfix_backmerge.is_operator_visible", return_value=True), \
+         patch("app.hotfix_backmerge.parse_bump_history", return_value=chronic_history):
         await hb._emit_size_violation_alerts(
             db_session,
             project.id,
@@ -247,7 +250,8 @@ async def test_chronic_offender_escalates_not_silently_bumped(db_session, mocker
     assert "bumping the cap" not in chronic_alert.message.lower()
 
     # --- first-time breach: empty history → WARNING ---
-    with patch("app.hotfix_backmerge.parse_bump_history", return_value=[]):
+    with patch("app.hotfix_backmerge.is_operator_visible", return_value=True), \
+         patch("app.hotfix_backmerge.parse_bump_history", return_value=[]):
         await hb._emit_size_violation_alerts(
             db_session,
             project.id,
@@ -286,7 +290,8 @@ async def test_chronic_alert_deduplicates(db_session, mocker):
         {"section": "backend", "rel": "big_module.py", "count": 1700, "cap": 1600}
     ]
 
-    with patch("app.hotfix_backmerge.parse_bump_history", return_value=chronic_history):
+    with patch("app.hotfix_backmerge.is_operator_visible", return_value=True), \
+         patch("app.hotfix_backmerge.parse_bump_history", return_value=chronic_history):
         await hb._emit_size_violation_alerts(
             db_session, project.id, violations=violation, pr_number=10, trigger_desc=""
         )
@@ -306,10 +311,11 @@ async def test_parse_bump_history_error_does_not_block_alert(db_session, mocker)
     """If parse_bump_history raises, _emit_size_violation_alerts still emits a WARNING."""
     project = await _make_project(db_session)
 
-    with patch(
-        "app.hotfix_backmerge.parse_bump_history",
-        side_effect=RuntimeError("git not available"),
-    ):
+    with patch("app.hotfix_backmerge.is_operator_visible", return_value=True), \
+         patch(
+             "app.hotfix_backmerge.parse_bump_history",
+             side_effect=RuntimeError("git not available"),
+         ):
         await hb._emit_size_violation_alerts(
             db_session,
             project.id,
