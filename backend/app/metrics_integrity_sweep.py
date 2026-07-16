@@ -164,6 +164,16 @@ class CheckResult:
     # ``detail`` prose — so the observability snapshot and dashboards can report
     # self-heal throughput machine-readably.
     auto_resolved: int | None = None
+    # Breakdown of ``auto_resolved`` by the proof tier that closed each gap. Both
+    # tiers are structural (``path_proven``) and neither clears the enforce gate,
+    # but the split matters operationally: a fleet auto-resolving caps entirely via
+    # the weaker ``backing_path`` fallback looks healthy by ``auto_resolved`` count
+    # yet has earned no ``named_test_present`` coverage at all. Surfaced structured
+    # so the observability snapshot can report tier throughput without parsing the
+    # ``detail`` prose. Both are ``None`` for checks that never auto-resolve; when
+    # set they sum to ``auto_resolved``.
+    auto_resolved_backing_path: int | None = None
+    auto_resolved_named_test_present: int | None = None
 
     @property
     def flagged(self) -> bool:
@@ -180,6 +190,8 @@ class CheckResult:
             "subject": self.subject,
             "detail": self.detail,
             "auto_resolved": self.auto_resolved,
+            "auto_resolved_backing_path": self.auto_resolved_backing_path,
+            "auto_resolved_named_test_present": self.auto_resolved_named_test_present,
         }
 
     def finding_key(self) -> str:
@@ -249,6 +261,14 @@ class _MetricsIntegrityObservability:
     flags_total: int = 0
     errors_total: int = 0
     enrolled_total: int = 0
+    # Cumulative self-heal throughput across all ticks. Each CheckResult already
+    # carries per-result ``auto_resolved`` (and its tier split), but nothing
+    # aggregated it, so self-heal throughput was invisible to operators and
+    # dashboards. Summed per tick and exposed in ``snapshot()`` alongside the
+    # per-tick totals so the trend is machine-readable.
+    auto_resolved_total: int = 0
+    auto_resolved_backing_path_total: int = 0
+    auto_resolved_named_test_present_total: int = 0
     last_tick_at: str | None = None
     last_tick: Dict[str, Any] | None = None
     recent_ticks: Deque[Dict[str, Any]] = field(
@@ -268,11 +288,19 @@ class _MetricsIntegrityObservability:
     ) -> Dict[str, Any]:
         flagged = [r for r in results if r.flagged]
         errored = [r for r in results if r.status == CheckStatus.ERROR]
+        auto_resolved = sum(r.auto_resolved or 0 for r in results)
+        auto_resolved_bp = sum(r.auto_resolved_backing_path or 0 for r in results)
+        auto_resolved_nt = sum(
+            r.auto_resolved_named_test_present or 0 for r in results
+        )
         self.ticks += 1
         self.checks_run += len(results)
         self.flags_total += len(flagged)
         self.errors_total += len(errored)
         self.enrolled_total += enrolled
+        self.auto_resolved_total += auto_resolved
+        self.auto_resolved_backing_path_total += auto_resolved_bp
+        self.auto_resolved_named_test_present_total += auto_resolved_nt
         tick = {
             "at": now.isoformat(),
             "mode": mode,
@@ -280,6 +308,9 @@ class _MetricsIntegrityObservability:
             "flagged": len(flagged),
             "errors": len(errored),
             "enrolled": enrolled,
+            "auto_resolved": auto_resolved,
+            "auto_resolved_backing_path": auto_resolved_bp,
+            "auto_resolved_named_test_present": auto_resolved_nt,
             "flags": [r.as_dict() for r in flagged],
         }
         self.last_tick_at = str(tick["at"])
@@ -298,6 +329,11 @@ class _MetricsIntegrityObservability:
             "flags_total": self.flags_total,
             "errors_total": self.errors_total,
             "enrolled_total": self.enrolled_total,
+            "auto_resolved_total": self.auto_resolved_total,
+            "auto_resolved_backing_path_total": self.auto_resolved_backing_path_total,
+            "auto_resolved_named_test_present_total": (
+                self.auto_resolved_named_test_present_total
+            ),
             "last_tick_at": self.last_tick_at,
             "last_tick": dict(self.last_tick) if self.last_tick else None,
             "recent_ticks": list(self.recent_ticks),
@@ -3626,9 +3662,10 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
     commit for one project is logged and rolled back without aborting the check.
 
     * ``self_reported`` = total ``working`` capabilities in the project.
-    * ``ground_truth``  = caps with recorded proof (pre-existing ``proven`` plus
-      newly auto-recorded ``path_proven`` self-heal tiers); it counts recorded
-      evidence, not enforce-gate-clearing ``proven`` status specifically.
+    * ``ground_truth``  = caps with a true machine-verified ``proven`` status only;
+      ``path_proven`` self-heal tiers (structural backing-path or static
+      named_test_present checks) are NOT counted here because they do not clear
+      the enforce gate and do not represent an executed green merge-test verdict.
     * ``delta``         = unresolved gap: needs_backing_paths + backing_paths that
       failed HEAD verification + caps that already carry only a path_proven proof.
 
@@ -4059,6 +4096,8 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
         # only ``proven_count``. Auto-resolved caps are tracked via the
         # ``auto_resolved`` CheckResult field so dashboards can report self-heal
         # throughput without conflating path_proven with proven.
+        auto_resolved_nt = len(named_test_present_resolved)
+        auto_resolved_bp = len(auto_resolved) - auto_resolved_nt
         # Caps with an enrolled execution trial are NOT yet proven — the trial
         # must run green first — so they still count as an unresolved gap this
         # sweep, but are reported distinctly (a real proof is en route) rather
@@ -4145,6 +4184,8 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
                     subject=pid,
                     detail=_detail,
                     auto_resolved=len(auto_resolved),
+                    auto_resolved_backing_path=auto_resolved_bp,
+                    auto_resolved_named_test_present=auto_resolved_nt,
                 )
             )
         else:
@@ -4182,6 +4223,8 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
                     subject=pid,
                     detail=_ok_detail,
                     auto_resolved=len(auto_resolved),
+                    auto_resolved_backing_path=auto_resolved_bp,
+                    auto_resolved_named_test_present=auto_resolved_nt,
                 )
             )
 
@@ -4636,3 +4679,141 @@ async def check_capability_proof_gate_auto_graduation(
             ),
         )
     ]
+
+
+@register_check(
+    "observe_mode_unverified_resolution",
+    "Aggregate SPAWN_CAPABILITY_PROOF_UNVERIFIED_KEY stamps from tasks spawned "
+    "while the capability proof gate was in observe (or off) mode. Per-project "
+    "counts show how many dependents resolved against an unproven 'working' "
+    "capability — the operational evidence that the gate needs before the operator "
+    "can safely advance observe→enforce.",
+)
+async def check_observe_mode_unverified_resolution(
+    ctx: SweepContext,
+) -> List[CheckResult]:
+    """Surface per-project counts of observe-mode unverified-resolution stamps.
+
+    The spawn resolver (``research_completion.py``) writes
+    ``SPAWN_CAPABILITY_PROOF_UNVERIFIED_KEY`` into every dependent task's context
+    when a prerequisite resolves as satisfied-by-the-codebase but the backing
+    capability is ``working`` without a ``proven`` status. Those stamps are durable
+    but were never read back — this check aggregates them so the operator has
+    visibility into how many in-flight and recent tasks relied on an unproven
+    capability foundation.
+
+    * ``self_reported`` = total tasks carrying the stamp (our own write, so this
+      is both source and recompute — the check surfaces the accumulated count,
+      not a divergence from a separate counter).
+    * ``ground_truth``  = 0 (no task should resolve against an unproven cap once
+      the gate is in enforce mode; this signals the outstanding debt).
+    * ``delta``         = count of stamped tasks, i.e. the unresolved observe-mode
+      obligation.
+
+    Bounded to ``ctx.max_projects`` projects; within each project at most
+    ``ctx.sample_limit`` recently-created tasks are scanned.
+    """
+    from app.database import resolve_dialect_name
+    from app.models import Project, Task
+    from app.research_completion import SPAWN_CAPABILITY_PROOF_UNVERIFIED_KEY
+
+    cutoff = ctx.now.replace(tzinfo=None) - timedelta(days=ctx.window_days)
+
+    projects = (
+        await ctx.session.execute(select(Project.id).limit(ctx.max_projects))
+    ).all()
+
+    if not projects:
+        return [
+            CheckResult(
+                check="observe_mode_unverified_resolution",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no projects to audit",
+            )
+        ]
+
+    # ``has_key`` compiles to the Postgres-only JSONB ``?`` operator — fails
+    # on the SQLite smoke gate. Branch to ``func.json_extract`` for SQLite.
+    if resolve_dialect_name(ctx.session) == "sqlite":
+        stamp_predicate = func.json_extract(
+            Task.context, f"$.{SPAWN_CAPABILITY_PROOF_UNVERIFIED_KEY}"
+        ).is_not(None)
+    else:
+        stamp_predicate = Task.context.has_key(SPAWN_CAPABILITY_PROOF_UNVERIFIED_KEY)
+
+    results: List[CheckResult] = []
+    any_stamped = False
+
+    for (project_id,) in projects:
+        pid = str(project_id)
+        stamped_tasks = (
+            await ctx.session.execute(
+                select(Task)
+                .where(
+                    Task.project_id == project_id,
+                    Task.created_at >= cutoff,
+                    stamp_predicate,
+                )
+                .order_by(Task.created_at.desc())
+                .limit(ctx.sample_limit)
+            )
+        ).scalars().all()
+
+        if not stamped_tasks:
+            results.append(
+                CheckResult(
+                    check="observe_mode_unverified_resolution",
+                    status=CheckStatus.SKIPPED,
+                    subject=pid,
+                    detail="no tasks with unverified-resolution stamps in window",
+                )
+            )
+            continue
+
+        any_stamped = True
+        count = len(stamped_tasks)
+
+        # Aggregate distinct capability refs across all stamped tasks.
+        cap_refs: dict[str, int] = {}
+        for t in stamped_tasks:
+            for entry in (t.context or {}).get(SPAWN_CAPABILITY_PROOF_UNVERIFIED_KEY) or []:
+                ref = entry.get("ref") if isinstance(entry, dict) else None
+                if ref:
+                    cap_refs[ref] = cap_refs.get(ref, 0) + 1
+
+        top_refs = sorted(cap_refs, key=lambda r: -cap_refs[r])[:5]
+        ref_summary = ", ".join(
+            f"{r}({cap_refs[r]})" for r in top_refs
+        ) if top_refs else "unknown"
+        truncated = f"+{len(cap_refs) - 5} more" if len(cap_refs) > 5 else ""
+
+        results.append(
+            CheckResult(
+                check="observe_mode_unverified_resolution",
+                status=CheckStatus.FLAGGED,
+                self_reported=count,
+                ground_truth=0,
+                delta=count,
+                severity="warn",
+                subject=pid,
+                detail=(
+                    f"{count} task(s) in window resolved against an unproven "
+                    f"'working' capability (observe/off mode stamp); "
+                    f"top refs by count: {ref_summary}"
+                    + (f" {truncated}" if truncated else "")
+                ),
+            )
+        )
+
+    if not any_stamped:
+        results.append(
+            CheckResult(
+                check="observe_mode_unverified_resolution",
+                status=CheckStatus.OK,
+                subject="global",
+                detail="no observe-mode unverified-resolution stamps found in window",
+            )
+        )
+
+    return results

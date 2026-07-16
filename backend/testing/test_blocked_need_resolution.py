@@ -3813,103 +3813,131 @@ async def test_enforce_gate_full_cycle_blocked_then_resumed(_spawn_db, mocker):
 
 
 @pytest.mark.asyncio
-async def test_capability_proof_gate_enforcement_cycle_blocked_to_queued(_spawn_db):
-    """ACCEPTANCE EVIDENCE (finding test:end-to-end-integration-test-for-capability-proof-gate-enforcement-cycle).
+async def test_capability_proof_trial_green_wakes_blocked_dependents(_spawn_db, mocker):
+    """ACCEPTANCE EVIDENCE (event-driven wake seam). A GREEN capability_proof_trial
+    immediately wakes BLOCKED dependents instead of leaving them for the periodic
+    reaper.
 
-    Full enforcement cycle with explicit provider and consumer tasks:
+    Phase 1: a task is BLOCKED on an unproven capability (enforce mode).
+    Phase 2: ``_handle_capability_proof_trial_completion`` runs with a GREEN result,
+    commits the proof, and immediately calls
+    ``event_driven_unblock_on_capability_proof``.
+    Phase 3: the dependent's status transitions to QUEUED without any periodic sweep.
 
-    1. Provider task advertises 'provides_capability: my-cap'.
-    2. Consumer task is BLOCKED on 'my-cap' (no proof exists yet).
-    3. Blocked-resume sweep: consumer stays BLOCKED (gate holds — unproven).
-    4. Provider completes with proven acceptance evidence → proof recorded.
-    5. Blocked-resume sweep: consumer moves to QUEUED (gate released — proven).
+    This pins the event-driven unblock trigger in ``task_completion.py`` against the
+    full pipeline: proof commit → ``event_driven_unblock_on_capability_proof`` →
+    QUEUED.
     """
-    from app.blocked_task_unblock_sweeps import sweep_unblock_blocked_tasks
-    from app.capability_proof import record_capability_proof
-    from app.models import Project, Task, TaskStatus
-    from app.shared_state import runtime_config as _rc
-    from app.time_utils import _utcnow as _now
+    import json as _json
+    from datetime import timedelta
 
-    saved_mode = _rc.get("capability_proof_gate_mode")
+    from app.models import Project, Task as _T, TaskStatus
+    from app.shared_state import runtime_config as _rc
+    from app.task_completion import _handle_capability_proof_trial_completion
+    from app.time_utils import _utcnow
+
+    cap = "container-runtime-trial"
+    test_refs = ["backend/testing/test_container.py::test_runtime_trial"]
+
     _rc["capability_proof_gate_mode"] = "enforce"
+    _rc["capability_proof_execution_trials_enabled"] = True
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
+
     try:
-        # Set up project with an unproven working capability.
+        # ── Phase 1: create project + BLOCKED dependent ──────────────────────
         project = Project(
-            name="enforcement-cycle",
-            user_id="test-user-ec",
-            problem_model={
-                "capabilities": [{"name": "my-cap", "status": "working"}]
-            },
+            name="trial-wake-test",
+            user_id="u1",
+            problem_model={"capabilities": [{"name": cap, "status": "working"}]},
+            capability_proof_records={},
         )
         _spawn_db.add(project)
         await _spawn_db.commit()
         await _spawn_db.refresh(project)
 
-        # Consumer task: BLOCKED on the capability need (no proof yet).
-        consumer = Task(
+        now = _utcnow()
+        need = {"kind": "capability", "ref": cap}
+        blocked = _T(
             project_id=project.id,
-            title="Consumer: needs my-cap",
+            title="dependent-needs-trial-cap",
             description="x",
             status=TaskStatus.BLOCKED,
             created_by="ORCHESTRATOR",
+            requires_approval=False,
             payloads=[{"type": "create"}],
-            context={"needs": [{"kind": "capability", "ref": "my-cap"}]},
-        )
-        _spawn_db.add(consumer)
-        await _spawn_db.commit()
-        await _spawn_db.refresh(consumer)
-
-        async def _stub_verify(*_a, **_k):
-            return False
-
-        # Step 3: sweep holds the consumer BLOCKED (gate enforces — unproven).
-        requeued = await sweep_unblock_blocked_tasks(
-            _spawn_db,
-            _now(),
-            verify_pr_merged=_stub_verify,
-        )
-        await _spawn_db.refresh(consumer)
-        assert consumer.status == TaskStatus.BLOCKED, (
-            "consumer must stay BLOCKED while capability has no proof (gate holds)"
-        )
-        assert requeued == 0, "gate must not requeue the consumer when unproven"
-
-        # Step 4: provider task completes with proven acceptance evidence.
-        provider = Task(
-            project_id=project.id,
-            title="Provider: my-cap",
-            description="x",
-            status=TaskStatus.COMPLETED,
-            created_by="ORCHESTRATOR",
-            payloads=[{"type": "create"}],
+            status_log=[],
+            depends_on=[],
+            blocker_kind="precondition",
+            blocked_reason=f"BLOCKER: needs capability {cap}",
+            blocked_at=now,
+            recheck_after=now - timedelta(minutes=1),
             context={
-                "provides_capability": "my-cap",
-                "code_acceptance_verdict": {
-                    "proven": True,
-                    "kind": "named_test",
-                    "proof_ref": "backend/testing/test_my_cap.py::test_it",
-                },
+                "blocker": {
+                    "source": "agent",
+                    "waiting_on": "capability",
+                    "needs": [need],
+                    "need": need,
+                }
             },
         )
-        recorded = record_capability_proof(provider, project)
-        assert recorded == ["my-cap"], "provider must mint proof for 'my-cap'"
-        _spawn_db.add(project)
+        _spawn_db.add(blocked)
         await _spawn_db.commit()
-        await _spawn_db.refresh(project)
+        await _spawn_db.refresh(blocked)
+        assert blocked.status == TaskStatus.BLOCKED, "Phase 1: dependent must start BLOCKED"
 
-        # Step 5: sweep resumes the consumer now that proof is recorded.
-        requeued2 = await sweep_unblock_blocked_tasks(
-            _spawn_db,
-            _now(),
-            verify_pr_merged=_stub_verify,
+        # Create the proof-trial task (the agent that ran the tests).
+        trial_task = _T(
+            project_id=project.id,
+            title=f"Capability proof trial: {cap}",
+            payloads=[{
+                "type": "capability_proof_trial",
+                "cap": cap,
+                "test_refs": test_refs,
+                "head_sha": "abc123",
+            }],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            requires_approval=False,
+            status_log=[],
+            depends_on=[],
         )
-        await _spawn_db.refresh(consumer)
-        assert consumer.status == TaskStatus.QUEUED, (
-            "consumer must transition from BLOCKED to QUEUED after proof is recorded"
+        _spawn_db.add(trial_task)
+        await _spawn_db.commit()
+        await _spawn_db.refresh(trial_task)
+
+        # ── Phase 2: GREEN trial ingestion fires the event-driven unblock ────
+        green = {
+            "type": "capability_proof_trial",
+            "cap": cap,
+            "head_sha": "abc123",
+            "test_refs": test_refs,
+            "ran": True,
+            "passed": True,
+            "could_not_run": False,
+            "skipped_summary": {"total": 2, "skipped": 0},
+        }
+        await _handle_capability_proof_trial_completion(
+            trial_task, _json.dumps(green), _spawn_db
         )
-        assert requeued2 == 1, "sweep must requeue the consumer after proof lands"
+
+        # ── Phase 3: dependent must now be QUEUED — no periodic sweep needed ─
+        await _spawn_db.refresh(blocked)
+        assert blocked.status == TaskStatus.QUEUED, (
+            "GREEN capability_proof_trial must immediately wake BLOCKED dependents "
+            f"via event_driven_unblock_on_capability_proof — got {blocked.status}"
+        )
+
+        # Confirm the proof was actually recorded (not just a status flip).
+        await _spawn_db.refresh(project)
+        assert cap in (project.capability_proof_records or {}), (
+            "GREEN trial must record proof in capability_proof_records"
+        )
+        proof_entry = project.capability_proof_records[cap][0]
+        assert proof_entry["proof_kind"] == "named_test"
+        assert proof_entry["executed"] is True
+
     finally:
-        if saved_mode is None:
-            _rc.pop("capability_proof_gate_mode", None)
-        else:
-            _rc["capability_proof_gate_mode"] = saved_mode
+        _rc.pop("capability_proof_gate_mode", None)
+        _rc.pop("capability_proof_execution_trials_enabled", None)
+
+
