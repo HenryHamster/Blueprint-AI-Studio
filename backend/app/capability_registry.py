@@ -1264,11 +1264,7 @@ def consumer_gate_proof_status(
 
     ``proof_records`` is the project's ``capability_proof_records`` column; ``None``
     / a missing column is treated as an EMPTY ledger (nothing corroborates), which
-    fails CLOSED. This deliberately differs from
-    :func:`capability_proof_gate_release_status`, where ``proof_records=None`` means
-    "the caller did not supply the ledger" and preserves the legacy
-    problem_model-only derivation; here the caller ALWAYS supplies the project's
-    column, so ``None`` genuinely means "this project has no recorded proofs".
+    fails CLOSED, matching :func:`capability_proof_gate_release_status`.
     """
     if now is None:
         from app.time_utils import _utcnow
@@ -1282,7 +1278,9 @@ def consumer_gate_proof_status(
     # consolidation leaves a marker, so an agent declaring ``absorbs:
     # [proven-or-exempt-name]`` cannot forge an absorbed→survivor edge here.
     alias_map = platform_recorded_alias_map(proof_records)
-    proof_map = fold_ledger_proof_upgrades(proof_map, proof_records, now=now, alias_map=alias_map)
+    proof_map = fold_ledger_proof_upgrades(
+        proof_map, proof_records, now=now, alias_map=alias_map
+    )
     return ledger_corroborated_proof_status(
         proof_map,
         proof_records,
@@ -1302,12 +1300,9 @@ def capability_proof_gate_release_status(
 
     This is the release-qualification enforcement point of the capability proof
     gate — the third seam alongside the spawn-time resolver and the
-    blocked-resume sweep. Extracted here as a single IO-free primitive so the
-    qualifier's promotion decision derives from the SAME tiered proof map
-    (:func:`working_capability_proof_status`) and exemption set
-    (:func:`exempt_capability_names`) the other two seams use, rather than
-    re-implementing the "unproven working capability blocks promotion" rule in
-    the 5k-line qualifier where it can silently drift.
+    blocked-resume sweep. It delegates the decision to
+    :func:`consumer_gate_proof_status`, the same ledger-backed grade those other
+    seams consume, while retaining release-specific audit detail.
 
     Behaviour:
 
@@ -1374,55 +1369,32 @@ def capability_proof_gate_release_status(
         from app.time_utils import _utcnow
 
         now = _utcnow()
-    proof_map = working_capability_proof_status(
+    declared_proof_map = working_capability_proof_status(
         problem_model, now=now, proof_records=proof_records
+    )
+    proof_map = consumer_gate_proof_status(
+        problem_model, proof_records, now=now
     )
     # The carve-out set: PLATFORM-recorded operator exemptions only (finding #9).
     # An agent-declared proof_exempt/source never lands here, so it cannot skip the
     # corroboration pass below.
     exempt_set = exempt_capability_names(problem_model, proof_records)
-    # Base (problem_model-derived) unproven set: a capability the agent-authored view
-    # already reports as not-proven.
+    # The authoritative unproven set includes both absent ledger proof and an
+    # uncorroborated agent-authored claim, while allowing a ledger-only proof to
+    # clear exactly as it does at spawn and blocked-resume.
     unproven = [name for name, status in proof_map.items() if status != "proven"]
 
-    # Corroboration pass (finding #1): every capability the base map treats as
-    # cleared ("proven") must be backed by a machine-verified PLATFORM ledger
-    # entry — not just a self-reported evidence_ref / proof_exempt flag on the
-    # problem_model. Uncorroborated "proven" caps are demoted to blocked. Runs
-    # UNCONDITIONALLY: proof_records=None is an empty ledger (nothing corroborates),
-    # never a licence to trust the problem_model on its own.
-    #
-    # EXCEPT a platform-recorded exemption (finding #2): an operator-granted
-    # exemption clears BY ITS AUTHORIZATION, not by machine proof, and the earn loop
-    # deliberately never mints a ledger proof entry for an exempt capability.
-    # Requiring one would demote every exemption to unproven and block promotion —
-    # nullifying the grant. Such a capability is skipped here (neither corroborated
-    # nor uncorroborated; it is audited under ``exempt_cleared`` / ``exempt_names``).
-    #
-    # The corroboration rule itself lives in ledger_corroborated_proof_status, which
-    # the two CONSUMER seams also call (via consumer_gate_proof_status) — one
-    # implementation, so this seam and they cannot drift apart. A "proven" capability
-    # the ledger refuses comes back demoted; that demotion IS the uncorroborated set.
-    # PLATFORM-recorded alias resolution (forwarding markers), NOT the agent-writable
-    # ``absorbs`` list — identical rule to the two consumer seams so the three cannot
-    # drift (the drift between seams is the vulnerability).
-    alias_map = platform_recorded_alias_map(proof_records)
-    corroborated_map = ledger_corroborated_proof_status(
-        proof_map, proof_records, exempt_set, now=now, alias_map=alias_map
-    )
+    # Retain release-specific provenance detail by comparing the declared map to
+    # the authoritative result. The decision itself is already complete above.
     uncorroborated: list[str] = [
         name
-        for name, status in proof_map.items()
-        if status == "proven" and corroborated_map.get(name) != "proven"
+        for name, status in declared_proof_map.items()
+        if status == "proven" and proof_map.get(name) != "proven"
     ]
-    if uncorroborated:
-        unproven = sorted(set(unproven) | set(uncorroborated))
-    uncorroborated_set = set(uncorroborated)
     corroborated = [
         name
         for name, status in proof_map.items()
         if status == "proven"
-        and name not in uncorroborated_set
         and name not in exempt_set
     ]
     detail["corroborated"] = sorted(corroborated)

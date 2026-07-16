@@ -2139,18 +2139,19 @@ def test_capability_proof_gate_full_cycle():
     # regression in that shared derivation surfaces in the connected cycle.
     from app.capability_registry import capability_proof_gate_release_status
 
-    # Enforce + unproven working capability → promotion blocked, audited.
+    # A proof that survived only in the platform ledger clears release exactly as
+    # it already clears spawn and blocked-resume.
     q_blocked, q_detail = capability_proof_gate_release_status(
         unproven_model, "enforce", named_test_records
     )
-    assert q_blocked is True, (
-        "the release qualifier must block promotion under enforce mode when a "
-        "working capability is unproven"
+    assert q_blocked is False, (
+        "a ledger-only machine proof must clear release qualification"
     )
     assert q_detail["mode"] == "enforce"
-    assert q_detail["unproven"] == ["container-runtime"]
-    assert q_detail["unproven_count"] == 1
+    assert q_detail["unproven"] == []
+    assert q_detail["unproven_count"] == 0
     assert q_detail["total_working"] == 1
+    assert q_detail["corroborated"] == ["container-runtime"]
 
     # Enforce + proven working capability, CORROBORATED by the platform ledger →
     # promotion NOT blocked. The ledger is what clears it: the same problem_model
@@ -2887,13 +2888,34 @@ async def _create_project_with_caps(
     ``proof_records`` seeds the platform-only ``capability_proof_records`` ledger —
     the operator-recorded carve-out set the graduation sweep must honor.
     """
+    from app.capability_registry import normalize_capability_name
     from app.models import Project
+
+    records = dict(proof_records or {})
+    for cap in caps:
+        name = normalize_capability_name(cap.get("name"))
+        refs = cap.get("evidence_refs")
+        if (
+            name
+            and name not in records
+            and isinstance(refs, list)
+            and any(isinstance(ref, dict) and ref.get("proven") is True for ref in refs)
+        ):
+            records[name] = [
+                {
+                    "task_id": f"proof:{name}",
+                    "proof_kind": "named_test",
+                    "proof_ref": f"testing/test_{name}.py::test_{name}",
+                    "proved_at": "2026-07-16T00:00:00Z",
+                    "commit_sha": "a" * 40,
+                }
+            ]
 
     p = Project(
         name="grad-test",
         user_id="u1",
         problem_model={"capabilities": caps},
-        capability_proof_records=proof_records or {},
+        capability_proof_records=records,
     )
     db.add(p)
     await db.commit()
@@ -3381,18 +3403,11 @@ async def test_auto_graduation_skips_when_no_working_caps(_grad_db):
 @pytest.mark.asyncio
 async def test_auto_graduation_does_not_exclude_a_self_declared_exemption(_grad_db):
     """A DECLARED ``proof_exempt`` no longer excludes a capability from the coverage
-    aggregate (finding #9).
+    aggregate or advance the global mode (finding #9).
 
-    The graduation sweep reads the problem_model tier-1 map, where an attributed
-    ``proof_exempt`` declaration still grades ``proven`` (that is what keeps the earn
-    loop from chasing a capability the strategist says cannot be machine-proven). It
-    is NOT, however, an exemption: ``exempt_capability_names`` now requires an
-    operator record in the platform-only ledger, so the capability is no longer
-    excluded from the denominator — it is simply counted, and the fleet advances
-    toward ENFORCE, which is the safe direction. At the gate itself the very same
-    capability is refused (see
-    ``test_agent_fabricated_exemption_provenance_blocks_blocked_resume``), so a
-    self-declared exemption buys an agent nothing anywhere.
+    The graduation sweep consumes the same ledger-backed grade as enforce
+    consumers. With no platform exemption or proof record, the declaration is
+    ``unverified`` and coverage is zero.
     """
     from app.metrics_integrity_sweep import (
         CheckStatus,
@@ -3419,9 +3434,9 @@ async def test_auto_graduation_does_not_exclude_a_self_declared_exemption(_grad_
     ctx = _make_sweep_ctx(_grad_db)
     results = await check_capability_proof_gate_auto_graduation(ctx)
     assert len(results) == 1
-    assert results[0].status == CheckStatus.FLAGGED
-    assert "off → observe" in results[0].detail
-    assert _rc["capability_proof_gate_mode"] == "observe"
+    assert results[0].status == CheckStatus.OK
+    assert "below threshold" in results[0].detail
+    assert _rc["capability_proof_gate_mode"] == "off"
 
 
 @pytest.mark.asyncio
@@ -3981,8 +3996,6 @@ async def test_capability_proof_trial_green_wakes_blocked_dependents(_spawn_db, 
     finally:
         _rc.pop("capability_proof_gate_mode", None)
         _rc.pop("capability_proof_execution_trials_enabled", None)
-
-
 # ---------------------------------------------------------------------------
 # Capability proof gate enforcement cycle — end-to-end integration test
 # ---------------------------------------------------------------------------

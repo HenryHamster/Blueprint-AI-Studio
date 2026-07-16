@@ -936,7 +936,7 @@ async def sweep_proof_earn_loop(session, now=None) -> dict[str, Any]:
     from app.capability_demand import collect_missing_capability_demand
     from app.capability_proof import commission_proof_earn_loop
     from app.capability_registry import (
-        working_capability_proof_status,
+        consumer_gate_proof_status,
     )
     from app.models import Project
     from sqlalchemy.orm import load_only
@@ -1002,7 +1002,11 @@ async def sweep_proof_earn_loop(session, now=None) -> dict[str, Any]:
             # fire on a project with all capabilities unproven and no blocked
             # dependents, leaving the gate permanently stuck in 'off'.
             if not demand_result.get("demands"):
-                proof_by_name = working_capability_proof_status(pm)
+                proof_by_name = consumer_gate_proof_status(
+                    pm,
+                    getattr(project, "capability_proof_records", None),
+                    now=_now,
+                )
                 unproven_names = [
                     name for name, status in proof_by_name.items()
                     if status != "proven"

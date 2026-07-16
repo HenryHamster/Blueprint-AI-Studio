@@ -10691,6 +10691,9 @@ class TestCapabilityProofGateCoverageSurface:
             "proven": True,
         }
         # One project, one proven + one unproven non-exempt working cap → 1/2.
+        # Cap A's evidence_refs claim must be corroborated by a platform ledger
+        # entry — compute_fleet_proof_coverage counts only ledger-cleared proofs,
+        # so a self-reported evidence_refs alone grades "unverified", not "proven".
         db_session.add(
             Project(
                 name="cov-proj",
@@ -10707,6 +10710,15 @@ class TestCapabilityProofGateCoverageSurface:
                             "status": "working",
                             "evidence_refs": [],
                         },
+                    ]
+                },
+                capability_proof_records={
+                    "cap-a": [
+                        {
+                            "proof_kind": "named_test",
+                            "ref": "testing/test_x.py::test_x",
+                            "proved_at": "2026-01-01T00:00:00Z",
+                        }
                     ]
                 },
             )

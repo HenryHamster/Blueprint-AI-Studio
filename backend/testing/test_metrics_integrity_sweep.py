@@ -5307,6 +5307,30 @@ def _proven_ref(recorded_at: str | None = None) -> dict:
     return ref
 
 
+def _set_machine_proof_records(
+    project, *names: str, proved_at: str | None = None
+) -> None:
+    """Corroborate test capabilities through the platform proof ledger."""
+    from app.capability_registry import normalize_capability_name
+
+    timestamp = proved_at or _utcnow().isoformat()
+    records = dict(project.capability_proof_records or {})
+    for raw_name in names:
+        name = normalize_capability_name(raw_name)
+        assert name is not None
+        records[name] = [
+            {
+                "task_id": f"proof:{name}",
+                "proof_kind": "named_test",
+                "proof_ref": f"testing/test_{name}.py::test_{name}",
+                "proved_at": timestamp,
+                "commit_sha": "a" * 40,
+            }
+        ]
+    project.capability_proof_records = records
+    flag_modified(project, "capability_proof_records")
+
+
 @pytest.mark.asyncio
 async def test_auto_graduation_check_disabled_by_default(db):
     """The check is a no-op when the feature flag is not enabled."""
@@ -5377,6 +5401,7 @@ async def test_auto_graduation_off_to_observe(db):
             },
         ]
     }
+    _set_machine_proof_records(project, "repo-map", proved_at=fresh)
     flag_modified(project, "problem_model")
     db.add(project)
     await db.commit()
@@ -5425,6 +5450,9 @@ async def test_auto_graduation_observe_to_enforce(db):
             },
         ]
     }
+    _set_machine_proof_records(
+        project, "repo-map", "ci-integration", proved_at=fresh
+    )
     flag_modified(project, "problem_model")
     db.add(project)
     await db.commit()
@@ -5493,6 +5521,45 @@ async def test_auto_graduation_no_advancement_below_threshold(db):
 
 
 @pytest.mark.asyncio
+async def test_self_declared_proof_empty_ledger_cannot_advance_global_mode(db):
+    """A problem-model proof claim cannot inflate ledger-backed fleet coverage."""
+    project = await _project(db)
+    now = _utcnow()
+    project.problem_model = {
+        "capabilities": [
+            {
+                "name": "repo-map",
+                "status": "working",
+                "evidence_refs": [_proven_ref(now.isoformat())],
+            }
+        ]
+    }
+    project.capability_proof_records = {}
+    flag_modified(project, "problem_model")
+    flag_modified(project, "capability_proof_records")
+    db.add(project)
+    await db.commit()
+
+    coverage = await mis.compute_fleet_proof_coverage(db, max_projects=25, now=now)
+    assert coverage["total_non_exempt_working"] == 1
+    assert coverage["total_proven"] == 0
+    assert coverage["coverage_ratio"] == 0.0
+
+    _set_auto_graduation_config(mode="off", observe_threshold=0.5)
+    ctx = SweepContext(
+        session=db,
+        now=now,
+        mode="observe",
+        max_projects=25,
+        sample_limit=200,
+        window_days=14,
+    )
+    results = await mis.check_capability_proof_gate_auto_graduation(ctx)
+    assert results[0].status == CheckStatus.OK
+    assert _rc["capability_proof_gate_mode"] == "off"
+
+
+@pytest.mark.asyncio
 async def test_auto_graduation_posts_operator_notification(db):
     """On graduation, post_capability_proof_gate_graduated_message is called
     for each contributing project so the operator learns about the gate change
@@ -5514,6 +5581,7 @@ async def test_auto_graduation_posts_operator_notification(db):
             },
         ]
     }
+    _set_machine_proof_records(project, "repo-map", proved_at=fresh)
     flag_modified(project, "problem_model")
     db.add(project)
     await db.commit()
@@ -5559,6 +5627,7 @@ async def test_auto_graduation_notification_sent_for_each_contributing_project(d
     for _ in range(2):
         p = await _project(db)
         p.problem_model = {"capabilities": [cap]}
+        _set_machine_proof_records(p, "repo-map", proved_at=fresh)
         flag_modified(p, "problem_model")
         db.add(p)
     await db.commit()
@@ -5720,6 +5789,7 @@ async def test_auto_graduation_fleet_coverage_stale_proof_counts_without_now(db)
             }
         ]
     }
+    _set_machine_proof_records(project, "repo-map", proved_at=stale_ts)
     flag_modified(project, "problem_model")
     db.add(project)
     await db.commit()
@@ -5790,6 +5860,7 @@ async def test_compute_fleet_proof_coverage_trial_eligible_unproven(db):
             },
         ]
     }
+    _set_machine_proof_records(project, "Cap Proven")
     flag_modified(project, "problem_model")
     db.add(project)
     await db.commit()
@@ -5823,6 +5894,7 @@ async def test_auto_graduation_advances_by_one_step_per_run(db):
             {"name": "repo-map", "status": "working", "evidence_refs": [_proven_ref(fresh)]},
         ]
     }
+    _set_machine_proof_records(project, "repo-map", proved_at=fresh)
     flag_modified(project, "problem_model")
     db.add(project)
     await db.commit()
@@ -5849,6 +5921,126 @@ async def test_auto_graduation_advances_by_one_step_per_run(db):
     assert _rc.get("capability_proof_gate_mode") == "enforce"
     assert "observe" in results2[0].detail
     assert "enforce" in results2[0].detail
+
+
+@pytest.mark.asyncio
+async def test_auto_graduation_db_failure_leaves_in_memory_mode_unchanged(db):
+    """When the DB commit fails, in-memory mode must not be advanced.
+
+    The check should abort with an ERROR result and leave _rc unchanged so the
+    running process does not enforce a mode that was never durably committed.
+    """
+    from datetime import timedelta
+
+    from app.models import DeploymentState
+
+    project = await _project(db)
+    now = _utcnow()
+    fresh = (now - timedelta(days=1)).isoformat()
+
+    project.problem_model = {
+        "capabilities": [
+            {
+                "name": "repo-map",
+                "status": "working",
+                "evidence_refs": [_proven_ref(fresh)],
+            },
+        ]
+    }
+    _set_machine_proof_records(project, "repo-map", proved_at=fresh)
+    flag_modified(project, "problem_model")
+    db.add(project)
+    # Create a DeploymentState row so the graduation code has a row to update.
+    dep_state = DeploymentState()
+    db.add(dep_state)
+    await db.commit()
+
+    _set_auto_graduation_config(mode="off", observe_threshold=0.5)
+
+    # Use a proxy that delegates all ops to the real session but raises on the
+    # first commit call, avoiding AsyncMock/AsyncSession interaction quirks.
+    class _FailOnFirstCommit:
+        _commits = 0
+
+        def __init__(self, real):
+            object.__setattr__(self, "_real", real)
+            object.__setattr__(self, "_commits", 0)
+
+        def __getattr__(self, name):
+            return getattr(object.__getattribute__(self, "_real"), name)
+
+        async def commit(self):
+            c = object.__getattribute__(self, "_commits")
+            object.__setattr__(self, "_commits", c + 1)
+            if c == 0:
+                raise RuntimeError("simulated DB failure")
+            return await object.__getattribute__(self, "_real").commit()
+
+    fail_db = _FailOnFirstCommit(db)
+    ctx = SweepContext(
+        session=fail_db, now=now, mode="observe", max_projects=25,
+        sample_limit=200, window_days=14,
+    )
+
+    results = await mis.check_capability_proof_gate_auto_graduation(ctx)
+
+    assert len(results) == 1
+    r = results[0]
+    # Must return ERROR, not FLAGGED, so the tick shows the failed advancement.
+    assert r.status == CheckStatus.ERROR
+    assert "off" in r.detail or "persist" in r.detail
+    # Critical invariant: in-memory mode must remain unchanged.
+    assert _rc.get("capability_proof_gate_mode") == "off"
+
+
+@pytest.mark.asyncio
+async def test_auto_graduation_notification_failure_does_not_rollback_mode(db):
+    """When notification posting fails, the already-committed mode must persist.
+
+    The gate advancement (DB + in-memory) is already durable; a notification
+    error must not undo the mode or report failure to the tick.
+    """
+    from datetime import timedelta
+    from unittest.mock import patch
+
+    project = await _project(db)
+    now = _utcnow()
+    fresh = (now - timedelta(days=1)).isoformat()
+
+    project.problem_model = {
+        "capabilities": [
+            {
+                "name": "repo-map",
+                "status": "working",
+                "evidence_refs": [_proven_ref(fresh)],
+            },
+        ]
+    }
+    _set_machine_proof_records(project, "repo-map", proved_at=fresh)
+    flag_modified(project, "problem_model")
+    db.add(project)
+    await db.commit()
+
+    _set_auto_graduation_config(mode="off", observe_threshold=0.5)
+
+    ctx = SweepContext(
+        session=db, now=now, mode="observe", max_projects=25,
+        sample_limit=200, window_days=14,
+    )
+
+    with patch(
+        "app.notification_dispatch.post_capability_proof_gate_graduated_message",
+        side_effect=RuntimeError("notification service down"),
+    ):
+        results = await mis.check_capability_proof_gate_auto_graduation(ctx)
+
+    assert len(results) == 1
+    r = results[0]
+    # Advancement still reported as FLAGGED (info).
+    assert r.status == CheckStatus.FLAGGED
+    assert "observe" in r.detail
+    # In-memory mode must still be advanced despite notification failure.
+    assert _rc.get("capability_proof_gate_mode") == "observe"
 
 
 # --- observe_mode_unverified_resolution ---------------------------------------

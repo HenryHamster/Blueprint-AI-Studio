@@ -2130,7 +2130,10 @@ async def commission_proof_earn_loop(
 
     # Step 1: compute the intersection.
     demanded_unproven = compute_unproven_demanded_capabilities(
-        demand_result, problem_model
+        demand_result,
+        problem_model,
+        getattr(project, "capability_proof_records", None),
+        now=now,
     )
     if not demanded_unproven:
         return {
@@ -2143,10 +2146,12 @@ async def commission_proof_earn_loop(
             "named_test_executed": [],
         }
 
-    # Step 1b: defensive filter — skip exempt capabilities (they classify as
-    # "proven" via working_capability_proof_status, so they should never appear
-    # in demanded_unproven, but this is a belt-and-suspenders guard).
-    _exempt = exempt_capability_names(problem_model)
+    # Step 1b: defensive filter — skip platform-exempt capabilities (the
+    # authoritative grade already clears them, so they should never appear in
+    # demanded_unproven, but this is a belt-and-suspenders guard).
+    _exempt = exempt_capability_names(
+        problem_model, getattr(project, "capability_proof_records", None)
+    )
     if _exempt:
         demanded_unproven = [
             e

@@ -4261,7 +4261,7 @@ async def compute_fleet_proof_coverage(
     surfaced read-only to the operator (e.g. the settings endpoint) as well as
     driving :func:`check_capability_proof_gate_auto_graduation`.
 
-    Coverage = total proven working caps / total non-exempt working caps.
+    Coverage = total ledger-cleared working caps / total non-exempt working caps.
     Exempt capabilities are excluded from BOTH numerator and denominator, and a
     project with working caps that are all exempt does not contribute.
 
@@ -4279,18 +4279,15 @@ async def compute_fleet_proof_coverage(
       float, or ``None`` when the denominator is zero (ratio undefined)
     """
     from app.capability_registry import (
+        consumer_gate_proof_status,
         exempt_capability_names,
-        working_capability_proof_status,
     )
     from app.models import Project
 
     # Snapshot ``now`` ONCE for the whole fleet scan and thread it explicitly into
-    # every ``working_capability_proof_status`` call below. PROOF_FRESHNESS_TTL
-    # demotion is applied against this single instant, so a proof older than the TTL
-    # is NOT counted toward ``total_proven`` — stale proofs cannot silently inflate
-    # graduation coverage. Passing an explicit ``now`` (rather than relying on the
-    # per-call ``_utcnow()`` default) also keeps the freshness cutoff deterministic
-    # across all projects in one scan instead of drifting mid-loop.
+    # every authoritative grading call below. PROOF_FRESHNESS_TTL demotion is
+    # applied against this single instant, so a proof older than the TTL is NOT
+    # counted toward ``total_proven``.
     if now is None:
         now = _utcnow()
 
@@ -4328,8 +4325,8 @@ async def compute_fleet_proof_coverage(
     for project_id, raw_pm, raw_records in projects:
         pm = raw_pm if isinstance(raw_pm, dict) else {}
         proof_records = raw_records if isinstance(raw_records, dict) else {}
-        proof_by_name = working_capability_proof_status(
-            pm, now=now, proof_records=proof_records
+        proof_by_name = consumer_gate_proof_status(
+            pm, proof_records, now=now
         )
         if not proof_by_name:
             continue
@@ -4387,8 +4384,8 @@ async def compute_trial_eligibility_projection(
 ) -> Dict[str, Any]:
     """Count unproven working capabilities that have backing_paths (trial-eligible).
 
-    A capability is trial-eligible when it is unproven (not yet ``proven`` tier),
-    has a ``working`` status, and declares at least one ``backing_path``. Enabling
+    A capability is trial-eligible when the platform ledger has not cleared it,
+    it has a ``working`` status, and declares at least one ``backing_path``. Enabling
     ``capability_proof_execution_trials_enabled`` allows the earn loop to discover
     test coverage for these capabilities and enroll bounded execution trials that
     can mint the real ``proven`` tier — clearing the enforce gate.
@@ -4404,7 +4401,7 @@ async def compute_trial_eligibility_projection(
     * ``projects_contributing`` — projects with at least one unproven working cap
     * ``num_projects`` — projects scanned (bounded by ``max_projects``)
     """
-    from app.capability_registry import working_capability_proof_status
+    from app.capability_registry import consumer_gate_proof_status
     from app.models import Project
 
     projects = (
@@ -4412,6 +4409,7 @@ async def compute_trial_eligibility_projection(
             select(
                 Project.id,
                 Project.problem_model,
+                Project.capability_proof_records,
             ).limit(max_projects)
         )
     ).all()
@@ -4420,9 +4418,10 @@ async def compute_trial_eligibility_projection(
     total_unproven_working = 0
     projects_contributing = 0
 
-    for _project_id, raw_pm in projects:
+    for _project_id, raw_pm, raw_records in projects:
         pm = raw_pm if isinstance(raw_pm, dict) else {}
-        proof_by_name = working_capability_proof_status(pm)
+        proof_records = raw_records if isinstance(raw_records, dict) else {}
+        proof_by_name = consumer_gate_proof_status(pm, proof_records)
         if not proof_by_name:
             continue
 
