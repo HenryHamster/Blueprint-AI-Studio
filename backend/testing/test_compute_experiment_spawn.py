@@ -132,11 +132,28 @@ def test_validate_contract_accepts_valid_input_artifact_job_id():
             "spend_cap_usd": 1.0,
             "deadline_seconds": 300,
             "input_artifact_job_id": str(uuid.uuid4()),
+            "no_progress_timeout_seconds": 60,
         },
         require_smoke=False,
     )
     assert ok is True
     assert reason == ""
+
+
+def test_validate_contract_rejects_input_artifact_without_watchdog():
+    ok, reason = _validate_compute_launch_contract(
+        {
+            "command": "run",
+            "spend_cap_usd": 1.0,
+            "deadline_seconds": 300,
+            "input_artifact_job_id": str(uuid.uuid4()),
+        },
+        require_smoke=False,
+    )
+
+    assert ok is False
+    assert "input_artifact_job_id requires" in reason
+    assert "no_progress_timeout_seconds" in reason
 
 
 def test_validate_contract_rejects_malformed_input_artifact_job_id():
@@ -146,6 +163,7 @@ def test_validate_contract_rejects_malformed_input_artifact_job_id():
             "spend_cap_usd": 1.0,
             "deadline_seconds": 300,
             "input_artifact_job_id": "not-a-uuid",
+            "no_progress_timeout_seconds": 60,
         },
         require_smoke=False,
     )

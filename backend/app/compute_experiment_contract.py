@@ -376,6 +376,11 @@ def _validate_compute_launch_contract(
 
     input_artifact_job_id = contract.get("input_artifact_job_id")
     if input_artifact_job_id is not None:
+        if no_progress_timeout is None or npt <= 0:
+            return False, (
+                "input_artifact_job_id requires an explicit positive "
+                "no_progress_timeout_seconds watchdog"
+            )
         # Shape check only — the orchestrator does the authoritative same-project +
         # bundle-exists validation at create_compute_job time (needs the DB). Here we
         # only reject an obviously-malformed UUID so a bad reference is caught early.

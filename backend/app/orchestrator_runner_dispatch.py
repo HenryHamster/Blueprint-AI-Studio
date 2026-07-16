@@ -1393,14 +1393,20 @@ def _build_compute_launch_kwargs(
     # No-progress watchdog window (peer of runtime deadline). Forwarded when set so
     # a stalled job is cut early; create_compute_job validates/clamps it. Integer
     # field, so it uses a plain presence check rather than the string `_present`.
-    if payload.get("no_progress_timeout_seconds") is not None:
-        kwargs["no_progress_timeout_seconds"] = payload["no_progress_timeout_seconds"]
+    nested_compute_experiment = payload.get("compute_experiment") or {}
+    no_progress_timeout = payload.get("no_progress_timeout_seconds")
+    if no_progress_timeout is None:
+        no_progress_timeout = nested_compute_experiment.get(
+            "no_progress_timeout_seconds"
+        )
+    if no_progress_timeout is not None:
+        kwargs["no_progress_timeout_seconds"] = no_progress_timeout
     # Cross-job checkpoint resume: forward the optional predecessor reference so the
     # new job rehydrates that job's durable bundle before its command runs.
     # create_compute_job does the authoritative same-project + bundle-exists check.
-    input_artifact_job_id = payload.get("input_artifact_job_id") or (
-        payload.get("compute_experiment") or {}
-    ).get("input_artifact_job_id")
+    input_artifact_job_id = payload.get("input_artifact_job_id") or nested_compute_experiment.get(
+        "input_artifact_job_id"
+    )
     if _present(input_artifact_job_id):
         kwargs["input_artifact_job_id"] = input_artifact_job_id
     # declared_metric names the contract metric the no-progress watchdog watches

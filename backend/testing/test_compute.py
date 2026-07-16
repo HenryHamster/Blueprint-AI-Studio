@@ -21697,6 +21697,31 @@ def test_build_compute_launch_kwargs_forwards_declared_metric():
     assert "declared_metric" not in absent
 
 
+def test_build_compute_launch_kwargs_preserves_resume_watchdog_pair_flat_and_nested():
+    """Both supported payload shapes forward a checkpoint resume guard together."""
+    from app.orchestrator_runner_dispatch import _build_compute_launch_kwargs
+
+    predecessor = str(uuid.uuid4())
+    base = {"command": "python x.py", "spend_cap_usd": 1.0, "deadline_seconds": 60}
+    flat = _build_compute_launch_kwargs(
+        {"input_artifact_job_id": predecessor, "no_progress_timeout_seconds": 60},
+        **base,
+    )
+    nested_resume = _build_compute_launch_kwargs(
+        {
+            "compute_experiment": {
+                "input_artifact_job_id": predecessor,
+                "no_progress_timeout_seconds": 60,
+            }
+        },
+        **base,
+    )
+
+    for kwargs in (flat, nested_resume):
+        assert kwargs["input_artifact_job_id"] == predecessor
+        assert kwargs["no_progress_timeout_seconds"] == 60
+
+
 # ── Cross-job checkpoint resume (input_artifact_job_id) ───────────────────────
 
 
@@ -21802,6 +21827,7 @@ async def test_compute_job_resume_hydrates_prior_bundle(client, db_session, monk
         machine_type="e2-standard-2",
         spend_cap_usd=1.0,
         deadline_seconds=300,
+        no_progress_timeout_seconds=60,
         input_artifact_job_id=str(predecessor.id),
     )
     assert job.backend == compute_backends_module.RUNNER_SUBPROCESS_BACKEND_NAME
@@ -21868,6 +21894,32 @@ async def test_compute_job_resume_hydrates_prior_bundle(client, db_session, monk
 
 
 @pytest.mark.asyncio
+async def test_compute_job_resume_requires_explicit_watchdog_before_persisting(
+    db_session, monkeypatch
+):
+    """Direct callers cannot create an unguarded checkpoint successor row."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    task = await _make_compute_task(db_session)
+
+    with pytest.raises(compute_jobs.ComputeLaunchPreconditionFailed) as exc:
+        await compute_jobs.create_compute_job(
+            db_session,
+            task,
+            command="python train.py --resume",
+            machine_type="e2-standard-2",
+            spend_cap_usd=1.0,
+            deadline_seconds=300,
+            input_artifact_job_id=str(uuid.uuid4()),
+        )
+
+    assert exc.value.detail["error"] == "input_artifact_watchdog_required"
+    jobs = (
+        await db_session.execute(select(ComputeJob).where(ComputeJob.task_id == task.id))
+    ).scalars().all()
+    assert jobs == []
+
+
+@pytest.mark.asyncio
 async def test_compute_job_resume_rejects_unknown_input_artifact_job_id(
     db_session, monkeypatch
 ):
@@ -21884,6 +21936,7 @@ async def test_compute_job_resume_rejects_unknown_input_artifact_job_id(
             machine_type="e2-standard-2",
             spend_cap_usd=1.0,
             deadline_seconds=300,
+            no_progress_timeout_seconds=60,
             input_artifact_job_id=str(uuid.uuid4()),
         )
     assert exc.value.detail["error"] == "input_artifact_job_not_found"
@@ -21911,6 +21964,7 @@ async def test_compute_job_resume_rejects_malformed_input_artifact_job_id(
             machine_type="e2-standard-2",
             spend_cap_usd=1.0,
             deadline_seconds=300,
+            no_progress_timeout_seconds=60,
             input_artifact_job_id="not-a-uuid",
         )
     assert exc.value.detail["error"] == "invalid_input_artifact_job_id"
@@ -21940,6 +21994,7 @@ async def test_compute_job_resume_rejects_cross_project_input_artifact(
             machine_type="e2-standard-2",
             spend_cap_usd=1.0,
             deadline_seconds=300,
+            no_progress_timeout_seconds=60,
             input_artifact_job_id=str(foreign.id),
         )
     assert exc.value.detail["error"] == "input_artifact_job_cross_project"
@@ -21965,6 +22020,7 @@ async def test_compute_job_resume_rejects_bundleless_input_artifact(
             machine_type="e2-standard-2",
             spend_cap_usd=1.0,
             deadline_seconds=300,
+            no_progress_timeout_seconds=60,
             input_artifact_job_id=str(predecessor.id),
         )
     assert exc.value.detail["error"] == "input_artifact_job_has_no_bundle"
@@ -22013,6 +22069,7 @@ async def test_compute_job_resume_rejects_failed_or_unverified_hydration_source(
                 machine_type="e2-standard-2",
                 spend_cap_usd=1.0,
                 deadline_seconds=300,
+                no_progress_timeout_seconds=60,
                 input_artifact_job_id=str(predecessor.id),
             )
         assert exc.value.detail["error"] == "input_artifact_job_resume_provenance_invalid"
@@ -22050,6 +22107,7 @@ async def test_compute_job_resume_rejects_failed_or_unverified_hydration_source(
         machine_type="e2-standard-2",
         spend_cap_usd=1.0,
         deadline_seconds=300,
+        no_progress_timeout_seconds=60,
         input_artifact_job_id=str(verified.id),
     )
     assert successor.polling_metadata["input_artifact_job_id"] == str(verified.id)
@@ -22091,6 +22149,7 @@ async def test_compute_job_resume_rejects_non_terminal_source(db_session, monkey
                 machine_type="e2-standard-2",
                 spend_cap_usd=1.0,
                 deadline_seconds=300,
+                no_progress_timeout_seconds=60,
                 input_artifact_job_id=str(job.id),
             )
         assert exc.value.detail["error"] == "input_artifact_job_not_terminal", (

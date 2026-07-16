@@ -703,6 +703,21 @@ async def create_compute_job(
             capped_np_timeout = None  # 0 = disable
         else:
             capped_np_timeout = max(60, min(raw_np, capped_deadline))
+    if (
+        input_artifact_job_id is not None
+        and str(input_artifact_job_id).strip()
+        and capped_np_timeout is None
+    ):
+        raise ComputeLaunchPreconditionFailed(
+            {
+                "error": "input_artifact_watchdog_required",
+                "message": (
+                    "input_artifact_job_id requires an explicit positive "
+                    "no_progress_timeout_seconds watchdog"
+                ),
+                "input_artifact_job_id": str(input_artifact_job_id),
+            }
+        )
     # Persist the canonical accelerator short name (e.g. "T4") so the launch spec,
     # cost rate, and provisioning path all resolve the same supported shape.
     persisted_accelerator = accel_spec.name if accel_spec is not None else None
