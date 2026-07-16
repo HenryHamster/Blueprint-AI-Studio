@@ -1003,9 +1003,12 @@ async def strategic_operation(
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    # Message mutations use the canonical counter-first lock order. Allocate
-    # before the Project/Task authority locks below; an unused sequence gap is
-    # safe for idempotent retries and avoids send/resolve deadlocks.
+    # Lock project for atomic update (skip_locked + 429 avoids lock_timeout cascade)
+    project = await _lock_project_or_429(session, task.project_id)
+
+    # Message mutations follow Project -> sequence -> Task. The Project lock is
+    # the strongest lock this operation needs, so no later lock upgrade can
+    # occur while the shared sequence counter is held.
     preallocated_message_sequence: int | None = None
     if payload.op in MESSAGE_OPS:
         preallocated_message_sequence = (
@@ -1015,9 +1018,6 @@ async def strategic_operation(
                 lock_timeout_ms=1_500,
             )
         )
-
-    # Lock project for atomic update (skip_locked + 429 avoids lock_timeout cascade)
-    project = await _lock_project_or_429(session, task.project_id)
 
     # Re-acquire the task row FRESH under FOR UPDATE now that we hold the project
     # lock (canonical Project→Task order — see task_locking.lock_project_then_task).

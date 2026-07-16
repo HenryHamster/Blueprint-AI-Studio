@@ -3135,6 +3135,44 @@ class TestPurgeArchive:
         assert gone is None
 
     @pytest.mark.asyncio
+    async def test_purge_keeps_backend_managed_and_deletes_payloadless_archive(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        payloadless = Task(
+            project_id=project.id,
+            title="legacy parent",
+            payloads=[],
+            archived=True,
+            status=TaskStatus.COMPLETED,
+        )
+        shadow = Task(
+            project_id=project.id,
+            title="Resident shadow",
+            payloads=[{"type": "strategic_resident_turn"}],
+            archived=True,
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(payloadless)
+        db_session.add(shadow)
+        await db_session.commit()
+
+        response = await client.post("/api/admin/tasks/purge-archive", json={})
+        assert response.status_code == 200
+        assert response.json()["deleted_count"] == 1
+        remaining_ids = set(
+            (
+                await db_session.execute(
+                    select(Task.id).where(Task.id.in_([payloadless.id, shadow.id]))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert payloadless.id not in remaining_ids
+        assert shadow.id in remaining_ids
+
+    @pytest.mark.asyncio
     async def test_purge_older_than_days_filter(self, client: AsyncClient, db_session):
         """older_than_days skips recently archived tasks."""
         from testing.factories import make_task
@@ -30534,6 +30572,32 @@ def test_plan_subtasks_defaults_missing_fields():
 
 class TestTaskListPlanSubtasksContract:
     """GET /api/admin/tasks drops heavy JSONB blobs and exposes plan_subtasks."""
+
+    @pytest.mark.asyncio
+    async def test_list_hides_backend_managed_unless_explicitly_included(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        normal = Task(project_id=project.id, title="normal", payloads=[])
+        shadow = Task(
+            project_id=project.id,
+            title="shadow",
+            payloads=[{"type": "strategic_resident_turn"}],
+            archived=True,
+        )
+        db_session.add(normal)
+        db_session.add(shadow)
+        await db_session.commit()
+
+        default = await client.get(f"/api/admin/tasks?project_id={project.id}")
+        assert [row["title"] for row in default.json()["tasks"]] == ["normal"]
+        debug = await client.get(
+            f"/api/admin/tasks?project_id={project.id}&include_backend_managed=true"
+        )
+        assert {row["title"] for row in debug.json()["tasks"]} == {
+            "normal",
+            "shadow",
+        }
 
     @pytest.mark.asyncio
     async def test_list_omits_heavy_jsonb_fields(self, client: AsyncClient, db_session):

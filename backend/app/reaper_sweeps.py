@@ -15,6 +15,7 @@ from typing import Any
 
 from sqlalchemy import func, or_
 from sqlmodel import select
+from app.task_capabilities import BACKEND_MANAGED_TASK_TYPES
 
 from app.blocked_task_unblock_sweeps import (
     _BLOCKED_ESCALATE_AFTER,
@@ -269,6 +270,12 @@ async def sweep_queued_age_alerts(
                 .where(
                     Task.status == TaskStatus.QUEUED,
                     Task.created_at <= _queued_cutoff,
+                    or_(
+                        Task.payloads[0]["type"].as_string().is_(None),
+                        Task.payloads[0]["type"].as_string().not_in(
+                            sorted(BACKEND_MANAGED_TASK_TYPES)
+                        ),
+                    ),
                 )
                 .limit(batch_size)
             )

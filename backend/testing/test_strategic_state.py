@@ -4459,6 +4459,17 @@ async def test_strategic_reply_post_is_idempotent_and_resolves_question_atomical
         )
     )
     assert reply_count == 1
+    resident_turns = (
+        await db_session.execute(
+            select(Task).where(
+                Task.project_id == project.id,
+                Task.payloads[0]["type"].as_string()
+                == "strategic_resident_turn",
+            )
+        )
+    ).scalars().all()
+    assert len(resident_turns) == 1
+    assert resident_turns[0].first_payload["message_sequence_start"] == canonical["sequence"]
     receipt = await db_session.get(ProjectMessageAttachmentUpload, attachment_id)
     assert receipt is not None
     assert receipt.message_id == uuid.UUID(first.json()["id"])
