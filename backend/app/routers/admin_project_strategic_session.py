@@ -73,6 +73,7 @@ from app.strategic_runtime_work import build_strategic_runtime_summary
 # time-derived (status=='active' AND now-last_seen < this), so the broad-revision
 # fingerprint must probe it against the wall clock, not just max(last_seen_at).
 from app.routers.admin_runners import _RUNNER_LIVENESS_SECONDS
+from app.runner_project_binding import runner_allowed_for_project
 from app.work_session_actions import build_work_session_actions
 from app.work_session_command_execution import (
     OPERATOR_COMMAND_EVENT_TYPE,
@@ -1188,7 +1189,7 @@ async def _compute_strategic_state_fingerprints(
     runner_row = (
         await session.execute(
             select(func.count(), func.max(LocalRunner.last_seen_at)).where(
-                LocalRunner.project_id == project_id,
+                runner_allowed_for_project(project_id),
                 LocalRunner.status != "deleted",
             )
         )
@@ -1201,7 +1202,7 @@ async def _compute_strategic_state_fingerprints(
     _liveness_cutoff = _utcnow() - _dt.timedelta(seconds=_RUNNER_LIVENESS_SECONDS)
     live_runner_count = await session.scalar(
         select(func.count()).where(
-            LocalRunner.project_id == project_id,
+            runner_allowed_for_project(project_id),
             LocalRunner.status == "active",
             LocalRunner.last_seen_at.is_not(None),
             LocalRunner.last_seen_at >= _liveness_cutoff,

@@ -19,6 +19,7 @@ from sqlmodel import select
 
 from app.experiment_authoring_context import build_runner_devices
 from app.models import LocalRunner, Project
+from app.runner_project_binding import runner_allowed_for_project
 from app.time_utils import _utcnow
 from app.workbench_state import (
     STRATEGIC_LOCAL_CONTINUATION_KEY,
@@ -73,7 +74,7 @@ async def _load_local_runner_status(
     rows = (
         await session.execute(
             select(LocalRunner).where(
-                LocalRunner.project_id == project_id,
+                runner_allowed_for_project(project_id),
                 LocalRunner.status != "deleted",
             )
         )
@@ -153,7 +154,7 @@ async def _resolve_local_continuation_runner_affinity(
         await session.execute(
             select(LocalRunner)
             .where(
-                LocalRunner.project_id == project_id,
+                runner_allowed_for_project(project_id),
                 LocalRunner.status != "deleted",
             )
             .order_by(

@@ -2969,9 +2969,10 @@ async def upload_compute_job_viewable(
             )
 
         # ── Flat read: find the job, validate scope + pre-check caps ────────────
+        allowed_projects = await allowed_project_ids(session, runner)
         _job_scope = (
             ComputeJob.id == job_id,
-            ComputeJob.project_id == runner.project_id,
+            ComputeJob.project_id.in_(allowed_projects),
             ComputeJob.backend == RUNNER_SUBPROCESS_BACKEND_NAME,
             ComputeJob.polling_metadata["runner_target_id"].as_string() == str(runner.id),
         )

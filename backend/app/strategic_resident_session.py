@@ -907,20 +907,21 @@ def _resident_runner_is_available(runner: Any) -> bool:
 async def _load_resident_runner_rows(
     session: AsyncSession, project_id: uuid.UUID
 ) -> list[Any]:
-    """Load the project's non-deleted local runners, most-recently-seen first.
+    """Load the project's allow-listed local runners, most-recently-seen first.
 
     Shared query for auto-pick, the picker options, and override validation, so
     they all scan the same ordered device set (matching
     ``_resolve_local_continuation_runner_affinity``'s ordering).
     """
     from app.models import LocalRunner
+    from app.runner_project_binding import runner_allowed_for_project
 
     return list(
         (
             await session.execute(
                 select(LocalRunner)
                 .where(
-                    LocalRunner.project_id == project_id,
+                    runner_allowed_for_project(project_id),
                     LocalRunner.status != "deleted",
                 )
                 .order_by(
@@ -954,13 +955,13 @@ async def _auto_select_local_runner(
 async def _resolve_override_runner(
     session: AsyncSession, project_id: uuid.UUID, runner_id: str
 ) -> Any | None:
-    """Resolve an explicit override ``runner_id`` to a runner OF THIS PROJECT.
+    """Resolve an explicit override ``runner_id`` to a runner on this project's allow-list.
 
-    Returns the ``LocalRunner`` when it exists, belongs to *project_id*, and is not
-    deleted — else None (the caller raises a clear "device not found" error rather
-    than silently pinning to an unknown/foreign device). Availability is checked
-    separately by the caller so it can distinguish "not found" (404) from
-    "offline" (409 block).
+    Returns the ``LocalRunner`` when it exists, is on *project_id*'s allow-list
+    (enrollment project or a secondary binding), and is not deleted — else None
+    (the caller raises a clear "device not found" error rather than silently
+    pinning to an unknown/foreign device). Availability is checked separately by
+    the caller so it can distinguish "not found" (404) from "offline" (409 block).
     """
     from app.models import LocalRunner
 
@@ -971,9 +972,12 @@ async def _resolve_override_runner(
     runner = await session.get(LocalRunner, runner_uuid)
     if (
         runner is None
-        or str(runner.project_id) != str(project_id)
         or runner.status == "deleted"
     ):
+        return None
+    from app.runner_project_binding import allowed_project_ids
+
+    if project_id not in await allowed_project_ids(session, runner):
         return None
     return runner
 

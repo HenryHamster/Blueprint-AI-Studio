@@ -23,10 +23,29 @@ from __future__ import annotations
 
 import uuid
 
+from sqlalchemy import or_
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.elements import ColumnElement
 from sqlmodel import select
 
 from app.models import LocalRunner, RunnerProjectBinding
+
+
+def runner_allowed_for_project(project_id: uuid.UUID) -> ColumnElement[bool]:
+    """SQL predicate selecting runners allowed to serve ``project_id``.
+
+    This is the query-side equivalent of :func:`allowed_project_ids`: the
+    enrollment project remains an implicit member, while explicit secondary
+    grants come from ``RunnerProjectBinding``.  Keeping this union in one helper
+    prevents discovery/read paths from drifting back to enrollment-only scope.
+    """
+    bound_runner_ids = select(RunnerProjectBinding.runner_id).where(
+        RunnerProjectBinding.project_id == project_id
+    )
+    return or_(
+        LocalRunner.project_id == project_id,
+        LocalRunner.id.in_(bound_runner_ids),
+    )
 
 
 async def bound_project_ids(

@@ -499,19 +499,20 @@ async def validate_compute_runner_target_enrollment(
     project_id: Any,
     runner_target: dict[str, Any],
 ) -> dict[str, Any] | None:
-    """Check a shape-valid ``runner_target`` against the project's enrolled runners.
+    """Check a shape-valid ``runner_target`` against the project's runner allow-list.
 
-    Returns ``None`` when the pinned runner exists AND is enrolled in
-    ``project_id``, else a machine-readable 422 detail dict::
+    Returns ``None`` when the pinned runner exists AND is on ``project_id``'s
+    allow-list (enrollment project or a secondary binding), else a machine-readable
+    422 detail dict::
 
         {"error": "runner_target_invalid", "reason_code": "not_found"|"not_enrolled",
          "runner_id": "<id>", "message": "..."}
 
-    Liveness is deliberately NOT checked here — an offline-but-enrolled runner
+    Liveness is deliberately NOT checked here — an offline-but-allowed runner
     is a valid authoring target (a soft pin falls through at dispatch; a strict
-    pin holds with an explicit reason until the runner comes back). Cross-project
-    runner ids are rejected at authoring time so a typo'd or stale id fails the
-    launch with a clear 422 instead of silently never dispatching.
+    pin holds with an explicit reason until the runner comes back). A runner not
+    on the project's allow-list is rejected at authoring time so a typo'd or stale
+    id fails the launch with a clear 422 instead of silently never dispatching.
     """
     from app.models import LocalRunner  # local import keeps this module neutral
 
@@ -527,14 +528,16 @@ async def validate_compute_runner_target_enrollment(
                 "registered runner"
             ),
         }
-    if runner.project_id != project_id:
+    from app.runner_project_binding import allowed_project_ids
+
+    if project_id not in await allowed_project_ids(session, runner):
         return {
             "error": "runner_target_invalid",
             "reason_code": "not_enrolled",
             "runner_id": runner_id,
             "message": (
-                f"runner {runner_id} is not enrolled in this project — "
-                "runner_target must name one of the project's enrolled runners"
+                f"runner {runner_id} is not on this project's allow-list — "
+                "runner_target must name one of the project's runners"
             ),
         }
     return None

@@ -48,6 +48,7 @@ from app.message_audience import (
 from app.reaper_orphan_classify import _classify_orphan
 from app.release_version import current_open_version
 from app.routers.admin_runners import _runner_health
+from app.runner_project_binding import runner_allowed_for_project
 from app.strategic_runtime_work import (
     local_runner_hold_task_filters,
     strategic_local_runner_hold_task_filters,
@@ -1077,7 +1078,7 @@ async def _load_stale_runner_pins(
             for runner in (
                 await session.execute(
                     select(LocalRunner).where(
-                        LocalRunner.project_id == project_id,
+                        runner_allowed_for_project(project_id),
                         LocalRunner.id.in_(runner_ids),
                     )
                 )
@@ -1137,7 +1138,7 @@ async def _load_dead_runners(
         (
             await session.execute(
                 select(LocalRunner).where(
-                    LocalRunner.project_id == project_id,
+                    runner_allowed_for_project(project_id),
                     LocalRunner.status != "deleted",
                 )
             )
@@ -1195,7 +1196,14 @@ async def _load_dead_runners(
     return needs_operator_count, watch_count, uncovered[:_DEAD_RUNNER_PREVIEW_LIMIT]
 
 
-def _dead_runner_attention_item(runner: LocalRunner) -> dict[str, Any]:
+def _dead_runner_attention_item(
+    runner: LocalRunner,
+    *,
+    project_id: uuid.UUID | None = None,
+) -> dict[str, Any]:
+    # Use the requested project's id so secondary-bound runners route back to
+    # the viewing project (B), not the runner's enrollment project (A).
+    scoped_project_id = project_id if project_id is not None else runner.project_id
     health = _runner_health(runner)
     active_work = int(health.get("active_work_count") or 0)
     had_active_work = active_work > 0
@@ -1238,12 +1246,12 @@ def _dead_runner_attention_item(runner: LocalRunner) -> dict[str, Any]:
         "ref": {
             "kind": "runner",
             "id": str(runner.id),
-            "project_id": str(runner.project_id),
+            "project_id": str(scoped_project_id),
         },
         "target": _attention_target(
             {
                 "surface": "runtime",
-                "project_id": str(runner.project_id),
+                "project_id": str(scoped_project_id),
                 "section": "devices",
                 "runner_id": str(runner.id),
             }
@@ -2596,7 +2604,7 @@ async def build_operator_attention(
     for task, runner in stale_runner_pin_tasks:
         add_candidate(_stale_runner_pin_attention_item(task, runner=runner))
     for runner in dead_runners:
-        add_candidate(_dead_runner_attention_item(runner))
+        add_candidate(_dead_runner_attention_item(runner, project_id=project.id))
     for task in stale_provisioning_tasks:
         add_candidate(
             _stale_task_attention_item(task, reason="stale_provisioning_task")
