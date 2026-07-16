@@ -6902,6 +6902,46 @@ class TestCloseOrphanPrIfAny:
         assert close_mock.await_args.args[3] == 5983
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("payload_type", ["review", "panel_review"])
+    async def test_review_cancel_does_not_close_reviewed_pr(
+        self, tl_db, mocker, payload_type
+    ):
+        """A reviewer references the implementation PR but never owns it."""
+        from app import task_lifecycle as tl
+
+        session, _ = tl_db
+        project = Project(name="p", user_id="u")
+        session.add(project)
+        await session.commit()
+        await session.refresh(project)
+
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": payload_type, "pr_number": 15138}],
+            status=TaskStatus.CANCELLED,
+            context={"review_loop": {"pr_number": 15138}},
+        )
+        session.add(task)
+        await session.commit()
+        await session.refresh(task)
+
+        token_mock = AsyncMock(return_value=("tok", "Owner", "Repo"))
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new=token_mock,
+        )
+        close_mock = AsyncMock(return_value=True)
+        mocker.patch("app.github.close_pull_request", new=close_mock)
+
+        closed = await tl.close_orphan_pr_if_any(
+            task, session, reason="duplicate_review"
+        )
+
+        assert closed is False
+        token_mock.assert_not_called()
+        close_mock.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_noop_when_no_pr_url(self, tl_db, mocker):
         from app import task_lifecycle as tl
 
