@@ -1537,6 +1537,10 @@ _NO_USABLE_GPU_TERMINAL_REASON = (
 _NO_DATA_TERMINAL_REASON = (
     "compute job exited 0 but never measured its declared result — no usable result"
 )
+_NO_CRITERION_EXPERIMENT_REASON = (
+    "compute_experiment declared no metric and produced no measurements — "
+    "a metric or success_criterion is required for experiments"
+)
 
 # Seeded into polling_metadata["status_message"] at job-creation time (see the
 # launch metadata builder). It is a launch-time placeholder, NOT a terminal
@@ -1758,6 +1762,38 @@ def _job_expects_data(job: ComputeJob, task: Task | None) -> bool:
         criterion.get("metric") if isinstance(criterion, dict) else None
     )
     return bool(declared_metric)
+
+
+def _is_criterion_free_experiment(job: "ComputeJob", task: Task | None) -> bool:
+    """True for compute_experiment tasks that declared no metric and no criterion.
+
+    A compute_experiment is a measurement task by definition — finishing with no
+    declared metric, no arms, and no success_criterion is never a clean SUCCESS.
+    The run produced nothing evaluable, so it must be reclassified as FAILURE rather
+    than silently benefiting from the _job_expects_data carve-out that was designed
+    for pure side-effect commands. Non-experiment task types (research, plan, …) are
+    unaffected: they are legitimate side-effect jobs and the carve-out stays intact.
+
+    Checks both the task payload AND the job's polling_metadata for a stamped
+    declared_metric so a job created with an explicit declared_metric kwarg (which
+    stamps polling_metadata["declared_metric"] at creation time) is never
+    misclassified as criterion-free.
+    """
+    if task is None:
+        return False
+    payload = task.first_payload or {}
+    if str(payload.get("type") or "") != "compute_experiment":
+        return False
+    # Declared metric stamped in polling_metadata at job creation → not criterion-free.
+    if (job.polling_metadata or {}).get("declared_metric"):
+        return False
+    # Already has a declared metric or arms in payload — handled by the existing path.
+    if payload.get("declared_metric") or payload.get("arms"):
+        return False
+    # Has a success_criterion (metric or artifact_produced) — a well-defined contract.
+    if payload.get("success_criterion") is not None:
+        return False
+    return True
 
 
 async def get_compute_job_for_task(
@@ -2988,15 +3024,26 @@ async def _process_single_compute_job(
         # only ever reported via stdout, inside an arm, or on an earlier poll. An
         # arms-only sweep instead requires at least one numeric per-arm result;
         # a flat metric cannot fulfill that distinct contract.
+        #
+        # Separate path: compute_experiment tasks that declare NO metric and NO
+        # success_criterion are criterion-free experiments.  _job_expects_data does
+        # not fire for them (no declared_metric, no arms), but they still must not
+        # record a clean SUCCESS — a metric is definitionally mandatory for experiments.
         declared_metric = _declared_progress_metric(job)
+        _criterion_free_experiment = _is_criterion_free_experiment(job, task)
         no_data = (
             not timeout_like
             and not no_usable_gpu
             and status.status == ComputeJobStatus.SUCCEEDED
-            and _job_expects_data(job, task)
             and (
-                (declared_metric is not None and _declared_metric_unmeasured(job, status))
-                or (_task_declares_arms(task) and not _arms_have_reported_data(job, status))
+                _criterion_free_experiment
+                or (
+                    _job_expects_data(job, task)
+                    and (
+                        (declared_metric is not None and _declared_metric_unmeasured(job, status))
+                        or (_task_declares_arms(task) and not _arms_have_reported_data(job, status))
+                    )
+                )
             )
         )
         terminal_artifact_reference = (
@@ -3032,10 +3079,14 @@ async def _process_single_compute_job(
                     _NO_USABLE_GPU_TERMINAL_REASON
                     if no_usable_gpu
                     else (
-                        _no_data_terminal_reason(terminal_artifact_reference)
-                        if no_data
-                        else _resolve_terminal_reason(
-                            status_message=status.message, outcome=outcome
+                        _NO_CRITERION_EXPERIMENT_REASON
+                        if _criterion_free_experiment
+                        else (
+                            _no_data_terminal_reason(terminal_artifact_reference)
+                            if no_data
+                            else _resolve_terminal_reason(
+                                status_message=status.message, outcome=outcome
+                            )
                         )
                     )
                     )

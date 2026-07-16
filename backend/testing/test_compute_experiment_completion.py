@@ -2348,8 +2348,13 @@ async def test_lifecycle_deadline_kill_surfaces_through_task(
 async def test_lifecycle_success_completes_through_task(
     db_session, monkeypatch, _quiet_compute_io
 ):
-    """End-to-end happy path: a job runs to SUCCESS and the task passes the gate."""
-    task = await _make_compute_task(db_session)
+    """End-to-end happy path: a job with a declared criterion runs to SUCCESS."""
+    # Use a task with a success_criterion — criterion-free experiments must not
+    # record clean SUCCESS (they are reclassified as FAILURE by the no-data guard).
+    # declared_metric is NOT forwarded to create_compute_job to avoid triggering the
+    # preflight smoke step (the fake backend has no smoke support); the success_criterion
+    # in the task payload is enough to satisfy _is_criterion_free_experiment.
+    task = await _make_compute_task_with_criterion(db_session, "accuracy", ">=", 0.8)
     task.status = TaskStatus.IN_PROGRESS
     db_session.add(task)
     await db_session.commit()
@@ -2362,6 +2367,12 @@ async def test_lifecycle_success_completes_through_task(
         spend_cap_usd=1.0,
         deadline_seconds=300,
     )
+    # Bypass smoke: this test focuses on the job-monitor launch/poll/terminal path.
+    # Dedicated smoke tests cover the preflight gate separately.
+    meta = dict(job.polling_metadata or {})
+    meta["preflight_smoke_done"] = True
+    job.polling_metadata = meta
+    await db_session.commit()
     started_at = _utcnow() - timedelta(seconds=30)
 
     class FakeBackend:
@@ -2385,6 +2396,7 @@ async def test_lifecycle_success_completes_through_task(
                 exit_code=0,
                 finished_at=_utcnow(),
                 message="completed",
+                metrics={"accuracy": 0.92},
             )
 
         async def terminate(self, persisted_job, *, reason):
@@ -2397,15 +2409,17 @@ async def test_lifecycle_success_completes_through_task(
         expire_on_commit=False,
         class_=AsyncSession,
     )
-    # Three passes: pre-flight smoke, STARTING→launch, RUNNING→poll-to-terminal.
-    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+    # Two passes (smoke bypassed): STARTING→launch, RUNNING→poll-to-terminal.
     await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
     await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
     await db_session.refresh(job)
     assert job.outcome == ComputeJobOutcome.SUCCESS
 
+    # Use build_compute_result_logs (not _result_from_terminal_job) so that the
+    # accuracy metric stored in polling_metadata["result_metrics"] is flattened
+    # into the result artifact and the criterion evaluator can assess it.
     await _handle_compute_experiment_completion(
-        task, _result_from_terminal_job(job), db_session
+        task, compute_jobs.build_compute_result_logs(job), db_session
     )
 
     await db_session.refresh(task)

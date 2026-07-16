@@ -3879,10 +3879,28 @@ def test_job_expects_data_variants():
     crit_task = Task(payloads=[{"success_criterion": {"metric": "acc"}}])
     assert compute_jobs._job_expects_data(empty_job, crit_task) is True
 
-    # Pure side-effect job: no declared metric, no arms, no criterion → no data.
+    # Pure side-effect job: no declared metric, no arms, no criterion → no data expected.
     side_effect_task = Task(payloads=[{"type": "research"}])
     assert compute_jobs._job_expects_data(empty_job, side_effect_task) is False
     assert compute_jobs._job_expects_data(empty_job, None) is False
+
+    # criterion-free compute_experiment: _job_expects_data returns False (it handles
+    # metric/arms only); the separate _is_criterion_free_experiment path catches this.
+    experiment_no_criterion = Task(payloads=[{"type": "compute_experiment"}])
+    assert compute_jobs._job_expects_data(empty_job, experiment_no_criterion) is False
+    assert compute_jobs._is_criterion_free_experiment(empty_job, experiment_no_criterion) is True
+
+    # compute_experiment WITH a stamped declared_metric in polling_metadata → not criterion-free.
+    job_with_metric = ComputeJob(polling_metadata={"declared_metric": "acc"})
+    assert compute_jobs._is_criterion_free_experiment(job_with_metric, experiment_no_criterion) is False
+
+    # compute_experiment WITH a success_criterion in payload → not criterion-free.
+    experiment_with_criterion = Task(payloads=[{"type": "compute_experiment", "success_criterion": {"metric": "acc"}}])
+    assert compute_jobs._is_criterion_free_experiment(empty_job, experiment_with_criterion) is False
+
+    # Non-experiment type (research) → never criterion-free.
+    assert compute_jobs._is_criterion_free_experiment(empty_job, side_effect_task) is False
+    assert compute_jobs._is_criterion_free_experiment(empty_job, None) is False
 
 
 async def _run_no_data_guard_job(
@@ -4040,16 +4058,22 @@ async def test_no_data_guard_respects_reported_metrics(db_session, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_no_declared_metric_metricless_still_success(db_session, monkeypatch):
-    """A job that declares NO metric and writes none stays SUCCESS (no regression)."""
-    project = Project(name="No Metric Declared Success", user_id="test-user")
+async def test_compute_experiment_without_criterion_fails(db_session, monkeypatch):
+    """A compute_experiment that declares no metric and no success_criterion must FAIL.
+
+    compute_experiment is a measurement task by definition; a metric is mandatory.
+    The _job_expects_data carve-out was designed for pure side-effect commands (no
+    declared metric), not for experiments — this regression guard ensures a criterion-
+    free experiment is reclassified as FAILURE rather than recorded as clean SUCCESS.
+    """
+    project = Project(name="No Metric Declared Experiment", user_id="test-user")
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
     task = Task(
         project_id=project.id,
-        title="no declared metric experiment",
+        title="compute_experiment with no metric",
         status=TaskStatus.IN_PROGRESS,
         payloads=[{"type": "compute_experiment"}],
     )
@@ -4074,11 +4098,11 @@ async def test_no_declared_metric_metricless_still_success(db_session, monkeypat
 
     class FakeBackend:
         def external_id_for(self, persisted_job):
-            return "no-declared-metric-job"
+            return "no-criterion-experiment-job"
 
         async def launch(self, spec):
             return ComputeLaunchResult(
-                external_id="no-declared-metric-job",
+                external_id="no-criterion-experiment-job",
                 started_at=_utcnow() - timedelta(seconds=30),
                 cost_rate_per_second=0.0,
                 message="launched",
@@ -4112,6 +4136,25 @@ async def test_no_declared_metric_metricless_still_success(db_session, monkeypat
     await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
 
     await db_session.refresh(job)
+    assert job.outcome == ComputeJobOutcome.FAILURE
+    assert "compute_experiment declared no metric" in (job.terminal_reason or "")
+
+
+@pytest.mark.asyncio
+async def test_side_effect_job_no_metric_stays_success(db_session, monkeypatch):
+    """Side-effect jobs (non-experiment type) with no metric stay SUCCESS.
+
+    The _job_expects_data carve-out must remain intact for non-experiment task types
+    (research, plan, etc.) that legitimately have no declared metric.  Only
+    compute_experiment tasks are required to declare a criterion.
+    """
+    job = await _run_no_data_guard_job(
+        db_session,
+        monkeypatch,
+        task_payload={"type": "research"},
+        status_metrics=None,
+        artifact_reference=None,
+    )
     assert job.outcome == ComputeJobOutcome.SUCCESS
 
 
