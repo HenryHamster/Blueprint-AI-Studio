@@ -3840,18 +3840,17 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # task would inherit no criterion_ids even though its direction has some.
     # Best-effort: a lookup failure leaves that direction absent from the cache.
     _direction_criterion_cache: dict[str, list[str]] = {}
-    _criterion_release_version_id = None
-    try:
-        from app.release_version import current_open_version as _current_open_version
+    from app.acceptance_criteria import (
+        direction_criterion_release_version_id as _direction_criterion_version,
+        resolve_task_criterion_release_version_id as _resolve_criterion_version,
+        task_criterion_release_version_id as _task_criterion_version,
+    )
 
-        _open_version = await _current_open_version(session, task.project_id)
-        if _open_version is not None:
-            _criterion_release_version_id = _open_version.id
-    except Exception:
-        logger.debug(
-            "[RESEARCH] open version lookup failed for project %s; "
-            "criterion cache will stay version-unscoped",
-            task.project_id,
+    _criterion_release_version_id = _task_criterion_version(task)
+    _criterion_version_was_explicit = _criterion_release_version_id is not None
+    if _criterion_release_version_id is None:
+        _criterion_release_version_id = await _resolve_criterion_version(
+            session, task, task.project_id
         )
     _dirs_to_prefetch: set[str] = set()
     if _parent_direction_id:
@@ -3871,7 +3870,18 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             )
             for _pf_dir_id, _pf_row in _pf_rows.items():
                 try:
-                    if _pf_row is not None and _pf_row.criterion_keys:
+                    if (
+                        _pf_row is not None
+                        and _pf_row.criterion_keys
+                        and (
+                            _direction_criterion_version(_pf_row)
+                            == _criterion_release_version_id
+                            or (
+                                not _criterion_version_was_explicit
+                                and _direction_criterion_version(_pf_row) is None
+                            )
+                        )
+                    ):
                         from app.acceptance_criteria import (
                             filter_active_criterion_keys as _filter_active,
                         )
@@ -5155,6 +5165,15 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 **(
                     {"parent_direction_id": parent_direction_id}
                     if parent_direction_id
+                    else {}
+                ),
+                **(
+                    {
+                        "criterion_release_version_id": str(
+                            _criterion_release_version_id
+                        )
+                    }
+                    if _criterion_release_version_id is not None
                     else {}
                 ),
                 **(

@@ -742,6 +742,7 @@ async def check_criterion_merge_evidence_gap(
 
     from app.acceptance_criteria import (
         get_criteria_for_version,
+        task_matches_criterion_release_version,
     )
     from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY, acceptance_is_proven
     from app.landed_signal import has_landed_signal
@@ -827,6 +828,8 @@ async def check_criterion_merge_evidence_gap(
         ground_truth = 0
         missing_task_ids: List[str] = []
         for task in tasks:
+            if not task_matches_criterion_release_version(task, open_version):
+                continue
             if not has_landed_signal(task):
                 continue
             verdict = (task.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)

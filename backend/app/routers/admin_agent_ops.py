@@ -1345,6 +1345,14 @@ async def strategic_operation(
             if criterion_keys_supplied
             else []
         )
+        create_criterion_release_version_id: uuid.UUID | None = None
+        if criterion_keys:
+            from app.release_version import current_open_version as _criterion_open_version
+
+            _criterion_version = await _criterion_open_version(session, project.id)
+            create_criterion_release_version_id = (
+                _criterion_version.id if _criterion_version is not None else None
+            )
         new_dir: dict = {
             "id": f"d-{uuid.uuid4().hex[:8]}",
             "text": text,
@@ -1395,6 +1403,10 @@ async def strategic_operation(
         }
         if criterion_keys_supplied:
             new_dir["criterion_keys"] = criterion_keys
+            if create_criterion_release_version_id is not None:
+                new_dir["criterion_release_version_id"] = str(
+                    create_criterion_release_version_id
+                )
         if staged_create:
             new_dir["staged_for_version"] = staged_for_version
             new_dir["staged_at"] = _utcnow().isoformat()
@@ -1577,6 +1589,14 @@ async def strategic_operation(
             if criterion_keys_supplied
             else []
         )
+        update_criterion_release_version_id: uuid.UUID | None = None
+        if criterion_keys:
+            from app.release_version import current_open_version as _criterion_open_version
+
+            _criterion_version = await _criterion_open_version(session, project.id)
+            update_criterion_release_version_id = (
+                _criterion_version.id if _criterion_version is not None else None
+            )
         directions = list(project.directions or [])
         updated = False
         # Re-ground reconciliation: capture the direction's prior gap_id BEFORE
@@ -1717,6 +1737,12 @@ async def strategic_operation(
                         )
                 if criterion_keys_supplied:
                     d["criterion_keys"] = criterion_keys
+                    if update_criterion_release_version_id is not None:
+                        d["criterion_release_version_id"] = str(
+                            update_criterion_release_version_id
+                        )
+                    else:
+                        d.pop("criterion_release_version_id", None)
                 # Handle success_evidence and retirement_condition in context
                 _DIR_FIELD_MAX = 500
                 if "success_evidence" in changes or "retirement_condition" in changes:
@@ -2117,6 +2143,9 @@ async def strategic_operation(
         if _retire_dir_row is not None and _retire_dir_row.criterion_keys:
             _cleared_keys = list(_retire_dir_row.criterion_keys)
             _retire_dir_row.criterion_keys = []
+            _retire_data = dict(_retire_dir_row.data or {})
+            _retire_data.pop("criterion_release_version_id", None)
+            _retire_dir_row.data = _retire_data
             session.add(_retire_dir_row)
             warnings.append(
                 f"Retired direction {dir_id} had {len(_cleared_keys)} criterion "
@@ -3351,6 +3380,17 @@ async def strategic_operation(
         if direction_id:
             new_task_ctx["direction_id"] = direction_id
 
+        _task_criterion_release_version_id: uuid.UUID | None = None
+        if direction_id or raw_explicit_criterion_ids is not None:
+            from app.release_version import current_open_version as _current_open_version
+
+            _open_version = await _current_open_version(session, project.id)
+            if _open_version is not None:
+                _task_criterion_release_version_id = _open_version.id
+                new_task_ctx["criterion_release_version_id"] = str(
+                    _open_version.id
+                )
+
         # Resolve criterion_keys from two sources: the direction row (when
         # direction_id is set) and any explicit criterion_ids the strategist
         # passed. Both are merged and filtered to active keys on the open
@@ -3361,7 +3401,19 @@ async def strategic_operation(
             from app.directions_repo import get_direction_row as _get_direction_row
 
             _dir_row = await _get_direction_row(session, project.id, direction_id)
-            if _dir_row is not None and _dir_row.criterion_keys:
+            from app.acceptance_criteria import (
+                direction_criterion_release_version_id as _direction_criterion_version,
+            )
+
+            _direction_version_id = _direction_criterion_version(_dir_row)
+            if (
+                _dir_row is not None
+                and _dir_row.criterion_keys
+                and (
+                    _direction_version_id == _task_criterion_release_version_id
+                    or _direction_version_id is None
+                )
+            ):
                 # Merge: explicit keys first, then direction-derived; deduplicate.
                 _keys_to_filter = list(
                     dict.fromkeys(_keys_to_filter + list(_dir_row.criterion_keys))
@@ -3370,15 +3422,13 @@ async def strategic_operation(
             from app.acceptance_criteria import (
                 filter_active_criterion_keys as _filter_active_crit,
             )
-            from app.release_version import current_open_version as _current_open_version
-
-            _open_version = await _current_open_version(session, project.id)
-            _task_criterion_ids = await _filter_active_crit(
-                session,
-                project.id,
-                _keys_to_filter,
-                release_version_id=_open_version.id if _open_version is not None else None,
-            )
+            if _task_criterion_release_version_id is not None:
+                _task_criterion_ids = await _filter_active_crit(
+                    session,
+                    project.id,
+                    _keys_to_filter,
+                    release_version_id=_task_criterion_release_version_id,
+                )
 
         # Cross-field guard: criterion_ids (explicit or direction-derived)
         # require named_test acceptance evidence so the acceptance pipeline can
@@ -4917,6 +4967,9 @@ async def strategic_operation(
                         f"removed: {sorted(_scrubbed)}"
                     )
                 dir_row.criterion_keys = merged
+                _dir_data = dict(dir_row.data or {})
+                _dir_data["criterion_release_version_id"] = str(open_version.id)
+                dir_row.data = _dir_data
                 session.add(dir_row)
                 mapped_keys.append(dk)
 

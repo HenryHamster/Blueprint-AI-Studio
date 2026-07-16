@@ -659,28 +659,47 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     # or has no active keys, children get an empty list and
     # record_task_merge_evidence falls back to direction lookup at merge time.
     _plan_criterion_ids: list[str] = []
+    from app.acceptance_criteria import (
+        direction_criterion_release_version_id as _direction_criterion_version,
+        resolve_task_criterion_release_version_id as _resolve_criterion_version,
+        task_criterion_release_version_id as _task_criterion_version,
+    )
+
+    _plan_criterion_release_version_id = _task_criterion_version(task)
+    _plan_version_was_explicit = _plan_criterion_release_version_id is not None
+    if _plan_criterion_release_version_id is None:
+        _plan_criterion_release_version_id = await _resolve_criterion_version(
+            session, task, task.project_id
+        )
     if parent_direction_id:
         try:
             from app.directions_repo import get_direction_row as _get_dir_row
 
             _dir_row = await _get_dir_row(session, task.project_id, parent_direction_id)
-            if _dir_row is not None and _dir_row.criterion_keys:
+            if (
+                _dir_row is not None
+                and _dir_row.criterion_keys
+                and (
+                    _direction_criterion_version(_dir_row)
+                    == _plan_criterion_release_version_id
+                    or (
+                        not _plan_version_was_explicit
+                        and _direction_criterion_version(_dir_row) is None
+                    )
+                )
+            ):
                 from app.acceptance_criteria import (
                     filter_active_criterion_keys as _filter_active,
                 )
-                from app.release_version import (
-                    current_open_version as _cur_open_ver,
-                )
-
-                _open_ver = await _cur_open_ver(session, task.project_id)
-                _cached_ids = await _filter_active(
-                    session,
-                    task.project_id,
-                    list(_dir_row.criterion_keys),
-                    release_version_id=_open_ver.id if _open_ver is not None else None,
-                )
-                if _cached_ids:
-                    _plan_criterion_ids = _cached_ids
+                if _plan_criterion_release_version_id is not None:
+                    _cached_ids = await _filter_active(
+                        session,
+                        task.project_id,
+                        list(_dir_row.criterion_keys),
+                        release_version_id=_plan_criterion_release_version_id,
+                    )
+                    if _cached_ids:
+                        _plan_criterion_ids = _cached_ids
         except Exception:
             logger.debug(
                 "[PLAN] criterion_keys lookup failed for direction %s",
@@ -1104,6 +1123,15 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
                 ),
                 **(
                     {"direction_id": parent_direction_id} if parent_direction_id else {}
+                ),
+                **(
+                    {
+                        "criterion_release_version_id": str(
+                            _plan_criterion_release_version_id
+                        )
+                    }
+                    if _plan_criterion_release_version_id is not None
+                    else {}
                 ),
                 **(
                     {"research_task_id": parent_research_task_id}
