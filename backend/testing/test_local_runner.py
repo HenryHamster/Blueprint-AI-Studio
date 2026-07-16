@@ -48,6 +48,8 @@ from app.routers.admin_runners import (
 )
 from app.routers.runner import (
     _FileRangeReader,
+    _MAX_MULTIPART_FIELD_BYTES,
+    _MAX_MULTIPART_PARTS,
     _parse_heartbeat_timestamp,
     _parse_multipart_form,
     _parse_multipart_form_stream,
@@ -5665,6 +5667,95 @@ class TestMultipartStreamParser:
             self._spool(b"whatever"), "application/json"
         )
         assert fields == {} and file_part is None
+
+
+class TestMultipartParserHardening:
+    """Security hardening: oversized fields and excessive boundary counts are rejected."""
+
+    @staticmethod
+    def _spool(body: bytes):
+        import io
+
+        return io.BytesIO(body)
+
+    @staticmethod
+    def _build_viewable_multipart(filename: str, file_bytes: bytes, *, field_overrides=None):
+        """Build a viewable-endpoint multipart body (filename field + file part)."""
+        boundary = "----test-boundary-hardening"
+        crlf = b"\r\n"
+        extra_fields = field_overrides or {}
+        body = bytearray()
+        # optional extra scalar fields (used to inject oversized content)
+        for name, value in extra_fields.items():
+            body += b"--" + boundary.encode() + crlf
+            body += f'Content-Disposition: form-data; name="{name}"'.encode() + crlf + crlf
+            body += value + crlf
+        body += b"--" + boundary.encode() + crlf
+        body += b'Content-Disposition: form-data; name="filename"' + crlf + crlf
+        body += filename.encode() + crlf
+        body += b"--" + boundary.encode() + crlf
+        body += b'Content-Disposition: form-data; name="file"; filename="plot.png"' + crlf
+        body += b"Content-Type: image/png" + crlf + crlf
+        body += file_bytes + crlf
+        body += b"--" + boundary.encode() + b"--" + crlf
+        return bytes(body), f"multipart/form-data; boundary={boundary}"
+
+    def test_stream_parser_rejects_oversized_non_file_field(self):
+        """A non-file scalar field exceeding _MAX_MULTIPART_FIELD_BYTES raises ValueError."""
+        oversized_value = b"x" * (_MAX_MULTIPART_FIELD_BYTES + 1)
+        body, ct = self._build_viewable_multipart(
+            "plot.png", b"PNG_BYTES", field_overrides={"extra": oversized_value}
+        )
+        with pytest.raises(ValueError, match=r"non-file field.*exceeds"):
+            _parse_multipart_form_stream(self._spool(body), ct)
+
+    def test_in_memory_parser_rejects_oversized_non_file_field(self):
+        """_parse_multipart_form also rejects oversized scalar fields."""
+        oversized_value = b"y" * (_MAX_MULTIPART_FIELD_BYTES + 1)
+        body, ct = self._build_viewable_multipart(
+            "plot.png", b"PNG_BYTES", field_overrides={"extra": oversized_value}
+        )
+        with pytest.raises(ValueError, match=r"non-file field.*exceeds"):
+            _parse_multipart_form(body, ct)
+
+    def test_stream_parser_rejects_too_many_boundaries(self):
+        """A crafted body with more than _MAX_MULTIPART_PARTS boundary markers raises ValueError."""
+        boundary = "----crafted-boundary"
+        crlf = b"\r\n"
+        # Build a body whose boundary string appears far more than max_parts times
+        # without valid multipart structure — this exercises the Pass 1 counter.
+        delimiter = b"--" + boundary.encode()
+        # Each repetition is a minimal delimiter occurrence: delimiter + scalar field
+        body = bytearray()
+        for i in range(_MAX_MULTIPART_PARTS + 2):
+            body += delimiter + crlf
+            body += b'Content-Disposition: form-data; name="f"' + crlf + crlf
+            body += b"v" + crlf
+        body += delimiter + b"--" + crlf
+        ct = f"multipart/form-data; boundary={boundary}"
+        with pytest.raises(ValueError, match=r"more than.*boundary marker"):
+            _parse_multipart_form_stream(self._spool(bytes(body)), ct)
+
+    def test_stream_parser_normal_upload_still_succeeds(self):
+        """A well-formed viewable multipart body is still parsed correctly after hardening."""
+        file_bytes = b"FAKEPNG" * 16
+        body, ct = self._build_viewable_multipart("reward.png", file_bytes)
+        spool = self._spool(body)
+        fields, file_part = _parse_multipart_form_stream(spool, ct)
+        assert fields.get("filename") == b"reward.png"
+        assert file_part is not None
+        assert file_part["length"] == len(file_bytes)
+        # Verify actual file bytes round-trip correctly
+        spool.seek(file_part["start"])
+        assert spool.read(file_part["length"]) == file_bytes
+
+    def test_in_memory_parser_normal_upload_still_succeeds(self):
+        """_parse_multipart_form still works for a well-formed viewable body after hardening."""
+        file_bytes = b"FAKEPNG" * 8
+        body, ct = self._build_viewable_multipart("chart.png", file_bytes)
+        fields, files = _parse_multipart_form(body, ct)
+        assert fields.get("filename") == b"chart.png"
+        assert files.get("file") == file_bytes
 
 
 class TestArtifactUploadEndpoint:

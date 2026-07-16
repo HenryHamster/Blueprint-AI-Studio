@@ -25,6 +25,7 @@ registered runner (vm_instance_id='runner:{id}', context['runner_target_id']),
 and this endpoint hands those pinned tasks to the polling runner.
 """
 
+import asyncio
 import base64
 import binascii
 import logging
@@ -91,6 +92,15 @@ _MAX_RUNNER_RESULT_METRICS_KEYS = 256
 _MAX_RUNNER_ARTIFACT_BYTES = 25 * 1024 * 1024  # 25 MiB
 # Allowance for multipart framing/headers when early-rejecting on Content-Length.
 _MULTIPART_BODY_MARGIN = 1 * 1024 * 1024  # 1 MiB
+# Non-file scalar field size cap in multipart forms.  Filenames and other
+# metadata are a few hundred bytes at most; 4 KiB is far beyond any legitimate
+# value and bounds the heap impact of a crafted oversized field.
+_MAX_MULTIPART_FIELD_BYTES = 4 * 1024  # 4 KiB
+# Hard upper bound on boundary markers in a multipart body.  A normal
+# viewable upload has 3 parts (filename scalar + file part + trailing
+# close-boundary); capping at 64 prevents a crafted body from growing the
+# offset list without bound.
+_MAX_MULTIPART_PARTS = 64
 _ARTIFACT_TRANSFER_TTL_SECONDS = 60 * 60
 # Interim live-output tail (running reports only). Stamped as
 # polling_metadata["live_output"] — the same key/shape the GCP live-tail path
@@ -2302,6 +2312,10 @@ def _parse_multipart_form(body: bytes, content_type: str) -> tuple[dict, dict]:
         if filename is not None:
             files[name] = content
         else:
+            if len(content) > _MAX_MULTIPART_FIELD_BYTES:
+                raise ValueError(
+                    f"non-file field {name!r} exceeds {_MAX_MULTIPART_FIELD_BYTES} byte limit"
+                )
             fields[name] = content
     return fields, files
 
@@ -2336,6 +2350,8 @@ def _parse_multipart_form_stream(
     *,
     read_chunk: int = 1024 * 1024,
     header_window: int = 64 * 1024,
+    max_parts: int = _MAX_MULTIPART_PARTS,
+    max_field_bytes: int = _MAX_MULTIPART_FIELD_BYTES,
 ) -> tuple[dict, dict | None]:
     """Memory-bounded multipart parse over a SEEKABLE binary file.
 
@@ -2384,6 +2400,10 @@ def _parse_multipart_form_stream(
             if idx == -1:
                 break
             positions.append(base + idx)
+            if len(positions) > max_parts:
+                raise ValueError(
+                    f"multipart body contains more than {max_parts} boundary markers"
+                )
             search_from = idx + dlen
         keep = min(len(buf), overlap)
         base += len(buf) - keep
@@ -2431,6 +2451,10 @@ def _parse_multipart_form_stream(
                     "length": length,
                 }
         else:
+            if length > max_field_bytes:
+                raise ValueError(
+                    f"non-file field {name!r} exceeds {max_field_bytes} byte limit"
+                )
             fileobj.seek(content_start)
             fields[name] = fileobj.read(length)
 
@@ -3010,11 +3034,17 @@ async def upload_compute_job_viewable(
     spool = tempfile.SpooledTemporaryFile(max_size=spool_threshold)
     try:
         received = 0
+        chunk_count = 0
         async for chunk in request.stream():
             received += len(chunk)
             if received > max_body_bytes:
                 raise HTTPException(status_code=413, detail="viewable file body exceeds upload cap")
             spool.write(chunk)
+            chunk_count += 1
+            # Yield the event loop every 64 chunks (~64 MiB at default chunk size)
+            # so a large video upload cannot monopolize it during body ingestion.
+            if chunk_count % 64 == 0:
+                await asyncio.sleep(0)
 
         req_content_type = request.headers.get("content-type", "")
 
@@ -3024,20 +3054,31 @@ async def upload_compute_job_viewable(
         # the file part so its bytes never re-enter the heap.
         stream_upload = received > spool_threshold
         file_part: dict | None = None
-        if stream_upload:
-            fields, file_part = _parse_multipart_form_stream(spool, req_content_type)
-            if file_part is None:
-                raise HTTPException(status_code=400, detail="missing 'file' field in multipart form")
-            file_bytes = None
-            file_length = file_part["length"]
-        else:
-            spool.seek(0)
-            raw = spool.read()
-            fields, files = _parse_multipart_form(raw, req_content_type)
-            file_bytes = files.get("file")
-            if file_bytes is None:
-                raise HTTPException(status_code=400, detail="missing 'file' field in multipart form")
-            file_length = len(file_bytes)
+        try:
+            if stream_upload:
+                # Run the synchronous disk-scan in a thread so the event loop
+                # remains responsive while scanning a multi-hundred-MiB body.
+                fields, file_part = await asyncio.to_thread(
+                    _parse_multipart_form_stream, spool, req_content_type
+                )
+                if file_part is None:
+                    raise HTTPException(
+                        status_code=400, detail="missing 'file' field in multipart form"
+                    )
+                file_bytes = None
+                file_length = file_part["length"]
+            else:
+                spool.seek(0)
+                raw = spool.read()
+                fields, files = _parse_multipart_form(raw, req_content_type)
+                file_bytes = files.get("file")
+                if file_bytes is None:
+                    raise HTTPException(
+                        status_code=400, detail="missing 'file' field in multipart form"
+                    )
+                file_length = len(file_bytes)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         if file_length == 0:
             raise HTTPException(status_code=400, detail="empty viewable file body")
 
