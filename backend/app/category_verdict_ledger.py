@@ -60,8 +60,10 @@ async def upsert_category_verdict(
     gap: str | None,
     citations: Any | None,
     grader_run_id: str | None,
+    qualification_attempt_id: uuid.UUID | None = None,
 ) -> CategoryVerdict:
-    """UPSERT the verdict for ONE ``(version_id, candidate_sha, category_key)``.
+    """UPSERT the verdict for ONE ``(version_id, candidate_sha, category_key,
+    qualification_attempt_id)``.
 
     SELECT-then-INSERT/UPDATE on the unique key so a re-grade of a single
     category rewrites ONLY its own row (latest write wins) and never touches
@@ -74,6 +76,7 @@ async def upsert_category_verdict(
                 CategoryVerdict.version_id == version_id,
                 CategoryVerdict.candidate_sha == candidate_sha,
                 CategoryVerdict.category_key == category_key,
+                CategoryVerdict.qualification_attempt_id == qualification_attempt_id,
             )
         )
     ).scalar_one_or_none()
@@ -84,6 +87,7 @@ async def upsert_category_verdict(
         existing.gap = gap
         existing.citations = citations
         existing.grader_run_id = grader_run_id
+        existing.qualification_attempt_id = qualification_attempt_id
         existing.graded_at = _utcnow()
         session.add(existing)
         await session.flush()
@@ -98,6 +102,7 @@ async def upsert_category_verdict(
         gap=gap,
         citations=citations,
         grader_run_id=grader_run_id,
+        qualification_attempt_id=qualification_attempt_id,
         graded_at=_utcnow(),
     )
     session.add(row)
@@ -109,13 +114,23 @@ async def get_category_verdicts(
     session: AsyncSession,
     version_id: uuid.UUID,
     candidate_sha: str | None,
+    qualification_attempt_id: uuid.UUID | None = None,
 ) -> list[CategoryVerdict]:
-    """Return every category verdict recorded for one candidate tree."""
-    result = await session.execute(
-        select(CategoryVerdict).where(
-            CategoryVerdict.version_id == version_id,
-            CategoryVerdict.candidate_sha == candidate_sha,
+    """Return every category verdict recorded for one candidate tree.
+
+    When ``qualification_attempt_id`` is provided, filter to only verdicts
+    recorded by that attempt, enabling same-SHA multi-attempt provenance.
+    """
+    clauses = [
+        CategoryVerdict.version_id == version_id,
+        CategoryVerdict.candidate_sha == candidate_sha,
+    ]
+    if qualification_attempt_id is not None:
+        clauses.append(
+            CategoryVerdict.qualification_attempt_id == qualification_attempt_id
         )
+    result = await session.execute(
+        select(CategoryVerdict).where(*clauses)
     )
     return list(result.scalars().all())
 
@@ -164,24 +179,27 @@ async def upsert_residual(
     version_id: uuid.UUID,
     candidate_sha: str | None,
     uncaptured_gap: str | None,
+    qualification_attempt_id: uuid.UUID | None = None,
 ) -> None:
     """UPSERT the residual "uncaptured goal aspect" for one candidate tree.
 
-    SELECT-then-INSERT/UPDATE on the unique ``(version_id, candidate_sha)`` key.
-    Passing ``uncaptured_gap=None`` records/clears the residual to "no gap".
-    Flushes but does not commit.
+    SELECT-then-INSERT/UPDATE on the unique ``(version_id, candidate_sha,
+    qualification_attempt_id)`` key.  Passing ``uncaptured_gap=None`` records/clears
+    the residual to "no gap".  Flushes but does not commit.
     """
     existing = (
         await session.execute(
             select(ResidualVerdict).where(
                 ResidualVerdict.version_id == version_id,
                 ResidualVerdict.candidate_sha == candidate_sha,
+                ResidualVerdict.qualification_attempt_id == qualification_attempt_id,
             )
         )
     ).scalar_one_or_none()
 
     if existing is not None:
         existing.uncaptured_gap = uncaptured_gap
+        existing.qualification_attempt_id = qualification_attempt_id
         existing.graded_at = _utcnow()
         session.add(existing)
         await session.flush()
@@ -192,6 +210,7 @@ async def upsert_residual(
             version_id=version_id,
             candidate_sha=candidate_sha,
             uncaptured_gap=uncaptured_gap,
+            qualification_attempt_id=qualification_attempt_id,
             graded_at=_utcnow(),
         )
     )
@@ -202,18 +221,26 @@ async def get_residual(
     session: AsyncSession,
     version_id: uuid.UUID,
     candidate_sha: str | None,
+    qualification_attempt_id: uuid.UUID | None = None,
 ) -> str | None:
     """Return the recorded ``uncaptured_gap`` for a candidate, or None if absent.
 
+    When ``qualification_attempt_id`` is provided, filter to the residual recorded
+    by that attempt, enabling same-SHA multi-attempt provenance.
     None is returned both when no residual row exists and when the row exists
     with a null gap — both mean "no uncaptured goal aspect".
     """
+    clauses = [
+        ResidualVerdict.version_id == version_id,
+        ResidualVerdict.candidate_sha == candidate_sha,
+    ]
+    if qualification_attempt_id is not None:
+        clauses.append(
+            ResidualVerdict.qualification_attempt_id == qualification_attempt_id
+        )
     existing = (
         await session.execute(
-            select(ResidualVerdict).where(
-                ResidualVerdict.version_id == version_id,
-                ResidualVerdict.candidate_sha == candidate_sha,
-            )
+            select(ResidualVerdict).where(*clauses)
         )
     ).scalar_one_or_none()
     if existing is None:

@@ -2767,6 +2767,14 @@ async def run_qualification(
     version.qualification_retry_episode = retry_episode
     if is_new_attempt:
         version.qualification_attempts = (version.qualification_attempts or 0) + 1
+    # Attempt contract: freeze promotion policy and capability-proof mode BEFORE
+    # the first child-spawn await so a mid-flight operator/config change cannot
+    # compose children spawned under one contract with a verdict computed under
+    # another.  Legacy records that predate the freeze fall back to live values.
+    _spawn_policy_snapshot = _load_policy(project)
+    _spawn_capability_proof_mode = str(
+        _runtime_config.get("capability_proof_gate_mode", "off") or "off"
+    ).strip().lower()
     try:
         if _audit_needed:
             audit_task = await _spawn_release_audit_task(
@@ -2904,10 +2912,8 @@ async def run_qualification(
         # cannot compose children spawned under one contract with a verdict
         # computed under another.
         "version_goal": version_goal,
-        "promotion_policy_snapshot": _load_policy(project),
-        "capability_proof_mode": str(
-            _runtime_config.get("capability_proof_gate_mode", "off") or "off"
-        ).strip().lower(),
+        "promotion_policy_snapshot": _spawn_policy_snapshot,
+        "capability_proof_mode": _spawn_capability_proof_mode,
     }
     # Read-modify-write is safe here (unlike the no_credentials / sha_error
     # early returns, which run pre-lock and use the atomic
@@ -4625,7 +4631,11 @@ async def _finalize_qualification(
     # changes do not compose children spawned under one contract with a verdict
     # computed under another.  Legacy records that predate the freeze fall back
     # to the live values so existing finalizes continue to work.
-    _frozen_version_goal: str = qual.get("version_goal") or (version.goal or "").strip()
+    _frozen_version_goal: str = (
+        str(qual["version_goal"]).strip()
+        if "version_goal" in qual
+        else (version.goal or "").strip()
+    )
     _frozen_capability_proof_mode: str | None = (
         str(qual["capability_proof_mode"]).strip().lower()
         if "capability_proof_mode" in qual
@@ -4682,6 +4692,17 @@ async def _finalize_qualification(
     # Prefer the promotion policy frozen at spawn; fall back to the live policy
     # for legacy records that predate the attempt-contract freeze.
     policy = qual.get("promotion_policy_snapshot") or _load_policy(_policy_project)
+
+    # Derive whether enforce mode was active at spawn from the frozen (or fallback)
+    # policy.  _apply_completion_debt_weight_mode baked the freeze-time mode into
+    # weights.completion_debt, so a present positive value means enforce was active
+    # when the policy was captured.  Used below for debt-scoring fallback (line 6393)
+    # and the enforce preview gate (line 6584) so mid-flight knob changes cannot
+    # omit the fail-closed debt score or produce metadata under the wrong contract.
+    _frozen_cd_weight: float = float(
+        (policy.get("weights") or {}).get("completion_debt", 0.0) or 0.0
+    )
+    _frozen_cd_was_enforce: bool = _frozen_cd_weight > 0.0
 
     # Resolve the launch contract before checking child infrastructure state.
     # Rubric drift is authoritative for this attempt: a lifecycle/text change
@@ -6209,12 +6230,14 @@ async def _finalize_qualification(
                         gap=_v.get("gap"),
                         citations=_v.get("citations") or [],
                         grader_run_id=merge_grade_task_id,
+                        qualification_attempt_id=attempt_id,
                     )
                 await _category_ledger.upsert_residual(
                     session,
                     version.id,
                     candidate_sha,
                     merge_grade_cert.get("residual_uncaptured_gap"),
+                    qualification_attempt_id=attempt_id,
                 )
             except Exception:  # noqa: BLE001 — ledger write failure must not crash finalize
                 logger.warning(
@@ -6410,7 +6433,7 @@ async def _finalize_qualification(
         _debt_pressure_score: float | None = _score_completion_debt_pressure(
             _completion_debt_scoring_snapshot
         )
-    elif _resolve_completion_debt_weight_mode() == "enforce":
+    elif _frozen_cd_was_enforce:
         # In enforce mode a failed debt-snapshot read must NOT inflate confidence
         # by silently dropping the (1 - w_debt) down-scaling inside
         # compute_composite.  Use 0.0 (maximum-debt worst case) so the composite
@@ -6601,7 +6624,7 @@ async def _finalize_qualification(
     # completion_debt_weight_mode knob with accumulated evidence rather than
     # flying blind.  Has no effect on the live composite.
     if (
-        _resolve_completion_debt_weight_mode() != "enforce"
+        not _frozen_cd_was_enforce
         and composite["blocker"] is None
         and _debt_pressure_score is not None
     ):
