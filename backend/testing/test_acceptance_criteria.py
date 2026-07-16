@@ -1784,6 +1784,95 @@ async def test_attestation_approaching_expiry_warns_before_lapse(db_session):
 
 
 # ---------------------------------------------------------------------------
+# get_unmapped_active_criterion_keys — standalone helper tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_unmapped_active_criterion_keys_empty_when_no_criteria(db_session):
+    """No active criteria → empty result."""
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+    await db_session.commit()
+
+    result = await ac.get_unmapped_active_criterion_keys(
+        db_session, project.id, version.id
+    )
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_get_unmapped_active_criterion_keys_all_unmapped(db_session):
+    """Active criteria with no Direction mapping → all returned."""
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+    c1 = await ac.create_criterion(db_session, project.id, version.id, "First unmapped")
+    c2 = await ac.create_criterion(db_session, project.id, version.id, "Second unmapped")
+    await db_session.commit()
+
+    result = await ac.get_unmapped_active_criterion_keys(
+        db_session, project.id, version.id
+    )
+    assert sorted(result) == sorted([c1.criterion_key, c2.criterion_key])
+
+
+@pytest.mark.asyncio
+async def test_get_unmapped_active_criterion_keys_excludes_mapped(db_session):
+    """Criteria linked to any direction (even retired) are excluded from the unmapped set."""
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+    c_mapped = await ac.create_criterion(db_session, project.id, version.id, "Mapped")
+    c_unmapped = await ac.create_criterion(db_session, project.id, version.id, "Unmapped")
+    db_session.add(_make_direction(project.id, "d1", [c_mapped.criterion_key], "active"))
+    await db_session.commit()
+
+    result = await ac.get_unmapped_active_criterion_keys(
+        db_session, project.id, version.id
+    )
+    assert result == [c_unmapped.criterion_key]
+    assert c_mapped.criterion_key not in result
+
+
+@pytest.mark.asyncio
+async def test_get_unmapped_active_criterion_keys_excludes_inactive(db_session):
+    """Retracted / superseded criteria are not considered unmapped — only active rows count."""
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+    c_active = await ac.create_criterion(db_session, project.id, version.id, "Active")
+    c_retracted = await ac.create_criterion(
+        db_session, project.id, version.id, "Retracted"
+    )
+    # Retract the second criterion
+    c_retracted.status = "retracted"
+    db_session.add(c_retracted)
+    await db_session.commit()
+
+    result = await ac.get_unmapped_active_criterion_keys(
+        db_session, project.id, version.id
+    )
+    assert result == [c_active.criterion_key]
+    assert c_retracted.criterion_key not in result
+
+
+@pytest.mark.asyncio
+async def test_get_unmapped_active_criterion_keys_empty_when_all_mapped(db_session):
+    """All active criteria have a direction mapping → empty result."""
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+    c1 = await ac.create_criterion(db_session, project.id, version.id, "C1")
+    c2 = await ac.create_criterion(db_session, project.id, version.id, "C2")
+    db_session.add(
+        _make_direction(project.id, "d1", [c1.criterion_key, c2.criterion_key], "active")
+    )
+    await db_session.commit()
+
+    result = await ac.get_unmapped_active_criterion_keys(
+        db_session, project.id, version.id
+    )
+    assert result == []
+
+
+# ---------------------------------------------------------------------------
 # get_criterion_by_key, criterion_ids propagation, and merge evidence recording
 # ---------------------------------------------------------------------------
 

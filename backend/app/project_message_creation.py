@@ -25,6 +25,7 @@ from app.models import (
     ProjectMessageSequence,
     _utcnow,
 )
+from app.database import resolve_dialect_name
 from app.project_message_projection import message_event_payload
 from app.strategic_trigger import (
     ARMING_NOT_ARMED,
@@ -206,7 +207,7 @@ async def reserve_project_message_sequences(
     if count < 1 or count > 100:
         raise ValueError("message sequence reservation count must be between 1 and 100")
 
-    dialect = session.bind.dialect.name if session.bind is not None else ""
+    dialect = resolve_dialect_name(session)
     if dialect == "postgresql":
         if lock_timeout_ms is not None:
             await session.execute(

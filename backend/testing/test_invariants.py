@@ -758,6 +758,19 @@ def _concurrently_txn_escape_violations(source: str, revision: str) -> list[str]
         concurrentlies: list[tuple[int, int]] = []
 
         for node in ast.walk(func):
+            # autocommit_block() is an equivalent escape to op.execute("COMMIT"):
+            # `with op.get_context().autocommit_block():` runs all statements
+            # inside in autocommit mode, satisfying the CONCURRENTLY requirement.
+            if isinstance(node, ast.With):
+                for item in node.items:
+                    cm = item.context_expr
+                    if (
+                        isinstance(cm, ast.Call)
+                        and isinstance(cm.func, ast.Attribute)
+                        and cm.func.attr == "autocommit_block"
+                    ):
+                        commits.append((node.lineno, node.col_offset))
+                continue
             if not isinstance(node, ast.Call) or not isinstance(
                 node.func, ast.Attribute
             ):
@@ -1493,8 +1506,11 @@ class TestSchemaRevisionSync:
 
         # Collect all (table, column) pairs present in migrations
         migration_columns: set[tuple[str, str]] = set()
+        # Allow optional Python comment lines between the table-name and sa.Column
+        # arguments — some migrations (e.g. 0608) carry a note between the two
+        # args explaining a SQLite constraint, which the plain \s* form cannot skip.
         add_col_re = re.compile(
-            r"add_column\(\s*['\"](\w+)['\"]\s*,\s*sa\.Column\(\s*['\"](\w+)['\"]"
+            r"add_column\(\s*['\"](\w+)['\"]\s*,(?:\s*#[^\n]*)*\s*sa\.Column\(\s*['\"](\w+)['\"]"
         )
         create_table_re = re.compile(r"create_table\(\s*['\"](\w+)['\"]", re.MULTILINE)
         col_in_create_re = re.compile(r"sa\.Column\(\s*['\"](\w+)['\"]")
@@ -1503,10 +1519,19 @@ class TestSchemaRevisionSync:
             r"alter_column\(\s*['\"](\w+)['\"]\s*,\s*['\"](\w+)['\"].*?new_column_name\s*=\s*['\"](\w+)['\"]",
             re.DOTALL,
         )
+        # Module-level string constants used as table names in create_table calls,
+        # e.g. `_SEQUENCE_TABLE = "projectmessagesequence"` then
+        # `op.create_table(_SEQUENCE_TABLE, ...)`.  Resolve these so the variable-name
+        # form is treated the same as a literal-string form.
+        const_re = re.compile(r"^(_\w+)\s*=\s*['\"](\w+)['\"]", re.MULTILINE)
+        # Same regex, but accepting a bare identifier (module constant) as the table name.
+        create_table_var_re = re.compile(r"create_table\(\s*(_\w+)\s*,", re.MULTILINE)
 
         for path in files:
             with open(path) as f:
                 content = f.read()
+
+            consts = dict(const_re.findall(content))
 
             # add_column('table', sa.Column('name', ...))
             for m in add_col_re.finditer(content):
@@ -1520,6 +1545,24 @@ class TestSchemaRevisionSync:
             for ct in create_table_re.finditer(content):
                 table = ct.group(1)
                 # Find the matching closing paren for this create_table call
+                start = ct.end()
+                depth = 1
+                end = start
+                while end < len(content) and depth > 0:
+                    if content[end] == "(":
+                        depth += 1
+                    elif content[end] == ")":
+                        depth -= 1
+                    end += 1
+                block = content[start:end]
+                for col_m in col_in_create_re.finditer(block):
+                    migration_columns.add((table, col_m.group(1)))
+
+            # create_table(_VARIABLE, sa.Column('name', ...), ...) — resolve constant.
+            for ct in create_table_var_re.finditer(content):
+                table = consts.get(ct.group(1))
+                if table is None:
+                    continue
                 start = ct.end()
                 depth = 1
                 end = start
@@ -1704,9 +1747,15 @@ class TestSchemaRevisionSync:
         # it "missing from migrations" and demanded a create_index call that was
         # already there. (0529 even carries a comment asserting it was covered.)
         # Accept either form; a constant is resolved against `consts` below.
+        # group 1 = quoted index name, group 2 = bare-identifier index name,
+        # group 3 = quoted table name, group 4 = bare-identifier table name,
+        # group 5 = column list.  The table also accepts a bare identifier so that
+        # migrations that bind the table name to a module constant (e.g.
+        # `_ATTACHMENT_UPLOAD_TABLE = "projectmessageattachmentupload"` then
+        # `op.create_index("ix_...", _ATTACHMENT_UPLOAD_TABLE, [...])`) are found.
         create_idx_re = re.compile(
             r"create_index\(\s*(?:op\.f\(\s*)?(?:['\"](\w+)['\"]|(\w+))\s*\)?\s*,"
-            r"\s*['\"](\w+)['\"]\s*,\s*\[([^\]]+)\]",
+            r"\s*(?:['\"](\w+)['\"]|(\w+))\s*,\s*\[([^\]]+)\]",
             re.DOTALL,
         )
         drop_idx_re = re.compile(r"drop_index\(\s*(?:op\.f\(\s*)?['\"](\w+)['\"]")
@@ -1736,7 +1785,7 @@ class TestSchemaRevisionSync:
             r"CREATE\s+INDEX" + _GLUE + r"\s*(?:CONCURRENTLY" + _GLUE + r"\s*)?"
             r"(?:IF\s+NOT\s+EXISTS" + _GLUE + r"\s*)?"
             r"\{?(\w+)\}?"                        # name, or {_PY_CONST} interpolation
-            + _GLUE + r"\s*ON\s+(\w+)"            # table
+            + _GLUE + r"\s*ON\s+\{?(\w+)\}?"     # table, or {_PY_CONST} interpolation
             + _GLUE + r"\s*(?:USING\s+\w+)?"      # optional access method
             + _GLUE + r"\s*\(([^)]*)\)",          # column expression list
             re.IGNORECASE | re.DOTALL,
@@ -1777,7 +1826,10 @@ class TestSchemaRevisionSync:
                 # group 1 = quoted literal name, group 2 = bare constant name
                 raw_name = m.group(1) or m.group(2) or ""
                 name = consts.get(raw_name, raw_name)
-                table, cols_raw = m.group(3), m.group(4)
+                # group 3 = quoted table name, group 4 = bare-identifier table name
+                raw_table = m.group(3) or m.group(4) or ""
+                table = consts.get(raw_table, raw_table)
+                cols_raw = m.group(5)
                 cols = frozenset(str_re.findall(cols_raw))
                 if cols:
                     entry = (table, cols)
@@ -1787,7 +1839,9 @@ class TestSchemaRevisionSync:
             # Raw-SQL creates (CONCURRENTLY etc.) — see raw_create_idx_re above.
             for m in raw_create_idx_re.finditer(content):
                 name = consts.get(m.group(1), m.group(1))
-                table, cols_raw = m.group(2), m.group(3)
+                # Resolve {_PY_CONST} table interpolations (e.g. ON {_ATTACHMENT_UPLOAD_TABLE}).
+                table = consts.get(m.group(2), m.group(2))
+                cols_raw = m.group(3)
                 # The expression list carries operator classes / functions alongside
                 # the columns (e.g. "title gin_trgm_ops").  Keep only tokens that are
                 # REAL columns of that table, so an opclass can never masquerade as one.

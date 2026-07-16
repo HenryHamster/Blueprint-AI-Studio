@@ -2770,6 +2770,46 @@ async def _classify_stuck_reasons(
     return reasons
 
 
+async def get_unmapped_active_criterion_keys(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    release_version_id: uuid.UUID,
+) -> list[str]:
+    """Return criterion_keys of ACTIVE criteria not linked to any Direction.
+
+    An active criterion is unmapped when no Direction in the project lists its
+    key in ``Direction.criterion_keys``.  Unmapped criteria are structurally
+    guaranteed to never accumulate merge evidence via
+    :func:`record_task_merge_evidence` — that function only writes evidence for
+    criteria carried on the task itself or inherited from its direction's
+    ``criterion_keys``.  This helper surfaces the unmapped set so callers
+    (health sweeps, API endpoints, diagnostics) can flag the gap without going
+    through the full coverage-summary query.
+
+    Returns a sorted list of criterion_key strings (empty list when all active
+    criteria are mapped or when there are no active criteria).
+    """
+    key_result = await session.execute(
+        select(VersionAcceptanceCriterion.criterion_key).where(
+            VersionAcceptanceCriterion.release_version_id == release_version_id,
+            VersionAcceptanceCriterion.status == "active",
+        )
+    )
+    active_keys: set[str] = set(key_result.scalars().all())
+    if not active_keys:
+        return []
+
+    dir_result = await session.execute(
+        select(Direction).where(Direction.project_id == project_id)
+    )
+    mapped_keys: set[str] = set()
+    for direction in dir_result.scalars().all():
+        for k in direction.criterion_keys or []:
+            mapped_keys.add(k)
+
+    return sorted(active_keys - mapped_keys)
+
+
 async def get_version_coverage_summary(
     session: AsyncSession,
     release_version_id: uuid.UUID,
