@@ -4190,14 +4190,23 @@ def build_account_retarget_manifest(
     when not supplied. Provider settings are resolved from ``task`` +
     ``runtime_config`` when both are given.
 
-    Returns None when ``account_id`` is unknown to the in-memory pool (e.g. a
-    local / test VM, or the pool has not loaded) — the caller then leaves the
-    VM on its frozen boot credentials and does NOT relax the lease.
+    Returns None when ``account_id`` is unknown to the in-memory pool or its
+    live credential is unavailable. The caller must then abort the warm claim;
+    emitting an otherwise-valid manifest with an empty provider secret would
+    re-exec the VM onto a guaranteed-bad runtime.
     """
     if not account_id:
         return None
     acct = _account_by_id.get(str(account_id))
     if acct is None:
+        return None
+    live_secret = acct.get("runtime_secret") or acct.get("oauth_token")
+    if not isinstance(live_secret, str) or not live_secret.strip():
+        logger.warning(
+            "[WARM-POOL] Cannot build re-target manifest for account=%s: "
+            "live credential unavailable",
+            account_id,
+        )
         return None
     resolved_provider = provider or acct.get("provider")
     resolved_auth_mode = auth_mode or acct.get("auth_mode")
@@ -4224,7 +4233,7 @@ def build_account_retarget_manifest(
         provider=resolved_provider,
         auth_mode=resolved_auth_mode,
         model=model,
-        oauth_token=acct.get("runtime_secret") or acct.get("oauth_token"),
+        oauth_token=live_secret,
         claude_config_json=acct.get("claude_config_json"),
         provider_metadata=acct.get("provider_metadata") or {},
         provider_settings=settings,
