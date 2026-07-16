@@ -157,7 +157,6 @@ const SAFE_FACTORY_HELPER_MODULES_BY_TAIL = new Map([
 const LEGACY_API_MOCK_FILES = new Set([
   'components/AdversarialQualityPanel.viewport.test.tsx',
   'components/AlertsBanner.viewport.test.tsx',
-  'components/AlertsPopover.viewport.test.tsx',
   'components/AutonomousStatus.viewport.test.tsx',
   'components/CompletionDebtPanel.test.tsx',
   'components/ConfirmDialog.viewport.test.tsx',

@@ -22,7 +22,6 @@ interface UseOperatorKeyboardShortcutsOptions {
   setResearchBrowserDirectionId: (directionId: string | null) => void;
   setShortcutHelpOpen?: (open: boolean) => void;
   setShowActivityFeed: (show: boolean) => void;
-  setShowAlertsPopover: (show: boolean) => void;
   setShowKnowledgeBrowser: (show: boolean) => void;
   setShowResearchBrowser: (show: boolean) => void;
   shortcutHelpOpen?: boolean;
@@ -46,7 +45,6 @@ export function useOperatorKeyboardShortcuts({
   setResearchBrowserDirectionId,
   setShortcutHelpOpen,
   setShowActivityFeed,
-  setShowAlertsPopover,
   setShowKnowledgeBrowser,
   setShowResearchBrowser,
   shortcutHelpOpen = false,
@@ -55,7 +53,6 @@ export function useOperatorKeyboardShortcuts({
   const closeTransientTargets = useCallback(() => {
     setShowResearchBrowser(false);
     setShowKnowledgeBrowser(false);
-    setShowAlertsPopover(false);
     setShowActivityFeed(false);
     setResearchBrowserDirectionId(null);
     setKnowledgeBrowserDirectionId(null);
@@ -65,7 +62,6 @@ export function useOperatorKeyboardShortcuts({
     setKnowledgeBrowserInitialDocId,
     setResearchBrowserDirectionId,
     setShowActivityFeed,
-    setShowAlertsPopover,
     setShowKnowledgeBrowser,
     setShowResearchBrowser,
   ]);

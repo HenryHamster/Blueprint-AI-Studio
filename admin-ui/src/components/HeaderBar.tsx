@@ -1,6 +1,6 @@
 import type { RefObject } from 'react';
 import { useMemo, useState, useRef, useEffect } from 'react';
-import { Activity, Microscope, BookOpen, Command, MoreHorizontal, Search, Settings, Bell } from 'lucide-react';
+import { Activity, Microscope, BookOpen, Command, MoreHorizontal, Search, Settings } from 'lucide-react';
 import { AutonomousStatus } from './AutonomousStatus';
 import { AccountMenu } from './AccountMenu';
 import type { StoredAccount } from '../accountManager';
@@ -24,10 +24,6 @@ export interface HeaderBarProps {
   openMessageCount: number;
   newSinceLastVisitCount?: number;
   needsAttentionCount?: number;
-  alertCount?: number;
-  alertMaxSeverity?: 'ERROR' | 'WARNING' | 'INFO' | null;
-  showAlertsPopover?: boolean;
-  onToggleAlertsPopover?: () => void;
   onOpenNewTaskModal: () => void;
   onOpenSettings: () => void;
   /** Sign out the active account only. */
@@ -285,28 +281,6 @@ export function HeaderBar(props: HeaderBarProps) {
 
           {/* Desktop icon cluster */}
           <div className="workbench-control hidden items-center gap-0.5 rounded-md border p-0.5 md:flex">
-            {/* Alerts — only when active alerts exist */}
-            {(props.alertCount ?? 0) > 0 && (
-              /* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */
-              <button
-                onClick={props.onToggleAlertsPopover}
-                title={`${props.alertCount} alert${(props.alertCount ?? 0) > 1 ? 's' : ''}`}
-                className={`flex h-7 items-center gap-1 rounded px-1.5 text-xs transition-colors ${
-                  props.showAlertsPopover
-                    ? (props.alertMaxSeverity === 'ERROR' ? 'text-red-400 bg-red-500/10'
-                      : props.alertMaxSeverity === 'WARNING' ? 'text-yellow-300 bg-yellow-500/10'
-                      : 'text-blue-400 bg-blue-500/10')
-                    : 'text-neutral-400 hover:bg-workbench-layer hover:text-neutral-200'
-                }`}
-              >
-                <span className={`w-2 h-2 rounded-full ${
-                  props.alertMaxSeverity === 'ERROR' ? 'bg-red-500' :
-                  props.alertMaxSeverity === 'WARNING' ? 'bg-yellow-400' : 'bg-blue-500'
-                }`} />
-                <Bell className="w-3.5 h-3.5" />
-                <span>{props.alertCount}</span>
-              </button>
-            )}
             {/* Health pill — expands/collapses the full OrchestratorHealthBar */}
             {/* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */}
             <button

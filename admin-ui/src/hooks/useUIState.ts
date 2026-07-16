@@ -82,7 +82,6 @@ export function useUIState() {
   }, []);
 
   const [showFleetDetail, setShowFleetDetail] = useState(false);
-  const [showAlertsPopover, setShowAlertsPopover] = useState(false);
   const [showDirections, setShowDirections] = useState(false);
   const [showMetrics, setShowMetrics] = useState(false);
   const [showUserManagement, setShowUserManagement] = useState(false);
@@ -163,7 +162,6 @@ export function useUIState() {
     showKnowledgeBrowser, setShowKnowledgeBrowser,
     showActivityFeed, setShowActivityFeed, lastActivityFeedOpen, prevLastActivityFeedOpen,
     showFleetDetail, setShowFleetDetail,
-    showAlertsPopover, setShowAlertsPopover,
     showDirections, setShowDirections,
     showMetrics, setShowMetrics,
     showUserManagement, setShowUserManagement,

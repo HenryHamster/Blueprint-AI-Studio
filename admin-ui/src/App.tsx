@@ -27,7 +27,6 @@ import { apiFetch, API_BASE_URL } from './api/core';
 import { loadLastSeen, loadEventPrefs, loadTemporaryMutes, fetchServerNoisePrefs, fetchServerTempMutes, resolveNoisePrefs, resolveServerTempMutes, type EventPref, type TemporaryMutes } from './components/MessagesPanel.utils';
 const TaskDetailDrawer = lazy(() => import('./components/TaskDetailDrawer').then(m => ({ default: m.TaskDetailDrawer })));
 import { ToastContainer } from './components/Toasts';
-const AlertsPopover = lazy(() => import('./components/AlertsPopover').then(m => ({ default: m.AlertsPopover })));
 const FleetDetailDrawer = lazy(() => import('./components/FleetDetailDrawer').then(m => ({ default: m.FleetDetailDrawer })));
 import { HeaderBar, PrimaryTabNav } from './components/HeaderBar';
 import { SearchFilterBar, SingleSelectDropdown } from './components/SearchFilterBar';
@@ -446,9 +445,6 @@ export default function App() {
   }, [s.zoneHealth, dismissedZoneAlertIds]);
 
   const combinedAlerts = useMemo(() => [...zoneHealthAlerts, ...s.alerts], [zoneHealthAlerts, s.alerts]);
-  const alertMaxSeverity: 'ERROR' | 'WARNING' | 'INFO' | null = combinedAlerts.some(a => a.severity === 'ERROR') ? 'ERROR'
-    : combinedAlerts.some(a => a.severity === 'WARNING') ? 'WARNING'
-    : combinedAlerts.length > 0 ? 'INFO' : null;
 
   const strategicReadModel = useStrategicReadModel(s.selectedProjectId, { pollerEnabled: chatPollersEnabled });
   // Fast mode + resident-session liveness probe: resolves the mode indicator and
@@ -973,7 +969,6 @@ export default function App() {
   const transientWorkbenchPanelOpen = Boolean(
     s.showResearchBrowser ||
     s.showKnowledgeBrowser ||
-    s.showAlertsPopover ||
     showActivityFeed,
   );
 
@@ -990,7 +985,6 @@ export default function App() {
     setResearchBrowserDirectionId,
     setShortcutHelpOpen,
     setShowActivityFeed,
-    setShowAlertsPopover: s.setShowAlertsPopover,
     setShowKnowledgeBrowser: s.setShowKnowledgeBrowser,
     setShowResearchBrowser: s.setShowResearchBrowser,
     shortcutHelpOpen,
@@ -1164,10 +1158,6 @@ export default function App() {
         onToggleResearchBrowser={() => s.setShowResearchBrowser(prev => !prev)}
         showKnowledgeBrowser={s.showKnowledgeBrowser}
         onToggleKnowledgeBrowser={() => s.setShowKnowledgeBrowser(prev => !prev)}
-        alertCount={combinedAlerts.length}
-        alertMaxSeverity={alertMaxSeverity}
-        showAlertsPopover={s.showAlertsPopover}
-        onToggleAlertsPopover={() => s.setShowAlertsPopover(prev => !prev)}
         onOpenActivityFeed={() => setShowActivityFeed(true)}
         openMessageCount={openMessageCount}
         newSinceLastVisitCount={newSinceLastVisit}
@@ -1367,6 +1357,16 @@ export default function App() {
                 onStrategicInteraction={() => { void persistStrategicWorkbench({ active_surface: 'strategic' }); }}
                 onOpenCommandPalette={openCommandPalette}
                 onOpenStrategicContextWorkspace={openStrategicContextWorkspace}
+                alerts={combinedAlerts}
+                onDismissAlert={(id) => {
+                  if (id.startsWith('zone-')) setDismissedZoneAlertIds(prev => new Set([...prev, id]));
+                  else s.dismissAlert(id);
+                }}
+                onDismissAllAlerts={() => {
+                  setDismissedZoneAlertIds(prev => new Set([...prev, ...zoneHealthAlerts.map(a => a.id)]));
+                  s.dismissAllAlerts();
+                }}
+                onViewAlertTask={handleViewTask}
               />
               </Suspense>
             )}
@@ -1837,25 +1837,6 @@ export default function App() {
       )}
 
       <ToastContainer toasts={s.toasts} onDismiss={s.dismissToast} />
-
-      {s.showAlertsPopover && combinedAlerts.length > 0 && (
-        <Suspense fallback={null}>
-        <AlertsPopover
-          alerts={combinedAlerts}
-          onDismiss={(id) => {
-            if (id.startsWith('zone-')) setDismissedZoneAlertIds(prev => new Set([...prev, id]));
-            else s.dismissAlert(id);
-          }}
-          onDismissAll={() => {
-            setDismissedZoneAlertIds(prev => new Set([...prev, ...zoneHealthAlerts.map(a => a.id)]));
-            s.dismissAllAlerts();
-          }}
-          onViewTask={handleViewTask}
-          projectId={s.selectedProjectId ?? undefined}
-          onClose={() => s.setShowAlertsPopover(false)}
-        />
-        </Suspense>
-      )}
 
       {s.showFleetDetail && (
         <Suspense fallback={null}>

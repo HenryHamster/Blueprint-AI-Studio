@@ -18,6 +18,8 @@ import {
   type StrategicLiveActivity,
 } from '../utils/strategicSessionLive';
 import { StrategicStreamingBubble, StrategicActivityStrip, StrategicResidentActivityWidget } from './StrategicLiveTurn';
+import { AlertsBanner } from './AlertsBanner';
+import type { Alert } from '../types/alert';
 import { SaveViewDialog } from './SaveViewDialog';
 import { useMessageList } from './useMessageList';
 import { useMessagesPanelFilters } from './useMessagesPanelFilters';
@@ -356,6 +358,11 @@ export interface MessagesPanelProps {
    * `from_type=strategic` ProjectMessage once it lands via the conversation refresh.
    */
   strategicSessionTranscript?: StrategicSessionDelta[];
+  /** Active alerts surfaced inline at the top of the panel, replacing the separate AlertsPopover. */
+  alerts?: Alert[];
+  onDismissAlert?: (id: string) => void;
+  onDismissAllAlerts?: () => void;
+  onViewAlertTask?: (taskId: string) => void;
 }
 
 
@@ -446,7 +453,7 @@ function makePendingPreviewUrl(file: File): string | null {
 }
 
 
-export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion, focusComposerSignal, realtimeRefreshSignal, contextPackage, strategicState, strategicWorkbenchState, targetMessage, onTargetMessageHandled, onStrategicStateRefresh, onStrategicInteraction, onOpenStrategicContextWorkspace, onOpenCommandPalette, onOpenStrategicContextCommands, onStrategicRefresh, strategicSessionTranscript }: MessagesPanelProps) {
+export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion, focusComposerSignal, realtimeRefreshSignal, contextPackage, strategicState, strategicWorkbenchState, targetMessage, onTargetMessageHandled, onStrategicStateRefresh, onStrategicInteraction, onOpenStrategicContextWorkspace, onOpenCommandPalette, onOpenStrategicContextCommands, onStrategicRefresh, strategicSessionTranscript, alerts, onDismissAlert, onDismissAllAlerts, onViewAlertTask }: MessagesPanelProps) {
   const resolvedVariant = variant ?? (onClose ? 'modal' : 'page');
   const resolvedFilterChrome = filterChrome ?? (resolvedVariant === 'page' ? 'compact' : 'full');
   const resolvedShowCloseButton = showCloseButton ?? (resolvedVariant !== 'page' && Boolean(onClose));
@@ -2053,6 +2060,19 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         showCloseButton={resolvedShowCloseButton}
         filterChrome={resolvedFilterChrome}
       />
+
+      {/* Inline alerts — replaces the separate AlertsPopover bell-triggered surface */}
+      {alerts && alerts.length > 0 && (
+        <div className="shrink-0 border-b border-workbench-border px-3 py-2 md:px-4" data-testid="alerts-inline-banner">
+          <AlertsBanner
+            alerts={alerts}
+            onDismiss={onDismissAlert ?? (() => {})}
+            onDismissAll={onDismissAllAlerts}
+            onViewTask={onViewAlertTask}
+            projectId={selectedProjectId ?? undefined}
+          />
+        </div>
+      )}
 
       {showStrategicStatusStrip && (
         <div className="shrink-0 border-b border-workbench-border bg-workbench-base px-3 py-1.5 md:px-4" data-testid="strategic-context-package-strip">

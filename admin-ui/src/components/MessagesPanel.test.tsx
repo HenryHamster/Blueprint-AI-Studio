@@ -1777,6 +1777,38 @@ describe('MessagesPanel chrome modes', () => {
 
     expect(el.querySelector('[data-testid="strategic-context-package-strip"]')).toBeNull();
   });
+
+  test('renders inline alerts banner when alerts are passed', async () => {
+    const alerts = [
+      {
+        id: 'alert-1',
+        project_id: 'proj-1',
+        severity: 'ERROR' as const,
+        title: 'Zone Capacity Exhausted',
+        message: 'Zone us-central1 is exhausted',
+        task_id: null,
+        created_at: new Date().toISOString(),
+        dismissed_at: null,
+        acknowledged_at: null,
+      },
+    ];
+    const onDismissAlert = vi.fn();
+    const el = await renderPanel({ alerts, onDismissAlert });
+
+    const banner = el.querySelector('[data-testid="alerts-inline-banner"]');
+    expect(banner).not.toBeNull();
+    expect(banner?.textContent).toContain('Zone Capacity Exhausted');
+  });
+
+  test('does not render alerts banner when alerts array is empty', async () => {
+    const el = await renderPanel({ alerts: [] });
+    expect(el.querySelector('[data-testid="alerts-inline-banner"]')).toBeNull();
+  });
+
+  test('does not render alerts banner when alerts prop is not provided', async () => {
+    const el = await renderPanel({});
+    expect(el.querySelector('[data-testid="alerts-inline-banner"]')).toBeNull();
+  });
 });
 
 describe('MessagesPanel grouping', () => {
