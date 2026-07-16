@@ -288,6 +288,8 @@ export const QUALIFICATION_STATE_VOCAB: ReadonlySet<string> = new Set([
   'protection_blocked_review',
   'qualifying',
   'required_check_failed',
+  'rubric_changed',
+  'rubric_provenance_unknown',
 ]);
 // Derived qualification states that mean an audit / promotion run is actively
 // in flight for the current candidate. When the effective status is any of

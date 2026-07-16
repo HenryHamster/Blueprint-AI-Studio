@@ -46,6 +46,8 @@ const ALL_QUAL_STATE_VALUES: QualificationStateValue[] = [
   'protection_blocked_review',
   'qualifying',
   'required_check_failed',
+  'rubric_changed',
+  'rubric_provenance_unknown',
 ];
 
 describe('qualification_state_vocab fixture contract (admin-ui)', () => {

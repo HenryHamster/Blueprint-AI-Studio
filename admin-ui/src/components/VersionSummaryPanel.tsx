@@ -198,11 +198,29 @@ function EvidenceRow({ entry, idx, criterionKey }: { entry: EvidencePreviewEntry
 }
 
 function CriterionCoveragePanel({ coverage, onReinstate, onAttest, onLinkDirection }: { coverage: VersionCriterionCoverage; onReinstate?: (criterionKey: string) => Promise<void>; onAttest?: (criterionKey: string) => void; onLinkDirection?: (criterionKey: string) => void }): JSX.Element {
+  const phantom = coverage.phantom_bookkeeping ?? null;
+  const hasDrift = phantom !== null && phantom.has_drift;
+  const phantomKeys = phantom?.phantom_keys ?? [];
   if (coverage.criteria.length === 0) {
     return (
       <div className="mb-3" data-testid="criterion-coverage-panel">
         <div className="text-ui-sm font-semibold uppercase tracking-wide text-slate-500 mb-1">Version acceptance criteria</div>
-        <div className="text-ui-sm text-slate-500 italic">No acceptance criteria defined for this version.</div>
+        {hasDrift ? (
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+            <span className="text-ui-sm text-slate-500 italic">No criteria registered</span>
+            <span
+              className="text-ui-sm text-amber-400"
+              data-testid="phantom-drift-badge"
+              title="Criterion keys are referenced in direction prose or version goal but have no registered criteria — rubric may be broken or mis-keyed"
+            >
+              {phantomKeys.length > 0
+                ? `${phantomKeys.length} phantom key${phantomKeys.length === 1 ? '' : 's'} referenced`
+                : 'keys referenced but none registered'}
+            </span>
+          </div>
+        ) : (
+          <div className="text-ui-sm text-slate-500 italic">No acceptance criteria defined for this version.</div>
+        )}
         <MergeEvidenceGapBreakdown gaps={coverage.merge_evidence_gaps} />
       </div>
     );
@@ -251,6 +269,15 @@ function CriterionCoveragePanel({ coverage, onReinstate, onAttest, onLinkDirecti
             {coverage.stuck_count} stuck
           </span>
         )}
+        {hasDrift && phantomKeys.length > 0 && (
+          <span
+            className="text-ui-sm text-amber-400"
+            data-testid="phantom-drift-badge"
+            title="Criterion keys referenced in prose that have no registered criteria entry — dangling references"
+          >
+            {phantomKeys.length} phantom key{phantomKeys.length === 1 ? '' : 's'}
+          </span>
+        )}
       </div>
       <MergeEvidenceGapBreakdown gaps={coverage.merge_evidence_gaps} />
       <ul className="space-y-1">
@@ -261,7 +288,9 @@ function CriterionCoveragePanel({ coverage, onReinstate, onAttest, onLinkDirecti
             ? 'no direction'
             : c.stuck_reason === 'direction_retired'
               ? 'direction retired'
-              : null;
+              : c.stuck_reason === 'direction_inactive'
+                ? 'direction inactive'
+                : null;
           const isInProgress = status === 'active' && c.coverage === 'uncovered' && stuckLabel == null;
           return (
             <li

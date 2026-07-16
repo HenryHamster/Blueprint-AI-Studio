@@ -141,6 +141,10 @@ _RETIRED_DIRECTION_STATUSES = frozenset(
     {"expired", "retired", "superseded", "completed"}
 )
 
+# The only direction status that means a direction is actively being worked on.
+# Paused, staged, proposed, etc. are not active and should not suppress stuck alerts.
+_ACTIVE_DIRECTION_STATUSES = frozenset({"active"})
+
 # ``created_by`` provenance values that mark a criterion as human/operator
 # authored. The autonomous loop must NOT retract these — an operator has to act.
 # Loop/strategist provenance ("strategist", "STRATEGIC_AGENT") and legacy-null
@@ -559,6 +563,13 @@ async def _gather_referenced_criterion_keys(
     malformed blob contributes nothing rather than raising.
     """
     referenced: set[str] = set()
+
+    # Scan the version's frozen goal — qualification grades against this, so
+    # the drift report must include keys cited here even when current_focus
+    # has been updated to a different statement.
+    referenced |= extract_referenced_criterion_keys(
+        getattr(release_version, "goal", None)
+    )
 
     problem_model = getattr(project, "problem_model", None)
     if isinstance(problem_model, dict):
@@ -2276,12 +2287,16 @@ async def _resolve_acceptance_window_criteria(
         if _names_acceptance_window_metric(crit.text):
             targets[crit.id] = crit
 
-    # Rule (b): the criterion is mapped to a direction whose text names the metric.
+    # Rule (b): the criterion is mapped to an ACTIVE direction whose text names the metric.
+    # Non-active directions (paused, staged, proposed, retired, etc.) are inert here:
+    # their historical prose must not trigger probe evidence on the open version.
     dir_result = await session.execute(
         select(Direction).where(Direction.project_id == version.project_id)
     )
     for direction in dir_result.scalars().all():
         if not direction_matches_criterion_release_version(direction, version):
+            continue
+        if direction.status != "active":
             continue
         direction_text = direction.text
         if not direction_text and isinstance(direction.data, dict):
@@ -2446,12 +2461,16 @@ async def _resolve_metrics_integrity_criteria(
         if _names_metrics_integrity_sweep(crit.text):
             targets[crit.id] = crit
 
-    # Rule (b): the criterion is mapped to a direction whose text names the signal.
+    # Rule (b): the criterion is mapped to an ACTIVE direction whose text names the signal.
+    # Non-active directions (paused, staged, proposed, retired, etc.) are inert here:
+    # their historical prose must not trigger probe evidence on the open version.
     dir_result = await session.execute(
         select(Direction).where(Direction.project_id == version.project_id)
     )
     for direction in dir_result.scalars().all():
         if not direction_matches_criterion_release_version(direction, version):
+            continue
+        if direction.status != "active":
             continue
         direction_text = direction.text
         if not direction_text and isinstance(direction.data, dict):
@@ -2700,13 +2719,17 @@ async def _classify_stuck_reasons(
 
     Returns a mapping ``criterion_key -> stuck_reason`` where ``stuck_reason`` is:
 
-      ``"no_mapping"``        — no Direction in the project lists this key in its
-                                ``criterion_keys``;
-      ``"direction_retired"`` — at least one Direction maps this key but *every*
-                                mapping Direction has a retired status
-                                (``expired``/``retired``/``superseded``/``completed``);
-      ``None``                — at least one *active* (non-retired) Direction maps
-                                this key, so the criterion is in-progress, not stuck.
+      ``"no_mapping"``          — no Direction in the project lists this key in its
+                                  ``criterion_keys``;
+      ``"direction_retired"``   — at least one Direction maps this key but *every*
+                                  mapping Direction has a retired status
+                                  (``expired``/``retired``/``superseded``/``completed``);
+      ``"direction_inactive"``  — at least one Direction maps this key but none is
+                                  ``active`` and not all are retired — i.e. every mapping
+                                  Direction is paused, staged, proposed, or another
+                                  non-active, non-retired state;
+      ``None``                  — at least one *active* Direction maps this key, so
+                                  the criterion is in-progress, not stuck.
 
     A single bulk query fetches every project Direction, then classification
     happens in Python — no N+1. The empty-``criterion_keys`` filter and the
@@ -2738,10 +2761,12 @@ async def _classify_stuck_reasons(
         statuses = key_statuses.get(key)
         if not statuses:
             reasons[key] = "no_mapping"
+        elif statuses & _ACTIVE_DIRECTION_STATUSES:
+            reasons[key] = None
         elif statuses <= _RETIRED_DIRECTION_STATUSES:
             reasons[key] = "direction_retired"
         else:
-            reasons[key] = None
+            reasons[key] = "direction_inactive"
     return reasons
 
 
@@ -2780,7 +2805,7 @@ async def get_version_coverage_summary(
                     'status': 'active' | 'retracted' | 'superseded',
                     'evidence_count': int,
                     'evidence_truncated': bool,
-                    'stuck_reason': 'no_mapping' | 'direction_retired' | None,
+                    'stuck_reason': 'no_mapping' | 'direction_retired' | 'direction_inactive' | None,
                     'evidence': [ ... ],  # capped provenance preview
                 },
                 ...

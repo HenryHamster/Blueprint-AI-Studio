@@ -2125,6 +2125,19 @@ async def strategic_operation(
             matched_direction["notes"] = _cap_list(
                 notes, STRATEGIC_NOTES_HISTORY_MAX, "notes", warnings
             )
+        # Clear criterion links from the blob BEFORE the locked write so the
+        # dual-write (sync_directions -> upsert_direction) atomically propagates
+        # the cleared state to the Direction ORM row.  Without this, a future
+        # unrelated with_directions_locked -> sync_directions re-reads stale
+        # criterion_keys from the blob and resurrects them on the ORM row.
+        _prior_criterion_keys = matched_direction.get("criterion_keys")
+        if _prior_criterion_keys:
+            matched_direction["criterion_keys"] = []
+            matched_direction.pop("criterion_release_version_id", None)
+            warnings.append(
+                f"Retired direction {dir_id} had {len(_prior_criterion_keys)} criterion "
+                f"link(s) cleared: {_prior_criterion_keys}"
+            )
         _captured_retired_dir = dict(matched_direction)
         _captured_retire_id = str(dir_id)
         def _apply_retire(fresh: list) -> list:
@@ -2162,22 +2175,6 @@ async def strategic_operation(
             )
 
         await _with_vision_locked(session, project.id, _record_retire_memory)
-        # Criterion-link guard: clear criterion_keys from the Direction ORM row so
-        # downstream spawn paths don't propagate stale criterion links from a now-dead
-        # direction.  Best-effort (non-blocking) — a missing ORM row is harmless.
-        from app.directions_repo import get_direction_row as _get_retire_dir_row
-        _retire_dir_row = await _get_retire_dir_row(session, project.id, str(dir_id))
-        if _retire_dir_row is not None and _retire_dir_row.criterion_keys:
-            _cleared_keys = list(_retire_dir_row.criterion_keys)
-            _retire_dir_row.criterion_keys = []
-            _retire_data = dict(_retire_dir_row.data or {})
-            _retire_data.pop("criterion_release_version_id", None)
-            _retire_dir_row.data = _retire_data
-            session.add(_retire_dir_row)
-            warnings.append(
-                f"Retired direction {dir_id} had {len(_cleared_keys)} criterion "
-                f"link(s) cleared: {_cleared_keys}"
-            )
         verdicts = list(ctx.get("_strategic_retirement_gate_verdicts", []))
         verdicts.append(gate_audit)
         retired_ids = list(ctx.get("_strategic_retired_ids", []))

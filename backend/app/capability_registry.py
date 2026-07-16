@@ -227,6 +227,19 @@ def annotate_capability_proof_status(
     return annotated
 
 
+#: Platform capabilities fully implemented at runtime.  Registered here so
+#: prerequisite refs to these names resolve in the blocked-resume sweep and
+#: missing-foundation demand surface without requiring a per-project vocabulary
+#: entry in ``problem_model.capabilities``.
+PLATFORM_WORKING_CAPABILITIES: frozenset[str] = frozenset(
+    {
+        "project-custom-tool-registry",
+        "qualification-dimension-ledger",
+        "multi-project-runner",
+    }
+)
+
+
 def working_capability_names(problem_model: object) -> set[str]:
     """Return canonical names of registry capabilities declared ``working``.
 

@@ -846,6 +846,31 @@ async def test_coverage_summary_includes_phantom_bookkeeping_key(db_session):
 
 
 @pytest.mark.asyncio
+async def test_phantom_bookkeeping_scans_frozen_version_goal(db_session):
+    """Phantom reconciliation detects keys cited in the version's frozen goal.
+
+    qualification grades against ReleaseVersion.goal; the drift report must
+    include criterion keys referenced there even when current_focus is blank.
+    """
+    project = await _make_project(db_session)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        goal="Deliver the redesign tracking c-feedface and close out the backlog",
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # No registered criterion for c-feedface — expect drift
+    summary = await ac.get_version_coverage_summary(db_session, version.id)
+    report = summary["phantom_bookkeeping"]
+    assert report["has_drift"] is True
+    assert "c-feedface" in report["phantom_keys"]
+    assert report["zero_registered"] is True  # nothing registered at all
+
+
+@pytest.mark.asyncio
 async def test_coverage_summary_no_phantom_when_prose_matches(db_session):
     """No drift when the only referenced key is a registered active criterion."""
     project = await _make_project(db_session)
@@ -1396,6 +1421,123 @@ async def test_stuck_reason_mixed_directions_active_wins(db_session):
     by_key = {c["criterion_key"]: c for c in summary["criteria"]}
     assert by_key[c1.criterion_key]["stuck_reason"] is None
     assert summary["stuck_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_stuck_reason_paused_direction_returns_direction_inactive(db_session):
+    """Uncovered criterion whose only mappings are paused/staged/proposed → 'direction_inactive'.
+
+    Non-active, non-retired directions (paused, staged, proposed) must not
+    suppress the stuck alert — they should yield 'direction_inactive', not None.
+    """
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+
+    c1 = await ac.create_criterion(db_session, project.id, version.id, "Inactive-mapped")
+
+    for i, status in enumerate(("paused", "staged", "proposed")):
+        db_session.add(
+            _make_direction(project.id, f"inact{i}", [c1.criterion_key], status)
+        )
+    await db_session.commit()
+
+    summary = await ac.get_version_coverage_summary(db_session, version.id)
+
+    by_key = {c["criterion_key"]: c for c in summary["criteria"]}
+    assert by_key[c1.criterion_key]["coverage"] == "uncovered"
+    assert by_key[c1.criterion_key]["stuck_reason"] == "direction_inactive"
+    assert summary["stuck_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_stuck_reason_paused_plus_active_direction_not_stuck(db_session):
+    """One paused + one active mapping → not stuck (active wins over inactive)."""
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+
+    c1 = await ac.create_criterion(db_session, project.id, version.id, "Paused-and-active")
+
+    db_session.add(_make_direction(project.id, "pa1", [c1.criterion_key], "paused"))
+    db_session.add(_make_direction(project.id, "pa2", [c1.criterion_key], "active"))
+    await db_session.commit()
+
+    summary = await ac.get_version_coverage_summary(db_session, version.id)
+
+    by_key = {c["criterion_key"]: c for c in summary["criteria"]}
+    assert by_key[c1.criterion_key]["stuck_reason"] is None
+    assert summary["stuck_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_resolve_acceptance_window_criteria_excludes_non_active_directions(db_session):
+    """Rule (b) in _resolve_acceptance_window_criteria must NOT fire for paused directions.
+
+    A paused direction whose text names the acceptance-window metric must NOT
+    contribute its criterion_keys to probe targets — only active directions qualify.
+    """
+    project = await _make_project(db_session)
+    version = ReleaseVersion(project_id=project.id, version_number=1, status="open")
+    db_session.add(version)
+    await db_session.commit()
+
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Generic outcome"
+    )
+    paused_direction = Direction(
+        project_id=project.id,
+        direction_key="d-paused-aw",
+        data={
+            "id": "d-paused-aw",
+            "text": "acceptance_window metric",
+            ac.CRITERION_RELEASE_VERSION_CONTEXT_KEY: str(version.id),
+        },
+        text="acceptance_window metric",
+        status="paused",
+        criterion_keys=[criterion.criterion_key],
+    )
+    db_session.add(paused_direction)
+    await db_session.commit()
+
+    # A paused direction naming the metric must NOT cause the criterion to be targeted.
+    targets = await ac._resolve_acceptance_window_criteria(db_session, version)
+    assert criterion not in targets
+    assert all(t.criterion_key != criterion.criterion_key for t in targets)
+
+
+@pytest.mark.asyncio
+async def test_resolve_metrics_integrity_criteria_excludes_non_active_directions(db_session):
+    """Rule (b) in _resolve_metrics_integrity_criteria must NOT fire for paused directions.
+
+    A paused direction whose text names the metrics-integrity signal must NOT
+    contribute its criterion_keys to probe targets — only active directions qualify.
+    """
+    project = await _make_project(db_session)
+    version = ReleaseVersion(project_id=project.id, version_number=1, status="open")
+    db_session.add(version)
+    await db_session.commit()
+
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Generic outcome"
+    )
+    paused_direction = Direction(
+        project_id=project.id,
+        direction_key="d-paused-mi",
+        data={
+            "id": "d-paused-mi",
+            "text": "data integrity check",
+            ac.CRITERION_RELEASE_VERSION_CONTEXT_KEY: str(version.id),
+        },
+        text="data integrity check",
+        status="paused",
+        criterion_keys=[criterion.criterion_key],
+    )
+    db_session.add(paused_direction)
+    await db_session.commit()
+
+    # A paused direction naming the metric must NOT cause the criterion to be targeted.
+    targets = await ac._resolve_metrics_integrity_criteria(db_session, version)
+    assert criterion not in targets
+    assert all(t.criterion_key != criterion.criterion_key for t in targets)
 
 
 @pytest.mark.asyncio
@@ -4863,15 +5005,19 @@ async def test_attest_superseded_criterion_returns_409(client: AsyncClient, db_s
 async def test_retire_direction_clears_criterion_keys(
     client: AsyncClient, db_session, mocker
 ):
-    """retire_direction must clear criterion_keys from the Direction ORM row.
+    """retire_direction must clear criterion_keys from the Direction ORM row AND the blob.
 
     When a direction is retired the autonomous loop must not propagate its
-    criterion links to newly spawned tasks.  The criterion-link guard in the
-    retire_direction path sets Direction.criterion_keys to [] and surfaces a
-    warning in the response so the strategist knows stale links were cleared.
+    criterion links to newly spawned tasks.  The fix clears criterion_keys from
+    the blob dict BEFORE the locked write so the dual-write (sync_directions ->
+    upsert_direction) atomically propagates the cleared state to the Direction
+    ORM row.  Without this, a future unrelated with_directions_locked ->
+    sync_directions re-reads stale criterion_keys from the blob and resurrects
+    them on the ORM row.
     """
     from app.auth import create_agent_token
     from app import strategic_cycle
+    from app.directions_repo import sync_directions
 
     mocker.patch(
         "app.routers.admin_agent_ops.emit_strategic_updated", new=AsyncMock()
@@ -4902,7 +5048,22 @@ async def test_retire_direction_clears_criterion_keys(
         db_session, project.id, version.id, "Criterion linked to direction"
     )
 
-    # Wire the Direction ORM row (dual-write peer) with criterion_keys.
+    # Wire BOTH the Direction ORM row AND the blob entry with criterion_keys
+    # so the real propagation path (blob -> sync_directions -> upsert_direction)
+    # is exercised.  Without blob-resident keys the dual-write is a no-op and
+    # the resurrection regression isn't tested.
+    project.directions = [
+        {
+            "id": dir_id,
+            "text": "direction with criterion links",
+            "status": "active",
+            "priority": "medium",
+            "notes": [],
+            "research_history": [],
+            "criterion_keys": [criterion.criterion_key],
+        }
+    ]
+    db_session.add(project)
     dir_row = Direction(
         project_id=project.id,
         direction_key=dir_id,
@@ -4910,6 +5071,7 @@ async def test_retire_direction_clears_criterion_keys(
         criterion_keys=[criterion.criterion_key],
     )
     db_session.add(dir_row)
+    await db_session.commit()
 
     cycle = await strategic_cycle.create(db_session, project_id=project.id)
     task = Task(
@@ -4952,6 +5114,27 @@ async def test_retire_direction_clears_criterion_keys(
     await db_session.refresh(dir_row)
     assert dir_row.criterion_keys == [] or dir_row.criterion_keys is None, (
         f"Direction ORM row criterion_keys must be cleared after retire; "
+        f"got {dir_row.criterion_keys}"
+    )
+
+    # The blob entry must also have criterion_keys cleared.
+    await db_session.refresh(project)
+    retired_blob_entry = next(
+        (d for d in (project.directions or []) if d.get("id") == dir_id), None
+    )
+    assert retired_blob_entry is not None, "retired direction must exist in the blob"
+    blob_keys = retired_blob_entry.get("criterion_keys", [])
+    assert blob_keys == [] or blob_keys is None, (
+        f"Blob entry criterion_keys must be cleared after retire; "
+        f"got {blob_keys}"
+    )
+
+    # CRITICAL REGRESSION CHECK: a subsequent unrelated sync_directions call
+    # must NOT resurrect the stale criterion_keys from the blob.
+    await sync_directions(db_session, project.id, project.directions)
+    await db_session.refresh(dir_row)
+    assert dir_row.criterion_keys == [] or dir_row.criterion_keys is None, (
+        f"sync_directions after retirement must not resurrect criterion_keys; "
         f"got {dir_row.criterion_keys}"
     )
 

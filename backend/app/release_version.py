@@ -113,6 +113,10 @@ QUALIFICATION_STATE_VOCAB: frozenset[str] = frozenset(
         "deferred_unsynced",
         "error",
         "infra_failure",
+        # Recoverable rubric holds: the acceptance rubric changed mid-flight or
+        # provenance could not be reconstructed. A fresh grade resolves either.
+        "rubric_changed",
+        "rubric_provenance_unknown",
     }
 )
 
@@ -1086,6 +1090,38 @@ def summarize_qualification_state(
                 + (f" Detail: {detail}." if detail else "")
             ),
             "detail": detail,
+        }
+    if status == "rubric_changed":
+        # Recoverable hold: the acceptance rubric changed while the blind
+        # merge-grade was in flight. A fresh grade will use the new rubric.
+        return {
+            "state": "rubric_changed",
+            "summary": (
+                "The acceptance rubric CHANGED while the blind merge-grade was in "
+                "flight. This is a RECOVERABLE hold — NOT a failed qualification. "
+                "The in-flight grade was cancelled to avoid grading against a stale "
+                "rubric. Launch a FRESH grade; it will automatically use the updated "
+                "rubric and produce a new verdict."
+            ),
+            "blocker": lq.get("blocker"),
+            "rubric_drift": lq.get("rubric_drift"),
+            "rubric_provenance_error": lq.get("rubric_provenance_error"),
+        }
+    if status == "rubric_provenance_unknown":
+        # Recoverable hold: the pending grade's rubric provenance could not be
+        # reconstructed. A fresh grade resolves this automatically.
+        return {
+            "state": "rubric_provenance_unknown",
+            "summary": (
+                "The pending grade's acceptance rubric PROVENANCE could not be "
+                "reconstructed. This is a RECOVERABLE hold — NOT a failed "
+                "qualification. The attempt was held rather than graded against an "
+                "unverifiable contract. Launch a FRESH grade to get a new verdict "
+                "with a fully-verified rubric provenance."
+            ),
+            "blocker": lq.get("blocker"),
+            "rubric_drift": lq.get("rubric_drift"),
+            "rubric_provenance_error": lq.get("rubric_provenance_error"),
         }
     logger.warning(
         "[RELEASE_VERSION] summarize_qualification_state: unrecognized status %r; "

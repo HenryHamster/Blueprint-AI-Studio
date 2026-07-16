@@ -392,7 +392,11 @@ export type QualificationStateValue =
   | 'promotion_confirmation_timed_out'
   | 'deferred_unsynced'
   | 'error'
-  | 'infra_failure';
+  | 'infra_failure'
+  // Recoverable rubric holds: the acceptance rubric changed mid-flight or
+  // provenance could not be reconstructed. A fresh grade resolves either.
+  | 'rubric_changed'
+  | 'rubric_provenance_unknown';
 
 export interface QualificationState {
   state: QualificationStateValue;
@@ -419,6 +423,10 @@ export interface QualificationState {
   check_snapshot?: ManagedCheckWaitSnapshot | null;
   ci_state?: string | null;
   blocker?: string | null;
+  // Rubric-hold context forwarded by the rubric_changed and
+  // rubric_provenance_unknown states. Absent for all other states.
+  rubric_drift?: Record<string, unknown> | null;
+  rubric_provenance_error?: string | null;
   // Post-promotion serving confirmation. A 'promoted' state is provisional:
   // serving_status is 'unconfirmed' while the deploy is still within its
   // confirmation window, 'serving_confirmed' once the promoted SHA is live, or
@@ -460,7 +468,7 @@ export interface CriterionCoverageEntry {
   coverage: 'covered' | 'attested' | 'backfilled' | 'probed' | 'partial' | 'uncovered';
   status?: 'active' | 'retracted' | 'superseded';
   evidence_count: number;
-  stuck_reason?: 'no_mapping' | 'direction_retired' | null;
+  stuck_reason?: 'no_mapping' | 'direction_retired' | 'direction_inactive' | null;
   /** ISO-8601 UTC timestamp when the operator attestation expires.
    *  Present only when coverage='attested' and the attestation carries a
    *  parseable attested_at timestamp. Null/absent for legacy (non-expiring)
@@ -468,6 +476,14 @@ export interface CriterionCoverageEntry {
   attestation_expires_at?: string | null;
   /** Per-evidence preview rows. Optional — absent on older backends. */
   evidence?: EvidencePreviewEntry[];
+}
+
+export interface PhantomBookkeeping {
+  phantom_keys: string[];
+  zero_registered: boolean;
+  has_drift: boolean;
+  referenced_keys?: string[];
+  registered_count?: number;
 }
 
 export interface VersionCriterionCoverage {
@@ -500,6 +516,9 @@ export interface VersionCriterionCoverage {
    *  (unmatched_criterion_ids). Null/undefined until the first gap is recorded. */
   merge_evidence_gaps?: Record<string, number | string[]> | null;
   criteria: CriterionCoverageEntry[];
+  /** Criterion-key drift guard. Present on the open version only. Absent on
+   *  historical versions and older backends — treat absence as no drift. */
+  phantom_bookkeeping?: PhantomBookkeeping | null;
 }
 
 /** Per-dimension qualification state derived from last_qualification.
