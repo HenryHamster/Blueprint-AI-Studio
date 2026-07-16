@@ -23,19 +23,17 @@ logger = logging.getLogger(__name__)
 # This keeps a task's own typecheck/test failure from being mistaken for an
 # inherited gate failure while covering the wording emitted by ./check and
 # ./pr open.
-_REPO_WIDE_FAILURE_MARKERS = frozenset(
-    {
-        "repo-wide",
-        "untouched",
-        "pre-existing",
-        "outside this diff",
-        "unrelated to this diff",
-        "baseline failure",
-        "baseline failures",
-        "sanctioned standalone",
-        "mandatory impacted backend gate",
-    }
+GATE_REVALIDATION_QUERY_MARKERS = (
+    "repo-wide",
+    "untouched",
+    "pre-existing",
+    "outside this diff",
+    "unrelated to this diff",
+    "baseline failure",
+    "sanctioned standalone",
+    "mandatory impacted backend gate",
 )
+_REPO_WIDE_FAILURE_MARKERS = frozenset(GATE_REVALIDATION_QUERY_MARKERS)
 _GATE_SURFACE_MARKERS = frozenset(
     {
         "standalone_smoke",
