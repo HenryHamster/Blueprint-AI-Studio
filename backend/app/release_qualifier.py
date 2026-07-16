@@ -5792,7 +5792,23 @@ async def _finalize_qualification(
     # identity surfaces the same way as any other finalize-time infra failure
     # (no verdict recorded, returned to stabilize, retried by the next cycle).
     # Pre-computed by _finalize_locked_version pre-lock (SITE B lock-window fix).
-    if _pre_gates is not None:
+    # Phase 1b (read-side cutover): if a prior finalize already resolved this
+    # dimension at the same candidate_sha, reuse the stored verdict and skip the
+    # live GitHub fetch — only 'passed'/'blocked' rows appear in resolved_dims
+    # (_LEDGER_RESOLVED_STATUSES excludes 'unavailable'), so a prior defer never
+    # short-circuits the live gate.
+    if "migration_identity" in resolved_dims:
+        _mi_ledger = resolved_dims["migration_identity"]
+        migration_verdict = "block" if _mi_ledger["status"] == "blocked" else "pass"
+        migration_detail = (_mi_ledger.get("detail") or {}).get("detail")
+        logger.info(
+            "[RELEASE_QUALIFIER] v%d candidate %s reusing ledger "
+            "migration_identity=%s (skip live gate)",
+            version.version_number,
+            (candidate_sha or "")[:8],
+            _mi_ledger["status"],
+        )
+    elif _pre_gates is not None:
         migration_verdict = _pre_gates["migration_verdict"]
         migration_detail = _pre_gates["migration_detail"]
     else:
@@ -5812,6 +5828,23 @@ async def _finalize_qualification(
             else "migration_identity_check_unavailable",
         )
     migration_collision = migration_verdict == "block"
+    # Eager-write migration_identity so a later gate's infra failure cannot
+    # discard this verdict before _dual_write_dimension_results is reached.
+    await _upsert_dimension_result(
+        session,
+        version,
+        candidate_sha,
+        "migration_identity",
+        status="blocked" if migration_collision else "passed",
+        sub_score=None,
+        blocker="migration_identity_collision" if migration_collision else None,
+        detail={
+            "verdict": migration_verdict,
+            "detail": migration_detail,
+            "execution_site": "eager_write",
+        },
+        origin_attempt_id=attempt_id,
+    )
 
     # --- Deterministic scratch-DB migration-APPLY safety gate ---------------
     # Complementary to the filename-identity check above: replay the candidate's
@@ -5825,7 +5858,19 @@ async def _finalize_qualification(
     # Thread the exact SHA snapped into last_qualification through this gate;
     # do not re-derive it from any live checkout state.
     # Pre-computed by _finalize_locked_version pre-lock (SITE B lock-window fix).
-    if _pre_gates is not None:
+    # Phase 1b (read-side cutover): same pattern as migration_identity above.
+    if "migration_apply" in resolved_dims:
+        _ma_ledger = resolved_dims["migration_apply"]
+        apply_verdict = "block" if _ma_ledger["status"] == "blocked" else "pass"
+        apply_detail = (_ma_ledger.get("detail") or {}).get("detail")
+        logger.info(
+            "[RELEASE_QUALIFIER] v%d candidate %s reusing ledger "
+            "migration_apply=%s (skip live gate)",
+            version.version_number,
+            (candidate_sha or "")[:8],
+            _ma_ledger["status"],
+        )
+    elif _pre_gates is not None:
         apply_verdict = _pre_gates["apply_verdict"]
         apply_detail = _pre_gates["apply_detail"]
     else:
@@ -5842,6 +5887,23 @@ async def _finalize_qualification(
             else "migration_apply_check_unavailable",
         )
     migration_apply_blocked = apply_verdict == "block"
+    # Eager-write migration_apply so a later gate's infra failure cannot
+    # discard this verdict before _dual_write_dimension_results is reached.
+    await _upsert_dimension_result(
+        session,
+        version,
+        candidate_sha,
+        "migration_apply",
+        status="blocked" if migration_apply_blocked else "passed",
+        sub_score=None,
+        blocker="migration_apply_drift" if migration_apply_blocked else None,
+        detail={
+            "verdict": apply_verdict,
+            "detail": apply_detail,
+            "execution_site": "eager_write",
+        },
+        origin_attempt_id=attempt_id,
+    )
 
     # Keep today's coverage summary for observability; gate on launched rubric.
     criterion_coverage = await get_version_coverage_summary(session, version.id)
