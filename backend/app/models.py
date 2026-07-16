@@ -5561,7 +5561,9 @@ class NotificationDeadLetter(SQLModel, table=True):
     last_status: int | None = Field(
         default=None, sa_column=Column(Integer, nullable=True)
     )
-    webhook_url: str = Field(default="", sa_column=Column(String(2048), nullable=False))
+    # Fernet ciphertext can exceed the original 2048-character plaintext URL
+    # allowance, so encrypted-at-rest values require unbounded text storage.
+    webhook_url: str = Field(default="", sa_column=Column(Text, nullable=False))
     payload: dict = Field(
         default_factory=dict,
         sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),

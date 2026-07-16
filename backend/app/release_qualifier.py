@@ -262,7 +262,11 @@ from app.release_qualifier_sweep import (
     _reconcile_hotfix_audit_trail,
     sweep_stuck_qualifications,  # noqa: F401 — re-exported for reaper + tests
 )
-from app.migration_apply_gate import run_migration_apply_gate
+from app.migration_apply_gate import (
+    MIGRATION_APPLY_SCRATCH_ENV,
+    preflight_migration_apply_scratch,
+    run_migration_apply_gate,
+)
 from app.env_preflight_evidence import sanitize_env_preflight_artifact
 from app.rollup_migration_validation import (
     check_qualification_migration_identity,
@@ -3299,8 +3303,13 @@ async def _resolve_migration_apply_at_finalize(
         if resolved is None:
             return ("ok", None)
         token, owner, repo = resolved
+        scratch_preflight = preflight_migration_apply_scratch(
+            os.getenv(MIGRATION_APPLY_SCRATCH_ENV)
+        )
+        if scratch_preflight.status != "ready" or scratch_preflight.target is None:
+            return ("defer", scratch_preflight.detail)
         prod_engine = resolve_async_engine(session)
-        scratch_db_url = os.getenv("MIGRATION_APPLY_SCRATCH_DATABASE_URL")
+        scratch_db_url = scratch_preflight.target
         try:
             verdict, detail = await run_migration_apply_gate(
                 prod_engine=prod_engine,

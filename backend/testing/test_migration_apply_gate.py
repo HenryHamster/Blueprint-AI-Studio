@@ -27,11 +27,13 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.migration_apply_gate import (
+    MigrationApplyScratchPreflight,
     _create_database,
     _drop_database,
     _safe_tar_extractall,
     _validate_db_name,
     ephemeral_postgres_database,
+    preflight_migration_apply_scratch,
     run_migration_apply_gate,
 )
 from app.required_runtime_env import _verify_required_env
@@ -53,24 +55,28 @@ def _base_url():
     return make_url(os.environ["DATABASE_URL"])
 
 
-def test_scratch_prereq_declared_and_diagnosed(monkeypatch):
-    """Cloud Run declares the dedicated scratch target before gate attempts.
-
-    This is intentionally adjacent to the real migration-apply gate suite:
-    production startup diagnoses the missing dedicated target before a gate
-    attempt can fall back to pool credentials that cannot create databases.
-    """
+def test_scratch_prereq_is_typed_optional_and_boot_safe(monkeypatch):
     monkeypatch.setenv("K_REVISION", "app-00042-abc")
     monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", "test-presence-only")
     monkeypatch.delenv("MIGRATION_APPLY_SCRATCH_DATABASE_URL", raising=False)
 
-    with pytest.raises(RuntimeError) as exc:
-        _verify_required_env()
+    assert _verify_required_env() is None
+    result = preflight_migration_apply_scratch(None)
+    assert isinstance(result, MigrationApplyScratchPreflight)
+    assert result.status == "defer"
+    assert result.code == "scratch_database_url_missing"
+    assert "MIGRATION_APPLY_SCRATCH_DATABASE_URL" in (result.detail or "")
 
-    message = str(exc.value)
-    assert "MIGRATION_APPLY_SCRATCH_DATABASE_URL" in message
-    assert "migration-apply qualification gate" in message
-    assert "CREATE DATABASE" in message
+
+@pytest.mark.parametrize(
+    "raw",
+    ["not a URL with secret-value", "sqlite:///secret-value", "postgresql://host"],
+)
+def test_scratch_preflight_rejects_invalid_values_without_leaking(raw):
+    result = preflight_migration_apply_scratch(raw)
+    assert result.status == "defer"
+    assert result.code == "scratch_database_url_invalid"
+    assert "secret-value" not in (result.detail or "")
 
 
 # --- Synthetic candidate migration chains ----------------------------------
@@ -187,6 +193,7 @@ async def test_renumber_skip_is_blocked_naming_missing_table():
             prod_engine=prod_engine,
             candidate_sources=_CANDIDATE_SOURCES,
             required_metadata=_required_metadata(),
+            scratch_db_url=_base_url(),
         )
 
     assert verdict == "block", detail
@@ -211,6 +218,7 @@ async def test_derived_reference_schema_blocks_renumber_skip_without_injected_me
         verdict, detail = await run_migration_apply_gate(
             prod_engine=prod_engine,
             candidate_sources=_CANDIDATE_SOURCES,
+            scratch_db_url=_base_url(),
             # required_metadata omitted on purpose — derived from candidate chain.
         )
 
@@ -232,6 +240,7 @@ async def test_clean_candidate_is_ok():
             prod_engine=prod_engine,
             candidate_sources=_CANDIDATE_SOURCES,
             required_metadata=_required_metadata(),
+            scratch_db_url=_base_url(),
         )
 
     assert verdict == "ok", detail
@@ -249,6 +258,7 @@ async def test_indeterminate_prod_state_defers():
             prod_engine=prod_engine,
             candidate_sources=_CANDIDATE_SOURCES,
             required_metadata=_required_metadata(),
+            scratch_db_url=_base_url(),
         )
 
     assert verdict == "defer", detail
@@ -269,6 +279,7 @@ async def test_scratch_db_is_isolated_from_prod(monkeypatch):
             prod_engine=prod_engine,
             candidate_sources=_CANDIDATE_SOURCES,
             required_metadata=_required_metadata(),
+            scratch_db_url=_base_url(),
         )
 
         def _tables(sync_conn):
@@ -307,6 +318,7 @@ async def test_fetch_failure_defers(monkeypatch):
             repo="r",
             candidate_ref="deadbeef",
             required_metadata=_required_metadata(),
+            scratch_db_url=_base_url(),
         )
 
     assert verdict == "defer", detail
@@ -375,6 +387,7 @@ async def test_transient_fetch_recovers_on_retry(monkeypatch):
             repo="r",
             candidate_ref="deadbeef",
             required_metadata=sa.MetaData(),
+            scratch_db_url="postgresql+asyncpg://scratch:p@localhost:5432/control",
         )
     finally:
         await engine.dispose()
@@ -430,6 +443,7 @@ async def test_transient_seed_recovers_on_retry(monkeypatch):
             prod_engine=engine,
             candidate_sources={"0001_init.py": "revision='0001'\ndown_revision=None\n"},
             required_metadata=sa.MetaData(),
+            scratch_db_url="postgresql+asyncpg://scratch:p@localhost:5432/control",
         )
     finally:
         await engine.dispose()
@@ -587,6 +601,7 @@ def downgrade():
             prod_engine=engine,
             candidate_sources=multi_head_sources,
             required_metadata=_required_metadata(),
+            scratch_db_url="postgresql+asyncpg://scratch:p@localhost:5432/control",
         )
     finally:
         await engine.dispose()
@@ -608,6 +623,7 @@ async def test_non_postgres_bind_defers():
             prod_engine=engine,
             candidate_sources=_CANDIDATE_SOURCES,
             required_metadata=_required_metadata(),
+            scratch_db_url="postgresql+asyncpg://scratch:p@localhost:5432/control",
         )
     finally:
         await engine.dispose()
@@ -628,6 +644,7 @@ async def test_missing_github_coords_defers():
             owner="o",
             # repo/candidate_ref missing
             required_metadata=_required_metadata(),
+            scratch_db_url="postgresql+asyncpg://scratch:p@localhost:5432/control",
         )
     finally:
         await engine.dispose()
@@ -715,6 +732,7 @@ async def test_required_metadata_derived_from_candidate_reference_not_live_metad
             candidate_ref="candidate-sha",
             project_id="p",
             candidate_sources={"0001_init.py": "revision = '0001'"},
+            scratch_db_url="postgresql+asyncpg://scratch:p@localhost:5432/control",
         )
     finally:
         await engine.dispose()
@@ -792,6 +810,7 @@ async def test_default_path_blocks_when_candidate_code_needs_missing_migration(
             candidate_ref="candidate-sha",
             project_id="p",
             candidate_sources={"0001_init.py": "revision = '0001'"},
+            scratch_db_url="postgresql+asyncpg://scratch:p@localhost:5432/control",
         )
     finally:
         await engine.dispose()
@@ -974,6 +993,10 @@ async def test_repeatable_candidate_migration_failure_blocks(monkeypatch):
             prod_engine=engine,
             candidate_sources={"0001_bad.py": "revision='0001'\ndown_revision=None\n"},
             required_metadata=sa.MetaData(),
+            scratch_db_url=(
+                "postgresql+asyncpg://scratch_user:scratch-secret@"
+                "scratch-db:5432/control"
+            ),
         )
     finally:
         await engine.dispose()
@@ -1226,86 +1249,166 @@ async def test_scratch_db_url_routes_scratch_provisioning_to_dedicated_target(
 
 
 @pytest.mark.asyncio
-async def test_scratch_db_url_none_falls_back_to_prod_url(monkeypatch):
-    """When ``scratch_db_url`` is ``None`` (default), the gate must fall back
-    to the production engine's URL for scratch provisioning — the correct path
-    for dev/test environments where the Postgres user can CREATE DATABASE."""
+async def test_missing_scratch_url_defers_without_production_io(monkeypatch):
+    """Missing scratch config defers before production reads or any DDL."""
     import app.migration_apply_gate as gate_mod
-    from sqlalchemy.engine import make_url
 
-    prod_url = make_url("postgresql+asyncpg://prod_user:p@prod-db:5432/proddb")
+    read_prod = AsyncMock()
+    fetch_sources = AsyncMock()
+    provision = AsyncMock()
+    monkeypatch.setattr(gate_mod, "_read_prod_state", read_prod)
+    monkeypatch.setattr(gate_mod, "_fetch_candidate_sources_with_retry", fetch_sources)
+    monkeypatch.setattr(gate_mod, "_provision_seed_and_detect_drift", provision)
 
-    prod_meta = sa.MetaData()
-    sa.Table("widget", prod_meta, sa.Column("id", sa.Integer, primary_key=True))
-
-    monkeypatch.setattr(
-        gate_mod,
-        "_read_prod_state",
-        AsyncMock(return_value=gate_mod._ProdState(revision="a01", metadata=prod_meta)),
+    engine = create_async_engine(
+        "postgresql+asyncpg://prod_user:secret@prod-db:5432/proddb"
     )
-
-    observed: dict[str, object] = {}
-
-    async def _capture_build_candidate_reference_schema(
-        base_url, candidate_sources
-    ):
-        observed["build_reference_base_url"] = base_url
-        return prod_meta
-
-    async def _capture_provision_seed_and_detect_drift(
-        scratch_base_url, prod_state, candidate_sources, required_metadata
-    ):
-        observed["provision_base_url"] = scratch_base_url
-        return []
-
-    monkeypatch.setattr(
-        gate_mod,
-        "_build_candidate_reference_schema",
-        _capture_build_candidate_reference_schema,
-    )
-    monkeypatch.setattr(
-        gate_mod,
-        "_build_candidate_required_metadata",
-        AsyncMock(return_value=prod_meta),
-    )
-    monkeypatch.setattr(
-        gate_mod,
-        "_provision_seed_and_detect_drift",
-        _capture_provision_seed_and_detect_drift,
-    )
-
-    engine = create_async_engine(str(prod_url))
     try:
         verdict, detail = await run_migration_apply_gate(
             prod_engine=engine,
             candidate_sources={"0001_init.py": "revision='0001'\ndown_revision=None\n"},
-            # scratch_db_url omitted — should default to None
         )
     finally:
         await engine.dispose()
 
-    assert verdict == "ok", detail
+    assert verdict == "defer"
+    assert "scratch_database_url_missing" in (detail or "")
+    assert "secret" not in (detail or "")
+    read_prod.assert_not_awaited()
+    fetch_sources.assert_not_awaited()
+    provision.assert_not_awaited()
 
-    # With scratch_db_url=None, the gate must use the prod engine's URL.
-    # Compare host/database individually — str(URL) redacts passwords.
-    build_ref = observed.get("build_reference_base_url")
-    assert build_ref is not None, (
-        "_build_candidate_reference_schema was not called"
+
+@pytest.mark.asyncio
+async def test_unavailable_scratch_target_returns_sanitized_typed_defer(monkeypatch):
+    import app.migration_apply_gate as gate_mod
+
+    metadata = sa.MetaData()
+    monkeypatch.setattr(gate_mod, "_TRANSIENT_RETRY_BASE_DELAY", 0)
+    monkeypatch.setattr(gate_mod, "_TRANSIENT_RETRY_MAX_DELAY", 0)
+    monkeypatch.setattr(
+        gate_mod,
+        "_read_prod_state",
+        AsyncMock(return_value=gate_mod._ProdState(revision="a01", metadata=metadata)),
     )
-    assert build_ref.host == prod_url.host, (
-        f"_build_candidate_reference_schema host {build_ref.host!r} != {prod_url.host!r}"
-    )
-    assert build_ref.database == prod_url.database, (
-        f"_build_candidate_reference_schema database {build_ref.database!r} != {prod_url.database!r}"
+    monkeypatch.setattr(
+        gate_mod, "_provision_seed_and_detect_drift", AsyncMock(side_effect=OSError())
     )
 
-    provision_ref = observed.get("provision_base_url")
-    assert provision_ref is not None, (
-        "_provision_seed_and_detect_drift was not called"
+    engine = create_async_engine(
+        "postgresql+asyncpg://prod_user:prod-secret@prod-db:5432/proddb"
     )
-    assert provision_ref.host == prod_url.host, (
-        f"_provision_seed_and_detect_drift host {provision_ref.host!r} != {prod_url.host!r}"
+    try:
+        verdict, detail = await run_migration_apply_gate(
+            prod_engine=engine,
+            candidate_sources={"0001_init.py": "revision='0001'\ndown_revision=None\n"},
+            required_metadata=metadata,
+            scratch_db_url=(
+                "postgresql+asyncpg://scratch_user:scratch-secret@"
+                "scratch-db:5432/control"
+            ),
+        )
+    finally:
+        await engine.dispose()
+
+    assert verdict == "defer"
+    assert "scratch_database_unavailable" in (detail or "")
+    assert "MIGRATION_APPLY_SCRATCH_DATABASE_URL" in (detail or "")
+    assert "prod-secret" not in (detail or "")
+    assert "scratch-secret" not in (detail or "")
+
+
+@pytest.mark.asyncio
+async def test_reference_build_scratch_unavailable_returns_typed_defer(monkeypatch):
+    """_ScratchDatabaseUnavailable from the reference-build path must produce the
+    same typed, sanitized defer as the replay path — not the generic candidate-
+    reference message which does not name the prerequisite."""
+    import app.migration_apply_gate as gate_mod
+
+    metadata = sa.MetaData()
+    monkeypatch.setattr(gate_mod, "_TRANSIENT_RETRY_BASE_DELAY", 0)
+    monkeypatch.setattr(gate_mod, "_TRANSIENT_RETRY_MAX_DELAY", 0)
+    monkeypatch.setattr(
+        gate_mod,
+        "_read_prod_state",
+        AsyncMock(return_value=gate_mod._ProdState(revision="a01", metadata=metadata)),
     )
-    assert provision_ref.database == prod_url.database, (
-        f"_provision_seed_and_detect_drift database {provision_ref.database!r} != {prod_url.database!r}"
+    monkeypatch.setattr(
+        gate_mod,
+        "_build_candidate_reference_schema",
+        AsyncMock(side_effect=gate_mod._ScratchDatabaseUnavailable()),
     )
+
+    engine = create_async_engine(
+        "postgresql+asyncpg://prod_user:prod-secret@prod-db:5432/proddb"
+    )
+    try:
+        verdict, detail = await run_migration_apply_gate(
+            prod_engine=engine,
+            candidate_sources={"0001_init.py": "revision='0001'\ndown_revision=None\n"},
+            # required_metadata omitted → gate enters reference-build path
+            scratch_db_url=(
+                "postgresql+asyncpg://scratch_user:scratch-secret@"
+                "scratch-db:5432/control"
+            ),
+        )
+    finally:
+        await engine.dispose()
+
+    assert verdict == "defer"
+    assert "scratch_database_unavailable" in (detail or "")
+    assert "MIGRATION_APPLY_SCRATCH_DATABASE_URL" in (detail or "")
+    assert "prod-secret" not in (detail or "")
+    assert "scratch-secret" not in (detail or "")
+
+
+@pytest.mark.asyncio
+async def test_replay_seed_scratch_unavailable_returns_typed_defer(monkeypatch):
+    """_ScratchDatabaseUnavailable from _seed_scratch (the real wrapper, not a
+    direct mock of _provision_seed_and_detect_drift) must produce the typed defer.
+    Seeding failures are infra failures; raw details must not be returned."""
+    import contextlib
+
+    import app.migration_apply_gate as gate_mod
+
+    metadata = sa.MetaData()
+    monkeypatch.setattr(gate_mod, "_TRANSIENT_RETRY_BASE_DELAY", 0)
+    monkeypatch.setattr(gate_mod, "_TRANSIENT_RETRY_MAX_DELAY", 0)
+    monkeypatch.setattr(
+        gate_mod,
+        "_read_prod_state",
+        AsyncMock(return_value=gate_mod._ProdState(revision="a01", metadata=metadata)),
+    )
+
+    @contextlib.asynccontextmanager
+    async def _fake_ephemeral(_base_url, db_name=None):
+        yield object(), "scratch-replay"
+
+    monkeypatch.setattr(gate_mod, "ephemeral_postgres_database", _fake_ephemeral)
+    monkeypatch.setattr(
+        gate_mod,
+        "_seed_scratch",
+        AsyncMock(side_effect=gate_mod._ScratchDatabaseUnavailable()),
+    )
+
+    engine = create_async_engine(
+        "postgresql+asyncpg://prod_user:prod-secret@prod-db:5432/proddb"
+    )
+    try:
+        verdict, detail = await run_migration_apply_gate(
+            prod_engine=engine,
+            candidate_sources={"0001_init.py": "revision='0001'\ndown_revision=None\n"},
+            required_metadata=metadata,
+            scratch_db_url=(
+                "postgresql+asyncpg://scratch_user:scratch-secret@"
+                "scratch-db:5432/control"
+            ),
+        )
+    finally:
+        await engine.dispose()
+
+    assert verdict == "defer"
+    assert "scratch_database_unavailable" in (detail or "")
+    assert "MIGRATION_APPLY_SCRATCH_DATABASE_URL" in (detail or "")
+    assert "prod-secret" not in (detail or "")
+    assert "scratch-secret" not in (detail or "")
