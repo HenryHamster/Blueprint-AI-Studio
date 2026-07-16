@@ -13917,15 +13917,12 @@ async def test_decay_stale_open_messages_resolves_aged_note(reaper_db):
 
 @pytest.mark.asyncio
 async def test_decay_stale_open_leaves_recent_and_live_types(reaper_db):
-    """Recent NOTEs and any QUESTION/BLOCKER are never decayed."""
+    """Recent NOTEs and BLOCKER are never decayed; stale QUESTIONs are."""
     project = await _make_project(reaper_db)
     old = _utcnow() - timedelta(days=STALE_OPEN_DECAY_DAYS + 5)
     recent_note = await _make_conversational_message(
         reaper_db, project, msg_type=MessageType.NOTE
     )  # created now
-    live_question = await _make_conversational_message(
-        reaper_db, project, msg_type=MessageType.QUESTION, created_at=old
-    )
     live_blocker = await _make_conversational_message(
         reaper_db, project, msg_type=MessageType.BLOCKER, created_at=old
     )
@@ -13933,9 +13930,26 @@ async def test_decay_stale_open_leaves_recent_and_live_types(reaper_db):
     acted = await sweep_decay_stale_open_messages(reaper_db, _utcnow())
 
     assert acted == 0
-    for m in (recent_note, live_question, live_blocker):
+    for m in (recent_note, live_blocker):
         await reaper_db.refresh(m)
         assert m.status == "open"
+
+
+@pytest.mark.asyncio
+async def test_decay_stale_open_messages_resolves_aged_question(reaper_db):
+    """An OPEN QUESTION with no activity past the decay window is auto-decayed."""
+    project = await _make_project(reaper_db)
+    old = _utcnow() - timedelta(days=STALE_OPEN_DECAY_DAYS + 1)
+    msg = await _make_conversational_message(
+        reaper_db, project, msg_type=MessageType.QUESTION, created_at=old
+    )
+
+    acted = await sweep_decay_stale_open_messages(reaper_db, _utcnow())
+
+    assert acted == 1
+    await reaper_db.refresh(msg)
+    assert msg.status == "resolved"
+    assert msg.resolution == "auto-decayed (stale)"
 
 
 @pytest.mark.asyncio
