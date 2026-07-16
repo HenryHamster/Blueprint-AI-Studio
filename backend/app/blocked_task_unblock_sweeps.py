@@ -1339,6 +1339,7 @@ async def sweep_unblock_blocked_tasks(
         if _gfb(task):
             from app.gate_revalidation import (
                 has_live_respawn,
+                head_advanced_since_gate_failure,
                 resolve_gate_state,
             )
 
@@ -1351,38 +1352,42 @@ async def sweep_unblock_blocked_tasks(
                     github_info_cache=_github_cache,
                 )
                 _gate_cache[_pid_key] = _gs or {}
-            if _gs and _gs.get("green_at_head"):
-                if not await has_live_respawn(task, session):
-                    from sqlalchemy.orm.attributes import flag_modified
+            if (
+                _gs
+                and _gs.get("green_at_head")
+                and head_advanced_since_gate_failure(task, _gs.get("head_sha"))
+                and not await has_live_respawn(task, session)
+            ):
+                from sqlalchemy.orm.attributes import flag_modified
 
-                    _clear_blocked_fields(task, preserve_first_blocked=False)
-                    task.status = TaskStatus.QUEUED
-                    task.latest_status_message = (
-                        "Unblocked — repo-wide gate resolved at integration HEAD "
-                        f"({_gs['head_sha'][:12]}), requeued on fresh base"
+                _clear_blocked_fields(task, preserve_first_blocked=False)
+                task.status = TaskStatus.QUEUED
+                task.latest_status_message = (
+                    "Unblocked — repo-wide gate resolved at integration HEAD "
+                    f"({_gs['head_sha'][:12]}), requeued on fresh base"
+                )
+                ctx = task.context or {}
+                ctx["_gate_revalidated_at"] = _gs["checked_at_utc"]
+                ctx["_gate_revalidated_head"] = _gs["head_sha"]
+                task.context = ctx
+                flag_modified(task, "context")
+                session.add(task)
+                requeued += 1
+                pending_broadcasts.append(
+                    (
+                        str(task.project_id),
+                        {
+                            "task_id": str(task.id),
+                            "status": "QUEUED",
+                            "message": task.latest_status_message,
+                        },
                     )
-                    ctx = task.context or {}
-                    ctx["_gate_revalidated_at"] = _gs["checked_at_utc"]
-                    ctx["_gate_revalidated_head"] = _gs["head_sha"]
-                    task.context = ctx
-                    flag_modified(task, "context")
-                    session.add(task)
-                    requeued += 1
-                    pending_broadcasts.append(
-                        (
-                            str(task.project_id),
-                            {
-                                "task_id": str(task.id),
-                                "status": "QUEUED",
-                                "message": task.latest_status_message,
-                            },
-                        )
-                    )
-                    await _commit_task_row(_bc_start)
-                    continue
-                # else: live respawn exists → DON'T unblock; fall through
-                # to the existing blocker machinery so the respawn completes
-                # instead of racing the recovered original.
+                )
+                await _commit_task_row(_bc_start)
+                continue
+            # A live same-scope respawn means DON'T unblock; fall through to the
+            # existing blocker machinery so the respawn completes instead of
+            # racing the recovered original.
 
         ctx = task.context or {}
         # Multi-need classification (shared by the parked and live paths): a

@@ -19,16 +19,81 @@ from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
 
-# Gate-failure sentinel substrings matched case-insensitively against a task's
-# ``blocked_reason`` / ``latest_status_message``. Each names a repo-wide suite
-# or gate (standalone smoke, typecheck, vitest) rather than a task-specific
-# blocker.
-_GATE_FAILURE_SENTINELS = frozenset({
-    "standalone_smoke",
-    "standalone smoke",
-    "typecheck",
-    "vitest",
-})
+# Require both a repository-wide/baseline marker and a recognized gate surface.
+# This keeps a task's own typecheck/test failure from being mistaken for an
+# inherited gate failure while covering the wording emitted by ./check and
+# ./pr open.
+_REPO_WIDE_FAILURE_MARKERS = frozenset(
+    {
+        "repo-wide",
+        "untouched",
+        "pre-existing",
+        "outside this diff",
+        "unrelated to this diff",
+        "baseline failure",
+        "baseline failures",
+        "sanctioned standalone",
+        "mandatory impacted backend gate",
+    }
+)
+_GATE_SURFACE_MARKERS = frozenset(
+    {
+        "standalone_smoke",
+        "standalone smoke",
+        "standalone suite",
+        "./check test",
+        "./pr open",
+        "typecheck",
+        "vitest",
+        "websocket inventory",
+        "test_websocket_emitter_inventory",
+        "test_invariants.py",
+        "test_operator_workbench_contracts.py",
+        "impacted backend gate",
+    }
+)
+
+_ACTIVE_RESPAWN_STATUSES = (
+    TaskStatus.QUEUED,
+    TaskStatus.PROVISIONING,
+    TaskStatus.IN_PROGRESS,
+    TaskStatus.EVALUATING,
+)
+
+
+def _task_context(task: Task) -> dict:
+    ctx = task.context or {}
+    return ctx if isinstance(ctx, dict) else {}
+
+
+def _normalize_sha(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    return normalized or None
+
+
+def _same_sha(left: str, right: str) -> bool:
+    """Compare full or abbreviated Git SHAs without accepting tiny prefixes."""
+    if min(len(left), len(right)) < 7:
+        return left == right
+    return left.startswith(right) or right.startswith(left)
+
+
+def head_advanced_since_gate_failure(task: Task, head_sha: object) -> bool:
+    """Return True only when integration HEAD differs from the task baseline.
+
+    ``generated_head_sha`` is the branch point recorded when research spawned
+    the task. After an automatic revalidation, ``_gate_revalidated_head`` takes
+    precedence so the same green HEAD cannot repeatedly unblock a task that
+    blocks again without any repository change.
+    """
+    head = _normalize_sha(head_sha)
+    ctx = _task_context(task)
+    baseline = _normalize_sha(
+        ctx.get("_gate_revalidated_head") or ctx.get("generated_head_sha")
+    )
+    return bool(head and baseline and not _same_sha(head, baseline))
 
 
 def is_gate_failure_blocked(task: Task) -> bool:
@@ -45,20 +110,20 @@ def is_gate_failure_blocked(task: Task) -> bool:
     if not text.strip():
         return False
     lower = text.lower()
-    return any(s in lower for s in _GATE_FAILURE_SENTINELS)
+    return any(m in lower for m in _REPO_WIDE_FAILURE_MARKERS) and any(
+        m in lower for m in _GATE_SURFACE_MARKERS
+    )
 
 
 def _ci_conclusion_is_green(ci_result: dict) -> bool:
     """Does the GitHub checks result indicate a clean bill of health?"""
     if ci_result.get("_from_api_error"):
         return False
-    # "completed" + "success" = green.  "no_checks" on an integration branch
-    # whose CI never runs is also treated as green (gate was never an issue).
+    # Missing checks are not proof that a previously failing repository gate is
+    # fixed. Only an explicitly completed, successful check set is sufficient.
     status = ci_result.get("status")
     conclusion = ci_result.get("conclusion")
-    if status == "completed" and conclusion == "success":
-        return True
-    return status == "no_checks"
+    return status == "completed" and conclusion == "success"
 
 
 async def resolve_gate_state(
@@ -151,12 +216,38 @@ async def resolve_gate_state(
     }
 
 
+def _task_scope_keys(task: Task) -> set[tuple[str, str]]:
+    """Stable scope identities carried across retries and decompositions."""
+    ctx = _task_context(task)
+    keys: set[tuple[str, str]] = set()
+    fingerprint = task.prompt_fingerprint or ctx.get("prompt_fingerprint")
+    if isinstance(fingerprint, str) and fingerprint.strip():
+        keys.add(("prompt", fingerprint.strip()))
+    finding_hash = ctx.get("finding_hash")
+    if isinstance(finding_hash, str) and finding_hash.strip():
+        keys.add(("finding", finding_hash.strip()))
+    return keys
+
+
+def _same_task_scope(left: Task, right: Task) -> bool:
+    if _task_scope_keys(left) & _task_scope_keys(right):
+        return True
+    left_title = " ".join(str(left.title or "").split()).casefold()
+    right_title = " ".join(str(right.title or "").split()).casefold()
+    return bool(
+        left_title
+        and left_title == right_title
+        and (left.first_payload or {}).get("type")
+        == (right.first_payload or {}).get("type")
+    )
+
+
 async def has_live_respawn(task: Task, session) -> bool:
     """Dedup guard: check for active sibling tasks covering the same scope.
 
     Before unblocking a gate-failure-blocked task, call this to check whether
-    a live respawn (a sibling task in the same project sharing the same
-    ``parent_task_id`` with an active status) already covers the same scope.
+    a live respawn (an active sibling with a shared prompt/finding identity, or
+    an exact same normalized title/type fallback) already covers the same scope.
     If one exists, the blocked original should NOT resume — the respawn
     replaces it and the two would race.
 
@@ -169,22 +260,13 @@ async def has_live_respawn(task: Task, session) -> bool:
         return False
 
     stmt = (
-        select(Task.id)
+        select(Task)
         .where(
             Task.project_id == task.project_id,
             Task.parent_task_id == task.parent_task_id,
             Task.id != task.id,
-            Task.status.in_(
-                [
-                    TaskStatus.QUEUED,
-                    TaskStatus.PROVISIONING,
-                    TaskStatus.IN_PROGRESS,
-                    TaskStatus.EVALUATING,
-                    TaskStatus.BLOCKED,
-                ]
-            ),
+            Task.status.in_(_ACTIVE_RESPAWN_STATUSES),
         )
-        .limit(1)
     )
     result = await session.execute(stmt)
-    return result.scalar_one_or_none() is not None
+    return any(_same_task_scope(task, sibling) for sibling in result.scalars())
