@@ -4046,7 +4046,7 @@ async def test_capability_proof_gate_gap_flags_unproven_working(db):
 
     project = await _project(db)
     # Two working capabilities: one unproven (no evidence_refs, no backing_paths),
-    # one proven.
+    # one proven via both evidence_refs and the platform ledger.
     project.problem_model = {
         "capabilities": [
             {
@@ -4066,7 +4066,14 @@ async def test_capability_proof_gate_gap_flags_unproven_working(db):
             },
         ]
     }
+    # Seed a platform ledger entry so consumer_gate_proof_status corroborates it.
+    project.capability_proof_records = {
+        "ci-integration": [
+            {"proof_kind": "named_test", "proven": True, "ref": "backend/app/ci.py"},
+        ]
+    }
     flag_modified(project, "problem_model")
+    flag_modified(project, "capability_proof_records")
     db.add(project)
     await db.commit()
 
@@ -4799,7 +4806,7 @@ async def test_capability_proof_gate_gap_proposes_backing_paths(db):
 
 @pytest.mark.asyncio
 async def test_capability_proof_gate_gap_ok_when_all_proven(db):
-    """All working capabilities with proven evidence produce an OK result."""
+    """All working capabilities with corroborated proof produce an OK result."""
     from sqlalchemy.orm.attributes import flag_modified
 
     project = await _project(db)
@@ -4812,7 +4819,14 @@ async def test_capability_proof_gate_gap_ok_when_all_proven(db):
             },
         ]
     }
+    # Seed a platform ledger entry so consumer_gate_proof_status corroborates it.
+    project.capability_proof_records = {
+        "repo-map": [
+            {"proof_kind": "named_test", "proven": True, "ref": "backend/app/x.py"},
+        ]
+    }
     flag_modified(project, "problem_model")
+    flag_modified(project, "capability_proof_records")
     db.add(project)
     await db.commit()
 
@@ -4826,6 +4840,161 @@ async def test_capability_proof_gate_gap_ok_when_all_proven(db):
     ok = [r for r in results if r.subject == pid and r.status == CheckStatus.OK]
     assert len(ok) == 1
     assert ok[0].delta == 0
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_gate_gap_exempt_not_flagged(db):
+    """A working capability with an operator-recorded platform exemption is NOT
+    counted in the gap delta — the enforce gate would clear it."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = await _project(db)
+    project.problem_model = {
+        "capabilities": [
+            {
+                "name": "exempt-cap",
+                "status": "working",
+                "evidence_refs": [],  # no machine proof
+            },
+            {
+                "name": "non-exempt-cap",
+                "status": "working",
+                "evidence_refs": [],  # genuinely unproven
+            },
+        ]
+    }
+    # Operator-recorded exemption in the platform ledger.
+    project.capability_proof_records = {
+        "exempt-cap": [
+            {
+                "task_id": "operator:exempt-cap",
+                "proved_at": _utcnow().isoformat(),
+                "proof_kind": "operator_exemption",
+                "proof_ref": "exempt-cap",
+                "commit_sha": "",
+            }
+        ]
+    }
+    flag_modified(project, "problem_model")
+    flag_modified(project, "capability_proof_records")
+    db.add(project)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe", max_projects=25,
+        sample_limit=200, window_days=14,
+    )
+    results = await mis.check_capability_proof_gate_gap(ctx)
+    pid = str(project.id)
+    flagged = [r for r in results if r.flagged and r.subject == pid]
+    assert len(flagged) == 1, f"expected 1 flagged result, got {results}"
+    f = flagged[0]
+    # The exempt cap is excluded from both total_working and delta.
+    # Only non-exempt-cap remains in the gap.
+    assert f.self_reported == 2  # total working including exempt
+    # exempt-cap grades proven via platform exemption → ground_truth = 1
+    assert f.ground_truth == 1
+    # delta = non-exempt-cap still needs proof
+    assert f.delta == 1
+    assert "non-exempt-cap" in f.detail
+    # Exempt must be mentioned in the detail.
+    assert "exempt" in f.detail
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_gate_gap_ledger_only_proof_not_flagged(db):
+    """A working capability whose platform ledger holds a proof entry but whose
+    problem_model evidence_refs append was lost is NOT flagged as a gap —
+    consumer_gate_proof_status folds the ledger proof up to proven."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = await _project(db)
+    project.problem_model = {
+        "capabilities": [
+            {
+                "name": "ledger-only-cap",
+                "status": "working",
+                "evidence_refs": [],  # problem_model evidence was lost
+            },
+        ]
+    }
+    # Platform ledger still holds the proof.
+    project.capability_proof_records = {
+        "ledger-only-cap": [
+            {
+                "task_id": "test:ledger-only-cap",
+                "proved_at": _utcnow().isoformat(),
+                "proof_kind": "named_test",
+                "proof_ref": "testing/test_foo.py",
+                "commit_sha": "a" * 40,
+            }
+        ]
+    }
+    flag_modified(project, "problem_model")
+    flag_modified(project, "capability_proof_records")
+    db.add(project)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe", max_projects=25,
+        sample_limit=200, window_days=14,
+    )
+    results = await mis.check_capability_proof_gate_gap(ctx)
+    pid = str(project.id)
+    # No flagged results — the ledger-only proof is recognized.
+    assert not any(r.flagged for r in results if r.subject == pid), (
+        f"expected no flagged result for ledger-only proof, got {results}"
+    )
+    ok = [r for r in results if r.subject == pid and r.status == CheckStatus.OK]
+    assert len(ok) == 1
+    assert ok[0].delta == 0
+    assert ok[0].ground_truth == 1  # ledger-only cap is proven
+    assert ok[0].self_reported == 1
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_gate_gap_unverified_proven_is_flagged(db):
+    """A working capability that self-declares ``proven`` via problem_model
+    evidence_refs but has NO platform ledger corroboration is demoted to
+    ``unverified`` by consumer_gate_proof_status and correctly counted in the
+    gap delta — the enforce gate would reject it."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = await _project(db)
+    project.problem_model = {
+        "capabilities": [
+            {
+                "name": "self-declared-cap",
+                "status": "working",
+                "evidence_refs": [{"proven": True, "ref": "backend/app/x.py"}],
+            },
+        ]
+    }
+    # NO capability_proof_records — the self-declared claim cannot be corroborated.
+    flag_modified(project, "problem_model")
+    db.add(project)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe", max_projects=25,
+        sample_limit=200, window_days=14,
+    )
+    results = await mis.check_capability_proof_gate_gap(ctx)
+    pid = str(project.id)
+    flagged = [r for r in results if r.flagged and r.subject == pid]
+    assert len(flagged) == 1, (
+        f"expected 1 flagged result for self-declared unverified cap, got {results}"
+    )
+    f = flagged[0]
+    assert f.self_reported == 1
+    # ground_truth = 0 because the self-declared claim is NOT corroborated
+    assert f.ground_truth == 0, (
+        f"ground_truth should be 0 (self-declared without ledger is unverified), "
+        f"got {f.ground_truth}"
+    )
+    assert f.delta == 1
+    # The detail should mention the capability name.
+    assert "self-declared-cap" in f.detail
 
 
 @pytest.mark.asyncio

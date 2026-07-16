@@ -3687,9 +3687,9 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
         record_capability_named_test_proof,
     )
     from app.capability_registry import (
+        consumer_gate_proof_status,
         exempt_capability_names,
         normalize_capability_name,
-        working_capability_proof_status,
     )
     from app.models import Project
     from app.source_ref_validation import _looks_like_file_path, _path_exists_at_head
@@ -3715,6 +3715,11 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
     for project in projects:
         pid = str(project.id)
         pm = project.problem_model if isinstance(project.problem_model, dict) else {}
+        proof_records = (
+            project.capability_proof_records
+            if isinstance(project.capability_proof_records, dict)
+            else None
+        )
         caps_list = pm.get("capabilities") if pm else None
         if not isinstance(caps_list, list) or not caps_list:
             results.append(
@@ -3727,8 +3732,8 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
             )
             continue
 
-        proof_by_name = working_capability_proof_status(pm)
-        exempt_set = exempt_capability_names(pm)
+        proof_by_name = consumer_gate_proof_status(pm, proof_records, now=ctx.now)
+        exempt_set = exempt_capability_names(pm, proof_records)
         if not proof_by_name:
             results.append(
                 CheckResult(
