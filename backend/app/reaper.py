@@ -313,6 +313,7 @@ from app.reaper_sweeps import (
     _sweep_strategic_cycle_starvation,
 )
 from app.acceptance_gate import backfill_acceptance_verdicts
+from app.strategic_resident_shadow import sweep_shadow_resident_turns
 
 
 async def _mark_landed_parent_dependents(parent_id, session) -> None:
@@ -2714,6 +2715,22 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(
                         f"[REAPER] Strategic-cycle starvation sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 7a: project backend-only Resident shadow turns. This is a
+                # deterministic bounded projection with zero model calls.
+                try:
+                    await sweep_shadow_resident_turns(
+                        session_factory=AsyncSessionLocal,
+                        now=now,
+                        batch_size=32,
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Resident shadow turn sweep error: {e}",
                         exc_info=True,
                     )
                     with contextlib.suppress(Exception):

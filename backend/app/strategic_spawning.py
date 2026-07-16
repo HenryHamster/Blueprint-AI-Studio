@@ -4291,6 +4291,40 @@ async def _spawn_design_doc_update(
         baseline_problem_model=project.problem_model or {},
         baseline_running_update=project.running_update,
     )
+    from app.strategic_resident_turns import (
+        ShadowResidentOwnershipError,
+        coalesce_shadow_resident_turn,
+    )
+
+    try:
+        async with session.begin_nested():
+            await coalesce_shadow_resident_turn(
+                session,
+                project_id=project.id,
+                lane="background",
+                trigger_kind="project_change",
+                project_change_cursor={
+                    "strategic_cycle_id": str(cycle_id),
+                    "phase1_task_id": str(new_task.id),
+                },
+            )
+    except ShadowResidentOwnershipError:
+        await session.rollback()
+        logger.warning(
+            "[RESIDENT_SHADOW] Aborting legacy phase-1 spawn after Resident ownership flip "
+            "(project=%s cycle=%s)",
+            project.id,
+            cycle_id,
+        )
+        return False
+    except Exception:
+        logger.exception(
+            "[RESIDENT_SHADOW] Phase-1 background wake failed open for project %s "
+            "(cycle=%s task=%s)",
+            project.id,
+            cycle_id,
+            new_task.id,
+        )
     await session.commit()
     # Post-commit: signal the admin UI that a strategic cycle (Phase 1) started.
     from app.strategic_events import emit_strategic_cycle_started
@@ -5398,6 +5432,42 @@ async def _finalize_strategic_review_spawn(
     if _cycle_row is not None and integrity_conflict_counts is not None:
         strategic_cycle.record_integrity_conflict_counts(_cycle_row, integrity_conflict_counts)
         session.add(_cycle_row)
+    # Shadow only meaningful accepted cadence work. Unchanged cadence checks
+    # never reach this finalize transaction and therefore make zero Resident
+    # Tasks/model calls.
+    from app.strategic_resident_turns import ShadowResidentOwnershipError
+
+    try:
+        async with session.begin_nested():
+            from app.strategic_resident_turns import coalesce_shadow_resident_turn
+
+            await coalesce_shadow_resident_turn(
+                session,
+                project_id=project_id,
+                lane="background",
+                trigger_kind="project_change",
+                project_change_cursor={
+                    "strategic_cycle_id": str(cycle_id),
+                    "phase2_task_id": str(new_task.id),
+                },
+            )
+    except ShadowResidentOwnershipError:
+        await session.rollback()
+        logger.warning(
+            "[RESIDENT_SHADOW] Aborting legacy phase-2 spawn after Resident ownership flip "
+            "(project=%s cycle=%s)",
+            project_id,
+            cycle_id,
+        )
+        return False
+    except Exception:
+        logger.exception(
+            "[RESIDENT_SHADOW] Background cycle wake failed open for project %s "
+            "(cycle=%s task=%s); legacy cycle remains authoritative",
+            project_id,
+            cycle_id,
+            new_task.id,
+        )
     await session.commit()
     # Post-commit: signal the admin UI that a strategic cycle (Phase 2) started.
     from app.strategic_events import emit_strategic_cycle_started

@@ -3333,6 +3333,55 @@ async def test_step6_alert_broadcasts_after_commit(reaper_db, mocker):
 
 
 @pytest.mark.asyncio
+async def test_step6_ignores_backend_managed_resident_turns(reaper_db):
+    project = await _make_project(reaper_db)
+    reaper_db.add(
+        Task(
+            project_id=project.id,
+            title="Resident shadow",
+            payloads=[{"type": "strategic_resident_turn"}],
+            status=TaskStatus.QUEUED,
+            created_at=_utcnow() - timedelta(hours=24),
+            archived=True,
+        )
+    )
+    await reaper_db.commit()
+
+    alerted = await _rs.sweep_queued_age_alerts(
+        reaper_db,
+        _utcnow(),
+        runtime_config={"queued_age_alert_hours": 2},
+    )
+    assert alerted == 0
+
+
+@pytest.mark.asyncio
+async def test_reaper_contains_shadow_sweep_failure_and_runs_later_phase(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    import app.reaper as _reaper_mod
+
+    shadow = mocker.patch(
+        "app.reaper.sweep_shadow_resident_turns",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError("shadow projection failed"),
+    )
+    later = mocker.patch(
+        "app.reaper.sweep_regression_scan",
+        new_callable=AsyncMock,
+    )
+
+    await _run_reaper_once()
+
+    shadow.assert_awaited_once()
+    assert (
+        shadow.await_args.kwargs["session_factory"]
+        is _reaper_mod.AsyncSessionLocal
+    )
+    later.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_step6_alert_does_not_broadcast_on_commit_failure(reaper_db, mocker):
     """If the batch commit fails, queued-age alerts must not be broadcast."""
     project = await _make_project(reaper_db)

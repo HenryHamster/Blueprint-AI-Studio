@@ -17,6 +17,7 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
+from sqlalchemy import or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
@@ -39,6 +40,7 @@ from app.models import (
 )
 from app.max_plan_pool import filter_user_task_context
 from app.payload_schemas import validate_task_payload
+from app.task_capabilities import BACKEND_MANAGED_TASK_TYPES
 from app.research_completion import resolve_research_findings_for_surface
 from app.schemas import DeployPayload
 from app.shared_state import backfill_branch_columns, limiter
@@ -194,6 +196,11 @@ async def deploy_blueprint(
         session.add(task)
         created_tasks.append(task)
 
+    from app.strategic_resident_checkpointing import initialize_strategic_resident
+
+    await initialize_strategic_resident(
+        session, project.id, locked_project=project
+    )
     await session.commit()
 
     # Populate branch columns from GitHub immediately so that the first task
@@ -314,6 +321,7 @@ async def get_project_tasks(
     status: Optional[TaskStatus] = None,
     direction_id: Optional[str] = None,
     task_type: Optional[str] = None,
+    include_backend_managed: bool = Query(False, include_in_schema=False),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -367,6 +375,14 @@ async def get_project_tasks(
 
     # Fetch tasks
     tasks_stmt = select(Task).where(Task.project_id == project_id)
+    if not include_backend_managed:
+        task_type_expr = Task.payloads[0]["type"].as_string()
+        tasks_stmt = tasks_stmt.where(
+            or_(
+                task_type_expr.is_(None),
+                task_type_expr.not_in(sorted(BACKEND_MANAGED_TASK_TYPES)),
+            )
+        )
     if status:
         tasks_stmt = tasks_stmt.where(Task.status == status)
     if direction_id:

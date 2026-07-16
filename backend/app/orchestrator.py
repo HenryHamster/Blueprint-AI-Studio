@@ -57,7 +57,10 @@ from app.compute import (
 from app.compute_cloud_run import (
     launch_agent_cloud_run_job,  # noqa: F401 — app.orchestrator patch surface (see above)
 )
-from app.task_capabilities import CLOUD_RUN_CANDIDATE_TASK_TYPES
+from app.task_capabilities import (
+    AGENT_EXECUTED_TASK_TYPES,
+    CLOUD_RUN_CANDIDATE_TASK_TYPES,
+)
 from app.database import AsyncSessionLocal
 from app.models import (
     DeploymentState,
@@ -118,6 +121,14 @@ from app.time_utils import (
 )
 
 logger = logging.getLogger("blueprint")
+
+
+def _agent_executed_task_type_filter():
+    """Registry-owned dispatch fence for backend-managed control-plane Tasks."""
+
+    return Task.payloads[0]["type"].as_string().in_(
+        sorted(AGENT_EXECUTED_TASK_TYPES)
+    )
 
 
 def _dispatch_gate_metadata(row: tuple) -> dict:
@@ -393,6 +404,7 @@ async def _lock_dispatchable_task_for_mutation(
         .where(
             Task.id == task_id,
             Task.status == TaskStatus.QUEUED,
+            _agent_executed_task_type_filter(),
             Project.paused.is_(False),
             Project.not_archived(),
         )
@@ -1624,6 +1636,7 @@ async def orchestrator_worker():
                             .where(
                                 Task.status == TaskStatus.QUEUED,
                                 Task.requires_approval.is_(False),
+                                _agent_executed_task_type_filter(),
                             )
                         )
                     ).scalar() or 0
@@ -1992,6 +2005,7 @@ async def orchestrator_worker():
                     .where(
                         Task.status == TaskStatus.QUEUED,
                         Task.requires_approval.is_(False),
+                        _agent_executed_task_type_filter(),
                         Task.project_id.in_(
                             select(Project.id).where(
                                 Project.not_archived(),
@@ -2792,6 +2806,7 @@ async def orchestrator_worker():
                         .where(
                             Task.id.in_(eligible_ids),
                             Task.status == TaskStatus.QUEUED,
+                            _agent_executed_task_type_filter(),
                             Project.paused.is_(False),
                             Project.not_archived(),
                         )
@@ -2867,6 +2882,7 @@ async def orchestrator_worker():
                             .where(
                                 Task.status == TaskStatus.QUEUED,
                                 Task.requires_approval.is_(False),
+                                _agent_executed_task_type_filter(),
                             )
                         )
                     ).scalar() or 0

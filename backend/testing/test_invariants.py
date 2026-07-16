@@ -749,6 +749,28 @@ def _concurrently_txn_escape_violations(source: str, revision: str) -> list[str]
     except SyntaxError:
         return [f"{revision}: could not parse migration source"]
 
+    op_names = {
+        alias.asname or alias.name
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom) and node.module == "alembic"
+        for alias in node.names
+        if alias.name == "op"
+    }
+
+    def _is_alembic_op_receiver(node: ast.AST) -> bool:
+        return isinstance(node, ast.Name) and node.id in op_names
+
+    def _is_autocommit_context(node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "autocommit_block"
+            and isinstance(node.func.value, ast.Call)
+            and isinstance(node.func.value.func, ast.Attribute)
+            and node.func.value.func.attr == "get_context"
+            and _is_alembic_op_receiver(node.func.value.func.value)
+        )
+
     violations: list[str] = []
     for func in tree.body:
         if not isinstance(func, ast.FunctionDef) or func.name not in (
@@ -759,21 +781,39 @@ def _concurrently_txn_escape_violations(source: str, revision: str) -> list[str]
 
         commits: list[tuple[int, int]] = []
         concurrentlies: list[tuple[int, int]] = []
+        autocommit_concurrentlies: set[tuple[int, int]] = set()
+
+        parents = {
+            child: parent
+            for parent in ast.walk(func)
+            for child in ast.iter_child_nodes(parent)
+        }
+
+        def _is_in_migration_execution_scope(node: ast.AST) -> bool:
+            current = parents.get(node)
+            while current is not None and current is not func:
+                if isinstance(
+                    current,
+                    (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda),
+                ):
+                    return False
+                current = parents.get(current)
+            return current is func
+
+        def _inside_alembic_autocommit(node: ast.AST) -> bool:
+            if not _is_in_migration_execution_scope(node):
+                return False
+            current = parents.get(node)
+            while current is not None and current is not func:
+                if isinstance(current, (ast.With, ast.AsyncWith)) and any(
+                    _is_autocommit_context(item.context_expr)
+                    for item in current.items
+                ):
+                    return True
+                current = parents.get(current)
+            return False
 
         for node in ast.walk(func):
-            # autocommit_block() is an equivalent escape to op.execute("COMMIT"):
-            # `with op.get_context().autocommit_block():` runs all statements
-            # inside in autocommit mode, satisfying the CONCURRENTLY requirement.
-            if isinstance(node, ast.With):
-                for item in node.items:
-                    cm = item.context_expr
-                    if (
-                        isinstance(cm, ast.Call)
-                        and isinstance(cm.func, ast.Attribute)
-                        and cm.func.attr == "autocommit_block"
-                    ):
-                        commits.append((node.lineno, node.col_offset))
-                continue
             if not isinstance(node, ast.Call) or not isinstance(
                 node.func, ast.Attribute
             ):
@@ -783,11 +823,19 @@ def _concurrently_txn_escape_violations(source: str, revision: str) -> list[str]
 
             if attr == "execute" and node.args:
                 text = _ast_literal_text(node.args[0])
-                if text.strip().upper() == "COMMIT":
+                if (
+                    text.strip().upper() == "COMMIT"
+                    and _is_alembic_op_receiver(node.func.value)
+                    and _is_in_migration_execution_scope(node)
+                ):
                     commits.append(pos)
                 elif _CONCURRENTLY_DDL_RE.search(text):
                     concurrentlies.append(pos)
-            elif attr in ("create_index", "drop_index"):
+                    if _inside_alembic_autocommit(node):
+                        autocommit_concurrentlies.add(pos)
+            elif attr in ("create_index", "drop_index") and _is_alembic_op_receiver(
+                node.func.value
+            ):
                 for kw in node.keywords:
                     if (
                         kw.arg == "postgresql_concurrently"
@@ -795,15 +843,24 @@ def _concurrently_txn_escape_violations(source: str, revision: str) -> list[str]
                         and kw.value.value is True
                     ):
                         concurrentlies.append(pos)
+                        if _inside_alembic_autocommit(node):
+                            autocommit_concurrentlies.add(pos)
 
         if not concurrentlies:
             continue
-        first_concurrently = min(concurrentlies)
+        unescaped = [
+            event
+            for event in concurrentlies
+            if event not in autocommit_concurrentlies
+        ]
+        if not unescaped:
+            continue
+        first_concurrently = min(unescaped)
         if not any(commit < first_concurrently for commit in commits):
             violations.append(
                 f"{revision}.{func.name}: CONCURRENTLY index DDL is not preceded "
-                "by op.execute(\"COMMIT\") or autocommit_block() to escape the "
-                "per-migration transaction"
+                "by op.execute(\"COMMIT\") or enclosed by "
+                "op.get_context().autocommit_block()"
             )
 
     return violations
@@ -1514,32 +1571,29 @@ class TestSchemaRevisionSync:
         # arguments — some migrations (e.g. 0608) carry a note between the two
         # args explaining a SQLite constraint, which the plain \s* form cannot skip.
         add_col_re = re.compile(
-            r"add_column\(\s*['\"](\w+)['\"]\s*,(?:\s*#[^\n]*)*\s*sa\.Column\(\s*['\"](\w+)['\"]"
+            r"add_column\(\s*(?:['\"](\w+)['\"]|(\w+))\s*,"
+            r"(?:\s|#[^\n]*\n)*sa\.Column\(\s*['\"](\w+)['\"]"
         )
-        create_table_re = re.compile(r"create_table\(\s*['\"](\w+)['\"]", re.MULTILINE)
+        create_table_re = re.compile(
+            r"create_table\(\s*(?:['\"](\w+)['\"]|(\w+))", re.MULTILINE
+        )
         col_in_create_re = re.compile(r"sa\.Column\(\s*['\"](\w+)['\"]")
+        const_re = re.compile(r"^(_\w+)\s*=\s*['\"](\w+)['\"]", re.MULTILINE)
         # Renames: alter_column('table', 'old', new_column_name='new') → new column exists
         rename_re = re.compile(
             r"alter_column\(\s*['\"](\w+)['\"]\s*,\s*['\"](\w+)['\"].*?new_column_name\s*=\s*['\"](\w+)['\"]",
             re.DOTALL,
         )
-        # Module-level string constants used as table names in create_table calls,
-        # e.g. `_SEQUENCE_TABLE = "projectmessagesequence"` then
-        # `op.create_table(_SEQUENCE_TABLE, ...)`.  Resolve these so the variable-name
-        # form is treated the same as a literal-string form.
-        const_re = re.compile(r"^(_\w+)\s*=\s*['\"](\w+)['\"]", re.MULTILINE)
-        # Same regex, but accepting a bare identifier (module constant) as the table name.
-        create_table_var_re = re.compile(r"create_table\(\s*(_\w+)\s*,", re.MULTILINE)
-
         for path in files:
             with open(path) as f:
                 content = f.read()
-
             consts = dict(const_re.findall(content))
 
             # add_column('table', sa.Column('name', ...))
             for m in add_col_re.finditer(content):
-                migration_columns.add((m.group(1), m.group(2)))
+                table = m.group(1) or consts.get(m.group(2) or "", "")
+                if table:
+                    migration_columns.add((table, m.group(3)))
 
             # alter_column('table', 'old_name', new_column_name='new_name', ...)
             for m in rename_re.finditer(content):
@@ -1547,26 +1601,10 @@ class TestSchemaRevisionSync:
 
             # create_table('table', sa.Column('name', ...), ...)
             for ct in create_table_re.finditer(content):
-                table = ct.group(1)
-                # Find the matching closing paren for this create_table call
-                start = ct.end()
-                depth = 1
-                end = start
-                while end < len(content) and depth > 0:
-                    if content[end] == "(":
-                        depth += 1
-                    elif content[end] == ")":
-                        depth -= 1
-                    end += 1
-                block = content[start:end]
-                for col_m in col_in_create_re.finditer(block):
-                    migration_columns.add((table, col_m.group(1)))
-
-            # create_table(_VARIABLE, sa.Column('name', ...), ...) — resolve constant.
-            for ct in create_table_var_re.finditer(content):
-                table = consts.get(ct.group(1))
-                if table is None:
+                table = ct.group(1) or consts.get(ct.group(2) or "", "")
+                if not table:
                     continue
+                # Find the matching closing paren for this create_table call
                 start = ct.end()
                 depth = 1
                 end = start
@@ -1610,7 +1648,11 @@ class TestSchemaRevisionSync:
         # stop protecting them while the backend still creates those tables at
         # runtime. Assert every mapped table class is reachable through the
         # ``app.models`` facade so a peeled-out module can never go un-imported.
-        _models_owned_modules = {"app.models", "app.release_models"}
+        _models_owned_modules = {
+            "app.models",
+            "app.release_models",
+            "app.strategic_resident_models",
+        }
         facade_missing = sorted(
             mapper.class_.__name__
             for mapper in SQLModel._sa_registry.mappers
@@ -1763,7 +1805,9 @@ class TestSchemaRevisionSync:
             re.DOTALL,
         )
         drop_idx_re = re.compile(r"drop_index\(\s*(?:op\.f\(\s*)?['\"](\w+)['\"]")
-        create_table_re = re.compile(r"create_table\(\s*['\"](\w+)['\"]", re.MULTILINE)
+        create_table_re = re.compile(
+            r"create_table\(\s*(?:['\"](\w+)['\"]|(\w+))", re.MULTILINE
+        )
         col_start_re = re.compile(r"sa\.Column\(\s*['\"](\w+)['\"]")
         str_re = re.compile(r"['\"](\w+)['\"]")
         # RAW-SQL index creation, e.g.
@@ -1789,7 +1833,7 @@ class TestSchemaRevisionSync:
             r"CREATE\s+INDEX" + _GLUE + r"\s*(?:CONCURRENTLY" + _GLUE + r"\s*)?"
             r"(?:IF\s+NOT\s+EXISTS" + _GLUE + r"\s*)?"
             r"\{?(\w+)\}?"                        # name, or {_PY_CONST} interpolation
-            + _GLUE + r"\s*ON\s+\{?(\w+)\}?"     # table, or {_PY_CONST} interpolation
+            + _GLUE + r"\s*ON\s+\{?(\w+)\}?"      # table literal or {_CONST}
             + _GLUE + r"\s*(?:USING\s+\w+)?"      # optional access method
             + _GLUE + r"\s*\(([^)]*)\)",          # column expression list
             re.IGNORECASE | re.DOTALL,
@@ -1834,6 +1878,8 @@ class TestSchemaRevisionSync:
                 raw_table = m.group(3) or m.group(4) or ""
                 table = consts.get(raw_table, raw_table)
                 cols_raw = m.group(5)
+                if not table:
+                    continue
                 cols = frozenset(str_re.findall(cols_raw))
                 if cols:
                     entry = (table, cols)
@@ -1862,7 +1908,9 @@ class TestSchemaRevisionSync:
                     effective.add(entry)
 
             for ct in create_table_re.finditer(content):
-                table = ct.group(1)
+                table = ct.group(1) or consts.get(ct.group(2) or "", "")
+                if not table:
+                    continue
                 block = _matched_block(content, ct.end())
                 for col_m in col_start_re.finditer(block):
                     col_block = _matched_block(block, col_m.end())
@@ -2394,7 +2442,23 @@ class TestChainInvariantSeedFixtures:
             "detector false-positived on correctly COMMIT-escaped CONCURRENTLY DDL"
         )
 
-        # GOOD 2: CONCURRENTLY mentioned only in a docstring / comment and a plain
+        # GOOD 2: Alembic's supported autocommit block encloses the concurrent DDL.
+        good_autocommit = (
+            "from alembic import op\n"
+            "def upgrade():\n"
+            "    with op.get_context().autocommit_block():\n"
+            "        op.create_index(\n"
+            "            'ix_y', 'task', ['b'], postgresql_concurrently=True\n"
+            "        )\n"
+            "def downgrade():\n"
+            "    with op.get_context().autocommit_block():\n"
+            "        op.execute('DROP INDEX CONCURRENTLY IF EXISTS ix_y')\n"
+        )
+        assert not _concurrently_txn_escape_violations(
+            good_autocommit, "9005"
+        ), "detector false-positived on Alembic autocommit_block"
+
+        # GOOD 3: CONCURRENTLY mentioned only in a docstring / comment and a plain
         # (non-CONCURRENTLY) op.execute — the 0273 shape. Must NOT be flagged.
         docstring_only = (
             "from alembic import op\n"
@@ -2403,9 +2467,68 @@ class TestChainInvariantSeedFixtures:
             "    # DROP INDEX CONCURRENTLY handled elsewhere\n"
             "    op.execute('CREATE INDEX IF NOT EXISTS ix_x ON task (a)')\n"
         )
-        assert not _concurrently_txn_escape_violations(docstring_only, "9005"), (
+        assert not _concurrently_txn_escape_violations(docstring_only, "9006"), (
             "detector wrongly flagged a docstring/comment-only CONCURRENTLY mention"
         )
+
+        # BAD 4: a sibling autocommit block does not bless DDL outside its body.
+        sibling_autocommit = (
+            "from alembic import op\n"
+            "def upgrade():\n"
+            "    with op.get_context().autocommit_block():\n"
+            "        op.execute('SELECT 1')\n"
+            "    op.execute('CREATE INDEX CONCURRENTLY ix_x ON task (a)')\n"
+        )
+        assert _concurrently_txn_escape_violations(
+            sibling_autocommit, "9007"
+        ), "detector accepted concurrent DDL outside the autocommit block"
+
+        fake_commit = (
+            "from alembic import op\n"
+            "def upgrade():\n"
+            "    fake.execute('COMMIT')\n"
+            "    op.create_index('ix_x', 'task', ['a'], "
+            "postgresql_concurrently=True)\n"
+        )
+        assert _concurrently_txn_escape_violations(
+            fake_commit, "9008"
+        ), "detector accepted fake.execute('COMMIT') as an Alembic escape"
+
+        fake_autocommit = (
+            "from alembic import op\n"
+            "def upgrade():\n"
+            "    with fake.get_context().autocommit_block():\n"
+            "        op.create_index('ix_x', 'task', ['a'], "
+            "postgresql_concurrently=True)\n"
+        )
+        assert _concurrently_txn_escape_violations(
+            fake_autocommit, "9009"
+        ), "detector accepted a non-Alembic autocommit block"
+
+        nested_definition = (
+            "from alembic import op\n"
+            "def upgrade():\n"
+            "    with op.get_context().autocommit_block():\n"
+            "        def later():\n"
+            "            op.create_index('ix_x', 'task', ['a'], "
+            "postgresql_concurrently=True)\n"
+            "    later()\n"
+        )
+        assert _concurrently_txn_escape_violations(
+            nested_definition, "9010"
+        ), "detector treated a nested function definition as autocommit execution"
+
+        nested_commit = (
+            "from alembic import op\n"
+            "def upgrade():\n"
+            "    def later():\n"
+            "        op.execute('COMMIT')\n"
+            "    op.create_index('ix_x', 'task', ['a'], "
+            "postgresql_concurrently=True)\n"
+        )
+        assert _concurrently_txn_escape_violations(
+            nested_commit, "9011"
+        ), "detector accepted an unexecuted nested COMMIT as an escape"
 
 
 # ── Pre-merge dual-head guard coverage (whole-package) ─────────────────────
