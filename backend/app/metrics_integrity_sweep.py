@@ -4295,6 +4295,82 @@ async def compute_fleet_proof_coverage(
     }
 
 
+async def compute_trial_eligibility_projection(
+    session: Any, max_projects: int
+) -> Dict[str, Any]:
+    """Count unproven working capabilities that have backing_paths (trial-eligible).
+
+    A capability is trial-eligible when it is unproven (not yet ``proven`` tier),
+    has a ``working`` status, and declares at least one ``backing_path``. Enabling
+    ``capability_proof_execution_trials_enabled`` allows the earn loop to discover
+    test coverage for these capabilities and enroll bounded execution trials that
+    can mint the real ``proven`` tier — clearing the enforce gate.
+
+    This is a STATIC, read-only projection — no git HEAD checks or test discovery
+    are performed. It answers the operator question "how many capabilities could
+    benefit from enabling trials?" based purely on problem_model declarations.
+
+    Returns a dict with:
+
+    * ``trial_eligible`` — caps with backing_paths that are unproven working
+    * ``unproven_working`` — total unproven working caps across the scanned fleet
+    * ``projects_contributing`` — projects with at least one unproven working cap
+    * ``num_projects`` — projects scanned (bounded by ``max_projects``)
+    """
+    from app.capability_registry import working_capability_proof_status
+    from app.models import Project
+
+    projects = (
+        await session.execute(
+            select(
+                Project.id,
+                Project.problem_model,
+            ).limit(max_projects)
+        )
+    ).all()
+
+    total_trial_eligible = 0
+    total_unproven_working = 0
+    projects_contributing = 0
+
+    for _project_id, raw_pm in projects:
+        pm = raw_pm if isinstance(raw_pm, dict) else {}
+        proof_by_name = working_capability_proof_status(pm)
+        if not proof_by_name:
+            continue
+
+        unproven_names = {
+            name for name, status in proof_by_name.items() if status != "proven"
+        }
+        if not unproven_names:
+            continue
+
+        projects_contributing += 1
+        total_unproven_working += len(unproven_names)
+
+        caps = pm.get("capabilities") or []
+        for cap in caps:
+            if not isinstance(cap, dict):
+                continue
+            raw_name = cap.get("name", "")
+            if not isinstance(raw_name, str):
+                continue
+            # Normalize the name the same way working_capability_proof_status does.
+            norm = raw_name.lower().replace(" ", "-").strip("-")
+            if norm not in unproven_names:
+                continue
+            bp = cap.get("backing_paths")
+            if isinstance(bp, list) and any(isinstance(p, str) and p for p in bp):
+                total_trial_eligible += 1
+
+    return {
+        "trial_eligible": total_trial_eligible,
+        "unproven_working": total_unproven_working,
+        "projects_contributing": projects_contributing,
+        "num_projects": len(projects),
+    }
+
+
 @register_check(
     "capability_proof_gate_auto_graduation",
     "Compute fleet-wide capability proof coverage and automatically advance the "

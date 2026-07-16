@@ -423,6 +423,27 @@ async def get_settings(
             exc_info=True,
         )
 
+    # Projection: how many capabilities would be trial-eligible if the
+    # execution-trials flag were enabled. Best-effort; must never break load.
+    capability_proof_trial_projection: dict = {
+        "trial_eligible": 0,
+        "unproven_working": 0,
+        "projects_contributing": 0,
+        "num_projects": 0,
+    }
+    try:
+        from app.metrics_integrity_sweep import compute_trial_eligibility_projection
+
+        capability_proof_trial_projection = await compute_trial_eligibility_projection(
+            session,
+            int(_runtime_config.get("metrics_integrity_sweep_max_projects", 25)),
+        )
+    except Exception:
+        logger.warning(
+            "failed to compute capability-proof trial eligibility projection",
+            exc_info=True,
+        )
+
     return {
         "max_concurrent_vms": _runtime_config["max_concurrent_vms"],
         "max_retries": _runtime_config["max_retries"],
@@ -493,6 +514,7 @@ async def get_settings(
             )
         ),
         "capability_proof_gate_coverage": capability_proof_gate_coverage,
+        "capability_proof_trial_projection": capability_proof_trial_projection,
         "capability_proof_execution_trials_enabled": bool(
             _runtime_config.get("capability_proof_execution_trials_enabled", False)
         ),

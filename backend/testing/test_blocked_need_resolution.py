@@ -2928,6 +2928,74 @@ async def test_compute_fleet_proof_coverage_empty_fleet(_grad_db):
     assert cov["total_non_exempt_working"] == 0
 
 
+# ── compute_trial_eligibility_projection (settings surface) ─────────────────
+
+
+@pytest.mark.asyncio
+async def test_compute_trial_eligibility_projection_counts_backed_unproven(_grad_db):
+    """Caps with backing_paths that are unproven working are counted as
+    trial-eligible; proven caps and caps with no backing_paths are not."""
+    from app.metrics_integrity_sweep import compute_trial_eligibility_projection
+
+    # One unproven cap with backing_paths (trial-eligible), one without.
+    await _create_project_with_caps(
+        _grad_db,
+        [
+            {
+                "name": "Cap A",
+                "status": "working",
+                "backing_paths": ["backend/app/cap_a.py"],
+            },
+            {
+                "name": "Cap B",
+                "status": "working",
+                "backing_paths": [],
+            },
+        ],
+    )
+
+    proj = await compute_trial_eligibility_projection(_grad_db, 10)
+    assert proj["trial_eligible"] == 1, "only Cap A has backing_paths → 1 eligible"
+    assert proj["unproven_working"] == 2, "both caps are unproven working"
+    assert proj["projects_contributing"] == 1
+    assert proj["num_projects"] == 1
+
+
+@pytest.mark.asyncio
+async def test_compute_trial_eligibility_projection_excludes_proven(_grad_db):
+    """A cap that already has a named_test proven ref is NOT trial-eligible —
+    it is counted as proven, not unproven, so it does not inflate the projection."""
+    from app.metrics_integrity_sweep import compute_trial_eligibility_projection
+
+    await _create_project_with_caps(
+        _grad_db,
+        [
+            {
+                "name": "Cap Proven",
+                "status": "working",
+                "backing_paths": ["backend/app/proven.py"],
+                "evidence_refs": [_proven_ref()],
+            },
+        ],
+    )
+
+    proj = await compute_trial_eligibility_projection(_grad_db, 10)
+    assert proj["trial_eligible"] == 0, "proven cap must not be trial-eligible"
+    assert proj["unproven_working"] == 0
+
+
+@pytest.mark.asyncio
+async def test_compute_trial_eligibility_projection_empty_fleet(_grad_db):
+    """An empty fleet yields zero counts and num_projects=0."""
+    from app.metrics_integrity_sweep import compute_trial_eligibility_projection
+
+    proj = await compute_trial_eligibility_projection(_grad_db, 10)
+    assert proj["trial_eligible"] == 0
+    assert proj["unproven_working"] == 0
+    assert proj["projects_contributing"] == 0
+    assert proj["num_projects"] == 0
+
+
 # ── Core acceptance-evidence test ──────────────────────────────────────────
 
 
