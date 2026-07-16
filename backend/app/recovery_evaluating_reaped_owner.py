@@ -171,6 +171,29 @@ async def _handle_reaped_owner_fallback(
                 )
         return True
 
+    if _fb_pr_data is not None:
+        # Review/Fix children may be attached to the owner's rollup ancestor,
+        # so ``all_children_terminal`` never reaches the normal reconcile
+        # handler. An open marker-less PR must still re-arm its state consumer.
+        from sqlalchemy.orm.attributes import flag_modified
+
+        _fb_ctx = dict(ctx)
+        _fb_ctx["_pr_state_check_pending"] = True
+        task.context = _fb_ctx
+        task.latest_status_message = (
+            f"Reaped-owner fallback: PR #{_fb_pr_num} still open; "
+            "re-armed review reconciliation"
+        )
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+        await services.broadcast_to_project(
+            str(task.project_id),
+            "task_updated",
+            {"task_id": str(task.id), "status": TaskStatus.EVALUATING},
+        )
+        return True
+
     return False
 
 

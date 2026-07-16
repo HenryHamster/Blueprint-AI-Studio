@@ -9542,6 +9542,41 @@ async def test_unblock_sweep_optimistically_retries_agent_precondition_without_d
 
 
 @pytest.mark.asyncio
+async def test_unblock_sweep_does_not_retry_viewport_capability_sentinel(
+    reaper_db, mocker
+):
+    """A deterministic missing browser capability must not rerun all tests."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    t = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="precondition",
+        blocked_reason=(
+            "BLOCKER: VIEWPORT_GATE_INFRA_UNAVAILABLE: Chromium bootstrap failed"
+        ),
+        depends_on=[],
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "precondition",
+                "reason": "VIEWPORT_GATE_INFRA_UNAVAILABLE",
+            }
+        },
+        recheck_after=now - timedelta(minutes=1),
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 0
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.BLOCKED
+    assert t.context.get("_blocked_optimistic_retries") is None
+    assert t.context.get("_blocked_recheck_attempts") == 1
+
+
+@pytest.mark.asyncio
 async def test_unblock_sweep_parks_agent_precondition_after_retry_budget_spent(
     reaper_db, mocker
 ):

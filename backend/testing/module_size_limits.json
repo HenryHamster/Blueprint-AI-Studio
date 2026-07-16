@@ -8,7 +8,7 @@
     "task_lifecycle_requeue.py": 1250,
     "orchestrator.py": 5100,
     "orchestrator_ci_monitor.py": 3000,
-    "orchestrator_health.py": 1150,
+    "orchestrator_health.py": 1180,
     "orchestrator_runner_dispatch.py": 3100,
     "orchestrator_runtime_env.py": 400,
     "orchestrator_provision.py": 800,

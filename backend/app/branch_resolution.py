@@ -857,15 +857,14 @@ async def merged_pr_counts_as_integration_landing(
     return False
 
 
-async def recut_dependent_base_from_integration(task, project, session) -> str:
-    """Re-cut a held cross-rollup code-dependent's base from CURRENT integration.
+async def recut_dependent_base_from_branch(
+    task, project, session, *, source_branch: str
+) -> str:
+    """Re-cut a held code-dependent's base from a proven source branch.
 
-    A dependent that was HELD until a genuine cross-rollup code-dependency landed
-    on the integration trunk must run against a base that PROVABLY contains that
-    landed code. This merges the project's integration branch INTO the
-    dependent's staging/rollup base branch (via the GitHub merges API), bringing
-    the landed code in without re-homing the dependent onto integration — so the
-    rollup model and the qualify->promote gate are preserved.
+    The source is normally project integration. For sibling plans under one
+    research parent it can be their shared research staging branch after the
+    dependency's plan parent has merged there.
 
     The dependent keeps its own staging branch (it still rolls up); only its
     content is brought up to current integration. Sibling work already on a
@@ -887,13 +886,10 @@ async def recut_dependent_base_from_integration(task, project, session) -> str:
 
     Deferred imports keep this module a leaf on the hot resolver path.
     """
-    integration_branch = get_project_integration_branch(project)
     base_branch = (getattr(task, "first_payload", None) or {}).get(
         "base_branch"
-    ) or integration_branch
-    if base_branch == integration_branch:
-        # The dependent already bases on the integration trunk — cloning its
-        # HEAD at dispatch already includes the landed code. Nothing to re-cut.
+    ) or get_project_integration_branch(project)
+    if base_branch == source_branch:
         return "ok"
 
     try:
@@ -906,27 +902,27 @@ async def recut_dependent_base_from_integration(task, project, session) -> str:
             owner,
             repo,
             base=base_branch,
-            head=integration_branch,
+            head=source_branch,
             commit_message=(
-                f"Merge {integration_branch} into {base_branch} so dependent "
+                f"Merge {source_branch} into {base_branch} so dependent "
                 f"task {str(task.id)[:8]} bases on landed dependency code"
             ),
             project_id=str(getattr(task, "project_id", "") or "") or None,
         )
     except Exception:
         logger.exception(
-            "[CROSS-BASE] Re-cut of base %r from integration %r failed for task %s",
+            "[CROSS-BASE] Re-cut of base %r from source %r failed for task %s",
             base_branch,
-            integration_branch,
+            source_branch,
             getattr(task, "id", None),
         )
         return "error"
 
     if result.get("merged"):
         logger.info(
-            "[CROSS-BASE] Re-cut base %r from integration %r for task %s (%s)",
+            "[CROSS-BASE] Re-cut base %r from source %r for task %s (%s)",
             base_branch,
-            integration_branch,
+            source_branch,
             getattr(task, "id", None),
             "already up to date" if result.get("already") else "merged",
         )
@@ -938,6 +934,16 @@ async def recut_dependent_base_from_integration(task, project, session) -> str:
         # fold it into the transient "error" bucket that retries forever.
         return "missing"
     return "error"
+
+
+async def recut_dependent_base_from_integration(task, project, session) -> str:
+    """Backward-compatible wrapper for integration-sourced re-cuts."""
+    return await recut_dependent_base_from_branch(
+        task,
+        project,
+        session,
+        source_branch=get_project_integration_branch(project),
+    )
 
 
 def is_single_branch_project(project) -> bool:
