@@ -1236,6 +1236,14 @@ async def sweep_unblock_blocked_tasks(
     # a capability need the registry already declares ``working`` is satisfied by
     # the codebase itself and resumes with no edge.
     registry_cache: dict = {}
+    # ── Gate revalidation caches (repo-wide gate failures) ──────────────
+    # Per-project gate state cache: project_id → {head_sha, green_at_head,
+    # checked_at_utc}.  Populated on first gate-failure-blocked task per
+    # project and reused across siblings in the same sweep batch.
+    _gate_cache: dict[str, dict] = {}
+    # Per-project GitHub token cache: project_id → installation token string.
+    # Populated by resolve_gate_state and reused across sibling tasks.
+    _github_cache: dict[str, str] = {}
 
     async def _escalate_blocked_task(
         task,
@@ -1320,6 +1328,67 @@ async def sweep_unblock_blocked_tasks(
             continue
 
         _bc_start = len(pending_broadcasts)
+
+        # ── Gate revalidation for repo-wide gate failures ──────────────
+        # When integration HEAD has advanced past the task's branch point,
+        # cheaply re-check the gate condition against current HEAD instead
+        # of spawning a suite run.  One GitHub check-runs call per project
+        # per sweep cycle (cached), not per blocked task.
+        from app.gate_revalidation import is_gate_failure_blocked as _gfb
+
+        if _gfb(task):
+            from app.gate_revalidation import (
+                has_live_respawn,
+                head_advanced_since_gate_failure,
+                resolve_gate_state,
+            )
+
+            _pid_key = str(task.project_id)
+            _gs = _gate_cache.get(_pid_key)
+            if _gs is None:
+                _gs = await resolve_gate_state(
+                    session,
+                    task.project_id,
+                    github_info_cache=_github_cache,
+                )
+                _gate_cache[_pid_key] = _gs or {}
+            if (
+                _gs
+                and _gs.get("green_at_head")
+                and head_advanced_since_gate_failure(task, _gs.get("head_sha"))
+                and not await has_live_respawn(task, session)
+            ):
+                from sqlalchemy.orm.attributes import flag_modified
+
+                _clear_blocked_fields(task, preserve_first_blocked=False)
+                task.status = TaskStatus.QUEUED
+                task.latest_status_message = (
+                    "Unblocked — repo-wide gate resolved at integration HEAD "
+                    f"({_gs['head_sha'][:12]}), requeued on fresh base"
+                )
+                ctx = task.context or {}
+                ctx["_gate_revalidated_at"] = _gs["checked_at_utc"]
+                ctx["_gate_revalidated_head"] = _gs["head_sha"]
+                task.context = ctx
+                flag_modified(task, "context")
+                session.add(task)
+                requeued += 1
+                pending_broadcasts.append(
+                    (
+                        str(task.project_id),
+                        {
+                            "task_id": str(task.id),
+                            "status": "QUEUED",
+                            "message": task.latest_status_message,
+                        },
+                    )
+                )
+                await _commit_task_row(_bc_start)
+                continue
+            # A live same-scope respawn means DON'T unblock; fall through to the
+            # existing blocker machinery so the respawn completes instead of
+            # racing the recovered original.
+
         ctx = task.context or {}
         # Multi-need classification (shared by the parked and live paths): a
         # blocked dependent can wait on MORE THAN ONE prerequisite. Classify EVERY
