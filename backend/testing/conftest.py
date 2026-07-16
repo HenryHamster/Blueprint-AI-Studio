@@ -304,11 +304,24 @@ def reset_runtime_config():
     runtime_config dict in-place (e.g. residual_audit_defer_escalation_threshold).
     Without a reset those mutations bleed into unrelated tests and break
     assertions that rely on hardcoded defaults.
+
+    env_preflight_enabled defaults to False in tests so the Slice-3
+    env-preflight gate (promotion_policy.yaml env_preflight_enabled: true)
+    does not affect tests that don't explicitly opt into it.
     """
     import copy
     from app import shared_state
 
     snapshot = copy.deepcopy(shared_state.runtime_config)
+    # Ensure env_preflight is off by default in tests — individual tests
+    # that exercise the env-preflight gate set it explicitly.  Must be set
+    # on the LIVE runtime_config BEFORE the yield (not just in the snapshot)
+    # so run_qualification and _finalize_qualification see it during the test.
+    # Always override regardless of the starting value because
+    # runtime_config_state syncs env_preflight_enabled from
+    # promotion_policy.yaml at startup.
+    shared_state.runtime_config["env_preflight_enabled"] = False
+    snapshot["env_preflight_enabled"] = False
     yield
     shared_state.runtime_config.clear()
     shared_state.runtime_config.update(snapshot)

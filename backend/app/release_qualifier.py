@@ -2741,7 +2741,11 @@ async def run_qualification(
     _audit_needed = not (
         "audit" in resolved_dims and "test_erosion" in resolved_dims
     )
-    _smoketest_needed = smoketest_enabled and "smoketest" not in resolved_dims
+    # The qualifier-smoketest child is the evidence producer for BOTH the
+    # smoketest score AND the candidate-side env-preflight evidence (Slice 2,
+    # design 245212a4).  Spawn it when EITHER subsystem is enabled so the
+    # env-preflight gate is independently enforceable without smoketest.
+    _smoketest_needed = (smoketest_enabled or env_preflight_enabled) and "smoketest" not in resolved_dims
     _merge_grade_needed = (
         _merge_grade_goal_usable and "merge_grade" not in resolved_dims
     )
@@ -2841,6 +2845,15 @@ async def run_qualification(
         return {"status": "spawn_failed"}
 
     audit_challenge_spawn_pending = _audit_needed
+
+    # When the smoketest dimension is already resolved from a prior finalize
+    # (same candidate SHA) but env-preflight is enabled, carry forward the
+    # prior child's task_id so _finalize_qualification can re-read the
+    # SMOKETEST_RESULT artifact for env-preflight evidence.  Without this
+    # the evidence is lost and the boot_prereq_evidence_missing block fires
+    # spuriously on a same-SHA re-drive.
+    if env_preflight_enabled and "smoketest" in resolved_dims and not smoketest_task_id:
+        smoketest_task_id = prior_qual.get("smoketest_task_id")
 
     # 6. Stamp the pending qualification record.  smoketest_task_id is None
     #    when the smoketest subsystem is disabled — maybe_finalize_qualification
@@ -3005,6 +3018,11 @@ _BLOCKER_LABELS: dict[str, str] = {
         "a boot/env prerequisite the candidate declares is absent from the "
         "deploy-target environment (presence-only): bind the missing secret(s) "
         "in the deploy target before promotion"
+    ),
+    "boot_prereq_evidence_missing": (
+        "the candidate produced no boot/env-prerequisite evidence, so the boot "
+        "gate cannot be certified — ensure the evidence producer runs on the "
+        "candidate tree"
     ),
     # NOTE: ``uncorroborated_attestation`` was retired with the attestation gate
     # it labeled (replaced by the per-category goal-verification gate, whose
@@ -4623,6 +4641,14 @@ async def _finalize_qualification(
     _policy_project = await session.get(Project, version.project_id)
     policy = _load_policy(_policy_project)
 
+    # Resolve env_preflight_enabled EARLY — before the child-terminal-status
+    # checks and artifact reads — so both can reference it.  The flag was
+    # captured on the pending record at spawn; legacy records predating it
+    # default to the policy fallback.
+    env_preflight_enabled = bool(
+        qual.get("env_preflight_enabled", policy.get("env_preflight_enabled", False))
+    )
+
     # Resolve the launch contract before checking child infrastructure state.
     # Rubric drift is authoritative for this attempt: a lifecycle/text change
     # must be recorded even if a required child also failed while it ran.
@@ -4851,7 +4877,11 @@ async def _finalize_qualification(
             )
 
     _smoke_task_obj: Task | None = None
-    if smoketest_enabled and smoketest_task_id:
+    # A FAILED/CANCELLED/BLOCKED child is an infra failure regardless of
+    # which subsystem spawned it (smoketest OR env-preflight).  Check the
+    # terminal status before reading artifacts so the quality-verdict path
+    # only sees COMPLETED children.
+    if (smoketest_enabled or env_preflight_enabled) and smoketest_task_id:
         try:
             _smoke_task_obj = await session.get(Task, uuid.UUID(str(smoketest_task_id)))
             if (
@@ -5034,12 +5064,13 @@ async def _finalize_qualification(
     )
 
     # --- Read the smoketest result -----------------------------------------
-    # Audit H3: only when the smoketest subsystem was enabled — a disabled run
-    # spawned no qualifier-smoketest child, so there is no SMOKETEST_RESULT to
-    # read and smoketest_score stays None (compute_composite drops the
-    # dimension rather than hard-blocking on it).  When the smoketest dimension
-    # is already resolved from a prior finalize at this candidate_sha, compose
-    # from the ledger (the smoketest child was not re-spawned).
+    # Read the SMOKETEST_RESULT whenever the qualifier-smoketest child was
+    # spawned — whether for smoketest scoring, env-preflight evidence, or both.
+    # Audit H3: when smoketest is disabled the smoketest SCORE is dropped (the
+    # child may still have run for env-preflight evidence).  When the smoketest
+    # dimension is already resolved from a prior finalize at this candidate_sha,
+    # compose the SCORE from the ledger but still re-read the artifact for
+    # env-preflight evidence when enabled.
     if "smoketest" in resolved_dims:
         smoketest_result = None
         _smoke_score = resolved_dims["smoketest"].get("sub_score")
@@ -5056,9 +5087,26 @@ async def _finalize_qualification(
         else:
             smoketest_score = _smoke_score if _smoke_score is not None else 1.0
         smoketest_detail = resolved_dims["smoketest"].get("detail") or {}
+        # Also read the SMOKETEST_RESULT artifact for env-preflight evidence
+        # when env_preflight is enabled.  The artifact still exists from the
+        # prior finalize that resolved the smoketest dimension; smoketest_task_id
+        # was carried forward by run_qualification for this purpose.
+        if env_preflight_enabled and smoketest_task_id:
+            try:
+                smoketest_result = await _latest_artifact_logs(
+                    session,
+                    uuid.UUID(str(smoketest_task_id)),
+                    ArtifactType.SMOKETEST_RESULT,
+                )
+            except (ValueError, TypeError):
+                pass
     else:
         smoketest_result: dict[str, Any] | None = None
-        if smoketest_enabled and smoketest_task_id:
+        # Read the SMOKETEST_RESULT when EITHER smoketest or env-preflight
+        # was enabled (both use the same qualifier-smoketest child to
+        # produce the artifact).  When neither was enabled the child was
+        # never spawned and smoketest_task_id is None.
+        if (smoketest_enabled or env_preflight_enabled) and smoketest_task_id:
             try:
                 smoketest_result = await _latest_artifact_logs(
                     session,
@@ -5071,6 +5119,10 @@ async def _finalize_qualification(
                     smoketest_task_id,
                     version.version_number,
                 )
+        # smoketest_report_missing is gated to smoketest_enabled: when the
+        # child ran ONLY for env-preflight, a missing artifact surfaces as
+        # the deterministic boot_prereq_evidence_missing block, never an
+        # infra-failure retry loop (the v22 migration-gate lesson).
         if (
             smoketest_enabled
             and smoketest_task_id
@@ -5102,17 +5154,11 @@ async def _finalize_qualification(
     )
 
     # DEPLOYED-side env-preflight judge (Slice 3, design 245212a4), DARK by
-    # default.  Read the flag captured on the pending record at spawn (mirrors
-    # smoketest_enabled); legacy records predate it and default to False.  A
-    # promotion_policy.yaml / runtime rubric default is the last-resort fallback
-    # so the flag can be armed centrally.  The judge scores the candidate's
-    # declared env prerequisites (env_preflight artifact) against a PRESENCE-ONLY
-    # snapshot of THIS deployed process's own os.environ — never a value.  When
-    # the flag is False every downstream use is inert (score/missing ignored,
-    # no boot_prereq_missing blocker, no sub_score, no verdict blob).
-    env_preflight_enabled = bool(
-        qual.get("env_preflight_enabled", policy.get("env_preflight_enabled", False))
-    )
+    # default.  The flag was resolved above (before the smoketest result read)
+    # so the deployment-time checks in this section (env_preflight_score,
+    # env_preflight_missing, ack_override) can reference it.  When the flag is
+    # False every downstream use is inert (score/missing ignored, no
+    # boot_prereq_missing blocker, no sub_score, no verdict blob).
     env_preflight_score, env_preflight_missing, env_preflight_scope = (
         _score_env_preflight(
             env_preflight, _deployed_env_presence_snapshot(env_preflight)
@@ -6858,7 +6904,7 @@ async def _required_children_terminal(
     smoketest_resolved = "smoketest" in resolved_dims
     merge_grade_resolved = "merge_grade" in resolved_dims
 
-    smoketest_required = bool(qual.get("smoketest_enabled", True))
+    smoketest_required = bool(qual.get("smoketest_enabled") or qual.get("env_preflight_enabled", False))
     audit_task_id_raw = qual.get("audit_task_id")
     challenge_task_id_raw = qual.get("challenge_task_id")
     smoketest_task_id_raw = qual.get("smoketest_task_id")

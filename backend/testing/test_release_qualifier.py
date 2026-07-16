@@ -6851,14 +6851,15 @@ async def test_run_qualification_spawns_both_children_when_smoketest_enabled(
 
 @pytest.mark.asyncio
 async def test_run_qualification_skips_smoketest_when_disabled(db_session, mocker):
-    """Audit H3: with smoketest_enabled=False (the shipped default), only the
-    release_audit child is spawned — NO qualifier-smoketest task — and
-    last_qualification records smoketest_enabled=False with
+    """Audit H3: with smoketest_enabled=False and env_preflight_enabled=False,
+    only the release_audit child is spawned — NO qualifier-smoketest task —
+    and last_qualification records smoketest_enabled=False with
     smoketest_task_id None."""
     from app import shared_state
 
     # Explicit for clarity — this is also the autouse-reset default.
     shared_state.runtime_config["smoketest_enabled"] = False
+    shared_state.runtime_config["env_preflight_enabled"] = False
 
     project, version = await _make_project_and_version(db_session, phase="stabilize")
 
@@ -6903,6 +6904,61 @@ async def test_run_qualification_skips_smoketest_when_disabled(db_session, mocke
     by_type = {(t.first_payload or {}).get("type"): t for t in tasks}
     assert by_type["release_audit"].first_payload["candidate_sha"] == candidate
     assert by_type["release_audit"].first_payload["diff_range"] == f"main...{candidate}"
+
+
+@pytest.mark.asyncio
+async def test_run_qualification_spawns_smoketest_when_env_preflight_enabled_only(
+    db_session, mocker
+):
+    """Audit H3 / boot-gate: with smoketest_enabled=False but env_preflight_enabled=True,
+    run_qualification still spawns the smoketest child (carrying the env-preflight
+    run) and stamps smoketest_task_id non-None so the finalize gate can wait for it."""
+    from app import shared_state
+
+    shared_state.runtime_config["smoketest_enabled"] = False
+    shared_state.runtime_config["env_preflight_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    candidate = "babe5678" * 5  # 40-char placeholder SHA
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value=candidate),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"status": "completed", "conclusion": "success"}),
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    assert result["status"] == "spawned"
+    assert result["smoketest_enabled"] is False
+    assert result["env_preflight_enabled"] is True
+    # smoketest child IS spawned even though smoketest_enabled is False,
+    # because env_preflight_enabled triggers the same spawn path.
+    assert result["smoketest_task_id"] is not None
+
+    await db_session.refresh(version)
+    assert version.last_qualification["smoketest_enabled"] is False
+    assert version.last_qualification["env_preflight_enabled"] is True
+    assert version.last_qualification["smoketest_task_id"] is not None
+
+    from sqlmodel import select
+
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    types = sorted((t.first_payload or {}).get("type") for t in tasks)
+    # Both release_audit and smoketest children are spawned.
+    assert types == ["release_audit", "smoketest"]
 
 
 @pytest.mark.asyncio
@@ -10131,6 +10187,7 @@ async def _seed_qualification_children(
         "candidate_sha": _candidate_sha,
         "ci_green": ci_green,
         "smoketest_enabled": True,
+        "env_preflight_enabled": False,
         "started_at": "2026-05-19T00:00:00",
         "audit_task_id": str(audit_task.id),
         "smoketest_task_id": str(smoke_task.id),
@@ -21497,6 +21554,7 @@ async def _seed_pending_qualification(
         "candidate_sha": candidate_sha or "abcd" * 10,
         "ci_green": True,
         "smoketest_enabled": True,
+        "env_preflight_enabled": False,
         "started_at": started_at or _utcnow().isoformat(),
         "audit_task_id": str(audit_task.id),
         "smoketest_task_id": str(smoke_task.id),
@@ -21654,6 +21712,7 @@ async def _finalize_with_smoketest_logs(db_session, smoke_logs: dict):
     rubric_fingerprint = rq._rubric_fingerprint(rubric_snapshot)
     version.last_qualification = {
         **version.last_qualification,
+        "env_preflight_enabled": True,
         "rubric_snapshot": rubric_snapshot,
         "rubric_fingerprint": rubric_fingerprint,
         "rubric_lifecycle_snapshot": rubric_lifecycle,
@@ -21699,11 +21758,16 @@ async def _finalize_with_smoketest_logs(db_session, smoke_logs: dict):
 
 
 @pytest.mark.asyncio
-async def test_finalize_surfaces_env_preflight_evidence_without_gating(db_session):
+async def test_finalize_surfaces_env_preflight_evidence_without_gating(db_session, monkeypatch):
     """Slice 2 acceptance: a qualification run stores the pure-content
     {required_env, startup_check_names, manifest_source} env_preflight artifact
-    on last_qualification, sanitized to presence-only, with promotion confidence
-    and blocker UNCHANGED vs the same run without the artifact (no gating)."""
+    on last_qualification, sanitized to presence-only.
+
+    The run WITH evidence passes (declared vars were all-present in
+    scope=cloud_run context).  The run WITHOUT evidence now fail-closes
+    with boot_prereq_evidence_missing — evidence absence is a
+    deterministic block, not a silent pass (the fix for Defect 2).
+    """
     base_smoke = {
         "passed": True,
         "tests": [{"name": "a", "status": "pass"}],
@@ -21734,19 +21798,18 @@ async def test_finalize_surfaces_env_preflight_evidence_without_gating(db_sessio
     }
     assert "value" not in stored["required_env"][0]
 
-    # No gating: the run WITHOUT the artifact carries env_preflight=None but the
-    # promotion decision, confidence, and blocker are byte-for-byte identical.
+    # WITHOUT evidence: now fail-closes (boot_prereq_evidence_missing).
     assert without_qual["env_preflight"] is None
-    assert with_result["status"] == without_result["status"] == "dry_run"
-    assert with_result["would_promote"] is without_result["would_promote"] is True
-    assert (
-        with_qual["confidence"]
-        == without_qual["confidence"]
+    assert without_qual["blocker"] == "boot_prereq_evidence_missing", (
+        f"Expected boot_prereq_evidence_missing, got {without_qual['blocker']!r} — "
+        "missing evidence must fail-closed"
     )
-    assert (
-        with_qual["blocker"]
-        == without_qual["blocker"]
-    )
+    assert without_result["status"] == "not_promoted"
+
+    # WITH evidence (cloud_run-scoped vars are present in cloud_run context):
+    # promotion proceeds normally.
+    assert with_result["status"] == "dry_run"
+    assert with_result["would_promote"] is True
 
 
 def test_policy_env_preflight_enabled_default_on():
@@ -21816,6 +21879,14 @@ async def test_env_preflight_gate_fires_and_names_missing_var(db_session, monkey
         },
         smoke_logs=smoke_logs,
     )
+    # Enable env_preflight explicitly (seed defaults to False).
+    version.last_qualification = {
+        **version.last_qualification,
+        "env_preflight_enabled": True,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
 
     await rq._finalize_qualification(db_session, version)
     await db_session.commit()
@@ -21849,12 +21920,15 @@ async def test_env_preflight_gate_fires_and_names_missing_var(db_session, monkey
 
 @pytest.mark.asyncio
 async def test_env_preflight_gate_inert_when_no_artifact(db_session):
-    """When env_preflight_enabled is true but no env_preflight artifact was
-    produced by the smoketest (no manifest), the gate is inert — no
-    boot_prereq_missing block, and promotion proceeds normally.
+    """When env_preflight_enabled is true but no env_preflight evidence was
+    produced (the SMOKETEST_RESULT artifact exists but carries no env_preflight
+    key), the gate NOW FAILS CLOSED with boot_prereq_evidence_missing.
 
-    This distinguishes 'no declared requirements' (pass through) from 'declared
-    but absent' (hard block).
+    This is the corrected behavior (previously the defect was that missing
+    evidence silently passed through — a fail-open).  The evidence-missing
+    block is a deterministic quality verdict, never an infra-failure retry loop.
+    A real successful producer always emits a non-empty manifest (even
+    required_env: []), so 'no artifact while enabled' legitimately fail-closes.
     """
     from app import shared_state
 
@@ -21873,26 +21947,34 @@ async def test_env_preflight_gate_inert_when_no_artifact(db_session):
                 "test_count_delta": 0,
             },
         },
-        # No env_preflight key in smoke_logs — candidate declared no requirements.
+        # No env_preflight key in smoke_logs — no evidence produced.
         smoke_logs={
             "passed": True,
             "tests": [{"name": "a", "status": "pass"}],
             "suites": {"startup": {"passed": True}},
         },
     )
+    # Enable env_preflight explicitly (seed defaults to False).
+    version.last_qualification = {
+        **version.last_qualification,
+        "env_preflight_enabled": True,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
 
     await rq._finalize_qualification(db_session, version)
     await db_session.commit()
     await db_session.refresh(version)
 
     qual = version.last_qualification
-    # Gate is inert when no artifact — no boot_prereq_missing.
-    assert qual["blocker"] != "boot_prereq_missing", (
-        "boot_prereq_missing must NOT fire when no env_preflight artifact was produced"
+    # Gate must hard-block with evidence-missing when enabled but no evidence.
+    assert qual["blocker"] == "boot_prereq_evidence_missing", (
+        f"Expected boot_prereq_evidence_missing, got {qual['blocker']!r} — "
+        "env_preflight gate must fail-closed when no evidence was produced"
     )
-    # Promotion proceeds (dry_run since promotion_enabled=False).
-    assert qual["status"] == "dry_run"
-    assert qual["would_promote"] is True
+    assert qual["status"] == "not_promoted"
+    assert qual["confidence"] == 0.0
 
 
 @pytest.mark.asyncio
@@ -21939,6 +22021,14 @@ async def test_env_preflight_gate_inert_for_cloud_run_only_var_in_non_cloud_run_
         },
         smoke_logs=smoke_logs,
     )
+    # Enable env_preflight explicitly (seed defaults to False).
+    version.last_qualification = {
+        **version.last_qualification,
+        "env_preflight_enabled": True,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
 
     await rq._finalize_qualification(db_session, version)
     await db_session.commit()
@@ -21993,9 +22083,10 @@ async def test_env_preflight_gate_inert_with_ack_override(db_session, monkeypatc
         },
         smoke_logs=smoke_logs,
     )
-    # Arm the Slice-4 one-shot ack.
+    # Arm the Slice-4 one-shot ack and enable env_preflight (seed defaults to False).
     version.last_qualification = {
         **version.last_qualification,
+        "env_preflight_enabled": True,
         "ack_env_will_be_bound": {
             "actor": "test-operator",
             "acknowledged_at": "2026-07-16T00:00:00",
@@ -22020,6 +22111,195 @@ async def test_env_preflight_gate_inert_with_ack_override(db_session, monkeypatc
     # Missing names still recorded for audit (presence-only, names never values).
     assert _ABSENT_VAR in qual["env_preflight_ack_applied"]["missing"]
     # Dry-run promotion proceeds.
+    assert qual["status"] == "dry_run"
+    assert qual["would_promote"] is True
+
+
+@pytest.mark.asyncio
+async def test_env_preflight_blocks_without_smoketest_child(db_session):
+    """When env_preflight_enabled is True but smoketest_enabled is False
+    and NO env_preflight evidence is produced (the child was never spawned
+    or produced no usable artifact), the gate hard-blocks with
+    boot_prereq_evidence_missing — a deterministic quality verdict, NOT
+    an infra_failure retry loop.
+
+    This is the primary acceptance test: the boot gate is independently
+    enforceable even when the smoketest subsystem is disabled.
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 1,
+                "test_count_delta": 0,
+            },
+        },
+        # No env_preflight in smoke_logs — no evidence produced.
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+    # Simulate: smoketest disabled, env-preflight enabled.
+    version.last_qualification = {
+        **version.last_qualification,
+        "smoketest_enabled": False,
+        "env_preflight_enabled": True,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    qual = version.last_qualification
+    # Must block with boot_prereq_evidence_missing — NOT infra_failure.
+    assert qual["blocker"] == "boot_prereq_evidence_missing", (
+        f"Expected boot_prereq_evidence_missing, got {qual['blocker']!r} — "
+        "env_preflight gate must hard-block when enabled but no evidence produced"
+    )
+    assert qual["status"] == "not_promoted"
+    assert qual["confidence"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_env_preflight_passes_with_evidence_even_without_smoketest(db_session, monkeypatch):
+    """When env_preflight_enabled is True, smoketest_enabled is False, BUT the
+    evidence producer ran successfully and all declared prerequisites are present:
+    promotion proceeds normally (no block, no confidence erosion).
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+    monkeypatch.delenv("K_REVISION", raising=False)
+
+    smoke_logs = {
+        "passed": True,
+        "tests": [{"name": "a", "status": "pass"}],
+        "suites": {"startup": {"passed": True}},
+        "env_preflight": {
+            "required_env": [
+                # scope "always" → in scope for non-cloud-run.
+                {"name": "SOME_PRESENT_VAR", "scope": "always"},
+            ],
+            "startup_check_names": [],
+            "manifest_source": "backend/app/required_runtime_env.py",
+        },
+    }
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 1,
+                "test_count_delta": 0,
+            },
+        },
+        smoke_logs=smoke_logs,
+    )
+    # Simulate: smoketest disabled, env-preflight enabled.
+    version.last_qualification = {
+        **version.last_qualification,
+        "smoketest_enabled": False,
+        "env_preflight_enabled": True,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Ensure the declared required var is present in the deployed env.
+    monkeypatch.setenv("SOME_PRESENT_VAR", "1")
+
+    await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    qual = version.last_qualification
+    # No block — evidence was produced and all vars are present.
+    assert qual["blocker"] is None, (
+        f"Expected no blocker, got {qual['blocker']!r} — "
+        "gate must pass when evidence exists and all vars are present"
+    )
+    # Dry-run promotion proceeds (promotion_enabled=False but would_promote).
+    assert qual["status"] == "dry_run"
+    assert qual["would_promote"] is True
+
+
+@pytest.mark.asyncio
+async def test_env_preflight_passes_with_empty_requirements(db_session, monkeypatch):
+    """When env_preflight_enabled is True and the evidence producer ran
+    successfully reporting required_env: [] (candidate genuinely declares
+    zero prerequisites), the gate passes (score 1.0 — all zero requirements
+    are trivially met).  This must NOT block on evidence-missing or
+    boot_prereq_missing.
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+    monkeypatch.delenv("K_REVISION", raising=False)
+
+    smoke_logs = {
+        "passed": True,
+        "tests": [{"name": "a", "status": "pass"}],
+        "suites": {"startup": {"passed": True}},
+        "env_preflight": {
+            "required_env": [],  # candidate genuinely declares zero prerequisites
+            "startup_check_names": [],
+            "manifest_source": "backend/app/required_runtime_env.py",
+        },
+    }
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 1,
+                "test_count_delta": 0,
+            },
+        },
+        smoke_logs=smoke_logs,
+    )
+    # Simulate env-preflight enabled (smoketest enabled is the seed default).
+    version.last_qualification = {
+        **version.last_qualification,
+        "env_preflight_enabled": True,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    qual = version.last_qualification
+    # No block — evidence exists (empty list = trivially all-present).
+    assert qual["blocker"] is None, (
+        f"Expected no blocker, got {qual['blocker']!r} — "
+        "empty required_env must pass: candidate genuinely declares zero prerequisites"
+    )
     assert qual["status"] == "dry_run"
     assert qual["would_promote"] is True
 
@@ -25689,6 +25969,7 @@ async def _seed_audit_only_pending_qualification(
         "candidate_sha": "abcd" * 10,
         "ci_green": True,
         "smoketest_enabled": False,
+        "env_preflight_enabled": False,
         "started_at": started_at or _utcnow().isoformat(),
         "audit_task_id": str(audit_task.id),
         "smoketest_task_id": None,
@@ -25776,6 +26057,73 @@ async def test_maybe_finalize_smoketest_disabled_audit_only(db_session):
 
     await db_session.refresh(version)
     assert version.last_qualification["status"] == "dry_run"
+
+
+@pytest.mark.asyncio
+async def test_maybe_finalize_env_preflight_only_waits_for_smoketest_child(db_session):
+    """Boot-gate: when smoketest_enabled=False but env_preflight_enabled=True,
+    maybe_finalize_qualification must wait for the smoketest child (which carries
+    the env-preflight run) before finalizing — it must NOT call _finalize_qualification
+    while the smoketest child is still non-terminal."""
+    from app import shared_state
+    from app.time_utils import _utcnow
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session)
+
+    attempt_id = uuid.uuid4()
+    attempt_text = str(attempt_id)
+
+    audit_task = Task(
+        project_id=project.id,
+        title="audit-child",
+        payloads=[{"type": "release_audit", "base_branch": "main", "qualification_attempt_id": attempt_text}],
+        vm_instance_id="vm-audit-epf",
+        status=TaskStatus.COMPLETED,
+        context={"release_version_id": str(version.id), "qualification_attempt_id": attempt_text},
+    )
+    # Smoketest child still running (env-preflight in progress).
+    smoke_task = Task(
+        project_id=project.id,
+        title="smoke-child",
+        payloads=[{"type": "smoketest", "base_branch": "automain", "qualification_attempt_id": attempt_text}],
+        vm_instance_id="vm-smoke-epf",
+        status=TaskStatus.IN_PROGRESS,
+        context={"release_version_id": str(version.id), "qualification_attempt_id": attempt_text},
+    )
+    db_session.add(audit_task)
+    db_session.add(smoke_task)
+    await db_session.commit()
+    await db_session.refresh(audit_task)
+    await db_session.refresh(smoke_task)
+
+    version.last_qualification = {
+        "status": "pending",
+        **_EMPTY_RUBRIC_PROJECTION,
+        "qualification_attempt_id": attempt_text,
+        "candidate_sha": "cafe" * 10,
+        "ci_green": True,
+        "smoketest_enabled": False,
+        "env_preflight_enabled": True,
+        "started_at": _utcnow().isoformat(),
+        "audit_task_id": str(audit_task.id),
+        "smoketest_task_id": str(smoke_task.id),
+    }
+    version.active_qualification_attempt_id = attempt_id
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Triggering via the audit task — audit is done but smoketest is IN_PROGRESS.
+    result = await rq.maybe_finalize_qualification(
+        audit_task, session_factory=_shared_session_factory(db_session)
+    )
+
+    # Must NOT finalize — smoketest child (env-preflight) is still running.
+    assert result is None
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "pending"
 
 
 @pytest.mark.asyncio
