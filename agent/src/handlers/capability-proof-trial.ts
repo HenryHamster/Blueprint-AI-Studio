@@ -82,6 +82,21 @@ function tsPackageDir(ref: string): string {
 }
 
 /**
+ * Returns true when the ref set can be targeted in a single invocation — no Docker
+ * probe, no workspace access. Used for pre-clone early-exit so the Docker check
+ * only runs when the workspace is actually ready and execution is imminent.
+ */
+export function isRefSetTargetable(testRefs: string[]): boolean {
+  const refs = testRefs.filter(r => typeof r === 'string' && r.trim()).map(r => r.trim());
+  if (refs.length === 0) return false;
+  const exts = [...new Set(refs.map(refExt))];
+  if (exts.every(e => e === 'py')) return true;
+  if (!exts.every(e => TS_JS_EXTS.has(e))) return false;
+  // TS/JS: all refs must live in the SAME package.
+  return new Set(refs.map(tsPackageDir)).size === 1;
+}
+
+/**
  * Build the TARGETED runner that runs ONLY the passed covering test refs, choosing
  * the command by test-ref extension (the same per-file targeting primitive the
  * verify-tests gate's `buildAcceptanceTestRunner` embodies):
@@ -192,9 +207,9 @@ export async function handleCapabilityProofTrial(
     });
   };
 
-  // A trial with no cap or no targetable refs is a no-op (mints nothing).
-  const runner = buildCapabilityProofTrialRunner(testRefs, WORKSPACE);
-  if (!cap || testRefs.length === 0 || runner === null) {
+  // Pre-clone targetability check (no Docker probe — isDockerAvailable() only runs
+  // when the workspace is ready and we are about to execute, not here).
+  if (!cap || testRefs.length === 0 || !isRefSetTargetable(testRefs)) {
     sendLog(ws, `Capability proof trial: ${!cap ? 'no capability' : testRefs.length === 0 ? 'no test refs' : 'refs not cleanly targetable'} — reporting could_not_run.\n`);
     await report({
       type: 'capability_proof_trial',
@@ -226,6 +241,20 @@ export async function handleCapabilityProofTrial(
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     sendLog(ws, `Capability proof trial [${cap}]: could not resolve checkout SHA: ${message}\n`);
+  }
+
+  // Build the runner post-clone so the Docker probe reflects execution-time state.
+  const runner = buildCapabilityProofTrialRunner(testRefs, WORKSPACE);
+  if (runner === null) {
+    // Safety: isRefSetTargetable passed pre-clone but runner is null now — treat as
+    // untargetable to avoid a confusing could_not_run classification.
+    sendLog(ws, `Capability proof trial [${cap}]: runner unexpectedly null post-clone — reporting could_not_run.\n`);
+    await report({
+      type: 'capability_proof_trial',
+      cap, head_sha: executedHeadSha, queued_head_sha: headSha, test_refs: testRefs,
+      ran: false, passed: false, could_not_run: true,
+    });
+    return;
   }
 
   statusRef.value = `Running covering tests for capability '${cap}'...`;

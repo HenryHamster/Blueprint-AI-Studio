@@ -524,7 +524,7 @@ async def get_settings(
             _runtime_config.get("metrics_integrity_sweep_interval_minutes", 60)
         ),
         "metrics_integrity_sweep_max_checks": int(
-            _runtime_config.get("metrics_integrity_sweep_max_checks", 25)
+            _runtime_config.get("metrics_integrity_sweep_max_checks", 30)
         ),
         "metrics_integrity_sweep_max_projects": int(
             _runtime_config.get("metrics_integrity_sweep_max_projects", 25)

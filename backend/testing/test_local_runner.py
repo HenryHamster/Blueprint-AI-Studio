@@ -48,6 +48,8 @@ from app.routers.admin_runners import (
 )
 from app.routers.runner import (
     _FileRangeReader,
+    _MAX_MULTIPART_FIELD_BYTES,
+    _MAX_MULTIPART_PARTS,
     _parse_heartbeat_timestamp,
     _parse_multipart_form,
     _parse_multipart_form_stream,
@@ -5667,6 +5669,95 @@ class TestMultipartStreamParser:
         assert fields == {} and file_part is None
 
 
+class TestMultipartParserHardening:
+    """Security hardening: oversized fields and excessive boundary counts are rejected."""
+
+    @staticmethod
+    def _spool(body: bytes):
+        import io
+
+        return io.BytesIO(body)
+
+    @staticmethod
+    def _build_viewable_multipart(filename: str, file_bytes: bytes, *, field_overrides=None):
+        """Build a viewable-endpoint multipart body (filename field + file part)."""
+        boundary = "----test-boundary-hardening"
+        crlf = b"\r\n"
+        extra_fields = field_overrides or {}
+        body = bytearray()
+        # optional extra scalar fields (used to inject oversized content)
+        for name, value in extra_fields.items():
+            body += b"--" + boundary.encode() + crlf
+            body += f'Content-Disposition: form-data; name="{name}"'.encode() + crlf + crlf
+            body += value + crlf
+        body += b"--" + boundary.encode() + crlf
+        body += b'Content-Disposition: form-data; name="filename"' + crlf + crlf
+        body += filename.encode() + crlf
+        body += b"--" + boundary.encode() + crlf
+        body += b'Content-Disposition: form-data; name="file"; filename="plot.png"' + crlf
+        body += b"Content-Type: image/png" + crlf + crlf
+        body += file_bytes + crlf
+        body += b"--" + boundary.encode() + b"--" + crlf
+        return bytes(body), f"multipart/form-data; boundary={boundary}"
+
+    def test_stream_parser_rejects_oversized_non_file_field(self):
+        """A non-file scalar field exceeding _MAX_MULTIPART_FIELD_BYTES raises ValueError."""
+        oversized_value = b"x" * (_MAX_MULTIPART_FIELD_BYTES + 1)
+        body, ct = self._build_viewable_multipart(
+            "plot.png", b"PNG_BYTES", field_overrides={"extra": oversized_value}
+        )
+        with pytest.raises(ValueError, match=r"non-file field.*exceeds"):
+            _parse_multipart_form_stream(self._spool(body), ct)
+
+    def test_in_memory_parser_rejects_oversized_non_file_field(self):
+        """_parse_multipart_form also rejects oversized scalar fields."""
+        oversized_value = b"y" * (_MAX_MULTIPART_FIELD_BYTES + 1)
+        body, ct = self._build_viewable_multipart(
+            "plot.png", b"PNG_BYTES", field_overrides={"extra": oversized_value}
+        )
+        with pytest.raises(ValueError, match=r"non-file field.*exceeds"):
+            _parse_multipart_form(body, ct)
+
+    def test_stream_parser_rejects_too_many_boundaries(self):
+        """A crafted body with more than _MAX_MULTIPART_PARTS boundary markers raises ValueError."""
+        boundary = "----crafted-boundary"
+        crlf = b"\r\n"
+        # Build a body whose boundary string appears far more than max_parts times
+        # without valid multipart structure — this exercises the Pass 1 counter.
+        delimiter = b"--" + boundary.encode()
+        # Each repetition is a minimal delimiter occurrence: delimiter + scalar field
+        body = bytearray()
+        for i in range(_MAX_MULTIPART_PARTS + 2):
+            body += delimiter + crlf
+            body += b'Content-Disposition: form-data; name="f"' + crlf + crlf
+            body += b"v" + crlf
+        body += delimiter + b"--" + crlf
+        ct = f"multipart/form-data; boundary={boundary}"
+        with pytest.raises(ValueError, match=r"more than.*boundary marker"):
+            _parse_multipart_form_stream(self._spool(bytes(body)), ct)
+
+    def test_stream_parser_normal_upload_still_succeeds(self):
+        """A well-formed viewable multipart body is still parsed correctly after hardening."""
+        file_bytes = b"FAKEPNG" * 16
+        body, ct = self._build_viewable_multipart("reward.png", file_bytes)
+        spool = self._spool(body)
+        fields, file_part = _parse_multipart_form_stream(spool, ct)
+        assert fields.get("filename") == b"reward.png"
+        assert file_part is not None
+        assert file_part["length"] == len(file_bytes)
+        # Verify actual file bytes round-trip correctly
+        spool.seek(file_part["start"])
+        assert spool.read(file_part["length"]) == file_bytes
+
+    def test_in_memory_parser_normal_upload_still_succeeds(self):
+        """_parse_multipart_form still works for a well-formed viewable body after hardening."""
+        file_bytes = b"FAKEPNG" * 8
+        body, ct = self._build_viewable_multipart("chart.png", file_bytes)
+        fields, files = _parse_multipart_form(body, ct)
+        assert fields.get("filename") == b"chart.png"
+        assert files.get("file") == file_bytes
+
+
 class TestArtifactUploadEndpoint:
     async def _make_runner_job(self, db_session, *, pinned_runner_id=None):
         project = await _make_project(db_session)
@@ -11092,6 +11183,56 @@ class TestMidRunViewableUpload:
         )
 
     @pytest.mark.asyncio
+    async def test_runner_generation_retry_keeps_revision(self, client, db_session):
+        """A response-loss retry for one runner generation is idempotent."""
+        _project, runner, token, job = await self._make_running_job(db_session)
+        safe_name = "reward.png"
+        fake_uri = self._fake_uri(job.id, safe_name)
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "X-Blueprint-Viewable-Revision": "runner-generation-1",
+        }
+
+        with patch(
+            "app.storage.upload_compute_job_viewable_file", return_value=fake_uri
+        ):
+            first = await client.post(
+                f"/api/runner/compute-job/{job.id}/viewable",
+                data={"filename": safe_name},
+                files={"file": (safe_name, b"same-bytes", "image/png")},
+                headers=headers,
+            )
+            retry = await client.post(
+                f"/api/runner/compute-job/{job.id}/viewable",
+                data={"filename": safe_name},
+                files={"file": (safe_name, b"same-bytes", "image/png")},
+                headers=headers,
+            )
+
+        assert first.status_code == 200
+        assert retry.status_code == 200
+        assert first.json()["entry"]["revision"] == "runner-generation-1"
+        assert retry.json()["entry"]["revision"] == "runner-generation-1"
+
+    @pytest.mark.asyncio
+    async def test_invalid_runner_revision_rejected_before_storage(
+        self, client, db_session
+    ):
+        _project, runner, token, job = await self._make_running_job(db_session)
+        with patch("app.storage.upload_compute_job_viewable_file") as upload:
+            response = await client.post(
+                f"/api/runner/compute-job/{job.id}/viewable",
+                data={"filename": "reward.png"},
+                files={"file": ("reward.png", b"bytes", "image/png")},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "X-Blueprint-Viewable-Revision": "bad revision/with spaces",
+                },
+            )
+        assert response.status_code == 422
+        upload.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_oversize_image_rejected(self, client, db_session):
         """Image exceeding the per-file byte cap → 413."""
         _project, runner, token, job = await self._make_running_job(db_session)
@@ -11141,6 +11282,59 @@ class TestMidRunViewableUpload:
         assert resp.status_code == 409, (
             f"Expected 409 for terminal job, got {resp.status_code}: {resp.text}"
         )
+
+    @pytest.mark.asyncio
+    async def test_terminal_winning_during_live_upload_keeps_terminal_object(
+        self, client, db_session
+    ):
+        """A late live upload must never overwrite terminal's canonical object.
+
+        The fake storage write models the precise ordering from the race report:
+        terminal reconciliation publishes its canonical bytes while the live
+        request is stalled, then the stalled write completes.  Staging means the
+        latter can only write an unreferenced object, and the locked re-check
+        returns 409 without promoting it.
+        """
+        from app import storage
+
+        _project, _runner, token, job = await self._make_running_job(db_session)
+        safe_name = "reward_curve.png"
+        objects: dict[str, bytes] = {}
+        deleted: list[str] = []
+
+        async def _late_live_upload(job_id, basename, data, content_type):
+            # Terminal owns the canonical generation before the slow live write
+            # returns.  This commit is observable by the endpoint's locked reread.
+            job.status = ComputeJobStatus.SUCCEEDED
+            db_session.add(job)
+            await db_session.commit()
+            objects[safe_name] = b"terminal-generation"
+            objects[basename] = data
+            return storage.compute_job_viewable_uri(job_id, basename)
+
+        async def _delete_staging(job_id, basename):
+            deleted.append(basename)
+            objects.pop(basename, None)
+            return True
+
+        with patch(
+            "app.storage.upload_compute_job_viewable_file", new=_late_live_upload
+        ), patch(
+            "app.storage.delete_compute_job_viewable_file", new=_delete_staging
+        ), patch(
+            "app.storage.promote_compute_job_viewable_file",
+            new=AsyncMock(side_effect=AssertionError("terminal upload must not promote")),
+        ):
+            response = await client.post(
+                f"/api/runner/compute-job/{job.id}/viewable",
+                data={"filename": safe_name},
+                files={"file": (safe_name, b"late-live-bytes", "image/png")},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        assert response.status_code == 409, response.text
+        assert objects[safe_name] == b"terminal-generation"
+        assert len(deleted) == 1 and deleted[0].startswith(".staging/")
 
     @pytest.mark.asyncio
     async def test_file_cap_enforced(self, client, db_session):
@@ -11247,7 +11441,8 @@ class TestMidRunViewableUpload:
         assert captured["read"] == video_bytes
         assert captured["size"] == len(video_bytes)
         assert captured["content_type"] == "video/mp4"
-        assert captured["basename"] == safe_name
+        assert captured["basename"].startswith(".staging/")
+        assert captured["basename"].endswith(f"/{safe_name}")
 
         # DB row + manifest recorded with the streamed size.
         await db_session.refresh(job)
@@ -11265,8 +11460,12 @@ class TestMidRunViewableUpload:
         assert rows[0].file_size_bytes == len(video_bytes)
 
     @pytest.mark.asyncio
-    async def test_reupload_same_relpath_dedup(self, client, db_session):
-        """Re-upload of the same relpath → single manifest entry, single DB row."""
+    async def test_reupload_same_relpath_advances_revision_and_terminal_reconciles(
+        self, client, db_session
+    ):
+        """Same URI/size advances live revision; terminal replaces it once."""
+        from app import compute_jobs as compute_jobs_mod
+
         _project, runner, token, job = await self._make_running_job(db_session)
         safe_name = "reward_curve.png"
         fake_uri = self._fake_uri(job.id, safe_name)
@@ -11275,14 +11474,15 @@ class TestMidRunViewableUpload:
             "app.storage.upload_compute_job_viewable_file",
             return_value=fake_uri,
         ):
-            # First upload
+            # Equal-size generations exercise the real defect: storage_uri and
+            # byte length cannot distinguish the overwritten bytes.
             resp1 = await client.post(
                 f"/api/runner/compute-job/{job.id}/viewable",
                 data={"filename": safe_name},
                 files={
                     "file": (
                         safe_name,
-                        b"v1-data",
+                        b"version-one",
                         "image/png",
                     )
                 },
@@ -11292,15 +11492,17 @@ class TestMidRunViewableUpload:
                 f"First upload failed: {resp1.status_code}: {resp1.text}"
             )
             assert resp1.json()["total_viewable_files"] == 1
+            first_revision = resp1.json()["entry"]["revision"]
+            assert resp1.json()["entry"]["live"] is True
 
-            # Second upload (same relpath, larger content)
+            # Second upload: same relpath, same deterministic URI, same size.
             resp2 = await client.post(
                 f"/api/runner/compute-job/{job.id}/viewable",
                 data={"filename": safe_name},
                 files={
                     "file": (
                         safe_name,
-                        b"v2-data-larger",
+                        b"version-two",
                         "image/png",
                     )
                 },
@@ -11312,6 +11514,9 @@ class TestMidRunViewableUpload:
             assert resp2.json()["total_viewable_files"] == 1, (
                 "Re-upload must not increase the manifest count"
             )
+            second_revision = resp2.json()["entry"]["revision"]
+            assert second_revision != first_revision
+            assert resp2.json()["entry"]["storage_uri"] == fake_uri
 
         # ── Only ONE ComputeJobFile row ──────────────────────────────────────
         rows = (
@@ -11333,6 +11538,49 @@ class TestMidRunViewableUpload:
         assert len(vf) == 1, (
             f"Expected 1 viewable_files entry after re-upload, got {len(vf)}"
         )
+        assert vf[0]["revision"] == second_revision
+        assert vf[0]["live"] is True
+
+        # The terminal bundle is authoritative. Its legacy-shaped result has no
+        # revision, so reconciliation must assign a final one, clear ``live``,
+        # replace the manifest in place, and preserve the single signing row.
+        job.status = ComputeJobStatus.SUCCEEDED
+        db_session.add(job)
+        await db_session.commit()
+        terminal_manifest = [
+            {
+                "filename": safe_name,
+                "storage_uri": fake_uri,
+                "content_type": "image/png",
+                "size_bytes": len(b"version-two"),
+                "kind": "image",
+            }
+        ]
+        with patch.object(
+            compute_jobs_mod,
+            "persist_viewable_artifacts",
+            new=AsyncMock(return_value=(terminal_manifest, 0)),
+        ):
+            final_manifest, dropped = (
+                await compute_jobs_mod.persist_viewable_files_for_job(db_session, job)
+            )
+        await db_session.commit()
+
+        assert dropped == 0
+        assert len(final_manifest) == 1
+        assert final_manifest[0]["revision"] != second_revision
+        assert final_manifest[0]["live"] is False
+        await db_session.refresh(job)
+        assert (job.polling_metadata or {})["viewable_files"] == final_manifest
+        final_rows = (
+            await db_session.execute(
+                select(ComputeJobFile).where(
+                    ComputeJobFile.compute_job_id == job.id,
+                    ComputeJobFile.storage_uri == fake_uri,
+                )
+            )
+        ).scalars().all()
+        assert len(final_rows) == 1
 
     @pytest.mark.asyncio
     async def test_no_filename_rejected(self, client, db_session):
@@ -11629,6 +11877,159 @@ async def test_capability_proof_trial_red_records_no_proof(db_session):
 
 
 @pytest.mark.asyncio
+async def test_capability_proof_trial_definitive_red_revokes_prior_green(db_session):
+    """A definitive RED trial (ran=True, passed=False, could_not_run=False) REVOKES
+    any stale executed-proof ledger entry so the capability cannot keep clearing the
+    enforce gate until the 30-day TTL expires.
+
+    Acceptance: 'a definitive red B blocks the capability'.
+    """
+    import json as _json
+
+    from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+
+    from app.capability_proof import record_capability_named_test_execution_proof
+    from app.capability_registry import working_capability_proof_status
+    from app.task_completion import _handle_capability_proof_trial_completion
+
+    cap = "repo-map-red-revoke"
+    test_refs = ["backend/testing/test_prompt.py"]
+    project = await _make_trial_project(db_session, cap)
+    task = _make_trial_task(project, cap, test_refs, head_sha="sha_b")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # First stamp a GREEN proof at sha_a (revision A).
+    record_capability_named_test_execution_proof(
+        project, cap, test_refs, head_sha="sha_a", suite_verifying=True
+    )
+    _flag_modified(project, "capability_proof_records")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Confirm the capability is now "proven" via the execution proof.
+    assert (project.capability_proof_records or {}).get(cap) or \
+        working_capability_proof_status(project.problem_model).get(cap) == "proven"
+
+    # A RED trial at sha_b (revision B) should revoke the sha_a proof.
+    red = {
+        "type": "capability_proof_trial",
+        "cap": cap,
+        "head_sha": "sha_b",
+        "test_refs": test_refs,
+        "ran": True,
+        "passed": False,
+        "could_not_run": False,
+    }
+    with _TrialFlag(True):
+        await _handle_capability_proof_trial_completion(task, _json.dumps(red), db_session)
+
+    await db_session.refresh(project)
+    await db_session.refresh(task)
+
+    # The named_test_exec ledger entry must be gone.
+    norm_cap = cap
+    records = project.capability_proof_records or {}
+    exec_entries = [
+        e for e in (records.get(norm_cap) or [])
+        if e.get("task_id") == f"named_test_exec:{norm_cap}"
+    ]
+    assert exec_entries == [], "definitive RED must revoke the stale execution proof"
+
+    # The contradiction is still surfaced.
+    contradiction = (task.context or {}).get("capability_proof_trial_contradiction")
+    assert contradiction is not None
+    assert contradiction["cap"] == cap
+    assert contradiction["passed"] is False
+    assert contradiction["proof_revoked"] is True
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_trial_indeterminate_result_leaves_proof(db_session):
+    """An indeterminate result (could_not_run=True) must NOT revoke existing proof.
+
+    Acceptance: 'an indeterminate B ... result cannot corrupt the current verdict'.
+    """
+    import json as _json
+
+    from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+
+    from app.capability_proof import record_capability_named_test_execution_proof
+    from app.task_completion import _handle_capability_proof_trial_completion
+
+    cap = "repo-map-infra-fail"
+    test_refs = ["backend/testing/test_prompt.py"]
+    project = await _make_trial_project(db_session, cap)
+    task = _make_trial_task(project, cap, test_refs, head_sha="sha_b")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Stamp a GREEN proof at sha_a.
+    record_capability_named_test_execution_proof(
+        project, cap, test_refs, head_sha="sha_a", suite_verifying=True
+    )
+    _flag_modified(project, "capability_proof_records")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Infrastructure failure: could_not_run — indeterminate, should NOT revoke.
+    indeterminate = {
+        "type": "capability_proof_trial",
+        "cap": cap,
+        "head_sha": "sha_b",
+        "test_refs": test_refs,
+        "ran": False,
+        "passed": False,
+        "could_not_run": True,
+    }
+    with _TrialFlag(True):
+        await _handle_capability_proof_trial_completion(
+            task, _json.dumps(indeterminate), db_session
+        )
+
+    await db_session.refresh(project)
+    records = project.capability_proof_records or {}
+    exec_entries = [
+        e for e in (records.get(cap) or [])
+        if e.get("task_id") == f"named_test_exec:{cap}"
+    ]
+    assert exec_entries, "indeterminate result must NOT revoke the existing proof"
+
+    contradiction = (task.context or {}).get("capability_proof_trial_contradiction")
+    assert contradiction is not None
+    assert contradiction.get("proof_revoked") is False
+
+
+@pytest.mark.asyncio
+async def test_enroll_capability_proof_trial_dedup_in_flight(db_session):
+    """enroll_capability_proof_trial returns None when a trial for the same
+    capability is already QUEUED/PROVISIONING/IN_PROGRESS — 'revision B commissions
+    exactly one re-verification'."""
+    from app.capability_proof import enroll_capability_proof_trial
+
+    project = await _make_trial_project(db_session, "dedup-cap")
+
+    # Enroll the first trial.
+    with _TrialFlag(True):
+        first = await enroll_capability_proof_trial(
+            db_session, project, "dedup-cap", ["backend/testing/test_a.py"], "sha1"
+        )
+    assert first is not None
+    assert first.status == TaskStatus.QUEUED
+
+    # A second enrollment attempt for the same capability must be a no-op.
+    with _TrialFlag(True):
+        second = await enroll_capability_proof_trial(
+            db_session, project, "dedup-cap", ["backend/testing/test_a.py"], "sha2"
+        )
+    assert second is None, "duplicate trial must be blocked by the dedup guard"
+
+
+@pytest.mark.asyncio
 async def test_capability_proof_trial_flag_off_records_nothing(db_session):
     """With the dark flag OFF, even a GREEN trial records nothing."""
     import json as _json
@@ -11639,7 +12040,7 @@ async def test_capability_proof_trial_flag_off_records_nothing(db_session):
     cap = "repo-map-darkoff"
     test_refs = ["backend/testing/test_prompt.py::test_x"]
     project = await _make_trial_project(db_session, cap)
-    task = _make_trial_task(project, cap, test_refs)
+    task = _make_trial_task(project, cap, test_refs, head_sha="abc")
     db_session.add(task)
     await db_session.commit()
     await db_session.refresh(task)
@@ -11667,7 +12068,7 @@ async def test_capability_proof_trial_skipped_suite_records_nothing(db_session):
 
     cap = "repo-map-skipped"
     project = await _make_trial_project(db_session, cap)
-    task = _make_trial_task(project, cap, ["backend/testing/test_prompt.py"])
+    task = _make_trial_task(project, cap, ["backend/testing/test_prompt.py"], head_sha="abc")
     db_session.add(task)
     await db_session.commit()
     await db_session.refresh(task)
@@ -11685,6 +12086,117 @@ async def test_capability_proof_trial_skipped_suite_records_nothing(db_session):
     await db_session.refresh(project)
     assert working_capability_proof_status(project.problem_model).get(cap) != "proven"
     assert cap not in (project.capability_proof_records or {})
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_trial_wrong_cap_rejected(db_session):
+    """A trial result whose cap does not match the enrollment contract records
+    no proof — the runner cannot mint proof for the wrong capability."""
+    import json as _json
+
+    from app.capability_registry import working_capability_proof_status
+    from app.task_completion import _handle_capability_proof_trial_completion
+
+    cap = "enrolled-capability"
+    test_refs = ["backend/testing/test_prompt.py"]
+    project = await _make_trial_project(db_session, cap)
+    # Enroll with cap "enrolled-capability"
+    task = _make_trial_task(project, cap, test_refs)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Agent reports a DIFFERENT cap than what was enrolled.
+    wrong = {
+        "type": "capability_proof_trial",
+        "cap": "different-capability",
+        "head_sha": "deadbeef",
+        "test_refs": test_refs,
+        "ran": True, "passed": True, "could_not_run": False,
+    }
+
+    with _TrialFlag(True):
+        await _handle_capability_proof_trial_completion(task, _json.dumps(wrong), db_session)
+
+    await db_session.refresh(project)
+    # No proof recorded for the wrong cap.
+    status_map = working_capability_proof_status(project.problem_model)
+    assert status_map.get("different-capability") != "proven"
+    assert "different-capability" not in (project.capability_proof_records or {})
+    # And no proof for the enrolled cap either.
+    assert status_map.get(cap) != "proven"
+    assert cap not in (project.capability_proof_records or {})
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_trial_extra_test_refs_rejected(db_session):
+    """A trial result with test_refs that were NOT in the enrollment must NOT
+    mint proof — the runner cannot claim green for refs it was never enrolled to run."""
+    import json as _json
+
+    from app.capability_registry import working_capability_proof_status
+    from app.task_completion import _handle_capability_proof_trial_completion
+
+    cap = "refs-guard-cap"
+    enrolled_refs = ["backend/testing/test_prompt.py"]
+    project = await _make_trial_project(db_session, cap)
+    # Enroll with a specific set of test_refs
+    task = _make_trial_task(project, cap, enrolled_refs)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Agent reports extra test_refs not in the enrollment.
+    extra_refs_report = enrolled_refs + ["backend/testing/test_extra.py"]
+    wrong = {
+        "type": "capability_proof_trial",
+        "cap": cap,
+        "head_sha": "deadbeef",
+        "test_refs": extra_refs_report,
+        "ran": True, "passed": True, "could_not_run": False,
+    }
+
+    with _TrialFlag(True):
+        await _handle_capability_proof_trial_completion(task, _json.dumps(wrong), db_session)
+
+    await db_session.refresh(project)
+    assert cap not in (project.capability_proof_records or {})
+    assert working_capability_proof_status(project.problem_model).get(cap) != "proven"
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_trial_mismatched_head_sha_rejected(db_session):
+    """A trial result whose head_sha differs from the enrollment must NOT mint
+    proof — the runner must execute the enrolled revision."""
+    import json as _json
+
+    from app.capability_registry import working_capability_proof_status
+    from app.task_completion import _handle_capability_proof_trial_completion
+
+    cap = "sha-guard-cap"
+    test_refs = ["backend/testing/test_prompt.py"]
+    project = await _make_trial_project(db_session, cap)
+    # Enroll with head_sha "abc123"
+    task = _make_trial_task(project, cap, test_refs, head_sha="abc123")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Agent reports a different sha.
+    wrong = {
+        "type": "capability_proof_trial",
+        "cap": cap,
+        "head_sha": "def456",
+        "test_refs": test_refs,
+        "ran": True, "passed": True, "could_not_run": False,
+    }
+
+    with _TrialFlag(True):
+        await _handle_capability_proof_trial_completion(task, _json.dumps(wrong), db_session)
+
+    await db_session.refresh(project)
+    assert cap not in (project.capability_proof_records or {})
+    assert working_capability_proof_status(project.problem_model).get(cap) != "proven"
 
 
 @pytest.mark.asyncio

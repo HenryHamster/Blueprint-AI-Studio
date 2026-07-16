@@ -110,25 +110,44 @@ function WorkspaceSkeleton() {
   );
 }
 
-function BoardDataReadyReporter({ activeTab, loading }: { activeTab: PrimaryTab; loading: boolean }) {
+function BoardDataReadyReporter({ activeTab, initialLoading, refreshing, fetchEpoch }: { activeTab: PrimaryTab; initialLoading: boolean; refreshing: boolean; fetchEpoch: number }) {
   const navigationStartRef = useRef(0);
   const reportedRef = useRef(false);
+  const targetEpochRef = useRef<number | null>(null);
 
+  // On tab switch away from 'chat', record the start time and the epoch
+  // we expect the next fetch to produce (current + 1). If a fetch completes
+  // after the switch, the downstream effect captures it with real timing.
   useEffect(() => {
     if (activeTab === 'chat') return;
     navigationStartRef.current = performance.now();
     reportedRef.current = false;
+    targetEpochRef.current = fetchEpoch + 1;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab]);
 
+  // Report when a task-fetch completes after the switch (epoch advances past
+  // target).  Otherwise fall back to rAF when nothing is currently loading.
   useEffect(() => {
-    if (activeTab === 'chat' || loading || reportedRef.current) return;
-    const frame = requestAnimationFrame(() => {
-      if (reportedRef.current) return;
+    if (activeTab === 'chat' || reportedRef.current) return;
+
+    // Epoch advanced → a fetch completed since the tab switch → report.
+    if (targetEpochRef.current !== null && fetchEpoch >= targetEpochRef.current) {
       reportedRef.current = true;
       reportUiLoadTiming(activeTab, Math.round(performance.now() - navigationStartRef.current), 'board_data_ready');
-    });
-    return () => cancelAnimationFrame(frame);
-  }, [activeTab, loading]);
+      return;
+    }
+
+    // Nothing loading → fall back to rAF (paint boundary).
+    if (!initialLoading && !refreshing) {
+      const frame = requestAnimationFrame(() => {
+        if (reportedRef.current) return;
+        reportedRef.current = true;
+        reportUiLoadTiming(activeTab, Math.round(performance.now() - navigationStartRef.current), 'board_data_ready');
+      });
+      return () => cancelAnimationFrame(frame);
+    }
+  }, [activeTab, fetchEpoch, initialLoading, refreshing]);
 
   return null;
 }
@@ -160,6 +179,7 @@ export default function App() {
   }, [cycleCompletion, addToast]);
   const [openMessageCount, setOpenMessageCount] = useState(0);
   const [newSinceLastVisit, setNewSinceLastVisit] = useState(0);
+  const [activeAlerts, setActiveAlerts] = useState(0);
   const handleMessageCountChange = useCallback((count: number) => setOpenMessageCount(count), []);
 
   // Noise prefs for the closed-panel badge — loaded from localStorage on project change and
@@ -265,6 +285,7 @@ export default function App() {
     if (messagesPanelOpen) {
       setOpenMessageCount(0);
       setNewSinceLastVisit(0);
+      setActiveAlerts(0);
     }
   }, [messagesPanelOpen]);
   // Load noise prefs from localStorage when the project changes; refresh from server async.
@@ -313,6 +334,7 @@ export default function App() {
         // and the in-panel needs-action set.
         setOpenMessageCount(data.needs_operator ?? 0);
         setNewSinceLastVisit(data.unread ?? 0);
+        setActiveAlerts(data.active_alerts ?? 0);
       }
     } catch { /* ignore */ }
   }, {
@@ -1190,6 +1212,7 @@ export default function App() {
         ceilingDeferredProjectIds={s.ceilingDeferredProjectIds}
         gatedTaskTypes={s.gatedTaskTypes}
         costSectionAvailable={activeTab === 'runtime' && runtimeSection === 'analytics'}
+        activeAlerts={activeAlerts}
       />
       <Suspense fallback={null}><CommandPaletteHost open={commandPaletteOpen} commands={workbenchCommands} query={commandPaletteQuery} onQueryChange={setCommandPaletteQuery} setOpen={setCommandPaletteOpen} /></Suspense>
       <Suspense fallback={null}><KeyboardShortcutsOverlay open={shortcutHelpOpen} onClose={() => setShortcutHelpOpen(false)} /></Suspense>
@@ -1262,7 +1285,7 @@ export default function App() {
         </Suspense>
       ) : (
         <WorkbenchFrame>
-      <BoardDataReadyReporter activeTab={activeTab} loading={s.initialLoading} />
+      <BoardDataReadyReporter activeTab={activeTab} initialLoading={s.initialLoading} refreshing={s.refreshing} fetchEpoch={s.fetchEpoch} />
       {s.showUserManagement && s.userRole === 'admin' ? (
         <Suspense fallback={null}>
         <UserManagement
@@ -1367,6 +1390,7 @@ export default function App() {
                   s.dismissAllAlerts();
                 }}
                 onViewAlertTask={handleViewTask}
+                onOpenActivityFeed={() => setShowActivityFeed(true)}
               />
               </Suspense>
             )}
@@ -1613,6 +1637,7 @@ export default function App() {
         openMessageCount={openMessageCount}
         newSinceLastVisitCount={newSinceLastVisit}
         needsAttentionCount={pipelineAttentionCount}
+        activeAlerts={activeAlerts}
         placement="mobile"
         className="md:hidden"
       />

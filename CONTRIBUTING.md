@@ -6,7 +6,7 @@ Thanks for your interest in contributing to Blueprint! This guide will help you 
 
 ### Prerequisites
 
-- Node.js (v18+ for development; v20+ recommended for production deployment)
+- Node.js v18+ (v20.x recommended; production runners run Node 20)
 - Python 3.11+
 - Docker and Docker Compose
 - A GCP project (for infrastructure work)
@@ -106,6 +106,21 @@ Thanks for your interest in contributing to Blueprint! This guide will help you 
 - Use type hints for function signatures.
 - Write async handlers where applicable (FastAPI is async-first).
 - Add tests for new endpoints and business logic using pytest.
+
+### Running the blueprint-runner locally
+
+The agent runner (`agent/`) requires Node.js >=18.0.0; production runners use
+Node 20.x. The runner checks its Node version at start-up and exits immediately
+with an actionable message if the requirement is not met.
+
+To install a supported Node version via [nvm](https://github.com/nvm-sh/nvm):
+
+```bash
+nvm install 20
+nvm use 20
+node --version   # should print v20.x.x
+cd agent && npm install && npm start
+```
 
 ### Infrastructure
 

@@ -39,7 +39,7 @@ from app.compute_backends import (
     detect_local_gpu,
     get_compute_backend,
     is_zero_cost_backend,
-    persist_viewable_artifacts,
+    persist_viewable_artifacts_with_completeness,
     run_preflight_smoke,
     validate_backend_name,
 )
@@ -4467,10 +4467,9 @@ async def _record_viewable_job_files(
 
     One row per durably-stored file, pointing at the SAME canonical ``viewable/``
     URI the manifest already carries — no second upload, no second sanitizer, no
-    second cap policy. Each INSERT runs in its own SAVEPOINT so one constraint
-    violation (notably the UNIQUE ``storage_uri``, which is exactly what makes a
-    re-entry a benign no-op) or DB hiccup cannot lose the rows already written, and
-    can never roll back the job's terminal completion.
+    second cap policy. Existing deterministic-URI rows are updated in place; each
+    new INSERT runs in its own SAVEPOINT so one constraint violation or DB hiccup
+    cannot lose rows already written or roll back terminal completion.
 
     Best-effort by contract: returns the number of rows written, never raises.
     """
@@ -4498,6 +4497,27 @@ async def _record_viewable_job_files(
                 else "unknown"
             )
         try:
+            existing_row = (
+                await session.execute(
+                    select(ComputeJobFile).where(
+                        ComputeJobFile.storage_uri == storage_uri
+                    )
+                )
+            ).scalars().first()
+            if existing_row is not None:
+                # Mid-run registration already created the signing row.
+                # Reconcile its mutable metadata to the authoritative terminal
+                # bundle without adding a duplicate deterministic-URI row.
+                existing_row.safe_relpath = filename
+                existing_row.media_type = media_type
+                existing_row.content_type = (
+                    content_type if isinstance(content_type, str) else None
+                )
+                existing_row.file_size_bytes = (
+                    size_bytes if isinstance(size_bytes, int) else None
+                )
+                session.add(existing_row)
+                continue
             async with session.begin_nested():
                 row = ComputeJobFile(
                     compute_job_id=job.id,
@@ -4515,7 +4535,6 @@ async def _record_viewable_job_files(
                 await session.flush()
             written += 1
         except Exception:  # noqa: BLE001
-            # A UNIQUE(storage_uri) hit on re-entry is the common, benign case.
             logger.warning(
                 "[COMPUTE_JOB] ComputeJobFile insert failed for viewable file %r "
                 "in job=%s",
@@ -4551,9 +4570,10 @@ async def persist_viewable_files_for_job(
     WITHOUT re-downloading the bundle or re-uploading a byte. That guard is what
     holds the bundle download to exactly one per job.
 
-    Fail-soft by contract: any extraction/upload/DB error degrades to no manifest
-    and NEVER raises — viewable persistence must never block terminal completion.
-    Returns ``(manifest, dropped)``.
+    Fail-soft by contract: any extraction/upload/DB error NEVER blocks terminal
+    completion. An incomplete terminal pass preserves already-durable live
+    entries and deliberately does not stamp the idempotency marker, so a later
+    terminal reconciliation can retry. Returns ``(manifest, dropped)``.
     """
     meta = job.polling_metadata or {}
     if "viewable_file_count" in meta:
@@ -4565,25 +4585,71 @@ async def persist_viewable_files_for_job(
             dropped if isinstance(dropped, int) else 0,
         )
 
+    complete = False
     try:
-        manifest, dropped = await persist_viewable_artifacts(job)
+        manifest, dropped, complete = (
+            await persist_viewable_artifacts_with_completeness(job)
+        )
     except Exception:  # noqa: BLE001
         logger.warning(
             "[COMPUTE_JOB] viewable-artifact persistence failed for job=%s; "
-            "completing with no viewable manifest",
+            "preserving durable live previews for a later retry",
             job.id,
             exc_info=True,
         )
         manifest, dropped = [], 0
 
+    # Terminal bundle extraction is authoritative. Ensure every terminal entry
+    # has an opaque revision even when a legacy/custom backend returned the old
+    # shape, and clear the live marker before publishing the reconciled manifest.
+    terminal_manifest: list[dict[str, Any]] = []
+    for raw_entry in manifest if isinstance(manifest, list) else []:
+        if not isinstance(raw_entry, dict):
+            continue
+        entry = dict(raw_entry)
+        entry["revision"] = (
+            storage.normalize_viewable_revision(entry.get("revision"))
+            or storage.new_viewable_revision()
+        )
+        entry["live"] = False
+        terminal_manifest.append(entry)
+    if complete:
+        manifest = terminal_manifest
+    else:
+        # A fail-soft extraction or upload pass is not authoritative. Reconcile
+        # the terminal entries that did persist, but retain prior live entries
+        # for filenames the incomplete pass could not reproduce. Their objects
+        # and ComputeJobFile signing rows are already durable; hiding them would
+        # lose useful output while also stamping the pass as non-retryable.
+        terminal_names = {
+            entry.get("filename")
+            for entry in terminal_manifest
+            if isinstance(entry.get("filename"), str)
+        }
+        prior_live = [
+            dict(entry)
+            for entry in (meta.get("viewable_files") or [])
+            if isinstance(entry, dict)
+            and entry.get("live") is True
+            and entry.get("filename") not in terminal_names
+        ]
+        manifest = terminal_manifest + prior_live
+
     await _record_viewable_job_files(session, job, manifest)
 
-    # Stamped unconditionally (even at 0) — it doubles as the "pass completed"
-    # marker the idempotency guard above reads.
-    _set_meta(job, viewable_file_count=len(manifest))
-    if manifest:
-        _set_meta(job, viewable_files=manifest)
-    if dropped:
-        _set_meta(job, viewable_files_dropped=dropped)
+    reconciled_meta = dict(job.polling_metadata or {})
+    reconciled_meta["viewable_files"] = manifest
+    if complete:
+        # A complete terminal enumeration is authoritative, including an empty
+        # one. Stamp the idempotency marker only now; this also clears any prior
+        # live omission count and incomplete-pass diagnostic.
+        reconciled_meta["viewable_file_count"] = len(manifest)
+        reconciled_meta["viewable_files_dropped"] = dropped
+        reconciled_meta.pop("viewable_terminal_reconciliation_incomplete", None)
+    else:
+        # Leave viewable_file_count absent so the next terminal call retries.
+        reconciled_meta.pop("viewable_file_count", None)
+        reconciled_meta["viewable_terminal_reconciliation_incomplete"] = True
+    job.polling_metadata = reconciled_meta
     session.add(job)
     return manifest, dropped

@@ -129,6 +129,32 @@ describe('FleetRunnersPanel — behavioral', () => {
     return host as HTMLDivElement;
   }
 
+  test('bound runner is labelled shared and routes ownership separately from project stats', async () => {
+    const shared: FleetRunner = {
+      ...SAMPLE_RUNNERS[0],
+      enrollment_project_id: 'proj-enrollment',
+    };
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([shared]);
+    const el = await mount('proj-bound');
+
+    expect(el.querySelector('[data-testid="fleet-runner-shared"]')?.textContent).toContain('shared runner');
+    expect(listRunnerProjects).toHaveBeenCalledWith('proj-enrollment', shared.id);
+
+    const telemetry = el.querySelector('button[aria-label^="Toggle telemetry"]') as HTMLButtonElement;
+    await act(async () => { telemetry.click(); });
+    await act(async () => {});
+    // Telemetry must use the viewed bound project, not the enrollment project, so that
+    // a user who is a member of proj-bound but not proj-enrollment can still load it.
+    expect(fetchRunnerTelemetry).toHaveBeenCalledWith('proj-bound', shared.id, { sinceSeconds: 3600 });
+    expect(fetchRunnerStats).toHaveBeenCalledWith('proj-bound', shared.id);
+
+    const rotate = el.querySelector('button[aria-label^="Rotate token"]') as HTMLButtonElement;
+    await act(async () => { rotate.click(); });
+    const confirm = Array.from(el.querySelectorAll('button')).find(button => button.textContent === 'Rotate token') as HTMLButtonElement;
+    await act(async () => { confirm.click(); });
+    expect(rotateFleetRunnerToken).toHaveBeenCalledWith('proj-enrollment', shared.id);
+  });
+
   test('runnerSetupSnippets builds the blueprint-runner command with safe quoting', () => {
     const snippets = runnerSetupSnippets("tok'abc", 'https://blueprint.test/a path');
 

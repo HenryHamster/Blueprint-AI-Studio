@@ -745,6 +745,8 @@ export interface ViewableArtifact {
   content_type?: string | null;
   size_bytes?: number | null;
   kind: 'image' | 'video' | 'pdf' | null;
+  revision?: string | null;
+  live?: boolean | null;
 }
 
 export interface ComputeJob {
@@ -1726,6 +1728,14 @@ export interface CapabilityProofGateCoverage {
   total_non_exempt_working: number;
   projects_contributing: number;
   num_projects: number;
+  trial_eligible_unproven?: number;
+}
+
+export interface CapabilityProofTrialProjection {
+  trial_eligible: number;
+  unproven_working: number;
+  projects_contributing: number;
+  num_projects: number;
 }
 
 export interface CapabilityProofGateSettings {
@@ -1733,6 +1743,7 @@ export interface CapabilityProofGateSettings {
   capability_proof_gate_auto_graduation_enabled: boolean;
   capability_proof_gate_auto_graduation_observe_threshold: number;
   capability_proof_gate_auto_graduation_enforce_threshold: number;
+  capability_proof_execution_trials_enabled?: boolean;
 }
 
 // PATCHes any partial of the four capability-proof-gate config keys. The backend
@@ -1813,6 +1824,9 @@ export async function revokeCapabilityProofExemption(
 
 export interface FleetRunner {
   id: string;
+  // Present on newer servers. Mutations remain scoped here; absence preserves
+  // rolling-deployment compatibility by falling back to the viewed project.
+  enrollment_project_id?: string;
   hostname: string | null;
   version: string | null;
   status: string;

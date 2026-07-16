@@ -2997,6 +2997,7 @@ async def _make_lane(
     current_task_id=None,
     phase_requeues=0,
     created_at=None,
+    parked_at=None,
     name="lane",
 ):
     lane = ImprovementLane(
@@ -3015,6 +3016,11 @@ async def _make_lane(
     if created_at is not None:
         # created_at has a server_default; override after insert for age tests.
         lane.created_at = created_at
+        db_session.add(lane)
+        await db_session.commit()
+        await db_session.refresh(lane)
+    if parked_at is not None:
+        lane.parked_at = parked_at
         db_session.add(lane)
         await db_session.commit()
         await db_session.refresh(lane)
@@ -5068,3 +5074,151 @@ async def test_lane_workspace_reconciliation_race_safe_noop(db_session, mocker):
     await db_session.refresh(lane)
     assert lane.workspace_state == "WARM_RESERVED"
     assert lane.workspace_vm_instance_id == "vm-race-new"
+
+
+# ---------------------------------------------------------------------------
+# Stale PARKED lane retirement (Class 3 in sweep_stranded_lanes)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_retire_stale_parked_lane_no_live_tasks(db_session, lanes_on):
+    """A PARKED lane older than the threshold with all tasks terminal is retired."""
+    project = await _make_project(db_session, name="Retire Parked")
+    stale_cutoff = _utcnow() - timedelta(seconds=7200)
+    lane = await _make_lane(
+        db_session,
+        project,
+        status=ImprovementLaneStatus.PARKED,
+        parked_at=stale_cutoff,
+        name="retire-parked",
+    )
+    _runtime_config["improvement_lane_parked_terminal_stale_seconds"] = 3600
+
+    transitioned = await sweep_stranded_lanes(
+        db_session, _utcnow(), runtime_config=_runtime_config
+    )
+    assert transitioned == 1
+
+    await db_session.refresh(lane)
+    assert lane.status == ImprovementLaneStatus.RETIRED.value
+
+
+@pytest.mark.asyncio
+async def test_stale_parked_lane_spared_when_live_task_references_it(
+    db_session, lanes_on
+):
+    """A PARKED lane is NOT retired when a non-terminal task references its ID."""
+    project = await _make_project(db_session, name="Spare Parked Live")
+    stale_cutoff = _utcnow() - timedelta(seconds=7200)
+    lane = await _make_lane(
+        db_session,
+        project,
+        status=ImprovementLaneStatus.PARKED,
+        parked_at=stale_cutoff,
+        name="spare-parked-live",
+    )
+    live_task = Task(
+        project_id=project.id,
+        title="chain task",
+        payloads=[{"type": "fix", "prompt": "x", "base_branch": "automain"}],
+        status=TaskStatus.IN_PROGRESS,
+        context={"_review_fix_lane_id": str(lane.id)},
+    )
+    db_session.add(live_task)
+    await db_session.commit()
+    _runtime_config["improvement_lane_parked_terminal_stale_seconds"] = 3600
+
+    transitioned = await sweep_stranded_lanes(
+        db_session, _utcnow(), runtime_config=_runtime_config
+    )
+    assert transitioned == 0
+
+    await db_session.refresh(lane)
+    assert lane.status == ImprovementLaneStatus.PARKED.value
+
+
+@pytest.mark.asyncio
+async def test_multiple_stale_parked_lanes_same_project_both_retired(
+    db_session, lanes_on
+):
+    """Two stale PARKED lanes in the same project with no live chain tasks are
+    both retired in a single sweep call (correctness of the batched path)."""
+    project = await _make_project(db_session, name="Batch Parked")
+    stale_cutoff = _utcnow() - timedelta(seconds=7200)
+    lane_a = await _make_lane(
+        db_session,
+        project,
+        status=ImprovementLaneStatus.PARKED,
+        parked_at=stale_cutoff,
+        name="batch-lane-a",
+    )
+    lane_b = await _make_lane(
+        db_session,
+        project,
+        status=ImprovementLaneStatus.PARKED,
+        parked_at=stale_cutoff,
+        name="batch-lane-b",
+    )
+    _runtime_config["improvement_lane_parked_terminal_stale_seconds"] = 3600
+
+    transitioned = await sweep_stranded_lanes(
+        db_session, _utcnow(), runtime_config=_runtime_config
+    )
+    assert transitioned == 2, "both stale PARKED lanes with no live chain should retire"
+
+    await db_session.refresh(lane_a)
+    await db_session.refresh(lane_b)
+    assert lane_a.status == ImprovementLaneStatus.RETIRED.value
+    assert lane_b.status == ImprovementLaneStatus.RETIRED.value
+
+
+@pytest.mark.asyncio
+async def test_stale_parked_lane_live_task_prevents_only_its_own_lane(
+    db_session, lanes_on
+):
+    """With two stale PARKED lanes: lane A has a live chain task, lane B does not.
+    Only lane B is retired; lane A is spared. Both lanes are in the same project."""
+    project = await _make_project(db_session, name="Selective Retire")
+    stale_cutoff = _utcnow() - timedelta(seconds=7200)
+
+    lane_a = await _make_lane(
+        db_session,
+        project,
+        status=ImprovementLaneStatus.PARKED,
+        parked_at=stale_cutoff,
+        name="has-live-task",
+    )
+    lane_b = await _make_lane(
+        db_session,
+        project,
+        status=ImprovementLaneStatus.PARKED,
+        parked_at=stale_cutoff,
+        name="no-live-task",
+    )
+
+    # Live task references lane_a only.
+    live_task = Task(
+        project_id=project.id,
+        title="chain task for a",
+        payloads=[{"type": "fix", "prompt": "x", "base_branch": "automain"}],
+        status=TaskStatus.QUEUED,
+        context={"_review_fix_lane_id": str(lane_a.id)},
+    )
+    db_session.add(live_task)
+    await db_session.commit()
+    _runtime_config["improvement_lane_parked_terminal_stale_seconds"] = 3600
+
+    transitioned = await sweep_stranded_lanes(
+        db_session, _utcnow(), runtime_config=_runtime_config
+    )
+    assert transitioned == 1, "only lane B (no live chain task) should be retired"
+
+    await db_session.refresh(lane_a)
+    await db_session.refresh(lane_b)
+    assert lane_a.status == ImprovementLaneStatus.PARKED.value, (
+        "lane A has a live task — must not be retired"
+    )
+    assert lane_b.status == ImprovementLaneStatus.RETIRED.value, (
+        "lane B has no live task — must be retired"
+    )

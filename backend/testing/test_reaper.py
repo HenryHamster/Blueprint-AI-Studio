@@ -5316,6 +5316,7 @@ async def test_step9_sweep_finalizes_qualification_stuck_pending_after_reaper_ki
             "started_at": _now_for_seed().isoformat(),
             "audit_task_id": str(audit_task.id),
             "smoketest_task_id": str(smoke_task.id),
+            "rubric_snapshot": [],
         }
         reaper_db.add(version)
         await reaper_db.commit()
@@ -5430,6 +5431,7 @@ async def test_step9_sweep_skips_qualification_with_running_child(
             "started_at": _now_for_seed().isoformat(),
             "audit_task_id": str(audit_task.id),
             "smoketest_task_id": str(smoke_task.id),
+            "rubric_snapshot": [],
         }
         reaper_db.add(version)
         await reaper_db.commit()
@@ -5482,6 +5484,7 @@ async def test_step9_sweep_skips_qualification_with_running_child(
             "started_at": _now_for_seed().isoformat(),
             "audit_task_id": str(control_audit.id),
             "smoketest_task_id": str(control_smoke.id),
+            "rubric_snapshot": [],
         }
         reaper_db.add(control_version)
         await reaper_db.commit()
@@ -6949,6 +6952,51 @@ async def test_sweep_routine_message_retention_skips_commit_when_nothing_purged(
     result = await _rs.sweep_routine_message_retention(mock_session)
     assert result == 0
     mock_session.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_sweep_expired_message_attachment_uploads_is_global_and_bounded(
+    db_session,
+    mocker,
+):
+    from app.models import ProjectMessageAttachmentUpload
+
+    project = Project(name="Global attachment sweep", user_id="sweep-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    expired = [
+        ProjectMessageAttachmentUpload(
+            attachment_id=_uuid_mod.uuid4(),
+            project_id=project.id,
+            actor_user_id=f"actor-{index}",
+            storage_uri=f"gs://bucket/message-attachments/{project.id}/{index}/file.bin",
+            filename="file.bin",
+            expected_size_bytes=10,
+            created_at=_utcnow() - timedelta(minutes=30),
+            expires_at=_utcnow() - timedelta(minutes=15),
+        )
+        for index in range(3)
+    ]
+    db_session.add_all(expired)
+    await db_session.commit()
+    delete_object = mocker.patch(
+        "app.reaper_sweeps.delete_storage_uri_best_effort",
+        new_callable=AsyncMock,
+        return_value=True,
+    )
+
+    removed = await _rs.sweep_expired_message_attachment_uploads(
+        db_session,
+        batch_size=2,
+    )
+
+    assert removed == 2
+    assert delete_object.await_count == 2
+    remaining = (
+        await db_session.execute(select(ProjectMessageAttachmentUpload))
+    ).scalars().all()
+    assert len(remaining) == 1
 
 
 @pytest.mark.asyncio
@@ -9494,6 +9542,41 @@ async def test_unblock_sweep_optimistically_retries_agent_precondition_without_d
     # keep counting toward the cap.
     assert t.context.get("_blocked_optimistic_retries") == 1
     assert "optimistic" in (t.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_unblock_sweep_does_not_retry_viewport_capability_sentinel(
+    reaper_db, mocker
+):
+    """A deterministic missing browser capability must not rerun all tests."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    t = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="precondition",
+        blocked_reason=(
+            "BLOCKER: VIEWPORT_GATE_INFRA_UNAVAILABLE: Chromium bootstrap failed"
+        ),
+        depends_on=[],
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "precondition",
+                "reason": "VIEWPORT_GATE_INFRA_UNAVAILABLE",
+            }
+        },
+        recheck_after=now - timedelta(minutes=1),
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 0
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.BLOCKED
+    assert t.context.get("_blocked_optimistic_retries") is None
+    assert t.context.get("_blocked_recheck_attempts") == 1
 
 
 @pytest.mark.asyncio
@@ -13058,13 +13141,12 @@ def _assert_message_update_event_payload(
     assert payload["type"] == message_type
     assert payload["from"] == msg.from_type
     assert payload["status"] == status
-    assert payload["message"] == {
-        "id": str(msg.id),
-        "type": message_type,
-        "from": msg.from_type,
-        "status": status,
-        "excerpt": msg.content,
-    }
+    msg_payload = payload["message"]
+    assert msg_payload["id"] == str(msg.id)
+    assert msg_payload["type"] == message_type
+    assert msg_payload["from"] == msg.from_type
+    assert msg_payload["status"] == status
+    assert msg_payload["excerpt"] == msg.content
     assert payload["refetch"] == {"surfaces": ["messages", "strategic_session"]}
 
 
@@ -13574,6 +13656,47 @@ async def test_decay_stale_open_leaves_recent_and_live_types(reaper_db):
     for m in (recent_note, live_question, live_blocker):
         await reaper_db.refresh(m)
         assert m.status == "open"
+
+
+@pytest.mark.asyncio
+async def test_decay_stale_open_skips_operator_action_needed_note(reaper_db):
+    """An operator-action-needed NOTE older than 14 days survives the decay sweep."""
+    from app.message_audience import OPERATOR_ACTION_NEEDED
+
+    project = await _make_project(reaper_db)
+    old = _utcnow() - timedelta(days=STALE_OPEN_DECAY_DAYS + 1)
+    ctx = {"audience": OPERATOR_ACTION_NEEDED}
+    msg = await _make_conversational_message(
+        reaper_db, project, msg_type=MessageType.NOTE, created_at=old, context=ctx,
+    )
+
+    acted = await sweep_decay_stale_open_messages(reaper_db, _utcnow())
+
+    assert acted == 0
+    await reaper_db.refresh(msg)
+    assert msg.status == "open"
+    assert msg.resolution is None
+
+
+@pytest.mark.asyncio
+async def test_decay_stale_open_resolves_ordinary_note_with_operator_fyi(reaper_db):
+    """An ordinary NOTE with operator-fyi audience still decays — only
+    operator-action-needed blocks auto-resolution."""
+    from app.message_audience import OPERATOR_FYI
+
+    project = await _make_project(reaper_db)
+    old = _utcnow() - timedelta(days=STALE_OPEN_DECAY_DAYS + 1)
+    ctx = {"audience": OPERATOR_FYI}
+    msg = await _make_conversational_message(
+        reaper_db, project, msg_type=MessageType.NOTE, created_at=old, context=ctx,
+    )
+
+    acted = await sweep_decay_stale_open_messages(reaper_db, _utcnow())
+
+    assert acted == 1
+    await reaper_db.refresh(msg)
+    assert msg.status == "resolved"
+    assert msg.resolution == "auto-decayed (stale)"
 
 
 # ── Step 16: converge duplicate foundations ───────────────────────────────
@@ -17699,6 +17822,48 @@ async def test_moot_confirmation_sweep_cadence_gated(reaper_db):
         await reaper_db.refresh(project)
         # Untouched because the sweep was gated out.
         assert project.problem_model["pending_user_confirmation"][0]["id"] == "p-cred"
+    finally:
+        _rs._last_moot_confirm_sweep = _prev
+
+
+@pytest.mark.asyncio
+async def test_moot_confirmation_sweep_covers_all_projects_beyond_old_limit(reaper_db):
+    """Sweep must cover ALL projects, not just the first 25.
+
+    Creates 30 projects each with a clearable credentials_needed item and a
+    ready owner LLM account, then asserts all 30 items are cleared in a single
+    sweep invocation — verifying exhaustive pagination beyond the old LIMIT 25.
+    """
+    _prev = _rs._last_moot_confirm_sweep
+    _rs._last_moot_confirm_sweep = None
+    try:
+        await _make_ready_llm_account(reaper_db, "user1")
+        projects = []
+        for i in range(30):
+            p = Project(name=f"proj-pagination-{i}", user_id="user1")
+            p.problem_model = {
+                "pending_user_confirmation": [
+                    {
+                        "id": f"p-cred-{i}",
+                        "type": "credentials_needed",
+                        "proposal": "Add an Anthropic Claude OAuth token for the pool.",
+                    }
+                ]
+            }
+            reaper_db.add(p)
+            projects.append(p)
+        await reaper_db.commit()
+
+        cleared = await _rs.sweep_auto_clear_moot_pending_confirmations(
+            reaper_db, _utcnow()
+        )
+        assert cleared == 30, f"expected 30 cleared, got {cleared}"
+
+        for p in projects:
+            await reaper_db.refresh(p)
+            assert p.problem_model["pending_user_confirmation"] == [], (
+                f"project {p.id} still has pending confirmations"
+            )
     finally:
         _rs._last_moot_confirm_sweep = _prev
 

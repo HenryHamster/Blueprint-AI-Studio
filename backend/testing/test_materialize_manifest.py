@@ -159,6 +159,95 @@ class TestFileMaterialization:
             "hasTrustDialogAccepted": False
         }
         assert data["projects"]["/tmp/workspace"]["hasTrustDialogAccepted"] is True
+        assert data["projects"]["/tmp/workspace"]["allowedTools"] == []
+
+    def test_claude_config_trusts_manifest_workspace(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setattr(
+            materialize_manifest,
+            "_lookup_uid_gid",
+            lambda _user: (
+                (os.getuid(), os.getgid()) if hasattr(os, "getuid") else (0, 0)
+            ),
+        )
+        monkeypatch.setattr(os, "chown", lambda *_args: None, raising=False)
+        target = tmp_path / ".claude.json"
+        manifest = _write_manifest(
+            tmp_path,
+            env={"AGENT_WORKSPACE": "/workspace/agent"},
+            files=[
+                {
+                    "path": str(target),
+                    "content": json.dumps(
+                        {
+                            "projects": {
+                                "/operator/project": {"custom": "keep"}
+                            }
+                        }
+                    ),
+                    "mode": "0600",
+                }
+            ],
+        )
+        env_out = tmp_path / "agent.env"
+
+        assert materialize_manifest.main(["m", str(manifest), str(env_out)]) == 0
+
+        data = json.loads(target.read_text(encoding="utf-8"))
+        assert data["projects"]["/operator/project"] == {"custom": "keep"}
+        assert data["projects"]["/workspace/agent"] == {
+            "hasTrustDialogAccepted": True,
+            "allowedTools": [],
+        }
+
+    def test_claude_config_normalizes_malformed_allowed_tools_and_preserves_lists(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setattr(
+            materialize_manifest,
+            "_lookup_uid_gid",
+            lambda _user: (
+                (os.getuid(), os.getgid()) if hasattr(os, "getuid") else (0, 0)
+            ),
+        )
+        monkeypatch.setattr(os, "chown", lambda *_args: None, raising=False)
+        target = tmp_path / ".claude.json"
+        manifest = _write_manifest(
+            tmp_path,
+            env={"AGENT_WORKSPACE": "/workspace/agent"},
+            files=[
+                {
+                    "path": str(target),
+                    "content": json.dumps(
+                        {
+                            "projects": {
+                                "/workspace/agent": {
+                                    "allowedTools": {"Bash": True}
+                                },
+                                "/other/workspace": {
+                                    "allowedTools": ["Read", "Grep"]
+                                },
+                            }
+                        }
+                    ),
+                    "mode": "0600",
+                }
+            ],
+        )
+        env_out = tmp_path / "agent.env"
+
+        assert materialize_manifest.main(["m", str(manifest), str(env_out)]) == 0
+
+        data = json.loads(target.read_text(encoding="utf-8"))
+        assert data["projects"]["/workspace/agent"] == {
+            "hasTrustDialogAccepted": True,
+            "allowedTools": [],
+        }
+        assert data["projects"]["/other/workspace"]["allowedTools"] == [
+            "Read",
+            "Grep",
+        ]
 
     def test_missing_content_defaults_to_empty(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

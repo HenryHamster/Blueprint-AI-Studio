@@ -5023,6 +5023,150 @@ async def test_review_wait_auto_respawn_disabled(db_session, mocker):
     alert_mock.assert_called_once()
 
 
+@pytest.mark.asyncio
+async def test_review_wait_respawn_capped_resets_for_superseded_review(
+    db_session, mocker
+):
+    """When the previously respawned review was CANCELLED (superseded by a fix),
+    the effective respawn count must decrement, giving the new episode its own
+    budget. Without this, a single consumed respawn in an earlier review-wait
+    episode permanently exhausts the cap."""
+    from datetime import datetime, timedelta
+
+    from app.ci_completion import handle_ci_completion
+
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
+
+    project = Project(name="Respawn cap reset", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Create a previous respawned review that was CANCELLED (superseded by fix).
+    superseded_review = Task(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        title="Superseded review",
+        payloads=[{"type": "review"}],
+        status=TaskStatus.CANCELLED,
+    )
+    db_session.add(superseded_review)
+    await db_session.commit()
+
+    old_started = (
+        datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=70)
+    ).isoformat()
+    task = _make_task_no_review_approved(
+        db_session,
+        project,
+        ci_loop_extra={
+            "review_wait_started": old_started,
+            # Count is at the cap (1) but the respawned review was CANCELLED.
+            "review_wait_respawn_count": 1,
+            "review_wait_respawn_task_id": str(superseded_review.id),
+        },
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # The previous respawned review was superseded — a new spawn must fire.
+    fake_review = _make_fake_review_task(project.id)
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        new=AsyncMock(return_value=(fake_review, True)),
+    )
+
+    ci_result = {"status": "completed", "conclusion": "success"}
+    result = await handle_ci_completion(
+        task, ci_result, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is True
+    # The spawn must have been attempted despite the count being at cap,
+    # because the previous respawned review was superseded.
+    spawn_mock.assert_awaited_once()
+    spawn_args = spawn_mock.await_args
+    assert spawn_args.args[1] == "review", "must spawn a review task"
+
+    await db_session.refresh(task)
+    review_loop = (task.context or {}).get("review_loop", {})
+    # The effective count was decremented, so the respawn should have fired.
+    assert review_loop.get("review_wait_respawned") is True
+    assert review_loop.get("review_wait_escalated") is not True
+    assert task.requires_approval is not True
+    alert_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_review_wait_accelerated_deferred_retry(db_session, mocker):
+    """When the CI task's review_loop carries a recent review_spawn_deferred_at
+    marker (from a fix-completion handler that hit a transient lock-contention
+    deferral), the backstop must retry the review spawn immediately upon
+    entering review-wait instead of waiting for the 60-minute timeout."""
+    from datetime import datetime, timedelta
+
+    from app.ci_completion import handle_ci_completion
+
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
+
+    project = Project(name="Accelerated defer retry", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fake_review = _make_fake_review_task(project.id)
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        new=AsyncMock(return_value=(fake_review, True)),
+    )
+
+    # Start just 30 seconds ago — NOT past the 60min backstop. The
+    # review_spawn_deferred_at marker (2 seconds ago) should trigger the
+    # accelerated retry path instead.
+    recent_started = (
+        datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=30)
+    ).isoformat()
+    deferred_at = (
+        datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=2)
+    ).isoformat()
+
+    task = _make_task_no_review_approved(
+        db_session,
+        project,
+        ci_loop_extra={
+            "review_wait_started": recent_started,
+            "review_spawn_deferred_at": deferred_at,
+        },
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    ci_result = {"status": "completed", "conclusion": "success"}
+    result = await handle_ci_completion(
+        task, ci_result, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is True
+    # The accelerated path must have spawned a review (not the 60min backstop).
+    spawn_mock.assert_awaited_once()
+    spawn_args = spawn_mock.await_args
+    assert spawn_args.args[1] == "review"
+
+    await db_session.refresh(task)
+    review_loop = (task.context or {}).get("review_loop", {})
+    assert review_loop.get("review_wait_respawned") is True
+    # The deferred marker should have been consumed.
+    assert "review_spawn_deferred_at" not in review_loop
+    assert task.requires_approval is not True
+    alert_mock.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # Non-terminal check-run status: waiting / requested / pending
 # ---------------------------------------------------------------------------

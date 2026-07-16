@@ -225,6 +225,8 @@ export interface GalleryViewableArtifact {
   storage_uri: string;
   kind: 'image' | 'video' | 'pdf';
   bytes: number;
+  revision: string | null;
+  live: boolean | null;
 }
 
 /** Defensive parse of the job's first-class `viewable_artifacts` field — the
@@ -248,6 +250,8 @@ export function computeJobViewableArtifacts(job: ComputeJob): GalleryViewableArt
       storage_uri: e.storage_uri,
       kind: e.kind,
       bytes: typeof e.size_bytes === 'number' && Number.isFinite(e.size_bytes) ? e.size_bytes : 0,
+      revision: typeof e.revision === 'string' && e.revision.length > 0 ? e.revision : null,
+      live: typeof e.live === 'boolean' ? e.live : null,
     });
   }
   return items;

@@ -824,7 +824,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
       // per-runner failure resolves to null and simply omits that runner's
       // Projects section rather than failing the whole panel load.
       const lists = await Promise.all(
-        data.map(r => listRunnerProjects(projectId, r.id).catch(() => null)),
+        data.map(r => listRunnerProjects(r.enrollment_project_id ?? projectId, r.id).catch(() => null)),
       );
       if (mountedRef.current) {
         const map: Record<string, RunnerProjectAllowList> = {};
@@ -975,7 +975,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
     if (type === 'rotate') {
       setRotating(runner.id);
       try {
-        const result = await rotateFleetRunnerToken(projectId, runner.id);
+        const result = await rotateFleetRunnerToken(runner.enrollment_project_id ?? projectId, runner.id);
         setPendingToken({
           runnerId: result.runner_id,
           token: result.token,
@@ -992,7 +992,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
     } else {
       setRevoking(runner.id);
       try {
-        await revokeFleetRunner(projectId, runner.id);
+        await revokeFleetRunner(runner.enrollment_project_id ?? projectId, runner.id);
         await load();
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e));
@@ -1005,7 +1005,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
   const handleAddRunnerProject = async (runner: FleetRunner, addProjectId: string) => {
     setMutatingProjects(runner.id);
     try {
-      await addRunnerProject(projectId, runner.id, addProjectId);
+      await addRunnerProject(runner.enrollment_project_id ?? projectId, runner.id, addProjectId);
       setAddingProjectFor(null);
       setAddProjectSelection('');
       await load();
@@ -1019,7 +1019,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
   const handleRemoveRunnerProject = async (runner: FleetRunner, addedProjectId: string) => {
     setMutatingProjects(runner.id);
     try {
-      await removeRunnerProject(projectId, runner.id, addedProjectId);
+      await removeRunnerProject(runner.enrollment_project_id ?? projectId, runner.id, addedProjectId);
       await load();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -1031,7 +1031,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
   const handleUpdateStatus = async (runner: FleetRunner, status: 'active' | 'paused' | 'draining') => {
     setUpdatingStatus(runner.id);
     try {
-      await patchRunnerStatus(projectId, runner.id, status);
+      await patchRunnerStatus(runner.enrollment_project_id ?? projectId, runner.id, status);
       await load();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -1277,6 +1277,11 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                     <span className="text-sm font-medium text-neutral-200 truncate">
                       {runner.hostname ?? runner.id.slice(0, 8)}
                     </span>
+                    {runner.enrollment_project_id && runner.enrollment_project_id !== projectId && (
+                      <span className="rounded border border-sky-500/30 bg-sky-500/10 px-1.5 py-0.5 text-xs text-sky-300" data-testid="fleet-runner-shared">
+                        shared runner
+                      </span>
+                    )}
                     {runner.version && (
                       <span className="text-xs text-neutral-500">{runner.version}</span>
                     )}
@@ -1526,7 +1531,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
               {configOpen && (
                 <FleetRunnerConfigPanel
                   key={`config-${runner.id}`}
-                  projectId={projectId}
+                  projectId={runner.enrollment_project_id ?? projectId}
                   runner={runner}
                   onSaved={() => load()}
                 />
@@ -1624,6 +1629,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
               )}
               {telemetryOpen && (
                 <RunnerTelemetryDetail
+                  enrollmentProjectId={runner.enrollment_project_id ?? projectId}
                   projectId={projectId}
                   runnerId={runner.id}
                   onNavigateToTask={onNavigateToTask}
@@ -1721,10 +1727,12 @@ function Sparkline({
  *  over the last hour) + compute-job rollups. Lazy-loaded when the row expands. */
 function RunnerTelemetryDetail({
   projectId,
+  enrollmentProjectId,
   runnerId,
   onNavigateToTask,
 }: {
   projectId: string;
+  enrollmentProjectId: string;
   runnerId: string;
   onNavigateToTask?: (taskId: string) => void;
 }) {
@@ -1756,7 +1764,7 @@ function RunnerTelemetryDetail({
     return () => {
       cancelled = true;
     };
-  }, [projectId, runnerId]);
+  }, [projectId, enrollmentProjectId, runnerId]);
 
   if (loading) {
     return (

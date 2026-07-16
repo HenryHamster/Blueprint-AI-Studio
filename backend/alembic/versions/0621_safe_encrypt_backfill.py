@@ -10,7 +10,7 @@ WHY A NEW MIGRATION (INSTEAD OF EDITING 0531)
 ---------------------------------------------
 Applied migration history is immutable.  0531 already exists in the chain and
 cannot be modified.  0621 supersedes it: same backfill logic, no string
-interpolation, and it chains linearly from 0530 so the graph remains acyclic
+interpolation, and it chains linearly from 0609 so the graph remains acyclic
 and the EXPECTED_SCHEMA_REVISION stays consistent.
 
 BACKFILL TARGETS
@@ -30,7 +30,7 @@ ALREADY ciphertext and is skipped.  The plain ``encrypt_field(value) == value``
 short-circuit avoids a no-key no-op turning into a double-encrypt attempt.
 
 Revision ID: 0621
-Revises: 0607
+Revises: 0609
 Create Date: 2026-07-16 00:00:00.000000
 
 """
@@ -43,7 +43,7 @@ import sqlalchemy as sa
 logger = logging.getLogger(__name__)
 
 revision = "0621"
-down_revision = "0607"
+down_revision = "0609"
 branch_labels = None
 depends_on = None
 

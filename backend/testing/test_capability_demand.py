@@ -859,3 +859,39 @@ class TestComputeUnprovenDemandedCapabilities:
         assert len(result) == 1
         assert result[0]["ref"] == "backed-cap"
         assert result[0]["proof_status"] == "partial"
+
+
+# ── PLATFORM_WORKING_CAPABILITIES filter ─────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_platform_working_capability_filtered_from_demand(db_session):
+    """Cancelled dependents waiting on a platform-registered working capability
+    do not appear in the missing-foundation demand surface."""
+    from app.capability_registry import PLATFORM_WORKING_CAPABILITIES
+
+    project = await _make_project(db_session)
+    now = _utcnow()
+    platform_cap = next(iter(PLATFORM_WORKING_CAPABILITIES))
+
+    cancelled = make_task(
+        project_id=project.id,
+        status=TaskStatus.CANCELLED,
+        context={
+            UNRESUMABLE_CANCEL_CONTEXT_KEY: {
+                "give_up_class": GIVE_UP_NEVER_SATISFIABLE,
+                "need": {"kind": "capability", "ref": platform_cap},
+                "direction_id": "d-test",
+                "at": (now - timedelta(hours=1)).isoformat(),
+                MISSING_FOUNDATION_MARKER_KEY: True,
+            }
+        },
+    )
+    db_session.add(cancelled)
+    await db_session.commit()
+
+    result = await collect_missing_capability_demand(db_session, project.id, now=now)
+    assert result["total"] == 0, (
+        f"Platform capability '{platform_cap}' should be filtered from demand"
+    )
+    assert result["demands"] == []

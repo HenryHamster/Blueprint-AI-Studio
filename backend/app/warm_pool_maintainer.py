@@ -1857,16 +1857,17 @@ async def sweep_stranded_lanes(session, now: datetime, *, runtime_config) -> int
         .all()
     )
 
-    for lane in stale_parked:
-        lane_id_str = str(lane.id)
-        # Find non-terminal tasks belonging to this lane's chain. Use Python-side
-        # context filtering to stay dialect-agnostic (SQLite / Postgres).
-        # If any non-terminal task references this lane, the chain is still live.
-        live_tasks = (
+    # Batch the live-task lookup: one query per distinct project_id rather than
+    # one per lane.  This avoids redundant full-project scans when multiple
+    # stale lanes share the same project.
+    stale_project_ids = {lane.project_id for lane in stale_parked}
+    live_tasks_by_project: dict = {}
+    if stale_project_ids:
+        all_live = (
             (
                 await session.execute(
                     select(Task).where(
-                        Task.project_id == lane.project_id,
+                        Task.project_id.in_(list(stale_project_ids)),
                         Task.status.notin_(list(_LANE_TERMINAL_TASK_STATUSES)),
                     )
                 )
@@ -1874,6 +1875,12 @@ async def sweep_stranded_lanes(session, now: datetime, *, runtime_config) -> int
             .scalars()
             .all()
         )
+        for t in all_live:
+            live_tasks_by_project.setdefault(t.project_id, []).append(t)
+
+    for lane in stale_parked:
+        lane_id_str = str(lane.id)
+        live_tasks = live_tasks_by_project.get(lane.project_id, [])
         chain_is_live = any(
             (t.context or {}).get("_review_fix_lane_id") == lane_id_str
             for t in live_tasks

@@ -28,9 +28,12 @@ from app.models import (
     ProjectMember,
     ProjectStatus,
     ProjectMessage,
+    MessageHandlingState,
+    MessageSurface,
     MessageType,
     UserIntegration,
 )
+from app.project_message_creation import lock_project_and_next_message_sequence
 from app.auth import get_current_user
 from app.ci_resolution import compute_merge_verification_verdict
 from app.schemas import OnboardPayload
@@ -875,7 +878,12 @@ async def _detect_build_config(
 
 
 def _seed_strategic_intent(
-    project: Project, goal: str | None, steering: Dict[str, Any] | None
+    project: Project,
+    goal: str | None,
+    steering: Dict[str, Any] | None,
+    *,
+    actor_user_id: str | None = None,
+    sequence: int = 1,
 ) -> ProjectMessage | None:
     """Seed the user's onboarding goal into the project's strategic intent.
 
@@ -907,6 +915,10 @@ def _seed_strategic_intent(
 
     message = ProjectMessage(
         project_id=project.id,
+        actor_user_id=actor_user_id,
+        sequence=sequence,
+        surface=MessageSurface.CONVERSATION,
+        handling_state=MessageHandlingState.PENDING,
         from_type="user",
         message_type=MessageType.NOTE,
         content=goal,
@@ -1186,10 +1198,15 @@ async def onboard_project(
     # Seed the user's goal + optional steering into strategic intent so the
     # first strategic cycle reasons from it. Read defensively: the OnboardPayload
     # schema field lands via a sibling task, so until then this is a no-op.
+    seed_sequence = await lock_project_and_next_message_sequence(
+        session, project.id
+    )
     seeded_message = _seed_strategic_intent(
         project,
         getattr(payload, "goal", None),
         getattr(payload, "initial_steering", None),
+        actor_user_id=current_user["user_id"],
+        sequence=seed_sequence,
     )
     if seeded_message is not None:
         session.add(seeded_message)

@@ -35,7 +35,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Protocol, Sequence
+from typing import Any, Callable, Dict, Protocol, Sequence
 
 from google.cloud import storage as gcs_storage
 
@@ -384,6 +384,12 @@ _MAX_RESULT_METRICS_DECODED_BYTES = 8192
 # rather than allowed to balloon the durable result or wedge teardown.
 _MAX_COMMAND_LOG_BYTES = 32768
 _MAX_COMMAND_LOG_DECODED_BYTES = 65536
+
+# How often the reaper's progress heartbeat fires during a compute-image build,
+# so the lifecycle watchdog (REAPER_HANG_SECONDS=300) does not cancel the reaper
+# while a multi-minute baked-image build is in progress. 60s is well under the
+# 300s stall threshold, giving 4 missed beats before the watchdog acts.
+_HEARTBEAT_INTERVAL = 60
 
 class ComputeLaunchSpecError(ValueError):
     """A launch spec is malformed in a way no retry can fix.
@@ -2280,6 +2286,8 @@ def _download_artifact_bundle_to_path(job_id, dest_path: str) -> bool:
 
 def _select_viewable_candidates_from_bundle_path(
     path: str,
+    *,
+    fail_soft: bool = True,
 ) -> tuple[list[ViewableArtifactCandidate], int]:
     """Select a bundle's viewable files from an ON-DISK archive, bounded memory.
 
@@ -2378,9 +2386,14 @@ def _select_viewable_candidates_from_bundle_path(
                     )
                 if len(out) == len(selected_refs):
                     break
-    except (tarfile.TarError, OSError, EOFError, ValueError):
+    except (tarfile.TarError, OSError, EOFError, ValueError) as exc:
         _unlink_temp_sources(tmp_video_paths)
+        if not fail_soft:
+            raise RuntimeError("viewable bundle enumeration failed") from exc
         return [], 0
+    if len(out) != len(selected_refs) and not fail_soft:
+        _unlink_temp_sources(tmp_video_paths)
+        raise RuntimeError("viewable bundle enumeration was incomplete")
     # Unlink any temp video that did NOT become a surviving candidate (e.g. a
     # post-extract stat failed) so it can't leak; the rest are unlinked by
     # persist_viewable_artifacts after upload.
@@ -2391,6 +2404,8 @@ def _select_viewable_candidates_from_bundle_path(
 
 async def _stream_viewable_candidates_from_bundle(
     job_id,
+    *,
+    fail_soft: bool = True,
 ) -> tuple[list[ViewableArtifactCandidate], int]:
     """Fetch + select a bundle-backed job's viewable files without ever holding
     the bundle in memory.
@@ -2407,9 +2422,13 @@ async def _stream_viewable_candidates_from_bundle(
             _download_artifact_bundle_to_path, job_id, tmp_path
         )
         if not downloaded:
+            if not fail_soft:
+                raise RuntimeError("durable viewable bundle is unavailable")
             return [], 0
         return await asyncio.to_thread(
-            _select_viewable_candidates_from_bundle_path, tmp_path
+            _select_viewable_candidates_from_bundle_path,
+            tmp_path,
+            fail_soft=fail_soft,
         )
     except Exception:
         logger.warning(
@@ -2418,6 +2437,8 @@ async def _stream_viewable_candidates_from_bundle(
             job_id,
             exc_info=True,
         )
+        if not fail_soft:
+            raise
         return [], 0
     finally:
         try:
@@ -2625,6 +2646,8 @@ def _collect_viewable_candidates_from_dir(
 
 async def _collect_viewable_artifact_candidates(
     job: ComputeJob,
+    *,
+    fail_soft: bool = True,
 ) -> tuple[list[ViewableArtifactCandidate], int]:
     """Backend-aware selection of a terminal job's viewable files.
 
@@ -2653,7 +2676,10 @@ async def _collect_viewable_artifact_candidates(
         # Already sorted + capped on disk (count cap applied BEFORE any member
         # bytes are read; size-cap omissions folded into the returned count), so
         # it returns the final (selected, dropped) directly.
-        return await _stream_viewable_candidates_from_bundle(job.id)
+        return await _stream_viewable_candidates_from_bundle(
+            job.id,
+            fail_soft=fail_soft,
+        )
     else:
         return [], 0
     all_candidates.sort(key=lambda c: c.filename)
@@ -2665,15 +2691,26 @@ async def _collect_viewable_artifact_candidates(
 async def persist_viewable_artifacts(
     job: ComputeJob,
 ) -> tuple[list[dict[str, Any]], int]:
+    """Compatibility wrapper returning the historical ``(manifest, dropped)``."""
+    manifest, dropped, _complete = (
+        await persist_viewable_artifacts_with_completeness(job)
+    )
+    return manifest, dropped
+
+
+async def persist_viewable_artifacts_with_completeness(
+    job: ComputeJob,
+) -> tuple[list[dict[str, Any]], int, bool]:
     """Persist a terminal job's viewable files as individually-addressable objects.
 
     Extracts the viewable files (png/jpg/jpeg/webp/gif/mp4/webm — NO svg, which
     can execute script when served from a signed URL) from the
     job's artifacts, uploads each under the allowlisted per-job prefix, and
-    returns ``(manifest, dropped)`` — a list of
+    returns ``(manifest, dropped, complete)`` — a list of
     ``{filename, storage_uri, content_type, size_bytes, kind}`` for durably stored
     files, and the count of qualifying files that exceeded ``_MAX_VIEWABLE_FILE_COUNT``
-    and were not persisted.
+    and were not persisted. ``complete`` is false when the durable bundle could
+    not be enumerated fully or any selected file failed to persist.
 
     Fail-soft by contract: an empty/corrupt bundle, a missing dir, or ANY
     extraction/upload error degrades to ``([], 0)`` and NEVER raises,
@@ -2682,17 +2719,21 @@ async def persist_viewable_artifacts(
     appear in the returned manifest.
     """
     try:
-        candidates, dropped = await _collect_viewable_artifact_candidates(job)
+        candidates, dropped = await _collect_viewable_artifact_candidates(
+            job,
+            fail_soft=False,
+        )
     except Exception:
         logger.warning(
             "Viewable-artifact extraction failed for compute job %s",
             getattr(job, "id", None),
             exc_info=True,
         )
-        return [], 0
+        return [], 0, False
     if not candidates:
-        return [], dropped
+        return [], dropped, True
     manifest: list[dict[str, Any]] = []
+    complete = True
     for candidate in candidates:
         try:
             uri = await _upload_viewable_candidate(job, candidate)
@@ -2710,6 +2751,7 @@ async def persist_viewable_artifacts(
             if candidate.source_is_temp and candidate.source_path:
                 _unlink_temp_sources([candidate.source_path])
         if not uri:
+            complete = False
             continue
         manifest.append(
             {
@@ -2718,9 +2760,14 @@ async def persist_viewable_artifacts(
                 "content_type": candidate.content_type,
                 "size_bytes": candidate.size_bytes,
                 "kind": candidate.kind,
+                # The object URI is deterministic and may have held a live
+                # generation already. Terminal persistence is an authoritative
+                # overwrite, so it receives a fresh cache identity.
+                "revision": storage.new_viewable_revision(),
+                "live": False,
             }
         )
-    return manifest, dropped
+    return manifest, dropped, complete
 
 
 def _open_viewable_source_nofollow(path: str, artifact_root: str | None):
@@ -4149,6 +4196,7 @@ async def refresh_project_compute_image(
     allow_build: bool = True,
     build_semaphore: "asyncio.Semaphore | None" = None,
     acquire_timeout: float = 1.0,
+    progress_cb: "Callable[[], None] | None" = None,
     _manifest_fn=None,
     _token_fn=None,
     _default_branch_fn=None,
@@ -4185,7 +4233,9 @@ async def refresh_project_compute_image(
     * **rebuild** — only when the tag is ABSENT, drive the existing pipeline
       (:func:`build_project_compute_image` -> :func:`record_project_compute_image_build`),
       honoring the process-wide build concurrency guard (*build_semaphore*) and a
-      caller-supplied build budget (*allow_build*).
+      caller-supplied build budget (*allow_build*). When *progress_cb* is provided,
+      the build runs as a background task with periodic heartbeats so the reaper's
+      lifecycle watchdog does not cancel the cycle during a multi-minute build.
 
     Returns a small structured result whose ``status`` is one of ``no_config`` /
     ``unchanged`` / ``rebuilt`` / ``deferred`` / ``error``. All hooks default to
@@ -4334,12 +4384,32 @@ async def refresh_project_compute_image(
                 }
 
         try:
-            result = await build_fn(
-                project,
-                registry_repo=registry_repo,
-                build_config=build_config,
-                ref=default_branch,
-            )
+            if progress_cb is not None:
+                # Run the build as a background task with periodic progress
+                # heartbeats so the reaper lifecycle watchdog
+                # (REAPER_HANG_SECONDS=300) does not cancel the cycle during
+                # a multi-minute baked-image build.
+                _build_task = asyncio.ensure_future(build_fn(
+                    project,
+                    registry_repo=registry_repo,
+                    build_config=build_config,
+                    ref=default_branch,
+                ))
+                while True:
+                    _done, _pending = await asyncio.wait(
+                        [_build_task], timeout=_HEARTBEAT_INTERVAL
+                    )
+                    if _done:
+                        result = _build_task.result()
+                        break
+                    progress_cb()
+            else:
+                result = await build_fn(
+                    project,
+                    registry_repo=registry_repo,
+                    build_config=build_config,
+                    ref=default_branch,
+                )
         finally:
             if acquired:
                 build_semaphore.release()

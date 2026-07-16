@@ -227,6 +227,19 @@ def annotate_capability_proof_status(
     return annotated
 
 
+#: Platform capabilities fully implemented at runtime.  Registered here so
+#: prerequisite refs to these names resolve in the blocked-resume sweep and
+#: missing-foundation demand surface without requiring a per-project vocabulary
+#: entry in ``problem_model.capabilities``.
+PLATFORM_WORKING_CAPABILITIES: frozenset[str] = frozenset(
+    {
+        "project-custom-tool-registry",
+        "qualification-dimension-ledger",
+        "multi-project-runner",
+    }
+)
+
+
 def working_capability_names(problem_model: object) -> set[str]:
     """Return canonical names of registry capabilities declared ``working``.
 
@@ -795,6 +808,74 @@ def capability_need_blocked_by_proof_gate(
     return proof_status != "proven"
 
 
+def task_backed_capability_need_blocked_by_proof_gate(
+    need: Mapping,
+    proof_records: object,
+    problem_model: object,
+    *,
+    mode: _GateMode = "off",
+) -> bool:
+    """Gate an exact task-backed capability provider on platform proof only."""
+    if (
+        mode != "enforce"
+        or not isinstance(need, Mapping)
+        or need.get("kind") != "capability"
+    ):
+        return False
+    name = normalize_capability_name(need.get("ref"))
+    if not name:
+        return False
+    names = _capability_alias_cluster(problem_model, name)
+    if names & platform_exempt_capability_names(proof_records):
+        return False
+    from app.time_utils import _utcnow
+
+    return _ledger_proof_status_for_names(proof_records, names, now=_utcnow()) != "proven"
+
+
+def _capability_alias_cluster(problem_model: object, name: str) -> set[str]:
+    """Return a capability and all canonical/absorbed aliases connected to it."""
+    cluster = {name}
+    entries: list[set[str]] = []
+    for raw_name, _status, absorbs in _iter_capability_entries(problem_model):
+        aliases = {
+            normalized
+            for normalized in (
+                normalize_capability_name(raw_name),
+                *_normalized_absorbed_names(absorbs),
+            )
+            if normalized
+        }
+        if aliases:
+            entries.append(aliases)
+    changed = True
+    while changed:
+        changed = False
+        for aliases in entries:
+            if cluster & aliases and not aliases <= cluster:
+                cluster.update(aliases)
+                changed = True
+    return cluster
+
+
+def _ledger_proof_status_for_names(
+    proof_records: object, names: Iterable[str], *, now: datetime | None = None
+) -> EvidenceStatus:
+    """Grade machine proofs across one canonical/absorbed namespace."""
+    synthetic = [
+        {
+            "kind": entry.get("proof_kind"),
+            "proven": True,
+            "recorded_at": entry.get("proved_at"),
+        }
+        for name in names
+        for entry in _ledger_machine_proof_entries(proof_records, name)
+    ]
+    if not synthetic:
+        return "unproven"
+    return classify_evidence_tiered(synthetic, now=now)
+
+
 def _alias_to_survivor_map(problem_model: object) -> dict[str, str]:
     """Build ``{absorbed_name: survivor_name}`` from the problem_model's capabilities.
 
@@ -925,6 +1006,13 @@ def ledger_corroborated_proof_status(
     if not isinstance(proof_status_by_name, Mapping):
         return {}
     exempt = {n for n in exempt_names if isinstance(n, str)}
+    # Reverse alias map: survivor → [absorbed, ...] so a survivor name whose proof
+    # lives only under an absorbed alias key in the ledger (pre-rename record) is
+    # still corroborated. Built once per call, empty when alias_map is absent.
+    reverse_map: dict[str, list[str]] = {}
+    if alias_map:
+        for absorbed, survivor in alias_map.items():
+            reverse_map.setdefault(survivor, []).append(absorbed)
     out: dict[str, EvidenceStatus] = {}
     for name, status in proof_status_by_name.items():
         if (
@@ -934,7 +1022,7 @@ def ledger_corroborated_proof_status(
         ):
             out[name] = status
             continue
-        # Alias retry: if this name was absorbed by a surviving capability,
+        # Forward alias retry: if this name was absorbed by a surviving capability,
         # check the survivor's ledger key instead of the alias's own (which
         # may not exist in the platform ledger).
         if alias_map and name in alias_map:
@@ -942,6 +1030,14 @@ def ledger_corroborated_proof_status(
             if _ledger_proof_status(proof_records, survivor, now=now) == "proven":
                 out[name] = status
                 continue
+        # Reverse alias retry: if this name IS a survivor, also check its absorbed
+        # alias keys — proof recorded before a rename lives under the old name.
+        if reverse_map and name in reverse_map and any(
+            _ledger_proof_status(proof_records, absorbed, now=now) == "proven"
+            for absorbed in reverse_map[name]
+        ):
+            out[name] = status
+            continue
         out[name] = "unverified"
     return out
 
@@ -1067,6 +1163,10 @@ def consumer_gate_proof_status(
     problem_model-only derivation; here the caller ALWAYS supplies the project's
     column, so ``None`` genuinely means "this project has no recorded proofs".
     """
+    if now is None:
+        from app.time_utils import _utcnow
+
+        now = _utcnow()
     proof_map = working_capability_proof_status(
         problem_model, now=now, proof_records=proof_records
     )
@@ -1159,6 +1259,10 @@ def capability_proof_gate_release_status(
     if not problem_model:
         detail["error"] = "no problem_model"
         return False, detail
+    if now is None:
+        from app.time_utils import _utcnow
+
+        now = _utcnow()
     proof_map = working_capability_proof_status(
         problem_model, now=now, proof_records=proof_records
     )

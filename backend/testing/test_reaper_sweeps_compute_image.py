@@ -1,4 +1,4 @@
-"""Tests for sweep_protect_referenced_compute_image_digests.
+"""Tests for compute-image GC guard and auto-refresh sweeps.
 
 Covers:
 - Registry helpers (apply_tag, list_tags, delete_tag) are invoked via
@@ -7,6 +7,9 @@ Covers:
 - Fail-open: exceptions from list_tags or delete_tag do not crash the sweep.
 - Cadence gate: sweep is skipped when called too soon after the last run.
 - Recent ProjectComputeImage rows are protected even before any job lands.
+- Auto-refresh: no-config / unchanged / rebuilt / deferred / error paths.
+- Auto-refresh: progress_cb heartbeat keeps the reaper watchdog alive
+  during a slow (simulated multi-minute) build.
 """
 
 import asyncio
@@ -1510,3 +1513,150 @@ async def test_sweep_caps_builds_per_cycle(db):
     assert result["rebuilt"] == 2
     assert result["deferred"] == 2
     assert result["projects"] == 4
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# progress_cb heartbeat: build keeps the reaper watchdog alive
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_refresh_build_calls_progress_cb_during_build(db):
+    """A slow build calls progress_cb at least once (heartbeat interval respected).
+
+    When progress_cb is provided, the build runs as a background task with periodic
+    heartbeats so the reaper's lifecycle watchdog (REAPER_HANG_SECONDS=300) does
+    not cancel the cycle during a multi-minute baked-image build.
+    """
+    project = await _make_repo_project(db)
+    cb_calls: list[str] = []
+
+    def _progress():
+        cb_calls.append("heartbeat")
+
+    async def _slow_build(*a, **k):
+        # Simulate a multi-minute build by sleeping longer than the heartbeat
+        # interval.  With the monkeypatched 10ms interval we expect ~5 beats.
+        await asyncio.sleep(0.05)
+        return BuildResult(
+            pinned_ref=f"{_FULL_REPO}@sha256:{'c' * 64}",
+            tag="deadbeef",
+            dep_hash="h1",
+            built=True,
+            already_present=False,
+        )
+
+    with patch.object(_cb, "_HEARTBEAT_INTERVAL", 0.01):
+        result = await _cb.refresh_project_compute_image(
+            db,
+            project,
+            progress_cb=_progress,
+            _manifest_fn=lambda _p: _async(_BUILD_MANIFEST),
+            _token_fn=lambda o, r: _async("tok"),
+            _default_branch_fn=lambda t, o, r: _async("main"),
+            _fetch_bytes_fn=_fetch_bytes_stub(
+                {".blueprint/Dockerfile.compute": b"FROM python:3.11-slim\n"}
+            ),
+            _tag_exists_fn=lambda full_repo, dep_hash: False,
+            _build_fn=_slow_build,
+            _record_fn=_record_row,
+        )
+
+    assert result["status"] == "rebuilt"
+    assert len(cb_calls) >= 1, (
+        f"progress_cb must be called during a slow build, got {len(cb_calls)} calls"
+    )
+
+
+@pytest.mark.asyncio
+async def test_refresh_build_no_progress_cb_default_path(db):
+    """Without progress_cb, the build still succeeds (default await path)."""
+    project = await _make_repo_project(db)
+
+    async def _build(*a, **k):
+        return BuildResult(
+            pinned_ref=f"{_FULL_REPO}@sha256:{'c' * 64}",
+            tag="deadbeef",
+            dep_hash="h1",
+            built=True,
+            already_present=False,
+        )
+
+    result = await _cb.refresh_project_compute_image(
+        db,
+        project,
+        progress_cb=None,
+        _manifest_fn=lambda _p: _async(_BUILD_MANIFEST),
+        _token_fn=lambda o, r: _async("tok"),
+        _default_branch_fn=lambda t, o, r: _async("main"),
+        _fetch_bytes_fn=_fetch_bytes_stub(
+            {".blueprint/Dockerfile.compute": b"FROM python:3.11-slim\n"}
+        ),
+        _tag_exists_fn=lambda full_repo, dep_hash: False,
+        _build_fn=_build,
+        _record_fn=_record_row,
+    )
+    assert result["status"] == "rebuilt"
+
+
+@pytest.mark.asyncio
+async def test_refresh_unchanged_manifest_skips_progress_cb(db):
+    """An unchanged manifest (fast-path no-op) does NOT invoke progress_cb."""
+    project = await _make_repo_project(db)
+    cb_calls: list[str] = []
+
+    def _progress():
+        cb_calls.append("heartbeat")
+
+    def _tag_exists(full_repo, dep_hash):
+        return True  # already present => fast path, no build
+
+    result = await _cb.refresh_project_compute_image(
+        db,
+        project,
+        progress_cb=_progress,
+        _manifest_fn=lambda _p: _async(_BUILD_MANIFEST),
+        _token_fn=lambda o, r: _async("tok"),
+        _default_branch_fn=lambda t, o, r: _async("main"),
+        _fetch_bytes_fn=_fetch_bytes_stub(
+            {".blueprint/Dockerfile.compute": b"FROM python:3.11-slim\n"}
+        ),
+        _tag_exists_fn=_tag_exists,
+        _resolve_digest_fn=lambda full_repo, dep_hash: None,
+        _build_fn=lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("build must not run on unchanged manifest")
+        ),
+        _record_fn=_record_row,
+    )
+    assert result["status"] == "unchanged"
+    assert len(cb_calls) == 0, "no progress_cb calls expected on fast-path no-op"
+
+
+@pytest.mark.asyncio
+async def test_sweep_passes_progress_cb_to_driver(db):
+    """sweep_refresh_project_compute_images passes progress_cb to each driver call."""
+    await _make_repo_project(db, name="p1")
+
+    captured_kwargs: dict = {}
+
+    async def _refresh(session, project, **kwargs):
+        captured_kwargs.update(kwargs)
+        return {"status": "unchanged"}
+
+    cb_calls: list[str] = []
+
+    def _progress():
+        cb_calls.append("heartbeat")
+
+    with patch("app.reaper_sweeps._last_compute_image_refresh_sweep", None):
+        await sweep_refresh_project_compute_images(
+            db,
+            now=datetime(2026, 6, 1, 12, 0, 0),
+            _refresh_fn=_refresh,
+            _build_semaphore=asyncio.Semaphore(1),
+            progress_cb=_progress,
+        )
+
+    assert captured_kwargs.get("progress_cb") is _progress, (
+        "sweep must pass progress_cb through to the driver"
+    )

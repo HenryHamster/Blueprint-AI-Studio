@@ -284,7 +284,7 @@ _WEBHOOK_EVENT_AUDIENCE: dict[str, str] = {
     "RUNNER_DEGRADED": OPERATOR_FYI,
     "RUNNER_DEGRADED_ESCALATED": OPERATOR_ACTION_NEEDED,
     "RUNNER_FLEET_OFFLINE": OPERATOR_ACTION_NEEDED,
-    "RUNNER_LOW_DISK": OPERATOR_FYI,
+    "RUNNER_LOW_DISK": OPERATOR_ACTION_NEEDED,
     "RUNNER_OUTAGE_ESCALATED": OPERATOR_ACTION_NEEDED,
     "RUNNER_LOCAL_HOLD": OPERATOR_ACTION_NEEDED,
     "RUNNER_CONTAINER_HOLD": OPERATOR_ACTION_NEEDED,
@@ -298,6 +298,43 @@ _WEBHOOK_EVENT_AUDIENCE: dict[str, str] = {
     "RESIDUAL_FIX_MERGED": STRATEGIST_INTERNAL,
     "RESIDUAL_FIX_UNSUSPENDED": STRATEGIST_INTERNAL,
 }
+
+
+# ── Logical event pair registry ──────────────────────────────────────────
+#
+# Many events appear in BOTH the internal-ledger registry (lowercase/dotted)
+# and the external-webhook registry (UPPERCASE_UNDERSCORE) under different
+# naming conventions, but represent the same logical operation.  Paired entries
+# MUST agree on audience classification.  This mapping is the single source of
+# truth for those equivalences; ``test_message_audience.py`` reads it and fails
+# CI when a pair drifts so silent inconsistencies are caught before shipping.
+#
+# Only register pairs that are genuinely the same logical event.  Events that
+# only exist in one registry (internal-only bookkeeping or webhook-only fields)
+# must NOT appear here.
+_LOGICAL_EVENT_PAIRS: dict[str, str] = {
+    # internal_key (lowercase/dotted): webhook_key (UPPERCASE_UNDERSCORE)
+    "pr_merged": "PR_MERGED",
+    "auto_fix_escalated": "AUTO_FIX_ESCALATED",
+    "auto_fix_spawned": "AUTO_FIX_SPAWNED",
+    "residual_fix_escalated": "RESIDUAL_FIX_ESCALATED",
+    "residual_fix_audit_deferred": "RESIDUAL_FIX_AUDIT_DEFERRED",
+    "residual_fix_spawned": "RESIDUAL_FIX_SPAWNED",
+    "residual_fix_unsuspended": "RESIDUAL_FIX_UNSUSPENDED",
+    "direction_burn_pause": "DIRECTION_BURN_PAUSE",
+    "remediation_escalated": "REMEDIATION_ESCALATED",
+    "merge.unverified": "MERGE_UNVERIFIED",
+    "task.failed": "TASK_FAILED",
+    "approval.needed": "APPROVAL_NEEDED",
+    "runner.deactivated": "RUNNER_DEACTIVATED",
+    "runner.degraded": "RUNNER_DEGRADED",
+    "runner.low_disk": "RUNNER_LOW_DISK",
+}
+
+
+def get_logical_event_pairs() -> dict[str, str]:
+    """Return the known internal→webhook event equivalences (testing hook)."""
+    return dict(_LOGICAL_EVENT_PAIRS)
 
 
 def route_external_webhook_event(webhook_event_type: str) -> str:

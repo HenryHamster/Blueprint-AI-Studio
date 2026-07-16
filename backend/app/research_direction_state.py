@@ -25,10 +25,10 @@ from app.models import (
     ArtifactType,
     MessageType,
     Project,
-    ProjectMessage,
     Task,
     TaskStatus,
 )
+from app.project_message_creation import build_project_message
 from app.broadcast import broadcast_to_project
 from app.direction_metrics import (
     _fold_evicted_into_aggregate,
@@ -796,7 +796,8 @@ async def apply_post_spawn_state(
                                 task_id=task.id,
                             )
                             session.add(_deadlock_alert)
-                            _deadlock_msg = ProjectMessage(
+                            _deadlock_msg = await build_project_message(
+                                session,
                                 project_id=task.project_id,
                                 message_type=MessageType.BUG_REPORT,
                                 from_type="agent",
@@ -902,7 +903,8 @@ async def apply_post_spawn_state(
                                 task_id=task.id,
                             )
                             session.add(_af_alert)
-                            _af_msg = ProjectMessage(
+                            _af_msg = await build_project_message(
+                                session,
                                 project_id=task.project_id,
                                 message_type=MessageType.BUG_REPORT,
                                 from_type="agent",
@@ -1554,7 +1556,8 @@ async def _apply_terminal_transition(
 
             await with_directions_locked(session, task.project_id, _apply_zero_note)
         elif project:
-            msg = ProjectMessage(
+            msg = await build_project_message(
+                session,
                 project_id=task.project_id,
                 message_type=MessageType.NOTE,
                 from_type="agent",

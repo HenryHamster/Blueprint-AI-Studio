@@ -1554,6 +1554,9 @@ class TestOnboardStrategicIntentSeed:
         assert msg.content == goal
         assert msg.status == "open"
         assert msg.project_id == project.id
+        assert msg.sequence == 1
+        assert msg.surface == "conversation"
+        assert msg.handling_state == "pending"
 
     def test_empty_goal_is_a_noop(self):
         """An empty/whitespace goal preserves today's blank-slate behavior."""

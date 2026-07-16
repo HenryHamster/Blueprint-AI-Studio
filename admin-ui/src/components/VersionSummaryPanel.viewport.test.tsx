@@ -798,4 +798,137 @@ describe('VersionSummaryPanel — viewport regression', () => {
     const gapSection = host.querySelector('[data-testid="merge-evidence-gap-breakdown"]');
     if (gapSection !== null) throw new Error('Expected no merge-evidence-gap-breakdown when all gap counts are zero');
   });
+
+  // ── phantom drift detection ─────────────────────────────────────────────────
+
+  test('phantom drift badge renders in empty-state when has_drift is true with phantom keys', async () => {
+    const coverage: VersionCriterionCoverage = {
+      total: 0,
+      covered: 0,
+      partial: 0,
+      uncovered: 0,
+      criteria: [],
+      phantom_bookkeeping: {
+        phantom_keys: ['crit-alpha', 'crit-beta'],
+        zero_registered: true,
+        has_drift: true,
+      },
+    };
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<VersionSummaryPanel tasksMerged={SAMPLE_TASKS} criterionCoverage={coverage} />);
+    });
+    const badge = host.querySelector('[data-testid="phantom-drift-badge"]');
+    if (badge === null) throw new Error('Expected phantom-drift-badge when has_drift is true');
+    expect(badge.textContent).toContain('2 phantom keys referenced');
+    const panel = host.querySelector('[data-testid="criterion-coverage-panel"]');
+    const text = panel?.textContent ?? '';
+    if (text.includes('No acceptance criteria defined for this version.')) {
+      throw new Error('Empty-state with phantom drift must NOT say "No acceptance criteria defined for this version."');
+    }
+    expect(text).toContain('No criteria registered');
+  });
+
+  test('phantom drift badge shows singular form for one phantom key', async () => {
+    const coverage: VersionCriterionCoverage = {
+      total: 0,
+      covered: 0,
+      partial: 0,
+      uncovered: 0,
+      criteria: [],
+      phantom_bookkeeping: {
+        phantom_keys: ['crit-alpha'],
+        zero_registered: true,
+        has_drift: true,
+      },
+    };
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<VersionSummaryPanel tasksMerged={SAMPLE_TASKS} criterionCoverage={coverage} />);
+    });
+    const badge = host.querySelector('[data-testid="phantom-drift-badge"]');
+    if (badge === null) throw new Error('Expected phantom-drift-badge');
+    expect(badge.textContent).toContain('1 phantom key referenced');
+    expect(badge.textContent).not.toContain('keys');
+  });
+
+  test('phantom drift badge in non-empty criteria list when phantom_keys present', async () => {
+    const coverage: VersionCriterionCoverage = {
+      total: 1,
+      covered: 1,
+      partial: 0,
+      uncovered: 0,
+      criteria: [
+        { criterion_key: 'crit-registered', text: 'Registered criterion', coverage: 'covered', evidence_count: 1 },
+      ],
+      phantom_bookkeeping: {
+        phantom_keys: ['crit-dangling'],
+        zero_registered: false,
+        has_drift: true,
+      },
+    };
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<VersionSummaryPanel tasksMerged={SAMPLE_TASKS} criterionCoverage={coverage} />);
+    });
+    const badge = host.querySelector('[data-testid="phantom-drift-badge"]');
+    if (badge === null) throw new Error('Expected phantom-drift-badge in non-empty criteria list');
+    expect(badge.textContent).toContain('1 phantom key');
+  });
+
+  test('no phantom drift badge when phantom_bookkeeping is absent (older backend)', async () => {
+    const coverage: VersionCriterionCoverage = {
+      total: 1,
+      covered: 1,
+      partial: 0,
+      uncovered: 0,
+      criteria: [
+        { criterion_key: 'c1', text: 'Covered criterion', coverage: 'covered', evidence_count: 1 },
+      ],
+    };
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<VersionSummaryPanel tasksMerged={SAMPLE_TASKS} criterionCoverage={coverage} />);
+    });
+    const badge = host.querySelector('[data-testid="phantom-drift-badge"]');
+    if (badge !== null) throw new Error('Expected no phantom-drift-badge when phantom_bookkeeping is absent');
+  });
+
+  test('no phantom drift badge when has_drift is false', async () => {
+    const coverage: VersionCriterionCoverage = {
+      total: 1,
+      covered: 1,
+      partial: 0,
+      uncovered: 0,
+      criteria: [
+        { criterion_key: 'c1', text: 'Covered criterion', coverage: 'covered', evidence_count: 1 },
+      ],
+      phantom_bookkeeping: {
+        phantom_keys: [],
+        zero_registered: false,
+        has_drift: false,
+      },
+    };
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<VersionSummaryPanel tasksMerged={SAMPLE_TASKS} criterionCoverage={coverage} />);
+    });
+    const badge = host.querySelector('[data-testid="phantom-drift-badge"]');
+    if (badge !== null) throw new Error('Expected no phantom-drift-badge when has_drift is false');
+  });
 });

@@ -40,9 +40,11 @@ ALLOWLIST: set[str] = {
     # validated inline by _verify_tool_asset_token.
     "/api/admin/projects/{project_id}/tools/{tool_slug}/assets/{path:path}",
     # GET /api/admin/projects/{project_id}/tools/{tool_slug}/t/{token}/assets/{path:path}
-    # uses the same path-embedded capability JWT mechanism for relative subresources
-    # loaded by the iframe. The token is embedded in the URL path (not a query
-    # param) to work around opaque-origin restrictions on relative URL resolution.
+    # is the path-embedded-token variant. The token sits in the URL path so that
+    # relative subresource requests (e.g. <script src="./app.js">) inherit auth
+    # automatically inside sandboxed opaque-origin iframes (where query-string
+    # tokens are dropped on relative URL resolution). Auth is performed
+    # identically via _verify_tool_asset_token (scope: "tool-asset").
     "/api/admin/projects/{project_id}/tools/{tool_slug}/t/{token}/assets/{path:path}",
 }
 

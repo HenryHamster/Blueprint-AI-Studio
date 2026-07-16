@@ -31,6 +31,7 @@ interface AttachmentPreviewModalProps {
   open: boolean;
   onClose: () => void;
   edit?: AttachmentEditControls;
+  onPreviewError?: () => void;
 }
 
 function base64ToBlob(base64: string, mimeType: string): Blob {
@@ -58,7 +59,7 @@ function triggerDownload(blob: Blob, fileName: string) {
   URL.revokeObjectURL(url);
 }
 
-export function AttachmentPreviewModal({ attachment, open, onClose, edit }: AttachmentPreviewModalProps) {
+export function AttachmentPreviewModal({ attachment, open, onClose, edit, onPreviewError }: AttachmentPreviewModalProps) {
   const panelRef = useRef<HTMLDivElement>(null);
   const closeButtonRef = useRef<HTMLButtonElement>(null);
   const restoreFocusRef = useRef<HTMLElement | null>(null);
@@ -381,6 +382,7 @@ export function AttachmentPreviewModal({ attachment, open, onClose, edit }: Atta
                 alt={displayName}
                 draggable={false}
                 className="max-h-[calc(100vh-220px)] max-w-full select-none"
+                onError={onPreviewError}
               />
               {cropMode && selection && selection.w > 0 && selection.h > 0 && (
                 <div
@@ -394,12 +396,14 @@ export function AttachmentPreviewModal({ attachment, open, onClose, edit }: Atta
               src={imageSrc}
               alt={displayName}
               className="max-h-[calc(100vh-160px)] max-w-full object-contain"
+              onError={onPreviewError}
             />
           ) : isPdf && pdfSrc ? (
             <iframe
               src={pdfSrc}
               title={displayName}
               className="h-[calc(100vh-160px)] w-full border-0"
+              onError={onPreviewError}
             />
           ) : (
             <div className="flex flex-col items-center gap-4 px-6 py-12">

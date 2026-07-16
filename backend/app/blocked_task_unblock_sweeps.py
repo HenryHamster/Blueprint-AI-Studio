@@ -73,6 +73,7 @@ _BLOCKED_PARKED_REEVAL_CAP = 4
 # is deliberately small: re-dispatch costs a full agent VM run, so this trades a
 # few wasted runs for auto-recovery instead of a multi-hour operator wedge.
 _BLOCKED_OPTIMISTIC_RETRY_CAP = 3
+_DETERMINISTIC_CAPABILITY_BLOCKERS = ("VIEWPORT_GATE_INFRA_UNAVAILABLE",)
 
 # Durable context marker stamped on a blocked dependent that the resume system
 # terminally CANCELS because it can provably never resume. The terminal
@@ -199,6 +200,24 @@ async def _blocked_precondition_state(task, session, verify_pr_merged) -> str:
         # source=="agent" so parent-source blockers and metadata-less blocked
         # subtasks keep their existing "wait for explicit recovery" semantics.
         if blocker_source == "agent":
+            blocker_text = " ".join(
+                str(value or "")
+                for value in (
+                    task.blocked_reason,
+                    task.latest_status_message,
+                    blocker_meta.get("reason")
+                    if isinstance(blocker_meta, dict)
+                    else None,
+                )
+            )
+            if any(
+                sentinel in blocker_text
+                for sentinel in _DETERMINISTIC_CAPABILITY_BLOCKERS
+            ):
+                # The unchanged runner image cannot satisfy this capability.
+                # Re-running the full authoring/test workload is deterministic
+                # waste, so hold until infrastructure changes.
+                return "waiting"
             return "retry"
         return "waiting"
     if verify_pr_merged is None:
@@ -504,6 +523,7 @@ async def _classify_blocker_needs(
         capability_need_blocked_by_proof_gate,
         capability_need_proof_status,
         registry_satisfies_capability_need,
+        task_backed_capability_need_blocked_by_proof_gate,
     )
 
     needs = get_blocker_needs(task)
@@ -561,6 +581,21 @@ async def _classify_blocker_needs(
     if working_proof is None:
         working_proof = {}
     working_caps = set(working_proof)
+    project = None
+
+    async def _task_backed_capability_is_held(need):
+        nonlocal project
+        if need.get("kind") != "capability":
+            return False
+        if project is None:
+            from app.models import Project
+            project = await session.get(Project, task.project_id)
+        return task_backed_capability_need_blocked_by_proof_gate(
+            need,
+            getattr(project, "capability_proof_records", None),
+            getattr(project, "problem_model", None),
+            mode=proof_gate_mode,
+        )
 
     # Stranded-parent set so a GENUINE ghost merge does NOT satisfy a completed
     # need. LANDED-IN-BASE-LINEAGE semantics: the ghost-merge exclusion fires ONLY
@@ -582,6 +617,10 @@ async def _classify_blocker_needs(
     for need in needs:
         match = resolve_blocked_need(task, need, active)
         if match is not None:
+            if await _task_backed_capability_is_held(need):
+                disp["residual"].append(need)
+                disp["proof_gate_held"].append(need)
+                continue
             match_id = str(match.id)
             if match_id not in existing_edges and match_id not in disp["edges"]:
                 disp["edges"].append(match_id)
@@ -590,6 +629,10 @@ async def _classify_blocker_needs(
             completed_foundation_for_need(task, need, completed, failed_parents)
             is not None
         ):
+            if await _task_backed_capability_is_held(need):
+                disp["residual"].append(need)
+                disp["proof_gate_held"].append(need)
+                continue
             disp["completed_needs"].append(need)
             continue
         # Durable-knowledge fallback: a dangling kind='task' need whose originating
@@ -755,6 +798,7 @@ async def _partition_completed_needs_base_safe(
     from app.blocked_need_resolution import completed_foundation_for_need
     from app.orchestrator_health import (
         _has_landed_cross_base_code_dep,
+        _shared_staging_dependency_source,
         ensure_dependent_base_recut,
     )
 
@@ -773,8 +817,9 @@ async def _partition_completed_needs_base_safe(
     base_safe: list = []
     recut_pending: list = []
     for need, foundation in resolved:
-        if foundation is not None and _has_landed_cross_base_code_dep(
-            task, [foundation]
+        if foundation is not None and (
+            _has_landed_cross_base_code_dep(task, [foundation])
+            or await _shared_staging_dependency_source(task, foundation, session)
         ):
             recut_pending.append(need)
         else:
@@ -1215,6 +1260,14 @@ async def sweep_unblock_blocked_tasks(
     # a capability need the registry already declares ``working`` is satisfied by
     # the codebase itself and resumes with no edge.
     registry_cache: dict = {}
+    # ── Gate revalidation caches (repo-wide gate failures) ──────────────
+    # Per-project gate state cache: project_id → {head_sha, green_at_head,
+    # checked_at_utc}.  Populated on first gate-failure-blocked task per
+    # project and reused across siblings in the same sweep batch.
+    _gate_cache: dict[str, dict] = {}
+    # Per-project GitHub token cache: project_id → installation token string.
+    # Populated by resolve_gate_state and reused across sibling tasks.
+    _github_cache: dict[str, str] = {}
 
     async def _escalate_blocked_task(
         task,
@@ -1299,6 +1352,62 @@ async def sweep_unblock_blocked_tasks(
             continue
 
         _bc_start = len(pending_broadcasts)
+
+        # ── Gate revalidation for repo-wide gate failures ──────────────
+        # When integration HEAD has advanced past the task's branch point,
+        # cheaply re-check the gate condition against current HEAD instead
+        # of spawning a suite run.  One GitHub check-runs call per project
+        # per sweep cycle (cached), not per blocked task.
+        from app.gate_revalidation import is_gate_failure_blocked as _gfb
+
+        if _gfb(task):
+            from app.gate_revalidation import (
+                has_live_respawn,
+                resolve_gate_state,
+            )
+
+            _pid_key = str(task.project_id)
+            _gs = _gate_cache.get(_pid_key)
+            if _gs is None:
+                _gs = await resolve_gate_state(
+                    session,
+                    task.project_id,
+                    github_info_cache=_github_cache,
+                )
+                _gate_cache[_pid_key] = _gs or {}
+            if _gs and _gs.get("green_at_head"):
+                if not await has_live_respawn(task, session):
+                    from sqlalchemy.orm.attributes import flag_modified
+
+                    _clear_blocked_fields(task, preserve_first_blocked=False)
+                    task.status = TaskStatus.QUEUED
+                    task.latest_status_message = (
+                        "Unblocked — repo-wide gate resolved at integration HEAD "
+                        f"({_gs['head_sha'][:12]}), requeued on fresh base"
+                    )
+                    ctx = task.context or {}
+                    ctx["_gate_revalidated_at"] = _gs["checked_at_utc"]
+                    ctx["_gate_revalidated_head"] = _gs["head_sha"]
+                    task.context = ctx
+                    flag_modified(task, "context")
+                    session.add(task)
+                    requeued += 1
+                    pending_broadcasts.append(
+                        (
+                            str(task.project_id),
+                            {
+                                "task_id": str(task.id),
+                                "status": "QUEUED",
+                                "message": task.latest_status_message,
+                            },
+                        )
+                    )
+                    await _commit_task_row(_bc_start)
+                    continue
+                # else: live respawn exists → DON'T unblock; fall through
+                # to the existing blocker machinery so the respawn completes
+                # instead of racing the recovered original.
+
         ctx = task.context or {}
         # Multi-need classification (shared by the parked and live paths): a
         # blocked dependent can wait on MORE THAN ONE prerequisite. Classify EVERY
@@ -1777,6 +1886,40 @@ async def event_driven_unblock_on_knowledge(
     if requeued:
         logger.info(
             "[REAPER] event_driven_unblock_on_knowledge: new knowledge in project %s "
+            "unblocked %d task(s) → QUEUED",
+            project_id,
+            requeued,
+        )
+    return requeued
+
+
+async def event_driven_unblock_on_capability_proof(
+    project_id,
+    session,
+    *,
+    batch_size: int = 50,
+) -> int:
+    """Re-resolve proof-gated BLOCKED tasks after a capability earns proof.
+
+    A newly committed executed-test proof changes the registry answer for every
+    same-project ``kind='capability'`` need, but those tasks may have a future
+    ``recheck_after``. Reuse the shared locked, bounded resolver so only tasks
+    whose *all* needs are now satisfied resume. This event seam is deliberately
+    fail-open: proof persistence remains authoritative if wake-up work fails.
+    """
+    try:
+        requeued = await _event_driven_unblock_project(
+            project_id, session, batch_size=batch_size
+        )
+    except Exception:
+        logger.exception(
+            "[REAPER] event_driven_unblock_on_capability_proof failed for project %s",
+            project_id,
+        )
+        return 0
+    if requeued:
+        logger.info(
+            "[REAPER] event_driven_unblock_on_capability_proof: new proof in project %s "
             "unblocked %d task(s) → QUEUED",
             project_id,
             requeued,

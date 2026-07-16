@@ -328,6 +328,10 @@ export const QUAL_STATE_STYLE: Record<QualificationStateValue, string> = {
   // Audit infra failed mid-execution, no conclusive verdict — amber/caution to
   // distinguish from a setup error; re-qualify is the path forward.
   infra_failure: 'bg-amber-500/10 border-amber-500/30 text-amber-400',
+  // Recoverable rubric holds: rubric changed mid-flight or provenance unknown.
+  // Amber/caution — NOT a hard failure; a fresh grade resolves either hold.
+  rubric_changed: 'bg-amber-500/10 border-amber-500/30 text-amber-400',
+  rubric_provenance_unknown: 'bg-amber-500/10 border-amber-500/30 text-amber-400',
 };
 
 type PromotionFreshnessContext = {

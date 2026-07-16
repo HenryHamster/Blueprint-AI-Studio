@@ -134,6 +134,8 @@ export function createApiMock(overrides: Record<string, unknown> = {}) {
     triggerTaskRollup: vi.fn(),
     fetchDeadLetters: vi.fn(),
     redriveDeadLetters: vi.fn(),
+    getHotfixPreview: vi.fn(),
+    triggerHotfixPromote: vi.fn(),
   };
   return { ...base, ...overrides };
 }

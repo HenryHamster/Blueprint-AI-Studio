@@ -3327,11 +3327,75 @@ class MessageType(str, Enum):
     NOTE = "NOTE"
 
 
+class MessageSurface(str, Enum):
+    """Durable projection that owns a project message."""
+
+    CONVERSATION = "conversation"
+    ACTIVITY = "activity"
+
+
+class MessageHandlingState(str, Enum):
+    """Strategic Resident delivery state, separate from message resolution."""
+
+    PENDING = "pending"
+    CLAIMED = "claimed"
+    RESPONDED = "responded"
+    SUPERSEDED = "superseded"
+
+
 class ProjectMessage(SQLModel, table=True):
     """Async message board between users and the strategic agent."""
 
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     project_id: uuid.UUID = Field(foreign_key="project.id", index=True)
+    # Auth-provider/Firebase UID of the human actor. This deliberately is not a
+    # FK to AllowedUser.id: AllowedUser uses an internal UUID while project
+    # membership and request identity use the external string UID. Nullable for
+    # legacy/system messages whose actor cannot be inferred safely.
+    actor_user_id: str | None = Field(
+        default=None, sa_column=Column(String(255), nullable=True)
+    )
+    # Canonical conversation writers allocate a positive, monotonic sequence
+    # from ProjectMessageSequence's short per-project counter row. It remains
+    # nullable during the legacy-writer migration window; the partial unique
+    # index fences every canonical/backfilled value without breaking untouched
+    # emitters. Remove nullable=True only after all writers have migrated and
+    # the rollback soak has completed.
+    sequence: int | None = Field(
+        default=None, sa_column=Column(BigInteger, nullable=True)
+    )
+    surface: MessageSurface = Field(
+        default=MessageSurface.ACTIVITY,
+        sa_column=Column(
+            String(32),
+            nullable=False,
+            server_default=text("'activity'"),
+        ),
+    )
+    handling_state: MessageHandlingState = Field(
+        default=MessageHandlingState.PENDING,
+        sa_column=Column(
+            String(32),
+            nullable=False,
+            server_default=text("'pending'"),
+        ),
+    )
+    handled_by_task_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(
+            GUID(),
+            ForeignKey("task.id", ondelete="SET NULL"),
+            nullable=True,
+        ),
+    )
+    reply_to_message_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(
+            GUID(),
+            ForeignKey("projectmessage.id", ondelete="SET NULL"),
+            nullable=True,
+        ),
+    )
     message_type: MessageType = Field(
         default=MessageType.NOTE, sa_column=Column(String, default=MessageType.NOTE)
     )
@@ -3374,9 +3438,57 @@ class ProjectMessage(SQLModel, table=True):
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
     )
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(
+            NaiveUTCDateTime,
+            nullable=False,
+            server_default=func.now(),
+            onupdate=_utcnow,
+        ),
+    )
 
     __table_args__ = (
+        CheckConstraint(
+            "sequence IS NULL OR sequence > 0",
+            name="chk_projectmessage_sequence_positive",
+        ),
+        CheckConstraint(
+            "surface IN ('conversation','activity')",
+            name="chk_projectmessage_surface",
+        ),
+        CheckConstraint(
+            "handling_state IN ('pending','claimed','responded','superseded')",
+            name="chk_projectmessage_handling_state",
+        ),
+        CheckConstraint(
+            "reply_to_message_id IS NULL OR reply_to_message_id <> id",
+            name="chk_projectmessage_reply_not_self",
+        ),
         Index("ix_projectmessage_project_status", "project_id", "status"),
+        Index(
+            "ux_projectmessage_project_sequence",
+            "project_id",
+            "sequence",
+            unique=True,
+            postgresql_where=text("sequence IS NOT NULL"),
+            sqlite_where=text("sequence IS NOT NULL"),
+        ),
+        Index(
+            "ix_projectmessage_project_surface_sequence",
+            "project_id",
+            "surface",
+            "sequence",
+        ),
+        Index(
+            "ix_projectmessage_project_handling_sequence",
+            "project_id",
+            "handling_state",
+            "sequence",
+        ),
+        Index("ix_projectmessage_actor_user_id", "actor_user_id"),
+        Index("ix_projectmessage_handled_by_task_id", "handled_by_task_id"),
+        Index("ix_projectmessage_reply_to_message_id", "reply_to_message_id"),
         # One logical message per (project, client key). Partial so keyless
         # legacy sends are unconstrained; the create endpoint queries this
         # before insert and the index is the concurrency-safe backstop.
@@ -3406,6 +3518,105 @@ class ProjectMessage(SQLModel, table=True):
             "project_id",
             "resident_session_id",
             "created_at",
+        ),
+    )
+
+
+class ProjectMessageSequence(SQLModel, table=True):
+    """Per-project atomic allocator for durable conversation sequence values."""
+
+    project_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("project.id", ondelete="CASCADE"),
+            primary_key=True,
+            nullable=False,
+        )
+    )
+    last_sequence: int = Field(
+        default=0,
+        sa_column=Column(BigInteger, nullable=False, server_default=text("0")),
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "last_sequence >= 0",
+            name="chk_projectmessagesequence_nonnegative",
+        ),
+    )
+
+
+class ProjectMessageAttachmentUpload(SQLModel, table=True):
+    """Durable receipt for one authorized project-message attachment upload."""
+
+    attachment_id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    project_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("project.id", ondelete="CASCADE"),
+            nullable=False,
+        )
+    )
+    actor_user_id: str = Field(sa_column=Column(String(255), nullable=False))
+    storage_uri: str = Field(sa_column=Column(Text, nullable=False))
+    filename: str = Field(sa_column=Column(String(512), nullable=False))
+    content_type: str | None = Field(
+        default=None,
+        sa_column=Column(String(128), nullable=True),
+    )
+    expected_size_bytes: int = Field(sa_column=Column(BigInteger, nullable=False))
+    expires_at: datetime = Field(
+        sa_column=Column(NaiveUTCDateTime, nullable=False)
+    )
+    consumed_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+    message_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(
+            GUID(),
+            ForeignKey("projectmessage.id", ondelete="SET NULL"),
+            nullable=True,
+        ),
+    )
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(
+            NaiveUTCDateTime,
+            nullable=False,
+            server_default=func.now(),
+        ),
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "expected_size_bytes >= 0",
+            name="chk_projectmessageattachmentupload_size_nonnegative",
+        ),
+        CheckConstraint(
+            "expires_at > created_at",
+            name="chk_projectmessageattachmentupload_expiry_after_create",
+        ),
+        Index(
+            "ix_projectmessageattachmentupload_project_expires",
+            "project_id",
+            "expires_at",
+        ),
+        Index(
+            "ix_projectmessageattachmentupload_project_actor_created",
+            "project_id",
+            "actor_user_id",
+            "created_at",
+        ),
+        Index(
+            "ix_projectmessageattachmentupload_message_id",
+            "message_id",
+        ),
+        Index(
+            "ix_projectmessageattachmentupload_consumed_expires",
+            "consumed_at",
+            "expires_at",
         ),
     )
 
@@ -5350,7 +5561,9 @@ class NotificationDeadLetter(SQLModel, table=True):
     last_status: int | None = Field(
         default=None, sa_column=Column(Integer, nullable=True)
     )
-    webhook_url: str = Field(default="", sa_column=Column(String(2048), nullable=False))
+    # Fernet ciphertext can exceed the original 2048-character plaintext URL
+    # allowance, so encrypted-at-rest values require unbounded text storage.
+    webhook_url: str = Field(default="", sa_column=Column(Text, nullable=False))
     payload: dict = Field(
         default_factory=dict,
         sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),

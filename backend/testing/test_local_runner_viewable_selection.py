@@ -310,9 +310,17 @@ def _run_stream(artifact_dir, state, *, upload_return=200):
     """
     calls: list = []
 
-    def fake_upload(orch, token, job_id, relpath, path, size, content_type):
+    def fake_upload(
+        orch, token, job_id, relpath, path, size, content_type, revision=None
+    ):
         calls.append(
-            {"relpath": relpath, "path": path, "size": size, "content_type": content_type}
+            {
+                "relpath": relpath,
+                "path": path,
+                "size": size,
+                "content_type": content_type,
+                "revision": revision,
+            }
         )
         return upload_return() if callable(upload_return) else upload_return
 
@@ -462,9 +470,13 @@ class TestRunnerViewableStreaming:
         assert [c["relpath"] for c in first] == ["reward.png"]
         assert first[0]["content_type"] == "image/png"
 
-        # Same (mtime, size) → unchanged → not re-uploaded on the next heartbeat.
+        # Same stat revision → unchanged → not re-uploaded on the next heartbeat.
         second = _run_stream(art, state)
         assert second == []
+
+        # The runner retains the identity of the unchanged generation instead
+        # of allocating a cache-busting token on every poll.
+        assert state.revisions["reward.png"][1] == first[0]["revision"]
 
     def test_overwritten_file_is_resent(self, tmp_path):
         art = tmp_path / "artifacts"
@@ -472,13 +484,33 @@ class TestRunnerViewableStreaming:
         f = art / "reward_curve.png"
         f.write_bytes(b"\x89PNG one")
         state = local_runner._ViewableStreamState()
-        assert len(_run_stream(art, state)) == 1
+        first = _run_stream(art, state)
+        assert len(first) == 1
 
         # Rewrite with a DIFFERENT size and a bumped mtime (eval step overwrites it).
         f.write_bytes(b"\x89PNG two-longer-content")
         os.utime(str(f), (f.stat().st_atime, f.stat().st_mtime + 10))
         second = _run_stream(art, state)
         assert [c["relpath"] for c in second] == ["reward_curve.png"]
+        assert second[0]["revision"] != first[0]["revision"]
+
+    def test_same_size_overwrite_gets_new_revision(self, tmp_path):
+        """A deterministic URI and equal byte length must not hide new bytes."""
+        art = tmp_path / "artifacts"
+        art.mkdir()
+        f = art / "reward_curve.png"
+        f.write_bytes(b"generation-one")
+        state = local_runner._ViewableStreamState()
+
+        first = _run_stream(art, state)
+        first_revision = first[0]["revision"]
+
+        f.write_bytes(b"generation-two")  # exactly the same byte length
+        os.utime(str(f), ns=(f.stat().st_atime_ns, f.stat().st_mtime_ns + 1_000_000))
+        second = _run_stream(art, state)
+
+        assert second[0]["size"] == first[0]["size"]
+        assert second[0]["revision"] != first_revision
 
     def test_oversize_file_skipped_without_error(self, tmp_path, monkeypatch):
         monkeypatch.setattr(local_runner, "_MAX_VIEWABLE_IMAGE_BYTES", 64)
@@ -551,6 +583,37 @@ class TestRunnerViewableUpload:
                 "http://orch", "tok", "job-1", "reward.png", str(p), 4, "image/png"
             )
         assert status == 200
+
+    def test_sends_generation_revision_header(self, tmp_path):
+        p = tmp_path / "reward.png"
+        p.write_bytes(b"\x89PNG")
+        resp = mock.MagicMock()
+        resp.status = 200
+        resp.__enter__.return_value = resp
+        resp.__exit__.return_value = False
+        captured = {}
+
+        def fake_urlopen(request, timeout):
+            captured["revision"] = request.get_header(
+                "X-blueprint-viewable-revision"
+            )
+            return resp
+
+        with mock.patch.object(
+            local_runner.urllib.request, "urlopen", side_effect=fake_urlopen
+        ):
+            status = local_runner._upload_viewable(
+                "http://orch",
+                "tok",
+                "job-1",
+                "reward.png",
+                str(p),
+                4,
+                "image/png",
+                "runner-generation-7",
+            )
+        assert status == 200
+        assert captured["revision"] == "runner-generation-7"
 
     def test_returns_code_on_http_error(self, tmp_path):
         p = tmp_path / "reward.png"

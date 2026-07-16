@@ -13861,6 +13861,11 @@ async def test_compute_job_vm_heartbeat_bare_uuid_cannot_suppress_watchdog(
     )
     job.status = ComputeJobStatus.STARTING
     job.last_heartbeat_at = None
+    # The rollout boundary is exclusive: a VM created exactly when the HMAC
+    # rollout begins must not retain the guessable legacy credential.
+    job.created_at = datetime(2026, 7, 14, 7, 24, 41, tzinfo=timezone.utc).replace(
+        tzinfo=None
+    )
     await db_session.commit()
 
     progress_body = json.dumps({"progress": {"metric": "loss", "value": 0.5}}).encode()
@@ -13906,6 +13911,57 @@ async def test_compute_job_vm_heartbeat_bare_uuid_cannot_suppress_watchdog(
     series = (job.polling_metadata or {}).get("progress_series")
     assert series, "authenticated heartbeat must record the progress sample"
     assert series[-1]["name"] == "loss" and series[-1]["value"] == 0.5
+
+
+@pytest.mark.asyncio
+async def test_compute_job_vm_heartbeat_pre_rollout_uuid_keeps_vm_alive(
+    client, db_session, monkeypatch
+):
+    """A VM launched before the HMAC deploy may refresh its heartbeat with its UUID."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    project = Project(name="HB Flag-day Compatibility", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python3 train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        backend_name="local-subprocess",
+    )
+    job.status = ComputeJobStatus.RUNNING
+    job.created_at = datetime(2026, 7, 14, 7, 24, 40, tzinfo=timezone.utc).replace(
+        tzinfo=None
+    )
+    job.last_heartbeat_at = datetime(2026, 7, 14, 7, 20, tzinfo=timezone.utc).replace(
+        tzinfo=None
+    )
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/agent/compute-jobs/{job.id}/heartbeat",
+        headers={"Authorization": f"Bearer {job.id}"},
+    )
+
+    assert resp.status_code == 204
+    await db_session.refresh(job)
+    assert job.last_heartbeat_at is not None
+    assert job.last_heartbeat_at > datetime(
+        2026, 7, 14, 7, 20, tzinfo=timezone.utc
+    ).replace(tzinfo=None)
 
 
 @pytest.mark.asyncio
@@ -20476,7 +20532,17 @@ async def test_persist_viewable_artifacts_returns_tuple_with_dropped_count(tmp_p
     assert dropped == 2
     # Each manifest entry has the required fields
     entry = manifest[0]
-    assert {"filename", "storage_uri", "content_type", "size_bytes", "kind"} <= entry.keys()
+    assert {
+        "filename",
+        "storage_uri",
+        "content_type",
+        "size_bytes",
+        "kind",
+        "revision",
+        "live",
+    } <= entry.keys()
+    assert isinstance(entry["revision"], str) and entry["revision"]
+    assert entry["live"] is False
 
 
 @pytest.mark.asyncio
@@ -21045,9 +21111,10 @@ async def test_viewable_pipeline_enforces_video_ceiling(db_session, monkeypatch)
     await db_session.commit()
 
     # Only the within-ceiling video is persisted; the oversized one is skipped
-    # (size rejections are not counted in the dropped/count-cap tally).
+    # and reported in the aggregate omission count, matching image-size and
+    # count-cap omissions.
     assert [m["filename"] for m in manifest] == ["ok_clip.mp4"]
-    assert dropped == 0
+    assert dropped == 1
     uploads = {u["basename"]: u for u in calls["uploads"]}
     assert set(uploads) == {"ok_clip.mp4"}
     assert uploads["ok_clip.mp4"]["streamed"] is True
@@ -21270,6 +21337,137 @@ async def test_viewable_pipeline_upload_failure_is_non_blocking(
     }
     # A file that never landed in storage must NOT be advertised as signable.
     assert not any("fail_me" in r.storage_uri for r in rows)
+    meta = job.polling_metadata or {}
+    assert meta.get("viewable_terminal_reconciliation_incomplete") is True
+    assert "viewable_file_count" not in meta
+
+
+@pytest.mark.asyncio
+async def test_terminal_viewable_total_failure_preserves_live_entries_and_retries(
+    db_session, monkeypatch
+):
+    """A corrupt/unavailable terminal bundle must not erase durable live previews.
+
+    The incomplete pass also must not stamp the idempotency marker: a later
+    healthy terminal pass retries and authoritatively reconciles the previews.
+    """
+    job = await _create_bundle_compute_job(db_session)
+    live_manifest = [
+        {
+            "filename": "plot.png",
+            "storage_uri": storage.compute_job_viewable_uri(job.id, "plot.png"),
+            "content_type": "image/png",
+            "size_bytes": 11,
+            "kind": "image",
+            "revision": "live-plot-revision",
+            "live": True,
+        },
+        {
+            "filename": "clip.mp4",
+            "storage_uri": storage.compute_job_viewable_uri(job.id, "clip.mp4"),
+            "content_type": "video/mp4",
+            "size_bytes": 12,
+            "kind": "video",
+            "revision": "live-clip-revision",
+            "live": True,
+        },
+    ]
+    job.polling_metadata = {"viewable_files": live_manifest}
+    db_session.add(job)
+    await db_session.commit()
+
+    failed_calls = _mock_viewable_storage(monkeypatch, b"not-a-tar")
+    preserved, dropped = await compute_jobs.persist_viewable_files_for_job(
+        db_session, job
+    )
+    await db_session.commit()
+
+    assert dropped == 0
+    assert failed_calls["uploads"] == []
+    assert {entry["filename"] for entry in preserved} == {"plot.png", "clip.mp4"}
+    assert all(entry["live"] is True for entry in preserved)
+    failed_meta = job.polling_metadata or {}
+    assert failed_meta.get("viewable_terminal_reconciliation_incomplete") is True
+    assert "viewable_file_count" not in failed_meta
+
+    healthy_bundle = _make_viewable_tar_bundle(
+        {
+            "./plot.png": b"\x89PNG terminal",
+            "./clip.mp4": b"\x00\x00\x00\x18ftypmp42 terminal",
+        }
+    )
+    healthy_calls = _mock_viewable_storage(monkeypatch, healthy_bundle)
+    reconciled, dropped = await compute_jobs.persist_viewable_files_for_job(
+        db_session, job
+    )
+    await db_session.commit()
+
+    assert dropped == 0
+    assert len(healthy_calls["uploads"]) == 2
+    assert {entry["filename"] for entry in reconciled} == {"plot.png", "clip.mp4"}
+    assert all(entry["live"] is False for entry in reconciled)
+    complete_meta = job.polling_metadata or {}
+    assert complete_meta.get("viewable_file_count") == 2
+    assert "viewable_terminal_reconciliation_incomplete" not in complete_meta
+
+
+@pytest.mark.asyncio
+async def test_terminal_viewable_partial_upload_preserves_unreconciled_live_entry(
+    db_session, monkeypatch
+):
+    """A partial terminal upload replaces successes but retains failed live files."""
+    job = await _create_bundle_compute_job(db_session)
+    failed_live_revision = "live-failed-file-revision"
+    job.polling_metadata = {
+        "viewable_files": [
+            {
+                "filename": "good.png",
+                "storage_uri": storage.compute_job_viewable_uri(job.id, "good.png"),
+                "content_type": "image/png",
+                "size_bytes": 8,
+                "kind": "image",
+                "revision": "old-good-revision",
+                "live": True,
+            },
+            {
+                "filename": "fail_me.png",
+                "storage_uri": storage.compute_job_viewable_uri(
+                    job.id, "fail_me.png"
+                ),
+                "content_type": "image/png",
+                "size_bytes": 9,
+                "kind": "image",
+                "revision": failed_live_revision,
+                "live": True,
+            },
+        ]
+    }
+    db_session.add(job)
+    await db_session.commit()
+
+    bundle = _make_viewable_tar_bundle(
+        {
+            "./good.png": b"\x89PNG good-terminal",
+            "./fail_me.png": b"\x89PNG failed-terminal",
+        }
+    )
+    _mock_viewable_storage(monkeypatch, bundle, fail_on="fail_me")
+
+    manifest, dropped = await compute_jobs.persist_viewable_files_for_job(
+        db_session, job
+    )
+    await db_session.commit()
+
+    assert dropped == 0
+    by_name = {entry["filename"]: entry for entry in manifest}
+    assert set(by_name) == {"good.png", "fail_me.png"}
+    assert by_name["good.png"]["live"] is False
+    assert by_name["good.png"]["revision"] != "old-good-revision"
+    assert by_name["fail_me.png"]["live"] is True
+    assert by_name["fail_me.png"]["revision"] == failed_live_revision
+    meta = job.polling_metadata or {}
+    assert meta.get("viewable_terminal_reconciliation_incomplete") is True
+    assert "viewable_file_count" not in meta
 
 
 @pytest.mark.asyncio
@@ -21293,6 +21491,8 @@ async def test_viewable_pipeline_is_idempotent_and_downloads_bundle_once(
     )
     await db_session.commit()
     assert len(manifest1) == 2
+    first_revisions = {e["filename"]: e["revision"] for e in manifest1}
+    assert all(e["live"] is False for e in manifest1)
     assert calls["downloads"] == 1
     assert len(calls["uploads"]) == 2
 
@@ -21308,6 +21508,7 @@ async def test_viewable_pipeline_is_idempotent_and_downloads_bundle_once(
     )
     assert len(calls["uploads"]) == 2, "re-entry must NOT re-upload any file"
     assert {e["filename"] for e in manifest2} == {e["filename"] for e in manifest1}
+    assert {e["filename"]: e["revision"] for e in manifest2} == first_revisions
 
     rows = await _job_files(db_session, job.id)
     assert len(rows) == 2, f"expected no duplicate rows on re-entry, got {len(rows)}"

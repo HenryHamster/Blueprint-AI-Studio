@@ -20,6 +20,12 @@
 set -euo pipefail
 cd "$(dirname "$0")/../backend"
 
+# The real upgrade chain contains fail-closed encrypted-data migrations. Keep a
+# deterministic non-production Fernet key in the repo-owned harness so Alembic
+# proves the whole chain without weakening migration behavior or relying on the
+# pytest plaintext opt-in fixture (which runs only after migrations).
+TEST_ENCRYPTION_KEY="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+
 # --- Argument parsing ---
 # --postgres: kept as a no-op flag for callers that pass it explicitly.
 # --no-postgres: opt out (use in-memory SQLite for fast local dev).
@@ -368,12 +374,14 @@ elif [ "$USE_POSTGRES" = "1" ]; then
     -e USE_TEST_POSTGRES=true \
     -e GCP_PROJECT_ID=test-project \
     -e LOCAL_MODE=true \
+    -e GITHUB_PAT_ENCRYPTION_KEY=$TEST_ENCRYPTION_KEY \
     -e AGENT_JWT_SECRET=ci-test-secret-min-32-bytes-xxxxx \
     -e WS_TICKET_SECRET=ci-test-ws-secret-min-32-bytes-xx"
 else
   ENV_ARGS="-e DATABASE_URL=postgresql+asyncpg://x:x@localhost/x \
     -e GCP_PROJECT_ID=test-project \
     -e LOCAL_MODE=true \
+    -e GITHUB_PAT_ENCRYPTION_KEY=$TEST_ENCRYPTION_KEY \
     -e AGENT_JWT_SECRET=ci-test-secret-min-32-bytes-xxxxx \
     -e WS_TICKET_SECRET=ci-test-ws-secret-min-32-bytes-xx"
 fi
@@ -411,6 +419,7 @@ ENV_VARS="DATABASE_URL=${PG_DSN:-postgresql+asyncpg://x:x@localhost/x} \
   USE_TEST_POSTGRES=$([ "$USE_POSTGRES" = "1" ] && echo true || echo false) \
   GCP_PROJECT_ID=test-project \
   LOCAL_MODE=true \
+  GITHUB_PAT_ENCRYPTION_KEY=$TEST_ENCRYPTION_KEY \
   AGENT_JWT_SECRET=ci-test-secret-min-32-bytes-xxxxx \
   WS_TICKET_SECRET=ci-test-ws-secret-min-32-bytes-xx"
 

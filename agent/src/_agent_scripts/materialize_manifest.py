@@ -96,7 +96,9 @@ def _atomic_write_text(
         raise
 
 
-def _normalize_materialized_file_content(path: pathlib.Path, content: str) -> str:
+def _normalize_materialized_file_content(
+    path: pathlib.Path, content: str, workspace_path: str
+) -> str:
     if path.name != ".claude.json":
         return content
     try:
@@ -110,11 +112,18 @@ def _normalize_materialized_file_content(path: pathlib.Path, content: str) -> st
     if not isinstance(projects, dict):
         projects = {}
         parsed["projects"] = projects
-    workspace = projects.get("/tmp/workspace")
+    workspace = projects.get(workspace_path)
     if not isinstance(workspace, dict):
         workspace = {}
-        projects["/tmp/workspace"] = workspace
+        projects[workspace_path] = workspace
     workspace["hasTrustDialogAccepted"] = True
+    # Claude Code 2.1.197 assumes projectSettings.allowedTools is iterable once
+    # OAuth authentication succeeds. Legacy account exports and a newly-created
+    # trust entry may omit it (or carry an old non-list shape), which crashes
+    # before the first model call. Preserve valid lists and fail closed to an
+    # empty permission list for every other shape.
+    if not isinstance(workspace.get("allowedTools"), list):
+        workspace["allowedTools"] = []
     return json.dumps(parsed, separators=(",", ":"))
 
 
@@ -129,6 +138,7 @@ def main(argv: list[str]) -> int:
 
     # 1. Write env file (atomically — see _atomic_write_text)
     env = manifest.get("env") or {}
+    workspace_path = str(env.get("AGENT_WORKSPACE") or "/tmp/workspace")
     env_body = "".join(
         f'{key}="{_env_file_escape(value)}"\n'
         for key, value in env.items()
@@ -158,7 +168,7 @@ def main(argv: list[str]) -> int:
             for created in missing_parents:
                 os.chown(created, uid, gid)
             content = _normalize_materialized_file_content(
-                path, item.get("content", "") or ""
+                path, item.get("content", "") or "", workspace_path
             )
             _atomic_write_text(
                 path,

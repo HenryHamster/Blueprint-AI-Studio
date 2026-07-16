@@ -13,8 +13,8 @@ import json
 import logging
 import re
 import time
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, Request, Response
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
@@ -29,15 +29,20 @@ from app.shared_state import limiter
 from app.models import (
     MESSAGE_CONTENT_MAX,
     Alert,
+    Artifact,
     CompletionDebtEntry,
     ComputeJob,
     ComputeJobStatus,
     Direction,
     CriterionEvidence,
+    KnowledgeDocument,
     LocalRunner,
     MessagesLastSeen,
     MessagesNoisePrefs,
     ProjectMessage,
+    ProjectMessageAttachmentUpload,
+    MessageHandlingState,
+    MessageSurface,
     MessageType,
     ReleaseVersion,
     StrategicCycle,
@@ -52,10 +57,11 @@ from app.auth import get_current_user
 from app.admin import _get_user_project_with_role
 from app import strategic_cycle
 from app.message_convergence import LINKED_STATUS, OPEN_STATUS
-from app.notification_dispatch import HIGH_SIGNAL_NOTE_EVENT_TYPES
 from app.operator_attention import build_operator_attention
 from app.project_message_creation import (
+    build_project_message,
     create_operator_project_message,
+    lock_project_and_next_message_sequence,
     parse_operator_message_type,
 )
 from app.project_message_projection import (
@@ -129,6 +135,7 @@ from app.storage import (
     ARTIFACT_BUCKET_NAME,
     GCP_PROJECT_ID,
     _generate_v4_signed_url,
+    delete_storage_uri_best_effort,
     generate_download_signed_url,
     storage as gcs_storage,
 )
@@ -534,7 +541,20 @@ class StrategicSessionMessageCreate(BaseModel):
     message_type: str = "NOTE"
     context: Dict[str, Any] | None = None
     workbench_context: Dict[str, Any] | None = None
-    idempotency_key: str | None = None
+    idempotency_key: str = Field(..., min_length=1, max_length=255)
+    reply_to_message_id: uuid.UUID | None = None
+    source_refs: list[Dict[str, Any]] = Field(default_factory=list, max_length=12)
+    artifact_refs: list[Dict[str, Any]] = Field(default_factory=list, max_length=12)
+    attachments: list[Dict[str, Any]] = Field(default_factory=list, max_length=12)
+    operator_intent: Dict[str, Any] | None = None
+
+    @field_validator("idempotency_key")
+    @classmethod
+    def _nonblank_idempotency_key(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("idempotency_key must not be blank")
+        return normalized
 
 
 class StrategicSessionCheckInCreate(BaseModel):
@@ -560,6 +580,10 @@ _ATTACHMENT_SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _ATTACHMENT_CONTENT_TYPE_RE = re.compile(
     r"^[A-Za-z0-9!#$%&'*+.^_`|~-]+/[A-Za-z0-9!#$%&'*+.^_`|~-]+$"
 )
+_MESSAGE_ATTACHMENT_MAX_BYTES = 50 * 1024 * 1024
+_MESSAGE_ATTACHMENT_UPLOAD_EXPIRY_MINUTES = 15
+_MESSAGE_ATTACHMENT_CLEANUP_BATCH = 8
+_MESSAGE_ATTACHMENT_CLEANUP_TIMEOUT_SECONDS = 5.0
 
 
 def _sanitize_message_attachment_filename(filename: str) -> str:
@@ -595,6 +619,463 @@ def _message_context_has_attachments(context: Dict[str, Any] | None) -> bool:
     return isinstance(raw, list) and any(isinstance(item, dict) for item in raw)
 
 
+def _message_ref_uuid(value: Any, *, prefix: str | None = None) -> uuid.UUID | None:
+    raw = str(value or "").strip()
+    if prefix and raw.startswith(f"{prefix}:"):
+        raw = raw.split(":", 1)[1]
+    try:
+        return uuid.UUID(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+_VISIBLE_MESSAGE_RECORD_KEYS = {
+    "source_refs": frozenset({
+        "id", "message_id", "task_id", "artifact_id", "tool_id", "project_id",
+        "kind", "label", "title", "excerpt", "revision", "checksum", "author",
+        "timestamp", "created_at", "updated_at",
+    }),
+    "artifact_refs": frozenset({
+        "id", "artifact_id", "tool_id", "project_id", "kind", "label", "title",
+        "revision", "checksum", "author", "timestamp", "created_at", "updated_at",
+    }),
+    "attachments": frozenset({
+        "attachment_id", "storage_uri", "kind", "type", "mime_type", "media_type",
+        "name", "filename", "size_bytes", "checksum",
+    }),
+    "operator_intent": frozenset({
+        "kind", "action", "lane_owner", "summary", "target", "priority",
+        "approval", "operation_id", "expected_revision",
+    }),
+}
+
+
+def _bounded_visible_message_record(kind: str, item: Dict[str, Any]) -> Dict[str, Any]:
+    allowed = _VISIBLE_MESSAGE_RECORD_KEYS[kind]
+    result: Dict[str, Any] = {}
+    for key, value in item.items():
+        if key not in allowed:
+            continue
+        if isinstance(value, str):
+            result[key] = value[:2_000]
+        elif value is None or isinstance(value, (bool, int, float)):
+            result[key] = value
+        elif key == "target" and isinstance(value, dict):
+            result[key] = {
+                str(target_key)[:80]: (
+                    target_value[:500]
+                    if isinstance(target_value, str)
+                    else target_value
+                )
+                for target_key, target_value in list(value.items())[:12]
+                if target_value is None or isinstance(target_value, (str, bool, int, float))
+            }
+    return result
+
+
+def _assert_reference_revision(
+    ref: Dict[str, Any] | None,
+    *,
+    revision_values: tuple[Any, ...] = (),
+    checksum_value: Any = None,
+    detail: str,
+) -> None:
+    if not ref:
+        return
+    requested_revision = ref.get("revision")
+    if requested_revision is not None:
+        valid_revisions = {
+            str(value)
+            for value in revision_values
+            if value is not None
+        }
+        if str(requested_revision) not in valid_revisions:
+            raise HTTPException(status_code=409, detail=f"{detail} revision changed")
+    requested_checksum = ref.get("checksum")
+    if requested_checksum is not None and str(requested_checksum) != str(checksum_value or ""):
+        raise HTTPException(status_code=409, detail=f"{detail} checksum changed")
+
+
+def _canonical_message_attachment(
+    item: Dict[str, Any], project_id: uuid.UUID
+) -> Dict[str, Any]:
+    attachment_id = _message_ref_uuid(item.get("attachment_id") or item.get("id"))
+    storage_uri = str(item.get("storage_uri") or "").strip()
+    expected_prefix = (
+        f"gs://{ARTIFACT_BUCKET_NAME}/message-attachments/"
+        f"{project_id}/{attachment_id}/"
+        if attachment_id is not None
+        else ""
+    )
+    object_tail = storage_uri[len(expected_prefix):] if expected_prefix else ""
+    if (
+        attachment_id is None
+        or not storage_uri.startswith(expected_prefix)
+        or not object_tail
+        or "/" in object_tail
+    ):
+        raise HTTPException(status_code=400, detail="Invalid attachment reference")
+    normalized = _bounded_visible_message_record("attachments", item)
+    normalized["attachment_id"] = str(attachment_id)
+    normalized["storage_uri"] = storage_uri
+    return normalized
+
+
+async def _consume_message_attachment_uploads(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+    actor_user_id: str,
+    message_id: uuid.UUID,
+    context: Dict[str, Any],
+) -> Dict[str, Any]:
+    raw_attachments = context.get("attachments")
+    if not isinstance(raw_attachments, list) or not raw_attachments:
+        return context
+
+    attachment_ids = {
+        parsed
+        for item in raw_attachments
+        if isinstance(item, dict)
+        and (parsed := _message_ref_uuid(item.get("attachment_id") or item.get("id")))
+        is not None
+    }
+    receipts = (
+        await session.execute(
+            select(ProjectMessageAttachmentUpload)
+            .where(ProjectMessageAttachmentUpload.attachment_id.in_(attachment_ids))
+            .with_for_update()
+        )
+    ).scalars().all()
+    by_id = {receipt.attachment_id: receipt for receipt in receipts}
+    now = _utcnow()
+    canonical: list[Dict[str, Any]] = []
+    for item in raw_attachments:
+        attachment_id = _message_ref_uuid(item.get("attachment_id") or item.get("id"))
+        receipt = by_id.get(attachment_id) if attachment_id is not None else None
+        if (
+            receipt is None
+            or receipt.project_id != project_id
+            or receipt.actor_user_id != actor_user_id
+            or receipt.storage_uri != str(item.get("storage_uri") or "").strip()
+        ):
+            raise HTTPException(status_code=400, detail="Invalid attachment upload receipt")
+        if receipt.consumed_at is not None or receipt.message_id is not None:
+            raise HTTPException(status_code=409, detail="Attachment upload already consumed")
+        if receipt.expires_at <= now:
+            raise HTTPException(status_code=409, detail="Attachment upload expired; upload again")
+
+        normalized = _bounded_visible_message_record("attachments", item)
+        normalized.update({
+            "attachment_id": str(receipt.attachment_id),
+            "storage_uri": receipt.storage_uri,
+            "name": receipt.filename,
+            "filename": receipt.filename,
+            "mime_type": receipt.content_type or _ATTACHMENT_DEFAULT_CONTENT_TYPE,
+            "size_bytes": receipt.expected_size_bytes,
+        })
+        canonical.append(normalized)
+        receipt.consumed_at = now
+        receipt.message_id = message_id
+        session.add(receipt)
+    return {**context, "attachments": canonical}
+
+
+async def _cleanup_expired_message_attachment_uploads(
+    project_id: uuid.UUID,
+    actor_user_id: str,
+) -> None:
+    """Best-effort bounded orphan cleanup, run after upload responses."""
+
+    try:
+        async with AsyncSessionLocal() as cleanup_session:
+            receipts = (
+                await cleanup_session.execute(
+                    select(ProjectMessageAttachmentUpload)
+                    .where(
+                        ProjectMessageAttachmentUpload.project_id == project_id,
+                        ProjectMessageAttachmentUpload.actor_user_id == actor_user_id,
+                        ProjectMessageAttachmentUpload.consumed_at.is_(None),
+                        ProjectMessageAttachmentUpload.message_id.is_(None),
+                        ProjectMessageAttachmentUpload.expires_at <= _utcnow(),
+                    )
+                    .order_by(ProjectMessageAttachmentUpload.expires_at.asc())
+                    .limit(_MESSAGE_ATTACHMENT_CLEANUP_BATCH)
+                    .with_for_update(skip_locked=True)
+                )
+            ).scalars().all()
+            try:
+                cleanup_results = await asyncio.wait_for(
+                    asyncio.gather(*(
+                        delete_storage_uri_best_effort(receipt.storage_uri)
+                        for receipt in receipts
+                    )),
+                    timeout=_MESSAGE_ATTACHMENT_CLEANUP_TIMEOUT_SECONDS,
+                )
+            except TimeoutError:
+                await cleanup_session.rollback()
+                return
+            for receipt, deleted in zip(receipts, cleanup_results, strict=True):
+                if deleted:
+                    await cleanup_session.delete(receipt)
+            await cleanup_session.commit()
+    except Exception:
+        logger.warning(
+            "[ATTACHMENT] expired upload cleanup failed for project %s",
+            project_id,
+            exc_info=True,
+        )
+
+
+async def _validated_message_scoped_context(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+    payload: StrategicSessionMessageCreate,
+    lock_references: bool = False,
+) -> tuple[Dict[str, Any], ProjectMessage | None]:
+    """Build visible, bounded context and reject cross-project references."""
+
+    context: Dict[str, Any] = {}
+    visible_groups = {
+        "source_refs": payload.source_refs,
+        "artifact_refs": payload.artifact_refs,
+        "attachments": payload.attachments,
+    }
+    for key, explicit_items in visible_groups.items():
+        # Conversation context is message-scoped and visible. Never fall back
+        # to the legacy free-form context object: an explicit empty chip list
+        # must remain empty rather than silently attaching hidden state.
+        items = explicit_items or []
+        if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+            raise HTTPException(status_code=400, detail=f"{key} must be a list of objects")
+        if len(items) > 12:
+            raise HTTPException(status_code=400, detail=f"{key} exceeds 12 items")
+        normalized: list[Dict[str, Any]] = []
+        for item in items:
+            item_project_id = item.get("project_id")
+            if item_project_id is not None and str(item_project_id) != str(project_id):
+                raise HTTPException(status_code=400, detail=f"Cross-project {key} reference")
+            normalized_item = _bounded_visible_message_record(key, item)
+            if key == "attachments":
+                normalized_item = _canonical_message_attachment(item, project_id)
+            normalized.append(normalized_item)
+        if normalized:
+            context[key] = normalized
+
+    if payload.operator_intent is not None:
+        context["operator_intent"] = _bounded_visible_message_record(
+            "operator_intent", payload.operator_intent
+        )
+
+    reply_target: ProjectMessage | None = None
+    if payload.reply_to_message_id is not None:
+        reply_stmt = select(ProjectMessage).where(
+            ProjectMessage.id == payload.reply_to_message_id
+        )
+        if lock_references:
+            reply_stmt = reply_stmt.with_for_update()
+        reply_target = (await session.execute(reply_stmt)).scalar_one_or_none()
+        if reply_target is None or reply_target.project_id != project_id:
+            raise HTTPException(status_code=400, detail="Invalid reply_to_message_id")
+        context["reply_preview"] = {
+            "id": str(reply_target.id),
+            "from_type": reply_target.from_type,
+            "actor_user_id": getattr(reply_target, "actor_user_id", None),
+            "sequence": getattr(reply_target, "sequence", None),
+            "content": _compact_text(reply_target.content, max_chars=240) or "",
+        }
+
+    # Validate project-owned references in three bounded set queries rather
+    # than one round trip per chip (up to 24 chips are accepted).
+    message_ids: set[uuid.UUID] = set()
+    task_ids: set[uuid.UUID] = set()
+    artifact_ids: set[uuid.UUID] = set()
+    direction_ids: set[str] = set()
+    runner_ids: set[uuid.UUID] = set()
+    knowledge_ids: set[uuid.UUID] = set()
+    cycle_ids: set[uuid.UUID] = set()
+    reference_claims: dict[tuple[str, str], Dict[str, Any]] = {}
+    seen_reference_identities: set[tuple[str, str]] = set()
+
+    def _record_reference_claim(
+        kind: str,
+        ref_id: Any,
+        ref: Dict[str, Any],
+    ) -> None:
+        identity = (kind, str(ref_id))
+        if identity in seen_reference_identities:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Duplicate {kind} reference",
+            )
+        seen_reference_identities.add(identity)
+        reference_claims[identity] = ref
+
+    for ref in context.get("source_refs") or []:
+        kind = str(ref.get("kind") or "").lower()
+        ref_id = ref.get("id") or ref.get("message_id") or ref.get("task_id")
+        if kind == "message":
+            parsed = _message_ref_uuid(ref_id, prefix="message")
+            if parsed is None:
+                raise HTTPException(status_code=400, detail="Invalid message source reference")
+            message_ids.add(parsed)
+            _record_reference_claim(kind, parsed, ref)
+        elif kind == "task":
+            parsed = _message_ref_uuid(ref_id, prefix="task")
+            if parsed is None:
+                raise HTTPException(status_code=400, detail="Invalid task source reference")
+            task_ids.add(parsed)
+            _record_reference_claim(kind, parsed, ref)
+        elif kind == "artifact":
+            parsed = _message_ref_uuid(ref_id, prefix="artifact")
+            if parsed is None:
+                raise HTTPException(status_code=400, detail="Invalid artifact source reference")
+            artifact_ids.add(parsed)
+            _record_reference_claim(kind, parsed, ref)
+        elif kind == "canvas":
+            if str(ref_id or "") != f"strategic-canvas:{project_id}":
+                raise HTTPException(status_code=400, detail="Invalid canvas source reference")
+            _record_reference_claim(kind, ref_id, ref)
+        elif kind == "direction":
+            raw_direction = str(ref_id or "").strip()
+            if raw_direction.startswith("direction:"):
+                raw_direction = raw_direction.split(":", 1)[1]
+            if not raw_direction:
+                raise HTTPException(status_code=400, detail="Invalid direction source reference")
+            direction_ids.add(raw_direction)
+            _record_reference_claim(kind, raw_direction, ref)
+        elif kind == "runner":
+            parsed = _message_ref_uuid(ref_id, prefix="runner")
+            if parsed is None:
+                raise HTTPException(status_code=400, detail="Invalid runner source reference")
+            runner_ids.add(parsed)
+            _record_reference_claim(kind, parsed, ref)
+        elif kind == "knowledge_document":
+            parsed = _message_ref_uuid(ref_id, prefix="knowledge")
+            if parsed is None:
+                raise HTTPException(status_code=400, detail="Invalid knowledge source reference")
+            knowledge_ids.add(parsed)
+            _record_reference_claim(kind, parsed, ref)
+        elif kind == "strategic_cycle":
+            parsed = _message_ref_uuid(ref_id, prefix="cycle")
+            if parsed is None:
+                raise HTTPException(status_code=400, detail="Invalid cycle source reference")
+            cycle_ids.add(parsed)
+            _record_reference_claim(kind, parsed, ref)
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported source reference kind")
+
+    for ref in context.get("artifact_refs") or []:
+        artifact_id = ref.get("artifact_id") or ref.get("id")
+        parsed = _message_ref_uuid(artifact_id, prefix="artifact")
+        if parsed is None:
+            raise HTTPException(status_code=400, detail="Invalid artifact reference")
+        artifact_ids.add(parsed)
+        _record_reference_claim("artifact", parsed, ref)
+
+    if message_ids:
+        stmt = select(ProjectMessage).where(
+            ProjectMessage.id.in_(message_ids),
+            ProjectMessage.project_id == project_id,
+        )
+        if lock_references:
+            stmt = stmt.with_for_update()
+        rows = (await session.execute(stmt)).scalars().all()
+        valid_ids = {row.id for row in rows}
+        if valid_ids != message_ids:
+            raise HTTPException(status_code=400, detail="Invalid message source reference")
+        for row in rows:
+            _assert_reference_revision(
+                reference_claims.get(("message", str(row.id))),
+                revision_values=(row.sequence, row.updated_at.isoformat() if row.updated_at else None),
+                detail="Message source",
+            )
+    if task_ids:
+        stmt = select(Task).where(
+            Task.id.in_(task_ids),
+            Task.project_id == project_id,
+        )
+        if lock_references:
+            stmt = stmt.with_for_update()
+        rows = (await session.execute(stmt)).scalars().all()
+        valid_ids = {row.id for row in rows}
+        if valid_ids != task_ids:
+            raise HTTPException(status_code=400, detail="Invalid task source reference")
+        for row in rows:
+            _assert_reference_revision(
+                reference_claims.get(("task", str(row.id))),
+                revision_values=(row.updated_at.isoformat() if row.updated_at else None,),
+                detail="Task source",
+            )
+    if artifact_ids:
+        stmt = (
+            select(Artifact)
+            .join(Task, Task.id == Artifact.task_id)
+            .where(Artifact.id.in_(artifact_ids), Task.project_id == project_id)
+        )
+        if lock_references:
+            stmt = stmt.with_for_update()
+        rows = (await session.execute(stmt)).scalars().all()
+        valid_ids = {row.id for row in rows}
+        if valid_ids != artifact_ids:
+            raise HTTPException(status_code=400, detail="Invalid artifact reference")
+        for row in rows:
+            _assert_reference_revision(
+                reference_claims.get(("artifact", str(row.id))),
+                revision_values=(row.iteration, row.created_at.isoformat() if row.created_at else None),
+                checksum_value=row.commit_hash,
+                detail="Artifact",
+            )
+    for ids, model, detail in (
+        (runner_ids, LocalRunner, "Invalid runner source reference"),
+        (knowledge_ids, KnowledgeDocument, "Invalid knowledge source reference"),
+        (cycle_ids, StrategicCycle, "Invalid cycle source reference"),
+    ):
+        if not ids:
+            continue
+        query_ids = {str(value) for value in ids} if model is StrategicCycle else ids
+        stmt = select(model).where(
+            model.id.in_(query_ids), model.project_id == project_id
+        )
+        if lock_references:
+            stmt = stmt.with_for_update()
+        rows = (await session.execute(stmt)).scalars().all()
+        valid_ids = (
+            {_message_ref_uuid(row.id) for row in rows}
+            if model is StrategicCycle
+            else {row.id for row in rows}
+        )
+        if valid_ids != ids:
+            raise HTTPException(status_code=400, detail=detail)
+        if model is KnowledgeDocument:
+            for row in rows:
+                _assert_reference_revision(
+                    reference_claims.get(("knowledge_document", str(row.id))),
+                    revision_values=(row.updated_at.isoformat() if row.updated_at else None,),
+                    detail="Knowledge source",
+                )
+    if direction_ids:
+        stmt = select(Direction).where(
+            Direction.project_id == project_id,
+            Direction.direction_key.in_(direction_ids),
+        )
+        if lock_references:
+            stmt = stmt.with_for_update()
+        rows = (await session.execute(stmt)).scalars().all()
+        valid_direction_ids = {row.direction_key for row in rows}
+        if set(valid_direction_ids) != direction_ids:
+            raise HTTPException(status_code=400, detail="Invalid direction source reference")
+        for row in rows:
+            _assert_reference_revision(
+                reference_claims.get(("direction", row.direction_key)),
+                revision_values=(row.updated_at.isoformat() if row.updated_at else None,),
+                detail="Direction source",
+            )
+
+    return context, reply_target
+
+
 def _work_session_command_by_id(
     state: Dict[str, Any],
     command_id: str,
@@ -615,29 +1096,10 @@ def _work_session_command_by_id(
 
 _SESSION_CONVERSATION_LIMIT = 20
 _SESSION_OUTPUT_LIMIT = 8
-_SESSION_CONVERSATION_FROM_TYPES = ("user", "operator", "strategic", "strategist")
-_SESSION_CONVERSATION_MESSAGE_TYPES = (
-    MessageType.QUESTION,
-    MessageType.BLOCKER,
-    MessageType.BUG_REPORT,
-    MessageType.FEEDBACK,
-)
-_SESSION_CONVERSATION_EVENT_TYPES = frozenset(
-    {"question_answer", "feedback_acknowledgment", *HIGH_SIGNAL_NOTE_EVENT_TYPES}
-)
 
 
 def _session_conversation_predicate():
-    return or_(
-        ProjectMessage.from_type.in_(_SESSION_CONVERSATION_FROM_TYPES),
-        ProjectMessage.message_type.in_(_SESSION_CONVERSATION_MESSAGE_TYPES),
-        and_(
-            ProjectMessage.message_type == MessageType.NOTE,
-            ProjectMessage.context["event_type"]
-            .as_string()
-            .in_(list(_SESSION_CONVERSATION_EVENT_TYPES)),
-        ),
-    )
+    return ProjectMessage.surface == MessageSurface.CONVERSATION
 
 
 def _message_preview(
@@ -648,6 +1110,7 @@ def _message_preview(
     content_max_chars: int | None = 280,
 ) -> Dict[str, Any]:
     preview = message_preview_dict(message, content_max_chars=content_max_chars)
+    preview["client_idempotency_key"] = preview.get("idempotency_key")
     context = preview.get("context")
     strategic_session = (
         context.get("strategic_session")
@@ -771,39 +1234,107 @@ async def _recent_session_conversation(
     *,
     context_package: Dict[str, Any] | None,
     include_message_id: uuid.UUID | None = None,
+    before_sequence: int | None = None,
+    after_sequence: int | None = None,
+    limit: int = _SESSION_CONVERSATION_LIMIT,
+    search: str | None = None,
 ) -> Dict[str, Any]:
-    rows = (
-        await session.execute(
-            select(ProjectMessage)
-            .where(
-                ProjectMessage.project_id == project_id,
-                _session_conversation_predicate(),
-            )
-            .order_by(ProjectMessage.created_at.desc())
-            .limit(_SESSION_CONVERSATION_LIMIT + 1)
-        )
-    ).scalars().all()
-    visible_rows = list(rows[:_SESSION_CONVERSATION_LIMIT])
-    visible_ids = {message.id for message in visible_rows}
-    if include_message_id is not None and include_message_id not in visible_ids:
+    base_conditions: list[Any] = [
+        ProjectMessage.project_id == project_id,
+        _session_conversation_predicate(),
+    ]
+    if search:
+        escaped = search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        base_conditions.append(ProjectMessage.content.ilike(f"%{escaped}%", escape="\\"))
+    included_message: ProjectMessage | None = None
+    if include_message_id is not None:
         included_message = (
             await session.execute(
                 select(ProjectMessage).where(
                     ProjectMessage.id == include_message_id,
-                    ProjectMessage.project_id == project_id,
-                    _session_conversation_predicate(),
+                    *base_conditions,
                 )
             )
         ).scalars().first()
-        if included_message is not None:
-            visible_rows.append(included_message)
-    visible_rows.sort(
-        key=lambda message: (
-            message.created_at is None,
-            message.created_at or _utcnow(),
-            str(message.id),
+        if included_message is None:
+            raise HTTPException(status_code=404, detail="Conversation message not found")
+
+    if included_message is not None and included_message.sequence is not None:
+        before_count = limit // 2
+        after_count = max(0, limit - before_count - 1)
+        before_rows = (
+            await session.execute(
+                select(ProjectMessage)
+                .where(*base_conditions, ProjectMessage.sequence < included_message.sequence)
+                .order_by(ProjectMessage.sequence.desc())
+                .limit(before_count)
+            )
+        ).scalars().all()
+        after_rows = (
+            await session.execute(
+                select(ProjectMessage)
+                .where(*base_conditions, ProjectMessage.sequence > included_message.sequence)
+                .order_by(ProjectMessage.sequence.asc())
+                .limit(after_count)
+            )
+        ).scalars().all()
+        # Fill an uneven edge from the other side while preserving the limit.
+        missing = limit - (len(before_rows) + 1 + len(after_rows))
+        if missing and len(before_rows) < before_count:
+            after_rows = (
+                await session.execute(
+                    select(ProjectMessage)
+                    .where(*base_conditions, ProjectMessage.sequence > included_message.sequence)
+                    .order_by(ProjectMessage.sequence.asc())
+                    .limit(after_count + missing)
+                )
+            ).scalars().all()
+        elif missing and len(after_rows) < after_count:
+            before_rows = (
+                await session.execute(
+                    select(ProjectMessage)
+                    .where(*base_conditions, ProjectMessage.sequence < included_message.sequence)
+                    .order_by(ProjectMessage.sequence.desc())
+                    .limit(before_count + missing)
+                )
+            ).scalars().all()
+        visible_rows = [*reversed(before_rows), included_message, *after_rows]
+        first_sequence = visible_rows[0].sequence
+        has_more = bool(
+            first_sequence is not None
+            and await session.scalar(
+                select(ProjectMessage.id)
+                .where(*base_conditions, ProjectMessage.sequence < first_sequence)
+                .limit(1)
+            )
         )
-    )
+    elif after_sequence is not None:
+        rows = (
+            await session.execute(
+                select(ProjectMessage)
+                .where(*base_conditions, ProjectMessage.sequence > after_sequence)
+                .order_by(ProjectMessage.sequence.asc())
+                .limit(limit + 1)
+            )
+        ).scalars().all()
+        has_more = len(rows) > limit
+        visible_rows = rows[:limit]
+    else:
+        stmt = select(ProjectMessage).where(*base_conditions)
+        if before_sequence is not None:
+            stmt = stmt.where(ProjectMessage.sequence < before_sequence)
+        rows = (
+            await session.execute(
+                stmt.order_by(
+                    ProjectMessage.sequence.desc().nullslast(),
+                    ProjectMessage.created_at.desc(),
+                    ProjectMessage.id.desc(),
+                ).limit(limit + 1)
+            )
+        ).scalars().all()
+        has_more = len(rows) > limit
+        visible_rows = list(reversed(rows[:limit]))
+
     selected_ref_descriptors = await resolve_selected_ref_descriptors(
         session,
         project_id,
@@ -811,8 +1342,18 @@ async def _recent_session_conversation(
         limit=48,
     )
     return {
-        "limit": _SESSION_CONVERSATION_LIMIT,
-        "has_more": len(rows) > _SESSION_CONVERSATION_LIMIT,
+        "limit": limit,
+        "has_more": has_more,
+        "next_before_sequence": (
+            visible_rows[0].sequence
+            if has_more and visible_rows and visible_rows[0].sequence is not None
+            else None
+        ),
+        "next_after_sequence": (
+            visible_rows[-1].sequence
+            if after_sequence is not None and visible_rows
+            else None
+        ),
         "order": "oldest_first",
         "items": [
             _message_preview(
@@ -2129,6 +2670,12 @@ async def get_project_strategic_conversation(
     project_id: uuid.UUID,
     response: Response,
     include_message_id: uuid.UUID | None = Query(None),
+    before_sequence: int | None = Query(None, ge=1),
+    after_sequence: int | None = Query(None, ge=0),
+    limit: int = Query(_SESSION_CONVERSATION_LIMIT, ge=1, le=100),
+    idempotency_key: str | None = Query(None, max_length=255),
+    client_idempotency_key: str | None = Query(None, max_length=255),
+    search: str | None = Query(None, min_length=2, max_length=200),
     if_none_match: str | None = Header(None, alias="If-None-Match"),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
@@ -2142,13 +2689,71 @@ async def get_project_strategic_conversation(
     await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "member"
     )
-    conversation = await _recent_session_conversation(
-        session,
-        project_id,
-        context_package=None,
-        include_message_id=include_message_id,
+    lookup_key = (client_idempotency_key or idempotency_key or "").strip() or None
+    search = (search or "").strip() or None
+    if search and (include_message_id is not None or lookup_key):
+        raise HTTPException(
+            status_code=400,
+            detail="search cannot be combined with a targeted message lookup",
+        )
+    if client_idempotency_key and idempotency_key and client_idempotency_key != idempotency_key:
+        raise HTTPException(status_code=400, detail="Conflicting idempotency identities")
+    selectors = sum(
+        value is not None
+        for value in (before_sequence, after_sequence, include_message_id, lookup_key, search)
     )
-    result = {"conversation": conversation}
+    if selectors > 1:
+        raise HTTPException(
+            status_code=400,
+            detail="before, after, target, identity, and search selectors are mutually exclusive",
+        )
+    matched_message: ProjectMessage | None = None
+    if lookup_key:
+        matched_message = await _project_message_for_idempotency_key(
+            session,
+            project_id,
+            lookup_key,
+        )
+        if matched_message is not None and (
+            getattr(matched_message, "surface", None) == MessageSurface.CONVERSATION
+        ):
+            include_message_id = matched_message.id
+        else:
+            matched_message = None
+
+    if lookup_key:
+        conversation = {
+            "limit": limit,
+            "has_more": False,
+            "next_before_sequence": None,
+            "next_after_sequence": None,
+            "order": "oldest_first",
+            "items": [],
+        }
+    else:
+        conversation = await _recent_session_conversation(
+            session,
+            project_id,
+            context_package=None,
+            include_message_id=include_message_id,
+            before_sequence=before_sequence,
+            after_sequence=after_sequence,
+            limit=limit,
+            search=search,
+        )
+    result = {
+        **conversation,
+        "matched_message": (
+            _message_preview(matched_message, content_max_chars=None)
+            if matched_message is not None
+            else None
+        ),
+        "wakeup_state": (
+            (matched_message.context or {}).get("_resident_wakeup_state")
+            if matched_message is not None and isinstance(matched_message.context, dict)
+            else None
+        ),
+    }
     # A selected message can already be in the visible window, making the
     # rendered transcript identical to the unpinned one.  Bind the validator
     # to the requested pin independently so an unpinned 304 never suppresses
@@ -2437,14 +3042,23 @@ async def create_project_strategic_session_check_in(
         }
         if strategic_session:
             message_context["strategic_session"] = strategic_session
-        message = ProjectMessage(
+        next_sequence = await lock_project_and_next_message_sequence(
+            session, project_id
+        )
+        message = await build_project_message(
+            session,
             project_id=project_id,
+            actor_user_id=current_user["user_id"],
+            sequence=next_sequence,
+            surface=MessageSurface.CONVERSATION,
+            handling_state=MessageHandlingState.RESPONDED,
             message_type=MessageType.NOTE,
             from_type="system",
             content=trimmed_content or "Checked in with Strategic.",
             context=message_context,
             status="resolved",
             resolved_at=now,
+            updated_at=now,
             idempotency_key=idem_key,
         )
         session.add(message)
@@ -2547,6 +3161,36 @@ async def create_project_strategic_session_message(
         "member",
     )
 
+    message_context, _reply_target = await _validated_message_scoped_context(
+        session,
+        project_id=project.id,
+        payload=payload,
+    )
+
+    async def _revalidate_message_context(
+        locked_session: AsyncSession,
+        message_id: uuid.UUID,
+        current_context: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        revalidated_context, _ = await _validated_message_scoped_context(
+            locked_session,
+            project_id=project.id,
+            payload=payload,
+            lock_references=True,
+        )
+        if revalidated_context != message_context:
+            raise HTTPException(
+                status_code=409,
+                detail="Message references changed before commit; refresh and retry",
+            )
+        return await _consume_message_attachment_uploads(
+            locked_session,
+            project_id=project.id,
+            actor_user_id=current_user["user_id"],
+            message_id=message_id,
+            context=current_context,
+        )
+
     result = await create_operator_project_message(
         session,
         project=project,
@@ -2555,58 +3199,31 @@ async def create_project_strategic_session_message(
         content=(
             payload.content
             if payload.content.strip()
-            or not _message_context_has_attachments(payload.context)
+            or not _message_context_has_attachments(message_context)
             else "Sent attachment."
         ),
-        context=payload.context,
+        context=message_context,
         workbench_context=payload.workbench_context,
         idempotency_key=payload.idempotency_key,
-        persist_empty_workbench_context=True,
-        sync_local_continuation_marker=True,
+        persist_empty_workbench_context=False,
+        sync_local_continuation_marker=False,
+        surface=MessageSurface.CONVERSATION,
+        reply_to_message_id=payload.reply_to_message_id,
+        include_strategic_session_snapshot=False,
+        precommit_validate=_revalidate_message_context,
     )
-    state_response = await get_project_strategic_state(
-        request,
-        project_id,
-        # Internal direct call: pass a throwaway Response (headers discarded) and
-        # no If-None-Match so the full dict is always returned.
-        response=Response(),
-        session=session,
-        current_user=current_user,
-    )
-    message_preview = await _message_preview_for_session_state(
-        session,
-        project_id,
-        state_response,
-        result.message,
-    )
-    if result.status == "created":
-        await _persist_message_preview_strategic_session_descriptors(
-            session,
-            result.message,
-            message_preview,
-        )
-    session_read_model = await _build_strategic_session_response(
-        session,
-        project_id,
-        state_response,
-        include_message_id=result.message.id,
-    )
+    # The send receipt is intentionally lightweight. The canonical message has
+    # all visible chips/reply metadata needed for reconciliation; fetching the
+    # full strategic-state/runtime model here made send latency scale with the
+    # entire project and duplicated data the client refreshes independently.
+    message_preview = _message_preview(result.message, content_max_chars=None)
     response = {
         "id": result.message_id,
         "status": result.status,
         "arming": result.arming,
+        "wakeup_state": result.wakeup_state,
         "message": message_preview,
-        "project_id": session_read_model["project_id"],
-        "session_status": session_read_model["status"],
-        "location": session_read_model["location"],
-        "status_reason": session_read_model["status_reason"],
-        "session": session_read_model["session"],
-        "workbench": session_read_model["workbench"],
-        "strategic": session_read_model["strategic"],
-        "runtime": session_read_model["runtime"],
-        "context_package": session_read_model["context_package"],
-        "conversation": session_read_model["conversation"],
-        "recent_outputs": session_read_model["recent_outputs"],
+        "project_id": str(project.id),
     }
     if result.message_event is not None:
         await broadcast_to_project(
@@ -2620,6 +3237,74 @@ async def create_project_strategic_session_message(
 class MessageAttachmentUploadUrlRequest(BaseModel):
     filename: str = Field(..., min_length=1, max_length=512)
     content_type: str | None = Field(default=None, max_length=128)
+    size_bytes: int = Field(..., ge=1, le=_MESSAGE_ATTACHMENT_MAX_BYTES)
+
+
+@router.get(
+    "/projects/{project_id}/strategic-conversation/{message_id}/attachments/"
+    "{attachment_id}/download-url"
+)
+@limiter.limit("60/minute")
+async def get_conversation_attachment_download_url(
+    request: Request,
+    project_id: uuid.UUID,
+    message_id: uuid.UUID,
+    attachment_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Resolve one authorized durable attachment identity to a fresh URL."""
+
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    message = (
+        await session.execute(
+            select(ProjectMessage).where(
+                ProjectMessage.id == message_id,
+                ProjectMessage.project_id == project_id,
+                ProjectMessage.surface == MessageSurface.CONVERSATION,
+            )
+        )
+    ).scalar_one_or_none()
+    if message is None:
+        raise HTTPException(status_code=404, detail="Conversation message not found")
+    context = message.context if isinstance(message.context, dict) else {}
+    raw_attachments = context.get("attachments")
+    attachment: Dict[str, Any] | None = None
+    if isinstance(raw_attachments, list):
+        for candidate in raw_attachments[:12]:
+            if not isinstance(candidate, dict):
+                continue
+            if str(candidate.get("attachment_id") or candidate.get("id")) != str(attachment_id):
+                continue
+            try:
+                attachment = _canonical_message_attachment(candidate, project_id)
+            except HTTPException:
+                logger.warning(
+                    "[ATTACHMENT] invalid durable descriptor on message %s",
+                    message_id,
+                )
+                break
+            break
+    if attachment is None:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    try:
+        download_url = await generate_download_signed_url(
+            attachment["storage_uri"], expiration_minutes=15
+        )
+    except Exception as exc:
+        logger.warning(
+            "[ATTACHMENT] lazy download URL failed for message %s: %s",
+            message_id,
+            exc,
+        )
+        raise HTTPException(status_code=503, detail="Storage unavailable") from exc
+    return {
+        "attachment_id": str(attachment_id),
+        "download_url": download_url,
+        "expires_in_seconds": 900,
+    }
 
 
 @router.post("/projects/{project_id}/messages/attachment-upload-url")
@@ -2628,6 +3313,7 @@ async def get_message_attachment_upload_url(
     request: Request,
     project_id: uuid.UUID,
     req: MessageAttachmentUploadUrlRequest,
+    background_tasks: BackgroundTasks,
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -2650,9 +3336,10 @@ async def get_message_attachment_upload_url(
         return _generate_v4_signed_url(
             blob,
             version="v4",
-            expiration=_dt.timedelta(minutes=15),
+            expiration=_dt.timedelta(minutes=_MESSAGE_ATTACHMENT_UPLOAD_EXPIRY_MINUTES),
             method="PUT",
             content_type=content_type,
+            headers={"Content-Length": str(req.size_bytes)},
         )
 
     try:
@@ -2674,13 +3361,87 @@ async def get_message_attachment_upload_url(
         )
         raise HTTPException(status_code=503, detail="Storage unavailable") from exc
 
+    expires_at = _utcnow() + _dt.timedelta(
+        minutes=_MESSAGE_ATTACHMENT_UPLOAD_EXPIRY_MINUTES
+    )
+    receipt = ProjectMessageAttachmentUpload(
+        attachment_id=uuid.UUID(attachment_id),
+        project_id=project_id,
+        actor_user_id=current_user["user_id"],
+        storage_uri=storage_uri,
+        filename=safe_filename,
+        content_type=content_type,
+        expected_size_bytes=req.size_bytes,
+        expires_at=expires_at,
+    )
+    session.add(receipt)
+    try:
+        await session.commit()
+    except Exception:
+        await session.rollback()
+        await delete_storage_uri_best_effort(storage_uri)
+        raise
+    background_tasks.add_task(
+        _cleanup_expired_message_attachment_uploads,
+        project_id,
+        current_user["user_id"],
+    )
+
     return {
         "upload_url": upload_url,
         "download_url": download_url,
         "storage_uri": storage_uri,
         "attachment_id": attachment_id,
         "content_type": content_type,
+        "size_bytes": req.size_bytes,
+        "expires_at": expires_at.isoformat(),
     }
+
+
+@router.delete(
+    "/projects/{project_id}/messages/attachment-uploads/{attachment_id}"
+)
+@limiter.limit("60/minute")
+async def delete_message_attachment_upload(
+    request: Request,
+    project_id: uuid.UUID,
+    attachment_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Explicitly clean up one unconsumed or expired attachment upload."""
+
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    receipt = (
+        await session.execute(
+            select(ProjectMessageAttachmentUpload)
+            .where(
+                ProjectMessageAttachmentUpload.attachment_id == attachment_id,
+                ProjectMessageAttachmentUpload.project_id == project_id,
+                ProjectMessageAttachmentUpload.actor_user_id
+                == current_user["user_id"],
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if receipt is None:
+        return {"status": "not_found", "deleted": False}
+    if receipt.consumed_at is not None or receipt.message_id is not None:
+        raise HTTPException(status_code=409, detail="Consumed attachment cannot be deleted")
+    try:
+        deleted = await asyncio.wait_for(
+            delete_storage_uri_best_effort(receipt.storage_uri),
+            timeout=_MESSAGE_ATTACHMENT_CLEANUP_TIMEOUT_SECONDS,
+        )
+    except TimeoutError:
+        deleted = False
+    if not deleted:
+        raise HTTPException(status_code=503, detail="Storage cleanup unavailable")
+    await session.delete(receipt)
+    await session.commit()
+    return {"status": "deleted", "deleted": True}
 
 
 @router.post("/projects/{project_id}/strategic-session/start")

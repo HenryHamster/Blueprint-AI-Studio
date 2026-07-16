@@ -37,7 +37,7 @@ from app.blocked_need_resolution import (
     completed_foundation_for_need,
     resolve_blocked_need,
 )
-from app.capability_registry import normalize_capability_name
+from app.capability_registry import PLATFORM_WORKING_CAPABILITIES, normalize_capability_name
 from app.database import resolve_dialect_name
 from app.finding_deduplication import normalize_prerequisite
 from app.landed_signal import has_merge_unblock_signal
@@ -432,6 +432,13 @@ async def collect_missing_capability_demand(
 
     demands = []
     for entry in entries.values():
+        # Platform-registered working capabilities are always satisfied — exclude
+        # them so the demand surface does not prompt creation work that is already
+        # done (cancelled dependents waiting on these clear automatically).
+        if entry.get("kind") == "capability":
+            cap_ref = normalize_capability_name(entry.get("ref") or "")
+            if cap_ref and cap_ref in PLATFORM_WORKING_CAPABILITIES:
+                continue
         entry["direction_ids"] = sorted(entry["direction_ids"])
         demands.append(entry)
     # Largest demand first; ties broken by the oldest stranded dependent so the

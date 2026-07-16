@@ -2816,6 +2816,108 @@ class TestComputeDirectionQualityScore:
             d_recent_good
         ) > _compute_direction_quality_score(d_recent_bad)
 
+    def test_grade_distribution_high_majority_raises_score(self):
+        """A cycle with mostly HIGH-grade findings scores higher than one with mostly LOW."""
+        d_high = {
+            "research_history": [
+                {
+                    "tasks_created": 1,
+                    "prs_merged": 1,
+                    "taxonomy_summary": {"code_defect": 1},
+                    "grade_distribution": {"HIGH": 4, "MEDIUM": 1, "LOW": 0},
+                }
+            ]
+        }
+        d_low = {
+            "research_history": [
+                {
+                    "tasks_created": 1,
+                    "prs_merged": 1,
+                    "taxonomy_summary": {"code_defect": 1},
+                    "grade_distribution": {"HIGH": 0, "MEDIUM": 1, "LOW": 4},
+                }
+            ]
+        }
+        assert _compute_direction_quality_score(d_high) > _compute_direction_quality_score(d_low)
+
+    def test_grade_distribution_neutral_when_absent(self):
+        """grade_distribution absent from all cycles — score equals the 3-component baseline."""
+        d_with = {
+            "research_history": [
+                {
+                    "tasks_created": 1,
+                    "prs_merged": 1,
+                    "taxonomy_summary": {"code_defect": 1},
+                    "grade_distribution": {"HIGH": 1, "MEDIUM": 1, "LOW": 1},
+                }
+            ]
+        }
+        d_without = {
+            "research_history": [
+                {
+                    "tasks_created": 1,
+                    "prs_merged": 1,
+                    "taxonomy_summary": {"code_defect": 1},
+                }
+            ]
+        }
+        # Without grade_distribution the component is omitted; with balanced distribution
+        # it contributes 1/3 ≈ 0.333 which pulls the score away from the 3-component result.
+        assert _compute_direction_quality_score(d_with) != _compute_direction_quality_score(
+            d_without
+        )
+
+    def test_grade_distribution_all_high_maximises_grade_component(self):
+        """All-HIGH grade_distribution yields grade_quality_signal == 1.0."""
+        d = {
+            "research_history": [
+                {
+                    "tasks_created": 1,
+                    "prs_merged": 1,
+                    "taxonomy_summary": {"code_defect": 2},
+                    "grade_distribution": {"HIGH": 5, "MEDIUM": 0, "LOW": 0},
+                }
+            ]
+        }
+        # Taxonomy=1.0, productivity=1.0, scope=1.0, grade=1.0 → avg=1.0
+        assert _compute_direction_quality_score(d) == pytest.approx(1.0)
+
+    def test_grade_distribution_legacy_cycles_ignored(self):
+        """Cycles without grade_distribution are skipped in the grade component."""
+        d_mixed = {
+            "research_history": [
+                # Legacy entry — no grade_distribution
+                {"tasks_created": 1, "prs_merged": 1, "taxonomy_summary": {"code_defect": 1}},
+                # New entry with all-HIGH grades
+                {
+                    "tasks_created": 1,
+                    "prs_merged": 1,
+                    "taxonomy_summary": {"code_defect": 1},
+                    "grade_distribution": {"HIGH": 3, "MEDIUM": 0, "LOW": 0},
+                },
+            ]
+        }
+        d_all_grade = {
+            "research_history": [
+                {
+                    "tasks_created": 1,
+                    "prs_merged": 1,
+                    "taxonomy_summary": {"code_defect": 1},
+                    "grade_distribution": {"HIGH": 3, "MEDIUM": 0, "LOW": 0},
+                },
+                {
+                    "tasks_created": 1,
+                    "prs_merged": 1,
+                    "taxonomy_summary": {"code_defect": 1},
+                    "grade_distribution": {"HIGH": 3, "MEDIUM": 0, "LOW": 0},
+                },
+            ]
+        }
+        # Both should have grade_quality_signal dominated by HIGH;
+        # mixed case should be close to but not necessarily equal to all-grade case.
+        assert _compute_direction_quality_score(d_mixed) > 0.5
+        assert _compute_direction_quality_score(d_all_grade) > 0.5
+
     def test_quality_score_treats_unverified_merge_as_wasted(self):
         """Unverified merge (verified_prs_merged=0) counts as wasted cycle.
 

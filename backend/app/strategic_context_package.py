@@ -650,6 +650,20 @@ _PREVIEW_SIGNED_URL_MINUTES = 5
 # load_strategic_context_evidence) so live previews win the descriptor cut.
 _RUNNING_JOB_PREVIEW_LIMIT = 4
 
+# How many non-terminal compute-job rows to FETCH from the DB before filtering
+# for viewable-bearing ones, so an older job with a manifest of mid-run plots
+# is not hidden behind newer media-less rows.
+_RUNNING_JOB_PREVIEW_FETCH = 20
+
+# How many terminal-artifact rows to fetch from the DB before sorting for
+# viewable-bearing ones and capping. Same goal: prevent newer non-viewable
+# artifacts from burying an older artifact that carries actual image/video data.
+_ARTIFACT_EVIDENCE_FETCH = 20
+
+# How many terminal-artifact evidence items to surface in the context package
+# (the final output cap — unchanged from the original implicit 4).
+_ARTIFACT_EVIDENCE_LIMIT = 4
+
 
 async def _sign_viewable_manifest(
     session: AsyncSession,
@@ -697,14 +711,17 @@ async def _sign_viewable_manifest(
                 vf_storage_uri,
                 expiration_minutes=_PREVIEW_SIGNED_URL_MINUTES,
             )
-            previews.append(
-                {
-                    "url": signed_url,
-                    "storage_uri": vf_storage_uri,
-                    "kind": vf_kind,
-                    "filename": vf_filename,
-                }
-            )
+            preview: Dict[str, Any] = {
+                "url": signed_url,
+                "storage_uri": vf_storage_uri,
+                "kind": vf_kind,
+                "filename": vf_filename,
+            }
+            if isinstance(vf.get("revision"), str) and vf["revision"]:
+                preview["revision"] = vf["revision"]
+            if isinstance(vf.get("live"), bool):
+                preview["live"] = vf["live"]
+            previews.append(preview)
         except Exception:  # noqa: BLE001 — ownership violation or signing
             # failure — skip this file so it degrades gracefully rather
             # than breaking the whole evidence package.
@@ -844,7 +861,7 @@ async def _running_job_preview_items(
                 ComputeJob.status.in_(_NON_TERMINAL_COMPUTE_JOB_STATUSES),
             )
             .order_by(ComputeJob.updated_at.desc())
-            .limit(_RUNNING_JOB_PREVIEW_LIMIT)
+            .limit(_RUNNING_JOB_PREVIEW_FETCH)
         )
     ).all()
 
@@ -891,7 +908,7 @@ async def _running_job_preview_items(
         if isinstance(dropped, int) and dropped > 0:
             item["viewable_files_dropped"] = dropped
         items.append(item)
-    return items
+    return items[:_RUNNING_JOB_PREVIEW_LIMIT]
 
 
 async def load_strategic_context_evidence(
@@ -1013,7 +1030,7 @@ async def load_strategic_context_evidence(
                 meaningful_artifact_filter,
             )
             .order_by(Artifact.created_at.desc())
-            .limit(4)
+            .limit(_ARTIFACT_EVIDENCE_FETCH)
         )
     ).all()
 
@@ -1179,6 +1196,15 @@ async def load_strategic_context_evidence(
             provenance = provenance_by_task.get(item.get("task_id") or "")
             if provenance:
                 item.update(provenance)
+
+    # Sort viewable-bearing terminal-artifact items first so the bounded
+    # descriptor cut (_strategic_context_descriptors slices items[:4]) retains
+    # an older artifact whose logs carry a viewable_files manifest even when
+    # newer non-viewable rows filled the original SQL limit. Running-job items
+    # are prepended below and win the first descriptor slots; this sort ensures
+    # the remaining slots are filled by terminal artifacts WITH previews.
+    artifact_items.sort(key=lambda i: 0 if i.get("viewable_previews") else 1)
+    artifact_items = artifact_items[:_ARTIFACT_EVIDENCE_LIMIT]
 
     # Prepend live previews for RUNNING compute jobs so the operator watching a
     # long run sees plots/videos accrue in the canvas before the job terminates.
@@ -1561,6 +1587,47 @@ def _artifact_descriptor(artifact: Dict[str, Any]) -> Dict[str, Any] | None:
     viewable_files_dropped = artifact.get("viewable_files_dropped")
     if isinstance(viewable_files_dropped, int) and viewable_files_dropped > 0:
         descriptor["viewable_files_dropped"] = viewable_files_dropped
+    image_previews = [p for p in previews if p.get("kind") == "image"]
+    video_previews = [p for p in previews if p.get("kind") == "video"]
+    pdf_previews = [p for p in previews if p.get("kind") == "pdf"]
+
+    def add_preview_group(
+        field: str, grouped_previews: list[Dict[str, Any]]
+    ) -> bool:
+        if not grouped_previews:
+            return False
+        primary = grouped_previews[0]
+        descriptor[field] = {
+            "url": primary.get("url"),
+            "alt": title,
+            "storage_uri": primary.get("storage_uri"),
+            **({"revision": primary.get("revision")} if "revision" in primary else {}),
+            **({"live": primary.get("live")} if "live" in primary else {}),
+        }
+        descriptor[f"{field}s"] = [
+            {
+                "url": preview.get("url"),
+                "alt": preview.get("filename") or title,
+                "filename": preview.get("filename"),
+                "storage_uri": preview.get("storage_uri"),
+                **(
+                    {"revision": preview.get("revision")}
+                    if "revision" in preview
+                    else {}
+                ),
+                **({"live": preview.get("live")} if "live" in preview else {}),
+            }
+            for preview in grouped_previews
+        ]
+        return True
+
+    # Retain every preview type on a mixed-media artifact. ``kind`` remains a
+    # primary tile classification for older consumers, but must not discard a
+    # rollout video or PDF merely because an image has precedence.
+    has_images = add_preview_group("image", image_previews)
+    has_videos = add_preview_group("video", video_previews)
+    has_pdfs = add_preview_group("pdf", pdf_previews)
+
     if kind == "markdown":
         descriptor["body"] = (
             descriptor["summary"] or "Read-only artifact metadata is available."
@@ -1571,69 +1638,36 @@ def _artifact_descriptor(artifact: Dict[str, Any]) -> Dict[str, Any] | None:
             descriptor["summary"] or "Read-only log metadata is available."
         )
         descriptor["language"] = "text"
-    elif kind == "image":
+    elif kind == "image" and not has_images:
         # OUR filter wins: ``previews`` (top of function) is already restricted
         # to signed-URL previews (svg/kind-mismatch dropped by
         # _resolve_viewable_previews). Adopt engine's multi-image gallery list,
         # built from that filtered set — emits url/alt/filename only, never a
         # raw storage_uri.
-        image_previews = [p for p in previews if p.get("kind") == "image"] or previews
-        url = image_url or (image_previews[0].get("url") if image_previews else None)
-        primary_storage_uri = image_previews[0].get("storage_uri") if image_previews else None
-        descriptor["image"] = {"url": url, "alt": title, "storage_uri": primary_storage_uri}
-        descriptor["images"] = [
-            {
-                "url": p.get("url"),
-                "alt": p.get("filename") or title,
-                "filename": p.get("filename"),
-                "storage_uri": p.get("storage_uri"),
-            }
-            for p in image_previews
-        ]
-        if not url and not primary_storage_uri:
+        if not add_preview_group("image", previews):
+            descriptor["image"] = {"url": None, "alt": title, "storage_uri": None}
+            descriptor["images"] = []
             descriptor[
                 "unsupported_reason"
             ] = "Image artifact previews require a signed preview URL."
-    elif kind == "video":
+    elif kind == "video" and not has_videos:
         # OUR filtered ``previews`` (signed-URL-only) + engine's multi-video
         # gallery list; url/alt/filename only, never a raw storage_uri.
-        video_previews = [p for p in previews if p.get("kind") == "video"] or previews
-        url = video_url or (video_previews[0].get("url") if video_previews else None)
-        primary_storage_uri = video_previews[0].get("storage_uri") if video_previews else None
-        descriptor["video"] = {"url": url, "alt": title, "storage_uri": primary_storage_uri}
-        descriptor["videos"] = [
-            {
-                "url": p.get("url"),
-                "alt": p.get("filename") or title,
-                "filename": p.get("filename"),
-                "storage_uri": p.get("storage_uri"),
-            }
-            for p in video_previews
-        ]
-        if not url and not primary_storage_uri:
+        if not add_preview_group("video", previews):
+            descriptor["video"] = {"url": None, "alt": title, "storage_uri": None}
+            descriptor["videos"] = []
             descriptor[
                 "unsupported_reason"
             ] = "Video artifact previews require a signed preview URL."
-    elif kind == "pdf":
+    elif kind == "pdf" and not has_pdfs:
         # OUR filtered ``previews`` (signed-URL-only) + a parallel gallery list
         # for multiple pdfs. A PDF is opened as a top-level new-tab navigation
         # (never an inline app-origin iframe), so it renders in the browser's
         # sandboxed PDF viewer on the storage origin. url/alt/filename only,
         # never a raw storage_uri in the gallery entries.
-        pdf_previews = [p for p in previews if p.get("kind") == "pdf"] or previews
-        url = pdf_url or (pdf_previews[0].get("url") if pdf_previews else None)
-        primary_storage_uri = pdf_previews[0].get("storage_uri") if pdf_previews else None
-        descriptor["pdf"] = {"url": url, "alt": title, "storage_uri": primary_storage_uri}
-        descriptor["pdfs"] = [
-            {
-                "url": p.get("url"),
-                "alt": p.get("filename") or title,
-                "filename": p.get("filename"),
-                "storage_uri": p.get("storage_uri"),
-            }
-            for p in pdf_previews
-        ]
-        if not url and not primary_storage_uri:
+        if not add_preview_group("pdf", previews):
+            descriptor["pdf"] = {"url": None, "alt": title, "storage_uri": None}
+            descriptor["pdfs"] = []
             descriptor[
                 "unsupported_reason"
             ] = "PDF artifact previews require a signed preview URL."

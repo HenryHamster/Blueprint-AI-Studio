@@ -179,6 +179,7 @@ def test_registry_contains_initial_checks():
         "criterion_evidence_count_integrity",
         "criterion_claim_reconciliation",
         "capability_proof_gate_gap",
+        "capability_proof_trial_stall",
     } <= names
 
 
@@ -4166,6 +4167,19 @@ async def test_capability_proof_gate_gap_triggers_self_heal(db):
     # so the observability snapshot / dashboards can report it machine-readably.
     assert ok[0].auto_resolved == 1
     assert ok[0].as_dict()["auto_resolved"] == 1
+    # This cap self-healed via the backing_path fallback tier (read_head is forced
+    # to None above so no covering test is discovered), so the structured tier
+    # breakdown must attribute the single auto-resolution to backing_path — NOT
+    # named_test_present — and the two tiers must sum to auto_resolved.
+    assert ok[0].auto_resolved_backing_path == 1
+    assert ok[0].auto_resolved_named_test_present == 0
+    d = ok[0].as_dict()
+    assert d["auto_resolved_backing_path"] == 1
+    assert d["auto_resolved_named_test_present"] == 0
+    assert (
+        d["auto_resolved_backing_path"] + d["auto_resolved_named_test_present"]
+        == d["auto_resolved"]
+    )
 
     # Proof must have been recorded in capability_proof_records.
     await db.refresh(project)
@@ -4188,6 +4202,80 @@ async def test_capability_proof_gate_gap_triggers_self_heal(db):
         e.get("proven") is True and e.get("kind") == "backing_path"
         for e in evidence_refs
     ), f"expected a proven backing_path evidence_ref, got {evidence_refs}"
+
+
+def test_record_tick_aggregates_auto_resolved_throughput():
+    """The observability aggregator must sum per-result ``auto_resolved`` (and its
+    tier split) into the tick summary and the cumulative snapshot totals so
+    self-heal throughput is machine-readable — it previously tracked only
+    flags/errors/enrolled, leaving self-heal invisible to operators.
+    """
+    mis._reset_observability_for_tests()
+    snap0 = get_metrics_integrity_observability()
+    assert snap0["auto_resolved_total"] == 0
+    assert snap0["auto_resolved_backing_path_total"] == 0
+    assert snap0["auto_resolved_named_test_present_total"] == 0
+
+    results = [
+        CheckResult(
+            check="capability_proof_gate_gap",
+            status=CheckStatus.OK,
+            subject="p1",
+            auto_resolved=3,
+            auto_resolved_backing_path=2,
+            auto_resolved_named_test_present=1,
+        ),
+        # A flagged result that still healed some caps this tick.
+        CheckResult(
+            check="capability_proof_gate_gap",
+            status=CheckStatus.FLAGGED,
+            severity="warn",
+            subject="p2",
+            delta=1,
+            auto_resolved=1,
+            auto_resolved_backing_path=1,
+            auto_resolved_named_test_present=0,
+        ),
+        # A non-mutating check contributes nothing (auto_resolved is None).
+        CheckResult(
+            check="landed_vs_reported",
+            status=CheckStatus.OK,
+            subject="global",
+        ),
+    ]
+    tick = mis._OBSERVABILITY.record_tick(
+        now=_utcnow(), mode="observe", results=results, enrolled=0
+    )
+    # Per-tick sums across all results.
+    assert tick["auto_resolved"] == 4
+    assert tick["auto_resolved_backing_path"] == 3
+    assert tick["auto_resolved_named_test_present"] == 1
+
+    snap1 = get_metrics_integrity_observability()
+    assert snap1["auto_resolved_total"] == 4
+    assert snap1["auto_resolved_backing_path_total"] == 3
+    assert snap1["auto_resolved_named_test_present_total"] == 1
+
+    # A second tick accumulates on top of the first (monotonic totals).
+    mis._OBSERVABILITY.record_tick(
+        now=_utcnow(),
+        mode="observe",
+        results=[
+            CheckResult(
+                check="capability_proof_gate_gap",
+                status=CheckStatus.OK,
+                subject="p3",
+                auto_resolved=2,
+                auto_resolved_backing_path=0,
+                auto_resolved_named_test_present=2,
+            )
+        ],
+        enrolled=0,
+    )
+    snap2 = get_metrics_integrity_observability()
+    assert snap2["auto_resolved_total"] == 6
+    assert snap2["auto_resolved_backing_path_total"] == 3
+    assert snap2["auto_resolved_named_test_present_total"] == 3
 
 
 @pytest.mark.asyncio
@@ -4241,6 +4329,9 @@ async def test_capability_proof_gate_gap_mints_named_test_present_for_covered_ca
     ), patch(
         "app.capability_proof._read_file_at_head",
         new=AsyncMock(return_value=test_body),
+    ), patch(
+        "app.capability_proof._maybe_enroll_proof_trial",
+        new=AsyncMock(return_value=None),
     ):
         results = await mis.check_capability_proof_gate_gap(ctx)
 
@@ -4617,6 +4708,9 @@ async def test_capability_proof_gate_gap_proposes_backing_paths(db):
     ), patch(
         "app.capability_proof._read_file_at_head",
         new=_fake_read,
+    ), patch(
+        "app.capability_proof._maybe_enroll_proof_trial",
+        new=AsyncMock(return_value=None),
     ):
         results = await mis.check_capability_proof_gate_gap(ctx)
 
@@ -4917,6 +5011,90 @@ async def test_capability_proof_gate_gap_observe_does_not_enroll(db):
     # repo-map remains an unresolved gap (needs_backing_paths), so still flagged.
     assert len(flagged) == 1
     assert "repo-map" in flagged[0].detail
+
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_gate_gap_path_proven_not_counted_as_proven(db):
+    """A working capability auto-resolved to the ``path_proven`` tier (via
+    backing_path or static named_test_present self-heal) must NOT appear in
+    ``ground_truth`` — that counter is reserved for true machine-verified
+    ``proven`` status earned by a real green merge-test verdict.
+
+    Scenario: one working cap with a present backing_path is self-healed to
+    ``path_proven``.  A second working cap already carries a real ``proven``
+    evidence_ref.  After the check runs:
+      - ground_truth == 1 (only the truly proven cap)
+      - auto_resolved == 1 (the path_proven self-heal is counted as throughput)
+    """
+    from unittest.mock import AsyncMock, patch
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = await _project(db)
+    project.problem_model = {
+        "capabilities": [
+            {
+                "name": "path-healed-cap",
+                "status": "working",
+                # No proof yet — will be auto-resolved to path_proven tier.
+                "evidence_refs": [],
+                "backing_paths": ["backend/app/models.py"],
+            },
+            {
+                "name": "truly-proven-cap",
+                "status": "working",
+                # A real proven evidence_ref so working_capability_proof_status
+                # returns "proven" for this capability.
+                "evidence_refs": [
+                    {"kind": "named_test", "ref": "test_foo", "proven": True}
+                ],
+            },
+        ]
+    }
+    # Seed a real proof record so working_capability_proof_status grades it proven.
+    project.capability_proof_records = {
+        "truly-proven-cap": [
+            {"proof_kind": "named_test", "proven": True}
+        ]
+    }
+    flag_modified(project, "problem_model")
+    flag_modified(project, "capability_proof_records")
+    db.add(project)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db,
+        now=_utcnow(),
+        mode="observe",
+        max_projects=25,
+        sample_limit=200,
+        window_days=14,
+    )
+
+    with patch(
+        "app.source_ref_validation._path_exists_at_head",
+        new=AsyncMock(return_value=True),
+    ), patch(
+        "app.capability_proof._read_file_at_head",
+        new=AsyncMock(return_value=None),
+    ):
+        results = await mis.check_capability_proof_gate_gap(ctx)
+
+    pid = str(project.id)
+    proj_results = [r for r in results if r.subject == pid]
+    assert proj_results, f"expected a result for project {pid}, got {results}"
+    r = proj_results[0]
+
+    # path_proven self-heals must NOT inflate ground_truth — only the one truly
+    # proven cap contributes to the machine-verified coverage counter.
+    assert r.ground_truth == 1, (
+        f"ground_truth should be 1 (only truly-proven-cap), got {r.ground_truth}; "
+        "path_proven self-heals must not be counted as proven"
+    )
+    # The self-heal throughput counter (auto_resolved) is still reported correctly.
+    assert r.auto_resolved == 1, (
+        f"auto_resolved should be 1 (path-healed-cap), got {r.auto_resolved}"
+    )
 
 
 # --- Check: capability_proof_gate_auto_graduation ----------------------------
@@ -5499,3 +5677,252 @@ async def test_auto_graduation_advances_by_one_step_per_run(db):
     assert _rc.get("capability_proof_gate_mode") == "enforce"
     assert "observe" in results2[0].detail
     assert "enforce" in results2[0].detail
+
+
+# --- observe_mode_unverified_resolution ---------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_observe_mode_unverified_resolution_flags_stamped_tasks(db):
+    """Tasks carrying SPAWN_CAPABILITY_PROOF_UNVERIFIED_KEY are surfaced as FLAGGED."""
+    from app.research_completion import SPAWN_CAPABILITY_PROOF_UNVERIFIED_KEY
+
+    project = await _project(db)
+    now = _utcnow()
+
+    stamps = [
+        {"kind": "capability", "ref": "test-runner", "proof_status": "unverified"},
+        {"kind": "capability", "ref": "test-runner", "proof_status": "unverified"},
+    ]
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        context={SPAWN_CAPABILITY_PROOF_UNVERIFIED_KEY: stamps},
+    )
+    db.add(t)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=now, mode="observe", max_projects=25,
+        sample_limit=200, window_days=14,
+    )
+    results = await mis.check_observe_mode_unverified_resolution(ctx)
+
+    flagged = [r for r in results if r.status == CheckStatus.FLAGGED]
+    assert len(flagged) == 1
+    assert flagged[0].subject == str(project.id)
+    assert flagged[0].delta == 1
+    assert flagged[0].self_reported == 1
+    assert flagged[0].ground_truth == 0
+    assert "test-runner" in flagged[0].detail
+
+
+@pytest.mark.asyncio
+async def test_observe_mode_unverified_resolution_skipped_when_no_stamps(db):
+    """No stamped tasks → all projects SKIPPED and a global OK summary."""
+    project = await _project(db)
+    now = _utcnow()
+
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        context={"some_other_key": "value"},
+    )
+    db.add(t)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=now, mode="observe", max_projects=25,
+        sample_limit=200, window_days=14,
+    )
+    results = await mis.check_observe_mode_unverified_resolution(ctx)
+
+    assert not any(r.status == CheckStatus.FLAGGED for r in results)
+    ok_or_skipped = [r for r in results if r.status in (CheckStatus.OK, CheckStatus.SKIPPED)]
+    assert ok_or_skipped
+
+
+@pytest.mark.asyncio
+async def test_observe_mode_unverified_resolution_aggregates_multiple_tasks(db):
+    """Multiple stamped tasks in the same project increment delta correctly."""
+    from app.research_completion import SPAWN_CAPABILITY_PROOF_UNVERIFIED_KEY
+
+    project = await _project(db)
+    now = _utcnow()
+
+    for ref in ("cap-a", "cap-b", "cap-a"):
+        t = Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.COMPLETED,
+            context={
+                SPAWN_CAPABILITY_PROOF_UNVERIFIED_KEY: [
+                    {"kind": "capability", "ref": ref, "proof_status": "unverified"}
+                ]
+            },
+        )
+        db.add(t)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=now, mode="observe", max_projects=25,
+        sample_limit=200, window_days=14,
+    )
+    results = await mis.check_observe_mode_unverified_resolution(ctx)
+
+    flagged = [r for r in results if r.status == CheckStatus.FLAGGED]
+    assert len(flagged) == 1
+    assert flagged[0].delta == 3
+    assert "cap-a" in flagged[0].detail
+
+
+# --- capability_proof_trial_stall ---------------------------------------------
+
+
+def _make_trial_task(project_id, cap, *, ran=False, passed=False, could_not_run=False):
+    """Helper: a COMPLETED capability_proof_trial task with a contradiction stamp."""
+    contradiction = {
+        "cap": cap,
+        "head_sha": "abc123",
+        "test_refs": [],
+        "ran": ran,
+        "passed": passed,
+        "could_not_run": could_not_run,
+        "proof_revoked": False,
+        "recorded_at": _utcnow().isoformat(),
+    }
+    return Task(
+        project_id=project_id,
+        payloads=[{"type": "capability_proof_trial", "cap": cap}],
+        status=TaskStatus.COMPLETED,
+        context={"capability_proof_trial_contradiction": contradiction},
+    )
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_trial_stall_flags_all_could_not_run(db):
+    """All trials could_not_run → FLAGGED with severity=warn."""
+    project = await _project(db)
+    now = _utcnow()
+
+    for _ in range(2):
+        db.add(_make_trial_task(project.id, "cap-a", could_not_run=True))
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=now, mode="observe", max_projects=25,
+        sample_limit=200, window_days=14,
+    )
+    results = await mis.check_capability_proof_trial_stall(ctx)
+
+    flagged = [r for r in results if r.status == CheckStatus.FLAGGED]
+    assert len(flagged) == 1
+    f = flagged[0]
+    assert f.subject == str(project.id)
+    assert f.severity == "warn"
+    assert f.delta == 2
+    assert f.ground_truth == 0
+    assert "could_not_run=2" in f.detail
+    assert "cap-a" in f.detail
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_trial_stall_flags_all_red(db):
+    """All trials ran + failed (red) → FLAGGED with severity=error."""
+    project = await _project(db)
+    now = _utcnow()
+
+    db.add(_make_trial_task(project.id, "cap-b", ran=True, passed=False))
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=now, mode="observe", max_projects=25,
+        sample_limit=200, window_days=14,
+    )
+    results = await mis.check_capability_proof_trial_stall(ctx)
+
+    flagged = [r for r in results if r.status == CheckStatus.FLAGGED]
+    assert len(flagged) == 1
+    f = flagged[0]
+    assert f.severity == "error"
+    assert f.delta == 1
+    assert "red=1" in f.detail
+    assert "cap-b" in f.detail
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_trial_stall_ok_when_any_green(db):
+    """A green trial (no contradiction stamp) means no non-green tasks in window → OK/SKIPPED."""
+    project = await _project(db)
+    now = _utcnow()
+
+    # Green trial: completed but NO contradiction stamp.
+    green_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "capability_proof_trial", "cap": "cap-c"}],
+        status=TaskStatus.COMPLETED,
+        context={},
+    )
+    db.add(green_task)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=now, mode="observe", max_projects=25,
+        sample_limit=200, window_days=14,
+    )
+    results = await mis.check_capability_proof_trial_stall(ctx)
+
+    assert not any(r.status == CheckStatus.FLAGGED for r in results)
+    ok_or_skipped = [
+        r for r in results if r.status in (CheckStatus.OK, CheckStatus.SKIPPED)
+    ]
+    assert ok_or_skipped
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_trial_stall_skips_empty(db):
+    """No trial tasks at all → SKIPPED / global OK (no FLAGGED)."""
+    project = await _project(db)
+    now = _utcnow()
+    db.add(Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        context={},
+    ))
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=now, mode="observe", max_projects=25,
+        sample_limit=200, window_days=14,
+    )
+    results = await mis.check_capability_proof_trial_stall(ctx)
+
+    assert not any(r.status == CheckStatus.FLAGGED for r in results)
+    skipped = [r for r in results if r.status == CheckStatus.SKIPPED]
+    assert skipped
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_trial_stall_mixed_caps(db):
+    """One cap all-red, another all-could_not_run → two FLAGGED results."""
+    project = await _project(db)
+    now = _utcnow()
+
+    db.add(_make_trial_task(project.id, "cap-alpha", ran=True, passed=False))
+    db.add(_make_trial_task(project.id, "cap-beta", could_not_run=True))
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=now, mode="observe", max_projects=25,
+        sample_limit=200, window_days=14,
+    )
+    results = await mis.check_capability_proof_trial_stall(ctx)
+
+    flagged = [r for r in results if r.status == CheckStatus.FLAGGED]
+    assert len(flagged) == 2
+    severities = {f.detail.split("cap=")[1].split("'")[1]: f.severity for f in flagged}
+    assert severities["cap-alpha"] == "error"
+    assert severities["cap-beta"] == "warn"

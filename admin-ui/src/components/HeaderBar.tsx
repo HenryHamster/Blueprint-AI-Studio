@@ -24,6 +24,7 @@ export interface HeaderBarProps {
   openMessageCount: number;
   newSinceLastVisitCount?: number;
   needsAttentionCount?: number;
+  activeAlerts?: number;
   onOpenNewTaskModal: () => void;
   onOpenSettings: () => void;
   /** Sign out the active account only. */
@@ -66,6 +67,7 @@ export interface PrimaryTabNavProps {
   openMessageCount?: number;
   newSinceLastVisitCount?: number;
   needsAttentionCount?: number;
+  activeAlerts?: number;
   className?: string;
   placement?: 'header' | 'mobile';
 }
@@ -80,6 +82,7 @@ export function PrimaryTabNav({
   openMessageCount = 0,
   newSinceLastVisitCount = 0,
   needsAttentionCount = 0,
+  activeAlerts = 0,
   className = '',
   placement = 'header',
 }: PrimaryTabNavProps) {
@@ -123,6 +126,12 @@ export function PrimaryTabNav({
                 {badgeCount > 99 ? '99+' : badgeCount}
               </span>
             )}
+            {activeAlerts > 0 && (
+              <span
+                className="ml-1 inline-flex h-2 w-2 shrink-0 rounded-full bg-red-500"
+                title={`${activeAlerts} active alert${activeAlerts !== 1 ? 's' : ''}`}
+              />
+            )}
           </button>
         );
       })}
@@ -143,6 +152,7 @@ export function HeaderBar(props: HeaderBarProps) {
     onOpenSettings,
     openMessageCount,
     newSinceLastVisitCount,
+    activeAlerts,
     wsRef,
     apiHealthy,
     wsConnected,
@@ -277,6 +287,7 @@ export function HeaderBar(props: HeaderBarProps) {
             openMessageCount={openMessageCount}
             newSinceLastVisitCount={newSinceLastVisitCount}
             needsAttentionCount={props.needsAttentionCount}
+            activeAlerts={activeAlerts}
           />
 
           {/* Desktop icon cluster */}

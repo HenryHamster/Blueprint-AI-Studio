@@ -18157,11 +18157,28 @@ async def test_question_answer_posted_on_resolution(question_db, mocker):
     """Resolving a QUESTION via the log-parse path posts a from_type=strategic reply
     whose context carries event_type='question_answer' and reply_to=<question id>."""
     from unittest.mock import AsyncMock
-    from app.models import MessageType, Project, ProjectMessage, Task
+    from app.models import (
+        MessageHandlingState,
+        MessageSurface,
+        MessageType,
+        Project,
+        ProjectMessage,
+        Task,
+    )
     from app.strategic_completion import _handle_strategic_completion
     from sqlalchemy import select
 
     mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+    emitted: list[tuple[str, int | None]] = []
+
+    async def _record_message_event(_project_id, event_type, payload):
+        assert not question_db.in_transaction(), "message event emitted before commit"
+        emitted.append((event_type, payload["message"]["sequence"]))
+
+    mocker.patch(
+        "app.strategic_completion.broadcast_to_project",
+        new=AsyncMock(side_effect=_record_message_event),
+    )
 
     project = Project(name="P-qa", user_id="u1", vision={"purpose": "test"})
     question_db.add(project)
@@ -18170,6 +18187,7 @@ async def test_question_answer_posted_on_resolution(question_db, mocker):
 
     question_msg = ProjectMessage(
         project_id=project.id,
+        sequence=5,
         message_type=MessageType.QUESTION,
         content="What is the current deploy cadence?",
         context={},
@@ -18202,10 +18220,14 @@ async def test_question_answer_posted_on_resolution(question_db, mocker):
         }
     )
 
-    await _handle_strategic_completion(task, logs, question_db)
+    await _handle_strategic_completion(
+        task, logs, question_db, message_sequences=[10]
+    )
 
     await question_db.refresh(question_msg)
     assert question_msg.status == "resolved"
+    assert question_msg.handling_state == MessageHandlingState.RESPONDED
+    assert question_msg.handled_by_task_id == task.id
 
     result = await question_db.execute(
         select(ProjectMessage).where(
@@ -18218,10 +18240,19 @@ async def test_question_answer_posted_on_resolution(question_db, mocker):
     assert reply.context is not None
     assert reply.context.get("event_type") == "question_answer"
     assert reply.context.get("reply_to") == str(question_id)
+    assert reply.sequence == 10
+    assert reply.surface == MessageSurface.CONVERSATION
+    assert reply.handling_state == MessageHandlingState.RESPONDED
+    assert reply.handled_by_task_id == task.id
+    assert reply.reply_to_message_id == question_id
     assert (
         reply.context.get("answer")
         == "We deploy on Tuesdays and Fridays via the CI pipeline."
     )
+    assert emitted == [
+        ("message_updated", 5),
+        ("message_created", 10),
+    ]
 
 
 @pytest.mark.asyncio

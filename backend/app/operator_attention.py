@@ -1521,6 +1521,7 @@ def _stuck_criteria_attention_item(
     stuck_count: int,
     no_mapping_count: int,
     direction_retired_count: int,
+    direction_inactive_count: int = 0,
 ) -> dict[str, Any]:
     parts = []
     if no_mapping_count:
@@ -1529,6 +1530,9 @@ def _stuck_criteria_attention_item(
     if direction_retired_count:
         noun = "criterion" if direction_retired_count == 1 else "criteria"
         parts.append(f"{direction_retired_count} {noun} whose direction is retired")
+    if direction_inactive_count:
+        noun = "criterion" if direction_inactive_count == 1 else "criteria"
+        parts.append(f"{direction_inactive_count} {noun} whose direction is inactive")
     detail = "; ".join(parts) if parts else f"{stuck_count} stuck criteria"
     plural = "criteria" if stuck_count != 1 else "criterion"
     return {
@@ -1889,6 +1893,22 @@ async def get_operator_message_counts(
         + counts.get(MessageType.QUESTION, 0)
         + action_message_count
     )
+    # Count undismissed ERROR and WARNING alerts for the cross-tab indicator.
+    # Mirrors the alert count in build_operator_attention (lines ~2290).
+    active_alerts = int(
+        (
+            await session.execute(
+                select(func.count())
+                .select_from(Alert)
+                .where(
+                    Alert.project_id == project_id,
+                    Alert.dismissed_at.is_(None),
+                    Alert.severity.in_(list(_ACTIONABLE_ALERT_SEVERITIES)),
+                )
+            )
+        ).scalar()
+        or 0
+    )
     return {
         "blocker": counts.get(MessageType.BLOCKER, 0),
         "question": counts.get(MessageType.QUESTION, 0),
@@ -1897,6 +1917,7 @@ async def get_operator_message_counts(
         "high_signal_note": note_count,
         "unread": unread,
         "needs_operator": needs_operator,
+        "active_alerts": active_alerts,
     }
 
 
@@ -2393,6 +2414,7 @@ async def build_operator_attention(
     stuck_criteria_count = 0
     stuck_no_mapping_count = 0
     stuck_direction_retired_count = 0
+    stuck_direction_inactive_count = 0
     stuck_acceptance_criteria_count = 0
     stuck_acceptance_criteria: list[dict[str, Any]] = []
     coverage_blocked_count = 0
@@ -2425,6 +2447,8 @@ async def build_operator_attention(
                     stuck_no_mapping_count += 1
                 elif reason == "direction_retired":
                     stuck_direction_retired_count += 1
+                elif reason == "direction_inactive":
+                    stuck_direction_inactive_count += 1
                 elif (
                     criterion.get("status") == "active"
                     and criterion.get("coverage") == "uncovered"
@@ -2622,6 +2646,7 @@ async def build_operator_attention(
                 stuck_criteria_count,
                 stuck_no_mapping_count,
                 stuck_direction_retired_count,
+                stuck_direction_inactive_count,
             )
         )
     if coverage_blocked_count > 0:

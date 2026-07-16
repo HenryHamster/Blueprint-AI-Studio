@@ -9,7 +9,7 @@ events.
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -22,6 +22,7 @@ from app.message_audience import (
     OPERATOR_FYI,
     STRATEGIST_INTERNAL,
     PIPELINE_LOG,
+    get_logical_event_pairs,
     get_operator_visible_webhook_events,
     get_registered_event_types,
     is_external_webhook_operator_visible,
@@ -273,16 +274,77 @@ def test_operator_visible_webhook_events_excludes_internal():
     assert "DIRECTION_MILESTONE" not in visible
 
 
+def test_logical_event_pairs_have_consistent_audiences():
+    """Every logically-paired (internal, webhook) event resolves to the same audience.
+
+    Drift between _EVENT_AUDIENCE_REGISTRY (lowercase/dotted keys) and
+    _WEBHOOK_EVENT_AUDIENCE (UPPERCASE keys) for events that represent the
+    same logical operation is a silent routing bug.  This test is the
+    cross-check that fails CI when a pair diverges, so an edit to one table
+    that forgets to update the other is caught before shipping.
+    """
+    pairs = get_logical_event_pairs()
+    assert pairs, "Expected at least one logical event pair to be registered"
+    mismatched: list[str] = []
+    for internal_key, webhook_key in pairs.items():
+        internal_audience = route_event(internal_key)
+        webhook_audience = route_external_webhook_event(webhook_key)
+        if internal_audience != webhook_audience:
+            mismatched.append(
+                f"  {internal_key!r} → {internal_audience!r}  vs  "
+                f"{webhook_key!r} → {webhook_audience!r}"
+            )
+    assert not mismatched, (
+        "Logical event pairs have inconsistent audience classifications between "
+        "_EVENT_AUDIENCE_REGISTRY and _WEBHOOK_EVENT_AUDIENCE:\n"
+        + "\n".join(mismatched)
+        + "\n\nFix by aligning the audience in one or both registries in "
+        "backend/app/message_audience.py, then update _LOGICAL_EVENT_PAIRS if "
+        "the events are no longer equivalent."
+    )
+
+
+def test_logical_event_pairs_are_registered_in_their_respective_tables():
+    """Every pair entry has both its internal and webhook keys in their registries.
+
+    Catches typos or stale entries in _LOGICAL_EVENT_PAIRS that reference a key
+    that was renamed or removed from one of the tables.
+    """
+    pairs = get_logical_event_pairs()
+    internal_registry = get_registered_event_types()
+    webhook_keys = _get_all_webhook_event_keys()
+    unknown: list[str] = []
+    for internal_key, webhook_key in pairs.items():
+        if internal_key not in internal_registry:
+            unknown.append(f"  internal key {internal_key!r} not in _EVENT_AUDIENCE_REGISTRY")
+        if webhook_key not in webhook_keys:
+            unknown.append(f"  webhook key {webhook_key!r} not in _WEBHOOK_EVENT_AUDIENCE")
+    assert not unknown, (
+        "_LOGICAL_EVENT_PAIRS references keys absent from their registry:\n"
+        + "\n".join(unknown)
+    )
+
+
+def _get_all_webhook_event_keys() -> set[str]:
+    """Return all registered webhook event keys (test-only helper)."""
+    from app import message_audience as _ma
+    return set(getattr(_ma, "_WEBHOOK_EVENT_AUDIENCE", {}).keys())
+
+
 # ── post_event_message audience gating (via notification_dispatch) ──────
 
 
 @pytest.mark.asyncio
-async def test_post_event_message_creates_for_operator_fyi():
+async def test_post_event_message_creates_for_operator_fyi(monkeypatch):
     """post_event_message creates a ProjectMessage for operator-fyi events."""
     from app.notification_dispatch import post_event_message
 
     mock_session = AsyncMock()
-    mock_session.add = AsyncMock()
+    mock_session.add = MagicMock()
+    monkeypatch.setattr(
+        "app.project_message_creation.lock_project_and_next_message_sequence",
+        AsyncMock(return_value=1),
+    )
 
     msg = await post_event_message(
         mock_session,
@@ -297,7 +359,7 @@ async def test_post_event_message_creates_for_operator_fyi():
 
 
 @pytest.mark.asyncio
-async def test_post_event_message_tags_strategist_internal_as_non_operator():
+async def test_post_event_message_tags_strategist_internal_as_non_operator(monkeypatch):
     """Strategist-internal events create a non-operator strategist-feed row.
 
     Per the design, ``strategist-internal`` bookkeeping still lands as a row the
@@ -307,7 +369,11 @@ async def test_post_event_message_tags_strategist_internal_as_non_operator():
     from app.notification_dispatch import post_event_message
 
     mock_session = AsyncMock()
-    mock_session.add = AsyncMock()
+    mock_session.add = MagicMock()
+    monkeypatch.setattr(
+        "app.project_message_creation.lock_project_and_next_message_sequence",
+        AsyncMock(return_value=1),
+    )
 
     msg = await post_event_message(
         mock_session,
@@ -321,12 +387,16 @@ async def test_post_event_message_tags_strategist_internal_as_non_operator():
 
 
 @pytest.mark.asyncio
-async def test_post_event_message_unknown_event_fails_closed_to_internal():
+async def test_post_event_message_unknown_event_fails_closed_to_internal(monkeypatch):
     """Unregistered event types fail closed to strategist-internal (never operator-visible)."""
     from app.notification_dispatch import post_event_message
 
     mock_session = AsyncMock()
-    mock_session.add = AsyncMock()
+    mock_session.add = MagicMock()
+    monkeypatch.setattr(
+        "app.project_message_creation.lock_project_and_next_message_sequence",
+        AsyncMock(return_value=1),
+    )
 
     msg = await post_event_message(
         mock_session,
@@ -342,12 +412,16 @@ async def test_post_event_message_unknown_event_fails_closed_to_internal():
 
 
 @pytest.mark.asyncio
-async def test_post_event_message_creates_for_operator_action_needed():
+async def test_post_event_message_creates_for_operator_action_needed(monkeypatch):
     """post_event_message creates a ProjectMessage for operator-action-needed events."""
     from app.notification_dispatch import post_event_message
 
     mock_session = AsyncMock()
-    mock_session.add = AsyncMock()
+    mock_session.add = MagicMock()
+    monkeypatch.setattr(
+        "app.project_message_creation.lock_project_and_next_message_sequence",
+        AsyncMock(return_value=1),
+    )
 
     msg = await post_event_message(
         mock_session,
@@ -373,7 +447,7 @@ async def test_post_event_message_skips_row_for_pipeline_log(monkeypatch):
     monkeypatch.setattr(nd, "route_event", lambda *a, **k: PIPELINE_LOG)
 
     mock_session = AsyncMock()
-    mock_session.add = AsyncMock()
+    mock_session.add = MagicMock()
 
     msg = await nd.post_event_message(
         mock_session,
@@ -832,7 +906,11 @@ async def test_auto_fix_escalation_message_stamps_operator_action_needed(monkeyp
         nd, "open_system_bug_or_blocker_exists", AsyncMock(return_value=None)
     )
     mock_session = AsyncMock()
-    mock_session.add = AsyncMock()
+    mock_session.add = MagicMock()
+    monkeypatch.setattr(
+        "app.project_message_creation.lock_project_and_next_message_sequence",
+        AsyncMock(return_value=1),
+    )
 
     msg = await nd.post_auto_fix_escalation_message(
         mock_session,
@@ -856,7 +934,11 @@ async def test_residual_fix_escalation_message_stamps_operator_action_needed(
         nd, "open_system_bug_or_blocker_exists", AsyncMock(return_value=None)
     )
     mock_session = AsyncMock()
-    mock_session.add = AsyncMock()
+    mock_session.add = MagicMock()
+    monkeypatch.setattr(
+        "app.project_message_creation.lock_project_and_next_message_sequence",
+        AsyncMock(return_value=1),
+    )
 
     msg = await nd.post_residual_fix_escalation_message(
         mock_session,
@@ -880,7 +962,16 @@ async def test_question_answer_stamps_audience_default_from_type(monkeypatch):
     import app.notification_dispatch as nd
 
     mock_session = AsyncMock()
-    mock_session.add = AsyncMock()
+    mock_session.add = MagicMock()
+    monkeypatch.setattr(
+        "app.project_message_creation.lock_project_and_next_message_sequence",
+        AsyncMock(return_value=1),
+    )
+    monkeypatch.setattr(
+        nd,
+        "lock_project_and_next_message_sequence",
+        AsyncMock(return_value=1),
+    )
 
     orig_id = _uuid.uuid4()
     msg = await nd.post_question_answer(
@@ -894,4 +985,8 @@ async def test_question_answer_stamps_audience_default_from_type(monkeypatch):
     assert msg.context["event_type"] == "question_answer"
     assert msg.context["audience"] == OPERATOR_FYI
     assert msg.context["reply_to"] == str(orig_id)
+    assert msg.sequence == 1
+    assert msg.surface == "conversation"
+    assert msg.handling_state == "responded"
+    assert msg.reply_to_message_id == orig_id
     mock_session.add.assert_called_once()

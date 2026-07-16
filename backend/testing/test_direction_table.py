@@ -203,6 +203,44 @@ async def test_dual_write_syncs_on_mutation(db_session):
 
 
 @pytest.mark.asyncio
+async def test_unrelated_blob_sync_preserves_normalized_criterion_binding(db_session):
+    version_id = uuid.uuid4()
+    project = make_project(
+        directions=[{"id": "d-1", "text": "a", "status": "active"}]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    db_session.add(
+        Direction(
+            project_id=project.id,
+            direction_key="d-1",
+            text="a",
+            status="active",
+            data={
+                "id": "d-1",
+                "text": "a",
+                "status": "active",
+                "criterion_release_version_id": str(version_id),
+            },
+            criterion_keys=["c-11111111"],
+        )
+    )
+    await db_session.commit()
+
+    await with_directions_locked(
+        db_session,
+        project.id,
+        lambda directions: directions[0].update(priority="high"),
+    )
+    await db_session.commit()
+
+    row = (await _table_rows(db_session, project.id))["d-1"]
+    assert row.criterion_keys == ["c-11111111"]
+    assert row.data["criterion_release_version_id"] == str(version_id)
+    assert row.data["priority"] == "high"
+
+
+@pytest.mark.asyncio
 async def test_dual_write_removes_row_on_whole_array_replace(db_session):
     project = make_project(
         directions=[
