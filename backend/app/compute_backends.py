@@ -111,6 +111,26 @@ _RESUME_STALE_ARTIFACT_FILENAMES = (
     "live_tail.b64",
 )
 
+# Python one-liner for safe tar extraction on GCP resume VMs.  The literal
+# strings 'tarfile.open' and 'm.isreg() or m.isdir()' are asserted by the
+# test suite so they must appear verbatim in this constant.
+_RESUME_EXTRACTOR_PY = (
+    "import tarfile,os,sys;"
+    "b,d=sys.argv[1],sys.argv[2];"
+    'STALE={"result.json","command.log.json","terminal.json","live_tail.b64"};'
+    "os.makedirs(d,exist_ok=True);"
+    'tf=tarfile.open(b,"r:gz");'
+    "ms=tf.getmembers();"
+    "[tf.extract(m,d) for m in ms if not m.issym() and not m.islnk()"
+    ' and (m.isreg() or m.isdir())'
+    ' and ".." not in m.name.split("/")'
+    ' and not m.name.startswith("/")'
+    ' and not(m.isreg() and m.name.split("/")[-1] in STALE)];'
+    'fc=sum(1 for m in ms if m.isreg() and m.name.split("/")[-1] not in STALE);'
+    "tf.close();"
+    "sys.exit(0 if fc>0 else 1)"
+)
+
 
 def _load_result_json(result_path: str) -> Any:
     """Synchronous helper for run_preflight_smoke — offloaded via asyncio.to_thread
@@ -146,7 +166,11 @@ def _extract_safe_members(tar: tarfile.TarFile, dest_dir: str) -> int:
     malicious or corrupt predecessor bundle can only ever write inside
     ``dest_dir``. Symlink / hardlink members are skipped as well — their targets
     could point outside the destination even when the member name itself is safe.
-    Returns the count of members actually extracted.
+    Stale predecessor run-status files (result.json, terminal.json, etc.) are
+    also skipped so they cannot contaminate the new job's terminal detection.
+    Returns the count of non-stale regular files actually extracted (directories
+    are extracted but not counted, so an archive of only directories or stale
+    files returns 0 — fail-closed).
     """
     os.makedirs(dest_dir, exist_ok=True)
     extracted = 0
@@ -159,8 +183,13 @@ def _extract_safe_members(tar: tarfile.TarFile, dest_dir: str) -> int:
                 member.name,
             )
             continue
+        # Stale run-status files from the predecessor must not contaminate this job.
+        if member.isreg() and os.path.basename(member.name) in _RESUME_STALE_ARTIFACT_FILENAMES:
+            continue
         tar.extract(member, path=dest_dir)
-        extracted += 1
+        # Count only regular files — directories are structural scaffolding only.
+        if member.isreg():
+            extracted += 1
     return extracted
 
 
@@ -3161,7 +3190,7 @@ def _build_gcp_startup_script(
             f'  echo "{_SERIAL_EXIT_PREFIX}1"\n'
             f"  python3 /tmp/blueprint_terminal_record.py "
             f"{artifact_dir} FAILED 1 repo_clone_failed:$CLONE_CLASS "
-            f"{result_file} {command_log_path} >/dev/null 2>&1 || true\n"
+            f'{result_file} {command_log_path} "$__BP_RESUME_D" >/dev/null 2>&1 || true\n'
             f"  upload_artifacts\n"
             f'  kill "$TTL_PID" "$_NP_WATCHDOG_PID" 2>/dev/null || true\n'
             f"  poweroff || shutdown -h now || true\n"
@@ -3202,7 +3231,7 @@ def _build_gcp_startup_script(
             f'  echo "{_SERIAL_EXIT_PREFIX}1"\n'
             f"  python3 /tmp/blueprint_terminal_record.py "
             f"{artifact_dir} FAILED 1 setup_step_failed "
-            f"{result_file} {command_log_path} >/dev/null 2>&1 || true\n"
+            f'{result_file} {command_log_path} "$__BP_RESUME_D" >/dev/null 2>&1 || true\n'
             f"  upload_artifacts\n"
             f'  kill "$TTL_PID" "$_NP_WATCHDOG_PID" 2>/dev/null || true\n'
             f"  poweroff || shutdown -h now || true\n"
@@ -3253,7 +3282,7 @@ def _build_gcp_startup_script(
             + f'  echo "{_SERIAL_EXIT_PREFIX}1"\n'
             + "  python3 /tmp/blueprint_terminal_record.py "
             + f"{artifact_dir} FAILED 1 container_image_pull_failed "
-            + f"{result_file} {command_log_path} >/dev/null 2>&1 || true\n"
+            + f'{result_file} {command_log_path} "$__BP_RESUME_D" >/dev/null 2>&1 || true\n'
             + "  upload_artifacts\n"
             + '  kill "$TTL_PID" "$_NP_WATCHDOG_PID" 2>/dev/null || true\n'
             + "  poweroff || shutdown -h now || true\n"
@@ -3268,7 +3297,7 @@ def _build_gcp_startup_script(
     # Cross-job checkpoint resume: pull the predecessor's durable bundle from its
     # signed GET URL and extract it into the artifact dir BEFORE the command runs,
     # so a resumed job sees the prior checkpoint already present. Kept to
-    # single-line curl / python3 / tar invocations (no heredoc nesting) per the
+    # single-line curl / python3 invocations (no heredoc nesting) per the
     # repo's "generating code for one language from another" guidance. Fail-closed
     # by design, mirroring the in-process backend's `_rehydrate_input_artifact_bundle`
     # (which RAISES on a missing/unreadable predecessor bundle): a failed
@@ -3278,33 +3307,26 @@ def _build_gcp_startup_script(
     # workspace and burning the whole deadline redoing (or misreporting) work the
     # resume was meant to skip. A success writes `resume_hydration.ok` and continues.
     # Both markers land in the uploaded bundle. Stale run-status files from the
-    # predecessor (result.json /
-    # command.log.json / terminal.json / live_tail.b64) are removed after extract
-    # so they cannot contaminate THIS run's terminal detection; the boot beacon
-    # below then re-lays a fresh terminal.json.
+    # predecessor (result.json / command.log.json / terminal.json / live_tail.b64)
+    # are skipped by _RESUME_EXTRACTOR_PY so they never land in the staging dir;
+    # the boot beacon below then re-lays a fresh terminal.json.
     resume_block = ""
     if input_artifact_download_url:
         _resume_url_q = shlex.quote(input_artifact_download_url)
-        _resume_bundle_q = shlex.quote("/tmp/blueprint_resume_bundle.tar.gz")
+        _resume_bundle_path = "/tmp/blueprint_resume_bundle.tar.gz"
+        _resume_stage_path = "/tmp/blueprint_resume_stage"
+        _resume_bundle_q = shlex.quote(_resume_bundle_path)
         _resume_ok_q = shlex.quote(
             os.path.join(_GCP_ARTIFACT_DIR_PATH, "resume_hydration.ok")
         )
         _resume_fail_q = shlex.quote(
             os.path.join(_GCP_ARTIFACT_DIR_PATH, "resume_hydration.failed")
         )
-        _resume_stage_q = shlex.quote(f"{_GCP_ARTIFACT_DIR_PATH}.resume-staging")
-        _resume_stale = " ".join(
-            shlex.quote(os.path.join(_GCP_ARTIFACT_DIR_PATH, _name))
-            for _name in (
-                "result.json",
-                "command.log.json",
-                "terminal.json",
-                "live_tail.b64",
-            )
-        )
         resume_block = (
-            f"rm -f {_resume_bundle_q}\n"
-            f"rm -rf {_resume_stage_q} && mkdir -p {_resume_stage_q}\n"
+            # Start marker (also the end marker): used by the test harness to locate
+            # and extract the resume block for isolated bash execution.
+            f"rm -rf {_resume_stage_path}; rm -f {_resume_bundle_q}\n"
+            f"mkdir -p {_resume_stage_path}\n"
             f"if timeout {upload_timeout} curl --fail --silent --show-error "
             f"--location --output {_resume_bundle_q} {_resume_url_q} "
             f">/dev/null 2>&1 || timeout {upload_timeout} python3 -c "
@@ -3315,23 +3337,33 @@ def _build_gcp_startup_script(
             f"else\n"
             f"  RESUME_DL=0\n"
             f"fi\n"
+            # Safe extraction via _RESUME_EXTRACTOR_PY: skips links, path-traversal
+            # members, and stale predecessor status files; exits non-zero when no
+            # usable checkpoint files are found so an empty/stale-only archive is
+            # fail-closed (sets RESUME_DL=0 via the else branch below).
             f'if [ "$RESUME_DL" = 1 ] && [ -s {_resume_bundle_q} ] && '
-            f"tar -C {_resume_stage_q} --no-same-owner -xzf {_resume_bundle_q} "
-            f">/dev/null 2>&1; then\n"
-            f"  rm -f {_resume_stale.replace(_GCP_ARTIFACT_DIR_PATH, _GCP_ARTIFACT_DIR_PATH + '.resume-staging')}\n"
-            f"  _BP_RESUME_FC=$(find {_resume_stage_q} -type f 2>/dev/null | wc -l)\n"
-            f"  if [ \"$_BP_RESUME_FC\" -lt 1 ]; then RESUME_DL=0; fi\n"
-            f"  if [ \"$RESUME_DL\" = 1 ]; then rm -rf {artifact_dir} && mv {_resume_stage_q} {artifact_dir} || RESUME_DL=0; fi\n"
-            f"  __BP_RESUME_D=$(python3 -c 'import json,base64,sys; print("
+            f"python3 -c '{_RESUME_EXTRACTOR_PY}' "
+            f"{_resume_bundle_q} {_resume_stage_path} >/dev/null 2>&1; then\n"
+            f"  _BP_RESUME_FC=$(find {_resume_stage_path} -type f 2>/dev/null | wc -l)\n"
+            f"  if rm -rf {artifact_dir} && cp -a {_resume_stage_path} {artifact_dir} >/dev/null 2>&1; then\n"
+            f"    __BP_RESUME_D=$(python3 -c 'import json,base64,sys,datetime; print("
             f"base64.b64encode(json.dumps({{"
-            f'"ok":True,"file_count":int(sys.argv[1]),"resumed_from_job_id":{json.dumps(spec.input_artifact_job_id)} }}).encode()).decode())\' '
-            f"\"$_BP_RESUME_FC\" 2>/dev/null || true)\n"
-            f'  [ "$RESUME_DL" = 1 ] && [ -n "$__BP_RESUME_D" ] && echo "{_SERIAL_RESUME_PREFIX}$__BP_RESUME_D" || true\n'
-            f"  [ \"$RESUME_DL\" = 1 ] && echo resumed > {_resume_ok_q} 2>/dev/null || true\n"
-            f'  [ "$RESUME_DL" = 1 ] && echo "[resume] hydrated predecessor checkpoint bundle into '
-            f'artifact dir"\n'
+            f'"ok":True,"file_count":int(sys.argv[1]),"resumed_from_job_id":{json.dumps(spec.input_artifact_job_id)},'
+            '"recorded_at":datetime.datetime.now(datetime.timezone.utc).isoformat()'
+            f" }}).encode()).decode())' "
+            f'"$_BP_RESUME_FC" 2>/dev/null || true)\n'
+            f'    [ -n "$__BP_RESUME_D" ] && echo "{_SERIAL_RESUME_PREFIX}$__BP_RESUME_D" || true\n'
+            f"    echo resumed > {_resume_ok_q} 2>/dev/null || true\n"
+            f'    echo "[resume] hydrated predecessor checkpoint bundle into artifact dir"\n'
+            f'    echo "$__BP_RESUME_D" > /tmp/blueprint_resume_d.b64 2>/dev/null || true\n'
+            f"  else\n"
+            f"    RESUME_DL=0\n"
+            f"  fi\n"
+            f"else\n"
+            f"  RESUME_DL=0\n"
             f"fi\n"
             f'if [ "$RESUME_DL" != 1 ]; then\n'
+            f"  mkdir -p {artifact_dir} 2>/dev/null || true\n"
             f"  echo failed > {_resume_fail_q} 2>/dev/null || true\n"
             f'  echo "[resume] predecessor checkpoint hydration FAILED — aborting '
             f'run (fail-closed; refusing to run against an empty workspace)"\n'
@@ -3339,15 +3371,16 @@ def _build_gcp_startup_script(
             f'  echo "{_SERIAL_STATUS_PREFIX}FAILED"\n'
             f'  echo "{_SERIAL_EXIT_PREFIX}1"\n'
             f'  echo "{_SERIAL_RESUME_PREFIX}{_SERIAL_RESUME_FAILED_B64}"\n'
-            f"  python3 /tmp/blueprint_terminal_record.py "
-            f"{artifact_dir} FAILED 1 resume_hydration_failed "
-            f"{result_file} {command_log_path} >/dev/null 2>&1 || true\n"
+            f'  python3 /tmp/blueprint_terminal_record.py '
+            f'{artifact_dir} FAILED 1 resume_hydration_failed '
+            f'{result_file} {command_log_path} "${{__BP_RESUME_D:-}}" >/dev/null 2>&1 || true\n'
             f"  upload_artifacts\n"
             f'  kill "$TTL_PID" "$_NP_WATCHDOG_PID" 2>/dev/null || true\n'
             f"  poweroff || shutdown -h now || true\n"
             f"  exit 1\n"
             f"fi\n"
-            f"rm -f {_resume_bundle_q}"
+            # End marker (same as start marker, used by test harness for block extraction).
+            f"rm -rf {_resume_stage_path}; rm -f {_resume_bundle_q}"
         )
     max_log_bytes = _MAX_COMMAND_LOG_BYTES
     command_runner_b64 = _COMMAND_RUNNER_B64
@@ -3405,11 +3438,16 @@ upload_artifacts() {{
   return 0
 }}
 trap upload_artifacts EXIT HUP INT TERM QUIT
+# Initialise resume-provenance variable so set-u never fires in setup-failure
+# paths that run before the resume block, and so the TTL subshell below (forked
+# before resume) can still read the value via the /tmp file written on success.
+__BP_RESUME_D=""
 (
   sleep "$TTL_SECONDS"
+  _BP_TTL_PROV=$(cat /tmp/blueprint_resume_d.b64 2>/dev/null || true)
   python3 /tmp/blueprint_terminal_record.py \
     {artifact_dir} FAILED 124 runtime_ttl {result_file} {command_log_path} \
-    >/dev/null 2>&1 || true
+    "$_BP_TTL_PROV" >/dev/null 2>&1 || true
   echo "{_SERIAL_REASON_PREFIX}runtime_ttl"
   echo "{_SERIAL_STATUS_PREFIX}FAILED"
   echo "{_SERIAL_EXIT_PREFIX}124"
@@ -3458,7 +3496,7 @@ mkdir -p {artifact_dir}
 {resume_block}
 python3 /tmp/blueprint_terminal_record.py \
   {artifact_dir} FAILED 1 vm_terminated_before_completion {result_file} {command_log_path} \
-  >/dev/null 2>&1 || true
+  "$__BP_RESUME_D" >/dev/null 2>&1 || true
 {repo_setup_block}
 {setup_step_block}
 {cwd_line}
@@ -3478,7 +3516,7 @@ touch {progress_file} 2>/dev/null || true
       if [ "$_NP_NOW" = "$_NP_START" ]; then
         python3 /tmp/blueprint_terminal_record.py \
           {artifact_dir} FAILED 125 no_progress_timeout {result_file} {command_log_path} \
-          >/dev/null 2>&1 || true
+          "$__BP_RESUME_D" >/dev/null 2>&1 || true
         echo "{_SERIAL_REASON_PREFIX}no_progress_timeout"
         echo "{_SERIAL_STATUS_PREFIX}FAILED"
         echo "{_SERIAL_EXIT_PREFIX}125"
@@ -3529,7 +3567,7 @@ if [ -n "${{BLUEPRINT_RELEASE_SHA:-}}" ]; then
 fi
 python3 /tmp/blueprint_terminal_record.py \
   {artifact_dir} "$STATUS" "$EXIT_CODE" "$REASON" {result_file} {command_log_path} \
-  >/dev/null 2>&1 || true
+  "$__BP_RESUME_D" >/dev/null 2>&1 || true
 upload_artifacts
 kill "$TTL_PID" "$_HEARTBEAT_PID" "$_NP_WATCHDOG_PID" 2>/dev/null || true
 poweroff || shutdown -h now || true

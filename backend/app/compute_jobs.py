@@ -460,6 +460,29 @@ async def _resolve_resume_source_job_id(
     return str(parsed)
 
 
+def _has_verified_resume_provenance(job: Any) -> bool:
+    """Return True when *job* carries a valid cross-job checkpoint provenance.
+
+    A provenance is valid when it was written by a successful hydration run on
+    the same predecessor job: ok=True, resumed_from_job_id matches the job's
+    declared input_artifact_job_id, and at least one file was copied.  This is
+    the same contract enforced by ``_validate_input_artifact_job_id`` but
+    expressed as a boolean predicate for use in tests and status checks.
+    """
+    meta = (job.polling_metadata or {}) if hasattr(job, "polling_metadata") else {}
+    input_job_id = meta.get("input_artifact_job_id")
+    if input_job_id is None:
+        return False
+    provenance = meta.get("resume_provenance")
+    return (
+        isinstance(provenance, dict)
+        and provenance.get("ok") is True
+        and str(provenance.get("resumed_from_job_id") or "") == str(input_job_id)
+        and isinstance(provenance.get("file_count"), int)
+        and provenance["file_count"] > 0
+    )
+
+
 def clamp_spend_cap_usd(raw_value: float) -> float:
     return max(
         MIN_COMPUTE_JOB_SPEND_CAP_USD,
