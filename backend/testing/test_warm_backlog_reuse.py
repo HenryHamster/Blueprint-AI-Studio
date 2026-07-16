@@ -924,6 +924,7 @@ async def test_retarget_claim_emits_secret_manifest_when_account_differs(
             vm_instance_id=vm_id,
             account_id="acct-boot",
             provider="anthropic",
+            context={"scope": "small", "llm_auth_mode": "oauth"},
         )
         backlog = await _make_backlog_task(db_session, project.id)
 
@@ -973,6 +974,7 @@ async def test_retarget_claim_omits_manifest_when_account_matches(
             vm_instance_id=vm_id,
             account_id="acct-boot",
             provider="anthropic",
+            context={"scope": "small", "llm_auth_mode": "oauth"},
         )
         backlog = await _make_backlog_task(db_session, project.id)
 

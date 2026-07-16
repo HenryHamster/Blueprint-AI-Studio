@@ -567,6 +567,39 @@ function parseSecretFileMode(raw: unknown): number {
   return 0o600;
 }
 
+function normalizeClaudeConfigContent(
+  filePath: string,
+  content: string,
+  workspace = WORKSPACE,
+): string {
+  if (path.basename(filePath) !== '.claude.json') return content;
+  try {
+    const parsed = JSON.parse(content || '{}') as Record<string, unknown>;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return content;
+    }
+    parsed.hasCompletedOnboarding = true;
+    const projects = parsed.projects;
+    const normalizedProjects =
+      projects && typeof projects === 'object' && !Array.isArray(projects)
+        ? projects as Record<string, unknown>
+        : {};
+    parsed.projects = normalizedProjects;
+    const workspaceConfig = normalizedProjects[workspace];
+    const normalizedWorkspace =
+      workspaceConfig &&
+      typeof workspaceConfig === 'object' &&
+      !Array.isArray(workspaceConfig)
+        ? workspaceConfig as Record<string, unknown>
+        : {};
+    normalizedProjects[workspace] = normalizedWorkspace;
+    normalizedWorkspace.hasTrustDialogAccepted = true;
+    return JSON.stringify(parsed);
+  } catch {
+    return content;
+  }
+}
+
 function ensureParentDirectorySync(filePath: string): void {
   const parent = path.dirname(filePath);
   fs.mkdirSync(parent, { recursive: true, mode: 0o700 });
@@ -636,7 +669,11 @@ function materializeCredentialState(
       continue;
     }
     ensureParentDirectorySync(writePath);
-    writePrivateFileSync(writePath, file.content, file.mode);
+    writePrivateFileSync(
+      writePath,
+      normalizeClaudeConfigContent(writePath, file.content),
+      file.mode,
+    );
     materializedPaths.push(writePath);
   }
   for (const [key, value] of Object.entries(state.env)) {

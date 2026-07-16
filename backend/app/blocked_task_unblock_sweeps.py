@@ -73,6 +73,7 @@ _BLOCKED_PARKED_REEVAL_CAP = 4
 # is deliberately small: re-dispatch costs a full agent VM run, so this trades a
 # few wasted runs for auto-recovery instead of a multi-hour operator wedge.
 _BLOCKED_OPTIMISTIC_RETRY_CAP = 3
+_DETERMINISTIC_CAPABILITY_BLOCKERS = ("VIEWPORT_GATE_INFRA_UNAVAILABLE",)
 
 # Durable context marker stamped on a blocked dependent that the resume system
 # terminally CANCELS because it can provably never resume. The terminal
@@ -199,6 +200,24 @@ async def _blocked_precondition_state(task, session, verify_pr_merged) -> str:
         # source=="agent" so parent-source blockers and metadata-less blocked
         # subtasks keep their existing "wait for explicit recovery" semantics.
         if blocker_source == "agent":
+            blocker_text = " ".join(
+                str(value or "")
+                for value in (
+                    task.blocked_reason,
+                    task.latest_status_message,
+                    blocker_meta.get("reason")
+                    if isinstance(blocker_meta, dict)
+                    else None,
+                )
+            )
+            if any(
+                sentinel in blocker_text
+                for sentinel in _DETERMINISTIC_CAPABILITY_BLOCKERS
+            ):
+                # The unchanged runner image cannot satisfy this capability.
+                # Re-running the full authoring/test workload is deterministic
+                # waste, so hold until infrastructure changes.
+                return "waiting"
             return "retry"
         return "waiting"
     if verify_pr_merged is None:
@@ -755,6 +774,7 @@ async def _partition_completed_needs_base_safe(
     from app.blocked_need_resolution import completed_foundation_for_need
     from app.orchestrator_health import (
         _has_landed_cross_base_code_dep,
+        _shared_staging_dependency_source,
         ensure_dependent_base_recut,
     )
 
@@ -773,8 +793,9 @@ async def _partition_completed_needs_base_safe(
     base_safe: list = []
     recut_pending: list = []
     for need, foundation in resolved:
-        if foundation is not None and _has_landed_cross_base_code_dep(
-            task, [foundation]
+        if foundation is not None and (
+            _has_landed_cross_base_code_dep(task, [foundation])
+            or await _shared_staging_dependency_source(task, foundation, session)
         ):
             recut_pending.append(need)
         else:
