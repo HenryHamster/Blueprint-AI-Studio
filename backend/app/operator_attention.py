@@ -1893,6 +1893,22 @@ async def get_operator_message_counts(
         + counts.get(MessageType.QUESTION, 0)
         + action_message_count
     )
+    # Count undismissed ERROR and WARNING alerts for the cross-tab indicator.
+    # Mirrors the alert count in build_operator_attention (lines ~2290).
+    active_alerts = int(
+        (
+            await session.execute(
+                select(func.count())
+                .select_from(Alert)
+                .where(
+                    Alert.project_id == project_id,
+                    Alert.dismissed_at.is_(None),
+                    Alert.severity.in_(list(_ACTIONABLE_ALERT_SEVERITIES)),
+                )
+            )
+        ).scalar()
+        or 0
+    )
     return {
         "blocker": counts.get(MessageType.BLOCKER, 0),
         "question": counts.get(MessageType.QUESTION, 0),
@@ -1901,6 +1917,7 @@ async def get_operator_message_counts(
         "high_signal_note": note_count,
         "unread": unread,
         "needs_operator": needs_operator,
+        "active_alerts": active_alerts,
     }
 
 

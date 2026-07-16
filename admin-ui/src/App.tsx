@@ -179,6 +179,7 @@ export default function App() {
   }, [cycleCompletion, addToast]);
   const [openMessageCount, setOpenMessageCount] = useState(0);
   const [newSinceLastVisit, setNewSinceLastVisit] = useState(0);
+  const [activeAlerts, setActiveAlerts] = useState(0);
   const handleMessageCountChange = useCallback((count: number) => setOpenMessageCount(count), []);
 
   // Noise prefs for the closed-panel badge — loaded from localStorage on project change and
@@ -284,6 +285,7 @@ export default function App() {
     if (messagesPanelOpen) {
       setOpenMessageCount(0);
       setNewSinceLastVisit(0);
+      setActiveAlerts(0);
     }
   }, [messagesPanelOpen]);
   // Load noise prefs from localStorage when the project changes; refresh from server async.
@@ -332,6 +334,7 @@ export default function App() {
         // and the in-panel needs-action set.
         setOpenMessageCount(data.needs_operator ?? 0);
         setNewSinceLastVisit(data.unread ?? 0);
+        setActiveAlerts(data.active_alerts ?? 0);
       }
     } catch { /* ignore */ }
   }, {
@@ -1209,6 +1212,7 @@ export default function App() {
         ceilingDeferredProjectIds={s.ceilingDeferredProjectIds}
         gatedTaskTypes={s.gatedTaskTypes}
         costSectionAvailable={activeTab === 'runtime' && runtimeSection === 'analytics'}
+        activeAlerts={activeAlerts}
       />
       <Suspense fallback={null}><CommandPaletteHost open={commandPaletteOpen} commands={workbenchCommands} query={commandPaletteQuery} onQueryChange={setCommandPaletteQuery} setOpen={setCommandPaletteOpen} /></Suspense>
       <Suspense fallback={null}><KeyboardShortcutsOverlay open={shortcutHelpOpen} onClose={() => setShortcutHelpOpen(false)} /></Suspense>
@@ -1633,6 +1637,7 @@ export default function App() {
         openMessageCount={openMessageCount}
         newSinceLastVisitCount={newSinceLastVisit}
         needsAttentionCount={pipelineAttentionCount}
+        activeAlerts={activeAlerts}
         placement="mobile"
         className="md:hidden"
       />

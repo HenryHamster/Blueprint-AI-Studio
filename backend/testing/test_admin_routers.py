@@ -7411,6 +7411,7 @@ class TestMessages:
             "high_signal_note": 0,
             "unread": 1,
             "needs_operator": 1,
+            "active_alerts": 0,
         }
 
     @pytest.mark.asyncio
@@ -7454,6 +7455,51 @@ class TestMessages:
         assert resp.status_code == 200
         data = resp.json()
         assert data["high_signal_note"] == 1, f"expected 1 high_signal_note, got {data['high_signal_note']}"
+
+    @pytest.mark.asyncio
+    async def test_get_message_counts_active_alerts(self, client: AsyncClient, db_session):
+        """active_alerts counts undismissed ERROR and WARNING alert rows."""
+        from app.models import Alert, AlertSeverity
+
+        project = await _make_project(db_session)
+
+        # ERROR alert — should be counted
+        db_session.add(Alert(
+            project_id=project.id,
+            severity=AlertSeverity.ERROR,
+            title="test error",
+            message="test error alert",
+        ))
+        # WARNING alert — should be counted
+        db_session.add(Alert(
+            project_id=project.id,
+            severity=AlertSeverity.WARNING,
+            title="test warning",
+            message="test warning alert",
+        ))
+        # Dismissed ERROR alert — should NOT be counted
+        db_session.add(Alert(
+            project_id=project.id,
+            severity=AlertSeverity.ERROR,
+            title="dismissed error",
+            message="dismissed error alert",
+            dismissed_at=datetime.now(timezone.utc).replace(tzinfo=None),
+        ))
+        # INFO alert — should NOT be counted (only ERROR and WARNING)
+        db_session.add(Alert(
+            project_id=project.id,
+            severity=AlertSeverity.INFO,
+            title="test info",
+            message="test info alert",
+        ))
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/messages/counts?project_id={project.id}")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["active_alerts"] == 2, (
+            f"expected 2 active_alerts (ERROR + WARNING), got {data['active_alerts']}"
+        )
 
     @pytest.mark.asyncio
     async def test_get_message_counts_noise_prefs_muted_event_excluded(self, client: AsyncClient, db_session):
