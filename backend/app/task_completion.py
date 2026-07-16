@@ -3841,6 +3841,20 @@ async def _handle_capability_proof_trial_completion(
                     task.id,
                     head_sha,
                 )
+                # Wake BLOCKED dependents immediately instead of waiting for the
+                # periodic reaper to re-check them at recheck_after.
+                try:
+                    from app.reaper_sweeps import (  # noqa: PLC0415
+                        event_driven_unblock_on_proof,
+                    )
+                    await event_driven_unblock_on_proof(task.project_id, session)
+                except Exception:  # noqa: BLE001 — best-effort; never block the proof commit
+                    logger.warning(
+                        "[CAP_TRIAL] event_driven_unblock_on_proof failed for project %s "
+                        "(best-effort — proof already committed)",
+                        task.project_id,
+                        exc_info=True,
+                    )
             else:
                 logger.info(
                     "[CAP_TRIAL] GREEN trial for cap=%s (task %s) but recorder minted "

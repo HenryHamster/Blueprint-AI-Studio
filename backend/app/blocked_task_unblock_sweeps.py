@@ -1743,6 +1743,44 @@ async def event_driven_unblock_dependents(
     return requeued
 
 
+async def event_driven_unblock_on_proof(
+    project_id,
+    session,
+    *,
+    batch_size: int = 50,
+) -> int:
+    """Fast-path event-driven re-resolution of BLOCKED tasks when a capability proof lands.
+
+    When a capability_proof_trial completes GREEN and the proof is committed, any
+    BLOCKED task that was waiting on that capability's proof gate used to remain
+    BLOCKED until the slow periodic sweep re-checked it at ``recheck_after`` (or,
+    once escalated, only every 6h). This fires immediately after the proof commit so
+    waiters resume at once.
+
+    Like :func:`event_driven_unblock_on_knowledge`, this is keyed on ``project_id``
+    and re-evaluates the project's full BLOCKED set via :func:`_event_driven_unblock_project`.
+    The conservative capability-gate matching and all-needs-resolved resume gate are
+    preserved unchanged.
+
+    Fail-open + bounded + idempotent (``FOR UPDATE SKIP LOCKED``) alongside the
+    periodic sweep; must be called best-effort by the proof-ingestion chokepoint so
+    it can never block the proof commit.
+
+    Returns the number of tasks resumed (0 on error or no match).
+    """
+    requeued = await _event_driven_unblock_project(
+        project_id, session, batch_size=batch_size
+    )
+    if requeued:
+        logger.info(
+            "[REAPER] event_driven_unblock_on_proof: new capability proof in project %s "
+            "unblocked %d task(s) → QUEUED",
+            project_id,
+            requeued,
+        )
+    return requeued
+
+
 async def event_driven_unblock_on_knowledge(
     project_id,
     session,
