@@ -737,6 +737,15 @@ _LEDGER_DIMENSION_KEYS: frozenset[str] = frozenset({
     "capability_proof", "challenge", "acceptance_window",
 })
 
+# Dimensions whose live result is re-measured on every re-drive.  A ledger row
+# whose currency is "reused" (i.e. it belongs to a prior attempt that the
+# active attempt merely reused) must NOT overwrite the blob-derived state for
+# these dimensions: the blob already reflects the fresh live measurement while
+# the ledger row carries the stale prior-attempt fact.
+_MUTABLE_DIMENSION_KEYS: frozenset[str] = frozenset({
+    "ci", "migration_identity", "migration_apply",
+})
+
 
 def _ledger_status_to_ui(status: str) -> str:
     """Map the ledger's status vocabulary to the UI dimension-state vocabulary.
@@ -817,9 +826,6 @@ async def resolve_dimension_states_from_ledger(
         if key in _LEDGER_DIMENSION_KEYS:
             row = ledger_map.get(key)
             if row is not None:
-                entry["status"] = _ledger_status_to_ui(row.status)
-                entry["score"] = row.sub_score
-                entry["reason"] = row.blocker
                 origin_attempt = _attempt_text(row.origin_attempt_id)
                 reused_by = {
                     value
@@ -834,6 +840,25 @@ async def resolve_dimension_states_from_ledger(
                     currency = "reused"
                 else:
                     currency = "prior_attempt"
+
+                # Mutable dimensions are re-measured live on every re-drive.
+                # When the ledger row's currency is "reused", the blob already
+                # carries the fresh live result; skip the ledger overlay so the
+                # stale prior-attempt fact cannot contradict the active state.
+                if key in _MUTABLE_DIMENSION_KEYS and currency == "reused":
+                    entry["provenance"] = {
+                        "origin_attempt_id": origin_attempt,
+                        "candidate_sha": row.candidate_sha,
+                        "producing_task_id": (
+                            str(row.producing_task_id) if row.producing_task_id else None
+                        ),
+                        "currency": currency,
+                    }
+                    continue
+
+                entry["status"] = _ledger_status_to_ui(row.status)
+                entry["score"] = row.sub_score
+                entry["reason"] = row.blocker
                 entry["provenance"] = {
                     "origin_attempt_id": origin_attempt,
                     "candidate_sha": row.candidate_sha,

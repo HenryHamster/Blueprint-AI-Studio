@@ -1602,3 +1602,260 @@ async def test_strategic_recent_version_entry_no_ledger_matches_blob(db_session)
     assert qual_state is not None
     assert qual_state["sub_scores"]["audit"] == pytest.approx(0.9)
     assert qual_state["sub_scores"]["test_erosion"] == pytest.approx(0.85)
+
+
+# ---------------------------------------------------------------------------
+# Mutable dimension reused-currency guard
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_mutable_dim_reused_currency_falls_back_to_blob_ci(db_session):
+    """When a CI ledger row has currency='reused' (stale prior-attempt fact),
+    resolve_dimension_states_from_ledger falls back to the blob-derived state
+    for the ci dimension rather than surfacing the stale passed row.
+
+    Scenario: Attempt-1 passed CI; the re-drive (Attempt-2) re-measured CI as
+    blocking.  The ledger still holds the Attempt-1 row marked as
+    reused_by=[Attempt-2].  The blob records the fresh Attempt-2 result:
+    ci_resolution.state='red'.  The resolver must use the blob (blocked) for ci,
+    not the stale ledger (passed).
+    """
+    import uuid
+    from app.models import Project, ReleaseVersion, QualificationDimensionResult
+    from app.qualification_state_resolver import resolve_dimension_states_from_ledger
+
+    project = Project(name="Test Project", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.flush()
+
+    prior_attempt_id = uuid.uuid4()
+    active_attempt_id = uuid.uuid4()
+
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="open",
+        last_qualification={
+            "status": "not_promoted",
+            "candidate_sha": "sha-reused-ci",
+            "qualification_attempt_id": str(active_attempt_id),
+            # Fresh re-drive result: CI is now red.
+            "ci_resolution": {"state": "red"},
+            "sub_scores": {"audit": 0.9, "test_erosion": 0.85},
+            "migration_safety": "ok",
+            "migration_apply_safety": "ok",
+            "merge_grade_status": "pass",
+            "blocker": "ci_not_green",
+            "smoketest_enabled": True,
+        },
+    )
+    db_session.add(version)
+    await db_session.flush()
+
+    # Stale prior-attempt CI row: passed (from Attempt-1), now marked reused by Attempt-2.
+    db_session.add(QualificationDimensionResult(
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha="sha-reused-ci",
+        dimension="ci",
+        status="passed",
+        sub_score=None,
+        blocker=None,
+        origin_attempt_id=prior_attempt_id,
+        reused_by_attempt_ids=[str(active_attempt_id)],
+    ))
+    await db_session.flush()
+
+    result = await resolve_dimension_states_from_ledger(db_session, version)
+    d = {s["key"]: s for s in result}
+
+    # The fresh blob state is ci_resolution.state='red' → ci is blocked/failed.
+    assert d["ci"]["status"] == "failed", (
+        "stale reused CI ledger row must not override fresh blob-derived failed state"
+    )
+    # Provenance is still recorded with currency=reused so callers know why.
+    assert d["ci"]["provenance"]["currency"] == "reused"
+
+
+@pytest.mark.asyncio
+async def test_mutable_dim_current_currency_uses_ledger_ci(db_session):
+    """When a CI ledger row has currency='current' (origin_attempt_id matches active),
+    the ledger value IS used — this is the normal case."""
+    import uuid
+    from app.models import Project, ReleaseVersion, QualificationDimensionResult
+    from app.qualification_state_resolver import resolve_dimension_states_from_ledger
+
+    project = Project(name="Test Project", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.flush()
+
+    active_attempt_id = uuid.uuid4()
+
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="open",
+        last_qualification={
+            "status": "not_promoted",
+            "candidate_sha": "sha-current-ci",
+            "qualification_attempt_id": str(active_attempt_id),
+            # Blob says red, but the CURRENT ledger row says passed —
+            # the ledger is authoritative when currency='current'.
+            "ci_resolution": {"state": "red"},
+            "sub_scores": {"audit": 0.9},
+            "migration_safety": "ok",
+            "migration_apply_safety": "ok",
+            "merge_grade_status": "pass",
+            "blocker": None,
+            "smoketest_enabled": True,
+        },
+    )
+    db_session.add(version)
+    await db_session.flush()
+
+    # Current CI row: origin_attempt_id == active_attempt_id → currency=current.
+    db_session.add(QualificationDimensionResult(
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha="sha-current-ci",
+        dimension="ci",
+        status="passed",
+        sub_score=None,
+        blocker=None,
+        origin_attempt_id=active_attempt_id,
+    ))
+    await db_session.flush()
+
+    result = await resolve_dimension_states_from_ledger(db_session, version)
+    d = {s["key"]: s for s in result}
+
+    # Ledger (current) wins over stale blob.
+    assert d["ci"]["status"] == "passed", (
+        "current CI ledger row must override the blob-derived state"
+    )
+    assert d["ci"]["provenance"]["currency"] == "current"
+
+
+@pytest.mark.asyncio
+async def test_mutable_dim_reused_currency_falls_back_to_blob_migration_identity(db_session):
+    """Parallel of the CI test: a reused migration_identity ledger row falls back
+    to the blob-derived state (unavailable) rather than surfacing the stale passed."""
+    import uuid
+    from app.models import Project, ReleaseVersion, QualificationDimensionResult
+    from app.qualification_state_resolver import resolve_dimension_states_from_ledger
+
+    project = Project(name="Test Project", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.flush()
+
+    prior_attempt_id = uuid.uuid4()
+    active_attempt_id = uuid.uuid4()
+
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="open",
+        last_qualification={
+            "status": "not_promoted",
+            "candidate_sha": "sha-reused-mig-id",
+            "qualification_attempt_id": str(active_attempt_id),
+            # Fresh result: migration_safety is not 'ok' → resolves to unavailable/failed.
+            "ci_resolution": {"state": "green"},
+            "migration_safety": None,
+            "migration_apply_safety": "ok",
+            "merge_grade_status": "pass",
+            "sub_scores": {"audit": 0.9},
+            "blocker": None,
+            "smoketest_enabled": True,
+        },
+    )
+    db_session.add(version)
+    await db_session.flush()
+
+    # Stale prior-attempt migration_identity row: passed.
+    db_session.add(QualificationDimensionResult(
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha="sha-reused-mig-id",
+        dimension="migration_identity",
+        status="passed",
+        sub_score=None,
+        blocker=None,
+        origin_attempt_id=prior_attempt_id,
+        reused_by_attempt_ids=[str(active_attempt_id)],
+    ))
+    await db_session.flush()
+
+    result = await resolve_dimension_states_from_ledger(db_session, version)
+    d = {s["key"]: s for s in result}
+
+    # Blob-derived: migration_safety=None → not_applicable or unavailable, NOT passed.
+    assert d["migration_identity"]["status"] != "passed", (
+        "stale reused migration_identity ledger row must not override blob-derived state"
+    )
+    assert d["migration_identity"]["provenance"]["currency"] == "reused"
+
+
+@pytest.mark.asyncio
+async def test_mutable_dim_reused_currency_falls_back_to_blob_migration_apply(db_session):
+    """Parallel of the CI test: a reused migration_apply ledger row falls back
+    to the blob-derived state rather than surfacing the stale passed."""
+    import uuid
+    from app.models import Project, ReleaseVersion, QualificationDimensionResult
+    from app.qualification_state_resolver import resolve_dimension_states_from_ledger
+
+    project = Project(name="Test Project", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.flush()
+
+    prior_attempt_id = uuid.uuid4()
+    active_attempt_id = uuid.uuid4()
+
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="open",
+        last_qualification={
+            "status": "not_promoted",
+            "candidate_sha": "sha-reused-mig-apply",
+            "qualification_attempt_id": str(active_attempt_id),
+            # Fresh result: migration_apply_safety is 'unsafe' → fails.
+            "ci_resolution": {"state": "green"},
+            "migration_safety": "ok",
+            "migration_apply_safety": "unsafe",
+            "merge_grade_status": "pass",
+            "sub_scores": {"audit": 0.9},
+            "blocker": None,
+            "smoketest_enabled": True,
+        },
+    )
+    db_session.add(version)
+    await db_session.flush()
+
+    # Stale prior-attempt migration_apply row: passed.
+    db_session.add(QualificationDimensionResult(
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha="sha-reused-mig-apply",
+        dimension="migration_apply",
+        status="passed",
+        sub_score=None,
+        blocker=None,
+        origin_attempt_id=prior_attempt_id,
+        reused_by_attempt_ids=[str(active_attempt_id)],
+    ))
+    await db_session.flush()
+
+    result = await resolve_dimension_states_from_ledger(db_session, version)
+    d = {s["key"]: s for s in result}
+
+    # Blob-derived: migration_apply_safety='unsafe' → failed, NOT passed.
+    assert d["migration_apply"]["status"] != "passed", (
+        "stale reused migration_apply ledger row must not override blob-derived state"
+    )
+    assert d["migration_apply"]["provenance"]["currency"] == "reused"
