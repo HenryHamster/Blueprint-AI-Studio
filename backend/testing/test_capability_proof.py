@@ -4545,6 +4545,74 @@ class TestAuthorizedExemptionLedgerCarveOut:
         assert detail["uncorroborated"] == []
 
 
+class TestTaskBackedCapabilityProofGate:
+    """The task-provider route has registry-equivalent proof and alias guarantees."""
+
+    @staticmethod
+    def _blocked(need, records, model=None, mode="enforce"):
+        from app.capability_registry import task_backed_capability_need_blocked_by_proof_gate
+
+        return task_backed_capability_need_blocked_by_proof_gate(
+            need, records, model or {"capabilities": []}, mode=mode
+        )
+
+    def test_non_capability_need_never_enters_task_backed_proof_gate(self):
+        assert not self._blocked(
+            {"kind": "task", "ref": "foundation-id"}, {}, mode="enforce"
+        )
+
+    def test_stale_task_backed_ledger_proof_does_not_clear_enforce(self):
+        from datetime import datetime, timedelta, timezone
+        from app.evidence_primitive import PROOF_FRESHNESS_TTL
+
+        stale = (
+            datetime.now(timezone.utc) - PROOF_FRESHNESS_TTL - timedelta(days=1)
+        ).isoformat()
+        records = {
+            "provider-cap": [{"proof_kind": "named_test", "proved_at": stale}]
+        }
+        assert self._blocked({"kind": "capability", "ref": "provider-cap"}, records)
+
+    def test_fresh_task_backed_ledger_proof_clears_enforce(self):
+        from datetime import datetime, timedelta, timezone
+
+        fresh = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        records = {
+            "provider-cap": [{"proof_kind": "named_test", "proved_at": fresh}]
+        }
+        assert not self._blocked({"kind": "capability", "ref": "provider-cap"}, records)
+
+    def test_absorbed_alias_uses_canonical_proof_and_exemption(self):
+        from datetime import datetime, timedelta, timezone
+        from app.capability_registry import build_operator_exemption_record
+
+        model = {
+            "capabilities": [
+                {
+                    "name": "surviving-cap",
+                    "status": "working",
+                    "absorbs": ["old-cap"],
+                }
+            ]
+        }
+        need = {"kind": "capability", "ref": "old-cap"}
+        fresh = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        assert not self._blocked(
+            need,
+            {"surviving-cap": [{"proof_kind": "named_test", "proved_at": fresh}]},
+            model,
+        )
+        assert not self._blocked(
+            need,
+            {
+                "surviving-cap": [
+                    build_operator_exemption_record("surviving-cap", "operator")
+                ]
+            },
+            model,
+        )
+
+
 class TestConsumerGateSharesTheReleaseRule:
     """Finding #4: the TWO CONSUMER seams — the spawn-time prerequisite resolver
     (``research_completion``) and the blocked-resume sweep

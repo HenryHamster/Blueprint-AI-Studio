@@ -5964,6 +5964,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     from app.capability_registry import (
         consumer_gate_proof_status,
         registry_satisfies_capability_need,
+        task_backed_capability_need_blocked_by_proof_gate,
         working_capability_names,
     )
     from app.shared_state import runtime_config as _rc
@@ -6263,14 +6264,21 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         if prereq:
             foundation = resolve_prerequisite_task(prereq, _prereq_candidates)
             if foundation is not None and foundation.id != ct.id:
-                _wired = _wire_prerequisite_edge(
-                    ct,
-                    foundation,
-                    finding_title=finding_title,
-                    prereq_label=f"{prereq.get('kind')}:{prereq.get('ref')}",
-                )
-                if _wired:
-                    _maybe_inherit_base(ct, foundation, finding_title=finding_title)
+                prereq_need = build_need(prereq.get("kind"), prereq.get("ref"), label=prereq.get("label"))
+                if prereq_need and task_backed_capability_need_blocked_by_proof_gate(
+                    prereq_need, getattr(project_obj, "capability_proof_records", None),
+                    getattr(project_obj, "problem_model", None),
+                    mode=str(_rc.get("capability_proof_gate_mode", "off") or "off"),
+                ):
+                    needs.append(prereq_need)
+                    unresolved_entries.append(prereq)
+                else:
+                    _wired = _wire_prerequisite_edge(
+                        ct, foundation, finding_title=finding_title,
+                        prereq_label=f"{prereq.get('kind')}:{prereq.get('ref')}",
+                    )
+                    if _wired:
+                        _maybe_inherit_base(ct, foundation, finding_title=finding_title)
             elif foundation is None:
                 # Unresolved explicit prerequisite: a finding declared an explicit
                 # {kind, ref} foundation it must build on, but no in-flight or

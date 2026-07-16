@@ -3841,6 +3841,15 @@ async def _handle_capability_proof_trial_completion(
                     task.id,
                     head_sha,
                 )
+                # The proof is durable before waking waiters. The shared resolver
+                # locks a bounded project slice and resumes only all-needs-satisfied
+                # tasks; its event wrapper is fail-open so proof ingestion stays
+                # authoritative even if an immediate wake cannot run.
+                from app.reaper_sweeps import (
+                    event_driven_unblock_on_capability_proof,
+                )
+
+                await event_driven_unblock_on_capability_proof(task.project_id, session)
             else:
                 logger.info(
                     "[CAP_TRIAL] GREEN trial for cap=%s (task %s) but recorder minted "

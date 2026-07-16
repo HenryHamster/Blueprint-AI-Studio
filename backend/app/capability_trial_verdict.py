@@ -911,6 +911,7 @@ async def persist_trial_verdicts_in_transaction(
     )
     async with factory() as session:
         try:
+            proof_recorded = False
             project = (
                 await session.execute(
                     select(Project).where(Project.id == project_id).with_for_update()
@@ -937,7 +938,10 @@ async def persist_trial_verdicts_in_transaction(
                             record_capability_proof_from_trial,
                         )
 
-                        record_capability_proof_from_trial(project, cap_name, entry)
+                        proof_recorded = (
+                            record_capability_proof_from_trial(project, cap_name, entry)
+                            or proof_recorded
+                        )
                     except Exception:
                         logger.exception(
                             "[CAPABILITY_TRIAL] capability proof recording failed for "
@@ -1036,7 +1040,25 @@ async def persist_trial_verdicts_in_transaction(
                 )
             await session.commit()
             verdicts = get_trial_verdicts(project)
-            return dict(verdicts) if isinstance(verdicts, dict) else {}
+            persisted_verdicts = dict(verdicts) if isinstance(verdicts, dict) else {}
+            if proof_recorded:
+                # The trial-adoption proof is durable before waking waiters. The
+                # shared resolver is bounded, idempotent, and all-needs-aware;
+                # keep this best-effort so an immediate wake can never invalidate
+                # the authoritative verdict/proof commit above.
+                try:
+                    from app.reaper_sweeps import (
+                        event_driven_unblock_on_capability_proof,
+                    )
+
+                    await event_driven_unblock_on_capability_proof(project_id, session)
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "[CAPABILITY_TRIAL] event-driven capability-proof unblock "
+                        "failed for project %s (non-fatal)",
+                        project_id,
+                    )
+            return persisted_verdicts
         except Exception:
             await session.rollback()
             raise

@@ -504,6 +504,7 @@ async def _classify_blocker_needs(
         capability_need_blocked_by_proof_gate,
         capability_need_proof_status,
         registry_satisfies_capability_need,
+        task_backed_capability_need_blocked_by_proof_gate,
     )
 
     needs = get_blocker_needs(task)
@@ -561,6 +562,21 @@ async def _classify_blocker_needs(
     if working_proof is None:
         working_proof = {}
     working_caps = set(working_proof)
+    project = None
+
+    async def _task_backed_capability_is_held(need):
+        nonlocal project
+        if need.get("kind") != "capability":
+            return False
+        if project is None:
+            from app.models import Project
+            project = await session.get(Project, task.project_id)
+        return task_backed_capability_need_blocked_by_proof_gate(
+            need,
+            getattr(project, "capability_proof_records", None),
+            getattr(project, "problem_model", None),
+            mode=proof_gate_mode,
+        )
 
     # Stranded-parent set so a GENUINE ghost merge does NOT satisfy a completed
     # need. LANDED-IN-BASE-LINEAGE semantics: the ghost-merge exclusion fires ONLY
@@ -582,6 +598,10 @@ async def _classify_blocker_needs(
     for need in needs:
         match = resolve_blocked_need(task, need, active)
         if match is not None:
+            if await _task_backed_capability_is_held(need):
+                disp["residual"].append(need)
+                disp["proof_gate_held"].append(need)
+                continue
             match_id = str(match.id)
             if match_id not in existing_edges and match_id not in disp["edges"]:
                 disp["edges"].append(match_id)
@@ -590,6 +610,10 @@ async def _classify_blocker_needs(
             completed_foundation_for_need(task, need, completed, failed_parents)
             is not None
         ):
+            if await _task_backed_capability_is_held(need):
+                disp["residual"].append(need)
+                disp["proof_gate_held"].append(need)
+                continue
             disp["completed_needs"].append(need)
             continue
         # Durable-knowledge fallback: a dangling kind='task' need whose originating
@@ -1777,6 +1801,40 @@ async def event_driven_unblock_on_knowledge(
     if requeued:
         logger.info(
             "[REAPER] event_driven_unblock_on_knowledge: new knowledge in project %s "
+            "unblocked %d task(s) → QUEUED",
+            project_id,
+            requeued,
+        )
+    return requeued
+
+
+async def event_driven_unblock_on_capability_proof(
+    project_id,
+    session,
+    *,
+    batch_size: int = 50,
+) -> int:
+    """Re-resolve proof-gated BLOCKED tasks after a capability earns proof.
+
+    A newly committed executed-test proof changes the registry answer for every
+    same-project ``kind='capability'`` need, but those tasks may have a future
+    ``recheck_after``. Reuse the shared locked, bounded resolver so only tasks
+    whose *all* needs are now satisfied resume. This event seam is deliberately
+    fail-open: proof persistence remains authoritative if wake-up work fails.
+    """
+    try:
+        requeued = await _event_driven_unblock_project(
+            project_id, session, batch_size=batch_size
+        )
+    except Exception:
+        logger.exception(
+            "[REAPER] event_driven_unblock_on_capability_proof failed for project %s",
+            project_id,
+        )
+        return 0
+    if requeued:
+        logger.info(
+            "[REAPER] event_driven_unblock_on_capability_proof: new proof in project %s "
             "unblocked %d task(s) → QUEUED",
             project_id,
             requeued,

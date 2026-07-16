@@ -46,6 +46,7 @@ from app.blocked_task_unblock_sweeps import (
     _event_driven_unblock_project,
     event_driven_unblock_dependents,
     event_driven_unblock_on_knowledge,
+    event_driven_unblock_on_capability_proof,
 )
 from app.compute_backends import GCP_BACKEND_NAME, RUNNER_SUBPROCESS_BACKEND_NAME
 from app.compute_jobs import (
@@ -2801,6 +2802,7 @@ __all__ = [
     "_event_driven_unblock_project",
     "event_driven_unblock_dependents",
     "event_driven_unblock_on_knowledge",
+    "event_driven_unblock_on_capability_proof",
     # Re-exported from app.blocked_task_unblock_sweeps (helpers)
     "_apply_needs_disposition",
     "_blocked_precondition_state",

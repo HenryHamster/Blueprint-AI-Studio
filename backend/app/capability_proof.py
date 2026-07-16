@@ -425,25 +425,25 @@ def record_capability_proof_from_trial(
     project: Any,
     cap_name: str,
     entry: dict[str, Any],
-) -> None:
+) -> bool:
     """Record a bounded proof entry when a trial reaches an evidence-grounded ADOPT verdict.
 
     Called from persist_trial_verdicts_in_transaction after a successful adopt
     verdict is written. The dedup key ``trial:<normalized_cap_name>`` ensures a
     standing ADOPT does not produce duplicate proof entries on re-evaluation.
 
-    Non-raising: all errors are logged at WARNING level so they cannot roll back
-    the surrounding session commit.
+    Returns ``True`` when a new entry was recorded and ``False`` for a non-adopt
+    verdict, an invalid capability name, or an already-recorded adoption.
     """
     from app.time_utils import _utcnow
 
     verdict = entry.get("verdict")
     if verdict not in ("adopt", "ADOPT"):
-        return
+        return False
 
     norm = normalize_capability_name(cap_name)
     if not norm:
-        return
+        return False
 
     # Stable dedup key: one proof record per capability trial adoption.
     dedup_task_id = f"trial:{norm}"
@@ -465,7 +465,7 @@ def record_capability_proof_from_trial(
 
     entries: list[dict] = list(project.capability_proof_records.get(norm) or [])
     if any(e.get("task_id") == dedup_task_id for e in entries):
-        return
+        return False
 
     entries.append(proof_entry)
     if len(entries) > _MAX_PROOF_ENTRIES_PER_CAPABILITY:
@@ -491,6 +491,7 @@ def record_capability_proof_from_trial(
             "recorded_at": proved_at,
         },
     )
+    return True
 
 
 def record_capability_backing_path_proof(project: Any, cap_name: str) -> bool:

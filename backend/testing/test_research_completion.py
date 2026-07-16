@@ -712,6 +712,9 @@ class TestNoOutputDowngrade:
     async def _run_empty(self, db_session, mocker, task):
         from test_autonomous_research import _patch_research_externals
 
+        # Production invokes this post-completion handler after the task has
+        # entered COMPLETED; only an explicit quality downgrade changes it.
+        task.status = TaskStatus.COMPLETED
         _patch_research_externals(mocker)
         mocker.patch(
             "app.research_completion._parse_research_findings", return_value=[]
@@ -7346,6 +7349,216 @@ async def test_batch_findings_share_single_foundation_via_capability(
         assert str(foundation_child.id) in (by_title[dep_title].depends_on or []), (
             f"{dep_title} must depend on the single shared foundation"
         )
+
+
+@_pytest.mark.asyncio
+@_pytest.mark.parametrize(
+    ("mode", "has_fresh_proof", "expect_blocked"),
+    [
+        ("enforce", False, True),
+        ("enforce", True, False),
+        ("observe", False, False),
+        ("off", False, False),
+    ],
+)
+async def test_spawn_task_backed_capability_provider_honors_proof_gate(
+    db_session, mocker, mode, has_fresh_proof, expect_blocked
+):
+    """Same-batch advertised providers are gated only for unproven capabilities."""
+    from datetime import datetime, timedelta, timezone
+    from app.shared_state import runtime_config as _rc
+    from app.task_blocked import get_blocker_needs
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    project, direction, task = await _grader_project_and_task(
+        db_session, f"d-task-provider-{mode}-{has_fresh_proof}"
+    )
+    cap = "off-registry-provider-cap"
+    if has_fresh_proof:
+        project.capability_proof_records = {
+            cap: [
+                {
+                    "proof_kind": "named_test",
+                    "proved_at": (
+                        datetime.now(timezone.utc) - timedelta(days=1)
+                    ).isoformat(),
+                }
+            ]
+        }
+        db_session.add(project)
+        await db_session.commit()
+
+    provider = _make_finding(title="Build provider", direction_id=direction["id"])
+    provider["provides_capability"] = cap
+    dependent = _make_finding(title="Use provider", direction_id=direction["id"])
+    dependent["prerequisite"] = {"kind": "capability", "ref": cap}
+    saved_mode = _rc.get("capability_proof_gate_mode")
+    try:
+        _rc["capability_proof_gate_mode"] = mode
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings",
+            return_value=[provider, dependent],
+        )
+        await _handle_research_completion(task, "", db_session)
+    finally:
+        if saved_mode is None:
+            _rc.pop("capability_proof_gate_mode", None)
+        else:
+            _rc["capability_proof_gate_mode"] = saved_mode
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    by_title = {child.title: child for child in children}
+    foundation, child = by_title["Build provider"], by_title["Use provider"]
+    assert (child.status == TaskStatus.BLOCKED) is expect_blocked
+    if expect_blocked:
+        assert get_blocker_needs(child) == [{"kind": "capability", "ref": cap}]
+        assert str(foundation.id) not in (child.depends_on or [])
+    else:
+        assert str(foundation.id) in (child.depends_on or [])
+
+
+@_pytest.mark.asyncio
+@_pytest.mark.parametrize(
+    ("provider_status", "expect_edge"),
+    [
+        (TaskStatus.IN_PROGRESS, True),
+        (TaskStatus.COMPLETED, False),
+    ],
+)
+async def test_task_backed_capability_provider_resumes_after_trial_adoption_proof(
+    db_session, mocker, provider_status, expect_edge
+):
+    """A durable trial adoption immediately resumes a proof-gated dependent."""
+    from app.capability_trial_verdict import persist_trial_verdicts_in_transaction
+    from app.shared_state import runtime_config as _rc
+    from app.task_blocked import get_blocker_needs
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    cap = f"proof-resume-{provider_status.value.lower()}"
+    project, direction, task = await _grader_project_and_task(
+        db_session, f"d-task-provider-resume-{provider_status.value.lower()}"
+    )
+    provider = _make_finding(title="Build proof provider", direction_id=direction["id"])
+    provider["provides_capability"] = cap
+    dependent = _make_finding(title="Use proof provider", direction_id=direction["id"])
+    dependent["prerequisite"] = {"kind": "capability", "ref": cap}
+
+    saved_mode = _rc.get("capability_proof_gate_mode")
+    try:
+        _rc["capability_proof_gate_mode"] = "enforce"
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings",
+            return_value=[provider, dependent],
+        )
+        await _handle_research_completion(task, "", db_session)
+
+        children = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(_Task.parent_task_id == task.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        by_title = {child.title: child for child in children}
+        foundation = by_title["Build proof provider"]
+        child = by_title["Use proof provider"]
+        assert child.status == TaskStatus.BLOCKED
+        assert get_blocker_needs(child) == [{"kind": "capability", "ref": cap}]
+        assert str(foundation.id) not in (child.depends_on or [])
+
+        foundation.status = provider_status
+        if provider_status == TaskStatus.COMPLETED:
+            foundation.context = {**(foundation.context or {}), "pr_merged": True}
+        db_session.add(foundation)
+        await db_session.commit()
+
+        await persist_trial_verdicts_in_transaction(
+            db_session,
+            project.id,
+            pending_verdicts=[
+                (
+                    cap,
+                    {
+                        "verdict": "adopt",
+                        "lift": 0.2,
+                        "n_with": 4,
+                        "n_without": 4,
+                        "verdict_reason": "platform trial passed",
+                    },
+                )
+            ],
+        )
+        await db_session.refresh(child)
+        assert child.status == TaskStatus.QUEUED
+        assert get_blocker_needs(child) == []
+        assert (str(foundation.id) in (child.depends_on or [])) is expect_edge
+    finally:
+        if saved_mode is None:
+            _rc.pop("capability_proof_gate_mode", None)
+        else:
+            _rc["capability_proof_gate_mode"] = saved_mode
+
+
+@_pytest.mark.asyncio
+async def test_spawn_task_prerequisite_bypasses_task_backed_capability_gate(
+    db_session, mocker
+):
+    """Enforce still wires an ordinary task prerequisite to its active provider."""
+    from app.shared_state import runtime_config as _rc
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    project, direction, task = await _grader_project_and_task(
+        db_session, "d-task-provider-task"
+    )
+    foundation = _Task(
+        project_id=project.id,
+        title="Active task foundation",
+        status=TaskStatus.IN_PROGRESS,
+        context={"provides_capability": "unproven-provider-cap"},
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(foundation)
+    await db_session.commit()
+    finding = _make_finding(title="Use active task", direction_id=direction["id"])
+    finding["prerequisite"] = {"kind": "task", "ref": str(foundation.id)}
+    saved_mode = _rc.get("capability_proof_gate_mode")
+    try:
+        _rc["capability_proof_gate_mode"] = "enforce"
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings", return_value=[finding]
+        )
+        await _handle_research_completion(task, "", db_session)
+    finally:
+        if saved_mode is None:
+            _rc.pop("capability_proof_gate_mode", None)
+        else:
+            _rc["capability_proof_gate_mode"] = saved_mode
+
+    child = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .one()
+    )
+    assert child.status != TaskStatus.BLOCKED
+    assert str(foundation.id) in (child.depends_on or [])
 
 
 @_pytest.mark.asyncio

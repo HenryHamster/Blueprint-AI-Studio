@@ -3848,7 +3848,7 @@ def test_adopt_verdict_records_capability_proof():
     }
 
     with patch("app.capability_proof.flag_modified"):
-        record_capability_proof_from_trial(project, "repo_map", adopt_entry)
+        assert record_capability_proof_from_trial(project, "repo_map", adopt_entry)
 
     # Entry recorded under normalized cap name.
     assert "repo-map" in project.capability_proof_records
@@ -3870,7 +3870,9 @@ def test_adopt_verdict_records_capability_proof():
 
     # Re-evaluation is idempotent — no duplicate entry.
     with patch("app.capability_proof.flag_modified"):
-        record_capability_proof_from_trial(project, "repo_map", adopt_entry)
+        assert not record_capability_proof_from_trial(
+            project, "repo_map", adopt_entry
+        )
     assert len(project.capability_proof_records["repo-map"]) == 1
 
 
