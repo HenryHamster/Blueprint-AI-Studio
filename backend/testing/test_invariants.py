@@ -734,12 +734,15 @@ def _concurrently_txn_escape_violations(source: str, revision: str) -> list[str]
       * ``op.create_index(...)`` / ``op.drop_index(...)`` with the alembic
         ``postgresql_concurrently=True`` kwarg (which itself emits CONCURRENTLY).
 
-    A COMMIT event is ``.execute("COMMIT")``. Within each ``upgrade`` /
-    ``downgrade`` function, a COMMIT must lexically precede the FIRST
-    CONCURRENTLY event; otherwise the DDL runs inside Alembic's transaction and
-    fails on Postgres (while passing silently on SQLite, which ignores
-    CONCURRENTLY entirely). Only executed statements are inspected, so a
-    CONCURRENTLY mention in a docstring or comment is never flagged.
+    A COMMIT event is either ``.execute("COMMIT")`` or entering an
+    ``autocommit_block()`` context (``with op.get_context().autocommit_block():``)
+    — the latter is the modern Alembic pattern that eliminates the need for a
+    bare COMMIT. Within each ``upgrade`` / ``downgrade`` function, a COMMIT must
+    lexically precede the FIRST CONCURRENTLY event; otherwise the DDL runs
+    inside Alembic's transaction and fails on Postgres (while passing silently
+    on SQLite, which ignores CONCURRENTLY entirely). Only executed statements
+    are inspected, so a CONCURRENTLY mention in a docstring or comment is never
+    flagged.
     """
     try:
         tree = ast.parse(source)
@@ -826,7 +829,8 @@ def _concurrently_txn_escape_violations(source: str, revision: str) -> list[str]
         if not any(commit < first_concurrently for commit in commits):
             violations.append(
                 f"{revision}.{func.name}: CONCURRENTLY index DDL is not preceded "
-                "by op.execute(\"COMMIT\") to escape the per-migration transaction"
+                "by op.execute(\"COMMIT\") or autocommit_block() to escape the "
+                "per-migration transaction"
             )
 
     return violations
@@ -1892,7 +1896,6 @@ class TestSchemaRevisionSync:
                     effective.add(entry)
 
             # Raw-SQL creates (CONCURRENTLY etc.) — see raw_create_idx_re above.
-            _word_re = re.compile(r"\b(\w+)\b")
             for m in raw_create_idx_re.finditer(content):
                 name = consts.get(m.group(1), m.group(1))
                 # Resolve {_PY_CONST} table interpolations (e.g. ON {_ATTACHMENT_UPLOAD_TABLE}).
@@ -1901,12 +1904,12 @@ class TestSchemaRevisionSync:
                 # The expression list carries operator classes / functions alongside
                 # the columns (e.g. "title gin_trgm_ops").  Keep only tokens that are
                 # REAL columns of that table, so an opclass can never masquerade as one.
-                # Raw SQL uses bare identifiers (not quoted), so use word-token extraction.
                 sa_table = SQLModel.metadata.tables.get(table)
                 if sa_table is None:
                     continue
                 real_cols = {c.name for c in sa_table.columns}
-                cols = frozenset(t for t in _word_re.findall(cols_raw) if t in real_cols)
+                # cols_raw may use bare identifiers (raw SQL) or quoted strings (op.create_index)
+                cols = frozenset(t for t in re.findall(r"\w+", cols_raw) if t in real_cols)
                 if cols:
                     entry = (table, cols)
                     if name:

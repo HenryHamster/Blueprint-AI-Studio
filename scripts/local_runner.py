@@ -2847,63 +2847,125 @@ class _LiveRunnerConfig:
                 "config_rejected_generation": self._rejected_generation,
             }
 
-    def apply(self, config) -> bool:
-        """Reconcile a server config block onto the live process.
+    @staticmethod
+    def _parses_to_int(value) -> bool:
+        """True when ``int(value)`` would succeed (well-typed for a clamp field).
 
-        Returns True when every delivered field was applied and the generation
-        advanced; False when an unrecognized field forced the generation to stay
-        pending. Never raises — a malformed/absent block leaves live config
-        untouched and reports False.
+        A well-typed-but-out-of-range int is still valid here — the field-level
+        clamp is the server-bound defense for those. Only values ``int()``
+        cannot parse (wrong type, unparseable string) are malformed.
+        """
+        try:
+            int(value)
+        except (TypeError, ValueError):
+            return False
+        return True
+
+    def _classify_fields(self, config) -> tuple[list[str], list[str]]:
+        """Validation pass (no lock, no mutation): classify each delivered field.
+
+        Returns ``(unrecognized, malformed)`` — non-null keys the daemon does
+        not know, and recognized keys whose value has the wrong type/shape to be
+        applied (would otherwise be silently clamped-to-default or ignored while
+        the generation was still claimed applied). ``None`` values are always
+        well-formed no-ops. A generation is fully applicable only when BOTH
+        lists are empty.
+        """
+        unrecognized: list[str] = []
+        malformed: list[str] = []
+        for key, value in config.items():
+            if key == "config_generation":
+                continue
+            if key not in self._KNOWN_KEYS:
+                if value is not None:
+                    unrecognized.append(str(key))
+                continue
+            # Recognized key. A null value is a no-op (never malformed).
+            if value is None:
+                continue
+            if key in ("max_concurrent", "max_concurrent_compute", "gpus_per_job"):
+                if not self._parses_to_int(value):
+                    malformed.append(key)
+            elif key in ("task_types", "gpu_indices_allowed"):
+                # Accepted shapes: the "all" sentinel or a list. Anything else
+                # (a bare int/string/dict) would be silently dropped today.
+                if value != "all" and not isinstance(value, list):
+                    malformed.append(key)
+        return unrecognized, malformed
+
+    def apply(self, config) -> bool:
+        """Reconcile a server config block onto the live process, atomically.
+
+        Returns True when every delivered field is recognized AND well-formed:
+        the whole block applies and the generation advances. Returns False when
+        ANY field is unrecognized or malformed — in that case NOTHING is
+        mutated (the generation is rejected as a unit, not partially applied),
+        the older applied generation keeps being reported, and a structured
+        rejection reason naming the offending field(s) is recorded. Never
+        raises — a malformed/absent block leaves live config untouched and
+        reports False.
+
+        A well-typed-but-out-of-range clamp field (e.g. ``max_concurrent: 999``)
+        is NOT malformed: it is a valid value the daemon clamps into range as a
+        server-bound defense, and the block still applies fully.
         """
         if not isinstance(config, dict):
             return False
         generation = config.get("config_generation")
-        # Forward-compat guard: an unknown non-null field is NOT known-live-safe,
-        # so we refuse to claim the generation as applied and keep reporting the
-        # older one (the server renders it as still-pending).
-        fully_applicable = True
-        unrecognized: list[str] = []
-        for key, value in config.items():
-            if key == "config_generation":
-                continue
-            if key not in self._KNOWN_KEYS and value is not None:
-                fully_applicable = False
-                unrecognized.append(str(key))
+        # Validate BEFORE taking the lock or mutating anything, so a rejected
+        # generation is a true no-op rather than a half-applied block whose
+        # "rejected" verdict misdescribes the runner's real live state.
+        unrecognized, malformed = self._classify_fields(config)
+        fully_applicable = not unrecognized and not malformed
 
         with self._lock:
-            mc = config.get("max_concurrent")
-            if mc is not None:
-                self._max_concurrent = self._clamp(mc)
-            mcc = config.get("max_concurrent_compute")
-            if mcc is not None:
-                self._max_concurrent_compute = self._clamp(mcc)
-            if "task_types" in config:
-                tt = config.get("task_types")
-                if tt == "all" or tt is None:
-                    self._task_types = "all"
-                elif isinstance(tt, list):
-                    self._task_types = [str(x) for x in tt if isinstance(x, str) and x]
-            if "gpu_indices_allowed" in config:
-                self._apply_gpu_allowlist_locked(config.get("gpu_indices_allowed"))
-            if "gpus_per_job" in config:
-                self._apply_gpus_per_job_locked(config.get("gpus_per_job"))
-            if fully_applicable and isinstance(generation, str) and generation:
-                self._applied_generation = generation
             if fully_applicable:
+                mc = config.get("max_concurrent")
+                if mc is not None:
+                    self._max_concurrent = self._clamp(mc)
+                mcc = config.get("max_concurrent_compute")
+                if mcc is not None:
+                    self._max_concurrent_compute = self._clamp(mcc)
+                if "task_types" in config:
+                    tt = config.get("task_types")
+                    if tt == "all" or tt is None:
+                        self._task_types = "all"
+                    elif isinstance(tt, list):
+                        self._task_types = [
+                            str(x) for x in tt if isinstance(x, str) and x
+                        ]
+                if "gpu_indices_allowed" in config:
+                    self._apply_gpu_allowlist_locked(config.get("gpu_indices_allowed"))
+                if "gpus_per_job" in config:
+                    self._apply_gpus_per_job_locked(config.get("gpus_per_job"))
+                if isinstance(generation, str) and generation:
+                    self._applied_generation = generation
                 # A clean apply clears any prior rejection state (never let a
                 # resolved reason linger after convergence).
                 self._rejection_reason = None
                 self._rejected_fields = None
                 self._rejected_generation = None
             else:
-                # Refused this generation for an unrecognized field. Record the
-                # offending field name(s) + a stable human reason + the refused
-                # generation so the operator sees WHICH field broke, not 'stuck'.
-                sorted_fields = sorted(unrecognized)
-                self._rejection_reason = "unrecognized config field(s): " + ", ".join(
-                    sorted_fields
+                # Refused this generation. Mutate NOTHING. Record the offending
+                # field name(s) + a stable human reason + the refused generation
+                # so the operator sees WHICH field broke and that the runner's
+                # live state is still the previous generation, not 'stuck'.
+                sorted_unrecognized = sorted(unrecognized)
+                sorted_malformed = sorted(malformed)
+                reasons: list[str] = []
+                if sorted_unrecognized:
+                    reasons.append(
+                        "unrecognized config field(s): "
+                        + ", ".join(sorted_unrecognized)
+                    )
+                if sorted_malformed:
+                    reasons.append(
+                        "malformed config field(s): " + ", ".join(sorted_malformed)
+                    )
+                self._rejection_reason = "; ".join(reasons)
+                self._rejected_fields = sorted(
+                    set(sorted_unrecognized) | set(sorted_malformed)
                 )
-                self._rejected_fields = sorted_fields
                 self._rejected_generation = (
                     generation if isinstance(generation, str) and generation else None
                 )

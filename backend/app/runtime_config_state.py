@@ -226,7 +226,7 @@ runtime_config: Dict = {
     ),
     # Max registered checks run per tick (backstop against an over-grown registry).
     "metrics_integrity_sweep_max_checks": int(
-        os.getenv("METRICS_INTEGRITY_SWEEP_MAX_CHECKS", "25")
+        os.getenv("METRICS_INTEGRITY_SWEEP_MAX_CHECKS", "30")
     ),
     # Max projects scanned per per-project check (bounds the scan fan-out).
     "metrics_integrity_sweep_max_projects": int(

@@ -116,6 +116,7 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
   const [newTitle, setNewTitle] = useState('');
   const [creating, setCreating] = useState(false);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
   const [togglingId, setTogglingId] = useState<string | null>(null);
   const [lastCreatedSlug, setLastCreatedSlug] = useState<string | null>(null);
   const [lastCreatedSlugProjectId, setLastCreatedSlugProjectId] = useState<string | null>(null);
@@ -851,15 +852,37 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
                           disabled tool is never stranded. */}
                       {togglingId === tool.id && actionIsCurrent ? 'Disabling…' : 'Disable'}
                     </button>
-                    <button
-                      type="button"
-                      data-viewport-allow-small-target
-                      onClick={() => handleDelete(tool.id)}
-                      disabled={deletingId === tool.id && actionIsCurrent}
-                      className="text-xs text-red-400 hover:text-red-300 disabled:opacity-50"
-                    >
-                      {deletingId === tool.id && actionIsCurrent ? 'Removing…' : 'Remove'}
-                    </button>
+                    {pendingDeleteId === tool.id ? (
+                      <>
+                        <span className="text-xs text-neutral-400">Remove permanently?</span>
+                        <button
+                          type="button"
+                          data-viewport-allow-small-target
+                          onClick={() => setPendingDeleteId(null)}
+                          className="text-xs text-neutral-400 hover:text-neutral-200"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          type="button"
+                          data-viewport-allow-small-target
+                          onClick={() => { setPendingDeleteId(null); void handleDelete(tool.id); }}
+                          disabled={deletingId === tool.id && actionIsCurrent}
+                          className="text-xs text-red-400 hover:text-red-300 disabled:opacity-50"
+                        >
+                          {deletingId === tool.id && actionIsCurrent ? 'Removing…' : 'Permanently remove'}
+                        </button>
+                      </>
+                    ) : (
+                      <button
+                        type="button"
+                        data-viewport-allow-small-target
+                        onClick={() => setPendingDeleteId(tool.id)}
+                        className="text-xs text-red-400 hover:text-red-300"
+                      >
+                        Remove
+                      </button>
+                    )}
                   </div>
                 )}
                 {renderConfigPanel(tool)}
@@ -944,15 +967,37 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
                     >
                       {togglingId === tool.id && actionIsCurrent ? 'Enabling…' : 'Enable'}
                     </button>
-                    <button
-                      type="button"
-                      data-viewport-allow-small-target
-                      onClick={() => handleDelete(tool.id)}
-                      disabled={deletingId === tool.id && actionIsCurrent}
-                      className="text-xs text-red-400 hover:text-red-300 disabled:opacity-50"
-                    >
-                      {deletingId === tool.id && actionIsCurrent ? 'Removing…' : 'Remove'}
-                    </button>
+                    {pendingDeleteId === tool.id ? (
+                      <>
+                        <span className="text-xs text-neutral-400">Remove permanently?</span>
+                        <button
+                          type="button"
+                          data-viewport-allow-small-target
+                          onClick={() => setPendingDeleteId(null)}
+                          className="text-xs text-neutral-400 hover:text-neutral-200"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          type="button"
+                          data-viewport-allow-small-target
+                          onClick={() => { setPendingDeleteId(null); void handleDelete(tool.id); }}
+                          disabled={deletingId === tool.id && actionIsCurrent}
+                          className="text-xs text-red-400 hover:text-red-300 disabled:opacity-50"
+                        >
+                          {deletingId === tool.id && actionIsCurrent ? 'Removing…' : 'Permanently remove'}
+                        </button>
+                      </>
+                    ) : (
+                      <button
+                        type="button"
+                        data-viewport-allow-small-target
+                        onClick={() => setPendingDeleteId(tool.id)}
+                        className="text-xs text-red-400 hover:text-red-300"
+                      >
+                        Remove
+                      </button>
+                    )}
                   </div>
                 </div>
               ))}

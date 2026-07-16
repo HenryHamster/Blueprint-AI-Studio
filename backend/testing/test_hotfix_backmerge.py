@@ -3331,9 +3331,10 @@ def _make_file_content(n_lines: int) -> str:
     return "\n".join(f"line {i}" for i in range(n_lines))
 
 
-async def test_module_size_check_emits_warning_alert_on_violation(db_session, mocker):
-    """When a back-merge PR changes a tracked module that now exceeds its cap,
-    a WARNING Alert is emitted and the merge still proceeds (status=merged)."""
+async def test_module_size_violation_is_suppressed_from_operator_alerts(
+    db_session, mocker
+):
+    """Tracked size violations stay strategist-internal and never block merge."""
     project = await _make_project(db_session)
     # create_pull_request returns a PR with head.sha so step 3c resolves the ref.
     _patch_github(
@@ -3349,7 +3350,6 @@ async def test_module_size_check_emits_warning_alert_on_violation(db_session, mo
     )
     # The file at the LTS branch head is over cap by 200 lines.
     over = _ORCH_CAP + 200
-    bucket = (over // 100) * 100
     mocker.patch(
         "app.github.get_file_text_at_ref",
         new=AsyncMock(return_value=_make_file_content(over)),
@@ -3361,14 +3361,7 @@ async def test_module_size_check_emits_warning_alert_on_violation(db_session, mo
     await db_session.commit()
 
     assert result["status"] == "merged"
-
-    alerts = await _alerts_for(db_session, project.id)
-    assert len(alerts) == 1
-    a = alerts[0]
-    assert a.severity == AlertSeverity.WARNING
-    assert "orchestrator.py" in a.title
-    assert f"~{bucket} lines" in a.title  # bucket = (count // 100) * 100
-    assert f"cap {_ORCH_CAP}" in a.title
+    assert await _alerts_for(db_session, project.id) == []
 
 
 async def test_module_size_check_does_not_block_merge(db_session, mocker):
@@ -3395,9 +3388,8 @@ async def test_module_size_check_does_not_block_merge(db_session, mocker):
     assert result["status"] == "merged"
 
 
-async def test_module_size_check_dedupes_same_bucket(db_session, mocker):
-    """A second back-merge cycle with the same module still in the same 100-line
-    bucket does NOT create a second alert."""
+async def test_module_size_same_bucket_remains_suppressed(db_session, mocker):
+    """Repeated strategist-internal violations create no operator alerts."""
     project = await _make_project(db_session)
     _patch_github(
         mocker,
@@ -3419,7 +3411,7 @@ async def test_module_size_check_dedupes_same_bucket(db_session, mocker):
 
     await hb.open_backmerge_pr(db_session, project.id)
     await db_session.commit()
-    assert len(await _alerts_for(db_session, project.id)) == 1
+    assert await _alerts_for(db_session, project.id) == []
 
     # Second call: bucket+50 lines — still in the same bucket.
     mocker.patch(
@@ -3429,14 +3421,11 @@ async def test_module_size_check_dedupes_same_bucket(db_session, mocker):
     await hb.open_backmerge_pr(db_session, project.id)
     await db_session.commit()
 
-    # Still exactly one alert.
-    alerts = await _alerts_for(db_session, project.id)
-    assert len(alerts) == 1
+    assert await _alerts_for(db_session, project.id) == []
 
 
-async def test_module_size_check_refires_on_larger_bucket(db_session, mocker):
-    """When the same module grows into the next 100-line bucket, a new alert is
-    emitted (the bucket is encoded in the alert title, so titles differ)."""
+async def test_module_size_larger_bucket_remains_suppressed(db_session, mocker):
+    """Growth into a new bucket remains suppressed from operator alerts."""
     project = await _make_project(db_session)
     _patch_github(
         mocker,
@@ -3451,16 +3440,16 @@ async def test_module_size_check_refires_on_larger_bucket(db_session, mocker):
     # First whole 100-line bucket strictly above cap, and the next one up.
     bucket_a = ((_ORCH_CAP + 100) // 100) * 100
     bucket_b = bucket_a + 100
-    # First cycle: bucket_a+10 lines → bucket_a → alert A.
+    # First cycle: bucket_a+10 lines stays strategist-internal.
     mocker.patch(
         "app.github.get_file_text_at_ref",
         new=AsyncMock(return_value=_make_file_content(bucket_a + 10)),
     )
     await hb.open_backmerge_pr(db_session, project.id)
     await db_session.commit()
-    assert len(await _alerts_for(db_session, project.id)) == 1
+    assert await _alerts_for(db_session, project.id) == []
 
-    # Second cycle: bucket_b+10 lines → next bucket → title differs → new alert B.
+    # Second cycle reaches the next bucket but remains strategist-internal.
     mocker.patch(
         "app.github.get_file_text_at_ref",
         new=AsyncMock(return_value=_make_file_content(bucket_b + 10)),
@@ -3468,11 +3457,7 @@ async def test_module_size_check_refires_on_larger_bucket(db_session, mocker):
     await hb.open_backmerge_pr(db_session, project.id)
     await db_session.commit()
 
-    alerts = await _alerts_for(db_session, project.id)
-    assert len(alerts) == 2
-    titles = {a.title for a in alerts}
-    assert any(f"~{bucket_a} lines" in t for t in titles)
-    assert any(f"~{bucket_b} lines" in t for t in titles)
+    assert await _alerts_for(db_session, project.id) == []
 
 
 async def test_module_size_check_exception_does_not_block_merge(db_session, mocker):
@@ -3529,12 +3514,10 @@ async def test_module_size_check_within_cap_no_alert(db_session, mocker):
     assert await _alerts_for(db_session, project.id) == []
 
 
-async def test_module_size_check_alerts_on_uncapped_large_changed_file(
+async def test_uncapped_large_file_is_suppressed_from_operator_alerts(
     db_session, mocker
 ):
-    """A back-merge PR that changes a source file over the uncapped-file threshold
-    (hb._UNCAPPED_SIZE_THRESHOLD) with NO cap entry in module_size_limits.json
-    emits a WARNING Alert. The merge is NOT blocked — the check is advisory."""
+    """Uncapped large files stay strategist-internal and do not block merge."""
     project = await _make_project(db_session)
     _patch_github(
         mocker,
@@ -3571,16 +3554,7 @@ async def test_module_size_check_alerts_on_uncapped_large_changed_file(
     # The merge still proceeds — the check is advisory, never blocking.
     assert result["status"] == "merged"
 
-    # A WARNING alert is raised for the uncapped large module.
-    alerts = await _alerts_for(db_session, project.id)
-    assert len(alerts) == 1
-    a = alerts[0]
-    assert a.severity == AlertSeverity.WARNING
-    assert "brand_new_huge_module.py" in a.title
-    assert "no cap" in a.title
-    # The message directs the operator to add a cap.
-    assert "module_size_limits.json" in a.message
-    assert "check_size_limits.py" in a.message
+    assert await _alerts_for(db_session, project.id) == []
 
 
 @pytest.mark.parametrize(

@@ -2684,6 +2684,8 @@ async def test_strategic_session_includes_requested_older_message_once(
     base_time = _utcnow() - timedelta(hours=2)
     target = ProjectMessage(
         project_id=project.id,
+        sequence=1,
+        surface=MessageSurface.CONVERSATION,
         message_type=MessageType.QUESTION,
         from_type="strategic",
         content="older targeted question",
@@ -2693,7 +2695,7 @@ async def test_strategic_session_includes_requested_older_message_once(
     newer_messages = [
         ProjectMessage(
             project_id=project.id,
-            sequence=index + 1,
+            sequence=index + 2,
             surface=MessageSurface.CONVERSATION,
             message_type=MessageType.NOTE,
             from_type="user" if index % 2 == 0 else "strategic",
@@ -2722,12 +2724,13 @@ async def test_strategic_session_includes_requested_older_message_once(
     conversation = resp.json()["conversation"]
     ids = [item["id"] for item in conversation["items"]]
     assert conversation["limit"] == 20
-    assert conversation["has_more"] is True
+    assert conversation["has_more"] is False
     assert conversation["order"] == "oldest_first"
     assert ids.count(str(target.id)) == 1
     assert ids[0] == str(target.id)
+    # Centering around the oldest message: no before-rows; fills from after-side up to limit-1=19
     assert [item["content"] for item in conversation["items"][1:]] == [
-        f"newer session row {index:02d}" for index in range(20)
+        f"newer session row {index:02d}" for index in range(19)
     ]
 
     cross_project_resp = await client.get(
@@ -7028,6 +7031,44 @@ async def test_operator_attention_surfaces_preserved_handmerge_failed_task_as_ne
 
 
 @pytest.mark.asyncio
+async def test_operator_attention_handmerge_count_is_not_capped_by_scan_limit(
+    db_session,
+):
+    """The bounded ORM preview must retain the exact aggregate count."""
+    from app.operator_attention import _load_handmerge_preserved_tasks
+
+    project = await _make_project(db_session)
+    preserved_tasks = [
+        Task(
+            project_id=project.id,
+            title=f"Preserved hand-merge PR {idx + 1}",
+            payloads=[{"type": "create"}],
+            status=TaskStatus.FAILED,
+            latest_status_message="Manual hand-merge required",
+            context={
+                "failure_detail": "review_cap_preserved_for_handmerge",
+                "pr_preserved_for_handmerge": True,
+            },
+        )
+        for idx in range(201)
+    ]
+    db_session.add_all(preserved_tasks)
+    await db_session.commit()
+
+    count, preview = await _load_handmerge_preserved_tasks(
+        db_session,
+        project.id,
+    )
+
+    assert count == 201
+    assert len(preview) == 4
+    assert all(
+        (task.context or {}).get("pr_preserved_for_handmerge") is True
+        for task in preview
+    )
+
+
+@pytest.mark.asyncio
 async def test_operator_attention_pure_blocked_not_requiring_approval_stays_in_watch(
     client: AsyncClient, db_session
 ):
@@ -9349,6 +9390,80 @@ async def test_compute_strategic_state_revision_deterministic(
     assert rev8 != rev7, (
         "mutating a fingerprint value must change the revision"
     )
+
+
+@pytest.mark.asyncio
+async def test_load_project_runners_excludes_deleted(db_session):
+    """load_project_runners omits deleted runners and returns non-deleted ones."""
+    from app.strategic_runtime_work import load_project_runners
+
+    project = await _make_project(db_session)
+    active = LocalRunner(
+        project_id=project.id,
+        token_hash="aa" * 32,
+        hostname="active-host",
+        status="active",
+        last_seen_at=_utcnow(),
+        capabilities={"task_types": "all"},
+    )
+    deleted = LocalRunner(
+        project_id=project.id,
+        token_hash="bb" * 32,
+        hostname="deleted-host",
+        status="deleted",
+        last_seen_at=_utcnow(),
+        capabilities={"task_types": "all"},
+    )
+    db_session.add_all([active, deleted])
+    await db_session.commit()
+    await db_session.refresh(active)
+
+    rows = await load_project_runners(db_session, project.id)
+    ids = {str(r.id) for r in rows}
+    assert str(active.id) in ids
+    assert str(deleted.id) not in ids
+
+
+@pytest.mark.asyncio
+async def test_build_operator_attention_accepts_preloaded_runner_rows(db_session):
+    """build_operator_attention with runner_rows= skips the DB fetch and uses the list."""
+    from app.operator_attention import build_operator_attention
+
+    project = await _make_project(db_session)  # already adds ProjectMember for TEST_USER_ID
+
+    # Passing an empty pre-loaded list means no dead-runner items even if the DB
+    # had runners — verifies the parameter is honoured rather than re-fetched.
+    attention = await build_operator_attention(
+        db_session, project, TEST_USER_ID, runner_rows=[]
+    )
+    # Should succeed without error; dead-runner items absent since list was empty.
+    assert isinstance(attention, dict)
+    runner_items = [item for item in attention.get("items", []) if item.get("kind") == "dead_runner"]
+    assert runner_items == []
+
+
+@pytest.mark.asyncio
+async def test_build_resident_runner_options_accepts_preloaded_runner_rows(db_session):
+    """build_resident_runner_options with runner_rows= uses the provided list, not the DB."""
+    from app.strategic_resident_session import build_resident_runner_options
+
+    project = await _make_project(db_session)
+    # No runners in DB for this project, but we pass a synthetic list.
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash="cc" * 32,
+        hostname="synthetic-host",
+        status="active",
+        last_seen_at=_utcnow(),
+        capabilities={"task_types": "all", "agent_available": True},
+    )
+    db_session.add(runner)
+    await db_session.commit()
+    await db_session.refresh(runner)
+
+    options = await build_resident_runner_options(db_session, project.id, runner_rows=[runner])
+    assert len(options) == 1
+    assert options[0]["hostname"] == "synthetic-host"
 
 
 def test_task_summary_caps_latest_status_message():

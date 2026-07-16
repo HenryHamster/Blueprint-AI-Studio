@@ -3755,7 +3755,19 @@ export async function main() {
           // snapshot is non-fatal here (an account without claude_config_json never
           // promised the file); the existing per-claim guards still apply.
           try {
-            materializeClaimCredentialState(undefined, 'first-role');
+            if (activeCredentialStateSource === 'retarget') {
+              // Pool-mode first claims can already have materialized a
+              // backend-supplied account/provider re-target manifest in
+              // bootstrapPoolMode. Restoring the frozen boot snapshot here
+              // would silently undo that switch immediately before the role
+              // runs (for example, launching Claude with an OpenAI model).
+              // The retarget path already wrote and validated its credential
+              // state; re-check the promised files without replacing it.
+              assertVmProviderConfigPresent('first-role');
+              log('[first-role] preserving claim-time retarget credential state');
+            } else {
+              materializeClaimCredentialState(undefined, 'first-role');
+            }
           } catch (matErr) {
             const cat = (matErr as { failureCategory?: unknown } | null)?.failureCategory;
             if (cat === 'vm_config_missing') {

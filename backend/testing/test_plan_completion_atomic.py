@@ -2773,3 +2773,466 @@ async def test_plan_capability_prerequisite_obeys_enforced_proof_gate(
     proven = await spawn_child("Proven capability consumer")
     assert proven.status == TaskStatus.QUEUED
     assert "blocker" not in (proven.context or {})
+
+
+@pytest.mark.asyncio
+async def test_plan_subtask_active_provider_blocks_on_unproven_capability_enforce(
+    db_session, mocker, _quiet_mocks
+):
+    """Active sibling provider + enforce mode + empty ledger → consumer is BLOCKED.
+
+    When a sibling subtask declares provides_capability and the proof gate is
+    enforced but the ledger has no platform proof, the consumer must be blocked
+    rather than wired to the unproven provider.
+    """
+    project = make_project(
+        name="PlanActiveProviderGate",
+        problem_model={
+            "capabilities": [{"name": "repo-map", "status": "working"}]
+        },
+        capability_proof_records={},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    mocker.patch.dict(
+        "app.plan_completion._runtime_config",
+        {"capability_proof_gate_mode": "enforce"},
+    )
+
+    plan_logs = json.dumps(
+        {
+            "subtasks": [
+                {
+                    "title": "Provider subtask",
+                    "prompt": "build the repo map",
+                    "provides_capability": "repo-map",
+                },
+                {
+                    "title": "Consumer subtask",
+                    "prompt": "use the repo map",
+                    "prerequisite": {"kind": "capability", "ref": "repo-map"},
+                },
+            ]
+        }
+    )
+    plan = make_task(
+        project_id=project.id,
+        title="Plan: active provider gate test",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "plan", "prompt": "plan it", "base_branch": "main"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(plan)
+    await db_session.commit()
+    await db_session.refresh(plan)
+    mocker.patch(
+        "app.task_completion._ensure_branch", new_callable=AsyncMock, return_value=plan
+    )
+
+    await _handle_plan_completion(plan, plan_logs, db_session)
+
+    children = (
+        await db_session.execute(
+            select(Task)
+            .where(Task.parent_task_id == plan.id)
+            .order_by(Task.created_at)
+        )
+    ).scalars().all()
+    assert len(children) == 2
+    provider, consumer = children[0], children[1]
+    assert provider.context.get("provides_capability") == "repo-map"
+    # Consumer must be BLOCKED — the active sibling provides but is unproven
+    assert consumer.status == TaskStatus.BLOCKED
+    assert consumer.context["blocker"]["needs"] == [
+        {"kind": "capability", "ref": "repo-map"}
+    ]
+    # Consumer must NOT be directly wired to the provider
+    assert str(provider.id) not in (consumer.depends_on or [])
+
+
+@pytest.mark.asyncio
+async def test_plan_subtask_active_provider_unblocks_when_proven(
+    db_session, mocker, _quiet_mocks
+):
+    """Active sibling provider + enforce mode + proven ledger → consumer is wired."""
+    project = make_project(
+        name="PlanActiveProviderProven",
+        problem_model={
+            "capabilities": [{"name": "repo-map", "status": "working"}]
+        },
+        capability_proof_records={
+            "repo-map": [
+                {
+                    "proven": True,
+                    "satisfied": True,
+                    "kind": "named_test",
+                    "proof_ref": "testing/test_repo_map.py::test_map",
+                }
+            ]
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    mocker.patch.dict(
+        "app.plan_completion._runtime_config",
+        {"capability_proof_gate_mode": "enforce"},
+    )
+
+    plan_logs = json.dumps(
+        {
+            "subtasks": [
+                {
+                    "title": "Provider subtask",
+                    "prompt": "build the repo map",
+                    "provides_capability": "repo-map",
+                },
+                {
+                    "title": "Consumer subtask",
+                    "prompt": "use the repo map",
+                    "prerequisite": {"kind": "capability", "ref": "repo-map"},
+                },
+            ]
+        }
+    )
+    plan = make_task(
+        project_id=project.id,
+        title="Plan: active provider proven test",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "plan", "prompt": "plan it", "base_branch": "main"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(plan)
+    await db_session.commit()
+    await db_session.refresh(plan)
+    mocker.patch(
+        "app.task_completion._ensure_branch", new_callable=AsyncMock, return_value=plan
+    )
+
+    await _handle_plan_completion(plan, plan_logs, db_session)
+
+    children = (
+        await db_session.execute(
+            select(Task)
+            .where(Task.parent_task_id == plan.id)
+            .order_by(Task.created_at)
+        )
+    ).scalars().all()
+    assert len(children) == 2
+    provider, consumer = children[0], children[1]
+    # Consumer must NOT be blocked — the provider is proven in the ledger
+    assert consumer.status == TaskStatus.QUEUED
+    assert "blocker" not in (consumer.context or {})
+    # Consumer must be wired to the provider via depends_on
+    assert str(provider.id) in (consumer.depends_on or [])
+
+
+@pytest.mark.asyncio
+async def test_plan_subtask_completed_provider_blocks_on_unproven_capability_enforce(
+    db_session, mocker, _quiet_mocks
+):
+    """Completed sibling provider + enforce mode + empty ledger → consumer is BLOCKED.
+
+    A completed task advertising provides_capability satisfies the need only if
+    the proof gate allows it. In enforce mode with no platform ledger proof, the
+    consumer must still be blocked even though a shipped foundation exists.
+    """
+    project = make_project(
+        name="PlanCompletedProviderGate",
+        problem_model={
+            "capabilities": [{"name": "repo-map", "status": "working"}]
+        },
+        capability_proof_records={},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    mocker.patch.dict(
+        "app.plan_completion._runtime_config",
+        {"capability_proof_gate_mode": "enforce"},
+    )
+
+    # Create a pre-existing completed task that provides the capability
+    completed_provider = make_task(
+        project_id=project.id,
+        title="Completed repo-map provider",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "base_branch": "main"}],
+        context={"provides_capability": "repo-map", "pr_merged": True},
+    )
+    db_session.add(completed_provider)
+    await db_session.commit()
+    await db_session.refresh(completed_provider)
+
+    plan_logs = json.dumps(
+        {
+            "subtasks": [
+                {
+                    "title": "Consumer subtask",
+                    "prompt": "use the repo map",
+                    "prerequisite": {"kind": "capability", "ref": "repo-map"},
+                }
+            ]
+        }
+    )
+    plan = make_task(
+        project_id=project.id,
+        title="Plan: completed provider gate test",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "plan", "prompt": "plan it", "base_branch": "main"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(plan)
+    await db_session.commit()
+    await db_session.refresh(plan)
+    mocker.patch(
+        "app.task_completion._ensure_branch", new_callable=AsyncMock, return_value=plan
+    )
+
+    await _handle_plan_completion(plan, plan_logs, db_session)
+
+    consumer = (
+        await db_session.execute(select(Task).where(Task.parent_task_id == plan.id))
+    ).scalars().one()
+    # Consumer must be BLOCKED — a completed provider exists but no platform proof
+    assert consumer.status == TaskStatus.BLOCKED
+    assert consumer.context["blocker"]["needs"] == [
+        {"kind": "capability", "ref": "repo-map"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_unproven_capability_prereq_off_mode_surfaces_unverified_marker(
+    db_session, mocker, _quiet_mocks
+):
+    """In off mode, unproven working capability dispatches child with surface marker.
+
+    When capability_proof_gate_mode is "off" and a prerequisite names a
+    "working" registry capability that has no platform proof, the child still
+    dispatches (is not BLOCKED), but the unverified status is stamped durably
+    on the child's context under _spawn_capability_proof_unverified so an
+    operator can see the unproven foundation without re-deriving it from logs.
+    """
+    from app.research_completion import SPAWN_CAPABILITY_PROOF_UNVERIFIED_KEY
+
+    project = make_project(
+        name="PlanCapabilityOffModeSurface",
+        problem_model={
+            "capabilities": [{"name": "repo-map", "status": "working"}]
+        },
+        capability_proof_records={},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    mocker.patch.dict(
+        "app.plan_completion._runtime_config",
+        {"capability_proof_gate_mode": "off"},
+    )
+
+    plan_logs = json.dumps(
+        {
+            "subtasks": [
+                {
+                    "title": "Consumer subtask",
+                    "prompt": "use the repo map",
+                    "prerequisite": {"kind": "capability", "ref": "repo-map"},
+                }
+            ]
+        }
+    )
+    plan = make_task(
+        project_id=project.id,
+        title="Plan: off mode surface test",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "plan", "prompt": "plan it", "base_branch": "main"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(plan)
+    await db_session.commit()
+    await db_session.refresh(plan)
+    mocker.patch(
+        "app.task_completion._ensure_branch", new_callable=AsyncMock, return_value=plan
+    )
+
+    await _handle_plan_completion(plan, plan_logs, db_session)
+
+    consumer = (
+        await db_session.execute(select(Task).where(Task.parent_task_id == plan.id))
+    ).scalars().one()
+    # In off mode the child dispatches — NOT blocked by the proof gate
+    assert consumer.status == TaskStatus.QUEUED, (
+        f"In off mode, consumer should dispatch QUEUED, got {consumer.status}"
+    )
+    assert "blocker" not in (consumer.context or {}), (
+        "Off mode must not set a blocker on the consumer"
+    )
+    # But the unverified status is surfaced durably on the context
+    surface_markers = (consumer.context or {}).get(SPAWN_CAPABILITY_PROOF_UNVERIFIED_KEY)
+    assert surface_markers is not None, (
+        f"Off mode must stamp {SPAWN_CAPABILITY_PROOF_UNVERIFIED_KEY!r} on child context"
+    )
+    assert any(m.get("ref") == "repo-map" for m in surface_markers), (
+        f"Surface marker must name the unproven capability, got {surface_markers!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_proven_capability_prereq_dispatches_without_surface_marker(
+    db_session, mocker, _quiet_mocks
+):
+    """A proven working capability dispatches the child cleanly with no surface marker.
+
+    When the platform ledger holds a corroborated machine proof for the capability,
+    spawn_capability_gate_disposition returns 'ok' and no unverified marker is
+    stamped on the child's context in either enforce or off mode.
+    """
+    from app.research_completion import SPAWN_CAPABILITY_PROOF_UNVERIFIED_KEY
+
+    project = make_project(
+        name="PlanCapabilityProvenClean",
+        problem_model={
+            "capabilities": [{"name": "repo-map", "status": "working"}]
+        },
+        capability_proof_records={
+            "repo-map": [
+                {
+                    "proven": True,
+                    "satisfied": True,
+                    "kind": "named_test",
+                    "proof_ref": "testing/test_repo_map.py::test_map",
+                }
+            ]
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    mocker.patch.dict(
+        "app.plan_completion._runtime_config",
+        {"capability_proof_gate_mode": "off"},
+    )
+
+    plan_logs = json.dumps(
+        {
+            "subtasks": [
+                {
+                    "title": "Consumer subtask",
+                    "prompt": "use the proven repo map",
+                    "prerequisite": {"kind": "capability", "ref": "repo-map"},
+                }
+            ]
+        }
+    )
+    plan = make_task(
+        project_id=project.id,
+        title="Plan: proven capability clean dispatch",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "plan", "prompt": "plan it", "base_branch": "main"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(plan)
+    await db_session.commit()
+    await db_session.refresh(plan)
+    mocker.patch(
+        "app.task_completion._ensure_branch", new_callable=AsyncMock, return_value=plan
+    )
+
+    await _handle_plan_completion(plan, plan_logs, db_session)
+
+    consumer = (
+        await db_session.execute(select(Task).where(Task.parent_task_id == plan.id))
+    ).scalars().one()
+    # Proven capability: child dispatches cleanly, no blocker, no surface marker
+    assert consumer.status == TaskStatus.QUEUED, (
+        f"Proven capability consumer should dispatch QUEUED, got {consumer.status}"
+    )
+    assert "blocker" not in (consumer.context or {}), (
+        "Proven capability must not set a blocker on the consumer"
+    )
+    assert SPAWN_CAPABILITY_PROOF_UNVERIFIED_KEY not in (consumer.context or {}), (
+        f"Proven capability must not stamp {SPAWN_CAPABILITY_PROOF_UNVERIFIED_KEY!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_active_provider_enforce_blocks_directly_not_via_registry_fallback(
+    db_session, mocker, _quiet_mocks
+):
+    """Active sibling + enforce + unproven → child blocked via direct path, not registry fallback.
+
+    Specifically validates that the fix (enter_blocked_state immediately when
+    task_backed_capability_need_blocked_by_proof_gate fires for an active sibling)
+    correctly gates the consumer. The consumer must be BLOCKED with the need
+    recorded, and must NOT be wired to the provider via depends_on.
+    """
+    project = make_project(
+        name="PlanActiveDirectBlock",
+        problem_model={
+            "capabilities": [{"name": "semantic-search", "status": "working"}]
+        },
+        capability_proof_records={},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    mocker.patch.dict(
+        "app.plan_completion._runtime_config",
+        {"capability_proof_gate_mode": "enforce"},
+    )
+
+    plan_logs = json.dumps(
+        {
+            "subtasks": [
+                {
+                    "title": "Provider subtask",
+                    "prompt": "build semantic search",
+                    "provides_capability": "semantic-search",
+                },
+                {
+                    "title": "Consumer subtask",
+                    "prompt": "use semantic search",
+                    "prerequisite": {"kind": "capability", "ref": "semantic-search"},
+                },
+            ]
+        }
+    )
+    plan = make_task(
+        project_id=project.id,
+        title="Plan: active direct block test",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "plan", "prompt": "plan it", "base_branch": "main"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(plan)
+    await db_session.commit()
+    await db_session.refresh(plan)
+    mocker.patch(
+        "app.task_completion._ensure_branch", new_callable=AsyncMock, return_value=plan
+    )
+
+    await _handle_plan_completion(plan, plan_logs, db_session)
+
+    children = (
+        await db_session.execute(
+            select(Task)
+            .where(Task.parent_task_id == plan.id)
+            .order_by(Task.created_at)
+        )
+    ).scalars().all()
+    assert len(children) == 2
+    provider, consumer = children[0], children[1]
+    assert provider.context.get("provides_capability") == "semantic-search"
+    # Consumer must be BLOCKED by the proof gate
+    assert consumer.status == TaskStatus.BLOCKED, (
+        f"Consumer must be BLOCKED in enforce mode with unproven provider, "
+        f"got {consumer.status}"
+    )
+    assert consumer.context["blocker"]["needs"] == [
+        {"kind": "capability", "ref": "semantic-search"}
+    ], f"Blocker needs must name the capability, got {consumer.context.get('blocker')!r}"
+    # Consumer must NOT be wired to the provider via depends_on
+    assert str(provider.id) not in (consumer.depends_on or []), (
+        "Consumer must not depend_on unproven provider — proof gate must prevent wiring"
+    )

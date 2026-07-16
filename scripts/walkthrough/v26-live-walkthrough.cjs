@@ -342,9 +342,43 @@ async function main() {
           'Environment constraint, not a code defect',
         ]);
       } else {
-        // Attempt to run the blueprint-runner check command
-        step('1d. blueprint-runner start', 'DEAD_END', [
-          'Skipped: would block indefinitely polling for tasks',
+        // Node >= 22 is available — run local_runner --check to verify daemon-level
+        // orchestrator enrollment (not just API token issuance). This proves the runner
+        // WOULD connect to the orchestrator successfully (c-5214996f residual).
+        console.log('\n[FLOW 1d] Running local_runner --check (daemon enrollment preflight)...');
+        const localRunnerPath = path.join(REPO_ROOT, 'scripts', 'local_runner.py');
+        let runnerOutput = '';
+        let runnerExitCode = null;
+        try {
+          const result = execSync(
+            `python3 "${localRunnerPath}" --check`,
+            {
+              env: {
+                ...process.env,
+                BLUEPRINT_RUNNER_TOKEN: token,
+                BLUEPRINT_ORCHESTRATOR_URL: BACKEND_URL,
+                PATH: process.env.PATH,
+              },
+              timeout: 20000,
+              encoding: 'utf8',
+            }
+          );
+          runnerOutput = result;
+          runnerExitCode = 0;
+        } catch (err) {
+          runnerExitCode = err.status ?? 1;
+          runnerOutput = (err.stdout ?? '') + '\nSTDERR: ' + (err.stderr ?? String(err.message ?? ''));
+        }
+        const runnerPassed = runnerExitCode === 0;
+        step('1d. blueprint-runner start (daemon enrollment via local_runner --check)', runnerPassed ? 'PASS' : 'DEAD_END', [
+          `Node ${nodeVer} ✓ — running local_runner --check (daemon preflight, not full daemon)`,
+          `Exit code: ${runnerExitCode}`,
+          `Token supplied: ${token?.length ?? 0} chars to BLUEPRINT_RUNNER_TOKEN`,
+          `Orchestrator URL: ${BACKEND_URL}`,
+          runnerPassed
+            ? '✓ Daemon preflight passed — runner would connect to orchestrator successfully'
+            : '✗ Daemon preflight returned non-zero — see output below',
+          ...runnerOutput.trim().split('\n').slice(0, 20).map(l => `  ${l}`),
         ]);
       }
     } else {
@@ -531,6 +565,46 @@ async function main() {
       `Body excerpt (first 300 chars): ${msgsBodyText.slice(0, 300).replace(/\n/g, ' ')}`,
     ], msgsScreenshot);
 
+    // 3f. Cross-tab alert indicator (PR #15230) — PrimaryTabNav alert dots visible on
+    // every tab button when alerts are active, not just the tab currently selected.
+    // NOTE: App.tsx resets activeAlerts=0 when Chat opens (useEffect line ~288). To
+    // observe the cross-tab indicator we navigate to Pipeline (non-Chat) and wait for
+    // the alert poller to fire (leading=true → immediate) and re-populate activeAlerts.
+    console.log('\n[FLOW 3f] Checking cross-tab alert indicator (PR #15230 — PrimaryTabNav)...');
+    try {
+      // Navigate to Pipeline tab (not Chat) so messagesPanelOpen=false, enabling the poller
+      await page.locator('[data-testid="primary-tab-nav"] button').filter({ hasText: 'Pipeline' }).click({ timeout: 8000 });
+      // Wait for the leading poll to fire and React to update (local HTTP < 100ms, but
+      // React batching + paint can take up to 1-2s)
+      await page.waitForTimeout(3000);
+    } catch (_) { /* tolerate — screenshot will reveal state */ }
+
+    const tabButtonEls = await page.locator('[data-testid="primary-tab-nav"] button').all().catch(() => []);
+    const tabStates = [];
+    let dotsTotal = 0;
+    for (const btn of tabButtonEls) {
+      const label = await btn.innerText().catch(() => '');
+      const dotCount = await btn.locator('.bg-red-500').count().catch(() => 0);
+      dotsTotal += dotCount;
+      tabStates.push(`${label.replace(/\n|\d+/g, '').trim()}: dot=${dotCount > 0}`);
+    }
+    // Cross-tab: when on Pipeline, Chat + Project + Runtime should all show the dot
+    const nonPipelineTabsWithDots = tabStates.filter(s => !s.startsWith('Pipeline') && s.includes('dot=true'));
+    const crossTabIndicatorPresent = nonPipelineTabsWithDots.length >= 2; // at least Chat + Project
+    const alertIndicatorScreenshot = await takeScreenshot(page, 'flow3f-cross-tab-alert-indicator');
+    step('3f. Cross-tab alert indicator (PR #15230)', crossTabIndicatorPresent ? 'PASS' : 'DEAD_END', [
+      'PR #15230: fix(ui): restore cross-tab alert indicator after AlertsPopover→MessagesPanel consolidation',
+      'Contract: bg-red-500 dot appears on ALL tab buttons when activeAlerts > 0',
+      'Verification: navigate to Pipeline tab (messagesPanelOpen=false), wait for alert poller to set activeAlerts',
+      `Tab button states (active=Pipeline): ${tabStates.join(' | ')}`,
+      `Total alert dots found: ${dotsTotal}`,
+      `Non-pipeline tabs with dot: ${nonPipelineTabsWithDots.join(', ') || 'none'}`,
+      crossTabIndicatorPresent
+        ? '✓ Cross-tab alert indicator present on non-active tabs — PR #15230 confirmed'
+        : 'Alert dot not present on non-active tabs — activeAlerts may not have been set yet or no active alerts',
+      'Unit test: admin-ui/src/components/PrimaryTabNav.test.tsx — 13 assertions cover all tab+alert combos',
+    ], alertIndicatorScreenshot);
+
   } catch (err) {
     step('Walkthrough execution error', 'FAIL', [
       String(err),
@@ -676,7 +750,13 @@ function writeReport(startTs, integrityResult) {
   lines.push('- Token issuance and hash storage ✅ CONFIRMED (one-time token returned, hash stored)');
   lines.push('- Fleet list API returns enrolled runner ✅ CONFIRMED');
   lines.push('- Install snippet generation ✅ CONFIRMED (bash blueprint-runner start --token <tok> --url <url>)');
-  lines.push('- Node >= 22 prerequisite ⚠️ DEAD_END on this VM (Node v20 installed)');
+  const nodeVer = process.version;
+  const nodeMajor = parseInt(nodeVer.split('.')[0].replace('v', ''), 10);
+  if (nodeMajor >= 22) {
+    lines.push(`- Node >= 22 prerequisite ✅ CONFIRMED (${nodeVer} installed)`);
+  } else {
+    lines.push(`- Node >= 22 prerequisite ⚠️ DEAD_END on this VM (${nodeVer} installed; MIN_NODE_MAJOR=22)`);
+  }
   lines.push('');
   lines.push('### c-f52fd975 — Project Tools iframe subresource token (PR #15163)');
   lines.push('- Path-embedded token route `/t/{token}/assets/{path}` ✅ REGISTERED AND RESPONDING');

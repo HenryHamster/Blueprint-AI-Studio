@@ -222,6 +222,29 @@ class TestRecordCapabilityProof:
         assert recorded == []
         assert project.capability_proof_records == {}
 
+    def test_proof_not_recorded_when_no_verdict_in_context(self):
+        """A task with capability marker but NO acceptance verdict must NOT mint a proof.
+
+        record_code_acceptance_verdict no-ops (returns None, writes nothing) on
+        tasks that declared no acceptance evidence. Without the spawn-level block
+        on "code_acceptance_verdict", a malicious agent could forge a verdict
+        directly into the spawned child's JSONB context. This test proves that
+        without the forged verdict key in context, record_capability_proof cannot
+        mint a proof — confirming the spawn-level block is the correct defense.
+        """
+        task = _make_task(
+            provides_capability="language-aware-repo-map",
+            # No verdict — the agent-forge scenario when the block is in place.
+        )
+        project = _make_project()
+
+        with patch("app.capability_proof.flag_modified") as mock_fm:
+            recorded = record_capability_proof(task, project)
+
+        assert recorded == []
+        assert project.capability_proof_records == {}
+        mock_fm.assert_not_called()
+
     def test_proof_capped_per_capability(self):
         cap = "language-aware-repo-map"
         existing_entries = [
@@ -3549,6 +3572,159 @@ class TestEarnLoopExecutionTrialEnrollment:
         assert _kwargs.get("head_sha") == "newsha1111"
         assert result["named_test_executed"] == [self._CAP]
 
+    @pytest.mark.asyncio
+    async def test_merge_gate_proof_at_head_suppresses_reenroll(self):
+        """Cadence guard: a merge-gate named_test proof whose commit_sha matches
+        HEAD suppresses trial enrollment — we don't re-verify what the merge gate
+        already proved at this exact revision."""
+        from datetime import datetime
+
+        from app.capability_proof import _fresh_executed_proof_covers_head
+
+        now = datetime(2026, 7, 14, 0, 0, 0)
+        project = MagicMock()
+        project.capability_proof_records = {
+            "capability-proof-gate": [
+                {
+                    # Merge-gate proof: real task_id (not named_test_exec:), no
+                    # recorded_at, but has proof_kind=named_test and commit_sha.
+                    "task_id": "abc123-real-task-id",
+                    "proved_at": now.isoformat(),
+                    "proof_kind": "named_test",
+                    "commit_sha": "deadbeef",
+                }
+            ]
+        }
+        assert _fresh_executed_proof_covers_head(
+            project, "capability-proof-gate", "deadbeef", now=now
+        )
+
+    @pytest.mark.asyncio
+    async def test_merge_gate_proof_different_sha_still_reenrolls(self):
+        """A merge-gate proof for a DIFFERENT sha does not suppress enrollment
+        — HEAD moved so we need to re-verify at the new sha."""
+        from datetime import datetime
+
+        from app.capability_proof import _fresh_executed_proof_covers_head
+
+        now = datetime(2026, 7, 14, 0, 0, 0)
+        project = MagicMock()
+        project.capability_proof_records = {
+            "capability-proof-gate": [
+                {
+                    "task_id": "abc123-real-task-id",
+                    "proved_at": now.isoformat(),
+                    "proof_kind": "named_test",
+                    "commit_sha": "oldsha111",
+                }
+            ]
+        }
+        # HEAD moved to a new sha — merge-gate proof at old sha does not cover it.
+        assert not _fresh_executed_proof_covers_head(
+            project, "capability-proof-gate", "newsha222", now=now
+        )
+
+
+class TestRevokeStaleExecutionProof:
+    """revoke_stale_execution_proof removes the ledger entry and evidence_ref
+    for a capability after a definitive RED trial proves it broken at HEAD."""
+
+    def _project_with_exec_proof(self, cap_name: str):
+        """Return a project mock with a named_test_exec ledger entry."""
+        project = MagicMock()
+        norm = cap_name.lower().replace(" ", "-")
+        dedup_id = f"named_test_exec:{norm}"
+        project.capability_proof_records = {
+            norm: [
+                {
+                    "task_id": dedup_id,
+                    "proved_at": "2026-07-14T00:00:00",
+                    "recorded_at": "2026-07-14T00:00:00",
+                    "proof_kind": "named_test",
+                    "commit_sha": "deadbeef",
+                    "executed": True,
+                }
+            ]
+        }
+        project.problem_model = {
+            "capabilities": [
+                {
+                    "name": cap_name,
+                    "status": "working",
+                    "evidence_refs": [
+                        {
+                            "kind": "named_test",
+                            "proven": True,
+                            "source_id": dedup_id,
+                            "recorded_at": "2026-07-14T00:00:00",
+                        }
+                    ],
+                }
+            ]
+        }
+        return project
+
+    def test_revoke_removes_ledger_entry(self):
+        """A RED result removes the named_test_exec ledger entry."""
+        from app.capability_proof import revoke_stale_execution_proof
+
+        cap = "repo-map"
+        project = self._project_with_exec_proof(cap)
+        with patch("app.capability_proof.flag_modified"):
+            result = revoke_stale_execution_proof(project, cap)
+
+        assert result is True
+        entries = project.capability_proof_records.get("repo-map") or []
+        assert not any(e.get("task_id") == "named_test_exec:repo-map" for e in entries)
+
+    def test_revoke_removes_evidence_ref(self):
+        """Revocation also removes the matching evidence_ref from problem_model."""
+        from app.capability_proof import revoke_stale_execution_proof
+
+        cap = "repo-map"
+        project = self._project_with_exec_proof(cap)
+        with patch("app.capability_proof.flag_modified"):
+            revoke_stale_execution_proof(project, cap)
+
+        caps = project.problem_model.get("capabilities", [])
+        refs = caps[0].get("evidence_refs", []) if caps else []
+        assert not any(r.get("source_id") == "named_test_exec:repo-map" for r in refs)
+
+    def test_revoke_returns_false_when_no_entry(self):
+        """Returns False when no executed-proof entry exists (nothing to revoke)."""
+        from app.capability_proof import revoke_stale_execution_proof
+
+        project = MagicMock()
+        project.capability_proof_records = {"other-cap": []}
+        project.problem_model = {"capabilities": []}
+        with patch("app.capability_proof.flag_modified"):
+            result = revoke_stale_execution_proof(project, "repo-map")
+
+        assert result is False
+
+    def test_revoke_leaves_non_exec_entries(self):
+        """Revocation only removes the named_test_exec: entry; other proof
+        entries (e.g. merge-gate proofs) are left intact."""
+        from app.capability_proof import revoke_stale_execution_proof
+
+        cap = "repo-map"
+        project = self._project_with_exec_proof(cap)
+        # Add a merge-gate proof entry.
+        project.capability_proof_records["repo-map"].append(
+            {
+                "task_id": "merge-gate-task-id",
+                "proved_at": "2026-07-13T00:00:00",
+                "proof_kind": "named_test",
+                "commit_sha": "abc123",
+            }
+        )
+        with patch("app.capability_proof.flag_modified"):
+            revoke_stale_execution_proof(project, cap)
+
+        entries = project.capability_proof_records.get("repo-map") or []
+        assert len(entries) == 1
+        assert entries[0]["task_id"] == "merge-gate-task-id"
+
 
 class TestCapabilityProofFreshnessExpiry:
     """Capability proofs expire and force re-verification once stale.
@@ -3883,6 +4059,39 @@ class TestLedgerProofFreshness:
         assert "real-cap" in detail["uncorroborated"]
         assert detail["corroborated"] == []
 
+    def test_release_gate_rejects_stale_ledger_proof_without_explicit_now(self):
+        """``capability_proof_gate_release_status`` with no explicit ``now`` still
+        enforces freshness — a stale ledger proof does not clear the enforce gate.
+
+        Before the fix, the gate only checked freshness when ``now`` was explicitly
+        supplied; callers omitting it got unchecked legacy behaviour."""
+        from app.capability_registry import capability_proof_gate_release_status
+        from datetime import datetime, timedelta, timezone
+        from app.evidence_primitive import PROOF_FRESHNESS_TTL
+
+        stale = (
+            datetime.now(timezone.utc) - PROOF_FRESHNESS_TTL - timedelta(days=1)
+        ).isoformat()
+        model = {
+            "capabilities": [
+                {
+                    "name": "real-cap",
+                    "status": "working",
+                    "evidence_refs": [
+                        {"kind": "named_test", "ref": "t.py::x", "proven": True}
+                    ],
+                }
+            ]
+        }
+        records = {"real-cap": [{"proof_kind": "named_test", "proved_at": stale}]}
+        # No explicit now: freshness must still be evaluated.
+        blocked, detail = capability_proof_gate_release_status(
+            model, "enforce", records
+        )
+        assert blocked is True, "stale ledger proof must block promotion"
+        assert "real-cap" in detail["uncorroborated"]
+        assert detail["corroborated"] == []
+
 
 class TestReleaseGateLedgerCorroboration:
     """Finding #1: the release-qualifier enforce gate must clear a capability only
@@ -4100,6 +4309,37 @@ class TestLedgerCorroborationAliases:
         )
         assert with_alias["old-y"] == "proven", (
             "the absorbed alias must be corroborated through the survivor's ledger key"
+        )
+
+    def test_survivor_corroborated_through_absorbed_alias_ledger_key(self):
+        """When a capability was renamed (survivor-x absorbs old-y) and the proof
+        was recorded under the OLD name (old-y) before the rename, the SURVIVOR
+        name must still be corroborated via the absorbed alias's ledger key.
+
+        This is the reverse direction: the alias_map is ``{old-y: survivor-x}``
+        and the name being looked up is ``survivor-x`` (not a key in the map).
+        Without the reverse lookup, the survivor is demoted to ``unverified`` even
+        though its platform proof exists under the absorbed key."""
+        alias_map = {"old-y": "survivor-x"}
+        # Proof recorded under the absorbed (old) name before the rename.
+        records = {
+            "old-y": [{"proof_kind": "named_test"}]
+        }
+        # Without the reverse lookup, direct lookup of "survivor-x" finds nothing.
+        no_reverse = ledger_corroborated_proof_status(
+            {"survivor-x": "proven"}, records
+        )
+        assert no_reverse["survivor-x"] == "unverified", (
+            "without alias_map the survivor with proof under an old key must fail direct lookup"
+        )
+
+        # WITH alias_map: "survivor-x" is a VALUE in alias_map, so we check
+        # its absorbed keys and find the pre-rename proof under "old-y".
+        with_reverse = ledger_corroborated_proof_status(
+            {"survivor-x": "proven"}, records, alias_map=alias_map
+        )
+        assert with_reverse["survivor-x"] == "proven", (
+            "the survivor must be corroborated through its absorbed alias's ledger key"
         )
 
     def test_self_declared_non_absorbed_not_corroborated(self):
@@ -4752,6 +4992,40 @@ class TestConsumerGateSharesTheReleaseRule:
         RAISES the capability to ``proven``."""
         model = {"capabilities": [{"name": "ledger-only", "status": "working"}]}
         assert self._gate(model, self._ledger("ledger-only"))["ledger-only"] == "proven"
+
+    def test_stale_ledger_proof_does_not_corroborate_without_explicit_now(self):
+        """``consumer_gate_proof_status`` with no explicit ``now`` still enforces
+        freshness — a ledger proof older than PROOF_FRESHNESS_TTL is demoted to
+        ``unverified`` rather than corroborating the self-declared ``proven`` claim.
+
+        Before the fix, passing ``now=None`` left the timestamp unresolved and the
+        freshness check was skipped inside ``ledger_corroborated_proof_status``,
+        so an expired historical proof could corroborate a fresh agent-authored claim."""
+        from datetime import datetime, timedelta, timezone
+        from app.evidence_primitive import PROOF_FRESHNESS_TTL
+
+        stale = (
+            datetime.now(timezone.utc) - PROOF_FRESHNESS_TTL - timedelta(days=1)
+        ).isoformat()
+        model = {
+            "capabilities": [
+                {
+                    "name": "real-cap",
+                    "status": "working",
+                    "evidence_refs": [
+                        {"kind": "named_test", "ref": "t.py::x", "proven": True}
+                    ],
+                }
+            ]
+        }
+        records = {"real-cap": [{"proof_kind": "named_test", "proved_at": stale}]}
+        # No explicit now: the gate must still evaluate freshness and reject the stale proof.
+        gate = self._gate(model, records)
+        assert gate["real-cap"] != "proven", (
+            "a stale ledger proof must not corroborate a self-declared claim even "
+            "when consumer_gate_proof_status is called without an explicit now"
+        )
+        assert gate["real-cap"] == "unverified"
 
     def test_consumer_gate_matches_release_gate_verdict(self):
         """The consumer seams and the release seam must reach the SAME verdict on the

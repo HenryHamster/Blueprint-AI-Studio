@@ -78,13 +78,18 @@ exactly how many capabilities need real evidence before the gate can be enabled)
 ``capability_proof_gate_auto_graduation`` (computes fleet-wide proof coverage and
 automatically advances the gate mode off→observe→enforce as coverage crosses the
 configured thresholds; disabled by default — operators must opt in via
-``capability_proof_gate_auto_graduation_enabled``).
+``capability_proof_gate_auto_graduation_enabled``), and
+``capability_proof_trial_stall`` (per-project scan of recently-completed
+``capability_proof_trial`` tasks whose ``capability_proof_trial_contradiction``
+stamp shows ALL recent outcomes were non-green — could_not_run / red / skipped;
+flags stalled (project, cap) pairs, distinguishing infrastructure failure
+(could_not_run) from definitive failure (red), without altering any gate decision).
 
 Config knobs (runtime_config, operator-settable via PATCH /api/admin/settings):
 
 * ``metrics_integrity_sweep_mode``            — ``off`` / ``observe`` / ``enforce``
 * ``metrics_integrity_sweep_interval_minutes``— cadence gate (default 60)
-* ``metrics_integrity_sweep_max_checks``      — checks run per tick (default 25)
+* ``metrics_integrity_sweep_max_checks``      — checks run per tick (default 30)
 * ``metrics_integrity_sweep_max_projects``    — projects scanned per check (25)
 * ``metrics_integrity_sweep_sample_limit``    — rows sampled per DB check (200)
 """
@@ -128,7 +133,7 @@ CAPABILITY_PROOF_RESEARCH_PROVENANCE = "capability_proof_research"
 
 DEFAULT_MODE = "observe"
 DEFAULT_INTERVAL_MINUTES = 60
-DEFAULT_MAX_CHECKS_PER_TICK = 25
+DEFAULT_MAX_CHECKS_PER_TICK = 30
 DEFAULT_MAX_PROJECTS_PER_CHECK = 25
 DEFAULT_SAMPLE_LIMIT = 200
 #: How far back a windowed check looks when recomputing ground truth. Keeps the
@@ -4813,6 +4818,205 @@ async def check_observe_mode_unverified_resolution(
                 status=CheckStatus.OK,
                 subject="global",
                 detail="no observe-mode unverified-resolution stamps found in window",
+            )
+        )
+
+    return results
+
+
+# --- Check: capability_proof_trial_stall -------------------------------------
+
+#: Context key written by task_completion._handle_capability_proof_trial_completion
+#: on every non-green trial outcome. The sweep reads this key to detect stall patterns.
+_CAP_TRIAL_CONTRADICTION_KEY = "capability_proof_trial_contradiction"
+
+
+@register_check(
+    "capability_proof_trial_stall",
+    "Per-project scan of recently-completed capability_proof_trial tasks whose "
+    "capability_proof_trial_contradiction stamp shows ALL recent outcomes were "
+    "non-green (could_not_run / red / skipped). Flags stalled (project, cap) pairs, "
+    "distinguishing infrastructure failure (could_not_run) from definitive failure "
+    "(red), without altering any gate decision.",
+)
+async def check_capability_proof_trial_stall(ctx: SweepContext) -> List[CheckResult]:
+    """Surface per-project, per-cap trial stalls so silent earn-loop no-ops are visible.
+
+    When a ``capability_proof_trial`` task completes non-green, the ingestion handler
+    in ``task_completion`` stamps ``capability_proof_trial_contradiction`` on the task
+    context but does NOT demote proof status.  This is intentionally safe — but it
+    means the earn loop can silently no-op forever with no fleet-visible signal.
+
+    This check queries COMPLETED ``capability_proof_trial`` tasks within the
+    ``window_days`` window, groups them by (project_id, cap), and flags any group
+    where EVERY recent outcome was non-green.  It distinguishes:
+
+    * ``could_not_run`` — infrastructure failure (Docker, wall-clock, etc.); severity
+      ``warn`` — the tests may well pass once the runner is fixed.
+    * definitive red (``ran=True, passed=False, could_not_run=False``) — tests
+      actually ran and failed; severity ``error``.
+    * skipped — at least some trials were skipped (indeterminate); severity ``warn``.
+
+    A group with at least one green trial in the window is NOT flagged.
+
+    * ``self_reported`` = total trial tasks for this (project, cap) in the window.
+    * ``ground_truth``  = 0 (none of the trials were green).
+    * ``delta``         = self_reported (all trials were non-green).
+
+    Does NOT mutate any proof, gate setting, or counter.
+    Bounded to ``ctx.max_projects`` projects and ``ctx.sample_limit`` trial tasks.
+    """
+    from app.database import resolve_dialect_name
+    from app.models import Project, Task, TaskStatus
+
+    cutoff = ctx.now.replace(tzinfo=None) - timedelta(days=ctx.window_days)
+
+    projects = (
+        await ctx.session.execute(select(Project.id).limit(ctx.max_projects))
+    ).all()
+
+    if not projects:
+        return [
+            CheckResult(
+                check="capability_proof_trial_stall",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no projects to audit",
+            )
+        ]
+
+    # ``has_key`` compiles to the Postgres-only JSONB ``?`` operator — fails on the
+    # SQLite smoke gate.  Branch to ``func.json_extract`` for SQLite.
+    if resolve_dialect_name(ctx.session) == "sqlite":
+        contradiction_predicate = func.json_extract(
+            Task.context, f"$.{_CAP_TRIAL_CONTRADICTION_KEY}"
+        ).is_not(None)
+    else:
+        contradiction_predicate = Task.context.has_key(_CAP_TRIAL_CONTRADICTION_KEY)
+
+    results: List[CheckResult] = []
+    any_trial_found = False
+
+    for (project_id,) in projects:
+        pid = str(project_id)
+
+        trial_tasks = (
+            await ctx.session.execute(
+                select(Task)
+                .where(
+                    Task.project_id == project_id,
+                    Task.status == TaskStatus.COMPLETED,
+                    Task.payloads[0]["type"].as_string() == "capability_proof_trial",
+                    contradiction_predicate,
+                    Task.created_at >= cutoff,
+                )
+                .order_by(Task.created_at.desc())
+                .limit(ctx.sample_limit)
+            )
+        ).scalars().all()
+
+        if not trial_tasks:
+            results.append(
+                CheckResult(
+                    check="capability_proof_trial_stall",
+                    status=CheckStatus.SKIPPED,
+                    subject=pid,
+                    detail="no completed non-green trial tasks in window",
+                )
+            )
+            continue
+
+        any_trial_found = True
+
+        # Group contradiction stamps by cap name.  A single task has exactly one
+        # contradiction stamp; we collect counts per outcome type per cap.
+        cap_could_not_run: dict[str, int] = {}
+        cap_red: dict[str, int] = {}
+        cap_skipped_only: dict[str, int] = {}
+        cap_total: dict[str, int] = {}
+
+        for t in trial_tasks:
+            contradiction = (t.context or {}).get(_CAP_TRIAL_CONTRADICTION_KEY)
+            if not isinstance(contradiction, dict):
+                continue
+            cap = contradiction.get("cap")
+            if not isinstance(cap, str) or not cap.strip():
+                continue
+            cap_total[cap] = cap_total.get(cap, 0) + 1
+            if contradiction.get("could_not_run"):
+                cap_could_not_run[cap] = cap_could_not_run.get(cap, 0) + 1
+            elif bool(contradiction.get("ran")) and not bool(contradiction.get("passed")):
+                cap_red[cap] = cap_red.get(cap, 0) + 1
+            else:
+                cap_skipped_only[cap] = cap_skipped_only.get(cap, 0) + 1
+
+        # Now check each cap: are ALL trials in this window non-green?  A green trial
+        # would NOT have a contradiction stamp so it won't appear in trial_tasks;
+        # but we guard below by comparing cap_total against the sum of outcomes.
+        for cap, total in cap_total.items():
+            cnr = cap_could_not_run.get(cap, 0)
+            red = cap_red.get(cap, 0)
+            skp = cap_skipped_only.get(cap, 0)
+            non_green_sum = cnr + red + skp
+
+            # If we can't account for all trials via contradiction outcomes, the data
+            # is inconsistent — treat conservatively as inconclusive rather than flag.
+            if non_green_sum < total:
+                results.append(
+                    CheckResult(
+                        check="capability_proof_trial_stall",
+                        status=CheckStatus.INCONCLUSIVE,
+                        subject=pid,
+                        detail=(
+                            f"cap={cap!r}: {total} contradiction-stamped trial(s) "
+                            f"but only {non_green_sum} outcome(s) parseable — "
+                            "inconclusive (possible data inconsistency)"
+                        ),
+                    )
+                )
+                continue
+
+            # Choose severity: definitive red beats could_not_run beats skipped-only.
+            if red > 0:
+                severity = "error"
+                outcome_summary = (
+                    f"red={red}"
+                    + (f", could_not_run={cnr}" if cnr else "")
+                    + (f", skipped={skp}" if skp else "")
+                )
+            elif cnr > 0:
+                severity = "warn"
+                outcome_summary = (
+                    f"could_not_run={cnr}"
+                    + (f", skipped={skp}" if skp else "")
+                )
+            else:
+                severity = "warn"
+                outcome_summary = f"skipped={skp}"
+
+            results.append(
+                CheckResult(
+                    check="capability_proof_trial_stall",
+                    status=CheckStatus.FLAGGED,
+                    self_reported=total,
+                    ground_truth=0,
+                    delta=total,
+                    severity=severity,
+                    subject=pid,
+                    detail=(
+                        f"cap={cap!r}: {total} trial(s) in window, all non-green "
+                        f"({outcome_summary}); earn loop may be silently stalled"
+                    ),
+                )
+            )
+
+    if not any_trial_found and not any(r.flagged for r in results):
+        results.append(
+            CheckResult(
+                check="capability_proof_trial_stall",
+                status=CheckStatus.OK,
+                subject="global",
+                detail="no stalled capability_proof_trial outcomes found in window",
             )
         )
 

@@ -702,6 +702,79 @@ async def get_all_tasks(
     return response
 
 
+@router.get("/tasks/counts")
+async def get_task_counts(
+    project_id: uuid.UUID | None = Query(None),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Cheap aggregate counts endpoint for the header badge.
+
+    Returns only active/evaluating/queued counts with no Task rows loaded.
+    Used by non-pipeline tabs so the header stays current without the
+    full-row poll overhead.
+    """
+    user_project_ids_expr = _user_project_ids(current_user["user_id"])
+    global_row = (
+        await session.execute(
+            select(
+                func.count(
+                    case(
+                        (
+                            Task.status.in_(
+                                [TaskStatus.IN_PROGRESS, TaskStatus.PROVISIONING]
+                            ),
+                            1,
+                        )
+                    )
+                ),
+                func.count(case((Task.status == TaskStatus.EVALUATING, 1))),
+                func.count(case((Task.status == TaskStatus.QUEUED, 1))),
+            )
+            .select_from(Task)
+            .where(Task.project_id.in_(user_project_ids_expr))
+        )
+    ).one()
+    active_count, evaluating_count, queued_count = global_row
+
+    response: Dict[str, Any] = {
+        "active_count": active_count,
+        "evaluating_count": evaluating_count,
+        "queued_count": queued_count,
+    }
+
+    if project_id is not None:
+        scoped_row = (
+            await session.execute(
+                select(
+                    func.count(
+                        case(
+                            (
+                                Task.status.in_(
+                                    [TaskStatus.IN_PROGRESS, TaskStatus.PROVISIONING]
+                                ),
+                                1,
+                            )
+                        )
+                    ),
+                    func.count(case((Task.status == TaskStatus.EVALUATING, 1))),
+                    func.count(case((Task.status == TaskStatus.QUEUED, 1))),
+                )
+                .select_from(Task)
+                .where(
+                    Task.project_id == project_id,
+                    Task.project_id.in_(user_project_ids_expr),
+                )
+            )
+        ).one()
+        scoped_active, scoped_evaluating, scoped_queued = scoped_row
+        response["scoped_active_count"] = scoped_active
+        response["scoped_evaluating_count"] = scoped_evaluating
+        response["scoped_queued_count"] = scoped_queued
+
+    return response
+
+
 class BulkArchiveRequest(BaseModel):
     task_ids: List[str] | None = None
     filter: str | None = None  # 'completed' or 'terminal'
