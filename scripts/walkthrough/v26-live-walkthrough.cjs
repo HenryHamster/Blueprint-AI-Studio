@@ -15,7 +15,7 @@ const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { execSync } = require('child_process');
+const { execSync, spawn } = require('child_process');
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -331,7 +331,7 @@ async function main() {
         'UI dialog shows equivalent: runnerSetupSnippets(token, origin) → macosLinux',
       ]);
 
-      // 1d. Node version check (blueprint-runner requirement)
+      // 1d. Full daemon enrollment: preflight check then live daemon connect + heartbeat
       const nodeVer = process.version;
       const nodeMajor = parseInt(nodeVer.split('.')[0].replace('v', ''), 10);
       if (nodeMajor < 22) {
@@ -342,13 +342,11 @@ async function main() {
           'Environment constraint, not a code defect',
         ]);
       } else {
-        // Node >= 22 is available — run local_runner --check to verify daemon-level
-        // orchestrator enrollment (not just API token issuance). This proves the runner
-        // WOULD connect to the orchestrator successfully (c-5214996f residual).
-        console.log('\n[FLOW 1d] Running local_runner --check (daemon enrollment preflight)...');
+        // Phase 1: --check preflight (validates token + orchestrator before daemon start)
+        console.log('\n[FLOW 1d-1] Running local_runner --check (daemon enrollment preflight)...');
         const localRunnerPath = path.join(REPO_ROOT, 'scripts', 'local_runner.py');
-        let runnerOutput = '';
-        let runnerExitCode = null;
+        let checkOutput = '';
+        let checkExitCode = null;
         try {
           const result = execSync(
             `python3 "${localRunnerPath}" --check`,
@@ -363,22 +361,119 @@ async function main() {
               encoding: 'utf8',
             }
           );
-          runnerOutput = result;
-          runnerExitCode = 0;
+          checkOutput = result;
+          checkExitCode = 0;
         } catch (err) {
-          runnerExitCode = err.status ?? 1;
-          runnerOutput = (err.stdout ?? '') + '\nSTDERR: ' + (err.stderr ?? String(err.message ?? ''));
+          checkExitCode = err.status ?? 1;
+          checkOutput = (err.stdout ?? '') + '\nSTDERR: ' + (err.stderr ?? String(err.message ?? ''));
         }
-        const runnerPassed = runnerExitCode === 0;
-        step('1d. blueprint-runner start (daemon enrollment via local_runner --check)', runnerPassed ? 'PASS' : 'DEAD_END', [
-          `Node ${nodeVer} ✓ — running local_runner --check (daemon preflight, not full daemon)`,
-          `Exit code: ${runnerExitCode}`,
-          `Token supplied: ${token?.length ?? 0} chars to BLUEPRINT_RUNNER_TOKEN`,
-          `Orchestrator URL: ${BACKEND_URL}`,
-          runnerPassed
-            ? '✓ Daemon preflight passed — runner would connect to orchestrator successfully'
-            : '✗ Daemon preflight returned non-zero — see output below',
-          ...runnerOutput.trim().split('\n').slice(0, 20).map(l => `  ${l}`),
+        const checkPassed = checkExitCode === 0;
+
+        // Phase 2: Start the actual daemon (no --check) and observe it connecting +
+        // heartbeating. This proves FULL daemon enrollment — not just that the token
+        // is valid, but that the runner process connects to the orchestrator, sends a
+        // real heartbeat to POST /api/runner/heartbeat, and the fleet API reflects the
+        // live state (last_seen_at populated, current_token_heartbeat_confirmed = true).
+        let heartbeatObserved = false;
+        let tokenConfirmed = false;
+        let beforeLastSeen = null;
+        let afterLastSeen = null;
+        let afterRunnerView = null;
+        let daemonLogs = '';
+        let daemonVerdict = 'DEAD_END';
+        let daemonNotes = [];
+
+        if (checkPassed) {
+          console.log('\n[FLOW 1d-2] Starting full daemon (no --check) to prove live enrollment...');
+
+          // Snapshot fleet state before daemon start — last_seen_at should be null
+          // for this newly-registered runner (enrolled in step 1a).
+          const beforeFleet = await apiGet(`/api/admin/projects/${PROJECT_ID}/runners`);
+          const beforeRunners = Array.isArray(beforeFleet.body) ? beforeFleet.body : [];
+          const beforeRunner = beforeRunners.find(r => r.id === enrolledRunnerId);
+          beforeLastSeen = beforeRunner?.last_seen_at ?? null;
+
+          // Spawn the daemon. BLUEPRINT_RUNNER_SUPERVISED=1 tells it we manage its
+          // lifecycle — it won't try to re-exec itself on self-update.
+          const daemon = spawn(
+            'python3',
+            [localRunnerPath],
+            {
+              env: {
+                ...process.env,
+                BLUEPRINT_RUNNER_TOKEN: token,
+                BLUEPRINT_ORCHESTRATOR_URL: BACKEND_URL,
+                BLUEPRINT_RUNNER_SUPERVISED: '1',
+                PATH: process.env.PATH,
+              },
+              stdio: ['ignore', 'pipe', 'pipe'],
+            }
+          );
+          daemon.stdout?.on('data', d => { daemonLogs += d.toString(); });
+          daemon.stderr?.on('data', d => { daemonLogs += d.toString(); });
+
+          // Wait for the daemon's heartbeat loop to fire. The runner polls every 2s
+          // by default; 10s gives 4–5 heartbeat opportunities.
+          await new Promise(resolve => setTimeout(resolve, 10000));
+
+          // Read fleet state after daemon has been running.
+          const afterFleet = await apiGet(`/api/admin/projects/${PROJECT_ID}/runners`);
+          const afterRunners = Array.isArray(afterFleet.body) ? afterFleet.body : [];
+          afterRunnerView = afterRunners.find(r => r.id === enrolledRunnerId) ?? null;
+          afterLastSeen = afterRunnerView?.last_seen_at ?? null;
+          tokenConfirmed = afterRunnerView?.current_token_heartbeat_confirmed === true;
+
+          // A heartbeat was observed when last_seen_at transitioned from null to a
+          // timestamp (the runner was freshly registered in step 1a so it had no prior
+          // heartbeat, and the daemon is the only process that could have set it).
+          heartbeatObserved = afterLastSeen !== null && afterLastSeen !== beforeLastSeen;
+
+          // Terminate the daemon cleanly.
+          daemon.kill('SIGTERM');
+          // Brief grace period for the signal to be handled.
+          await new Promise(resolve => setTimeout(resolve, 1500));
+
+          daemonVerdict = heartbeatObserved && tokenConfirmed ? 'PASS' : 'DEAD_END';
+          daemonNotes = [
+            `Node ${nodeVer} ✓ — daemon mode (not --check; real connection to orchestrator)`,
+            `Fleet snapshot BEFORE daemon start: last_seen_at=${beforeLastSeen ?? 'null'}`,
+            `Fleet snapshot AFTER 10s daemon run: last_seen_at=${afterLastSeen ?? 'null'}`,
+            `current_token_heartbeat_confirmed: ${tokenConfirmed}`,
+            `Heartbeat observed in fleet state: ${heartbeatObserved ? '✓ YES — runner is live' : '✗ NO — daemon may not have connected'}`,
+            `Token generation confirmed: ${tokenConfirmed ? '✓ YES' : '✗ NO'}`,
+            `Health status: ${afterRunnerView?.health?.device_status ?? 'unknown'}`,
+            heartbeatObserved
+              ? `✓ Full daemon enrollment PROVEN: runner ${enrolledRunnerId} connected and heartbeated`
+              : `✗ Heartbeat not observed — check daemon logs below`,
+            '--- fleet API response after enrollment (key fields) ---',
+            `  id: ${afterRunnerView?.id}`,
+            `  hostname: ${afterRunnerView?.hostname}`,
+            `  status: ${afterRunnerView?.status}`,
+            `  last_seen_at: ${afterLastSeen}`,
+            `  current_token_heartbeat_confirmed: ${tokenConfirmed}`,
+            `  health.device_status: ${afterRunnerView?.health?.device_status ?? 'N/A'}`,
+            '--- daemon stdout/stderr (first 20 lines) ---',
+            ...daemonLogs.trim().split('\n').slice(0, 20).map(l => `  ${l}`),
+          ];
+        } else {
+          daemonVerdict = 'DEAD_END';
+          daemonNotes = [
+            `Skipping daemon start — preflight check failed (exit code ${checkExitCode})`,
+            'Fix the preflight errors above and re-run to attempt full daemon enrollment',
+          ];
+        }
+
+        // Report step 1d as a combined preflight + daemon result.
+        step('1d. blueprint-runner start (full daemon enrollment + heartbeat confirmed)', daemonVerdict, [
+          `--- Phase 1: preflight check (--check) ---`,
+          `Node ${nodeVer} ✓ — running local_runner --check`,
+          `Exit code: ${checkExitCode}`,
+          checkPassed
+            ? '✓ Preflight passed — token valid, orchestrator reachable'
+            : '✗ Preflight failed — see output below',
+          ...checkOutput.trim().split('\n').slice(0, 20).map(l => `  ${l}`),
+          `--- Phase 2: full daemon connect + heartbeat ---`,
+          ...daemonNotes,
         ]);
       }
     } else {
@@ -754,8 +849,16 @@ function writeReport(startTs, integrityResult) {
   const nodeMajor = parseInt(nodeVer.split('.')[0].replace('v', ''), 10);
   if (nodeMajor >= 22) {
     lines.push(`- Node >= 22 prerequisite ✅ CONFIRMED (${nodeVer} installed)`);
+    // Report the daemon enrollment outcome based on step 1d result
+    const step1d = results.find(r => r.name.includes('1d.'));
+    if (step1d?.verdict === 'PASS') {
+      lines.push('- **Full daemon enrollment** ✅ CONFIRMED — daemon connected to orchestrator; `last_seen_at` observed in fleet state; `current_token_heartbeat_confirmed=true`');
+    } else {
+      lines.push('- Full daemon enrollment ⚠️ — see step 1d for details (preflight passed; daemon result depends on environment)');
+    }
   } else {
     lines.push(`- Node >= 22 prerequisite ⚠️ DEAD_END on this VM (${nodeVer} installed; MIN_NODE_MAJOR=22)`);
+    lines.push('- Full daemon enrollment ⚠️ DEAD_END — Node version too old to start daemon');
   }
   lines.push('');
   lines.push('### c-f52fd975 — Project Tools iframe subresource token (PR #15163)');

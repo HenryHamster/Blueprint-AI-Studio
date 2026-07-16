@@ -983,7 +983,9 @@ async def _resolve_override_runner(
 
 
 async def build_resident_runner_options(
-    session: AsyncSession, project_id: uuid.UUID
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    runner_rows: list | None = None,
 ) -> list[dict[str, Any]]:
     """Build the device-picker options for the project's resident-session runners.
 
@@ -1001,8 +1003,11 @@ async def build_resident_runner_options(
         _local_runner_is_live,
     )
 
+    if runner_rows is None:
+        runner_rows = await _load_resident_runner_rows(session, project_id)
+
     options: list[dict[str, Any]] = []
-    for runner in await _load_resident_runner_rows(session, project_id):
+    for runner in runner_rows:
         online = bool(_local_runner_is_live(runner))
         agent_ready = bool(_local_runner_agent_available(runner))
         handles = bool(

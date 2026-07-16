@@ -700,6 +700,35 @@ def _criterion_counts_from_tasks(tasks: list[Task]) -> Dict[str, int]:
     return {"criterion_measured": measured, "criterion_met": met}
 
 
+async def load_project_runners(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> list[LocalRunner]:
+    """Fetch the project's non-deleted allow-listed runners, newest-seen first.
+
+    Call once per strategic-state assembly and pass the result to
+    build_strategic_runtime_summary, build_resident_runner_options, and
+    build_operator_attention to avoid three identical DB round-trips.
+    """
+    return list(
+        (
+            await session.execute(
+                select(LocalRunner)
+                .where(
+                    runner_allowed_for_project(project_id),
+                    LocalRunner.status != "deleted",
+                )
+                .order_by(
+                    LocalRunner.last_seen_at.desc(),
+                    LocalRunner.created_at.desc(),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
 async def build_strategic_runtime_summary(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -707,22 +736,12 @@ async def build_strategic_runtime_summary(
     active_task: Task | None,
     project_vision: Dict[str, Any] | None = None,
     operator_user_id: str | None = None,
+    runner_rows: list[LocalRunner] | None = None,
 ) -> Dict[str, Any]:
     """Project local-runner readiness plus passive background-work state."""
 
-    runner_rows = (
-        await session.execute(
-            select(LocalRunner)
-            .where(
-                runner_allowed_for_project(project_id),
-                LocalRunner.status != "deleted",
-            )
-            .order_by(
-                LocalRunner.last_seen_at.desc(),
-                LocalRunner.created_at.desc(),
-            )
-        )
-    ).scalars().all()
+    if runner_rows is None:
+        runner_rows = await load_project_runners(session, project_id)
     readiness_task_types = _active_strategic_task_types(active_task)
     strategic_runners = [
         runner for runner in runner_rows if _runner_handles_any_strategic_work(runner)
@@ -1086,52 +1105,45 @@ async def build_runtime_work_summary(
         TaskStatus.BLOCKED,
         TaskStatus.PARKED,
     ]
-    held_tasks = (
-        await session.execute(
-            select(Task)
-            .where(
-                Task.project_id == project_id,
-                Task.archived.is_(False),
-                Task.requires_approval.is_(True),
-                Task.status.in_(approval_statuses),
-            )
-            .order_by(Task.priority.asc(), Task.created_at.asc())
-            .limit(_RUNTIME_WORK_PREVIEW_LIMIT)
+    # Merge held_approvals data + count into one round trip using window function.
+    held_result = await session.execute(
+        select(Task, func.count().over().label("_total_count"))
+        .where(
+            Task.project_id == project_id,
+            Task.archived.is_(False),
+            Task.requires_approval.is_(True),
+            Task.status.in_(approval_statuses),
         )
-    ).scalars().all()
-    held_task_count = (
-        await session.execute(
-            select(func.count())
-            .select_from(Task)
-            .where(
-                Task.project_id == project_id,
-                Task.archived.is_(False),
-                Task.requires_approval.is_(True),
-                Task.status.in_(approval_statuses),
-            )
-        )
-    ).scalar()
+        .order_by(Task.priority.asc(), Task.created_at.asc())
+        .limit(_RUNTIME_WORK_PREVIEW_LIMIT)
+    )
+    _held_rows = held_result.all()
+    held_tasks = [row[0] for row in _held_rows]
+    held_task_count = _held_rows[0][1] if _held_rows else 0
 
     local_runner_hold_filters = local_runner_hold_task_filters(project_id)
     strategic_local_runner_hold_filters = strategic_local_runner_hold_task_filters(
         project_id
     )
-    compute_local_runner_hold_tasks = (
-        await session.execute(
-            select(Task)
-            .where(*local_runner_hold_filters)
-            .order_by(Task.priority.asc(), Task.created_at.asc())
-            .limit(_RUNTIME_WORK_PREVIEW_LIMIT)
-        )
-    ).scalars().all()
-    strategic_local_runner_hold_tasks = (
-        await session.execute(
-            select(Task)
-            .where(*strategic_local_runner_hold_filters)
-            .order_by(Task.priority.asc(), Task.created_at.asc())
-            .limit(_RUNTIME_WORK_PREVIEW_LIMIT)
-        )
-    ).scalars().all()
+    # Merge local-runner hold data + count into one round trip per filter.
+    _compute_hold_result = await session.execute(
+        select(Task, func.count().over().label("_total_count"))
+        .where(*local_runner_hold_filters)
+        .order_by(Task.priority.asc(), Task.created_at.asc())
+        .limit(_RUNTIME_WORK_PREVIEW_LIMIT)
+    )
+    _compute_hold_rows = _compute_hold_result.all()
+    compute_local_runner_hold_tasks = [row[0] for row in _compute_hold_rows]
+    local_runner_hold_count = _compute_hold_rows[0][1] if _compute_hold_rows else 0
+    _strategic_hold_result = await session.execute(
+        select(Task, func.count().over().label("_total_count"))
+        .where(*strategic_local_runner_hold_filters)
+        .order_by(Task.priority.asc(), Task.created_at.asc())
+        .limit(_RUNTIME_WORK_PREVIEW_LIMIT)
+    )
+    _strategic_hold_rows = _strategic_hold_result.all()
+    strategic_local_runner_hold_tasks = [row[0] for row in _strategic_hold_rows]
+    strategic_local_runner_hold_count = _strategic_hold_rows[0][1] if _strategic_hold_rows else 0
     local_runner_hold_tasks = [
         *compute_local_runner_hold_tasks,
         *[
@@ -1144,18 +1156,6 @@ async def build_runtime_work_summary(
         key=lambda task: (task.priority, task.created_at or _utcnow())
     )
     local_runner_hold_tasks = local_runner_hold_tasks[:_RUNTIME_WORK_PREVIEW_LIMIT]
-    local_runner_hold_count = (
-        await session.execute(
-            select(func.count()).select_from(Task).where(*local_runner_hold_filters)
-        )
-    ).scalar()
-    strategic_local_runner_hold_count = (
-        await session.execute(
-            select(func.count())
-            .select_from(Task)
-            .where(*strategic_local_runner_hold_filters)
-        )
-    ).scalar()
 
     wake_rows = (
         await session.execute(

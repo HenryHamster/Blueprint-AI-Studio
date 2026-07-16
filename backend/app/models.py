@@ -58,6 +58,11 @@ from app.release_models import (  # noqa: F401
     ResidualVerdict,
     VersionAcceptanceCriterion,
 )
+from app.strategic_resident_models import (  # noqa: F401
+    StrategicOperationReceipt,
+    StrategicResident,
+    StrategicResidentCheckpoint,
+)
 from app.time_utils import _utcnow
 from app.vm_cost_rates import (
     get_cloud_run_rate_for_machine_type,
@@ -4936,6 +4941,13 @@ class ImprovementLane(SQLModel, table=True):
         Index("ix_improvementlane_project_status", "project_id", "status"),
         # Direction scope: find lanes for a given direction.
         Index("ix_improvementlane_direction_status", "direction_id", "status"),
+        # Stale-parked-lane sweep: expired PARKED lanes.
+        Index(
+            "ix_improvementlane_status_parked_at",
+            "status",
+            "parked_at",
+            postgresql_where=text("status = 'PARKED'"),
+        ),
     )
 
 

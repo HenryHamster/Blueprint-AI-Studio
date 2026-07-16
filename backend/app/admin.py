@@ -65,7 +65,10 @@ from app.payload_schemas import (
     TaskType,
     validate_task_payload,
 )
-from app.task_capabilities import USER_LAUNCHABLE_TASK_TYPES
+from app.task_capabilities import (
+    BACKEND_MANAGED_TASK_TYPES,
+    USER_LAUNCHABLE_TASK_TYPES,
+)
 from app.compute_experiment_contract import (
     _validate_compute_launch_contract,
     resolve_compute_spend_approval,
@@ -306,6 +309,7 @@ async def get_all_tasks(
     project_id: uuid.UUID | None = Query(None),
     spawned_by: str | None = Query(None, max_length=100),
     approval_needed: bool | None = Query(None),
+    include_backend_managed: bool = Query(False, include_in_schema=False),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -315,6 +319,14 @@ async def get_all_tasks(
 
     # Build shared filter conditions
     filters = [Task.project_id.in_(_user_project_ids(current_user["user_id"]))]
+    if not include_backend_managed:
+        task_type_expr = Task.payloads[0]["type"].as_string()
+        filters.append(
+            or_(
+                task_type_expr.is_(None),
+                task_type_expr.not_in(sorted(BACKEND_MANAGED_TASK_TYPES)),
+            )
+        )
     if project_id is not None:
         filters.append(Task.project_id == project_id)
     if status:
@@ -702,6 +714,79 @@ async def get_all_tasks(
     return response
 
 
+@router.get("/tasks/counts")
+async def get_task_counts(
+    project_id: uuid.UUID | None = Query(None),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Cheap aggregate counts endpoint for the header badge.
+
+    Returns only active/evaluating/queued counts with no Task rows loaded.
+    Used by non-pipeline tabs so the header stays current without the
+    full-row poll overhead.
+    """
+    user_project_ids_expr = _user_project_ids(current_user["user_id"])
+    global_row = (
+        await session.execute(
+            select(
+                func.count(
+                    case(
+                        (
+                            Task.status.in_(
+                                [TaskStatus.IN_PROGRESS, TaskStatus.PROVISIONING]
+                            ),
+                            1,
+                        )
+                    )
+                ),
+                func.count(case((Task.status == TaskStatus.EVALUATING, 1))),
+                func.count(case((Task.status == TaskStatus.QUEUED, 1))),
+            )
+            .select_from(Task)
+            .where(Task.project_id.in_(user_project_ids_expr))
+        )
+    ).one()
+    active_count, evaluating_count, queued_count = global_row
+
+    response: Dict[str, Any] = {
+        "active_count": active_count,
+        "evaluating_count": evaluating_count,
+        "queued_count": queued_count,
+    }
+
+    if project_id is not None:
+        scoped_row = (
+            await session.execute(
+                select(
+                    func.count(
+                        case(
+                            (
+                                Task.status.in_(
+                                    [TaskStatus.IN_PROGRESS, TaskStatus.PROVISIONING]
+                                ),
+                                1,
+                            )
+                        )
+                    ),
+                    func.count(case((Task.status == TaskStatus.EVALUATING, 1))),
+                    func.count(case((Task.status == TaskStatus.QUEUED, 1))),
+                )
+                .select_from(Task)
+                .where(
+                    Task.project_id == project_id,
+                    Task.project_id.in_(user_project_ids_expr),
+                )
+            )
+        ).one()
+        scoped_active, scoped_evaluating, scoped_queued = scoped_row
+        response["scoped_active_count"] = scoped_active
+        response["scoped_evaluating_count"] = scoped_evaluating
+        response["scoped_queued_count"] = scoped_queued
+
+    return response
+
+
 class BulkArchiveRequest(BaseModel):
     task_ids: List[str] | None = None
     filter: str | None = None  # 'completed' or 'terminal'
@@ -811,9 +896,14 @@ async def purge_archive_tasks(
     """
     user_project_ids = _member_project_ids(current_user["user_id"])
 
+    task_type_expr = Task.payloads[0]["type"].as_string()
     where_clauses = [
         Task.archived.is_(True),
         Task.project_id.in_(user_project_ids),
+        or_(
+            task_type_expr.is_(None),
+            task_type_expr.not_in(sorted(BACKEND_MANAGED_TASK_TYPES)),
+        ),
     ]
     if request.older_than_days is not None:
         if request.older_than_days < 1:
@@ -2402,6 +2492,14 @@ async def create_task_manually(
             github_repo=github_repo,
         )
         session.add(project)
+        await session.flush()
+        from app.strategic_resident_checkpointing import (
+            initialize_strategic_resident,
+        )
+
+        await initialize_strategic_resident(
+            session, project.id, locked_project=project
+        )
         await session.commit()
         await session.refresh(project)
         # Auto-add owner membership
@@ -3180,6 +3278,14 @@ async def create_compute_experiment_task(
             build_config={"bootstrap_completed_at": _now_iso},
         )
         session.add(project)
+        await session.flush()
+        from app.strategic_resident_checkpointing import (
+            initialize_strategic_resident,
+        )
+
+        await initialize_strategic_resident(
+            session, project.id, locked_project=project
+        )
         await session.commit()
         await session.refresh(project)
         session.add(

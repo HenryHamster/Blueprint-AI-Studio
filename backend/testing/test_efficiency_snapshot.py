@@ -4318,8 +4318,10 @@ async def _payoff_alerts(db_session, project_id):
 
 
 @pytest.mark.asyncio
-async def test_payoff_transition_cost_regression_fires_warning(db_session, mocker):
-    """A transition to COST_REGRESSION fires one WARNING carrying the numbers."""
+async def test_payoff_cost_regression_is_suppressed_from_operator_alerts(
+    db_session, mocker
+):
+    """COST_REGRESSION stays strategist-internal and creates no operator alert."""
     bcast = mocker.patch(
         "app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock
     )
@@ -4339,24 +4341,13 @@ async def test_payoff_transition_cost_regression_fires_warning(db_session, mocke
     await db_session.refresh(project)
 
     fired = await maybe_alert_pool_payoff_transition(db_session, project.id)
-    assert fired == POOL_PAYOFF_COST_REGRESSION
+    assert fired is None
+    assert await _payoff_alerts(db_session, project.id) == []
+    bcast.assert_not_awaited()
 
-    alerts = await _payoff_alerts(db_session, project.id)
-    assert len(alerts) == 1
-    assert alerts[0].severity == AlertSeverity.WARNING
-    assert "COST_REGRESSION" in alerts[0].title
-    # Supporting numbers must be embedded so the operator can act from the alert.
-    assert "20.00%" in alerts[0].message  # idle-inclusive cost drift
-    assert "0.4" in alerts[0].message  # pool hit rate
-    assert "8 warm starts" in alerts[0].message
-    bcast.assert_awaited()
-
-    # The marker advanced so a repeat tick is deduped (see next test's path).
+    # Suppression must not advance the durable operator-alert marker.
     await db_session.refresh(project)
-    assert (
-        project.design_doc[DESIGN_DOC_KEY][LAST_ALERTED_PAYOFF_KEY]
-        == POOL_PAYOFF_COST_REGRESSION
-    )
+    assert LAST_ALERTED_PAYOFF_KEY not in project.design_doc[DESIGN_DOC_KEY]
 
 
 @pytest.mark.asyncio
@@ -4393,8 +4384,10 @@ async def test_payoff_transition_does_not_advance_marker_without_alert(
 
 
 @pytest.mark.asyncio
-async def test_payoff_transition_dedups_same_verdict(db_session, mocker):
-    """A second tick at the same verdict does not fire a second alert."""
+async def test_payoff_internal_verdict_remains_suppressed_across_ticks(
+    db_session, mocker
+):
+    """Repeated strategist-internal verdicts remain suppressed and unmarked."""
     mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
     project = make_project(
         build_config=_warm_pool_alert_build_config(),
@@ -4419,10 +4412,11 @@ async def test_payoff_transition_dedups_same_verdict(db_session, mocker):
 
     first = await maybe_alert_pool_payoff_transition(db_session, project_id)
     second = await maybe_alert_pool_payoff_transition(db_session, project_id)
-    assert first == POOL_PAYOFF_COST_REGRESSION
-    assert second is None  # deduped on the persisted marker
-    alerts = await _payoff_alerts(db_session, project_id)
-    assert len(alerts) == 1
+    assert first is None
+    assert second is None
+    assert await _payoff_alerts(db_session, project_id) == []
+    await db_session.refresh(project)
+    assert LAST_ALERTED_PAYOFF_KEY not in project.design_doc[DESIGN_DOC_KEY]
 
 
 @pytest.mark.asyncio
@@ -4614,8 +4608,8 @@ async def _routing_alerts(db_session, project_id):
 
 
 @pytest.mark.asyncio
-async def test_routing_verdict_adopt_fires_warning(db_session, mocker):
-    """A transition to ADOPT fires one WARNING carrying the supporting numbers."""
+async def test_routing_adopt_is_suppressed_from_operator_alerts(db_session, mocker):
+    """ADOPT stays strategist-internal and creates no operator alert."""
     bcast = mocker.patch(
         "app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock
     )
@@ -4627,28 +4621,21 @@ async def test_routing_verdict_adopt_fires_warning(db_session, mocker):
     await db_session.refresh(project)
 
     fired = await maybe_alert_provider_routing_transition(db_session, project.id)
-    assert fired == PROVIDER_ROUTING_ADOPT
+    assert fired is None
+    assert await _routing_alerts(db_session, project.id) == []
+    bcast.assert_not_awaited()
 
-    alerts = await _routing_alerts(db_session, project.id)
-    assert len(alerts) == 1
-    assert alerts[0].severity == AlertSeverity.WARNING
-    assert "ADOPT" in alerts[0].title
-    assert "0.50" in alerts[0].message  # cost ratio
-    assert "Adopt DeepSeek" in alerts[0].message
-    bcast.assert_awaited()
-
-    # The marker advanced so a repeat tick is deduped.
+    # Suppression must not advance the durable operator-alert marker.
     await db_session.refresh(project)
-    assert (
-        project.design_doc[DESIGN_DOC_KEY][LAST_ALERTED_ROUTING_KEY]
-        == PROVIDER_ROUTING_ADOPT
-    )
+    assert LAST_ALERTED_ROUTING_KEY not in project.design_doc[DESIGN_DOC_KEY]
 
 
 @pytest.mark.asyncio
-async def test_routing_verdict_reject_fires_warning(db_session, mocker):
-    """A transition to REJECT fires one WARNING."""
-    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+async def test_routing_reject_is_suppressed_from_operator_alerts(db_session, mocker):
+    """REJECT stays strategist-internal and creates no operator alert."""
+    bcast = mocker.patch(
+        "app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock
+    )
     project = make_project(
         design_doc=_routing_design_doc(verdict_state=PROVIDER_ROUTING_REJECT),
     )
@@ -4657,16 +4644,18 @@ async def test_routing_verdict_reject_fires_warning(db_session, mocker):
     await db_session.refresh(project)
 
     fired = await maybe_alert_provider_routing_transition(db_session, project.id)
-    assert fired == PROVIDER_ROUTING_REJECT
-
-    alerts = await _routing_alerts(db_session, project.id)
-    assert len(alerts) == 1
-    assert "REJECT" in alerts[0].title
+    assert fired is None
+    assert await _routing_alerts(db_session, project.id) == []
+    bcast.assert_not_awaited()
+    await db_session.refresh(project)
+    assert LAST_ALERTED_ROUTING_KEY not in project.design_doc[DESIGN_DOC_KEY]
 
 
 @pytest.mark.asyncio
-async def test_routing_verdict_dedups_same_verdict(db_session, mocker):
-    """A second tick at the same verdict does not fire a second alert."""
+async def test_routing_internal_verdict_remains_suppressed_across_ticks(
+    db_session, mocker
+):
+    """Repeated strategist-internal verdicts remain suppressed and unmarked."""
     mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
     project = make_project(
         design_doc=_routing_design_doc(verdict_state=PROVIDER_ROUTING_ADOPT),
@@ -4681,10 +4670,11 @@ async def test_routing_verdict_dedups_same_verdict(db_session, mocker):
 
     first = await maybe_alert_provider_routing_transition(db_session, project_id)
     second = await maybe_alert_provider_routing_transition(db_session, project_id)
-    assert first == PROVIDER_ROUTING_ADOPT
-    assert second is None  # deduped on the persisted marker
-    alerts = await _routing_alerts(db_session, project_id)
-    assert len(alerts) == 1
+    assert first is None
+    assert second is None
+    assert await _routing_alerts(db_session, project_id) == []
+    await db_session.refresh(project)
+    assert LAST_ALERTED_ROUTING_KEY not in project.design_doc[DESIGN_DOC_KEY]
 
 
 @pytest.mark.asyncio

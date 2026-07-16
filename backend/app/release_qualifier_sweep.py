@@ -316,12 +316,27 @@ async def _cancel_qualifier_children(
     ]
     now = _utcnow()
 
+    # Batch-fetch all child tasks in one query instead of N+1 session.get calls.
+    child_ids = [
+        qual[k] for k in child_keys if isinstance(qual.get(k), str)
+    ]
+    children_by_id: dict[str, Task] = {}
+    if child_ids:
+        children_by_id = {
+            str(t.id): t
+            for t in (
+                (await session.execute(select(Task).where(Task.id.in_(child_ids))))
+                .scalars()
+                .all()
+            )
+        }
+
     for child_key in child_keys:
         child_id = qual.get(child_key)
         if not child_id or not isinstance(child_id, str):
             continue
         try:
-            task = await session.get(Task, child_id)
+            task = children_by_id.get(child_id)
             if task is None:
                 continue
             if task.status in (

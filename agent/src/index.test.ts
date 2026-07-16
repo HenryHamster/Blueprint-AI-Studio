@@ -5227,6 +5227,20 @@ describe('main pool-mode startup ordering', () => {
             action: 'claim',
             task_id: 'pool-task-main-1',
             agent_token: makeTaskToken('pool-task-main-1'),
+            secret_manifest: {
+              env: {
+                PROVIDER: 'openai',
+                AUTH_MODE: 'api_key',
+                OPENAI_API_KEY: 'retargeted-openai-key',
+                CODEX_API_KEY: 'retargeted-openai-key',
+              },
+              files: [],
+              metadata: {
+                retarget: true,
+                provider: 'openai',
+                auth_mode: 'api_key',
+              },
+            },
           }),
         });
       }
@@ -5278,6 +5292,11 @@ describe('main pool-mode startup ordering', () => {
     });
     expect(process.env.TASK_ID).toBe('pool-task-main-1');
     expect(getAgentToken()).toBe(makeTaskToken('pool-task-main-1'));
+    // The first-role credential self-heal must preserve the pool claim's
+    // retargeted runtime instead of restoring the frozen Anthropic boot state.
+    expect(process.env.PROVIDER).toBe('openai');
+    expect(getProviderRunner().provider).toBe('openai');
+    expect(_getActiveCredentialStateSourceForTesting()).toBe('retarget');
     expect(process.env.BLUEPRINT_WARM_HANDOFF).toBeUndefined();
     expect(vi.mocked(fs.unlinkSync).mock.calls).toEqual(expect.arrayContaining([
       ['/tmp/task_stale-persisted_result.json'],

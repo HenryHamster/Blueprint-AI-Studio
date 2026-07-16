@@ -1212,6 +1212,33 @@ async def onboard_project(
         session.add(seeded_message)
         session.add(project)
 
+    from app.strategic_resident_checkpointing import initialize_strategic_resident
+
+    resident = await initialize_strategic_resident(
+        session, project.id, locked_project=project
+    )
+    if seeded_message is not None:
+        from app.strategic_resident_turns import coalesce_shadow_resident_turn
+
+        try:
+            async with session.begin_nested():
+                await coalesce_shadow_resident_turn(
+                    session,
+                    project_id=project.id,
+                    lane="interactive",
+                    trigger_kind="operator_message",
+                    message_sequence=seed_sequence,
+                    locked_resident=resident,
+                )
+        except Exception:
+            # Fresh projects are legacy-owned during the shadow rollout. A
+            # projection-only enqueue failure must not reject onboarding or the
+            # durably accepted initial steering message.
+            logger.warning(
+                "[ONBOARD] shadow Resident enqueue failed for project %s",
+                project.id,
+                exc_info=True,
+            )
     await session.commit()
     await session.refresh(project)
 

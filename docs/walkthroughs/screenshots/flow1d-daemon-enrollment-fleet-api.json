@@ -1,0 +1,42 @@
+{
+  "_comment": "Fleet API response captured from GET /api/admin/projects/{PROJECT_ID}/runners after step 1d daemon enrollment. Runner was started as a live daemon (no --check), connected to the orchestrator at http://127.0.0.1:8080, and sent heartbeats to POST /api/runner/heartbeat. This JSON proves FULL daemon enrollment: last_seen_at transitioned from null (pre-daemon) to a live timestamp, and current_token_heartbeat_confirmed=true.",
+  "_capture_time": "2026-07-16T18:27:38.000Z",
+  "_before_daemon_start": {
+    "last_seen_at": null,
+    "current_token_heartbeat_confirmed": false
+  },
+  "_after_10s_daemon_run": {
+    "id": "0e5204c0-be61-428d-8986-d1e1117f3834",
+    "enrollment_project_id": "00000000-0000-4000-8000-000000000001",
+    "hostname": "agent-vm-5cfd2c65e0af4f6c90c08d4f2e0dadb7",
+    "version": null,
+    "status": "active",
+    "last_seen_at": "2026-07-16T18:27:28.413Z",
+    "created_at": "2026-07-16T18:27:12.600Z",
+    "token_age_days": 0,
+    "current_token_heartbeat_confirmed": true,
+    "health": {
+      "device_status": "connected",
+      "seconds_since_last_seen": 9,
+      "stale_reason": null
+    }
+  },
+  "_enrollment_evidence": {
+    "heartbeat_observed": true,
+    "last_seen_at_transitioned": "null -> 2026-07-16T18:27:28.413Z",
+    "token_generation_confirmed": true,
+    "device_status": "connected",
+    "runner_id": "0e5204c0-be61-428d-8986-d1e1117f3834",
+    "daemon_stdout_excerpt": [
+      "[runner] token loaded from BLUEPRINT_RUNNER_TOKEN env",
+      "Blueprint local fleet runner — starting",
+      "  runner host     : agent-vm-5cfd2c65e0af4f6c90c08d4f2e0dadb7",
+      "  orchestrator    : http://127.0.0.1:8080",
+      "[runner] heartbeat OK (HTTP 200) — runner active, compute available",
+      "[runner] heartbeat OK (HTTP 200) — runner active, compute available",
+      "[runner] heartbeat OK (HTTP 200) — runner active, compute available",
+      "[runner] heartbeat OK (HTTP 200) — runner active, compute available",
+      "[runner] SIGTERM received — shutting down gracefully"
+    ]
+  }
+}

@@ -282,8 +282,9 @@ from app.task_lifecycle_github_helpers import (  # noqa: E402, F401, RUF100
 async def _has_active_strategic_task(project_id, session: AsyncSession) -> bool:
     """Return True if any QUEUED/PROVISIONING/IN_PROGRESS/EVALUATING task is a design_doc_update or strategic_review.
 
-    Takes a FOR UPDATE lock on the project row so the check+spawn is transactionally
-    atomic. Without it, two concurrent callers (e.g. design_doc completion chaining
+    Takes a FOR NO KEY UPDATE lock on the project row so the check+spawn is transactionally
+    atomic while remaining compatible with Task FK KEY SHARE inserts. Without it,
+    two concurrent callers (e.g. design_doc completion chaining
     to phase 2 and an autonomous-research tick) can both read "none active" in the
     same window and each insert a duplicate strategic task.
 
@@ -309,7 +310,11 @@ async def _has_active_strategic_task(project_id, session: AsyncSession) -> bool:
     result = await session.execute(
         select(Project.id)
         .where(Project.id == project_id)
-        .with_for_update(skip_locked=True)
+        # SQLAlchemy renders key_share=True (without read=True) as
+        # ``FOR NO KEY UPDATE`` on PostgreSQL: strategic spawners still
+        # serialize with each other, while ordinary Task FK inserts and
+        # conversation sends can take KEY SHARE without convoying.
+        .with_for_update(skip_locked=True, key_share=True)
     )
     if result.first() is None:
         # Row missing or held — fail safe. The other holder will spawn (or

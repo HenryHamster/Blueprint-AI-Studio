@@ -74,7 +74,7 @@ from app.strategic_context_package import (
     resolve_selected_ref_descriptors,
     selected_ref_descriptor,
 )
-from app.strategic_runtime_work import build_strategic_runtime_summary
+from app.strategic_runtime_work import build_strategic_runtime_summary, load_project_runners
 # Canonical runner-liveness window (300s). is_live in _runner_health is purely
 # time-derived (status=='active' AND now-last_seen < this), so the broad-revision
 # fingerprint must probe it against the wall clock, not just max(last_seen_at).
@@ -1099,7 +1099,13 @@ _SESSION_OUTPUT_LIMIT = 8
 
 
 def _session_conversation_predicate():
-    return ProjectMessage.surface == MessageSurface.CONVERSATION
+    return and_(
+        ProjectMessage.surface == MessageSurface.CONVERSATION,
+        or_(
+            ProjectMessage.context["event_type"].as_string().is_(None),
+            ProjectMessage.context["event_type"].as_string() != _CHECK_IN_EVENT_TYPE,
+        ),
+    )
 
 
 def _message_preview(
@@ -1256,8 +1262,7 @@ async def _recent_session_conversation(
                 )
             )
         ).scalars().first()
-        if included_message is None:
-            raise HTTPException(status_code=404, detail="Conversation message not found")
+        # Silently ignore cross-project or deleted messages — 404 would leak existence.
 
     if included_message is not None and included_message.sequence is not None:
         before_count = limit // 2
@@ -2295,10 +2300,16 @@ async def get_project_strategic_state(
         # path on ?state_revision= and keeps its held ETag untouched on a 304.
         return Response(status_code=304)
 
+    # Fetch project runners once; pass to attention, runtime summary, and
+    # resident options so all three share one DB round-trip instead of three.
+    project_runners = await load_project_runners(session, project.id)
+
     # Attention uses bounded previews but still performs several queries.  The
     # revision fingerprint covers its source rows, so only construct it when a
     # changed response actually needs to be assembled.
-    attention = await build_operator_attention(session, project, current_user["user_id"])
+    attention = await build_operator_attention(
+        session, project, current_user["user_id"], runner_rows=project_runners
+    )
 
     # Revision miss (or first-load with no token): build the full context
     # package. With the broad guard above, reaching here means a visible segment
@@ -2323,13 +2334,16 @@ async def get_project_strategic_state(
         active_task=active_task,
         project_vision=project.vision or {},
         operator_user_id=current_user["user_id"],
+        runner_rows=project_runners,
     )
     # Multi-device resident-session picker: every enrolled runner with its
     # online / agent-ready / eligible flags (for the auto-pick + override
     # dropdown) and, via ``_resident_session_availability``, the block-on-offline
     # verdict for a session pinned to a now-offline device.
     async with async_timed(request, "runners"):
-        resident_runner_options = await build_resident_runner_options(session, project.id)
+        resident_runner_options = await build_resident_runner_options(
+            session, project.id, runner_rows=project_runners
+        )
     async with async_timed(request, "workbench"):
         workbench_state = await get_strategic_workbench_state(
             session,
@@ -3174,7 +3188,7 @@ async def create_project_strategic_session_message(
     ) -> Dict[str, Any]:
         revalidated_context, _ = await _validated_message_scoped_context(
             locked_session,
-            project_id=project.id,
+            project_id=project_id,
             payload=payload,
             lock_references=True,
         )
@@ -3185,7 +3199,7 @@ async def create_project_strategic_session_message(
             )
         return await _consume_message_attachment_uploads(
             locked_session,
-            project_id=project.id,
+            project_id=project_id,
             actor_user_id=current_user["user_id"],
             message_id=message_id,
             context=current_context,
@@ -3223,7 +3237,7 @@ async def create_project_strategic_session_message(
         "arming": result.arming,
         "wakeup_state": result.wakeup_state,
         "message": message_preview,
-        "project_id": str(project.id),
+        "project_id": str(project_id),
     }
     if result.message_event is not None:
         await broadcast_to_project(
