@@ -458,6 +458,107 @@ def _web_research_grounding_miss(document: dict[str, Any]) -> str | None:
     return None
 
 
+_WEB_URL_PREFIXES = ("http://", "https://")
+# Definitive HTTP status codes that mean the resource does not exist.
+_HTTP_DEAD_STATUSES = frozenset({404, 410})
+# Maximum number of web URLs probed per design document (keeps gate latency bounded).
+_MAX_DESIGN_URL_PROBES = 10
+
+
+async def _probe_url_reachability(url: str) -> str:
+    """Probe a single URL and return 'reachable', 'dead', or 'transient'.
+
+    dead    — DNS resolution failure, connection refused, HTTP 404 or 410.
+    transient — timeout, HTTP 5xx, or any other recoverable network error.
+    reachable — HTTP 2xx or 3xx.
+
+    Tries HEAD first (cheaper); falls back to GET on 405 Method Not Allowed.
+    Performs one retry (with a 1-second delay) on transient errors so a
+    momentary network hiccup does not produce a hard rejection.
+    """
+    import httpx
+
+    timeout = httpx.Timeout(5.0)
+
+    async def _try() -> str:
+        try:
+            async with httpx.AsyncClient(
+                timeout=timeout, follow_redirects=True
+            ) as client:
+                resp = await client.head(url)
+                status = resp.status_code
+                if status == 405:
+                    resp = await client.get(url)
+                    status = resp.status_code
+        except httpx.ConnectError:
+            return "dead"
+        except (httpx.TimeoutException, httpx.NetworkError):
+            return "retry"
+        except Exception:  # noqa: BLE001 — best-effort probe; unexpected errors are transient
+            return "transient"
+        if status in _HTTP_DEAD_STATUSES:
+            return "dead"
+        if 200 <= status < 400:
+            return "reachable"
+        if status >= 500:
+            return "retry"
+        return "transient"
+
+    result = await _try()
+    if result == "retry":
+        await asyncio.sleep(1.0)
+        second = await _try()
+        return second if second != "retry" else "transient"
+    return result
+
+
+async def _design_web_only_grounding_miss(document: dict[str, Any]) -> str | None:
+    """Return a failure reason when a web-only design document cites only unreachable URLs.
+
+    Fires only when ALL usable citations in the design document are web URLs
+    (http:// or https://) — i.e. the document carries no file-path or file:
+    citations at all. This is the "greenfield design" case where the agent has
+    no codebase to reference and cites external web sources instead.
+
+    When file citations are present alongside web URLs, :func:`_design_grounding_miss`
+    already handles the codebase-grounding probe; this function returns None and
+    defers to it.
+
+    Errs toward acceptance — mirrors the philosophy of the surrounding gates:
+    - No web URLs present → None (nothing to check).
+    - File citations also present → None (codebase-grounding probe covers it).
+    - Any URL is reachable → None (one good source is enough).
+    - All errors are transient (timeouts, 5xx) → None (flaky network ≠ dead URL).
+    - ALL URLs are definitively dead (DNS/404/410) → returns failure reason.
+    """
+    citations = _usable_citations(document)
+    if not citations:
+        return None
+
+    web_urls = [c for c in citations if c.lower().startswith(_WEB_URL_PREFIXES)]
+    non_web = [c for c in citations if not c.lower().startswith(_WEB_URL_PREFIXES)]
+
+    if non_web or not web_urls:
+        return None
+
+    probed = web_urls[:_MAX_DESIGN_URL_PROBES]
+    results = await asyncio.gather(
+        *[_probe_url_reachability(u) for u in probed],
+        return_exceptions=True,
+    )
+    outcomes = [
+        r if isinstance(r, str) else "transient" for r in results
+    ]
+
+    if outcomes and all(o == "dead" for o in outcomes):
+        return (
+            "web-only design document cites only unreachable sources: all "
+            f"{len(outcomes)} URL(s) are definitively dead "
+            "(DNS failure or HTTP 404/410)"
+        )
+    return None
+
+
 def _compute_grounding_miss(document: dict[str, Any]) -> str | None:
     """Return an operator-readable reason when a COMPUTE document is ungrounded.
 
@@ -1081,6 +1182,20 @@ async def _handle_knowledge_document_completion(
             await _fail_gate(
                 task,
                 EvaluationVerdict(False, f"{kind} {grounding_miss}", "forward-quality"),
+                session,
+                kind,
+            )
+            return
+        # Web-only URL reachability probe (design only, greenfield path): when a
+        # design document cites ONLY web URLs (no file-path citations), those URLs
+        # are its sole grounding evidence. Probe each for reachability so a doc
+        # grounded entirely in dead/fabricated links cannot pass acceptance. Errs
+        # toward acceptance — passes on transient errors and when any URL is live.
+        web_only_miss = await _design_web_only_grounding_miss(document)
+        if web_only_miss is not None:
+            await _fail_gate(
+                task,
+                EvaluationVerdict(False, f"{kind} {web_only_miss}", "forward-quality"),
                 session,
                 kind,
             )
