@@ -128,7 +128,7 @@ function isDockerRunner(runner: TestRunner): boolean {
   return cmdAndArgs.includes('docker') || cmdAndArgs.includes('scripts/test-backend.sh');
 }
 
-function isDockerAvailable(): boolean {
+export function isDockerAvailable(): boolean {
   try {
     execSync('docker version', { stdio: 'ignore', timeout: 2000 });
     return true;

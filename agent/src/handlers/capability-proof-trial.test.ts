@@ -27,16 +27,34 @@ import { prepareWorkspaceForRole } from '../workspacePrep.js';
 
 const WS = '/tmp/ws';
 
+// Deterministic Docker-availability stubs for buildCapabilityProofTrialRunner tests.
+const dockerAvailable = () => true;
+const dockerUnavailable = () => false;
+
 describe('buildCapabilityProofTrialRunner', () => {
-  it('targets Python refs via scripts/test-backend.sh, backend/-relative', () => {
+  it('targets Python refs via scripts/test-backend.sh with --postgres when Docker available', () => {
     const runner = buildCapabilityProofTrialRunner(
       ['backend/testing/test_foo.py', 'backend/testing/test_bar.py'],
       WS,
+      dockerAvailable,
     );
     expect(runner).toEqual({
       cmd: 'bash',
       cwd: WS,
-      args: ['scripts/test-backend.sh', 'testing/test_foo.py', 'testing/test_bar.py'],
+      args: ['scripts/test-backend.sh', '--postgres', 'testing/test_foo.py', 'testing/test_bar.py'],
+    });
+  });
+
+  it('uses --no-postgres when Docker is unavailable (prevents env-failure on Docker-less VMs)', () => {
+    const runner = buildCapabilityProofTrialRunner(
+      ['backend/testing/test_foo.py', 'backend/testing/test_bar.py'],
+      WS,
+      dockerUnavailable,
+    );
+    expect(runner).toEqual({
+      cmd: 'bash',
+      cwd: WS,
+      args: ['scripts/test-backend.sh', '--no-postgres', 'testing/test_foo.py', 'testing/test_bar.py'],
     });
   });
 
@@ -44,11 +62,12 @@ describe('buildCapabilityProofTrialRunner', () => {
     const runner = buildCapabilityProofTrialRunner(
       ['backend/testing/test_foo.py::test_x'],
       WS,
+      dockerUnavailable,
     );
     expect(runner).toEqual({
       cmd: 'bash',
       cwd: WS,
-      args: ['scripts/test-backend.sh', 'testing/test_foo.py::test_x'],
+      args: ['scripts/test-backend.sh', '--no-postgres', 'testing/test_foo.py::test_x'],
     });
   });
 

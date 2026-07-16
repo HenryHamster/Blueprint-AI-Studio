@@ -29,6 +29,7 @@ import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import {
   classifyAcceptanceTestRun, acceptanceTestRunPassed,
   matchesEnvironmentFailureSignature,
+  isDockerAvailable,
 } from '../utils/test-runners.js';
 
 // Default hard cap on covering test files per trial (mirrors the backend
@@ -84,17 +85,23 @@ function tsPackageDir(ref: string): string {
  * Build the TARGETED runner that runs ONLY the passed covering test refs, choosing
  * the command by test-ref extension (the same per-file targeting primitive the
  * verify-tests gate's `buildAcceptanceTestRunner` embodies):
- *   - Python (`.py`) refs → `bash scripts/test-backend.sh testing/test_<name>.py ...`
+ *   - Python (`.py`) refs → `bash scripts/test-backend.sh <pgFlag> testing/test_<name>.py ...`
  *     (paths normalized to the `backend/`-relative form the script expects).
+ *     pgFlag is `--postgres` when Docker is available, `--no-postgres` otherwise —
+ *     the same isDockerAvailable() fallback the verify-tests gate uses (test-runners.ts:445)
+ *     so trials on Docker-less VMs do not trip the env-failure signature.
  *   - TS/JS refs → `npx vitest run <file> ...` from the owning package dir.
  *
  * Returns `null` when the refs cannot be targeted cleanly in a SINGLE invocation:
  * empty, an unknown extension, or a mix of languages / vitest packages. The caller
  * then reports `could_not_run: true` and mints nothing.
+ *
+ * `checkDockerAvailable` is injectable for testing (defaults to `isDockerAvailable`).
  */
 export function buildCapabilityProofTrialRunner(
   testRefs: string[],
   workspace: string = WORKSPACE,
+  checkDockerAvailable: () => boolean = isDockerAvailable,
 ): { cmd: string; args: string[]; cwd: string } | null {
   const refs = testRefs.filter(r => typeof r === 'string' && r.trim()).map(r => r.trim());
   if (refs.length === 0) return null;
@@ -109,7 +116,11 @@ export function buildCapabilityProofTrialRunner(
   if (lang === 'py') {
     // scripts/test-backend.sh expects `backend/`-relative paths (e.g.
     // `testing/test_foo.py`); strip a leading `backend/` from each ref.
-    const args = ['scripts/test-backend.sh'];
+    // Pass --postgres when Docker is available so tests run against a real PG
+    // sidecar (matching CI); fall back to --no-postgres on Docker-less VMs so
+    // the trial does not trip the env-failure signature and mint nothing.
+    const pgFlag = checkDockerAvailable() ? '--postgres' : '--no-postgres';
+    const args = ['scripts/test-backend.sh', pgFlag];
     for (const ref of refs) {
       args.push(ref.startsWith('backend/') ? ref.slice('backend/'.length) : ref);
     }
