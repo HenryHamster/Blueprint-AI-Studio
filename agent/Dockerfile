@@ -51,7 +51,7 @@ RUN apt-get update \
 # compatibility and its platform-native optional package are dispatch-critical;
 # an unpinned rebuild or npm configured with omit=optional can leave a PATH shim
 # that crashes before inference.
-ARG CLAUDE_CODE_VERSION=latest
+ARG CLAUDE_CODE_VERSION=2.1.197
 ARG CODEX_VERSION=0.144.1
 ARG GEMINI_VERSION=latest
 # The version smoke enters Codex's JS-shim -> native-package startup path
@@ -61,7 +61,9 @@ RUN npm install -g --include=optional \
         "@openai/codex@${CODEX_VERSION}" \
         "@google/gemini-cli@${GEMINI_VERSION}" \
     && codex_version="$(codex --version | awk '{print $NF}')" \
-    && test "${codex_version}" = "${CODEX_VERSION}"
+    && test "${codex_version}" = "${CODEX_VERSION}" \
+    && claude_version="$(claude --version | awk '{print $1}')" \
+    && test "${claude_version}" = "${CLAUDE_CODE_VERSION}"
 
 # Default git identity for any commits the agent makes — agent.pkr.hcl:118-119.
 # --system so it applies regardless of which user the container runs as.
