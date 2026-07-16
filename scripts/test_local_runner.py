@@ -3339,6 +3339,70 @@ class TestGpuDetection(unittest.TestCase):
         self.assertIsNone(body["agent_backend"])
         self.assertIsNone(body["compute_backend"])
         self.assertIsNone(body["version"])
+        self.assertNotIn("project_verification", body)
+
+    def test_project_verification_included_without_changing_availability(self):
+        posted_bodies = []
+        verification = {
+            "version": 1,
+            "boundary": {"class": "agent", "backend": "bwrap"},
+            "ready": False,
+            "reason": "docker unavailable in agent boundary",
+            "probes": {
+                "ruff": {"ok": True, "exit_code": 0, "reason": None},
+                "docker_postgres": {
+                    "ok": False,
+                    "exit_code": 127,
+                    "reason": "docker unavailable in agent boundary",
+                },
+            },
+        }
+
+        def fake_post(url, token, body, **kwargs):
+            posted_bodies.append(body)
+            local_runner._shutdown_event.set()
+            return 200, {"ok": True}
+
+        local_runner._shutdown_event.clear()
+        try:
+            with patch.object(local_runner, "_post", fake_post), \
+                 patch.object(local_runner, "_locate_agent_binary", return_value=["node", "/agent/dist/index.js"]), \
+                 patch.object(local_runner, "_node_runtime_ok", return_value=True):
+                local_runner._heartbeat_loop(
+                    "https://api",
+                    "tok",
+                    {},
+                    threading.Lock(),
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                    caps=_bwrap_caps(),
+                    project_verification=verification,
+                )
+        finally:
+            local_runner._shutdown_event.clear()
+
+        self.assertEqual(posted_bodies[0]["project_verification"], verification)
+        self.assertTrue(posted_bodies[0]["agent_available"])
+
+    def test_verification_plan_uses_write_agent_boundary(self):
+        fake_plan = iso.ExecutionPlan(backend=iso.BACKEND_BWRAP, argv=["bwrap"])
+        expected = {"version": 1, "ready": False}
+        with patch.object(iso, "plan_agent_execution", return_value=fake_plan) as planner, \
+             patch.object(iso, "probe_project_verification", return_value=expected), \
+             patch.object(local_runner.shutil, "copy2") as copy_probe:
+            report = local_runner._earn_project_verification(
+                _bwrap_caps(), ["node", "/agent/dist/index.js"], None
+            )
+
+        self.assertEqual(report, expected)
+        self.assertEqual(planner.call_args.kwargs["task_type"], "fix")
+        self.assertEqual(
+            planner.call_args.kwargs["injected_env"]["TASK_ID"],
+            "project-verification-probe",
+        )
+        self.assertEqual(copy_probe.call_args.args[0], iso.PROJECT_VERIFICATION_PROBE_PATH)
+        self.assertTrue(
+            copy_probe.call_args.args[1].endswith("/project-verification-probe.sh")
+        )
 
     def test_llm_clis_included_in_heartbeat_body(self):
         """Heartbeat body carries the LLM CLI inventory when caps are supplied."""

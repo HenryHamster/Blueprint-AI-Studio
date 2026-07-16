@@ -172,6 +172,52 @@ def test_build_config_directory_entry_has_confirmed_lint_cmd():
     assert "confirmed_lint_cmd" not in dumped2
 
 
+def test_build_config_directory_entry_round_trips_project_verification():
+    from app.schemas import BuildConfigDirectoryEntry
+
+    entry = BuildConfigDirectoryEntry(
+        path=" backend/// ",
+        type="python",
+        project_verification={
+            "protocol": "blueprint-v1",
+            "harness": "scripts/test-backend.sh",
+        },
+    )
+
+    assert entry.model_dump(exclude_none=True) == {
+        "path": "backend",
+        "type": "python",
+        "project_verification": {
+            "protocol": "blueprint-v1",
+            "harness": "scripts/test-backend.sh",
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "project_verification",
+    [
+        {"protocol": "other", "harness": "scripts/test-backend.sh"},
+        {"protocol": "blueprint-v1", "harness": "scripts/test backend.sh"},
+        {"protocol": "blueprint-v1", "harness": "/tmp/verify.sh"},
+        {"protocol": "blueprint-v1", "harness": "../verify.sh"},
+    ],
+)
+def test_build_config_directory_entry_rejects_invalid_project_verification(
+    project_verification,
+):
+    from pydantic import ValidationError
+
+    from app.schemas import BuildConfigDirectoryEntry
+
+    with pytest.raises(ValidationError):
+        BuildConfigDirectoryEntry(
+            path="backend",
+            type="python",
+            project_verification=project_verification,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Integration tests: PATCH /api/agent/projects/{project_id}/build-config/commands
 # ---------------------------------------------------------------------------

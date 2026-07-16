@@ -199,6 +199,42 @@ describe('resolveBuildConfig', () => {
     expect(entry).toEqual({ path: 'src', type: 'node' });
   });
 
+  it('retains only an explicit safe project-verification harness contract', () => {
+    const valid = resolveBuildConfig({
+      build_config: {
+        directories: [{
+          path: '.', type: 'python',
+          project_verification: { protocol: 'blueprint-v1', harness: 'tools/verify.sh' },
+        }],
+      },
+    });
+    expect(valid?.directories?.[0].project_verification).toEqual({
+      protocol: 'blueprint-v1', harness: 'tools/verify.sh',
+    });
+
+    const canonical = resolveBuildConfig({
+      build_config: {
+        directories: [{
+          path: ' backend/// ', type: 'python',
+          project_verification: { protocol: 'blueprint-v1', harness: 'tools/verify.sh' },
+        }],
+      },
+    });
+    expect(canonical?.directories?.[0].path).toBe('backend');
+
+    for (const project_verification of [
+      { protocol: 'other', harness: 'tools/verify.sh' },
+      { protocol: 'blueprint-v1', harness: '../verify.sh' },
+      { protocol: 'blueprint-v1', harness: '/tmp/verify.sh' },
+      { protocol: 'blueprint-v1', harness: 'tools/verify script.sh' },
+    ]) {
+      const config = resolveBuildConfig({
+        build_config: { directories: [{ path: '.', type: 'python', project_verification }] },
+      });
+      expect(config?.directories?.[0].project_verification).toBeUndefined();
+    }
+  });
+
   it('maps nested git_identity object to git_user_name/email', () => {
     const task = {
       build_config: {

@@ -56,6 +56,15 @@ DECLINE = "declined"
 SANDBOX_WORKSPACE = "/workspace"
 SANDBOX_HOME = "/home"
 
+PROJECT_VERIFICATION_VERSION = 1
+PROJECT_VERIFICATION_PROBE_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "project-verification-probe.sh"
+)
+PROJECT_VERIFICATION_SANDBOX_PATH = (
+    f"{SANDBOX_WORKSPACE}/project-verification-probe.sh"
+)
+PROJECT_VERIFICATION_VENV = "/opt/blueprint-backend-venv"
+
 
 # ── Env allowlists (never os.environ.copy) ───────────────────────────────────
 
@@ -1556,6 +1565,7 @@ def plan_agent_execution(
         *_BASE_RO_BINDS,
         agent_pkg_root,
         agent_real,
+        PROJECT_VERIFICATION_VENV,
         *npm_tool_roots(tools),
     ]
 
@@ -1895,6 +1905,126 @@ def pull_container_image(
         detail = ((result.stderr or "") + (result.stdout or "")).strip()
         return False, f"image pull exited {result.returncode}: {detail[:500]}"
     return True, f"pulled {image}"
+
+
+def _project_verification_probe_result(
+    plan: ExecutionPlan,
+    probe_mode: str,
+    *,
+    timeout: int,
+) -> dict[str, object]:
+    """Run one verification leg in the exact planned agent boundary."""
+    if plan.declined:
+        return {
+            "ok": False,
+            "exit_code": None,
+            "reason": plan.decline_reason or "agent boundary declined",
+        }
+    if plan.backend != BACKEND_BWRAP:
+        return {
+            "ok": False,
+            "exit_code": None,
+            "reason": f"backend {plan.backend!r} cannot provide authoring verification",
+        }
+    try:
+        separator = len(plan.argv) - 1 - list(reversed(plan.argv)).index("--")
+    except ValueError:
+        return {
+            "ok": False,
+            "exit_code": None,
+            "reason": "unexpected bwrap argv shape — cannot build verification probe",
+        }
+    probe_argv = list(plan.argv[: separator + 1]) + [
+        "/bin/bash",
+        PROJECT_VERIFICATION_SANDBOX_PATH,
+        probe_mode,
+    ]
+    try:
+        completed = subprocess.run(
+            probe_argv,
+            env=plan.env,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "ok": False,
+            "exit_code": None,
+            "reason": f"{probe_mode} probe timed out after {timeout}s",
+        }
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {
+            "ok": False,
+            "exit_code": None,
+            "reason": f"{probe_mode} probe failed to launch: {str(exc)[:300]}",
+        }
+
+    raw_returncode = int(completed.returncode)
+    # subprocess uses a negative return code to report signal termination.
+    # Keep that as non-zero, shell-style failure evidence: clamping it to zero
+    # would incorrectly earn verification readiness for a killed probe.
+    exit_code = (
+        min(255, 128 + abs(raw_returncode))
+        if raw_returncode < 0
+        else min(255, raw_returncode)
+    )
+    if exit_code == 0:
+        return {"ok": True, "exit_code": 0, "reason": None}
+    detail = " ".join(
+        ((completed.stderr or "") + " " + (completed.stdout or "")).split()
+    )[:400]
+    return {
+        "ok": False,
+        "exit_code": exit_code,
+        "reason": detail or f"{probe_mode} probe exited {exit_code}",
+    }
+
+
+def probe_project_verification(
+    plan: ExecutionPlan,
+    *,
+    ruff_timeout: int = 30,
+    docker_postgres_timeout: int = 90,
+) -> dict[str, object]:
+    """Earn versioned Ruff + live PostgreSQL evidence in an agent boundary.
+
+    The plan is built for a write/authoring agent task.  Each functional probe
+    reuses its bwrap prefix and environment verbatim, replacing only the terminal
+    agent command. PostgreSQL starts inside the private sandbox from the baked
+    toolchain; the host Docker daemon and its authority-bearing socket remain
+    deliberately unreachable.
+    """
+    boundary = plan.backend if not plan.declined else DECLINE
+    ruff = _project_verification_probe_result(
+        plan, "ruff", timeout=ruff_timeout
+    )
+    docker_postgres = _project_verification_probe_result(
+        plan, "docker-postgres", timeout=docker_postgres_timeout
+    )
+    ready = bool(
+        ruff.get("ok") is True
+        and ruff.get("exit_code") == 0
+        and docker_postgres.get("ok") is True
+        and docker_postgres.get("exit_code") == 0
+    )
+    failed_reasons = list(
+        dict.fromkeys(
+            str(result.get("reason"))
+            for result in (ruff, docker_postgres)
+            if result.get("reason")
+        )
+    )
+    return {
+        "version": PROJECT_VERIFICATION_VERSION,
+        "boundary": {"class": CLASS_AGENT, "backend": boundary},
+        "ready": ready,
+        "reason": None if ready else "; ".join(failed_reasons)[:500],
+        "probes": {
+            "ruff": ruff,
+            "docker_postgres": docker_postgres,
+        },
+    }
 
 
 def probe_gpu_in_sandbox(plan: ExecutionPlan, timeout: int = 30) -> tuple[bool, str]:

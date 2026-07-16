@@ -3810,3 +3810,106 @@ async def test_enforce_gate_full_cycle_blocked_then_resumed(_spawn_db, mocker):
     assert disp["residual"] == [], (
         "Phase 2: no residual needs — the task would be unblocked by the sweep"
     )
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_gate_enforcement_cycle_blocked_to_queued(_spawn_db):
+    """ACCEPTANCE EVIDENCE (finding test:end-to-end-integration-test-for-capability-proof-gate-enforcement-cycle).
+
+    Full enforcement cycle with explicit provider and consumer tasks:
+
+    1. Provider task advertises 'provides_capability: my-cap'.
+    2. Consumer task is BLOCKED on 'my-cap' (no proof exists yet).
+    3. Blocked-resume sweep: consumer stays BLOCKED (gate holds — unproven).
+    4. Provider completes with proven acceptance evidence → proof recorded.
+    5. Blocked-resume sweep: consumer moves to QUEUED (gate released — proven).
+    """
+    from app.blocked_task_unblock_sweeps import sweep_unblock_blocked_tasks
+    from app.capability_proof import record_capability_proof
+    from app.models import Project, Task, TaskStatus
+    from app.shared_state import runtime_config as _rc
+    from app.time_utils import _utcnow as _now
+
+    saved_mode = _rc.get("capability_proof_gate_mode")
+    _rc["capability_proof_gate_mode"] = "enforce"
+    try:
+        # Set up project with an unproven working capability.
+        project = Project(
+            name="enforcement-cycle",
+            user_id="test-user-ec",
+            problem_model={
+                "capabilities": [{"name": "my-cap", "status": "working"}]
+            },
+        )
+        _spawn_db.add(project)
+        await _spawn_db.commit()
+        await _spawn_db.refresh(project)
+
+        # Consumer task: BLOCKED on the capability need (no proof yet).
+        consumer = Task(
+            project_id=project.id,
+            title="Consumer: needs my-cap",
+            description="x",
+            status=TaskStatus.BLOCKED,
+            created_by="ORCHESTRATOR",
+            payloads=[{"type": "create"}],
+            context={"needs": [{"kind": "capability", "ref": "my-cap"}]},
+        )
+        _spawn_db.add(consumer)
+        await _spawn_db.commit()
+        await _spawn_db.refresh(consumer)
+
+        async def _stub_verify(*_a, **_k):
+            return False
+
+        # Step 3: sweep holds the consumer BLOCKED (gate enforces — unproven).
+        requeued = await sweep_unblock_blocked_tasks(
+            _spawn_db,
+            _now(),
+            verify_pr_merged=_stub_verify,
+        )
+        await _spawn_db.refresh(consumer)
+        assert consumer.status == TaskStatus.BLOCKED, (
+            "consumer must stay BLOCKED while capability has no proof (gate holds)"
+        )
+        assert requeued == 0, "gate must not requeue the consumer when unproven"
+
+        # Step 4: provider task completes with proven acceptance evidence.
+        provider = Task(
+            project_id=project.id,
+            title="Provider: my-cap",
+            description="x",
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            payloads=[{"type": "create"}],
+            context={
+                "provides_capability": "my-cap",
+                "code_acceptance_verdict": {
+                    "proven": True,
+                    "kind": "named_test",
+                    "proof_ref": "backend/testing/test_my_cap.py::test_it",
+                },
+            },
+        )
+        recorded = record_capability_proof(provider, project)
+        assert recorded == ["my-cap"], "provider must mint proof for 'my-cap'"
+        _spawn_db.add(project)
+        await _spawn_db.commit()
+        await _spawn_db.refresh(project)
+
+        # Step 5: sweep resumes the consumer now that proof is recorded.
+        requeued2 = await sweep_unblock_blocked_tasks(
+            _spawn_db,
+            _now(),
+            verify_pr_merged=_stub_verify,
+        )
+        await _spawn_db.refresh(consumer)
+        assert consumer.status == TaskStatus.QUEUED, (
+            "consumer must transition from BLOCKED to QUEUED after proof is recorded"
+        )
+        assert requeued2 == 1, "sweep must requeue the consumer after proof lands"
+    finally:
+        if saved_mode is None:
+            _rc.pop("capability_proof_gate_mode", None)
+        else:
+            _rc["capability_proof_gate_mode"] = saved_mode

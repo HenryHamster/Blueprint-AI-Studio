@@ -235,6 +235,89 @@ async def test_heartbeat_without_legs_is_tolerated(db_session):
 
 
 @pytest.mark.asyncio
+async def test_heartbeat_persists_normalized_project_verification(db_session):
+    """Zero-exit v1 evidence is persisted without clobbering operator policy."""
+    _project, runner = await _make_runner(db_session)
+    report = {
+        "version": 1,
+        "boundary": {"class": "agent", "backend": "bwrap"},
+        "ready": True,
+        "reason": None,
+        "probes": {
+            "ruff": {"ok": True, "exit_code": 0, "reason": None},
+            "docker_postgres": {"ok": True, "exit_code": 0, "reason": None},
+        },
+    }
+
+    await heartbeat(
+        payload=HeartbeatRequest(project_verification=report),
+        runner=runner,
+        session=db_session,
+    )
+    await db_session.refresh(runner)
+
+    assert runner.capabilities["project_verification"] == report
+    assert runner.capabilities["task_types"] == "all"
+    assert runner.capabilities["max_concurrent"] == 2
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_derives_verification_ready_from_zero_exit_evidence(db_session):
+    """A runner cannot mint readiness by claiming ready over a failed probe."""
+    _project, runner = await _make_runner(db_session)
+    await heartbeat(
+        payload=HeartbeatRequest(
+            project_verification={
+                "version": 1,
+                "boundary": {"class": "agent", "backend": "bwrap"},
+                "ready": True,
+                "probes": {
+                    "ruff": {"ok": True, "exit_code": 0},
+                    "docker_postgres": {
+                        "ok": True,
+                        "exit_code": 1,
+                        "reason": "daemon inaccessible in bwrap",
+                    },
+                },
+            }
+        ),
+        runner=runner,
+        session=db_session,
+    )
+    await db_session.refresh(runner)
+
+    normalized = runner.capabilities["project_verification"]
+    assert normalized["ready"] is False
+    assert normalized["probes"]["ruff"]["ok"] is True
+    assert normalized["probes"]["docker_postgres"] == {
+        "ok": False,
+        "exit_code": 1,
+        "reason": "daemon inaccessible in bwrap",
+    }
+
+
+@pytest.mark.asyncio
+async def test_old_runner_heartbeat_is_compatible_but_clears_stale_proof(db_session):
+    """Omission stays 200-compatible and cannot retain a prior binary's proof."""
+    _project, runner = await _make_runner(
+        db_session,
+        capabilities={
+            "task_types": "all",
+            "project_verification": {"version": 1, "ready": True},
+        },
+    )
+
+    response = await heartbeat(
+        payload=HeartbeatRequest(active_work_report=True),
+        runner=runner,
+        session=db_session,
+    )
+    assert response["ok"] is True
+    await db_session.refresh(runner)
+    assert "project_verification" not in runner.capabilities
+
+
+@pytest.mark.asyncio
 async def test_heartbeat_without_report_does_not_refresh_stamp(db_session):
     """A heartbeat that is NOT a genuine active-work report (active_work_report
     False) must NOT refresh active_work_reported_at nor clobber the active set.

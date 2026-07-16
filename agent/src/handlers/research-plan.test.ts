@@ -105,6 +105,7 @@ const {
     'matchesVmConfigMissing',
     'missingProviderConfigFiles',
     'missingVmProviderConfigFiles',
+    'normalizeClaudeConfigContent',
     'normalizePytestSelectorForRunner',
     'parseFailingTests',
     'parseFailingTestsFromVitestJson',

@@ -399,6 +399,7 @@ async def get_settings(
         "total_non_exempt_working": 0,
         "projects_contributing": 0,
         "num_projects": 0,
+        "trial_eligible_unproven": 0,
     }
     try:
         from app.metrics_integrity_sweep import compute_fleet_proof_coverage
@@ -416,6 +417,7 @@ async def get_settings(
             "total_non_exempt_working": _cov["total_non_exempt_working"],
             "projects_contributing": _cov["projects_contributing"],
             "num_projects": _cov["num_projects"],
+            "trial_eligible_unproven": _cov.get("trial_eligible_unproven", 0),
         }
     except Exception:
         logger.warning(

@@ -22,6 +22,7 @@ from app.models import (
     ProjectMember,
 )
 from app.routers.admin_runners import _normalize_gpus_per_job, _runner_config_view
+from app.routers.runner import _sanitize_project_verification
 from app.time_utils import _utcnow
 from app.runner_config import (
     GPUS_PER_JOB_MAX,
@@ -31,6 +32,48 @@ from app.runner_config import (
 )
 
 TEST_USER_ID = "test-user-123"
+
+
+class TestProjectVerificationHeartbeatSanitization:
+    def _passing_report(self) -> dict:
+        return {
+            "version": 1,
+            "boundary": {"class": "agent", "backend": "bwrap"},
+            "ready": True,
+            "probes": {
+                "ruff": {"ok": True, "exit_code": 0},
+                "docker_postgres": {"ok": True, "exit_code": 0},
+            },
+        }
+
+    def test_negative_exit_code_cannot_earn_readiness(self):
+        report = self._passing_report()
+        report["probes"]["ruff"]["exit_code"] = -9
+
+        sanitized = _sanitize_project_verification(report)
+
+        assert sanitized is not None
+        assert sanitized["ready"] is False
+        assert sanitized["probes"]["ruff"] == {
+            "ok": False,
+            "exit_code": None,
+            "reason": "ruff probe reported an invalid exit code",
+        }
+
+    @pytest.mark.parametrize("boundary_class", [None, "compute"])
+    def test_non_agent_boundary_cannot_earn_readiness(self, boundary_class):
+        report = self._passing_report()
+        if boundary_class is None:
+            report["boundary"].pop("class")
+        else:
+            report["boundary"]["class"] = boundary_class
+
+        sanitized = _sanitize_project_verification(report)
+
+        assert sanitized is not None
+        assert sanitized["ready"] is False
+        assert sanitized["boundary"]["class"] == "unknown"
+        assert "boundary class was not agent" in sanitized["reason"]
 
 
 async def _make_project(session, name="Runner Stats Project"):
@@ -1185,7 +1228,19 @@ class TestRunnerEnrollWalkthrough:
         # ── Step 2: heartbeat — runner appears live ───────────────────────────
         hb_resp = await client.post(
             "/api/runner/heartbeat",
-            json={"active_task_ids": [], "active_work_report": True},
+            json={
+                "active_task_ids": [],
+                "active_work_report": True,
+                "project_verification": {
+                    "version": 1,
+                    "boundary": {"class": "agent", "backend": "bwrap"},
+                    "ready": True,
+                    "probes": {
+                        "ruff": {"ok": True, "exit_code": 0},
+                        "docker_postgres": {"ok": True, "exit_code": 0},
+                    },
+                },
+            },
             headers={"Authorization": f"Bearer {token}"},
         )
         assert hb_resp.status_code == 200, hb_resp.text
@@ -1199,6 +1254,10 @@ class TestRunnerEnrollWalkthrough:
         # Health should now show the runner as connected (recent heartbeat).
         health = row2.get("health") or {}
         assert health.get("device_status") == "connected"
+        verification = row2["capabilities"]["project_verification"]
+        assert verification["version"] == 1
+        assert verification["ready"] is True
+        assert verification["probes"]["docker_postgres"]["exit_code"] == 0
 
         # ── Step 3: rotate token — old token invalidated, new token minted ───
         rot_resp = await client.post(

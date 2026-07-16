@@ -3185,6 +3185,7 @@ def _heartbeat_loop(
     caps: "iso.Capabilities | None" = None,
     agent_image: str | None = None,
     live_config: "_LiveRunnerConfig | None" = None,
+    project_verification: dict | None = None,
 ) -> None:
     url = f"{orchestrator_url}/api/runner/heartbeat"
     has_gpu = bool(gpu_capabilities.get("has_gpu"))
@@ -3429,6 +3430,8 @@ def _heartbeat_loop(
                 "gpu_free_vram_mib": gpu_memory[1] if gpu_memory else None,
                 **gpu_capabilities,
             }
+            if project_verification is not None:
+                body["project_verification"] = project_verification
             # Per-GPU VRAM (probe failure ⇒ fields omitted entirely, matching
             # the schema's absent-tolerant contract for old runners).
             if gpu_memory is not None:
@@ -6268,6 +6271,43 @@ def _gpu_sandbox_smoke(caps: "iso.Capabilities", allowlist: list) -> str:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def _earn_project_verification(
+    caps: "iso.Capabilities",
+    agent_binary: list[str] | None,
+    agent_image: str | None,
+) -> dict:
+    """Probe the write-agent boundary once; never change general availability."""
+    try:
+        with tempfile.TemporaryDirectory(prefix="blueprint-verification-") as workspace:
+            shutil.copy2(
+                iso.PROJECT_VERIFICATION_PROBE_PATH,
+                os.path.join(workspace, "project-verification-probe.sh"),
+            )
+            plan = iso.plan_agent_execution(
+                caps=caps,
+                agent_binary=agent_binary,
+                workspace_host=workspace,
+                injected_env={"TASK_ID": "project-verification-probe"},
+                source_env=dict(os.environ),
+                task_type="fix",
+                agent_image=agent_image,
+            )
+            return iso.probe_project_verification(plan)
+    except Exception as exc:  # noqa: BLE001 — readiness proof is fail-closed evidence
+        reason = f"verification probe setup failed: {str(exc)[:300]}"
+        failed_probe = {"ok": False, "exit_code": None, "reason": reason}
+        return {
+            "version": iso.PROJECT_VERIFICATION_VERSION,
+            "boundary": {"class": iso.CLASS_AGENT, "backend": iso.DECLINE},
+            "ready": False,
+            "reason": reason,
+            "probes": {
+                "ruff": dict(failed_probe),
+                "docker_postgres": dict(failed_probe),
+            },
+        }
+
+
 def _preflight(
     orchestrator_url: str,
     token: str,
@@ -6277,6 +6317,7 @@ def _preflight(
     max_concurrent: int,
     max_concurrent_compute: int,
     agent_image: str | None = None,
+    project_verification: dict | None = None,
 ) -> dict:
     """Print the aligned preflight block; return a dict of the decisions.
 
@@ -6325,35 +6366,38 @@ def _preflight(
     ping_error: str | None = None
     enrolled_max_concurrent: int | None = None
     try:
+        heartbeat_body = {
+            # Preflight probe, NOT a genuine active-work report: this empty
+            # active set must NOT overwrite a live report on a box that is
+            # already running a real runner. active_work_report=False makes
+            # the orchestrator ignore the active set here, so the reaper's
+            # zombie reconcile cannot mistake this probe for "no work claimed"
+            # and reap a live task (reaper_orphan_classify).
+            "active_task_ids": [],
+            "active_compute_job_ids": [],
+            "active_work_report": False,
+            "agent_available": claimable[iso.CLASS_AGENT],
+            "supported_agent_task_types": supported_agent_task_types,
+            "hostname": hostname,
+            "version": _runner_version(),
+            # Isolation-backend inventory + selected backends so `--check`
+            # populates the fleet view the same way the running heartbeat does.
+            "isolation_backends": iso.capabilities_inventory(caps),
+            "agent_backend": iso.decide_agent_backend(
+                caps, agent_binary_present=agent_binary is not None,
+                agent_image=agent_image,
+            ),
+            "compute_backend": iso.decide_compute_backend(
+                caps, has_image=agent_image is not None
+            ),
+            **gpu_caps,
+        }
+        if project_verification is not None:
+            heartbeat_body["project_verification"] = project_verification
         status, ping_body = _post(
             f"{orchestrator_url}/api/runner/heartbeat",
             token,
-            {
-                # Preflight probe, NOT a genuine active-work report: this empty
-                # active set must NOT overwrite a live report on a box that is
-                # already running a real runner. active_work_report=False makes
-                # the orchestrator ignore the active set here, so the reaper's
-                # zombie reconcile cannot mistake this probe for "no work claimed"
-                # and reap a live task (reaper_orphan_classify).
-                "active_task_ids": [],
-                "active_compute_job_ids": [],
-                "active_work_report": False,
-                "agent_available": claimable[iso.CLASS_AGENT],
-                "supported_agent_task_types": supported_agent_task_types,
-                "hostname": hostname,
-                "version": _runner_version(),
-                # Isolation-backend inventory + selected backends so `--check`
-                # populates the fleet view the same way the running heartbeat does.
-                "isolation_backends": iso.capabilities_inventory(caps),
-                "agent_backend": iso.decide_agent_backend(
-                    caps, agent_binary_present=agent_binary is not None,
-                    agent_image=agent_image,
-                ),
-                "compute_backend": iso.decide_compute_backend(
-                    caps, has_image=agent_image is not None
-                ),
-                **gpu_caps,
-            },
+            heartbeat_body,
         )
         orchestrator_ok = True
         if status in (200, 204):
@@ -6440,6 +6484,14 @@ def _preflight(
 
     for note in caps.notes:
         print(f"    note         : {note}", flush=True)
+
+    if project_verification is not None:
+        verification_state = (
+            "READY (Ruff + live sandbox PostgreSQL passed in agent boundary)"
+            if project_verification.get("ready") is True
+            else f"INCAPABLE — {project_verification.get('reason') or 'probe failed'}"
+        )
+        _fmt("verification", verification_state)
 
     # Provider credential check. Host env credentials are a FALLBACK only: the
     # orchestrator ships per-task pool credentials via the /next-task claim path,
@@ -7002,6 +7054,14 @@ def main() -> None:
     # Resolve after managed PATH activation so bwrap binds the verified release.
     agent_binary = _locate_agent_binary()
 
+    # Earn authoring-verification capability once at startup through the exact
+    # write-agent boundary. This is intentionally independent of generic agent
+    # and compute availability: read-only work and compute stay claimable when
+    # Ruff or Docker/Postgres verification is unavailable.
+    project_verification = _earn_project_verification(
+        caps, agent_binary, agent_image
+    )
+
     # LOUD warning (Fix 2): a docker-only box (docker + agent image usable, but NO
     # bwrap) can run ONLY the read-only agent slice (iso.AGENT_DOCKER_TYPES). The
     # runner CANNOT self-restrict its task_types — that is operator-configured
@@ -7039,6 +7099,7 @@ def main() -> None:
     result = _preflight(
         orchestrator_url, token, agent_binary, caps, gpu_state,
         max_concurrent, max_concurrent_compute, agent_image,
+        project_verification,
     )
     claimable = result["claimable"]
     gpu_capabilities = result["gpu_caps"]
@@ -7171,6 +7232,7 @@ def main() -> None:
             # Live-safe config channel: the heartbeat loop applies the server's
             # config block and echoes applied-vs-pending back.
             "live_config": live_config,
+            "project_verification": project_verification,
         },
         daemon=True,
     )

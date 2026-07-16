@@ -27,6 +27,12 @@ export interface DirectoryConfig {
   confirmed_lint_cmd?: string;
   /** True when the confirmed commands are stale (re-detection ran after confirmation). */
   commands_stale?: boolean;
+  /** Explicit opt-in to the receipt-emitting project verification contract.
+   * Ordinary lint/test commands do not imply support for this protocol. */
+  project_verification?: {
+    protocol: 'blueprint-v1';
+    harness: string;
+  };
 }
 
 /**
