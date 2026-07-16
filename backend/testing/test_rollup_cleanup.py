@@ -2695,6 +2695,133 @@ async def test_all_children_genuinely_cancelled_marks_parent_failed(cleanup_db, 
     mock_create_pr.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_infra_failed_review_awaiting_resurrection_keeps_parent_evaluating(
+    cleanup_db, mocker
+):
+    """A recent infra-failed review is still live recovery work.
+
+    The reaper may resurrect it once. Rollup must not terminalize the parent
+    from the cancelled direct work child during the short FAILED -> QUEUED
+    handoff window.
+    """
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mock_alert = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mock_record_failure = mocker.patch(
+        "app.task_lifecycle_requeue._record_parent_failure"
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="perf",
+        status=TaskStatus.EVALUATING,
+        context={
+            "research_branch": "research/infra-review-recovery",
+            "parent_base": "main",
+        },
+        plan_output="some findings",
+    )
+    cancelled_child = await _make_task(
+        cleanup_db,
+        project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.CANCELLED,
+    )
+    await _make_task(
+        cleanup_db,
+        project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.FAILED,
+        context={
+            "failure_category": "PROVISION_FAILURE",
+            "_resurrection_count": 0,
+        },
+        payloads=[
+            {
+                "type": "review",
+                "prompt": "Review the implementation PR",
+                "pr_number": 15220,
+            }
+        ],
+    )
+
+    await _check_and_trigger_rollup(cancelled_child, cleanup_db)
+
+    await cleanup_db.refresh(parent)
+    assert parent.status == TaskStatus.EVALUATING
+    assert "auto-resurrection" in (parent.latest_status_message or "")
+    assert parent.context.get("failure_category") is None
+    mock_alert.assert_not_awaited()
+    mock_record_failure.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_exhausted_infra_review_does_not_defer_cancelled_parent(
+    cleanup_db, mocker
+):
+    """Once the one-shot resurrection budget is spent, rollup must converge."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mock_alert = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch("app.task_lifecycle_requeue._record_parent_failure")
+    mocker.patch(
+        "app.rollup_management._cleanup_branches", new_callable=AsyncMock
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="perf",
+        status=TaskStatus.EVALUATING,
+        context={
+            "research_branch": "research/exhausted-infra-review",
+            "parent_base": "main",
+        },
+        plan_output="some findings",
+    )
+    cancelled_child = await _make_task(
+        cleanup_db,
+        project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.CANCELLED,
+    )
+    await _make_task(
+        cleanup_db,
+        project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.FAILED,
+        context={
+            "failure_category": "PROVISION_FAILURE",
+            "_resurrection_count": 1,
+        },
+        payloads=[
+            {
+                "type": "review",
+                "prompt": "Review the implementation PR",
+                "pr_number": 15220,
+            }
+        ],
+    )
+
+    await _check_and_trigger_rollup(cancelled_child, cleanup_db)
+
+    await cleanup_db.refresh(parent)
+    assert parent.status == TaskStatus.FAILED
+    assert "cancelled" in (parent.latest_status_message or "").lower()
+    assert parent.context.get("failure_category") == "AGENT_TIMEOUT"
+    mock_alert.assert_awaited()
+
+
 # ── Rollup merge conflict state handling ──────────────────────────────────────
 # Covers the mergeable_state state machine that runs after merge_pull_request
 # returns merged=False on a rollup PR targeting an intermediate branch:
