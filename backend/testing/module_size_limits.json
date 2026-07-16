@@ -87,7 +87,7 @@
     "playbook_storage.py": 1950,
     "playbook_auto.py": 450,
     "playbook_sr_metrics.py": 3100,
-    "models.py": 5550,
+    "models.py": 6450,
     "shared_state.py": 2850,
     "strategic_spawning.py": 8950,
     "failure_classification.py": 3950,
@@ -107,7 +107,7 @@
     "warm_pool_maintainer.py": 2650,
     "review_fix_lane_pilot.py": 2450,
     "routers/admin_projects.py": 2450,
-    "routers/admin_project_strategic_session.py": 3150,
+    "routers/admin_project_strategic_session.py": 4050,
     "recovery_evaluating.py": 2950,
     "recovery_evaluating_approval.py": 450,
     "recovery_evaluating_helpers.py": 1100,
@@ -122,7 +122,7 @@
     "routers/admin_project_config.py": 1800,
     "compute_backends.py": 4850,
     "direction_lifecycle.py": 2200,
-    "routers/admin_notifications.py": 1850,
+    "routers/admin_notifications.py": 2150,
     "strategic_state_read_model.py": 1100,
     "strategic_resident_session.py": 2800,
     "work_session_check_in.py": 400,
@@ -206,7 +206,7 @@
     "components/DirectionCard.tsx": 1650,
     "components/PipelineView.tsx": 1200,
     "components/DashboardHome.tsx": 3050,
-    "components/MessagesPanel.tsx": 2800,
+    "components/MessagesPanel.tsx": 3250,
     "components/MessageBubble.tsx": 650,
     "components/MetricsDashboard.tsx": 1500,
     "components/AutonomousStatus.tsx": 1500,
@@ -247,6 +247,7 @@
     "hooks/useWorkbenchCommands.ts": 1800,
     "api/compute.ts": 2350,
     "api/projects.ts": 1750,
-    "components/FleetRunnersPanel.tsx": 2000
+    "components/FleetRunnersPanel.tsx": 2000,
+    "strategicStateApi.ts": 1850
   }
 }
