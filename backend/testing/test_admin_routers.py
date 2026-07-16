@@ -2097,6 +2097,30 @@ class TestApplyOperatorBuildConfigOverrides:
         merged = apply_operator_build_config_overrides(detected, {})
         assert merged == {"language": "rust", "directories": []}
 
+    def test_preserves_project_verification_by_normalized_directory_path(self):
+        from app.build_config_detection import apply_operator_build_config_overrides
+
+        detected = {
+            "directories": [{"path": "backend", "type": "python"}],
+        }
+        existing = {
+            "directories": [{
+                "path": " ./backend/// ",
+                "type": "python",
+                "project_verification": {
+                    "protocol": "blueprint-v1",
+                    "harness": "scripts/test-backend.sh",
+                },
+            }],
+        }
+
+        merged = apply_operator_build_config_overrides(detected, existing)
+
+        assert merged["directories"][0]["project_verification"] == {
+            "protocol": "blueprint-v1",
+            "harness": "scripts/test-backend.sh",
+        }
+
 
 class TestBuildConfigLintWarnings:
     """Operator-visible warnings when build_config.directories[*].lint_cmd
@@ -2217,6 +2241,66 @@ class TestBuildConfigLintWarnings:
         assert isinstance(warnings, list)
         assert len(warnings) == 1
         assert "./a" in warnings[0]
+
+
+class TestPatchBuildConfigProjectVerification:
+    @pytest.mark.asyncio
+    async def test_patch_persists_canonical_project_verification(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session, name="patch-project-verification")
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={
+                "build_config": {
+                    "directories": [{
+                        "path": " backend/// ",
+                        "type": "python",
+                        "lint_cmd": "ruff check .",
+                        "test_cmd": "pytest",
+                        "project_verification": {
+                            "protocol": "blueprint-v1",
+                            "harness": "scripts/test-backend.sh",
+                        },
+                    }],
+                },
+            },
+        )
+
+        assert resp.status_code == 200, resp.text
+        directory = resp.json()["build_config"]["directories"][0]
+        assert directory["path"] == "backend"
+        assert directory["project_verification"] == {
+            "protocol": "blueprint-v1",
+            "harness": "scripts/test-backend.sh",
+        }
+        await db_session.refresh(project)
+        assert project.build_config["directories"][0] == directory
+
+    @pytest.mark.asyncio
+    async def test_patch_rejects_noncanonical_verification_harness(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session, name="patch-invalid-verification")
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={
+                "build_config": {
+                    "directories": [{
+                        "path": "backend",
+                        "type": "python",
+                        "project_verification": {
+                            "protocol": "blueprint-v1",
+                            "harness": "scripts/test backend.sh",
+                        },
+                    }],
+                },
+            },
+        )
+
+        assert resp.status_code == 400
 
 
 class TestPatchBuildConfigRequiresCiChecks:

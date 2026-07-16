@@ -7,6 +7,13 @@ import type { BuildConfig, DirectoryConfig, MigrationConfig } from './index.js';
 import { SHELL_CMD_RE } from './shell-safety.js';
 
 const VALID_TYPES = new Set(['python', 'node', 'go', 'rust', 'other']);
+const PROJECT_VERIFICATION_HARNESS_RE = /^[A-Za-z0-9_./-]+$/;
+
+function normalizeBuildConfigDirectoryPath(path: string): string {
+  let normalized = path.trim();
+  normalized = normalized.replace(/\/+$/, '');
+  return normalized || '.';
+}
 
 /**
  * Extract and type-narrow build_config from a task object.
@@ -29,8 +36,9 @@ export function resolveBuildConfig(task: Record<string, unknown>): BuildConfig |
   for (const d of rawDirs) {
     if (!d || typeof d !== 'object') continue;
     const dir = d as Record<string, unknown>;
-    const path = typeof dir.path === 'string' ? dir.path : '';
-    if (!path) continue;
+    const rawPath = typeof dir.path === 'string' ? dir.path : '';
+    if (!rawPath) continue;
+    const path = normalizeBuildConfigDirectoryPath(rawPath);
     // Reject path traversal: no .., no absolute paths, no null bytes
     if (path.includes('..') || path.startsWith('/') || path.includes('\0')) continue;
     if (!SHELL_CMD_RE.test(path)) continue;
@@ -68,6 +76,24 @@ export function resolveBuildConfig(task: Record<string, unknown>): BuildConfig |
     if (typeof confirmedInstallCmd === 'string') entry.confirmed_install_cmd = confirmedInstallCmd;
     if (typeof confirmedLintCmd === 'string') entry.confirmed_lint_cmd = confirmedLintCmd;
     if (dir.commands_stale === true) entry.commands_stale = true;
+    const projectVerification = dir.project_verification;
+    if (projectVerification && typeof projectVerification === 'object') {
+      const verification = projectVerification as Record<string, unknown>;
+      if (
+        verification.protocol === 'blueprint-v1'
+        && typeof verification.harness === 'string'
+        && verification.harness.length > 0
+        && !verification.harness.startsWith('/')
+        && !verification.harness.includes('..')
+        && !verification.harness.includes('\0')
+        && PROJECT_VERIFICATION_HARNESS_RE.test(verification.harness)
+      ) {
+        entry.project_verification = {
+          protocol: 'blueprint-v1',
+          harness: verification.harness,
+        };
+      }
+    }
     directories.push(entry);
   }
 

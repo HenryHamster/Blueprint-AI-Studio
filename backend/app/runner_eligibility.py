@@ -18,10 +18,18 @@ Re-exported from ``orchestrator_runner_dispatch`` so existing import paths and
 ``orch._runner_*`` references keep working.
 """
 
+import re
 import uuid
 from typing import NamedTuple
 
 from app.models import LocalRunner
+from app.task_capabilities import get_task_capability
+
+
+_RUFF_COMMAND_RE = re.compile(r"^(?:python3?\s+-m\s+)?ruff(?:\s|$)")
+_PYTEST_COMMAND_RE = re.compile(r"^(?:python3?\s+-m\s+)?pytest(?:\s|$)")
+_PROJECT_VERIFICATION_HARNESS_RE = re.compile(r"^[A-Za-z0-9_./-]+$")
+_PROJECT_VERIFICATION_VERSION = 1
 
 
 class RunnerDispatchSnapshot(NamedTuple):
@@ -44,6 +52,104 @@ class RunnerDispatchSnapshot(NamedTuple):
     capabilities: dict
     consecutive_job_failures: int = 0
     hostname: str | None = None
+
+
+def _effective_build_command(entry: dict, kind: str) -> str:
+    confirmed = entry.get(f"confirmed_{kind}_cmd")
+    if entry.get("commands_stale") is not True and isinstance(confirmed, str):
+        confirmed = confirmed.strip()
+        if confirmed:
+            return confirmed
+    detected = entry.get(f"{kind}_cmd")
+    return detected.strip() if isinstance(detected, str) else ""
+
+
+def _project_backend_verification_directories(build_config: object) -> tuple[str, ...]:
+    if not isinstance(build_config, dict):
+        return ()
+    directories = build_config.get("directories")
+    if not isinstance(directories, list):
+        return ()
+    verified: list[str] = []
+    for entry in directories:
+        if not isinstance(entry, dict) or entry.get("type") != "python":
+            continue
+        lint_cmd = _effective_build_command(entry, "lint")
+        test_cmd = _effective_build_command(entry, "test")
+        project_verification = entry.get("project_verification")
+        path = entry.get("path")
+        if (
+            isinstance(path, str)
+            and path.strip()
+            and _RUFF_COMMAND_RE.match(lint_cmd)
+            and _PYTEST_COMMAND_RE.match(test_cmd)
+            and isinstance(project_verification, dict)
+            and project_verification.get("protocol") == "blueprint-v1"
+            and isinstance(project_verification.get("harness"), str)
+            and bool(project_verification["harness"].strip())
+            and not project_verification["harness"].startswith("/")
+            and ".." not in project_verification["harness"]
+            and _PROJECT_VERIFICATION_HARNESS_RE.fullmatch(
+                project_verification["harness"]
+            )
+        ):
+            normalized = path.strip().rstrip("/") or "."
+            if normalized not in verified:
+                verified.append(normalized)
+    return tuple(verified)
+
+
+def _task_is_authoring(task_type: str) -> bool:
+    capability = get_task_capability(task_type)
+    return bool(
+        capability is not None
+        and capability.agent_mode == "write"
+        and capability.run_shape == "workflow"
+        and capability.output_kind == "pr"
+    )
+
+
+def _task_requires_project_verification(
+    task_type: str, build_config: object
+) -> bool:
+    return bool(
+        _task_is_authoring(task_type)
+        and _project_backend_verification_directories(build_config)
+    )
+
+
+def _successful_verification_probe(probes: dict, name: str) -> bool:
+    probe = probes.get(name)
+    return bool(
+        isinstance(probe, dict)
+        and probe.get("ok") is True
+        and type(probe.get("exit_code")) is int
+        and probe["exit_code"] == 0
+    )
+
+
+def _runner_has_project_verification(runner: LocalRunner | RunnerDispatchSnapshot) -> bool:
+    """Validate the complete v1 functional report, failing closed on every gap."""
+    report = (runner.capabilities or {}).get("project_verification")
+    if not isinstance(report, dict):
+        return False
+    boundary = report.get("boundary")
+    probes = report.get("probes")
+    if not isinstance(boundary, dict) or not isinstance(probes, dict):
+        return False
+    version = report.get("version")
+    if (
+        type(version) is not int
+        or version != _PROJECT_VERIFICATION_VERSION
+        or report.get("ready") is not True
+        or boundary.get("class") != "agent"
+        or boundary.get("backend") != "bwrap"
+    ):
+        return False
+    return all(
+        _successful_verification_probe(probes, name)
+        for name in ("ruff", "docker_postgres")
+    )
 
 
 def _runner_handles_task_type(

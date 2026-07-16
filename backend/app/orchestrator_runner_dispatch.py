@@ -302,8 +302,11 @@ from app.runner_eligibility import (  # noqa: F401
     _runner_has_container_capability,
     _runner_has_free_disk,
     _runner_has_free_vram,
+    _runner_has_project_verification,
     _runner_max_concurrent_compute,
     _runner_meets_min_compute_capability,
+    _task_is_authoring,
+    _task_requires_project_verification,
 )
 
 # Free-disk floor a runner must clear to be sent a container-image compute job.
@@ -635,6 +638,15 @@ async def _try_runner_dispatch(
         return False
     payload = task.first_payload or {}
     task_type = payload.get("type", "")
+    project = (
+        await session.get(Project, task.project_id)
+        if _task_is_authoring(task_type)
+        else None
+    )
+    requires_project_verification = bool(
+        project is not None
+        and _task_requires_project_verification(task_type, project.build_config)
+    )
     # A declared accelerator (flat or nested compute_experiment form) restricts
     # eligibility to GPU runners. Read generically so the gate is uniform; agent
     # task types simply carry no accelerator and are unaffected.
@@ -692,6 +704,7 @@ async def _try_runner_dispatch(
         # pool, and the 900s hold sweep then evicts the task to cloud. While the
         # declines still look transient, re-pick the decliner instead.
         declined_exclusion_advisory=decline_exclusion_is_advisory(task, task_type),
+        requires_project_verification=requires_project_verification,
     )
     if runner is None:
         return False
@@ -949,13 +962,14 @@ async def _diagnose_strict_runner_pin_hold(
     min_compute_capability: float | None = None,
     vram_gb: float | None = None,
     declined_record: dict | None = None,
+    requires_project_verification: bool = False,
 ) -> tuple[str, str]:
     """Explain why a strict-pinned runner cannot take this job RIGHT NOW.
 
     Returns ``(reason_code, detail)``. The reason must be truthful and specific
     (runner id + why), never a generic no-runner message: reason codes are
     ``declined_recently`` / ``at_capacity`` / ``task_type_not_allowed`` /
-    ``missing_gpu`` / ``missing_container_runtime`` / ``not_eligible`` (live but
+    ``missing_project_verification`` / ``missing_gpu`` / ``missing_container_runtime`` / ``not_eligible`` (live but
     failed another gate) for runners in the live cache, and ``not_found`` /
     ``not_enrolled`` / ``offline`` for runners that are not live. The pair is
     stamped into ``task.context['runner_pin_hold']`` and the hold status message
@@ -1006,6 +1020,14 @@ async def _diagnose_strict_runner_pin_hold(
             return (
                 "at_capacity",
                 f"runner is at capacity ({load} active+pinned vs {limit_label})",
+            )
+        if requires_project_verification and not _runner_has_project_verification(
+            snapshot
+        ):
+            return (
+                "missing_project_verification",
+                "runner has no valid v1 write-agent proof for python3 -m ruff "
+                "and live Docker/Postgres",
             )
         if accelerator and not (snapshot.capabilities or {}).get("has_gpu"):
             return (
@@ -1133,6 +1155,7 @@ def _select_eligible_runner(
     min_compute_capability: float | None = None,
     declined_runner_ids: set[str] | None = None,
     declined_exclusion_advisory: bool = False,
+    requires_project_verification: bool = False,
 ) -> "LocalRunner | RunnerDispatchSnapshot | None":
     """Pick the least-loaded eligible runner for a task/job, or None.
 
@@ -1209,6 +1232,8 @@ def _select_eligible_runner(
             and (task_type == "compute_experiment" or _runner_agent_available(r))
             and not _runner_at_capacity(r, pins.get(r.id, 0), task_type)
         ]
+        if requires_project_verification:
+            out = [r for r in out if _runner_has_project_verification(r)]
         if accelerator:
             # Trust VERIFIED GPU capability, not the bare self-reported has_gpu bool:
             # a mis-set flag would silently defeat this gate and win GPU jobs the

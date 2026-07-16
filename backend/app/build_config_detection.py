@@ -170,9 +170,9 @@ def apply_operator_build_config_overrides(
         if _op_key in existing:
             detected[_op_key] = existing[_op_key]
 
-    # Merge per-directory agent-confirmed command fields back onto re-detected
-    # directories.  These are written by the agent write-back endpoint and are
-    # NOT derivable from repo contents, so they must survive re-detection.
+    # Merge per-directory operator/runtime-owned fields back onto re-detected
+    # directories. These values are not derivable from repo contents, so they
+    # must survive re-detection.
     _CONFIRMED_DIR_KEYS = (
         "confirmed_lint_cmd",
         "confirmed_test_cmd",
@@ -198,6 +198,8 @@ def apply_operator_build_config_overrides(
                 for _k in _CONFIRMED_DIR_KEYS:
                     if _k in _ex and _ex[_k] is not None:
                         _entry[_k] = _ex[_k]
+                if _ex.get("project_verification") is not None:
+                    _entry["project_verification"] = _ex["project_verification"]
 
     return detected
 

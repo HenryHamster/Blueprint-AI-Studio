@@ -1058,6 +1058,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     analysisContext,
     regressingCategories: reasoningGateCats.length > 0 ? reasoningGateCats : undefined,
     buildConfig,
+    taskCapability: task.task_capability as Partial<Record<'agent_mode' | 'run_shape' | 'output_kind', unknown>> | undefined,
     visualAcceptance: resolveVisualAcceptance(payload, ctx),
     ciFailureSelectors: rawCiSelectors.length > 0 ? rawCiSelectors : undefined,
   });
