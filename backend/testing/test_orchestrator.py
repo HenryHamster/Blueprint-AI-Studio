@@ -9268,6 +9268,63 @@ class TestCrossBaseDependencyGate:
         )
 
     @pytest.mark.asyncio
+    async def test_sibling_plan_dep_eligible_after_shared_research_rollup(
+        self, db_session
+    ):
+        """A sibling plan must not wait for the outer research rollup.
+
+        The dependency's plan parent has already merged into the exact research
+        branch both plans share. Waiting for integration would deadlock the
+        research parent on the still-queued sibling.
+        """
+        from app.orchestrator import _check_candidate_task_deps
+        from app.landed_signal import mark_unblocked_non_merge
+
+        project = make_project(name="SharedResearchBase", user_id="u1")
+        db_session.add(project)
+        await db_session.commit()
+
+        dep_plan = make_task(
+            project_id=project.id,
+            payloads=[{"type": "plan", "base_branch": "research/shared"}],
+            context={
+                "plan_branch": "plan/dep",
+                "parent_base": "research/shared",
+            },
+            status=TaskStatus.COMPLETED,
+        )
+        mark_unblocked_non_merge(
+            dep_plan, reason="merged_pr_non_integration_branch"
+        )
+        db_session.add(dep_plan)
+        await db_session.commit()
+
+        dep = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "plan/dep"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.COMPLETED,
+            parent_task_id=dep_plan.id,
+        )
+        mark_unblocked_non_merge(dep, reason="merged_pr_non_integration_branch")
+        dependent = make_task(
+            project_id=project.id,
+            payloads=[{"type": "fix", "base_branch": "plan/dependent"}],
+            context={
+                "related_files": ["backend/app/foo.py"],
+                "parent_base": "research/shared",
+            },
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add_all([dep, dependent])
+        await db_session.commit()
+
+        result, _ = await _check_candidate_task_deps(
+            dependent, [dep], [dep.id], db_session, self._verify_true
+        )
+        assert result == "eligible"
+
+    @pytest.mark.asyncio
     async def test_force_dropped_dep_held_even_when_lineage_parent_landed(
         self, db_session
     ):
@@ -9421,6 +9478,73 @@ class TestCrossBaseBaseRecut:
         _, kwargs = merge_mock.await_args
         assert kwargs.get("base") == "plan/bbb"
         assert kwargs.get("head") == "main"
+
+    @pytest.mark.asyncio
+    async def test_sibling_plan_base_merges_shared_research_branch(
+        self, db_session, mocker
+    ):
+        from app.orchestrator_health import ensure_dependent_base_recut
+        from app.landed_signal import mark_unblocked_non_merge
+
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("tok", "owner", "repo"),
+        )
+        merge_mock = mocker.patch(
+            "app.github.merge_branch",
+            new_callable=AsyncMock,
+            return_value={"merged": True, "already": False},
+        )
+        project = make_project(
+            name="SharedResearchRecut",
+            user_id="u1",
+            integration_branch="automain",
+        )
+        db_session.add(project)
+        await db_session.commit()
+
+        dep_plan = make_task(
+            project_id=project.id,
+            payloads=[{"type": "plan", "base_branch": "research/shared"}],
+            context={
+                "plan_branch": "plan/dep",
+                "parent_base": "research/shared",
+            },
+            status=TaskStatus.COMPLETED,
+        )
+        mark_unblocked_non_merge(
+            dep_plan, reason="merged_pr_non_integration_branch"
+        )
+        db_session.add(dep_plan)
+        await db_session.commit()
+
+        dep = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "plan/dep"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.COMPLETED,
+            parent_task_id=dep_plan.id,
+        )
+        mark_unblocked_non_merge(dep, reason="merged_pr_non_integration_branch")
+        dependent = make_task(
+            project_id=project.id,
+            payloads=[{"type": "fix", "base_branch": "plan/dependent"}],
+            context={
+                "related_files": ["backend/app/foo.py"],
+                "parent_base": "research/shared",
+            },
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add_all([dep, dependent])
+        await db_session.commit()
+
+        assert await ensure_dependent_base_recut(
+            dependent, [dep], db_session
+        ) is True
+        _, kwargs = merge_mock.await_args
+        assert kwargs["base"] == "plan/dependent"
+        assert kwargs["head"] == "research/shared"
 
     @pytest.mark.asyncio
     async def test_merge_conflict_holds_dependent(self, db_session, mocker):

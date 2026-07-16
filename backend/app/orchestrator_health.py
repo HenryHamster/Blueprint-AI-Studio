@@ -515,17 +515,29 @@ async def _effective_dep_task(dt: Task, session: AsyncSession) -> Task:
     return replacement or dt
 
 
-def _has_landed_cross_base_code_dep(dependent: Task, dep_tasks: list) -> bool:
-    """True when *dependent* has a CROSS-BASE GENUINE code-dependency that has
-    LANDED on integration — i.e. its base must be re-cut before it can safely
-    run. Pure helper shared by both re-cut call sites (dispatch + completion)."""
-    return any(
-        (not _same_base_branch(dependent, dep))
-        and is_genuine_code_dependency(dependent, dep)
-        and dep.status == TaskStatus.COMPLETED
-        and has_landed_signal(dep)
-        for dep in dep_tasks
-    )
+async def _cross_base_recut_sources(
+    dependent: Task, dep_tasks: list, project: Project, session: AsyncSession
+) -> list[str]:
+    """Return branches whose dependency code must be merged into the base."""
+    from app.shared_state import get_project_integration_branch
+
+    sources: list[str] = []
+    integration_branch = get_project_integration_branch(project)
+    for dep in dep_tasks:
+        if (
+            _same_base_branch(dependent, dep)
+            or not is_genuine_code_dependency(dependent, dep)
+            or dep.status != TaskStatus.COMPLETED
+        ):
+            continue
+        source = (
+            integration_branch
+            if has_landed_signal(dep)
+            else await _shared_staging_dependency_source(dependent, dep, session)
+        )
+        if source and source not in sources:
+            sources.append(source)
+    return sources
 
 
 def _recut_backoff_active(ctx: dict) -> bool:
@@ -746,15 +758,18 @@ async def ensure_dependent_base_recut(
     trigger (``orchestrator._mark_unblocked_dependents``), and the reaper resume
     sweep (``reaper_sweeps._partition_completed_needs_base_safe``).
     """
-    if not _has_landed_cross_base_code_dep(dependent, dep_tasks):
-        # No re-cut needed. If this dependent previously accrued re-cut failures
-        # (e.g. it was held, the dep later changed), clear that stale accounting.
-        await _clear_recut_accounting(dependent, session)
-        return True
     project = await session.get(Project, dependent.project_id)
     if project is None:
         # Cannot resolve the integration branch — hold to be safe.
         return False
+    recut_sources = await _cross_base_recut_sources(
+        dependent, dep_tasks, project, session
+    )
+    if not recut_sources:
+        # No re-cut needed. If this dependent previously accrued re-cut failures
+        # (e.g. it was held, the dep later changed), clear that stale accounting.
+        await _clear_recut_accounting(dependent, session)
+        return True
     # Once a re-cut has FAILED, do not re-issue the GitHub merge call every cycle:
     # only re-attempt after the backed-off recheck window so a held dependent stops
     # hammering the merge API, while still allowing eventual recovery.
@@ -780,14 +795,17 @@ async def ensure_dependent_base_recut(
     # ``_clear_recut_accounting``, so recovery is never delayed.
     if _recut_backoff_active(dependent.context or {}):
         return False
-    from app.branch_resolution import recut_dependent_base_from_integration
+    from app.branch_resolution import recut_dependent_base_from_branch
 
-    outcome = await recut_dependent_base_from_integration(dependent, project, session)
-    if outcome == "ok":
-        await _clear_recut_accounting(dependent, session)
-        return True
-    await _record_recut_failure(dependent, outcome, session)
-    return False
+    for source_branch in recut_sources:
+        outcome = await recut_dependent_base_from_branch(
+            dependent, project, session, source_branch=source_branch
+        )
+        if outcome != "ok":
+            await _record_recut_failure(dependent, outcome, session)
+            return False
+    await _clear_recut_accounting(dependent, session)
+    return True
 
 
 async def recut_landed_cross_base_dependents(
@@ -934,6 +952,43 @@ async def _dep_parent_lineage_has_landed(dep: Task, session: AsyncSession) -> bo
     return has_landed_signal(parent)
 
 
+async def _shared_staging_dependency_source(
+    dependent: Task, dep: Task, session: AsyncSession
+) -> str | None:
+    """Return a shared staging branch that provably contains ``dep``'s code.
+
+    Sibling plans under one research parent use distinct plan branches, then
+    roll into the same research staging branch. Waiting for a dependency to
+    reach project integration creates a cycle because the outer research rollup
+    cannot land until the sibling dependent finishes.
+    """
+    dep_ctx = dep.context or {}
+    if dep_ctx.get(NON_MERGE_UNBLOCK_REASON_KEY) in _FORCE_DROP_REASONS:
+        return None
+    if not has_merge_unblock_signal(dep) or not dep.parent_task_id:
+        return None
+
+    dependent_ctx = dependent.context or {}
+    shared_base = dependent_ctx.get("parent_base") or dependent_ctx.get(
+        "original_base"
+    )
+    if not shared_base:
+        return None
+
+    parent = await session.get(Task, dep.parent_task_id)
+    if (
+        parent is None
+        or parent.status != TaskStatus.COMPLETED
+        or not has_merge_unblock_signal(parent)
+    ):
+        return None
+    parent_ctx = parent.context or {}
+    parent_target = parent_ctx.get("parent_base") or parent_ctx.get("original_base")
+    if parent_target != shared_base:
+        return None
+    return str(shared_base)
+
+
 async def _clear_deps_satisfied_marker(task_id, session: AsyncSession) -> None:
     """Durably clear the ``_deps_satisfied`` warm-claim marker on *task_id*.
 
@@ -1077,9 +1132,14 @@ async def _check_candidate_task_deps(
             # hadn't run yet), check whether its immediate lineage parent has
             # landed — the parent's rollup merge provably carried this dep's code
             # to integration, so holding further wedges the dependent forever.
-            if not has_landed_signal(effective_dt):
-                if not await _dep_parent_lineage_has_landed(effective_dt, session):
-                    all_met = False
+            if (
+                not has_landed_signal(effective_dt)
+                and not await _dep_parent_lineage_has_landed(effective_dt, session)
+                and not await _shared_staging_dependency_source(
+                    task, effective_dt, session
+                )
+            ):
+                all_met = False
             continue
 
         # Same-base (or ordering-only cross-base) COMPLETED dependency. For
