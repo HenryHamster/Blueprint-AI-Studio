@@ -5799,30 +5799,36 @@ async def _process_post_commit(
                             f"[REVIEW PIPELINE] Spawned review after fix for PR #{pr_number} → task {review_task.id}"
                         )
                     else:
-                        _spawn_reason = (task.context or {}).get(SPAWN_REASON_KEY, "")
-                        _transient_reasons = {
-                            SPAWN_REASON_DEFERRED,
-                        }
-                        _is_transient = _spawn_reason in _transient_reasons
+                        # _spawn_pipeline_task may have rolled back + committed
+                        # (DEFERRED lock-contention path). Re-fetch the task for
+                        # a fresh un-expired instance.
+                        fresh_task = await session.get(Task, task.id)
+                        if fresh_task is None:
+                            await session.commit()
+                            return {"status": "accepted"}
+                        task = fresh_task
+
+                        # Read the precise spawn reason written by
+                        # _spawn_pipeline_task into the source task's context.
+                        _sr = (task.context or {}).get(SPAWN_REASON_KEY, "unknown")
+                        _is_transient = _sr == SPAWN_REASON_DEFERRED
+
                         if _is_transient:
                             # Transient deferral (e.g. in-flight peer holds the
                             # spawn lock): create a specific alert and retry once.
-                            _retry_spawn_reason = _spawn_reason
                             logger.warning(
                                 "[REVIEW PIPELINE] Review spawn after fix deferred "
                                 "for PR #%s (reason=%s) — retrying once",
                                 pr_number,
-                                _retry_spawn_reason or "unknown",
+                                _sr,
                             )
-                            # Need to import _maybe_create_failure_alert here
-                            # because it's only imported locally at other call sites.
                             from app.alert_dispatch import _maybe_create_failure_alert
 
                             await _maybe_create_failure_alert(
                                 task,
                                 session,
                                 f"Review spawn after fix for PR #{pr_number} "
-                                f"deferred ({_retry_spawn_reason or 'unknown'}) — retrying",
+                                f"deferred ({_sr}) — retrying",
                             )
                             await asyncio.sleep(5)
                             # Re-fetch the task in case the spawn call rolled back
@@ -5830,7 +5836,7 @@ async def _process_post_commit(
                             _reloaded = await session.get(Task, task.id)
                             if _reloaded is not None:
                                 task = _reloaded
-                            review_task_retry, _ = await _spawn_pipeline_task(
+                            review_task, _ = await _spawn_pipeline_task(
                                 task,
                                 "review",
                                 session,
@@ -5839,55 +5845,64 @@ async def _process_post_commit(
                                 base_branch,
                                 original_task_id=original_task_id,
                             )
-                            if review_task_retry:
+                            if review_task:
                                 logger.info(
                                     "[REVIEW PIPELINE] Spawned review after fix "
                                     "(retry) for PR #%s → task %s",
                                     pr_number,
-                                    review_task_retry.id,
+                                    review_task.id,
                                 )
-                                review_task = review_task_retry
+
                         if not review_task:
                             # Terminal failure: cap, stuck cycle, already merged,
                             # or retry also failed. Escalate with accurate reason.
-                            _reason_label = (
-                                _spawn_reason.replace("_", " ").title()
-                                if _spawn_reason
-                                else "iteration cap"
-                            )
                             task.latest_status_message = (
-                                f"Fix applied but review not spawned for PR "
-                                f"#{pr_number} — {_reason_label}"
+                                f"Fix applied for PR #{pr_number} but review spawn "
+                                f"{'deferred (concurrent spawn)' if _is_transient else 'failed (' + _sr + ')'}"
                             )
-                            task.requires_approval = True
+                            if not _is_transient:
+                                task.requires_approval = True
                             session.add(task)
-                            cap_alert_title = (
-                                f"PR #{pr_number} stalled — {_reason_label}"
+
+                            # Always create a WARNING alert with the specific spawn
+                            # reason so operators see the failure immediately, not
+                            # just a generic "iteration cap" message.
+                            _alert_reason_label = (
+                                "deferred" if _is_transient else _sr
                             )
-                            existing_cap_alert = (
+                            alert_title = (
+                                f"PR #{pr_number} stalled — review spawn {_alert_reason_label}"
+                            )
+                            existing_alert = (
                                 (
                                     await session.execute(
                                         select(Alert).where(
                                             Alert.project_id == task.project_id,
                                             Alert.severity == AlertSeverity.WARNING,
                                             Alert.dismissed_at.is_(None),
-                                            Alert.title == cap_alert_title,
+                                            Alert.title == alert_title,
                                         )
                                     )
                                 )
                                 .scalars()
                                 .first()
                             )
-                            if not existing_cap_alert:
+                            if not existing_alert:
+                                _alert_msg = (
+                                    f"Fix was applied to PR #{pr_number} but the "
+                                    f"review spawn failed (reason: {_sr}). "
+                                    + (
+                                        "The spawn was deferred due to concurrent "
+                                        "activity; the next CI cycle will retry."
+                                        if _is_transient
+                                        else "Manual intervention may be required."
+                                    )
+                                )
                                 alert = Alert(
                                     project_id=task.project_id,
                                     severity=AlertSeverity.WARNING,
-                                    title=cap_alert_title,
-                                    message=(
-                                        f"Fix was applied to PR #{pr_number} but "
-                                        f"review spawn failed ({_reason_label}). "
-                                        "Manual intervention required."
-                                    ),
+                                    title=alert_title,
+                                    message=_alert_msg,
                                     task_id=task.id,
                                 )
                                 session.add(alert)
@@ -5903,12 +5918,56 @@ async def _process_post_commit(
                                 )
                             else:
                                 await session.commit()
+
                             logger.warning(
-                                "[REVIEW PIPELINE] Review spawn after fix "
-                                "returned None for PR #%s (reason=%s)",
+                                "[REVIEW PIPELINE] Review spawn after fix returned None "
+                                "for PR #%s (reason: %s)%s",
                                 pr_number,
-                                _spawn_reason or "iteration cap",
+                                _sr,
+                                " — transient, will retry" if _is_transient else "",
                             )
+
+                        # For transient deferrals, mark the CI task so the next
+                        # backstop cycle detects this as a recent unresolved
+                        # spawn and accelerates retry.
+                        if _is_transient:
+                            from app.time_utils import _utcnow as _ut
+                            _now = _ut().isoformat()
+                            # Propagate the deferred marker to the original CI
+                            # task (not just the fix task) so handle_ci_completion
+                            # can read it when entering review-wait.
+                            if original_task_id:
+                                try:
+                                    _ci_task = await session.get(
+                                        Task, uuid.UUID(original_task_id)
+                                    )
+                                    if _ci_task:
+                                        _ci_ctx = dict(_ci_task.context or {})
+                                        _ci_rl = dict(
+                                            _ci_ctx.get("review_loop") or {}
+                                        )
+                                        _ci_rl["review_spawn_deferred_at"] = _now
+                                        _ci_ctx["review_loop"] = _ci_rl
+                                        _ci_task.context = _ci_ctx
+                                        flag_modified(_ci_task, "context")
+                                        session.add(_ci_task)
+                                except Exception:
+                                    logger.exception(
+                                        "[REVIEW PIPELINE] Failed to propagate "
+                                        "deferred-spawn marker to CI task %s",
+                                        original_task_id,
+                                    )
+                            # Also set on the fix task's own review_loop as a
+                            # fallback (used when the CI task lookup fails).
+                            rl = dict(task.context.get("review_loop") or {})
+                            rl["review_spawn_deferred_at"] = _now
+                            task.context = {
+                                **(task.context or {}),
+                                "review_loop": rl,
+                            }
+                            flag_modified(task, "context")
+                            session.add(task)
+                            await session.commit()
 
             # Completion handlers — wrapped in try/except to prevent VM leak.
             # If a handler throws after the early commit, BackgroundTasks (including
