@@ -70,10 +70,10 @@ describe('App workbench wiring', () => {
     expect(appSource).toContain('setResearchFeed(all);');
   });
 
-  test('reports each non-chat board navigation only after initial data loading and a paint boundary', () => {
+  test('reports each non-chat board navigation after task-fetch completion or paint boundary', () => {
     expect(appSource).toContain('function BoardDataReadyReporter');
-    expect(appSource).toContain('<BoardDataReadyReporter activeTab={activeTab} loading={s.initialLoading} />');
-    expect(appSource).toMatch(/if \(activeTab === 'chat' \|\| loading \|\| reportedRef\.current\) return;[\s\S]*requestAnimationFrame\([\s\S]*reportUiLoadTiming\(activeTab, Math\.round\(performance\.now\(\) - navigationStartRef\.current\), 'board_data_ready'\)/);
-    expect(appSource).toMatch(/navigationStartRef\.current = performance\.now\(\);[\s\S]*reportedRef\.current = false;/);
+    expect(appSource).toContain('<BoardDataReadyReporter activeTab={activeTab} initialLoading={s.initialLoading} refreshing={s.refreshing} fetchEpoch={s.fetchEpoch} />');
+    expect(appSource).toMatch(/if \(targetEpochRef\.current !== null && fetchEpoch >= targetEpochRef\.current\) \{[\s\S]*reportUiLoadTiming\(activeTab, Math\.round\(performance\.now\(\) - navigationStartRef\.current\), 'board_data_ready'\)/);
+    expect(appSource).toMatch(/navigationStartRef\.current = performance\.now\(\);[\s\S]*reportedRef\.current = false;[\s\S]*targetEpochRef\.current = fetchEpoch \+ 1;/);
   });
 });
