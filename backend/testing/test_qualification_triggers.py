@@ -11,6 +11,7 @@ import pytest
 
 from app.qualification_triggers import (
     _MAX_ERROR_REDRIVE_ATTEMPTS,
+    _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS,
     _TRANSIENT_ERROR_CODES,
     explain_qualification_trigger,
     resolve_qualification_trigger,
@@ -590,3 +591,195 @@ class TestExplainQualificationTrigger:
         assert out["error_retry_episode"]["count"] == 1
         assert out["auto_trigger"] != "capped"
         assert out["decision"]["fire"] is True
+
+
+# ---------------------------------------------------------------------------
+# T3b — infra_failure_redrive
+# ---------------------------------------------------------------------------
+
+
+class TestInfraFailureRedrive:
+    def test_infra_failure_fires_when_below_cap(self):
+        d = _resolve(
+            status="infra_failure",
+            consecutive_infra_errors=0,
+        )
+        assert d.fire
+        assert d.trigger == "infra_failure_redrive"
+
+    def test_infra_failure_fires_one_below_cap(self):
+        d = _resolve(
+            status="infra_failure",
+            consecutive_infra_errors=_MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS - 1,
+        )
+        assert d.fire
+        assert d.trigger == "infra_failure_redrive"
+
+    def test_infra_failure_blocked_at_cap(self):
+        d = _resolve(
+            status="infra_failure",
+            consecutive_infra_errors=_MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS,
+        )
+        assert not d.fire
+        assert d.reason == "infra_failure_attempt_cap"
+        assert str(_MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS) in d.blocking[0]
+
+    def test_infra_failure_blocked_above_cap(self):
+        d = _resolve(
+            status="infra_failure",
+            consecutive_infra_errors=_MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS + 5,
+        )
+        assert not d.fire
+        assert d.reason == "infra_failure_attempt_cap"
+
+
+# ---------------------------------------------------------------------------
+# T5b — deferred_unsynced_redrive
+# ---------------------------------------------------------------------------
+
+
+class TestDeferredUnsyncedRedrive:
+    def test_deferred_unsynced_fires_unconditionally(self):
+        """The sync gate is inside run_qualification — the resolver always arms."""
+        d = _resolve(status="deferred_unsynced")
+        assert d.fire
+        assert d.trigger == "deferred_unsynced_redrive"
+
+
+# ---------------------------------------------------------------------------
+# resolver-matches-every-automatic-redrive-state
+# ---------------------------------------------------------------------------
+
+
+# Every qualification status the sweep autonomously re-drives MUST have a
+# matching rule in the resolver that returns fire=True under eligible
+# conditions.  A missing status falls through to "not_applicable" (fire=False),
+# which the explain-surface reports as "settled" — but the sweep is actively
+# re-driving it, so the read surface lies to the operator.
+_AUTOMATIC_REDRIVE_STATUSES: dict[str, dict] = {
+    "deferred_unsynced": {
+        "params": {},
+        "trigger": "deferred_unsynced_redrive",
+    },
+    "error": {
+        "params": {"error_code": "sha_error"},
+        "trigger": "error_redrive",
+    },
+    "infra_failure": {
+        "params": {},
+        "trigger": "infra_failure_redrive",
+    },
+    "rubric_changed": {
+        "params": {},
+        "trigger": "rubric_redrive",
+    },
+    "rubric_provenance_unknown": {
+        "params": {},
+        "trigger": "rubric_redrive",
+    },
+    "not_promoted": {
+        "params": {"blocker": "high_audit_finding", "requalification_ready": True},
+        "trigger": "blockers_cleared",
+    },
+    "promotion_failed": {
+        "params": {"requalification_ready": True},
+        "trigger": "blockers_cleared",
+    },
+    "dry_run": {
+        "params": {"candidate_sha": "old", "automain_sha": "new"},
+        "trigger": "post_dry_run_advance",
+    },
+}
+
+
+@pytest.mark.parametrize(
+    "status, case",
+    [(s, c) for s, c in _AUTOMATIC_REDRIVE_STATUSES.items()],
+    ids=lambda val: val if isinstance(val, str) else "",
+)
+def test_resolver_matches_every_automatic_redrive_state(status, case):
+    """The resolver MUST return fire=True for every status the sweep re-drives.
+
+    Each entry in _AUTOMATIC_REDRIVE_STATUSES is a qualification status that
+    the sweep_stuck_qualifications loops autonomously re-enter.  If any of
+    these falls through to the default not_applicable rule, the operator and
+    strategic read surfaces report the version as ``settled`` while the cycle
+    is actually re-driving it — a correctness gap in the trigger truth.
+    """
+    d = _resolve(status=status, **case["params"])
+    assert d.fire, (
+        f"status={status!r}: resolver returned fire=False "
+        f"(reason={d.reason}, trigger={d.trigger}) — "
+        f"expected fire=True with trigger={case['trigger']!r}"
+    )
+    assert d.trigger == case["trigger"], (
+        f"status={status!r}: expected trigger={case['trigger']!r}, "
+        f"got trigger={d.trigger!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# explain — infra_failure and deferred_unsynced states
+# ---------------------------------------------------------------------------
+
+
+class TestExplainNewStates:
+    def _explain(self, **kwargs):
+        defaults = dict(
+            phase="stabilize",
+            status=None,
+            error_code=None,
+            qualification_attempts=0,
+            error_redrive_count=0,
+            is_candidate_fully_met=True,
+            requalification_ready=None,
+            candidate_sha=None,
+            automain_sha=None,
+            automain_ci_state=None,
+            blocker=None,
+            in_flight=False,
+            promotion_in_flight=False,
+            last_attempt=None,
+            knob="on",
+            evaluated_at="2026-07-16T00:00:00",
+        )
+        defaults.update(kwargs)
+        return explain_qualification_trigger(**defaults)
+
+    def test_infra_failure_armed(self):
+        out = self._explain(status="infra_failure", consecutive_infra_errors=0)
+        assert out["auto_trigger"] == "armed"
+        assert out["decision"]["trigger"] == "infra_failure_redrive"
+
+    def test_infra_failure_capped(self):
+        out = self._explain(
+            status="infra_failure",
+            consecutive_infra_errors=_MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS,
+        )
+        assert out["auto_trigger"] == "capped"
+        assert out["decision"]["reason"] == "infra_failure_attempt_cap"
+
+    def test_infra_failure_capped_respects_knob(self):
+        # Knob dominates: observe/off modes suppress armed/capped labels.
+        out = self._explain(
+            status="infra_failure",
+            consecutive_infra_errors=_MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS,
+            knob="observe",
+        )
+        assert out["auto_trigger"] == "observe"
+
+    def test_deferred_unsynced_armed(self):
+        out = self._explain(status="deferred_unsynced")
+        assert out["auto_trigger"] == "armed"
+        assert out["decision"]["trigger"] == "deferred_unsynced_redrive"
+
+    def test_infra_failure_next_expected_when_capped(self):
+        out = self._explain(
+            status="infra_failure",
+            consecutive_infra_errors=_MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS,
+        )
+        assert out["next_expected_trigger"] == "operator_or_strategist_only"
+
+    def test_deferred_unsynced_next_expected_is_sweep_retry(self):
+        out = self._explain(status="deferred_unsynced")
+        assert out["next_expected_trigger"] == "sweep_retry"

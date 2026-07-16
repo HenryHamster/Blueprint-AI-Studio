@@ -1457,6 +1457,13 @@ async def _run_auto_qualification_trigger_for_version(
     # qualification_triggers: capping on the lifetime count strands a version at
     # status=error forever.
     error_redrive_count = int(qual.get("error_redrive_count") or 0) if qual else 0
+    # Per-candidate infra-failure streak from last_qualification.  The sweep's
+    # _redrive_infra_failure_qualification resolves an effective streak (per-dimension
+    # when available, falling back to this attempt-level counter), but for the
+    # resolver's pure decision the attempt-level counter is the correct input —
+    # the per-dimension resolution is an implementation detail of the redrive
+    # function and the resolver's cap uses the same threshold.
+    consecutive_infra_errors = int(qual.get("consecutive_infra_errors") or 0) if qual else 0
 
     # Determine in-flight and promotion-in-flight guards cheaply from stored state.
     in_flight = status == "pending"
@@ -1575,6 +1582,7 @@ async def _run_auto_qualification_trigger_for_version(
         blocker=blocker,
         in_flight=in_flight,
         promotion_in_flight=promotion_in_flight,
+        consecutive_infra_errors=consecutive_infra_errors,
     )
 
     if decision.fire:

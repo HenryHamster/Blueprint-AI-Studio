@@ -14,8 +14,12 @@ The resolver implements the ordered rule table from the design doc (efbe4182):
                       (new work to re-grade).  No pre-qualification coverage gate.
     T2 rubric_redrive — frozen rubric changed or could not be reconstructed
     T3 error_redrive — transient/non-transient error under attempt cap
+    T3b infra_failure_redrive — transient infrastructure failure under per-candidate
+                                streak cap (separate from error-redrive cap)
     T4 post_dry_run_advance — dry_run + automain has advanced (+ CI-red gate)
     T5 blockers_cleared — not_promoted readiness / promotion_failed / ci_unresolved
+    T5b deferred_unsynced_redrive — deferred deploy-sync re-entry (unconditional;
+                                   the sync gate is inside run_qualification)
 
 All paths call the same ``run_qualification`` chokepoint (which is self-defending via
 a FOR-UPDATE lock); this module only decides *whether* to call it.
@@ -32,6 +36,13 @@ _TRANSIENT_ERROR_CODES: frozenset[str] = frozenset({"sha_error", "no_credentials
 # Maximum number of error-based redrives before the version is considered capped.
 _MAX_ERROR_REDRIVE_ATTEMPTS: int = 5
 
+# Maximum number of sweep-driven re-entries for a ``status=infra_failure`` version.
+# Mirrors ``release_qualifier_redrive._MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS``:
+# infra_failure is non-conclusive (records a transient infrastructure problem) and
+# re-entering run_qualification is always the recovery path.  Cap at 3 so a
+# persistently broken infra path does not retry forever.
+_MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS: int = 3
+
 # CI state string representing a known-red build (from ci_resolution.py).
 _CI_RED = "red"
 
@@ -46,11 +57,12 @@ class TriggerDecision:
     trigger:
         Which rule matched: "none" when fire=False.  One of
         "none", "coverage_complete", "rubric_redrive", "error_redrive",
+        "infra_failure_redrive", "deferred_unsynced_redrive",
         "post_dry_run_advance", "blockers_cleared".
     reason:
         Machine-readable code for the decision (e.g. "ci_red", "in_flight",
-        "wrong_phase", "criterion_not_met", "error_attempt_cap", "armed",
-        "not_applicable").
+        "wrong_phase", "criterion_not_met", "error_attempt_cap",
+        "infra_failure_attempt_cap", "armed", "not_applicable").
     blocking:
         Human-readable list of reasons why fire=False (empty when fire=True).
     """
@@ -94,6 +106,7 @@ def resolve_qualification_trigger(
     blocker: str | None,
     in_flight: bool,
     promotion_in_flight: bool,
+    consecutive_infra_errors: int = 0,
 ) -> TriggerDecision:
     """Return a fire/hold decision for the open version.
 
@@ -140,6 +153,13 @@ def resolve_qualification_trigger(
         True when a qualification is currently pending/in_progress.
     promotion_in_flight:
         True when a promotion PR is open and auto-merging.
+    consecutive_infra_errors:
+        The per-candidate infra-failure streak from
+        ``last_qualification["consecutive_infra_errors"]`` (reset when the
+        candidate SHA changes or a non-infra verdict lands).  Read by the
+        infra_failure_redrive tier against ``_MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS``.
+        Defaults to 0 so callers that don't resolve the streak still get a
+        safe (fire-eligible) decision.
     """
     # T0 — Hard hold guards (mirror run_qualification's self-defending phase/lock guards).
     # These are informational; the guards in run_qualification remain the authority.
@@ -296,6 +316,33 @@ def resolve_qualification_trigger(
                 blocking=[],
             )
 
+    # T3b — infra_failure_redrive: transient infrastructure failures are
+    # non-conclusive (child timeout, unavailable check, GitHub API unreachable)
+    # and re-entering run_qualification on the current integration-branch HEAD
+    # is the recovery path.  Bounded by a per-candidate streak cap (separate
+    # from the error-redrive cap) so a persistently broken infra path does not
+    # retry forever.  The streak is SHA-scoped: a new candidate resets it to 0,
+    # so the cap trips only when the SAME candidate fails infra repeatedly.
+    if status == "infra_failure":
+        if consecutive_infra_errors >= _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS:
+            return TriggerDecision(
+                fire=False,
+                trigger="none",
+                reason="infra_failure_attempt_cap",
+                blocking=[
+                    f"infra failure redrive cap reached "
+                    f"({consecutive_infra_errors}/"
+                    f"{_MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS} attempts on this "
+                    f"candidate)"
+                ],
+            )
+        return TriggerDecision(
+            fire=True,
+            trigger="infra_failure_redrive",
+            reason="armed",
+            blocking=[],
+        )
+
     # T4 — post_dry_run_advance: fire when the dry_run candidate SHA has been
     # superseded by a new automain HEAD.  Blocked when CI for the new SHA is
     # definitively red (i.e. automain_ci_state == "red").
@@ -355,6 +402,22 @@ def resolve_qualification_trigger(
             blocking=["promotion_failed — awaiting remediation before re-drive"],
         )
 
+    # T5b — deferred_unsynced_redrive: the qualify-on-synced gate DEFERS a
+    # candidate the promotion target has not yet absorbed (a main→integration
+    # back-merge is still pending).  run_qualification re-snapshots the
+    # integration-branch HEAD and re-evaluates the sync gate on every re-entry,
+    # so a standing deferral is always eligible for re-entry — the real gate is
+    # inside run_qualification, not here.  Unconditional fire (no cap needed:
+    # each sweep costs one cheap run_qualification re-entry that either proceeds
+    # or re-defers).
+    if status == "deferred_unsynced":
+        return TriggerDecision(
+            fire=True,
+            trigger="deferred_unsynced_redrive",
+            reason="armed",
+            blocking=[],
+        )
+
     # Default: no applicable rule matched (e.g. promoted, abandoned, dry_run with
     # same SHA, or a status the resolver does not yet handle).
     return TriggerDecision(
@@ -384,6 +447,7 @@ def explain_qualification_trigger(
     knob: str,
     evaluated_at: str,
     qualification_provenance: dict[str, Any] | None = None,
+    consecutive_infra_errors: int = 0,
 ) -> dict[str, Any]:
     """Return an operator-facing explanation of the qualification trigger state.
 
@@ -427,6 +491,7 @@ def explain_qualification_trigger(
         blocker=blocker,
         in_flight=in_flight,
         promotion_in_flight=promotion_in_flight,
+        consecutive_infra_errors=consecutive_infra_errors,
     )
 
     # Map decision to auto_trigger label
@@ -436,7 +501,7 @@ def explain_qualification_trigger(
         auto_trigger = "observe"
     elif in_flight:
         auto_trigger = "in_flight"
-    elif decision.reason == "error_attempt_cap":
+    elif decision.reason in ("error_attempt_cap", "infra_failure_attempt_cap"):
         auto_trigger = "capped"
     elif decision.reason == "not_applicable":
         auto_trigger = "settled"
@@ -455,6 +520,7 @@ def explain_qualification_trigger(
         # spontaneously flipping.
         "criterion_not_met": "new_candidate_commit",
         "error_attempt_cap": "operator_or_strategist_only",
+        "infra_failure_attempt_cap": "operator_or_strategist_only",
         "ci_red": "new_candidate_commit",
         "findings_unresolved": "findings_resolved",
         "not_applicable": "operator_or_strategist_only",
