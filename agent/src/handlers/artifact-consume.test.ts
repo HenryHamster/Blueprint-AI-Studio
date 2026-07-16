@@ -13,6 +13,7 @@ import * as zlib from 'zlib';
 const gitCalls: string[][] = [];
 const sendLogMock = vi.fn();
 vi.mock('../index.js', () => ({
+  normalizeClaudeConfigContent: vi.fn((_path: string, content: string) => content),
   WORKSPACE: '/tmp/workspace',
   sendLog: (...args: unknown[]): void => { sendLogMock(...args); },
   git: (args: string[], _cwd?: string): string => {

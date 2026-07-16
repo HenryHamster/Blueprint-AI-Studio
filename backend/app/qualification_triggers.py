@@ -383,6 +383,7 @@ def explain_qualification_trigger(
     last_attempt: dict[str, Any] | None,
     knob: str,
     evaluated_at: str,
+    qualification_provenance: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return an operator-facing explanation of the qualification trigger state.
 
@@ -461,7 +462,7 @@ def explain_qualification_trigger(
     }
     next_expected = reason_to_next.get(decision.reason, "operator_or_strategist_only")
 
-    return {
+    out = {
         "auto_trigger": auto_trigger,
         "last_attempt": last_attempt,
         "next_expected_trigger": next_expected,
@@ -477,3 +478,6 @@ def explain_qualification_trigger(
         "evaluated_at": evaluated_at,
         "decision": decision.as_dict(),
     }
+    if qualification_provenance is not None:
+        out["qualification_provenance"] = qualification_provenance
+    return out

@@ -39,6 +39,13 @@ ALLOWLIST: set[str] = {
     # cannot send cookies. The capability JWT carries scope: "tool-asset" and is
     # validated inline by _verify_tool_asset_token.
     "/api/admin/projects/{project_id}/tools/{tool_slug}/assets/{path:path}",
+    # GET /api/admin/projects/{project_id}/tools/{tool_slug}/t/{token}/assets/{path:path}
+    # is the path-embedded-token variant. The token sits in the URL path so that
+    # relative subresource requests (e.g. <script src="./app.js">) inherit auth
+    # automatically inside sandboxed opaque-origin iframes (where query-string
+    # tokens are dropped on relative URL resolution). Auth is performed
+    # identically via _verify_tool_asset_token (scope: "tool-asset").
+    "/api/admin/projects/{project_id}/tools/{tool_slug}/t/{token}/assets/{path:path}",
 }
 
 # get_metrics_reader is a narrowly scoped read-only auth dep that accepts

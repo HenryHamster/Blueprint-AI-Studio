@@ -10734,6 +10734,7 @@ async def _seed_dimension_row(
     sub_score=None,
     blocker=None,
     detail=None,
+    origin_attempt_id=None,
 ):
     row = QualificationDimensionResult(
         project_id=project.id,
@@ -10744,6 +10745,7 @@ async def _seed_dimension_row(
         sub_score=sub_score,
         blocker=blocker,
         detail=detail,
+        origin_attempt_id=origin_attempt_id,
     )
     db_session.add(row)
     return row
@@ -11601,6 +11603,12 @@ _REUSE_PATH_PRE_GATES = {
     "apply_detail": {},
 }
 
+_EMPTY_RUBRIC_PROJECTION = {
+    "rubric_snapshot": [],
+    "rubric_fingerprint": rq._rubric_fingerprint([]),
+    "rubric_lifecycle_snapshot": [],
+}
+
 
 @pytest.mark.asyncio
 async def test_reused_blocked_smoketest_fact_stays_blocked_not_scored_1_0(
@@ -11625,6 +11633,7 @@ async def test_reused_blocked_smoketest_fact_stays_blocked_not_scored_1_0(
     sha = _LEDGER_SHA_A
     version.last_qualification = {
         "status": "pending",
+        **_EMPTY_RUBRIC_PROJECTION,
         "candidate_sha": sha,
         "ci_green": True,
         "smoketest_enabled": True,
@@ -11678,6 +11687,7 @@ async def test_reused_blocked_test_erosion_fact_stays_blocked_not_scored_1_0(
     sha = _LEDGER_SHA_A
     version.last_qualification = {
         "status": "pending",
+        **_EMPTY_RUBRIC_PROJECTION,
         "candidate_sha": sha,
         "ci_green": True,
         "smoketest_enabled": True,
@@ -11724,6 +11734,7 @@ async def test_reused_passed_smoketest_with_absent_score_still_neutral(
     sha = _LEDGER_SHA_A
     version.last_qualification = {
         "status": "pending",
+        **_EMPTY_RUBRIC_PROJECTION,
         "candidate_sha": sha,
         "ci_green": True,
         "smoketest_enabled": True,
@@ -18800,6 +18811,7 @@ async def _seed_infra_failure_children(
 
     version.last_qualification = {
         "status": "pending",
+        **_EMPTY_RUBRIC_PROJECTION,
         "candidate_sha": "dead" * 10,
         "ci_green": True,
         "smoketest_enabled": smoketest_enabled,
@@ -19486,6 +19498,7 @@ class TestFinalizeInfraFailure:
         )
         version.last_qualification = {
             "status": "pending",
+            **_EMPTY_RUBRIC_PROJECTION,
             "candidate_sha": "cafe" * 10,
             "ci_green": True,
             "smoketest_enabled": False,
@@ -19533,6 +19546,7 @@ class TestFinalizeInfraFailure:
 
         version.last_qualification = {
             "status": "pending",
+            **_EMPTY_RUBRIC_PROJECTION,
             "candidate_sha": "cafe" * 10,
             "ci_green": True,
             "smoketest_enabled": False,
@@ -19694,6 +19708,7 @@ class TestFinalizeInfraFailure:
         )
         version.last_qualification = {
             "status": "pending",
+            **_EMPTY_RUBRIC_PROJECTION,
             "candidate_sha": _candidate_sha,
             "ci_green": True,
             "smoketest_enabled": True,
@@ -19810,6 +19825,7 @@ class TestFinalizeInfraFailure:
         original_challenge_id = str(challenge_task.id)
         version.last_qualification = {
             "status": "pending",
+            **_EMPTY_RUBRIC_PROJECTION,
             "candidate_sha": _candidate_sha,
             "ci_green": True,
             "smoketest_enabled": True,
@@ -19928,6 +19944,7 @@ class TestFinalizeInfraFailure:
 
         version.last_qualification = {
             "status": "pending",
+            **_EMPTY_RUBRIC_PROJECTION,
             "candidate_sha": _candidate_sha,
             "ci_green": True,
             "smoketest_enabled": True,
@@ -20030,6 +20047,7 @@ class TestFinalizeInfraFailure:
         from app.failure_classification import RATE_LIMIT, persist_failure_category
 
         project, version = await _make_project_and_version(db_session)
+        attempt_id = uuid.uuid4()
         audit_task = Task(
             project_id=project.id,
             title="audit",
@@ -20039,11 +20057,15 @@ class TestFinalizeInfraFailure:
                     "base_branch": "main",
                     "diff_range": "main...abcd1234",
                     "candidate_sha": "abcd1234" * 5,
+                    "qualification_attempt_id": str(attempt_id),
                 }
             ],
             vm_instance_id="vm-audit-rate-limited",
             status=TaskStatus.FAILED,
-            context={"release_version_id": str(version.id)},
+            context={
+                "release_version_id": str(version.id),
+                "qualification_attempt_id": str(attempt_id),
+            },
         )
         db_session.add(audit_task)
         await db_session.commit()
@@ -20059,6 +20081,9 @@ class TestFinalizeInfraFailure:
 
         version.last_qualification = {
             "status": "pending",
+            **_EMPTY_RUBRIC_PROJECTION,
+            "qualification_attempt_id": str(attempt_id),
+            "retry_episode": 0,
             "candidate_sha": candidate,
             "ci_green": True,
             "smoketest_enabled": False,
@@ -20067,6 +20092,8 @@ class TestFinalizeInfraFailure:
             "smoketest_task_id": None,
             "prior_infra_streak": 0,
         }
+        version.active_qualification_attempt_id = attempt_id
+        version.qualification_attempts = 1
         db_session.add(version)
         await db_session.commit()
         await db_session.refresh(version)
@@ -20083,6 +20110,17 @@ class TestFinalizeInfraFailure:
         new_qual = version.last_qualification
         assert new_qual["audit_rl_respawn_count"] == 1
         assert new_qual["audit_task_id"] != original_audit_id
+        assert new_qual["qualification_attempt_id"] == str(attempt_id)
+        assert new_qual["retry_episode"] == 1
+        assert new_qual["retry_episode_cap"] == rq._MAX_AUDIT_RL_RESPAWNS
+        assert version.qualification_attempts == 1
+        assert version.qualification_retry_episode == 1
+        replacement = await db_session.get(Task, uuid.UUID(new_qual["audit_task_id"]))
+        assert replacement is not None
+        assert replacement.context["qualification_attempt_id"] == str(attempt_id)
+        assert replacement.first_payload["qualification_attempt_id"] == str(
+            attempt_id
+        )
 
         # No QualificationVerdict row — verdict was not rendered.
         verdicts = await _infra_verdicts_for_version(db_session, version)
@@ -20137,6 +20175,7 @@ class TestFinalizeInfraFailure:
 
         version.last_qualification = {
             "status": "pending",
+            **_EMPTY_RUBRIC_PROJECTION,
             "candidate_sha": "cafe5678" * 5,
             "ci_green": True,
             "smoketest_enabled": False,
@@ -20202,6 +20241,7 @@ class TestFinalizeInfraFailure:
         original_audit_id = str(audit_task.id)
         version.last_qualification = {
             "status": "pending",
+            **_EMPTY_RUBRIC_PROJECTION,
             "candidate_sha": candidate,
             "ci_green": True,
             "smoketest_enabled": False,
@@ -20274,6 +20314,7 @@ class TestFinalizeInfraFailure:
 
         version.last_qualification = {
             "status": "pending",
+            **_EMPTY_RUBRIC_PROJECTION,
             "candidate_sha": candidate,
             "ci_green": True,
             "smoketest_enabled": False,
@@ -20334,6 +20375,7 @@ class TestFinalizeInfraFailure:
 
         version.last_qualification = {
             "status": "pending",
+            **_EMPTY_RUBRIC_PROJECTION,
             "candidate_sha": "dead1234" * 5,
             "ci_green": True,
             "smoketest_enabled": False,
@@ -20395,6 +20437,7 @@ class TestFinalizeInfraFailure:
         persist_failure_category(first_audit, PROVISION_FAILURE)
         version.last_qualification = {
             "status": "pending",
+            **_EMPTY_RUBRIC_PROJECTION,
             "candidate_sha": first_candidate,
             "ci_green": True,
             "smoketest_enabled": False,
@@ -20725,6 +20768,7 @@ class TestFinalizeInfraFailure:
         }
         version.last_qualification = {
             "status": "pending",
+            **_EMPTY_RUBRIC_PROJECTION,
             "candidate_sha": "dead" * 10,
             "ci_green": True,
             "smoketest_enabled": False,
@@ -21155,6 +21199,7 @@ class TestReaperInducedAuditHeartbeatTimeout:
 
         version.last_qualification = {
             "status": "pending",
+            **_EMPTY_RUBRIC_PROJECTION,
             "candidate_sha": "dead" * 10,
             "ci_green": True,
             "smoketest_enabled": False,
@@ -21406,21 +21451,38 @@ async def _seed_pending_qualification(
     """
     from app.time_utils import _utcnow
 
+    attempt_id = uuid.uuid4()
+    attempt_text = str(attempt_id)
+
     audit_task = Task(
         project_id=project.id,
         title="audit-child",
-        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        payloads=[{
+            "type": "release_audit",
+            "base_branch": "main",
+            "qualification_attempt_id": attempt_text,
+        }],
         vm_instance_id="vm-audit-child",
         status=audit_status,
-        context={"release_version_id": str(version.id)},
+        context={
+            "release_version_id": str(version.id),
+            "qualification_attempt_id": attempt_text,
+        },
     )
     smoke_task = Task(
         project_id=project.id,
         title="smoke-child",
-        payloads=[{"type": "smoketest", "base_branch": "automain"}],
+        payloads=[{
+            "type": "smoketest",
+            "base_branch": "automain",
+            "qualification_attempt_id": attempt_text,
+        }],
         vm_instance_id="vm-smoke-child",
         status=smoke_status,
-        context={"release_version_id": str(version.id)},
+        context={
+            "release_version_id": str(version.id),
+            "qualification_attempt_id": attempt_text,
+        },
     )
     db_session.add(audit_task)
     db_session.add(smoke_task)
@@ -21430,6 +21492,8 @@ async def _seed_pending_qualification(
 
     version.last_qualification = {
         "status": "pending",
+        **_EMPTY_RUBRIC_PROJECTION,
+        "qualification_attempt_id": attempt_text,
         "candidate_sha": candidate_sha or "abcd" * 10,
         "ci_green": True,
         "smoketest_enabled": True,
@@ -21437,6 +21501,7 @@ async def _seed_pending_qualification(
         "audit_task_id": str(audit_task.id),
         "smoketest_task_id": str(smoke_task.id),
     }
+    version.active_qualification_attempt_id = attempt_id
     db_session.add(version)
     await db_session.commit()
     await db_session.refresh(version)
@@ -22049,29 +22114,32 @@ async def _seed_pending_qualification_with_challenge(
     and stamps challenge_task_id in last_qualification."""
     from app.time_utils import _utcnow
 
+    attempt_id = uuid.uuid4()
+    attempt_text = str(attempt_id)
+
     audit_task = Task(
         project_id=project.id,
         title="audit-child",
-        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        payloads=[{"type": "release_audit", "base_branch": "main", "qualification_attempt_id": attempt_text}],
         vm_instance_id="vm-audit-child-ch",
         status=audit_status,
-        context={"release_version_id": str(version.id)},
+        context={"release_version_id": str(version.id), "qualification_attempt_id": attempt_text},
     )
     smoke_task = Task(
         project_id=project.id,
         title="smoke-child",
-        payloads=[{"type": "smoketest", "base_branch": "automain"}],
+        payloads=[{"type": "smoketest", "base_branch": "automain", "qualification_attempt_id": attempt_text}],
         vm_instance_id="vm-smoke-child-ch",
         status=smoke_status,
-        context={"release_version_id": str(version.id)},
+        context={"release_version_id": str(version.id), "qualification_attempt_id": attempt_text},
     )
     challenge_task = Task(
         project_id=project.id,
         title="challenge-child",
-        payloads=[{"type": "release_audit_challenge", "base_branch": "main"}],
+        payloads=[{"type": "release_audit_challenge", "base_branch": "main", "qualification_attempt_id": attempt_text}],
         vm_instance_id="vm-challenge-child",
         status=challenge_status,
-        context={"release_version_id": str(version.id)},
+        context={"release_version_id": str(version.id), "qualification_attempt_id": attempt_text},
     )
     db_session.add(audit_task)
     db_session.add(smoke_task)
@@ -22083,6 +22151,8 @@ async def _seed_pending_qualification_with_challenge(
 
     version.last_qualification = {
         "status": "pending",
+        **_EMPTY_RUBRIC_PROJECTION,
+        "qualification_attempt_id": attempt_text,
         "candidate_sha": "abcd" * 10,
         "ci_green": True,
         "smoketest_enabled": True,
@@ -22092,6 +22162,7 @@ async def _seed_pending_qualification_with_challenge(
         "challenge_task_id": str(challenge_task.id),
         "audit_challenge_task_id": str(challenge_task.id),
     }
+    version.active_qualification_attempt_id = attempt_id
     db_session.add(version)
     await db_session.commit()
     await db_session.refresh(version)
@@ -23115,6 +23186,159 @@ async def test_redrive_infra_failure_cap_keyed_on_persisted_streak(
 
 
 @pytest.mark.asyncio
+async def test_same_candidate_redrive_reuses_dimension_with_origin_attempt(
+    db_session, mocker,
+):
+    """A fresh operator re-drive reuses same-candidate facts with provenance.
+
+    This exercises the production start seam (not a synthetic serializer): the
+    first attempt's resolved audit/test facts remain owned by their producing
+    attempt, the new active attempt is recorded as a reuser, and the child that
+    still must run carries the new identity in both context and payload.
+    """
+    project, version = await _make_project_and_version(
+        db_session, phase="stabilize"
+    )
+    sha = "c0ffee12" * 5
+    origin_attempt = uuid.uuid4()
+    for dimension, score in (
+        ("audit", 0.92),
+        ("test_erosion", 1.0),
+        ("ci", None),
+        ("migration_identity", None),
+        ("migration_apply", None),
+        ("challenge", None),
+    ):
+        await _seed_dimension_row(
+            db_session,
+            project,
+            version,
+            dimension,
+            status="passed",
+            sub_score=score,
+            candidate_sha=sha,
+            origin_attempt_id=origin_attempt,
+        )
+    await _seed_dimension_row(
+        db_session,
+        project,
+        version,
+        "merge_grade",
+        status="unavailable",
+        candidate_sha=sha,
+        origin_attempt_id=origin_attempt,
+    )
+    version.goal = "Prove qualification attempt provenance across a re-drive"
+    version.active_qualification_attempt_id = origin_attempt
+    version.qualification_attempts = 1
+    version.last_qualification = {
+        "status": "infra_failure",
+        "qualification_attempt_id": str(origin_attempt),
+        "candidate_sha": sha,
+        "error": "merge_grade_report_unparseable",
+        "retry_episode": 0,
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock(automain=sha))
+    mocker.patch(
+        "app.release_qualifier.compute_audited_surface_hash",
+        return_value="same-candidate-surface",
+    )
+    audit_spawn = mocker.spy(rq, "_spawn_release_audit_task")
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert result["status"] == "spawned"
+    active_attempt = uuid.UUID(result["qualification_attempt_id"])
+    assert active_attempt != origin_attempt
+    assert version.active_qualification_attempt_id == active_attempt
+    assert version.qualification_attempts == 2
+    assert version.qualification_retry_episode == 0
+    assert version.last_qualification["qualification_attempt_id"] == str(
+        active_attempt
+    )
+    audit_spawn.assert_not_called()
+
+    audit_row = (
+        await db_session.execute(
+            select(QualificationDimensionResult).where(
+                QualificationDimensionResult.release_version_id == version.id,
+                QualificationDimensionResult.candidate_sha == sha,
+                QualificationDimensionResult.dimension == "audit",
+            )
+        )
+    ).scalar_one()
+    assert audit_row.origin_attempt_id == origin_attempt
+    assert str(active_attempt) in (audit_row.reused_by_attempt_ids or [])
+    assert version.last_qualification["resolved_dimensions"]["audit"] == {
+        "status": "passed",
+        "sub_score": 0.92,
+        "blocker": None,
+        "detail": None,
+        "origin_attempt_id": str(origin_attempt),
+        "reused_by_attempt_id": str(active_attempt),
+        "producing_task_id": None,
+    }
+
+    merge_task = await db_session.get(
+        Task, uuid.UUID(version.last_qualification["merge_grade_task_id"])
+    )
+    assert merge_task is not None
+    assert merge_task.context["qualification_attempt_id"] == str(active_attempt)
+    assert merge_task.first_payload["qualification_attempt_id"] == str(
+        active_attempt
+    )
+
+
+@pytest.mark.asyncio
+async def test_pending_to_finalized_attempt_identity_continuity(db_session):
+    """The immutable verdict keeps the UUID published by the pending record."""
+    from app import release_promotion as rp
+
+    _project, version = await _make_project_and_version(db_session)
+    attempt_id = uuid.uuid4()
+    version.active_qualification_attempt_id = attempt_id
+    version.last_qualification = {
+        "status": "pending",
+        "qualification_attempt_id": str(attempt_id),
+        "candidate_sha": "facefeed" * 5,
+        "started_at": "2026-07-15T10:00:00",
+    }
+    finalized = {
+        **version.last_qualification,
+        "status": "dry_run",
+        "finalized_at": "2026-07-15T10:05:00",
+        "confidence": 0.91,
+        "threshold": 0.9,
+    }
+    version.last_qualification = finalized
+    db_session.add(version)
+    await rp._record_qualification_verdict(
+        db_session,
+        version,
+        finalized,
+        terminal_status="dry_run",
+        would_promote=True,
+        promotion_enabled=False,
+    )
+    await db_session.commit()
+
+    verdict = (
+        await db_session.execute(
+            select(QualificationVerdict).where(
+                QualificationVerdict.release_version_id == version.id
+            )
+        )
+    ).scalar_one()
+    assert verdict.qualification_attempt_id == attempt_id
+    assert version.last_qualification["qualification_attempt_id"] == str(attempt_id)
+
+
+@pytest.mark.asyncio
 async def test_infra_redrive_reuses_resolved_dimensions_without_respawn(
     db_session, mocker,
 ):
@@ -23175,14 +23399,18 @@ async def test_infra_redrive_reuses_resolved_dimensions_without_respawn(
     # Set version in infra_failure at the SAME candidate_sha — the merge-grade
     # gate hit a transient unparseable-report failure while every other gate
     # already resolved (passed).
+    attempt_id = uuid.uuid4()
     version.last_qualification = {
         "status": "infra_failure",
+        "qualification_attempt_id": str(attempt_id),
+        "retry_episode": 0,
         "candidate_sha": sha,
         "error": "merge_grade_report_unparseable",
         "consecutive_infra_errors": 0,
         "started_at": "2026-07-10T00:00:00",
         "finalized_at": "2026-07-10T00:01:00",
     }
+    version.active_qualification_attempt_id = attempt_id
     version.qualification_attempts = 1
     # The merge-grade spawn requires a non-empty, non-contentless goal.
     version.goal = "Deliver the per-dimension ledger reuse on qualifier re-drive"
@@ -23225,6 +23453,9 @@ async def test_infra_redrive_reuses_resolved_dimensions_without_respawn(
 
     # The version transitioned from infra_failure to pending.
     assert qual["status"] == "pending"
+    assert qual["qualification_attempt_id"] == str(attempt_id)
+    assert qual["retry_episode"] == 1
+    assert version.qualification_attempts == 1
 
     # --- Core assertions: resolved-dimension children were NOT re-spawned ---
     # audit child was NOT spawned (audit+test_erosion already resolved).
@@ -23377,11 +23608,12 @@ async def test_infra_redrive_isolates_failure_to_one_dimension_ledger_facts_surv
     audit_spawn.assert_awaited_once()
     # smoketest already 'passed' — NOT re-spawned by the audit-gate re-drive.
     smoketest_spawn.assert_not_called()
-    # merge_grade already 'passed' — NOT re-spawned either.
-    merge_grade_spawn.assert_not_called()
+    # Automain's rubric provenance is attempt-scoped: a prior merge grade is
+    # re-measured for the newly frozen rubric even when the candidate is stable.
+    merge_grade_spawn.assert_awaited_once()
     assert qual["audit_task_id"] is not None
     assert qual["smoketest_task_id"] is None
-    assert qual["merge_grade_task_id"] is None
+    assert qual["merge_grade_task_id"] is not None
 
     # audit is being re-measured, so it is NOT in the carried-forward reuse set;
     # the other resolved dimensions ARE carried forward.
@@ -25426,13 +25658,16 @@ async def _seed_audit_only_pending_qualification(
     False."""
     from app.time_utils import _utcnow
 
+    attempt_id = uuid.uuid4()
+    attempt_text = str(attempt_id)
+
     audit_task = Task(
         project_id=project.id,
         title="audit-child",
-        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        payloads=[{"type": "release_audit", "base_branch": "main", "qualification_attempt_id": attempt_text}],
         vm_instance_id="vm-audit-only",
         status=audit_status,
-        context={"release_version_id": str(version.id)},
+        context={"release_version_id": str(version.id), "qualification_attempt_id": attempt_text},
     )
     db_session.add(audit_task)
     await db_session.commit()
@@ -25449,6 +25684,8 @@ async def _seed_audit_only_pending_qualification(
 
     version.last_qualification = {
         "status": "pending",
+        **_EMPTY_RUBRIC_PROJECTION,
+        "qualification_attempt_id": attempt_text,
         "candidate_sha": "abcd" * 10,
         "ci_green": True,
         "smoketest_enabled": False,
@@ -25456,6 +25693,7 @@ async def _seed_audit_only_pending_qualification(
         "audit_task_id": str(audit_task.id),
         "smoketest_task_id": None,
     }
+    version.active_qualification_attempt_id = attempt_id
     db_session.add(version)
     await db_session.commit()
     await db_session.refresh(version)
@@ -40082,6 +40320,7 @@ async def test_finalize_new_candidate_sha_writes_new_dimension_rows(
     sha_2 = "b" * 40
     version.last_qualification = {
         "status": "pending",
+        **_EMPTY_RUBRIC_PROJECTION,
         "candidate_sha": sha_2,
         "ci_green": True,
         "smoketest_enabled": True,

@@ -119,6 +119,10 @@ _MAX_IMAGE_CACHE_PROJECTS = 64
 # 1 PiB per bucket — far beyond any real image cache, so an absurd runner-reported
 # integer can never poison the telemetry while every plausible value passes.
 _MAX_IMAGE_CACHE_BYTES = 1 << 50
+_PROJECT_VERIFICATION_VERSION = 1
+_MAX_PROJECT_VERIFICATION_REASON_CHARS = 500
+_PROJECT_VERIFICATION_BACKENDS = frozenset({"bwrap", "declined"})
+_PROJECT_VERIFICATION_BOUNDARY_CLASS = "agent"
 
 
 def _sanitize_image_cache_by_project(raw: Any) -> dict | None:
@@ -162,6 +166,92 @@ def _sanitize_image_cache_by_project(raw: Any) -> dict | None:
         "by_project": by_project,
         "unattributed_bytes": _clamp_bytes(raw.get("unattributed_bytes")),
         "unattributed_image_count": _clamp_count(raw.get("unattributed_image_count")),
+    }
+
+
+def _sanitize_project_verification(raw: Any) -> dict | None:
+    """Normalize untrusted versioned boundary proof; never trust aggregate ready."""
+    if not isinstance(raw, dict):
+        return None
+
+    raw_version = raw.get("version")
+    version = (
+        max(0, min(1_000_000, raw_version))
+        if isinstance(raw_version, int) and not isinstance(raw_version, bool)
+        else 0
+    )
+    raw_boundary = raw.get("boundary")
+    boundary_class = "unknown"
+    boundary_backend = "unknown"
+    if isinstance(raw_boundary, dict):
+        candidate_class = raw_boundary.get("class")
+        if candidate_class == _PROJECT_VERIFICATION_BOUNDARY_CLASS:
+            boundary_class = candidate_class
+        candidate = raw_boundary.get("backend")
+        if (
+            isinstance(candidate, str)
+            and candidate.strip() in _PROJECT_VERIFICATION_BACKENDS
+        ):
+            boundary_backend = candidate.strip()
+
+    raw_probes = raw.get("probes")
+    raw_probes = raw_probes if isinstance(raw_probes, dict) else {}
+
+    def _probe(name: str) -> dict:
+        value = raw_probes.get(name)
+        value = value if isinstance(value, dict) else {}
+        raw_exit = value.get("exit_code")
+        valid_exit_code = (
+            isinstance(raw_exit, int)
+            and not isinstance(raw_exit, bool)
+            and 0 <= raw_exit <= 255
+        )
+        exit_code = raw_exit if valid_exit_code else None
+        passed = value.get("ok") is True and exit_code == 0
+        raw_reason = value.get("reason")
+        reason = (
+            raw_reason.strip()[:_MAX_PROJECT_VERIFICATION_REASON_CHARS]
+            if isinstance(raw_reason, str) and raw_reason.strip()
+            else None
+        )
+        if not passed and reason is None:
+            reason = (
+                f"{name} probe reported an invalid exit code"
+                if raw_exit is not None and not valid_exit_code
+                else f"{name} probe did not provide zero-exit evidence"
+            )
+        return {"ok": passed, "exit_code": exit_code, "reason": reason}
+
+    ruff = _probe("ruff")
+    docker_postgres = _probe("docker_postgres")
+    ready = bool(
+        version == _PROJECT_VERIFICATION_VERSION
+        and boundary_class == _PROJECT_VERIFICATION_BOUNDARY_CLASS
+        and boundary_backend == "bwrap"
+        and ruff["ok"]
+        and docker_postgres["ok"]
+    )
+    reasons: list[str] = []
+    if version != _PROJECT_VERIFICATION_VERSION:
+        reasons.append(f"unsupported project verification version {version}")
+    if boundary_class != _PROJECT_VERIFICATION_BOUNDARY_CLASS:
+        reasons.append("write-agent boundary class was not agent")
+    if boundary_backend != "bwrap":
+        reasons.append("write-agent bwrap boundary was not available")
+    reasons.extend(
+        result["reason"]
+        for result in (ruff, docker_postgres)
+        if not result["ok"] and result["reason"]
+    )
+    aggregate_reason = "; ".join(dict.fromkeys(reasons))
+    return {
+        "version": version,
+        "boundary": {"class": boundary_class, "backend": boundary_backend},
+        "ready": ready,
+        "reason": None
+        if ready
+        else aggregate_reason[:_MAX_PROJECT_VERIFICATION_REASON_CHARS],
+        "probes": {"ruff": ruff, "docker_postgres": docker_postgres},
     }
 # _RUNNER_LIVENESS_SECONDS is imported from runner_health_monitors (SSOT) above.
 
@@ -470,6 +560,10 @@ class HeartbeatRequest(BaseModel):
     isolation_backends: dict | None = None
     agent_backend: str | None = None
     compute_backend: str | None = None
+    # Versioned functional evidence for project-authoring verification. Kept raw
+    # here so a future runner version cannot turn the whole liveness heartbeat
+    # into a 422; the handler normalizes known v1 fields and fails closed.
+    project_verification: Any = None
     # LLM CLI inventory: {"claude": {"present": bool, "version": str}, ...}
     # Probed and sent by the runner each heartbeat; persisted in capabilities JSONB
     # so the orchestrator can filter pool LLM runtimes to clis the runner has.
@@ -1428,6 +1522,16 @@ async def heartbeat(
         caps["agent_backend"] = payload.agent_backend
     if payload.compute_backend is not None:
         caps["compute_backend"] = payload.compute_backend
+    sanitized_verification = _sanitize_project_verification(
+        payload.project_verification
+    )
+    if sanitized_verification is not None:
+        caps["project_verification"] = sanitized_verification
+    elif payload.active_work_report:
+        # A genuine daemon heartbeat without fresh evidence must not retain proof
+        # earned by a prior/newer runner binary. Old runners remain heartbeat-
+        # compatible but are verification-incapable until they report v1.
+        caps.pop("project_verification", None)
     if payload.has_gpu is not None:
         caps["has_gpu"] = payload.has_gpu
     if payload.gpu_count is not None:

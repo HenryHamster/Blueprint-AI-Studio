@@ -281,6 +281,7 @@ async def _spawn_release_audit_task(
     base_branch: str,
     diff_range: str,
     candidate_sha: str,
+    qualification_attempt_id: uuid.UUID | str,
     audit_base_sha: str | None = None,
     version_goal: str | None = None,
 ) -> Task:
@@ -292,6 +293,7 @@ async def _spawn_release_audit_task(
         # Audit C4: pin the audit to the exact qualified commit.  The agent
         # reads this from the payload and checks out this SHA.
         "candidate_sha": candidate_sha,
+        "qualification_attempt_id": str(qualification_attempt_id),
         # Explicitly pin to Opus — regression guard against silent downgrade.
         "quality_tier": "opus",
     }
@@ -331,6 +333,7 @@ async def _spawn_release_audit_task(
         context={
             "release_version_id": str(version_id),
             "candidate_sha": candidate_sha,
+            "qualification_attempt_id": str(qualification_attempt_id),
             "scope": "medium",
         },
     )
@@ -346,6 +349,7 @@ async def _spawn_release_audit_task(
                 "diff_range": diff_range,
                 "audit_base_sha": audit_base_sha,
                 "release_version_id": str(version_id),
+                "qualification_attempt_id": str(qualification_attempt_id),
             },
         )
     )
@@ -360,6 +364,7 @@ async def _spawn_release_audit_challenge_task(
     base_branch: str,
     diff_range: str,
     candidate_sha: str,
+    qualification_attempt_id: uuid.UUID | str,
     primary_audit_task_id: str | None = None,
     primary_findings: list[dict[str, str]] | None = None,
     version_goal: str | None = None,
@@ -376,6 +381,7 @@ async def _spawn_release_audit_challenge_task(
         "base_branch": base_branch,
         "diff_range": diff_range,
         "candidate_sha": candidate_sha,
+        "qualification_attempt_id": str(qualification_attempt_id),
         # Explicitly pin to Opus — regression guard against silent downgrade.
         "quality_tier": "opus",
     }
@@ -418,6 +424,7 @@ async def _spawn_release_audit_challenge_task(
         context={
             "release_version_id": str(version_id),
             "candidate_sha": candidate_sha,
+            "qualification_attempt_id": str(qualification_attempt_id),
             "scope": "medium",
         },
     )
@@ -434,6 +441,7 @@ async def _spawn_release_audit_challenge_task(
                 "task_type": "release_audit_challenge",
                 "diff_range": diff_range,
                 "release_version_id": str(version_id),
+                "qualification_attempt_id": str(qualification_attempt_id),
                 **(
                     {"primary_audit_task_id": primary_audit_task_id}
                     if primary_audit_task_id is not None
@@ -451,6 +459,7 @@ async def _spawn_qualifier_smoketest_task(
     *,
     version_id: uuid.UUID,
     candidate_sha: str,
+    qualification_attempt_id: uuid.UUID | str,
 ) -> Task:
     """Create + queue a qualify-time ``smoketest`` task on the candidate commit."""
     project = await session.get(Project, project_id)
@@ -461,6 +470,7 @@ async def _spawn_qualifier_smoketest_task(
         # Audit C4: pin the smoketest to the exact qualified commit.  The agent
         # clones the integration branch then checks out this SHA.
         "candidate_sha": candidate_sha,
+        "qualification_attempt_id": str(qualification_attempt_id),
     }
     type_model = (_runtime_config.get("task_type_models", {}) or {}).get("smoketest")
     if type_model:
@@ -488,6 +498,7 @@ async def _spawn_qualifier_smoketest_task(
             "release_version_id": str(version_id),
             "qualifier_smoketest": True,
             "candidate_sha": candidate_sha,
+            "qualification_attempt_id": str(qualification_attempt_id),
         },
     )
     session.add(task)
@@ -501,6 +512,7 @@ async def _spawn_qualifier_smoketest_task(
                 "task_type": "smoketest",
                 "qualifier_smoketest": True,
                 "release_version_id": str(version_id),
+                "qualification_attempt_id": str(qualification_attempt_id),
             },
         )
     )
@@ -515,11 +527,11 @@ async def _spawn_release_merge_grade_task(
     base_branch: str,
     diff_range: str,
     candidate_sha: str,
+    qualification_attempt_id: uuid.UUID | str,
     version_goal: str,
     merged_pr_numbers: list[int],
     categories: list[dict[str, Any]] | None = None,
     rubric_fingerprint: str | None = None,
-    qualification_attempt_id: str | None = None,
 ) -> Task:
     """Create + queue a blind ``release_merge_grade`` task for the qualifier.
 
@@ -546,6 +558,7 @@ async def _spawn_release_merge_grade_task(
         "diff_range": diff_range,
         # Pin the grade to the exact qualified commit (mirrors release_audit).
         "candidate_sha": candidate_sha,
+        "qualification_attempt_id": str(qualification_attempt_id),
         # The ONLY narrative the grader is allowed to see: the frozen goal.
         "version_goal": version_goal,
         # The merged-PR window for this version (same acceptance-window /
@@ -558,7 +571,6 @@ async def _spawn_release_merge_grade_task(
         # then grades only the holistic goal coverage.
         "categories": list(categories or []),
         "rubric_fingerprint": rubric_fingerprint,
-        "qualification_attempt_id": qualification_attempt_id,
         # Explicitly pin to Opus — regression guard against silent downgrade
         # (mirrors release_audit / release_audit_challenge).
         "quality_tier": "opus",
@@ -603,7 +615,7 @@ async def _spawn_release_merge_grade_task(
         context={
             "release_version_id": str(version_id),
             "candidate_sha": candidate_sha,
-            "qualification_attempt_id": qualification_attempt_id,
+            "qualification_attempt_id": str(qualification_attempt_id),
             "rubric_fingerprint": rubric_fingerprint,
             "scope": "medium",
         },
@@ -619,9 +631,9 @@ async def _spawn_release_merge_grade_task(
                 "task_type": "release_merge_grade",
                 "diff_range": diff_range,
                 "release_version_id": str(version_id),
+                "qualification_attempt_id": str(qualification_attempt_id),
                 "merged_pr_count": len(merged_pr_numbers),
                 "rubric_fingerprint": rubric_fingerprint,
-                "qualification_attempt_id": qualification_attempt_id,
             },
         )
     )
@@ -1005,6 +1017,9 @@ async def _handle_infra_failure(
     failing_dimension = _infer_dimension_from_infra_error(infra_error)
 
     record: dict[str, Any] = {
+        "qualification_attempt_id": qual.get("qualification_attempt_id"),
+        "retry_episode": qual.get("retry_episode", 0),
+        "retry_episode_cap": qual.get("retry_episode_cap"),
         "candidate_sha": qual.get("candidate_sha"),
         "ci_green": qual.get("ci_green"),
         "smoketest_enabled": qual.get("smoketest_enabled", True),
@@ -1060,6 +1075,7 @@ async def _handle_infra_failure(
             failing_dimension,
             infra_error=infra_error,
             signature=signature,
+            origin_attempt_id=qual.get("qualification_attempt_id"),
         )
         if failing_dimension is not None
         else None
@@ -1267,6 +1283,9 @@ async def _handle_independent_blocker(
     """
     finalized_at = _utcnow().isoformat()
     record: dict[str, Any] = {
+        "qualification_attempt_id": qual.get("qualification_attempt_id"),
+        "retry_episode": qual.get("retry_episode", 0),
+        "retry_episode_cap": qual.get("retry_episode_cap"),
         "candidate_sha": qual.get("candidate_sha"),
         "ci_green": qual.get("ci_green"),
         "smoketest_enabled": qual.get("smoketest_enabled", True),

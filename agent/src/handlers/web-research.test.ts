@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
 vi.mock('../index.js', () => ({
+  normalizeClaudeConfigContent: vi.fn((_path: string, content: string) => content),
   WORKSPACE: '/tmp/workspace',
   sendLog: vi.fn(),
   runClaudeCode: vi.fn().mockResolvedValue({
@@ -87,12 +88,12 @@ describe('handleWebResearch', () => {
     vi.clearAllMocks();
     vi.mocked(runClaudeCode).mockResolvedValue({
       exitCode: 0, allOutput: '', lastResultText: '',
-    } as Awaited<ReturnType<typeof runClaudeCode>>);
+    });
     vi.mocked(readHandlerOutput).mockReturnValue(null);
     vi.mocked(apiGet).mockResolvedValue({ documents: [] });
     // Default deterministic global fetch so the handler's web-citation grounding
     // step never reaches the real network (every probe sees a reachable 200).
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ status: 200 } as Response));
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ status: 200 }));
   });
 
   afterEach(() => {
@@ -190,7 +191,7 @@ describe('handleWebResearch', () => {
     vi.mocked(runClaudeCode).mockResolvedValue({
       exitCode: 0, allOutput: '',
       lastResultText: `Here is the document:\n${JSON.stringify(VALID_DOCUMENT)}`,
-    } as Awaited<ReturnType<typeof runClaudeCode>>);
+    });
 
     await handleWebResearch(
       TASK_ID, { prompt: 'Research the state of WebAssembly' },
@@ -321,13 +322,13 @@ describe('handleWebResearch', () => {
     // First run: clean exit but unparseable output.
     vi.mocked(runClaudeCode).mockResolvedValueOnce({
       exitCode: 0, allOutput: 'Research complete but forgot to emit JSON.', lastResultText: '',
-    } as Awaited<ReturnType<typeof runClaudeCode>>);
+    });
     // Repair run: good document JSON.
     vi.mocked(runClaudeCode).mockResolvedValueOnce({
       exitCode: 0,
       allOutput: JSON.stringify(VALID_DOCUMENT),
       lastResultText: JSON.stringify(VALID_DOCUMENT),
-    } as Awaited<ReturnType<typeof runClaudeCode>>);
+    });
 
     await handleWebResearch(
       TASK_ID, { prompt: 'Research the state of WebAssembly' },
@@ -347,7 +348,7 @@ describe('handleWebResearch', () => {
     // Both runs return unparseable output on clean exit.
     vi.mocked(runClaudeCode).mockResolvedValue({
       exitCode: 0, allOutput: '', lastResultText: '',
-    } as Awaited<ReturnType<typeof runClaudeCode>>);
+    });
 
     await handleWebResearch(
       TASK_ID, { prompt: 'Research the state of WebAssembly' },
@@ -365,7 +366,7 @@ describe('handleWebResearch', () => {
     vi.mocked(readHandlerOutput).mockReturnValue(null);
     vi.mocked(runClaudeCode).mockResolvedValue({
       exitCode: 1, allOutput: 'boom', lastResultText: '',
-    } as Awaited<ReturnType<typeof runClaudeCode>>);
+    });
 
     await handleWebResearch(
       TASK_ID, { prompt: 'Research X' },
@@ -409,7 +410,7 @@ describe('handleWebResearch — bounded self-repair on format miss', () => {
     vi.mocked(readHandlerOutput).mockReturnValue(null);
     vi.mocked(apiGet).mockResolvedValue({ documents: [] });
     // Reachable control + citation probes so grounding never hits the network.
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ status: 200 } as Response));
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ status: 200 }));
   });
 
   afterEach(() => {
@@ -419,10 +420,10 @@ describe('handleWebResearch — bounded self-repair on format miss', () => {
   it('makes exactly one focused re-ask when exitCode=0 but no document extracts, and COMPLETES with the recovered document', async () => {
     vi.mocked(runClaudeCode).mockResolvedValueOnce({
       exitCode: 0, allOutput: 'I searched but never emitted the JSON document.', lastResultText: '',
-    } as Awaited<ReturnType<typeof runClaudeCode>>);
+    });
     vi.mocked(runClaudeCode).mockResolvedValueOnce({
       exitCode: 0, allOutput: '', lastResultText: JSON.stringify(VALID_DOCUMENT),
-    } as Awaited<ReturnType<typeof runClaudeCode>>);
+    });
 
     await handleWebResearch(
       TASK_ID, { prompt: 'Research the state of WebAssembly' },
@@ -445,7 +446,7 @@ describe('handleWebResearch — bounded self-repair on format miss', () => {
   it('does NOT record repair success when the re-ask is also unparseable; falls back to raw output', async () => {
     vi.mocked(runClaudeCode).mockResolvedValue({
       exitCode: 0, allOutput: 'no json', lastResultText: 'raw fallback',
-    } as Awaited<ReturnType<typeof runClaudeCode>>);
+    });
 
     await handleWebResearch(
       TASK_ID, { prompt: 'Research X' },
@@ -461,7 +462,7 @@ describe('handleWebResearch — bounded self-repair on format miss', () => {
   it('skips the re-ask entirely (no format telemetry) when the run exited non-zero', async () => {
     vi.mocked(runClaudeCode).mockResolvedValue({
       exitCode: 1, allOutput: 'boom', lastResultText: '',
-    } as Awaited<ReturnType<typeof runClaudeCode>>);
+    });
 
     await handleWebResearch(
       TASK_ID, { prompt: 'Research X' },
@@ -478,11 +479,11 @@ describe('handleWebResearch — bounded self-repair on format miss', () => {
     // First run: clean exit but no document.
     vi.mocked(runClaudeCode).mockResolvedValueOnce({
       exitCode: 0, allOutput: 'Research done but no JSON.', lastResultText: '',
-    } as Awaited<ReturnType<typeof runClaudeCode>>);
+    });
     // Repair run: valid document.
     vi.mocked(runClaudeCode).mockResolvedValueOnce({
       exitCode: 0, allOutput: '', lastResultText: JSON.stringify(VALID_DOCUMENT),
-    } as Awaited<ReturnType<typeof runClaudeCode>>);
+    });
     // Progress file exists with content.
     vi.mocked(fs.existsSync).mockImplementation((p: unknown) => {
       return String(p).includes(`web_research_progress_${TASK_ID}`) || false;
@@ -507,10 +508,10 @@ describe('handleWebResearch — bounded self-repair on format miss', () => {
   it('omits prior analysis in the repair prompt when the progress file is absent', async () => {
     vi.mocked(runClaudeCode).mockResolvedValueOnce({
       exitCode: 0, allOutput: 'Research done but no JSON.', lastResultText: '',
-    } as Awaited<ReturnType<typeof runClaudeCode>>);
+    });
     vi.mocked(runClaudeCode).mockResolvedValueOnce({
       exitCode: 0, allOutput: '', lastResultText: JSON.stringify(VALID_DOCUMENT),
-    } as Awaited<ReturnType<typeof runClaudeCode>>);
+    });
     // existsSync returns false for the progress file (absent).
     vi.mocked(fs.existsSync).mockReturnValue(false);
 

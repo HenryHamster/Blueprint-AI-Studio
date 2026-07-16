@@ -1552,6 +1552,7 @@ Maximum 5 responses per iteration.  Skip writing the file entirely if every issu
     disallowedTools: disallowedToolsFix,
     noChangesMessage: 'No file changes after review-fix iteration.',
     buildConfig: fixBuildConfig,
+    taskCapability: task.task_capability as Partial<Record<'agent_mode' | 'run_shape' | 'output_kind', unknown>> | undefined,
     // Close the ci_failure fix loop: thread the exact CI-failing selectors
     // into ./check so ./pr open can't push until they pass locally. Empty for
     // non-ci_failure fixes (ciFailureSelectors is [] unless fixReason ===

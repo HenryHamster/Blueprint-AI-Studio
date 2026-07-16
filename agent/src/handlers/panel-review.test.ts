@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../index.js', () => ({
+  normalizeClaudeConfigContent: vi.fn((_path: string, content: string) => content),
   WORKSPACE: '/tmp/workspace',
   strVal: (v: unknown, fallback = '') => (typeof v === 'string' ? v : fallback),
   sanitize: (value: string) => value,

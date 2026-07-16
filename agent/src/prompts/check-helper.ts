@@ -10,6 +10,8 @@ import {
   detectLinterKind,
   validateCfgShellSafety,
   isBlueprintSelfRepo,
+  projectVerificationDirectories,
+  projectVerificationTargets,
   shouldRunBackendMergeGate,
   sanitizeCiFailureSelectors,
   type CodeChangeHelperConfig,
@@ -29,6 +31,13 @@ export const BLUEPRINT_BACKEND_RUFF_FORMAT_CMD = 'python3 -m ruff format --check
 // embedded in a bash generation context (not a different language inside bash).
 // Lazy-loaded so test suites which mock fs do not crash on module import.
 const _CHECK_HELPER_DIR = path.dirname(fileURLToPath(import.meta.url));
+
+const _BACKEND_VERIFICATION_PATH = path.join(_CHECK_HELPER_DIR, 'check_backend_verification.sh');
+function loadBackendVerificationScript(): string {
+  try { return fs.readFileSync(_BACKEND_VERIFICATION_PATH, 'utf8'); } catch {
+    return '    echo "[check] required backend verification fragment missing — failing closed"\n    FAILED+=("required backend verification fragment")\n';
+  }
+}
 
 const _CI_FAILURE_VERIFY_PATH = path.join(_CHECK_HELPER_DIR, 'check_ci_failure_verify.sh');
 function loadCiFailureVerifyScript(): string {
@@ -151,6 +160,31 @@ function buildMergeVerifyBlock(taskId: string): string {
  *  NOT replace the standalone smoke run; the two are complementary. */
 function buildImpactedTestBlock(taskId: string): string {
   return loadImpactedTestScript().replace(/@TASK_ID@/g, taskId);
+}
+
+function buildRequiredBackendVerificationBlock(cfg: CodeChangeHelperConfig): string {
+  const blocks: string[] = [];
+  for (const { directory: dir, harness } of projectVerificationTargets(cfg)) {
+    const dirRe = dir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const pythonPathRe = dir === '.' ? '.*\\.py$' : `^${dirRe}/.*\\.py$`;
+    const testPathRe = dir === '.'
+      ? '^(testing|tests)/test_.*\\.py$'
+      : `^${dirRe}/(testing|tests)/test_.*\\.py$`;
+    const selectorPrefixRe = dir === '.' ? '' : `${dirRe}/`;
+    const fragment = loadBackendVerificationScript()
+      .replace(/@TASK_ID@/g, cfg.taskId)
+      .replace(/@DIR_RE@/g, dirRe)
+      .replace(/@PYTHON_PATH_RE@/g, pythonPathRe)
+      .replace(/@TEST_PATH_RE@/g, testPathRe)
+      .replace(/@SELECTOR_PREFIX_RE@/g, selectorPrefixRe)
+      .replace(/@DIR@/g, dir)
+      .replace(/@HARNESS@/g, harness);
+    const condition = dir === '.'
+      ? `[ -n "$(printf '%s\\n' "$CHANGED" | while IFS= read -r f; do case "$f" in *.py) [ -f "$f" ] && printf x && break ;; esac; done)" ]`
+      : `[ -n "$(printf '%s\\n' "$CHANGED" | while IFS= read -r f; do case "$f" in ${dir}/*.py) [ -f "$f" ] && printf x && break ;; esac; done)" ]`;
+    blocks.push(`if ${condition}; then\n${fragment}fi`);
+  }
+  return blocks.length > 0 ? `\n${blocks.join('\n\n')}\n` : '';
 }
 
 /** Emit a bash sub-block that uploads the failed viewport screenshot(s) for a
@@ -290,6 +324,7 @@ done
 # config-driven pytest gate below only if this environment still cannot run
 # the suite faithfully. ./pr surfaces it after a passing \`./check test\`.
 rm -f /tmp/check_gate_env_${cfg.taskId}.txt
+${projectVerificationDirectories(cfg).length > 0 ? `rm -f /tmp/project_verification_receipt_${cfg.taskId}.json` : ''}
 
 # Determine changed paths: committed since base + uncommitted. Verify at
 # least one diff source actually worked — silently-empty CHANGED used to
@@ -723,7 +758,7 @@ else
   exit 1
 fi
 `;
-  const script = header + stackBlocks + visualCaptureBlock + footer;
+  const script = header + stackBlocks + buildRequiredBackendVerificationBlock(cfg) + visualCaptureBlock + footer;
   // For Blueprint self-repo, `check` is a committed static entrypoint that
   // delegates to `.check-task` when present. Write the per-task generated
   // script there (gitignored) so the tracked `check` file stays clean and

@@ -230,12 +230,16 @@ export async function fetchAssetToken(
 
 /**
  * Build the absolute URL for loading a project-declared tool's asset entry
- * point with the capability token as a query parameter.
+ * point with the capability token embedded in the URL path.
  *
- * The entry path is a relative path like "index.html" or "dist/index.html"
- * within the tool's `.blueprint/tools/{toolSlug}/` directory. Path separators
- * are preserved so multi-segment paths work with the FastAPI `{path:path}`
- * route parameter.
+ * The token is placed in the path rather than as a query parameter so that
+ * relative subresources (e.g. `<script src="./app.js">`) resolve inside the
+ * token-prefix tree and authenticate automatically.  A query-string token
+ * would be dropped on relative resolution, causing 401 for every subresource
+ * in multi-file tools inside a `sandbox="allow-scripts"` (no
+ * `allow-same-origin`) iframe where cookies and custom headers are unavailable.
+ *
+ * Route shape: `/api/admin/projects/{id}/tools/{slug}/t/{token}/assets/{path}`
  */
 export function buildToolAssetUrl(
   projectId: string,
@@ -247,7 +251,7 @@ export function buildToolAssetUrl(
   const proj = encodeURIComponent(projectId);
   const slug = encodeURIComponent(toolSlug);
   const encodedPath = entryPath.split('/').map(seg => encodeURIComponent(seg)).join('/');
-  return `${base}/api/admin/projects/${proj}/tools/${slug}/assets/${encodedPath}?token=${encodeURIComponent(token)}`;
+  return `${base}/api/admin/projects/${proj}/tools/${slug}/t/${encodeURIComponent(token)}/assets/${encodedPath}`;
 }
 
 // ── Compute image status (owner-only baked-image read surface) ──────────────

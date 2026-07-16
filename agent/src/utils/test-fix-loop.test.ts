@@ -10,6 +10,7 @@ const { execFileAsync, mockApiPost, mockReaddirSync } = vi.hoisted(() => ({
   mockReaddirSync: vi.fn<(path: fs.PathLike) => string[]>(),
 }));
 vi.mock('../index.js', () => ({
+  normalizeClaudeConfigContent: vi.fn((_path: string, content: string) => content),
   WORKSPACE: '/tmp/workspace',
   sendLog: vi.fn(),
   sendHeartbeatSync: vi.fn(),

@@ -1,6 +1,7 @@
 import fs from 'fs';
 import { WORKSPACE } from '../index.js';
 import type { BuildConfig } from '../index.js';
+import { effectiveLintCmd, effectiveTestCmd } from '../utils/test-runners.js';
 import { SHELL_CMD_RE } from '../shell-safety.js';
 import { agentTokenShellFn, jsonStrShellFn } from '../token-file.js';
 import { writeCheckHelper } from './check-helper.js';
@@ -102,6 +103,7 @@ export interface CodeChangeHelperConfig {
    *  Blueprint admin-ui/agent/backend blocks (the self-repo fallback used
    *  only when no build_config is present). */
   buildConfig?: BuildConfig;
+  taskCapability?: Partial<Record<'agent_mode' | 'run_shape' | 'output_kind', unknown>>;
   /** Exact pytest node-id selectors that CI reported failing, for a
    *  ci_failure fix task. When set, the generated ./check verifies these
    *  selectors pass LOCALLY (targeted `scripts/test-backend.sh` run — never
@@ -131,6 +133,51 @@ export interface CodeChangeHelperConfig {
    *  declaration — the generated ./check is then byte-identical to today.
    *  `component` is validated shell-safe (it is bash- and JSON-interpolated). */
   visualAcceptance?: { component: string; width: number };
+}
+
+export interface ProjectVerificationTarget {
+  directory: string;
+  harness: string;
+}
+
+const PROJECT_VERIFICATION_HARNESS_RE = /^[A-Za-z0-9_./-]+$/;
+
+function normalizeBuildConfigDirectoryPath(path: string): string {
+  // Build-config spelling is retained by the API, but generated checks compare
+  // against Git's repo-relative paths. Strip an optional leading `./` here so
+  // a supported declaration such as `./backend` matches `backend/x.py`.
+  const normalized = path.trim().replace(/\/+$/, '').replace(/^(?:\.\/)+/, '');
+  return normalized || '.';
+}
+
+export function projectVerificationTargets(cfg: CodeChangeHelperConfig): ProjectVerificationTarget[] {
+  const capability = cfg.taskCapability;
+  if (
+    capability?.agent_mode !== 'write'
+    || capability.run_shape !== 'workflow'
+    || capability.output_kind !== 'pr'
+  ) return [];
+  const out: ProjectVerificationTarget[] = [];
+  for (const dir of cfg.buildConfig?.directories ?? []) {
+    const lint = effectiveLintCmd(dir)?.trim() ?? '';
+    const test = effectiveTestCmd(dir)?.trim() ?? '';
+    const verification = dir.project_verification;
+    const normalized = normalizeBuildConfigDirectoryPath(dir.path);
+    const declaresChecks = dir.type === 'python' && detectLinterKind(lint) === 'ruff'
+      && /^(?:python3?\s+-m\s+)?pytest(?:\s|$)/.test(test)
+      && verification?.protocol === 'blueprint-v1'
+      && PROJECT_VERIFICATION_HARNESS_RE.test(verification.harness)
+      && !verification.harness.startsWith('/')
+      && !verification.harness.includes('..');
+    if (declaresChecks && !out.some(target => target.directory === normalized)) {
+      out.push({ directory: normalized, harness: verification.harness });
+    }
+  }
+  return out;
+}
+
+export function projectVerificationDirectories(cfg: CodeChangeHelperConfig): string[] {
+  return projectVerificationTargets(cfg).map(target => target.directory);
 }
 
 // A declared visual-acceptance component name we are willing to interpolate
@@ -286,6 +333,15 @@ function validateBuildConfigShellSafety(buildConfig: BuildConfig | undefined): v
   for (const dir of buildConfig.directories ?? []) {
     if (!SHELL_CMD_RE.test(dir.path)) {
       throw new Error(`build_config directory path contains unsafe characters for shell interpolation: ${dir.path}`);
+    }
+    const harness = dir.project_verification?.harness;
+    if (harness !== undefined && (
+      !PROJECT_VERIFICATION_HARNESS_RE.test(harness)
+      || harness.startsWith('/')
+      || harness.includes('..')
+      || harness.includes('\0')
+    )) {
+      throw new Error(`build_config project verification harness contains unsafe characters: ${harness}`);
     }
     // NOTE: per-directory commands (install/lint/build/test) are intentionally
     // NOT validated here. resolveBuildConfig retains operator-configured commands

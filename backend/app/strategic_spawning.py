@@ -287,14 +287,14 @@ async def _strategic_recent_version_entry(
     session, version, project=None
 ) -> dict[str, Any]:
     from app.qualification_state_resolver import (
-        resolve_open_version_qualification_state,
+        resolve_open_version_qualification_read_model,
     )
 
     aggregate, artifacts = _version_serving_summary(version, project)
     # Route through the shared seam so this surface's qualification_state carries
     # the ledger-backed per-dimension sub_score overlay instead of the mutable
     # last_qualification blob, matching the dimension_states shown elsewhere.
-    qualification_state, _ = await resolve_open_version_qualification_state(
+    qualification_read = await resolve_open_version_qualification_read_model(
         session, version, project, serving=(aggregate, artifacts)
     )
     return {
@@ -302,7 +302,9 @@ async def _strategic_recent_version_entry(
         "status": version.status,
         "phase": version.phase,
         "last_qualification": version.last_qualification,
-        "qualification_state": qualification_state,
+        "qualification_state": qualification_read.qualification_state,
+        "qualification_provenance": qualification_read.provenance,
+        "dimension_states": qualification_read.dimension_states,
         "serving_status": aggregate["serving_status"],
         "served_sha": (version.served_sha or "")[:12] or None,
         "deploy_failure_reason": aggregate["reason_code"],
@@ -6053,18 +6055,17 @@ async def _spawn_strategic_review(
                 # stale-pending window. The helper keeps audit resolution
                 # best-effort internally so a failed resolve never blocks assembly.
                 from app.qualification_state_resolver import (
-                    resolve_open_version_qualification_state,
+                    resolve_open_version_qualification_read_model,
                 )
 
-                (
-                    _open_qual_state,
-                    _open_qual_disagreement,
-                ) = await resolve_open_version_qualification_state(
+                _qualification_read = await resolve_open_version_qualification_read_model(
                     session,
                     _open_version,
                     project,
                     serving=(_open_aggregate, _open_artifacts),
                 )
+                _open_qual_state = _qualification_read.qualification_state
+                _open_qual_disagreement = _qualification_read.disagreement
                 _phase_block = to_phase_block(
                     _open_version,
                     aggregate_serving_status=_open_aggregate["serving_status"],
@@ -6086,6 +6087,16 @@ async def _spawn_strategic_review(
                     **_phase_block,
                     "tasks_merged_this_version": _tasks_merged,
                     "qualification_attempts": _open_version.qualification_attempts,
+                    "qualification_retry_episode": (
+                        _open_version.qualification_retry_episode
+                    ),
+                    "active_qualification_attempt_id": (
+                        str(_open_version.active_qualification_attempt_id)
+                        if _open_version.active_qualification_attempt_id
+                        else None
+                    ),
+                    "qualification_provenance": _qualification_read.provenance,
+                    "dimension_states": _qualification_read.dimension_states,
                     # Signals the strategist to author the objective this cycle.
                     # Absent once the goal is set (null goal → action needed).
                     **(

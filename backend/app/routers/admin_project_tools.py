@@ -1087,45 +1087,16 @@ async def mint_tool_asset_token(
 # ── Asset serving endpoint (public router — JWT auth, no cookies) ────────────
 
 
-def _verify_tool_asset_token(token: str) -> dict:
-    """Verify a tool-asset capability JWT.
-
-    Returns the decoded payload on success.  Raises HTTPException(401) on
-    invalid/expired tokens.  Also rejects tokens whose ``scope`` is not
-    ``"tool-asset"`` — agent tokens cannot access this endpoint.
-    """
-    try:
-        payload = jwt.decode(token, AGENT_JWT_SECRET, algorithms=[AGENT_JWT_ALGORITHM])
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Asset token expired") from None
-    except jwt.PyJWTError:
-        raise HTTPException(status_code=401, detail="Invalid asset token") from None
-    if payload.get("scope") != TOOL_ASSET_TOKEN_SCOPE:
-        raise HTTPException(status_code=401, detail="Token scope is not tool-asset")
-    return payload
-
-
-@asset_router.get("/projects/{project_id}/tools/{tool_slug}/assets/{path:path}")
-async def serve_tool_asset(
+async def _serve_tool_asset_impl(
+    *,
     project_id: uuid.UUID,
     tool_slug: str,
     path: str,
-    request: Request,
-    session: AsyncSession = Depends(get_session),
-    token: str = Query(..., description="Capability JWT for tool-asset access"),
-):
-    """Serve a static asset for a project-declared tool.
-
-    Authenticated via a short-lived ``token`` query parameter (not cookies /
-    Firebase — opaque-origin iframes cannot send cookies).  The token must
-    carry ``scope: "tool-asset"``, the correct ``project_id``, and the correct
-    ``tool_slug``.
-
-    Files are read from ``.blueprint/tools/{tool_slug}/{path}`` in the
-    project's connected GitHub repo default branch.  Content-Type is detected
-    from the file extension.  Security: path traversal (``..``) and absolute
-    paths are rejected.
-    """
+    token: str,
+    session: AsyncSession,
+    add_referrer_policy: bool = False,
+) -> Response:
+    """Shared implementation for both asset-serving routes."""
     # 1. Validate the capability JWT.
     payload = _verify_tool_asset_token(token)
     if payload.get("project_id") != str(project_id):
@@ -1203,33 +1174,106 @@ async def serve_tool_asset(
         )
         raise HTTPException(status_code=502, detail=f"Failed to fetch asset: {e}")
 
-    # Security headers for tokened, same-origin-reachable asset responses.
-    #
-    # A top-level navigation to a tokened asset URL would otherwise execute
-    # repo-authored (attacker-controllable) HTML with the full privileges of
-    # the admin-SPA origin.  Defense:
-    #   * Content-Security-Policy: sandbox allow-scripts — forces the served
-    #     document into an opaque origin (no allow-same-origin) even on a
-    #     top-level navigation, so it cannot touch admin-origin cookies /
-    #     storage / DOM.  This mirrors the iframe's own
-    #     ``sandbox="allow-scripts"`` attribute, so the legitimate embed path
-    #     is unaffected (scripts still run).
-    #   * X-Content-Type-Options: nosniff — prevents the browser from
-    #     MIME-sniffing an asset into an executable type.
-    #   * No ``Access-Control-Allow-Origin: *`` — tokened responses must not be
-    #     wildcard-CORS-readable by arbitrary origins.  The sandboxed iframe
-    #     loads its subresources as same-origin-of-document requests (no CORS
-    #     preflight), so dropping the wildcard does not break the embed path.
     headers = {
         "Cache-Control": "public, max-age=300",
         "X-Content-Type-Options": "nosniff",
         "Content-Security-Policy": "sandbox allow-scripts",
     }
+    if add_referrer_policy and content_type == "text/html":
+        headers["Referrer-Policy"] = "no-referrer"
 
     return Response(
         content=body,
         media_type=content_type,
         headers=headers,
+    )
+
+
+def _verify_tool_asset_token(token: str) -> dict:
+    """Verify a tool-asset capability JWT.
+
+    Returns the decoded payload on success.  Raises HTTPException(401) on
+    invalid/expired tokens.  Also rejects tokens whose ``scope`` is not
+    ``"tool-asset"`` — agent tokens cannot access this endpoint.
+    """
+    try:
+        payload = jwt.decode(token, AGENT_JWT_SECRET, algorithms=[AGENT_JWT_ALGORITHM])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Asset token expired") from None
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Invalid asset token") from None
+    if payload.get("scope") != TOOL_ASSET_TOKEN_SCOPE:
+        raise HTTPException(status_code=401, detail="Token scope is not tool-asset")
+    return payload
+
+
+@asset_router.get("/projects/{project_id}/tools/{tool_slug}/t/{token}/assets/{path:path}")
+async def serve_tool_asset_path_token(
+    project_id: uuid.UUID,
+    tool_slug: str,
+    token: str,
+    path: str,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+):
+    """Serve a static asset for a project-declared tool via a path-embedded token.
+
+    The token lives in the URL path so that relative subresources (e.g.
+    ``<script src="./app.js">``) resolve inside the token-prefix tree and
+    authenticate automatically — the query-string token would be dropped on
+    relative resolution, causing 401 for every subresource.
+
+    The ``sandbox="allow-scripts"`` (no ``allow-same-origin``) iframe constraint
+    makes cookies and custom headers impossible; path-embedding is the only
+    mechanism that survives relative URL resolution inside an opaque-origin
+    sandboxed iframe.
+
+    Security mitigations for token-in-path leakage:
+    - Short JWT TTL (same as the query-param route, ~5 min) limits the useful
+      window if a token leaks through Referer or server logs.
+    - ``Referrer-Policy: no-referrer`` is added to all HTML responses so the
+      token is not forwarded in Referer headers when the page navigates to
+      external resources.
+    - Token is validated identically to the query-param route via
+      ``_verify_tool_asset_token``.
+    """
+    return await _serve_tool_asset_impl(
+        project_id=project_id,
+        tool_slug=tool_slug,
+        path=path,
+        token=token,
+        session=session,
+        add_referrer_policy=True,
+    )
+
+
+@asset_router.get("/projects/{project_id}/tools/{tool_slug}/assets/{path:path}")
+async def serve_tool_asset(
+    project_id: uuid.UUID,
+    tool_slug: str,
+    path: str,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+    token: str = Query(..., description="Capability JWT for tool-asset access"),
+):
+    """Serve a static asset for a project-declared tool.
+
+    Authenticated via a short-lived ``token`` query parameter (not cookies /
+    Firebase — opaque-origin iframes cannot send cookies).  The token must
+    carry ``scope: "tool-asset"``, the correct ``project_id``, and the correct
+    ``tool_slug``.
+
+    Files are read from ``.blueprint/tools/{tool_slug}/{path}`` in the
+    project's connected GitHub repo default branch.  Content-Type is detected
+    from the file extension.  Security: path traversal (``..``) and absolute
+    paths are rejected.
+    """
+    return await _serve_tool_asset_impl(
+        project_id=project_id,
+        tool_slug=tool_slug,
+        path=path,
+        token=token,
+        session=session,
     )
 
 

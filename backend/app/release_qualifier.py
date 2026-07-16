@@ -1252,43 +1252,60 @@ def _promotion_in_flight_result(
     return None
 
 
-async def _increment_qualification_attempts(
+def _coerce_qualification_attempt_id(value: Any) -> uuid.UUID | None:
+    """Return a UUID attempt identity, accepting legacy string projections."""
+    if value is None:
+        return None
+    try:
+        return uuid.UUID(str(value))
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def _qualification_attempt_for_record(
+    version: release_version.ReleaseVersion,
+    record: dict[str, Any],
+) -> uuid.UUID:
+    """Resolve identity, deriving a stable UUID5 for partial legacy backfills."""
+    explicit = _coerce_qualification_attempt_id(
+        record.get("qualification_attempt_id")
+    ) or _coerce_qualification_attempt_id(
+        getattr(version, "active_qualification_attempt_id", None)
+    )
+    if explicit is not None:
+        return explicit
+    legacy_key = ":".join(
+        (
+            str(version.id),
+            str(record.get("candidate_sha") or "unknown"),
+            str(record.get("started_at") or "unknown"),
+        )
+    )
+    return uuid.uuid5(uuid.NAMESPACE_URL, f"blueprint:qualification:{legacy_key}")
+
+
+async def _record_attempt_projection_atomic(
     session: AsyncSession,
     version_id: uuid.UUID,
+    *,
+    attempt_id: uuid.UUID,
+    retry_episode: int,
+    is_new_attempt: bool,
 ) -> None:
-    """Atomically bump ``qualification_attempts`` on a ReleaseVersion row.
-
-    Audit R4 MEDIUM — the ``no_credentials`` / ``sha_error`` early-return
-    paths in ``run_qualification`` run BEFORE the ``ReleaseVersion`` FOR UPDATE
-    lock is taken, so a read-modify-write
-    (``version.qualification_attempts = (version.qualification_attempts or 0) + 1``)
-    is vulnerable to a lost update: two concurrent callers (strategic
-    ``qualify_request`` + admin ``POST /qualify``) both read the same value and
-    write back the same ``+1``.
-
-    This issues a single atomic SQL ``UPDATE ... SET qualification_attempts =
-    qualification_attempts + 1`` — the increment happens in the database
-    relative to the row's current value, so concurrent callers can never lose
-    an increment.  ``COALESCE`` is used so a (defensively) NULL counter still
-    increments cleanly to 1.  Dialect-agnostic: works on both Postgres and the
-    SQLite test fixtures.
-
-    The caller's later ``session.commit()`` persists this; the in-memory
-    instance's ``qualification_attempts`` attribute is expired by the
-    ``update()`` statement's session synchronization and lazily reloads on next
-    access (the early-return callers do not read it back).
-    """
+    """Atomically publish identity and distinct lifetime/retry accounting."""
+    values: dict[str, Any] = {
+        "active_qualification_attempt_id": attempt_id,
+        "qualification_retry_episode": max(0, int(retry_episode)),
+    }
+    if is_new_attempt:
+        values["qualification_attempts"] = (
+            sa_func.coalesce(release_version.ReleaseVersion.qualification_attempts, 0)
+            + 1
+        )
     await session.execute(
         update(release_version.ReleaseVersion)
         .where(release_version.ReleaseVersion.id == version_id)
-        .values(
-            qualification_attempts=(
-                sa_func.coalesce(
-                    release_version.ReleaseVersion.qualification_attempts, 0
-                )
-                + 1
-            )
-        )
+        .values(**values)
     )
 
 
@@ -1931,6 +1948,9 @@ async def run_qualification(
     *,
     session_factory=None,
     allow_synchronous_reuse_promote: bool = False,
+    qualification_attempt_id: uuid.UUID | str | None = None,
+    retry_episode: int = 0,
+    retry_episode_cap: int | None = None,
 ) -> dict[str, Any]:
     """Kick off qualification for the open release ``version``.
 
@@ -2000,6 +2020,13 @@ async def run_qualification(
     ``"no_credentials"``, ``"sha_error"``, ``"spawn_failed"``).  The caller
     commits the session.
     """
+    continued_attempt_id = _coerce_qualification_attempt_id(
+        qualification_attempt_id
+    )
+    attempt_id = continued_attempt_id or uuid.uuid4()
+    is_new_attempt = continued_attempt_id is None
+    retry_episode = max(0, int(retry_episode or 0))
+
     # Guard 1: only qualify a stabilize-phase candidate.  Cheap, no I/O — do
     # it before resolving credentials so a wrong-phase call is a pure no-op.
     # The phase is re-checked under the row lock further down (after the
@@ -2063,6 +2090,9 @@ async def run_qualification(
             "status": "error",
             "error": "no_credentials",
             "started_at": _utcnow().isoformat(),
+            "qualification_attempt_id": str(attempt_id),
+            "retry_episode": retry_episode,
+            "retry_episode_cap": retry_episode_cap,
         }
         flag_modified(version, "last_qualification")
         session.add(version)
@@ -2072,8 +2102,18 @@ async def run_qualification(
         # (strategic qualify_request + admin POST /qualify) could otherwise
         # both read the same attempts value and write back the same +1,
         # losing one increment.
-        await _increment_qualification_attempts(session, version.id)
-        return {"status": "no_credentials"}
+        await _record_attempt_projection_atomic(
+            session,
+            version.id,
+            attempt_id=attempt_id,
+            retry_episode=retry_episode,
+            is_new_attempt=is_new_attempt,
+        )
+        return {
+            "status": "no_credentials",
+            "qualification_attempt_id": str(attempt_id),
+            "retry_episode": retry_episode,
+        }
     token, owner, repo = resolved
 
     # 2. Snapshot the candidate SHA — integration branch HEAD.  Audit C3: this
@@ -2097,14 +2137,27 @@ async def run_qualification(
             "error": "sha_error",
             "detail": f"{type(exc).__name__}: {exc}"[:300],
             "started_at": _utcnow().isoformat(),
+            "qualification_attempt_id": str(attempt_id),
+            "retry_episode": retry_episode,
+            "retry_episode_cap": retry_episode_cap,
         }
         flag_modified(version, "last_qualification")
         session.add(version)
         # Audit R4 MEDIUM: atomic SQL increment — see the no_credentials path
         # above.  This early return is also pre-lock, so a read-modify-write
         # would be vulnerable to a lost update under concurrent callers.
-        await _increment_qualification_attempts(session, version.id)
-        return {"status": "sha_error"}
+        await _record_attempt_projection_atomic(
+            session,
+            version.id,
+            attempt_id=attempt_id,
+            retry_episode=retry_episode,
+            is_new_attempt=is_new_attempt,
+        )
+        return {
+            "status": "sha_error",
+            "qualification_attempt_id": str(attempt_id),
+            "retry_episode": retry_episode,
+        }
 
     # 3. CI check on the candidate SHA (cheap, orchestrator-side).  Done before
     #    the row lock — it is read-only external I/O.  This resolves CI through
@@ -2357,6 +2410,28 @@ async def run_qualification(
     # shows the coverage gate would no longer fire (a retracted/superseded
     # criterion cleared the wedge) — the acceptance-contract safety valve.
     prior_qual = version.last_qualification or {}
+    if continued_attempt_id is not None:
+        projected_attempt_id = _coerce_qualification_attempt_id(
+            prior_qual.get("qualification_attempt_id")
+        ) or _coerce_qualification_attempt_id(
+            version.active_qualification_attempt_id
+        )
+        if (
+            projected_attempt_id is not None
+            and projected_attempt_id != continued_attempt_id
+        ):
+            logger.info(
+                "[RELEASE_QUALIFIER] refusing stale retry attempt %s for v%d; "
+                "active attempt is %s",
+                continued_attempt_id,
+                version.version_number,
+                projected_attempt_id,
+            )
+            return {
+                "status": "stale_qualification_attempt",
+                "qualification_attempt_id": str(continued_attempt_id),
+                "active_qualification_attempt_id": str(projected_attempt_id),
+            }
     prior_status = prior_qual.get("status")
     ci_unresolved_recovered_same_sha = (
         prior_status == "not_promoted"
@@ -2553,14 +2628,13 @@ async def run_qualification(
         session, version
     )
     # An acceptance rubric and every fact derived from it belong to this exact
-    # launch, not just to a version or candidate SHA.  Persist the UUID in the
-    # pending projection below so finalization, task payloads, and ledger
-    # provenance all use one durable attempt identity.
-    qualification_attempt_id = str(uuid.uuid4())
+    # launch, not just to a version or candidate SHA.  Use the durable attempt
+    # UUID established at the start of this run so finalization, task payloads,
+    # and ledger provenance all share one identity.
     rubric_provenance = _rubric_provenance(
         rubric_snapshot,
         source="qualification_launch",
-        qualification_attempt_id=qualification_attempt_id,
+        qualification_attempt_id=str(attempt_id),
     )
     rubric_fingerprint = rubric_provenance["fingerprint"]
     # Consult the per-dimension fact ledger before spawning children (Phase 1
@@ -2579,7 +2653,7 @@ async def run_qualification(
             if dim == "merge_grade" and not _rubric_dimension_reusable(
                 row.detail,
                 fingerprint=rubric_fingerprint,
-                qualification_attempt_id=qualification_attempt_id,
+                qualification_attempt_id=str(attempt_id),
             ):
                 logger.info(
                     "[RELEASE_QUALIFIER] v%d candidate %s refusing merge-grade "
@@ -2595,6 +2669,10 @@ async def run_qualification(
                 "sub_score": row.sub_score,
                 "blocker": row.blocker,
                 "detail": row.detail,
+                "origin_attempt_id": (
+                    str(row.origin_attempt_id) if row.origin_attempt_id else None
+                ),
+                "reused_by_attempt_id": str(attempt_id),
                 "producing_task_id": (
                     str(row.producing_task_id) if row.producing_task_id else None
                 ),
@@ -2652,6 +2730,11 @@ async def run_qualification(
         )
         resolved_dims.pop("audit", None)
         resolved_dims.pop("test_erosion", None)
+    await _mark_dimensions_reused_by_attempt(
+        session,
+        [row for dim, row in prior_dim_results.items() if dim in resolved_dims],
+        attempt_id,
+    )
     # A child task is needed only when NOT ALL of its produced dimensions are
     # already resolved.  audit task → {audit, test_erosion}; smoketest task →
     # {smoketest}; merge_grade task → {merge_grade}.
@@ -2674,6 +2757,12 @@ async def run_qualification(
             _smoketest_needed,
             _merge_grade_needed,
         )
+    # The ReleaseVersion row is locked here, so lifetime/new-attempt accounting
+    # and the active projection advance atomically with the pending/error write.
+    version.active_qualification_attempt_id = attempt_id
+    version.qualification_retry_episode = retry_episode
+    if is_new_attempt:
+        version.qualification_attempts = (version.qualification_attempts or 0) + 1
     try:
         if _audit_needed:
             audit_task = await _spawn_release_audit_task(
@@ -2683,6 +2772,7 @@ async def run_qualification(
                 base_branch=promotion_target,
                 diff_range=diff_range,
                 candidate_sha=candidate_sha,
+                qualification_attempt_id=attempt_id,
                 audit_base_sha=_incremental_audit_base_sha(prior_qual, candidate_sha),
                 version_goal=version.goal,
             )
@@ -2705,11 +2795,11 @@ async def run_qualification(
                 base_branch=promotion_target,
                 diff_range=diff_range,
                 candidate_sha=candidate_sha,
+                qualification_attempt_id=attempt_id,
                 version_goal=version_goal,
                 merged_pr_numbers=merged_pr_numbers,
                 categories=_mg_categories,
                 rubric_fingerprint=rubric_fingerprint,
-                qualification_attempt_id=qualification_attempt_id,
             )
             merge_grade_task_id = str(merge_grade_task.id)
         if _smoketest_needed:
@@ -2718,6 +2808,7 @@ async def run_qualification(
                 project_id,
                 version_id=version.id,
                 candidate_sha=candidate_sha,
+                qualification_attempt_id=attempt_id,
             )
             smoketest_task_id = str(smoketest_task.id)
     except Exception as exc:  # noqa: BLE001 — spawn failure must not raise out
@@ -2733,17 +2824,18 @@ async def run_qualification(
             "error": "spawn_failed",
             "detail": str(exc)[:300],
             "candidate_sha": candidate_sha,
-            "qualification_attempt_id": qualification_attempt_id,
             "ci_green": ci_green,
             "ci_state": ci_state,
             "started_at": started_at,
+            "qualification_attempt_id": str(attempt_id),
+            "retry_episode": retry_episode,
+            "retry_episode_cap": retry_episode_cap,
         }
         # Read-modify-write is safe here (unlike the no_credentials / sha_error
         # early returns, which run pre-lock and use the atomic
-        # _increment_qualification_attempts): this site runs UNDER the
+        # _record_attempt_projection_atomic): this site runs UNDER the
         # ReleaseVersion FOR UPDATE row lock taken above, so no concurrent
         # caller can interleave a lost update.
-        version.qualification_attempts = (version.qualification_attempts or 0) + 1
         flag_modified(version, "last_qualification")
         session.add(version)
         return {"status": "spawn_failed"}
@@ -2758,6 +2850,9 @@ async def run_qualification(
     #    finalization was a quality verdict / dry-run / non-infra outcome).
     version.last_qualification = {
         "status": "pending",
+        "qualification_attempt_id": str(attempt_id),
+        "retry_episode": retry_episode,
+        "retry_episode_cap": retry_episode_cap,
         "candidate_sha": candidate_sha,
         "candidate_diff_hash": candidate_diff_hash,
         "audit_base_sha": _incremental_audit_base_sha(prior_qual, candidate_sha),
@@ -2775,7 +2870,6 @@ async def run_qualification(
         "audit_challenge_spawn_pending": audit_challenge_spawn_pending,
         "smoketest_task_id": smoketest_task_id,
         "merge_grade_task_id": merge_grade_task_id,
-        "qualification_attempt_id": qualification_attempt_id,
         "rubric_snapshot": rubric_snapshot,
         "rubric_fingerprint": rubric_fingerprint,
         "rubric_lifecycle_snapshot": rubric_lifecycle_snapshot,
@@ -2804,10 +2898,9 @@ async def run_qualification(
     }
     # Read-modify-write is safe here (unlike the no_credentials / sha_error
     # early returns, which run pre-lock and use the atomic
-    # _increment_qualification_attempts): this site runs UNDER the
+    # _record_attempt_projection_atomic): this site runs UNDER the
     # ReleaseVersion FOR UPDATE row lock taken above, so no concurrent caller
     # can interleave a lost update.
-    version.qualification_attempts = (version.qualification_attempts or 0) + 1
     flag_modified(version, "last_qualification")
     session.add(version)
 
@@ -2826,6 +2919,8 @@ async def run_qualification(
     )
     return {
         "status": "spawned",
+        "qualification_attempt_id": str(attempt_id),
+        "retry_episode": retry_episode,
         "candidate_sha": candidate_sha,
         "ci_green": ci_green,
         "ci_state": ci_state,
@@ -2864,6 +2959,21 @@ _AUDIT_CHALLENGE_BINDING_HOLDS: frozenset[str] = frozenset(
         "audit_challenge_empty_verdicts",
     }
 )
+
+
+def _advance_qualification_retry_episode(
+    version: release_version.ReleaseVersion,
+    record: dict[str, Any],
+    *,
+    cap: int,
+) -> dict[str, Any]:
+    episode = int(record.get("retry_episode") or 0) + 1
+    version.qualification_retry_episode = episode
+    return {
+        **record,
+        "retry_episode": episode,
+        "retry_episode_cap": cap,
+    }
 
 # Human-readable rendering of the compute_composite() hard-blocker codes.
 _BLOCKER_LABELS: dict[str, str] = {
@@ -3704,6 +3814,7 @@ async def _upsert_dimension_result(
     detail: Any | None = None,
     producing_task_id: Any | None = None,
     audited_surface_hash: str | None = None,
+    origin_attempt_id: uuid.UUID | str | None = None,
 ) -> None:
     """Best-effort UPSERT of ONE per-(candidate_sha, dimension) qualification fact.
 
@@ -3739,6 +3850,7 @@ async def _upsert_dimension_result(
     _sub_score: float | None = None
     if isinstance(sub_score, (int, float)) and not isinstance(sub_score, bool):
         _sub_score = float(sub_score)
+    _origin_uuid = _coerce_qualification_attempt_id(origin_attempt_id)
 
     try:
         async with session.begin_nested():
@@ -3752,6 +3864,17 @@ async def _upsert_dimension_result(
                 )
             ).scalar_one_or_none()
             if existing is not None:
+                # Preserve an older producer only when the start path explicitly
+                # marked this fact as reused by the active attempt.  Otherwise a
+                # resolved write is a genuine recomputation with a new origin.
+                if (
+                    existing.status in _LEDGER_RESOLVED_STATUSES
+                    and _origin_uuid is not None
+                    and existing.origin_attempt_id != _origin_uuid
+                    and str(_origin_uuid)
+                    in {str(value) for value in (existing.reused_by_attempt_ids or [])}
+                ):
+                    return
                 # Never downgrade a resolved fact (passed/failed/blocked) to a
                 # non-resolved status (e.g. "unavailable" from an infra failure
                 # in a different gate or a failed _load_prior_dimension_results).
@@ -3777,6 +3900,8 @@ async def _upsert_dimension_result(
                 existing.audited_surface_hash = audited_surface_hash
                 existing.detail = detail
                 existing.producing_task_id = _producing_uuid
+                if _origin_uuid is not None:
+                    existing.origin_attempt_id = _origin_uuid
                 existing.computed_at = _utcnow()
                 session.add(existing)
             else:
@@ -3792,6 +3917,7 @@ async def _upsert_dimension_result(
                         audited_surface_hash=audited_surface_hash,
                         detail=detail,
                         producing_task_id=_producing_uuid,
+                        origin_attempt_id=_origin_uuid,
                     )
                 )
             await session.flush()
@@ -3872,6 +3998,36 @@ async def _load_prior_dimension_results(
     return {r.dimension: r for r in rows}
 
 
+async def _mark_dimensions_reused_by_attempt(
+    session: AsyncSession,
+    rows: list[QualificationDimensionResult],
+    attempt_id: uuid.UUID,
+) -> None:
+    """Best-effort append reuse provenance without changing fact ownership."""
+    if not rows:
+        return
+    try:
+        async with session.begin_nested():
+            attempt_text = str(attempt_id)
+            for row in rows:
+                reused = [
+                    str(value)
+                    for value in (row.reused_by_attempt_ids or [])
+                    if _coerce_qualification_attempt_id(value) is not None
+                ]
+                if attempt_text not in reused:
+                    row.reused_by_attempt_ids = [*reused, attempt_text]
+                    session.add(row)
+            await session.flush()
+    except Exception as exc:  # noqa: BLE001 -- ledger provenance is failure-isolated
+        logger.warning(
+            "[RELEASE_QUALIFIER] failed to mark dimension reuse for attempt %s "
+            "(non-fatal -- additive ledger provenance only): %s",
+            attempt_id,
+            exc,
+        )
+
+
 async def _record_infra_dimension_unavailable(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
@@ -3880,6 +4036,7 @@ async def _record_infra_dimension_unavailable(
     *,
     infra_error: str,
     signature: str | None = None,
+    origin_attempt_id: uuid.UUID | str | None = None,
 ) -> int:
     """Mark ONE dimension 'unavailable' in the ledger on an infrastructure failure.
 
@@ -3945,6 +4102,7 @@ async def _record_infra_dimension_unavailable(
             "infra_failure_signature": signature,
             "consecutive_infra_errors": new_streak,
         },
+        origin_attempt_id=origin_attempt_id,
     )
     return new_streak
 
@@ -4241,6 +4399,7 @@ async def _dual_write_dimension_results(
             detail=_detail,
             producing_task_id=spec["producing_task_id"],
             audited_surface_hash=spec.get("audited_surface_hash"),
+            origin_attempt_id=base_record.get("qualification_attempt_id"),
         )
 
 
@@ -4407,6 +4566,13 @@ async def _finalize_qualification(
     session afterwards.  Returns a result dict.
     """
     qual = dict(version.last_qualification or {})
+    attempt_id = _qualification_attempt_for_record(version, qual)
+    qual["qualification_attempt_id"] = str(attempt_id)
+    version.active_qualification_attempt_id = attempt_id
+    if "retry_episode" not in qual:
+        qual["retry_episode"] = int(
+            getattr(version, "qualification_retry_episode", 0) or 0
+        )
     candidate_sha = qual.get("candidate_sha")
     audit_task_id = qual.get("audit_task_id")
     challenge_task_id = qual.get("challenge_task_id")
@@ -4451,6 +4617,7 @@ async def _finalize_qualification(
             session, version, candidate_sha, "ci",
             status="passed" if ci_green else "blocked",
             detail=ci_resolution if isinstance(ci_resolution, dict) else None,
+            origin_attempt_id=attempt_id,
         )
 
     _policy_project = await session.get(Project, version.project_id)
@@ -4556,6 +4723,7 @@ async def _finalize_qualification(
                         base_branch=new_base_branch,
                         diff_range=new_diff_range,
                         candidate_sha=candidate_sha,
+                        qualification_attempt_id=attempt_id,
                         version_goal=version.goal,
                     )
                     new_count = rl_respawn_count + 1
@@ -4564,6 +4732,9 @@ async def _finalize_qualification(
                         "audit_task_id": str(new_audit_task.id),
                         "audit_rl_respawn_count": new_count,
                     }
+                    updated_qual = _advance_qualification_retry_episode(
+                        version, updated_qual, cap=_MAX_AUDIT_RL_RESPAWNS
+                    )
                     version.last_qualification = updated_qual
                     flag_modified(version, "last_qualification")
                     session.add(version)
@@ -4611,6 +4782,7 @@ async def _finalize_qualification(
                         base_branch=new_base_branch,
                         diff_range=new_diff_range,
                         candidate_sha=candidate_sha,
+                        qualification_attempt_id=attempt_id,
                         version_goal=version.goal,
                     )
                     new_count = infra_respawn_count + 1
@@ -4627,6 +4799,9 @@ async def _finalize_qualification(
                         "audit_task_id": str(new_audit_task.id),
                         "audit_infra_respawn_count": new_count,
                     }
+                    updated_qual = _advance_qualification_retry_episode(
+                        version, updated_qual, cap=_MAX_AUDIT_RL_RESPAWNS
+                    )
                     version.last_qualification = updated_qual
                     flag_modified(version, "last_qualification")
                     session.add(version)
@@ -4847,6 +5022,7 @@ async def _finalize_qualification(
         status=_audit_status,
         sub_score=audit_score,
         producing_task_id=audit_task_id,
+        origin_attempt_id=attempt_id,
     )
     _te_status = "blocked" if test_erosion_score is None else "passed"
     await _upsert_dimension_result(
@@ -4854,6 +5030,7 @@ async def _finalize_qualification(
         status=_te_status,
         sub_score=test_erosion_score,
         producing_task_id=audit_task_id,
+        origin_attempt_id=attempt_id,
     )
 
     # --- Read the smoketest result -----------------------------------------
@@ -4988,6 +5165,7 @@ async def _finalize_qualification(
         status=_smoke_status,
         sub_score=smoketest_score,
         producing_task_id=smoketest_task_id,
+        origin_attempt_id=attempt_id,
     )
     primary_findings = _primary_findings_for_challenge_retry(audit_report)
 
@@ -5022,6 +5200,7 @@ async def _finalize_qualification(
                 base_branch=challenge_base_branch,
                 diff_range=challenge_diff_range,
                 candidate_sha=candidate_sha,
+                qualification_attempt_id=attempt_id,
                 primary_audit_task_id=audit_task_id,
                 primary_findings=primary_findings,
                 version_goal=version.goal,
@@ -5148,6 +5327,7 @@ async def _finalize_qualification(
                                         base_branch=_chal_base_branch,
                                         diff_range=_chal_diff_range,
                                         candidate_sha=candidate_sha,
+                                        qualification_attempt_id=attempt_id,
                                         primary_audit_task_id=audit_task_id,
                                         primary_findings=_chal_primary_findings,
                                         version_goal=version.goal,
@@ -5180,6 +5360,9 @@ async def _finalize_qualification(
                                     ),
                                     "challenge_infra_respawn_count": _chal_new_count,
                                 }
+                                version.last_qualification = _advance_qualification_retry_episode(
+                                    version, version.last_qualification, cap=_MAX_AUDIT_RL_RESPAWNS
+                                )
                                 flag_modified(version, "last_qualification")
                                 session.add(version)
                                 await session.flush()
@@ -5290,6 +5473,7 @@ async def _finalize_qualification(
                     base_branch=_early_base_branch,
                     diff_range=_early_diff_range,
                     candidate_sha=candidate_sha,
+                    qualification_attempt_id=attempt_id,
                     primary_audit_task_id=audit_task_id,
                     primary_findings=primary_findings,
                     version_goal=version.goal,
@@ -5316,6 +5500,9 @@ async def _finalize_qualification(
                         primary_findings
                     ),
                 }
+                version.last_qualification = _advance_qualification_retry_episode(
+                    version, version.last_qualification, cap=_MAX_AUDIT_CHALLENGE_BINDING_RESPAWNS
+                )
                 flag_modified(version, "last_qualification")
                 session.add(version)
                 await session.flush()
@@ -5401,6 +5588,7 @@ async def _finalize_qualification(
                         base_branch=retry_base_branch,
                         diff_range=retry_diff_range,
                         candidate_sha=candidate_sha,
+                        qualification_attempt_id=attempt_id,
                         primary_audit_task_id=audit_task_id,
                         primary_findings=primary_findings,
                         version_goal=version.goal,
@@ -5447,6 +5635,9 @@ async def _finalize_qualification(
                         else {}
                     ),
                 }
+                version.last_qualification = _advance_qualification_retry_episode(
+                    version, version.last_qualification, cap=_MAX_AUDIT_CHALLENGE_BINDING_RESPAWNS
+                )
                 flag_modified(version, "last_qualification")
                 session.add(version)
                 await session.flush()
@@ -5565,6 +5756,7 @@ async def _finalize_qualification(
             status=_reconciled_audit_status,
             sub_score=audit_score,
             producing_task_id=audit_task_id,
+            origin_attempt_id=attempt_id,
         )
     else:
         # audit+test_erosion resolved from ledger — reconciliation fields are
@@ -5824,6 +6016,7 @@ async def _finalize_qualification(
             sub_score=_mg_coverage if isinstance(_mg_coverage, (int, float)) and not isinstance(_mg_coverage, bool) else None,
             detail=merge_grade_cert,
             producing_task_id=merge_grade_task_id,
+            origin_attempt_id=attempt_id,
         )
 
     # --- Goal-verification per-category ledger (redesign) -------------------
@@ -6747,6 +6940,37 @@ async def _required_children_terminal(
         else None
     )
 
+    # Strict matching begins once the JSON projection carries identity.  A
+    # partially-backfilled legacy pending row may have only the typed column
+    # while its already-running children have no attempt key; keep that window
+    # readable/finalizable until the projection backfill converges.
+    active_attempt_id = _coerce_qualification_attempt_id(
+        qual.get("qualification_attempt_id")
+    )
+    if active_attempt_id is not None:
+        for leg, task in (
+            ("audit", audit_task),
+            ("smoketest", smoketest_task),
+            ("challenge", challenge_task),
+            ("merge_grade", merge_grade_task),
+        ):
+            if task is None:
+                continue
+            child_attempt_id = _coerce_qualification_attempt_id(
+                (task.context or {}).get("qualification_attempt_id")
+            )
+            if child_attempt_id != active_attempt_id:
+                logger.warning(
+                    "[RELEASE_QUALIFIER] finalize-gate: v%d %s child %s belongs "
+                    "to attempt %s, active attempt is %s -- not ready",
+                    version.version_number,
+                    leg,
+                    task.id,
+                    child_attempt_id,
+                    active_attempt_id,
+                )
+                return False
+
     if (
         (not audit_resolved and audit_task is None)
         or (smoketest_required and not smoketest_resolved and smoketest_task is None)
@@ -6982,6 +7206,7 @@ async def _finalize_in_dedicated_session(
     *,
     session_factory=None,
     timeout_now: datetime | None = None,
+    expected_attempt_id: uuid.UUID | str | None = None,
 ) -> dict[str, Any] | None:
     """Run the finalize→promote chain for ``version_id`` on a DEDICATED session.
 
@@ -7044,7 +7269,12 @@ async def _finalize_in_dedicated_session(
     factory = session_factory or AsyncSessionLocal
     async with factory() as session:
         try:
-            result = await _finalize_locked_version(session, version_id, timeout_now)
+            result = await _finalize_locked_version(
+                session,
+                version_id,
+                timeout_now,
+                expected_attempt_id=expected_attempt_id,
+            )
         except Exception:
             # Roll back this dedicated session's partial work before unwinding.
             # In production each dedicated session is independent and the
@@ -8021,6 +8251,8 @@ async def _finalize_locked_version(
     session: AsyncSession,
     version_id: uuid.UUID,
     timeout_now: datetime | None,
+    *,
+    expected_attempt_id: uuid.UUID | str | None = None,
 ) -> dict[str, Any] | None:
     """Lock + finalize one version within an already-open dedicated session.
 
@@ -8062,6 +8294,23 @@ async def _finalize_locked_version(
         return None
     peek_qual = peek.last_qualification or {}
     if peek_qual.get("status") != "pending":
+        return None
+    expected_attempt_uuid = _coerce_qualification_attempt_id(expected_attempt_id)
+    active_attempt_uuid = _coerce_qualification_attempt_id(
+        peek_qual.get("qualification_attempt_id")
+    ) or _coerce_qualification_attempt_id(peek.active_qualification_attempt_id)
+    if (
+        expected_attempt_uuid is not None
+        and active_attempt_uuid is not None
+        and expected_attempt_uuid != active_attempt_uuid
+    ):
+        logger.info(
+            "[RELEASE_QUALIFIER] finalize ignored completion from stale attempt "
+            "%s; v%d active attempt is %s",
+            expected_attempt_uuid,
+            peek.version_number,
+            active_attempt_uuid,
+        )
         return None
     peek_candidate_sha: str | None = peek_qual.get("candidate_sha")
     pre_timeout_age_seconds = (
@@ -8309,5 +8558,7 @@ async def maybe_finalize_qualification(
         return None
 
     return await _finalize_in_dedicated_session(
-        version_id, session_factory=session_factory
+        version_id,
+        session_factory=session_factory,
+        expected_attempt_id=context.get("qualification_attempt_id"),
     )

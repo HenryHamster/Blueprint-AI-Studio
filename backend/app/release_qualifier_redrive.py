@@ -260,7 +260,13 @@ async def _redrive_error_qualification(
         if error_redrive_count >= _MAX_ERROR_REDRIVE_ATTEMPTS:
             return False
         result = await release_qualifier.run_qualification(
-            redrive_session, version.project_id, version
+            redrive_session,
+            version.project_id,
+            version,
+            qualification_attempt_id=qual.get("qualification_attempt_id")
+            or version.active_qualification_attempt_id,
+            retry_episode=int(qual.get("retry_episode") or 0) + 1,
+            retry_episode_cap=_MAX_ERROR_REDRIVE_ATTEMPTS,
         )
         # COMMIT on every outcome — do NOT roll back the non-spawned paths.
         #
@@ -397,7 +403,13 @@ async def _redrive_infra_failure_qualification(
         if effective_streak >= _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS:
             return False
         result = await release_qualifier.run_qualification(
-            redrive_session, version.project_id, version
+            redrive_session,
+            version.project_id,
+            version,
+            qualification_attempt_id=qual.get("qualification_attempt_id")
+            or version.active_qualification_attempt_id,
+            retry_episode=int(qual.get("retry_episode") or 0) + 1,
+            retry_episode_cap=_MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS,
         )
         # COMMIT on every outcome — do NOT roll back the non-spawned paths.
         # run_qualification writes a new last_qualification (and bumps

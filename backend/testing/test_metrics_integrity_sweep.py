@@ -4158,10 +4158,10 @@ async def test_capability_proof_gate_gap_triggers_self_heal(db):
     ok = [r for r in results if r.subject == pid and r.status == CheckStatus.OK]
     assert len(ok) == 1, f"expected 1 OK result, got {results}"
     assert ok[0].delta == 0
-    # path_proven self-heals do NOT count as machine-verified proof — ground_truth
-    # reflects only true 'proven' caps, so it remains 0 here.
+    # ground_truth is only the genuine ``proven`` count — auto-resolved caps are
+    # path_proven (backing_path tier), NOT proven, so they are NOT included.
     assert ok[0].ground_truth == 0
-    assert "auto-resolved" in ok[0].detail
+    assert "path_proven" in ok[0].detail
     # Self-heal throughput is surfaced structured (not just in the detail prose)
     # so the observability snapshot / dashboards can report it machine-readably.
     assert ok[0].auto_resolved == 1
@@ -4328,6 +4328,9 @@ async def test_capability_proof_gate_gap_mints_named_test_present_for_covered_ca
     ), patch(
         "app.capability_proof._read_file_at_head",
         new=AsyncMock(return_value=test_body),
+    ), patch(
+        "app.capability_proof._maybe_enroll_proof_trial",
+        new=AsyncMock(return_value=None),
     ):
         results = await mis.check_capability_proof_gate_gap(ctx)
 
@@ -4339,7 +4342,9 @@ async def test_capability_proof_gate_gap_mints_named_test_present_for_covered_ca
     ok = [r for r in results if r.subject == pid and r.status == CheckStatus.OK]
     assert len(ok) == 1, f"expected 1 OK result, got {results}"
     assert ok[0].delta == 0
-    assert ok[0].ground_truth == 1
+    # ground_truth is only genuine ``proven`` caps — named_test_present is
+    # path_proven tier, so ground_truth stays 0 while auto_resolved == 1.
+    assert ok[0].ground_truth == 0
     assert "named_test_present" in ok[0].detail, (
         f"expected detail to name the named_test_present tier, got {ok[0].detail!r}"
     )
@@ -4702,6 +4707,9 @@ async def test_capability_proof_gate_gap_proposes_backing_paths(db):
     ), patch(
         "app.capability_proof._read_file_at_head",
         new=_fake_read,
+    ), patch(
+        "app.capability_proof._maybe_enroll_proof_trial",
+        new=AsyncMock(return_value=None),
     ):
         results = await mis.check_capability_proof_gate_gap(ctx)
 
@@ -5565,6 +5573,61 @@ async def test_auto_graduation_fleet_coverage_stale_proof_counts_without_now(db)
         db, max_projects=25, now=fresh_cutoff
     )
     assert coverage_fresh["total_proven"] == 1
+
+
+@pytest.mark.asyncio
+async def test_compute_fleet_proof_coverage_trial_eligible_unproven(db):
+    """``trial_eligible_unproven`` counts unproven working caps with backing_paths.
+
+    This is the projection for finding 1: it answers "how many unproven caps
+    could earn a trial if capability_proof_execution_trials_enabled were ON?"
+    A cap is trial-eligible when it is (a) non-exempt, (b) not yet proven, and
+    (c) declares at least one backing_path. Proven caps and caps with no
+    backing_paths are excluded from the count.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+    from app.metrics_integrity_sweep import compute_fleet_proof_coverage
+
+    project = await _project(db)
+    project.problem_model = {
+        "capabilities": [
+            {
+                "name": "Cap Proven",
+                "status": "working",
+                "evidence_refs": [
+                    {"kind": "named_test", "ref": "test_x.py::test_x", "proven": True}
+                ],
+            },
+            {
+                "name": "Cap Unproven With Backing",
+                "status": "working",
+                "evidence_refs": [],
+                "backing_paths": ["backend/app/some_module.py"],
+            },
+            {
+                "name": "Cap Unproven No Backing",
+                "status": "working",
+                "evidence_refs": [],
+            },
+            {
+                "name": "Cap Planned",
+                "status": "planned",
+                "evidence_refs": [],
+                "backing_paths": ["backend/app/planned.py"],
+            },
+        ]
+    }
+    flag_modified(project, "problem_model")
+    db.add(project)
+    await db.commit()
+
+    coverage = await compute_fleet_proof_coverage(db, max_projects=25)
+    # 3 working (non-planned) caps, 1 proven → 1 trial-eligible unproven with backing_paths.
+    assert coverage["total_non_exempt_working"] == 3
+    assert coverage["total_proven"] == 1
+    assert coverage["trial_eligible_unproven"] == 1, (
+        "only the unproven working cap with backing_paths is trial-eligible"
+    )
 
 
 @pytest.mark.asyncio

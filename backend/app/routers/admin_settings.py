@@ -399,6 +399,7 @@ async def get_settings(
         "total_non_exempt_working": 0,
         "projects_contributing": 0,
         "num_projects": 0,
+        "trial_eligible_unproven": 0,
     }
     try:
         from app.metrics_integrity_sweep import compute_fleet_proof_coverage
@@ -416,10 +417,32 @@ async def get_settings(
             "total_non_exempt_working": _cov["total_non_exempt_working"],
             "projects_contributing": _cov["projects_contributing"],
             "num_projects": _cov["num_projects"],
+            "trial_eligible_unproven": _cov.get("trial_eligible_unproven", 0),
         }
     except Exception:
         logger.warning(
             "failed to compute fleet capability-proof coverage for settings",
+            exc_info=True,
+        )
+
+    # Projection: how many capabilities would be trial-eligible if the
+    # execution-trials flag were enabled. Best-effort; must never break load.
+    capability_proof_trial_projection: dict = {
+        "trial_eligible": 0,
+        "unproven_working": 0,
+        "projects_contributing": 0,
+        "num_projects": 0,
+    }
+    try:
+        from app.metrics_integrity_sweep import compute_trial_eligibility_projection
+
+        capability_proof_trial_projection = await compute_trial_eligibility_projection(
+            session,
+            int(_runtime_config.get("metrics_integrity_sweep_max_projects", 25)),
+        )
+    except Exception:
+        logger.warning(
+            "failed to compute capability-proof trial eligibility projection",
             exc_info=True,
         )
 
@@ -493,6 +516,7 @@ async def get_settings(
             )
         ),
         "capability_proof_gate_coverage": capability_proof_gate_coverage,
+        "capability_proof_trial_projection": capability_proof_trial_projection,
         "capability_proof_execution_trials_enabled": bool(
             _runtime_config.get("capability_proof_execution_trials_enabled", False)
         ),

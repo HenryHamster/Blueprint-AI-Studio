@@ -4087,16 +4087,12 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
                     with contextlib.suppress(Exception):
                         await ctx.session.rollback()
 
-        # path_proven self-heals (backing_path / static named_test_present) are
-        # NOT machine-verified proof — they do not clear the enforce gate and
-        # must not inflate ground_truth. Only caps with true 'proven' status count.
-        new_proven = proven_count
-        # Tier split of the auto-resolutions this sweep: named_test_present caps
-        # were recorded from a statically-covered path set; the remainder fell
-        # back to the weaker structural backing_path tier. Both are path_proven,
-        # but the split is surfaced structured so operators can see whether the
-        # self-heal is minting any named_test_present coverage or only backing_path.
-        # (This is reporting only — it never feeds ground_truth above.)
+        # ``auto_resolved`` are path_proven (backing_path / named_test_present
+        # tier) — NOT the genuine ``proven`` tier. ground_truth is the count of
+        # working capabilities that have actually reached ``proven``, which is
+        # only ``proven_count``. Auto-resolved caps are tracked via the
+        # ``auto_resolved`` CheckResult field so dashboards can report self-heal
+        # throughput without conflating path_proven with proven.
         auto_resolved_nt = len(named_test_present_resolved)
         auto_resolved_bp = len(auto_resolved) - auto_resolved_nt
         # Caps with an enrolled execution trial are NOT yet proven — the trial
@@ -4179,7 +4175,7 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
                     check="capability_proof_gate_gap",
                     status=CheckStatus.FLAGGED,
                     self_reported=total_working,
-                    ground_truth=new_proven,
+                    ground_truth=proven_count,
                     delta=len(unresolved),
                     severity="warn",
                     subject=pid,
@@ -4191,19 +4187,20 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
             )
         else:
             _ok_detail = (
-                f"all {total_working} working capability(ies) carry proven evidence"
+                f"all {total_working} working capability(ies) addressed: "
+                f"{proven_count} proven"
             )
             if auto_resolved:
                 if named_test_present_resolved:
                     _ok_detail += (
-                        f" ({len(auto_resolved)} auto-resolved: "
-                        f"{len(named_test_present_resolved)} via named_test_present, "
+                        f", {len(auto_resolved)} path_proven via self-heal "
+                        f"({len(named_test_present_resolved)} named_test_present, "
                         f"{len(auto_resolved) - len(named_test_present_resolved)} "
-                        "via backing_paths)"
+                        "backing_paths)"
                     )
                 else:
                     _ok_detail += (
-                        f" ({len(auto_resolved)} auto-resolved via backing_paths)"
+                        f", {len(auto_resolved)} path_proven via self-heal (backing_paths)"
                     )
             if exempt_count:
                 _ok_detail += (
@@ -4218,7 +4215,7 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
                     check="capability_proof_gate_gap",
                     status=CheckStatus.OK,
                     self_reported=total_working,
-                    ground_truth=new_proven,
+                    ground_truth=proven_count,
                     delta=0,
                     subject=pid,
                     detail=_ok_detail,
@@ -4307,6 +4304,13 @@ async def compute_fleet_proof_coverage(
     total_proven = 0
     projects_contributing = 0
     contributing_project_ids: list = []
+    # Count of non-exempt unproven working capabilities that declare at least
+    # one backing_path: these are trial-eligible when
+    # ``capability_proof_execution_trials_enabled`` is ON, giving the operator
+    # a projection of how enabling trials would change coverage. This is a
+    # declaration-only check (no git verification) — it answers "how many caps
+    # could earn a trial?" not "how many tests pass?".
+    trial_eligible_unproven = 0
 
     for project_id, raw_pm, raw_records in projects:
         pm = raw_pm if isinstance(raw_pm, dict) else {}
@@ -4331,6 +4335,23 @@ async def compute_fleet_proof_coverage(
         total_non_exempt_working += len(non_exempt)
         total_proven += sum(1 for s in non_exempt.values() if s == "proven")
 
+        # Projection: count non-exempt unproven caps with backing_paths declared.
+        from app.capability_registry import normalize_capability_name
+        caps_list = pm.get("capabilities") or []
+        for cap in caps_list:
+            if not isinstance(cap, dict):
+                continue
+            cap_name = normalize_capability_name(cap.get("name"))
+            if not cap_name or cap_name in exempt_set:
+                continue
+            if non_exempt.get(cap_name, "proven") == "proven":
+                continue
+            backing = cap.get("backing_paths")
+            if isinstance(backing, list) and any(
+                isinstance(p, str) and p.strip() for p in backing
+            ):
+                trial_eligible_unproven += 1
+
     coverage_ratio = (
         total_proven / total_non_exempt_working
         if total_non_exempt_working > 0
@@ -4344,6 +4365,83 @@ async def compute_fleet_proof_coverage(
         "total_non_exempt_working": total_non_exempt_working,
         "total_proven": total_proven,
         "coverage_ratio": coverage_ratio,
+        "trial_eligible_unproven": trial_eligible_unproven,
+    }
+
+
+async def compute_trial_eligibility_projection(
+    session: Any, max_projects: int
+) -> Dict[str, Any]:
+    """Count unproven working capabilities that have backing_paths (trial-eligible).
+
+    A capability is trial-eligible when it is unproven (not yet ``proven`` tier),
+    has a ``working`` status, and declares at least one ``backing_path``. Enabling
+    ``capability_proof_execution_trials_enabled`` allows the earn loop to discover
+    test coverage for these capabilities and enroll bounded execution trials that
+    can mint the real ``proven`` tier — clearing the enforce gate.
+
+    This is a STATIC, read-only projection — no git HEAD checks or test discovery
+    are performed. It answers the operator question "how many capabilities could
+    benefit from enabling trials?" based purely on problem_model declarations.
+
+    Returns a dict with:
+
+    * ``trial_eligible`` — caps with backing_paths that are unproven working
+    * ``unproven_working`` — total unproven working caps across the scanned fleet
+    * ``projects_contributing`` — projects with at least one unproven working cap
+    * ``num_projects`` — projects scanned (bounded by ``max_projects``)
+    """
+    from app.capability_registry import working_capability_proof_status
+    from app.models import Project
+
+    projects = (
+        await session.execute(
+            select(
+                Project.id,
+                Project.problem_model,
+            ).limit(max_projects)
+        )
+    ).all()
+
+    total_trial_eligible = 0
+    total_unproven_working = 0
+    projects_contributing = 0
+
+    for _project_id, raw_pm in projects:
+        pm = raw_pm if isinstance(raw_pm, dict) else {}
+        proof_by_name = working_capability_proof_status(pm)
+        if not proof_by_name:
+            continue
+
+        unproven_names = {
+            name for name, status in proof_by_name.items() if status != "proven"
+        }
+        if not unproven_names:
+            continue
+
+        projects_contributing += 1
+        total_unproven_working += len(unproven_names)
+
+        caps = pm.get("capabilities") or []
+        for cap in caps:
+            if not isinstance(cap, dict):
+                continue
+            raw_name = cap.get("name", "")
+            if not isinstance(raw_name, str):
+                continue
+            # Normalize the name the same way working_capability_proof_status does.
+            norm = raw_name.lower().replace(" ", "-").strip("-")
+            if norm not in unproven_names:
+                continue
+            bp = cap.get("backing_paths")
+            if isinstance(bp, list) and any(isinstance(p, str) and p for p in bp):
+                total_trial_eligible += 1
+
+    return {
+        "trial_eligible": total_trial_eligible,
+        "unproven_working": total_unproven_working,
+        "projects_contributing": projects_contributing,
+        "num_projects": len(projects),
     }
 
 

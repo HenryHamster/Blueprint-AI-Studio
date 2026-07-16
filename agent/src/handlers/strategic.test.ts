@@ -127,6 +127,7 @@ const {
     'matchesVmConfigMissing',
     'missingProviderConfigFiles',
     'missingVmProviderConfigFiles',
+    'normalizeClaudeConfigContent',
     'normalizePytestSelectorForRunner',
     'parseFailingTests',
     'parseFailingTestsFromVitestJson',
@@ -330,6 +331,7 @@ vi.mock('fs', () => ({
 }));
 
 vi.mock('../index.js', () => ({
+  normalizeClaudeConfigContent: vi.fn((_path: string, content: string) => content),
   ...Object.fromEntries(INDEX_EXPORT_NAMES.map((name) => [name, vi.fn()])),
   WORKSPACE: '/tmp/workspace',
   strVal: (v: unknown, def = '') => (typeof v === 'string' ? v : def),

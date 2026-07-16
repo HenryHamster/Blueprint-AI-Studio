@@ -40,6 +40,8 @@ done
 # config-driven pytest gate below only if this environment still cannot run
 # the suite faithfully. ./pr surfaces it after a passing `./check test`.
 rm -f /tmp/check_gate_env_6867e9ef-f0d6-41cb-8b9d-1be50b02c806.txt
+_VERIFY_TASK_ID="${TASK_ID:-6867e9ef-f0d6-41cb-8b9d-1be50b02c806}"
+rm -f "/tmp/project_verification_receipt_${_VERIFY_TASK_ID}.json"
 
 # Determine changed paths: committed since base + uncommitted. Verify at
 # least one diff source actually worked — silently-empty CHANGED used to
@@ -249,6 +251,72 @@ if touches "backend/"; then
         echo "[check]   - If you have NO faithful test evidence for a test-relevant change, call ./blocked \"<reason>\" --needs-capability \"postgres test environment\" instead of shipping blind."
         printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "backend: pytest gate skipped — no Docker for the sanctioned harness and no Postgres test env; a bare run would be an unfaithful SQLite fallback" >> /tmp/check_gate_env_6867e9ef-f0d6-41cb-8b9d-1be50b02c806.txt ;;
     esac
+  fi
+
+  if [ -n "$(printf '%s\n' "$CHANGED" | while IFS= read -r f; do case "$f" in backend/*.py) [ -f "$f" ] && printf x && break ;; esac; done)" ]; then
+    # Only real Ruff plus impacted Postgres pytest can mint this receipt.
+    _VERIFY_CHANGED=$(mktemp /tmp/check_verify_changed.XXXXXX)
+    : >"$_VERIFY_CHANGED"
+    printf '%s\n' "$CHANGED" | grep -E '^backend/.*\.py$' | while IFS= read -r f; do
+      [ -f "$f" ] && printf '%s\0' "$f" >>"$_VERIFY_CHANGED"
+    done
+    _VERIFY_RUFF_OK=0
+    if [ -s "$_VERIFY_CHANGED" ] && xargs -0 -a "$_VERIFY_CHANGED" python3 -m ruff check --select E,F,W --ignore E501 2>&1; then
+      _VERIFY_RUFF_OK=1
+    else
+      echo "[check] required backend verification FAILED — Ruff missing, failed, or had no changed Python target"
+      FAILED+=("backend required ruff")
+    fi
+    if [ "$_VERIFY_RUFF_OK" = "1" ]; then
+      _VERIFY_CANDIDATES=$(mktemp /tmp/check_verify_selectors.XXXXXX)
+      printf '%s\n' "$CHANGED" | grep -E '^backend/testing/test_.*\.py$' | while IFS= read -r f; do
+        [ -f "${f%%::*}" ] && printf '%s\n' "$f"
+      done >"$_VERIFY_CANDIDATES" || true
+      printf '%s\n' "$CHANGED" | python3 backend/testing/impacted_tests.py >>"$_VERIFY_CANDIDATES"
+      _VERIFY_RESOLVER_RC=$?
+      _VERIFY_SELECTORS=$(while IFS= read -r f; do [ -f "${f%%::*}" ] && printf '%s\n' "$f"; done <"$_VERIFY_CANDIDATES" | awk '!seen[$0]++')
+      rm -f "$_VERIFY_CANDIDATES"
+      if [ "$_VERIFY_RESOLVER_RC" -ne 0 ]; then
+        echo "[check] required backend verification resolver FAILED (exit $_VERIFY_RESOLVER_RC)"
+        FAILED+=("backend verification resolver")
+      elif [ -z "$_VERIFY_SELECTORS" ]; then
+        echo "[check] required backend verification FAILED — no impacted pytest file/node resolved"
+        FAILED+=("backend verification no impacted pytest")
+      else
+        _VERIFY_POSTGRES_FLAG=""
+        if command -v pg_config >/dev/null 2>&1 && [ -x "$(pg_config --bindir)/initdb" ]; then
+          _VERIFY_POSTGRES_FLAG=--sandbox-postgres
+        elif command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+          _VERIFY_POSTGRES_FLAG=--postgres
+        else
+          echo "[check] required backend verification FAILED — PostgreSQL runtime unavailable"
+          FAILED+=("backend verification PostgreSQL unavailable")
+        fi
+      fi
+      if [ -n "${_VERIFY_POSTGRES_FLAG:-}" ]; then
+        mapfile -t _VERIFY_ARGS < <(printf '%s\n' "$_VERIFY_SELECTORS" | head -n 8 | sed 's|^backend/||')
+        _VERIFY_HARNESS_RECEIPT="/tmp/backend_verification_harness_${_VERIFY_TASK_ID}.json"
+        rm -f "$_VERIFY_HARNESS_RECEIPT"
+        if ( set -o pipefail; BLUEPRINT_VERIFICATION_RESULT_FILE="$_VERIFY_HARNESS_RECEIPT" USE_TEST_POSTGRES=true bash scripts/test-backend.sh "$_VERIFY_POSTGRES_FLAG" "${_VERIFY_ARGS[@]}" 2>&1 | tail -200 ) \
+          && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d.get("exit_code")==0 and d.get("targeted") is True and d.get("use_test_postgres") is True and d.get("postgres_sidecar") is True and int(d.get("tests",0))>int(d.get("skipped",0)) and d.get("selectors")' "$_VERIFY_HARNESS_RECEIPT"; then
+          _VERIFY_SELECTORS_JSON=$(printf '%s\n' "${_VERIFY_ARGS[@]}" | python3 -c 'import json,sys; print(json.dumps([x.rstrip("\n") for x in sys.stdin if x.rstrip("\n")]))')
+          _VERIFY_RECEIPT="/tmp/project_verification_receipt_${_VERIFY_TASK_ID}.json"
+          _VERIFY_TMP="${_VERIFY_RECEIPT}.$$"
+          if python3 -c 'import datetime,json,sys; out,task,selectors,runtime_path,postgres_flag=sys.argv[1:]; runtime=json.load(open(runtime_path,encoding="utf-8")); payload={"version":1,"task_id":task,"directory":"backend","created_at":datetime.datetime.now(datetime.timezone.utc).isoformat(),"ruff":{"command":"python3 -m ruff check --select E,F,W --ignore E501 <changed-python-files>","exit_code":0},"pytest":{"command":"USE_TEST_POSTGRES=true bash scripts/test-backend.sh "+postgres_flag+" <impacted-selectors>","harness":"scripts/test-backend.sh","selectors":json.loads(selectors),"targeted":True,"use_test_postgres":True,"postgres_sidecar":True,"tests":runtime["tests"],"skipped":runtime["skipped"],"exit_code":0}}; open(out,"w",encoding="utf-8").write(json.dumps(payload,sort_keys=True)+"\n")' "$_VERIFY_TMP" "$_VERIFY_TASK_ID" "$_VERIFY_SELECTORS_JSON" "$_VERIFY_HARNESS_RECEIPT" "$_VERIFY_POSTGRES_FLAG" \
+            && mv -f "$_VERIFY_TMP" "$_VERIFY_RECEIPT"; then
+            echo "[check] required backend verification receipt: $_VERIFY_RECEIPT"
+          else
+            rm -f "$_VERIFY_TMP" "$_VERIFY_RECEIPT"
+            FAILED+=("backend verification receipt")
+          fi
+        else
+          echo "[check] required targeted Postgres pytest FAILED or produced no non-skipped evidence"
+          FAILED+=("backend required targeted Postgres pytest")
+        fi
+        rm -f "$_VERIFY_HARNESS_RECEIPT"
+      fi
+    fi
+    rm -f "$_VERIFY_CHANGED"
   fi
 fi
 

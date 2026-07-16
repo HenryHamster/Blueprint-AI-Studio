@@ -5,6 +5,7 @@ vi.mock('child_process', () => ({
 }));
 
 vi.mock('../index.js', () => ({
+  normalizeClaudeConfigContent: vi.fn((_path: string, content: string) => content),
   WORKSPACE: '/tmp/workspace',
   sendLog: vi.fn(),
 }));

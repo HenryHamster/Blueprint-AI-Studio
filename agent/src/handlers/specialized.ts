@@ -374,6 +374,8 @@ ${migrateFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
     owner,
     repo,
     testsOnMainBranch: baseBranch === (migratePromotionTarget ?? resolveBaseBranch({}, task)),
+    buildConfig: migrateBuildConfig,
+    taskCapability: task.task_capability as Partial<Record<'agent_mode' | 'run_shape' | 'output_kind', unknown>> | undefined,
     baseCommit: migrateBaseCommit,
     model,
     effort,
