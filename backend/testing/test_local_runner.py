@@ -11092,6 +11092,56 @@ class TestMidRunViewableUpload:
         )
 
     @pytest.mark.asyncio
+    async def test_runner_generation_retry_keeps_revision(self, client, db_session):
+        """A response-loss retry for one runner generation is idempotent."""
+        _project, runner, token, job = await self._make_running_job(db_session)
+        safe_name = "reward.png"
+        fake_uri = self._fake_uri(job.id, safe_name)
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "X-Blueprint-Viewable-Revision": "runner-generation-1",
+        }
+
+        with patch(
+            "app.storage.upload_compute_job_viewable_file", return_value=fake_uri
+        ):
+            first = await client.post(
+                f"/api/runner/compute-job/{job.id}/viewable",
+                data={"filename": safe_name},
+                files={"file": (safe_name, b"same-bytes", "image/png")},
+                headers=headers,
+            )
+            retry = await client.post(
+                f"/api/runner/compute-job/{job.id}/viewable",
+                data={"filename": safe_name},
+                files={"file": (safe_name, b"same-bytes", "image/png")},
+                headers=headers,
+            )
+
+        assert first.status_code == 200
+        assert retry.status_code == 200
+        assert first.json()["entry"]["revision"] == "runner-generation-1"
+        assert retry.json()["entry"]["revision"] == "runner-generation-1"
+
+    @pytest.mark.asyncio
+    async def test_invalid_runner_revision_rejected_before_storage(
+        self, client, db_session
+    ):
+        _project, runner, token, job = await self._make_running_job(db_session)
+        with patch("app.storage.upload_compute_job_viewable_file") as upload:
+            response = await client.post(
+                f"/api/runner/compute-job/{job.id}/viewable",
+                data={"filename": "reward.png"},
+                files={"file": ("reward.png", b"bytes", "image/png")},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "X-Blueprint-Viewable-Revision": "bad revision/with spaces",
+                },
+            )
+        assert response.status_code == 422
+        upload.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_oversize_image_rejected(self, client, db_session):
         """Image exceeding the per-file byte cap → 413."""
         _project, runner, token, job = await self._make_running_job(db_session)
@@ -11141,6 +11191,59 @@ class TestMidRunViewableUpload:
         assert resp.status_code == 409, (
             f"Expected 409 for terminal job, got {resp.status_code}: {resp.text}"
         )
+
+    @pytest.mark.asyncio
+    async def test_terminal_winning_during_live_upload_keeps_terminal_object(
+        self, client, db_session
+    ):
+        """A late live upload must never overwrite terminal's canonical object.
+
+        The fake storage write models the precise ordering from the race report:
+        terminal reconciliation publishes its canonical bytes while the live
+        request is stalled, then the stalled write completes.  Staging means the
+        latter can only write an unreferenced object, and the locked re-check
+        returns 409 without promoting it.
+        """
+        from app import storage
+
+        _project, _runner, token, job = await self._make_running_job(db_session)
+        safe_name = "reward_curve.png"
+        objects: dict[str, bytes] = {}
+        deleted: list[str] = []
+
+        async def _late_live_upload(job_id, basename, data, content_type):
+            # Terminal owns the canonical generation before the slow live write
+            # returns.  This commit is observable by the endpoint's locked reread.
+            job.status = ComputeJobStatus.SUCCEEDED
+            db_session.add(job)
+            await db_session.commit()
+            objects[safe_name] = b"terminal-generation"
+            objects[basename] = data
+            return storage.compute_job_viewable_uri(job_id, basename)
+
+        async def _delete_staging(job_id, basename):
+            deleted.append(basename)
+            objects.pop(basename, None)
+            return True
+
+        with patch(
+            "app.storage.upload_compute_job_viewable_file", new=_late_live_upload
+        ), patch(
+            "app.storage.delete_compute_job_viewable_file", new=_delete_staging
+        ), patch(
+            "app.storage.promote_compute_job_viewable_file",
+            new=AsyncMock(side_effect=AssertionError("terminal upload must not promote")),
+        ):
+            response = await client.post(
+                f"/api/runner/compute-job/{job.id}/viewable",
+                data={"filename": safe_name},
+                files={"file": (safe_name, b"late-live-bytes", "image/png")},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        assert response.status_code == 409, response.text
+        assert objects[safe_name] == b"terminal-generation"
+        assert len(deleted) == 1 and deleted[0].startswith(".staging/")
 
     @pytest.mark.asyncio
     async def test_file_cap_enforced(self, client, db_session):
@@ -11247,7 +11350,8 @@ class TestMidRunViewableUpload:
         assert captured["read"] == video_bytes
         assert captured["size"] == len(video_bytes)
         assert captured["content_type"] == "video/mp4"
-        assert captured["basename"] == safe_name
+        assert captured["basename"].startswith(".staging/")
+        assert captured["basename"].endswith(f"/{safe_name}")
 
         # DB row + manifest recorded with the streamed size.
         await db_session.refresh(job)
@@ -11265,8 +11369,12 @@ class TestMidRunViewableUpload:
         assert rows[0].file_size_bytes == len(video_bytes)
 
     @pytest.mark.asyncio
-    async def test_reupload_same_relpath_dedup(self, client, db_session):
-        """Re-upload of the same relpath → single manifest entry, single DB row."""
+    async def test_reupload_same_relpath_advances_revision_and_terminal_reconciles(
+        self, client, db_session
+    ):
+        """Same URI/size advances live revision; terminal replaces it once."""
+        from app import compute_jobs as compute_jobs_mod
+
         _project, runner, token, job = await self._make_running_job(db_session)
         safe_name = "reward_curve.png"
         fake_uri = self._fake_uri(job.id, safe_name)
@@ -11275,14 +11383,15 @@ class TestMidRunViewableUpload:
             "app.storage.upload_compute_job_viewable_file",
             return_value=fake_uri,
         ):
-            # First upload
+            # Equal-size generations exercise the real defect: storage_uri and
+            # byte length cannot distinguish the overwritten bytes.
             resp1 = await client.post(
                 f"/api/runner/compute-job/{job.id}/viewable",
                 data={"filename": safe_name},
                 files={
                     "file": (
                         safe_name,
-                        b"v1-data",
+                        b"version-one",
                         "image/png",
                     )
                 },
@@ -11292,15 +11401,17 @@ class TestMidRunViewableUpload:
                 f"First upload failed: {resp1.status_code}: {resp1.text}"
             )
             assert resp1.json()["total_viewable_files"] == 1
+            first_revision = resp1.json()["entry"]["revision"]
+            assert resp1.json()["entry"]["live"] is True
 
-            # Second upload (same relpath, larger content)
+            # Second upload: same relpath, same deterministic URI, same size.
             resp2 = await client.post(
                 f"/api/runner/compute-job/{job.id}/viewable",
                 data={"filename": safe_name},
                 files={
                     "file": (
                         safe_name,
-                        b"v2-data-larger",
+                        b"version-two",
                         "image/png",
                     )
                 },
@@ -11312,6 +11423,9 @@ class TestMidRunViewableUpload:
             assert resp2.json()["total_viewable_files"] == 1, (
                 "Re-upload must not increase the manifest count"
             )
+            second_revision = resp2.json()["entry"]["revision"]
+            assert second_revision != first_revision
+            assert resp2.json()["entry"]["storage_uri"] == fake_uri
 
         # ── Only ONE ComputeJobFile row ──────────────────────────────────────
         rows = (
@@ -11333,6 +11447,49 @@ class TestMidRunViewableUpload:
         assert len(vf) == 1, (
             f"Expected 1 viewable_files entry after re-upload, got {len(vf)}"
         )
+        assert vf[0]["revision"] == second_revision
+        assert vf[0]["live"] is True
+
+        # The terminal bundle is authoritative. Its legacy-shaped result has no
+        # revision, so reconciliation must assign a final one, clear ``live``,
+        # replace the manifest in place, and preserve the single signing row.
+        job.status = ComputeJobStatus.SUCCEEDED
+        db_session.add(job)
+        await db_session.commit()
+        terminal_manifest = [
+            {
+                "filename": safe_name,
+                "storage_uri": fake_uri,
+                "content_type": "image/png",
+                "size_bytes": len(b"version-two"),
+                "kind": "image",
+            }
+        ]
+        with patch.object(
+            compute_jobs_mod,
+            "persist_viewable_artifacts",
+            new=AsyncMock(return_value=(terminal_manifest, 0)),
+        ):
+            final_manifest, dropped = (
+                await compute_jobs_mod.persist_viewable_files_for_job(db_session, job)
+            )
+        await db_session.commit()
+
+        assert dropped == 0
+        assert len(final_manifest) == 1
+        assert final_manifest[0]["revision"] != second_revision
+        assert final_manifest[0]["live"] is False
+        await db_session.refresh(job)
+        assert (job.polling_metadata or {})["viewable_files"] == final_manifest
+        final_rows = (
+            await db_session.execute(
+                select(ComputeJobFile).where(
+                    ComputeJobFile.compute_job_id == job.id,
+                    ComputeJobFile.storage_uri == fake_uri,
+                )
+            )
+        ).scalars().all()
+        assert len(final_rows) == 1
 
     @pytest.mark.asyncio
     async def test_no_filename_rejected(self, client, db_session):

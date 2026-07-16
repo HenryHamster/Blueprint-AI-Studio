@@ -1,7 +1,7 @@
 """Tests for strategic_context_package.py read-model functions."""
 
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import pytest
@@ -192,7 +192,7 @@ async def test_load_strategic_context_evidence_staleness_reflects_oldest_pending
     await db_session.commit()
     await db_session.refresh(task)
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     # Create a doc from 72 hours ago — should be the oldest.
     old_doc = KnowledgeDocument(
         project_id=project.id,
@@ -374,6 +374,56 @@ async def test_bundle_artifact_resolves_manifest_viewable_video(
     # storage_uri now rides on the descriptor sub-dict for lazy re-resolution;
     # the no-leak contract is enforced at the item level (asserted above).
     assert descriptor["video"]["storage_uri"] == own_video
+
+
+@pytest.mark.asyncio
+async def test_viewable_revision_reaches_signed_preview_and_descriptor(
+    db_session, monkeypatch
+):
+    """Revision/live metadata survives signing without changing the media URI."""
+    project, task = await _make_project_task(db_session, name="RevisionPreview")
+    plot_uri = (
+        f"gs://{ARTIFACT_BUCKET_NAME}/compute-jobs/"
+        "11111111-1111-1111-1111-111111111111/artifacts/viewable/reward.png"
+    )
+    db_session.add(
+        Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.DEBUG_RESULT,
+            storage_uri=(
+                f"gs://{ARTIFACT_BUCKET_NAME}/compute-jobs/"
+                "11111111-1111-1111-1111-111111111111/artifacts/bundle.tar.gz"
+            ),
+            logs=json.dumps(
+                {
+                    "viewable_files": [
+                        {
+                            "filename": "reward.png",
+                            "storage_uri": plot_uri,
+                            "kind": "image",
+                            "revision": "terminal-revision-9",
+                            "live": False,
+                        }
+                    ]
+                }
+            ),
+        )
+    )
+    await db_session.commit()
+
+    async def fake_verify(storage_uri, project_id, session):
+        assert storage_uri == plot_uri
+
+    monkeypatch.setattr(scp, "verify_artifact_project_ownership", fake_verify)
+    monkeypatch.setattr(scp, "generate_download_signed_url", _fake_signer([]))
+
+    evidence = await load_strategic_context_evidence(db_session, project.id)
+    preview = evidence["artifacts"]["items"][0]["viewable_previews"][0]
+    assert preview["revision"] == "terminal-revision-9"
+    assert preview["live"] is False
+    descriptor = _artifact_descriptor(evidence["artifacts"]["items"][0])
+    assert descriptor["image"]["revision"] == "terminal-revision-9"
+    assert descriptor["images"][0]["live"] is False
 
 
 @pytest.mark.asyncio
@@ -913,6 +963,29 @@ def test_artifact_descriptor_multi_video_populates_videos_list():
     assert desc["videos"][0]["url"] == "https://signed.example.com/clip0.mp4?sig=v1"
     assert desc["videos"][1]["url"] == "https://signed.example.com/clip1.mp4?sig=v2"
     assert desc["videos"][0]["filename"] == "clip0.mp4"
+
+
+def test_artifact_descriptor_preserves_all_mixed_media_preview_groups():
+    """Image precedence identifies the tile without dropping video or PDF evidence."""
+    item = {
+        "id": "art-mixed-media",
+        "artifact_type": "COMPUTE_RESULT",
+        "logical_key": "results/",
+        "label": "Training results",
+        "viewable_previews": [
+            {"url": "https://signed.example.com/reward.png", "kind": "image", "filename": "reward.png"},
+            {"url": "https://signed.example.com/rollout.mp4", "kind": "video", "filename": "rollout.mp4"},
+            {"url": "https://signed.example.com/report.pdf", "kind": "pdf", "filename": "report.pdf"},
+        ],
+    }
+
+    desc = _artifact_descriptor(item)
+
+    assert desc is not None
+    assert desc["kind"] == "image"
+    assert desc["images"][0]["filename"] == "reward.png"
+    assert desc["videos"][0]["filename"] == "rollout.mp4"
+    assert desc["pdfs"][0]["filename"] == "report.pdf"
 
 
 def test_artifact_descriptor_image_carries_storage_uri_for_lazy_resolution():

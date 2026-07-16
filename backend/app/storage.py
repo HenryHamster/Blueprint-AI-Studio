@@ -451,6 +451,30 @@ _VIEWABLE_BASENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 # the object name stays a single path segment (no ``/``).
 _VIEWABLE_RELPATH_JOINER = "__"
 
+# Opaque per-generation identity carried beside a deterministic viewable object
+# URI.  The object name intentionally stays stable (so the signing allowlist and
+# ComputeJobFile uniqueness contract do not change); consumers use this token to
+# notice that the bytes at that URI were replaced.  Keep the accepted alphabet
+# URL/query/cache-key safe because clients append the value as a cache buster.
+_VIEWABLE_REVISION_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+
+
+def new_viewable_revision() -> str:
+    """Return a fresh opaque identity for one stored viewable-file generation."""
+    return uuid.uuid4().hex
+
+
+def normalize_viewable_revision(value: object) -> str | None:
+    """Return a valid additive revision token, else ``None``.
+
+    Legacy manifests have no revision and remain valid.  Invalid/unbounded
+    runner-supplied values are never reflected into manifests or cache keys.
+    """
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value if _VIEWABLE_REVISION_RE.fullmatch(value) else None
+
 
 def viewable_content_type_for_filename(filename: str) -> tuple[str, str] | None:
     """Return ``(content_type, kind)`` for a viewable filename, else ``None``.
@@ -665,6 +689,53 @@ async def delete_compute_job_viewable_file(job_id, basename: str) -> bool:
         )
         return False
     return True
+
+
+async def promote_compute_job_viewable_file(
+    job_id, staged_basename: str, canonical_basename: str
+) -> str | None:
+    """Atomically promote a staged live upload to its canonical viewable URI.
+
+    The runner endpoint uploads outside its ``ComputeJob`` row lock so a large
+    video cannot hold a database transaction open.  Its temporary object must
+    therefore not use the deterministic canonical name: terminal reconciliation
+    may win that row lock while the upload is in flight.  Callers promote only
+    after re-checking the job remains non-terminal under that lock.
+
+    ``copy_blob`` overwrites the destination before the staging object is
+    deleted, so a failed cleanup cannot make the canonical generation vanish.
+    A canonical source is accepted as a no-op for backwards-compatible test
+    seams and older callers which still return the canonical URI directly.
+    """
+    if not staged_basename or not canonical_basename:
+        return None
+    staged_uri = compute_job_viewable_uri(job_id, staged_basename)
+    canonical_uri = compute_job_viewable_uri(job_id, canonical_basename)
+    if staged_uri == canonical_uri:
+        return canonical_uri
+
+    def _promote() -> None:
+        storage_client = storage.Client(project=GCP_PROJECT_ID)
+        bucket = storage_client.bucket(ARTIFACT_BUCKET_NAME)
+        source = bucket.blob(compute_job_viewable_object_name(job_id, staged_basename))
+        bucket.copy_blob(
+            source,
+            bucket,
+            compute_job_viewable_object_name(job_id, canonical_basename),
+        )
+        source.delete()
+
+    try:
+        await asyncio.to_thread(_promote)
+    except Exception:
+        logger.warning(
+            "Failed to promote staged viewable artifact %r for compute job %s",
+            staged_basename,
+            job_id,
+            exc_info=True,
+        )
+        return None
+    return canonical_uri
 
 
 async def generate_compute_job_artifact_upload_signed_url(

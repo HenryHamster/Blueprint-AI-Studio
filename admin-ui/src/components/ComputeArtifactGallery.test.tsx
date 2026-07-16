@@ -313,6 +313,35 @@ describe('ComputeArtifactGallery', () => {
     vi.useRealTimers();
   });
 
+  test('refreshes an open same-URI preview by revision and reconciles live to terminal', async () => {
+    resolveArtifactDownloadUrl
+      .mockResolvedValueOnce('https://signed/plot-v1.png')
+      .mockResolvedValueOnce('https://signed/plot-v2.png');
+    const live = { ...imageArtifact, revision: 'v1', live: true };
+    const { getByTestId, rerender } = render(
+      <ComputeArtifactGallery projectId="proj-1" job={makeJob({ status: 'RUNNING', viewable_artifacts: [live] })} />,
+    );
+
+    fireEvent.click(getByTestId('drawer-artifact-gallery-toggle'));
+    await waitFor(() => expect(getByTestId('drawer-artifact-thumbnail').querySelector('img')?.src)
+      .toBe('https://signed/plot-v1.png'));
+
+    rerender(
+      <ComputeArtifactGallery
+        projectId="proj-1"
+        job={makeJob({
+          status: 'SUCCEEDED',
+          viewable_artifacts: [{ ...live, revision: 'v2', live: false }],
+        })}
+      />,
+    );
+
+    expect(getByTestId('drawer-artifact-gallery-toggle').textContent).toBe('Hide previews');
+    await waitFor(() => expect(getByTestId('drawer-artifact-thumbnail').querySelector('img')?.src)
+      .toBe('https://signed/plot-v2.png'));
+    expect(resolveArtifactDownloadUrl).toHaveBeenCalledTimes(2);
+  });
+
   test('expanding gallery with image, video, and pdf resolves image+video but never pdf eagerly', async () => {
     resolveArtifactDownloadUrl.mockImplementation(async (_p: string, uri: string) => `https://signed/${uri}`);
     const { getByTestId, queryAllByTestId } = render(
