@@ -3490,6 +3490,94 @@ async def test_process_post_commit_locks_project_before_task_for_nonstrategic(
     assert calls["skip_locked"] is True
 
 
+def test_strategic_completion_reserves_message_block_before_authority_locks():
+    source = inspect.getsource(_process_post_commit)
+    reserve_at = source.index("await reserve_project_message_sequences(")
+    reservation_commit_at = source.index("await session.commit()", reserve_at)
+    authority_lock_at = source.index("async with lock_project_then_task(")
+
+    assert reserve_at < reservation_commit_at < authority_lock_at
+    assert '_peek_task_type == "strategic_review"' not in source
+    assert '_peek_completion_handler == "strategic"' in source
+    assert "message_sequences=preallocated_strategic_message_sequences" in source
+
+
+@pytest.mark.asyncio
+async def test_design_doc_capability_does_not_reserve_strategic_message_sequences(
+    tl_db, mocker
+):
+    session, factory = tl_db
+    project = await _make_project(session)
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="design_doc_update",
+        status=TaskStatus.COMPLETED,
+    )
+    payload = AgentStatusPayload(
+        task_id=task.id,
+        status=TaskStatus.COMPLETED,
+        logs=json.dumps({"messages": [{"type": "NOTE", "content": "Bounded output"}]}),
+    )
+    events: list[str] = []
+
+    class _StopAfterAuthorityLock(Exception):
+        pass
+
+    @contextlib.asynccontextmanager
+    async def _stop_at_authority_lock(*_args, **_kwargs):
+        events.append("authority_lock")
+        raise _StopAfterAuthorityLock()
+        yield (None, None)  # pragma: no cover
+
+    reserve = mocker.patch(
+        "app.project_message_creation.reserve_project_message_sequences",
+        new_callable=AsyncMock,
+        side_effect=AssertionError("design-doc completion must not reserve messages"),
+    )
+    mocker.patch(
+        "app.task_locking.lock_project_then_task",
+        new=_stop_at_authority_lock,
+    )
+
+    with pytest.raises(_StopAfterAuthorityLock):
+        await _process_post_commit(task.id, payload, _session_factory=factory)
+
+    assert events == ["authority_lock"]
+    reserve.assert_not_awaited()
+
+
+def test_strategic_completion_message_count_covers_direct_and_reply_emissions():
+    from app.strategic_completion import (
+        _handle_strategic_completion,
+        strategic_completion_message_count,
+    )
+
+    logs = json.dumps(
+        {
+            "messages": [
+                {"type": "NOTE", "content": "First"},
+                {"type": "NOTE", "content": "  "},
+                {"type": "QUESTION", "content": "Second"},
+            ],
+            "resolved_messages": [
+                {"id": str(uuid.uuid4())},
+                {"id": str(uuid.uuid4())},
+                {"id": "invalid-but-still-possible"},
+            ],
+        }
+    )
+
+    assert strategic_completion_message_count(logs) == 5
+    source = inspect.getsource(_handle_strategic_completion)
+    for helper_name in ("post_feedback_acknowledgment", "post_question_answer"):
+        helper_at = source.index(f"await {helper_name}")
+        assert (
+            "sequence=next(reserved_message_sequences, None)"
+            in source[helper_at : helper_at + 1_200]
+        )
+
+
 @pytest.mark.asyncio
 async def test_process_post_commit_persists_timing_fields(tl_db, mocker):
     """Phase 0 telemetry: setup_secs, warm_start, prior_role_vm_id round-trip

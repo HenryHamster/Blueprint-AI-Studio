@@ -6952,6 +6952,51 @@ async def test_sweep_routine_message_retention_skips_commit_when_nothing_purged(
 
 
 @pytest.mark.asyncio
+async def test_sweep_expired_message_attachment_uploads_is_global_and_bounded(
+    db_session,
+    mocker,
+):
+    from app.models import ProjectMessageAttachmentUpload
+
+    project = Project(name="Global attachment sweep", user_id="sweep-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    expired = [
+        ProjectMessageAttachmentUpload(
+            attachment_id=_uuid_mod.uuid4(),
+            project_id=project.id,
+            actor_user_id=f"actor-{index}",
+            storage_uri=f"gs://bucket/message-attachments/{project.id}/{index}/file.bin",
+            filename="file.bin",
+            expected_size_bytes=10,
+            created_at=_utcnow() - timedelta(minutes=30),
+            expires_at=_utcnow() - timedelta(minutes=15),
+        )
+        for index in range(3)
+    ]
+    db_session.add_all(expired)
+    await db_session.commit()
+    delete_object = mocker.patch(
+        "app.reaper_sweeps.delete_storage_uri_best_effort",
+        new_callable=AsyncMock,
+        return_value=True,
+    )
+
+    removed = await _rs.sweep_expired_message_attachment_uploads(
+        db_session,
+        batch_size=2,
+    )
+
+    assert removed == 2
+    assert delete_object.await_count == 2
+    remaining = (
+        await db_session.execute(select(ProjectMessageAttachmentUpload))
+    ).scalars().all()
+    assert len(remaining) == 1
+
+
+@pytest.mark.asyncio
 async def test_sweep_regression_scan_cadence_gate_suppresses_second_call(mocker):
     """sweep_regression_scan returns 0 immediately when called within the 15-min window."""
     _rs._last_regression_scan = None  # reset to force first call through

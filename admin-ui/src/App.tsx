@@ -1367,6 +1367,7 @@ export default function App() {
                   s.dismissAllAlerts();
                 }}
                 onViewAlertTask={handleViewTask}
+                onOpenActivityFeed={() => setShowActivityFeed(true)}
               />
               </Suspense>
             )}

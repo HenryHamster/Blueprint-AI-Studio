@@ -795,6 +795,7 @@ async def raise_capability_verdict_notice(
     verdict are silent.
     """
     from app.models import MessageType, ProjectMessage
+    from app.project_message_creation import build_project_message
 
     dedupe_key = f"capability_verdict_decided_{cap_name}_{new_verdict}"
     if await _check_open_message_exists(session, project_id, dedupe_key):
@@ -821,7 +822,8 @@ async def raise_capability_verdict_notice(
             f"reason={verdict_reason} lift={lift} n_with={n_with} n_without={n_without}"
         )
     session.add(
-        ProjectMessage(
+        await build_project_message(
+            session,
             project_id=project_id,
             message_type=MessageType.NOTE,
             from_type="system",
@@ -1206,6 +1208,7 @@ async def raise_stalled_trial_notice(
     Returns True when a new notice was written, False when the dedupe key already existed.
     """
     from app.models import MessageType, ProjectMessage
+    from app.project_message_creation import build_project_message
 
     dedupe_key = f"capability_trial_stalled_{cap_name}"
     if await _check_open_message_exists(session, project_id, dedupe_key):
@@ -1229,7 +1232,8 @@ async def raise_stalled_trial_notice(
         f"— raise holdback_fraction or extend trial window"
     )
     session.add(
-        ProjectMessage(
+        await build_project_message(
+            session,
             project_id=project_id,
             message_type=MessageType.NOTE,
             from_type="system",
@@ -1358,6 +1362,7 @@ async def raise_ambiguous_lift_escalation_notice(
     Returns True when a new notice was written, False when the dedupe key already existed.
     """
     from app.models import MessageType, ProjectMessage
+    from app.project_message_creation import build_project_message
 
     dedupe_key = f"capability_trial_ambiguous_lift_escalation_{cap_name}"
     if await _check_open_message_exists(session, project_id, dedupe_key):
@@ -1376,7 +1381,8 @@ async def raise_ambiguous_lift_escalation_notice(
         f"— operator review required: consider expanding trial, adjusting thresholds, or closing"
     )
     session.add(
-        ProjectMessage(
+        await build_project_message(
+            session,
             project_id=project_id,
             message_type=MessageType.NOTE,
             from_type="system",

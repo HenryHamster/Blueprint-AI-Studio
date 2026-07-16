@@ -1411,6 +1411,7 @@ async def emit_lane_event_message(
     lane emits at most one open message per event type and the board never floods.
     """
     from app.models import MessageType, ProjectMessage
+    from app.project_message_creation import build_project_message
 
     if lane_id is not None:
         dedupe_key = f"lane_{event_type}_{lane_id}"
@@ -1430,7 +1431,8 @@ async def emit_lane_event_message(
     if already:
         return
     session.add(
-        ProjectMessage(
+        await build_project_message(
+            session,
             project_id=project_id,
             message_type=MessageType.NOTE,
             from_type="system",
@@ -1454,6 +1456,7 @@ async def raise_gate_integrity_alert(
     repeated detections in a sweep don't spam the board.
     """
     from app.models import MessageType, ProjectMessage
+    from app.project_message_creation import build_project_message
 
     dedupe_key = "review_fix_lane_gate_integrity_violation"
     result = await session.execute(
@@ -1469,7 +1472,8 @@ async def raise_gate_integrity_alert(
     if already:
         return
     session.add(
-        ProjectMessage(
+        await build_project_message(
+            session,
             project_id=project_id,
             message_type=MessageType.BLOCKER,
             from_type="system",

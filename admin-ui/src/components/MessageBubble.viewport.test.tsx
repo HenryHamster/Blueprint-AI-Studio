@@ -31,7 +31,7 @@ function makeProps(overrides: Partial<MessageBubbleProps> = {}): MessageBubblePr
     msg: makeMsg(),
     faded: false,
     readOnly: false,
-    allMessages: [],
+    replyTarget: null,
     resolvingId: null,
     resolveInput: '',
     deletingIds: new Set(),

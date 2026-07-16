@@ -15,12 +15,19 @@ export function createStrategicStateApiMock(overrides: Record<string, unknown> =
     updateStrategicWorkbenchState: vi.fn(),
     fetchStrategicSession: vi.fn(),
     fetchStrategicConversation: vi.fn(),
+    findStrategicMessageByClientIdentity: vi.fn(),
     createStrategicSessionMessage: vi.fn(),
+    StrategicSessionMessageCreateError: class StrategicSessionMessageCreateError extends Error {
+      readonly status = 500;
+    },
     checkInStrategicSession: vi.fn(),
     executeStrategicWorkSessionCommand: vi.fn(),
     startStrategicSession: vi.fn(),
     stopStrategicSession: vi.fn(),
     getMessageAttachmentUploadUrl: vi.fn(),
+    deleteMessageAttachmentUpload: vi.fn(),
+    getMessageAttachmentDownloadUrl: vi.fn(),
+    invalidateMessageAttachmentDownloadUrl: vi.fn(),
   };
   return { ...base, ...overrides };
 }

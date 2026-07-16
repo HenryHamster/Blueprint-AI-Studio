@@ -55,7 +55,15 @@ from app.compute_jobs import (
     finalize_runner_subprocess_job_for_dead_runner,
 )
 from app.database import AsyncSessionLocal
-from app.models import ComputeJob, ComputeJobStatus, LocalRunner, Task, TaskStatus
+from app.models import (
+    ComputeJob,
+    ComputeJobStatus,
+    LocalRunner,
+    ProjectMessageAttachmentUpload,
+    Task,
+    TaskStatus,
+)
+from app.storage import delete_storage_uri_best_effort
 from app.runner_health_monitors import _RUNNER_LIVENESS_SECONDS
 from app.time_utils import _is_cadence_due, _utcnow
 from app.reaper_fleet_health_sweeps import (
@@ -1067,6 +1075,60 @@ async def sweep_routine_message_retention(session, *, retention_days: int = 7) -
         await session.commit()
         logger.info(f"[REAPER] Purged {purged} stale routine message(s)")
     return purged
+
+
+async def sweep_expired_message_attachment_uploads(
+    session,
+    *,
+    batch_size: int = 32,
+    timeout_seconds: float = 5.0,
+) -> int:
+    """Delete a global bounded batch of expired, unconsumed upload receipts."""
+
+    receipts = (
+        await session.execute(
+            select(ProjectMessageAttachmentUpload)
+            .where(
+                ProjectMessageAttachmentUpload.consumed_at.is_(None),
+                ProjectMessageAttachmentUpload.message_id.is_(None),
+                ProjectMessageAttachmentUpload.expires_at <= _utcnow(),
+            )
+            .order_by(ProjectMessageAttachmentUpload.expires_at.asc())
+            .limit(max(1, min(int(batch_size), 100)))
+            .with_for_update(skip_locked=True)
+        )
+    ).scalars().all()
+    if not receipts:
+        return 0
+    try:
+        deleted = await asyncio.wait_for(
+            asyncio.gather(
+                *(
+                    delete_storage_uri_best_effort(receipt.storage_uri)
+                    for receipt in receipts
+                )
+            ),
+            timeout=max(0.1, float(timeout_seconds)),
+        )
+    except TimeoutError:
+        await session.rollback()
+        logger.warning("[REAPER] Expired message attachment cleanup timed out")
+        return 0
+
+    removed = 0
+    for receipt, object_deleted in zip(receipts, deleted, strict=True):
+        if object_deleted:
+            await session.delete(receipt)
+            removed += 1
+    if removed:
+        await session.commit()
+        logger.info(
+            "[REAPER] Deleted %d expired message attachment upload(s)",
+            removed,
+        )
+    else:
+        await session.rollback()
+    return removed
 
 
 async def sweep_evergreen_fill_decision_retention(

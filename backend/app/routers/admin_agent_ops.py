@@ -44,7 +44,20 @@ from app.direction_lifecycle import (
     direction_has_churn_retirement_recommendation,
     reactivate_paused_direction,
 )
-from app.models import KnowledgeDocument, MessageType, Project, ProjectMessage, Task, TaskStatus
+from app.models import (
+    KnowledgeDocument,
+    MessageHandlingState,
+    MessageSurface,
+    MessageType,
+    Project,
+    ProjectMessage,
+    Task,
+    TaskStatus,
+)
+from app.project_message_creation import (
+    build_project_message,
+    lock_project_and_next_message_sequence,
+)
 from app.payload_schemas import (
     ALL_TASK_TYPES as _VALID_TASK_TYPES,
     validate_internal_payload as _validate_internal_payload,
@@ -888,7 +901,8 @@ async def agent_annotate(
             if warning:
                 ctx = {**ctx, "_provenance_warnings": warning}
 
-    msg = ProjectMessage(
+    msg = await build_project_message(
+        session,
         project_id=task.project_id,
         message_type=msg_type,
         from_type="agent",
@@ -988,6 +1002,19 @@ async def strategic_operation(
     task = await session.get(Task, payload.task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
+
+    # Message mutations use the canonical counter-first lock order. Allocate
+    # before the Project/Task authority locks below; an unused sequence gap is
+    # safe for idempotent retries and avoids send/resolve deadlocks.
+    preallocated_message_sequence: int | None = None
+    if payload.op in MESSAGE_OPS:
+        preallocated_message_sequence = (
+            await lock_project_and_next_message_sequence(
+                session,
+                task.project_id,
+                lock_timeout_ms=1_500,
+            )
+        )
 
     # Lock project for atomic update (skip_locked + 429 avoids lock_timeout cascade)
     project = await _lock_project_or_429(session, task.project_id)
@@ -2886,7 +2913,39 @@ async def strategic_operation(
         # the server already committed. Accept an optional idempotency_key from
         # the agent and short-circuit if a matching row already exists.
         raw_idem = str(data.get("idempotency_key") or "").strip()
-        idem_key: str | None = raw_idem[:255] if raw_idem else None
+        if len(raw_idem) > 255:
+            raise HTTPException(
+                status_code=400,
+                detail="idempotency_key exceeds 255 characters",
+            )
+        idem_key: str | None = raw_idem or None
+        from app.routers.admin_notifications import ROUTINE_EVENT_TYPES
+
+        event_type = str(msg_ctx.get("event_type") or "").strip() or None
+        is_routine = event_type in ROUTINE_EVENT_TYPES
+        reply_to_message_id: uuid.UUID | None = None
+        raw_reply_to = msg_ctx.get("reply_to")
+        if raw_reply_to is not None:
+            try:
+                reply_to_message_id = uuid.UUID(str(raw_reply_to))
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="Invalid reply_to message") from None
+            reply_target = (
+                await session.execute(
+                    select(ProjectMessage)
+                    .where(
+                        ProjectMessage.id == reply_to_message_id,
+                        ProjectMessage.project_id == project.id,
+                    )
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if reply_target is None:
+                raise HTTPException(status_code=400, detail="Invalid reply_to message")
+            reply_target.handling_state = MessageHandlingState.RESPONDED
+            reply_target.handled_by_task_id = task.id
+            reply_target.updated_at = _utcnow()
+            session.add(reply_target)
         if idem_key:
             existing = (
                 await session.execute(
@@ -2897,6 +2956,23 @@ async def strategic_operation(
                 )
             ).scalar_one_or_none()
             if existing is not None:
+                if not (
+                    existing.from_type == "strategic"
+                    and existing.from_task_id == task.id
+                    and existing.message_type == msg_type
+                    and existing.content == content
+                    and existing.reply_to_message_id == reply_to_message_id
+                    and existing.surface
+                    == (
+                        MessageSurface.ACTIVITY
+                        if is_routine
+                        else MessageSurface.CONVERSATION
+                    )
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="idempotency_key already belongs to a different message",
+                    )
                 return _resp(
                     {
                         "status": "ok",
@@ -2919,8 +2995,25 @@ async def strategic_operation(
             if isinstance(_resident_blob, dict) and resident_session_is_active(_resident_blob)
             else None
         )
-        new_msg = ProjectMessage(
+        next_sequence = preallocated_message_sequence
+        if next_sequence is None:
+            raise HTTPException(status_code=500, detail="Message sequence was not allocated")
+        new_msg = await build_project_message(
+            session,
             project_id=project.id,
+            sequence=next_sequence,
+            surface=(
+                MessageSurface.ACTIVITY
+                if is_routine
+                else MessageSurface.CONVERSATION
+            ),
+            handling_state=(
+                MessageHandlingState.PENDING
+                if is_routine
+                else MessageHandlingState.RESPONDED
+            ),
+            handled_by_task_id=task.id if not is_routine else None,
+            reply_to_message_id=reply_to_message_id,
             message_type=msg_type,
             from_type="strategic",
             from_task_id=task.id,
@@ -2950,6 +3043,23 @@ async def strategic_operation(
                     )
                 ).scalar_one_or_none()
                 if existing is not None:
+                    if not (
+                        existing.from_type == "strategic"
+                        and existing.from_task_id == task.id
+                        and existing.message_type == msg_type
+                        and existing.content == content
+                        and existing.reply_to_message_id == reply_to_message_id
+                        and existing.surface
+                        == (
+                            MessageSurface.ACTIVITY
+                            if is_routine
+                            else MessageSurface.CONVERSATION
+                        )
+                    ):
+                        raise HTTPException(
+                            status_code=409,
+                            detail="idempotency_key already belongs to a different message",
+                        )
                     return _resp(
                         {
                             "status": "ok",
@@ -2979,7 +3089,11 @@ async def strategic_operation(
         from app.message_convergence import resolve_message_ref as _resolve_message_ref
 
         msg = await _resolve_message_ref(session, project.id, str(msg_id))
-        if msg.status == "resolved":
+        was_resolved = msg.status == "resolved"
+        if was_resolved and msg.message_type not in (
+            MessageType.QUESTION,
+            MessageType.FEEDBACK,
+        ):
             return _resp({"status": "already_resolved"})
         owned_by_direction = data.get("owned_by_direction")
         owned_by_task_id = data.get("owned_by_task")
@@ -2988,7 +3102,11 @@ async def strategic_operation(
             link_message_to_outcome as _link_message_to_outcome,
         )
 
-        if _is_bug_class(msg) and (owned_by_direction or owned_by_task_id):
+        if (
+            not was_resolved
+            and _is_bug_class(msg)
+            and (owned_by_direction or owned_by_task_id)
+        ):
             # Bug-class message with ownership info: record forward link and move
             # to 'linked' state. Terminal 'resolved' happens when outcome lands.
             kind = "direction" if owned_by_direction else "task"
@@ -3015,64 +3133,99 @@ async def strategic_operation(
                     "linked_to": {"kind": kind, "id": str(identifier)},
                 }
             )
-        msg.status = "resolved"
-        resolution_raw = data.get("resolution", "Addressed by strategic review")
-        msg.resolution = _cap_str(
-            resolution_raw, STRATEGIC_RESOLUTION_MAX, "resolution", warnings
-        )
-        msg.resolved_at = _utcnow()
-        session.add(msg)
-        await session.commit()
+        if not was_resolved:
+            msg.status = "resolved"
+            resolution_raw = data.get("resolution", "Addressed by strategic review")
+            msg.resolution = _cap_str(
+                resolution_raw, STRATEGIC_RESOLUTION_MAX, "resolution", warnings
+            )
+            msg.resolved_at = _utcnow()
+            msg.updated_at = msg.resolved_at
+            msg.handling_state = MessageHandlingState.RESPONDED
+            msg.handled_by_task_id = task.id
+            session.add(msg)
         message_id_str = str(msg.id)
-        message_update_event = message_updated_event_payload(msg)
-        # Snapshot project.id too: the reply-post except below rolls back the
-        # session (expiring `project`), and the unconditional broadcast that
-        # follows reads project.id — a sync lazy-load there would MissingGreenlet.
         _project_id_str = str(project.id)
         reply_msg: ProjectMessage | None = None
+        reply_created = False
         if msg.message_type in (MessageType.QUESTION, MessageType.FEEDBACK):
-            try:
+            reply_msg = (
+                await session.execute(
+                    select(ProjectMessage)
+                    .where(
+                        ProjectMessage.project_id == project.id,
+                        ProjectMessage.reply_to_message_id == msg.id,
+                    )
+                    .order_by(ProjectMessage.created_at.asc(), ProjectMessage.id.asc())
+                    .limit(1)
+                )
+            ).scalars().first()
+            if reply_msg is None:
                 from app.notification_dispatch import (
                     post_feedback_acknowledgment as _post_feedback_ack,
                     post_question_answer as _post_qa,
                 )
 
                 resolution = msg.resolution or "Addressed by strategic review"
-                if msg.message_type == MessageType.QUESTION:
-                    pending_reply_msg = await _post_qa(
-                        session, project.id, msg.id, resolution, task.id
+                if preallocated_message_sequence is None:
+                    raise HTTPException(
+                        status_code=500,
+                        detail="Message sequence was not allocated",
                     )
-                else:
-                    pending_reply_msg = await _post_feedback_ack(
+                if msg.message_type == MessageType.QUESTION:
+                    reply_msg = await _post_qa(
                         session,
                         project.id,
                         msg.id,
                         resolution,
                         task.id,
+                        sequence=preallocated_message_sequence,
                     )
-                await session.commit()
-                reply_msg = pending_reply_msg
-            except Exception:
-                await session.rollback()
-                reply_msg = None
-                logger.warning(
-                    "post resolution reply failed for message %s",
-                    message_id_str,
-                    exc_info=True,
-                )
-        await broadcast_to_project(
-            _project_id_str,
-            "message_updated",
-            message_update_event,
+                else:
+                    reply_msg = await _post_feedback_ack(
+                        session,
+                        project.id,
+                        msg.id,
+                        resolution,
+                        task.id,
+                        sequence=preallocated_message_sequence,
+                    )
+                reply_created = True
+
+        await session.flush()
+        message_update_event = (
+            message_updated_event_payload(msg) if not was_resolved else None
         )
-        if reply_msg is not None:
+        reply_event = (
+            message_event_payload(reply_msg)
+            if reply_created and reply_msg is not None
+            else None
+        )
+        await session.commit()
+
+        if message_update_event is not None:
+            await broadcast_to_project(
+                _project_id_str,
+                "message_updated",
+                message_update_event,
+            )
+        if reply_event is not None:
             await broadcast_to_project(
                 _project_id_str,
                 "message_created",
-                message_event_payload(reply_msg),
+                reply_event,
             )
         return _resp(
-            {"status": "ok", "op": "resolve_message", "message_id": message_id_str}
+            {
+                "status": "already_resolved" if was_resolved else "ok",
+                "op": "resolve_message",
+                "message_id": message_id_str,
+                **(
+                    {"reply_message_id": str(reply_msg.id)}
+                    if reply_msg is not None
+                    else {}
+                ),
+            }
         )
 
     elif payload.op == "spawn_task":

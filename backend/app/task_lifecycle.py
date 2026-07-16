@@ -1492,7 +1492,9 @@ async def _process_post_commit(
     from app.strategic_completion import (
         _handle_strategic_completion,
         _record_strategic_task_failure,
+        strategic_completion_message_count,
     )
+    from app.project_message_creation import reserve_project_message_sequences
     from app.research_completion import _handle_research_completion
     from app.knowledge_completion import (
         _handle_design_completion,
@@ -1525,11 +1527,38 @@ async def _process_post_commit(
         # comes purely from Project-before-Task being universal, not from holding
         # the row across the whole unit.)
         _peek_row = (
-            await session.execute(select(Task.project_id).where(Task.id == task_id))
+            await session.execute(
+                select(Task.project_id, Task.payloads).where(Task.id == task_id)
+            )
         ).first()
         if _peek_row is None:
             return {"status": "accepted"}
         _peek_project_id = _peek_row[0]
+        _peek_payloads = _peek_row[1] if isinstance(_peek_row[1], list) else []
+        _peek_task_type = (
+            str((_peek_payloads[0] or {}).get("type") or "")
+            if _peek_payloads and isinstance(_peek_payloads[0], dict)
+            else ""
+        )
+        _peek_capability = get_task_capability(_peek_task_type)
+        _peek_completion_handler = (
+            _peek_capability.completion_handler if _peek_capability else None
+        )
+        preallocated_strategic_message_sequences: list[int] = []
+        if _peek_completion_handler == "strategic":
+            message_count = strategic_completion_message_count(payload.logs or "")
+            if message_count:
+                preallocated_strategic_message_sequences = (
+                    await reserve_project_message_sequences(
+                        session,
+                        _peek_project_id,
+                        count=message_count,
+                        lock_timeout_ms=1_500,
+                    )
+                )
+                # Reservation gaps are harmless. Commit immediately so the
+                # counter row is never held while acquiring Project -> Task.
+                await session.commit()
 
         # skip_locked + bounded retry: the row is typically only held briefly
         # (by the agent_status early-commit path that just released it, or by a
@@ -5838,7 +5867,11 @@ async def _process_post_commit(
                     "repo_bootstrap": _handle_repo_bootstrap_completion,
                     "capability_proof_trial": _handle_capability_proof_trial_completion,
                 }
-                _capability = get_task_capability(task_type)
+                _capability = (
+                    _peek_capability
+                    if task_type == _peek_task_type
+                    else get_task_capability(task_type)
+                )
                 _handler_name = _capability.completion_handler if _capability else None
                 if _handler_name:
                     _handler = _completion_handlers[_handler_name]
@@ -5851,7 +5884,15 @@ async def _process_post_commit(
                     # docs/concurrency.md); passing it lets the handler skip its
                     # own re-acquisition. None propagates the legacy
                     # bounded-retry path inside the handler (defensive only).
-                    if _capability.completion_needs_locked_project:
+                    if _handler_name == "strategic":
+                        await _handler(
+                            task,
+                            _handler_logs,
+                            session,
+                            project=locked_project,
+                            message_sequences=preallocated_strategic_message_sequences,
+                        )
+                    elif _capability.completion_needs_locked_project:
                         await _handler(
                             task, _handler_logs, session, project=locked_project
                         )

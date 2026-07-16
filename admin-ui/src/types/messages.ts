@@ -82,6 +82,8 @@ export interface ProjectMessageCheckInContext extends Record<string, unknown> {
 export interface MessageAttachment {
   type: string;
   mime_type: string;
+  attachment_id?: string;
+  storage_uri?: string;
   data?: string;
   name?: string;
   size_bytes?: number;
@@ -91,11 +93,19 @@ export interface MessageAttachment {
   _attachmentKey?: string;
 }
 
+export interface ProjectMessageReplyPreview {
+  id?: string;
+  from_type?: string | null;
+  actor_user_id?: string | null;
+  sequence?: number | null;
+  content?: string;
+}
+
 export type ProjectMessageContext = Record<string, unknown> & {
   event_type?: string;
   user_event_type?: string;
   reply_to?: string;
-  reply_preview?: string;
+  reply_preview?: string | ProjectMessageReplyPreview;
   answer?: string;
   resolution?: string;
   direction_id?: string;
@@ -122,6 +132,15 @@ export interface ProjectMessage {
   resolution: string | null;
   resolved_at: string | null;
   created_at: string | null;
+  actor_user_id?: string | null;
+  sequence?: number | null;
+  surface?: 'conversation' | 'activity' | string;
+  handling_state?: 'pending' | 'claimed' | 'responded' | 'superseded' | string;
+  handled_by_task_id?: string | null;
+  reply_to_message_id?: string | null;
+  updated_at?: string | null;
+  client_idempotency_key?: string | null;
+  idempotency_key?: string | null;
 }
 
 export type ProjectMessagePreview = ProjectMessage;

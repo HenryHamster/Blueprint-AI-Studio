@@ -1,7 +1,7 @@
 import { describe, test, expect, vi, afterEach, beforeEach } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
-import { render, waitFor } from '@testing-library/react';
+import { fireEvent, render, waitFor } from '@testing-library/react';
 import { MessagesPanel, type MessagesPanelProps } from './MessagesPanel';
 import { classifySignalLevel, effectiveSignal, loadEventPrefs, saveEventPrefs, EVENT_PREFS_KEY, eventPrefsKey, groupRoutineMessages, outcomeBreakdown, isFailingGroup, getToastSeverity, isCriticalSeverity, loadTemporaryMutes, saveTemporaryMutes, isEventTypeTemporarilyMuted } from './MessagesPanel.utils';
 import type { ProjectMessage } from './MessageBubble';
@@ -9,6 +9,8 @@ import type { SavedView } from './MessagesPanel.utils';
 import { armingToastCopy, armingHintCopy, parseArmingOutcome, type ArmingOutcome } from './messageArming';
 import type { StrategicStateResponse } from '../strategicStateApi';
 import type { StrategicSessionDelta } from '../hooks/useLogViewer';
+import { auth } from '../firebase';
+import * as pendingAttachmentStore from '../utils/pendingAttachmentStore';
 
 // Full replacement (NOT a partial mock): the real `../firebase` calls
 // initializeApp()/getAuth() at module load, which we must not run in jsdom.
@@ -84,6 +86,23 @@ function _setupApiFetchMock(opts: {
           order: 'oldest_first',
           items: msgs,
         },
+      }), { status: 200 });
+    }
+    if (/\/api\/admin\/projects\/[^/]+\/strategic-session\/messages$/.test(urlStr) && method === 'POST') {
+      const body = JSON.parse(String(initObj?.body ?? '{}')) as Record<string, unknown>;
+      return new Response(JSON.stringify({
+        arming: 'steering',
+        wakeup_state: 'queued',
+        message: makeMsg({
+          id: `sent-${String(body.idempotency_key ?? 'message')}`,
+          project_id: 'proj-1',
+          from_type: 'user',
+          message_type: String(body.message_type ?? 'FEEDBACK') as _MockMsg['message_type'],
+          content: String(body.content ?? ''),
+          idempotency_key: String(body.idempotency_key ?? ''),
+          reply_to_message_id: body.reply_to_message_id ? String(body.reply_to_message_id) : null,
+          surface: 'conversation',
+        }),
       }), { status: 200 });
     }
     if (/\/api\/admin\/messages(\?|$)/.test(urlStr) && method === 'GET') {
@@ -594,7 +613,7 @@ describe('MessagesPanel chrome modes', () => {
   let root: Root | null = null;
   let host: HTMLDivElement | null = null;
 
-  beforeEach(() => { localStorage.clear(); });
+  beforeEach(() => { localStorage.clear(); sessionStorage.clear(); });
 
   afterEach(() => {
     const r = root;
@@ -608,6 +627,9 @@ describe('MessagesPanel chrome modes', () => {
 
   async function mountPanel(props: Partial<MessagesPanelProps> = {}) {
     host = document.createElement('div');
+    host.style.display = 'flex';
+    host.style.flexDirection = 'column';
+    host.style.height = '600px';
     document.body.appendChild(host);
     const r = createRoot(host);
     root = r;
@@ -1383,11 +1405,11 @@ describe('MessagesPanel chrome modes', () => {
         onTargetMessageHandled,
       }, [question]);
 
+      await waitFor(() => expect(el.querySelector('[data-message-id="question-target"]')).toBeTruthy());
       await waitFor(() => expect(onTargetMessageHandled).toHaveBeenCalledTimes(1));
       const bubble = el.querySelector('[data-message-id="question-target"]');
       expect(bubble?.className).toContain('ring-1');
       expect(scrollIntoView).toHaveBeenCalled();
-      expect(scrollTo).not.toHaveBeenCalled();
       expect(el.textContent).toContain('Replying to Agent');
       expect(el.textContent).toContain('Should I keep the local runner online?');
       const sessionCallUrl = String(_strategicSessionGetCalls()[0]?.[0] ?? '');
@@ -1407,8 +1429,9 @@ describe('MessagesPanel chrome modes', () => {
         );
       });
       await waitFor(() => expect(_strategicSessionGetCalls().length).toBeGreaterThanOrEqual(2));
-      const followUpSessionCallUrl = String(_strategicSessionGetCalls().at(-1)?.[0] ?? '');
-      expect(followUpSessionCallUrl).toContain('include_message_id=question-target');
+      const sessionCallUrls = _strategicSessionGetCalls().map(call => String(call[0]));
+      expect(sessionCallUrls.some(url => url.includes('include_message_id=question-target'))).toBe(true);
+      expect(sessionCallUrls.at(-1)).not.toContain('include_message_id=question-target');
     } finally {
       Element.prototype.scrollIntoView = originalScrollIntoView;
       HTMLElement.prototype.scrollTo = originalScrollTo;
@@ -1619,7 +1642,7 @@ describe('MessagesPanel chrome modes', () => {
     }
   });
 
-  test('minimal chat question replies still resolve through the generic message patch', async () => {
+  test('minimal chat question replies use one durable idempotent Resident message POST', async () => {
     const question = makeMsg({
       id: 'question-target',
       from_type: 'agent',
@@ -1647,15 +1670,17 @@ describe('MessagesPanel chrome modes', () => {
       sendButton.click();
     });
 
-    await waitFor(() => {
-      const patchCall = vi.mocked(apiFetch).mock.calls.find(call => {
-        const url = String(call[0]);
-        const init = call[1] as RequestInit | undefined;
-        return url.includes('/api/admin/messages/question-target') && init?.method === 'PATCH';
-      });
-      expect(patchCall).toBeTruthy();
+    await waitFor(() => expect(_strategicSessionMessagePostCalls()).toHaveLength(1));
+    expect(vi.mocked(apiFetch).mock.calls.some(call => (
+      String(call[0]).includes('/api/admin/messages/question-target')
+      && (call[1] as RequestInit | undefined)?.method === 'PATCH'
+    ))).toBe(false);
+    const postBody = JSON.parse(String((_strategicSessionMessagePostCalls()[0][1] as RequestInit).body ?? '{}'));
+    expect(postBody).toMatchObject({
+      content: 'Keep it online.',
+      reply_to_message_id: 'question-target',
     });
-    expect(_strategicSessionMessagePostCalls()).toHaveLength(0);
+    expect(postBody.idempotency_key).toBeTruthy();
   });
 
   test('minimal chat non-question replies send through the Strategic session facade', async () => {
@@ -1692,10 +1717,7 @@ describe('MessagesPanel chrome modes', () => {
     expect(postBody).toMatchObject({
       message_type: 'FEEDBACK',
       content: 'Compare the smaller plan.',
-      context: {
-        reply_to: 'strategic-reply-target',
-        reply_preview: 'I can compare those two plans.',
-      },
+      reply_to_message_id: 'strategic-reply-target',
     });
   });
 
@@ -2770,6 +2792,7 @@ describe('MessagesPanel event type volume in prefs popover', () => {
     root = null;
     host?.remove();
     host = null;
+    sessionStorage.clear();
     vi.clearAllMocks();
   });
 
@@ -5409,6 +5432,7 @@ describe('MessagesPanel send arming receipt', () => {
           download_url: 'https://storage.googleapis.com/signed-download',
           storage_uri: 'gs://bucket/message-attachments/proj-1/att-123/test.png',
           attachment_id: 'att-123',
+          size_bytes: JSON.parse(String(body)).size_bytes,
         }), { status: 200 });
       }
       if (/\/api\/admin\/messages$/.test(urlStr) && method === 'POST') {
@@ -5539,6 +5563,7 @@ describe('MessagesPanel send arming receipt', () => {
           download_url: 'https://storage.googleapis.com/signed-download',
           storage_uri: 'gs://bucket/message-attachments/proj-1/att-123/test.png',
           attachment_id: 'att-123',
+          size_bytes: JSON.parse(String(body)).size_bytes,
         }), { status: 200 });
       }
       if (/\/api\/admin\/messages$/.test(urlStr) && method === 'POST') {
@@ -5609,6 +5634,10 @@ describe('MessagesPanel send arming receipt', () => {
       expect(addToast).not.toHaveBeenCalledWith('Failed to send message', 'error');
       expect(messagePostCalls).toHaveLength(0);
       expect(el.textContent).toContain('test-screenshot.png');
+      expect((apiFetch as ReturnType<typeof vi.fn>).mock.calls.some(call => (
+        String(call[0]).includes('/attachment-uploads/att-123')
+        && (call[1] as RequestInit | undefined)?.method === 'DELETE'
+      ))).toBe(true);
     } finally {
       globalThis.fetch = origFetch;
     }
@@ -5657,6 +5686,7 @@ describe('MessagesPanel attachment integration', () => {
 
   beforeEach(async () => {
     localStorage.clear();
+    sessionStorage.clear();
     originalFetch = globalThis.fetch;
     globalThis.fetch = vi.fn(async (url: RequestInfo | URL) => {
       if (String(url) === 'https://storage.googleapis.com/signed-upload') {
@@ -5675,6 +5705,7 @@ describe('MessagesPanel attachment integration', () => {
     host?.remove();
     host = null;
     if (originalFetch) globalThis.fetch = originalFetch;
+    sessionStorage.clear();
     vi.clearAllMocks();
   });
 
@@ -5691,6 +5722,7 @@ describe('MessagesPanel attachment integration', () => {
           download_url: 'https://storage.googleapis.com/signed-download',
           storage_uri: 'gs://bucket/message-attachments/proj-1/att-123/report.txt',
           attachment_id: 'att-123',
+          size_bytes: JSON.parse(String((init as RequestInit).body)).size_bytes,
         }), { status: 200 });
       }
       if (/\/api\/admin\/messages(\?|$)/.test(urlStr) && method === 'POST') {
@@ -5752,6 +5784,7 @@ describe('MessagesPanel attachment integration', () => {
     await act(async () => {
       fileInput.dispatchEvent(new Event('change', { bubbles: true }));
     });
+    await waitFor(() => expect((el.querySelector('button[aria-label="Attach file"]') as HTMLButtonElement).disabled).toBe(false));
   }
 
   test('handleAttachFiles renders attachment preview chips with file name', async () => {
@@ -5764,6 +5797,298 @@ describe('MessagesPanel attachment integration', () => {
     await waitFor(() => {
       expect(el.textContent).toContain('test.txt');
     });
+  });
+
+  test('failed add retains a pre-existing identity owned by text and reply context', async () => {
+    const draftKey = 'messages_composer_draft:test-user@example.com:proj-1';
+    const identityKey = 'conversationDraftSend:test-user%40example.com:proj-1';
+    localStorage.setItem(draftKey, JSON.stringify({
+      version: 2, actor_user_id: 'test-user@example.com', project_id: 'proj-1', type: 'FEEDBACK',
+      content: 'Keep this draft', reply_to: { id: 'question-1', content: 'Which runner?', from: 'Strategic', message_type: 'QUESTION', status: 'open' },
+      source_refs: [], artifact_refs: [], attachment_send_key: 'pre-existing-identity',
+    }));
+    _setupAttachmentMock([]);
+    const el = await renderPanel(vi.fn(), { filterChrome: 'minimal' });
+    await waitFor(() => expect(sessionStorage.getItem(identityKey)).toBe('pre-existing-identity'));
+    const putSpy = vi.spyOn(pendingAttachmentStore, 'putPendingAttachment').mockRejectedValue(new Error('quota'));
+    try {
+      await attachFile(el, 'failed.txt', 'failed bytes', 'text/plain');
+      expect(sessionStorage.getItem(identityKey)).toBe('pre-existing-identity');
+      expect(JSON.parse(localStorage.getItem(draftKey) ?? '{}')).toMatchObject({
+        content: 'Keep this draft', reply_to: { id: 'question-1' }, attachment_send_key: 'pre-existing-identity',
+      });
+    } finally {
+      putSpy.mockRestore();
+    }
+  });
+
+  test('failed first add clears only actor A identity after switching to actor B in the same project', async () => {
+    const mutableAuth = auth as unknown as { currentUser: { email: string; uid?: string } };
+    mutableAuth.currentUser = { email: 'a@example.com', uid: 'actor-a' };
+    localStorage.setItem('messages_composer_draft:actor-b:proj-1', JSON.stringify({
+      version: 2, actor_user_id: 'actor-b', project_id: 'proj-1', type: 'FEEDBACK', content: 'actor B draft',
+      reply_to: null, source_refs: [], artifact_refs: [], attachment_send_key: 'actor-b-identity',
+    }));
+    _setupAttachmentMock([]);
+    let rejectAdd!: (error: Error) => void;
+    const deferredFailure = new Promise<void>((_, reject) => { rejectAdd = reject; });
+    const putSpy = vi.spyOn(pendingAttachmentStore, 'putPendingAttachment').mockReturnValue(deferredFailure);
+    try {
+      const el = await renderPanel(vi.fn(), { filterChrome: 'minimal' });
+      const input = el.querySelector<HTMLInputElement>('input[type="file"]')!;
+      const transfer = new DataTransfer();
+      transfer.items.add(new File(['actor A bytes'], 'actor-a.txt', { type: 'text/plain' }));
+      Object.defineProperty(input, 'files', { value: transfer.files, configurable: true });
+      fireEvent.change(input);
+      await waitFor(() => expect(putSpy).toHaveBeenCalledTimes(1));
+      await waitFor(() => expect(sessionStorage.getItem('conversationDraftSend:actor-a:proj-1')).toBeTruthy());
+
+      mutableAuth.currentUser = { email: 'b@example.com', uid: 'actor-b' };
+      await act(async () => {
+        root?.render(<MessagesPanel selectedProjectId="proj-1" addToast={() => {}} onMessageCountChange={() => {}} filterChrome="minimal" focusComposerSignal={1} />);
+      });
+      await waitFor(() => expect((el.querySelector('textarea') as HTMLTextAreaElement).value).toBe('actor B draft'));
+      await waitFor(() => expect(sessionStorage.getItem('conversationDraftSend:actor-b:proj-1')).toBe('actor-b-identity'));
+
+      rejectAdd(new Error('IndexedDB failed'));
+      await waitFor(() => expect(sessionStorage.getItem('conversationDraftSend:actor-a:proj-1')).toBeNull());
+      expect(sessionStorage.getItem('conversationDraftSend:actor-b:proj-1')).toBe('actor-b-identity');
+      expect((el.querySelector('textarea') as HTMLTextAreaElement).value).toBe('actor B draft');
+    } finally {
+      mutableAuth.currentUser = { email: 'test-user@example.com' };
+      putSpy.mockRestore();
+    }
+  });
+
+  test('conversation keeps one calm Resident status and links detailed work to Activity', async () => {
+    const onOpenActivityFeed = vi.fn();
+    const freshAt = new Date().toISOString();
+    _setupAttachmentMock([]);
+    const el = await renderPanel(vi.fn(), {
+      filterChrome: 'minimal',
+      strategicState: makeStrategicState({
+        resident_session: { session_id: 'resident-1', status: 'active', updated_at: freshAt },
+      }),
+      strategicSessionTranscript: [
+        { id: 1, session_id: 'resident-1', seq: 1, kind: 'status', text: 'working', status: 'working', ts: freshAt },
+        { id: 2, session_id: 'resident-1', seq: 2, kind: 'command', text: '$ secret detailed command', ts: freshAt },
+      ],
+      onOpenActivityFeed,
+    });
+    await vi.waitFor(() => expect(el.querySelector('[data-testid="strategic-resident-activity"]')).toBeTruthy());
+    expect(el.querySelector('[data-testid="strategic-activity-strip"]')).toBeNull();
+    expect(el.textContent).not.toContain('$ secret detailed command');
+    const activityButton = [...el.querySelectorAll('button')].find(button => button.textContent?.trim() === 'Activity');
+    expect(activityButton).toBeTruthy();
+    await act(async () => { activityButton?.click(); });
+    expect(onOpenActivityFeed).toHaveBeenCalledTimes(1);
+  });
+
+  test('pending attachment bytes restore after a project switch before upload', async () => {
+    const addToast = vi.fn();
+    _setupAttachmentMock([]);
+    const el = await renderPanel(addToast, { filterChrome: 'minimal' });
+    await attachFile(el, 'durable.txt', 'durable attachment bytes', 'text/plain');
+    await waitFor(() => expect(el.textContent).toContain('durable.txt'));
+
+    _suppressSinceLastVisit('test-user@example.com', 'proj-2');
+    await act(async () => {
+      root?.render(
+        <MessagesPanel
+          selectedProjectId="proj-2"
+          onClose={() => {}}
+          addToast={addToast}
+          onMessageCountChange={() => {}}
+          filterChrome="minimal"
+        />,
+      );
+    });
+    await waitFor(() => expect(el.textContent).not.toContain('durable.txt'));
+
+    await act(async () => {
+      root?.render(
+        <MessagesPanel
+          selectedProjectId="proj-1"
+          onClose={() => {}}
+          addToast={addToast}
+          onMessageCountChange={() => {}}
+          filterChrome="minimal"
+        />,
+      );
+    });
+    await waitFor(() => expect(el.textContent).toContain('durable.txt'));
+  });
+
+  test('removing the final empty-draft attachment clears its durable send identity across remount', async () => {
+    _setupAttachmentMock([]);
+    const el = await renderPanel(vi.fn(), { filterChrome: 'minimal' });
+    await attachFile(el, 'remove-me.txt', 'temporary bytes', 'text/plain');
+    await waitFor(() => expect(el.textContent).toContain('remove-me.txt'));
+    const draftKey = 'messages_composer_draft:test-user@example.com:proj-1';
+    const identityKey = 'conversationDraftSend:test-user%40example.com:proj-1';
+    await waitFor(() => expect(JSON.parse(localStorage.getItem(draftKey) ?? '{}').attachment_send_key).toBeTruthy());
+    expect(sessionStorage.getItem(identityKey)).toBeTruthy();
+
+    await act(async () => {
+      (el.querySelector('button[aria-label="Remove remove-me.txt"]') as HTMLButtonElement).click();
+    });
+    await waitFor(() => expect(el.textContent).not.toContain('remove-me.txt'));
+    await waitFor(() => expect(localStorage.getItem(draftKey)).toBeNull());
+    expect(sessionStorage.getItem(identityKey)).toBeNull();
+
+    await act(async () => { root?.render(<div data-testid="away" />); });
+    await act(async () => {
+      root?.render(
+        <MessagesPanel
+          selectedProjectId="proj-1"
+          onClose={() => {}}
+          addToast={() => {}}
+          onMessageCountChange={() => {}}
+          filterChrome="minimal"
+        />,
+      );
+    });
+    await waitFor(() => expect(el.querySelector('textarea')).toBeTruthy());
+    expect(el.textContent).not.toContain('remove-me.txt');
+    expect(localStorage.getItem(draftKey)).toBeNull();
+    expect(sessionStorage.getItem(identityKey)).toBeNull();
+  });
+
+  test('deferred attachment deletion locks Send and prevents POST until removal settles', async () => {
+    const messageBodies: Array<Record<string, unknown>> = [];
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
+      const urlStr = String(url);
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+      if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
+        return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
+      }
+      if (urlStr.includes('/strategic-conversation') && method === 'GET') {
+        return new Response(JSON.stringify({ conversation: { limit: 100, has_more: false, items: [] } }), { status: 200 });
+      }
+      if (urlStr.includes('/strategic-session/messages') && method === 'POST') {
+        const body = JSON.parse(String((init as RequestInit).body)) as Record<string, unknown>;
+        messageBodies.push(body);
+        return new Response(JSON.stringify({
+          message: makeMsg({
+            id: 'after-delete-message', project_id: 'proj-1', from_type: 'user',
+            content: String(body.content), surface: 'conversation', handling_state: 'pending',
+            idempotency_key: String(body.idempotency_key),
+          }),
+          wakeup_state: 'queued',
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+    let finishDelete!: () => void;
+    const deletion = new Promise<void>(resolve => { finishDelete = resolve; });
+    const deleteSpy = vi.spyOn(pendingAttachmentStore, 'deletePendingAttachment').mockReturnValue(deletion);
+    try {
+      const el = await renderPanel(vi.fn(), { filterChrome: 'minimal' });
+      await attachFile(el, 'delete-before-send.txt', 'temporary bytes', 'text/plain');
+      await waitFor(() => expect(el.textContent).toContain('delete-before-send.txt'));
+      fireEvent.change(el.querySelector('textarea')!, { target: { value: 'Send only after deletion' } });
+      fireEvent.click(el.querySelector('button[aria-label="Remove delete-before-send.txt"]')!);
+      await waitFor(() => expect(deleteSpy).toHaveBeenCalledTimes(1));
+
+      const send = el.querySelector('button[aria-label="Send message"]') as HTMLButtonElement;
+      expect(send.disabled).toBe(true);
+      fireEvent.click(send);
+      expect(messageBodies).toHaveLength(0);
+
+      finishDelete();
+      await waitFor(() => expect(el.textContent).not.toContain('delete-before-send.txt'));
+      await waitFor(() => expect(send.disabled).toBe(false));
+      fireEvent.click(send);
+      await waitFor(() => expect(messageBodies).toHaveLength(1));
+    } finally {
+      deleteSpy.mockRestore();
+    }
+  });
+
+  test('deferred replacement excludes delete until the new bytes are durable', async () => {
+    _setupAttachmentMock([]);
+    const el = await renderPanel(vi.fn(), { filterChrome: 'minimal' });
+    await attachFile(el, 'replace-race.png', 'old image bytes', 'image/png');
+    await waitFor(() => expect(el.textContent).toContain('replace-race.png'));
+    let finishReplace!: () => void;
+    const replacement = new Promise<void>(resolve => { finishReplace = resolve; });
+    const putSpy = vi.spyOn(pendingAttachmentStore, 'putPendingAttachment').mockReturnValue(replacement);
+    const deleteSpy = vi.spyOn(pendingAttachmentStore, 'deletePendingAttachment').mockResolvedValue();
+    try {
+      fireEvent.click(el.querySelector('button[aria-label="Open replace-race.png preview"]')!);
+      fireEvent.click(document.body.querySelector('button[aria-label="Replace image"]')!);
+      const replaceInput = el.querySelector<HTMLInputElement>('input[accept="image/*"]')!;
+      const transfer = new DataTransfer();
+      transfer.items.add(new File(['new image bytes'], 'replacement.png', { type: 'image/png' }));
+      Object.defineProperty(replaceInput, 'files', { value: transfer.files, configurable: true });
+      fireEvent.change(replaceInput);
+      await waitFor(() => expect(putSpy).toHaveBeenCalledTimes(1));
+
+      const remove = el.querySelector('button[aria-label="Remove replace-race.png"]') as HTMLButtonElement;
+      expect(remove.disabled).toBe(true);
+      fireEvent.click(remove);
+      expect(deleteSpy).not.toHaveBeenCalled();
+
+      finishReplace();
+      await waitFor(() => expect(el.textContent).toContain('replacement.png'));
+      const settledRemove = el.querySelector('button[aria-label="Remove replacement.png"]') as HTMLButtonElement;
+      await waitFor(() => expect(settledRemove.disabled).toBe(false));
+      fireEvent.click(settledRemove);
+      await waitFor(() => expect(deleteSpy).toHaveBeenCalledTimes(1));
+    } finally {
+      putSpy.mockRestore();
+      deleteSpy.mockRestore();
+    }
+  });
+
+  test('deferred replacement prevents Send until replacement bytes settle', async () => {
+    const messageBodies: Array<Record<string, unknown>> = [];
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
+      const urlStr = String(url);
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+      if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
+      if (urlStr.includes('/strategic-conversation') && method === 'GET') return new Response(JSON.stringify({ conversation: { limit: 100, has_more: false, items: [] } }), { status: 200 });
+      if (urlStr.includes('/attachment-upload-url') && method === 'POST') {
+        const size = JSON.parse(String((init as RequestInit).body)).size_bytes;
+        return new Response(JSON.stringify({ upload_url: 'https://storage.googleapis.com/signed-upload', download_url: 'https://storage.googleapis.com/signed-download', storage_uri: 'gs://bucket/replacement', attachment_id: 'replacement-upload', size_bytes: size }), { status: 200 });
+      }
+      if (urlStr.includes('/strategic-session/messages') && method === 'POST') {
+        const body = JSON.parse(String((init as RequestInit).body)) as Record<string, unknown>;
+        messageBodies.push(body);
+        return new Response(JSON.stringify({ message: makeMsg({ id: 'replacement-send', project_id: 'proj-1', from_type: 'user', content: String(body.content), surface: 'conversation', handling_state: 'pending', idempotency_key: String(body.idempotency_key) }), wakeup_state: 'queued' }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+    const el = await renderPanel(vi.fn(), { filterChrome: 'minimal' });
+    await attachFile(el, 'replace-send.png', 'old image bytes', 'image/png');
+    await waitFor(() => expect(el.textContent).toContain('replace-send.png'));
+    let finishReplace!: () => void;
+    const replacement = new Promise<void>(resolve => { finishReplace = resolve; });
+    const putSpy = vi.spyOn(pendingAttachmentStore, 'putPendingAttachment').mockReturnValue(replacement);
+    try {
+      fireEvent.change(el.querySelector('textarea')!, { target: { value: 'Send replacement only' } });
+      fireEvent.click(el.querySelector('button[aria-label="Open replace-send.png preview"]')!);
+      fireEvent.click(document.body.querySelector('button[aria-label="Replace image"]')!);
+      const replaceInput = el.querySelector<HTMLInputElement>('input[accept="image/*"]')!;
+      const transfer = new DataTransfer();
+      transfer.items.add(new File(['new image bytes'], 'send-ready.png', { type: 'image/png' }));
+      Object.defineProperty(replaceInput, 'files', { value: transfer.files, configurable: true });
+      fireEvent.change(replaceInput);
+      await waitFor(() => expect(putSpy).toHaveBeenCalledTimes(1));
+      const send = el.querySelector('button[aria-label="Send message"]') as HTMLButtonElement;
+      expect(send.disabled).toBe(true);
+      fireEvent.click(send);
+      expect(messageBodies).toHaveLength(0);
+
+      finishReplace();
+      await waitFor(() => expect(el.textContent).toContain('send-ready.png'));
+      await waitFor(() => expect(send.disabled).toBe(false));
+      fireEvent.click(send);
+      await waitFor(() => expect(messageBodies).toHaveLength(1));
+      expect((messageBodies[0].attachments as Array<{ name: string }>)[0].name).toBe('send-ready.png');
+    } finally {
+      putSpy.mockRestore();
+    }
   });
 
   test('handleRemoveAttachment removes attachment chip by index', async () => {
@@ -6006,7 +6331,7 @@ describe('MessagesPanel auto-scroll', () => {
   let root: Root | null = null;
   let host: HTMLDivElement | null = null;
 
-  beforeEach(() => { localStorage.clear(); });
+  beforeEach(() => { localStorage.clear(); sessionStorage.clear(); });
 
   afterEach(() => {
     const r = root;
@@ -6014,6 +6339,7 @@ describe('MessagesPanel auto-scroll', () => {
     root = null;
     host?.remove();
     host = null;
+    sessionStorage.clear();
     vi.clearAllMocks();
   });
 
@@ -6025,7 +6351,26 @@ describe('MessagesPanel auto-scroll', () => {
         return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
       }
       if (/\/api\/admin\/projects\/[^/]+\/strategic-session\/messages$/.test(urlStr) && method === 'POST') {
-        return new Response(JSON.stringify({ arming: 'steering' }), { status: 200 });
+        const payload = JSON.parse(String((init as RequestInit | undefined)?.body ?? '{}')) as {
+          content?: string;
+          idempotency_key?: string;
+          message_type?: ProjectMessage['message_type'];
+        };
+        return new Response(JSON.stringify({
+          arming: 'steering',
+          wakeup_state: 'queued',
+          message: makeMsg({
+            id: `operator-${payload.idempotency_key ?? 'send'}`,
+            content: payload.content ?? '',
+            message_type: payload.message_type ?? 'FEEDBACK',
+            from_type: 'user',
+            actor_user_id: 'test-user@example.com',
+            surface: 'conversation',
+            handling_state: 'pending',
+            client_idempotency_key: payload.idempotency_key ?? null,
+            idempotency_key: payload.idempotency_key ?? null,
+          }),
+        }), { status: 200 });
       }
       if (/\/api\/admin\/projects\/[^/]+\/strategic-conversation(?:\?|$)/.test(urlStr) && method === 'GET') {
         return new Response(JSON.stringify({
@@ -6654,8 +6999,8 @@ describe('MessagesPanel strategic-refresh pending badge', () => {
 // ── Composer draft persistence tests ─────────────────────────────────────────
 
 describe('MessagesPanel composer draft persistence', () => {
-  beforeEach(() => { localStorage.clear(); });
-  afterEach(() => { localStorage.clear(); vi.clearAllMocks(); });
+  beforeEach(() => { localStorage.clear(); sessionStorage.clear(); });
+  afterEach(() => { localStorage.clear(); sessionStorage.clear(); vi.clearAllMocks(); });
 
   function renderDraftPanel(projectId = 'proj-draft') {
     _suppressSinceLastVisit('test-user@example.com', projectId);
@@ -7543,7 +7888,12 @@ describe('MessagesPanel convert-to-direction modal', () => {
 
 describe('MessagesPanel optimistic-send tab-switch persistence', () => {
   beforeEach(() => { localStorage.clear(); sessionStorage.clear(); });
-  afterEach(() => { localStorage.clear(); sessionStorage.clear(); vi.clearAllMocks(); });
+  afterEach(() => {
+    (auth as unknown as { currentUser: { email: string; uid?: string } }).currentUser = { email: 'test-user@example.com' };
+    localStorage.clear();
+    sessionStorage.clear();
+    vi.clearAllMocks();
+  });
 
   // Standard mock for strategic conversation mode (minimal chrome).
   function _setupConvMock(items: ReturnType<typeof makeMsg>[] = []): void {
@@ -7572,6 +7922,228 @@ describe('MessagesPanel optimistic-send tab-switch persistence', () => {
       return new Response(JSON.stringify({}), { status: 200 });
     });
   }
+
+  test('an in-flight project A send cannot merge or clear project B after switching', async () => {
+    let finishPost: ((response: Response) => void) | null = null;
+    const postResponse = new Promise<Response>(resolve => { finishPost = resolve; });
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
+      const urlStr = String(url);
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+      if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
+        return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
+      }
+      if (urlStr.includes('/strategic-session/messages') && method === 'POST') return postResponse;
+      if (urlStr.includes('/strategic-conversation') && method === 'GET') {
+        return new Response(JSON.stringify({ items: [], limit: 100, has_more: false }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+    _suppressSinceLastVisit('test-user@example.com', 'proj-A');
+    _suppressSinceLastVisit('test-user@example.com', 'proj-B');
+    const { container, rerender } = render(
+      <MessagesPanel selectedProjectId="proj-A" addToast={() => {}} onMessageCountChange={() => {}} filterChrome="minimal" />,
+    );
+    const textarea = await waitFor(() => container.querySelector('textarea') as HTMLTextAreaElement);
+    fireEvent.change(textarea, { target: { value: 'message for A' } });
+    fireEvent.click(container.querySelector('button[aria-label="Send message"]') as HTMLButtonElement);
+    await waitFor(() => expect(String((apiFetch as ReturnType<typeof vi.fn>).mock.calls.find(call => String(call[0]).includes('/strategic-session/messages'))?.[0])).toContain('proj-A'));
+
+    rerender(<MessagesPanel selectedProjectId="proj-B" addToast={() => {}} onMessageCountChange={() => {}} filterChrome="minimal" />);
+    await waitFor(() => expect(textarea.value).toBe(''));
+    fireEvent.change(textarea, { target: { value: 'draft for B' } });
+    await act(async () => {
+      finishPost?.(new Response(JSON.stringify({
+        message: makeMsg({
+          id: 'canonical-A',
+          project_id: 'proj-A',
+          from_type: 'user',
+          content: 'message for A',
+          handling_state: 'pending',
+          idempotency_key: 'send-A',
+        }),
+        wakeup_state: 'queued',
+      }), { status: 200 }));
+      await postResponse;
+    });
+    await waitFor(() => expect(textarea.value).toBe('draft for B'));
+    expect(container.textContent).not.toContain('message for A');
+    expect(sessionStorage.getItem('optimisticSend:test-user%40example.com:proj-B')).toBeNull();
+  });
+
+  test('retries interrupted restored-send recovery after switching away and back', async () => {
+    const seed = {
+      actor_user_id: 'test-user@example.com',
+      project_id: 'proj-recovery-a',
+      key: 'interrupted-recovery-key',
+      content: 'recover after returning',
+      created_at: new Date().toISOString(),
+      message_type: 'FEEDBACK',
+      state: 'sending',
+    };
+    sessionStorage.setItem(
+      'optimisticSend:test-user%40example.com:proj-recovery-a',
+      JSON.stringify(seed),
+    );
+    _suppressSinceLastVisit('test-user@example.com', 'proj-recovery-a');
+    _suppressSinceLastVisit('test-user@example.com', 'proj-recovery-b');
+    const interruptedLookup = new Promise<Response>(() => {});
+    let allowRecoveryToFinish = false;
+    let identityLookups = 0;
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
+      const urlStr = String(url);
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+      if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
+        return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
+      }
+      if (urlStr.includes('idempotency_key=interrupted-recovery-key')) {
+        identityLookups += 1;
+        if (!allowRecoveryToFinish) return interruptedLookup;
+        return new Response(JSON.stringify({
+          conversation: { limit: 1, has_more: false, items: [] },
+          matched_message: null,
+        }), { status: 200 });
+      }
+      if (urlStr.includes('/strategic-conversation') && method === 'GET') {
+        return new Response(JSON.stringify({ conversation: { limit: 100, has_more: false, items: [] } }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+
+    const { container, rerender } = render(
+      <MessagesPanel selectedProjectId="proj-recovery-a" addToast={() => {}} onMessageCountChange={() => {}} filterChrome="minimal" />,
+    );
+    await waitFor(() => expect(identityLookups).toBeGreaterThanOrEqual(1));
+    const lookupsBeforeSwitch = identityLookups;
+    allowRecoveryToFinish = true;
+    rerender(<MessagesPanel selectedProjectId="proj-recovery-b" addToast={() => {}} onMessageCountChange={() => {}} filterChrome="minimal" />);
+    rerender(<MessagesPanel selectedProjectId="proj-recovery-a" addToast={() => {}} onMessageCountChange={() => {}} filterChrome="minimal" />);
+
+    await waitFor(() => expect(identityLookups).toBeGreaterThan(lookupsBeforeSwitch));
+    await waitFor(() => expect(container.querySelector('button[aria-label="Retry message"]')).toBeTruthy());
+  });
+
+  test('restores an unsent actor/project envelope with reply, source identities, and attachment send key', async () => {
+    localStorage.setItem('messages_composer_draft:test-user@example.com:proj-envelope', JSON.stringify({
+      version: 2,
+      actor_user_id: 'test-user@example.com',
+      project_id: 'proj-envelope',
+      type: 'FEEDBACK',
+      content: 'draft with durable context',
+      reply_to: { id: 'question-1', content: 'Which runner?', from: 'Strategic', message_type: 'QUESTION', status: 'open' },
+      source_refs: [{ kind: 'task', id: 'task-1', revision: 7 }],
+      artifact_refs: [],
+      attachment_send_key: 'draft-attachment-key',
+    }));
+    _suppressSinceLastVisit('test-user@example.com', 'proj-envelope');
+    _setupConvMock([]);
+    const { container } = render(
+      <MessagesPanel selectedProjectId="proj-envelope" addToast={() => {}} onMessageCountChange={() => {}} filterChrome="minimal" />,
+    );
+    await waitFor(() => expect((container.querySelector('textarea') as HTMLTextAreaElement).value).toBe('draft with durable context'));
+    expect(container.textContent).toContain('Replying to Strategic: Which runner?');
+    await waitFor(() => expect(sessionStorage.getItem('conversationDraftSend:test-user%40example.com:proj-envelope')).toBe('draft-attachment-key'));
+  });
+
+  test('switching actors on the same project replaces rather than leaks composer state', async () => {
+    const mutableAuth = auth as unknown as { currentUser: { email: string; uid?: string } };
+    localStorage.setItem('messages_composer_draft:actor-a:proj-actor', JSON.stringify({
+      version: 2, actor_user_id: 'actor-a', project_id: 'proj-actor', type: 'FEEDBACK', content: 'private A',
+      reply_to: null, source_refs: [], artifact_refs: [], attachment_send_key: null,
+    }));
+    localStorage.setItem('messages_composer_draft:actor-b:proj-actor', JSON.stringify({
+      version: 2, actor_user_id: 'actor-b', project_id: 'proj-actor', type: 'FEEDBACK', content: 'private B',
+      reply_to: null, source_refs: [], artifact_refs: [], attachment_send_key: null,
+    }));
+    mutableAuth.currentUser = { email: 'a@example.com', uid: 'actor-a' };
+    _setupConvMock([]);
+    const { container, rerender } = render(
+      <MessagesPanel selectedProjectId="proj-actor" addToast={() => {}} onMessageCountChange={() => {}} filterChrome="minimal" focusComposerSignal={0} />,
+    );
+    await waitFor(() => expect((container.querySelector('textarea') as HTMLTextAreaElement).value).toBe('private A'));
+    mutableAuth.currentUser = { email: 'b@example.com', uid: 'actor-b' };
+    rerender(<MessagesPanel selectedProjectId="proj-actor" addToast={() => {}} onMessageCountChange={() => {}} filterChrome="minimal" focusComposerSignal={1} />);
+    await waitFor(() => expect((container.querySelector('textarea') as HTMLTextAreaElement).value).toBe('private B'));
+    expect(container.textContent).not.toContain('private A');
+    mutableAuth.currentUser = { email: 'test-user@example.com' };
+  });
+
+  test('expired attachment receipt re-uploads durable bytes under the same message identity', async () => {
+    let uploadReceiptCount = 0;
+    const messageBodies: Array<Record<string, unknown>> = [];
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
+      const urlStr = String(url);
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+      if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
+        return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
+      }
+      if (urlStr.includes('/attachment-upload-url') && method === 'POST') {
+        uploadReceiptCount += 1;
+        const request = JSON.parse(String((init as RequestInit).body));
+        return new Response(JSON.stringify({
+          upload_url: `https://storage.googleapis.com/recovery-upload-${uploadReceiptCount}`,
+          download_url: `https://storage.googleapis.com/recovery-download-${uploadReceiptCount}`,
+          storage_uri: `gs://bucket/message-attachments/proj-1/recovery-${uploadReceiptCount}/report.txt`,
+          attachment_id: `recovery-${uploadReceiptCount}`,
+          size_bytes: request.size_bytes,
+        }), { status: 200 });
+      }
+      if (urlStr.includes('/strategic-conversation') && method === 'GET') {
+        return new Response(JSON.stringify({ limit: 1, has_more: false, items: [], matched_message: null }), { status: 200 });
+      }
+      if (urlStr.includes('/strategic-session/messages') && method === 'POST') {
+        const body = JSON.parse(String((init as RequestInit).body)) as Record<string, unknown>;
+        messageBodies.push(body);
+        if (messageBodies.length < 3) {
+          return new Response(JSON.stringify({ detail: 'Attachment upload expired; upload again' }), { status: 409 });
+        }
+        return new Response(JSON.stringify({
+          message: makeMsg({
+            id: 'recovered-message',
+            project_id: 'proj-1',
+            from_type: 'user',
+            content: String(body.content),
+            surface: 'conversation',
+            handling_state: 'pending',
+            idempotency_key: String(body.idempotency_key),
+          }),
+          wakeup_state: 'queued',
+        }), { status: 200 });
+      }
+      if (urlStr.includes('/attachment-uploads/') && method === 'DELETE') return new Response(null, { status: 204 });
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+    globalThis.fetch = vi.fn(async (url: RequestInfo | URL) => (
+      String(url).includes('/recovery-upload-')
+        ? new Response(null, { status: 200 })
+        : new Response('', { status: 404 })
+    ));
+
+    const addToast = vi.fn();
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+    const { container: el } = render(
+      <MessagesPanel selectedProjectId="proj-1" addToast={addToast} onMessageCountChange={() => {}} filterChrome="minimal" />,
+    );
+    const fileInput = el.querySelector<HTMLInputElement>('input[type="file"]')!;
+    const file = new File(['durable recovery bytes'], 'recovery.txt', { type: 'text/plain' });
+    const transfer = new DataTransfer();
+    transfer.items.add(file);
+    Object.defineProperty(fileInput, 'files', { value: transfer.files, configurable: true });
+    fireEvent.change(fileInput);
+    await waitFor(() => expect(el.textContent).toContain('recovery.txt'));
+    fireEvent.change(el.querySelector('textarea')!, { target: { value: 'recover this upload' } });
+    fireEvent.click(el.querySelector('button[aria-label="Send message"]')!);
+    await waitFor(() => expect(el.querySelector('button[aria-label="Retry message"]')).toBeTruthy());
+    fireEvent.click(el.querySelector('button[aria-label="Retry message"]')!);
+    await waitFor(() => expect(messageBodies).toHaveLength(3), { timeout: 5000 });
+
+    expect(uploadReceiptCount).toBe(2);
+    expect(new Set(messageBodies.map(body => body.idempotency_key)).size).toBe(1);
+    expect((messageBodies[2].attachments as Array<{ attachment_id: string }>)[0].attachment_id).toBe('recovery-2');
+    expect((apiFetch as ReturnType<typeof vi.fn>).mock.calls.some(call => (
+      String(call[0]).includes('/attachment-uploads/recovery-1')
+      && (call[1] as RequestInit | undefined)?.method === 'DELETE'
+    ))).toBe(true);
+  });
 
   test('send → unmount → remount shows the in-flight bubble (tab-switch scenario)', async () => {
     // This is the exact operator scenario: send a message in conversation mode,
@@ -7617,7 +8189,7 @@ describe('MessagesPanel optimistic-send tab-switch persistence', () => {
       await act(async () => { await new Promise<void>(res => setTimeout(res, 10)); });
 
       // sessionStorage must have the entry for this project by now.
-      const storedAfterSend = sessionStorage.getItem('optimisticSend:proj-tab-1');
+      const storedAfterSend = sessionStorage.getItem('optimisticSend:test-user%40example.com:proj-tab-1');
       // Note: by this point handleSubmit may have cleared it too (mock responds instantly).
       // What matters is that the next assertion (remount) still shows the bubble if the
       // entry survived. We verify the entry OR fall back to the remount check.
@@ -7630,15 +8202,16 @@ describe('MessagesPanel optimistic-send tab-switch persistence', () => {
       // simulates a case where the POST returned before the tab switch but the entry
       // was cleared — in practice, the entry persists long enough for the user to
       // perceive the switch.
-      if (!sessionStorage.getItem('optimisticSend:proj-tab-1') && storedAfterSend) {
-        sessionStorage.setItem('optimisticSend:proj-tab-1', storedAfterSend);
+      if (!sessionStorage.getItem('optimisticSend:test-user%40example.com:proj-tab-1') && storedAfterSend) {
+        sessionStorage.setItem('optimisticSend:test-user%40example.com:proj-tab-1', storedAfterSend);
       }
 
-      if (!sessionStorage.getItem('optimisticSend:proj-tab-1')) {
+      if (!sessionStorage.getItem('optimisticSend:test-user%40example.com:proj-tab-1')) {
         // The full send cycle completed (POST + fetchMessages) before the tab switch.
         // In this degenerate timing, the durable message is already on the server.
         // Seed a fresh entry to exercise the restoration path anyway.
-        sessionStorage.setItem('optimisticSend:proj-tab-1', JSON.stringify({
+        sessionStorage.setItem('optimisticSend:test-user%40example.com:proj-tab-1', JSON.stringify({
+          actor_user_id: 'test-user@example.com', project_id: 'proj-tab-1',
           key: 'tab-test-key', content: 'hello from operator',
           created_at: new Date().toISOString(), message_type: 'FEEDBACK',
         }));
@@ -7671,12 +8244,37 @@ describe('MessagesPanel optimistic-send tab-switch persistence', () => {
   test('remounting restores optimistic bubble from sessionStorage', async () => {
     // Pre-seed a fresh (< 60 s old) optimistic entry in sessionStorage.
     const seed = {
+      actor_user_id: 'test-user@example.com',
+      project_id: 'proj-tab-2',
       key: 'seed-key-1',
       content: 'message sent before tab switch',
       created_at: new Date().toISOString(),
       message_type: 'FEEDBACK',
+      state: 'needs_retry',
+      reply_to_message_id: 'question-1',
+      reply_to: { id: 'question-1', content: 'Which runner?', from: 'Strategic', message_type: 'QUESTION', status: 'open' },
+      context: {
+        reply_to: 'question-1',
+        reply_preview: 'Which runner?',
+        attachments: [{ type: 'attachment', mime_type: 'text/plain', name: 'run.txt', size_bytes: 12 }],
+        source_refs: [{ kind: 'task', id: 'task-1', label: 'Runner check' }],
+        strategic_session: {
+          version: 1,
+          interaction_mode: 'chat',
+          active_surface: 'strategic',
+          selected_refs: [{ kind: 'task', id: 'task-1' }],
+          selected_ref_descriptors: [{ kind: 'task', id: 'task-1', label: 'Runner check' }],
+        },
+      },
+      payload: {
+        content: 'message sent before tab switch',
+        idempotency_key: 'seed-key-1',
+        reply_to_message_id: 'question-1',
+        source_refs: [{ kind: 'task', id: 'task-1', label: 'Runner check' }],
+        attachments: [{ type: 'attachment', mime_type: 'text/plain', name: 'run.txt', size_bytes: 12 }],
+      },
     };
-    sessionStorage.setItem('optimisticSend:proj-tab-2', JSON.stringify(seed));
+    sessionStorage.setItem('optimisticSend:test-user%40example.com:proj-tab-2', JSON.stringify(seed));
 
     _suppressSinceLastVisit('test-user@example.com', 'proj-tab-2');
     // Fetch always returns empty so the bubble is NOT auto-cleared by the landed check.
@@ -7700,24 +8298,65 @@ describe('MessagesPanel optimistic-send tab-switch persistence', () => {
     // The restored optimistic bubble should be visible in the conversation.
     await waitFor(() => {
       expect(container.textContent).toContain('message sent before tab switch');
+      expect(container.textContent).toContain('Which runner?');
+      expect(container.querySelector('button[aria-label="Preview run.txt"]')).not.toBeNull();
+      expect(container.textContent).toContain('Runner check');
     });
   });
 
-  test('optimistic bubble cleared from sessionStorage once durable message lands', async () => {
+  test('safe abandon confirms canonical absence before unlocking an unrecoverable attachment send', async () => {
+    const seed = {
+      actor_user_id: 'test-user@example.com',
+      project_id: 'proj-abandon',
+      key: 'abandon-key',
+      content: 'unrecoverable attachment',
+      created_at: new Date().toISOString(),
+      message_type: 'FEEDBACK',
+      state: 'needs_retry',
+      payload: {
+        content: 'unrecoverable attachment',
+        idempotency_key: 'abandon-key',
+        attachments: [{
+          type: 'attachment', mime_type: 'text/plain', name: 'gone.txt', size_bytes: 12,
+          attachment_id: 'stale-upload', storage_uri: 'gs://bucket/stale-upload',
+        }],
+      },
+    };
+    sessionStorage.setItem('optimisticSend:test-user%40example.com:proj-abandon', JSON.stringify(seed));
+    _suppressSinceLastVisit('test-user@example.com', 'proj-abandon');
+    _setupConvMock([]);
+    const addToast = vi.fn();
+    const { container } = render(
+      <MessagesPanel selectedProjectId="proj-abandon" addToast={addToast} onMessageCountChange={() => {}} filterChrome="minimal" />,
+    );
+    const abandon = await waitFor(() => container.querySelector('button') && [...container.querySelectorAll('button')]
+      .find(button => button.textContent?.trim() === 'Abandon pending message'));
+    expect(abandon).toBeTruthy();
+    fireEvent.click(abandon!);
+    await waitFor(() => expect(sessionStorage.getItem('optimisticSend:test-user%40example.com:proj-abandon')).toBeNull());
+    expect((container.querySelector('textarea') as HTMLTextAreaElement).readOnly).toBe(false);
+    expect(addToast).toHaveBeenCalledWith('Pending message abandoned after confirming it was not accepted.', 'info');
+  });
+
+  test('wake receipt clears from sessionStorage once the durable message is claimed', async () => {
     // The durable message has the same content as the seeded optimistic bubble so
     // the "landed" useEffect detects it and clears the sessionStorage entry.
     const durableMsg = makeMsg({
       id: 'durable-1', project_id: 'proj-tab-3',
       message_type: 'FEEDBACK', from_type: 'user',
       content: 'msg that landed on server',
+      idempotency_key: 'seed-key-3',
+      handling_state: 'claimed',
     });
     const seed = {
+      actor_user_id: 'test-user@example.com',
+      project_id: 'proj-tab-3',
       key: 'seed-key-3',
       content: 'msg that landed on server',
       created_at: new Date().toISOString(),
       message_type: 'FEEDBACK',
     };
-    sessionStorage.setItem('optimisticSend:proj-tab-3', JSON.stringify(seed));
+    sessionStorage.setItem('optimisticSend:test-user%40example.com:proj-tab-3', JSON.stringify(seed));
 
     _suppressSinceLastVisit('test-user@example.com', 'proj-tab-3');
     // Return the durable message on the FIRST fetch so the "landed" check fires
@@ -7736,7 +8375,7 @@ describe('MessagesPanel optimistic-send tab-switch persistence', () => {
     // Once fetchMessages returns the durable message, the "landed" useEffect fires
     // and removes the sessionStorage entry.
     await waitFor(() => {
-      expect(sessionStorage.getItem('optimisticSend:proj-tab-3')).toBeNull();
+      expect(sessionStorage.getItem('optimisticSend:test-user%40example.com:proj-tab-3')).toBeNull();
     });
   });
 });
