@@ -11633,7 +11633,7 @@ class TestMidRunViewableUpload:
         with patch.object(
             compute_jobs_mod,
             "persist_viewable_artifacts_with_completeness",
-            new=AsyncMock(return_value=(terminal_manifest, 0, True)),
+            new=AsyncMock(return_value=(terminal_manifest, 0, True, 0)),
         ):
             final_manifest, dropped = (
                 await compute_jobs_mod.persist_viewable_files_for_job(db_session, job)
@@ -11745,7 +11745,7 @@ class TestMidRunViewableUpload:
         with patch.object(
             compute_jobs_mod,
             "persist_viewable_artifacts_with_completeness",
-            new=AsyncMock(return_value=(terminal_manifest, 0, True)),
+            new=AsyncMock(return_value=(terminal_manifest, 0, True, 0)),
         ):
             manifest, dropped = (
                 await compute_jobs_mod.persist_viewable_files_for_job(

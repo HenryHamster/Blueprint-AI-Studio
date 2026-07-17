@@ -95,7 +95,10 @@ interface FreshMedia {
   /** Best usable URL — the freshly minted signed URL when available, else the baked one. */
   url: string | null;
   status: MediaStatus;
-  /** Re-mint the signed URL (or, for baked-only media, re-attempt the current URL). */
+  /** True when a storage_uri + projectId is available to re-mint a fresh signed URL.
+   *  False for baked-only media — retry() cannot produce a different URL in that case. */
+  canRetry: boolean;
+  /** Re-mint the signed URL. Only meaningful when canRetry is true. */
   retry: () => void;
   /** Call from the media element's `onError` when the loaded URL turns out to be dead. */
   onMediaError: () => void;
@@ -202,7 +205,12 @@ function useFreshMediaUrl(
     }
   }, [canResolve, generation]);
 
-  return { url, status, retry, onMediaError };
+  // After a fresh signed URL is successfully re-minted (auto-retry) but the
+  // media element still fails, the underlying GCS object is gone (7-day
+  // lifecycle reap) — re-minting another URL would be futile.  Only offer
+  // retry when signing itself failed (which may recover) or no load error yet.
+  const retryWouldHelp = !loadError || outcome?.failed === true;
+  return { url, status, canRetry: canResolve && retryWouldHelp, retry, onMediaError };
 }
 
 /** Pulsing "LIVE" badge for mid-run viewable previews. Renders a small overlay
@@ -283,6 +291,18 @@ function MediaSkeleton({ className }: { className: string }) {
   );
 }
 
+function MediaExpired({ label }: { label: string }) {
+  return (
+    <div
+      className="flex w-full items-center justify-center gap-1.5 px-2 py-2 text-xs text-neutral-500"
+      data-testid="strategic-artifact-expired"
+    >
+      <AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+      {label} — URL expired
+    </div>
+  );
+}
+
 function MediaRetry({ label, onRetry }: { label: string; onRetry: () => void }) {
   return (
     <button
@@ -316,9 +336,13 @@ function ResolvedImage({
   onExpand: (url: string, alt: string) => void;
   live?: boolean | null;
 }) {
-  const { url, status, retry, onMediaError } = useFreshMediaUrl(projectId, storageUri, revision, bakedUrl);
+  const { url, status, canRetry, retry, onMediaError } = useFreshMediaUrl(projectId, storageUri, revision, bakedUrl);
   if (status === 'loading') return <MediaSkeleton className={className} />;
-  if (status === 'error' || !url) return <MediaRetry label="Image preview unavailable" onRetry={retry} />;
+  if (status === 'error' || !url) {
+    return canRetry
+      ? <MediaRetry label="Image preview unavailable" onRetry={retry} />
+      : <MediaExpired label="Image preview unavailable" />;
+  }
   return (
     <button
       type="button"
@@ -357,9 +381,13 @@ function ResolvedVideo({
   className: string;
   live?: boolean | null;
 }) {
-  const { url, status, retry, onMediaError } = useFreshMediaUrl(projectId, storageUri, revision, bakedUrl);
+  const { url, status, canRetry, retry, onMediaError } = useFreshMediaUrl(projectId, storageUri, revision, bakedUrl);
   if (status === 'loading') return <MediaSkeleton className={className} />;
-  if (status === 'error' || !url) return <MediaRetry label="Video preview unavailable" onRetry={retry} />;
+  if (status === 'error' || !url) {
+    return canRetry
+      ? <MediaRetry label="Video preview unavailable" onRetry={retry} />
+      : <MediaExpired label="Video preview unavailable" />;
+  }
   // Bind the URL directly to <video src> (not a nested <source>) so `onError`
   // fires reliably when the signed URL is dead — matching ComputeJobsPanel.
   const video = (
@@ -399,9 +427,13 @@ function ResolvedPdf({
   // (re-minted from storage_uri, falling back to the baked url) and open it in a
   // new tab so the browser renders it in its own sandboxed viewer on the storage
   // origin.
-  const { url, status, retry } = useFreshMediaUrl(projectId, storageUri, revision, bakedUrl);
+  const { url, status, canRetry, retry } = useFreshMediaUrl(projectId, storageUri, revision, bakedUrl);
   if (status === 'loading') return <MediaSkeleton className={className} />;
-  if (status === 'error' || !url) return <MediaRetry label="PDF preview unavailable" onRetry={retry} />;
+  if (status === 'error' || !url) {
+    return canRetry
+      ? <MediaRetry label="PDF preview unavailable" onRetry={retry} />
+      : <MediaExpired label="PDF preview unavailable" />;
+  }
   const button = (
     <button
       type="button"

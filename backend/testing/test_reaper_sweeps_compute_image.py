@@ -1566,6 +1566,60 @@ async def test_sweep_caps_builds_per_cycle(db):
     assert result["projects"] == 4
 
 
+@pytest.mark.asyncio
+async def test_sweep_issues_single_batch_query_for_projects(db):
+    """The sweep fetches all project rows in ONE batched SELECT, not N+1.
+
+    Before the fix the sweep ran select(Project.id) then session.get(Project,id)
+    per-project inside the loop — N+1 round-trips.  After the fix a single
+    select(Project) prefetches all rows; session.get() hits the identity map
+    and issues no extra round-trips in the happy-path.
+    """
+    for i in range(3):
+        await _make_repo_project(db, name=f"batch-p{i}")
+
+    visited: list[str] = []
+    execute_calls: list = []
+
+    _real_execute = db.execute.__func__  # type: ignore[attr-defined]
+
+    async def _counting_execute(stmt, *args, **kwargs):
+        execute_calls.append(stmt)
+        return await _real_execute(db, stmt, *args, **kwargs)
+
+    with (
+        patch.object(db, "execute", side_effect=_counting_execute),
+        patch("app.reaper_sweeps._last_compute_image_refresh_sweep", None),
+    ):
+        async def _refresh(session, project, **kwargs):
+            visited.append(project.name)
+            return {"status": "unchanged"}
+
+        result = await sweep_refresh_project_compute_images(
+            db,
+            now=datetime(2026, 6, 1, 12, 0, 0),
+            _refresh_fn=_refresh,
+            _build_semaphore=asyncio.Semaphore(1),
+        )
+
+    assert set(visited) == {"batch-p0", "batch-p1", "batch-p2"}
+    assert result["projects"] == 3
+
+    # Exactly ONE execute call should reference the Project table for the
+    # initial prefetch; the per-project session.get() calls must not add
+    # extra executes in the happy-path (identity-map hits).
+    project_selects = [
+        c for c in execute_calls
+        if hasattr(c, "froms") and any(
+            getattr(f, "name", None) == "project" for f in getattr(c, "froms", [])
+        )
+    ]
+    assert len(project_selects) == 1, (
+        f"Expected exactly 1 batch SELECT for projects, got {len(project_selects)} — "
+        "N+1 pattern may have regressed"
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # progress_cb heartbeat: build keeps the reaper watchdog alive
 # ══════════════════════════════════════════════════════════════════════════════

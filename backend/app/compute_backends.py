@@ -2394,7 +2394,7 @@ def _select_viewable_candidates_from_bundle_path(
     path: str,
     *,
     fail_soft: bool = True,
-) -> tuple[list[ViewableArtifactCandidate], int]:
+) -> tuple[list[ViewableArtifactCandidate], int, int]:
     """Select a bundle's viewable files from an ON-DISK archive, bounded memory.
 
     Two passes over the (seekable) archive file:
@@ -2423,6 +2423,7 @@ def _select_viewable_candidates_from_bundle_path(
         refs: list[tuple[str, str, str, str]] = []  # (relname, member, ctype, kind)
         seen: set[str] = set()
         size_dropped = 0
+        svg_count = 0
         with tarfile.open(path, mode="r:gz") as tar:
             for member in tar:
                 if not member.isfile():
@@ -2438,6 +2439,8 @@ def _select_viewable_candidates_from_bundle_path(
                         and member.size > _MAX_VIEWABLE_FILE_BYTES
                     ):
                         size_dropped += 1
+                    elif member.name.lower().endswith(".svg"):
+                        svg_count += 1
                     continue
                 relname, content_type, kind = classified
                 if relname in seen:
@@ -2449,7 +2452,7 @@ def _select_viewable_candidates_from_bundle_path(
         selected_refs = refs[:_MAX_VIEWABLE_FILE_COUNT]
         dropped = (len(refs) - len(selected_refs)) + size_dropped
         if not selected_refs:
-            return [], dropped
+            return [], dropped, svg_count
 
         wanted = {ref[1]: ref for ref in selected_refs}
         out: dict[str, ViewableArtifactCandidate] = {}
@@ -2496,7 +2499,7 @@ def _select_viewable_candidates_from_bundle_path(
         _unlink_temp_sources(tmp_video_paths)
         if not fail_soft:
             raise RuntimeError("viewable bundle enumeration failed") from exc
-        return [], 0
+        return [], 0, 0
     if len(out) != len(selected_refs) and not fail_soft:
         _unlink_temp_sources(tmp_video_paths)
         raise RuntimeError("viewable bundle enumeration was incomplete")
@@ -2505,21 +2508,21 @@ def _select_viewable_candidates_from_bundle_path(
     # persist_viewable_artifacts after upload.
     kept = {c.source_path for c in out.values() if c.source_path is not None}
     _unlink_temp_sources([p for p in tmp_video_paths if p not in kept])
-    return sorted(out.values(), key=lambda c: c.filename), dropped
+    return sorted(out.values(), key=lambda c: c.filename), dropped, svg_count
 
 
 async def _stream_viewable_candidates_from_bundle(
     job_id,
     *,
     fail_soft: bool = True,
-) -> tuple[list[ViewableArtifactCandidate], int]:
+) -> tuple[list[ViewableArtifactCandidate], int, int]:
     """Fetch + select a bundle-backed job's viewable files without ever holding
     the bundle in memory.
 
     The bundle is streamed to a temp file, selected from on disk (two-pass,
     count-capped BEFORE any member bytes are read), and the temp file is always
     removed. Fail-soft: a missing bundle or ANY download/parse error degrades to
-    ``([], 0)``.
+    ``([], 0, 0)``.
     """
     handle, tmp_path = tempfile.mkstemp(prefix="bp-viewable-", suffix=".tar.gz")
     os.close(handle)
@@ -2530,7 +2533,7 @@ async def _stream_viewable_candidates_from_bundle(
         if not downloaded:
             if not fail_soft:
                 raise RuntimeError("durable viewable bundle is unavailable")
-            return [], 0
+            return [], 0, 0
         return await asyncio.to_thread(
             _select_viewable_candidates_from_bundle_path,
             tmp_path,
@@ -2545,7 +2548,7 @@ async def _stream_viewable_candidates_from_bundle(
         )
         if not fail_soft:
             raise
-        return [], 0
+        return [], 0, 0
     finally:
         try:
             os.unlink(tmp_path)
@@ -2645,7 +2648,7 @@ def _read_viewable_file_nofollow(path: str, artifact_root: str) -> bytes | None:
 
 def _collect_viewable_candidates_from_dir(
     artifact_dir: str,
-) -> tuple[list[ViewableArtifactCandidate], int]:
+) -> tuple[list[ViewableArtifactCandidate], int, int]:
     """Select viewable files by walking a local job's on-disk artifact dir.
 
     The on-disk analogue of :func:`_extract_viewable_candidates_from_bundle`:
@@ -2676,10 +2679,11 @@ def _collect_viewable_candidates_from_dir(
         or not os.path.isdir(artifact_dir)
         or os.path.islink(artifact_dir)
     ):
-        return [], 0
+        return [], 0, 0
     artifact_root = os.path.realpath(artifact_dir)
     out: list[ViewableArtifactCandidate] = []
     size_dropped = 0
+    svg_count = 0
     seen: set[str] = set()
     try:
         for root, dirs, files in os.walk(artifact_dir, followlinks=False):
@@ -2689,6 +2693,8 @@ def _collect_viewable_candidates_from_dir(
             for name in sorted(files):
                 classified = storage.viewable_content_type_for_filename(name)
                 if classified is None:
+                    if name.lower().endswith(".svg"):
+                        svg_count += 1
                     continue
                 path = os.path.join(root, name)
                 if os.path.islink(path) or not os.path.isfile(path):
@@ -2746,59 +2752,60 @@ def _collect_viewable_candidates_from_dir(
                     )
                 )
     except OSError:
-        return out, size_dropped
-    return out, size_dropped
+        return out, size_dropped, svg_count
+    return out, size_dropped, svg_count
 
 
 async def _collect_viewable_artifact_candidates(
     job: ComputeJob,
     *,
     fail_soft: bool = True,
-) -> tuple[list[ViewableArtifactCandidate], int]:
+) -> tuple[list[ViewableArtifactCandidate], int, int]:
     """Backend-aware selection of a terminal job's viewable files.
 
     Local/local-gpu jobs are read from the on-disk artifact dir that survives the
     subprocess; gcp and runner-subprocess jobs are read from the durable
     ``bundle.tar.gz`` — STREAMED to a temp file and selected from disk, never
     materialized in the orchestrator's heap (a results bundle has no size bound;
-    pulling one into the API process is an OOM). Returns ``([], 0)`` for an
+    pulling one into the API process is an OOM). Returns ``([], 0, 0)`` for an
     unrecognised backend or a missing bundle.
 
     Candidates are sorted by sanitized filename for deterministic selection when
-    the archive/walk order is arbitrary. Returns ``(selected, dropped)`` where
-    ``dropped`` is the total count of viewable files omitted from the manifest —
-    both those exceeding ``_MAX_VIEWABLE_FILE_COUNT`` (count-cap overflow) AND
-    those skipped for exceeding ``_MAX_VIEWABLE_FILE_BYTES`` (size-cap).
+    the archive/walk order is arbitrary. Returns ``(selected, dropped, svg_count)``
+    where ``dropped`` is the total count of viewable files omitted from the manifest
+    — both those exceeding ``_MAX_VIEWABLE_FILE_COUNT`` (count-cap overflow) AND
+    those skipped for exceeding ``_MAX_VIEWABLE_FILE_BYTES`` (size-cap) — and
+    ``svg_count`` is the number of ``.svg`` files encountered (excluded for XSS).
     """
     if job.backend in (LOCAL_BACKEND_NAME, LOCAL_GPU_BACKEND_NAME):
         meta = job.polling_metadata or {}
         artifact_dir = str(meta.get("artifact_dir") or "").strip()
         if not artifact_dir:
             artifact_dir = _local_artifact_dir_for_external_id(job.external_compute_id)
-        all_candidates, size_dropped = await asyncio.to_thread(
+        all_candidates, size_dropped, svg_count = await asyncio.to_thread(
             _collect_viewable_candidates_from_dir, artifact_dir
         )
     elif job.backend in (GCP_BACKEND_NAME, RUNNER_SUBPROCESS_BACKEND_NAME):
         # Already sorted + capped on disk (count cap applied BEFORE any member
         # bytes are read; size-cap omissions folded into the returned count), so
-        # it returns the final (selected, dropped) directly.
+        # it returns the final (selected, dropped, svg_count) directly.
         return await _stream_viewable_candidates_from_bundle(
             job.id,
             fail_soft=fail_soft,
         )
     else:
-        return [], 0
+        return [], 0, 0
     all_candidates.sort(key=lambda c: c.filename)
     selected = all_candidates[:_MAX_VIEWABLE_FILE_COUNT]
     count_dropped = len(all_candidates) - len(selected)
-    return selected, count_dropped + size_dropped
+    return selected, count_dropped + size_dropped, svg_count
 
 
 async def persist_viewable_artifacts(
     job: ComputeJob,
 ) -> tuple[list[dict[str, Any]], int]:
     """Compatibility wrapper returning the historical ``(manifest, dropped)``."""
-    manifest, dropped, _complete = (
+    manifest, dropped, _complete, _svg = (
         await persist_viewable_artifacts_with_completeness(job)
     )
     return manifest, dropped
@@ -2806,7 +2813,7 @@ async def persist_viewable_artifacts(
 
 async def persist_viewable_artifacts_with_completeness(
     job: ComputeJob,
-) -> tuple[list[dict[str, Any]], int, bool]:
+) -> tuple[list[dict[str, Any]], int, bool, int]:
     """Persist a terminal job's viewable files as individually-addressable objects.
 
     Extracts the viewable files (png/jpg/jpeg/webp/gif/mp4/webm — NO svg, which
@@ -2825,7 +2832,7 @@ async def persist_viewable_artifacts_with_completeness(
     appear in the returned manifest.
     """
     try:
-        candidates, dropped = await _collect_viewable_artifact_candidates(
+        candidates, dropped, svg_count = await _collect_viewable_artifact_candidates(
             job,
             fail_soft=False,
         )
@@ -2835,9 +2842,9 @@ async def persist_viewable_artifacts_with_completeness(
             getattr(job, "id", None),
             exc_info=True,
         )
-        return [], 0, False
+        return [], 0, False, 0
     if not candidates:
-        return [], dropped, True
+        return [], dropped, True, svg_count
     manifest: list[dict[str, Any]] = []
     complete = True
     for candidate in candidates:
@@ -2873,7 +2880,7 @@ async def persist_viewable_artifacts_with_completeness(
                 "live": False,
             }
         )
-    return manifest, dropped, complete
+    return manifest, dropped, complete, svg_count
 
 
 def _open_viewable_source_nofollow(path: str, artifact_root: str | None):

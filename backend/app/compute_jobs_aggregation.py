@@ -8,7 +8,7 @@ share the same time-window logic as ``list_compute_jobs``.
 from __future__ import annotations
 
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from sqlalchemy import func
 from sqlmodel import select
@@ -170,13 +170,23 @@ async def aggregate_all_compute_jobs_summary(
     session,
     *,
     project_id: uuid.UUID,
+    since: datetime | None = None,
 ) -> dict:
-    """Return aggregate stats over ALL compute jobs for a project, with no time cap.
+    """Return aggregate stats over compute jobs for a project.
 
-    Unlike aggregate_compute_jobs_summary, this covers the full history rather
-    than a recent window — useful for computing cumulative experiment totals.
+    When ``since`` is provided, all three aggregate queries are bounded to jobs
+    created on or after that timestamp, limiting the scan to recent rows and
+    allowing the ``ix_computejob_project_status_created`` composite index to be
+    used selectively.  An additional lightweight all-time total count is returned
+    as ``total_jobs_all_time`` so callers retain access to the cumulative figure.
+
+    When ``since`` is None, the full history is scanned (original behaviour).
     """
     project_filter = [ComputeJob.project_id == project_id]
+    if since is not None:
+        time_filter = [ComputeJob.project_id == project_id, ComputeJob.created_at >= since]
+    else:
+        time_filter = project_filter
 
     totals_row = (
         await session.execute(
@@ -188,14 +198,14 @@ async def aggregate_all_compute_jobs_summary(
                     ),
                     0.0,
                 ).label("spend"),
-            ).where(*project_filter)
+            ).where(*time_filter)
         )
     ).one()
 
     status_rows = (
         await session.execute(
             select(ComputeJob.status, func.count(ComputeJob.id))
-            .where(*project_filter)
+            .where(*time_filter)
             .group_by(ComputeJob.status)
         )
     ).all()
@@ -215,7 +225,11 @@ async def aggregate_all_compute_jobs_summary(
             select(_criterion_met_expr(session))
             .select_from(ComputeJob)
             .join(Task, ComputeJob.task_id == Task.id)
-            .where(ComputeJob.project_id == project_id, ComputeJob.task_id.is_not(None))
+            .where(
+                ComputeJob.project_id == project_id,
+                ComputeJob.task_id.is_not(None),
+                *([ComputeJob.created_at >= since] if since is not None else []),
+            )
             .group_by(Task.id, Task.plan_output)
         )
     ).all()
@@ -224,7 +238,7 @@ async def aggregate_all_compute_jobs_summary(
         1 for row in criterion_rows if _criterion_is_met(row.met_value)
     )
 
-    return {
+    result: dict = {
         "total_jobs": total,
         "active_jobs": active_count,
         "terminal_jobs": total - active_count,
@@ -233,3 +247,15 @@ async def aggregate_all_compute_jobs_summary(
         "criterion_measured": criterion_measured,
         "criterion_met": criterion_met,
     }
+
+    if since is not None:
+        all_time_row = (
+            await session.execute(
+                select(func.count(ComputeJob.id).label("all_time_total")).where(
+                    *project_filter
+                )
+            )
+        ).one()
+        result["total_jobs_all_time"] = int(all_time_row.all_time_total)
+
+    return result

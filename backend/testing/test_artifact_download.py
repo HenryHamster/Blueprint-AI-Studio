@@ -1202,3 +1202,55 @@ async def test_signable_viewable_set_matches_listed_set(
     assert resp2.status_code == 404, (
         "non-viewable-extension ComputeJobFile row must not be signable"
     )
+
+
+@pytest.mark.asyncio
+async def test_resolve_download_url_manifest_uri_non_viewable_extension_404(
+    client: AsyncClient, db_session, mocker
+):
+    """A URI in the viewable_files manifest whose filename has a non-viewable
+    extension (e.g. '.csv') is rejected 404 — the extension guard is symmetric
+    across both the manifest branch and the ComputeJobFile branch."""
+    sign = _mock_signing(mocker)
+    project = await _make_project(db_session)
+    await _add_member(db_session, project.id)
+    task = await _make_task(db_session, project)
+
+    job = ComputeJob(
+        task_id=task.id,
+        project_id=project.id,
+        backend="gcp",
+        status=ComputeJobStatus.SUCCEEDED,
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+    )
+    db_session.add(job)
+    await db_session.flush()
+
+    # Inject a non-viewable URI directly into the manifest (bypassing
+    # write-time enforcement to simulate a bypass attempt or legacy data).
+    non_viewable_uri = (
+        f"gs://{BUCKET}/compute-jobs/{job.id}/artifacts/viewable/metrics.csv"
+    )
+    job.polling_metadata = {
+        "viewable_files": [
+            {
+                "filename": "metrics.csv",
+                "storage_uri": non_viewable_uri,
+                "content_type": "text/csv",
+                "size_bytes": 256,
+                "kind": "unknown",
+            }
+        ]
+    }
+    db_session.add(job)
+    await db_session.commit()
+
+    resp = await client.get(
+        "/api/admin/artifacts/download-url",
+        params={"storage_uri": non_viewable_uri, "project_id": str(project.id)},
+    )
+    assert resp.status_code == 404, (
+        "manifest URI with non-viewable extension must not be signable"
+    )
+    sign.assert_not_called()

@@ -2436,11 +2436,13 @@ async def referenced_compute_image_digests(
 
 
 _COMPUTE_JOB_BATCH_SIZE = 50
+_COMPUTE_JOB_POLL_CONCURRENCY = 10
 
 
 async def process_compute_jobs_once(session_factory=AsyncSessionLocal) -> None:
     last_created_at = None
     last_id = None
+    _sem = asyncio.Semaphore(_COMPUTE_JOB_POLL_CONCURRENCY)
 
     while True:
         async with session_factory() as session:
@@ -2475,15 +2477,18 @@ async def process_compute_jobs_once(session_factory=AsyncSessionLocal) -> None:
         if not jobs:
             break
 
-        for job in jobs:
-            try:
-                await _process_single_compute_job(job, session_factory=session_factory)
-            except Exception as exc:  # noqa: PERF203
-                logger.exception(
-                    "[COMPUTE_JOB] monitor failed for job=%s: %s",
-                    job.id,
-                    exc,
-                )
+        async def _run_job(job):
+            async with _sem:
+                try:
+                    await _process_single_compute_job(job, session_factory=session_factory)
+                except Exception as exc:
+                    logger.exception(
+                        "[COMPUTE_JOB] monitor failed for job=%s: %s",
+                        job.id,
+                        exc,
+                    )
+
+        await asyncio.gather(*[_run_job(job) for job in jobs])
 
         if len(jobs) < _COMPUTE_JOB_BATCH_SIZE:
             break
@@ -4732,8 +4737,9 @@ async def persist_viewable_files_for_job(
         )
 
     complete = False
+    svg_count = 0
     try:
-        manifest, dropped, complete = (
+        manifest, dropped, complete, svg_count = (
             await persist_viewable_artifacts_with_completeness(job)
         )
     except Exception:  # noqa: BLE001
@@ -4794,6 +4800,10 @@ async def persist_viewable_files_for_job(
         # live omission count and incomplete-pass diagnostic.
         reconciled_meta["viewable_file_count"] = len(manifest)
         reconciled_meta["viewable_files_dropped"] = dropped
+        if svg_count:
+            reconciled_meta["viewable_files_svg_excluded"] = svg_count
+        else:
+            reconciled_meta.pop("viewable_files_svg_excluded", None)
         reconciled_meta.pop("viewable_terminal_reconciliation_incomplete", None)
     else:
         # Leave viewable_file_count absent so the next terminal call retries.
