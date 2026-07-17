@@ -31,6 +31,7 @@ from app.migration_apply_gate import (
     _check_data_migration_proof_gate,
     _create_database,
     _drop_database,
+    _looks_like_serving_only_import,
     _migration_has_data_ops,
     _migration_has_proof_declaration,
     _new_migration_sources,
@@ -1390,6 +1391,86 @@ async def test_apply_candidate_migrations_classifies_import_error(monkeypatch):
         await engine.dispose()
 
     assert "ImportError" in str(exc_info.value)
+
+
+# --- _looks_like_serving_only_import -----------------------------------------
+
+
+def test_looks_like_serving_only_import_matched_by_name_attribute():
+    """``_looks_like_serving_only_import`` returns True when the ``ImportError``
+    has a ``.name`` attribute starting with ``"app."`` — the ``ModuleNotFoundError``
+    pattern when a candidate-side app module is absent from the serving engine."""
+    exc = ImportError("No module named 'app.field_encryption'")
+    exc.name = "app.field_encryption"  # type: ignore[attr-defined]
+    assert _looks_like_serving_only_import(exc) is True
+
+
+def test_looks_like_serving_only_import_matched_by_from_in_message():
+    """``_looks_like_serving_only_import`` returns True when the error message
+    contains ``"from 'app."`` — the ``ImportError`` pattern when a symbol from
+    an existing ``app.*`` module cannot be found in the serving engine."""
+    exc = ImportError(
+        "cannot import name 'require_encryption_active' "
+        "from 'app.field_encryption'"
+    )
+    assert _looks_like_serving_only_import(exc) is True
+
+
+def test_looks_like_serving_only_import_matched_by_no_module_in_message():
+    """``_looks_like_serving_only_import`` returns True when the error message
+    contains ``"No module named 'app."`` — the ``ModuleNotFoundError`` pattern
+    when a candidate-side app submodule is entirely absent from the serving engine
+    and ``.name`` attribute is absent."""
+    exc = ImportError("No module named 'app.new_compute_module'")
+    assert _looks_like_serving_only_import(exc) is True
+
+
+def test_looks_like_serving_only_import_rejects_third_party_import():
+    """A non-app third-party ``ImportError`` (e.g. ``nonexistent_package``) must
+    return False — these are genuine dependency defects, not serving-only artifacts."""
+    exc = ImportError("No module named 'nonexistent_package'")
+    assert _looks_like_serving_only_import(exc) is False
+
+
+def test_looks_like_serving_only_import_rejects_stdlib_module():
+    """An ``ImportError`` for a stdlib module that happens to exist only on newer
+    Python must return False — it is NOT an ``app.*`` serving-only artifact."""
+    exc = ImportError("No module named 'tomllib'")
+    assert _looks_like_serving_only_import(exc) is False
+
+
+# --- Serving-only ImportError degrade (unit: _apply_candidate_migrations) -----
+
+
+@pytest.mark.asyncio
+async def test_apply_candidate_migrations_classifies_app_import_as_serving_only(
+    monkeypatch,
+):
+    """An ``ImportError`` for a candidate-side ``app.*`` module during migration
+    import must be classified as ``_ServingOnlyImportError`` (degrade), not
+    ``_DeterministicMigrationDefect`` (block)."""
+    import app.migration_apply_gate as gate_mod
+
+    async def _app_import_error_apply(scratch_engine, script_location, *, timeout_code):
+        raise ImportError(
+            "cannot import name 'require_encryption_active' "
+            "from 'app.field_encryption'"
+        )
+
+    monkeypatch.setattr(
+        gate_mod, "_run_migration_apply_subprocess", _app_import_error_apply
+    )
+
+    with pytest.raises(gate_mod._ServingOnlyImportError) as exc_info:
+        await gate_mod._apply_candidate_migrations(
+            object(),
+            {"0001_app_dep.py": "revision='0001'\ndown_revision=None\n"},
+        )
+
+    assert "app.field_encryption" in str(exc_info.value)
+
+
+# --- Deterministic defect blocking (runs everywhere) ---------------------------
 
 
 @pytest.mark.asyncio
