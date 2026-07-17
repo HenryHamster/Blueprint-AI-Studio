@@ -854,7 +854,9 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
                     </button>
                     {pendingDeleteId === tool.id ? (
                       <>
-                        <span className="text-xs text-neutral-400">Remove permanently?</span>
+                        <span className="text-xs text-neutral-400">
+                          Remove &ldquo;{tool.title}&rdquo;? This will permanently delete its content and configuration.
+                        </span>
                         <button
                           type="button"
                           data-viewport-allow-small-target
@@ -969,7 +971,9 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
                     </button>
                     {pendingDeleteId === tool.id ? (
                       <>
-                        <span className="text-xs text-neutral-400">Remove permanently?</span>
+                        <span className="text-xs text-neutral-400">
+                          Remove &ldquo;{tool.title}&rdquo;? This will permanently delete its content and configuration.
+                        </span>
                         <button
                           type="button"
                           data-viewport-allow-small-target

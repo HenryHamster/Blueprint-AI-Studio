@@ -569,7 +569,8 @@ describe('ProjectToolHost — delete confirmation gate', () => {
 
     expect(findButton('Remove')).toBeUndefined();
     expect(findButton('Permanently remove')).toBeTruthy();
-    expect(h().textContent).toContain('Remove permanently?');
+    expect(h().textContent).toContain('My Widget');
+    expect(h().textContent).toContain('permanently delete its content');
     expect(vi.mocked(deleteProjectTool)).not.toHaveBeenCalled();
   });
 
