@@ -561,21 +561,23 @@ jobs:
                 -v --tb=short --timeout=30 --timeout-method=signal --log-cli-level=WARNING 2>&1 | tee test-output.txt
             return ${PIPESTATUS[0]}
           }
-          # Extract failed test IDs from pytest's "short test summary info" section.
+          # Extract failed/erroring test IDs from pytest's "short test summary
+          # info" section. Fixture setup/teardown regressions are reported as
+          # ERROR (not FAILED) and must be compared against the baseline too.
           extract_failures() {
-            grep -E "^FAILED " test-output.txt | sed 's/^FAILED //' | sed 's/ -.*//' | sort -u > pr-test-failures.txt || true
+            grep -E "^(FAILED|ERROR) " test-output.txt | sed -E 's/^(FAILED|ERROR) //' | sed 's/ -.*//' | sort -u > pr-test-failures.txt || true
           }
           run_shard; pytest_status=$?
           extract_failures
 
-          # A non-zero exit with NO FAILED summary is a CRASH/HANG (timeout, OOM,
+          # A non-zero exit with no FAILED/ERROR summary is a CRASH/HANG (timeout, OOM,
           # collection error, or a Docker/DB blip) — NOT real test failures. Retry
           # the shard ONCE so a transient crash self-heals instead of writing the
           # sentinel, which always counts as net-new and blocks the promotion gate
           # (the crash-sentinel wedge). Real FAILED lines are NOT retried — a
           # genuine regression fails fast on the first run.
           if [ "$pytest_status" -ne 0 ] && [ ! -s pr-test-failures.txt ]; then
-            echo "::warning::shard ${{ matrix.shard }} exited $pytest_status with no FAILED summary (crash/hang) — retrying once"
+            echo "::warning::shard ${{ matrix.shard }} exited $pytest_status with no FAILED/ERROR summary (crash/hang) — retrying once"
             run_shard; pytest_status=$?
             extract_failures
           fi
@@ -584,7 +586,7 @@ jobs:
           # Fallback: STILL a non-zero exit with no FAILED summary after the retry.
           # Surface a sentinel + the tail so the Evaluate step is useful.
           if [ "$pytest_status" -ne 0 ] && [ ! -s pr-test-failures.txt ]; then
-            echo "<pytest crashed or hung; no FAILED summary captured>" > pr-test-failures.txt
+            echo "<pytest crashed or hung; no FAILED/ERROR summary captured>" > pr-test-failures.txt
             echo ""
             echo "=== Last 50 lines of pytest output ==="
             tail -50 test-output.txt
