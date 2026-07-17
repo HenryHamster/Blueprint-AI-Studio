@@ -5051,7 +5051,13 @@ async def test_heartbeat_all_durability_fields_persisted_simultaneously(db_sessi
         "]}"
     )
     cursor = "2026-07-10T09:30:00.000000"
-    exam_ledger = _json.dumps({"records": [{"tick": 3, "surface": "direction:d-1"}], "tick": 3, "corrective": False})
+    exam_ledger = _json.dumps(
+        {
+            "records": [{"tick": 3, "surface": "direction:d-1"}],
+            "tick": 3,
+            "corrective": False,
+        }
+    )
 
     # Establish a baseline lease.
     project = await db_session.get(Project, project.id)
