@@ -25,6 +25,14 @@ vi.mock('../firebase', () => ({
   signOut: vi.fn(),
 }));
 
+// Load-timing telemetry is covered by uiLoadTiming.test.ts. Keep this component
+// suite hermetic: a successful auth mock must never turn each render into a
+// real request to Vitest's localhost environment URL.
+vi.mock('../uiLoadTiming', () => ({
+  currentUiSurface: vi.fn(() => 'chat'),
+  reportUiLoadTiming: vi.fn(),
+}));
+
 // Partial mock — `MessagesPanel.tsx` imports `authHeaders` (and `API_BASE_URL`)
 // from '../api' alongside `apiFetch`, and so does its serverSync helper. A
 // static factory that only declared `apiFetch`/`API_BASE_URL` left `authHeaders`
@@ -658,6 +666,22 @@ describe('MessagesPanel chrome modes', () => {
     return [...el.querySelectorAll('button')]
       .find(button => button.title === 'Show filters and saved views' || button.title === 'Hide filters and saved views') as HTMLButtonElement | undefined;
   }
+
+  test('mount fails coverage if load telemetry reaches the real network', async () => {
+    const originalFetch = globalThis.fetch;
+    const unexpectedFetch = vi.fn((input: RequestInfo | URL): Promise<Response> => {
+      throw new Error('Unexpected network request from MessagesPanel: ' + String(input));
+    });
+    globalThis.fetch = unexpectedFetch as typeof globalThis.fetch;
+    try {
+      await renderPanel();
+      await act(async () => { await Promise.resolve(); });
+      expect(unexpectedFetch).not.toHaveBeenCalled();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
 
   test('page default omits close chrome and collapses filters', async () => {
     const el = await renderPanel();
