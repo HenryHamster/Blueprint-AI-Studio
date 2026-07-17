@@ -3794,11 +3794,11 @@ async def _resolve_migration_apply_at_finalize(
             os.getenv(MIGRATION_APPLY_SCRATCH_ENV)
         )
         if scratch_preflight.status == "absent":
-            # Config-absent: degrade gate non-blocking rather than holding every
-            # candidate indefinitely.  Documented intent in required_runtime_env.py:
-            # "absent qualification vars should degrade specific gate checks rather
-            # than preventing startup" and qualify as a hold-forever silent blocker.
-            return ("ok", None)
+            # Config-absent: record as "skipped" so a skipped gate can never read
+            # as a passed gate.  Not "defer" (transient infra) and not "ok" (gate
+            # actually ran & passed) — this is a permanent config choice meaning
+            # the gate was never attempted.
+            return ("skipped", "scratch_database_not_configured")
         if scratch_preflight.status != "ready" or scratch_preflight.target is None:
             return ("defer", scratch_preflight.detail)
         prod_engine = resolve_async_engine(session)
@@ -4823,7 +4823,6 @@ async def _dual_write_dimension_results(
     blocker = composite.get("blocker")
     ci_green = bool(base_record.get("ci_green"))
     smoketest_enabled = bool(base_record.get("smoketest_enabled", True))
-    env_preflight_enabled = bool(base_record.get("env_preflight_enabled", False))
 
     def _score(key: str) -> float | None:
         v = sub_scores.get(key)
@@ -4837,7 +4836,7 @@ async def _dual_write_dimension_results(
     def _mig_status(verdict: Any) -> str:
         if verdict == "block":
             return "blocked"
-        if verdict == "defer":
+        if verdict in ("defer", "skipped"):
             return "unavailable"
         if verdict in ("ok", "pass"):
             return "passed"
@@ -4922,22 +4921,6 @@ async def _dual_write_dimension_results(
             "sub_score": _score("smoketest") if smoketest_enabled else None,
             "blocker": _own_blocker({"smoketest_startup_failed"}),
             "detail": base_record.get("smoketest_detail"),
-            "producing_task_id": base_record.get("smoketest_task_id"),
-        },
-        {
-            "dimension": "env_preflight",
-            "status": (
-                "unavailable"
-                if not env_preflight_enabled
-                else "blocked"
-                if blocker in {"boot_prereq_missing", "boot_prereq_evidence_missing"}
-                else "passed"
-            ),
-            "sub_score": _score("env_preflight") if env_preflight_enabled else None,
-            "blocker": _own_blocker(
-                {"boot_prereq_missing", "boot_prereq_evidence_missing"}
-            ),
-            "detail": base_record.get("env_preflight_verdict"),
             "producing_task_id": base_record.get("smoketest_task_id"),
         },
         {
@@ -6779,6 +6762,14 @@ async def _finalize_qualification(
             else "migration_apply_check_unavailable",
         )
     migration_apply_blocked = apply_verdict == "block"
+    if apply_verdict == "skipped":
+        # Gate was never attempted (scratch DB not configured).  Record as
+        # "unavailable" so a skipped gate can never read as a passed gate.
+        _ma_status = "unavailable"
+        _ma_blocker = None
+    else:
+        _ma_status = "blocked" if migration_apply_blocked else "passed"
+        _ma_blocker = "migration_apply_drift" if migration_apply_blocked else None
     # Eager-write migration_apply so a later gate's infra failure cannot
     # discard this verdict before _dual_write_dimension_results is reached.
     await _upsert_dimension_result(
@@ -6786,9 +6777,9 @@ async def _finalize_qualification(
         version,
         candidate_sha,
         "migration_apply",
-        status="blocked" if migration_apply_blocked else "passed",
+        status=_ma_status,
         sub_score=None,
-        blocker="migration_apply_drift" if migration_apply_blocked else None,
+        blocker=_ma_blocker,
         detail={
             "verdict": apply_verdict,
             "detail": apply_detail,
