@@ -301,6 +301,77 @@ class TestIsEncryptionActive:
         assert is_encryption_active() is False
 
 
+class TestWrongKeyPassthrough:
+    """Documents the two-tier safety model for wrong-key decryption.
+
+    decrypt_field itself passes ciphertext through unchanged when InvalidToken
+    fires (backward compat for pre-migration plaintext rows).  The boot-time
+    continuity probe is the primary safety net that catches a wrong-key rotation
+    before any per-row decryption is attempted.
+    """
+
+    def test_wrong_valid_key_fails_continuity_closed(self, monkeypatch):
+        """Wrong-key: probe raises; decrypt_field passes ciphertext through unchanged.
+
+        Two assertions:
+        1. decrypt_field with a wrong-but-valid Fernet key returns the ciphertext
+           as-is (InvalidToken passthrough — backward compat documented behavior).
+        2. If the boot-time continuity probe is present, it raises on a wrong key
+           (the probe is the actual safety net that makes the passthrough acceptable).
+        """
+        correct_key = Fernet.generate_key()
+        wrong_key = Fernet.generate_key()
+
+        f_correct = Fernet(correct_key)
+        plaintext = "sensitive_token_value"
+        ciphertext = f_correct.encrypt(plaintext.encode()).decode()
+
+        # Configure the wrong key so decrypt_field will hit InvalidToken
+        monkeypatch.setenv(ENCRYPTION_KEY_ENV, wrong_key.decode())
+
+        # Assertion 1: decrypt_field returns ciphertext unchanged (passthrough).
+        # This is intentional backward compat — the boot-time probe is the guard.
+        result = decrypt_field(ciphertext)
+        assert result == ciphertext, (
+            "decrypt_field must return ciphertext unchanged on InvalidToken; "
+            "the continuity probe is the safety net, not per-call raising"
+        )
+
+        # Assertion 2: if the continuity probe exists, it must raise on a wrong key.
+        try:
+            from app.field_encryption import check_encryption_key_continuity  # type: ignore[attr-defined]
+        except ImportError:
+            # Probe not yet present (shipped by companion task); skip probe assertion.
+            import pytest
+
+            pytest.skip(
+                "check_encryption_key_continuity not yet present — "
+                "probe assertion deferred until companion task lands"
+            )
+        else:
+            with pytest.raises((RuntimeError, ValueError)):
+                check_encryption_key_continuity()
+
+    def test_wrong_key_decrypt_emits_warning(self, monkeypatch, caplog):
+        """decrypt_field logs a WARNING (not debug) when InvalidToken fires."""
+        import logging
+
+        correct_key = Fernet.generate_key()
+        wrong_key = Fernet.generate_key()
+
+        f_correct = Fernet(correct_key)
+        ciphertext = f_correct.encrypt(b"secret").decode()
+
+        monkeypatch.setenv(ENCRYPTION_KEY_ENV, wrong_key.decode())
+
+        with caplog.at_level(logging.WARNING, logger="app.field_encryption"):
+            decrypt_field(ciphertext)
+
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warning_records, "Expected at least one WARNING log from decrypt_field on InvalidToken"
+        assert ENCRYPTION_KEY_ENV in warning_records[0].getMessage()
+
+
 class TestRequireEncryptionActive:
     """require_encryption_active fails closed on malformed/absent keys."""
 

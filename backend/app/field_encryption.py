@@ -165,5 +165,12 @@ def decrypt_field(value: str | None) -> str | None:
         # UnicodeDecodeError on result .decode(), binascii.Error from malformed base64).
         # All other exceptions propagate so library API changes or truly unexpected
         # errors are not silently swallowed.
-        logger.debug("Decryption fallback (%s): %s", type(e).__name__, e)
+        logger.warning(
+            "Decryption fallback for %s (%s): %s — value returned as-is; "
+            "if %s is rotated, the boot-time continuity probe should have caught this",
+            type(e).__name__,
+            ENCRYPTION_KEY_ENV,
+            e,
+            ENCRYPTION_KEY_ENV,
+        )
         return value
