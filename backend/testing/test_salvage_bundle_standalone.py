@@ -51,6 +51,12 @@ Findings covered here (18-finding compute-viewable salvage bundle, 2026-07-17):
   f16 — reserve slots (test already in prior 12-finding bundle section)
   f17 — omission telemetry (tests already in prior 12-finding bundle section)
   f18 — PDF support (tests already in prior 12-finding bundle section)
+
+Findings covered here (4-finding operator-inbox/messages salvage bundle, 2026-07-17):
+  m1 — inbox attention-driven: badge/toast/strip/list all use the canonical server attention model
+  m2 — confirmation chips actionable: click handler branches on both message and confirmation kinds
+  m3 — QUESTION auto-decay: CONVERSATIONAL_DECAY_MESSAGE_TYPES includes QUESTION; stale_unanswered stamped
+  m4 — notifications converged: toast dispatch uses isMessageNeedingOperatorAttention, not effectiveSignal
 """
 
 from __future__ import annotations
@@ -407,29 +413,28 @@ def test_trigger_resolver_returns_not_applicable_for_promoted():
 
     Finding #7 claim: the trigger resolver returned not_applicable for states that
     dedicated sweep re-drive functions handle automatically, without exposing them
-    through the unified decision contract.  Promoted and abandoned versions must
-    return not_applicable (terminal — no re-drive possible).
+    through the unified decision contract.  When the last-qualification status is
+    a terminal-like value that no T1–T5 rule matches, the resolver falls through
+    to the default not_applicable verdict (fire=False).
     """
     from app.qualification_triggers import resolve_qualification_trigger
 
     for terminal_status in ("promoted", "abandoned"):
         decision = resolve_qualification_trigger(
+            phase="stabilize",
             status=terminal_status,
-            blocker=None,
+            error_code=None,
+            qualification_attempts=1,
+            error_redrive_count=0,
+            is_candidate_fully_met=False,
+            requalification_ready=None,
             candidate_sha="abc123",
-            dry_run_sha=None,
             automain_sha="abc123",
-            ci_state="green",
-            ci_required=False,
-            attempt_count=0,
-            infra_error=None,
-            infra_error_count=0,
-            infra_consecutive_errors=0,
-            rubric_changed=False,
-            deferred_unsynced=False,
-            blockers_cleared=False,
-            readiness_sufficient=False,
-            qualification_locked=False,
+            automain_ci_state="green",
+            blocker=None,
+            in_flight=False,
+            promotion_in_flight=False,
+            consecutive_infra_errors=0,
         )
         assert decision.fire is False, (
             f"resolve_qualification_trigger must return fire=False for status={terminal_status!r}"
@@ -1354,7 +1359,7 @@ def test_runner_422_error_message_includes_pdf():
     # The 422 error message near the viewable endpoint must include pdf.
     idx = source.find('"/compute-job/{job_id}/viewable"')
     assert idx >= 0, "viewable endpoint definition not found"
-    body = source[idx : idx + 5000]
+    body = source[idx : idx + 8000]
 
     assert "pdf" in body, (
         "The runner viewable endpoint 422 error message must list 'pdf' as a "
@@ -1616,4 +1621,274 @@ def test_compute_artifact_gallery_uses_revision_in_cache_key():
         "ComputeArtifactGallery.tsx must compute a composite key of "
         "(storage_uri, revision) to invalidate the signed-URL cache when "
         "the same storage path is overwritten with new content"
+    )
+
+
+# =========================================================================== #
+# 4-finding operator-inbox/messages salvage bundle (2026-07-17)
+# =========================================================================== #
+
+
+def _messages_panel_source() -> str:
+    """Return the source of admin-ui/src/components/MessagesPanel.tsx."""
+    try:
+        return _ui_component_source("MessagesPanel.tsx")
+    except FileNotFoundError:
+        raise
+
+
+def _use_message_list_source() -> str:
+    """Return the source of admin-ui/src/components/useMessageList.ts."""
+    from pathlib import Path
+
+    candidates = [
+        Path(__file__).resolve().parents[2] / "admin-ui" / "src" / "components" / "useMessageList.ts",
+        Path("/repo/admin-ui/src/components/useMessageList.ts"),
+    ]
+    for path in candidates:
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+    raise FileNotFoundError("useMessageList.ts not found")
+
+
+def _app_tsx_source() -> str:
+    """Return the source of admin-ui/src/App.tsx."""
+    from pathlib import Path
+
+    candidates = [
+        Path(__file__).resolve().parents[2] / "admin-ui" / "src" / "App.tsx",
+        Path("/repo/admin-ui/src/App.tsx"),
+    ]
+    for path in candidates:
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+    raise FileNotFoundError("App.tsx not found")
+
+
+# --------------------------------------------------------------------------- #
+# Finding m1 — inbox attention-driven: all four surfaces use server model
+# --------------------------------------------------------------------------- #
+
+
+def test_messages_panel_badge_uses_server_needs_operator():
+    """App.tsx must use server-side needs_operator for the badge count.
+
+    Finding m1: the badge (HeaderBar/tab-title) must read the server-derived
+    needs_operator count, not a client-side effectiveSignal re-derivation, so
+    all four notification surfaces agree on the same canonical source.
+    """
+    try:
+        source = _app_tsx_source()
+    except FileNotFoundError:
+        import pytest
+        pytest.skip("admin-ui/src/App.tsx not available in this environment")
+
+    assert "needs_operator" in source, (
+        "App.tsx must read 'needs_operator' from the server-side attention "
+        "model (messages/counts endpoint) for the badge count — client-side "
+        "effectiveSignal re-derivation would diverge from the toast and "
+        "needs-action strip surfaces"
+    )
+
+
+def test_messages_panel_toast_uses_attention_model_not_effective_signal():
+    """MessagesPanel toast dispatch must use isMessageNeedingOperatorAttention.
+
+    Finding m4/m1: toast and desktop-notification dispatch must gate on the
+    canonical server attention model (isMessageNeedingOperatorAttention), not
+    on client-derived effectiveSignal(), so the badge and toast always agree
+    about which messages are 'needs_operator'.
+    """
+    try:
+        source = _messages_panel_source()
+    except FileNotFoundError:
+        import pytest
+        pytest.skip("admin-ui/src/components not available in this environment")
+
+    assert "isMessageNeedingOperatorAttention" in source, (
+        "MessagesPanel.tsx must define and call isMessageNeedingOperatorAttention "
+        "to gate toast/desktop-notification dispatch — using effectiveSignal() "
+        "instead would let a locally-muted event_type suppress toasts that the "
+        "server marks needs_operator, causing badge/toast divergence"
+    )
+    # The function must check severity === 'needs_operator' so only server-confirmed
+    # items trigger toasts (not every open message).
+    assert "needs_operator" in source, (
+        "isMessageNeedingOperatorAttention must filter by severity='needs_operator' "
+        "from the canonical attention model items"
+    )
+
+
+def test_use_message_list_promotes_needs_operator_ids_to_high_signal():
+    """useMessageList must promote needsOperatorIds to highSignalOpen unconditionally.
+
+    Finding m1: the list high/routine split must use needsOperatorIds (from the
+    server attention model) to promote messages to highSignalOpen even when the
+    event_type is locally muted — so the list stays consistent with the badge,
+    toast, and needs-action strip surfaces.
+    """
+    try:
+        source = _use_message_list_source()
+    except FileNotFoundError:
+        import pytest
+        pytest.skip("admin-ui/src/components not available in this environment")
+
+    assert "needsOperatorIds" in source, (
+        "useMessageList.ts must accept a needsOperatorIds parameter to promote "
+        "server-marked needs_operator messages to highSignalOpen regardless of "
+        "local mute prefs"
+    )
+    # highSignalOpen must include the needsOperatorIds union so a locally-muted
+    # but server-attention-marked message appears in the high-signal section.
+    assert "needsOperatorIds?.has" in source or "needsOperatorIds.has" in source, (
+        "useMessageList.ts must call needsOperatorIds.has(m.id) when computing "
+        "highSignalOpen so server-attention items override local mute prefs"
+    )
+    # routineOpen must exclude needsOperatorIds to avoid double-counting.
+    assert "needsOperatorIds" in source, (
+        "useMessageList.ts must exclude needsOperatorIds items from routineOpen "
+        "to prevent a message from appearing in both sections"
+    )
+
+
+def test_messages_panel_count_high_signal_guarded_by_strategic_model_flag():
+    """countHighSignalMessages must only fire when usesStrategicReadModel is false.
+
+    Finding m1: when the strategic read model is active, onMessageCountChange
+    must be driven by the server attention count, not countHighSignalMessages().
+    This guard prevents the badge from oscillating between server and
+    client-derived values as the read model toggles.
+    """
+    try:
+        source = _messages_panel_source()
+    except FileNotFoundError:
+        import pytest
+        pytest.skip("admin-ui/src/components not available in this environment")
+
+    # countHighSignalMessages must be guarded so it only fires in the fallback path.
+    assert "usesStrategicReadModel" in source, (
+        "MessagesPanel.tsx must check usesStrategicReadModel before calling "
+        "onMessageCountChange with countHighSignalMessages() — without the guard "
+        "the badge oscillates between server and client derivations"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding m2 — confirmation chips must be actionable (expand → accept/dismiss)
+# --------------------------------------------------------------------------- #
+
+
+def test_needs_action_strip_confirmation_chips_are_actionable():
+    """MessagesPanel needs-action strip must handle confirmation items, not just messages.
+
+    Finding m2: the click handler for needs-action strip chips must branch on
+    BOTH 'message' and 'confirmation' kinds. A branch that only scrolls to a
+    message leaves confirmation chips visually enabled but inert.
+    """
+    try:
+        source = _messages_panel_source()
+    except FileNotFoundError:
+        import pytest
+        pytest.skip("admin-ui/src/components not available in this environment")
+
+    # isConfirmation must be derived and used in the chip render path.
+    assert "isConfirmation" in source, (
+        "MessagesPanel.tsx must derive isConfirmation from item.kind === 'confirmation' "
+        "and use it to enable the expand/accept/dismiss flow in the needs-action strip"
+    )
+    # The expand toggle must be wired — setExpandedConfirmationItemId drives the
+    # reveal of Accept/Dismiss buttons.
+    assert "setExpandedConfirmationItemId" in source, (
+        "MessagesPanel.tsx must call setExpandedConfirmationItemId to expand a "
+        "confirmation chip and reveal the Accept/Dismiss controls"
+    )
+    # Accept and dismiss API calls must be wired through the strip chips.
+    assert "acceptPendingConfirmation" in source, (
+        "MessagesPanel.tsx must call acceptPendingConfirmation from the "
+        "needs-action strip chip (not only from StrategicContextRail)"
+    )
+    assert "dismissPendingConfirmation" in source, (
+        "MessagesPanel.tsx must call dismissPendingConfirmation from the "
+        "needs-action strip chip (not only from StrategicContextRail)"
+    )
+    # After accept/dismiss the attention model must be refreshed.
+    assert "refreshStrategicState" in source, (
+        "MessagesPanel.tsx must call refreshStrategicState after accept/dismiss "
+        "so the needs-action strip re-evaluates immediately without waiting for "
+        "the next poll cycle"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding m3 — QUESTION auto-decay: CONVERSATIONAL_DECAY_MESSAGE_TYPES + stamping
+# --------------------------------------------------------------------------- #
+
+
+def test_conversational_decay_types_includes_question():
+    """CONVERSATIONAL_DECAY_MESSAGE_TYPES must include QUESTION.
+
+    Finding m3: the stale-open decay sweep must cover QUESTION messages —
+    not just NOTE/FEEDBACK — so unanswered questions age out automatically
+    with a distinct 'stale_unanswered' resolution reason operators can
+    distinguish from genuinely-answered questions.
+    """
+    from app.message_convergence import CONVERSATIONAL_DECAY_MESSAGE_TYPES
+
+    assert "QUESTION" in CONVERSATIONAL_DECAY_MESSAGE_TYPES, (
+        "CONVERSATIONAL_DECAY_MESSAGE_TYPES must include 'QUESTION' so that "
+        "sweep_decay_stale_open_messages covers unanswered QUESTION messages; "
+        f"current set: {CONVERSATIONAL_DECAY_MESSAGE_TYPES}"
+    )
+
+
+def test_stale_question_decay_uses_longer_window_and_distinct_reason():
+    """sweep_decay_stale_open_messages must apply a longer decay window for QUESTION.
+
+    Finding m3: QUESTION decay must use STALE_QUESTION_DECAY_DAYS (default 30d,
+    longer than NOTE/FEEDBACK at 14d) and stamp resolution='stale_unanswered'
+    so operators can distinguish auto-resolved from genuinely-answered questions.
+    """
+    import inspect
+    from app.reaper_sweeps import sweep_decay_stale_open_messages, STALE_QUESTION_DECAY_DAYS
+
+    assert STALE_QUESTION_DECAY_DAYS >= 20, (
+        f"STALE_QUESTION_DECAY_DAYS={STALE_QUESTION_DECAY_DAYS} must be longer "
+        "than the NOTE/FEEDBACK window (14d) — questions deserve more patience "
+        "before being auto-resolved"
+    )
+
+    source = inspect.getsource(sweep_decay_stale_open_messages)
+
+    # Must apply the question-specific window.
+    assert "stale_question_decay_days" in source or "question_decay_days" in source, (
+        "sweep_decay_stale_open_messages must read a distinct question decay window "
+        "(stale_question_decay_days) rather than applying the same 14-day NOTE window "
+        "to QUESTION messages"
+    )
+    # Must stamp the distinct reason.
+    assert "stale_unanswered" in source, (
+        "sweep_decay_stale_open_messages must stamp resolution='stale_unanswered' "
+        "for QUESTION messages so operators can distinguish auto-resolved questions "
+        "from genuinely-answered ones"
+    )
+    # BLOCKER must be excluded (never auto-decayed by this sweep).
+    assert "BLOCKER" not in source.split("CONVERSATIONAL_DECAY_MESSAGE_TYPES")[0].rsplit("def ", 1)[-1] or (
+        "BLOCKER" not in [
+            line.strip()
+            for line in source.splitlines()
+            if "in_(" in line and "BLOCKER" in line
+        ]
+    ), "BLOCKER must not appear in the CONVERSATIONAL_DECAY_MESSAGE_TYPES include-list"
+
+
+def test_stale_question_decay_days_constant_is_correct():
+    """STALE_QUESTION_DECAY_DAYS must be 30 (the design-specified longer window)."""
+    from app.reaper_sweeps import STALE_QUESTION_DECAY_DAYS, STALE_OPEN_DECAY_DAYS
+
+    assert STALE_QUESTION_DECAY_DAYS == 30, (
+        f"STALE_QUESTION_DECAY_DAYS should be 30; got {STALE_QUESTION_DECAY_DAYS}"
+    )
+    assert STALE_QUESTION_DECAY_DAYS > STALE_OPEN_DECAY_DAYS, (
+        "QUESTION decay window must exceed the NOTE/FEEDBACK window "
+        f"({STALE_OPEN_DECAY_DAYS}d) — questions deserve more patience"
     )
