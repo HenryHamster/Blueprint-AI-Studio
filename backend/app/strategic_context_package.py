@@ -1791,14 +1791,18 @@ def _artifact_descriptor(artifact: Dict[str, Any]) -> Dict[str, Any] | None:
             ] = "PDF artifact previews require a signed preview URL."
     elif kind == "chart":
         artifact_series = artifact.get("progress_series")
-        if isinstance(artifact_series, list) and artifact_series:
-            # Group progress samples by metric name; use the metric with the
-            # most entries (typically the declared progress metric).
-            metric_groups: Dict[str, List[Dict[str, Any]]] = {}
+        # Group progress samples by metric name; use the metric with the most
+        # entries (typically the declared progress metric). ``metric_groups``
+        # can end up empty even when ``artifact_series`` is non-empty (e.g. all
+        # entries are non-dicts or the series is malformed), so guard the
+        # ``max()`` call and fall through to the bar-chart fallback below.
+        metric_groups: Dict[str, List[Dict[str, Any]]] = {}
+        if isinstance(artifact_series, list):
             for sample in artifact_series:
                 if isinstance(sample, dict):
                     name = str(sample.get("name", "unknown"))
                     metric_groups.setdefault(name, []).append(sample)
+        if metric_groups:
             best_metric = max(metric_groups, key=lambda k: len(metric_groups[k]))
             best_samples = metric_groups[best_metric]
             # Cap at 300 points to keep the descriptor bounded.

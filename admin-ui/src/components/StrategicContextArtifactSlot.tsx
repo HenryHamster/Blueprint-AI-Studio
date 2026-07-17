@@ -594,7 +594,11 @@ function DetailValue({
  *  y-axis is auto-scaled to the min/max of the values. */
 function LineChart({ points }: { points: StrategicContextDescriptorChartPoint[] }) {
   if (points.length === 0) return null;
-  const vals = points.map(p => Math.abs(p.value));
+  // Plot raw values (not Math.abs) so negative, upward-trending metrics —
+  // common in RL, e.g. rewards -1.0 → -0.5 → 0.1 — render with the correct
+  // trend direction. Mirrors the ComputeJobsPanel.tsx sparkline, which scales
+  // raw values.
+  const vals = points.map(p => p.value);
   const minVal = Math.min(...vals);
   const maxVal = Math.max(...vals);
   const range = maxVal - minVal || 1;
@@ -609,7 +613,7 @@ function LineChart({ points }: { points: StrategicContextDescriptorChartPoint[] 
     .join(' ');
   return (
     <svg width={W} height={H} viewBox={`0 0 ${W} ${H}`} className="w-full overflow-visible" aria-hidden="true">
-      <polyline points={polyPoints} fill="none" stroke="#38bdf8" strokeWidth="1.5" strokeLinejoin="round" strokeLinecap="round" />
+      <polyline points={polyPoints} fill="none" className="stroke-sky-400" strokeWidth="1.5" strokeLinejoin="round" strokeLinecap="round" />
     </svg>
   );
 }

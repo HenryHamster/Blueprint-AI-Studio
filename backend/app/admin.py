@@ -2438,6 +2438,19 @@ class ComputeExperimentTaskPayload(BaseModel):
             raise ValueError("provisioning_model must be STANDARD or SPOT")
         return normalized
 
+    @field_validator("input_artifact_job_id")
+    @classmethod
+    def validate_input_artifact_job_id(cls, v: str | None) -> str | None:
+        # Enforce the comment's contract: must be a valid UUID string. Parse and
+        # re-emit the canonical form so a malformed value is rejected at the
+        # Pydantic layer (422) rather than passed through to the runner.
+        if v is None:
+            return v
+        try:
+            return str(uuid.UUID(v))
+        except (ValueError, AttributeError, TypeError) as exc:
+            raise ValueError("input_artifact_job_id must be a valid UUID string") from exc
+
     @field_validator("base_branch")
     @classmethod
     def validate_branch_name(cls, v: str | None) -> str | None:
