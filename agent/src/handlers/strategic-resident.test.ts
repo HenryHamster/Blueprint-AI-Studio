@@ -577,6 +577,80 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
     expect(urls).toContain('/api/agent/git-read-token');
     expect(urls.some((u) => u.includes('/api/agent/github/token'))).toBe(false);
   });
+
+  it('preserves the advanced message cursor across workspace reclone', async () => {
+    const initialCursor = '2026-01-01T00:00:00.000000';
+    const advancedCursor = '2026-07-15T14:00:00.000000Z';
+    const operatorMessage = {
+      id: 'msg-cursor-check',
+      content: 'operator message after the initial cursor',
+      created_at: advancedCursor,
+      from_type: 'user',
+    };
+    let messagePollCount = 0;
+
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/api/agent/git-read-token')) {
+        return Promise.resolve({ token: 'read-scoped-token' });
+      }
+      if (url.includes('/messages?')) {
+        return Promise.resolve({
+          messages: messagePollCount++ === 0 ? [operatorMessage] : [],
+        });
+      }
+      if (url.includes('checkpoint-state')) {
+        return Promise.resolve({
+          problem_model: {},
+          vision: {},
+          strategic_memory_notes: [],
+          running_update: '',
+          open_messages: [],
+        });
+      }
+      return Promise.resolve(null);
+    });
+    mockPrepareWorkspaceForRole.mockClear();
+    mockApiPost.mockResolvedValue({ authority_held: true });
+
+    let turnCount = 0;
+    const session = makeSession(
+      () => {
+        turnCount += 1;
+        return Promise.resolve(turnResult({
+          resultText: turnCount === 1
+            ? 'acknowledged the operator message'
+            : 'completed one follow-through tick',
+          inputTokens: 50,
+        }));
+      },
+      () => turnCount < 2,
+    );
+    mockStartSession.mockReturnValue(session);
+
+    await handleStrategicResident(
+      'task-cursor-reclone',
+      { project_name: 'CursorProj', open_messages: [] },
+      {
+        project_metadata: { project_id: 'proj-cursor' },
+        context: { message_cursor: initialCursor },
+      },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    const heartbeatCursors = mockApiPost.mock.calls
+      .filter(([url]) => url.includes('heartbeat'))
+      .map(([, body]) => (body as Record<string, unknown>).message_cursor as string | undefined);
+    const lastCursor = heartbeatCursors.at(-1);
+
+    expect(heartbeatCursors.length).toBeGreaterThan(0);
+    expect(turnCount).toBe(2);
+    expect(mockPrepareWorkspaceForRole.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(lastCursor).toBeDefined();
+    expect(lastCursor).not.toBe(initialCursor);
+    expect(new Date(lastCursor ?? 0).getTime()).toBeGreaterThanOrEqual(
+      new Date(advancedCursor).getTime(),
+    );
+  });
 });
 
 // ── Ambient git credential must stay READ-SCOPED (audit finding #10) ───────────

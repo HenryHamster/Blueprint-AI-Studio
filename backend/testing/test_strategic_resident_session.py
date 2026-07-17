@@ -5019,3 +5019,188 @@ async def test_heartbeat_returns_direction_grounding(db_session):
     # Each entry has exactly the three expected keys.
     for entry in grounding:
         assert set(entry.keys()) == {"id", "text", "status"}
+
+
+# ---------------------------------------------------------------------------
+# Combined durability: all fields persisted simultaneously + multi-hop restart
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_all_durability_fields_persisted_simultaneously(db_session):
+    """A single heartbeat that carries decisions_reg, message_cursor, AND the
+    exam ledger (via note) persists ALL three independently into the session blob
+    AND into task.context — no field silently drops when the others are present.
+
+    This exercises the atomicity of the combined write path that the live agent
+    exercises at every turn end: a single heartbeat call carries the whole
+    operator-correction + cursor + ledger trio.
+    """
+    import json as _json
+
+    project = await _make_project_with_member(db_session)
+    task = await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    decisions_reg = (
+        '{"version": 1, "decisions": ['
+        '{"id": "d-1", "tick": 3, "summary": "prefer strategy A"}'
+        "]}"
+    )
+    cursor = "2026-07-10T09:30:00.000000"
+    exam_ledger = _json.dumps(
+        {
+            "records": [{"tick": 3, "surface": "direction:d-1"}],
+            "tick": 3,
+            "corrective": False,
+        }
+    )
+
+    # Establish a baseline lease.
+    project = await db_session.get(Project, project.id)
+    await renew_resident_session_lease(
+        db_session, project, session_id=snap["session_id"],
+        task_id=snap["task_id"], progress=True,
+    )
+
+    # One heartbeat with all three fields together.
+    project = await db_session.get(Project, project.id)
+    result = await renew_resident_session_lease(
+        db_session, project,
+        session_id=snap["session_id"],
+        task_id=snap["task_id"],
+        progress=False,
+        message_cursor=cursor,
+        decisions_reg=decisions_reg,
+        note=exam_ledger,           # exam ledger is serialized into `note`
+    )
+    assert result["authority_held"] is True
+
+    # --- blob: all three fields present -----------------------------------------
+    fresh_project = await db_session.get(Project, project.id)
+    blob = read_resident_session(fresh_project.vision)
+    assert blob is not None
+
+    assert blob.get("_message_cursor") == cursor, (
+        "message_cursor must be written to blob even when decisions_reg is also present"
+    )
+    stored_reg = _json.loads(blob["_decisions_reg"])
+    assert stored_reg["decisions"][0]["summary"] == "prefer strategy A", (
+        "decisions_reg must be written to blob even when message_cursor is also present"
+    )
+    assert blob.get("_exam_ledger") == exam_ledger, (
+        "exam ledger must be written to blob even when decisions_reg+cursor are also present"
+    )
+
+    # --- task.context: all three fields present ----------------------------------
+    fresh_task = await db_session.get(Task, task.id)
+    ctx = fresh_task.context or {}
+
+    assert ctx.get("message_cursor") == cursor, (
+        "message_cursor must be mirrored to task.context"
+    )
+    assert "_decisions_reg" in ctx, (
+        "decisions_reg must be mirrored to task.context"
+    )
+    ctx_reg = _json.loads(ctx["_decisions_reg"])
+    assert ctx_reg["decisions"][0]["summary"] == "prefer strategy A"
+    assert "_exam_ledger" in ctx, (
+        "exam ledger must be mirrored to task.context"
+    )
+
+
+@pytest.mark.asyncio
+async def test_decisions_reg_survives_session_without_update(db_session):
+    """Decisions register written in session A persists in the blob and is
+    carried forward to session C even when session B never updates it.
+
+    This closes the three-hop durability gap: the blob (project.vision) is the
+    authoritative source; a session that happens to see no new operator decisions
+    passes decisions_reg=None in its heartbeats without overwriting the stored
+    value. The restart path reads from the blob, not from the previous task.
+
+    Sequence:
+      Session A  →  heartbeat(decisions_reg=<value>)  →  blob updated
+      Session B  →  heartbeat(decisions_reg=None)      →  blob UNCHANGED
+      Session C  →  started: task.context must carry the value from session A
+    """
+    project = await _make_project_with_member(db_session)
+    await _make_live_local_runner(db_session, project)
+
+    decisions_reg_a = (
+        '{"version": 1, "decisions": ['
+        '{"id": "d-orig", "tick": 1, "summary": "operator approved the research plan"}'
+        "]}"
+    )
+
+    # ── Session A: write decisions_reg ──────────────────────────────────────────
+    task_a = await _make_strategic_review_task(db_session, project)
+    snap_a = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    project = await db_session.get(Project, project.id)
+    await renew_resident_session_lease(
+        db_session, project, session_id=snap_a["session_id"],
+        task_id=snap_a["task_id"], progress=True,
+    )
+    project = await db_session.get(Project, project.id)
+    await renew_resident_session_lease(
+        db_session, project,
+        session_id=snap_a["session_id"],
+        task_id=snap_a["task_id"],
+        progress=False,
+        decisions_reg=decisions_reg_a,
+    )
+
+    # Mark session A's task terminal so session B can start fresh.
+    task_a = await db_session.get(Task, task_a.id)
+    task_a.status = TaskStatus.COMPLETED
+    db_session.add(task_a)
+    task_b_row = await _make_strategic_review_task(db_session, project)
+    await db_session.commit()
+
+    # ── Session B: restart — heartbeats send NO decisions_reg ──────────────────
+    project = await db_session.get(Project, project.id)
+    snap_b = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    assert snap_b["session_id"] != snap_a["session_id"]
+
+    # Session B does a normal liveness heartbeat with no decisions_reg — simulates
+    # a session that observed no operator corrections during its lifetime.
+    project = await db_session.get(Project, project.id)
+    await renew_resident_session_lease(
+        db_session, project, session_id=snap_b["session_id"],
+        task_id=snap_b["task_id"], progress=False,
+        decisions_reg=None,          # explicitly absent
+    )
+
+    # Mark session B's task terminal so session C can start fresh.
+    task_b_row = await db_session.get(Task, task_b_row.id)
+    task_b_row.status = TaskStatus.COMPLETED
+    db_session.add(task_b_row)
+    task_c_row = await _make_strategic_review_task(db_session, project)
+    await db_session.commit()
+
+    # ── Session C: start — must carry decisions_reg from session A ─────────────
+    project = await db_session.get(Project, project.id)
+    snap_c = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    assert snap_c["session_id"] != snap_b["session_id"]
+
+    fresh_task_c = await db_session.get(Task, task_c_row.id)
+    ctx_c = fresh_task_c.context or {}
+    assert "_decisions_reg" in ctx_c, (
+        "decisions_reg from session A must survive two restarts into session C's task.context"
+    )
+    import json as _json
+    reg = _json.loads(ctx_c["_decisions_reg"])
+    assert len(reg["decisions"]) == 1
+    assert reg["decisions"][0]["id"] == "d-orig", (
+        "the exact operator correction from session A must be in session C's context"
+    )
+    assert reg["decisions"][0]["summary"] == "operator approved the research plan"
