@@ -7,7 +7,6 @@ import json
 import logging
 import tempfile
 import uuid
-from datetime import datetime, timezone
 from typing import Any, Dict
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
@@ -39,12 +38,6 @@ from app.vm_cost_rates import resolve_compute_machine_type, supported_machine_ty
 
 _LIVE_TAIL_MAX_DECODED_BYTES = 20480
 _LIVE_TAIL_MAX_TEXT_CHARS = 10240
-# VMs started by the serving tree before this deploy still send their public job
-# UUID as the heartbeat bearer.  Keep that compatibility path narrowly scoped to
-# rows created before the HMAC rollout; rows at or after the boundary are HMAC-only.
-_COMPUTE_JOB_HEARTBEAT_HMAC_ROLLOUT_AT = datetime(
-    2026, 7, 14, 7, 24, 41, tzinfo=timezone.utc
-).replace(tzinfo=None)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/agent", tags=["agent"])
@@ -53,15 +46,17 @@ router = APIRouter(prefix="/api/agent", tags=["agent"])
 def _accepts_legacy_compute_heartbeat(job: ComputeJob, bearer: str) -> bool:
     """Whether a pre-HMAC VM may use its legacy UUID bearer.
 
-    This is intentionally fail-closed for rows without a creation timestamp and
-    for jobs created exactly at the rollout boundary, where the HMAC startup
-    script is already the required contract.
+    A job is treated as launched under the HMAC contract when its
+    polling_metadata carries ``heartbeat_auth == "hmac"`` — a marker stamped at
+    launch time by the backend that embedded the HMAC token in the startup
+    script.  Jobs without that marker were launched by a pre-HMAC engine and
+    may authenticate with the bare job UUID (constant-time compare).  Jobs with
+    the marker are HMAC-only (fail-closed).
     """
-    return (
-        job.created_at is not None
-        and job.created_at < _COMPUTE_JOB_HEARTBEAT_HMAC_ROLLOUT_AT
-        and hmac.compare_digest(bearer.encode("utf-8"), str(job.id).encode("ascii"))
-    )
+    meta = job.polling_metadata or {}
+    if meta.get("heartbeat_auth") == "hmac":
+        return False
+    return hmac.compare_digest(bearer.encode("utf-8"), str(job.id).encode("ascii"))
 
 
 class LaunchComputeJobRequest(BaseModel):

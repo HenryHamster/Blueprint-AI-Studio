@@ -1094,7 +1094,16 @@ class GcpComputeBackend:
                 started_at=started_at or _utcnow(),
                 cost_rate_per_second=0.0,
                 message="adopted existing compute-job VM",
-                metadata={"zone": existing_zone, "artifact_uri": artifact_uri},
+                # The adopted VM was provisioned by this backend, so its startup
+                # script embeds the HMAC heartbeat token just like the normal
+                # path below. Stamp the marker so legacy UUID-bearer heartbeats
+                # are rejected for the crash-recovered job too — otherwise anyone
+                # knowing the job UUID could spoof its heartbeats.
+                metadata={
+                    "zone": existing_zone,
+                    "artifact_uri": artifact_uri,
+                    "heartbeat_auth": "hmac",
+                },
             )
         runtime_budget_seconds = spec.runtime_deadline_seconds
         if runtime_budget_seconds is not None:
@@ -1137,7 +1146,12 @@ class GcpComputeBackend:
         if not ok:
             raise RuntimeError("GCP compute-job VM provisioning failed")
         zone = await asyncio.to_thread(compute.get_vm_zone, external_id)
-        metadata: Dict[str, Any] = {"artifact_uri": artifact_uri}
+        metadata: Dict[str, Any] = {
+            "artifact_uri": artifact_uri,
+            # Durable per-job marker: this VM's startup script embeds the HMAC
+            # heartbeat token, so legacy UUID-bearer heartbeats must be rejected.
+            "heartbeat_auth": "hmac",
+        }
         if spec.provisioning_deadline_at is not None:
             metadata["provisioning_deadline_at"] = (
                 spec.provisioning_deadline_at.isoformat()

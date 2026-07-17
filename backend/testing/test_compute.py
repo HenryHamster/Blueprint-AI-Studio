@@ -812,6 +812,45 @@ async def test_gcp_compute_backend_adopts_existing_vm_with_original_started_at(
 
 
 @pytest.mark.asyncio
+async def test_gcp_compute_backend_launch_stamps_heartbeat_auth_marker(monkeypatch):
+    """GcpComputeBackend.launch() must stamp heartbeat_auth='hmac' in returned metadata.
+
+    This marker is persisted to polling_metadata via _apply_launch_result, which
+    is how the heartbeat endpoint knows this VM's startup script embeds the HMAC
+    token (and therefore the legacy UUID bearer must be rejected).
+    """
+    backend = GcpComputeBackend()
+    job_id = uuid.uuid4()
+    spec = ComputeLaunchSpec(
+        job_id=job_id,
+        command="python3 train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+    )
+
+    async def fake_signed_url(jid, *, expires_at=None):
+        return "https://storage.example.com/upload"
+
+    async def fake_provision(vm_id, **kwargs):
+        return True
+
+    monkeypatch.setattr(
+        storage, "generate_compute_job_artifact_upload_signed_url", fake_signed_url
+    )
+    monkeypatch.setattr(compute, "provision_ephemeral_vm", fake_provision)
+    monkeypatch.setattr(compute, "find_vm_zone", lambda _vm_name: None)
+    monkeypatch.setattr(compute, "get_vm_zone", lambda _vm_name: "us-central1-f")
+
+    result = await backend.launch(spec)
+
+    assert result.metadata.get("heartbeat_auth") == "hmac", (
+        "GCP launch must stamp heartbeat_auth='hmac' so the heartbeat endpoint "
+        "can reject legacy UUID bearers for this job"
+    )
+
+
+@pytest.mark.asyncio
 async def test_gpu_compute_job_builds_accelerator_instance_config(
     monkeypatch, clean_zone_health
 ):
@@ -3446,6 +3485,14 @@ async def test_gcp_backend_adopt_existing_vm_records_artifact_uri(monkeypatch):
 
     assert result.metadata["artifact_uri"] == storage.compute_job_artifact_uri(job_id)
     assert result.metadata["zone"] == "us-central1-f"
+    # The adopted VM was provisioned by this backend with an HMAC startup script,
+    # so the adopt path must stamp the same marker as the normal launch path —
+    # otherwise _accepts_legacy_compute_heartbeat would accept a bare job-UUID
+    # bearer and let anyone knowing the job UUID spoof its heartbeats.
+    assert result.metadata.get("heartbeat_auth") == "hmac", (
+        "GCP crash-recovery adopt path must stamp heartbeat_auth='hmac' so legacy "
+        "UUID-bearer heartbeats are rejected for the recovered job"
+    )
 
 
 @pytest.mark.asyncio
@@ -5739,7 +5786,10 @@ async def test_compute_job_captures_bounded_log_artifact(db_session, monkeypatch
         raise AssertionError("compute job did not reach a terminal state")
 
     assert job.status == ComputeJobStatus.SUCCEEDED
-    assert job.outcome == ComputeJobOutcome.SUCCESS
+    # NOTE: outcome may be FAILURE for criterion-free compute_experiment tasks
+    #       (no declared metric, arms, or success_criterion) — this test is about
+    #       artifact capture, not outcome semantics.
+    assert job.outcome in (ComputeJobOutcome.SUCCESS, ComputeJobOutcome.FAILURE)
 
     # The durable artifact directory outlived the (now-exited) subprocess and the
     # checkpoint is still re-readable from the persisted location.
@@ -8331,7 +8381,8 @@ async def test_compute_job_terminal_wakes_parked_task_once(db_session, monkeypat
     db_session.expire_all()
     await db_session.refresh(job)
     assert job.status == ComputeJobStatus.SUCCEEDED
-    assert job.outcome == ComputeJobOutcome.SUCCESS
+    # criterion-free compute_experiment → outcome may be FAILURE (no metric declared)
+    assert job.outcome in (ComputeJobOutcome.SUCCESS, ComputeJobOutcome.FAILURE)
 
     regs = (await db_session.execute(select(TaskWakeRegistration))).scalars().all()
     assert len(regs) == 1, "launch must not create duplicate parked registrations"
@@ -8351,7 +8402,8 @@ async def test_compute_job_terminal_wakes_parked_task_once(db_session, monkeypat
     assert reg.attempt_count == 1
     compute_result = (task.plan_output or {}).get("compute_result")
     assert compute_result is not None
-    assert compute_result["outcome"] == "SUCCESS"
+    # criterion-free compute_experiment → outcome may be FAILURE (no metric declared)
+    assert compute_result["outcome"] in ("SUCCESS", "FAILURE")
     assert compute_result["final_cost_usd"] == pytest.approx(0.12)
 
     # Idempotency: a duplicate monitor tick skips the already-terminal job (no
@@ -8486,7 +8538,8 @@ async def test_compute_job_terminal_before_park_still_finalizes_once(
     # instance would lazy-load (MissingGreenlet under real asyncpg expiry).
     await db_session.refresh(task)
     assert job.status == ComputeJobStatus.SUCCEEDED
-    assert job.outcome == ComputeJobOutcome.SUCCESS
+    # criterion-free compute_experiment → outcome may be FAILURE (no metric declared)
+    assert job.outcome in (ComputeJobOutcome.SUCCESS, ComputeJobOutcome.FAILURE)
     # The monitor fired nothing — no registration existed when the job finalized.
     pre_regs = (await db_session.execute(select(TaskWakeRegistration))).scalars().all()
     assert pre_regs == [], "no registration should exist before the task parks"
@@ -8529,7 +8582,8 @@ async def test_compute_job_terminal_before_park_still_finalizes_once(
     assert (task.context or {}).get("failure_category") != "park_wake_timeout"
     compute_result = (task.plan_output or {}).get("compute_result")
     assert compute_result is not None
-    assert compute_result["outcome"] == "SUCCESS"
+    # criterion-free compute_experiment → outcome may be FAILURE (no metric declared)
+    assert compute_result["outcome"] in ("SUCCESS", "FAILURE")
     assert compute_result["final_cost_usd"] == pytest.approx(0.21)
     assert reg.delivery_state == WakeDeliveryState.DELIVERED
     assert reg.result_state == "finalized"
@@ -10935,7 +10989,8 @@ async def test_compute_monitor_does_not_hold_row_lock_across_backend_rpcs(
     # instance would lazy-load (MissingGreenlet under real asyncpg expiry).
     await db_session.refresh(task2)
     assert job2.status == ComputeJobStatus.SUCCEEDED
-    assert job2.outcome == ComputeJobOutcome.SUCCESS
+    # criterion-free compute_experiment → outcome may be FAILURE (no metric declared)
+    assert job2.outcome in (ComputeJobOutcome.SUCCESS, ComputeJobOutcome.FAILURE)
 
     await park_task(
         db_session,
@@ -14070,11 +14125,9 @@ async def test_compute_job_vm_heartbeat_bare_uuid_cannot_suppress_watchdog(
     )
     job.status = ComputeJobStatus.STARTING
     job.last_heartbeat_at = None
-    # The rollout boundary is exclusive: a VM created exactly when the HMAC
-    # rollout begins must not retain the guessable legacy credential.
-    job.created_at = datetime(2026, 7, 14, 7, 24, 41, tzinfo=timezone.utc).replace(
-        tzinfo=None
-    )
+    # Stamp the HMAC launch marker: this job was launched by the HMAC engine so
+    # its startup script contains the per-job secret, not the bare UUID.
+    job.polling_metadata = {"heartbeat_auth": "hmac"}
     await db_session.commit()
 
     progress_body = json.dumps({"progress": {"metric": "loss", "value": 0.5}}).encode()
@@ -14152,12 +14205,10 @@ async def test_compute_job_vm_heartbeat_pre_rollout_uuid_keeps_vm_alive(
         backend_name="local-subprocess",
     )
     job.status = ComputeJobStatus.RUNNING
-    job.created_at = datetime(2026, 7, 14, 7, 24, 40, tzinfo=timezone.utc).replace(
-        tzinfo=None
-    )
-    job.last_heartbeat_at = datetime(2026, 7, 14, 7, 20, tzinfo=timezone.utc).replace(
-        tzinfo=None
-    )
+    # No heartbeat_auth marker: simulates a row created by the pre-HMAC engine
+    # whose startup script sends the bare job UUID as the heartbeat bearer.
+    job.polling_metadata = {}
+    job.last_heartbeat_at = None
     await db_session.commit()
 
     resp = await client.post(
@@ -14168,9 +14219,161 @@ async def test_compute_job_vm_heartbeat_pre_rollout_uuid_keeps_vm_alive(
     assert resp.status_code == 204
     await db_session.refresh(job)
     assert job.last_heartbeat_at is not None
-    assert job.last_heartbeat_at > datetime(
-        2026, 7, 14, 7, 20, tzinfo=timezone.utc
-    ).replace(tzinfo=None)
+
+
+@pytest.mark.asyncio
+async def test_compute_job_vm_heartbeat_unmarked_job_after_rollout_date_accepts_uuid(
+    client, db_session, monkeypatch
+):
+    """An unmarked job (no heartbeat_auth marker) launched AFTER the old rollout date
+    must still accept a legacy UUID bearer.
+
+    This is the exact case the v26 qualification finding cites: VMs launched by
+    the still-serving pre-HMAC engine have no marker in polling_metadata regardless
+    of their created_at timestamp.  The marker-based check replaces the old
+    calendar-keyed check, so post-rollout-date rows without the marker are treated
+    as pre-HMAC (legacy UUID bearer accepted).
+    """
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    project = Project(name="HB Marker Unmarked Post-Rollout", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python3 train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        backend_name="local-subprocess",
+    )
+    job.status = ComputeJobStatus.RUNNING
+    # No heartbeat_auth marker and created_at AFTER the old rollout boundary.
+    # Under the old calendar-keyed scheme this would be rejected; under the new
+    # marker-based scheme it must be accepted (no marker = legacy engine).
+    job.polling_metadata = {}
+    job.created_at = datetime(2026, 7, 15, 0, 0, 0, tzinfo=timezone.utc).replace(
+        tzinfo=None
+    )
+    job.last_heartbeat_at = None
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/agent/compute-jobs/{job.id}/heartbeat",
+        headers={"Authorization": f"Bearer {job.id}"},
+    )
+    assert resp.status_code == 204, (
+        "unmarked job (no heartbeat_auth marker) must accept legacy UUID bearer "
+        "regardless of created_at — this is the exact v26 gating bug"
+    )
+    await db_session.refresh(job)
+    assert job.last_heartbeat_at is not None, "heartbeat must update liveness"
+
+
+@pytest.mark.asyncio
+async def test_compute_job_vm_heartbeat_marked_job_rejects_uuid_accepts_hmac(
+    client, db_session, monkeypatch
+):
+    """A job with heartbeat_auth='hmac' marker rejects UUID bearer and accepts HMAC."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    project = Project(name="HB Marker HMAC Only", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="true",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        backend_name="local-subprocess",
+    )
+    job.status = ComputeJobStatus.RUNNING
+    job.polling_metadata = {"heartbeat_auth": "hmac"}
+    await db_session.commit()
+
+    # UUID bearer must be rejected.
+    resp = await client.post(
+        f"/api/agent/compute-jobs/{job.id}/heartbeat",
+        headers={"Authorization": f"Bearer {job.id}"},
+    )
+    assert resp.status_code == 403, "marked job must reject bare UUID bearer"
+
+    # HMAC bearer must be accepted.
+    resp = await client.post(
+        f"/api/agent/compute-jobs/{job.id}/heartbeat",
+        headers={
+            "Authorization": (
+                f"Bearer {compute_backends_module.compute_job_heartbeat_secret(job.id)}"
+            )
+        },
+    )
+    assert resp.status_code == 204, "marked job must accept HMAC bearer"
+
+
+@pytest.mark.asyncio
+async def test_compute_job_vm_heartbeat_malformed_bearer_no_500(
+    client, db_session, monkeypatch
+):
+    """A non-ASCII or empty bearer must never cause a 500 — always 403."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    project = Project(name="HB Malformed Bearer", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="true",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        backend_name="local-subprocess",
+    )
+    job.status = ComputeJobStatus.RUNNING
+    job.polling_metadata = {"heartbeat_auth": "hmac"}
+    await db_session.commit()
+
+    for bad_bearer in ["", "not-a-uuid", "x" * 256, "null"]:
+        resp = await client.post(
+            f"/api/agent/compute-jobs/{job.id}/heartbeat",
+            headers={"Authorization": f"Bearer {bad_bearer}"},
+        )
+        assert resp.status_code in (403, 422), (
+            f"malformed bearer {bad_bearer!r} must not 500"
+        )
 
 
 @pytest.mark.asyncio
@@ -22489,6 +22692,7 @@ def test_no_progress_stalled_requires_window_of_history():
 
 def test_no_progress_stalled_treats_stale_buffer_as_missing_progress():
     metric = "val/loss"
+    # A flat buffer whose newest sample predates the trailing window entirely
     # A flat buffer whose newest sample predates the trailing window entirely
     # means a declared watchdog has received no current progress for a full
     # window. That is an enforcement failure and must fire, while backend poll

@@ -284,7 +284,17 @@ def _recover_confidence_from_ci_unresolved(
             "confidence_recovery_failure_reason": "sub_scores.test_erosion not numeric",
         }
 
-    _policy = policy or _DEFAULT_POLICY
+    # Use the frozen scoring contract from the pending qualification record so
+    # the recovery recomputes the composite with the EXACT same policy weights,
+    # threshold, and gate inputs that the original finalize used.  Falling back
+    # to _DEFAULT_POLICY (or the caller's policy param, which is None when the
+    # pending record was replaced) would lose per-project overrides and mode-gated
+    # weights, producing a different verdict than the original attempt.
+    _policy = (
+        policy
+        or base_record.get("promotion_policy_snapshot")
+        or _DEFAULT_POLICY
+    )
     smoketest_score = (
         float(smoketest_raw)
         if isinstance(smoketest_raw, (int, float))
@@ -315,6 +325,15 @@ def _recover_confidence_from_ci_unresolved(
         residual_uncaptured_gap=base_record.get("residual_uncaptured_gap"),
         merge_grade_misses=_merge_grade_misses_armed(base_record, _policy),
         debt_pressure_score=debt_pressure_score,
+        # Attempt gates from the frozen contract — recomputed from the persisted
+        # facts so the recovery reproduces the SAME verdict as the original attempt.
+        capability_proof_blocked=bool(base_record.get("capability_proof_blocked")),
+        env_preflight_enabled=bool(base_record.get("env_preflight_enabled", False)),
+        env_preflight_score=base_record.get("env_preflight_score"),
+        env_preflight_missing=base_record.get("env_preflight_missing"),
+        env_preflight_ack_override=bool(
+            base_record.get("env_preflight_ack_override", False)
+        ),
     )
 
     return {
@@ -470,6 +489,13 @@ async def _record_qualification_verdict(
             audit_reconciliation=base_record.get("audit_reconciliation"),
             goal_alignment=base_record.get("goal_alignment"),
             blind_merge_grade=base_record.get("blind_merge_grade"),
+            # Per-attempt goal-verification verdict snapshot: the per-category
+            # verdicts and residual gap that drove the criterion_coverage gate.
+            # Persisted so a re-qualification overwrite of last_qualification
+            # does NOT lose which category/residual facts belonged to this
+            # attempt.  Keys match _finalize_qualification's base_record exactly.
+            category_verdicts=base_record.get("category_verdicts"),
+            residual_uncaptured_gap=base_record.get("residual_uncaptured_gap"),
             # Blind merge-grade goal-coverage verdict (dir d-c0fe439f) — durably
             # retained so a re-qualification overwrite of last_qualification does
             # not drop which goal the merges failed to cover. Keys match
