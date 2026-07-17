@@ -1220,15 +1220,19 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
   }, [projectId]);
 
   // Auto-fetch durable knowledge docs for terminal jobs that have a knowledge_document_id.
+  // Guards stale responses with a cancelled flag so a project switch never
+  // inserts old-project documents alongside new-project documents.
   useEffect(() => {
     if (!projectId) return;
+    let cancelled = false;
     for (const job of jobs) {
       const docId = job.knowledge_document_id;
       if (!docId || isComputeJobActive(job) || knowledgeDocs[job.id]) continue;
       fetchKnowledgeDocument(projectId, docId).then((doc) => {
-        setKnowledgeDocs((prev) => ({ ...prev, [job.id]: doc }));
+        if (!cancelled) setKnowledgeDocs((prev) => ({ ...prev, [job.id]: doc }));
       }).catch(() => {/* non-fatal */});
     }
+    return () => { cancelled = true; };
   }, [jobs, projectId, knowledgeDocs]);
 
   // Local 1s clock drives the live deadline countdowns between polls, plus the

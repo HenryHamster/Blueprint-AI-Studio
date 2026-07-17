@@ -805,20 +805,31 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
   // Which runner's allow-list is mid-mutation (add/remove) — drives the spinner.
   const [mutatingProjects, setMutatingProjects] = useState<string | null>(null);
   const mountedRef = useRef(true);
+  // Request-epoch guard: bumped on projectId change so a slow response from
+  // the previous project never overwrites the current project's state.
+  const requestEpochRef = useRef(0);
 
   useEffect(() => {
     mountedRef.current = true;
     return () => { mountedRef.current = false; };
   }, []);
 
+  // Bump epoch on project switch to invalidate any in-flight load() from
+  // the previous project.
+  useEffect(() => {
+    requestEpochRef.current += 1;
+  }, [projectId]);
+
   // showLoading is opt-in so only the initial / projectId-change load surfaces
   // the full-panel spinner; background polls and refreshSignal reloads refresh
   // silently. Keeping setLoading(true) inside this callback (not in the effect
   // body) also keeps the effects free of a synchronous setState.
   const load = useCallback(async (showLoading = false) => {
+    const epoch = requestEpochRef.current;
     if (showLoading && mountedRef.current) setLoading(true);
     try {
       const data = await listFleetRunners(projectId);
+      if (epoch !== requestEpochRef.current) return;
       if (mountedRef.current) { setRunners(data); setError(null); }
       // Fetch each runner's project allow-list concurrently. Best-effort: a
       // per-runner failure resolves to null and simply omits that runner's
@@ -826,6 +837,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
       const lists = await Promise.all(
         data.map(r => listRunnerProjects(r.enrollment_project_id ?? projectId, r.id).catch(() => null)),
       );
+      if (epoch !== requestEpochRef.current) return;
       if (mountedRef.current) {
         const map: Record<string, RunnerProjectAllowList> = {};
         data.forEach((r, i) => {
@@ -835,9 +847,11 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
         setRunnerProjects(map);
       }
     } catch (e) {
-      if (mountedRef.current) setError(e instanceof Error ? e.message : String(e));
+      if (epoch === requestEpochRef.current && mountedRef.current) {
+        setError(e instanceof Error ? e.message : String(e));
+      }
     } finally {
-      if (mountedRef.current) setLoading(false);
+      if (epoch === requestEpochRef.current && mountedRef.current) setLoading(false);
     }
   }, [projectId]);
 

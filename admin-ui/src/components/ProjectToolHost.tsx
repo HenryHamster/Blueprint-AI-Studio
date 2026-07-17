@@ -103,6 +103,15 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
   const [manifestState, setManifestState] = useState<ManifestState>({ status: 'loading' });
   const abortRef = useRef<AbortController | null>(null);
   const [computeImageState, setComputeImageState] = useState<ComputeImageFetchState>({ status: 'idle' });
+  // Reset per-project state when projectId changes so the previous project's
+  // data is never briefly visible while the new project's data is loading.
+  const projectKeyRef = useRef(projectId);
+  useEffect(() => {
+    if (projectKeyRef.current === projectId) return;
+    projectKeyRef.current = projectId;
+    setManifestState({ status: 'loading' });
+    setComputeImageState({ status: 'idle' });
+  }, [projectId]);
   const [driftLoading, setDriftLoading] = useState(false);
   const [actionProjectId, setActionProjectId] = useState<string | null>(null);
 
