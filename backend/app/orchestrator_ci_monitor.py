@@ -56,6 +56,18 @@ _VERIFY_TESTS_MAX_RETRIES = 1
 _VERIFY_TESTS_SPAWN_DEFERRAL_CAP = 5
 
 
+def _verify_spawn_requires_fresh_pr_state(
+    *, pr_fetched_this_poll: bool, verify_task_id: str | None
+) -> bool:
+    """Prevent stale cached-open PR data from launching obsolete test VMs.
+
+    The CI fast path deliberately fabricates ``state=open`` between bounded PR
+    refreshes. That is safe for read-only check polling, but not for the first
+    expensive verify-tests spawn: the PR may already have merged meanwhile.
+    """
+    return not pr_fetched_this_poll and not verify_task_id
+
+
 def _ci_result_from_resolved_pr_ci_status(resolved: dict) -> dict | None:
     """Build the ci_result handoff for terminal resolver states."""
     state = resolved.get("state")
@@ -1929,6 +1941,34 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
                         "fail", ci_loop.get("verify_tests_output", "")
                     )
                 elif not _v_task_id:
+                    if _verify_spawn_requires_fresh_pr_state(
+                        pr_fetched_this_poll=need_pr_fetch,
+                        verify_task_id=_v_task_id,
+                    ):
+                        # The cached-head fast path intentionally substitutes an
+                        # optimistic open PR shape. Force the next cycle through
+                        # get_pull_request before provisioning a verify VM so a
+                        # PR merged between refreshes terminalizes instead of
+                        # spawning an obsolete post-merge test task.
+                        ci_loop["polls_since_pr_fetch"] = 999
+                        ci_loop["ci_poll_interval"] = min(ci_poll_interval, 30)
+                        ci_loop["ci_last_polled"] = _utcnow().isoformat()
+                        ci_task.latest_status_message = (
+                            f"PR #{ci_pr_number} — refreshing live PR state "
+                            "before detected-test spawn"
+                        )
+                        ci_task.context = {
+                            **(ci_task.context or {}),
+                            "review_loop": ci_loop,
+                        }
+                        flag_modified(ci_task, "context")
+                        session.add(ci_task)
+                        await session.commit()
+                        logger.info(
+                            f"[CI] PR #{ci_pr_number} no-CI merge gate: "
+                            "forcing fresh PR state before verify_tests spawn"
+                        )
+                        continue
                     # First encounter: spawn verify_tests on PR head.
                     _v_branch = _resolve_ci_fix_branch(
                         ci_loop, ci_task.first_payload, pr_data

@@ -164,6 +164,34 @@ async def test_ci_monitor_extraction_contract(db_session, mocker):
     assert refreshed.status == TaskStatus.EVALUATING
 
 
+def test_verify_spawn_forces_fresh_pr_state_after_cached_open_fast_path():
+    """A stale cached ``open`` shape cannot launch a post-merge verifier."""
+    import inspect
+
+    from app.orchestrator_ci_monitor import (
+        _monitor_evaluating_tasks,
+        _verify_spawn_requires_fresh_pr_state,
+    )
+
+    assert _verify_spawn_requires_fresh_pr_state(
+        pr_fetched_this_poll=False,
+        verify_task_id=None,
+    )
+    assert not _verify_spawn_requires_fresh_pr_state(
+        pr_fetched_this_poll=True,
+        verify_task_id=None,
+    )
+    assert not _verify_spawn_requires_fresh_pr_state(
+        pr_fetched_this_poll=False,
+        verify_task_id="existing-verifier",
+    )
+
+    source = inspect.getsource(_monitor_evaluating_tasks)
+    assert "_verify_spawn_requires_fresh_pr_state(" in source
+    assert 'ci_loop["polls_since_pr_fetch"] = 999' in source
+    assert "refreshing live PR state" in source
+
+
 # ── Contention quarantine bound ───────────────────────────────────────────────
 
 
