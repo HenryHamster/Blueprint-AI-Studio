@@ -80,8 +80,10 @@ async def _send_conversation(
 
 def test_sequence_critical_section_contains_only_atomic_acceptance_work():
     source = inspect.getsource(create_operator_project_message)
-    arming_at = source.index("arming = await maybe_arm_operator_refresh")
-    project_fence_at = source.index("locked_project = (", arming_at)
+    workbench_at = source.index("await persist_strategic_workbench_update")
+    workbench_flush_at = source.index("await session.flush()", workbench_at)
+    project_fence_at = source.index("await lock_resident_message_owner_state")
+    arming_at = source.index("arming = await maybe_arm_operator_refresh", project_fence_at)
     identity_lock_at = source.index(
         "await _lock_operator_idempotency_key",
         project_fence_at,
@@ -102,8 +104,10 @@ def test_sequence_critical_section_contains_only_atomic_acceptance_work():
     commit_at = source.index("await session.commit()", message_at)
 
     assert (
-        arming_at
+        workbench_at
+        < workbench_flush_at
         < project_fence_at
+        < arming_at
         < identity_lock_at
         < reply_at
         < precommit_at

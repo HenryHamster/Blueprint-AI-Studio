@@ -149,6 +149,7 @@ def create_agent_token(
     task_type: str = "",
     project_id: str = "",
     ttl_hours: int = AGENT_TOKEN_TTL_HOURS,
+    claim_nonce: str = "",
 ) -> str:
     """Generate a short-lived JWT for a specific agent VM.
 
@@ -160,12 +161,15 @@ def create_agent_token(
     expire = datetime.now(timezone.utc) + timedelta(hours=ttl_hours)
     to_encode = {
         "sub": str(task_id),
+        "jti": str(uuid.uuid4()),
         "vm_instance_id": vm_instance_id,
         "task_type": task_type,
         "project_id": project_id,
         "exp": expire,
         "iat": datetime.now(timezone.utc),
     }
+    if claim_nonce:
+        to_encode["claim_nonce"] = claim_nonce
     encoded_jwt = jwt.encode(to_encode, AGENT_JWT_SECRET, algorithm=AGENT_JWT_ALGORITHM)
     return encoded_jwt
 

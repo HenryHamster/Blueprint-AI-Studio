@@ -54,7 +54,7 @@ def test_task_capability_modes_partition_all_known_types():
 
 def test_task_capability_execution_owners_partition_all_known_types():
     assert AGENT_EXECUTED_TASK_TYPES
-    assert BACKEND_MANAGED_TASK_TYPES == frozenset({"strategic_resident_turn"})
+    assert not BACKEND_MANAGED_TASK_TYPES
     assert AGENT_EXECUTED_TASK_TYPES.isdisjoint(BACKEND_MANAGED_TASK_TYPES)
     assert AGENT_EXECUTED_TASK_TYPES | BACKEND_MANAGED_TASK_TYPES == ALL_TASK_TYPES
 
@@ -165,9 +165,15 @@ def test_strategic_task_types_match_legacy_tuple():
 
 
 def test_strategic_local_runner_preset_tracks_registry():
+    from app.task_capabilities import STRATEGIC_LOCAL_AGENT_TASK_TYPES
     from app.routers import admin_runners
 
-    assert set(admin_runners._STRATEGIC_LOCAL_TASK_TYPES) == set(STRATEGIC_TASK_TYPES)
+    assert set(admin_runners._STRATEGIC_LOCAL_TASK_TYPES) == set(
+        STRATEGIC_LOCAL_AGENT_TASK_TYPES
+    )
+    assert STRATEGIC_LOCAL_AGENT_TASK_TYPES == (
+        STRATEGIC_TASK_TYPES | {"strategic_resident_turn"}
+    )
 
 
 def test_strategic_phase_ordering_is_registry_declared():
@@ -605,12 +611,12 @@ def test_task_type_catalog_launchable_flags_and_output_kinds():
         "cost_ceiling_usd": 5.0,
         "run_shape": "experiment_loop",
     }
-    assert by_id["strategic_resident_turn"]["execution_owner"] == "backend"
+    assert by_id["strategic_resident_turn"]["execution_owner"] == "agent"
     assert by_id["strategic_resident_turn"]["filter_visible"] is False
-    assert by_id["strategic_resident_turn"]["provider_configurable"] is False
+    assert by_id["strategic_resident_turn"]["provider_configurable"] is True
     assert by_id["strategic_resident_turn"]["user_launchable"] is False
     assert by_id["strategic_resident_turn"]["requires_code"] is False
-    assert by_id["strategic_resident_turn"]["cost_ceiling_usd"] == 0.0
+    assert by_id["strategic_resident_turn"]["cost_ceiling_usd"] == 4.0
     # Panel review is a multi-agent workflow producing a verdict artifact with a
     # higher cost ceiling than the normal review path and is now launchable
     # because the executable workflow is live.

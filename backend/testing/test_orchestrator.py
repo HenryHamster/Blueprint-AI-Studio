@@ -12116,6 +12116,154 @@ async def test_retry_after_release_clears_failure_class(db_session, mocker):
     )
 
 
+class TestResidentProviderPolicyDispatch:
+    """The cold orchestrator must not escape a rejected Resident route.
+
+    This drives the real selector through the one-cycle dispatch harness.  A
+    configured Anthropic environment credential is deliberately available so
+    the test fails if a policy hold is collapsed to ``None`` and then silently
+    falls through the generic environment-credential fallback.
+    """
+
+    orch_warm_db = TestWarmVMSkipProvision.orch_warm_db  # type: ignore[attr-defined]
+    _run_one_cycle = staticmethod(TestWarmVMSkipProvision._run_one_cycle)  # type: ignore[attr-defined]
+    _naive_utcnow = staticmethod(TestWarmVMSkipProvision._naive_utcnow)  # type: ignore[attr-defined]
+
+    @pytest.mark.parametrize(
+        ("payload", "context"),
+        [
+            pytest.param(
+                {
+                    "type": "strategic_resident_turn",
+                    "shadow_only": False,
+                    "resident_provider_policy": {
+                        "provider": "openai",
+                        "model": "gpt-5.4",
+                    },
+                    "resident_failover_policy": {},
+                },
+                {"_resident_no_silent_provider_downgrade": True},
+                id="unsafe-pinned-provider",
+            ),
+            pytest.param(
+                {
+                    "type": "strategic_resident_turn",
+                    "shadow_only": False,
+                    "provider_preference": ["openai"],
+                    "resident_provider_policy": {},
+                    "resident_failover_policy": {},
+                },
+                {"_resident_no_silent_provider_downgrade": True},
+                id="unsafe-only-unpinned-route",
+            ),
+            pytest.param(
+                {
+                    "type": "strategic_resident_turn",
+                    "shadow_only": False,
+                    "provider_preference": ["anthropic"],
+                    "resident_provider_policy": {"provider": "anthropic"},
+                    "resident_failover_policy": {},
+                },
+                {},
+                id="missing-no-silent-downgrade-fence",
+            ),
+            pytest.param(
+                {
+                    "type": "strategic_resident_turn",
+                    "shadow_only": False,
+                    "provider_preference": ["anthropic"],
+                    "resident_provider_policy": {"provider": "zai"},
+                    "resident_failover_policy": {},
+                },
+                {"_resident_no_silent_provider_downgrade": True},
+                id="primary-forbidden-by-project-route",
+            ),
+            pytest.param(
+                {
+                    "type": "strategic_resident_turn",
+                    "shadow_only": False,
+                    "provider_preference": ["anthropic"],
+                    "resident_provider_policy": {"model": "gpt-5.4"},
+                    "resident_failover_policy": {},
+                },
+                {
+                    "_resident_no_silent_provider_downgrade": True,
+                    "_resident_mutation_authorized": True,
+                    "_resident_input_frozen": True,
+                },
+                id="model-pin-without-provider",
+            ),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_unsafe_resident_route_holds_before_env_fallback(
+        self, orch_warm_db, mocker, monkeypatch, payload, context
+    ):
+        from sqlmodel import select as _select
+
+        import app.orchestrator as _orch_module
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "must-not-be-used")
+        env_fallback = mocker.spy(_orch_module, "_resolve_env_runtime_fallback")
+        provision = mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+        mocker.patch(
+            "app.orchestrator._sync_runtime_config_from_state",
+            new_callable=AsyncMock,
+            return_value=[],
+        )
+
+        async with orch_warm_db() as session:
+            project = make_project(name="Resident Provider Hold", user_id=_TEST_USER)
+            session.add(project)
+            await session.commit()
+            await session.refresh(project)
+            task = make_task(
+                project_id=project.id,
+                status=TaskStatus.QUEUED,
+                payloads=[payload],
+                context={
+                    "_resident_mutation_authorized": True,
+                    "_resident_input_frozen": True,
+                    **context,
+                },
+            )
+            session.add(task)
+            await session.commit()
+            await session.refresh(task)
+            task_id = task.id
+
+        await self._run_one_cycle(mocker)
+
+        assert not env_fallback.called, (
+            "a Resident provider-policy hold must never enter the generic "
+            "environment credential fallback"
+        )
+        assert not provision.called
+        async with orch_warm_db() as session:
+            row = await session.get(Task, task_id)
+            assert row is not None
+            assert row.status == TaskStatus.QUEUED
+            assert row.vm_instance_id is None
+            assert "Waiting for configured Resident provider policy" in (
+                row.latest_status_message or ""
+            )
+            active = (
+                await session.execute(
+                    _select(Task).where(
+                        Task.id == task_id,
+                        Task.status.in_(
+                            [TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]
+                        ),
+                    )
+                )
+            ).scalars().all()
+            assert active == []
+
+
 class TestCloudRunDispatch:
     """Tests for the Cloud Run Jobs dispatch path in the orchestrator.
 

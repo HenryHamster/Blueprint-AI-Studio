@@ -75,6 +75,7 @@ import {
   getLastProviderRunErrorReport, clearLastProviderRunErrorReport,
   type LLMCliTranslation, type ClaudeOutput, type RunnerCommand,
   type ValidationCommand, type ProviderRunner, type ProviderRunErrorReport,
+  type ProviderRunOptions,
 } from './providers/runners.js';
 
 export {
@@ -88,7 +89,7 @@ export {
   runClaudeCode, runProviderAgent,
   getLastProviderRunErrorReport, clearLastProviderRunErrorReport,
 };
-export type { LLMCliTranslation, ClaudeOutput, RunnerCommand, ValidationCommand, ProviderRunner, ProviderRunErrorReport };
+export type { LLMCliTranslation, ClaudeOutput, RunnerCommand, ValidationCommand, ProviderRunner, ProviderRunErrorReport, ProviderRunOptions };
 export { computeRefreshDelayMs, isBootstrapToken };
 
 // ── Failure categories ───────────────────────────────────────────────────────
@@ -1280,6 +1281,21 @@ export async function persistAndPostStatus(taskId: string, payload: Record<strin
   try { fs.unlinkSync(resultPath); } catch { /* ignore — file already gone */ }
   clearPendingStatusFlags(taskId);
   return result;
+}
+
+export async function persistResidentTurnFailure(
+  taskId: string,
+  projectId: string,
+  reason: string,
+  failureCategory: FailureCategory,
+): Promise<void> {
+  await apiPost('/api/agent/resident-turn/fail', {
+    task_id: taskId,
+    project_id: projectId,
+    failure_id: `resident-turn:${taskId}:failure`,
+    reason: reason.slice(0, 5_000),
+    failure_category: failureCategory,
+  });
 }
 
 // Phase 0 telemetry — start-of-role timestamp captured by main() after a
@@ -4003,12 +4019,19 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
   // first recordToolUse() call after this point. setup_secs = the gap.
   roleClaimTimestamp = Date.now();
   const taskId = strVal(task.task_id);
-  process.env.TASK_ID = taskId;  // Expose for crash handlers (they can't access local vars)
-  setCrashReportTaskId(taskId);  // Decoupled crash identity — survives the poll-window TASK_ID clear
-  _inWarmPollWindow = false;     // We're back in active role execution
   const payloads = Array.isArray(task.payloads) ? task.payloads as Record<string, unknown>[] : [];
   const payload: Record<string, unknown> = payloads[0] ?? {};
   const taskType = strVal(payload.type, 'create');
+  const claimAgentToken = requireClaimAgentToken(taskType, strVal(task.agent_token));
+  if (claimAgentToken) {
+    activateClaimedRole(
+      { taskId, agentToken: claimAgentToken },
+      'resident claim token rotation failed',
+    );
+  }
+  process.env.TASK_ID = taskId;  // Expose for crash handlers (they can't access local vars)
+  setCrashReportTaskId(taskId);  // Decoupled crash identity — survives the poll-window TASK_ID clear
+  _inWarmPollWindow = false;     // We're back in active role execution
   const model = payload.model ? strVal(payload.model) : (process.env.LLM_MODEL || undefined);
   const effort = payload.effort ? strVal(payload.effort) : undefined;
   const projectMetadata = task.project_metadata as Record<string, unknown> | undefined;
@@ -4050,41 +4073,45 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
   sendLog(ws, `Agent started (VM: ${VM_INSTANCE_ID}, type: ${taskType})\n`);
 
   try {
-    // Get GitHub credentials
+    // Load the published task-capability contract before any handler runs.
+    statusRef.value = 'Loading task-capability contract...';
+    await ensureTaskCapabilityContractLoaded();
+
+    let ghToken = '';
+    let owner = '';
+    let repo = '';
+    const credentialFreeResidentTurn = !taskRequiresGithubCredentials(taskType);
+    // Get GitHub credentials only for repository-backed tasks. Resident turns
+    // are deliberately provider-only: no GitHub token, clone, or workspace.
     // Timeout must cover the backend's worst case for get_github_token_for_task:
     // _github_request sleeps up to 120s on a near-empty rate-limit bucket, plus up
     // to 3 retries each with a 15s httpx timeout. 180s comfortably covers the full
     // backoff. The same path is already covered at 240s for the PR-create call
     // (line ~2724); the token-only fetch here uses 180s (no extra GitHub round-trips
     // beyond token minting). Any failure here is infrastructure, not a code fault.
-    statusRef.value = 'Fetching GitHub credentials...';
-    let ghRes: { data: { token: string; owner: string; repo: string } };
-    try {
-      ghRes = await apiGet(`/api/agent/github/token?task_id=${taskId}`, API_MAX_RETRIES, 180_000) as { data: { token: string; owner: string; repo: string } };
-    } catch (e) {
-      const err = e instanceof Error ? e : new Error(String(e));
-      (err as Error & { failureCategory?: FailureCategory }).failureCategory = 'github_token_fetch_failed';
-      throw err;
+    if (!credentialFreeResidentTurn) {
+      statusRef.value = 'Fetching GitHub credentials...';
+      let ghRes: { data: { token: string; owner: string; repo: string } };
+      try {
+        ghRes = await apiGet(`/api/agent/github/token?task_id=${taskId}`, API_MAX_RETRIES, 180_000) as { data: { token: string; owner: string; repo: string } };
+      } catch (e) {
+        const err = e instanceof Error ? e : new Error(String(e));
+        (err as Error & { failureCategory?: FailureCategory }).failureCategory = 'github_token_fetch_failed';
+        throw err;
+      }
+      ({ token: ghToken, owner, repo } = ghRes.data);
+      log(`GitHub: ${owner}/${repo}`);
     }
-    const { token: ghToken, owner, repo } = ghRes.data;
-    log(`GitHub: ${owner}/${repo}`);
-
-    // Load the published task-capability contract before any handler runs. The
-    // agent token is valid here (the github/token fetch above just succeeded
-    // with it), and the guard makes this a once-per-VM cost. configureAgentPermissions
-    // / isReadOnlyTaskType throw until this completes, so a missing or incomplete
-    // contract fails the role loudly here rather than silently mis-granting write
-    // permissions to a read-only task.
-    statusRef.value = 'Loading task-capability contract...';
-    await ensureTaskCapabilityContractLoaded();
 
     // Seed the GitHub token file immediately so bash helpers can use it from
     // the first invocation. Then schedule proactive refreshes every 45 min
     // (the GitHub installation token TTL is 60 min; the backend cache is 50 min,
     // so force_refresh=false hits the cache at zero GitHub API cost).
-    ensureGithubTokenFileEnv();
-    writeGithubTokenFile(ghToken);
-    scheduleGithubTokenRefresh(taskId, WORKSPACE, owner, repo, isReadOnlyTaskType(taskType));
+    if (!credentialFreeResidentTurn) {
+      ensureGithubTokenFileEnv();
+      writeGithubTokenFile(ghToken);
+      scheduleGithubTokenRefresh(taskId, WORKSPACE, owner, repo, isReadOnlyTaskType(taskType));
+    }
 
     // Dispatch to handler — contract-driven (registry-driven task types).
     //
@@ -4182,11 +4209,17 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
     // Keep heartbeat alive during retries so the reaper doesn't kill us mid-report.
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
-        await persistAndPostStatus(taskId, {
-          task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
-          logs: sanitize(`Fatal error: ${errMsg}`),
-          failure_category: failureCategory,
-        });
+        if (taskType === 'strategic_resident_turn') {
+          const projectId = strVal(projectMetadata?.project_id);
+          if (!projectId) throw new Error('Resident claim is missing project_id');
+          await persistResidentTurnFailure(taskId, projectId, safeErr, failureCategory);
+        } else {
+          await persistAndPostStatus(taskId, {
+            task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
+            logs: sanitize(`Fatal error: ${errMsg}`),
+            failure_category: failureCategory,
+          });
+        }
         break; // Success — stop retrying
       } catch (e) {
         const postErr = e instanceof Error ? e.message : String(e);
@@ -4224,6 +4257,17 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
   }
 
   return { taskId, prNumber, baseBranch: baseBranchForReset, parkDirective: null };
+}
+
+export function taskRequiresGithubCredentials(taskType: string): boolean {
+  return taskType !== 'strategic_resident_turn';
+}
+
+export function requireClaimAgentToken(taskType: string, token: string): string {
+  if (taskType === 'strategic_resident_turn' && !token) {
+    throw new Error('resident claim token rotation failed: missing agent_token');
+  }
+  return token;
 }
 
 // Global crash handlers — report errors via heartbeat before dying.

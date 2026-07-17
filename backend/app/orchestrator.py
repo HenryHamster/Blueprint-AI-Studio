@@ -36,7 +36,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Tuple
 
-from sqlalchemy import func as _func, inspect as sa_inspect
+from sqlalchemy import and_, func as _func, inspect as sa_inspect, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlmodel import select
@@ -98,6 +98,9 @@ from app.stall_alert_diagnostics import (
     _compute_retry_after_escalation_action,
     _missing_runtime_credentials_stall_reason,
 )
+from app.strategic_resident_saturated_dispatch import (
+    dispatch_local_required_resident_turns_without_cloud_slots,
+)
 from app.state_persistence import (
     _persist_circuit_breakers,  # noqa: F401 — re-exported; callers import via app.orchestrator
     _persist_zone_health,
@@ -126,8 +129,16 @@ logger = logging.getLogger("blueprint")
 def _agent_executed_task_type_filter():
     """Registry-owned dispatch fence for backend-managed control-plane Tasks."""
 
-    return Task.payloads[0]["type"].as_string().in_(
-        sorted(AGENT_EXECUTED_TASK_TYPES)
+    task_type = Task.payloads[0]["type"].as_string()
+    generic_types = set(AGENT_EXECUTED_TASK_TYPES) - {"strategic_resident_turn"}
+    return or_(
+        task_type.in_(sorted(generic_types)),
+        and_(
+            task_type == "strategic_resident_turn",
+            Task.payloads[0]["shadow_only"].as_boolean().is_(False),
+            Task.context["_resident_mutation_authorized"].as_boolean().is_(True),
+            Task.context["_resident_input_frozen"].as_boolean().is_(True),
+        ),
     )
 
 
@@ -1174,6 +1185,7 @@ async def orchestrator_worker():
         select_llm_runtime_for_task,
     )
     from app.providers.registry import get_provider
+    from app.strategic_resident_provider_policy import ResidentProviderPolicyHold
     from app.vm_lifecycle import (
         _get_actual_gcp_vm_count,
         _ensure_vm_deleted,
@@ -1628,6 +1640,25 @@ async def orchestrator_worker():
                 )
                 _shared_state.tasks_active_gauge = active_count
                 if slots_available == 0:
+                    # Local runners do not consume GCP VM slots. Service the
+                    # bounded local-only Resident lane before the cloud-capacity
+                    # early exit so compatible idle capacity remains usable.
+                    (
+                        _resident_local_pinned,
+                        _resident_local_held,
+                    ) = await dispatch_local_required_resident_turns_without_cloud_slots(
+                        session,
+                        lock_dispatchable_task=_lock_dispatchable_task_for_mutation,
+                    )
+                    _cycle_dispatched += _resident_local_pinned
+                    if _resident_local_pinned or _resident_local_held:
+                        logger.info(
+                            "resident_local_dispatch_while_cloud_saturated",
+                            extra={
+                                "resident_tasks_pinned": _resident_local_pinned,
+                                "resident_tasks_held": _resident_local_held,
+                            },
+                        )
                     # Update queued gauge even when we skip dispatching
                     _shared_state.tasks_queued_gauge = (
                         await session.execute(
@@ -1670,7 +1701,7 @@ async def orchestrator_worker():
                             "cycle_duration_seconds": round(
                                 time.monotonic() - cycle_start, 3
                             ),
-                            "tasks_dispatched": 0,
+                            "tasks_dispatched": _resident_local_pinned,
                             # No slots ⇒ no window was scanned. Keeps the
                             # orchestrator_cycle_complete schema identical across both
                             # emit sites so consumers never see a missing key.
@@ -3527,17 +3558,27 @@ async def orchestrator_worker():
                         _effective_blacklist = (
                             list({*(_blacklist or []), *_sticky}) or None
                         )
-                        runtime_selection = await select_llm_runtime_for_task(
-                            user_id=dispatch_user_id,
-                            task=task,
-                            runtime_config=_runtime_config,
-                            blacklist=_effective_blacklist,
-                            project_id=str(task.project_id) if task.project_id else None,
-                            # No runner_available_clis here: this is the cloud
-                            # pre-provision path where no concrete runner is known
-                            # yet. Cloud VMs are provisioned with all LLM CLIs
-                            # pre-installed, so CLI-based filtering is unnecessary.
-                        )
+                        try:
+                            runtime_selection = await select_llm_runtime_for_task(
+                                user_id=dispatch_user_id,
+                                task=task,
+                                runtime_config=_runtime_config,
+                                blacklist=_effective_blacklist,
+                                project_id=(
+                                    str(task.project_id) if task.project_id else None
+                                ),
+                                # Cloud VMs have every supported provider CLI.
+                                runner_available_clis=None,
+                                raise_resident_policy_hold=True,
+                            )
+                        except ResidentProviderPolicyHold as exc:
+                            task.latest_status_message = (
+                                "Waiting for configured Resident provider policy — "
+                                f"{exc}"
+                            )
+                            session.add(task)
+                            await session.commit()
+                            continue
                         # From here until ownership transfers, the containment
                         # handler owns releasing the slot this selection
                         # pre-incremented (select_max_plan_account).

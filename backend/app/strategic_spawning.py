@@ -4092,6 +4092,7 @@ async def _spawn_design_doc_update(
     session: AsyncSession,
     *,
     apply_spawn_budget_guard: bool = False,
+    expected_legacy_generation: int | None = None,
 ) -> bool:
     """Spawn a design doc update task (Phase 1 of strategic cycle).
 
@@ -4100,6 +4101,21 @@ async def _spawn_design_doc_update(
     Returns True if a task was created, False if skipped.
     """
     from app.task_lifecycle import _has_active_strategic_task
+    from app.strategic_resident_transition_locks import (
+        commit_legacy_authorized,
+        LegacyEngineAuthorityExpired,
+        lock_and_validate_legacy_authority,
+    )
+
+    try:
+        if expected_legacy_generation is None:
+            expected_legacy_generation = await lock_and_validate_legacy_authority(
+                session, project.id
+            )
+            await session.commit()
+    except LegacyEngineAuthorityExpired:
+        await session.rollback()
+        return False
 
 
     # Guard: no design_doc_update or strategic_review already running
@@ -4265,6 +4281,15 @@ async def _spawn_design_doc_update(
         steering_excerpt = strategic_refresh_excerpt(project.vision)
         if steering_excerpt:
             task_context["steering_excerpt"] = steering_excerpt
+    try:
+        await lock_and_validate_legacy_authority(
+            session,
+            project.id,
+            expected_generation=expected_legacy_generation,
+        )
+    except LegacyEngineAuthorityExpired:
+        await session.rollback()
+        return False
     new_task = Task(
         project_id=project.id,
         title=f"Architecture review: {project.name}",
@@ -4293,17 +4318,14 @@ async def _spawn_design_doc_update(
         baseline_problem_model=project.problem_model or {},
         baseline_running_update=project.running_update,
     )
-    from app.strategic_resident_turns import (
-        ShadowResidentOwnershipError,
-        coalesce_shadow_resident_turn,
-    )
+    from app.strategic_resident_runtime import coalesce_resident_turn
 
     # Snapshot IDs before the try block so they remain accessible after rollback.
     _project_id = project.id
     _new_task_id = new_task.id
     try:
         async with session.begin_nested():
-            await coalesce_shadow_resident_turn(
+            await coalesce_resident_turn(
                 session,
                 project_id=_project_id,
                 lane="background",
@@ -4313,15 +4335,6 @@ async def _spawn_design_doc_update(
                     "phase1_task_id": str(_new_task_id),
                 },
             )
-    except ShadowResidentOwnershipError:
-        logger.warning(
-            "[RESIDENT_SHADOW] Aborting legacy phase-1 spawn after Resident ownership flip "
-            "(project=%s cycle=%s)",
-            _project_id,
-            cycle_id,
-        )
-        await session.rollback()
-        return False
     except Exception:
         logger.exception(
             "[RESIDENT_SHADOW] Phase-1 background wake failed open for project %s "
@@ -4330,7 +4343,9 @@ async def _spawn_design_doc_update(
             cycle_id,
             _new_task_id,
         )
-    await session.commit()
+    await commit_legacy_authorized(
+        session, project.id, expected_legacy_generation
+    )
     # Post-commit: signal the admin UI that a strategic cycle (Phase 1) started.
     from app.strategic_events import emit_strategic_cycle_started
 
@@ -5293,6 +5308,7 @@ async def _finalize_strategic_review_spawn(
     steering_excerpt: str | None,
     runner_pin_id: str | None = None,
     integrity_conflict_counts: dict[str, int] | None = None,
+    expected_legacy_generation: int | None = None,
 ) -> bool:
     """Guarded INSERT/commit tail shared by the cadence + resident spawn paths.
 
@@ -5320,6 +5336,21 @@ async def _finalize_strategic_review_spawn(
     """
     from app.autonomous_research import _try_research_spawn_advisory_lock
     from app.task_lifecycle import _has_active_strategic_task
+    from app.strategic_resident_transition_locks import (
+        commit_legacy_authorized,
+        LegacyEngineAuthorityExpired,
+        lock_and_validate_legacy_authority,
+    )
+
+    try:
+        await lock_and_validate_legacy_authority(
+            session,
+            project_id,
+            expected_generation=expected_legacy_generation,
+        )
+    except LegacyEngineAuthorityExpired:
+        await session.rollback()
+        return False
 
     # ``project_id`` was captured at the caller's function entry (before any
     # payload build), so the rollback-expiry MissingGreenlet (BUG_REPORT
@@ -5440,13 +5471,11 @@ async def _finalize_strategic_review_spawn(
     # Shadow only meaningful accepted cadence work. Unchanged cadence checks
     # never reach this finalize transaction and therefore make zero Resident
     # Tasks/model calls.
-    from app.strategic_resident_turns import ShadowResidentOwnershipError
-
     try:
         async with session.begin_nested():
-            from app.strategic_resident_turns import coalesce_shadow_resident_turn
+            from app.strategic_resident_runtime import coalesce_resident_turn
 
-            await coalesce_shadow_resident_turn(
+            await coalesce_resident_turn(
                 session,
                 project_id=project_id,
                 lane="background",
@@ -5456,15 +5485,6 @@ async def _finalize_strategic_review_spawn(
                     "phase2_task_id": str(new_task.id),
                 },
             )
-    except ShadowResidentOwnershipError:
-        await session.rollback()
-        logger.warning(
-            "[RESIDENT_SHADOW] Aborting legacy phase-2 spawn after Resident ownership flip "
-            "(project=%s cycle=%s)",
-            project_id,
-            cycle_id,
-        )
-        return False
     except Exception:
         logger.exception(
             "[RESIDENT_SHADOW] Background cycle wake failed open for project %s "
@@ -5473,7 +5493,9 @@ async def _finalize_strategic_review_spawn(
             cycle_id,
             new_task.id,
         )
-    await session.commit()
+    await commit_legacy_authorized(
+        session, project_id, expected_legacy_generation
+    )
     # Post-commit: signal the admin UI that a strategic cycle (Phase 2) started.
     from app.strategic_events import emit_strategic_cycle_started
 
@@ -5504,6 +5526,7 @@ async def _spawn_strategic_review(
     runner_pin_id: str | None = None,
     *,
     apply_spawn_budget_guard: bool = False,
+    expected_legacy_generation: int | None = None,
 ) -> bool:
     """Spawn Phase 2 of the strategic cycle: vision + direction review.
 
@@ -5585,6 +5608,20 @@ async def _spawn_strategic_review(
     project ORM attributes in the post-build finalize path.
     """
     from app.task_lifecycle import _has_active_strategic_task
+    from app.strategic_resident_transition_locks import (
+        LegacyEngineAuthorityExpired,
+        lock_and_validate_legacy_authority,
+    )
+
+    try:
+        if expected_legacy_generation is None:
+            expected_legacy_generation = await lock_and_validate_legacy_authority(
+                session, project.id
+            )
+            await session.commit()
+    except LegacyEngineAuthorityExpired:
+        await session.rollback()
+        return False
 
     # Guard: no design_doc_update or strategic_review already running
     if await _has_active_strategic_task(project.id, session):
@@ -5825,6 +5862,7 @@ async def _spawn_strategic_review(
             # spawn path passes this; cadence spawns leave it None → QUEUED as before)
             # so POST /api/runner/next-task claims it directly.
             runner_pin_id=runner_pin_id,
+            expected_legacy_generation=expected_legacy_generation,
         )
 
     # Build direction stats with rich data (pure over ``project.directions``;
@@ -7859,6 +7897,7 @@ async def _spawn_strategic_review(
         operator_steered=operator_steered,
         steering_excerpt=steering_excerpt,
         integrity_conflict_counts=_integrity_counts,
+        expected_legacy_generation=expected_legacy_generation,
     )
 
 

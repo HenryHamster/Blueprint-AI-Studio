@@ -1,5 +1,7 @@
 import { vi, describe, it, expect, beforeEach } from 'vitest';
 
+const residentTurnHandlerMock = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+
 // ── Module mocks ──────────────────────────────────────────────────────────────
 // Mock ../index.js (the main agent runner) to prevent main() from executing
 // and to supply the named exports that handler files import at module level.
@@ -44,6 +46,10 @@ vi.mock('./audits.js', () => ({
 // and confirm there is exactly one registration under release_audit_challenge.
 vi.mock('./audit-challenge.js', () => ({
   handleReleaseAuditChallenge: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock('./strategic-resident-turn.js', () => ({
+  handleStrategicResidentTurn: residentTurnHandlerMock,
 }));
 
 // Mock fs and child_process so handler files that import them at module level
@@ -107,8 +113,8 @@ describe('handlers registry', () => {
   // for registered types with no bespoke handler (see the contract-driven
   // dispatch suite below). The count still documents the bespoke set so a
   // dropped/duplicated bespoke entry is caught.
-  it('has exactly 30 bespoke handler entries', () => {
-    expect(Object.keys(handlers)).toHaveLength(30);
+  it('has exactly the registered bespoke handler entries', () => {
+    expect(Object.keys(handlers)).toHaveLength(ALL_AGENT_TASK_TYPES.length);
   });
 
   it.each(EXPECTED_TYPES)('contains bespoke handler for task type "%s"', (taskType) => {
@@ -147,6 +153,30 @@ describe('handlers registry', () => {
     const resolution = resolveHandler('release_audit_challenge', {}, { type: 'release_audit_challenge' });
     expect(resolution.dispatch).toBe('bespoke');
     expect(resolution.handler).toBe(handleReleaseAuditChallenge);
+  });
+
+  it('passes the server-projected Resident provider fence from payloads[0] to its handler', async () => {
+    const claimTask = {
+      payloads: [{
+        type: 'strategic_resident_turn',
+        _resident_expected_runtime_provider: 'anthropic',
+      }],
+    };
+    const payload = claimTask.payloads[0];
+    const resolution = resolveHandler(payload.type, claimTask, payload);
+    expect(resolution.dispatch).toBe('bespoke');
+    expect(resolution.handler).not.toBeNull();
+    if (resolution.handler === null) throw new Error('Resident handler missing');
+
+    await resolution.handler(
+      'task-id', payload, claimTask, '', '', '', null, { value: '' },
+    );
+    expect(residentTurnHandlerMock).toHaveBeenCalledWith(
+      'task-id',
+      expect.objectContaining({ _resident_expected_runtime_provider: 'anthropic' }),
+      claimTask,
+      '', '', '', null, { value: '' },
+    );
   });
 
   it('all handlers are distinct function references from each other', () => {
@@ -418,6 +448,7 @@ const TASK_CLASS_MAP = {
   compute_experiment:'read-only',
   repo_bootstrap:    'read-only',
   capability_proof_trial: 'read-only',
+  strategic_resident_turn: 'read-only',
   // Research / planning (7): read-heavy, no code shipped
   plan:              'research',
   research:          'research',
@@ -442,11 +473,11 @@ describe('task type class classification — cross-cutting invariants', () => {
     }
   });
 
-  it('class distribution is 8 code-change + 15 read-only + 7 research = 30 total', () => {
+  it('class distribution is 8 code-change + 16 read-only + 7 research = 31 total', () => {
     const counts: Record<TaskClass, number> = { 'code-change': 0, 'read-only': 0, research: 0 };
     for (const cls of Object.values(TASK_CLASS_MAP)) counts[cls]++;
     expect(counts['code-change']).toBe(8);
-    expect(counts['read-only']).toBe(15);
+    expect(counts['read-only']).toBe(16);
     expect(counts['research']).toBe(7);
   });
 

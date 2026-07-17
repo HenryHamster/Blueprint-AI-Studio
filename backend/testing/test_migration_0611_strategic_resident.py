@@ -247,6 +247,156 @@ def _sqlite_legacy_schema(connection):
     return project, task, prefs, message
 
 
+def _exercise_staged_cutover_checkpoint(
+    connection,
+    *,
+    resident,
+    checkpoint,
+    project_id: uuid.UUID,
+):
+    """Exercise the one-transaction legacy cutover exception and its fences."""
+
+    stored_project_id = (
+        project_id if connection.dialect.name == "postgresql" else project_id.hex
+    )
+    resident_row = (
+        connection.execute(
+            sa.select(resident).where(resident.c.project_id == stored_project_id)
+        )
+        .mappings()
+        .one()
+    )
+    prior = (
+        connection.execute(
+            sa.select(checkpoint).where(
+                checkpoint.c.id == resident_row["current_checkpoint_id"]
+            )
+        )
+        .mappings()
+        .one()
+    )
+    transition_id = uuid.uuid4()
+    checkpoint_id = uuid.uuid4()
+    source_turn_task_id = uuid.uuid4()
+    stored_checkpoint_id = (
+        checkpoint_id
+        if connection.dialect.name == "postgresql"
+        else checkpoint_id.hex
+    )
+    stored_source_id = (
+        source_turn_task_id
+        if connection.dialect.name == "postgresql"
+        else source_turn_task_id.hex
+    )
+    checkpoint_hash = "d" * 64
+    boundary = {
+        "transition_id": str(transition_id),
+        "previous_owner": "legacy",
+        "previous_authority_generation": resident_row["authority_generation"],
+        "previous_checkpoint_id": str(prior["id"]),
+        "previous_checkpoint_version": prior["version"],
+        "previous_checkpoint_hash": prior["content_hash"],
+        "authority_generation": resident_row["authority_generation"] + 1,
+        "source_turn_task_id": str(source_turn_task_id),
+    }
+    checkpoint_values = {
+        "id": stored_checkpoint_id,
+        "project_id": stored_project_id,
+        "version": prior["version"] + 1,
+        "schema_version": 1,
+        "content_hash": checkpoint_hash,
+        "checkpoint": {
+            "schema_version": 1,
+            "migration": {"cutover_boundary": boundary},
+        },
+        "authority_generation": resident_row["authority_generation"] + 1,
+        "source_turn_task_id": stored_source_id,
+    }
+    # A cutover-shaped row without the private, locked Resident marker is forged.
+    with pytest.raises(sa.exc.IntegrityError), connection.begin_nested():
+        connection.execute(checkpoint.insert().values(**checkpoint_values))
+
+    authorization = {
+        **boundary,
+        "project_id": str(project_id),
+        "next_authority_generation": boundary["authority_generation"],
+        "checkpoint_id": str(checkpoint_id),
+        "checkpoint_version": checkpoint_values["version"],
+        "checkpoint_hash": checkpoint_hash,
+    }
+    staged_rollout = {
+        **dict(resident_row["rollout_state"] or {}),
+        "_resident_cutover_checkpoint_authorization": authorization,
+    }
+    mismatched_rollout = {
+        **staged_rollout,
+        "_resident_cutover_checkpoint_authorization": {
+            **authorization,
+            "checkpoint_hash": "e" * 64,
+        },
+    }
+    connection.execute(
+        resident.update()
+        .where(resident.c.project_id == stored_project_id)
+        .values(rollout_state=mismatched_rollout)
+    )
+    # Possessing the private key is insufficient: every marker field must bind
+    # exactly to the candidate checkpoint and its immutable lineage.
+    with pytest.raises(sa.exc.IntegrityError), connection.begin_nested():
+        connection.execute(checkpoint.insert().values(**checkpoint_values))
+
+    connection.execute(
+        resident.update()
+        .where(resident.c.project_id == stored_project_id)
+        .values(rollout_state=staged_rollout)
+    )
+    connection.execute(checkpoint.insert().values(**checkpoint_values))
+    connection.execute(
+        resident.update()
+        .where(resident.c.project_id == stored_project_id)
+        .values(
+            previous_checkpoint_id=prior["id"],
+            current_checkpoint_id=stored_checkpoint_id,
+            engine_owner="strategic_resident",
+            authority_generation=resident_row["authority_generation"] + 1,
+            active_turn_task_id=None,
+            active_turn_lane=None,
+            interactive_successor_task_id=None,
+            background_successor_task_id=None,
+            rollout_state={
+                key: value
+                for key, value in staged_rollout.items()
+                if key != "_resident_cutover_checkpoint_authorization"
+            },
+        )
+    )
+    cutover_row = (
+        connection.execute(
+            sa.select(resident).where(resident.c.project_id == stored_project_id)
+        )
+        .mappings()
+        .one()
+    )
+    assert cutover_row["engine_owner"] == "strategic_resident"
+    assert cutover_row["authority_generation"] == 2
+    assert cutover_row["current_checkpoint_id"] == stored_checkpoint_id
+    assert "_resident_cutover_checkpoint_authorization" not in cutover_row[
+        "rollout_state"
+    ]
+    # Removing the marker closes both the insert and generation-rotating pointer
+    # exceptions; a later caller cannot replay the transition authorization.
+    with pytest.raises(sa.exc.IntegrityError), connection.begin_nested():
+        connection.execute(
+            resident.update()
+            .where(resident.c.project_id == stored_project_id)
+            .values(
+                current_checkpoint_id=prior["id"],
+                previous_checkpoint_id=stored_checkpoint_id,
+                authority_generation=3,
+            )
+        )
+
+
 def test_sqlite_upgrade_backfills_and_fences_authority_and_project_links():
     migration = _load_migration()
     engine = sa.create_engine("sqlite://")
@@ -950,7 +1100,6 @@ def test_sqlite_upgrade_backfills_and_fences_authority_and_project_links():
                 connection.scalar(sa.select(sa.func.count()).select_from(checkpoint))
                 == 33
             )  # 32 v1 rows plus the provenance v2 row
-
             # A project-owned Resident and all checkpoints cascade cleanly even
             # though the current pointer is protected against ordinary clearing.
             connection.execute(project.delete().where(project.c.id == p2))

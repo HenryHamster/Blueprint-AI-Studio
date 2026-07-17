@@ -508,6 +508,45 @@ async def notification_retry_drain_service() -> None:
             logger.warning("[NOTIFY] Retry drain loop error: %s", exc)
 
 
+_DEFERRED_EXTERNAL_NOTIFICATIONS_KEY = "_deferred_external_notifications"
+
+
+def begin_deferred_external_notifications(session: AsyncSession) -> None:
+    """Defer session-scoped webhooks until an authority-fenced commit succeeds."""
+    session.info.setdefault(_DEFERRED_EXTERNAL_NOTIFICATIONS_KEY, [])
+
+
+def _schedule_external_notification(
+    session: AsyncSession,
+    project_id: Any,
+    event_type: str,
+    payload: dict,
+) -> None:
+    pending = session.info.get(_DEFERRED_EXTERNAL_NOTIFICATIONS_KEY)
+    if pending is not None:
+        pending.append((project_id, event_type, dict(payload)))
+        return
+    asyncio.ensure_future(
+        dispatch_external_notification(project_id, event_type, payload)
+    )
+
+
+def flush_deferred_external_notifications(session: AsyncSession) -> None:
+    """Schedule webhooks only after the associated transaction has committed."""
+    pending = session.info.pop(_DEFERRED_EXTERNAL_NOTIFICATIONS_KEY, None)
+    if pending is None:
+        return
+    for project_id, event_type, payload in pending:
+        asyncio.ensure_future(
+            dispatch_external_notification(project_id, event_type, payload)
+        )
+
+
+def discard_deferred_external_notifications(session: AsyncSession) -> None:
+    """Drop effects staged by a transaction that failed its authority fence."""
+    session.info.pop(_DEFERRED_EXTERNAL_NOTIFICATIONS_KEY, None)
+
+
 async def dispatch_external_notification(
     project_id: Any,
     event_type: str,
@@ -1018,12 +1057,8 @@ async def post_direction_milestone_message(
         context=context,
         task_id=task_id,
     )
-    asyncio.ensure_future(
-        dispatch_external_notification(
-            project_id,
-            "DIRECTION_MILESTONE",
-            payload,
-        )
+    _schedule_external_notification(
+        session, project_id, "DIRECTION_MILESTONE", payload
     )
     return msg
 
@@ -1585,16 +1620,15 @@ async def post_residual_fix_spawned_message(
         },
         task_id=task_id,
     )
-    asyncio.ensure_future(
-        dispatch_external_notification(
-            project_id,
-            "RESIDUAL_FIX_SPAWNED",
-            {
-                "fingerprint": fingerprint,
-                "hit_count": case.hit_count,
-                "task_id": str(task_id) if task_id else None,
-            },
-        )
+    _schedule_external_notification(
+        session,
+        project_id,
+        "RESIDUAL_FIX_SPAWNED",
+        {
+            "fingerprint": fingerprint,
+            "hit_count": case.hit_count,
+            "task_id": str(task_id) if task_id else None,
+        },
     )
     return msg
 
@@ -1895,19 +1929,18 @@ async def post_residual_fix_auto_recovered_message(
         },
         task_id=task_id,
     )
-    asyncio.ensure_future(
-        dispatch_external_notification(
-            project_id,
-            "RESIDUAL_FIX_UNSUSPENDED",
-            {
-                "fingerprint": fingerprint,
-                "recovered_at": recovered_at,
-                "manual_intervention_required": False,
-                "auto_recovered": True,
-                "recovery_attempts": recovery_attempts,
-                "summary": summary,
-            },
-        )
+    _schedule_external_notification(
+        session,
+        project_id,
+        "RESIDUAL_FIX_UNSUSPENDED",
+        {
+            "fingerprint": fingerprint,
+            "recovered_at": recovered_at,
+            "manual_intervention_required": False,
+            "auto_recovered": True,
+            "recovery_attempts": recovery_attempts,
+            "summary": summary,
+        },
     )
     return msg
 
@@ -1968,19 +2001,18 @@ async def post_residual_fix_audit_deferred_escalation_message(
         context=ctx,
     )
     session.add(msg)
-    asyncio.ensure_future(
-        dispatch_external_notification(
-            project_id,
-            "RESIDUAL_FIX_AUDIT_DEFERRED",
-            {
-                "fingerprint": fingerprint,
-                "audit_defer_count": defer_count,
-                "threshold": threshold,
-                "severity": "blocker",
-                "manual_intervention_required": False,
-                "summary": summary,
-            },
-        )
+    _schedule_external_notification(
+        session,
+        project_id,
+        "RESIDUAL_FIX_AUDIT_DEFERRED",
+        {
+            "fingerprint": fingerprint,
+            "audit_defer_count": defer_count,
+            "threshold": threshold,
+            "severity": "blocker",
+            "manual_intervention_required": False,
+            "summary": summary,
+        },
     )
     return msg
 
@@ -2056,20 +2088,19 @@ async def post_remediation_escalation_message(
         context=ctx,
     )
     session.add(msg)
-    asyncio.ensure_future(
-        dispatch_external_notification(
-            project_id,
-            "REMEDIATION_ESCALATED",
-            {
-                "direction_text": direction_text[:120],
-                "failure_pattern": failure_pattern[:200],
-                "attempts": attempts,
-                "remediation_summary": remediation_summary[:240],
-                "severity": "blocker",
-                "manual_intervention_required": True,
-                "summary": summary,
-            },
-        )
+    _schedule_external_notification(
+        session,
+        project_id,
+        "REMEDIATION_ESCALATED",
+        {
+            "direction_text": direction_text[:120],
+            "failure_pattern": failure_pattern[:200],
+            "attempts": attempts,
+            "remediation_summary": remediation_summary[:240],
+            "severity": "blocker",
+            "manual_intervention_required": True,
+            "summary": summary,
+        },
     )
     return msg
 
@@ -2135,20 +2166,19 @@ async def post_direction_burn_pause_message(
         context=ctx,
     )
     session.add(msg)
-    asyncio.ensure_future(
-        dispatch_external_notification(
-            project_id,
-            "DIRECTION_BURN_PAUSE",
-            {
-                "direction_text": direction_text[:120],
-                "reason": reason,
-                "direction_id": direction_id,
-                "evidence": evidence or {},
-                "severity": "blocker",
-                "manual_intervention_required": True,
-                "summary": summary,
-            },
-        )
+    _schedule_external_notification(
+        session,
+        project_id,
+        "DIRECTION_BURN_PAUSE",
+        {
+            "direction_text": direction_text[:120],
+            "reason": reason,
+            "direction_id": direction_id,
+            "evidence": evidence or {},
+            "severity": "blocker",
+            "manual_intervention_required": True,
+            "summary": summary,
+        },
     )
     return msg
 
@@ -2213,19 +2243,18 @@ async def post_direction_churn_pause_message(
         context=ctx,
     )
     session.add(msg)
-    asyncio.ensure_future(
-        dispatch_external_notification(
-            project_id,
-            "DIRECTION_CHURN_PAUSE",
-            {
-                "direction_text": direction_text[:120],
-                "reason": reason,
-                "direction_id": direction_id,
-                "evidence": evidence or {},
-                "severity": "blocker",
-                "summary": summary,
-            },
-        )
+    _schedule_external_notification(
+        session,
+        project_id,
+        "DIRECTION_CHURN_PAUSE",
+        {
+            "direction_text": direction_text[:120],
+            "reason": reason,
+            "direction_id": direction_id,
+            "evidence": evidence or {},
+            "severity": "blocker",
+            "summary": summary,
+        },
     )
     return msg
 
@@ -2334,20 +2363,19 @@ async def post_direction_outcome_scaffolding_escalation_message(
         context=ctx,
     )
     session.add(msg)
-    asyncio.ensure_future(
-        dispatch_external_notification(
-            project_id,
-            "DIRECTION_OUTCOME_SCAFFOLDING_ESCALATION",
-            {
-                "direction_text": direction_text[:120],
-                "direction_id": direction_id,
-                "flagged_cycles": flagged_cycles,
-                "evidence": evidence or {},
-                "severity": "blocker",
-                "manual_intervention_required": True,
-                "summary": summary,
-            },
-        )
+    _schedule_external_notification(
+        session,
+        project_id,
+        "DIRECTION_OUTCOME_SCAFFOLDING_ESCALATION",
+        {
+            "direction_text": direction_text[:120],
+            "direction_id": direction_id,
+            "flagged_cycles": flagged_cycles,
+            "evidence": evidence or {},
+            "severity": "blocker",
+            "manual_intervention_required": True,
+            "summary": summary,
+        },
     )
     return msg
 

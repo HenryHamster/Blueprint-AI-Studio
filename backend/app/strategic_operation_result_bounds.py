@@ -121,6 +121,29 @@ def _bounded_text_items(
     return bounded
 
 
+def _bounded_implications(
+    values: Any,
+    *,
+    node_budget: list[int],
+    ancestors: set[int],
+) -> list[str | dict[str, Any]]:
+    bounded: list[str | dict[str, Any]] = []
+    for item in list(values or [])[:_RESULT_LIST_MAX]:
+        node_budget[0] -= 1
+        if node_budget[0] < 0:
+            raise OperationResultTooLarge("operation result exceeds the node budget")
+        bounded.append(
+            _bounded_record(
+                item,
+                node_budget=node_budget,
+                ancestors=ancestors,
+            )
+            if isinstance(item, Mapping)
+            else _bounded_text(item)
+        )
+    return bounded
+
+
 def bounded_result(
     value: BoundedOperationResult | Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -130,6 +153,11 @@ def bounded_result(
     node_budget = [_RESULT_NODE_MAX]
     ancestors: set[int] = set()
     result = {
+        "reply": (
+            _bounded_text(raw["reply"])
+            if raw.get("reply") is not None
+            else None
+        ),
         "facts": [
             _bounded_record(item, node_budget=node_budget, ancestors=ancestors)
             for item in list(raw.get("facts") or [])[:_RESULT_LIST_MAX]
@@ -145,9 +173,20 @@ def bounded_result(
             for item in list(raw.get("operations") or [])[:_RESULT_LIST_MAX]
             if isinstance(item, Mapping)
         ],
-        "strategic_implications": _bounded_text_items(
+        "receipts": [
+            _bounded_record(item, node_budget=node_budget, ancestors=ancestors)
+            for item in list(raw.get("receipts") or [])[:_RESULT_LIST_MAX]
+            if isinstance(item, Mapping)
+        ],
+        "unknown_effects": [
+            _bounded_record(item, node_budget=node_budget, ancestors=ancestors)
+            for item in list(raw.get("unknown_effects") or [])[:_RESULT_LIST_MAX]
+            if isinstance(item, Mapping)
+        ],
+        "strategic_implications": _bounded_implications(
             raw.get("strategic_implications"),
             node_budget=node_budget,
+            ancestors=ancestors,
         ),
         "proposed_memory": [
             _bounded_record(item, node_budget=node_budget, ancestors=ancestors)

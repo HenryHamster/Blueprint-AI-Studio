@@ -28,6 +28,7 @@ from app.models import (
     ArtifactType,
     LocalRunner,
     Project,
+    StrategicResident,
     Task,
     TaskStatus,
     MessageType,
@@ -73,6 +74,32 @@ from app.task_evaluators import (
     CHALLENGE_INDETERMINATE,
 )
 from app.task_capabilities import BACKEND_MANAGED_TASK_TYPES
+from app.strategic_resident_turns import STRATEGIC_RESIDENT_TURN_TASK_TYPE
+
+
+@pytest.fixture(autouse=True)
+def _materialize_migrated_legacy_resident(monkeypatch):
+    """Mirror migration 0611 for legacy tests that construct Project directly."""
+    from app import strategic_resident_transition_locks as transition_locks
+    from app.strategic_resident_checkpointing import initialize_strategic_resident
+
+    real_gate = transition_locks.lock_and_validate_legacy_authority
+
+    async def migrated_gate(session, project_id, *, expected_generation=None):
+        resident = await session.get(StrategicResident, project_id)
+        if resident is None:
+            await initialize_strategic_resident(session, project_id)
+        return await real_gate(
+            session,
+            project_id,
+            expected_generation=expected_generation,
+        )
+
+    monkeypatch.setattr(
+        transition_locks,
+        "lock_and_validate_legacy_authority",
+        migrated_gate,
+    )
 
 
 def _select_agent_tasks(project_id):
@@ -84,7 +111,8 @@ def _select_agent_tasks(project_id):
         or_(
             task_type.is_(None),
             task_type.not_in(sorted(BACKEND_MANAGED_TASK_TYPES)),
-        )
+        ),
+        task_type != STRATEGIC_RESIDENT_TURN_TASK_TYPE,
     )
 
 USE_POSTGRES = os.getenv("USE_TEST_POSTGRES", "").lower() == "true" and os.getenv(
@@ -462,6 +490,51 @@ async def test_owner_flip_rolls_back_whole_legacy_cycle_spawn(
         )
     ).scalars().all()
     assert cycles == []
+
+
+@pytest.mark.parametrize("cycle_count", [1, 2])
+@pytest.mark.asyncio
+async def test_mid_spawn_generation_flip_rolls_back_cycle_finalization(
+    db_session, mocker, cycle_count
+):
+    """Both phase families CAS the generation again immediately before INSERT."""
+    from app.models import StrategicCycle
+    from app.strategic_resident_checkpointing import initialize_strategic_resident
+    from app.strategic_resident_transition_locks import LegacyEngineAuthorityExpired
+
+    project = _make_project(
+        vision={"_strategic_cycle_count": cycle_count, "_research_spawn_count": 5}
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await initialize_strategic_resident(db_session, project.id)
+    await db_session.commit()
+    authority = AsyncMock(
+        side_effect=[
+            1,
+            LegacyEngineAuthorityExpired("generation flipped during payload build"),
+        ]
+    )
+    mocker.patch(
+        "app.strategic_resident_transition_locks.lock_and_validate_legacy_authority",
+        new=authority,
+    )
+    old = _shared_state.runtime_config.get("architecture_review_frequency", 3)
+    _shared_state.runtime_config["architecture_review_frequency"] = 3
+    try:
+        await _spawn_research_task(project, db_session)
+    finally:
+        _shared_state.runtime_config["architecture_review_frequency"] = old
+
+    assert authority.await_count == 2
+    assert (
+        await db_session.execute(select(Task).where(Task.project_id == project.id))
+    ).scalars().all() == []
+    assert (
+        await db_session.execute(
+            select(StrategicCycle).where(StrategicCycle.project_id == project.id)
+        )
+    ).scalars().all() == []
 
 
 @pytest.mark.asyncio

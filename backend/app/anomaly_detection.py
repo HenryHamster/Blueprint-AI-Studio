@@ -1365,25 +1365,36 @@ async def _expire_stale_proposals(session) -> int:
     silently dropped, just deferred. No project-wide bulk lock is taken.
     """
     from app.task_locking import with_directions_locked
+    from app.models import StrategicResident
+    from sqlalchemy import or_
+    from app.strategic_resident_transition_locks import (
+        LegacyEngineAuthorityExpired,
+        commit_legacy_authorized,
+    )
 
     cutoff = (_utcnow() - timedelta(days=30)).isoformat()
     # Read candidate project IDs without any lock — a plain scalar select that
     # never contends with the hot path. We re-read each project's directions
     # fresh inside its own row lock below, so this snapshot can be stale.
-    project_ids = (
-        (
-            await session.execute(
-                select(Project.id).where(
-                    Project.autonomous_enabled.is_(True),
-                    Project.not_archived(),
-                )
+    project_authorities = (
+        await session.execute(
+            select(Project.id, StrategicResident.authority_generation)
+            .outerjoin(
+                StrategicResident,
+                StrategicResident.project_id == Project.id,
+            )
+            .where(
+                Project.autonomous_enabled.is_(True),
+                Project.not_archived(),
+                or_(
+                    StrategicResident.project_id.is_(None),
+                    StrategicResident.engine_owner == "legacy",
+                ),
             )
         )
-        .scalars()
-        .all()
-    )
+    ).all()
     total_expired = 0
-    for project_id in project_ids:
+    for project_id, expected_generation in project_authorities:
         # Per-project counter captured via closure; the mutate_fn runs against
         # the directions list freshly loaded inside the project's row lock.
         expired_holder = {"count": 0}
@@ -1407,7 +1418,12 @@ async def _expire_stale_proposals(session) -> int:
             session, project_id, _expire, skip_locked=True
         )
         if applied and expired_holder["count"]:
-            await session.commit()  # releases this project's row lock
+            try:
+                await commit_legacy_authorized(
+                    session, project_id, int(expected_generation or 0)
+                )
+            except LegacyEngineAuthorityExpired:
+                continue
             total_expired += expired_holder["count"]
             logger.info(
                 f"[DIRECTIONS] Expired {expired_holder['count']} stale proposals "

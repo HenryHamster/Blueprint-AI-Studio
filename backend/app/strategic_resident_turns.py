@@ -46,7 +46,7 @@ _TERMINAL_TASK_STATUSES = frozenset(
 @dataclass(frozen=True)
 class ResidentTurnWake:
     task_id: uuid.UUID | None
-    state: Literal["queued", "coalesced", "paused"]
+    state: Literal["queued", "coalesced", "paused", "waiting_for_capacity"]
     lane: Lane
     active_task_id: uuid.UUID | None
     successor_task_id: uuid.UUID | None

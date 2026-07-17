@@ -51,6 +51,7 @@ from app.models import (
     Project,
     ProjectMessage,
     StrategicCycle,
+    StrategicResident,
     Task,
     TaskStatus,
     _utcnow,
@@ -283,6 +284,45 @@ def read_resident_session(vision: dict[str, Any] | None) -> dict[str, Any] | Non
     """Return the raw session-state blob from ``Project.vision`` (or None)."""
     blob = (vision or {}).get(RESIDENT_SESSION_KEY)
     return blob if isinstance(blob, dict) else None
+
+
+async def _legacy_resident_engine_enabled(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    lock_transition_rows: bool = False,
+) -> bool:
+    """Return whether legacy session lifecycle may own this project.
+
+    Optional transition locks close the start/cutover race in the same
+    Project -> Resident order used by the ownership transition.
+    """
+
+    if lock_transition_rows:
+        project_exists = (
+            await session.execute(
+                select(Project.id)
+                .where(Project.id == project_id)
+                .with_for_update(key_share=True)
+            )
+        ).scalar_one_or_none()
+        if project_exists is None:
+            return False
+    query = select(StrategicResident).where(StrategicResident.project_id == project_id)
+    if lock_transition_rows:
+        query = query.with_for_update()
+    query = query.execution_options(populate_existing=True)
+    resident = (await session.execute(query)).scalar_one_or_none()
+    # Rollout compatibility: a pre-backfill project with no control-plane row is
+    # still legacy-owned. The ownership transition itself requires the row.
+    return resident is None or resident.engine_owner == "legacy"
+
+
+def _legacy_owner_disabled_error() -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail="Legacy Resident sessions are disabled for Strategic Resident-owned projects",
+    )
 
 
 def read_resident_session_blocked_reason(vision: dict[str, Any] | None) -> str | None:
@@ -549,11 +589,8 @@ async def _compute_resident_work_state(
     the heartbeat cannot extend the dead-man's switch (contract pinned by
     ``test_heartbeat_liveness_only_does_not_extend_lease``).
     """
-    # A single recursive CTE finds the entire strategist subtree (roots +
-    # transitive descendants) bounded at _WORK_STATE_ANCESTOR_WALK_MAX_DEPTH
-    # levels, then aggregates max(updated_at), in-flight count, and
-    # terminal-since count in the same query — no Python-side BFS, no
-    # unbounded loop, no cycle risk.
+    # One bounded recursive CTE aggregates the strategist task subtree without
+    # a Python-side walk or cycle risk.
     terminal_cutoff = _utcnow() - timedelta(
         seconds=_WORK_STATE_TERMINAL_WINDOW_SECONDS
     )
@@ -619,8 +656,10 @@ async def _compute_resident_work_state(
             )
         )
     ).scalar_one_or_none()
-    # task_max comes from raw SQL (asyncpg returns TIMESTAMPTZ as tz-aware);
-    # msg_max/cycle_max go through NaiveUTCDateTime and are tz-naive. Normalise.
+    # SQLite returns the raw aggregate as text, while asyncpg returns a
+    # tz-aware datetime. The ORM aggregates below use NaiveUTCDateTime.
+    if isinstance(task_max, str):
+        task_max = datetime.fromisoformat(task_max.replace("Z", "+00:00"))
     if task_max is not None and task_max.tzinfo is not None:
         task_max = task_max.astimezone(timezone.utc).replace(tzinfo=None)
     stamps = [dt for dt in (task_max, msg_max, cycle_max) if dt is not None]
@@ -1292,6 +1331,8 @@ async def start_resident_session(
     """
     now = _utcnow()
     now_iso = now.isoformat()
+    if not await _legacy_resident_engine_enabled(session, project.id):
+        raise _legacy_owner_disabled_error()
 
     # Fast-path idempotency: an already-active session whose recorded task is
     # still live is returned as-is (no new session, no spawn). Correctness still
@@ -1466,6 +1507,12 @@ async def start_resident_session(
             vision[RESIDENT_SESSION_KEY]["_decisions_reg"] = carried_decisions_register
         decision["mode"] = "adopt" if adopt_task is not None else "spawn"
 
+    if not await _legacy_resident_engine_enabled(
+        session,
+        project.id,
+        lock_transition_rows=True,
+    ):
+        raise _legacy_owner_disabled_error()
     await with_vision_locked(session, project.id, _claim, skip_locked=False)
     await session.commit()
     await session.refresh(project)
@@ -2077,6 +2124,10 @@ async def _auto_start_on_workday_entry(
             project = await fresh.get(Project, project_id)
             if project is None:
                 return None
+            if not await _legacy_resident_engine_enabled(fresh, project_id):
+                # The continuous-mode preference may remain during coexistence,
+                # but it must never re-arm the legacy engine after cutover.
+                return None
             runner_id = await _auto_select_local_runner(fresh, project_id)
             if runner_id is None:
                 # Healthy session — record the gate reason directly on it.
@@ -2193,6 +2244,22 @@ async def renew_resident_session_lease(
         raise HTTPException(status_code=404, detail="No resident session for project")
     if blob.get("session_id") != session_id or str(blob.get("task_id")) != str(task_id):
         raise HTTPException(status_code=409, detail="Heartbeat session/task mismatch")
+    if not await _legacy_resident_engine_enabled(session, project.id):
+        cont = strategic_local_continuation_status_from_vision(
+            project.vision,
+            operator_user_id=blob.get("operator_user_id"),
+        )
+        return {
+            "authority_held": False,
+            "leased_until": cont.get("expires_at"),
+            "stop_requested": True,
+            "status": STATUS_ENDED,
+            "work_state_rev": 0,
+            "work_state_summary": {},
+            "exam_ledger": None,
+            "active_direction_ids": [],
+            "direction_grounding": [],
+        }
 
     op_id = blob.get("operator_user_id")
     runner_id = blob.get("runner_id")

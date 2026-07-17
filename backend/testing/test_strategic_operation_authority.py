@@ -94,6 +94,7 @@ async def _authority_rows(
                 "resident_id": str(project.id),
                 "authority_generation": generation,
                 "engine_owner": owner,
+                "shadow_only": False,
             }
         ],
         context={
@@ -102,15 +103,17 @@ async def _authority_rows(
             "_resident_project_id": str(project.id),
             "_resident_authority_generation": generation,
             "_resident_engine_owner_observed": owner,
+            "_resident_shadow_only": False,
         },
     )
     session.add(task)
     await session.commit()
+    checkpoint_body = {"schema_version": 1}
     checkpoint = StrategicResidentCheckpoint(
         project_id=project.id,
         version=1,
-        content_hash="c" * 64,
-        checkpoint={"schema_version": 1},
+        content_hash=hashlib.sha256(b'{"schema_version":1}').hexdigest(),
+        checkpoint=checkpoint_body,
         authority_generation=generation,
         source_turn_task_id=None,
     )
@@ -219,6 +222,65 @@ async def test_valid_mutation_and_receipt_commit_atomically(authority_db):
     )
     await authority_db.refresh(project)
     assert project.running_update == "advanced state"
+
+
+@pytest.mark.asyncio
+async def test_operation_context_hash_is_derived_and_persisted(authority_db):
+    project, task, _resident = await _authority_rows(authority_db)
+    from app.strategic_resident_context import reconstruct_authoritative_turn_input
+
+    provider_input = await reconstruct_authoritative_turn_input(
+        authority_db,
+        project_id=project.id,
+        turn_task_id=task.id,
+    )
+    context_hash = provider_input["lineage"]["context_hash"]
+    request = _request(
+        project,
+        task,
+        operation_id="inspect-context-bound",
+        expected={"context_hash": context_hash},
+    )
+    request = FencedOperationRequest(
+        **{
+            **request.__dict__,
+            "operation_kind": "inspect_ci",
+            "capability": "ci.inspect",
+        }
+    )
+
+    receipt = await execute_fenced_db_operation(
+        authority_db,
+        request,
+        lambda _context: {
+            "evidence": [
+                {
+                    "kind": "ci_run",
+                    "source_id": "run-context-bound",
+                    "revision": "sha-context-bound",
+                    "checksum": "a" * 64,
+                }
+            ]
+        },
+    )
+    assert receipt.expected_revisions["context_hash"] == context_hash
+    assert receipt.observed_revisions_before["context_hash"] == context_hash
+    assert receipt.receipt["structured_result"]["evidence"][0]["source_id"] == (
+        "run-context-bound"
+    )
+
+    stale_request = _request(
+        project,
+        task,
+        operation_id="inspect-stale-context",
+        expected={"context_hash": "e" * 64},
+    )
+    with pytest.raises(ExpectedRevisionMismatch, match="context_hash"):
+        await execute_fenced_db_operation(
+            authority_db,
+            stale_request,
+            lambda _context: {},
+        )
 
 
 @pytest.mark.asyncio

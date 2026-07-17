@@ -7,7 +7,7 @@ import os
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import case, exists, func
+from sqlalchemy import case, exists, func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
@@ -19,6 +19,7 @@ from app.models import (
     TaskStatus,
     Alert,
     AlertSeverity,
+    StrategicResident,
 )
 from app.database import AsyncSessionLocal, resolve_dialect_name
 from app.knowledge_query import build_knowledge_index, build_compute_sweep_groups
@@ -128,7 +129,10 @@ def _direction_in_refractory(d: dict, now: datetime) -> bool:
 
 
 async def _project_spend_ceiling_spawn_defer_reason(
-    project: Project, session: AsyncSession
+    project: Project,
+    session: AsyncSession,
+    *,
+    expected_legacy_generation: int | None = None,
 ) -> str | None:
     """Return a spawn deferral reason when the project spend ceiling is reached.
 
@@ -154,6 +158,7 @@ async def _project_spend_ceiling_spawn_defer_reason(
             window_spend_usd=recent_spend,
             ceiling_usd=spend_ceiling,
             spend_window_days=spend_window_days,
+            expected_legacy_generation=expected_legacy_generation,
         )
         return (
             f"project spend ceiling reached: ${recent_spend:.2f}/${spend_ceiling:.2f} "
@@ -170,6 +175,7 @@ async def _project_spend_ceiling_spawn_defer_reason(
             ceiling_usd=spend_ceiling,
             warning_fraction=warning_fraction,
             spend_window_days=spend_window_days,
+            expected_legacy_generation=expected_legacy_generation,
         )
     return None
 
@@ -324,18 +330,31 @@ async def _undirected_research_recently_active(project_id, session) -> bool:
     return recent > 0
 
 
-async def _spawn_research_task(project: Project, session: AsyncSession):
+async def _spawn_research_task(
+    project: Project,
+    session: AsyncSession,
+    *,
+    expected_legacy_generation: int | None = None,
+):
     """Spawn a research task for a project if conditions are met.
 
     Uses a per-project lock to prevent races between the post-merge hook
     and the idle-check loop, which run concurrently with separate sessions.
     """
     async with _get_spawn_lock(str(project.id)):
-        return await _spawn_research_task_inner(project, session)
+        return await _spawn_research_task_inner(
+            project,
+            session,
+            expected_legacy_generation=expected_legacy_generation,
+        )
 
 
 async def _maybe_notify_operator_refresh_deferred(
-    project: Project, session: AsyncSession, reason: str
+    project: Project,
+    session: AsyncSession,
+    reason: str,
+    *,
+    expected_legacy_generation: int | None = None,
 ) -> None:
     """Surface, exactly once, that an operator steering refresh was deferred.
 
@@ -366,14 +385,29 @@ async def _maybe_notify_operator_refresh_deferred(
 
         await post_strategic_steering_deferred_message(session, project.id, reason)
         await with_vision_locked(session, project.id, mark_strategic_refresh_notified)
-        await session.commit()
+        if expected_legacy_generation is None:
+            await session.commit()
+        else:
+            from app.strategic_resident_transition_locks import (
+                commit_legacy_authorized,
+            )
+
+            await commit_legacy_authorized(
+                session, project.id, expected_legacy_generation
+            )
         logger.info(
             "[STRATEGIC] operator steering refresh deferred for project %s (%s) "
             "— posted one-time deferral notice",
             project.id,
             reason,
         )
-    except Exception:
+    except Exception as exc:
+        from app.strategic_resident_transition_locks import (
+            LegacyEngineAuthorityExpired,
+        )
+
+        if isinstance(exc, LegacyEngineAuthorityExpired):
+            raise
         logger.exception(
             "[STRATEGIC] failed to post operator steering deferral notice for "
             "project %s",
@@ -382,7 +416,10 @@ async def _maybe_notify_operator_refresh_deferred(
 
 
 async def _maybe_notify_operator_steering_acted(
-    project: Project, session: AsyncSession
+    project: Project,
+    session: AsyncSession,
+    *,
+    expected_legacy_generation: int | None = None,
 ) -> None:
     """Confirm, exactly once, that operator steering reached the strategist.
 
@@ -401,13 +438,28 @@ async def _maybe_notify_operator_steering_acted(
         )
 
         await post_strategic_steering_acted_message(session, project.id)
-        await session.commit()
+        if expected_legacy_generation is None:
+            await session.commit()
+        else:
+            from app.strategic_resident_transition_locks import (
+                commit_legacy_authorized,
+            )
+
+            await commit_legacy_authorized(
+                session, project.id, expected_legacy_generation
+            )
         logger.info(
             "[STRATEGIC] operator steering consumed on spawn for project %s "
             "— posted one-time confirmation notice",
             project.id,
         )
-    except Exception:
+    except Exception as exc:
+        from app.strategic_resident_transition_locks import (
+            LegacyEngineAuthorityExpired,
+        )
+
+        if isinstance(exc, LegacyEngineAuthorityExpired):
+            raise
         logger.exception(
             "[STRATEGIC] failed to post operator steering confirmation for project %s",
             project.id,
@@ -482,6 +534,8 @@ async def _check_half_open_test_task(
     project_id: uuid.UUID,
     session: AsyncSession,
     breaker: dict,
+    *,
+    expected_legacy_generation: int | None = None,
 ) -> bool:
     """Check a HALF_OPEN circuit breaker's test task for failure conditions.
 
@@ -507,6 +561,16 @@ async def _check_half_open_test_task(
         and test_task.started_at
         and (_utcnow() - test_task.started_at).total_seconds() > 1800
     ):
+        if expected_legacy_generation is not None:
+            from app.strategic_resident_transition_locks import (
+                lock_and_validate_legacy_authority,
+            )
+
+            await lock_and_validate_legacy_authority(
+                session,
+                project_id,
+                expected_generation=expected_legacy_generation,
+            )
         logger.warning(
             f"[CIRCUIT BREAKER] HALF_OPEN test task {test_id} stuck for 30m+, treating as failure → OPEN"
         )
@@ -514,13 +578,32 @@ async def _check_half_open_test_task(
         breaker["opened_at"] = _utcnow()
         breaker["cooldown_seconds"] = min(breaker["cooldown_seconds"] * 2, 7200)
         breaker["half_open_task_id"] = None
+        if expected_legacy_generation is not None:
+            from app.strategic_resident_transition_locks import (
+                commit_legacy_authorized,
+            )
+
+            await commit_legacy_authorized(
+                session, project_id, expected_legacy_generation
+            )
         await _maybe_create_circuit_breaker_alert(
             project_id,
             session,
             f"HALF_OPEN test task stuck for 30m+ — circuit breaker re-opened (cooldown: {breaker['cooldown_seconds']}s)",
+            expected_legacy_generation=expected_legacy_generation,
         )
         return True
     elif not test_task:
+        if expected_legacy_generation is not None:
+            from app.strategic_resident_transition_locks import (
+                lock_and_validate_legacy_authority,
+            )
+
+            await lock_and_validate_legacy_authority(
+                session,
+                project_id,
+                expected_generation=expected_legacy_generation,
+            )
         logger.warning(
             f"[CIRCUIT BREAKER] HALF_OPEN test task {test_id} no longer exists (deleted/reaped) → OPEN"
         )
@@ -528,10 +611,19 @@ async def _check_half_open_test_task(
         breaker["opened_at"] = _utcnow()
         breaker["cooldown_seconds"] = min(breaker["cooldown_seconds"] * 2, 7200)
         breaker["half_open_task_id"] = None
+        if expected_legacy_generation is not None:
+            from app.strategic_resident_transition_locks import (
+                commit_legacy_authorized,
+            )
+
+            await commit_legacy_authorized(
+                session, project_id, expected_legacy_generation
+            )
         await _maybe_create_circuit_breaker_alert(
             project_id,
             session,
             f"HALF_OPEN test task deleted/reaped — circuit breaker re-opened (cooldown: {breaker['cooldown_seconds']}s)",
+            expected_legacy_generation=expected_legacy_generation,
         )
         return True
 
@@ -543,6 +635,8 @@ async def _advance_circuit_breaker_and_check(
     session: AsyncSession,
     breaker: dict,
     spawn_label: str,
+    *,
+    expected_legacy_generation: int | None = None,
 ) -> bool:
     """Advance OPEN→HALF_OPEN if cooldown elapsed; re-check HALF_OPEN test task.
 
@@ -555,7 +649,25 @@ async def _advance_circuit_breaker_and_check(
             and (_utcnow() - breaker["opened_at"]).total_seconds()
             >= breaker["cooldown_seconds"]
         ):
+            if expected_legacy_generation is not None:
+                from app.strategic_resident_transition_locks import (
+                    lock_and_validate_legacy_authority,
+                )
+
+                await lock_and_validate_legacy_authority(
+                    session,
+                    project.id,
+                    expected_generation=expected_legacy_generation,
+                )
             breaker["state"] = "HALF_OPEN"
+            if expected_legacy_generation is not None:
+                from app.strategic_resident_transition_locks import (
+                    commit_legacy_authorized,
+                )
+
+                await commit_legacy_authorized(
+                    session, project.id, expected_legacy_generation
+                )
             logger.warning(
                 f"[CIRCUIT BREAKER] OPEN → HALF-OPEN for {project.id} (cooldown elapsed, allowing one test task)"
             )
@@ -565,22 +677,140 @@ async def _advance_circuit_breaker_and_check(
                 f"— circuit breaker state=OPEN (still in cooldown)"
             )
             await _maybe_notify_operator_refresh_deferred(
-                project, session, "paused while the research circuit breaker is open"
+                project,
+                session,
+                "paused while the research circuit breaker is open",
+                expected_legacy_generation=expected_legacy_generation,
             )
             return True
     elif breaker["state"] == "HALF_OPEN":
-        if await _check_half_open_test_task(project.id, session, breaker):
+        if await _check_half_open_test_task(
+            project.id,
+            session,
+            breaker,
+            expected_legacy_generation=expected_legacy_generation,
+        ):
             await _maybe_notify_operator_refresh_deferred(
                 project,
                 session,
                 "paused while the research circuit breaker is open",
+                expected_legacy_generation=expected_legacy_generation,
             )
             return True
     return False
 
 
-async def _spawn_research_task_inner(project: Project, session: AsyncSession):
+def _stage_anomaly_action_alert(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    anomaly_action: dict,
+) -> None:
+    """Stage durable anomaly state while legacy authority is still locked."""
+    action = anomaly_action.get("action")
+    if action == "adjusted" and anomaly_action.get("is_new"):
+        pre_vms = anomaly_action.get("pre_adjustment_max_vms") or "?"
+        new_vms = anomaly_action["max_concurrent_vms"]
+        gate = anomaly_action["failure_gate_threshold"]
+        triggers = ", ".join(anomaly_action.get("trigger_anomalies") or [])
+        session.add(
+            Alert(
+                project_id=project_id,
+                severity=AlertSeverity.WARNING,
+                title="Pipeline auto-adjusted: anomaly threshold exceeded",
+                message=(
+                    f"max_concurrent_vms reduced from {pre_vms} to {new_vms}, "
+                    f"failure_gate_threshold tightened to {gate}. "
+                    f"Triggered by: {triggers}."
+                ),
+            )
+        )
+    elif action == "restored":
+        session.add(
+            Alert(
+                project_id=project_id,
+                severity=AlertSeverity.INFO,
+                title="Pipeline restored: anomaly conditions cleared",
+                message=(
+                    "max_concurrent_vms restored to "
+                    f"{anomaly_action['max_concurrent_vms']}, "
+                    "failure_gate_threshold restored to "
+                    f"{anomaly_action['failure_gate_threshold']}."
+                ),
+            )
+        )
+
+
+async def _publish_anomaly_action(
+    project_id: uuid.UUID,
+    anomaly_action: dict,
+) -> None:
+    """Publish anomaly effects only after the authorized transaction commits."""
+    action = anomaly_action.get("action")
+    if action == "none":
+        return
+    from app.broadcast import broadcast_to_project
+    from app.notification_dispatch import dispatch_external_notification
+
+    await broadcast_to_project(str(project_id), "anomaly_adjustment", anomaly_action)
+    if action == "adjusted" and anomaly_action.get("is_new"):
+        asyncio.ensure_future(  # noqa: RUF006
+            dispatch_external_notification(
+                str(project_id),
+                "ANOMALY_ADJUSTMENT",
+                {
+                    "max_concurrent_vms": anomaly_action["max_concurrent_vms"],
+                    "failure_gate_threshold": anomaly_action[
+                        "failure_gate_threshold"
+                    ],
+                    "trigger_anomalies": anomaly_action.get("trigger_anomalies")
+                    or [],
+                    "pre_adjustment_max_vms": anomaly_action.get(
+                        "pre_adjustment_max_vms"
+                    )
+                    or "?",
+                },
+            )
+        )
+    elif action == "restored":
+        asyncio.ensure_future(  # noqa: RUF006
+            dispatch_external_notification(
+                str(project_id),
+                "ANOMALY_RESTORED",
+                {
+                    "max_concurrent_vms": anomaly_action["max_concurrent_vms"],
+                    "failure_gate_threshold": anomaly_action[
+                        "failure_gate_threshold"
+                    ],
+                },
+            )
+        )
+
+
+async def _spawn_research_task_inner(
+    project: Project,
+    session: AsyncSession,
+    *,
+    expected_legacy_generation: int | None = None,
+):
     """Inner implementation — always called under the per-project spawn lock."""
+    from app.strategic_resident_transition_locks import (
+        commit_legacy_authorized,
+        LegacyEngineAuthorityExpired,
+        lock_and_validate_legacy_authority,
+    )
+
+    try:
+        legacy_generation = (
+            await lock_and_validate_legacy_authority(
+                session,
+                project.id,
+                expected_generation=expected_legacy_generation,
+            )
+        )
+        await session.commit()
+    except LegacyEngineAuthorityExpired:
+        await session.rollback()
+        return
     from app.research_completion import (
         _compute_momentum_factor,
         _compute_productivity_score,
@@ -623,7 +853,10 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         # before bailing. The marker itself is left intact (we only return), so
         # the steering is still delivered on a later tick once accounts recover.
         await _maybe_notify_operator_refresh_deferred(
-            project, session, "paused while no model accounts are available"
+            project,
+            session,
+            "paused while no model accounts are available",
+            expected_legacy_generation=legacy_generation,
         )
         return
 
@@ -649,11 +882,14 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             project,
             session,
             "paused while the monthly budget target is exhausted",
+            expected_legacy_generation=legacy_generation,
         )
         return
 
     spend_defer_reason = await _project_spend_ceiling_spawn_defer_reason(
-        project, session
+        project,
+        session,
+        expected_legacy_generation=legacy_generation,
     )
     if spend_defer_reason:
         logger.info(
@@ -662,7 +898,10 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             spend_defer_reason,
         )
         await _maybe_notify_operator_refresh_deferred(
-            project, session, "paused while the project spend ceiling is reached"
+            project,
+            session,
+            "paused while the project spend ceiling is reached",
+            expected_legacy_generation=legacy_generation,
         )
         return
     # Guard: circuit breaker must allow spawning
@@ -673,7 +912,11 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     # the breaker clears.
     breaker = _shared_state.get_circuit_breaker(str(project.id))
     if await _advance_circuit_breaker_and_check(
-        project, session, breaker, "autonomous research spawn"
+        project,
+        session,
+        breaker,
+        "autonomous research spawn",
+        expected_legacy_generation=legacy_generation,
     ):
         return
     # Guard: defer autonomous research until repo_bootstrap completes for external-repo
@@ -687,6 +930,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             project,
             session,
             "repo_bootstrap task is pending (bootstrap_completed_at not set)",
+            expected_legacy_generation=legacy_generation,
         )
         logger.info(
             "[AUTONOMOUS] Deferring research spawn for project %s — "
@@ -900,6 +1144,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         session,
         busy_direction_ids,
         now,
+        expected_legacy_generation=legacy_generation,
     )
     # Allow strategic cycles to proceed even without active directions (they create directions).
     # Stop forcing after 3 consecutive strategic failures to prevent infinite loops.
@@ -931,7 +1176,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             vision.pop("_strategic_failures_at", None)
 
         await with_vision_locked(session, project.id, _clear_strategic_failures)
-        await session.commit()
+        await commit_legacy_authorized(session, project.id, legacy_generation)
     # Check if ANY direction is active in the project (ignoring cooldown filter).
     # active_directions only contains non-cooldown directions, so a project with
     # active-but-cooling directions should not trigger a strategic cycle.
@@ -1281,7 +1526,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 vision.pop("_pending_strategic_review", None)
 
             await with_vision_locked(session, project.id, _drop_pending_sr)
-            await session.commit()
+            await commit_legacy_authorized(session, project.id, legacy_generation)
             await session.refresh(project)
 
             from app.alert_dispatch import _create_strategic_alert  # noqa: PLC0415
@@ -1291,6 +1536,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 session,
                 f"Pending strategic review retry abandoned after {_reason}. "
                 f"Original failure: {pending_sr.get('error', 'unknown')}",
+                expected_legacy_generation=legacy_generation,
             )
             # Fall through to tactical research below
         else:
@@ -1301,6 +1547,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                     project,
                     session,
                     apply_spawn_budget_guard=True,
+                    expected_legacy_generation=legacy_generation,
                     cycle_id=pending_sr.get("cycle_id"),
                     operator_steered=bool(pending_sr.get("operator_steered")),
                     steering_excerpt=pending_sr.get("steering_excerpt"),
@@ -1324,7 +1571,9 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                         vision.pop("_pending_strategic_review", None)
 
                     await with_vision_locked(session, project.id, _clear_pending_sr)
-                    await session.commit()
+                    await commit_legacy_authorized(
+                        session, project.id, legacy_generation
+                    )
                     await session.refresh(project)
                     logger.info(
                         f"[STRATEGIC] Retried pending strategic review for project {project.id} (originally failed at {pending_sr.get('failed_at')})"
@@ -1345,9 +1594,13 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                             marker["first_attempted_at"] = _now_iso
 
                     await with_vision_locked(session, project.id, _bump_pending_sr_skip)
-                    await session.commit()
+                    await commit_legacy_authorized(
+                        session, project.id, legacy_generation
+                    )
                     await session.refresh(project)
                     # Fall through to tactical research
+            except LegacyEngineAuthorityExpired:
+                raise
             except Exception:
                 logger.exception(
                     f"[STRATEGIC] Retry of pending strategic review failed for project {project.id}"
@@ -1363,7 +1616,9 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                         marker["first_attempted_at"] = _now_iso
 
                 await with_vision_locked(session, project.id, _bump_pending_sr)
-                await session.commit()
+                await commit_legacy_authorized(
+                    session, project.id, legacy_generation
+                )
                 await session.refresh(project)
                 # Fall through to tactical research
 
@@ -1454,6 +1709,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 project,
                 session,
                 "queued behind an active strategic cycle",
+                expected_legacy_generation=legacy_generation,
             )
             is_strategic = (
                 False  # skip the spawn block; tactical research below may still fire
@@ -1556,6 +1812,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                     project,
                     session,
                     apply_spawn_budget_guard=True,
+                    expected_legacy_generation=legacy_generation,
                 )
                 if spawned:
                     logger.info(
@@ -1570,6 +1827,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                     project,
                     session,
                     apply_spawn_budget_guard=True,
+                    expected_legacy_generation=legacy_generation,
                 )
                 if spawned:
                     logger.info(
@@ -1632,7 +1890,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 }
 
             await with_vision_locked(session, project.id, _mark_payload_bloat_skip)
-            await session.commit()
+            await commit_legacy_authorized(session, project.id, legacy_generation)
             # session.commit() expired `project`; the notify helper and the
             # fall-through `if spawned:` block below both read project.vision/.id.
             # Re-load it so those reads do not lazy-load from async context and
@@ -1645,6 +1903,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 project,
                 session,
                 "strategic refresh paused — context payload exceeds the size limit",
+                expected_legacy_generation=legacy_generation,
             )
 
         if spawned:
@@ -1693,7 +1952,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             # again, fires another strategic spawn. Even with the
             # has_active_strategic guard above, eventually that strategic
             # task completes and the next tick re-fires immediately.
-            await session.commit()
+            await commit_legacy_authorized(session, project.id, legacy_generation)
 
             # Symmetric success counterpart to the deferral notice: when the
             # consumed marker was operator-origin AND carried preserved steering
@@ -1703,7 +1962,11 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             # strategist cannot actually see. Best-effort — never fatal to the
             # spawn that already succeeded and committed above.
             if _consumed.get("operator") and _consumed.get("excerpt"):
-                await _maybe_notify_operator_steering_acted(project, session)
+                await _maybe_notify_operator_steering_acted(
+                    project,
+                    session,
+                    expected_legacy_generation=legacy_generation,
+                )
 
     # Guard: limit parallel research tasks per project.
     # EVALUATING parents are just waiting on children — they don't block new research.
@@ -1890,7 +2153,9 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         anomalies = await _compute_research_anomalies(project.id, session)
 
     # Check anomaly-driven pipeline adjustments (apply or restore) after anomaly tracking
-    anomaly_action = await check_anomaly_actions()
+    # Apply/publish only at the final fenced transaction below. A stale legacy
+    # tick must not mutate fleet policy or emit operator-visible effects.
+    anomaly_action = {"action": "none"}
     if anomaly_action["action"] != "none":
         from app.broadcast import broadcast_to_project
         from app.notification_dispatch import dispatch_external_notification
@@ -2718,11 +2983,21 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 exc_info=True,
             )
 
-    await session.commit()
-
-    # Track first task for HALF_OPEN → CLOSED transition
+    # Hold Project -> Resident authority while applying the in-memory policy
+    # change and staging its durable alert. Cutover can proceed only after this
+    # transaction commits; a superseded generation rolls the entire mutation
+    # back before any broadcast or external notification is scheduled.
+    await lock_and_validate_legacy_authority(
+        session,
+        project.id,
+        expected_generation=legacy_generation,
+    )
     if breaker["state"] == "HALF_OPEN" and spawned_tasks:
         breaker["half_open_task_id"] = str(spawned_tasks[0].id)
+    anomaly_action = await check_anomaly_actions()
+    _stage_anomaly_action_alert(session, project.id, anomaly_action)
+    await commit_legacy_authorized(session, project.id, legacy_generation)
+    await _publish_anomaly_action(project.id, anomaly_action)
 
     for t in spawned_tasks:
         logger.info(
@@ -2734,7 +3009,13 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         )
 
 
-async def _spawn_periodic_task(project: Project, task_type: str, session: AsyncSession):
+async def _spawn_periodic_task(
+    project: Project,
+    task_type: str,
+    session: AsyncSession,
+    *,
+    expected_legacy_generation: int | None = None,
+):
     """Spawn a periodic non-research task (qa, security_audit, deps) if its schedule is due."""
     from sqlalchemy import func
 
@@ -2745,7 +3026,9 @@ async def _spawn_periodic_task(project: Project, task_type: str, session: AsyncS
         )
         return
     spend_defer_reason = await _project_spend_ceiling_spawn_defer_reason(
-        project, session
+        project,
+        session,
+        expected_legacy_generation=expected_legacy_generation,
     )
     if spend_defer_reason:
         logger.info(
@@ -2759,7 +3042,11 @@ async def _spawn_periodic_task(project: Project, task_type: str, session: AsyncS
     # Guard: circuit breaker must allow spawning
     breaker = _shared_state.get_circuit_breaker(str(project.id))
     if await _advance_circuit_breaker_and_check(
-        project, session, breaker, f"periodic task spawn (type={task_type})"
+        project,
+        session,
+        breaker,
+        f"periodic task spawn (type={task_type})",
+        expected_legacy_generation=expected_legacy_generation,
     ):
         return
 
@@ -2963,11 +3250,27 @@ async def _spawn_periodic_task(project: Project, task_type: str, session: AsyncS
         },
     )
     session.add(history)
-    await session.commit()
-    await session.refresh(new_task)
+    if expected_legacy_generation is not None:
+        from app.strategic_resident_transition_locks import (
+            lock_and_validate_legacy_authority,
+        )
 
+        await lock_and_validate_legacy_authority(
+            session,
+            project.id,
+            expected_generation=expected_legacy_generation,
+        )
     if breaker["state"] == "HALF_OPEN":
         breaker["half_open_task_id"] = str(new_task.id)
+    if expected_legacy_generation is None:
+        await session.commit()
+    else:
+        from app.strategic_resident_transition_locks import commit_legacy_authorized
+
+        await commit_legacy_authorized(
+            session, project.id, expected_legacy_generation
+        )
+    await session.refresh(new_task)
 
     logger.info(
         f"[AUTONOMOUS] Spawned periodic {task_type} task {new_task.id} for project {project.id}"
@@ -2991,10 +3294,14 @@ async def _check_autonomous_research(owner: str, repo: str):
     # short read session, so no per-project spawn can hold this open.
     try:
         async with AsyncSessionLocal() as session:
-            project_ids = (
-                (
-                    await session.execute(
-                        select(Project.id).where(
+            project_authorities = (
+                await session.execute(
+                    select(Project.id, StrategicResident.authority_generation)
+                    .outerjoin(
+                        StrategicResident,
+                        StrategicResident.project_id == Project.id,
+                    )
+                    .where(
                             Project.github_owner == owner,
                             Project.github_repo == repo,
                             Project.autonomous_enabled.is_(True),
@@ -3002,13 +3309,14 @@ async def _check_autonomous_research(owner: str, repo: str):
                             # work even when autonomous_enabled is still True.
                             Project.paused.is_(False),
                             Project.not_archived(),
+                            or_(
+                                StrategicResident.project_id.is_(None),
+                                StrategicResident.engine_owner == "legacy",
+                            ),
                         )
                     )
-                )
-                .scalars()
-                .all()
-            )
-            if not project_ids:
+            ).all()
+            if not project_authorities:
                 return
 
             # Spawn if VM slots are available (PROVISIONING + IN_PROGRESS, not blocked QUEUED)
@@ -3040,13 +3348,17 @@ async def _check_autonomous_research(owner: str, repo: str):
     # ``InvalidRequestError: Instance ... is not persistent within this
     # Session``.  Re-fetching by id also ensures pause/config changes made after
     # enumeration are observed before spawning.
-    for project_id in project_ids:
+    for project_id, expected_generation in project_authorities:
         try:
             async with AsyncSessionLocal() as session:
                 project = await session.get(Project, project_id)
                 if project is None:
                     continue
-                await _spawn_research_task(project, session)
+                await _spawn_research_task(
+                    project,
+                    session,
+                    expected_legacy_generation=int(expected_generation or 0),
+                )
         except Exception as e:
             logger.error(
                 f"[AUTONOMOUS] Research trigger spawn failed for project {project_id} ({owner}/{repo}): {e}",
@@ -3068,7 +3380,11 @@ from app.autonomous_research_residual import (
 
 
 async def _run_idle_research_for_project(
-    project: Project, session: AsyncSession, vm_consuming: int
+    project: Project,
+    session: AsyncSession,
+    vm_consuming: int,
+    *,
+    expected_legacy_generation: int,
 ) -> None:
     """Idle-research spawn work for a single project.
 
@@ -3112,10 +3428,19 @@ async def _run_idle_research_for_project(
         return
 
     if vm_consuming < _runtime_config["max_concurrent_vms"]:
-        await _spawn_research_task(project, session)
+        await _spawn_research_task(
+            project,
+            session,
+            expected_legacy_generation=expected_legacy_generation,
+        )
 
         for task_type in ("security_audit", "qa", "deps"):
-            await _spawn_periodic_task(project, task_type, session)
+            await _spawn_periodic_task(
+                project,
+                task_type,
+                session,
+                expected_legacy_generation=expected_legacy_generation,
+            )
 
     # Spawn the working residual-fingerprint create-fix lane for any
     # recurring failure pattern that warrants a targeted fix.
@@ -3123,7 +3448,9 @@ async def _run_idle_research_for_project(
     # and _spawn_periodic_task so an over-budget project cannot spawn new
     # work through this lane either.
     _residual_defer_reason = await _project_spend_ceiling_spawn_defer_reason(
-        project, session
+        project,
+        session,
+        expected_legacy_generation=expected_legacy_generation,
     )
     if _residual_defer_reason:
         logger.info(
@@ -3132,9 +3459,21 @@ async def _run_idle_research_for_project(
             _residual_defer_reason,
         )
     else:
-        await _spawn_residual_fingerprint_remediation(project, session)
-        await _spawn_viewport_regression_remediation(project, session)
-    await session.commit()
+        await _spawn_residual_fingerprint_remediation(
+            project,
+            session,
+            expected_legacy_generation=expected_legacy_generation,
+        )
+        await _spawn_viewport_regression_remediation(
+            project,
+            session,
+            expected_legacy_generation=expected_legacy_generation,
+        )
+    from app.strategic_resident_transition_locks import commit_legacy_authorized
+
+    await commit_legacy_authorized(
+        session, project.id, expected_legacy_generation
+    )
 
 
 async def _check_idle_research():
@@ -3167,22 +3506,27 @@ async def _check_idle_research():
             await _expire_stale_proposals(session)
             await session.commit()
 
-            project_ids = (
-                (
-                    await session.execute(
-                        select(Project.id).where(
+            project_authorities = (
+                await session.execute(
+                    select(Project.id, StrategicResident.authority_generation)
+                    .outerjoin(
+                        StrategicResident,
+                        StrategicResident.project_id == Project.id,
+                    )
+                    .where(
                             Project.autonomous_enabled.is_(True),
                             # Skip paused projects: pause blocks ALL new work
                             # (research, periodic, and residual remediation)
                             # regardless of the autonomous_enabled toggle.
                             Project.paused.is_(False),
                             Project.not_archived(),
+                            or_(
+                                StrategicResident.project_id.is_(None),
+                                StrategicResident.engine_owner == "legacy",
+                            ),
                         )
                     )
-                )
-                .scalars()
-                .all()
-            )
+            ).all()
 
             # Spawn if VM slots are available — count only tasks consuming VMs,
             # not QUEUED tasks blocked on dependencies. Newly spawned research is
@@ -3209,13 +3553,18 @@ async def _check_idle_research():
     # Project in the session that will run the spawn so it remains persistent
     # for every refresh/write in ``_run_idle_research_for_project``.  Passing a
     # Project loaded by a now-closed batch session is a detached-instance bug.
-    for project_id in project_ids:
+    for project_id, expected_generation in project_authorities:
         try:
             async with AsyncSessionLocal() as session:
                 project = await session.get(Project, project_id)
                 if project is None:
                     continue
-                await _run_idle_research_for_project(project, session, vm_consuming)
+                await _run_idle_research_for_project(
+                    project,
+                    session,
+                    vm_consuming,
+                    expected_legacy_generation=int(expected_generation or 0),
+                )
         except Exception as e:
             logger.error(
                 f"[AUTONOMOUS] Idle research spawn failed for project {project_id}: {e}",
