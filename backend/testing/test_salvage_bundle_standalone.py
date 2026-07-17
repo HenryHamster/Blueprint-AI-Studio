@@ -41,6 +41,8 @@ Findings covered here (18-finding keyless-encryption / release-recovery salvage 
   e16 — _MIN_INFRA_ERROR_STREAK == 3 (permanent gate incapacity streak threshold)
   e17 — hotfix endpoint validates non-empty reason and ack_inert_until_deploy before promoting
   e18 — (acceptance evidence deployed-side, hotfix channel) → pinned by existing tests above
+  e19 — scratch subprocess injects an ephemeral Fernet key (not from the real env)
+  e20 — _looks_like_keyless_encryption_artifact requires all three signals (no false positives)
 
 Findings covered here (7-finding compute-images bundle):
   cb-1 — dispatch reads ProjectComputeImage to resolve default container image
@@ -2739,4 +2741,143 @@ def test_hotfix_endpoint_validates_reason_and_ack_inert_until_deploy():
     )
     assert "not body.ack_inert_until_deploy" in source or "ack_inert_until_deploy must be true" in source, (
         "admin_hotfix_promote.py must reject requests where ack_inert_until_deploy is false"
+    )
+
+
+# e19 — scratch subprocess injects ephemeral Fernet key
+# --------------------------------------------------------------------------- #
+
+
+def test_scratch_subprocess_injects_ephemeral_fernet_key():
+    """_run_migration_apply_subprocess must set GITHUB_PAT_ENCRYPTION_KEY to a
+    freshly generated Fernet key, not read it from the real environment.
+
+    Finding e19: migration 0609 calls _load_fernet() at import time and raises
+    RuntimeError when GITHUB_PAT_ENCRYPTION_KEY is unset.  The scratch subprocess
+    env deliberately strips secrets via _SUBPROCESS_ENV_ALLOWLIST, so without the
+    injection the gate would always defer on 0609.  The fix injects a synthetic
+    per-run key so the migration body can execute on the empty scratch DB.
+
+    This is a pure source-code inspection — no DB required.
+    """
+    import inspect
+    from app.migration_apply_gate import _run_migration_apply_subprocess, _ENCRYPTION_KEY_ENV_VAR
+
+    source = inspect.getsource(_run_migration_apply_subprocess)
+
+    assert _ENCRYPTION_KEY_ENV_VAR in source, (
+        f"_run_migration_apply_subprocess must set {_ENCRYPTION_KEY_ENV_VAR} — "
+        "without it migration 0609 raises RuntimeError and wedges qualification"
+    )
+    assert "Fernet.generate_key()" in source, (
+        "_run_migration_apply_subprocess must use Fernet.generate_key() to produce "
+        "a synthetic ephemeral key — not copy the production secret into the subprocess"
+    )
+    # Confirm the key is set from generate_key, not taken from the real env.
+    assert "os.environ" not in source.split(_ENCRYPTION_KEY_ENV_VAR)[1].split("Fernet.generate_key()")[0], (
+        f"{_ENCRYPTION_KEY_ENV_VAR} must be set to Fernet.generate_key() output, "
+        "not forwarded from os.environ — the subprocess env must not receive the real secret"
+    )
+
+
+# e20 — _looks_like_keyless_encryption_artifact three-signal guard
+# --------------------------------------------------------------------------- #
+
+
+def test_looks_like_keyless_encryption_artifact_classifier():
+    """_looks_like_keyless_encryption_artifact requires all three signals and
+    returns False when any one is missing, preventing false positives from
+    accumulated chain stderr (e.g. earlier no-op migrations that emit the env-var
+    name in their own warning lines before 0609 fails).
+
+    Finding e20: the tightened classifier (#15590) requires RuntimeError AND the
+    env-var name AND 'Migration 0609' — a two-signal match would swallow unrelated
+    RuntimeErrors that follow no-op migration warnings.
+    """
+    from app.migration_apply_gate import _looks_like_keyless_encryption_artifact, _ENCRYPTION_KEY_ENV_VAR
+
+    # Full positive: all three signals present → True
+    full_match = (
+        f"RuntimeError: {_ENCRYPTION_KEY_ENV_VAR} is required. "
+        "Migration 0609 does not permit this migration to stamp."
+    )
+    assert _looks_like_keyless_encryption_artifact(full_match) is True, (
+        "_looks_like_keyless_encryption_artifact must return True when all three "
+        "signals are present (RuntimeError + env-var name + 'Migration 0609')"
+    )
+
+    # Missing 'Migration 0609' → False (prevents false positives from other RuntimeErrors)
+    no_0609 = f"RuntimeError: {_ENCRYPTION_KEY_ENV_VAR} is required. Some other migration failed."
+    assert _looks_like_keyless_encryption_artifact(no_0609) is False, (
+        "_looks_like_keyless_encryption_artifact must return False when 'Migration 0609' "
+        "is absent — earlier no-op migrations emit the env-var name to stderr, so a "
+        "two-signal match would produce false positives"
+    )
+
+    # Missing env-var name → False
+    no_key = "RuntimeError: encryption key required. Migration 0609 does not permit stamping."
+    assert _looks_like_keyless_encryption_artifact(no_key) is False, (
+        "_looks_like_keyless_encryption_artifact must return False when the env-var "
+        f"name ({_ENCRYPTION_KEY_ENV_VAR}) is absent"
+    )
+
+    # Missing 'RuntimeError' → False
+    no_runtime_error = (
+        f"ValueError: {_ENCRYPTION_KEY_ENV_VAR} is required. Migration 0609 failed."
+    )
+    assert _looks_like_keyless_encryption_artifact(no_runtime_error) is False, (
+        "_looks_like_keyless_encryption_artifact must return False when 'RuntimeError' "
+        "is absent — the match must be anchored to the specific exception type"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# test: fail-fast dual-write spec vs ledger-registry drift without a DB
+# --------------------------------------------------------------------------- #
+
+
+def test_dual_write_spec_matches_ledger_registry():
+    """_DUAL_WRITE_SPEC_DIMENSIONS must equal LEDGER_DIMENSION_KEYS at import time.
+
+    The guard that keeps the qualification dual-write spec list synchronised with
+    the ledger dimension registry was previously a runtime assert inside
+    _dual_write_dimension_results that only fires when that async function executes
+    against a real database session.  A new ledger dimension added to the registry
+    but omitted from the spec list would therefore silently never be persisted,
+    with the drift caught only weeks later at promotion-PR time.
+
+    The fix adds a module-level _DUAL_WRITE_SPEC_DIMENSIONS constant that is
+    asserted == LEDGER_DIMENSION_KEYS at module import time.  This test verifies:
+    (a) the constant is importable without a DB session, and
+    (b) the module-level assert fires (i.e. the import itself did not raise),
+    confirming the spec and registry are in sync in the current codebase.
+    """
+    from app.release_qualifier import _DUAL_WRITE_SPEC_DIMENSIONS
+    from app.qualification_dimensions import LEDGER_DIMENSION_KEYS
+
+    # If the module-level assert in release_qualifier.py had failed, the import
+    # above would have raised AssertionError — reaching this line proves it passed.
+    assert _DUAL_WRITE_SPEC_DIMENSIONS == LEDGER_DIMENSION_KEYS, (
+        f"_DUAL_WRITE_SPEC_DIMENSIONS ({sorted(_DUAL_WRITE_SPEC_DIMENSIONS)}) != "
+        f"LEDGER_DIMENSION_KEYS ({sorted(LEDGER_DIMENSION_KEYS)}); "
+        f"extra in spec: {sorted(_DUAL_WRITE_SPEC_DIMENSIONS - LEDGER_DIMENSION_KEYS)}, "
+        f"missing from spec: {sorted(LEDGER_DIMENSION_KEYS - _DUAL_WRITE_SPEC_DIMENSIONS)}"
+    )
+
+    # The constant must be a frozenset so it is immutable and hashable.
+    assert isinstance(_DUAL_WRITE_SPEC_DIMENSIONS, frozenset), (
+        "_DUAL_WRITE_SPEC_DIMENSIONS must be a frozenset — "
+        "a mutable set could be accidentally modified at runtime"
+    )
+
+    # Every expected ledger-backed dimension must be present.
+    expected = {
+        "ci", "audit", "test_erosion", "smoketest", "challenge",
+        "migration_identity", "migration_apply", "merge_grade",
+        "acceptance_window", "debt_pressure", "capability_proof", "env_preflight",
+    }
+    assert _DUAL_WRITE_SPEC_DIMENSIONS == expected, (
+        f"_DUAL_WRITE_SPEC_DIMENSIONS content differs from the expected 12-dimension set; "
+        f"extra: {sorted(_DUAL_WRITE_SPEC_DIMENSIONS - expected)}, "
+        f"missing: {sorted(expected - _DUAL_WRITE_SPEC_DIMENSIONS)}"
     )

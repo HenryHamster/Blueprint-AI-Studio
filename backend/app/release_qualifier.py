@@ -313,6 +313,31 @@ _CONCLUSIVE_VERDICT_STATUSES: frozenset[str] = frozenset(
     {"promoted", "not_promoted", "dry_run"}
 )
 
+# Explicit enumeration of every dimension written by _dual_write_dimension_results.
+# This constant is asserted == LEDGER_DIMENSION_KEYS at module load so any drift
+# between the spec list and the registry is caught at import time (no DB needed),
+# rather than only when _dual_write_dimension_results executes against a real session.
+_DUAL_WRITE_SPEC_DIMENSIONS: frozenset[str] = frozenset({
+    "ci",
+    "audit",
+    "test_erosion",
+    "smoketest",
+    "challenge",
+    "migration_identity",
+    "migration_apply",
+    "merge_grade",
+    "acceptance_window",
+    "debt_pressure",
+    "capability_proof",
+    "env_preflight",
+})
+assert _DUAL_WRITE_SPEC_DIMENSIONS == LEDGER_DIMENSION_KEYS, (
+    f"_DUAL_WRITE_SPEC_DIMENSIONS ({_DUAL_WRITE_SPEC_DIMENSIONS}) != "
+    f"LEDGER_DIMENSION_KEYS ({LEDGER_DIMENSION_KEYS}); "
+    f"extra: {_DUAL_WRITE_SPEC_DIMENSIONS - LEDGER_DIMENSION_KEYS}, "
+    f"missing: {LEDGER_DIMENSION_KEYS - _DUAL_WRITE_SPEC_DIMENSIONS}"
+)
+
 _NEVER_GRADED_GAP = (
     "No merge-grade verdict exists for this candidate — the acceptance contract "
     "was never graded (a merge-grade runs only for a version with a usable, "
