@@ -5267,3 +5267,145 @@ async def check_research_quality_grader_pass_rate(ctx: SweepContext) -> List[Che
         )
 
     return results
+
+
+@register_check(
+    "encrypted_field_plaintext_detector",
+    "Sample encrypted-at-rest columns and flag rows still in plaintext after "
+    "a stamped-applied encryption backfill migration; SKIPPED when encryption "
+    "is not active",
+)
+async def check_encrypted_field_plaintext_detector(
+    ctx: SweepContext,
+) -> List[CheckResult]:
+    """Ground truth: when Fernet encryption is active, every non-NULL value in the
+    audited (table, column) pairs should be decryptable.  A value where
+    ``decrypt_field(value) == value`` is still plaintext — the backfill migration
+    may have stamped ``applied`` without actually encrypting (e.g. because the
+    key was absent or misconfigured at migration time).
+
+    Returns a single global SKIPPED when ``is_encryption_active()`` is False —
+    the whole deployment fails closed on write, so there is nothing to detect.
+
+    Audits the same 5 (table, column) pairs as migration 0621
+    (``_BACKFILL_TARGETS``), bounded to ``ctx.sample_limit`` rows per pair.
+    Returns one ``CheckResult`` per (table, column) with ``subject`` set to
+    ``"<table>.<column>"``.
+    """
+    from app.field_encryption import decrypt_field, is_encryption_active
+    from app.models import MaxPlanAccount, NotificationDeadLetter, UserIntegration
+
+    if not is_encryption_active():
+        return [
+            CheckResult(
+                check="encrypted_field_plaintext_detector",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail=(
+                    "encryption not active — cannot detect plaintext in "
+                    "encrypted columns"
+                ),
+            )
+        ]
+
+    # (model_class, column_attr, subject_label, skip_empty_strings)
+    targets = [
+        (
+            MaxPlanAccount,
+            MaxPlanAccount.oauth_token,
+            "maxplanaccount.oauth_token",
+            False,
+        ),
+        (
+            MaxPlanAccount,
+            MaxPlanAccount.claude_config_json,
+            "maxplanaccount.claude_config_json",
+            False,
+        ),
+        (
+            MaxPlanAccount,
+            MaxPlanAccount.secret_blob_ref,
+            "maxplanaccount.secret_blob_ref",
+            False,
+        ),
+        (
+            NotificationDeadLetter,
+            NotificationDeadLetter.webhook_url,
+            "notification_dead_letter.webhook_url",
+            True,
+        ),
+        (
+            UserIntegration,
+            UserIntegration.github_pat,
+            "userintegration.github_pat",
+            False,
+        ),
+    ]
+
+    results: List[CheckResult] = []
+    for model_class, column_attr, label, skip_empty in targets:
+        col_name = column_attr.key
+        try:
+            stmt = select(model_class).where(column_attr.isnot(None))
+            if skip_empty:
+                stmt = stmt.where(column_attr != "")
+            stmt = stmt.limit(ctx.sample_limit)
+            rows = (await ctx.session.execute(stmt)).scalars().all()
+
+            plaintext_count = 0
+            for row in rows:
+                value = getattr(row, col_name)
+                if value and decrypt_field(value) == value:
+                    plaintext_count += 1
+
+            sampled = len(rows)
+            if plaintext_count:
+                results.append(
+                    CheckResult(
+                        check="encrypted_field_plaintext_detector",
+                        status=CheckStatus.FLAGGED,
+                        self_reported=sampled,
+                        ground_truth=sampled - plaintext_count,
+                        delta=plaintext_count,
+                        severity="warn",
+                        subject=label,
+                        detail=(
+                            f"{plaintext_count}/{sampled} sampled {label} "
+                            "value(s) are still plaintext after encryption "
+                            "backfill"
+                        ),
+                    )
+                )
+            else:
+                results.append(
+                    CheckResult(
+                        check="encrypted_field_plaintext_detector",
+                        status=CheckStatus.OK,
+                        self_reported=sampled,
+                        ground_truth=sampled,
+                        delta=0,
+                        subject=label,
+                        detail=(
+                            f"all {sampled} sampled {label} value(s) "
+                            "are encrypted"
+                        ),
+                    )
+                )
+        except Exception as exc:  # noqa: BLE001 — per-column isolation is intentional
+            logger.warning(
+                "[METRICS_INTEGRITY] encrypted_field_plaintext_detector "
+                "failed for %s: %s",
+                label,
+                exc,
+            )
+            results.append(
+                CheckResult(
+                    check="encrypted_field_plaintext_detector",
+                    status=CheckStatus.ERROR,
+                    severity="error",
+                    subject=label,
+                    detail=str(exc)[:200],
+                )
+            )
+
+    return results
