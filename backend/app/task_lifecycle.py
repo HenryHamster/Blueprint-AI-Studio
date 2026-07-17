@@ -5741,8 +5741,10 @@ async def _process_post_commit(
                 #                   intermediate); rebase output is mechanical;
                 #                   re-reviewing would be inconsistent with the
                 #                   no-conflict happy path. Wait for CI then merge.
-                #   - migration_guard → mechanical Alembic renumber/rechain after
-                #                   the pre-merge guard blocked an approved PR.
+                #   - migration_guard → targeted Alembic chain repair after the
+                #                   pre-merge guard blocked an approved PR. The
+                #                   repair may drop already-landed semantic work
+                #                   or renumber genuinely new schema work.
                 #                   Wait for CI then merge.
                 #   - minor-only first-pass verdict → the fix only addressed
                 #                   minor nits; a re-review would near-certainly
