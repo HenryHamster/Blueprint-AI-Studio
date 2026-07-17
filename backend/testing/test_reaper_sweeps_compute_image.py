@@ -1711,3 +1711,119 @@ async def test_sweep_passes_progress_cb_to_driver(db):
     assert captured_kwargs.get("progress_cb") is _progress, (
         "sweep must pass progress_cb through to the driver"
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Operator-visible drift alert: sweep surfaces a rebuilt image via Alert
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_rebuilt_creates_info_alert(db):
+    """A 'rebuilt' sweep result creates exactly one INFO alert for the project."""
+    from app.alert_dispatch import _COMPUTE_IMAGE_DRIFT_ALERT_TITLE
+    from app.models import Alert, AlertSeverity
+
+    project = await _make_repo_project(db)
+    pinned = f"{_FULL_REPO}@{_DIGEST_A}"
+
+    async def _refresh(session, project, **kwargs):
+        return {"status": "rebuilt", "dep_hash": "deadbeef01234567", "pinned_ref": pinned}
+
+    with patch("app.reaper_sweeps._last_compute_image_refresh_sweep", None):
+        result = await sweep_refresh_project_compute_images(
+            db,
+            now=datetime(2026, 6, 1, 12, 0, 0),
+            _refresh_fn=_refresh,
+            _build_semaphore=asyncio.Semaphore(1),
+        )
+
+    assert result["rebuilt"] == 1
+    alerts = (
+        (
+            await db.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.title == _COMPUTE_IMAGE_DRIFT_ALERT_TITLE,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1, "exactly one drift alert expected after a rebuild"
+    assert alerts[0].severity == AlertSeverity.INFO
+    assert "deadbeef01234567" in alerts[0].message
+    assert _FULL_REPO in alerts[0].message
+
+
+@pytest.mark.asyncio
+async def test_rebuilt_alert_deduped_on_second_sweep(db):
+    """A second rebuild sweep while the alert is open does NOT create a duplicate."""
+    from app.alert_dispatch import _COMPUTE_IMAGE_DRIFT_ALERT_TITLE
+    from app.models import Alert
+
+    project = await _make_repo_project(db)
+
+    async def _refresh(session, project, **kwargs):
+        return {"status": "rebuilt", "dep_hash": "aabbccdd", "pinned_ref": f"{_FULL_REPO}@{_DIGEST_A}"}
+
+    async def _run():
+        with patch("app.reaper_sweeps._last_compute_image_refresh_sweep", None):
+            return await sweep_refresh_project_compute_images(
+                db,
+                now=datetime(2026, 6, 1, 12, 0, 0),
+                _refresh_fn=_refresh,
+                _build_semaphore=asyncio.Semaphore(1),
+            )
+
+    await _run()
+    await _run()
+
+    alerts = (
+        (
+            await db.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.title == _COMPUTE_IMAGE_DRIFT_ALERT_TITLE,
+                    Alert.dismissed_at.is_(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1, "open alert must be deduped, not duplicated on re-sweep"
+
+
+@pytest.mark.asyncio
+async def test_unchanged_creates_no_drift_alert(db):
+    """Unchanged and no_config sweep results do NOT create a drift alert."""
+    from app.alert_dispatch import _COMPUTE_IMAGE_DRIFT_ALERT_TITLE
+    from app.models import Alert
+
+    await _make_repo_project(db)
+
+    async def _refresh(session, project, **kwargs):
+        return {"status": "unchanged"}
+
+    with patch("app.reaper_sweeps._last_compute_image_refresh_sweep", None):
+        await sweep_refresh_project_compute_images(
+            db,
+            now=datetime(2026, 6, 1, 12, 0, 0),
+            _refresh_fn=_refresh,
+            _build_semaphore=asyncio.Semaphore(1),
+        )
+
+    alerts = (
+        (
+            await db.execute(
+                select(Alert).where(
+                    Alert.title == _COMPUTE_IMAGE_DRIFT_ALERT_TITLE,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert alerts == [], "no drift alert expected for unchanged/no_config sweep result"
