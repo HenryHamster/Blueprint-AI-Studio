@@ -925,6 +925,21 @@ def _compute_direction_quality_score(d: dict) -> float:
     if grade_data_w > 0:
         components.append(grade_high_w / grade_data_w)
 
+    # (f) quality grader pass rate — recency-weighted fraction of cycles that
+    # passed forward-quality grading.  Added ONLY when at least one cycle in
+    # the window carries a quality_grader_verdict; cycles without the key are
+    # neutral so legacy entries do not drag down new ones.
+    qg_data_w = 0.0
+    qg_pass_w = 0.0
+    for entry, w in zip(recent, weights, strict=True):
+        qgv = entry.get("quality_grader_verdict")
+        if isinstance(qgv, dict) and "passed" in qgv:
+            qg_data_w += w
+            if qgv.get("passed"):
+                qg_pass_w += w
+    if qg_data_w > 0:
+        components.append(qg_pass_w / qg_data_w)
+
     score = sum(components) / len(components)
     return max(0.0, min(1.0, score))
 

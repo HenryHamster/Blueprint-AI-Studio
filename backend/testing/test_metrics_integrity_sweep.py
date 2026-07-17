@@ -35,6 +35,7 @@ from app.models import (
     Artifact,
     ArtifactType,
     CriterionEvidence,
+    Direction,
     EvergreenBacklogItem,
     Project,
     ReleaseVersion,
@@ -180,6 +181,8 @@ def test_registry_contains_initial_checks():
         "criterion_claim_reconciliation",
         "capability_proof_gate_gap",
         "capability_proof_trial_stall",
+        "unmapped_acceptance_criteria",
+        "research_quality_grader_pass_rate",
     } <= names
 
 
@@ -5926,3 +5929,187 @@ async def test_capability_proof_trial_stall_mixed_caps(db):
     severities = {f.detail.split("cap=")[1].split("'")[1]: f.severity for f in flagged}
     assert severities["cap-alpha"] == "error"
     assert severities["cap-beta"] == "warn"
+
+
+# --- check_unmapped_acceptance_criteria -------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_unmapped_acceptance_criteria_flags_criterion_with_no_direction(db):
+    """An active criterion not linked to any Direction is FLAGGED."""
+    project = await _project(db)
+    version, criterion = await _open_version_with_criterion(
+        db, project, text="Unmapped criterion"
+    )
+    # No Direction row → criterion is unmapped.
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_unmapped_acceptance_criteria(ctx)
+    flagged = [r for r in results if r.status == CheckStatus.FLAGGED]
+    assert len(flagged) == 1, f"expected 1 flagged, got {results}"
+    f = flagged[0]
+    assert f.check == "unmapped_acceptance_criteria"
+    assert f.self_reported == 1
+    assert f.ground_truth == 0
+    assert f.delta == 1
+    assert criterion.criterion_key in f.detail
+
+
+@pytest.mark.asyncio
+async def test_unmapped_acceptance_criteria_ok_when_criterion_mapped(db):
+    """A criterion linked to a Direction is NOT flagged."""
+    project = await _project(db)
+    version, criterion = await _open_version_with_criterion(
+        db, project, text="Mapped criterion"
+    )
+    # Create a Direction that lists this criterion_key.
+    direction = Direction(
+        project_id=project.id,
+        direction_key="d-test-mapped",
+        status="active",
+        criterion_keys=[criterion.criterion_key],
+    )
+    db.add(direction)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_unmapped_acceptance_criteria(ctx)
+    assert all(not r.flagged for r in results), f"unexpected flagged: {results}"
+    ok = [r for r in results if r.status == CheckStatus.OK]
+    assert len(ok) >= 1
+    assert ok[0].delta == 0
+
+
+@pytest.mark.asyncio
+async def test_unmapped_acceptance_criteria_skips_no_open_version(db):
+    """Project with no open version → SKIPPED for that project."""
+    project = await _project(db)
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_unmapped_acceptance_criteria(ctx)
+    mine = [r for r in results if r.subject == str(project.id)]
+    assert len(mine) == 1
+    assert mine[0].status == CheckStatus.SKIPPED
+    assert "no open version" in mine[0].detail
+
+
+@pytest.mark.asyncio
+async def test_unmapped_acceptance_criteria_skips_no_active_criteria(db):
+    """Open version with no active criteria → SKIPPED."""
+    project = await _project(db)
+    version = ReleaseVersion(project_id=project.id, version_number=1, status="open")
+    db.add(version)
+    await db.commit()
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_unmapped_acceptance_criteria(ctx)
+    mine = [r for r in results if r.subject == str(project.id)]
+    assert len(mine) == 1
+    assert mine[0].status == CheckStatus.SKIPPED
+    assert "no active criteria" in mine[0].detail
+
+
+# --- check_research_quality_grader_pass_rate --------------------------------
+
+
+@pytest.mark.asyncio
+async def test_research_quality_grader_pass_rate_flags_all_failed(db):
+    """Direction whose recent cycles all have quality_grader_verdict passed=False is FLAGGED."""
+    project = await _project(db)
+    project.directions = [
+        {
+            "id": "d-failing-qg",
+            "status": "active",
+            "text": "Test direction",
+            "research_history": [
+                {"task_id": "t1", "quality_grader_verdict": {"passed": False, "reason": "bad"}},
+                {"task_id": "t2", "quality_grader_verdict": {"passed": False, "reason": "bad"}},
+            ],
+        }
+    ]
+    from sqlalchemy.orm.attributes import flag_modified
+    flag_modified(project, "directions")
+    db.add(project)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_research_quality_grader_pass_rate(ctx)
+    flagged = [r for r in results if r.status == CheckStatus.FLAGGED]
+    assert len(flagged) == 1, f"expected 1 flagged, got {results}"
+    f = flagged[0]
+    assert f.check == "research_quality_grader_pass_rate"
+    assert f.self_reported == 2
+    assert f.ground_truth == 0
+    assert f.delta == 2
+
+
+@pytest.mark.asyncio
+async def test_research_quality_grader_pass_rate_ok_when_passing(db):
+    """Direction with at least one passing quality_grader_verdict is NOT flagged."""
+    project = await _project(db)
+    project.directions = [
+        {
+            "id": "d-passing-qg",
+            "status": "active",
+            "research_history": [
+                {"task_id": "t1", "quality_grader_verdict": {"passed": False, "reason": "bad"}},
+                {"task_id": "t2", "quality_grader_verdict": {"passed": True, "reason": "ok"}},
+            ],
+        }
+    ]
+    from sqlalchemy.orm.attributes import flag_modified
+    flag_modified(project, "directions")
+    db.add(project)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_research_quality_grader_pass_rate(ctx)
+    assert all(not r.flagged for r in results), f"unexpected flagged: {results}"
+    ok = [r for r in results if r.status == CheckStatus.OK]
+    assert len(ok) >= 1
+
+
+@pytest.mark.asyncio
+async def test_research_quality_grader_pass_rate_skips_legacy_entries(db):
+    """Directions with no quality_grader_verdict in history are skipped (not flagged)."""
+    project = await _project(db)
+    project.directions = [
+        {
+            "id": "d-legacy",
+            "status": "active",
+            "research_history": [
+                {"task_id": "t1", "tasks_created": 3},
+                {"task_id": "t2", "tasks_created": 2},
+            ],
+        }
+    ]
+    from sqlalchemy.orm.attributes import flag_modified
+    flag_modified(project, "directions")
+    db.add(project)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_research_quality_grader_pass_rate(ctx)
+    assert all(not r.flagged for r in results), f"unexpected flagged: {results}"
+    ok = [r for r in results if r.status == CheckStatus.OK]
+    assert len(ok) >= 1
+    assert "no directions" in ok[0].detail
