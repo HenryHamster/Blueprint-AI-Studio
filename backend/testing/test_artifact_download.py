@@ -547,6 +547,60 @@ def test_sanitize_svg_bytes_strips_script_and_events():
     bad = b"not xml at all <<< >>>"
     assert storage.sanitize_svg_bytes(bad) == bad
 
+
+def test_sanitize_svg_bytes_strips_xhtml_namespaced_script():
+    """<script> inside <foreignObject> with XHTML namespace must be removed.
+
+    A bare _SVG_SCRIPT_TAGS set-lookup misses {xhtml}script — this test pins
+    the local-name matching fix so the bypass class stays closed.
+    """
+    xhtml_ns = "http://www.w3.org/1999/xhtml"
+    svg_ns = "http://www.w3.org/2000/svg"
+    # foreignObject with an XHTML-namespaced script inside.
+    payload = (
+        f'<svg xmlns="{svg_ns}" xmlns:xhtml="{xhtml_ns}">'
+        f"<foreignObject>"
+        f'<xhtml:script>alert(1)</xhtml:script>'
+        f"</foreignObject>"
+        f"</svg>"
+    ).encode()
+    result = storage.sanitize_svg_bytes(payload)
+    assert b"script" not in result.lower()
+    assert b"alert" not in result
+    assert b"foreignObject" not in result  # entire foreignObject subtree dropped
+
+
+def test_sanitize_svg_bytes_strips_smil_href_animation():
+    """SMIL <animate> that rewrites href to javascript: must be removed.
+
+    Static-attribute checks miss runtime rewriting — this test pins the
+    animation-element fix so the vector stays closed.
+    """
+    svg_ns = "http://www.w3.org/2000/svg"
+    payload = (
+        f'<svg xmlns="{svg_ns}">'
+        f'<a href="#safe"><text>click</text>'
+        f'<animate attributeName="href" to="javascript:alert(1)"/>'
+        f"</a>"
+        f"</svg>"
+    ).encode()
+    result = storage.sanitize_svg_bytes(payload)
+    assert b"animate" not in result
+    assert b"javascript:" not in result
+    assert b"text" in result  # safe geometry preserved
+
+    # <set> variant
+    payload2 = (
+        f'<svg xmlns="{svg_ns}">'
+        f'<a href="#safe">'
+        f'<set attributeName="href" to="javascript:alert(2)"/>'
+        f"</a>"
+        f"</svg>"
+    ).encode()
+    result2 = storage.sanitize_svg_bytes(payload2)
+    assert b"set" not in result2 or b"javascript:" not in result2
+    assert b"javascript:" not in result2
+
     # Clean SVG is returned as valid XML bytes.
     clean = b"<svg xmlns='http://www.w3.org/2000/svg'><rect/></svg>"
     sanitized = storage.sanitize_svg_bytes(clean)

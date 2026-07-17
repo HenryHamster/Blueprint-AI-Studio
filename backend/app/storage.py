@@ -481,21 +481,30 @@ def normalize_viewable_revision(value: object) -> str | None:
 
 _SVG_NAMESPACE = "http://www.w3.org/2000/svg"
 _XLINK_NAMESPACE = "http://www.w3.org/1999/xlink"
-# Tag names that can execute script, matched with or without the SVG namespace.
-_SVG_SCRIPT_TAGS = {
-    "script",
-    f"{{{_SVG_NAMESPACE}}}script",
-}
+# Local names of elements to remove entirely, regardless of namespace.
+# foreignObject can embed arbitrary HTML and is a known XSS vector.
+_SVG_DANGEROUS_LOCAL_NAMES = {"script", "foreignobject"}
+# SMIL animation elements that can rewrite href to javascript: at runtime.
+_SVG_ANIMATION_LOCAL_NAMES = {"animate", "animatetransform", "set"}
+# attributeName values that animation elements could use to redirect navigation.
+_HREF_ATTR_NAMES = {"href", "xlink:href"}
+
+
+def _svg_local_name(tag: str) -> str:
+    """Return the local name of an ElementTree tag, lowercased."""
+    return tag.split("}")[-1].lower() if "}" in tag else tag.lower()
 
 
 def sanitize_svg_bytes(data: bytes) -> bytes:
     """Strip executable content from SVG bytes before serving.
 
-    Removes ``<script>`` elements (namespaced and bare), all ``on*`` event
-    attributes, and ``href`` / ``xlink:href`` attributes whose value starts
-    with ``javascript:``. Returns the sanitized XML bytes, or the original
-    ``data`` unchanged when parsing fails — malformed SVG will not execute
-    anything in the browser anyway.
+    Removes ``<script>`` elements in ALL namespaces (matched by local name),
+    ``<foreignObject>`` subtrees (which can embed arbitrary HTML), SMIL
+    animation elements that rewrite href to a javascript: URL, all ``on*``
+    event attributes, and ``href`` / ``xlink:href`` attributes whose value
+    starts with ``javascript:``.  Returns the sanitized XML bytes, or the
+    original ``data`` unchanged when parsing fails — malformed SVG will not
+    execute anything in the browser anyway.
 
     This is defence-in-depth: ``<img src>`` already sandboxes SVG in all
     modern browsers (no script execution, no cookies, no same-origin network
@@ -511,8 +520,20 @@ def sanitize_svg_bytes(data: bytes) -> bytes:
     to_remove: list[tuple[_ET.Element, _ET.Element]] = []
     for parent in root.iter():
         for child in list(parent):
-            if child.tag in _SVG_SCRIPT_TAGS:
+            local = _svg_local_name(child.tag)
+            if local in _SVG_DANGEROUS_LOCAL_NAMES:
                 to_remove.append((parent, child))
+                continue
+            # Strip SMIL animation elements that can rewrite href to javascript:
+            if local in _SVG_ANIMATION_LOCAL_NAMES:
+                attr_name = child.attrib.get("attributeName", "").strip().lower()
+                if attr_name in _HREF_ATTR_NAMES:
+                    to_remove.append((parent, child))
+                    continue
+                for val_key in ("to", "from", "values"):
+                    if child.attrib.get(val_key, "").lstrip().lower().startswith("javascript:"):
+                        to_remove.append((parent, child))
+                        break
     for parent, child in to_remove:
         parent.remove(child)
 
