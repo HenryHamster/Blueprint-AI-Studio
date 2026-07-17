@@ -1304,7 +1304,7 @@ class TestLiveRunnerConfig(unittest.TestCase):
         self.assertTrue(holder.apply({"max_concurrent": 4, "config_generation": "gen-A"}))
         self.assertEqual(holder.report()["applied_config_generation"], "gen-A")
         # A block carrying an UNRECOGNIZED non-null field is not fully applicable:
-        # the known fields still apply, but the generation stays pending (older).
+        # the whole block is rejected atomically — the known fields do NOT apply.
         applied = holder.apply({
             "max_concurrent": 7,
             "future_field": "something",
@@ -1398,7 +1398,7 @@ class TestLiveRunnerConfig(unittest.TestCase):
         self.assertIsNone(rep["config_apply_reason"])
         self.assertIsNone(rep["config_rejected_generation"])
 
-        # An unrecognized non-null field is rejected; known field still applied.
+        # An unrecognized non-null field causes atomic rejection — known field NOT applied.
         applied = holder.apply({
             "max_concurrent": 6,
             "zzz_field": "x",
