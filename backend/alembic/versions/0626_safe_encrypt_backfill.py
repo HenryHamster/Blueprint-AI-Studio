@@ -30,6 +30,26 @@ Identical to 0531 / 0472: ``decrypt_field(value) != value`` means the value is
 ALREADY ciphertext and is skipped.  The plain ``encrypt_field(value) == value``
 short-circuit avoids a no-key no-op turning into a double-encrypt attempt.
 
+# BLUEPRINT_DATA_MIGRATION_PROOF: upgrade() runs DML via bind.execute(sa.update(...))
+# on 5 hardcoded (table, column) targets. Safe because: (1) idempotent-per-row —
+# decrypt_field(value) != value skips ciphertext; (2) wrong-key guard —
+# _assert_plaintext_or_raise() rejects undecryptable ciphertext; (3) fixed allowlist
+# — no row-data interpolation into table/column names; (4) parameterised queries —
+# no f-string SQL; (5) fail-closed at both upgrade() and _backfill_column() levels;
+# (6) notification_dead_letter.webhook_url filters col != "". Downgrade uses the same
+# invariants.
+
+WHY NO app.* IMPORTS
+--------------------
+The promotion apply gate (backend/app/migration_apply_gate.py,
+``_apply_candidate_migrations``) executes candidate migration FILES in-process
+on the DEPLOYED engine.  Any ``from app.*`` import resolves against the SERVING
+tree rather than the candidate, so missing symbols cause ImportError and
+infra-fail every qualification attempt.  Precedent: migration 0561 was fixed by
+PR #15100 (commit 1e51b910b) for the same class.  All encryption helpers are
+inlined here as module-local frozen copies — no runtime dependency on
+``app.field_encryption``.
+
 Revision ID: 0626
 Revises: 0625
 Create Date: 2026-07-16 00:00:00.000000
