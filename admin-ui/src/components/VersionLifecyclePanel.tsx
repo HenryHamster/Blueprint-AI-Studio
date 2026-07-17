@@ -641,7 +641,12 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                 older backends that don't emit it degrade gracefully. Status is
                 always 'open' here — the lifecycle query only returns the open row. */}
             {cv.highlights && (
-              <VersionHighlightsLine highlights={cv.highlights} phase={cv.phase} status="open" />
+              <VersionHighlightsLine
+                highlights={cv.highlights}
+                phase={cv.phase}
+                status="open"
+                qualificationState={cv.qualification_state?.state}
+              />
             )}
             {editingGoal && projectId ? (
               <div className="flex flex-col gap-1.5">
@@ -1246,7 +1251,12 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                       <OutOfBandPromotionBadge oob={v.out_of_band_promotion} />
                     )}
                     {!isExpanded && v.highlights && (
-                      <VersionHighlightsLine highlights={v.highlights} phase={v.phase} status={v.status} />
+                      <VersionHighlightsLine
+                        highlights={v.highlights}
+                        phase={v.phase}
+                        status={v.status}
+                        qualificationState={v.qualification_state?.state}
+                      />
                     )}
                     <ArtifactEvidenceList artifacts={v.artifacts} agentServingShas={agentServingShas} />
                     {isExpanded && v.id && <VersionHistorySummary versionId={v.id} />}

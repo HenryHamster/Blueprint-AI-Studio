@@ -141,7 +141,15 @@ export function PromotionPolicyBadge({
 }
 
 export function QualSummary({ q }: { q: VersionQualification | null }) {
-  if (!q || q.confidence == null) return <span className="text-neutral-500 text-ui-sm">—</span>;
+  if (!q) return <span className="text-neutral-500 text-ui-sm">—</span>;
+  if (q.status === 'pending' || q.status === 'qualifying') {
+    return (
+      <span className="text-blue-400 text-ui-sm" data-testid="qualification-progress">
+        qualification in progress
+      </span>
+    );
+  }
+  if (q.confidence == null) return <span className="text-neutral-500 text-ui-sm">—</span>;
   const conf = `${Math.round(q.confidence * 100)}%`;
   const thr = q.threshold != null ? `/${Math.round(q.threshold * 100)}%` : '';
   const status = q.status ?? 'unknown';
@@ -1122,13 +1130,16 @@ export function VersionHighlightsLine({
   highlights,
   phase,
   status,
+  qualificationState,
 }: {
   highlights: VersionSummaryHighlights;
   phase?: string | null;
   status: string;
+  qualificationState?: QualificationStateValue | null;
 }) {
+  const qualificationInProgress = qualificationState === 'qualifying';
   const conf =
-    highlights.qualification_confidence != null
+    !qualificationInProgress && highlights.qualification_confidence != null
       ? `${Math.round(highlights.qualification_confidence * 100)}%`
       : null;
   const thresh =
@@ -1140,7 +1151,16 @@ export function VersionHighlightsLine({
       <p className="text-neutral-300 italic">{highlights.headline}</p>
       <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-neutral-400">
         <span>{highlights.merged_count} merged</span>
-        <span>{highlights.proven}/{highlights.total_merged_for_acceptance} proven</span>
+        {highlights.total_merged_for_acceptance > 0 ? (
+          <span>{highlights.proven}/{highlights.total_merged_for_acceptance} merged-task proofs</span>
+        ) : (
+          <span data-testid="no-eligible-merged-task-proofs">no eligible merged-task proofs</span>
+        )}
+        {qualificationInProgress && (
+          <span className="text-blue-400" data-testid="highlights-qualification-progress">
+            qualification in progress
+          </span>
+        )}
         {conf && thresh && <span>conf {conf} / thr {thresh}</span>}
         {phase && <span className="text-neutral-500">{phase} · {status}</span>}
       </div>
@@ -1170,7 +1190,12 @@ export function VersionHistorySummary({ versionId }: { versionId: string }) {
 
   return (
     <div className="mt-1 pl-2 border-l-2 border-neutral-700/40 space-y-0.5 text-ui-sm">
-      <VersionHighlightsLine highlights={summary.highlights} phase={summary.phase} status={summary.status} />
+      <VersionHighlightsLine
+        highlights={summary.highlights}
+        phase={summary.phase}
+        status={summary.status}
+        qualificationState={summary.qualification_state?.state}
+      />
       <VersionSummaryPanel tasksMerged={summary.tasks_merged} acceptanceAggregate={summary.acceptance_aggregate} />
     </div>
   );

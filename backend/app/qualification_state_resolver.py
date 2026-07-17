@@ -91,10 +91,20 @@ def _attempt_uuid(value: Any) -> uuid.UUID | None:
 
 
 def active_qualification_attempt_id(version: ReleaseVersion) -> uuid.UUID | None:
-    """Return the attempt projected as current, accepting partial backfills."""
-    qual = version.last_qualification if isinstance(version.last_qualification, dict) else {}
-    return _attempt_uuid(qual.get("qualification_attempt_id")) or _attempt_uuid(
-        getattr(version, "active_qualification_attempt_id", None)
+    """Return the durable active attempt, accepting legacy blob-only rows.
+
+    ``ReleaseVersion.active_qualification_attempt_id`` is authoritative. The JSON
+    projection can briefly lag it while a new attempt is being installed, so
+    preferring the blob can compose a new attempt with prior-attempt facts.
+    Fall back to the blob only for pre-migration or partial-backfill rows.
+    """
+    qual = (
+        version.last_qualification
+        if isinstance(version.last_qualification, dict)
+        else {}
+    )
+    return _attempt_uuid(getattr(version, "active_qualification_attempt_id", None)) or (
+        _attempt_uuid(qual.get("qualification_attempt_id"))
     )
 
 
@@ -722,14 +732,34 @@ _LEDGER_DIMENSION_KEYS: frozenset[str] = LEDGER_DIMENSION_KEYS
 _MUTABLE_DIMENSION_KEYS: frozenset[str] = MUTABLE_DIMENSION_KEYS
 
 
-def _ledger_status_to_ui(status: str) -> str:
+def _ledger_status_to_ui(
+    status: str,
+    *,
+    dimension: str,
+    sub_score: float | None,
+    blocker: str | None,
+) -> str:
     """Map the ledger's status vocabulary to the UI dimension-state vocabulary.
 
     The ledger writes ``passed``/``blocked``/``failed``/``unavailable``.
     The UI expects ``passed``/``failed``/``unavailable``/``not_applicable``/``pending``.
-    ``blocked`` is the only vocabulary difference — mapped to ``failed`` for the UI.
+    ``blocked`` maps to ``failed`` for the UI. Audit ledger rows use ``failed``
+    for any finding-derived deduction below a perfect 1.0, even when the score is
+    valid and no hard blocker fired. The blob resolver has always displayed such
+    positive audit scores as passed/scored; preserve that operator-facing meaning
+    instead of painting a 0.96 audit red.
     """
-    return "failed" if status == "blocked" else status
+    if status == "blocked":
+        return "failed"
+    if (
+        dimension == "audit"
+        and status == "failed"
+        and blocker is None
+        and sub_score is not None
+        and sub_score > 0.0
+    ):
+        return "passed"
+    return status
 
 
 async def resolve_dimension_states_from_ledger(
@@ -775,6 +805,10 @@ async def resolve_dimension_states_from_ledger(
 
     active_attempt = active_qualification_attempt_id(version)
     active_text = str(active_attempt) if active_attempt else None
+    status = qual.get("status")
+    attempt_in_flight = (
+        status in ("pending", "qualifying") and not qual.get("promotion_pending")
+    )
     if active_text is not None:
         rows = [
             row
@@ -816,25 +850,7 @@ async def resolve_dimension_states_from_ledger(
                 else:
                     currency = "prior_attempt"
 
-                # Mutable dimensions are re-measured live on every re-drive.
-                # When the ledger row's currency is "reused", the blob already
-                # carries the fresh live result; skip the ledger overlay so the
-                # stale prior-attempt fact cannot contradict the active state.
-                if key in _MUTABLE_DIMENSION_KEYS and currency == "reused":
-                    entry["provenance"] = {
-                        "origin_attempt_id": origin_attempt,
-                        "candidate_sha": row.candidate_sha,
-                        "producing_task_id": (
-                            str(row.producing_task_id) if row.producing_task_id else None
-                        ),
-                        "currency": currency,
-                    }
-                    continue
-
-                entry["status"] = _ledger_status_to_ui(row.status)
-                entry["score"] = row.sub_score
-                entry["reason"] = row.blocker
-                entry["provenance"] = {
+                provenance = {
                     "origin_attempt_id": origin_attempt,
                     "candidate_sha": row.candidate_sha,
                     "producing_task_id": (
@@ -842,6 +858,36 @@ async def resolve_dimension_states_from_ledger(
                     ),
                     "currency": currency,
                 }
+
+                # A running attempt begins with every dimension pending. Only a
+                # terminal fact produced by THAT durable attempt may advance an
+                # individual row. Reused/prior facts remain useful provenance,
+                # but must not make an unfinished attempt look failed or passed;
+                # unavailable/pending rows are likewise not terminal proof.
+                if attempt_in_flight and (
+                    currency != "current"
+                    or row.status not in {"passed", "failed", "blocked"}
+                ):
+                    entry["provenance"] = provenance
+                    continue
+
+                # Mutable dimensions are re-measured live on every re-drive.
+                # When the ledger row's currency is "reused", the blob already
+                # carries the fresh live result; skip the ledger overlay so the
+                # stale prior-attempt fact cannot contradict the active state.
+                if key in _MUTABLE_DIMENSION_KEYS and currency == "reused":
+                    entry["provenance"] = provenance
+                    continue
+
+                entry["status"] = _ledger_status_to_ui(
+                    row.status,
+                    dimension=key,
+                    sub_score=row.sub_score,
+                    blocker=row.blocker,
+                )
+                entry["score"] = row.sub_score
+                entry["reason"] = row.blocker
+                entry["provenance"] = provenance
 
     return result
 

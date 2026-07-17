@@ -1740,6 +1740,141 @@ async def test_mutable_dim_current_currency_uses_ledger_ci(db_session):
 
 
 @pytest.mark.asyncio
+async def test_qualifying_attempt_only_surfaces_terminal_dimension_facts(
+    db_session,
+):
+    """Pending UI state is attempt-scoped, while same-attempt proof can advance.
+
+    This covers the production v26 shape: a new durable attempt is active while
+    the JSON projection can still carry an older attempt id, and the candidate's
+    ledger contains a mixture of current, unavailable, and explicitly reused
+    facts. Only terminal rows produced by the durable active attempt may replace
+    the all-pending projection.
+    """
+    import uuid
+
+    from app.models import Project, QualificationDimensionResult, ReleaseVersion
+    from app.qualification_state_resolver import resolve_dimension_states_from_ledger
+
+    project = Project(name="Attempt scoped project", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.flush()
+
+    stale_blob_attempt = uuid.uuid4()
+    active_attempt = uuid.uuid4()
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="open",
+        active_qualification_attempt_id=active_attempt,
+        last_qualification={
+            "status": "qualifying",
+            "candidate_sha": "sha-attempt-scoped",
+            "qualification_attempt_id": str(stale_blob_attempt),
+        },
+    )
+    db_session.add(version)
+    await db_session.flush()
+
+    db_session.add_all([
+        # Audit deductions are valid scored evidence, not a hard failure. This
+        # exact 0.96 shape previously rendered as a red failed dimension.
+        QualificationDimensionResult(
+            project_id=project.id,
+            release_version_id=version.id,
+            candidate_sha="sha-attempt-scoped",
+            dimension="audit",
+            status="failed",
+            sub_score=0.96,
+            blocker=None,
+            origin_attempt_id=active_attempt,
+        ),
+        # Nonterminal same-attempt facts must remain pending while qualification
+        # is still running.
+        QualificationDimensionResult(
+            project_id=project.id,
+            release_version_id=version.id,
+            candidate_sha="sha-attempt-scoped",
+            dimension="ci",
+            status="unavailable",
+            blocker=None,
+            origin_attempt_id=active_attempt,
+        ),
+        # An explicit reuse is provenance, not current-attempt terminal proof.
+        QualificationDimensionResult(
+            project_id=project.id,
+            release_version_id=version.id,
+            candidate_sha="sha-attempt-scoped",
+            dimension="merge_grade",
+            status="failed",
+            sub_score=0.2,
+            blocker="merge_grade_misses",
+            origin_attempt_id=stale_blob_attempt,
+            reused_by_attempt_ids=[str(active_attempt)],
+        ),
+    ])
+    await db_session.flush()
+
+    states = _by_key(await resolve_dimension_states_from_ledger(db_session, version))
+
+    assert states["audit"]["status"] == "passed"
+    assert states["audit"]["score"] == pytest.approx(0.96)
+    assert states["audit"]["provenance"]["currency"] == "current"
+    assert states["ci"]["status"] == "pending"
+    assert states["ci"]["provenance"]["currency"] == "current"
+    assert states["merge_grade"]["status"] == "pending"
+    assert states["merge_grade"]["provenance"]["currency"] == "reused"
+
+
+@pytest.mark.asyncio
+async def test_finalized_attempt_does_not_hide_reused_terminal_failure(db_session):
+    """The in-flight guard must not erase real terminal failures after finalize."""
+    import uuid
+
+    from app.models import Project, QualificationDimensionResult, ReleaseVersion
+    from app.qualification_state_resolver import resolve_dimension_states_from_ledger
+
+    project = Project(name="Finalized attempt project", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.flush()
+
+    prior_attempt = uuid.uuid4()
+    active_attempt = uuid.uuid4()
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="open",
+        active_qualification_attempt_id=active_attempt,
+        last_qualification={
+            "status": "not_promoted",
+            "candidate_sha": "sha-finalized-reuse",
+            "qualification_attempt_id": str(active_attempt),
+        },
+    )
+    db_session.add(version)
+    await db_session.flush()
+    db_session.add(QualificationDimensionResult(
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha="sha-finalized-reuse",
+        dimension="merge_grade",
+        status="failed",
+        sub_score=0.2,
+        blocker="merge_grade_misses",
+        origin_attempt_id=prior_attempt,
+        reused_by_attempt_ids=[str(active_attempt)],
+    ))
+    await db_session.flush()
+
+    states = _by_key(await resolve_dimension_states_from_ledger(db_session, version))
+    assert states["merge_grade"]["status"] == "failed"
+    assert states["merge_grade"]["reason"] == "merge_grade_misses"
+    assert states["merge_grade"]["provenance"]["currency"] == "reused"
+
+
+@pytest.mark.asyncio
 async def test_mutable_dim_reused_currency_falls_back_to_blob_migration_identity(db_session):
     """Parallel of the CI test: a reused migration_identity ledger row falls back
     to the blob-derived state (unavailable) rather than surfacing the stale passed."""

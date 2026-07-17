@@ -234,17 +234,27 @@ function CriterionCoveragePanel({ coverage, onReinstate, onAttest, onLinkDirecti
   // not machine-verified) and are NOT part of `covered`. Older backends omit
   // the field entirely — treat undefined as 0.
   const attestedCount = coverage.attested ?? 0;
+  const unmappedCount = coverage.criteria.filter(
+    (c) => (c.status ?? 'active') === 'active'
+      && c.coverage === 'uncovered'
+      && c.stuck_reason === 'no_mapping',
+  ).length;
+  const awaitingEvidenceCount = coverage.criteria.filter(
+    (c) => (c.status ?? 'active') === 'active'
+      && c.coverage === 'uncovered'
+      && c.stuck_reason == null,
+  ).length;
 
   return (
     <div className="mb-3" data-testid="criterion-coverage-panel">
       <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 mb-1">
-        <span className="text-ui-sm font-semibold uppercase tracking-wide text-slate-500">Version acceptance criteria</span>
+        <span className="text-ui-sm font-semibold uppercase tracking-wide text-slate-500">Machine-verified criterion coverage</span>
         <span className="text-ui-sm text-slate-400 font-medium" data-testid="criterion-coverage-fraction">
           {coverage.total === 0
             ? '0 active criteria'
             : attestedCount > 0
-              ? `${coverage.covered} verified + ${attestedCount} attested / ${coverage.total}`
-              : `${coverage.covered}/${coverage.total} active covered`}
+              ? `${coverage.covered}/${coverage.total} machine-verified + ${attestedCount} attested`
+              : `${coverage.covered}/${coverage.total} machine-verified`}
         </span>
         {attestedCount > 0 && (
           <span
@@ -259,6 +269,16 @@ function CriterionCoveragePanel({ coverage, onReinstate, onAttest, onLinkDirecti
         {(coverage.probed ?? 0) > 0 && <span className="text-ui-sm text-sky-300" data-testid="probed-count-badge">{coverage.probed} probed</span>}
         {coverage.partial > 0 && <span className="text-ui-sm text-amber-400">{coverage.partial} partial</span>}
         {coverage.uncovered > 0 && <span className="text-ui-sm text-slate-500">{coverage.uncovered} uncovered</span>}
+        {unmappedCount > 0 && (
+          <span className="text-ui-sm text-red-400" data-testid="unmapped-criteria-count">
+            {unmappedCount} unmapped
+          </span>
+        )}
+        {awaitingEvidenceCount > 0 && (
+          <span className="text-ui-sm text-blue-300" data-testid="awaiting-evidence-count">
+            {awaitingEvidenceCount} awaiting evidence
+          </span>
+        )}
         {inactiveCount > 0 && (
           <span className="text-ui-sm text-slate-500" data-testid="inactive-count-badge">{inactiveCount} inactive</span>
         )}
