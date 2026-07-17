@@ -12,8 +12,10 @@ from app.field_encryption import (
     decrypt_field,
     is_encryption_active,
     require_encryption_active,
+    probe_key_continuity,
     ENCRYPTION_KEY_ENV,
     ALLOW_PLAINTEXT_CREDENTIALS_ENV,
+    CONTINUITY_REFERENCE_PLAINTEXT,
 )
 
 
@@ -427,3 +429,66 @@ class TestRequireEncryptionActive:
         monkeypatch.setenv(ENCRYPTION_KEY_ENV, "malformed")
         with pytest.raises(RuntimeError, match="Migration 0531"):
             require_encryption_active("Migration 0531")
+
+
+class TestProbeKeyContinuity:
+    """probe_key_continuity fails closed when the configured key cannot decrypt
+    the reference ciphertext."""
+
+    def test_wrong_valid_key_fails_continuity_closed(self, monkeypatch):
+        """A syntactically valid but wrong Fernet key raises RuntimeError.
+
+        key_a encrypts the reference plaintext; key_b is the active runtime key.
+        probe_key_continuity must raise because the ciphertext (key_a's) cannot
+        be decrypted with key_b.
+        """
+        import app.field_encryption as fe
+
+        key_a = Fernet.generate_key()
+        reference_ciphertext = Fernet(key_a).encrypt(
+            CONTINUITY_REFERENCE_PLAINTEXT.encode()
+        ).decode()
+        monkeypatch.setattr(fe, "CONTINUITY_REFERENCE_CIPHERTEXT", reference_ciphertext)
+
+        key_b = Fernet.generate_key().decode()
+        monkeypatch.setenv(ENCRYPTION_KEY_ENV, key_b)
+
+        with pytest.raises(RuntimeError, match=ENCRYPTION_KEY_ENV):
+            probe_key_continuity("test context")
+
+    def test_correct_key_passes_continuity(self, monkeypatch):
+        """The same key used to create the reference ciphertext passes the probe."""
+        import app.field_encryption as fe
+
+        key_a = Fernet.generate_key()
+        reference_ciphertext = Fernet(key_a).encrypt(
+            CONTINUITY_REFERENCE_PLAINTEXT.encode()
+        ).decode()
+        monkeypatch.setattr(fe, "CONTINUITY_REFERENCE_CIPHERTEXT", reference_ciphertext)
+        monkeypatch.setenv(ENCRYPTION_KEY_ENV, key_a.decode())
+
+        probe_key_continuity("test context")  # must not raise
+
+    def test_no_key_configured_is_noop(self, monkeypatch):
+        """When no key is configured, probe_key_continuity does nothing."""
+        monkeypatch.delenv(ENCRYPTION_KEY_ENV, raising=False)
+        monkeypatch.setenv(ALLOW_PLAINTEXT_CREDENTIALS_ENV, "true")
+        probe_key_continuity("test context")  # must not raise
+
+    def test_error_message_names_env_var(self, monkeypatch):
+        """RuntimeError message names GITHUB_PAT_ENCRYPTION_KEY for operator guidance."""
+        import app.field_encryption as fe
+
+        key_a = Fernet.generate_key()
+        reference_ciphertext = Fernet(key_a).encrypt(
+            CONTINUITY_REFERENCE_PLAINTEXT.encode()
+        ).decode()
+        monkeypatch.setattr(fe, "CONTINUITY_REFERENCE_CIPHERTEXT", reference_ciphertext)
+
+        key_b = Fernet.generate_key().decode()
+        monkeypatch.setenv(ENCRYPTION_KEY_ENV, key_b)
+
+        with pytest.raises(RuntimeError) as exc_info:
+            probe_key_continuity("startup")
+        assert ENCRYPTION_KEY_ENV in str(exc_info.value)
+        assert "startup" in str(exc_info.value)

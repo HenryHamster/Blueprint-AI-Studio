@@ -24,6 +24,19 @@ logger = logging.getLogger(__name__)
 ENCRYPTION_KEY_ENV = "GITHUB_PAT_ENCRYPTION_KEY"
 ALLOW_PLAINTEXT_CREDENTIALS_ENV = "ALLOW_PLAINTEXT_CREDENTIALS"
 
+# Boot-time key-continuity probe.  CONTINUITY_REFERENCE_CIPHERTEXT is a Fernet
+# token encrypted with the canonical key that was active when this probe was
+# established.  probe_key_continuity() decrypts it with the CURRENT configured
+# key; InvalidToken means the key rotated without re-encrypting at-rest data
+# (or the wrong key is configured), so we fail closed at startup.
+# Update CONTINUITY_REFERENCE_CIPHERTEXT (and the canonical key in the vault)
+# together whenever the encryption key is legitimately rotated.
+CONTINUITY_REFERENCE_PLAINTEXT = "blueprint-field-encryption-continuity-v1"
+CONTINUITY_REFERENCE_CIPHERTEXT = (
+    "gAAAAABqWc-UjssiEbbY7MXJtZebObzuo9KxQLvsb3gZwX-M_KHrWVmu1Oa4eJY19_TpY3bmu62Ig4nf8i6oQuP"
+    "-iCQcvbVnzIaS3JXdBCq3qTdd3nUx9l4Sx4B2hZn53Sa0DEVvxVhw"
+)
+
 
 def is_encryption_active() -> bool:
     """Return ``True`` if Fernet encryption is properly configured and active.
@@ -137,6 +150,33 @@ def encrypt_field(value: str | None) -> str | None:
         _require_encryption_available()
         return value
     return f.encrypt(value.encode()).decode()
+
+
+def probe_key_continuity(context: str) -> None:
+    """Fail fast if the configured key cannot decrypt the reference ciphertext.
+
+    Raises ``RuntimeError`` when the active Fernet key is different from the
+    canonical key used to produce ``CONTINUITY_REFERENCE_CIPHERTEXT`` — which
+    means credentials encrypted under the old key are now unreadable, and any
+    backfill re-run would silently store plaintext.
+
+    Does nothing when no key is configured (encryption inactive); callers that
+    require encryption should call ``require_encryption_active`` separately.
+    """
+    f = _get_fernet()
+    if f is None:
+        return
+    try:
+        f.decrypt(CONTINUITY_REFERENCE_CIPHERTEXT.encode())
+    except InvalidToken as exc:
+        raise RuntimeError(
+            f"{context}: {ENCRYPTION_KEY_ENV} is set but cannot decrypt the "
+            "boot-time continuity reference token — the configured key does not "
+            "match the canonical encryption key used for existing at-rest "
+            "ciphertext. A wrong-key rotation will leave encrypted columns "
+            "unreadable. Restore the correct key or re-encrypt all data before "
+            "deploying."
+        ) from exc
 
 
 def decrypt_field(value: str | None) -> str | None:
