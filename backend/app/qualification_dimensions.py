@@ -122,7 +122,7 @@ QUALIFICATION_DIMENSIONS: tuple[QualificationDimension, ...] = (
     ),
     QualificationDimension(
         "env_preflight", "Env Preflight",
-        blocker_codes=("boot_prereq_missing",),
+        blocker_codes=("boot_prereq_missing", "boot_prereq_evidence_missing"),
     ),
 )
 

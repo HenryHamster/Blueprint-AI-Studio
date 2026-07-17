@@ -47,6 +47,7 @@ _LEGACY_BLOCKER_TO_DIM = {
     "test_file_deleted": "test_erosion",
     "capability_proof_gate_blocked": "capability_proof",
     "boot_prereq_missing": "env_preflight",
+    "boot_prereq_evidence_missing": "env_preflight",
 }
 
 _LEGACY_LEDGER_KEYS = frozenset({
