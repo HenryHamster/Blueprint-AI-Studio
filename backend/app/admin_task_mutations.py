@@ -62,6 +62,31 @@ CANCEL_WAITING_DEPENDENT_STATUSES = (
 )
 
 
+def _mark_admin_cancelled(
+    task: Task,
+    *,
+    cancelled_by_task_id: str | None = None,
+) -> None:
+    """Persist operator-cancellation provenance on a cancelled task.
+
+    Parent terminalization and direction-health accounting operate on the task
+    row, not ``TaskHistory``. Keep the originating operator identity durable on
+    both the explicitly cancelled task and any tasks cancelled as a consequence
+    so they cannot be misclassified as agent deaths after the request completes.
+    """
+    from app.failure_classification import ADMIN_CANCEL, persist_failure_category
+
+    persist_failure_category(task, ADMIN_CANCEL)
+    ctx = dict(task.context or {})
+    ctx["failure_class"] = ADMIN_CANCEL
+    ctx.pop("timeout_subtype", None)
+    ctx.pop("external_api_subtype", None)
+    ctx["cancelled_by"] = "USER"
+    if cancelled_by_task_id is not None:
+        ctx["cancelled_by_task_id"] = cancelled_by_task_id
+    task.context = ctx
+
+
 async def _refresh_direction_outcomes_for_task(task: Task) -> None:
     """Re-run the research-history merge recompute for *task* on a fresh session.
 
@@ -306,6 +331,7 @@ async def _apply_status_mutation(
     if new_status == TaskStatus.CANCELLED:
         from app.task_lifecycle import close_orphan_pr_if_any
 
+        _mark_admin_cancelled(task)
         await close_orphan_pr_if_any(task, session, reason="admin_status_change")
 
     parent_vm_id_for_bg: str | None = None
@@ -330,6 +356,7 @@ async def _apply_status_mutation(
 
     children_cleanup_for_bg: List[tuple] = []
     if new_status == TaskStatus.CANCELLED:
+        cancellation_source_id = str(task.id)
         active_children = (
             (
                 await session.execute(
@@ -342,11 +369,52 @@ async def _apply_status_mutation(
             .scalars()
             .all()
         )
-        for child in active_children:
+
+        # A manually cancelled prerequisite must also terminalize dependents that
+        # are still waiting to run. Filter the project-scoped candidate set in
+        # Python because ``depends_on`` is JSONB in production and JSON in the
+        # SQLite test seam.
+        dependent_candidates = (
+            (
+                await session.execute(
+                    select(Task).where(
+                        Task.project_id == task.project_id,
+                        Task.status.in_(CANCEL_WAITING_DEPENDENT_STATUSES),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        waiting_dependents = [
+            candidate
+            for candidate in dependent_candidates
+            if cancellation_source_id
+            in {str(dep_id) for dep_id in (candidate.depends_on or [])}
+        ]
+
+        cascade_targets = {child.id: child for child in active_children}
+        cascade_targets.update(
+            {dependent.id: dependent for dependent in waiting_dependents}
+        )
+        waiting_dependent_ids = {dependent.id for dependent in waiting_dependents}
+        for child in cascade_targets.values():
             child.status = TaskStatus.CANCELLED
             if child.vm_provisioned_at:
                 child.vm_stopped_at = _utcnow()
             child.requires_approval = False
+            _mark_admin_cancelled(
+                child,
+                cancelled_by_task_id=cancellation_source_id,
+            )
+            if child.id in waiting_dependent_ids:
+                child.latest_status_message = (
+                    "Cancelled: dependency task administratively cancelled"
+                )
+            elif not child.latest_status_message:
+                child.latest_status_message = (
+                    "Cancelled: parent task administratively cancelled"
+                )
             children_cleanup_for_bg.append(
                 (
                     str(child.id),
@@ -356,15 +424,17 @@ async def _apply_status_mutation(
                 )
             )
             session.add(child)
-        if active_children:
+        if cascade_targets:
             from app.task_lifecycle import close_orphan_pr_if_any
 
-            for child in active_children:
+            for child in cascade_targets.values():
                 await close_orphan_pr_if_any(
                     child, session, reason="admin_status_change_cascade"
                 )
             logger.info(
-                f"[ADMIN] Cascaded CANCELLED to {len(active_children)} children of task {task.id}"
+                "[ADMIN] Cascaded ADMIN_CANCEL to %s child/dependent task(s) of task %s",
+                len(cascade_targets),
+                task.id,
             )
 
     if parent_vm_id_for_bg or parent_acct_id_for_bg or children_cleanup_for_bg:
