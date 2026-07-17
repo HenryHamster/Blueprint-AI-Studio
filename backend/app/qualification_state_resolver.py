@@ -576,14 +576,30 @@ _LEDGER_DIMENSION_KEYS: frozenset[str] = frozenset({
 })
 
 
-def _ledger_status_to_ui(status: str) -> str:
-    """Map the ledger's status vocabulary to the UI dimension-state vocabulary.
+def _ledger_status_to_ui(
+    status: str,
+    *,
+    dimension: str,
+    sub_score: float | None,
+    blocker: str | None,
+) -> str:
+    """Map the ledger status to honest operator-facing dimension state.
 
-    The ledger writes ``passed``/``blocked``/``failed``/``unavailable``.
-    The UI expects ``passed``/``failed``/``unavailable``/``not_applicable``/``pending``.
-    ``blocked`` is the only vocabulary difference — mapped to ``failed`` for the UI.
+    ``blocked`` maps to ``failed``. Audit rows use ``failed`` for any deduction
+    below 1.0, even when they carry a positive score and no hard blocker; those
+    are scored evidence rather than a red terminal failure.
     """
-    return "failed" if status == "blocked" else status
+    if status == "blocked":
+        return "failed"
+    if (
+        dimension == "audit"
+        and status == "failed"
+        and blocker is None
+        and sub_score is not None
+        and sub_score > 0.0
+    ):
+        return "passed"
+    return status
 
 
 async def resolve_dimension_states_from_ledger(
@@ -626,6 +642,12 @@ async def resolve_dimension_states_from_ledger(
 
     if not rows:
         return resolve_dimension_states(version.last_qualification)
+    status = qual.get("status")
+    attempt_in_flight = (
+        status in ("pending", "qualifying") and not qual.get("promotion_pending")
+    )
+    attempt_started_at = _parse_iso_naive(qual.get("started_at"))
+
 
     # Start with the full blob-derived state (all 13 dimensions). Then overwrite
     # the 11 ledger-backed dimensions with ledger data. The 2 blob-only dimensions
@@ -638,7 +660,33 @@ async def resolve_dimension_states_from_ledger(
         if key in _LEDGER_DIMENSION_KEYS:
             row = ledger_map.get(key)
             if row is not None:
-                entry["status"] = _ledger_status_to_ui(row.status)
+                row_computed_at = getattr(row, "computed_at", None)
+                if isinstance(row_computed_at, datetime):
+                    row_computed_at = row_computed_at.replace(tzinfo=None)
+
+                # The serving main schema predates durable per-attempt ledger
+                # identity. During an in-flight attempt, use its persisted
+                # started_at as a strict generation boundary: prior-attempt rows
+                # for the same candidate remain pending, as do nonterminal rows.
+                # If the boundary is missing, fail closed to pending instead of
+                # presenting stale pass/fail state as current proof.
+                row_is_current_attempt = (
+                    attempt_started_at is not None
+                    and row_computed_at is not None
+                    and row_computed_at >= attempt_started_at
+                )
+                if attempt_in_flight and (
+                    not row_is_current_attempt
+                    or row.status not in {"passed", "failed", "blocked"}
+                ):
+                    continue
+
+                entry["status"] = _ledger_status_to_ui(
+                    row.status,
+                    dimension=key,
+                    sub_score=row.sub_score,
+                    blocker=row.blocker,
+                )
                 entry["score"] = row.sub_score
                 entry["reason"] = row.blocker
 

@@ -423,6 +423,45 @@ describe('VersionSummaryPanel — viewport regression', () => {
     if (!badge.textContent?.includes('1')) throw new Error('Expected stuck count 1 in badge text');
   });
 
+  test('separates machine-verified coverage, unmapped criteria, and evidence still in progress', async () => {
+    const coverage: VersionCriterionCoverage = {
+      total: 7,
+      covered: 0,
+      partial: 0,
+      uncovered: 7,
+      stuck_count: 2,
+      criteria: [
+        { criterion_key: 'u1', text: 'Unmapped one', coverage: 'uncovered', evidence_count: 0, stuck_reason: 'no_mapping' },
+        { criterion_key: 'u2', text: 'Unmapped two', coverage: 'uncovered', evidence_count: 0, stuck_reason: 'no_mapping' },
+        { criterion_key: 'a1', text: 'Awaiting one', coverage: 'uncovered', evidence_count: 0 },
+        { criterion_key: 'a2', text: 'Awaiting two', coverage: 'uncovered', evidence_count: 0 },
+        { criterion_key: 'a3', text: 'Awaiting three', coverage: 'uncovered', evidence_count: 0 },
+        { criterion_key: 'a4', text: 'Awaiting four', coverage: 'uncovered', evidence_count: 0 },
+        { criterion_key: 'a5', text: 'Awaiting five', coverage: 'uncovered', evidence_count: 0 },
+      ],
+    };
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<VersionSummaryPanel tasksMerged={SAMPLE_TASKS} criterionCoverage={coverage} />);
+    });
+
+    const fraction = host.querySelector('[data-testid="criterion-coverage-fraction"]');
+    const unmapped = host.querySelector('[data-testid="unmapped-criteria-count"]');
+    const awaiting = host.querySelector('[data-testid="awaiting-evidence-count"]');
+    if (fraction?.textContent !== '0/7 machine-verified') {
+      throw new Error(`Expected explicit machine-verified coverage, got: ${fraction?.textContent}`);
+    }
+    if (unmapped?.textContent !== '2 unmapped') {
+      throw new Error(`Expected unmapped count, got: ${unmapped?.textContent}`);
+    }
+    if (awaiting?.textContent !== '5 awaiting evidence') {
+      throw new Error(`Expected awaiting-evidence count, got: ${awaiting?.textContent}`);
+    }
+  });
+
   test('stuck_count badge is absent when stuck_count is 0', async () => {
     const coverage: VersionCriterionCoverage = {
       total: 1,
@@ -547,7 +586,7 @@ describe('VersionSummaryPanel — viewport regression', () => {
     expect(badge.className).toContain('bg-amber-600/20');
   });
 
-  test('header shows split "verified + attested" fraction when attested > 0', async () => {
+  test('header separates machine-verified coverage from attested coverage', async () => {
     const coverage: VersionCriterionCoverage = {
       total: 3,
       covered: 1,
@@ -569,7 +608,7 @@ describe('VersionSummaryPanel — viewport regression', () => {
     });
     const fraction = host.querySelector('[data-testid="criterion-coverage-fraction"]');
     if (fraction === null) throw new Error('Expected criterion-coverage-fraction element');
-    expect(fraction.textContent).toBe('1 verified + 2 attested / 3');
+    expect(fraction.textContent).toBe('1/3 machine-verified + 2 attested');
     const attestedBadge = host.querySelector('[data-testid="attested-count-badge"]');
     if (attestedBadge === null) throw new Error('Expected attested-count-badge when attested > 0');
     expect(attestedBadge.textContent).toContain('2 attested');
@@ -596,7 +635,7 @@ describe('VersionSummaryPanel — viewport regression', () => {
     });
     const fraction = host.querySelector('[data-testid="criterion-coverage-fraction"]');
     if (fraction === null) throw new Error('Expected criterion-coverage-fraction element');
-    expect(fraction.textContent).toBe('1/2 active covered');
+    expect(fraction.textContent).toBe('1/2 machine-verified');
     if (host.querySelector('[data-testid="attested-count-badge"]') !== null) {
       throw new Error('Expected no attested-count-badge when attested is undefined');
     }
