@@ -97,6 +97,13 @@ Findings covered here (4-finding operator-inbox/messages salvage bundle, 2026-07
   m2 — confirmation chips actionable: click handler branches on both message and confirmation kinds
   m3 — QUESTION auto-decay: CONVERSATIONAL_DECAY_MESSAGE_TYPES includes QUESTION; stale_unanswered stamped
   m4 — notifications converged: toast dispatch uses isMessageNeedingOperatorAttention, not effectiveSignal
+
+Findings covered here (5-finding operator-inbox lifecycle/convergence salvage bundle, 2026-07-17):
+  n1 — lifecycle fields consumed: lifecycleOperatorActionLabel renders operator_action hint in needs-action strip
+  n2 — acknowledgeable items get Ack button: lifecycle.acknowledgeable drives attention-ack-btn
+  n3 — acknowledge_effect label: lifecycleAcknowledgeEffectLabel helper converts effect to human-readable tooltip
+  n4 — QUESTION auto-decay (already fixed; see m3 tests above)
+  n5 — confirmation chips actionable (already fixed; see m2 tests above)
 """
 
 from __future__ import annotations
@@ -2334,6 +2341,153 @@ def test_stale_question_decay_days_constant_is_correct():
         "QUESTION decay window must exceed the NOTE/FEEDBACK window "
         f"({STALE_OPEN_DECAY_DAYS}d) — questions deserve more patience"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Findings n1-n3 — lifecycle fields consumed in needs-action strip
+# (5-finding operator-inbox lifecycle/convergence salvage bundle, 2026-07-17)
+# --------------------------------------------------------------------------- #
+
+
+def test_lifecycle_operator_action_label_function_exists():
+    """MessagesPanel must define lifecycleOperatorActionLabel for the needs-action strip.
+
+    Finding n1: the lifecycle.operator_action field from the canonical attention
+    model must be consumed in the needs-action strip so operators see a readable
+    hint about what action to take (e.g. 'Reply or resolve', 'Approve or reject').
+    The helper function must map the known operator_action values to short labels.
+    """
+    try:
+        source = _messages_panel_source()
+    except FileNotFoundError:
+        import pytest
+        pytest.skip("admin-ui/src/components not available in this environment")
+
+    assert "lifecycleOperatorActionLabel" in source, (
+        "MessagesPanel.tsx must define lifecycleOperatorActionLabel to convert "
+        "lifecycle.operator_action values to human-readable hint text shown in "
+        "the needs-action strip chips"
+    )
+    # Spot-check that common operator_action values are mapped.
+    assert "reply_or_resolve_message" in source, (
+        "lifecycleOperatorActionLabel must map 'reply_or_resolve_message' — "
+        "this is the operator_action for QUESTION/BLOCKER/FEEDBACK message items"
+    )
+    assert "approve_or_reject_task" in source, (
+        "lifecycleOperatorActionLabel must map 'approve_or_reject_task' — "
+        "the approval_required attention reason"
+    )
+
+
+def test_needs_action_strip_renders_operator_action_hint():
+    """MessagesPanel needs-action strip must render the operator_action hint text.
+
+    Finding n1: the lifecycleOperatorActionLabel helper must be called and its
+    result rendered inside the chip so the operator sees a readable hint next to
+    the item label (e.g. 'Reply or resolve' for a QUESTION message item).
+    """
+    try:
+        source = _messages_panel_source()
+    except FileNotFoundError:
+        import pytest
+        pytest.skip("admin-ui/src/components not available in this environment")
+
+    # The hint must be driven by item.lifecycle?.operator_action.
+    assert "operator_action" in source, (
+        "MessagesPanel.tsx needs-action strip must read item.lifecycle?.operator_action "
+        "to derive the operator hint label"
+    )
+    # The hint span must be rendered with a test id or identifiable attribute so
+    # the operator sees the action in the chip.
+    assert "operator-action-hint" in source or "operatorActionHint" in source, (
+        "MessagesPanel.tsx must render the operator_action hint in the chip — "
+        "either via a data-testid='operator-action-hint' span or an operatorActionHint variable"
+    )
+
+
+def test_needs_action_strip_acknowledgeable_items_have_ack_button():
+    """MessagesPanel needs-action strip must render an Ack button for acknowledgeable items.
+
+    Finding n2: lifecycle.acknowledgeable=true means the operator can dismiss the
+    item from the strip without a full resolve. The strip must render an 'Ack'
+    button for items where lifecycle.acknowledgeable is true, driven by
+    lifecycle.acknowledge_effect for the tooltip text.
+    """
+    try:
+        source = _messages_panel_source()
+    except FileNotFoundError:
+        import pytest
+        pytest.skip("admin-ui/src/components not available in this environment")
+
+    # acknowledgeable must be read from the lifecycle block.
+    assert "acknowledgeable" in source, (
+        "MessagesPanel.tsx needs-action strip must read item.lifecycle?.acknowledgeable "
+        "to conditionally show the Ack button"
+    )
+    # The Ack button must be rendered with a test id.
+    assert "attention-ack-btn" in source, (
+        "MessagesPanel.tsx must render a button with data-testid='attention-ack-btn' "
+        "for acknowledgeable attention items in the needs-action strip"
+    )
+    # The Ack button click must add the item to resolvedConfirmationIds to remove it.
+    assert "handleAck" in source or "resolvedConfirmationIds" in source, (
+        "MessagesPanel.tsx Ack button must dismiss the item from the strip by "
+        "adding its id to resolvedConfirmationIds"
+    )
+
+
+def test_lifecycle_acknowledge_effect_label_function_exists():
+    """MessagesPanel must define lifecycleAcknowledgeEffectLabel for the Ack button tooltip.
+
+    Finding n3: the lifecycle.acknowledge_effect field must be consumed to provide
+    tooltip text on the Ack button that explains what acknowledging does (e.g.
+    'Mark as seen — removes from needs-action strip until next update' for
+    acknowledge_effect='clears_unread_only').
+    """
+    try:
+        source = _messages_panel_source()
+    except FileNotFoundError:
+        import pytest
+        pytest.skip("admin-ui/src/components not available in this environment")
+
+    assert "lifecycleAcknowledgeEffectLabel" in source, (
+        "MessagesPanel.tsx must define lifecycleAcknowledgeEffectLabel to convert "
+        "lifecycle.acknowledge_effect values to human-readable tooltip text on the "
+        "Ack button — leaving acknowledge_effect unused leaves operators without "
+        "feedback on what acknowledging does"
+    )
+    assert "clears_unread_only" in source, (
+        "lifecycleAcknowledgeEffectLabel must handle 'clears_unread_only' — "
+        "the acknowledge_effect for all message attention items"
+    )
+
+
+def test_attention_lifecycle_by_reason_covers_message_types():
+    """_ATTENTION_LIFECYCLE_BY_REASON must define lifecycle for all message attention reasons.
+
+    Finding n1: operator_action and acknowledgeable must be set for message-type
+    attention reasons so the strip can render hints and Ack buttons correctly.
+    """
+    from app.operator_attention import _ATTENTION_LIFECYCLE_BY_REASON
+
+    message_reasons = {"question", "blocker", "bug_report", "feedback"}
+    for reason in message_reasons:
+        assert reason in _ATTENTION_LIFECYCLE_BY_REASON, (
+            f"_ATTENTION_LIFECYCLE_BY_REASON must include '{reason}' — "
+            "message-type attention items need lifecycle metadata for the strip"
+        )
+        entry = _ATTENTION_LIFECYCLE_BY_REASON[reason]
+        assert "operator_action" in entry, (
+            f"_ATTENTION_LIFECYCLE_BY_REASON['{reason}'] must set operator_action"
+        )
+        assert entry.get("acknowledgeable") is True, (
+            f"_ATTENTION_LIFECYCLE_BY_REASON['{reason}'] must set acknowledgeable=True "
+            "— message items can be acknowledged (marked as seen) from the strip"
+        )
+        assert entry.get("acknowledge_effect") == "clears_unread_only", (
+            f"_ATTENTION_LIFECYCLE_BY_REASON['{reason}'] must set "
+            "acknowledge_effect='clears_unread_only' for message items"
+        )
 
 
 # --------------------------------------------------------------------------- #
