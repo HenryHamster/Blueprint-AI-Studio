@@ -1714,16 +1714,34 @@ export async function patchStructuralHealthSettings(patch: { structural_health_a
   }
 }
 
+export interface MetricsIntegrityFlag {
+  check: string;
+  status: string;
+  self_reported: number | null;
+  ground_truth: number | null;
+  delta: number | null;
+  severity: string;
+  subject: string | null;
+  detail: string;
+  auto_resolved: number | null;
+  auto_resolved_backing_path: number | null;
+  auto_resolved_named_test_present: number | null;
+  at?: string;
+}
+
 export interface MetricsIntegrityObservabilityResponse {
   ticks: number;
   checks_run: number;
   flags_total: number;
   errors_total: number;
   enrolled_total: number;
+  auto_resolved_total: number;
+  auto_resolved_backing_path_total: number;
+  auto_resolved_named_test_present_total: number;
   last_tick_at: string | null;
   last_tick: Record<string, unknown> | null;
   recent_ticks: Record<string, unknown>[];
-  recent_flags: Record<string, unknown>[];
+  recent_flags: MetricsIntegrityFlag[];
 }
 
 export async function fetchMetricsIntegrityObservability(

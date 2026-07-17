@@ -5517,15 +5517,16 @@ async def spawn_subtask(
     await session.commit()
 
     # Log history for each new task
-    # Batch-reload all new tasks (N+1 guard: commit expired the session;
-    # one batch SELECT + identity-map lookups replaces N individual
-    # session.refresh calls).
+    # Batch-reload all new tasks: commit expired the session; one batch
+    # SELECT builds a dict, eliminating per-task session.get round-trips.
+    task_map: dict = {}
     if new_tasks:
-        await session.execute(
+        _batch_result = await session.execute(
             select(Task).where(Task.id.in_([t.id for t in new_tasks]))
         )
+        task_map = {t.id: t for t in _batch_result.scalars().all()}
     for task in new_tasks:
-        fresh_task = await session.get(Task, task.id)
+        fresh_task = task_map.get(task.id)
         history = TaskHistory(
             task_id=fresh_task.id if fresh_task else task.id,
             action="SPAWNED",

@@ -48,6 +48,9 @@ vi.mock('../api', () => ({
     flags_total: 0,
     errors_total: 0,
     enrolled_total: 0,
+    auto_resolved_total: 0,
+    auto_resolved_backing_path_total: 0,
+    auto_resolved_named_test_present_total: 0,
     last_tick_at: null,
     last_tick: null,
     recent_ticks: [],
@@ -133,12 +136,41 @@ describe('SettingsOrchestratorSection', () => {
       flags_total: 2,
       errors_total: 1,
       enrolled_total: 3,
+      auto_resolved_total: 4,
+      auto_resolved_backing_path_total: 2,
+      auto_resolved_named_test_present_total: 2,
       last_tick_at: '2026-07-05T12:00:00Z',
       last_tick: null,
       recent_ticks: [],
       recent_flags: [
-        { check_id: 'check-a', metric: 'cpu', expected: '< 0.8', found: '0.92' },
-        { check_id: 'check-b', metric: 'memory', expected: '< 0.7', found: '0.81' },
+        {
+          check: 'capability_proof_gate_gap',
+          status: 'flagged',
+          self_reported: 10,
+          ground_truth: 7,
+          delta: -3,
+          severity: 'warn',
+          subject: 'proj-abc',
+          detail: '3 capabilities have no proof',
+          auto_resolved: 2,
+          auto_resolved_backing_path: 1,
+          auto_resolved_named_test_present: 1,
+          at: '2026-07-05T12:00:00Z',
+        },
+        {
+          check: 'metrics_drift',
+          status: 'flagged',
+          self_reported: 5,
+          ground_truth: 8,
+          delta: 3,
+          severity: 'error',
+          subject: 'global',
+          detail: 'task completion rate drifted',
+          auto_resolved: null,
+          auto_resolved_backing_path: null,
+          auto_resolved_named_test_present: null,
+          at: '2026-07-05T12:00:00Z',
+        },
       ],
     });
 
@@ -148,8 +180,8 @@ describe('SettingsOrchestratorSection', () => {
     expect(await within(panel).findByText('7 ticks · 2 flags')).toBeInTheDocument();
     expect(within(panel).getByText('Checks Run').parentElement).toHaveTextContent('19');
     expect(within(panel).getByText('Errors Total').parentElement).toHaveTextContent('1');
-    expect(within(panel).getByText('check-b')).toBeInTheDocument();
-    expect(within(panel).getByText('memory')).toBeInTheDocument();
+    expect(within(panel).getByText('metrics_drift')).toBeInTheDocument();
+    expect(within(panel).getByText('global')).toBeInTheDocument();
     expect(within(panel).queryByText('No drift flags recorded in recent ticks.')).not.toBeInTheDocument();
   });
 
@@ -160,6 +192,9 @@ describe('SettingsOrchestratorSection', () => {
       flags_total: 0,
       errors_total: 0,
       enrolled_total: 0,
+      auto_resolved_total: 0,
+      auto_resolved_backing_path_total: 0,
+      auto_resolved_named_test_present_total: 0,
       last_tick_at: null,
       last_tick: null,
       recent_ticks: [],
