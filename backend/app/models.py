@@ -2311,6 +2311,7 @@ class ComputeJob(SQLModel, table=True):
         Index("ix_computejob_next_poll", "next_poll_at"),
         Index("ix_computejob_created_at", "created_at"),
         Index("ix_computejob_updated_at", "updated_at"),
+        Index("ix_computejob_completed_at", "completed_at"),
         Index(
             "ix_computejob_polling_metadata_runner_target_id",
             "polling_metadata",

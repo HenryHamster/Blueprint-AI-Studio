@@ -142,8 +142,25 @@ resource "google_storage_bucket" "artifacts" {
   force_destroy               = false
   uniform_bucket_level_access = true
 
+  # Bundle tarballs and transfer archives expire at 30 days.
   lifecycle_rule {
-    condition { age = 7 }
+    condition {
+      age            = 30
+      matches_suffix = [".tar.gz"]
+    }
+    action { type = "Delete" }
+  }
+
+  # Task payloads, credentials, screenshots, and agent logs live under
+  # tasks/<uuid>/... and expire at 30 days.  Viewable compute-job media
+  # (compute-jobs/<uuid>/artifacts/viewable/...) is deliberately excluded
+  # from GCS lifecycle rules — it is retired by the reaper at 180 days
+  # once its owning ComputeJob has been terminal long enough.
+  lifecycle_rule {
+    condition {
+      age             = 30
+      matches_prefix  = ["tasks/"]
+    }
     action { type = "Delete" }
   }
 }

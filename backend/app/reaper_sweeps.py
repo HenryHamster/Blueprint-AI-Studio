@@ -62,6 +62,7 @@ from app.compute_jobs import (
 from app.database import AsyncSessionLocal
 from app.models import (
     ComputeJob,
+    ComputeJobFile,
     ComputeJobStatus,
     LocalRunner,
     ProjectMessageAttachmentUpload,
@@ -3041,6 +3042,73 @@ async def sweep_stranded_runner_subprocess_compute_jobs(
     return finalized
 
 
+# How old a completed ComputeJob must be before its viewable artifacts are reaped.
+VIEWABLE_ARTIFACT_RETENTION_DAYS = 180
+
+
+async def sweep_retire_viewable_artifacts(
+    session,
+    *,
+    retention_days: int = VIEWABLE_ARTIFACT_RETENTION_DAYS,
+    batch_size: int = 100,
+) -> int:
+    """Step 23: Delete viewable GCS objects and their ComputeJobFile rows for
+    completed jobs older than ``retention_days`` (default 180).
+
+    Viewable objects at ``compute-jobs/<uuid>/artifacts/viewable/`` are
+    intentionally excluded from the GCS bucket lifecycle rules (which only
+    cover ``.tar.gz`` bundles and ``tasks/`` payloads).  This sweep is their
+    sole reaper: once the owning ComputeJob has been terminal for the full
+    retention window the object is deleted best-effort and the row removed.
+
+    At most ``batch_size`` files are processed per call to bound GCS call
+    volume.  Returns the number of ComputeJobFile rows deleted.
+    """
+    cutoff = _utcnow() - timedelta(days=max(1, int(retention_days)))
+
+    old_job_ids = (
+        select(ComputeJob.id)
+        .where(
+            ComputeJob.completed_at.is_not(None),
+            ComputeJob.completed_at < cutoff,
+        )
+        .scalar_subquery()
+    )
+
+    rows = (
+        await session.execute(
+            select(ComputeJobFile)
+            .where(ComputeJobFile.compute_job_id.in_(old_job_ids))
+            .order_by(ComputeJobFile.id.asc())
+            .limit(max(1, min(int(batch_size), 500)))
+            .with_for_update(skip_locked=True)
+        )
+    ).scalars().all()
+
+    if not rows:
+        return 0
+
+    deleted_flags = await asyncio.gather(
+        *(delete_storage_uri_best_effort(row.storage_uri) for row in rows)
+    )
+
+    removed = 0
+    for row, ok in zip(rows, deleted_flags, strict=True):
+        if ok:
+            await session.delete(row)
+            removed += 1
+    if removed:
+        await session.commit()
+        logger.info(
+            "[REAPER] Retired %d viewable artifact file(s) older than %d days",
+            removed,
+            retention_days,
+        )
+    else:
+        await session.rollback()
+    return removed
+
+
 __all__ = [
     # Re-exported from app.blocked_task_unblock_sweeps (constants)
     "_BLOCKED_ESCALATE_AFTER",
@@ -3095,4 +3163,6 @@ __all__ = [
     "sweep_refresh_project_compute_images",
     "sweep_silent_runner_compute_jobs",
     "sweep_stranded_runner_subprocess_compute_jobs",
+    "VIEWABLE_ARTIFACT_RETENTION_DAYS",
+    "sweep_retire_viewable_artifacts",
 ]
