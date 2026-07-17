@@ -13,15 +13,15 @@ visible to subsequent queries, so the fix is to check whether the row
 referenced by OLD.current_checkpoint_id still exists; if it does not, the
 update was driven by the FK cascade and clearing is safe.
 
-Revision ID: 0612
-Revises: 0611
+Revision ID: 0612b
+Revises: 0612
 Create Date: 2026-07-17
 """
 
 from alembic import op
 
-revision = "0612"
-down_revision = "0611"
+revision = "0612b"
+down_revision = "0612"
 branch_labels = None
 depends_on = None
 

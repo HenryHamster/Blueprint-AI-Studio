@@ -18,7 +18,7 @@ remain readable and backward-compatible.  Indexes on the attempt columns support
 the attempt-scoped query path in ``category_verdict_ledger``.
 
 Revision ID: 0613
-Revises: 0612
+Revises: 0612b
 Create Date: 2026-07-17
 """
 from alembic import op
@@ -27,7 +27,7 @@ import sqlmodel
 from sqlalchemy.dialects import postgresql
 
 revision = "0613"
-down_revision = "0612"
+down_revision = "0612b"
 branch_labels = None
 depends_on = None
 
