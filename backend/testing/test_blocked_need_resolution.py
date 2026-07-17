@@ -2846,6 +2846,10 @@ async def _grad_db():
         expire_on_commit=False,
     )
     async with Session() as s:
+        from app.models import DeploymentState
+
+        s.add(DeploymentState())
+        await s.commit()
         yield s
     async with engine.begin() as conn:
         await conn.run_sync(SQLModel.metadata.drop_all)

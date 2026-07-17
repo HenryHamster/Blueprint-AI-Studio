@@ -5299,6 +5299,15 @@ def _set_auto_graduation_config(
     _rc["capability_proof_gate_auto_graduation_enforce_threshold"] = enforce_threshold
 
 
+async def _seed_auto_graduation_deployment_state(db) -> None:
+    """Create the durable singleton required before a gate mode can advance."""
+    from app.models import DeploymentState
+
+    if await db.get(DeploymentState, 1) is None:
+        db.add(DeploymentState())
+        await db.commit()
+
+
 def _proven_ref(recorded_at: str | None = None) -> dict:
     """A minimal proven evidence_ref for a named_test."""
     ref = {"kind": "named_test", "ref": "testing/test_foo.py::test_bar", "proven": True}
@@ -5353,6 +5362,7 @@ async def test_auto_graduation_check_disabled_by_default(db):
 @pytest.mark.asyncio
 async def test_auto_graduation_already_at_enforce_is_noop(db):
     """When the gate is already at enforce, the check returns OK without advancing."""
+    await _seed_auto_graduation_deployment_state(db)
     _set_auto_graduation_config(mode="enforce")
     ctx = SweepContext(
         session=db, now=_utcnow(), mode="observe", max_projects=25,
@@ -5369,6 +5379,7 @@ async def test_auto_graduation_already_at_enforce_is_noop(db):
 @pytest.mark.asyncio
 async def test_auto_graduation_skipped_when_no_projects(db):
     """When there are no projects, the check is SKIPPED."""
+    await _seed_auto_graduation_deployment_state(db)
     _set_auto_graduation_config(mode="off")
     ctx = SweepContext(
         session=db, now=_utcnow(), mode="observe", max_projects=25,
@@ -5406,6 +5417,7 @@ async def test_auto_graduation_off_to_observe(db):
     db.add(project)
     await db.commit()
 
+    await _seed_auto_graduation_deployment_state(db)
     _set_auto_graduation_config(mode="off", observe_threshold=0.5)
 
     ctx = SweepContext(
@@ -5457,6 +5469,7 @@ async def test_auto_graduation_observe_to_enforce(db):
     db.add(project)
     await db.commit()
 
+    await _seed_auto_graduation_deployment_state(db)
     _set_auto_graduation_config(mode="observe", enforce_threshold=0.95)
 
     ctx = SweepContext(
@@ -5504,6 +5517,7 @@ async def test_auto_graduation_no_advancement_below_threshold(db):
     db.add(project)
     await db.commit()
 
+    await _seed_auto_graduation_deployment_state(db)
     _set_auto_graduation_config(mode="off", observe_threshold=0.6)
 
     ctx = SweepContext(
@@ -5545,6 +5559,7 @@ async def test_self_declared_proof_empty_ledger_cannot_advance_global_mode(db):
     assert coverage["total_proven"] == 0
     assert coverage["coverage_ratio"] == 0.0
 
+    await _seed_auto_graduation_deployment_state(db)
     _set_auto_graduation_config(mode="off", observe_threshold=0.5)
     ctx = SweepContext(
         session=db,
@@ -5586,6 +5601,7 @@ async def test_auto_graduation_posts_operator_notification(db):
     db.add(project)
     await db.commit()
 
+    await _seed_auto_graduation_deployment_state(db)
     _set_auto_graduation_config(mode="off", observe_threshold=0.5)
 
     ctx = SweepContext(
@@ -5632,6 +5648,7 @@ async def test_auto_graduation_notification_sent_for_each_contributing_project(d
         db.add(p)
     await db.commit()
 
+    await _seed_auto_graduation_deployment_state(db)
     _set_auto_graduation_config(mode="off", observe_threshold=0.5)
 
     ctx = SweepContext(
@@ -5672,6 +5689,7 @@ async def test_auto_graduation_notification_skipped_when_no_advancement(db):
     await db.commit()
 
     # Coverage = 0.5, threshold = 0.8 → below threshold, no advancement.
+    await _seed_auto_graduation_deployment_state(db)
     _set_auto_graduation_config(mode="off", observe_threshold=0.8)
 
     ctx = SweepContext(
@@ -5901,6 +5919,7 @@ async def test_auto_graduation_advances_by_one_step_per_run(db):
 
     # Both thresholds at 0.5 so 100% coverage triggers both — verifies the
     # code uses if/elif (one step) not two separate ifs (two steps).
+    await _seed_auto_graduation_deployment_state(db)
     _set_auto_graduation_config(mode="off", observe_threshold=0.5, enforce_threshold=0.5)
 
     ctx = SweepContext(
@@ -5955,6 +5974,7 @@ async def test_auto_graduation_db_failure_leaves_in_memory_mode_unchanged(db):
     db.add(dep_state)
     await db.commit()
 
+    await _seed_auto_graduation_deployment_state(db)
     _set_auto_graduation_config(mode="off", observe_threshold=0.5)
 
     # Use a proxy that delegates all ops to the real session but raises on the
@@ -5994,6 +6014,42 @@ async def test_auto_graduation_db_failure_leaves_in_memory_mode_unchanged(db):
 
 
 @pytest.mark.asyncio
+async def test_auto_graduation_missing_state_leaves_in_memory_mode_unchanged(db):
+    """A missing durable singleton must abort graduation without changing memory."""
+    from datetime import timedelta
+
+    project = await _project(db)
+    now = _utcnow()
+    fresh = (now - timedelta(days=1)).isoformat()
+    project.problem_model = {
+        "capabilities": [
+            {
+                "name": "repo-map",
+                "status": "working",
+                "evidence_refs": [_proven_ref(fresh)],
+            },
+        ]
+    }
+    _set_machine_proof_records(project, "repo-map", proved_at=fresh)
+    flag_modified(project, "problem_model")
+    db.add(project)
+    await db.commit()
+
+    _set_auto_graduation_config(mode="off", observe_threshold=0.5)
+    ctx = SweepContext(
+        session=db, now=now, mode="observe", max_projects=25,
+        sample_limit=200, window_days=14,
+    )
+
+    results = await mis.check_capability_proof_gate_auto_graduation(ctx)
+
+    assert len(results) == 1
+    assert results[0].status == CheckStatus.ERROR
+    assert "deployment state is missing" in results[0].detail
+    assert _rc.get("capability_proof_gate_mode") == "off"
+
+
+@pytest.mark.asyncio
 async def test_auto_graduation_notification_failure_does_not_rollback_mode(db):
     """When notification posting fails, the already-committed mode must persist.
 
@@ -6021,6 +6077,7 @@ async def test_auto_graduation_notification_failure_does_not_rollback_mode(db):
     db.add(project)
     await db.commit()
 
+    await _seed_auto_graduation_deployment_state(db)
     _set_auto_graduation_config(mode="off", observe_threshold=0.5)
 
     ctx = SweepContext(

@@ -4579,7 +4579,48 @@ async def check_capability_proof_gate_auto_graduation(
             )
         ]
 
-    # Advance the gate mode — update in-memory config.
+    # Persist the new gate mode before changing process-local state.  A process
+    # must never enforce a mode that was not durably committed.
+    try:
+        state = await ctx.session.get(DeploymentState, 1)
+        if state is None:
+            await ctx.session.rollback()
+            return [
+                CheckResult(
+                    check="capability_proof_gate_auto_graduation",
+                    status=CheckStatus.ERROR,
+                    subject="global",
+                    detail=(
+                        f"cannot auto-graduate gate from {current_mode} to {advance_to}: "
+                        "deployment state is missing; in-memory mode unchanged"
+                    ),
+                )
+            ]
+        config_json = dict(getattr(state, "runtime_config_json", None) or {})
+        config_json["capability_proof_gate_mode"] = advance_to
+        state.runtime_config_json = config_json
+        ctx.session.add(state)
+        await ctx.session.commit()
+    except Exception as exc:
+        await ctx.session.rollback()
+        logger.warning(
+            "[METRICS-INTEGRITY] failed to persist capability proof gate "
+            "auto-graduation to DB; in-memory mode remains %s",
+            current_mode,
+            exc_info=True,
+        )
+        return [
+            CheckResult(
+                check="capability_proof_gate_auto_graduation",
+                status=CheckStatus.ERROR,
+                subject="global",
+                detail=(
+                    f"failed to persist gate auto-graduation from {current_mode} "
+                    f"to {advance_to}: {exc}; in-memory mode unchanged"
+                ),
+            )
+        ]
+
     _runtime_config["capability_proof_gate_mode"] = advance_to
     logger.info(
         "[METRICS-INTEGRITY] capability proof gate auto-graduated: "
@@ -4594,26 +4635,6 @@ async def check_capability_proof_gate_auto_graduation(
         total_non_exempt_working,
         total_proven,
     )
-
-    # Persist the new gate mode to the database so it survives restarts.
-    try:
-        state = await ctx.session.get(DeploymentState, 1)
-        if state is not None:
-            config_json = getattr(state, "runtime_config_json", None)
-            if isinstance(config_json, dict):
-                config_json["capability_proof_gate_mode"] = advance_to
-            else:
-                config_json = {"capability_proof_gate_mode": advance_to}
-            state.runtime_config_json = config_json
-            ctx.session.add(state)
-            await ctx.session.commit()
-    except Exception:
-        logger.warning(
-            "[METRICS-INTEGRITY] failed to persist capability proof gate "
-            "auto-graduation to DB; in-memory value is %s",
-            advance_to,
-            exc_info=True,
-        )
 
     # Notify the operator of this autonomous gate-mode change. The advance
     # (especially → enforce, which begins BLOCKING task spawning and release
