@@ -119,6 +119,11 @@ def project_checkpoint_to_legacy(
     *,
     now: datetime,
 ) -> None:
+    # Caller (strategic_resident_ownership.cutover_to_strategic_resident) holds the
+    # project row lock via with_for_update() from _lock_project_resident_tasks, so
+    # direct writes to project.vision / project.directions / project.running_update
+    # are serialized and safe. This function is intentionally synchronous to avoid
+    # requiring an async session inside what is already a locked transaction.
     body = checkpoint.checkpoint if isinstance(checkpoint.checkpoint, dict) else {}
     working = body.get("working_strategy")
     if not isinstance(body.get("charter"), dict) or not isinstance(working, dict):
