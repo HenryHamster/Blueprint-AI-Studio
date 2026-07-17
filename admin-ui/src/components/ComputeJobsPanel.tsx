@@ -2425,11 +2425,11 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                 const galleryExpanded = expandedDocIds.has(galleryKey);
                 let omissionDetail: string;
                 if (liveOm && (liveOm.size_cap ?? 0) > 0 && !(liveOm.count_cap ?? 0)) {
-                  omissionDetail = 'exceeded per-file size limit (8 MiB/image · 512 MiB/video)';
+                  omissionDetail = 'exceeded per-file size limit (8 MiB/image · 8 MiB/PDF · 512 MiB/video)';
                 } else if (liveOm && (liveOm.count_cap ?? 0) > 0 && !(liveOm.size_cap ?? 0)) {
                   omissionDetail = '25-file count limit reached';
                 } else {
-                  omissionDetail = 'preview cap: 25 files · 8 MiB/image · 512 MiB/video';
+                  omissionDetail = 'preview cap: 25 files · 8 MiB/image · 8 MiB/PDF · 512 MiB/video';
                 }
                 const omittedNote =
                   omissionCount > 0 ? (
