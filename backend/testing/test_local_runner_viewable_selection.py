@@ -616,6 +616,37 @@ class TestRunnerViewableStreaming:
         assert calls[0]["relpath"] == "report.pdf"
         assert calls[0]["content_type"] == "application/pdf"
 
+    def test_frequently_rewritten_early_file_does_not_starve_later_files(self, tmp_path):
+        """A file that changes every heartbeat must not prevent later files from uploading.
+
+        Scenario: aaa.png is rewritten before each heartbeat (always eligible),
+        bbb.png and ccc.png are stable new files added in the second scan.
+        Without fairness rotation, aaa.png would win every heartbeat and the
+        later files would never be uploaded. With the scan_start cursor,
+        successive heartbeats start past the last-uploaded relpath, so every
+        eligible file gets a slot within N heartbeats.
+        """
+        art = tmp_path / "artifacts"
+        art.mkdir()
+        (art / "aaa.png").write_bytes(b"x" * 8)
+        (art / "bbb.png").write_bytes(b"y" * 8)
+        (art / "ccc.png").write_bytes(b"z" * 8)
+        state = local_runner._ViewableStreamState()
+
+        uploaded = []
+        for heartbeat in range(6):
+            # Rewrite aaa.png every heartbeat so it is always eligible.
+            f = art / "aaa.png"
+            f.write_bytes(b"x" * (8 + heartbeat))
+            os.utime(str(f), (f.stat().st_atime, f.stat().st_mtime + heartbeat + 1))
+            calls = _run_stream(art, state)
+            uploaded.extend(c["relpath"] for c in calls)
+
+        # All three files must have been uploaded at least once.
+        assert "aaa.png" in uploaded, "aaa.png should upload"
+        assert "bbb.png" in uploaded, "bbb.png must not be starved"
+        assert "ccc.png" in uploaded, "ccc.png must not be starved"
+
 
 class TestRunnerViewableUpload:
     """``_upload_viewable`` maps transport outcomes to a status/None, never raising."""

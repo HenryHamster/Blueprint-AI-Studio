@@ -117,7 +117,7 @@ export function ComputeArtifactGallery({ projectId, job }: { projectId: string; 
         return '25-file count limit reached';
       }
     }
-    return 'preview cap: 25 files · 8 MiB/image · 512 MiB/video';
+    return 'preview cap: 25 files · 8 MiB/image · 8 MiB/PDF · 512 MiB/video';
   }
 
   const omittedNote =

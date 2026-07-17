@@ -83,7 +83,7 @@ describe('ComputeArtifactGallery', () => {
     );
     expect(getByTestId('drawer-artifact-gallery')).toBeTruthy();
     expect(getByTestId('drawer-artifact-omitted-note').textContent).toBe(
-      '3 files omitted (preview cap: 25 files · 8 MiB/image · 512 MiB/video)',
+      '3 files omitted (preview cap: 25 files · 8 MiB/image · 8 MiB/PDF · 512 MiB/video)',
     );
     // No previews to toggle when everything was dropped.
     expect(queryByTestId('drawer-artifact-gallery-toggle')).toBeNull();
@@ -97,7 +97,7 @@ describe('ComputeArtifactGallery', () => {
       />,
     );
     expect(getByTestId('drawer-artifact-omitted-note').textContent).toBe(
-      '1 file omitted (preview cap: 25 files · 8 MiB/image · 512 MiB/video)',
+      '1 file omitted (preview cap: 25 files · 8 MiB/image · 8 MiB/PDF · 512 MiB/video)',
     );
   });
 

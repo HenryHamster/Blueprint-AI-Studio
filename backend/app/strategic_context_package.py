@@ -1342,6 +1342,7 @@ async def load_strategic_context_evidence(
         },
         "artifacts": {
             "total": int(artifact_total or 0),
+            "live_count": len(running_items),
             "items": artifact_items,
         },
     }
@@ -1931,7 +1932,13 @@ def _strategic_context_descriptors(
         descriptors.append(source_table)
 
     seen_ids = {str(descriptor["id"]) for descriptor in descriptors}
-    for artifact in (evidence.get("artifacts") or {}).get("items", [])[:4]:
+    # Render ALL returned evidence items as descriptors (not a hard [:4] slice):
+    # evidence.artifacts.items is already bounded to _RUNNING_JOB_PREVIEW_LIMIT
+    # live items + _ARTIFACT_EVIDENCE_LIMIT terminal items, so the list is at most
+    # 8 entries. Applying another [:4] here would hide terminal results whenever
+    # 4+ live jobs are running. The outer [:10] at the end of this function caps
+    # total descriptor count so the package stays bounded.
+    for artifact in (evidence.get("artifacts") or {}).get("items", []):
         descriptor = _artifact_descriptor(artifact)
         if descriptor and descriptor["id"] not in seen_ids:
             seen_ids.add(str(descriptor["id"]))
