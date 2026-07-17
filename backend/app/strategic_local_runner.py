@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from app.experiment_authoring_context import build_runner_devices
-from app.models import LocalRunner, Project
+from app.models import LocalRunner, Project, ProjectComputeImage
 from app.runner_project_binding import runner_allowed_for_project
 from app.time_utils import _utcnow
 from app.workbench_state import (
@@ -100,6 +100,33 @@ async def _load_local_runner_status(
         if devices:
             status["devices"] = devices
     return status
+
+
+async def _load_baked_image_ref(
+    session: AsyncSession, project_id: uuid.UUID
+) -> str | None:
+    """Return the most recent digest-pinned ref for the project's baked compute image.
+
+    Queries for the most recently-updated ``built=True`` row with a non-null
+    ``pinned_ref``.  Returns ``None`` when no such row exists (project has no
+    baked image yet) so callers can omit the field rather than propagating an
+    empty string.
+    """
+    row = (
+        await session.execute(
+            select(ProjectComputeImage)
+            .where(
+                ProjectComputeImage.project_id == project_id,
+                ProjectComputeImage.built.is_(True),
+                ProjectComputeImage.pinned_ref.isnot(None),
+            )
+            .order_by(ProjectComputeImage.updated_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        return None
+    return row.pinned_ref or None
 
 
 def _agent_visible_vision(vision: dict[str, Any] | None) -> dict[str, Any]:

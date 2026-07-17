@@ -149,6 +149,7 @@ from app.workbench_state import (
 
 from app.strategic_local_runner import (  # noqa: F401 — re-exported for callers/tests
     _RUNNER_LIVENESS_SECONDS,
+    _load_baked_image_ref,
     _load_local_runner_status,
     _agent_visible_vision,
     _local_runner_handles_task_type,
@@ -7485,6 +7486,17 @@ async def _spawn_strategic_review(
     _local_runner_status["require_local_runner"] = resolve_project_require_local_runner(
         project
     )
+    # Baked compute image ref: the most recent digest-pinned ref built for this
+    # project, so the strategist can prefer the project image over a raw NGC URI
+    # when authoring compute_experiments. Merged at the call site (not inside
+    # _load_local_runner_status) to keep that helper's return shape stable.
+    # Fail-open: any error is swallowed and the field is simply absent.
+    try:
+        _baked_ref = await _load_baked_image_ref(session, project.id)
+        if _baked_ref:
+            _local_runner_status["baked_image_ref"] = _baked_ref
+    except Exception:  # noqa: BLE001 — fail-open; baked ref is advisory
+        logger.debug("[STRATEGIC] baked image ref load failed; continuing")
     # Experiment-authoring context: the experiment LEDGER (a bounded query over
     # recent terminal compute_experiment tasks — what was already measured, at
     # what cost, with what verdict) plus one-line near-duplicate advisories for
@@ -7619,6 +7631,7 @@ async def _spawn_strategic_review(
                 if (
                     _local_runner_status.get("ever_registered")
                     or _local_runner_status.get("require_local_runner")
+                    or _local_runner_status.get("baked_image_ref")
                 )
                 else {}
             ),

@@ -19502,6 +19502,82 @@ async def test_resolve_digest_pin_does_not_warn_when_pinned(db_session, caplog):
 
 
 # ---------------------------------------------------------------------------
+# _load_baked_image_ref: surface project-baked compute image ref for agent context.
+#
+# The strategic spawning pipeline merges baked_image_ref into local_runner_status
+# so authoring agents can prefer the project image over a raw NGC URI.  These
+# tests cover the query helper directly:
+#   - no rows → None
+#   - built=True row with pinned_ref → returns pinned_ref
+#   - built=False row ignored
+#   - returns most recent when multiple rows exist
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_dispatch_defaults_project_image(db_session):
+    """_load_baked_image_ref returns the most recent built digest-pinned ref,
+    so the strategic spawner can merge it into local_runner_status and agents
+    default compute_experiments to the project-baked image."""
+    from app.models import ProjectComputeImage
+    from app.strategic_local_runner import _load_baked_image_ref
+
+    project = await _make_project(db_session, name="Baked Image Context Proj")
+
+    # No rows → None (project has not been built yet).
+    assert await _load_baked_image_ref(db_session, project.id) is None
+
+    pinned = "ghcr.io/org/compute-proj@sha256:" + "e" * 64
+    db_session.add(
+        ProjectComputeImage(
+            project_id=project.id,
+            image_name="compute-proj",
+            registry_repo="ghcr.io/org",
+            dep_hash="dep1",
+            tag="latest",
+            pinned_ref=pinned,
+            digest="sha256:" + "e" * 64,
+            built=True,
+        )
+    )
+    await db_session.commit()
+
+    # Single built row → pinned_ref returned.
+    assert await _load_baked_image_ref(db_session, project.id) == pinned
+
+    # An unbuilt row (built=False) for the same project must be ignored.
+    db_session.add(
+        ProjectComputeImage(
+            project_id=project.id,
+            image_name="compute-proj",
+            registry_repo="ghcr.io/org",
+            dep_hash="dep2-unbuilt",
+            tag="latest",
+            pinned_ref="ghcr.io/org/compute-proj@sha256:" + "f" * 64,
+            digest="sha256:" + "f" * 64,
+            built=False,
+        )
+    )
+    await db_session.commit()
+    assert await _load_baked_image_ref(db_session, project.id) == pinned
+
+    # A newer built row supersedes the older one (ordered by updated_at DESC).
+    newer_pinned = "ghcr.io/org/compute-proj@sha256:" + "a" * 64
+    db_session.add(
+        ProjectComputeImage(
+            project_id=project.id,
+            image_name="compute-proj",
+            registry_repo="ghcr.io/org",
+            dep_hash="dep3-newer",
+            tag="latest",
+            pinned_ref=newer_pinned,
+            digest="sha256:" + "a" * 64,
+            built=True,
+        )
+    )
+    await db_session.commit()
+    assert await _load_baked_image_ref(db_session, project.id) == newer_pinned
+
+
+# ---------------------------------------------------------------------------
 # _stamp_container_image_pin_status: durable per-payload reproducibility flag.
 # ---------------------------------------------------------------------------
 def test_stamp_container_image_pin_status_mutable():

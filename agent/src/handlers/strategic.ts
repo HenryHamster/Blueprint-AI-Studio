@@ -183,29 +183,41 @@ export function buildLocalRunnerSection(status: unknown): string {
   const activeGpu = typeof s.active_gpu === 'number' ? s.active_gpu : 0;
   const everRegistered = s.ever_registered === true;
   const requireLocal = s.require_local_runner === true;
-  // Backend already gates inclusion on (ever_registered || require_local_runner);
+  const bakedImageRef = typeof s.baked_image_ref === 'string' && s.baked_image_ref ? s.baked_image_ref : null;
+  // Backend gates inclusion on (ever_registered || require_local_runner || baked_image_ref);
   // re-check defensively so a stray payload never renders an empty/misleading note.
-  if (!everRegistered && !requireLocal) return '';
+  if (!everRegistered && !requireLocal && !bakedImageRef) return '';
 
   const lines: string[] = ['## Self-hosted compute (local runner availability)'];
-  lines.push(
-    `- Live runners: ${activeTotal} total, ${activeGpu} GPU-capable`
-    + (requireLocal
-      ? ' — this project ENFORCES local-only compute (require_local_runner=true), so a compute_experiment never bills cloud.'
-      : '.'),
-  );
-  if (activeGpu > 0) {
+  if (bakedImageRef) {
     lines.push(
-      '- GPU hardware is ONLINE: a GPU `compute_experiment` will run on the operator\'s self-hosted runner. Authoring one is fine.',
+      `- Project-baked compute image: \`${bakedImageRef}\`. `
+      + 'PREFER to omit `container_image` in compute_experiments — the platform defaults to this digest-pinned image automatically. '
+      + 'Only set `container_image` explicitly when you need a DIFFERENT image (e.g. a specific NGC stack the baked image does not cover).',
     );
-  } else if (requireLocal) {
+  }
+  if (everRegistered || requireLocal) {
     lines.push(
-      '- GPU hardware is OFFLINE and this project is local-only: a GPU `compute_experiment` authored now is HELD (never billed to cloud) and terminally fails after the hold window. Do NOT author GPU experiments until a GPU runner is live — defer the hypothesis or take a non-GPU approach.',
+      `- Live runners: ${activeTotal} total, ${activeGpu} GPU-capable`
+      + (requireLocal
+        ? ' — this project ENFORCES local-only compute (require_local_runner=true), so a compute_experiment never bills cloud.'
+        : '.'),
     );
-  } else {
-    lines.push(
-      '- GPU hardware is OFFLINE: a GPU `compute_experiment` authored now would FALL BACK to billable cloud GPU. Prefer to defer GPU experiments until the operator\'s runner is live, unless the cloud spend is justified.',
-    );
+  }
+  if (everRegistered || requireLocal) {
+    if (activeGpu > 0) {
+      lines.push(
+        '- GPU hardware is ONLINE: a GPU `compute_experiment` will run on the operator\'s self-hosted runner. Authoring one is fine.',
+      );
+    } else if (requireLocal) {
+      lines.push(
+        '- GPU hardware is OFFLINE and this project is local-only: a GPU `compute_experiment` authored now is HELD (never billed to cloud) and terminally fails after the hold window. Do NOT author GPU experiments until a GPU runner is live — defer the hypothesis or take a non-GPU approach.',
+      );
+    } else {
+      lines.push(
+        '- GPU hardware is OFFLINE: a GPU `compute_experiment` authored now would FALL BACK to billable cloud GPU. Prefer to defer GPU experiments until the operator\'s runner is live, unless the cloud spend is justified.',
+      );
+    }
   }
   // Per-device hardware detail (backend-bounded per-runner AND in total under
   // the experiment-authoring shared budget) so the strategist can reason about
