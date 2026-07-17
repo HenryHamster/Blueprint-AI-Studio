@@ -2355,12 +2355,17 @@ async def test_ephemeral_fernet_key_differs_across_calls(monkeypatch):
 
 def test_looks_like_keyless_encryption_artifact():
     """The predicate helper must identify the deliberate keyless fail-closed
-    artifact and reject unrelated migration failures."""
+    artifact and reject unrelated migration failures.
+
+    The classifier is migration-number-agnostic: it matches any encryption
+    migration whose RuntimeError references the encryption env-var on the same
+    line, not just the historical '0609' anchor.
+    """
     import app.migration_apply_gate as gate_mod
 
     # True positive: the error message from migration 0609 when the encryption
     # key is deliberately withheld in the scratch subprocess.
-    fail_closed_detail = (
+    fail_closed_0609 = (
         "Traceback (most recent call last):\n"
         "  ...\n"
         "RuntimeError: Migration 0609 requires GITHUB_PAT_ENCRYPTION_KEY "
@@ -2368,8 +2373,20 @@ def test_looks_like_keyless_encryption_artifact():
         "reconciliation; ALLOW_PLAINTEXT_CREDENTIALS does not permit "
         "this migration to stamp."
     )
-    assert gate_mod._looks_like_keyless_encryption_artifact(fail_closed_detail), (
-        "must identify the deliberate keyless fail-closed artifact"
+    assert gate_mod._looks_like_keyless_encryption_artifact(fail_closed_0609), (
+        "must identify the deliberate keyless fail-closed artifact (migration 0609)"
+    )
+
+    # True positive: a future encryption migration (e.g. 0621) that uses the
+    # same fail-closed pattern but with a different migration number.
+    fail_closed_future = (
+        "Traceback (most recent call last):\n"
+        "  ...\n"
+        "RuntimeError: Migration 0621: GITHUB_PAT_ENCRYPTION_KEY is not set "
+        "and ALLOW_PLAINTEXT_CREDENTIALS is not true — fail-closed."
+    )
+    assert gate_mod._looks_like_keyless_encryption_artifact(fail_closed_future), (
+        "must match any encryption migration fail-closed error, not just '0609'"
     )
 
     # False positive: an unrelated RuntimeError that does NOT reference the
@@ -2518,4 +2535,55 @@ async def test_keyless_encryption_migration_replay_degrades_not_defers(monkeypat
     assert apply_call_count == 1, (
         f"keyless-encryption artifact retried {apply_call_count} time(s); "
         "must degrade on first attempt"
+    )
+
+
+@pytest.mark.asyncio
+async def test_provision_seed_uses_replay_timeout_code(monkeypatch):
+    """_provision_seed_and_detect_drift must forward
+    timeout_code='migration_apply_replay_apply_timeout' to
+    _apply_candidate_migrations so replay-stage timeouts are correctly labelled,
+    not silently downgraded to the generic chain-timeout code.
+
+    This pins the de-duplicated definition (the shadowing copy dropped the kwarg).
+    """
+    import app.migration_apply_gate as gate_mod
+
+    captured_kwargs: dict = {}
+
+    async def _capture_apply(scratch_engine, candidate_sources, **kwargs):
+        captured_kwargs.update(kwargs)
+
+    monkeypatch.setattr(gate_mod, "_apply_candidate_migrations", _capture_apply)
+    monkeypatch.setattr(gate_mod, "_seed_scratch", AsyncMock())
+    monkeypatch.setattr(gate_mod, "_reflect_scratch_drift", AsyncMock(return_value=[]))
+
+    prod_meta = sa.MetaData()
+    sa.Table("t", prod_meta, sa.Column("id", sa.Integer, primary_key=True))
+    prod_state = gate_mod._ProdState(revision="abc1", metadata=prod_meta)
+
+    scratch_base_url = make_url(
+        "postgresql+asyncpg://u:p@host:5432/control"
+    )
+
+    import contextlib
+
+    @contextlib.asynccontextmanager
+    async def _fake_ephemeral(_base_url, db_name=None):
+        yield object(), "scratch-replay-test"
+
+    monkeypatch.setattr(gate_mod, "ephemeral_postgres_database", _fake_ephemeral)
+
+    await gate_mod._provision_seed_and_detect_drift(
+        scratch_base_url=scratch_base_url,
+        prod_state=prod_state,
+        candidate_sources={"abc1_init.py": "revision='abc1'\ndef upgrade(): pass\ndef downgrade(): pass\n"},
+        required_metadata=prod_meta,
+    )
+
+    assert captured_kwargs.get("timeout_code") == "migration_apply_replay_apply_timeout", (
+        f"Expected timeout_code='migration_apply_replay_apply_timeout', "
+        f"got {captured_kwargs.get('timeout_code')!r}. "
+        "The de-duplicated _provision_seed_and_detect_drift must forward the "
+        "replay-specific timeout_code to _apply_candidate_migrations."
     )

@@ -356,65 +356,6 @@ async def _with_transient_retry(
     coro_factory: Callable[[], Awaitable[_T]],
     *,
     label: str,
-) -> _T:
-    """Invoke *coro_factory* with bounded exponential backoff on exceptions.
-
-    *coro_factory* is a zero-argument awaitable factory — a lambda or closure
-    — because a consumed coroutine cannot be re-awaited.  On each attempt a
-    fresh coroutine is created so the retry observes a clean call stack.
-
-    Reads retry parameters from module-level ``_TRANSIENT_RETRY_*`` constants
-    so tests can monkeypatch them for speed without altering production.
-
-    After exhausting *max_attempts* consecutive failures, re-raises the *last*
-    exception so existing ``try``/``except`` structures around the caller
-    convert it to ``("defer", ...)``.
-    """
-    last_exc: Exception | None = None
-    for attempt in range(1, _TRANSIENT_RETRY_MAX_ATTEMPTS + 1):
-        if attempt > 1:
-            delay = exponential_backoff(
-                attempt - 1,
-                base=_TRANSIENT_RETRY_BASE_DELAY,
-                cap=_TRANSIENT_RETRY_MAX_DELAY,
-                jitter=0.25,
-            )
-            logger.warning(
-                "[MIGRATION_APPLY_GATE] %s attempt %d/%d transient failure; "
-                "retrying in %.1fs: %s",
-                label,
-                attempt - 1,
-                _TRANSIENT_RETRY_MAX_ATTEMPTS,
-                delay,
-                last_exc,
-            )
-            await asyncio.sleep(delay)
-        try:
-            return await coro_factory()
-        except _MigrationApplyTimeout:
-            # A stage watchdog already proved this attempt exceeded its budget.
-            # Re-running it internally only multiplies a deterministic stall.
-            raise
-        except Exception as exc:  # noqa: BLE001 — retry on transient exceptions
-            last_exc = exc
-    # All attempts exhausted — re-raise the last exception.
-    raise cast(Exception, last_exc)
-
-
-# Retry configuration for transient operations — overridable in tests (via
-# monkeypatch) for speed without altering production behavior.
-_TRANSIENT_RETRY_MAX_ATTEMPTS = 3
-_TRANSIENT_RETRY_BASE_DELAY = 1.0
-_TRANSIENT_RETRY_MAX_DELAY = 16.0
-
-
-_T = TypeVar("_T")
-
-
-async def _with_transient_retry(
-    coro_factory: Callable[[], Awaitable[_T]],
-    *,
-    label: str,
     no_retry_types: tuple[type[Exception], ...] = (),
 ) -> _T:
     """Invoke *coro_factory* with bounded exponential backoff on exceptions.
@@ -524,17 +465,18 @@ def _looks_like_keyless_encryption_artifact(detail: str) -> bool:
     """Return True when *detail* describes the deliberate keyless fail-closed
     of an encryption migration in the secret-free scratch subprocess.
 
-    Requires all three signals to avoid false-positives from accumulated chain
-    stderr: earlier no-op migrations (0531 etc.) always emit the env-var name
-    to stderr, so matching on the env var + RuntimeError alone would swallow
-    any unrelated RuntimeError that happens to follow a no-op warning line.
-    Requiring 'Migration 0609' anchors the match to the specific fail-closed
-    error raised by migration 0609 itself.
+    Uses a single-line regex to require that the encryption env-var name
+    appears on the same line as the RuntimeError — this rejects accumulated
+    chain stderr where earlier no-op migrations (0531 etc.) emit the env-var
+    name as a warning on a prior line before an unrelated RuntimeError.
+    Migration-number-agnostic: matches any encryption migration that
+    fail-closes with the same pattern (0609, 0621, future migrations).
     """
-    return (
-        "RuntimeError" in detail
-        and _ENCRYPTION_KEY_ENV_VAR in detail
-        and "Migration 0609" in detail
+    return bool(
+        re.search(
+            r"RuntimeError[^\n]*" + re.escape(_ENCRYPTION_KEY_ENV_VAR),
+            detail,
+        )
     )
 
 
@@ -1380,29 +1322,6 @@ async def _provision_seed_and_detect_drift(
             candidate_sources,
             timeout_code="migration_apply_replay_apply_timeout",
         )
-        return await _reflect_scratch_drift(scratch_engine, required_metadata)
-
-
-async def _provision_seed_and_detect_drift(
-    scratch_base_url: URL,
-    prod_state: _ProdState,
-    candidate_sources: dict[str, str],
-    required_metadata: sa.MetaData,
-) -> list[str]:
-    """Provision an isolated scratch DB, seed with production's recorded state,
-    apply candidate migrations, and return any schema drift.
-
-    Raises ``_MigrationApplyError`` on seed/apply/collision failure (deferrable).
-    Returns an empty list when the post-upgrade schema satisfies all requirements.
-    """
-    async with ephemeral_postgres_database(scratch_base_url) as (scratch_engine, name):
-        # ISOLATION GUARD: never run DDL against the production database.
-        if name == scratch_base_url.database:
-            raise _MigrationApplyError(
-                "scratch database name collided with the scratch server's default database"
-            )
-        await _seed_scratch(scratch_engine, prod_state)
-        await _apply_candidate_migrations(scratch_engine, candidate_sources)
         return await _reflect_scratch_drift(scratch_engine, required_metadata)
 
 
