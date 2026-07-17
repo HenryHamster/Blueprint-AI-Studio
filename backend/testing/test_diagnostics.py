@@ -676,6 +676,86 @@ class TestBuildStuckTasks:
             f"Expected exactly 1 DB query for dependency lookup, got {call_count}"
         )
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "child_status",
+        [
+            TaskStatus.QUEUED,
+            TaskStatus.PROVISIONING,
+            TaskStatus.IN_PROGRESS,
+            TaskStatus.EVALUATING,
+            TaskStatus.BLOCKED,
+        ],
+    )
+    async def test_evaluating_parent_with_active_child_is_not_stuck(
+        self, db_session, child_status
+    ):
+        """An old parent is progressing while any pipeline child is live."""
+        project = Project(name=f"diag-eval-{child_status}", user_id="test-user-123")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        parent = _make_task(
+            project.id,
+            TaskStatus.EVALUATING,
+            created_ago_secs=4 * 3600,
+            started_ago_secs=4 * 3600,
+        )
+        db_session.add(parent)
+        await db_session.commit()
+        await db_session.refresh(parent)
+
+        db_session.add(
+            Task(
+                project_id=project.id,
+                parent_task_id=parent.id,
+                title="live pipeline child",
+                payloads=[{"type": "fix"}],
+                status=child_status,
+            )
+        )
+        await db_session.commit()
+
+        result = await _build_stuck_tasks([parent], _utc_now(), db_session)
+        assert result == []
+        await db_session.refresh(parent)
+        assert parent.status == TaskStatus.EVALUATING
+
+    @pytest.mark.asyncio
+    async def test_evaluating_parent_with_only_terminal_children_is_stuck(
+        self, db_session
+    ):
+        """Terminal children do not hide a genuinely stale EVALUATING parent."""
+        project = Project(name="diag-eval-terminal", user_id="test-user-123")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        parent = _make_task(
+            project.id,
+            TaskStatus.EVALUATING,
+            created_ago_secs=4 * 3600,
+            started_ago_secs=4 * 3600,
+        )
+        db_session.add(parent)
+        await db_session.commit()
+        await db_session.refresh(parent)
+        db_session.add(
+            Task(
+                project_id=project.id,
+                parent_task_id=parent.id,
+                title="finished pipeline child",
+                payloads=[{"type": "fix"}],
+                status=TaskStatus.COMPLETED,
+            )
+        )
+        await db_session.commit()
+
+        result = await _build_stuck_tasks([parent], _utc_now(), db_session)
+        assert len(result) == 1
+        assert result[0]["stuck_reason"] == "evaluation_timeout"
+
     # ── output fields ─────────────────────────────────────────────────────────
 
     @pytest.mark.asyncio

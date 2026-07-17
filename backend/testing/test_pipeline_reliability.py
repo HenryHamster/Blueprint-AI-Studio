@@ -730,9 +730,15 @@ async def test_ci_polling_closed_without_merge_fails_task(orch_db, mocker):
         return_value={
             "state": "closed",
             "merged": False,
-            "head": {"sha": "abc123"},
+            "head": {"sha": "abc123", "ref": "feat/closed"},
+            "base": {"ref": "main"},
             "mergeable": None,
         },
+    )
+    mocker.patch(
+        "app.github.get_open_pull_request_for_head_branch",
+        new_callable=AsyncMock,
+        return_value=None,
     )
 
     alert_mock = mocker.patch(
@@ -758,6 +764,178 @@ async def test_ci_polling_closed_without_merge_fails_task(orch_db, mocker):
         "pr_merged must not be set when PR was closed without merging"
     )
     alert_mock.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_ci_polling_rebinds_closed_pr_to_open_replacement(orch_db, mocker):
+    """A unique same-head/base replacement owns the task after old PR closure."""
+    session, _Session = orch_db
+
+    project = Project(name="CI Replacement PR Test", user_id="user1")
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+
+    ci_task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "create", "prompt": "replacement", "branch": "feat/replaced"}
+        ],
+        status=TaskStatus.EVALUATING,
+        context={
+            "rollup_pr_number": 77,
+            "review_loop": {
+                "ci_waiting": True,
+                "pr_number": 77,
+                "branch": "feat/replaced",
+                "base_branch": "automain",
+                "ci_wait_started": _naive_utcnow().isoformat(),
+            },
+        },
+    )
+    session.add(ci_task)
+    await session.commit()
+    await session.refresh(ci_task)
+    task_id = ci_task.id
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        return_value=("fake-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={
+            "number": 77,
+            "state": "closed",
+            "merged": False,
+            "head": {"sha": "oldsha", "ref": "feat/replaced"},
+            "base": {"ref": "automain"},
+            "mergeable": None,
+        },
+    )
+    lookup = mocker.patch(
+        "app.github.get_open_pull_request_for_head_branch",
+        new_callable=AsyncMock,
+        return_value={
+            "number": 91,
+            "state": "open",
+            "head": {"sha": "newsha", "ref": "feat/replaced"},
+            "base": {"ref": "automain"},
+        },
+    )
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+
+    await _run_one_cycle(mocker)
+
+    async with _Session() as verify_session:
+        from sqlmodel import select as _select
+
+        updated = (
+            (
+                await verify_session.execute(
+                    _select(Task).where(Task.id == task_id)
+                )
+            )
+            .scalars()
+            .first()
+        )
+
+    assert updated.status == TaskStatus.EVALUATING
+    loop = (updated.context or {}).get("review_loop", {})
+    assert loop.get("pr_number") == 91
+    assert loop.get("head_sha") == "newsha"
+    assert (updated.context or {}).get("rollup_pr_number") == 91
+    assert "superseded by open pr #91" in (
+        updated.latest_status_message or ""
+    ).lower()
+    lookup.assert_awaited_once_with(
+        "fake-token",
+        "owner",
+        "repo",
+        "feat/replaced",
+        "automain",
+        project_id=str(project.id),
+    )
+    alert_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_ci_polling_retries_when_replacement_lookup_is_uncertain(
+    orch_db, mocker
+):
+    """A GitHub lookup outage cannot turn a possibly-superseded PR into failure."""
+    session, _Session = orch_db
+
+    project = Project(name="CI Replacement Lookup Retry", user_id="user1")
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+
+    ci_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "branch": "feat/retry-replacement"}],
+        status=TaskStatus.EVALUATING,
+        context={
+            "review_loop": {
+                "ci_waiting": True,
+                "pr_number": 77,
+                "branch": "feat/retry-replacement",
+                "base_branch": "automain",
+                "ci_wait_started": _naive_utcnow().isoformat(),
+            }
+        },
+    )
+    session.add(ci_task)
+    await session.commit()
+    await session.refresh(ci_task)
+    task_id = ci_task.id
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        return_value=("fake-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={
+            "state": "closed",
+            "merged": False,
+            "head": {"sha": "oldsha", "ref": "feat/retry-replacement"},
+            "base": {"ref": "automain"},
+            "mergeable": None,
+        },
+    )
+    mocker.patch(
+        "app.github.get_open_pull_request_for_head_branch",
+        new_callable=AsyncMock,
+        side_effect=_HTTPException(status_code=503, detail="rate limited"),
+    )
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+
+    await _run_one_cycle(mocker)
+
+    async with _Session() as verify_session:
+        from sqlmodel import select as _select
+
+        updated = (
+            (
+                await verify_session.execute(
+                    _select(Task).where(Task.id == task_id)
+                )
+            )
+            .scalars()
+            .first()
+        )
+
+    assert updated.status == TaskStatus.EVALUATING
+    assert "replacement lookup unavailable" in (
+        updated.latest_status_message or ""
+    ).lower()
+    assert (updated.context or {}).get("review_loop", {}).get("pr_number") == 77
+    alert_mock.assert_not_called()
 
 
 @pytest.mark.asyncio

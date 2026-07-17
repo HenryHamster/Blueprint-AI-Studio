@@ -88,6 +88,15 @@ async def test_reaper_evaluating_sweep_queries_updated_at(reaper_db, mocker):
         status=TaskStatus.COMPLETED,
     )
     reaper_db.add(child)
+    reaper_db.add(
+        Task(
+            project_id=project.id,
+            parent_task_id=parent.id,
+            payloads=[{"type": "fix", "prompt": "still working"}],
+            status=TaskStatus.IN_PROGRESS,
+            last_heartbeat=_utcnow(),
+        )
+    )
     await reaper_db.commit()
 
     try:
