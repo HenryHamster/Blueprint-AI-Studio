@@ -1419,17 +1419,15 @@ async def test_refresh_build_error_is_isolated(db):
 
 @pytest.mark.asyncio
 async def test_refresh_hash_matches_build_and_push_input_keying(db):
-    """The dep_hash keys Dockerfile as 'Dockerfile' and dep files by relative path.
-
-    Same as compute_dependency_hash's contract in build_and_push — so an unchanged
-    manifest always resolves to the SAME tag the real build would produce.
-    """
-    from app.compute_image_build import compute_dependency_hash
+    """The cheap refresh and real build use the same typed fingerprint inputs."""
+    from app.compute_image_build import assemble_fingerprint_inputs, compute_dependency_hash
 
     project = await _make_repo_project(db)
     dockerfile = b"FROM python:3.11-slim\nRUN pip install torch\n"
     reqs = b"torch==2.3.0\nnumpy==1.26\n"
-    expected = compute_dependency_hash({"Dockerfile": dockerfile, "requirements.txt": reqs})
+    expected = compute_dependency_hash(
+        assemble_fingerprint_inputs(dockerfile, {"requirements.txt": reqs})
+    )
 
     seen: list = []
 
@@ -1451,6 +1449,214 @@ async def test_refresh_hash_matches_build_and_push_input_keying(db):
         _record_fn=_record_row,
     )
     assert seen == [expected], "driver dep_hash must match build_and_push keying"
+
+
+@pytest.mark.asyncio
+async def test_refresh_cheap_hash_equals_build_hash_with_parent_and_build_args(db):
+    """refresh_project_compute_image produces the same dep_hash as build_and_push
+    when the manifest has parent and build_args — both paths must call
+    assemble_fingerprint_inputs so they cannot drift.
+    """
+    from app.compute_image_build import assemble_fingerprint_inputs, compute_dependency_hash
+
+    project = await _make_repo_project(db)
+    dockerfile = b"FROM python:3.11-slim\nRUN pip install torch\n"
+    reqs = b"torch==2.3.0\n"
+    parent = "python:3.11-slim"
+    build_args = {"CUDA": "12.4", "PY": "3.11"}
+
+    # Expected: same inputs as assemble_fingerprint_inputs would produce.
+    expected = compute_dependency_hash(
+        assemble_fingerprint_inputs(
+            dockerfile,
+            {"requirements.txt": reqs},
+            parent=parent,
+            build_args=build_args,
+        )
+    )
+
+    manifest = {
+        "compute": {
+            "image": {
+                "name": "widget-compute",
+                "build": {
+                    "dockerfile": ".blueprint/Dockerfile.compute",
+                    "parent": parent,
+                    "build_args": build_args,
+                },
+            }
+        }
+    }
+
+    seen: list = []
+
+    def _tag_exists(full_repo, dep_hash):
+        seen.append(dep_hash)
+        return True
+
+    await _cb.refresh_project_compute_image(
+        db,
+        project,
+        _manifest_fn=lambda _p: _async(manifest),
+        _token_fn=lambda o, r: _async("tok"),
+        _default_branch_fn=lambda t, o, r: _async("main"),
+        _fetch_bytes_fn=_fetch_bytes_stub(
+            {".blueprint/Dockerfile.compute": dockerfile, "requirements.txt": reqs}
+        ),
+        _tag_exists_fn=_tag_exists,
+        _resolve_digest_fn=lambda full_repo, dep_hash: None,
+        _record_fn=_record_row,
+    )
+    assert seen == [expected], (
+        "refresh dep_hash with parent/build_args must equal assemble_fingerprint_inputs output"
+    )
+
+
+@pytest.mark.asyncio
+async def test_refresh_lockfile_less_bare_manifest_changes_hash(db):
+    """When no lockfile is present, the bare manifest (package.json) participates
+    in the cheap hash — a changed bare manifest must yield a different dep_hash.
+    """
+    project = await _make_repo_project(db)
+    dockerfile = b"FROM node:20-slim\n"
+    pkg_v1 = b'{"name": "app", "version": "1.0.0"}\n'
+    pkg_v2 = b'{"name": "app", "version": "2.0.0"}\n'
+
+    hashes: list = []
+
+    for pkg_bytes in (pkg_v1, pkg_v2):
+        seen: list = []
+
+        def _tag_exists(full_repo, dep_hash, _b=pkg_bytes):
+            seen.append(dep_hash)
+            return True
+
+        await _cb.refresh_project_compute_image(
+            db,
+            project,
+            _manifest_fn=lambda _p: _async(_BUILD_MANIFEST),
+            _token_fn=lambda o, r: _async("tok"),
+            _default_branch_fn=lambda t, o, r: _async("main"),
+            _fetch_bytes_fn=_fetch_bytes_stub(
+                {".blueprint/Dockerfile.compute": dockerfile, "package.json": pkg_bytes}
+                # no package-lock.json → bare-manifest fallback kicks in
+            ),
+            _tag_exists_fn=_tag_exists,
+            _resolve_digest_fn=lambda full_repo, dep_hash: None,
+            _record_fn=_record_row,
+        )
+        hashes.append(seen[0])
+
+    assert hashes[0] != hashes[1], (
+        "lockfile-less bare manifest content change must yield different dep_hash"
+    )
+
+
+@pytest.mark.asyncio
+async def test_refresh_explicit_deps_override_defaults(db):
+    """When build_config has 'deps', only those files participate in the cheap hash
+    (not the full _DEFAULT_DEP_FILES discovery).
+    """
+    from app.compute_image_build import assemble_fingerprint_inputs, compute_dependency_hash
+
+    project = await _make_repo_project(db)
+    dockerfile = b"FROM python:3.11-slim\n"
+    explicit_dep = b"numpy==1.26\n"
+
+    manifest = {
+        "compute": {
+            "image": {
+                "name": "widget-compute",
+                "build": {
+                    "dockerfile": ".blueprint/Dockerfile.compute",
+                    "deps": ["packages/api/requirements.txt"],
+                },
+            }
+        }
+    }
+    expected = compute_dependency_hash(
+        assemble_fingerprint_inputs(
+            dockerfile,
+            {"packages/api/requirements.txt": explicit_dep},
+        )
+    )
+
+    seen: list = []
+
+    def _tag_exists(full_repo, dep_hash):
+        seen.append(dep_hash)
+        return True
+
+    await _cb.refresh_project_compute_image(
+        db,
+        project,
+        _manifest_fn=lambda _p: _async(manifest),
+        _token_fn=lambda o, r: _async("tok"),
+        _default_branch_fn=lambda t, o, r: _async("main"),
+        _fetch_bytes_fn=_fetch_bytes_stub(
+            {
+                ".blueprint/Dockerfile.compute": dockerfile,
+                "packages/api/requirements.txt": explicit_dep,
+                # requirements.txt also "present" — must NOT be included when deps explicit
+                "requirements.txt": b"other==1.0\n",
+            }
+        ),
+        _tag_exists_fn=_tag_exists,
+        _resolve_digest_fn=lambda full_repo, dep_hash: None,
+        _record_fn=_record_row,
+    )
+    assert seen == [expected], (
+        "explicit deps must override default discovery; only declared files hash"
+    )
+
+
+@pytest.mark.asyncio
+async def test_refresh_missing_explicit_dep_fails_closed_before_registry_or_build(db):
+    """A partial explicit-dependency fetch must not reuse or record an image."""
+    project = await _make_repo_project(db)
+    manifest = {
+        "compute": {
+            "image": {
+                "name": "widget-compute",
+                "build": {"deps": ["requirements.txt", "missing.lock"]},
+            }
+        }
+    }
+    called = {"tag": 0, "build": 0, "record": 0}
+
+    def _tag_exists(*_args):
+        called["tag"] += 1
+        raise AssertionError("partial explicit dependencies must not query the registry")
+
+    async def _build(*_args, **_kwargs):
+        called["build"] += 1
+        raise AssertionError("partial explicit dependencies must not start a build")
+
+    async def _record(*_args, **_kwargs):
+        called["record"] += 1
+        raise AssertionError("partial explicit dependencies must not record a pin")
+
+    result = await _cb.refresh_project_compute_image(
+        db,
+        project,
+        _manifest_fn=lambda _p: _async(manifest),
+        _token_fn=lambda o, r: _async("tok"),
+        _default_branch_fn=lambda t, o, r: _async("main"),
+        _fetch_bytes_fn=_fetch_bytes_stub(
+            {
+                ".blueprint/Dockerfile.compute": b"FROM python:3.11-slim\n",
+                "requirements.txt": b"numpy==1.26\n",
+            }
+        ),
+        _tag_exists_fn=_tag_exists,
+        _build_fn=_build,
+        _record_fn=_record,
+    )
+    assert result == {
+        "status": "no_config",
+        "reason": "declared dependency file not found: missing.lock",
+    }
+    assert called == {"tag": 0, "build": 0, "record": 0}
 
 
 # ══════════════════════════════════════════════════════════════════════════════

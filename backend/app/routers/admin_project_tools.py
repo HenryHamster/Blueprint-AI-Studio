@@ -292,6 +292,28 @@ def _validate_manifest_compute_image_build(spec: Any) -> str | None:
         for k, v in build_args.items():
             if not isinstance(k, str) or not isinstance(v, str):
                 return "compute.image.build: build_args keys and values must be strings"
+    deps = spec.get("deps")
+    if deps is not None:
+        if not isinstance(deps, list):
+            return "compute.image.build: deps must be an array of strings"
+        for i, entry in enumerate(deps):
+            if not isinstance(entry, str) or not entry.strip():
+                return f"compute.image.build: deps[{i}] must be a non-empty string"
+            dep_path = entry.strip()
+            # Validate using both POSIX and Windows path syntax because a
+            # manifest can be authored on either platform while the service
+            # runs on Linux.  A drive-qualified, rooted, UNC, or traversal path
+            # must never be treated as repo-relative.
+            if (
+                dep_path.startswith(("/", "\\"))
+                or re.match(r"^[A-Za-z]:", dep_path)
+                or "\x00" in dep_path
+                or any(part == ".." for part in re.split(r"[\\/]", dep_path))
+            ):
+                return (
+                    f"compute.image.build: deps[{i}] must be a relative path "
+                    "without '..'"
+                )
     return None
 
 
@@ -324,6 +346,7 @@ def _normalize_manifest_compute_image(spec: Dict[str, Any]) -> Dict[str, Any]:
         dockerfile = raw_build.get("dockerfile")
         parent = raw_build.get("parent")
         raw_args = raw_build.get("build_args")
+        raw_deps = raw_build.get("deps")
         result["build"] = {
             "dockerfile": (
                 dockerfile.strip()
@@ -335,6 +358,11 @@ def _normalize_manifest_compute_image(spec: Dict[str, Any]) -> Dict[str, Any]:
                 {str(k): str(v) for k, v in raw_args.items()}
                 if isinstance(raw_args, dict)
                 else {}
+            ),
+            "deps": (
+                [str(d).strip() for d in raw_deps if isinstance(d, str)]
+                if isinstance(raw_deps, list)
+                else []
             ),
         }
     return result

@@ -8,7 +8,6 @@ produce a bounded, credential-free staging archive.
 from __future__ import annotations
 
 import contextlib
-import json
 import logging
 import os
 import shutil
@@ -379,21 +378,23 @@ def remote_build_and_push(*, repo_dir: str, registry_repo: str, image_name: str,
     if violations:
         raise CredentialLeakError("build_args contains platform secret keys: " + ", ".join(sorted(violations)))
 
-    inputs: Dict[str, bytes] = {}
     dockerfile_path = os.path.join(repo_dir, dockerfile)
     if not os.path.isfile(dockerfile_path):
         raise FileNotFoundError(f"Dockerfile not found: {dockerfile_path}")
-    inputs["Dockerfile"] = Path(dockerfile_path).read_bytes()
-    _check_dockerfile_network_directives(inputs["Dockerfile"])
+    dockerfile_bytes = Path(dockerfile_path).read_bytes()
+    _check_dockerfile_network_directives(dockerfile_bytes)
+    dep_file_bytes: Dict[str, bytes] = {}
     for rel in dep_files:
         path = os.path.join(repo_dir, rel)
         if not os.path.isfile(path):
             raise FileNotFoundError(f"declared dependency file not found: {path}")
-        inputs[rel] = Path(path).read_bytes()
-    if parent:
-        inputs["__parent_image__"] = parent.encode()
-    if build_args:
-        inputs["__build_args__"] = json.dumps(dict(sorted(build_args.items())), sort_keys=True).encode()
+        dep_file_bytes[rel] = Path(path).read_bytes()
+    inputs = compute_image_build.assemble_fingerprint_inputs(
+        dockerfile_bytes,
+        dep_file_bytes,
+        parent=parent,
+        build_args=build_args,
+    )
     dep_hash = compute_image_build.compute_dependency_hash(inputs)
     full_repo = f"{registry_repo}/{image_name}"
     tag_exists = _tag_exists_fn or remote_registry_tag_exists

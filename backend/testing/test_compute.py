@@ -18186,6 +18186,296 @@ def test_dependency_hash_empty_raises():
 
 
 # ---------------------------------------------------------------------------
+# assemble_fingerprint_inputs / bare_manifest_fallback_files
+# ---------------------------------------------------------------------------
+
+
+def test_assemble_fingerprint_inputs_parent_changes_hash():
+    """Changing the parent image changes the fingerprint hash."""
+    h1 = _bci.compute_dependency_hash(
+        _bci.assemble_fingerprint_inputs(b"FROM x\n", {}, parent="python:3.11-slim")
+    )
+    h2 = _bci.compute_dependency_hash(
+        _bci.assemble_fingerprint_inputs(b"FROM x\n", {}, parent="python:3.12-slim")
+    )
+    assert h1 != h2
+
+
+def test_assemble_fingerprint_inputs_no_parent_differs_from_with_parent():
+    """No parent and some parent produce different hashes."""
+    h_no = _bci.compute_dependency_hash(
+        _bci.assemble_fingerprint_inputs(b"FROM x\n", {})
+    )
+    h_yes = _bci.compute_dependency_hash(
+        _bci.assemble_fingerprint_inputs(b"FROM x\n", {}, parent="python:3.11-slim")
+    )
+    assert h_no != h_yes
+
+
+def test_assemble_fingerprint_inputs_build_args_order_independent():
+    """build_args hash is stable regardless of insertion order."""
+    h1 = _bci.compute_dependency_hash(
+        _bci.assemble_fingerprint_inputs(
+            b"FROM x\n", {}, build_args={"A": "1", "B": "2"}
+        )
+    )
+    h2 = _bci.compute_dependency_hash(
+        _bci.assemble_fingerprint_inputs(
+            b"FROM x\n", {}, build_args={"B": "2", "A": "1"}
+        )
+    )
+    assert h1 == h2
+
+
+def test_assemble_fingerprint_inputs_build_args_value_changes_hash():
+    """Changing a build-arg value changes the hash."""
+    h1 = _bci.compute_dependency_hash(
+        _bci.assemble_fingerprint_inputs(b"FROM x\n", {}, build_args={"CUDA": "12.4"})
+    )
+    h2 = _bci.compute_dependency_hash(
+        _bci.assemble_fingerprint_inputs(b"FROM x\n", {}, build_args={"CUDA": "12.5"})
+    )
+    assert h1 != h2
+
+
+def test_assemble_fingerprint_inputs_empty_build_args_same_as_none():
+    """Empty build_args dict does not add a pseudo-key (same hash as no build_args)."""
+    h_none = _bci.compute_dependency_hash(
+        _bci.assemble_fingerprint_inputs(b"FROM x\n", {})
+    )
+    h_empty = _bci.compute_dependency_hash(
+        _bci.assemble_fingerprint_inputs(b"FROM x\n", {}, build_args={})
+    )
+    assert h_none == h_empty
+
+
+def test_assemble_fingerprint_inputs_nested_dep_file_changes_hash():
+    """A declared dep file at a nested path changes the hash when its content changes."""
+    h1 = _bci.compute_dependency_hash(
+        _bci.assemble_fingerprint_inputs(
+            b"FROM x\n",
+            {"packages/api/requirements.txt": b"numpy==1.26\n"},
+        )
+    )
+    h2 = _bci.compute_dependency_hash(
+        _bci.assemble_fingerprint_inputs(
+            b"FROM x\n",
+            {"packages/api/requirements.txt": b"numpy==2.0\n"},
+        )
+    )
+    assert h1 != h2
+
+
+@pytest.mark.parametrize("reserved_name", ["Dockerfile", "__parent_image__", "__build_args__"])
+def test_assemble_fingerprint_inputs_reserved_looking_dep_is_typed(reserved_name):
+    """Valid dependency names cannot overwrite Dockerfile or metadata inputs."""
+    base = _bci.assemble_fingerprint_inputs(
+        b"FROM x\n",
+        {reserved_name: b"one"},
+        parent="python:3.11-slim",
+        build_args={"CUDA": "12.4"},
+    )
+    changed = _bci.assemble_fingerprint_inputs(
+        b"FROM x\n",
+        {reserved_name: b"two"},
+        parent="python:3.11-slim",
+        build_args={"CUDA": "12.4"},
+    )
+    assert _bci.compute_dependency_hash(base) != _bci.compute_dependency_hash(changed)
+    assert base["\x00dockerfile"] == b"FROM x\n"
+    assert base["\x00parent_image"] == b"python:3.11-slim"
+    assert base["\x00build_args"] == b'{"CUDA": "12.4"}'
+    assert base[f"\x00dep:{reserved_name}"] == b"one"
+
+
+def test_build_and_push_includes_parent_in_hash(tmp_path):
+    """build_and_push uses assemble_fingerprint_inputs: parent affects the dep_hash."""
+    (tmp_path / ".blueprint").mkdir()
+    (tmp_path / ".blueprint" / "Dockerfile.compute").write_bytes(b"FROM scratch\n")
+    (tmp_path / "requirements.txt").write_bytes(b"torch==2.3\n")
+
+    seen_hashes: list[str] = []
+
+    def fake_run(cmd, **kw):
+        class P:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        return P()
+
+    for p in ("python:3.11", "python:3.12"):
+        result = _bci.build_and_push(
+            repo_dir=str(tmp_path),
+            registry_repo="reg/repo",
+            image_name="img",
+            dockerfile=".blueprint/Dockerfile.compute",
+            dep_files=["requirements.txt"],
+            parent=p,
+            _run=fake_run,
+            _tag_exists=lambda *a, **k: True,
+        )
+        seen_hashes.append(result.dep_hash)
+
+    assert seen_hashes[0] != seen_hashes[1], "different parent must yield different dep_hash"
+
+
+def test_bare_manifest_fallback_files_includes_package_json_when_no_lockfile():
+    """package.json is a candidate when no node lockfile is in the resolved set."""
+    result = _bci.bare_manifest_fallback_files(frozenset())
+    assert "package.json" in result
+
+
+def test_bare_manifest_fallback_files_excludes_package_json_when_lockfile_present():
+    """package.json is NOT a candidate when a node lockfile is in the resolved set."""
+    for lockfile in ("package-lock.json", "yarn.lock", "pnpm-lock.yaml"):
+        result = _bci.bare_manifest_fallback_files(frozenset([lockfile]))
+        assert "package.json" not in result, f"package.json must be skipped when {lockfile} present"
+
+
+def test_bare_manifest_fallback_files_includes_pipfile_when_no_lock():
+    result = _bci.bare_manifest_fallback_files(frozenset())
+    assert "Pipfile" in result
+
+
+def test_bare_manifest_fallback_files_excludes_pipfile_when_lock_present():
+    result = _bci.bare_manifest_fallback_files(frozenset(["Pipfile.lock"]))
+    assert "Pipfile" not in result
+
+
+def test_bare_manifest_fallback_files_all_lockfiles_present_returns_nothing():
+    """When every ecosystem has a lockfile, no bare manifests are candidates."""
+    all_lockfiles = frozenset(
+        ["package-lock.json", "Pipfile.lock", "requirements.txt"]
+    )
+    result = _bci.bare_manifest_fallback_files(all_lockfiles)
+    assert result == []
+
+
+def test_bare_manifest_lockfile_less_content_changes_hash():
+    """A bare manifest's content changes the fingerprint hash when no lockfile is present."""
+    # package.json present, no node lockfile => package.json is a hash input
+    h1 = _bci.compute_dependency_hash(
+        _bci.assemble_fingerprint_inputs(
+            b"FROM x\n",
+            {"package.json": b'{"name": "my-app", "version": "1.0.0"}\n'},
+        )
+    )
+    h2 = _bci.compute_dependency_hash(
+        _bci.assemble_fingerprint_inputs(
+            b"FROM x\n",
+            {"package.json": b'{"name": "my-app", "version": "2.0.0"}\n'},
+        )
+    )
+    assert h1 != h2
+
+
+# ---------------------------------------------------------------------------
+# Manifest compute.image.build: deps field
+# ---------------------------------------------------------------------------
+
+
+def test_manifest_compute_image_build_deps_valid():
+    from app.routers.admin_project_tools import (
+        _validate_manifest_compute_image,
+        _normalize_manifest_compute_image,
+    )
+
+    spec = {
+        "name": "reg/img:tag",
+        "build": {"deps": ["packages/api/requirements.txt", "shared/pyproject.toml"]},
+    }
+    assert _validate_manifest_compute_image(spec) is None
+    norm = _normalize_manifest_compute_image(spec)
+    assert norm["build"]["deps"] == [
+        "packages/api/requirements.txt",
+        "shared/pyproject.toml",
+    ]
+
+
+def test_manifest_compute_image_build_deps_empty_list():
+    from app.routers.admin_project_tools import (
+        _validate_manifest_compute_image,
+        _normalize_manifest_compute_image,
+    )
+
+    spec = {"name": "reg/img:tag", "build": {"deps": []}}
+    assert _validate_manifest_compute_image(spec) is None
+    norm = _normalize_manifest_compute_image(spec)
+    assert norm["build"]["deps"] == []
+
+
+def test_manifest_compute_image_build_deps_absent_defaults_empty():
+    from app.routers.admin_project_tools import _normalize_manifest_compute_image
+
+    norm = _normalize_manifest_compute_image({"name": "reg/img:tag", "build": {}})
+    assert norm["build"]["deps"] == []
+
+
+def test_manifest_compute_image_build_deps_traversal_rejected():
+    from app.routers.admin_project_tools import _validate_manifest_compute_image
+
+    err = _validate_manifest_compute_image(
+        {"name": "reg/img:t", "build": {"deps": ["../etc/passwd"]}}
+    )
+    assert err is not None
+    assert "deps" in err
+
+
+def test_manifest_compute_image_build_deps_absolute_path_rejected():
+    from app.routers.admin_project_tools import _validate_manifest_compute_image
+
+    err = _validate_manifest_compute_image(
+        {"name": "reg/img:t", "build": {"deps": ["/etc/secret"]}}
+    )
+    assert err is not None
+    assert "deps" in err
+
+
+def test_manifest_compute_image_build_deps_whitespace_absolute_path_rejected():
+    from app.routers.admin_project_tools import _validate_manifest_compute_image
+
+    err = _validate_manifest_compute_image(
+        {"name": "reg/img:t", "build": {"deps": [" /etc/passwd"]}}
+    )
+    assert err is not None
+    assert "deps" in err
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["C:\\secrets\\token", "C:/secrets/token", "\\secrets\\token", "\\\\server\\share\\token", "//server/share/token", "lib\\..\\secret"],
+)
+def test_manifest_compute_image_build_deps_non_repo_relative_paths_rejected(path):
+    from app.routers.admin_project_tools import _validate_manifest_compute_image
+
+    err = _validate_manifest_compute_image(
+        {"name": "reg/img:t", "build": {"deps": [path]}}
+    )
+    assert err is not None
+    assert "deps" in err
+
+
+def test_manifest_compute_image_build_deps_non_string_rejected():
+    from app.routers.admin_project_tools import _validate_manifest_compute_image
+
+    err = _validate_manifest_compute_image(
+        {"name": "reg/img:t", "build": {"deps": [123]}}
+    )
+    assert err is not None
+    assert "deps" in err
+
+
+def test_manifest_compute_image_build_deps_not_list_rejected():
+    from app.routers.admin_project_tools import _validate_manifest_compute_image
+
+    err = _validate_manifest_compute_image(
+        {"name": "reg/img:t", "build": {"deps": "requirements.txt"}}
+    )
+    assert err is not None
+    assert "deps" in err
+
+
+# ---------------------------------------------------------------------------
 # Credential scanner
 # ---------------------------------------------------------------------------
 

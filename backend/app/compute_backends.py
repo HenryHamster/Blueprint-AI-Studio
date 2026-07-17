@@ -3856,9 +3856,13 @@ def resolve_project_compute_image_build(
     *manifest_compute* is the ``compute`` dict returned by
     ``admin_project_tools._discover_manifest_tools`` (shape
     ``{"image": {"name": ..., "build": {...} | None}}``). Returns a dict
-    ``{"name", "dockerfile", "parent", "build_args"}`` when the project declares
-    a ``build`` section, or ``None`` when it only points at a prebuilt image
-    (or declares no compute image at all).
+    ``{"name", "dockerfile", "parent", "build_args", "deps"}`` when the project
+    declares a ``build`` section, or ``None`` when it only points at a prebuilt
+    image (or declares no compute image at all).
+
+    ``deps`` is either an explicit list of repo-relative dependency file paths
+    (when the manifest's ``build.deps`` field is set) or an empty list (meaning
+    the build system will auto-discover dependency files).
     """
     if not isinstance(manifest_compute, dict):
         return None
@@ -3871,19 +3875,33 @@ def resolve_project_compute_image_build(
     name = image.get("name")
     if not isinstance(name, str) or not name.strip():
         return None
+    raw_deps = build.get("deps")
+    deps: list[str] = list(raw_deps) if isinstance(raw_deps, list) else []
     return {
         "name": name.strip(),
         "dockerfile": build.get("dockerfile") or ".blueprint/Dockerfile.compute",
         "parent": build.get("parent"),
         "build_args": dict(build.get("build_args") or {}),
+        "deps": deps,
     }
 
 
 def _discover_dep_files(repo_dir: str) -> list[str]:
-    """Return the default dependency files that actually exist in *repo_dir*."""
+    """Return dependency files that exist in *repo_dir*, including lockfile-less fallbacks.
+
+    Checks all :data:`_DEFAULT_DEP_FILES` first, then adds bare ecosystem
+    manifests (``package.json``, ``Pipfile``, ``setup.cfg``) for any ecosystem
+    where no lockfile was found, so a project with only a bare manifest still
+    changes its image hash when that manifest changes.
+    """
+    present_set: set[str] = set()
     present: list[str] = []
     for rel in _DEFAULT_DEP_FILES:
         if os.path.isfile(os.path.join(repo_dir, rel)):
+            present.append(rel)
+            present_set.add(rel)
+    for rel in compute_image_build.bare_manifest_fallback_files(frozenset(present_set)):
+        if rel not in present_set and os.path.isfile(os.path.join(repo_dir, rel)):
             present.append(rel)
     return present
 
@@ -3996,7 +4014,11 @@ async def build_project_compute_image(
             clone_url = f"https://x-access-token:{token}@github.com/{owner}/{repo}.git"
             await asyncio.to_thread(_git_clone_ref, clone_url, resolved_ref, repo_dir)
 
-        resolved_dep_files = list(dep_files) if dep_files is not None else _discover_dep_files(repo_dir)
+        explicit_deps = list(build_config.get("deps") or [])
+        resolved_dep_files = (
+            list(dep_files) if dep_files is not None
+            else (explicit_deps if explicit_deps else _discover_dep_files(repo_dir))
+        )
 
         result = await asyncio.to_thread(
             build_fn,
@@ -4378,31 +4400,70 @@ async def refresh_project_compute_image(
                 "reason": f"no Dockerfile at {dockerfile_rel}",
             }
 
-        # Key inputs EXACTLY as build_and_push does: Dockerfile under
-        # "Dockerfile", each present dep file under its relative path — so the
-        # hash matches what a real build produces (an unchanged manifest =>
-        # identical dep_hash => registry-tag-exists fast path).
-        inputs: Dict[str, bytes] = {"Dockerfile": dockerfile_bytes}
-        for rel in _DEFAULT_DEP_FILES:
-            data = await fetch_bytes_fn(
-                rel,
-                token=token,
-                owner=owner,
-                repo=repo,
-                ref=default_branch,
-                project_id=project_id_str,
-            )
-            if data is not None:
-                inputs[rel] = data
+        # Fetch dep file bytes using assemble_fingerprint_inputs (same logic as
+        # build_and_push) so the cheap hash is guaranteed to match the real build.
+        # When the manifest declares explicit deps, fetch only those; otherwise
+        # fetch the defaults and bare-manifest fallbacks.
+        explicit_deps = list(build_config.get("deps") or [])
+        dep_file_bytes: Dict[str, bytes] = {}
+        if explicit_deps:
+            for rel in explicit_deps:
+                data = await fetch_bytes_fn(
+                    rel,
+                    token=token,
+                    owner=owner,
+                    repo=repo,
+                    ref=default_branch,
+                    project_id=project_id_str,
+                )
+                if data is None:
+                    # Explicit declarations are mandatory, just as they are in
+                    # build_and_push.  Never hash a partial input set and reuse
+                    # a registry tag that the real build could not produce.
+                    return {
+                        "status": "no_config",
+                        "reason": f"declared dependency file not found: {rel}",
+                    }
+                dep_file_bytes[rel] = data
+        else:
+            # Fetch all defaults, then bare-manifest fallbacks for any ecosystem
+            # that has no lockfile present.
+            fetched_names: set[str] = set()
+            for rel in _DEFAULT_DEP_FILES:
+                data = await fetch_bytes_fn(
+                    rel,
+                    token=token,
+                    owner=owner,
+                    repo=repo,
+                    ref=default_branch,
+                    project_id=project_id_str,
+                )
+                if data is not None:
+                    dep_file_bytes[rel] = data
+                    fetched_names.add(rel)
+            for rel in compute_image_build.bare_manifest_fallback_files(
+                frozenset(fetched_names)
+            ):
+                if rel not in dep_file_bytes:
+                    data = await fetch_bytes_fn(
+                        rel,
+                        token=token,
+                        owner=owner,
+                        repo=repo,
+                        ref=default_branch,
+                        project_id=project_id_str,
+                    )
+                    if data is not None:
+                        dep_file_bytes[rel] = data
 
         parent = build_config.get("parent")
         build_args = dict(build_config.get("build_args") or {})
-        if parent:
-            inputs["__parent_image__"] = str(parent).encode("utf-8")
-        if build_args:
-            inputs["__build_args__"] = json.dumps(
-                dict(sorted(build_args.items())), sort_keys=True
-            ).encode("utf-8")
+        inputs = compute_image_build.assemble_fingerprint_inputs(
+            dockerfile_bytes,
+            dep_file_bytes,
+            parent=parent,
+            build_args=build_args,
+        )
         dep_hash = compute_image_build.compute_dependency_hash(inputs)
 
         registry_repo = resolve_compute_image_registry_repo()
