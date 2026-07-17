@@ -1008,15 +1008,16 @@ def registry_tag_exists(
 ) -> bool:
     """Whether ``registry_repo:tag`` already exists in the registry.
 
-    Uses ``docker manifest inspect`` (works for Artifact Registry with docker
-    credentials configured). Any lookup error (network, auth, absent tag) is
-    treated as "not present" so the caller falls through to a build — the build
-    itself is idempotent-by-hash, so a false negative only costs one rebuild.
+    Uses ``gcloud artifacts docker images describe`` (daemon-free, works on
+    Cloud Run where no docker daemon is available). Any lookup error (no
+    gcloud, auth, network, absent tag) is treated as "not present" so the
+    caller falls through to a build — the build itself is idempotent-by-hash,
+    so a false negative only costs one rebuild.
     """
     ref = f"{registry_repo}:{tag}"
     try:
         proc = _run(
-            ["docker", "manifest", "inspect", ref],
+            ["gcloud", "artifacts", "docker", "images", "describe", ref, "--format=json"],
             capture_output=True,
             text=True,
             timeout=120,
@@ -1134,81 +1135,20 @@ def delete_registry_protection_tag(
     return proc.returncode == 0
 
 
-def _resolve_local_digest(
-    registry_repo: str, tag: str, *, _run=subprocess.run
-) -> str | None:
-    """Digest of ``registry_repo:tag`` **as recorded in the LOCAL docker store**.
-
-    ``docker image inspect`` only knows about images this host has built or pulled.
-    On a fresh or pruned host it returns nothing — which is exactly why it must
-    never be the ONLY digest source (see :func:`resolve_registry_digest`).
-    """
-    ref = f"{registry_repo}:{tag}"
-    try:
-        proc = _run(
-            [
-                "docker",
-                "image",
-                "inspect",
-                "--format={{index .RepoDigests 0}}",
-                ref,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if proc.returncode != 0:
-        return None
-    out = (proc.stdout or "").strip()
-    # Format: registry/repo@sha256:...
-    _, sep, digest = out.partition("@")
-    if sep and digest.startswith("sha256:"):
-        return digest
-    return None
-
-
-# Back-compat alias: the old name said "pushed" but only ever read the local store.
-_resolve_pushed_digest = _resolve_local_digest
-
-
-def _descriptor_digest(doc: Any) -> str | None:
-    """Pull ``Descriptor.digest`` out of a ``docker manifest inspect -v`` document."""
-    if isinstance(doc, list):
-        for entry in doc:
-            digest = _descriptor_digest(entry)
-            if digest:
-                return digest
-        return None
-    if not isinstance(doc, dict):
-        return None
-    desc = doc.get("Descriptor")
-    if isinstance(desc, dict):
-        digest = desc.get("digest")
-        if isinstance(digest, str) and digest.startswith("sha256:"):
-            return digest
-    return None
-
-
 def resolve_registry_digest(
     registry_repo: str, tag: str, *, _run=subprocess.run
 ) -> str | None:
     """Digest of ``registry_repo:tag`` **as it exists in the REGISTRY**, or None.
 
-    This is the authoritative source, and the one that survives a fresh host: it
-    asks the registry (``docker manifest inspect --verbose``) rather than the local
-    image store. The old fast path resolved the digest of an already-present image
-    from the local store alone, so on any host that had never built/pulled that tag
-    (a fresh orchestrator, or one that had run ``docker system prune``) it resolved
-    to ``None``, returned a tag-only ``pinned_ref``, and the caller persisted
-    ``digest=NULL`` — silently DESTROYING the project's digest pin on a re-trigger
-    with unchanged dependencies.
+    Uses ``gcloud artifacts docker images describe`` (daemon-free, works on
+    Cloud Run). Returns the ``image_summary.digest`` field from the JSON
+    response, or None on any error (no gcloud, auth, network, absent tag,
+    missing key).
     """
     ref = f"{registry_repo}:{tag}"
     try:
         proc = _run(
-            ["docker", "manifest", "inspect", "--verbose", ref],
+            ["gcloud", "artifacts", "docker", "images", "describe", ref, "--format=json"],
             capture_output=True,
             text=True,
             timeout=120,
@@ -1224,16 +1164,22 @@ def resolve_registry_digest(
         doc = json.loads(raw)
     except (ValueError, TypeError):
         return None
-    return _descriptor_digest(doc)
+    if not isinstance(doc, dict):
+        return None
+    summary = doc.get("image_summary")
+    if not isinstance(summary, dict):
+        return None
+    digest = summary.get("digest")
+    if isinstance(digest, str) and digest.startswith("sha256:"):
+        return digest
+    return None
 
 
 def _resolve_digest(
     registry_repo: str, tag: str, *, _run=subprocess.run
 ) -> str | None:
-    """Best available digest for a tag: registry first, local store as a fallback."""
-    return resolve_registry_digest(
-        registry_repo, tag, _run=_run
-    ) or _resolve_local_digest(registry_repo, tag, _run=_run)
+    """Digest for a tag, sourced from the registry."""
+    return resolve_registry_digest(registry_repo, tag, _run=_run)
 
 
 @dataclass
@@ -1479,12 +1425,8 @@ def build_and_push(
             f"docker push failed (exit {push_proc.returncode}): {(push_proc.stderr or '')[-2000:]}"
         )
 
-    # Just-pushed: the local store now HAS the RepoDigest, so it is the cheapest
-    # accurate source; the registry lookup backstops a store that did not record
-    # one (older docker, or a push through a proxy).
-    digest = _resolve_local_digest(
-        full_repo, dep_hash, _run=_run
-    ) or resolve_registry_digest(full_repo, dep_hash, _run=_run)
+    # Just-pushed: resolve the canonical digest from the registry (daemon-free).
+    digest = resolve_registry_digest(full_repo, dep_hash, _run=_run)
     pinned = f"{full_repo}@{digest}" if digest else f"{full_repo}:{dep_hash}"
     return BuildResult(
         pinned_ref=pinned,
