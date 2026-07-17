@@ -14,7 +14,7 @@ from typing import Optional, Dict, List, TypedDict
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -325,9 +325,31 @@ async def _build_stuck_tasks(
     }
     parents_with_active_children: set[uuid.UUID] = set()
     if evaluating_parent_ids:
+        evaluating_parent_ids_by_text = {
+            str(parent_id): parent_id for parent_id in evaluating_parent_ids
+        }
+        original_task_ids = tuple(evaluating_parent_ids_by_text)
+        if resolve_dialect_name(session) == "sqlite":
+            payload_original_id = func.json_extract(
+                Task.payloads, "$[0].original_task_id"
+            )
+            context_original_id = func.json_extract(
+                Task.context, "$.review_loop.original_task_id"
+            )
+        else:
+            payload_original_id = Task.payloads[0]["original_task_id"].as_string()
+            context_original_id = Task.context["review_loop"][
+                "original_task_id"
+            ].as_string()
+
         active_child_rows = await session.execute(
-            select(Task.parent_task_id).where(
-                Task.parent_task_id.in_(evaluating_parent_ids),
+            select(
+                Task.id,
+                Task.parent_task_id,
+                payload_original_id,
+                context_original_id,
+            ).where(
+                Task.project_id.in_({task.project_id for task in tasks}),
                 Task.status.in_(
                     [
                         TaskStatus.QUEUED,
@@ -337,11 +359,25 @@ async def _build_stuck_tasks(
                         TaskStatus.BLOCKED,
                     ]
                 ),
+                Task.archived.is_(False),
+                or_(
+                    Task.parent_task_id.in_(evaluating_parent_ids),
+                    payload_original_id.in_(original_task_ids),
+                    context_original_id.in_(original_task_ids),
+                ),
             )
         )
-        parents_with_active_children = {
-            parent_id for parent_id in active_child_rows.scalars().all() if parent_id
-        }
+        for child_id, parent_id, payload_original, context_original in (
+            active_child_rows.all()
+        ):
+            if parent_id in evaluating_parent_ids:
+                parents_with_active_children.add(parent_id)
+
+            chain_parent_id = evaluating_parent_ids_by_text.get(
+                str(payload_original or context_original or "")
+            )
+            if chain_parent_id is not None and child_id != chain_parent_id:
+                parents_with_active_children.add(chain_parent_id)
 
     # Pre-fetch all dependency statuses and titles in a single batch query to avoid N+1
     from app.time_utils import _to_naive_utc

@@ -756,6 +756,75 @@ class TestBuildStuckTasks:
         assert len(result) == 1
         assert result[0]["stuck_reason"] == "evaluation_timeout"
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "sibling_status, expected_stuck",
+        [
+            (TaskStatus.IN_PROGRESS, False),
+            (TaskStatus.COMPLETED, True),
+        ],
+    )
+    @pytest.mark.parametrize("identity_surface", ["payload", "context"])
+    async def test_evaluating_parent_uses_review_chain_sibling_liveness(
+        self, db_session, sibling_status, expected_stuck, identity_surface
+    ):
+        """Review/fix siblings are linked by durable original-task identity."""
+        project = Project(
+            name=f"diag-eval-chain-{sibling_status}-{identity_surface}",
+            user_id="test-user-123",
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        research_root = _make_task(project.id, TaskStatus.EVALUATING)
+        db_session.add(research_root)
+        await db_session.commit()
+        await db_session.refresh(research_root)
+
+        parent = _make_task(
+            project.id,
+            TaskStatus.EVALUATING,
+            created_ago_secs=4 * 3600,
+            started_ago_secs=4 * 3600,
+        )
+        parent.parent_task_id = research_root.id
+        db_session.add(parent)
+        await db_session.commit()
+        await db_session.refresh(parent)
+
+        db_session.add(
+            Task(
+                project_id=project.id,
+                parent_task_id=research_root.id,
+                title="migration fix sibling",
+                payloads=[
+                    {
+                        "type": "fix",
+                        **(
+                            {"original_task_id": str(parent.id)}
+                            if identity_surface == "payload"
+                            else {}
+                        ),
+                    }
+                ],
+                context=(
+                    {"review_loop": {"original_task_id": str(parent.id)}}
+                    if identity_surface == "context"
+                    else {}
+                ),
+                status=sibling_status,
+            )
+        )
+        await db_session.commit()
+
+        result = await _build_stuck_tasks([parent], _utc_now(), db_session)
+        if expected_stuck:
+            assert len(result) == 1
+            assert result[0]["stuck_reason"] == "evaluation_timeout"
+        else:
+            assert result == []
+
     # ── output fields ─────────────────────────────────────────────────────────
 
     @pytest.mark.asyncio
