@@ -24,6 +24,24 @@ logger = logging.getLogger(__name__)
 ENCRYPTION_KEY_ENV = "GITHUB_PAT_ENCRYPTION_KEY"
 ALLOW_PLAINTEXT_CREDENTIALS_ENV = "ALLOW_PLAINTEXT_CREDENTIALS"
 
+# All Fernet tokens are base64url-encoded and begin with this prefix after
+# the version byte (0x80) is encoded. Any stored value starting with this
+# string is almost certainly Fernet ciphertext, not plaintext.
+FERNET_CIPHERTEXT_PREFIX = "gAAAAA"
+
+# Boot-time key-continuity probe.  CONTINUITY_REFERENCE_CIPHERTEXT is a Fernet
+# token encrypted with the canonical key that was active when this probe was
+# established.  probe_key_continuity() decrypts it with the CURRENT configured
+# key; InvalidToken means the key rotated without re-encrypting at-rest data
+# (or the wrong key is configured), so we fail closed at startup.
+# Update CONTINUITY_REFERENCE_CIPHERTEXT (and the canonical key in the vault)
+# together whenever the encryption key is legitimately rotated.
+CONTINUITY_REFERENCE_PLAINTEXT = "blueprint-field-encryption-continuity-v1"
+CONTINUITY_REFERENCE_CIPHERTEXT = (
+    "gAAAAABqWc-UjssiEbbY7MXJtZebObzuo9KxQLvsb3gZwX-M_KHrWVmu1Oa4eJY19_TpY3bmu62Ig4nf8i6oQuP"
+    "-iCQcvbVnzIaS3JXdBCq3qTdd3nUx9l4Sx4B2hZn53Sa0DEVvxVhw"
+)
+
 
 def is_encryption_active() -> bool:
     """Return ``True`` if Fernet encryption is properly configured and active.
@@ -139,6 +157,51 @@ def encrypt_field(value: str | None) -> str | None:
     return f.encrypt(value.encode()).decode()
 
 
+def assert_plaintext_or_raise(value: str | None) -> None:
+    """Reject ciphertext that the configured key cannot decrypt.
+
+    ``decrypt_field`` deliberately returns undecryptable values unchanged for
+    rolling-deploy compatibility. Backfill migrations must not mistake an
+    unchanged Fernet token for plaintext and encrypt it a second time.
+    """
+    if value is None:
+        return
+    if value.startswith(FERNET_CIPHERTEXT_PREFIX) and decrypt_field(value) == value:
+        raise RuntimeError(
+            f"Wrong-key ciphertext detected: value starts with '{FERNET_CIPHERTEXT_PREFIX}' "
+            f"but decrypt_field returned it unchanged — the wrong encryption key may be "
+            f"configured. Check {ENCRYPTION_KEY_ENV}. Refusing to treat "
+            "undecryptable ciphertext as plaintext."
+        )
+
+
+def probe_key_continuity(context: str) -> None:
+    """Fail fast if the configured key cannot decrypt the reference ciphertext.
+
+    Raises ``RuntimeError`` when the active Fernet key is different from the
+    canonical key used to produce ``CONTINUITY_REFERENCE_CIPHERTEXT`` — which
+    means credentials encrypted under the old key are now unreadable, and any
+    backfill re-run would silently store plaintext.
+
+    Does nothing when no key is configured (encryption inactive); callers that
+    require encryption should call ``require_encryption_active`` separately.
+    """
+    f = _get_fernet()
+    if f is None:
+        return
+    try:
+        f.decrypt(CONTINUITY_REFERENCE_CIPHERTEXT.encode())
+    except InvalidToken as exc:
+        raise RuntimeError(
+            f"{context}: {ENCRYPTION_KEY_ENV} is set but cannot decrypt the "
+            "boot-time continuity reference token — the configured key does not "
+            "match the canonical encryption key used for existing at-rest "
+            "ciphertext. A wrong-key rotation will leave encrypted columns "
+            "unreadable. Restore the correct key or re-encrypt all data before "
+            "deploying."
+        ) from exc
+
+
 def decrypt_field(value: str | None) -> str | None:
     """Decrypt *value* that was previously encrypted with :func:`encrypt_field`.
 
@@ -165,5 +228,12 @@ def decrypt_field(value: str | None) -> str | None:
         # UnicodeDecodeError on result .decode(), binascii.Error from malformed base64).
         # All other exceptions propagate so library API changes or truly unexpected
         # errors are not silently swallowed.
-        logger.debug("Decryption fallback (%s): %s", type(e).__name__, e)
+        logger.warning(
+            "Decryption fallback for %s (%s): %s — value returned as-is; "
+            "if %s is rotated, the boot-time continuity probe should have caught this",
+            type(e).__name__,
+            ENCRYPTION_KEY_ENV,
+            e,
+            ENCRYPTION_KEY_ENV,
+        )
         return value

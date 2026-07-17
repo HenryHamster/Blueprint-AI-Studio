@@ -183,6 +183,7 @@ def test_registry_contains_initial_checks():
         "capability_proof_trial_stall",
         "unmapped_acceptance_criteria",
         "research_quality_grader_pass_rate",
+        "encrypted_field_plaintext_detector",
     } <= names
 
 
@@ -6531,3 +6532,154 @@ async def test_research_quality_grader_pass_rate_skips_legacy_entries(db):
     ok = [r for r in results if r.status == CheckStatus.OK]
     assert len(ok) >= 1
     assert "no directions" in ok[0].detail
+
+
+# --- Check: encrypted_field_plaintext_detector --------------------------------
+
+
+@pytest.mark.asyncio
+async def test_encrypted_field_flags_plaintext_when_encryption_active(db):
+    """When encryption is active and a column has plaintext values, FLAGGED.
+    Uses MaxPlanAccount.oauth_token as the test subject.
+    """
+    from app.models import MaxPlanAccount
+
+    with (
+        patch("app.field_encryption.is_encryption_active", return_value=True),
+        patch(
+            "app.field_encryption.decrypt_field", side_effect=lambda v: v
+        ),  # identity → plaintext signal
+    ):
+        account = MaxPlanAccount(
+            user_id="u-enc-test", name="test-acc", oauth_token="plaintext-token"
+        )
+        db.add(account)
+        await db.commit()
+
+        ctx = SweepContext(
+            session=db,
+            now=_utcnow(),
+            mode="observe",
+            max_projects=25,
+            sample_limit=200,
+            window_days=14,
+        )
+        results = await mis.check_encrypted_field_plaintext_detector(ctx)
+
+    oauth_results = [
+        r for r in results if r.subject == "maxplanaccount.oauth_token"
+    ]
+    assert len(oauth_results) == 1, f"expected 1 oauth_token result, got {results}"
+    f = oauth_results[0]
+    assert f.status == CheckStatus.FLAGGED, f"expected FLAGGED, got {f.status}"
+    assert f.delta == 1, f"expected delta=1, got {f.delta}"
+    assert f.self_reported == 1
+    assert f.ground_truth == 0
+
+
+@pytest.mark.asyncio
+async def test_encrypted_field_ok_when_values_are_ciphertext(db):
+    """When encryption is active and values decrypt to something different,
+    they are ciphertext → OK."""
+    from app.models import MaxPlanAccount
+
+    with (
+        patch("app.field_encryption.is_encryption_active", return_value=True),
+        patch(
+            "app.field_encryption.decrypt_field",
+            side_effect=lambda v: v + "_decrypted",
+        ),  # decrypt changes value → encrypted
+    ):
+        account = MaxPlanAccount(
+            user_id="u-enc-ok", name="test-ok", oauth_token="ciphertext-value"
+        )
+        db.add(account)
+        await db.commit()
+
+        ctx = SweepContext(
+            session=db,
+            now=_utcnow(),
+            mode="observe",
+            max_projects=25,
+            sample_limit=200,
+            window_days=14,
+        )
+        results = await mis.check_encrypted_field_plaintext_detector(ctx)
+
+    oauth_results = [
+        r for r in results if r.subject == "maxplanaccount.oauth_token"
+    ]
+    assert len(oauth_results) == 1
+    r = oauth_results[0]
+    assert r.status == CheckStatus.OK, f"expected OK, got {r.status}"
+    assert r.delta == 0
+    assert r.self_reported == 1
+    assert r.ground_truth == 1
+
+
+@pytest.mark.asyncio
+async def test_encrypted_field_plaintext_detector_skips_when_encryption_inactive(
+    db,
+):
+    """When encryption is not active, the check returns a single global SKIPPED."""
+    with patch(
+        "app.field_encryption.is_encryption_active", return_value=False
+    ):
+        ctx = SweepContext(
+            session=db,
+            now=_utcnow(),
+            mode="observe",
+            max_projects=25,
+            sample_limit=200,
+            window_days=14,
+        )
+        results = await mis.check_encrypted_field_plaintext_detector(ctx)
+
+    assert len(results) == 1
+    assert results[0].status == CheckStatus.SKIPPED
+    assert results[0].subject == "global"
+    assert "encryption not active" in results[0].detail
+
+
+@pytest.mark.asyncio
+async def test_plaintext_in_encrypted_column_is_flagged(db):
+    """Acceptance-named test: a plaintext secret in an encrypted column is
+    flagged when encryption is active.
+
+    Uses MaxPlanAccount.claude_config_json with a real-like plaintext value.
+    mocks decrypt_field to return its input unchanged (simulating the real
+    InvalidToken fallback when decrypting plaintext).
+    """
+    from app.models import MaxPlanAccount
+
+    with (
+        patch("app.field_encryption.is_encryption_active", return_value=True),
+        patch("app.field_encryption.decrypt_field", side_effect=lambda v: v),
+    ):
+        account = MaxPlanAccount(
+            user_id="u-plain-ci",
+            name="plain-ci",
+            claude_config_json='{"key": "sk-ant-this-is-plaintext"}',
+        )
+        db.add(account)
+        await db.commit()
+
+        ctx = SweepContext(
+            session=db,
+            now=_utcnow(),
+            mode="observe",
+            max_projects=25,
+            sample_limit=200,
+            window_days=14,
+        )
+        results = await mis.check_encrypted_field_plaintext_detector(ctx)
+
+    # The check should flag at least one column (claude_config_json has plaintext)
+    flagged = [r for r in results if r.flagged]
+    assert len(flagged) >= 1, f"expected at least one FLAGGED, got {results}"
+    # At least one FLAGGED result should identify the claude_config_json column
+    claude_flagged = [r for r in flagged if "claude_config_json" in r.subject]
+    assert len(claude_flagged) == 1
+    cf = claude_flagged[0]
+    assert cf.delta >= 1  # at least one row in that column is plaintext
+    assert "plaintext" in cf.detail

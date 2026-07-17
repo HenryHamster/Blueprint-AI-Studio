@@ -112,7 +112,7 @@ logger = logging.getLogger(__name__)
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0625"
+EXPECTED_SCHEMA_REVISION = "0626"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -190,6 +190,7 @@ def _verify_encryption_config():
         ENCRYPTION_KEY_ENV,
         ALLOW_PLAINTEXT_CREDENTIALS_ENV,
         is_encryption_active,
+        probe_key_continuity,
     )
     from app.required_runtime_env import _verify_required_env
 
@@ -200,6 +201,7 @@ def _verify_encryption_config():
     _verify_required_env()
 
     if is_encryption_active():
+        probe_key_continuity("startup")
         return
 
     on_cloud_run = bool(os.getenv("K_REVISION"))
