@@ -874,12 +874,24 @@ async def test_ci_polling_rebinds_closed_pr_to_open_replacement(orch_db, mocker)
         status=TaskStatus.EVALUATING,
         context={
             "rollup_pr_number": 77,
+            "blueprint_review_verdict": "APPROVE",
             "review_loop": {
                 "ci_waiting": True,
                 "pr_number": 77,
                 "branch": "feat/replaced",
                 "base_branch": "automain",
-                "ci_wait_started": _naive_utcnow().isoformat(),
+                "ci_wait_started": _naive_utc_ago(hours=2).isoformat(),
+                "ci_wait_pause_baseline": 1234.0,
+                "ci_passed": True,
+                "review_approved": True,
+                "verdict": "APPROVE",
+                "merge_in_progress_resets": 3,
+                "_ci_backstop_first_defer_at": _naive_utc_ago(
+                    hours=1
+                ).isoformat(),
+                "review_recovery_attempted": True,
+                "review_history": [{"verdict": "APPROVE"}],
+                "iteration": 2,
             },
         },
     )
@@ -936,6 +948,25 @@ async def test_ci_polling_rebinds_closed_pr_to_open_replacement(orch_db, mocker)
     loop = (updated.context or {}).get("review_loop", {})
     assert loop.get("pr_number") == 91
     assert loop.get("head_sha") == "newsha"
+    assert datetime.fromisoformat(loop["ci_wait_started"]) > _naive_utc_ago(
+        minutes=1
+    )
+    assert loop.get("ci_wait_pause_baseline") == 0.0
+    assert loop.get("iteration") == 2, "chain-level convergence budget is durable"
+    for stale_key in (
+        "ci_passed",
+        "review_approved",
+        "verdict",
+        "merge_in_progress_resets",
+        "_ci_backstop_first_defer_at",
+        "review_recovery_attempted",
+        "review_history",
+        "escalated",
+    ):
+        assert stale_key not in loop, (
+            f"replacement inherited old-attempt state {stale_key}"
+        )
+    assert "blueprint_review_verdict" not in (updated.context or {})
     assert (updated.context or {}).get("rollup_pr_number") == 91
     assert "superseded by open pr #91" in (
         updated.latest_status_message or ""
@@ -948,7 +979,109 @@ async def test_ci_polling_rebinds_closed_pr_to_open_replacement(orch_db, mocker)
         "automain",
         project_id=str(project.id),
     )
-    alert_mock.assert_not_called()
+    # The old PR was already beyond the soft-alert threshold when this cycle
+    # began. Its one alert is allowed, but the replacement must not inherit
+    # the `escalated` latch (asserted above).
+    assert alert_mock.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_replacement_ci_backstop_uses_new_attempt_clock(eval_db, mocker):
+    """A replacement gets a full backstop window, then expires from that clock."""
+    from app.closed_pr_reconciliation import reconcile_closed_pr_replacement
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.github.get_open_pull_request_for_head_branch",
+        new_callable=AsyncMock,
+        return_value={
+            "number": 91,
+            "state": "open",
+            "head": {"sha": "newsha", "ref": "feat/replaced"},
+            "base": {"ref": "automain"},
+        },
+    )
+
+    project = Project(name="Replacement Backstop Clock", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    stale_wait = _naive_utc_ago(hours=2).isoformat()
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "branch": "feat/replaced"}],
+        status=TaskStatus.EVALUATING,
+        context={
+            "rollup_pr_number": 77,
+            "review_loop": {
+                "ci_waiting": True,
+                "pr_number": 77,
+                "branch": "feat/replaced",
+                "base_branch": "automain",
+                "ci_wait_started": stale_wait,
+                "ci_passed": False,
+                "_ci_backstop_first_defer_at": stale_wait,
+                "ci_fix_spawned": "old-fix-task",
+            },
+        },
+    )
+    eval_db.add(task)
+    await eval_db.commit()
+    await eval_db.refresh(task)
+
+    old_loop = dict((task.context or {})["review_loop"])
+    await reconcile_closed_pr_replacement(
+        task=task,
+        session=eval_db,
+        review_loop=old_loop,
+        pr_number=77,
+        pr_data={
+            "number": 77,
+            "state": "closed",
+            "merged": False,
+            "head": {"sha": "oldsha", "ref": "feat/replaced"},
+            "base": {"ref": "automain"},
+        },
+        github_token="fake-token",
+        github_owner="owner",
+        github_repo="repo",
+    )
+    await eval_db.refresh(task)
+    new_wait = (task.context or {})["review_loop"]["ci_wait_started"]
+    assert new_wait != stale_wait
+    assert "ci_fix_spawned" not in (task.context or {})["review_loop"]
+
+    # The stale predecessor clock cannot kill the replacement immediately.
+    await _check_evaluating_timeouts()
+    await eval_db.refresh(task)
+    assert task.status == TaskStatus.EVALUATING
+
+    # Once the replacement's own clock ages past the threshold, the same
+    # backstop remains effective; this is a reset, not a timeout bypass.
+    new_loop = dict((task.context or {})["review_loop"])
+    new_loop["ci_wait_started"] = _naive_utc_ago(minutes=90).isoformat()
+    new_loop["review_recovery_attempted"] = True
+    task.context = {**(task.context or {}), "review_loop": new_loop}
+    eval_db.add(task)
+    await eval_db.commit()
+    mocker.patch(
+        "app.recovery_evaluating_ci_backstop._verify_ci_before_backstop",
+        new_callable=AsyncMock,
+        return_value=False,
+    )
+
+    await _check_evaluating_timeouts()
+    await eval_db.refresh(task)
+    assert task.status == TaskStatus.FAILED
+    assert "backstop" in (task.latest_status_message or "").lower()
 
 
 @pytest.mark.asyncio

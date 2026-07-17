@@ -57,6 +57,7 @@ HOTFIX_ELIGIBLE_MODULES: frozenset[str] = frozenset(
         # repair its own delivery path — the same self-reference gap the
         # channel exists to close applies to its own HTTP surface.
         "backend/app/routers/admin_operator_triggers.py",
+
         # main.py is allowlisted but GUARDED: a diff that alters
         # EXPECTED_SCHEMA_REVISION is rejected below (a revision bump without the
         # matching migration deployed wedges boot).

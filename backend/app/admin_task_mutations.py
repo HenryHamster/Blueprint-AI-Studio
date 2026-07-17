@@ -62,6 +62,31 @@ CANCEL_WAITING_DEPENDENT_STATUSES = (
 )
 
 
+def _mark_admin_cancelled(
+    task: Task,
+    *,
+    cancelled_by_task_id: str | None = None,
+) -> None:
+    """Persist operator-cancellation provenance on a cancelled task.
+
+    Parent terminalization and direction-health accounting operate on the task
+    row, not ``TaskHistory``. Keep the originating operator identity durable on
+    both the explicitly cancelled task and any tasks cancelled as a consequence
+    so they cannot be misclassified as agent deaths after the request completes.
+    """
+    from app.failure_classification import ADMIN_CANCEL, persist_failure_category
+
+    persist_failure_category(task, ADMIN_CANCEL)
+    ctx = dict(task.context or {})
+    ctx["failure_class"] = ADMIN_CANCEL
+    ctx.pop("timeout_subtype", None)
+    ctx.pop("external_api_subtype", None)
+    ctx["cancelled_by"] = "USER"
+    if cancelled_by_task_id is not None:
+        ctx["cancelled_by_task_id"] = cancelled_by_task_id
+    task.context = ctx
+
+
 async def _refresh_direction_outcomes_for_task(task: Task) -> None:
     """Re-run the research-history merge recompute for *task* on a fresh session.
 
@@ -297,6 +322,27 @@ async def _apply_status_mutation(
             detail=f"Cannot transition from terminal state {task.status} to {new_status} (only requeue or cancel is allowed)",
         )
 
+    prior_status = task.status
+    task_type = (task.first_payload).get("type", "")
+    if (
+        new_status == TaskStatus.QUEUED
+        and prior_status in _TERMINAL_STATUSES
+        and task_type in ("research", "plan")
+    ):
+        # A terminal rollup's PR identity and CI/review/verifier latches belong
+        # to the attempt that just ended. Reconcile them BEFORE changing status:
+        # the helper is terminal-only so active review progress cannot be reset.
+        from app.terminal_rollup_requeue import reconcile_terminal_rollup_requeue
+
+        reconciliation = await reconcile_terminal_rollup_requeue(task, session, payload)
+        changes["rollup_requeue_reconciliation"] = reconciliation
+        if reconciliation == "merged_pr_rearmed":
+            # The operator is requeueing a false terminal state after the
+            # tracked rollup already landed. Run the authoritative rollup
+            # classifier after commit instead of waiting for a sweep or ever
+            # entering fresh-PR creation.
+            changes["_check_merged_rollup_parent_now"] = True
+
     task.status = new_status
     changes["status"] = new_status.value
 
@@ -306,6 +352,7 @@ async def _apply_status_mutation(
     if new_status == TaskStatus.CANCELLED:
         from app.task_lifecycle import close_orphan_pr_if_any
 
+        _mark_admin_cancelled(task)
         await close_orphan_pr_if_any(task, session, reason="admin_status_change")
 
     parent_vm_id_for_bg: str | None = None
@@ -330,6 +377,7 @@ async def _apply_status_mutation(
 
     children_cleanup_for_bg: List[tuple] = []
     if new_status == TaskStatus.CANCELLED:
+        cancellation_source_id = str(task.id)
         active_children = (
             (
                 await session.execute(
@@ -342,11 +390,52 @@ async def _apply_status_mutation(
             .scalars()
             .all()
         )
-        for child in active_children:
+
+        # A manually cancelled prerequisite must also terminalize dependents that
+        # are still waiting to run. Filter the project-scoped candidate set in
+        # Python because ``depends_on`` is JSONB in production and JSON in the
+        # SQLite test seam.
+        dependent_candidates = (
+            (
+                await session.execute(
+                    select(Task).where(
+                        Task.project_id == task.project_id,
+                        Task.status.in_(CANCEL_WAITING_DEPENDENT_STATUSES),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        waiting_dependents = [
+            candidate
+            for candidate in dependent_candidates
+            if cancellation_source_id
+            in {str(dep_id) for dep_id in (candidate.depends_on or [])}
+        ]
+
+        cascade_targets = {child.id: child for child in active_children}
+        cascade_targets.update(
+            {dependent.id: dependent for dependent in waiting_dependents}
+        )
+        waiting_dependent_ids = {dependent.id for dependent in waiting_dependents}
+        for child in cascade_targets.values():
             child.status = TaskStatus.CANCELLED
             if child.vm_provisioned_at:
                 child.vm_stopped_at = _utcnow()
             child.requires_approval = False
+            _mark_admin_cancelled(
+                child,
+                cancelled_by_task_id=cancellation_source_id,
+            )
+            if child.id in waiting_dependent_ids:
+                child.latest_status_message = (
+                    "Cancelled: dependency task administratively cancelled"
+                )
+            elif not child.latest_status_message:
+                child.latest_status_message = (
+                    "Cancelled: parent task administratively cancelled"
+                )
             children_cleanup_for_bg.append(
                 (
                     str(child.id),
@@ -356,15 +445,17 @@ async def _apply_status_mutation(
                 )
             )
             session.add(child)
-        if active_children:
+        if cascade_targets:
             from app.task_lifecycle import close_orphan_pr_if_any
 
-            for child in active_children:
+            for child in cascade_targets.values():
                 await close_orphan_pr_if_any(
                     child, session, reason="admin_status_change_cascade"
                 )
             logger.info(
-                f"[ADMIN] Cascaded CANCELLED to {len(active_children)} children of task {task.id}"
+                "[ADMIN] Cascaded ADMIN_CANCEL to %s child/dependent task(s) of task %s",
+                len(cascade_targets),
+                task.id,
             )
 
     if parent_vm_id_for_bg or parent_acct_id_for_bg or children_cleanup_for_bg:
@@ -387,7 +478,6 @@ async def _apply_status_mutation(
         # failure_class) on its next dispatch. Safe no-op on never-blocked tasks.
         from app.task_blocked import reset_task_for_fresh_attempt
 
-        task_type = (task.first_payload).get("type", "")
         is_parent_type = task_type in ("research", "plan")
         from app.task_lifecycle import _requeue_parent_task
 
@@ -544,7 +634,9 @@ async def _handle_rollup_pr_approval(
             )
             raise HTTPException(status_code=409, detail=detail)
 
-        merge_result = await merge_pull_request(gh_token, owner, repo, rollup_pr_number)
+        merge_result = await merge_pull_request(
+            gh_token, owner, repo, rollup_pr_number, allow_changes_requested=True
+        )
         if merge_result.get("merged"):
             _project = await session.get(Project, task.project_id)
             base_branch = (task.first_payload).get(
@@ -840,7 +932,9 @@ async def _merge_critical_pr(
             )
             raise HTTPException(status_code=409, detail=detail)
 
-        merge_result = await merge_pull_request(gh_token, owner, repo, pr_number)
+        merge_result = await merge_pull_request(
+            gh_token, owner, repo, pr_number, allow_changes_requested=True
+        )
         if merge_result.get("merged"):
             record_pr_merged = await merged_pr_counts_as_integration_landing(
                 task,
@@ -1141,6 +1235,9 @@ async def _commit_and_broadcast(
     _refresh_direction_after_merge = bool(
         changes.pop("_refresh_direction_after_merge", False)
     )
+    _check_merged_rollup_parent_now = bool(
+        changes.pop("_check_merged_rollup_parent_now", False)
+    )
 
     session.add(task)
     history = TaskHistory(
@@ -1183,7 +1280,35 @@ async def _commit_and_broadcast(
         and payload["context"].get("pr_merged")
     ):
         should_check_rollup = True
-    if should_check_rollup:
+    if _check_merged_rollup_parent_now:
+        # _check_and_trigger_rollup is intentionally child-driven: passing the
+        # parent is a no-op because parent_task_id is absent. Re-enter through a
+        # real completed child so the normal parent lock, merged-PR landing
+        # classifier, branch cleanup, and terminal broadcast all run now.
+        rollup_child = (
+            (
+                await session.execute(
+                    select(Task)
+                    .where(
+                        Task.parent_task_id == task.id,
+                        Task.status == TaskStatus.COMPLETED,
+                    )
+                    .order_by(Task.updated_at.desc())
+                    .limit(1)
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if rollup_child is not None:
+            await _check_and_trigger_rollup(rollup_child, session)
+        else:
+            logger.warning(
+                "[ADMIN] Already-merged rollup parent %s has no completed child "
+                "to drive authoritative convergence; leaving it for recovery",
+                task.id,
+            )
+    elif should_check_rollup:
         await _check_and_trigger_rollup(task, session)
 
 

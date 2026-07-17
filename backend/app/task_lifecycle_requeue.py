@@ -242,8 +242,8 @@ async def _terminate_all_non_death_cancelled(
     cancelled_count = len([c for c in children if c.status == TaskStatus.CANCELLED])
     parent.status = TaskStatus.CANCELLED
     parent.latest_status_message = (
-        f"All {cancelled_count} subtask(s) deliberately shelved or superseded — "
-        f"not a failure"
+        f"All {cancelled_count} subtask(s) deliberately shelved or superseded, or "
+        f"administratively cancelled — not a failure"
     )
     session.add(parent)
     await session.commit()
@@ -254,7 +254,8 @@ async def _terminate_all_non_death_cancelled(
     )
     logger.info(
         f"[REQUEUE] Parent {parent.id} CANCELLED — all {cancelled_count} "
-        f"subtask(s) non-death cancelled (co-deferred / superseded / scope-empty). "
+        f"subtask(s) non-death cancelled (admin / co-deferred / superseded / "
+        f"scope-empty). "
         f"No direction-health penalty, no failure alert."
     )
     return 0

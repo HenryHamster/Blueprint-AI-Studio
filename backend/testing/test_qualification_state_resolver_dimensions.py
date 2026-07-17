@@ -1603,11 +1603,7 @@ async def test_strategic_recent_version_entry_no_ledger_matches_blob(db_session)
     assert qual_state["sub_scores"]["audit"] == pytest.approx(0.9)
     assert qual_state["sub_scores"]["test_erosion"] == pytest.approx(0.85)
 
-
-# ---------------------------------------------------------------------------
-# Mutable dimension reused-currency guard
-# ---------------------------------------------------------------------------
-
+@pytest.mark.asyncio
 
 @pytest.mark.asyncio
 async def test_mutable_dim_reused_currency_falls_back_to_blob_ci(db_session):
@@ -1828,6 +1824,7 @@ async def test_qualifying_attempt_only_surfaces_terminal_dimension_facts(
 
 
 @pytest.mark.asyncio
+
 async def test_finalized_attempt_does_not_hide_reused_terminal_failure(db_session):
     """The in-flight guard must not erase real terminal failures after finalize."""
     import uuid
@@ -1875,6 +1872,35 @@ async def test_finalized_attempt_does_not_hide_reused_terminal_failure(db_sessio
 
 
 @pytest.mark.asyncio
+def test_qualifying_dimensions_fail_closed_without_started_at(db_session):
+    """Missing generation identity must stay pending rather than claim stale proof."""
+    import uuid
+
+    from app.models import Project, ReleaseVersion
+    from app.qualification_state_resolver import resolve_dimension_states_from_ledger
+
+    project = Project(name="Missing generation project", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.flush()
+
+    active_attempt_id = uuid.uuid4()
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="open",
+        active_qualification_attempt_id=active_attempt_id,
+        last_qualification={
+            "status": "not_promoted",
+            "candidate_sha": "sha-reused-mig-id",
+            "qualification_attempt_id": str(active_attempt_id),
+        },
+    )
+    db_session.add(version)
+    await db_session.flush()
+    states = _by_key(await resolve_dimension_states_from_ledger(db_session, version))
+    assert states["merge_grade"]["status"] == "pending"
+
 async def test_mutable_dim_reused_currency_falls_back_to_blob_migration_identity(db_session):
     """Parallel of the CI test: a reused migration_identity ledger row falls back
     to the blob-derived state (unavailable) rather than surfacing the stale passed."""
@@ -1888,7 +1914,6 @@ async def test_mutable_dim_reused_currency_falls_back_to_blob_migration_identity
 
     prior_attempt_id = uuid.uuid4()
     active_attempt_id = uuid.uuid4()
-
     version = ReleaseVersion(
         project_id=project.id,
         version_number=1,
@@ -1910,6 +1935,18 @@ async def test_mutable_dim_reused_currency_falls_back_to_blob_migration_identity
     )
     db_session.add(version)
     await db_session.flush()
+
+    db_session.add(QualificationDimensionResult(
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha="sha-missing-generation",
+        dimension="ci",
+        status="passed",
+    ))
+    await db_session.flush()
+
+    states = _by_key(await resolve_dimension_states_from_ledger(db_session, version))
+    assert states["ci"]["status"] == "pending"
 
     # Stale prior-attempt migration_identity row: passed.
     db_session.add(QualificationDimensionResult(

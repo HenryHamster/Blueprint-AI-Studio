@@ -933,6 +933,86 @@ async def test_in_progress_no_tool_use_past_progress_stale_reaped(
     assert t.attempt_count == 1
 
 
+@pytest.mark.parametrize("task_type", ["verify_tests", "compute_experiment"])
+@pytest.mark.parametrize(
+    "tool_use_age",
+    [None, timedelta(minutes=10)],
+    ids=["null-tool-use", "stale-tool-use"],
+)
+@pytest.mark.asyncio
+async def test_direct_handler_fresh_heartbeat_ignores_tool_progress_staleness(
+    reaper_db,
+    stop_after_one_cycle,
+    reaper_side_effects,
+    task_type,
+    tool_use_age,
+):
+    """Direct non-LLM handlers use heartbeat, not impossible tool events.
+
+    Both registered direct handlers can legitimately remain active beyond the
+    default small-scope 480s progress cutoff. A NULL tool stamp is their normal
+    state; a stale stamp can be carried from an earlier attempt. Neither is
+    evidence of a stall while the current handler heartbeat remains fresh.
+    """
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": task_type, "scope": "small"}],
+        vm_instance_id=f"vm-direct-{task_type}-{tool_use_age is None}",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        started_at=now - timedelta(minutes=10),
+        last_heartbeat=now - timedelta(seconds=30),
+        last_tool_use_at=(
+            None if tool_use_age is None else now - tool_use_age
+        ),
+        # Anthropic deliberately exercises the NULL-tool progress branch that
+        # reaped verify_tests in production; direct handlers never call Claude.
+        context={"scope": "small", "llm_provider": "anthropic"},
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.IN_PROGRESS
+    assert t.attempt_count == 0
+
+
+@pytest.mark.parametrize("task_type", ["verify_tests", "compute_experiment"])
+@pytest.mark.asyncio
+async def test_direct_handler_stale_heartbeat_still_reaped(
+    reaper_db,
+    stop_after_one_cycle,
+    reaper_side_effects,
+    task_type,
+):
+    """The direct-handler carve-out must never mask a dead agent."""
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": task_type, "scope": "small"}],
+        vm_instance_id=f"vm-dead-direct-{task_type}",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        started_at=now - timedelta(minutes=10),
+        last_heartbeat=now - timedelta(minutes=6),
+        last_tool_use_at=None,
+        context={"scope": "small", "llm_provider": "anthropic"},
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.QUEUED
+    assert t.attempt_count == 1
+
+
 @pytest.mark.asyncio
 async def test_in_progress_stalled_but_fresh_offrow_tool_use_not_reaped(
     reaper_db, stop_after_one_cycle, reaper_side_effects

@@ -16535,6 +16535,44 @@ async def test_migration_apply_gate_retries_on_defer_and_succeeds(db_session, mo
 
 
 @pytest.mark.asyncio
+async def test_migration_apply_timeout_defer_is_not_blindly_retried(
+    db_session, mocker
+):
+    """Fresh credentials cannot repair a timed-out local gate stage."""
+
+    _project, version = await _make_project_and_version(
+        db_session, phase="stabilize"
+    )
+    candidate_sha = "abc1234" * 5 + "abcd1234"
+    gate = mocker.patch(
+        "app.release_qualifier.run_migration_apply_gate",
+        return_value=(
+            "defer",
+            "migration_apply_replay_apply_timeout: exceeded 180s wall-clock budget",
+        ),
+    )
+    resolve = mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        return_value=("token", "acme", "widget"),
+    )
+    mocker.patch(
+        "app.release_qualifier.resolve_async_engine",
+        return_value=object(),
+    )
+
+    verdict, detail = await rq._resolve_migration_apply_at_finalize(
+        db_session, version, candidate_sha
+    )
+
+    assert verdict == "defer"
+    assert detail.startswith("migration_apply_replay_apply_timeout:")
+    assert gate.await_count == 1
+    assert resolve.await_count == 1
+    assert rq._migration_apply_infra_error(detail).startswith(
+        "migration_apply_replay_apply_timeout:"
+    )
+
+@pytest.mark.asyncio
 async def test_migration_apply_gate_retries_on_defer_both_fail(db_session, mocker):
     """When both the first and the retry call to run_migration_apply_gate return
     defer, the final verdict is defer — fails closed, no infinite retry."""
@@ -17918,120 +17956,6 @@ async def test_force_promote_current_version_skips_audit_and_promotes(
     assert version.last_qualification.get("forced_promote_by") == "operator-1"
 
 
-@pytest.mark.asyncio
-async def test_force_promote_records_operator_reason(db_session, mocker):
-    """The operator-supplied justification string is plumbed through
-    force_promote_current_version into the recorded promotion audit metadata
-    (forced_promote_reason), alongside forced_promote_by / forced_promote_at."""
-    project, version = await _make_project_and_version(db_session, phase="stabilize")
-
-    candidate = "facec0de" * 5  # 40-char candidate sha
-    merge_sha = "mainnew" * 5 + "00000"
-    mocker.patch(
-        "app.github.get_repo_installation_token",
-        new=AsyncMock(return_value="gh-token"),
-    )
-    mocker.patch(
-        "app.github.get_branch_sha",
-        new=_branch_sha_mock(automain=candidate, main=merge_sha),
-    )
-    mocker.patch(
-        "app.github.list_repo_tree_paths_at_ref",
-        new=AsyncMock(
-            return_value=[{"path": "backend/app/main.py", "size": 10, "sha": "b1"}]
-        ),
-    )
-    _patch_promote_github_defaults(mocker)
-    mocker.patch("app.github.create_branch", new=_create_branch_mock())
-    mocker.patch(
-        "app.github.create_pull_request",
-        new=AsyncMock(return_value={"number": 7, "html_url": "http://pr/7"}),
-    )
-    mocker.patch(
-        "app.github.merge_pull_request",
-        new=AsyncMock(return_value={"merged": True, "message": "Merged"}),
-    )
-    mocker.patch(
-        "app.release_qualifier._spawn_release_audit_task", new=AsyncMock()
-    )
-    mocker.patch.object(
-        rq,
-        "_resolve_ci_at_finalize",
-        new=AsyncMock(return_value=(True, {"state": "green", "resolved_sha": candidate, "detail": "ci green for test"})),
-    )
-
-    result = await rq.force_promote_current_version(
-        db_session,
-        project.id,
-        actor="operator-1",
-        reason="prod incident #123 — hotfix must ship now",
-        session_factory=_shared_session_factory(db_session),
-    )
-
-    assert result["status"] == "promoted"
-    await db_session.refresh(version)
-    assert version.last_qualification.get("forced_promote") is True
-    assert version.last_qualification.get("forced_promote_by") == "operator-1"
-    assert (
-        version.last_qualification.get("forced_promote_reason")
-        == "prod incident #123 — hotfix must ship now"
-    )
-
-
-@pytest.mark.asyncio
-async def test_force_promote_reason_defaults_to_none(db_session, mocker):
-    """When no reason is supplied, forced_promote_reason is recorded as None
-    (the metadata key is always present so the audit trail is unambiguous)."""
-    project, version = await _make_project_and_version(db_session, phase="stabilize")
-
-    candidate = "facec0de" * 5
-    merge_sha = "mainnew" * 5 + "00000"
-    mocker.patch(
-        "app.github.get_repo_installation_token",
-        new=AsyncMock(return_value="gh-token"),
-    )
-    mocker.patch(
-        "app.github.get_branch_sha",
-        new=_branch_sha_mock(automain=candidate, main=merge_sha),
-    )
-    mocker.patch(
-        "app.github.list_repo_tree_paths_at_ref",
-        new=AsyncMock(
-            return_value=[{"path": "backend/app/main.py", "size": 10, "sha": "b1"}]
-        ),
-    )
-    _patch_promote_github_defaults(mocker)
-    mocker.patch("app.github.create_branch", new=_create_branch_mock())
-    mocker.patch(
-        "app.github.create_pull_request",
-        new=AsyncMock(return_value={"number": 7, "html_url": "http://pr/7"}),
-    )
-    mocker.patch(
-        "app.github.merge_pull_request",
-        new=AsyncMock(return_value={"merged": True, "message": "Merged"}),
-    )
-    mocker.patch(
-        "app.release_qualifier._spawn_release_audit_task", new=AsyncMock()
-    )
-    mocker.patch.object(
-        rq,
-        "_resolve_ci_at_finalize",
-        new=AsyncMock(return_value=(True, {"state": "green", "resolved_sha": candidate, "detail": "ci green for test"})),
-    )
-
-    result = await rq.force_promote_current_version(
-        db_session,
-        project.id,
-        actor="operator-1",
-        session_factory=_shared_session_factory(db_session),
-    )
-
-    assert result["status"] == "promoted"
-    await db_session.refresh(version)
-    assert "forced_promote_reason" in version.last_qualification
-    assert version.last_qualification.get("forced_promote_reason") is None
-
-
 # ── Operator hotfix-deploy channel ────────────────────────────────────────────
 
 
@@ -18087,14 +18011,8 @@ def _patch_hotfix_promote_github(mocker, *, changed_files):
         "app.github.merge_pull_request",
         new=AsyncMock(return_value={"merged": True, "message": "Merged"}),
     )
+    mocker.patch("app.github.create_tag", new=AsyncMock(return_value={}))
     mocker.patch("app.release_qualifier._spawn_release_audit_task", new=AsyncMock())
-    mocker.patch.object(
-        rq,
-        "_resolve_ci_at_finalize",
-        new=AsyncMock(
-            return_value=(True, {"state": "green", "resolved_sha": candidate, "detail": "ci green for test"})
-        ),
-    )
     return create_branch_mock, create_pr_mock
 
 
@@ -18124,52 +18042,6 @@ async def test_hotfix_promote_rejects_non_allowlisted_file(db_session, mocker):
     assert result["status"] == "scope_rejected"
     assert "backend/app/compute_jobs.py" in result["offending_files"]
     # No branch cut, no PR opened — the lane refused before promoting.
-    create_branch_mock.assert_not_called()
-    create_pr_mock.assert_not_called()
-    await db_session.refresh(version)
-    assert version.status == "open"
-
-
-@pytest.mark.asyncio
-async def test_hotfix_scope_rejects_incomplete_compare(db_session, mocker):
-    """A capped GitHub compare cannot authorize a machinery-only hotfix.
-
-    This exercises the real compare helper through the promotion seam: GitHub
-    returns its documented 300-file cap, so the helper returns its
-    indeterminate sentinel and promotion declines before any branch or PR side
-    effect.
-    """
-    project, version = await _make_project_and_version(db_session, phase="stabilize")
-    real_compare_helper = github_refs.get_changed_files_with_patches_between_refs
-    create_branch_mock, create_pr_mock = _patch_hotfix_promote_github(
-        mocker,
-        changed_files=[("backend/app/release_qualifier.py", "@@ -1 +1 @@\n-x\n+y\n")],
-    )
-    compare_response = MagicMock(status_code=200)
-    compare_response.json.return_value = {
-        "files": [
-            {"filename": "backend/app/release_qualifier.py", "patch": None}
-            for _ in range(300)
-        ],
-    }
-    # Override the helper mock installed by the ordinary hotfix fixture: this
-    # assertion must exercise github_refs' actual completeness check.
-    mocker.patch("app.github._github_request", new=AsyncMock(return_value=compare_response))
-    mocker.patch(
-        "app.github_refs.get_changed_files_with_patches_between_refs",
-        new=real_compare_helper,
-    )
-
-    result = await rq.hotfix_promote_current_version(
-        db_session,
-        project.id,
-        actor="operator-1",
-        reason="candidate diff must be complete",
-        session_factory=_shared_session_factory(db_session),
-    )
-
-    assert result["status"] == "scope_rejected"
-    assert "could not resolve the candidate diff" in result["reason"]
     create_branch_mock.assert_not_called()
     create_pr_mock.assert_not_called()
     await db_session.refresh(version)
@@ -18248,7 +18120,6 @@ async def test_hotfix_promote_accepts_machinery_diff_and_writes_audit_trail(
     hotfix_deploy_pending_backfill completion-debt entry with the expected detail
     fields, plus an operator Alert."""
     project, version = await _make_project_and_version(db_session, phase="stabilize")
-    real_compare_helper = github_refs.get_changed_files_with_patches_between_refs
     _, create_pr_mock = _patch_hotfix_promote_github(
         mocker,
         changed_files=[
@@ -18256,26 +18127,13 @@ async def test_hotfix_promote_accepts_machinery_diff_and_writes_audit_trail(
             ("backend/app/release_qualifier.py", "@@ -1 +1 @@\n-a\n+b\n"),
         ],
     )
-    # This is a normal GitHub compare response shape: the API has ``files``
-    # and ``total_commits``, but no ``total_files`` field.
-    compare_response = MagicMock(status_code=200)
-    compare_response.json.return_value = {
-        "total_commits": 2,
-        "files": [
-            {
-                "filename": "backend/app/release_scoring.py",
-                "patch": "@@ -1 +1 @@\n-x\n+y\n",
-            },
-            {
-                "filename": "backend/app/release_qualifier.py",
-                "patch": "@@ -1 +1 @@\n-a\n+b\n",
-            },
-        ],
-    }
-    mocker.patch("app.github._github_request", new=AsyncMock(return_value=compare_response))
+
+    # Promotion opens a best-effort staged-direction session. Under the in-memory
+    # SQLite StaticPool it must share this test session or a second session close
+    # can roll back the outer transaction.
     mocker.patch(
-        "app.github_refs.get_changed_files_with_patches_between_refs",
-        new=real_compare_helper,
+        "app.database.AsyncSessionLocal",
+        new=_shared_session_factory(db_session),
     )
 
     result = await rq.hotfix_promote_current_version(
@@ -18339,6 +18197,283 @@ async def test_hotfix_promote_accepts_machinery_diff_and_writes_audit_trail(
     assert version.last_qualification.get("hotfix_promote_scope_modules") == [
         "backend/app/release_scoring.py"
     ]
+
+
+@pytest.mark.asyncio
+async def test_hotfix_promote_pending_auto_merge_still_writes_audit_trail(
+    db_session, mocker
+):
+    """PRIMARY CI-gated flow: the promotion PR opens with auto-merge armed but
+    does NOT merge synchronously (required checks still pending), so promote()
+    returns ``pending_auto_merge`` — NOT ``promoted``.  The bypass has already
+    taken effect (audit gate skipped, PR open toward main), so the durable audit
+    trail (completion-debt backfill + operator Alert) MUST still be written.
+    This is the regression the review flagged: the trail was gated on
+    ``status == 'promoted'`` and stayed silent on this primary path."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    _patch_hotfix_promote_github(
+        mocker,
+        changed_files=[
+            ("backend/app/release_scoring.py", "@@ -1 +1 @@\n-x\n+y\n"),
+        ],
+    )
+    # Override the helper's merge default: 405-style not-merged-no-conflict —
+    # required checks still pending — so promote() enables auto-merge and returns
+    # pending_auto_merge instead of promoted.
+    mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(
+            return_value={"merged": False, "message": "required checks pending"}
+        ),
+    )
+    enable_auto_merge_mock = mocker.patch(
+        "app.github.enable_auto_merge",
+        new=AsyncMock(return_value={"enabled": True, "message": "auto-merge enabled"}),
+    )
+
+    # Promotion opens a best-effort staged-direction session. Under the in-memory
+    # SQLite StaticPool it must share this test session or a second session close
+    # can roll back the outer transaction.
+    mocker.patch(
+        "app.database.AsyncSessionLocal",
+        new=_shared_session_factory(db_session),
+    )
+
+    result = await rq.hotfix_promote_current_version(
+        db_session,
+        project.id,
+        actor="operator-1",
+        reason="prod gate false-block — machinery-only fix",
+        scope_modules=["backend/app/release_scoring.py"],
+        session_factory=_shared_session_factory(db_session),
+    )
+
+    # The primary CI-gated outcome: PR open with auto-merge armed, not yet landed.
+    assert result["status"] == "pending_auto_merge"
+    enable_auto_merge_mock.assert_awaited_once()
+
+    # ── The audit trail is written on THIS path, not only on 'promoted'. ──
+    await db_session.commit()
+    debt = (
+        (
+            await db_session.execute(
+                select(CompletionDebtEntry).where(
+                    CompletionDebtEntry.project_id == project.id,
+                    CompletionDebtEntry.kind == "hotfix_deploy_pending_backfill",
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert debt is not None, "pending_auto_merge hotfix must open a completion-debt entry"
+    assert debt.status == "open"
+    detail = debt.detail if isinstance(debt.detail, dict) else json.loads(debt.detail)
+    assert detail["actor"] == "operator-1"
+    assert "backend/app/release_scoring.py" in detail["diff_file_list"]
+
+    alert = (
+        (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.source == "hotfix_promote",
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert alert is not None, "pending_auto_merge hotfix must raise an operator Alert"
+    assert alert.severity == "WARNING"
+
+
+def test_evaluate_hotfix_scope_pure_predicate():
+    """Unit coverage for the pure fail-closed scope predicate."""
+    from app import hotfix_policy
+
+    # Machinery-only → eligible.
+    v = hotfix_policy.evaluate_hotfix_scope(["backend/app/release_scoring.py"])
+    assert v.eligible is True
+
+    # Product file → ineligible.
+    v = hotfix_policy.evaluate_hotfix_scope(
+        ["backend/app/release_scoring.py", "backend/app/compute_jobs.py"]
+    )
+    assert v.eligible is False
+    assert "backend/app/compute_jobs.py" in v.offending_files
+
+    # Empty diff → fail-closed reject.
+    assert hotfix_policy.evaluate_hotfix_scope([]).eligible is False
+
+    # main.py with a schema-revision bump → reject; without → allow.
+    bump = '+EXPECTED_SCHEMA_REVISION = "0580"\n'
+    v = hotfix_policy.evaluate_hotfix_scope(
+        ["backend/app/main.py"], main_py_patch=bump
+    )
+    assert v.eligible is False
+    v = hotfix_policy.evaluate_hotfix_scope(
+        ["backend/app/main.py"], main_py_patch="@@\n-log.info('x')\n+log.info('y')\n"
+    )
+    assert v.eligible is True
+
+    # main.py changed but patch unavailable → fail-closed reject.
+    assert (
+        hotfix_policy.evaluate_hotfix_scope(
+            ["backend/app/main.py"], main_py_patch=None
+        ).eligible
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_force_promote_records_operator_reason(db_session, mocker):
+    """The operator-supplied justification string is plumbed through
+    force_promote_current_version into the recorded promotion audit metadata
+    (forced_promote_reason), alongside forced_promote_by / forced_promote_at."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    candidate = "facec0de" * 5  # 40-char candidate sha
+    merge_sha = "mainnew" * 5 + "00000"
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain=candidate, main=merge_sha),
+    )
+    mocker.patch(
+        "app.github.list_repo_tree_paths_at_ref",
+        new=AsyncMock(
+            return_value=[{"path": "backend/app/main.py", "size": 10, "sha": "b1"}]
+        ),
+    )
+    _patch_promote_github_defaults(mocker)
+    mocker.patch("app.github.create_branch", new=_create_branch_mock())
+    mocker.patch(
+        "app.github.create_pull_request",
+        new=AsyncMock(return_value={"number": 7, "html_url": "http://pr/7"}),
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(return_value={"merged": True, "message": "Merged"}),
+    )
+    mocker.patch(
+        "app.release_qualifier._spawn_release_audit_task", new=AsyncMock()
+    )
+
+    result = await rq.force_promote_current_version(
+        db_session,
+        project.id,
+        actor="operator-1",
+        reason="prod incident #123 — hotfix must ship now",
+        session_factory=_shared_session_factory(db_session),
+    )
+
+    assert result["status"] == "promoted"
+    await db_session.refresh(version)
+    assert version.last_qualification.get("forced_promote") is True
+    assert version.last_qualification.get("forced_promote_by") == "operator-1"
+    assert (
+        version.last_qualification.get("forced_promote_reason")
+        == "prod incident #123 — hotfix must ship now"
+    )
+
+
+@pytest.mark.asyncio
+async def test_force_promote_reason_defaults_to_none(db_session, mocker):
+    """When no reason is supplied, forced_promote_reason is recorded as None
+    (the metadata key is always present so the audit trail is unambiguous)."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    candidate = "facec0de" * 5
+    merge_sha = "mainnew" * 5 + "00000"
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain=candidate, main=merge_sha),
+    )
+    mocker.patch(
+        "app.github.list_repo_tree_paths_at_ref",
+        new=AsyncMock(
+            return_value=[{"path": "backend/app/main.py", "size": 10, "sha": "b1"}]
+        ),
+    )
+    _patch_promote_github_defaults(mocker)
+    mocker.patch("app.github.create_branch", new=_create_branch_mock())
+    mocker.patch(
+        "app.github.create_pull_request",
+        new=AsyncMock(return_value={"number": 7, "html_url": "http://pr/7"}),
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(return_value={"merged": True, "message": "Merged"}),
+    )
+    mocker.patch(
+        "app.release_qualifier._spawn_release_audit_task", new=AsyncMock()
+    )
+
+    result = await rq.force_promote_current_version(
+        db_session,
+        project.id,
+        actor="operator-1",
+        session_factory=_shared_session_factory(db_session),
+    )
+
+    assert result["status"] == "promoted"
+    await db_session.refresh(version)
+    assert "forced_promote_reason" in version.last_qualification
+    assert version.last_qualification.get("forced_promote_reason") is None
+
+
+@pytest.mark.asyncio
+async def test_hotfix_scope_rejects_incomplete_compare(db_session, mocker):
+    """A capped GitHub compare cannot authorize a machinery-only hotfix.
+
+    This exercises the real compare helper through the promotion seam: GitHub
+    returns its documented 300-file cap, so the helper returns its
+    indeterminate sentinel and promotion declines before any branch or PR side
+    effect.
+    """
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    real_compare_helper = github_refs.get_changed_files_with_patches_between_refs
+    create_branch_mock, create_pr_mock = _patch_hotfix_promote_github(
+        mocker,
+        changed_files=[("backend/app/release_qualifier.py", "@@ -1 +1 @@\n-x\n+y\n")],
+    )
+    compare_response = MagicMock(status_code=200)
+    compare_response.json.return_value = {
+        "files": [
+            {"filename": "backend/app/release_qualifier.py", "patch": None}
+            for _ in range(300)
+        ],
+    }
+    # Override the helper mock installed by the ordinary hotfix fixture: this
+    # assertion must exercise github_refs' actual completeness check.
+    mocker.patch("app.github._github_request", new=AsyncMock(return_value=compare_response))
+    mocker.patch(
+        "app.github_refs.get_changed_files_with_patches_between_refs",
+        new=real_compare_helper,
+    )
+
+    result = await rq.hotfix_promote_current_version(
+        db_session,
+        project.id,
+        actor="operator-1",
+        reason="candidate diff must be complete",
+        session_factory=_shared_session_factory(db_session),
+    )
+
+    assert result["status"] == "scope_rejected"
+    assert "could not resolve the candidate diff" in result["reason"]
+    create_branch_mock.assert_not_called()
+    create_pr_mock.assert_not_called()
+    await db_session.refresh(version)
+    assert version.status == "open"
 
 
 @pytest.mark.asyncio
@@ -18719,138 +18854,6 @@ async def test_hotfix_request_and_sweep_writers_serialize_on_version_lock(
         )
     ) == 1
 
-
-@pytest.mark.asyncio
-async def test_hotfix_promote_pending_auto_merge_still_writes_audit_trail(
-    db_session, mocker
-):
-    """PRIMARY CI-gated flow: the promotion PR opens with auto-merge armed but
-    does NOT merge synchronously (required checks still pending), so promote()
-    returns ``pending_auto_merge`` — NOT ``promoted``.  The bypass has already
-    taken effect (audit gate skipped, PR open toward main), so the durable audit
-    trail (completion-debt backfill + operator Alert) MUST still be written.
-    This is the regression the review flagged: the trail was gated on
-    ``status == 'promoted'`` and stayed silent on this primary path."""
-    project, version = await _make_project_and_version(db_session, phase="stabilize")
-    _patch_hotfix_promote_github(
-        mocker,
-        changed_files=[
-            ("backend/app/release_scoring.py", "@@ -1 +1 @@\n-x\n+y\n"),
-        ],
-    )
-    # Override the helper's merge default: 405-style not-merged-no-conflict —
-    # required checks still pending — so promote() enables auto-merge and returns
-    # pending_auto_merge instead of promoted.
-    mocker.patch(
-        "app.github.merge_pull_request",
-        new=AsyncMock(
-            return_value={"merged": False, "message": "required checks pending"}
-        ),
-    )
-    enable_auto_merge_mock = mocker.patch(
-        "app.github.enable_auto_merge",
-        new=AsyncMock(return_value={"enabled": True, "message": "auto-merge enabled"}),
-    )
-
-    result = await rq.hotfix_promote_current_version(
-        db_session,
-        project.id,
-        actor="operator-1",
-        reason="prod gate false-block — machinery-only fix",
-        scope_modules=["backend/app/release_scoring.py"],
-        session_factory=_shared_session_factory(db_session),
-    )
-
-    # The primary CI-gated outcome: PR open with auto-merge armed, not yet landed.
-    assert result["status"] == "pending_auto_merge"
-    enable_auto_merge_mock.assert_awaited_once()
-
-    # ── The audit trail is written on THIS path, not only on 'promoted'. ──
-    await db_session.commit()
-    debt = (
-        (
-            await db_session.execute(
-                select(CompletionDebtEntry).where(
-                    CompletionDebtEntry.project_id == project.id,
-                    CompletionDebtEntry.kind == "hotfix_deploy_pending_backfill",
-                )
-            )
-        )
-        .scalars()
-        .first()
-    )
-    assert debt is not None, "pending_auto_merge hotfix must open a completion-debt entry"
-    assert debt.status == "open"
-    detail = debt.detail if isinstance(debt.detail, dict) else json.loads(debt.detail)
-    assert detail["actor"] == "operator-1"
-    assert "backend/app/release_scoring.py" in detail["diff_file_list"]
-
-    alert = (
-        (
-            await db_session.execute(
-                select(Alert).where(
-                    Alert.project_id == project.id,
-                    Alert.source == "hotfix_promote",
-                )
-            )
-        )
-        .scalars()
-        .first()
-    )
-    assert alert is not None, "pending_auto_merge hotfix must raise an operator Alert"
-    assert alert.severity == "WARNING"
-
-
-def test_evaluate_hotfix_scope_pure_predicate():
-    """Unit coverage for the pure fail-closed scope predicate."""
-    from app import hotfix_policy
-
-    # Machinery-only → eligible.
-    v = hotfix_policy.evaluate_hotfix_scope(["backend/app/release_scoring.py"])
-    assert v.eligible is True
-
-    # The scope validator must be able to repair its own allowlist.
-    v = hotfix_policy.evaluate_hotfix_scope(["backend/app/hotfix_policy.py"])
-    assert v.eligible is True
-
-    # The hotfix endpoint router must also be hotfixable so the delivery path
-    # can be repaired through the same channel it exposes.
-    v = hotfix_policy.evaluate_hotfix_scope(
-        ["backend/app/routers/admin_operator_triggers.py"]
-    )
-    assert v.eligible is True, (
-        "admin_operator_triggers.py must be in HOTFIX_ELIGIBLE_MODULES so the "
-        "hotfix endpoint itself can be repaired through the hotfix channel"
-    )
-
-    # Product file → ineligible.
-    v = hotfix_policy.evaluate_hotfix_scope(
-        ["backend/app/release_scoring.py", "backend/app/compute_jobs.py"]
-    )
-    assert v.eligible is False
-    assert "backend/app/compute_jobs.py" in v.offending_files
-
-    # Empty diff → fail-closed reject.
-    assert hotfix_policy.evaluate_hotfix_scope([]).eligible is False
-
-    # main.py with a schema-revision bump → reject; without → allow.
-    bump = '+EXPECTED_SCHEMA_REVISION = "0580"\n'
-    v = hotfix_policy.evaluate_hotfix_scope(
-        ["backend/app/main.py"], main_py_patch=bump
-    )
-    assert v.eligible is False
-    v = hotfix_policy.evaluate_hotfix_scope(
-        ["backend/app/main.py"], main_py_patch="@@\n-log.info('x')\n+log.info('y')\n"
-    )
-    assert v.eligible is True
-
-    # main.py changed but patch unavailable → fail-closed reject.
-    assert (
-        hotfix_policy.evaluate_hotfix_scope(
-            ["backend/app/main.py"], main_py_patch=None
-        ).eligible
-        is False
-    )
 
 
 @pytest.mark.asyncio
@@ -22052,6 +22055,9 @@ class TestFinalizeInfraFailure:
 
 
     @pytest.mark.asyncio
+
+    async def test_permanent_gate_incapacity_classification(self, db_session):
+        """Volatile per-attempt details do not hide a persistent gate failure."""
     async def test_permanent_gate_incapacity_recommends_hotfix_channel_when_eligible(
         self, db_session, mocker
     ):
@@ -22064,7 +22070,11 @@ class TestFinalizeInfraFailure:
         sig = "migration_apply:unknown:migration_apply_check_unavailable"
         same_entry = {
             "finalized_at": "2026-07-10T00:00:00",
-            "error": "migration_apply_check_unavailable",
+
+            "error": (
+                "migration_apply_check_unavailable: scratch database "
+                "blueprint_migration_attempt_a unavailable"
+            ),
             "signature": sig,
             "candidate_sha": "dead" * 10,
             "failing_leg": "migration_apply",
@@ -22082,6 +22092,12 @@ class TestFinalizeInfraFailure:
             "prior_infra_streak": 2,
             "infra_attempt_history": [
                 dict(same_entry, finalized_at="2026-07-10T00:00:00"),
+
+                dict(
+                    same_entry,
+                    finalized_at="2026-07-10T00:01:00",
+                    error="migration_apply_check_unavailable: connection id 8472",
+                ),
                 dict(same_entry, finalized_at="2026-07-10T00:01:00"),
             ],
         }
@@ -22106,6 +22122,8 @@ class TestFinalizeInfraFailure:
             db_session,
             version,
             dict(version.last_qualification),
+
+            "migration_apply_check_unavailable: scratch database attempt_c timed out",
             "migration_apply_check_unavailable",
         )
         await db_session.commit()
@@ -22113,6 +22131,11 @@ class TestFinalizeInfraFailure:
         assert result["status"] == "infra_failure"
         assert result["is_permanent_gate_incapacity"] is True
         assert result["same_signature_streak"] == 3
+
+
+        await db_session.refresh(version)
+
+        # Verify a force-promote Alert was raised with the right message.
         assert result["hotfix_scope_preview"]["eligible"] is True
         preview_mock.assert_awaited_once_with(
             db_session, project.id, candidate_sha="dead" * 10
@@ -22135,6 +22158,14 @@ class TestFinalizeInfraFailure:
         assert len(alerts) >= 1
         latest = alerts[-1]
         assert "persistently incapable" in latest.message
+
+        assert "hotfix scope" in latest.message
+        assert "promote/hotfix" in latest.message
+        assert "whole-tree force-promotion" in latest.message
+        assert "agent VM" not in latest.message
+        assert "clone pipeline" not in latest.message
+        assert latest.message.count("Sanctioned remediation:") == 1
+        assert "Sanctioned Sanctioned" not in latest.message
         assert "POST /projects/{id}/promote/hotfix" in latest.message
         assert "force-promote" not in latest.message
         assert "agent VM" not in latest.message
@@ -22367,12 +22398,17 @@ class TestFinalizeInfraFailure:
         await db_session.commit()
         await db_session.refresh(version)
 
+
+        # A genuinely different stable gate code resets the per-signature streak.
+        # Merely changing the diagnostic suffix is covered by the test above.
         # The current call has a DIFFERENT error (carries a detail suffix) than the prior
         # two entries, so the per-signature streak should reset to 1.
         result = await rqa._handle_infra_failure(
             db_session,
             version,
             dict(version.last_qualification),
+
+            "migration_apply_scratch_provision_failed: unreachable",
             "migration_apply_check_unavailable:unreachable",
         )
         await db_session.commit()

@@ -1058,6 +1058,7 @@ async def get_changed_files_with_patches_between_refs(
             )
             return None
         return parsed_files
+
     except (ValueError, TypeError, KeyError) as exc:
         logger.warning(
             "[GITHUB] get_changed_files_with_patches_between_refs: unparseable "

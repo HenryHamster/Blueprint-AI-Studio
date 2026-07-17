@@ -558,6 +558,68 @@ async def get_pull_request(
     return response.json()
 
 
+async def get_pull_request_review_decision(
+    token: str,
+    owner: str,
+    repo: str,
+    pr_number: int,
+    project_id: str | None = None,
+) -> str | None:
+    """Return GitHub's aggregate review decision for a pull request.
+
+    The REST pull-request payload does not expose ``reviewDecision``. Query the
+    authoritative GraphQL field so merge policy can distinguish an outstanding
+    ``CHANGES_REQUESTED`` veto from an approved or no-review PR. ``None`` is a
+    successful, explicit no-decision response; lookup failures raise so callers
+    cannot accidentally collapse "unknown" into "no veto".
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    response = await _github_request(
+        "POST",
+        "https://api.github.com/graphql",
+        headers,
+        json={
+            "query": (
+                "query($owner: String!, $repo: String!, $number: Int!) {"
+                " repository(owner: $owner, name: $repo) {"
+                "  pullRequest(number: $number) { reviewDecision }"
+                " }"
+                "}"
+            ),
+            "variables": {"owner": owner, "repo": repo, "number": pr_number},
+        },
+        project_id=project_id,
+    )
+    if is_rate_limited_response(response):
+        raise_rate_limited(
+            f"[GITHUB] review decision for PR #{pr_number} rate limited",
+            f"GitHub rate limit exhausted fetching review decision for PR #{pr_number}",
+            retry_after_seconds_from_response(response),
+        )
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Failed to fetch review decision for PR #{pr_number}",
+        )
+    payload = safe_json(response) or {}
+    if payload.get("errors"):
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"GitHub could not resolve review decision for PR #{pr_number}",
+        )
+    pull_request = payload.get("data", {}).get("repository", {}).get("pullRequest")
+    if not isinstance(pull_request, dict):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"PR #{pr_number} not found while fetching review decision",
+        )
+    decision = pull_request.get("reviewDecision")
+    return str(decision).upper() if decision is not None else None
+
 # Outcome of a paginated reviews enumeration. TRUNCATED ("we know we missed some")
 # and FAILED ("we saw nothing at all") are deliberately distinct — see
 # get_pull_request_reviews_checked.
@@ -787,6 +849,8 @@ async def merge_pull_request(
     pr_number: int,
     merge_method: str = "squash",
     project_id: str | None = None,
+    *,
+    allow_changes_requested: bool = False,
 ) -> dict:
     """Merges a PR. Returns dict with 'merged' bool and 'message'. Does not raise on conflict.
 
@@ -801,7 +865,30 @@ async def merge_pull_request(
     error page from GitHub's edge is not JSON, and the previous unconditional
     ``response.json()`` on the raw response raised a bare ``JSONDecodeError``
     that no caller handles.
+
+    Autonomous callers fail closed on GitHub's aggregate ``reviewDecision``:
+    ``CHANGES_REQUESTED`` returns a distinct non-merge result before the PUT,
+    and an unavailable decision lookup raises. Only explicit human/operator
+    approval lanes may set ``allow_changes_requested=True``; a static invariant
+    pins that override allowlist.
     """
+    if not allow_changes_requested:
+        decision = await get_pull_request_review_decision(
+            token, owner, repo, pr_number, project_id=project_id
+        )
+        if decision == "CHANGES_REQUESTED":
+            logger.info(
+                "[PR] Merge held for PR #%s — GitHub reviewDecision is "
+                "CHANGES_REQUESTED",
+                pr_number,
+            )
+            return {
+                "merged": False,
+                "conflict": False,
+                "review_veto": True,
+                "message": "GitHub has outstanding changes requested",
+            }
+
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github.v3+json",

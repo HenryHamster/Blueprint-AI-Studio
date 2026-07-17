@@ -4132,6 +4132,13 @@ def test_non_genuine_cancelled_excludes_new_markers():
     )
     assert not _counts_as_failure(_cancelled_task({"failure_category": "REASSIGNED"}))
     assert not _counts_as_failure(_cancelled_task({"failure_category": "SCOPE_EMPTY"}))
+    # Explicit operator/admin cancellation is not a code or agent death.
+    assert _is_non_genuine_cancelled(
+        _cancelled_task({"failure_category": "ADMIN_CANCEL", "cancelled_by": "USER"})
+    )
+    assert not _counts_as_failure(
+        _cancelled_task({"failure_category": "ADMIN_CANCEL", "cancelled_by": "USER"})
+    )
     # prerequisite_escalated_to_parent — research cycle cancels a child whose
     # prerequisite has no live/deferred provider this cycle. Recoverable: work
     # re-surfaces in the next cycle. Must NOT count as a genuine death.
