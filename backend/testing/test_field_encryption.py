@@ -12,10 +12,12 @@ from app.field_encryption import (
     decrypt_field,
     is_encryption_active,
     require_encryption_active,
+    assert_plaintext_or_raise,
     probe_key_continuity,
     ENCRYPTION_KEY_ENV,
     ALLOW_PLAINTEXT_CREDENTIALS_ENV,
     CONTINUITY_REFERENCE_PLAINTEXT,
+    FERNET_CIPHERTEXT_PREFIX,
 )
 
 
@@ -429,6 +431,35 @@ class TestRequireEncryptionActive:
         monkeypatch.setenv(ENCRYPTION_KEY_ENV, "malformed")
         with pytest.raises(RuntimeError, match="Migration 0531"):
             require_encryption_active("Migration 0531")
+
+
+class TestAssertPlaintextOrRaise:
+    """Wrong-key ciphertext must not be treated as plaintext by backfills."""
+
+    def test_wrong_valid_key_raises(self, monkeypatch):
+        key_a = Fernet.generate_key().decode()
+        key_b = Fernet.generate_key().decode()
+        monkeypatch.setenv(ENCRYPTION_KEY_ENV, key_a)
+        ciphertext = encrypt_field("sensitive_secret")
+        assert ciphertext is not None
+        assert ciphertext.startswith(FERNET_CIPHERTEXT_PREFIX)
+
+        monkeypatch.setenv(ENCRYPTION_KEY_ENV, key_b)
+        assert decrypt_field(ciphertext) == ciphertext
+        with pytest.raises(RuntimeError, match=ENCRYPTION_KEY_ENV):
+            assert_plaintext_or_raise(ciphertext)
+
+    def test_plaintext_and_correctly_keyed_ciphertext_pass(self, monkeypatch):
+        key = Fernet.generate_key().decode()
+        monkeypatch.setenv(ENCRYPTION_KEY_ENV, key)
+        assert_plaintext_or_raise("ghp_genuine_plaintext_token")
+        ciphertext = encrypt_field("some_secret")
+        assert ciphertext is not None
+        assert_plaintext_or_raise(ciphertext)
+
+    def test_none_passes(self, monkeypatch):
+        monkeypatch.setenv(ENCRYPTION_KEY_ENV, Fernet.generate_key().decode())
+        assert_plaintext_or_raise(None)
 
 
 class TestProbeKeyContinuity:

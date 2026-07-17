@@ -24,6 +24,11 @@ logger = logging.getLogger(__name__)
 ENCRYPTION_KEY_ENV = "GITHUB_PAT_ENCRYPTION_KEY"
 ALLOW_PLAINTEXT_CREDENTIALS_ENV = "ALLOW_PLAINTEXT_CREDENTIALS"
 
+# All Fernet tokens are base64url-encoded and begin with this prefix after
+# the version byte (0x80) is encoded. Any stored value starting with this
+# string is almost certainly Fernet ciphertext, not plaintext.
+FERNET_CIPHERTEXT_PREFIX = "gAAAAA"
+
 # Boot-time key-continuity probe.  CONTINUITY_REFERENCE_CIPHERTEXT is a Fernet
 # token encrypted with the canonical key that was active when this probe was
 # established.  probe_key_continuity() decrypts it with the CURRENT configured
@@ -150,6 +155,24 @@ def encrypt_field(value: str | None) -> str | None:
         _require_encryption_available()
         return value
     return f.encrypt(value.encode()).decode()
+
+
+def assert_plaintext_or_raise(value: str | None) -> None:
+    """Reject ciphertext that the configured key cannot decrypt.
+
+    ``decrypt_field`` deliberately returns undecryptable values unchanged for
+    rolling-deploy compatibility. Backfill migrations must not mistake an
+    unchanged Fernet token for plaintext and encrypt it a second time.
+    """
+    if value is None:
+        return
+    if value.startswith(FERNET_CIPHERTEXT_PREFIX) and decrypt_field(value) == value:
+        raise RuntimeError(
+            f"Wrong-key ciphertext detected: value starts with '{FERNET_CIPHERTEXT_PREFIX}' "
+            f"but decrypt_field returned it unchanged — the wrong encryption key may be "
+            f"configured. Check {ENCRYPTION_KEY_ENV}. Refusing to treat "
+            "undecryptable ciphertext as plaintext."
+        )
 
 
 def probe_key_continuity(context: str) -> None:
