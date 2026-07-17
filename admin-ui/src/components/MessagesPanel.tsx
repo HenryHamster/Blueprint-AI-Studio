@@ -325,6 +325,10 @@ export interface MessagesPanelProps {
   focusComposerSignal?: number;
   /** Incrementing signal from realtime events to refresh messages immediately. */
   realtimeRefreshSignal?: number;
+  /** Increments when the strategic-state poll completes with new data.
+   *  When set, the conversation refresh piggybacks on the strategic-state
+   *  poll cadence instead of running its own independent timer. */
+  strategicPollEpoch?: number;
   /** Compact Strategic context descriptor, shown only in the minimal chat surface. */
   contextPackage?: StrategicContextPackageDescriptor | null;
   /** Strategic workbench read model, used by the minimal chat surface. */
@@ -425,7 +429,7 @@ function makePendingPreviewUrl(file: File): string | null {
   }
   return null;
 }
-export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion, focusComposerSignal, realtimeRefreshSignal, contextPackage, strategicState, strategicWorkbenchState, targetMessage, onTargetMessageHandled, onStrategicStateRefresh, onStrategicInteraction, onOpenStrategicContextWorkspace, onOpenCommandPalette, onOpenActivityFeed, onOpenStrategicContextCommands, onStrategicRefresh, strategicSessionTranscript, alerts, onDismissAlert, onDismissAllAlerts, onViewAlertTask }: MessagesPanelProps) {
+export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion, focusComposerSignal, realtimeRefreshSignal, strategicPollEpoch, contextPackage, strategicState, strategicWorkbenchState, targetMessage, onTargetMessageHandled, onStrategicStateRefresh, onStrategicInteraction, onOpenStrategicContextWorkspace, onOpenCommandPalette, onOpenActivityFeed, onOpenStrategicContextCommands, onStrategicRefresh, strategicSessionTranscript, alerts, onDismissAlert, onDismissAllAlerts, onViewAlertTask }: MessagesPanelProps) {
   const resolvedVariant = variant ?? (onClose ? 'modal' : 'page');
   const resolvedFilterChrome = filterChrome ?? (resolvedVariant === 'page' ? 'compact' : 'full');
   const resolvedShowCloseButton = showCloseButton ?? (resolvedVariant !== 'page' && Boolean(onClose));
@@ -783,6 +787,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     actorUserId: currentActorUserId,
     includeMessageId: conversationIncludeMessageId,
     realtimeRefreshSignal,
+    strategicPollEpoch,
     getMessages: getCurrentMessages,
     setMessages,
     onLoadingChange: setLoading,
@@ -1232,7 +1237,14 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     );
     try {
       if (conversationMode) {
-        await refreshResidentConversation(false);
+        // When the strategic read model is available, the conversation refresh
+        // piggybacks on the strategic-state poll cadence (via strategicPollEpoch)
+        // instead of running its own independent timer. This eliminates the
+        // duplicate strategic-state assembly the conversation handler would
+        // otherwise trigger on the backend.
+        if (!usesStrategicReadModelRef.current) {
+          await refreshResidentConversation(false);
+        }
         const sessionMessages = messagesRef.current;
         sessionMessages.forEach(message => seenMessageIdsRef.current.add(message.id));
         hasInitiallyLoadedRef.current = true;

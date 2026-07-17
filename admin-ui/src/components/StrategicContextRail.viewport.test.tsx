@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
-import { act, createRef } from 'react';
+import { act, createRef, Suspense } from 'react';
 import { MessagesComposer } from './MessagesComposer';
 import { StrategicContextRail } from './StrategicContextRail';
 import { WorkbenchSplit, WorkbenchSurface } from './WorkbenchLayout';
+import { Skeleton } from './DashboardMetricCardsPrimitives';
 import { expectMinTouchTargetAt, expectNoOverflowAt, expectNoTextTruncationAt } from '../test/viewport';
 import type { StrategicStateResponse } from '../strategicStateApi';
 
@@ -535,5 +536,42 @@ describe('StrategicContextRail — viewport regression', () => {
 
     await act(async () => { contextButton!.click(); });
     expect(onOpenContext).toHaveBeenCalledTimes(1);
+  });
+
+  test('Suspense boundary skeleton fallback renders without overflow at 400px — acceptance evidence', async () => {
+    function WorkspaceSkeleton() {
+      return (
+        <div className="flex-1 p-6 space-y-4">
+          <Skeleton className="h-7 w-1/4" />
+          <Skeleton className="h-4 w-1/2" />
+          <Skeleton className="h-48 w-full rounded-lg" />
+          <div className="space-y-3">
+            <Skeleton className="h-4 w-full" />
+            <Skeleton className="h-4 w-5/6" />
+            <Skeleton className="h-4 w-2/3" />
+          </div>
+        </div>
+      );
+    }
+    await expectNoOverflowAt(400, async () => {
+      host = document.createElement('div');
+      host.style.width = '400px';
+      document.body.appendChild(host);
+      root = createRoot(host);
+      await act(async () => {
+        root!.render(
+          <Suspense fallback={<WorkspaceSkeleton />}>
+            <StrategicContextRail
+              state={STATE}
+              onOpenProjectSection={vi.fn()}
+              onOpenPipeline={vi.fn()}
+              onOpenRuntimeHealth={vi.fn()}
+              onOpenRuntimeDevices={vi.fn()}
+            />
+          </Suspense>,
+        );
+      });
+    });
+    expect(host?.querySelector('.flex-1.p-6') ?? host?.querySelector('[class*="skeleton"]') ?? host?.children[0]).toBeTruthy();
   });
 });

@@ -1253,6 +1253,149 @@ async def sweep_deliver_task_wakes(
     )
 
 
+# ── Step 18d: age-based decay for unowned OPEN BUG_REPORT / BLOCKER messages ─
+#
+# Steps 15, 17, and 18 resolve bug-class messages when an owning outcome lands
+# or when cited code is absent on HEAD.  None of those paths handles a
+# BUG_REPORT or BLOCKER that was never owned, never linked to a live outcome,
+# and whose cited code cannot be definitively grounded either way.  Such
+# messages currently stay OPEN forever — noise in the operator inbox that the
+# strategist must manually dismiss.
+#
+# This sweep adds a standalone age-based fallback: after STALE_OPEN_BUG_CLASS_DECAY_DAYS
+# (default 30) an unowned, unlinked, system/agent-authored BUG_REPORT or BLOCKER
+# is auto-decayed just like a stale conversational NOTE.  Operator-authored
+# messages ("user") are excluded — only machine-generated findings decay
+# automatically.  Messages still carrying a live ``_convergence_link`` are
+# skipped so the Step-15 convergence sweep owns the terminal transition.
+#
+# Conservative by construction: messages authored by operators stay open
+# indefinitely; the threshold is long enough (30 days, overridable via
+# ``runtime_config['stale_open_bug_class_decay_days']``) that genuinely
+# actionable findings are unlikely to have been missed; and the sweep only
+# acts on the OPEN state, so a linked or resolved message is never touched.
+
+# Default decay window for unowned OPEN BUG_REPORT / BLOCKER messages.
+STALE_OPEN_BUG_CLASS_DECAY_DAYS = 30
+
+
+async def sweep_decay_stale_open_bug_messages(
+    session,
+    now: datetime,
+    *,
+    batch_size: int = 200,
+) -> int:
+    """Step 18d: age-out unowned OPEN BUG_REPORT/BLOCKER messages.
+
+    Selects up to ``batch_size`` OPEN, system/agent-authored BUG_REPORT or
+    BLOCKER messages with no live ``_convergence_link``, no creation-time
+    ownership context (``direction_id`` or ``pr_number`` + ``source_task_id``),
+    and ``created_at`` older than ``STALE_OPEN_BUG_CLASS_DECAY_DAYS``
+    (configurable via ``runtime_config['stale_open_bug_class_decay_days']``).
+    Resolves each with ``resolution='auto-decayed (stale)'``.
+
+    Disjoint in effect from Step 17 (only acts on messages that have no
+    owning context) and from Step 15 (the linked sweep owns messages with a
+    live ``_convergence_link``). Fail-safe per message, idempotent (resolution
+    moves status off 'open'), and broadcasts a ``message_updated`` envelope
+    per resolved row.
+
+    Returns the number of messages auto-decayed.
+    """
+    from app.broadcast import broadcast_to_project as _bcast
+    from app.models import ProjectMessage
+    from app.message_convergence import (
+        BUG_CLASS_TYPES,
+        OPEN_STATUS,
+        SYSTEM_AUTHORED_FROM_TYPES,
+        get_message_link,
+        mark_message_resolved,
+    )
+    from app.project_message_projection import message_updated_event_payload
+    from app.shared_state import runtime_config
+
+    decay_days = int(
+        runtime_config.get(
+            "stale_open_bug_class_decay_days", STALE_OPEN_BUG_CLASS_DECAY_DAYS
+        )
+    )
+    cutoff = now - timedelta(days=decay_days)
+
+    msgs = (
+        (
+            await session.execute(
+                select(ProjectMessage)
+                .where(
+                    ProjectMessage.status == OPEN_STATUS,
+                    ProjectMessage.from_type.in_(list(SYSTEM_AUTHORED_FROM_TYPES)),
+                    ProjectMessage.message_type.in_(list(BUG_CLASS_TYPES)),
+                    ProjectMessage.created_at <= cutoff,
+                )
+                .order_by(ProjectMessage.created_at)
+                .limit(batch_size)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if len(msgs) >= batch_size:
+        logger.warning(
+            "[REAPER] stale-open-bug decay sweep hit cap=%d open bug-class "
+            "messages — result truncated; next cycle continues",
+            batch_size,
+        )
+    if not msgs:
+        return 0
+
+    resolved = 0
+    pending_broadcasts: list[tuple[str, dict]] = []
+    for msg in msgs:
+        # Skip messages that still carry a live convergence link — the Step-15
+        # sweep owns their terminal transition.
+        if get_message_link(msg) is not None:
+            continue
+        # Skip messages that carry creation-time ownership context — Step 17
+        # owns their lifecycle (resolves on owner success, NOT on age). A
+        # message with a direction_id or a pr_number+source_task_id is
+        # intentionally kept open by Step 17 when its owner failed, is still
+        # in-flight, or cannot be confirmed landed; decaying it here would
+        # silently clear an actionable BLOCKER/BUG_REPORT.
+        ctx = msg.context if isinstance(msg.context, dict) else {}
+        if ctx.get("direction_id") or (
+            ctx.get("pr_number") and ctx.get("source_task_id")
+        ):
+            continue
+        mark_message_resolved(msg, now, "auto-decayed (stale)")
+        session.add(msg)
+        resolved += 1
+        pending_broadcasts.append(
+            (str(msg.project_id), message_updated_event_payload(msg))
+        )
+        logger.info(
+            "[REAPER] Step 18d: auto-decayed stale bug-class message %s "
+            "(no activity for >=%dd)",
+            msg.id,
+            decay_days,
+        )
+
+    if resolved:
+        await session.commit()
+        for project_id, payload in pending_broadcasts:
+            try:
+                await _bcast(project_id, "message_updated", payload)
+            except Exception as _bcast_err:  # noqa: BLE001
+                logger.warning(
+                    "[REAPER] Step 18d: broadcast failed for message %s: %s",
+                    payload.get("message_id"),
+                    _bcast_err,
+                )
+        logger.info(
+            "[REAPER] Step 18d: auto-decayed %d stale open bug-class message(s)",
+            resolved,
+        )
+    return resolved
+
+
 async def sweep_wake_delivery_stall_alerts(
     session,
     *,

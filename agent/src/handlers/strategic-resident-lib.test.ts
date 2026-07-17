@@ -2542,6 +2542,56 @@ describe('buildCompactionCheckpoint', () => {
     // openMessagesText is the deliberate exception — empty refreshed wins.
     expect(resolved.openMessagesText).toBeUndefined();
   });
+
+  it('buildCompactionCheckpoint carries contextPrefix when provided', () => {
+    const result = buildCompactionCheckpoint({
+      roleIdentity: 'role',
+      examLedgerJson: '',
+      recentInteractions: '',
+      autonomousState: '',
+      contextPrefix: 'Operator Purpose: build a great product.\nConstraints: do not break prod.',
+    });
+    expect(result).toContain('Operator Purpose: build a great product.');
+    expect(result).toContain('Constraints: do not break prod.');
+  });
+
+  it('buildCompactionCheckpoint carries skillsText as a ## Project Skills section', () => {
+    const result = buildCompactionCheckpoint({
+      roleIdentity: 'role',
+      examLedgerJson: '',
+      recentInteractions: '',
+      autonomousState: '',
+      skillsText: '- **deploy** (`skill-deploy`) — `./deploy`\n  Deploy the application.',
+    });
+    expect(result).toContain('## Project Skills');
+    expect(result).toContain('skill-deploy');
+  });
+
+  it('buildCompactionCheckpoint carries toolContentText as a ## Project Tool Content section', () => {
+    const result = buildCompactionCheckpoint({
+      roleIdentity: 'role',
+      examLedgerJson: '',
+      recentInteractions: '',
+      autonomousState: '',
+      toolContentText: '### Notes (notes)\nKey insight: ship fast.',
+    });
+    expect(result).toContain('## Project Tool Content');
+    expect(result).toContain('Key insight: ship fast.');
+  });
+
+  it('buildCompactionCheckpoint omits contextPrefix/skills/tools sections when blank or absent', () => {
+    const result = buildCompactionCheckpoint({
+      roleIdentity: 'role only',
+      examLedgerJson: '',
+      recentInteractions: '',
+      autonomousState: '',
+      contextPrefix: '',
+      skillsText: '   ',
+      toolContentText: undefined,
+    });
+    expect(result).not.toContain('## Project Skills');
+    expect(result).not.toContain('## Project Tool Content');
+  });
 });
 
 describe('formatStrategicMemoryNotes', () => {

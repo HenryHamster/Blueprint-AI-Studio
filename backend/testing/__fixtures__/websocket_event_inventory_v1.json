@@ -2066,6 +2066,22 @@
       "workbench_resource": null
     },
     {
+      "callee": "_bcast",
+      "canonical_callee": "broadcast_to_project",
+      "classification": "message_v1_payload",
+      "event": "message_updated",
+      "event_expression": null,
+      "event_is_literal": true,
+      "lineno": 1373,
+      "notes": "",
+      "occurrence": 1,
+      "payload_arg_kind": "name:payload",
+      "scope": "sweep_decay_stale_open_bug_messages",
+      "source_path": "backend/app/reaper_bug_message_sweeps.py",
+      "workbench_action": null,
+      "workbench_resource": null
+    },
+    {
       "callee": "broadcast_to_project",
       "canonical_callee": "broadcast_to_project",
       "classification": "legacy_project_event",
@@ -5047,7 +5063,7 @@
     "legacy_global_event": 15,
     "legacy_project_event": 212,
     "legacy_review_required": 25,
-    "message_v1_payload": 15,
+    "message_v1_payload": 16,
     "raw_websocket_control": 3,
     "strategic_v1_emitter": 4,
     "strategic_v1_helper": 21,

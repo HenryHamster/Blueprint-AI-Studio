@@ -571,6 +571,18 @@ export interface CompactionCheckpointContext {
    * state). Softens the "session-start snapshot" note. Defaults to false.
    */
   groundingRefreshed?: boolean;
+  // ── Session-static bootstrap sections (operator purpose + tool grounding) ──
+  // These are NOT server-mutable mid-session so they never go through the
+  // checkpoint-state refresh path — the same session-start values carry forward
+  // on every checkpoint.  Without them a compacted session loses the operator
+  // purpose/constraints preamble, project skills, and tool-content context that
+  // every autonomous tick starts with.
+  /** Operator purpose, current focus, and constraints preamble (buildContextPrefix). */
+  contextPrefix?: string;
+  /** Formatted project skills from `.blueprint/tools.json`. */
+  skillsText?: string;
+  /** Formatted built-in tool content (operator notes, whiteboard). */
+  toolContentText?: string;
 }
 
 /**
@@ -685,6 +697,23 @@ ${ctx.recentHandledConversationText.trim()}`);
   }
   if (ctx.previousDecisionOutcomesText?.trim()) {
     sections.push(`## Prior-cycle decision outcomes\n${ctx.previousDecisionOutcomesText.trim()}`);
+  }
+
+  // (viii) Session-static bootstrap sections — operator purpose + tool grounding.
+  // These mirror the bootstrap sections that carry operator purpose, constraints,
+  // project skills, and tool content.  Without them a post-compaction session
+  // operates without foundational operator grounding every tick normally sees.
+  if (ctx.contextPrefix?.trim()) {
+    sections.push(ctx.contextPrefix.trim());
+  }
+  if (ctx.skillsText?.trim()) {
+    sections.push(`## Project Skills\n${ctx.skillsText.trim()}`);
+  }
+  if (ctx.toolContentText?.trim()) {
+    sections.push(`## Project Tool Content
+(Live content the operator jotted in this project's built-in tools — notes and whiteboard sketches. Treat it as operator input, not authoritative state. Pull the latest with \`./fetch tools\` if you need to re-read it mid-session.)
+
+${ctx.toolContentText.trim()}`);
   }
 
   sections.push(`Resume from this checkpoint. Your next turn will arrive as a

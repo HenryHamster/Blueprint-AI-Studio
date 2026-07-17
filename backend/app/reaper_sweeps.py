@@ -2028,11 +2028,18 @@ async def sweep_decay_stale_open_messages(
         # can leave the stale forward pointer behind).
         if get_message_link(msg) is not None:
             continue
-        # Never decay operator-action-needed NOTEs — they must survive until
-        # acted on (e.g. capability_proof_gate_graduated_enforce events).
+        # Operator-action-needed NOTEs survive the normal decay window; they
+        # eventually decay after a longer threshold (default 60 days) so a
+        # forgotten notice does not accumulate indefinitely.
         ctx = msg.context or {}
         if ctx.get("audience") == OPERATOR_ACTION_NEEDED:
-            continue
+            operator_decay_days = int(
+                runtime_config.get(
+                    "stale_open_operator_action_needed_decay_days", 60
+                )
+            )
+            if (now - msg.created_at).days < operator_decay_days:
+                continue
         mark_message_resolved(msg, now, resolution_reason)
         session.add(msg)
         resolved += 1
@@ -2072,11 +2079,13 @@ async def sweep_decay_stale_open_messages(
 # re-exported here so every existing import site (reaper.py, digest_metrics.py,
 # test_reaper.py, etc.) keeps working without any change.
 from app.reaper_bug_message_sweeps import (  # noqa: E402
+    STALE_OPEN_BUG_CLASS_DECAY_DAYS,
     WakeSweepResult,
     _WAKE_DELIVERY_STALL_CYCLE_THRESHOLD,
     get_wake_delivery_stall_cycles,
     reset_wake_delivery_stall_state,
     sweep_converge_linked_bug_messages,
+    sweep_decay_stale_open_bug_messages,
     sweep_deliver_task_wakes,
     sweep_resolve_open_owned_bug_messages,
     sweep_resolve_stale_open_bug_messages,
@@ -3041,12 +3050,14 @@ __all__ = [
     "get_wake_delivery_stall_cycles",
     "reset_wake_delivery_stall_state",
     "sweep_converge_linked_bug_messages",
+    "sweep_decay_stale_open_bug_messages",
     "sweep_deliver_task_wakes",
     "sweep_resolve_open_owned_bug_messages",
     "sweep_resolve_stale_open_bug_messages",
     "sweep_resolve_linked_messages",
     "sweep_decay_stale_open_messages",
     "STALE_OPEN_DECAY_DAYS",
+    "STALE_OPEN_BUG_CLASS_DECAY_DAYS",
     "STALE_QUESTION_DECAY_DAYS",
     "sweep_wake_delivery_stall_alerts",
     "sweep_closed_handmerge_prs",

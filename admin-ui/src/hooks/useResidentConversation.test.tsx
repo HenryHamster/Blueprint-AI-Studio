@@ -175,4 +175,112 @@ describe('resident conversation pagination', () => {
     await act(async () => { await refreshPromise; });
     expect(setMessages).not.toHaveBeenCalled();
   });
+
+  test('schedules forward refresh when strategicPollEpoch transitions to nonzero', async () => {
+    vi.useFakeTimers();
+    let messages = [message(1)];
+    fetchStrategicConversation.mockResolvedValue({
+      conversation: { limit: 100, has_more: false, next_before_sequence: null, items: [message(2)] },
+    });
+    const setMessages = vi.fn(update => {
+      messages = typeof update === 'function' ? update(messages) : update;
+    });
+    const { rerender } = renderHook(
+      ({ strategicPollEpoch }) => useResidentConversation({
+        enabled: true,
+        projectId: 'project-1',
+        actorUserId: 'actor-1',
+        includeMessageId: null,
+        strategicPollEpoch,
+        getMessages: () => messages,
+        setMessages,
+        onLoadingChange: vi.fn(),
+        onError: vi.fn(),
+      }),
+      { initialProps: { strategicPollEpoch: undefined as number | undefined } },
+    );
+
+    // No refresh should be scheduled when epoch is undefined
+    expect(fetchStrategicConversation).not.toHaveBeenCalled();
+
+    // Transition to a nonzero epoch — this should schedule a forward refresh
+    rerender({ strategicPollEpoch: 1 });
+    expect(fetchStrategicConversation).not.toHaveBeenCalled(); // timer hasn't fired
+
+    // Advance past the 100ms setTimeout
+    await act(async () => { vi.advanceTimersByTime(150); });
+
+    expect(fetchStrategicConversation).toHaveBeenCalledTimes(1);
+    // Forward refresh uses afterSequence, not includeMessageId
+    expect(fetchStrategicConversation.mock.calls[0][1]).toMatchObject({
+      afterSequence: 1,
+    });
+
+    vi.useRealTimers();
+  });
+
+  test('does not schedule forward refresh when strategicPollEpoch is zero', async () => {
+    vi.useFakeTimers();
+    let messages: ProjectMessage[] = [];
+    fetchStrategicConversation.mockResolvedValue({
+      conversation: { limit: 100, has_more: false, next_before_sequence: null, items: [] },
+    });
+    const setMessages = vi.fn(update => {
+      messages = typeof update === 'function' ? update(messages) : update;
+    });
+    const { rerender } = renderHook(
+      ({ strategicPollEpoch }) => useResidentConversation({
+        enabled: true,
+        projectId: 'project-1',
+        actorUserId: 'actor-1',
+        includeMessageId: null,
+        strategicPollEpoch,
+        getMessages: () => messages,
+        setMessages,
+        onLoadingChange: vi.fn(),
+        onError: vi.fn(),
+      }),
+      { initialProps: { strategicPollEpoch: undefined as number | undefined } },
+    );
+
+    // Transition to zero epoch — must NOT schedule a refresh
+    rerender({ strategicPollEpoch: 0 });
+    await act(async () => { vi.advanceTimersByTime(150); });
+
+    expect(fetchStrategicConversation).not.toHaveBeenCalled();
+
+    vi.useRealTimers();
+  });
+
+  test('does not schedule forward refresh when enabled is false even with nonzero epoch', async () => {
+    vi.useFakeTimers();
+    let messages: ProjectMessage[] = [];
+    fetchStrategicConversation.mockResolvedValue({
+      conversation: { limit: 100, has_more: false, next_before_sequence: null, items: [] },
+    });
+    const setMessages = vi.fn(update => {
+      messages = typeof update === 'function' ? update(messages) : update;
+    });
+    const { rerender } = renderHook(
+      ({ enabled, strategicPollEpoch }) => useResidentConversation({
+        enabled,
+        projectId: 'project-1',
+        actorUserId: 'actor-1',
+        includeMessageId: null,
+        strategicPollEpoch,
+        getMessages: () => messages,
+        setMessages,
+        onLoadingChange: vi.fn(),
+        onError: vi.fn(),
+      }),
+      { initialProps: { enabled: true, strategicPollEpoch: undefined as number | undefined } },
+    );
+
+    rerender({ enabled: false, strategicPollEpoch: 1 });
+    await act(async () => { vi.advanceTimersByTime(150); });
+
+    expect(fetchStrategicConversation).not.toHaveBeenCalled();
+
+    vi.useRealTimers();
+  });
 });

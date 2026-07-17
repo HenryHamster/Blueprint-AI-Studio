@@ -632,6 +632,12 @@ export async function handleStrategicResident(
       stagedDirectionsText: stagedDirectionsText || undefined,
       previousDecisionOutcomesText: previousDecisionOutcomesText || undefined,
       groundingRefreshed: refreshedGrounding !== null,
+      // Session-static bootstrap sections: operator purpose/constraints preamble,
+      // project skills, and tool content.  These are never server-refreshed so
+      // the same session-start values carry forward on every checkpoint.
+      contextPrefix: contextPrefix || undefined,
+      skillsText: skillsText || undefined,
+      toolContentText: toolContentText || undefined,
     };
   };
   // An operator turn just completed → run an autonomous turn to act on it.

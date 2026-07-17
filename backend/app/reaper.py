@@ -298,6 +298,7 @@ from app.reaper_sweeps import (
     sweep_resolve_stale_open_bug_messages,
     sweep_resolve_linked_messages,
     sweep_decay_stale_open_messages,
+    sweep_decay_stale_open_bug_messages,
     sweep_deliver_task_wakes,
     sweep_wake_delivery_stall_alerts,
     sweep_orphaned_cross_base_children,
@@ -3127,6 +3128,22 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(
                         f"[REAPER] Stale-open decay sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 18d: Stale-open bug-class decay — age out OPEN unowned
+                # BUG_REPORT/BLOCKER messages after the long decay window (default
+                # 30 days) so machine-generated findings that are never owned or
+                # linked don't accumulate forever. Disjoint from Steps 17/18 (which
+                # cover owned and HEAD-absent messages). Fail-safe per message.
+                _mark_reaper_progress()
+                try:
+                    await sweep_decay_stale_open_bug_messages(session, now)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Stale-open-bug decay sweep error: {e}",
                         exc_info=True,
                     )
                     with contextlib.suppress(Exception):
