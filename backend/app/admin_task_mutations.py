@@ -334,7 +334,7 @@ async def _apply_status_mutation(
         # the helper is terminal-only so active review progress cannot be reset.
         from app.terminal_rollup_requeue import reconcile_terminal_rollup_requeue
 
-        reconciliation = await reconcile_terminal_rollup_requeue(task, session)
+        reconciliation = await reconcile_terminal_rollup_requeue(task, session, payload)
         changes["rollup_requeue_reconciliation"] = reconciliation
         if reconciliation == "merged_pr_rearmed":
             # The operator is requeueing a false terminal state after the

@@ -68,6 +68,15 @@ def _stale_loop(pr_number: int) -> dict:
     }
 
 
+def _stale_rollup_cycle_context() -> dict:
+    return {
+        "_merge_total_deferrals": 61,
+        "_merge_escalation_attempted": True,
+        "rollup_pr_creating_at": 1_721_234_567.0,
+        "_rollup_retries": 5,
+    }
+
+
 @pytest.mark.parametrize("terminal_status", [TaskStatus.FAILED, TaskStatus.CANCELLED])
 @pytest.mark.asyncio
 async def test_terminal_requeue_manual_open_rebind_gets_fresh_attempt(
@@ -83,6 +92,7 @@ async def test_terminal_requeue_manual_open_rebind_gets_fresh_attempt(
         db_session,
         status=terminal_status,
         context={
+            **_stale_rollup_cycle_context(),
             "rollup_pr_number": 15494,
             "rollup_pr_url": "https://example.test/pulls/15494",
             "_is_rollup_review": True,
@@ -150,6 +160,8 @@ async def test_terminal_requeue_manual_open_rebind_gets_fresh_attempt(
     assert loop["iteration"] == 3
     assert loop["original_task_id"] == "chain-root"
     assert loop["fix_reason"] == "preserve this chain reason"
+    for stale_key in _stale_rollup_cycle_context():
+        assert stale_key not in ctx
     token.assert_awaited_once()
     assert get_pr.await_args.args[3] == 15494
     replacement_lookup.assert_not_awaited()
@@ -162,6 +174,7 @@ async def test_terminal_requeue_closed_only_releases_identity_for_fresh_rollup(
     parent = await _rollup_parent(
         db_session,
         context={
+            **_stale_rollup_cycle_context(),
             "rollup_pr_number": 15488,
             "rollup_pr_url": "https://example.test/pulls/15488",
             "_is_rollup_review": True,
@@ -207,6 +220,8 @@ async def test_terminal_requeue_closed_only_releases_identity_for_fresh_rollup(
     assert "_is_rollup_review" not in ctx
     assert "blueprint_review_verdict" not in ctx
     assert ctx["owns_rollup_branch"] is True
+    for stale_key in _stale_rollup_cycle_context():
+        assert stale_key not in ctx
     loop = ctx["review_loop"]
     assert loop == {
         "branch": "research/parent1",
@@ -459,6 +474,86 @@ async def test_terminal_requeue_merged_pr_immediately_runs_rollup_classifier(
     assert "already merged" in (parent.latest_status_message or "").lower()
     assert get_pr.await_count >= 2
     create_pr.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_terminal_requeue_atomic_manual_rebind_sanitizes_effective_context(
+    db_session, mocker
+):
+    """A combined context+status PATCH cannot restore its stale proof later."""
+
+    parent = await _rollup_parent(
+        db_session,
+        context={
+            "rollup_pr_number": 15488,
+            "review_loop": _stale_loop(15488),
+        },
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("token", "owner", "repo"),
+    )
+    get_pr = mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "number": 15494,
+            "state": "open",
+            "merged": False,
+            "head": {"ref": "research/parent1", "sha": "replacement-head"},
+            "base": {"ref": "automain"},
+        },
+    )
+    mocker.patch(
+        "app.github.get_open_pull_request_for_head_branch",
+        new_callable=AsyncMock,
+    )
+    mocker.patch(
+        "app.pause_clock.current_baseline",
+        new_callable=AsyncMock,
+        return_value=7.0,
+    )
+    mocker.patch("app.task_lifecycle.broadcast_to_project", new_callable=AsyncMock)
+
+    incoming_loop = _stale_loop(15494)
+    await modify_task_apply(
+        parent,
+        {
+            "status": TaskStatus.QUEUED.value,
+            "context": {
+                **_stale_rollup_cycle_context(),
+                "rollup_pr_number": 15494,
+                "blueprint_review_verdict": "APPROVE",
+                "review_loop": incoming_loop,
+            },
+        },
+        BackgroundTasks(),
+        db_session,
+    )
+
+    await db_session.refresh(parent)
+    assert parent.status == TaskStatus.EVALUATING
+    ctx = parent.context or {}
+    loop = ctx["review_loop"]
+    assert get_pr.await_args.args[3] == 15494
+    assert ctx["rollup_pr_number"] == 15494
+    assert loop["pr_number"] == 15494
+    assert loop["head_sha"] == "replacement-head"
+    assert loop["ci_wait_pause_baseline"] == 7.0
+    assert loop["ci_wait_started"] != incoming_loop["ci_wait_started"]
+    for stale_key in (
+        "ci_passed",
+        "review_approved",
+        "verify_tests_task_id",
+        "verify_tests_verdict",
+        "escalated",
+        "merge_failures",
+    ):
+        assert stale_key not in loop
+    assert "blueprint_review_verdict" not in ctx
+    for stale_key in _stale_rollup_cycle_context():
+        assert stale_key not in ctx
 
 
 def test_attempt_reset_preserves_chain_metadata_only():

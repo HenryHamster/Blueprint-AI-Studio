@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import logging
 
+from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -16,6 +18,24 @@ logger = logging.getLogger("blueprint")
 _TERMINAL_STATUSES = frozenset(
     {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
 )
+
+
+def preapply_terminal_requeue_context(task: Task, payload: dict) -> None:
+    """Stage an atomic rebind exactly once before attempt reconciliation.
+
+    Replacing the handler-local payload context with an empty patch makes the
+    later generic context phase retain the reconciled task context instead of
+    restoring raw old-attempt proof from the request.
+    """
+
+    incoming = payload.get("context")
+    if not isinstance(incoming, dict):
+        return
+    merged = {**(task.context or {}), **incoming}
+    if len(json.dumps(merged)) > 102400:
+        raise HTTPException(status_code=400, detail="Merged context exceeds 100KB limit")
+    task.context = merged
+    payload["context"] = {}
 
 
 async def _store_context(task: Task, session: AsyncSession, context: dict) -> None:
@@ -98,6 +118,7 @@ async def _bind_fresh_pr_attempt(
 async def reconcile_terminal_rollup_requeue(
     task: Task,
     session: AsyncSession,
+    payload: dict | None = None,
 ) -> str:
     """Prepare a terminal rollup parent for an operator-requested fresh attempt.
 
@@ -115,7 +136,16 @@ async def reconcile_terminal_rollup_requeue(
     if task.status not in _TERMINAL_STATUSES:
         return "active_unchanged"
 
-    context = dict(task.context or {})
+    if payload is not None:
+        preapply_terminal_requeue_context(task, payload)
+    from app.rollup_state import _clear_rollup_transient_state
+
+    # Review-loop proof is only one half of a concrete rollup attempt. Parent
+    # context also carries per-cycle merge/create/retry latches; keeping those
+    # would let a replacement inherit exhausted counters, a prior escalation,
+    # or an in-flight create claim. Use the canonical scrubber so this boundary
+    # cannot drift from normal terminal rollup cleanup.
+    context = _clear_rollup_transient_state(dict(task.context or {}))
     old_loop = dict(context.get("review_loop") or {})
     # A manual parent-level rebind is authoritative for terminal recovery even
     # when the stale review loop still names the closed predecessor.
