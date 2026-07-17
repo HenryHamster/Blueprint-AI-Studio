@@ -27,7 +27,9 @@ export default defineConfig({
     setupFiles: ['./src/test/setup.ts'],
     include: ['src/**/*.test.{ts,tsx}', 'eslint-rules/**/*.test.{js,ts}'],
     exclude: ['node_modules/**', 'src/**/*.viewport.test.{ts,tsx}'],
-    retry: 2,
+    // A retry can turn a nondeterministic failure into a green build. Unit
+    // tests must pass on their first execution so flakes remain actionable.
+    retry: 0,
   },
   define: {
     'import.meta.env.VITE_FIREBASE_API_KEY': JSON.stringify(process.env.VITE_FIREBASE_API_KEY ?? 'ci-placeholder'),

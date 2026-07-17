@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { KnowledgeBrowser } from './KnowledgeBrowser';
+import { waitFor } from '@testing-library/react';
 
 // A compute_experiment document — proves compute knowledge is recognized as a
 // first-class source kind with 'Compute' badge and filter option.
@@ -1568,7 +1569,13 @@ describe('KnowledgeBrowser — viewable-media error fallback sanitizes citation 
   // a clickable link — regression guard for gating finding a6ecad413d65e268.
   test('does not render a javascript: citation ref as a clickable link in the error fallback', async () => {
     const maliciousRef = 'javascript:alert(document.cookie)//pwn.png';
-    const { fetchKnowledgeDocument, resolveArtifactDownloadUrl } = await import('../api');
+    const { fetchKnowledgeDocuments, fetchKnowledgeDocument, resolveArtifactDownloadUrl } = await import('../api');
+    vi.mocked(fetchKnowledgeDocuments).mockResolvedValueOnce({
+      documents: [webResearchDoc],
+      total: 1,
+      limit: 50,
+      offset: 0,
+    });
     vi.mocked(fetchKnowledgeDocument).mockResolvedValueOnce({
       ...webResearchDoc,
       body: '# Body',
@@ -1590,11 +1597,13 @@ describe('KnowledgeBrowser — viewable-media error fallback sanitizes citation 
         />,
       );
     });
-    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
-    const docButton = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
-      b => b.textContent?.includes('Survey of reachable web sources'),
-    );
-    if (!docButton) throw new Error('expected knowledge document button');
+    const docButton = await waitFor(() => {
+      const button = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+        b => b.textContent?.includes('Survey of reachable web sources'),
+      );
+      if (!button) throw new Error('expected knowledge document button');
+      return button;
+    });
     await act(async () => { (docButton as HTMLElement).click(); });
     // Allow the rejected resolveArtifactDownloadUrl promise to settle into the error state.
     await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
