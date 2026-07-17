@@ -6276,7 +6276,7 @@ async def test_capability_proof_trial_stall_flags_all_red(db):
 
 @pytest.mark.asyncio
 async def test_capability_proof_trial_stall_ok_when_any_green(db):
-    """A green trial (no contradiction stamp) means no non-green tasks in window → OK/SKIPPED."""
+    """A green trial (no contradiction stamp) for a cap → that cap is NOT flagged."""
     project = await _project(db)
     now = _utcnow()
 
@@ -6301,6 +6301,64 @@ async def test_capability_proof_trial_stall_ok_when_any_green(db):
         r for r in results if r.status in (CheckStatus.OK, CheckStatus.SKIPPED)
     ]
     assert ok_or_skipped
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_trial_stall_ok_when_mixed_green_and_red(db):
+    """Green trial + red trial for the same cap → cap is NOT flagged (has a passing outcome)."""
+    project = await _project(db)
+    now = _utcnow()
+
+    # Red (non-green) trial.
+    db.add(_make_trial_task(project.id, "cap-d", ran=True, passed=False))
+    # Green trial for the same cap — no contradiction stamp.
+    db.add(Task(
+        project_id=project.id,
+        payloads=[{"type": "capability_proof_trial", "cap": "cap-d"}],
+        status=TaskStatus.COMPLETED,
+        context={},
+    ))
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=now, mode="observe", max_projects=25,
+        sample_limit=200, window_days=14,
+    )
+    results = await mis.check_capability_proof_trial_stall(ctx)
+
+    flagged = [r for r in results if r.status == CheckStatus.FLAGGED]
+    assert not flagged, (
+        f"cap-d should not be flagged — it has a green trial; got: {flagged}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_trial_stall_ok_when_mixed_green_and_could_not_run(db):
+    """Green trial + could_not_run trial for the same cap → cap is NOT flagged."""
+    project = await _project(db)
+    now = _utcnow()
+
+    # could_not_run (non-green) trial.
+    db.add(_make_trial_task(project.id, "cap-e", could_not_run=True))
+    # Green trial for the same cap — no contradiction stamp.
+    db.add(Task(
+        project_id=project.id,
+        payloads=[{"type": "capability_proof_trial", "cap": "cap-e"}],
+        status=TaskStatus.COMPLETED,
+        context={},
+    ))
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=now, mode="observe", max_projects=25,
+        sample_limit=200, window_days=14,
+    )
+    results = await mis.check_capability_proof_trial_stall(ctx)
+
+    flagged = [r for r in results if r.status == CheckStatus.FLAGGED]
+    assert not flagged, (
+        f"cap-e should not be flagged — it has a green trial; got: {flagged}"
+    )
 
 
 @pytest.mark.asyncio

@@ -4897,7 +4897,6 @@ async def check_capability_proof_trial_stall(ctx: SweepContext) -> List[CheckRes
     Does NOT mutate any proof, gate setting, or counter.
     Bounded to ``ctx.max_projects`` projects and ``ctx.sample_limit`` trial tasks.
     """
-    from app.database import resolve_dialect_name
     from app.models import Project, Task, TaskStatus
 
     cutoff = ctx.now.replace(tzinfo=None) - timedelta(days=ctx.window_days)
@@ -4916,15 +4915,6 @@ async def check_capability_proof_trial_stall(ctx: SweepContext) -> List[CheckRes
             )
         ]
 
-    # ``has_key`` compiles to the Postgres-only JSONB ``?`` operator — fails on the
-    # SQLite smoke gate.  Branch to ``func.json_extract`` for SQLite.
-    if resolve_dialect_name(ctx.session) == "sqlite":
-        contradiction_predicate = func.json_extract(
-            Task.context, f"$.{_CAP_TRIAL_CONTRADICTION_KEY}"
-        ).is_not(None)
-    else:
-        contradiction_predicate = Task.context.has_key(_CAP_TRIAL_CONTRADICTION_KEY)
-
     results: List[CheckResult] = []
     any_trial_found = False
 
@@ -4938,7 +4928,6 @@ async def check_capability_proof_trial_stall(ctx: SweepContext) -> List[CheckRes
                     Task.project_id == project_id,
                     Task.status == TaskStatus.COMPLETED,
                     Task.payloads[0]["type"].as_string() == "capability_proof_trial",
-                    contradiction_predicate,
                     Task.created_at >= cutoff,
                 )
                 .order_by(Task.created_at.desc())
@@ -4952,23 +4941,32 @@ async def check_capability_proof_trial_stall(ctx: SweepContext) -> List[CheckRes
                     check="capability_proof_trial_stall",
                     status=CheckStatus.SKIPPED,
                     subject=pid,
-                    detail="no completed non-green trial tasks in window",
+                    detail="no completed trial tasks in window",
                 )
             )
             continue
 
         any_trial_found = True
 
-        # Group contradiction stamps by cap name.  A single task has exactly one
-        # contradiction stamp; we collect counts per outcome type per cap.
+        # Group contradiction stamps by cap name.  A single non-green task has exactly
+        # one contradiction stamp; green tasks have none.  We track caps that have at
+        # least one green trial so we can skip flagging them even if other trials for
+        # the same cap were non-green.
         cap_could_not_run: dict[str, int] = {}
         cap_red: dict[str, int] = {}
         cap_skipped_only: dict[str, int] = {}
         cap_total: dict[str, int] = {}
+        cap_has_green: dict[str, bool] = {}
 
         for t in trial_tasks:
             contradiction = (t.context or {}).get(_CAP_TRIAL_CONTRADICTION_KEY)
             if not isinstance(contradiction, dict):
+                # Green trial: no contradiction stamp.  Extract cap from payload so we
+                # can mark this cap as having at least one passing outcome in the window.
+                payloads = t.payloads or []
+                cap = payloads[0].get("cap") if payloads else None
+                if isinstance(cap, str) and cap.strip():
+                    cap_has_green[cap] = True
                 continue
             cap = contradiction.get("cap")
             if not isinstance(cap, str) or not cap.strip():
@@ -4981,10 +4979,26 @@ async def check_capability_proof_trial_stall(ctx: SweepContext) -> List[CheckRes
             else:
                 cap_skipped_only[cap] = cap_skipped_only.get(cap, 0) + 1
 
-        # Now check each cap: are ALL trials in this window non-green?  A green trial
-        # would NOT have a contradiction stamp so it won't appear in trial_tasks;
-        # but we guard below by comparing cap_total against the sum of outcomes.
+        # If all trial tasks in the window were green (cap_total empty), there are no
+        # stalls for this project.
+        if not cap_total:
+            results.append(
+                CheckResult(
+                    check="capability_proof_trial_stall",
+                    status=CheckStatus.SKIPPED,
+                    subject=pid,
+                    detail="no non-green trial tasks in window (all trials passed)",
+                )
+            )
+            continue
+
+        # Now check each cap: are ALL trials in this window non-green?  A cap with at
+        # least one green trial in the window is not stalled and must not be flagged.
         for cap, total in cap_total.items():
+            # A cap with at least one green trial in the window is not stalled.
+            if cap_has_green.get(cap):
+                continue
+
             cnr = cap_could_not_run.get(cap, 0)
             red = cap_red.get(cap, 0)
             skp = cap_skipped_only.get(cap, 0)
