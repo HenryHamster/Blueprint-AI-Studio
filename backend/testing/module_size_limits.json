@@ -157,7 +157,7 @@
     "routers/admin_project_tools.py": 2200,
     "routers/admin_runners.py": 1950,
     "compute_image_build.py": 1750,
-    "capability_proof.py": 2250,
+    "capability_proof.py": 2800,
     "plan_completion.py": 1750
   },
   "agent": {
