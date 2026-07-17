@@ -747,6 +747,70 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
       new Date(advancedCursor).getTime(),
     );
   });
+
+  it('restores the modern operatorDecisionReview object from the persisted exam ledger so OPERATOR-DECISION REVIEW fires with message-id metadata on the first autonomous tick after a full restart', async () => {
+    // Full-restart durability for the modern operatorDecisionReview object path.
+    //
+    // A prior session serialized a PendingOperatorDecisionReview (the modern
+    // format, with messageIds / startedAt / attempts) into task.context._exam_ledger.
+    // After VM recycle the fresh session must:
+    //   1. restore the review object from the durable blob via restoreLedger, and
+    //   2. open the FIRST autonomous tick with the OPERATOR-DECISION REVIEW
+    //      instruction AND the per-review metadata line (message id, attempts).
+    //
+    // This is the direct-object path; the sibling test above covers the legacy
+    // boolean (operatorDecisionCorrective: true → synthetic review) path.
+    let autonomousPrompt = '';
+    let alive = true;
+
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/api/agent/git-read-token')) {
+        return Promise.resolve({ token: 'read-scoped-token' });
+      }
+      if (url.includes('/messages?')) return Promise.resolve({ messages: [] });
+      return Promise.resolve(null);
+    });
+    mockApiPost.mockResolvedValue({ authority_held: true });
+
+    const session = makeSession(
+      (text) => {
+        autonomousPrompt = typeof text === 'string' ? text : JSON.stringify(text);
+        alive = false;
+        return Promise.resolve(turnResult({ resultText: 'reviewed the operator exchange', inputTokens: 0 }));
+      },
+      () => alive,
+    );
+    mockStartSession.mockImplementation(() => session);
+
+    await handleStrategicResident(
+      'task-review-restore',
+      { project_name: 'ReviewProj', open_messages: [] },
+      {
+        project_metadata: { project_id: 'proj-review' },
+        // Modern serialized review: an operator exchange with explicit message ids
+        // and one prior attempt is pending classification.
+        context: {
+          _exam_ledger: JSON.stringify({
+            records: [],
+            tick: 5,
+            corrective: false,
+            operatorDecisionReview: {
+              status: 'pending',
+              messageIds: ['msg-op-review-1', 'msg-op-review-2'],
+              startedAt: '2026-07-15T10:00:00Z',
+              attempts: 1,
+            },
+          }),
+        },
+      },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    // The restored review drove the OPERATOR-DECISION REVIEW frame into the
+    // first autonomous prompt, including the message-id metadata line.
+    expect(autonomousPrompt).toContain('OPERATOR-DECISION REVIEW');
+    expect(autonomousPrompt).toContain('msg-op-review-1');
+  });
 });
 
 // ── Ambient git credential must stay READ-SCOPED (audit finding #10) ───────────
@@ -1196,5 +1260,199 @@ describe('recloneResidentWorkspace', () => {
     // parked in the ambient credential file.
     expect(mockPrepareWorkspaceForRole).not.toHaveBeenCalled();
     expect(mockWriteGitTokenFile).not.toHaveBeenCalled();
+  });
+});
+
+// ── Early operator-turn acknowledgment ───────────────────────────────────────
+// When an operator turn runs longer than the configured threshold, the handler
+// must post a durable "on it" message so the operator gets a progress signal
+// during a slow turn rather than silence for the full duration. The ack is
+// suppressed entirely for fast turns (timer is cleared before it fires).
+
+describe('handleStrategicResident — early operator-turn acknowledgment', () => {
+  beforeEach(() => {
+    mockApiGet.mockReset();
+    mockApiPost.mockReset();
+    mockStartSession.mockReset();
+    mockSendLog.mockReset();
+    mockSendWsFrame.mockReset();
+    mockSendWsFrame.mockReturnValue(true);
+    vi.spyOn(fs, 'existsSync').mockReturnValue(true);
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  it('posts an early acknowledgment when the operator turn exceeds the configured threshold', async () => {
+    vi.useFakeTimers();
+
+    const OPERATOR_MSG = {
+      id: 'msg-slow',
+      content: 'Question that will take a while to answer',
+      created_at: new Date().toISOString(),
+      from_type: 'user',
+    };
+    let pollCount = 0;
+    let resolveTurn!: (r: ResidentTurnResult) => void;
+    const blockedTurnPromise = new Promise<ResidentTurnResult>((resolve) => { resolveTurn = resolve; });
+
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/api/agent/git-read-token')) return Promise.resolve({ token: 'read-scoped-token' });
+      if (url.includes('/messages?')) {
+        if (pollCount++ === 0) return Promise.resolve({ messages: [OPERATOR_MSG] });
+        return Promise.resolve({ messages: [] });
+      }
+      return Promise.resolve(null);
+    });
+
+    const strategicPosts: Array<Record<string, unknown>> = [];
+    mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
+      if (url.includes('/api/agent/strategic') && body?.op === 'create_message') {
+        strategicPosts.push(body);
+      }
+      if (url.includes('heartbeat')) return Promise.resolve({ authority_held: true, stop_requested: true });
+      return Promise.resolve({});
+    });
+
+    const session = makeSession(() => blockedTurnPromise, () => true);
+    mockStartSession.mockReturnValue(session);
+
+    // 2s threshold (above the 1s floor) — should fire during the slow turn
+    const handlerDone = handleStrategicResident(
+      'task-early-ack',
+      {
+        project_name: 'P',
+        open_messages: [],
+        strategic_session_operator_ack_threshold_seconds: 2,
+      },
+      { project_metadata: { project_id: 'proj-ack' }, context: {} },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    // Advance past the threshold — ack timer fires at 2000ms
+    await vi.advanceTimersByTimeAsync(3000);
+
+    // The early ack must have been posted
+    expect(strategicPosts.length).toBeGreaterThanOrEqual(1);
+    expect(JSON.stringify(strategicPosts[0])).toContain('On it');
+
+    // Resolve the slow turn; handler should proceed to the heartbeat and stop
+    resolveTurn(turnResult({ sentOperatorMessage: true }));
+    await vi.advanceTimersByTimeAsync(1000);
+    await handlerDone;
+  });
+
+  it('does not post an early ack when the turn completes before the threshold elapses', async () => {
+    vi.useFakeTimers();
+
+    const OPERATOR_MSG = {
+      id: 'msg-fast',
+      content: 'Quick question',
+      created_at: new Date().toISOString(),
+      from_type: 'user',
+    };
+    let pollCount = 0;
+
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/api/agent/git-read-token')) return Promise.resolve({ token: 'read-scoped-token' });
+      if (url.includes('/messages?')) {
+        if (pollCount++ === 0) return Promise.resolve({ messages: [OPERATOR_MSG] });
+        return Promise.resolve({ messages: [] });
+      }
+      return Promise.resolve(null);
+    });
+
+    const ackPosts: Array<Record<string, unknown>> = [];
+    mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
+      if (url.includes('/api/agent/strategic') && body?.op === 'create_message') {
+        ackPosts.push(body);
+      }
+      if (url.includes('heartbeat')) return Promise.resolve({ authority_held: true, stop_requested: true });
+      return Promise.resolve({});
+    });
+
+    // Turn resolves immediately — before any 10s timer can fire
+    const session = makeSession(
+      () => Promise.resolve(turnResult({ sentOperatorMessage: true })),
+      () => true,
+    );
+    mockStartSession.mockReturnValue(session);
+
+    await handleStrategicResident(
+      'task-fast-ack',
+      {
+        project_name: 'P',
+        open_messages: [],
+        strategic_session_operator_ack_threshold_seconds: 10,
+      },
+      { project_metadata: { project_id: 'proj-fast-ack' }, context: {} },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    // Advance well past the 10s threshold to confirm the timer was cancelled, not just unfired
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(ackPosts.length).toBe(0);
+  });
+
+  it('completes normally when the early ack post fails', async () => {
+    vi.useFakeTimers();
+
+    const OPERATOR_MSG = {
+      id: 'msg-ack-fail',
+      content: 'Message where ack will fail',
+      created_at: new Date().toISOString(),
+      from_type: 'user',
+    };
+    let pollCount = 0;
+    let resolveTurn!: (r: ResidentTurnResult) => void;
+    const blockedTurnPromise = new Promise<ResidentTurnResult>((resolve) => { resolveTurn = resolve; });
+
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/api/agent/git-read-token')) return Promise.resolve({ token: 'read-scoped-token' });
+      if (url.includes('/messages?')) {
+        if (pollCount++ === 0) return Promise.resolve({ messages: [OPERATOR_MSG] });
+        return Promise.resolve({ messages: [] });
+      }
+      return Promise.resolve(null);
+    });
+
+    let heartbeatCount = 0;
+    mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
+      // Ack post fails — must be non-fatal
+      if (url.includes('/api/agent/strategic') && body?.op === 'create_message') {
+        return Promise.reject(new Error('ack post failed'));
+      }
+      if (url.includes('heartbeat')) {
+        heartbeatCount += 1;
+        return Promise.resolve({ authority_held: true, stop_requested: true });
+      }
+      return Promise.resolve({});
+    });
+
+    const session = makeSession(() => blockedTurnPromise, () => true);
+    mockStartSession.mockReturnValue(session);
+
+    const handlerDone = handleStrategicResident(
+      'task-ack-fail',
+      {
+        project_name: 'P',
+        open_messages: [],
+        strategic_session_operator_ack_threshold_seconds: 2,
+      },
+      { project_metadata: { project_id: 'proj-ack-fail' }, context: {} },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    // Ack fires at 2s and its post fails (non-fatal)
+    await vi.advanceTimersByTimeAsync(3000);
+
+    // Handler must still complete normally after the ack failure
+    resolveTurn(turnResult({ sentOperatorMessage: true }));
+    await vi.advanceTimersByTimeAsync(1000);
+    await handlerDone;
+
+    // The heartbeat (proof the turn completed) must have been reached
+    expect(heartbeatCount).toBeGreaterThanOrEqual(1);
   });
 });

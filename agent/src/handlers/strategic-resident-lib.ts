@@ -137,6 +137,10 @@ export interface ResidentConfig {
   /** Minimum wall-clock cooldown between compactions (ms). Prevents double-compacting
    *  when consecutive turns both land above the threshold. Default: 5 min. */
   compactionCooldownMs: number;
+  /** Early operator-turn acknowledgment threshold (ms). When an operator turn
+   *  exceeds this duration, a durable "on it" message is posted so the operator
+   *  gets a progress signal during a slow turn. 0 = disabled. Default: 10s. */
+  operatorAckThresholdMs: number;
 }
 
 function num(v: unknown, fallback: number): number {
@@ -277,6 +281,9 @@ export function residentConfig(payload: Record<string, unknown>): ResidentConfig
     ? num(payload.strategic_session_compaction_threshold_tokens, 0)
     : undefined;
   const compactionCooldownSec = num(payload.strategic_session_compaction_cooldown_seconds, 300);
+  const ackThresholdSec = num(payload.strategic_session_operator_ack_threshold_seconds, 10);
+  // 0 or negative disables the early ack; positive values clamp to a 1s floor.
+  const operatorAckThresholdMs = ackThresholdSec <= 0 ? 0 : Math.max(1000, Math.round(ackThresholdSec * 1000));
   return {
     idleTickMs,
     // Poll operator messages faster than the heartbeat tick so a turn starts
@@ -291,6 +298,7 @@ export function residentConfig(payload: Record<string, unknown>): ResidentConfig
     maxOpsPerTurn,
     compactionThresholdTokens,
     compactionCooldownMs: Math.max(60_000, Math.round(compactionCooldownSec * 1000)),
+    operatorAckThresholdMs,
   };
 }
 

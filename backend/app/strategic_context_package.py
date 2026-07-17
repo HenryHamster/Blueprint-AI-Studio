@@ -1854,6 +1854,35 @@ def _resource_descriptor(resource: Dict[str, Any]) -> Dict[str, Any] | None:
     }
 
 
+def _build_turn_latency_metric(
+    turn_latency_summary: Dict[str, Any] | None,
+) -> Dict[str, Any] | None:
+    """Build a turn-latency metric card entry from the resident session summary.
+
+    Returns a ``{label, value, tone, target}`` dict when operator-turn latency
+    data is present and meaningful (at least one operator turn recorded); returns
+    ``None`` when the summary is absent, empty, or has zero operator turns, so
+    the metric never emits noise for a session without operator interaction.
+    """
+    if not isinstance(turn_latency_summary, dict):
+        return None
+    op_data = turn_latency_summary.get("operator")
+    if not isinstance(op_data, dict) or op_data.get("count", 0) <= 0:
+        return None
+    mean_ms = op_data.get("mean_turn_ms")
+    max_ms = op_data.get("max_turn_ms")
+    if mean_ms is None or max_ms is None:
+        return None
+    mean_s = mean_ms / 1000
+    max_s = max_ms / 1000
+    return {
+        "label": "Turn latency",
+        "value": f"{mean_s:.1f}s avg / {max_s:.1f}s max",
+        "tone": "warning" if mean_ms > 5000 else "neutral",
+        "target": {"surface": "project", "section": "problem-model"},
+    }
+
+
 def _strategic_context_descriptors(
     *,
     canvas: Dict[str, Any],
@@ -1864,6 +1893,7 @@ def _strategic_context_descriptors(
     task_counts: Dict[str, int],
     attention_count: int,
     status: str,
+    turn_latency_metric: Dict[str, Any] | None = None,
 ) -> List[Dict[str, Any]]:
     blocked_count = int(task_counts.get("blocked") or 0)
     failed_count = int(task_counts.get("failed") or 0)
@@ -1927,6 +1957,8 @@ def _strategic_context_descriptors(
             ],
         },
     ]
+    if turn_latency_metric is not None:
+        descriptors[1]["metrics"].append(turn_latency_metric)
     source_table = _strategic_context_source_table_descriptor(sources)
     if source_table:
         descriptors.append(source_table)
@@ -1980,6 +2012,7 @@ def build_strategic_context_package_summary(
     task_counts: Dict[str, int],
     attention: Dict[str, Any] | None,
     evidence: Dict[str, Any] | None = None,
+    turn_latency_summary: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """Describe the current Strategic context without embedding large source docs."""
 
@@ -2135,6 +2168,7 @@ def build_strategic_context_package_summary(
         task_counts=task_counts,
         attention_count=attention_count,
         status=status,
+        turn_latency_metric=_build_turn_latency_metric(turn_latency_summary),
     )
 
     return {

@@ -1140,22 +1140,27 @@ export async function handleStrategicResident(
     msgs: ResidentInboundMessage[],
   ): Promise<'stop' | 'continue'> => {
     const pickupLagMs = computePickupLagMs(msgs);
-    // Early acknowledgment: post a NOTE immediately so the operator sees feedback
-    // before the full turn completes (which can take 4+ minutes). This is a
-    // separate, lightweight message — the real reply lands at persistReply below.
-    try {
-      const ackText = msgs.length === 1
-        ? `Acknowledged — working on your message (this may take a moment).`
-        : `Acknowledged ${msgs.length} messages — working on them (this may take a moment).`;
-      await apiPost('/api/agent/strategic', {
-        task_id: taskId,
-        op: 'create_message',
-        data: { type: 'NOTE', content: ackText },
-      });
-    } catch (e) {
-      sendLog(ws, `[resident] early acknowledgment failed (non-fatal): ${String(e)}\n`);
+    // Threshold-gated early acknowledgment: start a timer that fires after
+    // cfg.operatorAckThresholdMs so the operator sees a progress signal during
+    // slow turns. If the turn completes before the threshold, the timer is
+    // cancelled and no ack is posted. A threshold of 0 disables the ack.
+    let ackTimer: ReturnType<typeof setTimeout> | null = null;
+    if (cfg.operatorAckThresholdMs > 0) {
+      ackTimer = setTimeout(() => {
+        const ackText = msgs.length === 1
+          ? `On it — working on your message (this may take a moment).`
+          : `On it — working on ${msgs.length} messages (this may take a moment).`;
+        apiPost('/api/agent/strategic', {
+          task_id: taskId,
+          op: 'create_message',
+          data: { type: 'NOTE', content: ackText },
+        }).catch((e: unknown) => {
+          sendLog(ws, `[resident] early acknowledgment failed (non-fatal): ${String(e)}\n`);
+        });
+      }, cfg.operatorAckThresholdMs);
     }
     const r = await runTurn(combineOperatorMessages(msgs), true, pickupLagMs);
+    if (ackTimer !== null) clearTimeout(ackTimer);
     if (turnWedgedSession(r)) return 'stop';
     await persistReply(r);
     // Collect the ids of the messages we just consumed so the backend can mark

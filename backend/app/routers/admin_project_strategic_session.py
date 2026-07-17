@@ -2357,6 +2357,9 @@ async def get_project_strategic_state(
     # package. With the broad guard above, reaching here means a visible segment
     # changed, so the package's inputs are (re)assembled unconditionally.
     context_evidence = await load_strategic_context_evidence(session, project.id)
+    _turn_latency_summary = (
+        _resident_session_summary(project) or {}
+    ).get("turn_latency_summary")
     context_package = build_strategic_context_package_summary(
         project,
         active_cycle=active_cycle_summary,
@@ -2369,6 +2372,7 @@ async def get_project_strategic_state(
         task_counts=task_counts,
         attention=attention,
         evidence=context_evidence,
+        turn_latency_summary=_turn_latency_summary,
     )
     runtime_summary = await build_strategic_runtime_summary(
         session,

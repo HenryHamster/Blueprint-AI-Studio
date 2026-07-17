@@ -5249,3 +5249,110 @@ async def test_decisions_reg_survives_session_without_update(db_session):
         "the exact operator correction from session A must be in session C's context"
     )
     assert reg["decisions"][0]["summary"] == "operator approved the research plan"
+
+
+# ---------------------------------------------------------------------------
+# Heartbeat field-isolation: IF-guard write semantics
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_cursor_not_overwritten_by_ledger_only_heartbeat(db_session):
+    """When a second heartbeat carries only the exam ledger (no message_cursor),
+    the cursor written by the first heartbeat is preserved in the session blob.
+
+    The ``renew_resident_session_lease`` code writes each field only when the
+    caller supplies it (IF-guard pattern).  A ledger-only heartbeat must not
+    silently clear a durable cursor that a prior heartbeat committed."""
+    import json as _json
+
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap = await start_resident_session(db_session, project, operator_user_id=TEST_USER_ID)
+
+    CURSOR = "2026-07-15T09:00:00.000000"
+
+    # Heartbeat 1: write cursor, no exam ledger.
+    project = await db_session.get(Project, project.id)
+    await renew_resident_session_lease(
+        db_session, project,
+        session_id=snap["session_id"],
+        task_id=snap["task_id"],
+        progress=False,
+        message_cursor=CURSOR,
+    )
+
+    # Heartbeat 2: write exam ledger only — deliberately omits cursor.
+    LEDGER = _json.dumps({"records": [], "tick": 2, "corrective": False})
+    project = await db_session.get(Project, project.id)
+    await renew_resident_session_lease(
+        db_session, project,
+        session_id=snap["session_id"],
+        task_id=snap["task_id"],
+        progress=False,
+        note=LEDGER,
+    )
+
+    # The cursor from heartbeat 1 must still be present.
+    fresh = await db_session.get(Project, project.id)
+    blob = read_resident_session(fresh.vision)
+    assert blob is not None
+    assert blob.get("_message_cursor") == CURSOR, (
+        "cursor must be preserved when a subsequent ledger-only heartbeat runs"
+    )
+    # Exam ledger was also written (not silent).
+    assert blob.get("_exam_ledger") == LEDGER
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_exam_ledger_not_overwritten_by_cursor_only_heartbeat(db_session):
+    """When a second heartbeat carries only a message_cursor (no exam ledger),
+    the exam ledger written by the first heartbeat is preserved in the session blob.
+
+    Mirrors the field-isolation guarantee above for the reverse write order:
+    a cursor-only heartbeat must not silently clear a durable exam ledger."""
+    import json as _json
+
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap = await start_resident_session(db_session, project, operator_user_id=TEST_USER_ID)
+
+    LEDGER = _json.dumps(
+        {"records": [{"surfaceKey": "direction:d-1", "atTick": 1, "at": "2026-07-15T09:00:00Z",
+                      "verdict": "clear", "note": "no issues found"}],
+         "tick": 1, "corrective": False}
+    )
+
+    # Heartbeat 1: write exam ledger, no cursor.
+    project = await db_session.get(Project, project.id)
+    await renew_resident_session_lease(
+        db_session, project,
+        session_id=snap["session_id"],
+        task_id=snap["task_id"],
+        progress=False,
+        note=LEDGER,
+    )
+
+    CURSOR = "2026-07-15T10:30:00.000000"
+
+    # Heartbeat 2: write cursor only — deliberately omits exam ledger.
+    project = await db_session.get(Project, project.id)
+    await renew_resident_session_lease(
+        db_session, project,
+        session_id=snap["session_id"],
+        task_id=snap["task_id"],
+        progress=False,
+        message_cursor=CURSOR,
+    )
+
+    # The exam ledger from heartbeat 1 must still be present.
+    fresh = await db_session.get(Project, project.id)
+    blob = read_resident_session(fresh.vision)
+    assert blob is not None
+    assert blob.get("_exam_ledger") == LEDGER, (
+        "exam ledger must be preserved when a subsequent cursor-only heartbeat runs"
+    )
+    # Cursor was also written (not silent).
+    assert blob.get("_message_cursor") == CURSOR
