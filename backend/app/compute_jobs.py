@@ -59,9 +59,9 @@ from app.artifact_prerequisites import (
     stamp_artifact_logical_key,
 )
 from app.database import AsyncSessionLocal
-from app.json_extract import (
-    scan_all_balanced_json_objects,
-    scan_balanced_json_objects,
+from app.compute_result_metrics import (
+    coerce_metric_number as _coerce_metric_number,
+    stdout_metrics_fallback as _stdout_metrics_fallback,
 )
 from app.models import (
     Artifact,
@@ -4222,93 +4222,6 @@ def _is_durable_artifact_uri(reference: str) -> bool:
     if lowered.startswith(("gs://", "s3://", "az://", "file:")):
         return True
     return "/" in text
-
-
-def _coerce_metric_number(value: Any) -> float | int | None:
-    """Numeric coercion mirroring the agent's ``numOrNull`` for reported metrics.
-
-    Accepts finite ints/floats and numeric strings; rejects bools, NaN/inf, and
-    non-numeric values so a reported metric can only land as a real number.
-    """
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        return (
-            value
-            if value == value and value not in (float("inf"), float("-inf"))
-            else None
-        )
-    if isinstance(value, str) and value.strip():
-        try:
-            num = float(value)
-        except ValueError:
-            return None
-        return num if num == num and num not in (float("inf"), float("-inf")) else None
-    return None
-
-
-# Upper bound on how much captured command-log text the stdout->metrics fallback
-# scans for a trailing JSON object. The balanced-JSON scan is super-linear in the
-# number of "{" candidates, so a noisy multi-megabyte log can never make the
-# fallback expensive: only the trailing window is scanned (the experiment prints
-# its result object last, so last-object-wins lives in the tail).
-_STDOUT_METRICS_SCAN_MAX_CHARS = 100_000
-
-
-def _stdout_metrics_fallback(meta: dict) -> dict | None:
-    """Recover experiment metrics from captured stdout when no result file exists.
-
-    A command that writes ``{metric: value}`` JSON to ``$BLUEPRINT_RESULT_FILE``
-    populates ``result_metrics`` directly; that path always wins. This fallback
-    only fires when ``result_metrics`` is absent/empty: it scans the captured
-    command log for the LAST balanced JSON object the command printed to
-    stdout/stderr (last-object-wins) and returns its numeric keys so a metric
-    that only reached stdout is still measurable.
-
-    Bounded and defensive: scans at most the trailing
-    ``_STDOUT_METRICS_SCAN_MAX_CHARS`` of the log, keeps only numeric keys, and
-    returns ``None`` when there is no command log or no balanced JSON object. The
-    caller filters reserved/backend-derived keys, so this never overwrites
-    ``durable_file_count`` or a job-level field.
-    """
-    command_log = meta.get("command_log")
-    if not isinstance(command_log, dict):
-        return None
-    text = command_log.get("text")
-    if not isinstance(text, str) or not text.strip():
-        return None
-    if len(text) > _STDOUT_METRICS_SCAN_MAX_CHARS:
-        text = text[-_STDOUT_METRICS_SCAN_MAX_CHARS:]
-    obj = scan_balanced_json_objects(text, last=True)
-    if not isinstance(obj, dict):
-        return None
-    numeric = {k: v for k, v in obj.items() if _coerce_metric_number(v) is not None}
-    if not numeric:
-        return None
-    # Recover repeated-metric series. An A/B experiment authored as a single
-    # command that prints the SAME metric key once per arm (e.g. fp32 then fp16
-    # both emitting {"median_matmul_ms": ...}) collapses under last-object-wins
-    # above: only the final arm's value survives, so the comparison that IS the
-    # proof becomes unrecoverable from structured data. For any recovered metric
-    # emitted more than once with differing values, attach the full ordered
-    # series under ``<metric>__series`` so both arms stay readable. The canonical
-    # ``<metric>`` value is left untouched (still the last emission), keeping
-    # last-object-wins backward compatible for single-value experiments.
-    series: dict[str, list[float | int]] = {}
-    all_objs = scan_all_balanced_json_objects(text)
-    for key in numeric:
-        values = [
-            num
-            for o in all_objs
-            if isinstance(o, dict)
-            for num in (_coerce_metric_number(o.get(key)),)
-            if num is not None
-        ]
-        if len(values) >= 2 and len(set(values)) >= 2:
-            series[f"{key}__series"] = values
-    return {**numeric, **series}
 
 
 def build_compute_result_logs(job: ComputeJob) -> str:
