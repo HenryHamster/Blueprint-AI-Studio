@@ -182,6 +182,40 @@ async def test_backlog_reuse_config_gate_off_is_unchanged(
 
 
 @pytest.mark.asyncio
+async def test_local_runner_returns_to_capability_aware_dispatch(
+    client: AsyncClient, db_session, mocker
+):
+    """A runner:* agent must never claim through capability-blind warm reuse."""
+    _patch_broadcast(mocker)
+    with _FlagGuard(backlog=True, continuity=True):
+        project = await _make_project(db_session, name="Local Runner Handoff")
+        vm_id = "runner:00000000-0000-0000-0000-000000000123"
+        prior = await _make_backlog_task(
+            db_session, project.id, status=TaskStatus.COMPLETED, vm_instance_id=vm_id
+        )
+        backlog = await _make_backlog_task(db_session, project.id)
+
+        token = create_agent_token(
+            str(prior.id), vm_id, task_type="create", project_id=str(project.id)
+        )
+        resp = await client.post(
+            "/api/agent/next-role",
+            json={"vm_instance_id": vm_id, "prior_task_id": str(prior.id)},
+            headers={"x-agent-token": token},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {
+            "action": "exit",
+            "reason": "local_runner_capability_recheck",
+        }
+
+        db_session.expire(backlog)
+        await db_session.refresh(backlog)
+        assert backlog.status == TaskStatus.QUEUED
+        assert backlog.vm_instance_id is None
+
+
+@pytest.mark.asyncio
 async def test_pool_vm_scoped_token_excluded_from_backlog_reuse(
     client: AsyncClient, db_session, mocker
 ):
