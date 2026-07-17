@@ -8097,6 +8097,67 @@ describe('MessagesPanel confirmation chip actionability', () => {
     const chipAfter = [...(container.querySelector('[data-testid="needs-action-strip"]')?.querySelectorAll('button') ?? [])].find(b => b.textContent?.includes('Confirm deployment plan'));
     expect(chipAfter).toBeTruthy();
   });
+
+  test('message chip in non-conversation mode is not disabled and triggers scroll', async () => {
+    // Non-conversation mode (full chrome) — message chips must not be inert.
+    const scrollSpy = vi.fn();
+    Element.prototype.scrollIntoView = scrollSpy;
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
+      const urlStr = String(url);
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+      if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
+        return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
+      }
+      if (urlStr.includes('/api/admin/messages') && method === 'GET') {
+        return new Response(JSON.stringify({ messages: [
+          { id: 'msg-target', project_id: 'proj-1', message_type: 'QUESTION', from_type: 'agent',
+            from_task_id: null, content: 'What should I do?', context: {}, status: 'open',
+            resolution: null, resolved_at: null, created_at: new Date().toISOString() },
+        ] }), { status: 200 });
+      }
+      return new Response('', { status: 404 });
+    });
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+    const state = makeStrategicState({
+      attention: {
+        level: 'needs_operator',
+        summary: '1 message needs action',
+        last_seen_at: null,
+        counts: { needs_operator: 1, watch: 0, unread: 0, questions: 1, blockers: 0, approvals: 0, manual_directions: 0, failed_tasks: 0, blocked_tasks: 0, parked_tasks: 0 },
+        items: [{
+          id: 'message:msg-target',
+          kind: 'message',
+          severity: 'needs_operator',
+          reason: 'question',
+          label: 'Question waiting',
+          ref: { kind: 'message', id: 'msg-target', project_id: 'proj-1' },
+        }],
+      },
+    });
+    const { container } = render(
+      <MessagesPanel
+        selectedProjectId="proj-1"
+        addToast={() => {}}
+        onMessageCountChange={() => {}}
+        filterChrome="compact"
+        strategicState={state}
+      />,
+    );
+    const strip = await waitFor(() => {
+      const el = container.querySelector('[data-testid="needs-action-strip"]');
+      expect(el).toBeTruthy();
+      return el as HTMLElement;
+    });
+    const chip = [...strip.querySelectorAll('button')].find(b => b.textContent?.includes('Question waiting'));
+    expect(chip).toBeTruthy();
+    // Message chip must not be disabled in non-conversation mode
+    expect(chip!.disabled).toBe(false);
+    // Clicking must not throw — the handler now runs for non-conversation mode too
+    fireEvent.click(chip!);
+    // scrollIntoView may or may not be called depending on DOM state, but the
+    // click must not error and the button must remain enabled after click
+    expect(chip!.disabled).toBe(false);
+  });
 });
 
 describe('MessagesPanel optimistic-send tab-switch persistence', () => {

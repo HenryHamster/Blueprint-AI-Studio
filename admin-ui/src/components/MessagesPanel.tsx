@@ -2628,7 +2628,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
                 const messageId = isMessage ? item.ref?.id : null;
                 const isExpanded = isConfirmation && expandedConfirmationItemId === item.id;
                 const handleClick = () => {
-                  if (isMessage && messageId && conversationMode) {
+                  if (isMessage && messageId) {
                     void scrollConversationMessageIntoView(messageId).then(revealed => {
                       if (revealed) setHighlightedMessageId(messageId);
                     });
