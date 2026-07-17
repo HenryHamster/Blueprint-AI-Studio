@@ -438,7 +438,7 @@ function SweepKnowledgeGroupsSection({
                 <button
                   type="button"
                   onClick={() => toggleCompare(sweepId)}
-                  className="min-h-[44px] flex items-center gap-1 rounded px-1.5 py-0.5 text-ui-xs font-semibold text-indigo-400 hover:text-indigo-200 hover:bg-indigo-500/15 transition-colors"
+                  className="min-h-[44px] min-w-[44px] flex items-center gap-1 rounded px-1.5 py-0.5 text-ui-xs font-semibold text-indigo-400 hover:text-indigo-200 hover:bg-indigo-500/15 transition-colors"
                   data-testid="sweep-knowledge-compare-toggle"
                 >
                   <LayoutGrid className="w-3 h-3" />
