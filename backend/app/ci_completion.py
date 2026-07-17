@@ -482,6 +482,46 @@ async def _attempt_merge_with_retry_and_escalation(
             return False
         # _diff_empty is False → non-empty diff → fall through to merge.
 
+    # GitHub review state is an independent authority from Blueprint's internal
+    # reviewer. An internal APPROVE must never erase an outstanding external
+    # CHANGES_REQUESTED decision (PR #15482). Check the aggregate GitHub field
+    # at the final merge chokepoint so every autonomous merge path inherits the
+    # same veto. A successful ``None`` means no external review decision; an
+    # unavailable lookup is indeterminate and defers rather than failing open.
+    if ci_pr_number:
+        from app.github import get_pull_request_review_decision
+
+        try:
+            _external_review_decision = await get_pull_request_review_decision(
+                gh_token,
+                owner,
+                repo,
+                ci_pr_number,
+                project_id=str(task.project_id) if task.project_id else None,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[CI] Merge deferred for PR #%s — GitHub review decision unavailable: %s",
+                ci_pr_number,
+                exc,
+            )
+            task.latest_status_message = (
+                "Merge deferred — unable to verify GitHub review decision for "
+                f"PR #{ci_pr_number}"
+            )[:500]
+            session.add(task)
+            return False
+        if _external_review_decision == "CHANGES_REQUESTED":
+            logger.info(
+                "[CI] Merge held for PR #%s — GitHub reviewDecision is "
+                "CHANGES_REQUESTED",
+                ci_pr_number,
+            )
+            task.latest_status_message = (
+                f"Merge held — GitHub has outstanding changes requested on PR #{ci_pr_number}"
+            )[:500]
+            session.add(task)
+            return False
     # Round 4 W1: capture a content snapshot BEFORE releasing the lock.
     # ``parent_id_local`` mirrors the snapshot-stale convention from
     # rollup_management.py: the in-memory ``task`` is stale after release;

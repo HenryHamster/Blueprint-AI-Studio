@@ -327,6 +327,57 @@ async def test_merge_pr_success_and_conflict_shapes_unchanged(mocker):
     }
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("decision", [None, "APPROVED", "CHANGES_REQUESTED"])
+async def test_get_pull_request_review_decision_reads_graphql_aggregate(
+    mocker, decision
+):
+    from app import github_pulls
+
+    mock_request = mocker.patch(
+        "app.github._github_request",
+        new=AsyncMock(
+            return_value=MockResponse(
+                200,
+                {
+                    "data": {
+                        "repository": {"pullRequest": {"reviewDecision": decision}}
+                    }
+                },
+            )
+        ),
+    )
+
+    result = await github_pulls.get_pull_request_review_decision(
+        "t", "owner", "repo", 42, project_id="project-id"
+    )
+
+    assert result == decision
+    request = mock_request.call_args
+    assert request.args[:2] == ("POST", "https://api.github.com/graphql")
+    assert request.kwargs["json"]["variables"] == {
+        "owner": "owner",
+        "repo": "repo",
+        "number": 42,
+    }
+
+
+@pytest.mark.asyncio
+async def test_get_pull_request_review_decision_graphql_error_is_indeterminate(mocker):
+    from app import github_pulls
+
+    mocker.patch(
+        "app.github._github_request",
+        new=AsyncMock(
+            return_value=MockResponse(200, {"errors": [{"message": "unavailable"}]})
+        ),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await github_pulls.get_pull_request_review_decision("t", "o", "r", 42)
+
+    assert exc_info.value.status_code == 502
+
 # ─────────────────────────────────────────────────────────────────────────────
 # get_pull_request_reviews_checked — pagination
 #

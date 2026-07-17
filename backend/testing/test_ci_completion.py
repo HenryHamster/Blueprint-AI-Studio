@@ -58,6 +58,15 @@ def _default_size_cap_ok(mocker):
     )
 
 
+@pytest.fixture(autouse=True)
+def _default_external_review_decision_clear(mocker):
+    """Existing merge tests model PRs with no external review veto."""
+    mocker.patch(
+        "app.github.get_pull_request_review_decision",
+        AsyncMock(return_value=None),
+    )
+
+
 @pytest_asyncio.fixture(autouse=True)
 async def _patch_dedicated_sessions_to_test_engine(mocker, db_session):
     """Dedicated AsyncSessionLocal scopes in ci_completion must use the shared
@@ -174,6 +183,73 @@ def _make_task(
     db_session.add(task)
     return task
 
+
+@pytest.mark.asyncio
+async def test_external_changes_requested_vetoes_internal_approve(
+    db_session, mocker
+):
+    """GitHub CHANGES_REQUESTED is a hard veto even after Blueprint APPROVE."""
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    decision_mock = mocker.patch(
+        "app.github.get_pull_request_review_decision",
+        AsyncMock(return_value="CHANGES_REQUESTED"),
+    )
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request", AsyncMock(return_value={"merged": True})
+    )
+    project = Project(name="External review veto", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = _make_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is False
+    assert task.status == TaskStatus.EVALUATING
+    assert "outstanding changes requested" in task.latest_status_message
+    decision_mock.assert_awaited_once()
+    merge_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("external_decision", [None, "APPROVED"])
+async def test_cleared_or_absent_external_review_does_not_block_merge(
+    db_session, mocker, external_decision
+):
+    """Approved and no-review PRs retain the normal internal-approve behavior."""
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    mocker.patch(
+        "app.github.get_pull_request_review_decision",
+        AsyncMock(return_value=external_decision),
+    )
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request", AsyncMock(return_value={"merged": True})
+    )
+    mocker.patch("app.github.create_pr_comment", AsyncMock(return_value=None))
+    project = Project(
+        name=f"External review clear {external_decision}", user_id="test-user"
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = _make_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is True
+    assert task.status == TaskStatus.COMPLETED
+    merge_mock.assert_awaited_once()
 
 # ---------------------------------------------------------------------------
 # 1. Retry with exponential backoff (source != 'webhook')
