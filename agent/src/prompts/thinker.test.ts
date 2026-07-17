@@ -1236,6 +1236,59 @@ describe('runThinkerWithGate currentPurpose injection', () => {
     );
   });
 
+  it('restores durable purpose in an existing blank-purpose handoff without another LLM turn', async () => {
+    fsMockState.presentFiles.add(problemModelPath);
+    fsMockState.fileContents.set(
+      problemModelPath,
+      JSON.stringify({ intent: { purpose: '' }, gaps: [{ id: 'g-live' }] }),
+    );
+    fsMockState.presentFiles.add(runningUpdatePath);
+    fsMockState.fileContents.set(runningUpdatePath, '# Running Update\n');
+    mockRunClaudeCode.mockResolvedValueOnce({
+      exitCode: 0,
+      allOutput: '{"intent":{"purpose":""},"gaps":[{"id":"g-live"}]}',
+      lastResultText: '{"intent":{"purpose":""},"gaps":[{"id":"g-live"}]}',
+    });
+
+    const result = await runThinkerWithGate(
+      'prompt', taskId, ws, statusRef, undefined, undefined, [], durablePurpose,
+    );
+
+    expect(result).toEqual({
+      ok: true,
+      analysisText: '{"intent":{"purpose":""},"gaps":[{"id":"g-live"}]}',
+    });
+    expect(mockRunClaudeCode).toHaveBeenCalledTimes(1);
+    const written = JSON.parse(fsMockState.fileContents.get(problemModelPath) || '{}') as {
+      intent?: { purpose?: string };
+      gaps?: Array<{ id: string }>;
+    };
+    expect(written.intent?.purpose).toBe(durablePurpose);
+    expect(written.gaps).toEqual([{ id: 'g-live' }]);
+  });
+
+  it('validates and restores durable purpose when blank JSON is recovered from stdout', async () => {
+    fsMockState.presentFiles.add(runningUpdatePath);
+    fsMockState.fileContents.set(runningUpdatePath, '# Running Update\n');
+    const blankPurposeOutput = '{"intent":{"purpose":""},"gaps":[{"id":"g-live"}]}';
+    mockRunClaudeCode.mockResolvedValueOnce({
+      exitCode: 0,
+      allOutput: blankPurposeOutput,
+      lastResultText: blankPurposeOutput,
+    });
+
+    const result = await runThinkerWithGate(
+      'prompt', taskId, ws, statusRef, undefined, undefined, [], durablePurpose,
+    );
+
+    expect(result).toEqual({ ok: true, analysisText: blankPurposeOutput });
+    expect(mockRunClaudeCode).toHaveBeenCalledTimes(1);
+    const written = JSON.parse(fsMockState.fileContents.get(problemModelPath) || '{}') as {
+      intent?: { purpose?: string };
+    };
+    expect(written.intent?.purpose).toBe(durablePurpose);
+  });
+
   it('repair_reopenPrompt_includes_injected_purpose_when_currentPurpose_provided', async () => {
     // The repair reopen prompt must include the currentPurpose preservation
     // instruction so the fresh repair session has the ground-truth value.

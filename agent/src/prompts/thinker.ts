@@ -618,6 +618,44 @@ ${DEFAULT_TOOL_GUIDANCE}`;
 // problem_model JSON before the executor runs. On any failure path it calls
 // persistAndPostStatus(FAILED, failure_category=strategic_thinker_artifacts_missing)
 // and returns { ok: false } so the caller can simply return.
+function realPurpose(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const purpose = value.trim();
+  if (purpose === '' || purpose === '...' || /^<[^>]+>$/.test(purpose)) return undefined;
+  return purpose;
+}
+
+type PurposeState =
+  | { ok: true; changed: false; rejected: string; purpose?: string }
+  | { ok: true; changed: true; rejected: string; purpose: string }
+  | { ok: false; changed: false; rejected: string };
+
+function materializeOperatorPurpose(
+  model: Record<string, unknown>,
+  currentPurpose?: string,
+): PurposeState {
+  const intent = model.intent as Record<string, unknown> | undefined;
+  // Partial problem_model updates may omit intent entirely; the backend's
+  // non-destructive merge preserves the durable operator-owned fields.
+  if (intent == null) return { ok: true, changed: false, rejected: '' };
+
+  const raw = typeof intent.purpose === 'string' ? intent.purpose.trim() : '';
+  const existing = realPurpose(raw);
+  if (existing) {
+    return { ok: true, changed: false, rejected: raw, purpose: existing };
+  }
+
+  // The strategist cannot author operator intent. If it accidentally emits a
+  // schema placeholder, restore the known durable value rather than spending
+  // another LLM turn asking it to copy an operator-owned string. user_purpose
+  // travels with the artifact when preserved; currentPurpose is independently
+  // derived from the live project payload by the caller.
+  const authoritative = realPurpose(intent.user_purpose) || realPurpose(currentPurpose);
+  if (!authoritative) return { ok: false, changed: false, rejected: raw };
+  intent.purpose = authoritative;
+  return { ok: true, changed: true, rejected: raw, purpose: authoritative };
+}
+
 export async function runThinkerWithGate(
   thinkerPrompt: string,
   taskId: string,
@@ -665,25 +703,35 @@ export async function runThinkerWithGate(
       // Validate the problem_model structure: reject schema-template placeholders
       // and ensure it's a valid object (not null, array, or primitive).
       if (parsed != null && typeof parsed === 'object' && !Array.isArray(parsed)) {
-        const intent = (parsed as Record<string, unknown>).intent as Record<string, unknown> | undefined;
-        // If intent is present, validate intent.purpose is not a placeholder.
-        if (intent != null) {
-          const purpose = typeof intent.purpose === 'string' ? intent.purpose.trim() : '';
-          const isSchemaPlaceholder = purpose === '' || purpose === '...' || /^<[^>]+>$/.test(purpose);
-          if (isSchemaPlaceholder) {
-            sendLog(
-              ws,
-              `[WARNING] Problem model file exists but intent.purpose is a schema placeholder: "${purpose}"; triggering repair.\n`,
-            );
-            problemModelParseable = false;
-          } else {
-            problemModelParseable = true;
+        const model = parsed as Record<string, unknown>;
+        const purposeState = materializeOperatorPurpose(model, currentPurpose);
+        if (!purposeState.ok) {
+          sendLog(
+            ws,
+            `[WARNING] Problem model file exists but intent.purpose is a schema placeholder: "${purposeState.rejected}"; triggering repair.\n`,
+          );
+          problemModelParseable = false;
+        } else {
+          let purposePersisted = true;
+          if (purposeState.changed) {
+            try {
+              fs.writeFileSync(problemModelPath, `${JSON.stringify(model, null, 2)}\n`);
+              sendLog(
+                ws,
+                `[INFO] Restored operator-owned intent.purpose before thinker handoff validation.\n`,
+              );
+            } catch (e) {
+              sendLog(
+                ws,
+                `[WARNING] Restored intent.purpose but failed to write ${problemModelPath}: ${String(e)}; triggering repair.\n`,
+              );
+              purposePersisted = false;
+            }
+          }
+          problemModelParseable = purposePersisted;
+          if (purposePersisted) {
             sendLog(ws, `[INFO] Problem model file exists on disk and is valid; skipping repair reopen.\n`);
           }
-        } else {
-          // Partial updates may omit intent — that's legitimate.
-          problemModelParseable = true;
-          sendLog(ws, `[INFO] Problem model file exists on disk and is valid; skipping repair reopen.\n`);
         }
       } else {
         sendLog(ws, `[WARNING] Problem model file exists but is not a valid object structure.\n`);
@@ -700,11 +748,18 @@ export async function runThinkerWithGate(
     try {
       const problemModelProbe = extractJsonObjectDetailed(analysisText, 'intent');
       if (problemModelProbe.ok) {
-        problemModelParseable = true;
-        try {
-          fs.writeFileSync(problemModelPath, `${JSON.stringify(problemModelProbe.value, null, 2)}\n`);
-        } catch (e) {
-          sendLog(ws, `[WARNING] Parsed strategic problem-model JSON but failed to write ${problemModelPath}: ${String(e)}\n`);
+        const probeValue = problemModelProbe.value;
+        const purposeState = materializeOperatorPurpose(probeValue, currentPurpose);
+        if (purposeState.ok) {
+          problemModelParseable = true;
+          try {
+            fs.writeFileSync(problemModelPath, `${JSON.stringify(probeValue, null, 2)}\n`);
+            if (purposeState.changed) {
+              sendLog(ws, `[INFO] Restored operator-owned intent.purpose in parsed thinker output.\n`);
+            }
+          } catch (e) {
+            sendLog(ws, `[WARNING] Parsed strategic problem-model JSON but failed to write ${problemModelPath}: ${String(e)}\n`);
+          }
         }
       }
     } catch {
@@ -753,7 +808,7 @@ export async function runThinkerWithGate(
         // Reject empty-string, '...', or a full XML/schema-tag value like
         // '<from analysis>'. A legitimate purpose starting with '<' but not
         // ending with '>' won't match the full-tag regex, so real values are safe.
-        const isSchemaPlaceholder = purpose === '' || purpose === '...' || /^<[^>]+>$/.test(purpose);
+        const isSchemaPlaceholder = realPurpose(purpose) == null;
         if (isSchemaPlaceholder) {
           return {
             ok: false,
@@ -892,40 +947,50 @@ export async function runThinkerWithGate(
         const intent = (finalModel as Record<string, unknown>).intent as Record<string, unknown> | undefined;
         // If intent is present, it must have a valid non-placeholder purpose.
         if (intent != null) {
-          const purpose = typeof intent.purpose === 'string' ? intent.purpose.trim() : '';
-          const isSchemaPlaceholder = purpose === '' || purpose === '...' || /^<[^>]+>$/.test(purpose);
-          if (isSchemaPlaceholder) {
-            // Auto-heal: if the model carries a non-empty user_purpose (the
-            // durable operator-set backstop), restore intent.purpose from it
-            // rather than failing.  The backend's _preserve_operator_intent
-            // applies the same fallback on write-back, but the thinker gate
-            // fires BEFORE the model ever reaches the backend — the heal here
-            // lets the strategic cycle complete when the durable model has a
-            // blank purpose (agent-writable, intentionally permitted) while
-            // user_purpose still holds the operator's real text.
-            const userPurpose = typeof intent.user_purpose === 'string' ? intent.user_purpose.trim() : '';
-            if (userPurpose && userPurpose !== '...' && !/^<[^>]+>$/.test(userPurpose)) {
-              intent.purpose = userPurpose;
-              if (intent.source == null) {
-                intent.source = { type: 'user_message', excerpt: userPurpose.slice(0, 120) };
-              }
+          const purposeState = materializeOperatorPurpose(
+            finalModel as Record<string, unknown>,
+            currentPurpose,
+          );
+          if (!purposeState.ok) {
+            const purpose = purposeState.rejected;
+            sendLog(
+              ws,
+              `\n[ERROR] Final problem_model file has invalid intent.purpose after all retry attempts: "${purpose}"\n`,
+            );
+            try {
+              await persistAndPostStatus(taskId, {
+                task_id: taskId,
+                status: 'FAILED',
+                artifact_type: 'ERROR_LOG',
+                logs: `Problem model validation failed: intent.purpose is a schema placeholder "${purpose}"`,
+                failure_category: 'strategic_thinker_artifacts_missing',
+              });
+            } catch (e) {
+              sendLog(ws, `[ERROR] Failed to post validation failure: ${String(e)}\n`);
+            }
+            return { ok: false };
+          }
+          if (purposeState.changed) {
+            if (intent.source == null && realPurpose(intent.user_purpose)) {
+              intent.source = { type: 'user_message', excerpt: purposeState.purpose.slice(0, 120) };
+            }
+            try {
+              fs.writeFileSync(problemModelPath, `${JSON.stringify(finalModel, null, 2)}\n`);
+              sendLog(
+                ws,
+                `\n[INFO] Restored operator-owned intent.purpose: "${purposeState.purpose.slice(0, 80)}"\n`,
+              );
+            } catch (writeErr) {
+              sendLog(
+                ws,
+                `\n[WARNING] Restored intent.purpose but failed to write file: ${String(writeErr)}\n`,
+              );
               try {
-                fs.writeFileSync(problemModelPath, `${JSON.stringify(finalModel, null, 2)}\n`);
-                sendLog(
-                  ws,
-                  `\n[INFO] Auto-healed blank intent.purpose from user_purpose: "${userPurpose.slice(0, 80)}"\n`,
-                );
-              } catch (writeErr) {
-                sendLog(
-                  ws,
-                  `\n[WARNING] Healed intent.purpose from user_purpose but failed to write file: ${String(writeErr)}\n`,
-                );
-                try {
-                  await persistAndPostStatus(taskId, {
+                await persistAndPostStatus(taskId, {
                     task_id: taskId,
                     status: 'FAILED',
                     artifact_type: 'ERROR_LOG',
-                    logs: `Problem model validation failed: intent.purpose is a schema placeholder "${purpose}"`,
+                  logs: 'Problem model validation failed: restored intent.purpose could not be persisted',
                     failure_category: 'strategic_thinker_artifacts_missing',
                   });
                 } catch (e) {
@@ -933,25 +998,7 @@ export async function runThinkerWithGate(
                 }
                 return { ok: false };
               }
-            } else {
-              sendLog(
-                ws,
-                `\n[ERROR] Final problem_model file has invalid intent.purpose after all retry attempts: "${purpose}"\n`,
-              );
-              try {
-                await persistAndPostStatus(taskId, {
-                  task_id: taskId,
-                  status: 'FAILED',
-                  artifact_type: 'ERROR_LOG',
-                  logs: `Problem model validation failed: intent.purpose is a schema placeholder "${purpose}"`,
-                  failure_category: 'strategic_thinker_artifacts_missing',
-                });
-              } catch (e) {
-                sendLog(ws, `[ERROR] Failed to post validation failure: ${String(e)}\n`);
-              }
-              return { ok: false };
             }
-          }
         }
       } else {
         sendLog(ws, `\n[ERROR] Final problem_model file is not a valid object structure.\n`);
