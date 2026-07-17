@@ -77,6 +77,7 @@ _REPLACEMENT_ATTEMPT_KEYS = frozenset(
         "review_wait_respawn_task_id",
         "review_wait_respawned",
         "review_wait_started",
+        "skip_rereview_minor_only",
         "test_coverage_result",
         "unverified_merge_reason",
         "update_branch_failures",
@@ -88,6 +89,44 @@ _REPLACEMENT_ATTEMPT_KEYS = frozenset(
         "verify_tests_verdict",
     }
 )
+
+_PR_CHAIN_STATE_KEYS = frozenset(
+    {
+        "base_branch",
+        "branch",
+        "churn_detections",
+        "drift_signal",
+        "fix_agent_responses",
+        "fix_reason",
+        "hotfix",
+        "issue_ledger",
+        "iteration",
+        "iteration_reset_at",
+        "iteration_reset_by",
+        "max_iterations",
+        "original_task_id",
+        "reviewer_model",
+        "scope_overflow_warned",
+    }
+)
+
+
+def reset_pr_attempt_state(review_loop: dict | None) -> dict:
+    """Retain only reviewed chain metadata across a concrete PR boundary.
+
+    This is intentionally an allowlist, not a list of known fields to delete:
+    every new/unknown CI, review, verifier, merge, retry, or clock field defaults
+    to attempt-scoped and is cleared.  The retained fields are the audited
+    chain-level convergence budget/provenance, branch coordinates, reviewer pin,
+    and issue/churn memory that must survive a replacement PR.
+
+    ``_REPLACEMENT_ATTEMPT_KEYS`` remains the explicit documentation and test
+    surface for today's known latches, while this default-deny copy prevents a
+    future latch from silently crossing attempts before that list is updated.
+    """
+
+    loop = dict(review_loop or {})
+    return {key: loop[key] for key in _PR_CHAIN_STATE_KEYS if key in loop}
 
 
 async def reconcile_closed_pr_replacement(
@@ -107,10 +146,9 @@ async def reconcile_closed_pr_replacement(
     sweep. Lookup uncertainty persists retry state and also returns ``True`` so
     an outage cannot terminalize work that may have a live replacement.
     """
-    closed_head = ((pr_data.get("head") or {}).get("ref") or "")
-    closed_base = (
-        ((pr_data.get("base") or {}).get("ref") or "")
-        or review_loop.get("base_branch", "")
+    closed_head = (pr_data.get("head") or {}).get("ref") or ""
+    closed_base = ((pr_data.get("base") or {}).get("ref") or "") or review_loop.get(
+        "base_branch", ""
     )
     if not closed_head or not closed_base:
         return False
@@ -185,15 +223,16 @@ async def reconcile_closed_pr_replacement(
     from app import pause_clock
     from app.ci_merge_helpers import arm_ci_wait
 
-    replacement_head = ((replacement_pr.get("head") or {}).get("sha") or "")
+    replacement_head = (replacement_pr.get("head") or {}).get("sha") or ""
     replacement_base = (
-        ((replacement_pr.get("base") or {}).get("ref") or "") or closed_base
-    )
-    for key in _REPLACEMENT_ATTEMPT_KEYS:
-        review_loop.pop(key, None)
+        (replacement_pr.get("base") or {}).get("ref") or ""
+    ) or closed_base
+    chain_loop = reset_pr_attempt_state(review_loop)
+    review_loop.clear()
+    review_loop.update(chain_loop)
     review_loop["branch"] = (
-        ((replacement_pr.get("head") or {}).get("ref") or "") or closed_head
-    )
+        (replacement_pr.get("head") or {}).get("ref") or ""
+    ) or closed_head
     arm_ci_wait(
         review_loop,
         pr_number=replacement_number,
@@ -220,8 +259,7 @@ async def reconcile_closed_pr_replacement(
     session.add(task)
     await session.commit()
     logger.info(
-        "[CI] rebound task %s from closed PR #%s to open "
-        "replacement PR #%s (%s -> %s)",
+        "[CI] rebound task %s from closed PR #%s to open replacement PR #%s (%s -> %s)",
         task.id,
         pr_number,
         replacement_number,

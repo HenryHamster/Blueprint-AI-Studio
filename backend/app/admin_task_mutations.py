@@ -322,6 +322,27 @@ async def _apply_status_mutation(
             detail=f"Cannot transition from terminal state {task.status} to {new_status} (only requeue or cancel is allowed)",
         )
 
+    prior_status = task.status
+    task_type = (task.first_payload).get("type", "")
+    if (
+        new_status == TaskStatus.QUEUED
+        and prior_status in _TERMINAL_STATUSES
+        and task_type in ("research", "plan")
+    ):
+        # A terminal rollup's PR identity and CI/review/verifier latches belong
+        # to the attempt that just ended. Reconcile them BEFORE changing status:
+        # the helper is terminal-only so active review progress cannot be reset.
+        from app.terminal_rollup_requeue import reconcile_terminal_rollup_requeue
+
+        reconciliation = await reconcile_terminal_rollup_requeue(task, session, payload)
+        changes["rollup_requeue_reconciliation"] = reconciliation
+        if reconciliation == "merged_pr_rearmed":
+            # The operator is requeueing a false terminal state after the
+            # tracked rollup already landed. Run the authoritative rollup
+            # classifier after commit instead of waiting for a sweep or ever
+            # entering fresh-PR creation.
+            changes["_check_merged_rollup_parent_now"] = True
+
     task.status = new_status
     changes["status"] = new_status.value
 
@@ -457,7 +478,6 @@ async def _apply_status_mutation(
         # failure_class) on its next dispatch. Safe no-op on never-blocked tasks.
         from app.task_blocked import reset_task_for_fresh_attempt
 
-        task_type = (task.first_payload).get("type", "")
         is_parent_type = task_type in ("research", "plan")
         from app.task_lifecycle import _requeue_parent_task
 
@@ -1215,6 +1235,9 @@ async def _commit_and_broadcast(
     _refresh_direction_after_merge = bool(
         changes.pop("_refresh_direction_after_merge", False)
     )
+    _check_merged_rollup_parent_now = bool(
+        changes.pop("_check_merged_rollup_parent_now", False)
+    )
 
     session.add(task)
     history = TaskHistory(
@@ -1257,7 +1280,35 @@ async def _commit_and_broadcast(
         and payload["context"].get("pr_merged")
     ):
         should_check_rollup = True
-    if should_check_rollup:
+    if _check_merged_rollup_parent_now:
+        # _check_and_trigger_rollup is intentionally child-driven: passing the
+        # parent is a no-op because parent_task_id is absent. Re-enter through a
+        # real completed child so the normal parent lock, merged-PR landing
+        # classifier, branch cleanup, and terminal broadcast all run now.
+        rollup_child = (
+            (
+                await session.execute(
+                    select(Task)
+                    .where(
+                        Task.parent_task_id == task.id,
+                        Task.status == TaskStatus.COMPLETED,
+                    )
+                    .order_by(Task.updated_at.desc())
+                    .limit(1)
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if rollup_child is not None:
+            await _check_and_trigger_rollup(rollup_child, session)
+        else:
+            logger.warning(
+                "[ADMIN] Already-merged rollup parent %s has no completed child "
+                "to drive authoritative convergence; leaving it for recovery",
+                task.id,
+            )
+    elif should_check_rollup:
         await _check_and_trigger_rollup(task, session)
 
 

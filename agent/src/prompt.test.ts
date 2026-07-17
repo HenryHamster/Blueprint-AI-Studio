@@ -4747,7 +4747,8 @@ describe('buildCodeChangeHelperGuidance', () => {
       directories: [{ path: 'web', type: 'node', test_cmd: 'vitest run' }],
     };
     const g2 = buildCodeChangeHelperGuidance({ buildConfig: nodeOnly, ...FOREIGN });
-    expect(g2).not.toContain('GATE-ENVIRONMENT');
+    expect(checkIntroOf(g2)).not.toContain('GATE-ENVIRONMENT');
+    expect(g2).toContain('GATE-ENVIRONMENT'); // shared all-code-change lifecycle rule
     sharedInvariants(g);
   });
 
@@ -5488,6 +5489,15 @@ describe('SHARED_LIFECYCLE_REMAINDER — byte size and category coverage', () =>
     for (const cat of CATEGORIES) {
       expect(SHARED_LIFECYCLE_REMAINDER).toContain(cat);
     }
+  });
+
+  it('publishes environment-limited code changes to authoritative CI without hiding real failures', () => {
+    expect(SHARED_LIFECYCLE_REMAINDER).toContain('GATE-ENVIRONMENT');
+    expect(SHARED_LIFECYCLE_REMAINDER).toContain('do NOT call `./blocked`');
+    expect(SHARED_LIFECYCLE_REMAINDER).toContain('`./pr open`');
+    expect(SHARED_LIFECYCLE_REMAINDER).toContain('`./done`');
+    expect(SHARED_LIFECYCLE_REMAINDER).toContain('A real');
+    expect(SHARED_LIFECYCLE_REMAINDER).toContain('test failure still blocks publication');
   });
 
   it('is under 4500 bytes', () => {
