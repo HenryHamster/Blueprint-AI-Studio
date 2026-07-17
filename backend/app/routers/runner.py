@@ -2941,6 +2941,25 @@ async def upload_compute_job_artifact(
     session.add(job)
     await session.commit()
 
+    # For the first late bundle upload on a terminal job, backfill the artifact
+    # linkage that the terminal transition missed because the bundle had not yet
+    # arrived. Without this call the job retains runner_artifact metadata but
+    # artifact_id / result_reference remain NULL, so the canvas loses the result
+    # once live preview synthesis stops on terminal status.
+    if job.status in _COMPUTE_JOB_TERMINAL_STATUSES and existing_artifact is None:
+        try:
+            from app.compute_jobs import _link_terminal_artifact
+
+            await _link_terminal_artifact(session, job)
+            await session.commit()
+        except Exception:
+            logger.warning(
+                "[RUNNERS] Late bundle linkage failed for terminal job %s — "
+                "artifact_id not backfilled",
+                job_id,
+                exc_info=True,
+            )
+
     return {"ok": True, "runner_artifact": artifact_info}
 
 

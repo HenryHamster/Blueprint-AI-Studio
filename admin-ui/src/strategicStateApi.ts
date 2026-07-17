@@ -350,7 +350,7 @@ export interface StrategicContextPackageDescriptor {
       pending_count?: number;
       oldest_pending_age_hours?: number | null;
     };
-    artifacts?: StrategicContextEvidenceCollection<StrategicContextArtifactEvidence>;
+    artifacts?: StrategicContextEvidenceCollection<StrategicContextArtifactEvidence> & { live_count?: number };
   } | null;
   descriptors?: StrategicContextRenderableDescriptor[];
   drilldowns?: StrategicContextPackageDrilldown[];

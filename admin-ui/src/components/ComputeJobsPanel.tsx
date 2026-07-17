@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Cpu, Square, AlertTriangle, Clock, ExternalLink, Package, FileText, LayoutGrid, CheckCircle, XCircle, BookOpen, Search, List } from 'lucide-react';
 import { analyzeComputeJob, askComputeJob, fetchAwaitingLocalRunnerHolds, fetchComputeJobsPaged, fetchComputeJobsAggregateSummary, fetchComputeSweepGroups, fetchHeldComputeExperiments, fetchKnowledgeDocument, killComputeJob, rerunComputeExperiment, type AwaitingLocalRunnerHold, type ComputeJob, type ComputeJobCommandLog, type ComputeJobLiveOutput, type ComputeJobsSummary, type ComputeSweepGroupsResponse, type ComputeSuccessOperator, type HeldComputeExperiment, type KnowledgeDocument } from '../api';
+import { ComputeArtifactGallery } from './ComputeArtifactGallery';
 import { type ComputeExperimentForm, defaultComputeExperimentForm } from '../hooks/useTaskModal';
 import { usePersistedState } from '../hooks/usePersistedState';
 import { usePoller } from '../hooks/usePoller';
@@ -10,7 +11,6 @@ import { ReleaseEvidenceChip } from './ReleaseEvidence';
 import { asLiveReleaseEvidence } from './ReleaseEvidence.utils';
 import { AcceptanceGradeBadge } from './AcceptanceGradeBadge';
 import { EvidenceTierBadge, MutableImageBadge } from './EvidenceTierBadge';
-import { ComputeArtifactGallery } from './ComputeArtifactGallery';
 import { formatComputeAnalysisCauseLabel } from '../utils/computeAnalysisLabels';
 import {
   isComputeJobActive,
@@ -2317,7 +2317,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                   </ResolvedReferenceLink>
                 </div>
               )}
-              <ComputeArtifactGallery projectId={projectId} job={job} testIdPrefix="compute" />
+              <ComputeArtifactGallery testIdPrefix="compute" projectId={projectId} job={job} />
               {(() => {
                 const metrics = job.polling_metadata?.result_metrics as Record<string, unknown> | undefined;
                 if (!metrics) return null;

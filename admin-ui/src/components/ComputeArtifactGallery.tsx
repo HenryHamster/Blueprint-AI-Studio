@@ -5,7 +5,7 @@ import { computeJobViewableArtifacts, fmtBytes } from './ComputeJobsPanel.utils'
 
 // Signed download URLs go stale; treat a resolved URL as fresh for slightly
 // under the backend's 60-min TTL so a full-size open re-resolves rather than
-// navigating to an expired link. Mirrors ComputeJobsPanel's inline gallery.
+// navigating to an expired link.
 const SIGNED_PREVIEW_FRESH_MS = 50 * 60 * 1000;
 
 type PreviewResolution =
@@ -13,7 +13,7 @@ type PreviewResolution =
   | { state: 'resolved'; url: string; resolvedAt: number }
   | { state: 'error' };
 
-const artifactCacheKey = (storageUri: string, revision: string | null) =>
+const artifactCacheKey = (storageUri: string, revision: string | null | undefined) =>
   revision ? `${storageUri}@${revision}` : storageUri;
 
 /** Self-contained viewable-artifact gallery for a single compute job. Owns its
@@ -21,15 +21,19 @@ const artifactCacheKey = (storageUri: string, revision: string | null) =>
  *  the operator expands the gallery, opens images full-size in a new tab, and
  *  re-resolves on click / media error once a signed URL goes stale.
  *
- *  This is the drawer-friendly extraction of ComputeJobsPanel's inline gallery:
- *  it renders nothing (returns null) when the job carries no viewable artifacts,
- *  so it is safe to drop into any per-job row. */
+ *  Used in both the task-detail drawer (testIdPrefix="drawer", the default) and
+ *  the compute-jobs panel (testIdPrefix="compute"). Returns null when the job
+ *  carries no viewable artifacts and no omission count, so it is safe to drop
+ *  into any per-job row. */
 export function ComputeArtifactGallery({
   projectId,
   job,
   testIdPrefix = 'drawer',
-}: { projectId: string; job: ComputeJob; testIdPrefix?: 'drawer' | 'compute' }) {
-  const testId = (suffix: string) => `${testIdPrefix}-${suffix}`;
+}: {
+  projectId: string | undefined | null;
+  job: ComputeJob;
+  testIdPrefix?: string;
+}) {
   const [expanded, setExpanded] = useState(false);
   const [previewUrls, setPreviewUrls] = useState<Record<string, PreviewResolution>>({});
   const previewRequestIds = useRef<Record<string, number>>({});
@@ -62,6 +66,12 @@ export function ComputeArtifactGallery({
     setPreviewUrls((prev) => ({ ...prev, [key]: { state: 'error' } }));
   }, []);
 
+  // Resolve pending non-PDF artifacts eagerly when the gallery is expanded, and
+  // whenever the artifact list changes (e.g. a new revision arrives via polling).
+  // Functional setPreviewUrls updates batch correctly so calling resolvePreviewUrl
+  // for multiple artifacts in the loop cannot cause an infinite re-render cycle:
+  // the first setPreviewUrls sets the key to { state: 'resolving' } (truthy),
+  // so the next effect execution skips it via !previewUrls[key].
   useEffect(() => {
     if (!expanded) return;
     const pending = artifacts.filter((art) => {
@@ -71,6 +81,7 @@ export function ComputeArtifactGallery({
     });
     if (pending.length === 0) return;
     for (const art of pending) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- resolvePreviewUrl immediately flips state to {state:'resolving'} (truthy), so !previewUrls[key] is false on re-render and the loop exits; cascading re-renders don't occur. setTimeout(0) was removed because it breaks vi.useFakeTimers() in panel tests.
       void resolvePreviewUrl(artifactCacheKey(art.storage_uri, art.revision), art.storage_uri);
     }
   }, [artifacts, expanded, previewUrls, resolvePreviewUrl]);
@@ -126,7 +137,7 @@ export function ComputeArtifactGallery({
     omissionCount > 0 ? (
       <div
         className="text-ui-xs text-amber-400/90 font-mono"
-        data-testid={testId('artifact-omitted-note')}
+        data-testid={`${testIdPrefix}-artifact-omitted-note`}
       >
         {`${omissionCount} file${omissionCount === 1 ? '' : 's'} omitted (${omissionDetail()})`}
       </div>
@@ -136,21 +147,21 @@ export function ComputeArtifactGallery({
   // note alone (no toggle, nothing to preview) rather than rendering nothing.
   if (artifacts.length === 0) {
     return (
-      <div className="mt-1.5" data-testid={testId('artifact-gallery')}>
+      <div className="mt-1.5" data-testid={`${testIdPrefix}-artifact-gallery`}>
         {omittedNote}
       </div>
     );
   }
 
   return (
-    <div className="mt-1.5" data-testid={testId('artifact-gallery')}>
+    <div className="mt-1.5" data-testid={`${testIdPrefix}-artifact-gallery`}>
       <div className="flex items-center gap-1.5 mb-0.5 text-ui-sm text-neutral-500 font-mono">
         <span>Artifacts</span>
         <button
           type="button"
           onClick={() => setExpanded((value) => !value)}
           className="min-h-[44px] rounded border border-neutral-700 bg-neutral-800 px-1 py-0.5 text-ui-xs text-sky-400 hover:text-sky-300"
-          data-testid={testId('artifact-gallery-toggle')}
+          data-testid={`${testIdPrefix}-artifact-gallery-toggle`}
         >
           {expanded ? 'Hide previews' : `Show previews (${artifacts.length})`}
         </button>
@@ -188,7 +199,7 @@ export function ComputeArtifactGallery({
                   disabled={resolution?.state === 'resolving'}
                   title={`Open ${art.name} in a new tab`}
                   className="flex h-24 w-32 flex-col items-center justify-center gap-1 rounded border border-neutral-800 bg-neutral-950 px-1 text-center text-ui-xs text-neutral-400 hover:border-sky-500/50 disabled:opacity-70"
-                  data-testid={testId('artifact-pdf')}
+                  data-testid={`${testIdPrefix}-artifact-pdf`}
                 >
                   <FileText className="h-8 w-8 text-sky-400" />
                   <span>
@@ -201,7 +212,7 @@ export function ComputeArtifactGallery({
                 </button>
               );
               return (
-                <div key={key} className="flex flex-col gap-0.5" data-testid={testId('viewable-artifact')}>
+                <div key={key} className="flex flex-col gap-0.5" data-testid={`${testIdPrefix}-viewable-artifact`}>
                   {artLiveBadge ? <div className="relative">{pdfBtn}{artLiveBadge}</div> : pdfBtn}
                   {caption}
                 </div>
@@ -215,7 +226,7 @@ export function ComputeArtifactGallery({
                   src={resolution.url}
                   onError={() => markPreviewError(key)}
                   className="h-24 max-w-[16rem] rounded border border-neutral-800 bg-neutral-950"
-                  data-testid={testId('artifact-video')}
+                  data-testid={`${testIdPrefix}-artifact-video`}
                 />
               ) : (
                 <button
@@ -223,7 +234,7 @@ export function ComputeArtifactGallery({
                   onClick={() => { void openPreviewFullSize(key, art.storage_uri); }}
                   title={`Open ${art.name} full-size in a new tab`}
                   className="rounded border border-neutral-800 bg-neutral-950 hover:border-sky-500/50"
-                  data-testid={testId('artifact-thumbnail')}
+                  data-testid={`${testIdPrefix}-artifact-thumbnail`}
                 >
                   <img
                     src={resolution.url}
@@ -235,7 +246,7 @@ export function ComputeArtifactGallery({
                 </button>
               );
               return (
-                <div key={key} className="flex flex-col gap-0.5" data-testid={testId('viewable-artifact')}>
+                <div key={key} className="flex flex-col gap-0.5" data-testid={`${testIdPrefix}-viewable-artifact`}>
                   {artLiveBadge ? <div className="relative">{mediaElem}{artLiveBadge}</div> : mediaElem}
                   {caption}
                 </div>
@@ -247,7 +258,7 @@ export function ComputeArtifactGallery({
                 onClick={() => { void resolvePreviewUrl(key, art.storage_uri); }}
                 disabled={resolution?.state === 'resolving'}
                 className="flex h-24 w-32 items-center justify-center rounded border border-neutral-800 bg-neutral-950 px-1 text-center text-ui-xs text-neutral-500 hover:border-sky-500/50 disabled:opacity-70"
-                data-testid={testId('artifact-placeholder')}
+                data-testid={`${testIdPrefix}-artifact-placeholder`}
               >
                 {resolution?.state === 'resolving'
                   ? 'resolving…'
@@ -257,7 +268,7 @@ export function ComputeArtifactGallery({
               </button>
             );
             return (
-              <div key={key} className="flex flex-col gap-0.5" data-testid={testId('viewable-artifact')}>
+              <div key={key} className="flex flex-col gap-0.5" data-testid={`${testIdPrefix}-viewable-artifact`}>
                 {artLiveBadge ? <div className="relative">{placeholderBtn}{artLiveBadge}</div> : placeholderBtn}
                 {caption}
               </div>

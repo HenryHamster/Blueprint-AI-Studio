@@ -6406,6 +6406,64 @@ class TestArtifactUploadEndpoint:
         assert job.polling_metadata["runner_artifact"]["file_count"] == 3
 
     @pytest.mark.asyncio
+    async def test_first_bundle_to_terminal_job_triggers_artifact_linkage(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """First bundle upload to a terminal job triggers _link_terminal_artifact.
+
+        When a runner reports terminal status first (the normal race window in
+        local_runner.py) and the monitor finalises the job before the bundle
+        arrives, the /artifact endpoint must call _link_terminal_artifact so that
+        artifact_id and result_reference are backfilled — otherwise the canvas
+        loses the result once live preview synthesis stops.
+        """
+        project, runner, token, job = await self._make_runner_job(db_session)
+        # Finalize the job before the bundle arrives (simulating the race).
+        job.status = ComputeJobStatus.SUCCEEDED
+        db_session.add(job)
+        await db_session.commit()
+
+        async def fake_store(session, j, archive_bytes, file_count, total_bytes):
+            return {
+                "kind": "runner_artifact",
+                "uri": "gs://bucket/compute-jobs/x/artifacts/bundle.tar.gz",
+                "file_count": file_count,
+                "total_bytes": total_bytes,
+                "stored": True,
+            }
+
+        monkeypatch.setattr(
+            compute_backends_mod, "store_runner_artifact", fake_store, raising=False
+        )
+
+        linkage_calls = []
+
+        async def fake_link(session, j):
+            linkage_calls.append(j.id)
+
+        # Patch via the module the runner endpoint imports at call time.
+        import app.compute_jobs as cj_mod
+
+        monkeypatch.setattr(cj_mod, "_link_terminal_artifact", fake_link)
+
+        body, content_type = _build_multipart(b"\x1f\x8b\x08gz", 3, 77)
+        resp = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact",
+            content=body,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": content_type,
+            },
+        )
+
+        assert resp.status_code == 200, resp.text
+        await db_session.refresh(job)
+        # The bundle metadata must be stamped.
+        assert job.polling_metadata["runner_artifact"]["stored"] is True
+        # _link_terminal_artifact must have been called to backfill artifact_id.
+        assert job.id in linkage_calls
+
+    @pytest.mark.asyncio
     async def test_upload_to_running_job_can_still_be_replaced(
         self, client: AsyncClient, db_session, monkeypatch
     ):

@@ -770,7 +770,7 @@ export function StrategicContextWorkspace({
   const tone = contextStatusTone(contextPackage?.status);
   const knowledgeEvidence = contextPackage?.evidence?.knowledge?.items ?? [];
   const artifactEvidence = contextPackage?.evidence?.artifacts?.items ?? [];
-  const artifactLiveCount: number = (contextPackage?.evidence?.artifacts as { live_count?: number } | undefined)?.live_count ?? 0;
+  const artifactLiveCount: number = contextPackage?.evidence?.artifacts?.live_count ?? 0;
   const sessionMode = normalizeStrategicInteractionMode(workbenchState?.interaction_mode ?? workSession?.mode);
   const localRunner = state?.runtime?.local_runner ?? null;
   const runtimeWork = state?.runtime?.work ?? null;
