@@ -2401,6 +2401,10 @@ class ComputeExperimentTaskPayload(BaseModel):
     # positive, a stalled job that writes no progress to BLUEPRINT_PROGRESS_FILE
     # within this many seconds is torn down early with reason `no_progress_timeout`.
     no_progress_timeout_seconds: int | None = None
+    # Cross-job checkpoint resume: rehydrate a prior job's durable artifact bundle
+    # into this job's workspace before the command runs. Must be a valid UUID string
+    # referencing a completed compute job with a durable artifact.
+    input_artifact_job_id: str | None = None
     # Optional pin to a specific enrolled runner (soft preference by default;
     # strict=true dispatches only to that runner and holds with an explicit
     # reason while it is ineligible). Validated against the project's enrolled
@@ -3375,6 +3379,7 @@ async def create_compute_experiment_task(
         "container_registry_auth",
         "setup_step",
         "no_progress_timeout_seconds",
+        "input_artifact_job_id",
     ):
         val = getattr(payload, opt_key)
         if val is not None:
@@ -3487,6 +3492,7 @@ async def create_compute_experiment_task(
                 "container_registry_auth",
                 "setup_step",
                 "no_progress_timeout_seconds",
+                "input_artifact_job_id",
                 "runner_target",
             )
             if launch_contract.get(k) is not None

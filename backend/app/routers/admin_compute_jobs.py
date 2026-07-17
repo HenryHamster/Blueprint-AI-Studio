@@ -343,6 +343,9 @@ async def _build_compute_job_payload(
                 "deadline_seconds": int(raw_deadline) if raw_deadline is not None else None,
                 "require_live_release": bool(fp.get("require_live_release")) if fp.get("require_live_release") is not None else None,
                 "require_durable_artifact": bool(fp.get("require_durable_artifact")) if fp.get("require_durable_artifact") is not None else None,
+                "setup_step": fp.get("setup_step") or None,
+                "no_progress_timeout_seconds": int(fp["no_progress_timeout_seconds"]) if fp.get("no_progress_timeout_seconds") is not None else None,
+                "input_artifact_job_id": fp.get("input_artifact_job_id") or None,
             }
         data["task_title"] = title
         data["task_type"] = task_type
