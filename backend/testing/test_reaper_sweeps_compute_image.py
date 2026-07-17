@@ -1956,3 +1956,546 @@ def test_migration_head_matches_expected_schema_revision():
     assert heads[0] == EXPECTED_SCHEMA_REVISION, (
         f"Alembic head '{heads[0]}' != EXPECTED_SCHEMA_REVISION '{EXPECTED_SCHEMA_REVISION}'"
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Off-orchestrator image builder (DARK) — poll sweep state machine + backend
+#
+# Driver: app.reaper_sweeps.sweep_poll_image_builds
+# Backend: app.compute_backends.GcpEphemeralVmImageBuilderBackend
+#
+# All VM/serial/registry I/O is injected so the state transitions
+# (success/timeout/failed/still-building) are exercised with zero cloud calls.
+# ══════════════════════════════════════════════════════════════════════════════
+
+from app import compute as _compute  # noqa: E402
+from app.models import ComputeImageBuildStatus, ProjectComputeImageBuild  # noqa: E402
+from app.reaper_sweeps import sweep_poll_image_builds  # noqa: E402
+
+
+async def _add_build(
+    db: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    status: ComputeImageBuildStatus = ComputeImageBuildStatus.BUILDING,
+    builder_vm_id: str = "img-build-abc123",
+    zone: str | None = "us-central1-a",
+    deadline_at: datetime | None = None,
+    dep_hash: str = "deadbeefcafef00d",
+) -> ProjectComputeImageBuild:
+    build = ProjectComputeImageBuild(
+        project_id=project_id,
+        dep_hash=dep_hash,
+        registry_repo=_REGISTRY_REPO,
+        image_name=_IMAGE_NAME,
+        builder_vm_id=builder_vm_id,
+        zone=zone,
+        status=status,
+        deadline_at=deadline_at,
+    )
+    db.add(build)
+    await db.commit()
+    await db.refresh(build)
+    return build
+
+
+class _FakeImageBuilderBackend:
+    """Injectable stand-in for the GCE image-builder backend (no cloud I/O)."""
+
+    def __init__(self, poll_result=None, *, poll_raises=None, abort_ok=True):
+        self._poll_result = poll_result
+        self._poll_raises = poll_raises
+        self.abort_ok = abort_ok
+        self.polled: list = []
+        self.aborted: list = []
+
+    async def poll(self, build):
+        self.polled.append(build.id)
+        if self._poll_raises is not None:
+            raise self._poll_raises
+        return self._poll_result
+
+    async def abort(self, build, *, reason):
+        self.aborted.append((build.id, reason))
+        return self.abort_ok
+
+
+async def _record_build_row(session, project_id, registry_repo, image_name, result):
+    """SQLite-safe stand-in for record_project_compute_image_build (PG upsert)."""
+    row = ProjectComputeImage(
+        project_id=project_id,
+        image_name=image_name,
+        registry_repo=registry_repo,
+        dep_hash=getattr(result, "dep_hash", "") or "",
+        tag=getattr(result, "tag", "") or "",
+        pinned_ref=getattr(result, "pinned_ref", "") or "",
+        digest=_cb._parse_digest_from_pinned_ref(getattr(result, "pinned_ref", "") or ""),
+        built=bool(getattr(result, "built", False)),
+    )
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    return row
+
+
+# ── Poll sweep: SUCCEEDED transition ──────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_poll_sweep_success_records_pin_and_reaps(db):
+    """A SUCCEEDED build records its digest-pinned image and reaps the VM."""
+    project = await _make_project(db)
+    build = await _add_build(
+        db, project.id, deadline_at=_NOW + timedelta(minutes=30)
+    )
+    from app.compute_backends import ImageBuildStatusResult
+
+    pinned = f"{_FULL_REPO}@{_DIGEST_A}"
+    backend = _FakeImageBuilderBackend(
+        ImageBuildStatusResult(
+            status=ComputeImageBuildStatus.SUCCEEDED,
+            exit_code=0,
+            result={
+                "pinned_ref": pinned,
+                "tag": build.dep_hash,
+                "dep_hash": build.dep_hash,
+                "already_present": False,
+                "built": True,
+                "digest": _DIGEST_A,
+            },
+            reason="completed",
+        )
+    )
+
+    result = await sweep_poll_image_builds(
+        db, now=_NOW, _backend=backend, _record_fn=_record_build_row
+    )
+
+    assert result["succeeded"] == 1
+    assert result["failed"] == 0
+    assert result["timed_out"] == 0
+    await db.refresh(build)
+    assert build.status == ComputeImageBuildStatus.SUCCEEDED
+    assert build.result_json is not None
+    assert _DIGEST_A in build.result_json
+    # The VM was reaped after the terminal transition.
+    assert backend.aborted and backend.aborted[0][0] == build.id
+    # The pin was upserted.
+    rows = (await db.execute(select(ProjectComputeImage))).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].digest == _DIGEST_A
+
+
+@pytest.mark.asyncio
+async def test_poll_sweep_success_preserves_stored_digest_when_result_digestless(db):
+    """A digest-less SUCCEEDED result must NOT NULL an already-stored pin.
+
+    Exercises the shared digest-preservation guard the inline build path uses.
+    """
+    project = await _make_project(db)
+    dep_hash = "abc123abc123abc1"
+    stored_digest = "sha256:" + "e" * 64
+    db.add(
+        ProjectComputeImage(
+            project_id=project.id,
+            image_name=_IMAGE_NAME,
+            registry_repo=_REGISTRY_REPO,
+            dep_hash=dep_hash,
+            tag=dep_hash,
+            pinned_ref=f"{_FULL_REPO}@{stored_digest}",
+            digest=stored_digest,
+            built=True,
+        )
+    )
+    await db.commit()
+    build = await _add_build(
+        db, project.id, dep_hash=dep_hash, deadline_at=_NOW + timedelta(minutes=30)
+    )
+    from app.compute_backends import ImageBuildStatusResult
+
+    # A tag-only (digest-less) build result from a briefly-unreachable registry.
+    backend = _FakeImageBuilderBackend(
+        ImageBuildStatusResult(
+            status=ComputeImageBuildStatus.SUCCEEDED,
+            exit_code=0,
+            result={
+                "pinned_ref": f"{_FULL_REPO}:{dep_hash}",
+                "tag": dep_hash,
+                "dep_hash": dep_hash,
+                "already_present": True,
+                "built": False,
+                "digest": None,
+            },
+        )
+    )
+
+    captured: list = []
+
+    async def _record_capture(session, project_id, registry_repo, image_name, result):
+        # Emulate the production UPSERT on (project_id, dep_hash): the guard
+        # already ran, so a row for this dep_hash exists — update it in place
+        # (a plain INSERT would trip the unique constraint, as PG's ON CONFLICT
+        # handles for real).
+        captured.append(result)
+        existing = (
+            await session.execute(
+                select(ProjectComputeImage).where(
+                    ProjectComputeImage.project_id == project_id,
+                    ProjectComputeImage.dep_hash == getattr(result, "dep_hash", ""),
+                )
+            )
+        ).scalars().one()
+        existing.pinned_ref = result.pinned_ref
+        existing.digest = _cb._parse_digest_from_pinned_ref(result.pinned_ref)
+        existing.built = bool(getattr(result, "built", False))
+        session.add(existing)
+        await session.commit()
+        await session.refresh(existing)
+        return existing
+
+    result = await sweep_poll_image_builds(
+        db, now=_NOW, _backend=backend, _record_fn=_record_capture
+    )
+
+    assert result["succeeded"] == 1
+    # The guard swapped the digest-less result for the stored digested pin.
+    assert captured and captured[0].digest == stored_digest
+    assert build.result_json and stored_digest in build.result_json
+    # The stored digest survived — it was NOT NULLed by the digest-less result.
+    row = (
+        await db.execute(
+            select(ProjectComputeImage).where(
+                ProjectComputeImage.dep_hash == dep_hash
+            )
+        )
+    ).scalars().one()
+    assert row.digest == stored_digest
+
+
+# ── Poll sweep: TIMED_OUT transition ──────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_poll_sweep_past_deadline_times_out_without_polling(db):
+    """A build past its deadline is reaped and TIMED_OUT; poll is never consulted."""
+    project = await _make_project(db)
+    build = await _add_build(
+        db, project.id, deadline_at=_NOW - timedelta(minutes=5)
+    )
+    # poll() would raise if consulted — the deadline branch must short-circuit.
+    backend = _FakeImageBuilderBackend(poll_raises=AssertionError("must not poll"))
+
+    result = await sweep_poll_image_builds(
+        db, now=_NOW, _backend=backend, _record_fn=_record_build_row
+    )
+
+    assert result["timed_out"] == 1
+    assert result["errors"] == 0
+    assert backend.polled == [], "poll must not be consulted past the deadline"
+    await db.refresh(build)
+    assert build.status == ComputeImageBuildStatus.TIMED_OUT
+    assert build.error_reason and "deadline" in build.error_reason
+    assert backend.aborted and backend.aborted[0][0] == build.id
+
+
+# ── Poll sweep: FAILED + still-BUILDING transitions ───────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_poll_sweep_failed_marks_failed_and_reaps(db):
+    """A FAILED poll marks the row FAILED with the reason and reaps the VM."""
+    project = await _make_project(db)
+    build = await _add_build(
+        db, project.id, deadline_at=_NOW + timedelta(minutes=30)
+    )
+    from app.compute_backends import ImageBuildStatusResult
+
+    backend = _FakeImageBuilderBackend(
+        ImageBuildStatusResult(
+            status=ComputeImageBuildStatus.FAILED,
+            exit_code=3,
+            reason="build_failed_exit_3",
+        )
+    )
+
+    result = await sweep_poll_image_builds(
+        db, now=_NOW, _backend=backend, _record_fn=_record_build_row
+    )
+
+    assert result["failed"] == 1
+    await db.refresh(build)
+    assert build.status == ComputeImageBuildStatus.FAILED
+    assert build.error_reason == "build_failed_exit_3"
+    assert backend.aborted and backend.aborted[0][0] == build.id
+    # No pin recorded for a failed build.
+    rows = (await db.execute(select(ProjectComputeImage))).scalars().all()
+    assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_poll_sweep_still_building_leaves_row_untouched(db):
+    """A still-BUILDING poll leaves the row BUILDING and reaps nothing."""
+    project = await _make_project(db)
+    build = await _add_build(
+        db, project.id, deadline_at=_NOW + timedelta(minutes=30)
+    )
+    from app.compute_backends import ImageBuildStatusResult
+
+    backend = _FakeImageBuilderBackend(
+        ImageBuildStatusResult(status=ComputeImageBuildStatus.BUILDING)
+    )
+
+    result = await sweep_poll_image_builds(
+        db, now=_NOW, _backend=backend, _record_fn=_record_build_row
+    )
+
+    assert result["still_building"] == 1
+    assert result["succeeded"] == 0
+    await db.refresh(build)
+    assert build.status == ComputeImageBuildStatus.BUILDING
+    assert backend.aborted == [], "a running build must not be reaped"
+
+
+@pytest.mark.asyncio
+async def test_poll_sweep_only_visits_building_rows(db):
+    """PENDING/SUCCEEDED/FAILED rows are excluded from the poll query."""
+    project = await _make_project(db)
+    await _add_build(
+        db, project.id, status=ComputeImageBuildStatus.PENDING,
+        deadline_at=_NOW + timedelta(minutes=30),
+    )
+    await _add_build(
+        db, project.id, status=ComputeImageBuildStatus.SUCCEEDED,
+        deadline_at=_NOW + timedelta(minutes=30),
+    )
+    backend = _FakeImageBuilderBackend(poll_raises=AssertionError("no building rows"))
+
+    result = await sweep_poll_image_builds(
+        db, now=_NOW, _backend=backend, _record_fn=_record_build_row
+    )
+
+    assert result["polled"] == 0
+    assert backend.polled == []
+
+
+@pytest.mark.asyncio
+async def test_poll_sweep_isolates_per_row_failure(db):
+    """A raised poll for one row is isolated as an error, never aborts the sweep."""
+    project = await _make_project(db)
+    await _add_build(db, project.id, deadline_at=_NOW + timedelta(minutes=30))
+    backend = _FakeImageBuilderBackend(poll_raises=RuntimeError("registry down"))
+
+    result = await sweep_poll_image_builds(
+        db, now=_NOW, _backend=backend, _record_fn=_record_build_row
+    )
+
+    assert result["errors"] == 1
+    assert result["succeeded"] == 0
+
+
+# ── Serial-marker parsing ─────────────────────────────────────────────────────
+
+
+def test_parse_image_build_serial_succeeded():
+    """A SUCCEEDED marker with a base64 RESULT_JSON decodes to a result dict."""
+    import base64 as _b64
+    import json as _json
+    from app.compute_backends import _parse_image_build_serial
+
+    payload = {"pinned_ref": f"{_FULL_REPO}@{_DIGEST_A}", "digest": _DIGEST_A, "built": True}
+    b64 = _b64.b64encode(_json.dumps(payload).encode()).decode()
+    serial = (
+        "some boot noise\n"
+        f"BLUEPRINT_BUILD_RESULT={b64}\n"
+        "BLUEPRINT_BUILD_STATUS=SUCCEEDED\n"
+        "BLUEPRINT_BUILD_EXIT=0\n"
+    )
+    parsed = _parse_image_build_serial(serial)
+    assert parsed is not None
+    assert parsed.status == ComputeImageBuildStatus.SUCCEEDED
+    assert parsed.exit_code == 0
+    assert parsed.result["digest"] == _DIGEST_A
+
+
+def test_parse_image_build_serial_failed():
+    """A FAILED marker yields a FAILED result with the exit code."""
+    from app.compute_backends import _parse_image_build_serial
+
+    serial = "BLUEPRINT_BUILD_STATUS=FAILED\nBLUEPRINT_BUILD_EXIT=3\n"
+    parsed = _parse_image_build_serial(serial)
+    assert parsed is not None
+    assert parsed.status == ComputeImageBuildStatus.FAILED
+    assert parsed.exit_code == 3
+
+
+def test_parse_image_build_serial_no_marker_is_none():
+    """No status marker (build still running) parses to None."""
+    from app.compute_backends import _parse_image_build_serial
+
+    assert _parse_image_build_serial("still building...\nnothing here\n") is None
+
+
+def test_decode_build_result_tolerates_garbage():
+    """A garbled/oversized RESULT payload is treated as absent, never raises."""
+    from app.compute_backends import _decode_build_result
+
+    assert _decode_build_result(None) is None
+    assert _decode_build_result("not-base64!!!") is None
+    assert _decode_build_result("") is None
+
+
+# ── Deterministic VM name + config flag ───────────────────────────────────────
+
+
+def test_image_builder_vm_name_is_deterministic_and_dns_safe():
+    """The builder VM name is a stable, DNS-safe function of (project, dep_hash)."""
+    import re as _re
+    from app.compute_backends import _image_builder_vm_name
+
+    pid = uuid.uuid4()
+    name1 = _image_builder_vm_name(pid, "deadbeef")
+    name2 = _image_builder_vm_name(pid, "deadbeef")
+    assert name1 == name2, "same (project, dep_hash) must adopt the same VM"
+    # Different dep_hash => different VM.
+    assert name1 != _image_builder_vm_name(pid, "cafef00d")
+    # Different project, same dep_hash => different VM.
+    assert name1 != _image_builder_vm_name(uuid.uuid4(), "deadbeef")
+    # DNS-safe GCE instance name, <= 63 chars.
+    assert _re.fullmatch(r"[a-z]([-a-z0-9]*[a-z0-9])?", name1)
+    assert len(name1) <= 63
+
+
+def test_image_builder_backend_disabled_by_default(monkeypatch):
+    """The builder ships dark: enabled only when the env flag is truthy."""
+    from app.compute_backends import image_builder_backend_enabled
+
+    monkeypatch.delenv("COMPUTE_IMAGE_BUILDER_BACKEND_ENABLED", raising=False)
+    assert image_builder_backend_enabled() is False
+    monkeypatch.setenv("COMPUTE_IMAGE_BUILDER_BACKEND_ENABLED", "true")
+    assert image_builder_backend_enabled() is True
+    monkeypatch.setenv("COMPUTE_IMAGE_BUILDER_BACKEND_ENABLED", "false")
+    assert image_builder_backend_enabled() is False
+
+
+# ── Backend.start: leaf SA + deterministic adoption ───────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_backend_start_attaches_leaf_image_builder_sa(monkeypatch):
+    """start() provisions under the leaf image-builder SA, never the agent SA."""
+    from app.compute_backends import (
+        GcpEphemeralVmImageBuilderBackend,
+        ImageBuildRequest,
+    )
+
+    request = ImageBuildRequest(
+        build_id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        dep_hash="deadbeefcafef00d",
+        registry_repo="us-docker.pkg.dev/proj/compute-images",
+        image_name="widget-compute",
+        repo_clone={"owner": "acme", "repo": "demo", "ref": "main"},
+        repo_token="ghs_token",
+    )
+
+    captured: dict = {}
+
+    async def _fake_provision(vm_instance_id, **kwargs):
+        captured["vm_instance_id"] = vm_instance_id
+        captured.update(kwargs)
+        return True
+
+    monkeypatch.setattr(_compute, "find_vm_zone", lambda name: None)
+    monkeypatch.setattr(_compute, "get_vm_zone", lambda name: "us-central1-a")
+    monkeypatch.setattr(_compute, "provision_ephemeral_vm", _fake_provision)
+
+    async def _fake_signed_url(build_id, *, expires_at=None):
+        return "https://storage.example.com/put?sig=abc"
+
+    monkeypatch.setattr(
+        _cb.storage,
+        "generate_compute_job_artifact_upload_signed_url",
+        _fake_signed_url,
+    )
+
+    backend = GcpEphemeralVmImageBuilderBackend()
+    handle = await backend.start(request)
+
+    assert (
+        captured["service_account_email"]
+        == _compute.IMAGE_BUILDER_SERVICE_ACCOUNT_EMAIL
+    )
+    assert captured["service_account_email"] != _compute.AGENT_SERVICE_ACCOUNT_EMAIL
+    # The startup script lays down the TRUSTED build tool (base64) and invokes it
+    # — the --network=none confinement + credential scan live inside that tool.
+    script = captured["startup_script"]
+    assert "base64 -d > /tmp/blueprint_build_tool.py" in script
+    assert "python3 /tmp/blueprint_build_tool.py --repo-dir" in script
+    assert "BLUEPRINT_BUILD_STATUS=" in script
+    assert handle.zone == "us-central1-a"
+    assert handle.external_id == captured["vm_instance_id"]
+
+
+@pytest.mark.asyncio
+async def test_backend_start_adopts_existing_vm(monkeypatch):
+    """A re-trigger for an in-flight dep-hash VM adopts it instead of provisioning."""
+    from app.compute_backends import (
+        GcpEphemeralVmImageBuilderBackend,
+        ImageBuildRequest,
+    )
+
+    request = ImageBuildRequest(
+        build_id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        dep_hash="deadbeefcafef00d",
+        registry_repo="us-docker.pkg.dev/proj/compute-images",
+        image_name="widget-compute",
+        repo_clone={"owner": "acme", "repo": "demo", "ref": "main"},
+        repo_token="ghs_token",
+    )
+
+    monkeypatch.setattr(_compute, "find_vm_zone", lambda name: "us-central1-b")
+    monkeypatch.setattr(
+        _compute, "get_vm_created_at", lambda name, zone: _NOW
+    )
+
+    def _no_provision(*a, **k):
+        raise AssertionError("must not provision when adopting an in-flight VM")
+
+    monkeypatch.setattr(_compute, "provision_ephemeral_vm", _no_provision)
+
+    backend = GcpEphemeralVmImageBuilderBackend()
+    handle = await backend.start(request)
+
+    assert handle.zone == "us-central1-b"
+    assert "adopt" in (handle.message or "").lower()
+
+
+# ── compute.provision_ephemeral_vm forwards the leaf SA to _provision_gcp ──────
+
+
+@pytest.mark.asyncio
+async def test_provision_ephemeral_vm_forwards_service_account_email(monkeypatch):
+    """provision_ephemeral_vm threads service_account_email to _provision_gcp."""
+    captured: dict = {}
+
+    async def _fake_provision_gcp(vm_instance_id, task_id, **kwargs):
+        captured["vm_instance_id"] = vm_instance_id
+        captured.update(kwargs)
+        return True
+
+    monkeypatch.setattr(_compute, "LOCAL_MODE", False)
+    monkeypatch.setattr(_compute, "_ensure_image_family_valid", lambda: None)
+    monkeypatch.setattr(_compute, "_provision_gcp", _fake_provision_gcp)
+
+    ok = await _compute.provision_ephemeral_vm(
+        "img-build-test",
+        startup_script="#!/bin/bash\ntrue\n",
+        machine_type="e2-standard-4",
+        service_account_email="image-builder-sa@proj.iam.gserviceaccount.com",
+    )
+    assert ok is True
+    assert (
+        captured["service_account_email"]
+        == "image-builder-sa@proj.iam.gserviceaccount.com"
+    )
