@@ -22321,7 +22321,7 @@ async def test_gcp_vm_viewable_upload_rejects_terminal_job(
 async def test_gcp_vm_viewable_upload_rejects_unsupported_type(
     client, db_session, monkeypatch
 ):
-    """POST .../viewable with an unsupported extension (.svg) returns 422."""
+    """POST .../viewable with an unsupported extension (.html) returns 422."""
     monkeypatch.setattr(compute, "LOCAL_MODE", True)
     monkeypatch.setattr(storage, "upload_compute_job_viewable_file", AsyncMock())
     monkeypatch.setattr(storage, "delete_compute_job_viewable_file", AsyncMock())
@@ -22345,7 +22345,7 @@ async def test_gcp_vm_viewable_upload_rejects_unsupported_type(
     job.status = ComputeJobStatus.RUNNING
     await db_session.commit()
     token = compute_backends_module.compute_job_heartbeat_secret(job.id)
-    body, ct = _build_viewable_multipart_body(b"<svg></svg>", "diagram.svg")
+    body, ct = _build_viewable_multipart_body(b"<html><body>hi</body></html>", "page.html")
     resp = await client.post(
         f"/api/agent/compute-jobs/{job.id}/viewable",
         content=body,
@@ -22761,7 +22761,7 @@ async def test_viewable_pipeline_roundtrips_images_and_videos(db_session, monkey
             "./screen.jpeg": jpg_data,
             "./anim.webp": b"RIFF" + b"\x00" * 100,
             "./icon.gif": b"GIF89a" + b"\x00" * 50,
-            # SVG is EXCLUDED fail-closed (script execution via signed URL).
+            # SVG is sanitized server-side and now viewable.
             "./diagram.svg": b"<svg></svg>",
             "./output.mp4": mp4_data,
             "./clip.webm": b"\x1aE\xdf\xa3" + b"\x00" * 100,
@@ -22781,14 +22781,14 @@ async def test_viewable_pipeline_roundtrips_images_and_videos(db_session, monkey
     )
     await db_session.commit()
 
-    # 8 viewable files (SVG excluded fail-closed), uploaded ONCE each.
-    assert len(manifest) == 8
+    # 9 viewable files (SVG now viewable — sanitized before upload), uploaded ONCE each.
+    assert len(manifest) == 9
     assert dropped == 0
-    assert len(calls["uploads"]) == 8
+    assert len(calls["uploads"]) == 9
     assert calls["downloads"] == 1, "the bundle must be downloaded exactly once"
 
     rows = await _job_files(db_session, job.id)
-    assert len(rows) == 8
+    assert len(rows) == 9
 
     by_name = {r.safe_relpath: r for r in rows}
     assert by_name["plot.png"].media_type == "image"
@@ -22797,11 +22797,10 @@ async def test_viewable_pipeline_roundtrips_images_and_videos(db_session, monkey
     assert by_name["output.mp4"].content_type == "video/mp4"
     assert by_name["report.pdf"].media_type == "pdf"
     assert by_name["report.pdf"].content_type == "application/pdf"
-
-    # SVG must NOT be persisted as a signable/viewable file — excluded fail-closed
-    # on BOTH surfaces (script-execution risk when served from a signed URL).
-    assert "diagram.svg" not in by_name
-    assert not any(e["filename"] == "diagram.svg" for e in manifest)
+    # SVG is now persisted as kind=image (script-stripped before upload).
+    assert by_name["diagram.svg"].media_type == "image"
+    assert by_name["diagram.svg"].content_type == "image/svg+xml"
+    assert any(e["filename"] == "diagram.svg" for e in manifest)
 
     # Non-viewable files must NOT appear.
     for skipped in ("terminal.json", "command.log", "script.py", "results.txt"):
@@ -22816,16 +22815,14 @@ async def test_viewable_pipeline_roundtrips_images_and_videos(db_session, monkey
 
     # The manifest is stamped on the job for the admin UI / strategic context.
     meta = job.polling_metadata or {}
-    assert meta.get("viewable_file_count") == 8
-    assert len(meta.get("viewable_files") or []) == 8
+    assert meta.get("viewable_file_count") == 9
+    assert len(meta.get("viewable_files") or []) == 9
 
 
 @pytest.mark.asyncio
 async def test_pdf_is_viewable_artifact_kind(db_session, monkeypatch):
-    """A .pdf plot a compute job writes into $BLUEPRINT_ARTIFACT_DIR is persisted
-    as an individually-addressable, signable object carrying the NEW `kind`/
-    `media_type` value ``pdf`` — end to end from storage classifier through the
-    persistence pipeline and manifest — while SVG stays excluded fail-closed."""
+    """A .pdf plot persisted as kind='pdf' and an .svg as kind='image' (sanitized)
+    — end to end from storage classifier through the persistence pipeline."""
     # 1) The storage classifier maps .pdf to (application/pdf, "pdf") on BOTH
     #    viewable surfaces, and the MIME->kind mapper agrees.
     assert storage.viewable_content_type_for_filename("figure.pdf") == (
@@ -22835,16 +22832,20 @@ async def test_pdf_is_viewable_artifact_kind(db_session, monkeypatch):
     assert "pdf" in storage._VIEWABLE_CONTENT_TYPES
     assert ".pdf" in storage.VIEWABLE_COMPUTE_JOB_EXTENSIONS
     assert storage._media_kind_for_mime("application/pdf") == "pdf"
-    # SVG must remain excluded from both surfaces — pdf is added alongside it.
-    assert storage.svg_is_viewable() is False
+    # SVG is now also accepted on both surfaces (sanitized before upload).
+    assert storage.svg_is_viewable() is True
+    assert storage.viewable_content_type_for_filename("figure.svg") == (
+        "image/svg+xml",
+        "image",
+    )
 
-    # 2) A bundle containing a .pdf (alongside an excluded .svg) yields a manifest
-    #    entry + ComputeJobFile row with kind/media_type "pdf".
+    # 2) A bundle containing a .pdf (alongside a .svg) yields manifest
+    #    entries + ComputeJobFile rows for both.
     job = await _create_bundle_compute_job(db_session)
     bundle = _make_viewable_tar_bundle(
         {
             "./savefig.pdf": b"%PDF-1.5\n" + b"\x00" * 200,
-            "./diagram.svg": b"<svg></svg>",  # excluded fail-closed
+            "./diagram.svg": b"<svg><rect width='10' height='10'/></svg>",
         }
     )
     calls = _mock_viewable_storage(monkeypatch, bundle)
@@ -22855,22 +22856,22 @@ async def test_pdf_is_viewable_artifact_kind(db_session, monkeypatch):
     await db_session.commit()
 
     assert dropped == 0
-    assert len(manifest) == 1
-    pdf_entry = manifest[0]
-    assert pdf_entry["filename"] == "savefig.pdf"
+    assert len(manifest) == 2
+    by_name = {e["filename"]: e for e in manifest}
+    pdf_entry = by_name["savefig.pdf"]
     assert pdf_entry["kind"] == "pdf"
     assert pdf_entry["content_type"] == "application/pdf"
-    assert len(calls["uploads"]) == 1
+    svg_entry = by_name["diagram.svg"]
+    assert svg_entry["kind"] == "image"
+    assert svg_entry["content_type"] == "image/svg+xml"
+    assert len(calls["uploads"]) == 2
 
     rows = await _job_files(db_session, job.id)
-    assert len(rows) == 1
-    assert rows[0].safe_relpath == "savefig.pdf"
-    assert rows[0].media_type == "pdf"
-    assert rows[0].content_type == "application/pdf"
-
-    # SVG was NOT persisted on either surface.
-    assert not any(e["filename"] == "diagram.svg" for e in manifest)
-    assert not any(r.safe_relpath == "diagram.svg" for r in rows)
+    assert len(rows) == 2
+    row_by_name = {r.safe_relpath: r for r in rows}
+    assert row_by_name["savefig.pdf"].media_type == "pdf"
+    assert row_by_name["diagram.svg"].media_type == "image"
+    assert row_by_name["diagram.svg"].content_type == "image/svg+xml"
 
 
 @pytest.mark.asyncio

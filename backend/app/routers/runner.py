@@ -3184,7 +3184,7 @@ async def upload_compute_job_viewable(
             raise HTTPException(
                 status_code=422,
                 detail=f"file type not viewable: {raw_filename!r} — "
-                f"supported: png/jpg/jpeg/webp/gif/mp4/webm/pdf",
+                f"supported: png/jpg/jpeg/webp/gif/mp4/webm/pdf/svg",
             )
         content_type, kind = type_info
 

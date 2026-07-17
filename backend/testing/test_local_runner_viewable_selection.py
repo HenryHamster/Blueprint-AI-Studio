@@ -55,7 +55,7 @@ class TestViewableSelectionPolicy:
             "rollout.mp4",
             "clip.webm",
             "report.pdf",
-            "chart.svg",  # EXCLUDED by design: script execution via signed URL
+            "chart.svg",  # SVG is now viewable (sanitized before upload)
             "index.html",
             "results.json",
             "noext",
@@ -74,8 +74,11 @@ class TestViewableSelectionPolicy:
             "rollout.mp4": "video",
             "clip.webm": "video",
             "report.pdf": "pdf",
+            "chart.svg": "image",
         }
-        assert "chart.svg" not in by_name
+        assert "index.html" not in by_name
+        assert "results.json" not in by_name
+        assert "noext" not in by_name
 
     def test_empty_zero_byte_and_missing_dir(self, tmp_path):
         assert _collect_viewable_candidates_from_dir("") == ([], 0, 0)
@@ -355,7 +358,8 @@ def _run_stream(artifact_dir, state, *, upload_return=200):
 class TestRunnerViewableScan:
     """The runner's inlined scan mirrors the server allowlist/kinds/symlink policy."""
 
-    def test_scan_classifies_allowlist_and_excludes_svg(self, tmp_path):
+    def test_scan_classifies_allowlist_including_svg(self, tmp_path):
+        """SVG is now included in the viewable allowlist (sanitized server-side)."""
         art = tmp_path / "artifacts"
         art.mkdir()
         for name in (
@@ -367,7 +371,7 @@ class TestRunnerViewableScan:
             "rollout.mp4",
             "clip.webm",
             "report.pdf",
-            "chart.svg",  # EXCLUDED by design (script-bearing SVG is an XSS vector)
+            "chart.svg",
             "index.html",
             "results.json",
             "noext",
@@ -383,8 +387,11 @@ class TestRunnerViewableScan:
             "rollout.mp4": "video",
             "clip.webm": "video",
             "report.pdf": "pdf",
+            "chart.svg": "image",
         }
-        assert "chart.svg" not in by_name
+        assert "index.html" not in by_name
+        assert "results.json" not in by_name
+        assert "noext" not in by_name
 
     def test_scan_content_types(self, tmp_path):
         art = tmp_path / "artifacts"

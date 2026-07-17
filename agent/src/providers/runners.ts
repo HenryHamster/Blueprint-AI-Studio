@@ -2011,6 +2011,7 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
           lastResultText = `${lastResultText}${text}`.trim();
           statusRef.value = trimmed.slice(0, 100);
           modelOutputSeen = true;  // run report: text-mode providers have no event schema
+          recordToolUse('model_output', trimmed.slice(0, 200));
         }
       }
     });

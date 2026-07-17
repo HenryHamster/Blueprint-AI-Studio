@@ -3150,9 +3150,9 @@ async def test_list_compute_jobs_task_id_bypasses_time_window(
     assert scoped_body["summary"]["total_jobs"] == 1
 
 
-def test_viewable_artifacts_descriptor_preserves_pdf_kind():
-    """The operator-facing manifest normalizer preserves the pdf kind alongside
-    image/video, and still coerces an unknown/unsafe kind (e.g. svg) to None."""
+def test_viewable_artifacts_descriptor_preserves_pdf_and_svg_kinds():
+    """The operator-facing manifest normalizer preserves pdf, image (incl. SVG),
+    and video kinds, and coerces truly-unknown kinds to None."""
     from app.routers.admin_compute_jobs import _viewable_artifacts_descriptor
 
     out = _viewable_artifacts_descriptor(
@@ -3178,7 +3178,14 @@ def test_viewable_artifacts_descriptor_preserves_pdf_kind():
                 "storage_uri": "gs://bucket/compute-jobs/j/artifacts/viewable/diagram.svg",
                 "content_type": "image/svg+xml",
                 "size_bytes": 64,
-                "kind": "svg",
+                "kind": "image",  # SVG maps to kind="image" via _VIEWABLE_CONTENT_TYPES
+            },
+            {
+                "filename": "unknown.xyz",
+                "storage_uri": "gs://bucket/compute-jobs/j/artifacts/viewable/unknown.xyz",
+                "content_type": "application/octet-stream",
+                "size_bytes": 32,
+                "kind": "xyz",  # unrecognised kind is coerced to None fail-closed
             },
         ]
     )
@@ -3189,5 +3196,8 @@ def test_viewable_artifacts_descriptor_preserves_pdf_kind():
     assert by_name["report.pdf"]["live"] is False
     assert by_name["plot.png"]["kind"] == "image"
     assert by_name["plot.png"]["revision"] is None
-    # An svg (or any non-allowlisted kind) is coerced to None fail-closed.
-    assert by_name["diagram.svg"]["kind"] is None
+    # SVG persisted as kind="image" passes through as "image".
+    assert by_name["diagram.svg"]["kind"] == "image"
+    assert by_name["diagram.svg"]["content_type"] == "image/svg+xml"
+    # A truly unrecognised kind is coerced to None fail-closed.
+    assert by_name["unknown.xyz"]["kind"] is None

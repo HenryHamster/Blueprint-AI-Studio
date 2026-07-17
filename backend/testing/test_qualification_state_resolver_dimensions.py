@@ -275,6 +275,27 @@ def test_env_preflight_boot_prereq_missing_blocker_is_failed():
     assert d["env_preflight"]["reason"] == "boot_prereq_missing"
 
 
+def test_env_preflight_boot_prereq_evidence_missing_blocker_is_failed():
+    # The boot_prereq_evidence_missing blocker maps to the env_preflight dimension.
+    qual = {
+        "status": "not_promoted",
+        "blocker": "boot_prereq_evidence_missing",
+        "sub_scores": {
+            "audit": 0.9, "test_erosion": 0.85, "smoketest": 0.8,
+            "env_preflight": 0.0,
+        },
+        "ci_resolution": {"state": "green"},
+        "migration_safety": "ok",
+        "migration_apply_safety": "ok",
+        "smoketest_enabled": True,
+        "env_preflight_enabled": True,
+    }
+    result = resolve_dimension_states(qual)
+    d = _by_key(result)
+    assert d["env_preflight"]["status"] == "failed"
+    assert d["env_preflight"]["reason"] == "boot_prereq_evidence_missing"
+
+
 def test_env_preflight_enabled_no_manifest_is_unavailable():
     # Enabled but no env_preflight sub_score (candidate declared no manifest) →
     # unavailable, never a spurious block.
