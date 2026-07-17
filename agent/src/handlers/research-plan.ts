@@ -896,11 +896,16 @@ ${playbookKeys.length > 0 ? `Playbook entries available (use \`./playbook get <k
   // cloud normally).
   let localRunnerNote = '';
   const localRunnerStatus = payload.local_runner_status as
-    { ever_registered?: boolean; active_total?: number; active_gpu?: number; devices?: Array<Record<string, unknown>> } | undefined;
+    { ever_registered?: boolean; active_total?: number; active_gpu?: number; baked_image_ref?: string; devices?: Array<Record<string, unknown>> } | undefined;
   if (localRunnerStatus && typeof localRunnerStatus === 'object' && !Array.isArray(localRunnerStatus)) {
+    const bakedRef = typeof localRunnerStatus.baked_image_ref === 'string' && localRunnerStatus.baked_image_ref
+      ? localRunnerStatus.baked_image_ref : null;
+    if (bakedRef) {
+      localRunnerNote += `\n    Project-baked compute image: \`${bakedRef}\`. PREFER to omit \`container_image\` in compute_experiments — the platform defaults to this digest-pinned image. Only set \`container_image\` explicitly for a DIFFERENT stack the baked image does not cover.`;
+    }
     const activeGpu = typeof localRunnerStatus.active_gpu === 'number' ? localRunnerStatus.active_gpu : 0;
     if (activeGpu > 0) {
-      localRunnerNote = `\n    Local GPU available: ${activeGpu} live GPU-capable runner(s) registered for this project. GPU compute_experiments will run on operator-owned hardware (free) rather than billable cloud GPU — prefer authoring GPU experiments now while a runner is live.`;
+      localRunnerNote += `\n    Local GPU available: ${activeGpu} live GPU-capable runner(s) registered for this project. GPU compute_experiments will run on operator-owned hardware (free) rather than billable cloud GPU — prefer authoring GPU experiments now while a runner is live.`;
       // Bounded per-device summary (when the backend advertises it) so authored
       // experiments are sized to the hardware that will actually run them.
       const devices: unknown[] = Array.isArray(localRunnerStatus.devices) ? localRunnerStatus.devices : [];
@@ -921,7 +926,7 @@ ${playbookKeys.length > 0 ? `Playbook entries available (use \`./playbook get <k
         localRunnerNote += ` Devices: ${deviceBits.join('; ')}. Size any GPU experiment to fit the listed VRAM and only use container_image on a device with a container runtime.`;
       }
     } else if (localRunnerStatus.ever_registered) {
-      localRunnerNote = `\n    This project relies on operator-owned local GPU hardware which is CURRENTLY OFFLINE (0 live GPU runners). Do NOT author GPU compute_experiment findings right now — with no live runner they fall back to BILLABLE cloud GPU. Defer GPU experiments until a runner is live (or author CPU-only work).`;
+      localRunnerNote += `\n    This project relies on operator-owned local GPU hardware which is CURRENTLY OFFLINE (0 live GPU runners). Do NOT author GPU compute_experiment findings right now — with no live runner they fall back to BILLABLE cloud GPU. Defer GPU experiments until a runner is live (or author CPU-only work).`;
     }
   }
 

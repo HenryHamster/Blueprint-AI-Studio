@@ -3869,6 +3869,28 @@ class TestGpuDetection(unittest.TestCase):
 # ── Docker login helper ───────────────────────────────────────────────────────
 
 class TestDockerLogin(unittest.TestCase):
+    def test_docker_login_runtime_selection(self):
+        """Private registry auth uses podman when docker CLI is unavailable."""
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            result = MagicMock(returncode=0, stderr=b"")
+            return result
+
+        with patch.object(
+            local_runner.shutil,
+            "which",
+            side_effect=lambda name: "/usr/bin/podman" if name == "podman" else None,
+        ):
+            result = local_runner._docker_login(
+                {"server": "registry.example.com", "username": "u", "password": "pw"},
+                _subprocess_run=fake_run,
+            )
+
+        self.assertTrue(result)
+        self.assertEqual(captured["cmd"][0:2], ["podman", "login"])
+
     def test_docker_login_called_when_auth_has_password(self):
         """_docker_login calls subprocess.run with docker login args when password present."""
         captured = {}
@@ -9351,6 +9373,7 @@ class TestProgressTail(unittest.TestCase):
         finally:
             os.unlink(path)
 
+
     def test_valid_record_appears_in_snapshot(self):
         with tempfile.NamedTemporaryFile(
             mode="w", suffix=".jsonl", delete=False, encoding="utf-8"
@@ -9432,5 +9455,3 @@ class TestProgressTail(unittest.TestCase):
             self.assertEqual(result["count"], 1)
         finally:
             os.unlink(path)
-
-

@@ -19767,6 +19767,82 @@ async def test_resolve_digest_pin_does_not_warn_when_pinned(db_session, caplog):
 
 
 # ---------------------------------------------------------------------------
+# _load_baked_image_ref: surface project-baked compute image ref for agent context.
+#
+# The strategic spawning pipeline merges baked_image_ref into local_runner_status
+# so authoring agents can prefer the project image over a raw NGC URI.  These
+# tests cover the query helper directly:
+#   - no rows → None
+#   - built=True row with pinned_ref → returns pinned_ref
+#   - built=False row ignored
+#   - returns most recent when multiple rows exist
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_dispatch_defaults_project_image(db_session):
+    """_load_baked_image_ref returns the most recent built digest-pinned ref,
+    so the strategic spawner can merge it into local_runner_status and agents
+    default compute_experiments to the project-baked image."""
+    from app.models import ProjectComputeImage
+    from app.strategic_local_runner import _load_baked_image_ref
+
+    project = await _make_project(db_session, name="Baked Image Context Proj")
+
+    # No rows → None (project has not been built yet).
+    assert await _load_baked_image_ref(db_session, project.id) is None
+
+    pinned = "ghcr.io/org/compute-proj@sha256:" + "e" * 64
+    db_session.add(
+        ProjectComputeImage(
+            project_id=project.id,
+            image_name="compute-proj",
+            registry_repo="ghcr.io/org",
+            dep_hash="dep1",
+            tag="latest",
+            pinned_ref=pinned,
+            digest="sha256:" + "e" * 64,
+            built=True,
+        )
+    )
+    await db_session.commit()
+
+    # Single built row → pinned_ref returned.
+    assert await _load_baked_image_ref(db_session, project.id) == pinned
+
+    # An unbuilt row (built=False) for the same project must be ignored.
+    db_session.add(
+        ProjectComputeImage(
+            project_id=project.id,
+            image_name="compute-proj",
+            registry_repo="ghcr.io/org",
+            dep_hash="dep2-unbuilt",
+            tag="latest",
+            pinned_ref="ghcr.io/org/compute-proj@sha256:" + "f" * 64,
+            digest="sha256:" + "f" * 64,
+            built=False,
+        )
+    )
+    await db_session.commit()
+    assert await _load_baked_image_ref(db_session, project.id) == pinned
+
+    # A newer built row supersedes the older one (ordered by updated_at DESC).
+    newer_pinned = "ghcr.io/org/compute-proj@sha256:" + "a" * 64
+    db_session.add(
+        ProjectComputeImage(
+            project_id=project.id,
+            image_name="compute-proj",
+            registry_repo="ghcr.io/org",
+            dep_hash="dep3-newer",
+            tag="latest",
+            pinned_ref=newer_pinned,
+            digest="sha256:" + "a" * 64,
+            built=True,
+        )
+    )
+    await db_session.commit()
+    assert await _load_baked_image_ref(db_session, project.id) == newer_pinned
+
+
+# ---------------------------------------------------------------------------
 # _stamp_container_image_pin_status: durable per-payload reproducibility flag.
 # ---------------------------------------------------------------------------
 def test_stamp_container_image_pin_status_mutable():
@@ -24259,3 +24335,144 @@ def test_no_blocking_time_sleep_in_async_functions():
         "Blocking time.sleep() found inside async function(s) in compute.py "
         f"(use await asyncio.sleep instead): {offenders}"
     )
+
+
+# ---------------------------------------------------------------------------
+# test_compute_image_registry_iam — validates that compute-image operations
+# target the correct Artifact Registry repo and construct the gcloud/docker
+# commands that require the artifactregistry.writer / artifactregistry.reader
+# IAM bindings (infra/terraform/workload_identity.tf).
+# ---------------------------------------------------------------------------
+
+
+def test_compute_image_registry_iam(monkeypatch, tmp_path):
+    """The compute-image flow targets Artifact Registry with the correct commands
+    for tag existence checks, image push, and protection tag management — the
+    operations gated by artifactregistry.writer and artifactregistry.reader IAM
+    bindings on the compute-images repo."""
+    from app import compute_backends as cb
+    from app import compute_image_build as cib
+    from app import storage
+
+    # Create a minimal repo dir with a Dockerfile so build_and_push can read it.
+    dockerfile_dir = tmp_path / "repo"
+    dockerfile_dir.mkdir()
+    (dockerfile_dir / ".blueprint").mkdir()
+    (dockerfile_dir / ".blueprint" / "Dockerfile.compute").write_text("FROM scratch\nCOPY . /\n")
+
+    # Configure an Artifact Registry repo (mirrors prod resolution).
+    monkeypatch.delenv("COMPUTE_IMAGE_REGISTRY", raising=False)
+    monkeypatch.delenv("COMPUTE_IMAGE_REGION", raising=False)
+    monkeypatch.setattr(storage, "GCP_PROJECT_ID", "my-gcp-proj")
+    ar_repo = cb.resolve_compute_image_registry_repo()
+    assert ar_repo == "us-docker.pkg.dev/my-gcp-proj/compute-images"
+    assert "docker.pkg.dev" in ar_repo  # Valid AR host.
+
+    commands_run = []
+
+    def _capture_run(cmd, **kw):
+        commands_run.append(cmd)
+
+        class _OkProc:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        return _OkProc()
+
+    # ── registry_tag_exists — docker manifest inspect against AR ──────────────
+    # This is the first read operation against the AR repo (requires reader).
+    cib.registry_tag_exists(ar_repo, "test-tag", _run=_capture_run)
+    assert any(
+        "docker" in c and "manifest" in c and "inspect" in c
+        for c in commands_run
+    ), "Expected docker manifest inspect for AR tag existence check"
+    assert any(
+        ar_repo in str(c) for c in commands_run
+    ), f"Expected docker manifest inspect to target AR repo {ar_repo}"
+    commands_run.clear()
+
+    # ── build_and_push (fast-path: tag exists) — docker manifest inspect ──────
+    # Simulates the fast path where the dependency-hash tag already exists.
+    # The orchestrator checks the AR repo via docker manifest inspect (reader).
+    result = cib.build_and_push(
+        repo_dir=str(dockerfile_dir),
+        registry_repo=ar_repo,
+        image_name="my-project",
+        dockerfile=".blueprint/Dockerfile.compute",
+        dep_files=[],
+        _run=_capture_run,
+        _tag_exists=lambda *a, **k: True,
+        _scan_layers_fn=lambda *a, **k: [],
+    )
+    assert result.already_present is True
+    assert ar_repo in result.pinned_ref
+    commands_run.clear()
+
+    # ── build_and_push (full path: build + push) — docker push to AR ──────────
+    # Simulates the full build+push path. The orchestrator pushes to the AR
+    # repo, which requires artifactregistry.writer on compute_images_repo.
+    result = cib.build_and_push(
+        repo_dir=str(dockerfile_dir),
+        registry_repo=ar_repo,
+        image_name="my-project",
+        dockerfile=".blueprint/Dockerfile.compute",
+        dep_files=[],
+        _run=_capture_run,
+        _tag_exists=lambda *a, **k: False,
+        _scan_layers_fn=lambda *a, **k: [],
+        # Bypass credential scan and network assertions for unit test.
+        _assert_network_fn=lambda *a, **k: None,
+    )
+    assert result.built is True
+    assert ar_repo in result.pinned_ref
+    push_cmds = [c for c in commands_run if "push" in c]
+    assert any(
+        ar_repo in str(c) for c in push_cmds
+    ), f"Expected docker push to target AR repo {ar_repo}, got {push_cmds}"
+    commands_run.clear()
+
+    # ── apply_registry_protection_tag — gcloud artifacts docker tags add ──────
+    # Tag management requires artifactregistry.writer on the AR repo.
+    digest = "sha256:" + "a" * 64
+    tag = cib.apply_registry_protection_tag(ar_repo, digest, _run=_capture_run)
+    assert tag is not None
+    assert tag.startswith("inuse-")
+    add_cmds = [
+        c for c in commands_run
+        if "gcloud" in str(c) and "artifacts" in str(c) and "tags" in str(c) and "add" in str(c)
+    ]
+    assert len(add_cmds) >= 1, "Expected gcloud artifacts docker tags add command"
+    assert any(
+        ar_repo in str(c) for c in add_cmds
+    ), f"Expected tags add to target AR repo {ar_repo}"
+    commands_run.clear()
+
+    # ── list_registry_protection_tags — gcloud artifacts docker tags list ─────
+    # Listing tags requires artifactregistry.reader (or writer) on the AR repo.
+    listed = cib.list_registry_protection_tags(ar_repo, _run=_capture_run)
+    assert listed == []
+    list_cmds = [
+        c for c in commands_run
+        if "gcloud" in str(c) and "artifacts" in str(c) and "tags" in str(c) and "list" in str(c)
+    ]
+    assert len(list_cmds) >= 1, "Expected gcloud artifacts docker tags list command"
+    assert any(
+        ar_repo in str(c) for c in list_cmds
+    ), f"Expected tags list to target AR repo {ar_repo}"
+    commands_run.clear()
+
+    # ── delete_registry_protection_tag — gcloud artifacts docker tags delete ──
+    # Deleting tags requires artifactregistry.writer on the AR repo.
+    deleted = cib.delete_registry_protection_tag(
+        ar_repo, "inuse-aaaaaaaaaaaaaaaa", _run=_capture_run
+    )
+    assert deleted is True
+    delete_cmds = [
+        c for c in commands_run
+        if "gcloud" in str(c) and "artifacts" in str(c) and "tags" in str(c) and "delete" in str(c)
+    ]
+    assert len(delete_cmds) >= 1, "Expected gcloud artifacts docker tags delete command"
+    assert any(
+        ar_repo in str(c) for c in delete_cmds
+    ), f"Expected tags delete to target AR repo {ar_repo}"

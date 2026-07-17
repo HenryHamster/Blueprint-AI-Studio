@@ -3724,7 +3724,7 @@ def _derive_registry_host(container_image: str | None) -> str:
 
 
 def _docker_login(auth: dict, container_image: str | None = None, *, _subprocess_run=None) -> bool:
-    """Run `docker login` using the credentials in *auth*.
+    """Run the available container runtime's login using credentials in *auth*.
 
     Returns True on success, False on any failure (non-zero exit, missing
     required fields, subprocess error).  Auth must contain at least a
@@ -3750,7 +3750,14 @@ def _docker_login(auth: dict, container_image: str | None = None, *, _subprocess
     username = auth.get("username") or ""
     _run = _subprocess_run if _subprocess_run is not None else subprocess.run
 
-    cmd = ["docker", "login", "--password-stdin"]
+    runtime = (
+        "docker" if shutil.which("docker") else "podman" if shutil.which("podman") else None
+    )
+    if runtime is None:
+        print("[compute] container runtime login unavailable (docker/podman not installed)", flush=True)
+        return False
+
+    cmd = [runtime, "login", "--password-stdin"]
     if username:
         cmd += ["--username", username]
     if server:
