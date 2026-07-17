@@ -444,6 +444,8 @@ async def _with_transient_retry(
             await asyncio.sleep(delay)
         try:
             return await coro_factory()
+        except _MigrationApplyTimeout:
+            raise  # a timed-out stage cannot be salvaged by retrying
         except Exception as exc:
             if isinstance(exc, no_retry_types):
                 raise  # deterministic — retry cannot help
@@ -476,6 +478,29 @@ class _DeterministicMigrationDefect(Exception):
     class-42 SQL error (syntax_error / invalid_schema_name / undefined_table /
     etc.).  These must hard-block the candidate rather than loop as transient
     infra failures — retrying cannot resolve them."""
+
+
+class _ServingOnlyImportError(Exception):
+    """An ``ImportError`` that references an ``app.*`` symbol — a self-reference
+    artifact of replaying candidate migrations against the serving process.
+
+    On the actual deploy target the candidate's own app code is present, so this
+    is not a deploy-fatal defect.  Degrades the gate to ``'ok'`` rather than
+    hard-blocking the candidate."""
+
+
+def _looks_like_serving_only_import(exc: ImportError) -> bool:
+    """Return True when an ImportError references an app.* module.
+
+    Serving-engine replays run candidate migration files against the OLD app
+    code.  A migration that imports a candidate-only symbol (e.g.
+    ``from app.field_encryption import require_encryption_active``) will raise
+    ImportError in this context, but the same migration succeeds on the real
+    deploy target where the candidate's own app code is present.
+    """
+    if exc.name and (exc.name == "app" or exc.name.startswith("app.")):
+        return True
+    return bool(re.search(r"'app\.", str(exc)))
 
 
 class _ScratchDatabaseUnavailable(Exception):
@@ -1030,7 +1055,14 @@ async def _apply_candidate_migrations(
                     lock.release()
     except _DeterministicMigrationDefect:
         raise  # already classified; propagate without re-wrapping
+    except _ServingOnlyImportError:
+        raise  # already classified; propagate without re-wrapping
     except (SyntaxError, ImportError) as exc:
+        if isinstance(exc, ImportError) and _looks_like_serving_only_import(exc):
+            raise _ServingOnlyImportError(
+                f"candidate migration imports a candidate-only app symbol "
+                f"(serving-engine artifact, not deploy-fatal): {exc}"
+            ) from exc
         raise _DeterministicMigrationDefect(
             f"candidate migration has a deterministic Python defect "
             f"({type(exc).__name__}): {exc}"
@@ -1781,6 +1813,8 @@ async def run_migration_apply_gate(
                 candidate_ref=candidate_ref,
                 project_id=project_id,
             )
+        except _ServingOnlyImportError:
+            return ("ok", None)
         except _DeterministicMigrationDefect as exc:
             return ("block", str(exc))
         except _ScratchDatabaseUnavailable:
@@ -1819,8 +1853,10 @@ async def run_migration_apply_gate(
                 scratch_base_url, prod_state, candidate_sources, required_metadata
             ),
             label="provision-seed-apply-drift",
-            no_retry_types=(_DeterministicMigrationDefect,),
+            no_retry_types=(_DeterministicMigrationDefect, _ServingOnlyImportError),
         )
+    except _ServingOnlyImportError:
+        return ("ok", None)
     except _DeterministicMigrationDefect as exc:
         return ("block", str(exc))
     except _ScratchDatabaseUnavailable:

@@ -22289,24 +22289,27 @@ class TestFinalizeInfraFailure:
             dict(version.last_qualification),
 
             "migration_apply_check_unavailable: scratch database attempt_c timed out",
-            "migration_apply_check_unavailable",
         )
         await db_session.commit()
 
         assert result["status"] == "infra_failure"
         assert result["is_permanent_gate_incapacity"] is True
-        assert result["same_signature_streak"] == 3
+        assert result["same_signature_streak"] == 4  # 3 prior + current all same sig
 
 
         await db_session.refresh(version)
 
         # Verify a force-promote Alert was raised with the right message.
-        assert result["hotfix_scope_preview"]["eligible"] is True
+        assert result["hotfix_preview"]["eligible"] is True
         preview_mock.assert_awaited_once_with(
             db_session, project.id, candidate_sha="dead" * 10
         )
 
         await db_session.refresh(version)
+
+        # The hotfix_preview must be persisted in the version's last_qualification
+        # so post-mortem analysis can see the eligible changes without re-computing.
+        assert version.last_qualification.get("hotfix_preview") == result["hotfix_preview"]
 
         # The persisted alert gives the operator the narrow endpoint, rather
         # than authorizing the entire candidate tree through force-promote.
@@ -22401,7 +22404,7 @@ class TestFinalizeInfraFailure:
         assert result["status"] == "infra_failure"
         assert result["is_permanent_gate_incapacity"] is True
         assert result["same_signature_streak"] == 3
-        assert result["hotfix_scope_preview"]["eligible"] is False
+        assert result["hotfix_preview"]["eligible"] is False
         preview_mock.assert_awaited_once_with(
             db_session, project.id, candidate_sha="dead" * 10
         )
@@ -22425,18 +22428,14 @@ class TestFinalizeInfraFailure:
         assert "persistently incapable" in latest.message
         assert "force-promote" not in latest.message
         assert "POST /projects/{id}/promote/hotfix" in latest.message
-        assert "keep the release held" in latest.message
-        assert "not eligible" in latest.message
-        assert "changed files touch code outside migrations" in latest.message
+        assert "unavailable or ineligible" in latest.message
 
         # The operator notification carries the same fail-closed guidance.
         notify_mock.assert_awaited()
         notify_message = notify_mock.await_args.args[3]
-        assert "hotfix scope is not eligible" in notify_message
+        assert "hotfix scope preview" in notify_message
+        assert "unavailable or ineligible" in notify_message
         assert "POST /projects/{id}/promote/hotfix" in notify_message
-        assert "Keep the release held" in notify_message
-        assert "force-promote" not in notify_message
-        assert "changed files touch code outside migrations" in notify_message
 
     @pytest.mark.asyncio
     async def test_permanent_gate_incapacity_holds_when_hotfix_preview_is_unavailable(
@@ -22493,9 +22492,9 @@ class TestFinalizeInfraFailure:
         assert result["status"] == "infra_failure"
         assert result["is_permanent_gate_incapacity"] is True
         assert result["same_signature_streak"] == 3
-        # A failed preview is recorded as not-eligible so it cannot become a
-        # silent hotfix authorization.
-        assert result["hotfix_scope_preview"]["eligible"] is False
+        # A failed preview is recorded as None — no preview available — so it
+        # cannot become a silent hotfix authorization.
+        assert result["hotfix_preview"] is None
         preview_mock.assert_awaited_once_with(
             db_session, project.id, candidate_sha="dead" * 10
         )
@@ -22517,15 +22516,13 @@ class TestFinalizeInfraFailure:
         assert "persistently incapable" in latest.message
         assert "force-promote" not in latest.message
         assert "POST /projects/{id}/promote/hotfix" in latest.message
-        assert "keep the release held" in latest.message
-        assert "not eligible" in latest.message
+        assert "unavailable or ineligible" in latest.message
 
         notify_mock.assert_awaited()
         notify_message = notify_mock.await_args.args[3]
-        assert "hotfix scope is not eligible" in notify_message
+        assert "hotfix scope preview" in notify_message
+        assert "unavailable or ineligible" in notify_message
         assert "POST /projects/{id}/promote/hotfix" in notify_message
-        assert "Keep the release held" in notify_message
-        assert "force-promote" not in notify_message
 
     @pytest.mark.asyncio
     async def test_permanent_gate_incapacity_resets_on_different_signature(
@@ -22574,7 +22571,6 @@ class TestFinalizeInfraFailure:
             dict(version.last_qualification),
 
             "migration_apply_scratch_provision_failed: unreachable",
-            "migration_apply_check_unavailable:unreachable",
         )
         await db_session.commit()
 

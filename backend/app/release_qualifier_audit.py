@@ -966,9 +966,6 @@ async def _handle_infra_failure(
         "attempt": attempt_entry,
         "attempt_history": attempt_history,
     }
-    hotfix_preview: dict[str, Any] | None = None
-    if hotfix_preview is not None:
-        infra_evidence["hotfix_preview"] = hotfix_preview
 
     # Per-dimension failure isolation (Phase 1): infer WHICH dimension the infra
     # failure belongs to so only that (candidate_sha, dimension) ledger fact is
@@ -1004,8 +1001,6 @@ async def _handle_infra_failure(
         "audit_challenge_spawn_error": qual.get("audit_challenge_spawn_error"),
         "smoketest_task_id": qual.get("smoketest_task_id"),
     }
-    if hotfix_preview is not None:
-        record["hotfix_preview"] = hotfix_preview
     version.last_qualification = record
     flag_modified(version, "last_qualification")
     release_version.set_version_phase(
@@ -1041,12 +1036,13 @@ async def _handle_infra_failure(
         else None
     )
 
+    hotfix_preview: dict[str, Any] | None = None
     if is_permanent_gate_incapacity:
         # Make the sanctioned remediation concrete at the point incapacity is
         # declared.  This is read-only and deliberately best-effort: inability
         # to preview must not turn a held release into a promotion.
         try:
-            hotfix_preview = await _release_qualifier_module().check_hotfix_preview(
+            hotfix_preview = await _release_qualifier_module().check_hotfix_scope_preview(
                 session, version.project_id, candidate_sha=qual.get("candidate_sha")
             )
         except Exception:  # noqa: BLE001 — remediation guidance is best-effort
@@ -1055,6 +1051,12 @@ async def _handle_infra_failure(
                 version.version_number,
                 exc_info=True,
             )
+        # Persist the hotfix eligibility preview into the qualification record so
+        # post-mortem analysis can see the eligible changes without re-computing.
+        if hotfix_preview and hotfix_preview.get("eligible"):
+            infra_evidence["hotfix_preview"] = hotfix_preview
+            record["hotfix_preview"] = hotfix_preview
+            flag_modified(version, "last_qualification")
 
     # Phase 1b read: compose already-resolved dimension facts from the per-dimension
     # ledger into the record and verdict sub_scores, so a passed audit/CI/etc. is
@@ -1228,6 +1230,10 @@ async def _handle_infra_failure(
         "consecutive_infra_errors": current_streak,
         "is_permanent_gate_incapacity": is_permanent_gate_incapacity,
         "same_signature_streak": same_signature_streak,
+
+        # Hotfix scope preview (present only when is_permanent_gate_incapacity
+        # and the preview computation succeeded with an eligible result).
+        "hotfix_preview": hotfix_preview,
 
         # Per-dimension isolation (Phase 1): which single dimension was marked
         # unavailable, and that dimension's own infra-error streak (distinct from
