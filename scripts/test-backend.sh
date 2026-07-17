@@ -507,6 +507,7 @@ if [ "${1:-}" = "--standalone" ]; then
     testing/test_operator_workbench_contracts.py::test_websocket_emitter_inventory_covers_current_emitters
     testing/test_monthly_budget_alerts.py
     testing/test_migration_chain.py
+    testing/test_salvage_bundle_standalone.py
   )
   # /repo is a Docker bind-mount; skip on Docker-less VMs where it does not exist.
   [ -f /repo/scripts/test_blueprint_cli.py ] && STANDALONE_ARGS+=(/repo/scripts/test_blueprint_cli.py)
