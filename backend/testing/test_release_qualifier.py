@@ -12181,11 +12181,8 @@ async def test_infra_failure_streak_is_per_dimension(db_session):
 
 
 @pytest.mark.asyncio
-async def test_finalize_reuses_migration_identity_from_ledger(db_session, mocker):
-    """Phase 1b read-side cutover: when resolved_dims already carries a terminal
-    migration_identity fact (loaded from the ledger by run_qualification), the
-    live _resolve_migration_identity_at_finalize gate is SKIPPED and finalize
-    composes from the stored result instead of re-running the GitHub fetch."""
+async def test_finalize_refreshes_migration_identity_from_ledger(db_session, mocker):
+    """A legacy resolved_dimensions marker cannot suppress the live identity gate."""
     from app import shared_state
 
     shared_state.runtime_config["promotion_enabled"] = True
@@ -12226,12 +12223,10 @@ async def test_finalize_reuses_migration_identity_from_ledger(db_session, mocker
     await db_session.commit()
     await db_session.refresh(version)
 
-    # Patch the live identity gate to return "defer" — if the ledger-first check
-    # were skipped and this gate were called, _handle_infra_failure would run and
-    # result["status"] would be "infra_failure", which the assertion below catches.
+    # A live result distinct from the legacy row proves finalize re-measures it.
     identity_gate = mocker.patch(
         "app.release_qualifier._resolve_migration_identity_at_finalize",
-        new=AsyncMock(return_value=("defer", "sentinel-must-not-reach-live-gate")),
+        new=AsyncMock(return_value=("ok", "current-identity")),
     )
     # Let the apply gate succeed so finalize can proceed past both gates.
     mocker.patch(
@@ -12243,24 +12238,19 @@ async def test_finalize_reuses_migration_identity_from_ledger(db_session, mocker
     result = await rq._finalize_qualification(db_session, version)
     await db_session.commit()
 
-    # Finalize must NOT have gone through _handle_infra_failure.
     assert result.get("status") != "infra_failure", (
-        f"live migration_identity gate was called (ledger-first check missed): {result.get('error')}"
+        f"live migration_identity gate unexpectedly deferred: {result.get('error')}"
     )
-    # The live gate was never called.
-    identity_gate.assert_not_called()
-    # The eager write from Phase 1b must have written migration_identity to the
-    # ledger (or the existing resolved row is preserved).
+    identity_gate.assert_awaited_once()
     by_dim = await _dimension_rows_by_dim(db_session, version)
     assert "migration_identity" in by_dim
     assert by_dim["migration_identity"].status == "passed"
+    assert by_dim["migration_identity"].detail["detail"] == "current-identity"
 
 
 @pytest.mark.asyncio
-async def test_finalize_reuses_migration_apply_from_ledger(db_session, mocker):
-    """Phase 1b read-side cutover: when resolved_dims already carries a terminal
-    migration_apply fact (loaded from the ledger by run_qualification), the live
-    _resolve_migration_apply_at_finalize gate is SKIPPED."""
+async def test_finalize_refreshes_migration_apply_from_ledger(db_session, mocker):
+    """A legacy resolved_dimensions marker cannot suppress the live apply gate."""
     from app import shared_state
 
     shared_state.runtime_config["promotion_enabled"] = True
@@ -12306,11 +12296,10 @@ async def test_finalize_reuses_migration_apply_from_ledger(db_session, mocker):
         "app.release_qualifier._resolve_migration_identity_at_finalize",
         new=AsyncMock(return_value=("ok", None)),
     )
-    # Patch the live apply gate to return "defer" — if ledger-first were skipped,
-    # _handle_infra_failure would run and result["status"] would be "infra_failure".
+    # A live result distinct from the legacy row proves finalize re-measures it.
     apply_gate = mocker.patch(
         "app.release_qualifier._resolve_migration_apply_at_finalize",
-        new=AsyncMock(return_value=("defer", "sentinel-must-not-reach-live-gate")),
+        new=AsyncMock(return_value=("pass", "current-apply")),
     )
     mocker.patch("app.release_qualifier.promote", new=AsyncMock())
 
@@ -12318,12 +12307,13 @@ async def test_finalize_reuses_migration_apply_from_ledger(db_session, mocker):
     await db_session.commit()
 
     assert result.get("status") != "infra_failure", (
-        f"live migration_apply gate was called (ledger-first check missed): {result.get('error')}"
+        f"live migration_apply gate unexpectedly deferred: {result.get('error')}"
     )
-    apply_gate.assert_not_called()
+    apply_gate.assert_awaited_once()
     by_dim = await _dimension_rows_by_dim(db_session, version)
     assert "migration_apply" in by_dim
     assert by_dim["migration_apply"].status == "passed"
+    assert by_dim["migration_apply"].detail["detail"] == "current-apply"
 
 
 @pytest.mark.asyncio
@@ -12388,20 +12378,37 @@ async def test_migration_gates_eagerly_persisted_before_dual_write(db_session, m
 
 
 @pytest.mark.asyncio
-async def test_dual_write_reuses_already_resolved_dimension(db_session):
-    """Read-side composition: a re-finalize for the SAME candidate_sha reuses a
-    dimension that already reached a resolved (passed) fact — its stored row is
-    NOT overwritten with a freshly recomputed value — while a dimension left
-    'unavailable' by a prior infra hold IS re-recorded."""
+async def test_mutable_dimension_ledger_refreshed_on_same_sha_redrive(db_session):
+    """A same-SHA re-drive refreshes live CI/migration facts but retains audit.
+
+    This is the merge-verdict ledger seam: the new measurement replaces only
+    the mutable row's status/detail/origin, while an immutable audit verdict
+    stays pinned to its original producer and score.
+    """
     project, version = await _make_project_and_version(db_session)
 
-    # Prior finalize: audit passed with a DISTINCTIVE sub_score; migration_identity
-    # was held 'unavailable' by a transient infra failure.
+    old_attempt = uuid.uuid4()
+    new_attempt = uuid.uuid4()
+    # Prior finalize has resolved facts for every mutable gate plus a distinctive
+    # immutable audit score.  The next merge verdict disagrees with those live
+    # facts, making a stale/reused write observable.
     await _seed_dimension_row(
-        db_session, project, version, "audit", status="passed", sub_score=0.42
+        db_session, project, version, "audit", status="passed", sub_score=0.42,
+        origin_attempt_id=old_attempt,
     )
     await _seed_dimension_row(
-        db_session, project, version, "migration_identity", status="unavailable"
+        db_session, project, version, "ci", status="passed",
+        detail={"state": "old-green"}, origin_attempt_id=old_attempt,
+    )
+    await _seed_dimension_row(
+        db_session, project, version, "migration_identity", status="passed",
+        detail={"verdict": "ok", "detail": "old-identity"},
+        origin_attempt_id=old_attempt,
+    )
+    await _seed_dimension_row(
+        db_session, project, version, "migration_apply", status="blocked",
+        detail={"verdict": "block", "detail": "old-apply"},
+        origin_attempt_id=old_attempt,
     )
     db_session.add(version)
     await db_session.commit()
@@ -12409,11 +12416,15 @@ async def test_dual_write_reuses_already_resolved_dimension(db_session):
     base_record = {
         "candidate_sha": _LEDGER_SHA_A,
         "sub_scores": {"audit": 1.0, "test_erosion": 1.0, "smoketest": 1.0},
-        "ci_green": True,
+        "ci_green": False,
+        "ci_resolution": {"state": "current-red"},
         "smoketest_enabled": True,
-        "migration_safety": "ok",
-        "migration_apply_safety": "ok",
+        "migration_safety": "block",
+        "migration_safety_detail": "current-identity",
+        "migration_apply_safety": "pass",
+        "migration_apply_safety_detail": "current-apply",
         "merge_grade_status": "not_applicable",
+        "qualification_attempt_id": str(new_attempt),
     }
     composite = {"blocker": None}
 
@@ -12421,12 +12432,21 @@ async def test_dual_write_reuses_already_resolved_dimension(db_session):
     await db_session.commit()
 
     by_dim = await _dimension_rows_by_dim(db_session, version)
-    # audit was already resolved → REUSED verbatim (distinctive 0.42 preserved,
-    # NOT overwritten with the freshly-computed 1.0).
+    # audit is immutable → REUSED verbatim (distinctive 0.42 preserved, NOT
+    # overwritten with the freshly-computed 1.0).
     assert by_dim["audit"].status == "passed"
     assert by_dim["audit"].sub_score == 0.42
-    # migration_identity was only 'unavailable' → re-recorded from the live gate.
-    assert by_dim["migration_identity"].status == "passed"
+    assert by_dim["audit"].origin_attempt_id == old_attempt
+    # Every mutable gate is refreshed from this re-drive's merge verdict,
+    # including facts that had already resolved on the same candidate SHA.
+    assert by_dim["ci"].status == "blocked"
+    assert by_dim["ci"].detail == {"state": "current-red"}
+    assert by_dim["migration_identity"].status == "blocked"
+    assert by_dim["migration_identity"].detail["detail"] == "current-identity"
+    assert by_dim["migration_apply"].status == "passed"
+    assert by_dim["migration_apply"].detail["detail"] == "current-apply"
+    for dimension in ("ci", "migration_identity", "migration_apply"):
+        assert by_dim[dimension].origin_attempt_id == new_attempt
     # No duplicate audit rows were created by the re-finalize (upsert-in-place).
     all_audit_rows = (
         (
@@ -25247,13 +25267,16 @@ async def test_infra_redrive_isolates_failure_to_one_dimension_ledger_facts_surv
     assert qual["smoketest_task_id"] is None
     assert qual["merge_grade_task_id"] is not None
 
-    # audit is being re-measured, so it is NOT in the carried-forward reuse set;
-    # the other resolved dimensions ARE carried forward.
+    # Audit is being re-measured, so it is not in the carried-forward reuse set.
+    # Mutable gate facts are likewise re-measured on every same-SHA redrive;
+    # only immutable resolved dimensions are carried forward.
     resolved = qual.get("resolved_dimensions") or {}
     assert "audit" not in resolved
     assert resolved.get("smoketest", {}).get("status") == "passed"
     assert resolved["smoketest"]["sub_score"] == 0.91
-    assert resolved.get("ci", {}).get("status") == "passed"
+    assert "ci" not in resolved
+    assert "migration_identity" not in resolved
+    assert "migration_apply" not in resolved
 
     # --- (b) sibling dimensions' PASSED ledger facts survive un-discarded ----
     # and un-downgraded: the audit-gate transient failure could not throw away

@@ -1075,7 +1075,8 @@ class QualificationDimensionResult(SQLModel, table=True):
 
     # Which qualification dimension this row records — one of: audit,
     # migration_identity, migration_apply, ci, smoketest, merge_grade,
-    # test_erosion, acceptance_window, debt_pressure, challenge.
+    # test_erosion, acceptance_window, debt_pressure, challenge,
+    # capability_proof.
     dimension: str = Field(
         sa_column=Column(String(32), nullable=False),
     )

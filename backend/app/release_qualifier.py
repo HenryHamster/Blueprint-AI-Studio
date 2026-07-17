@@ -269,6 +269,8 @@ from app.migration_apply_gate import (
 )
 from app.env_preflight_evidence import sanitize_env_preflight_artifact
 from app.qualification_dimensions import (
+    LEDGER_DIMENSION_KEYS,
+    MUTABLE_DIMENSION_KEYS,
     PROMOTION_REQUIRED_DIMENSIONS,
 )
 from app.rollup_migration_validation import (
@@ -3060,6 +3062,11 @@ async def run_qualification(
     )
     resolved_dims: dict[str, dict[str, Any]] = {}
     for dim, row in prior_dim_results.items():
+        # Mutable gates are re-measured on every same-SHA re-drive.  Their old
+        # ledger facts stay durable, but must not be composed or marked reused:
+        # finalize writes the current measurement back to that one row.
+        if dim in MUTABLE_DIMENSION_KEYS:
+            continue
         if row.status in _LEDGER_RESOLVED_STATUSES:
             if dim == "merge_grade" and not _rubric_dimension_reusable(
                 row.detail,
@@ -4364,7 +4371,8 @@ async def _upsert_dimension_result(
                 # marked this fact as reused by the active attempt.  Otherwise a
                 # resolved write is a genuine recomputation with a new origin.
                 if (
-                    existing.status in _LEDGER_RESOLVED_STATUSES
+                    dimension not in MUTABLE_DIMENSION_KEYS
+                    and existing.status in _LEDGER_RESOLVED_STATUSES
                     and _origin_uuid is not None
                     and existing.origin_attempt_id != _origin_uuid
                     and str(_origin_uuid)
@@ -5009,6 +5017,18 @@ async def _dual_write_dimension_results(
         },
     ]
 
+    # Fail-fast: every dimension in the canonical ledger-backed registry must have a
+    # spec entry here.  A future ledger dimension added to the registry but omitted
+    # from the specs list would silently never be persisted — this assertion ensures
+    # the dual-write writer stays synchronised with LEDGER_DIMENSION_KEYS.
+    spec_dimension_set = {s["dimension"] for s in specs}
+    assert spec_dimension_set == LEDGER_DIMENSION_KEYS, (
+        f"dual-write spec dimensions ({spec_dimension_set}) != "
+        f"LEDGER_DIMENSION_KEYS ({LEDGER_DIMENSION_KEYS}); "
+        f"extra: {spec_dimension_set - LEDGER_DIMENSION_KEYS}, "
+        f"missing: {LEDGER_DIMENSION_KEYS - spec_dimension_set}"
+    )
+
     try:
         await session.flush()
     except Exception as exc:  # noqa: BLE001 — best-effort; never break finalize
@@ -5021,7 +5041,10 @@ async def _dual_write_dimension_results(
         return
 
     for spec in specs:
-        if spec["dimension"] in prior_resolved:
+        if (
+            spec["dimension"] in prior_resolved
+            and spec["dimension"] not in MUTABLE_DIMENSION_KEYS
+        ):
             # Already resolved (passed/failed/blocked) for this candidate tree in
             # an earlier finalize — reuse the stored fact, do NOT re-record or
             # overwrite it.  This is the read-side composition: a re-check after a
@@ -5304,7 +5327,14 @@ async def _finalize_qualification(
     # per-dimension ledger.  When a dimension is present here its gate evaluation
     # is composed from the ledger rather than re-run, and its child task may not
     # have been spawned (the spawn coordinator skipped it).
-    resolved_dims: dict[str, dict[str, Any]] = qual.get("resolved_dimensions") or {}
+    # Defensive compatibility for attempts written before mutable dimensions
+    # were excluded at spawn: never let a persisted legacy reuse marker suppress
+    # the current CI/migration measurement during finalize.
+    resolved_dims: dict[str, dict[str, Any]] = {
+        dim: fact
+        for dim, fact in (qual.get("resolved_dimensions") or {}).items()
+        if dim not in MUTABLE_DIMENSION_KEYS
+    }
 
     # Re-resolve CI for the candidate commit NOW rather than reusing the
     # boolean frozen at spawn — a candidate whose checks were merely pending

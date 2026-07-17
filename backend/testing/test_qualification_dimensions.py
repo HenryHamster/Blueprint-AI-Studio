@@ -8,6 +8,9 @@ cannot silently change behavior, and assert both consumer modules read the
 registry rather than re-declaring the vocabulary.
 """
 
+import inspect
+import re
+
 from app import qualification_dimensions as qd
 from app import qualification_state_resolver as qsr
 from app import release_qualifier as rq
@@ -120,3 +123,35 @@ def test_consumers_read_the_canonical_registry():
     assert qsr._LEDGER_DIMENSION_KEYS is qd.LEDGER_DIMENSION_KEYS
     assert qsr._MUTABLE_DIMENSION_KEYS is qd.MUTABLE_DIMENSION_KEYS
     assert rq._PROMOTION_REQUIRED_DIMENSIONS is qd.PROMOTION_REQUIRED_DIMENSIONS
+
+
+def test_dual_write_spec_covers_exactly_ledger_dimension_keys():
+    """The dual-write dimension spec keys must match the canonical ledger set.
+
+    Every ledger-backed dimension in the registry must have a corresponding spec
+    entry in ``_dual_write_dimension_results``, and every spec entry must be a
+    registered ledger-backed dimension.  A dimension added to the registry but
+    omitted from the specs list would silently never be persisted.
+    """
+    source = inspect.getsource(rq._dual_write_dimension_results)
+    spec_keys = set(re.findall(r'"dimension":\s*"([^"]+)"', source))
+    assert spec_keys == qd.LEDGER_DIMENSION_KEYS, (
+        f"spec list has extra dimensions not in LEDGER_DIMENSION_KEYS: "
+        f"{spec_keys - qd.LEDGER_DIMENSION_KEYS}; "
+        f"LEDGER_DIMENSION_KEYS has extra not in spec list: "
+        f"{qd.LEDGER_DIMENSION_KEYS - spec_keys}"
+    )
+
+
+def test_dimension_column_includes_capability_proof():
+    """The dimension column docstring/comment lists all 11 ledger keys.
+
+    A future operator inspecting the model documentation should see every
+    ledger-backed dimension, including capability_proof.
+    """
+    from app.release_models import QualificationDimensionResult
+
+    source = inspect.getsource(QualificationDimensionResult)
+    assert "capability_proof" in source, (
+        "QualificationDimensionResult.dimension comment is missing capability_proof"
+    )
