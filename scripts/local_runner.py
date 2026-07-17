@@ -50,6 +50,10 @@ Optional environment variables:
                                       (int 0–100, default: 0 = disabled)
     BLUEPRINT_RUNNER_GPU_INDICES      Comma-separated GPU-index allowlist (default: all)
     BLUEPRINT_RUNNER_GPUS_PER_JOB     GPUs assigned per compute job (default: 1)
+    BLUEPRINT_RUNNER_GPU_PROBE_IMAGE  Image used to prove container GPU passthrough.
+                                      Set this to a pullable project/private image with
+                                      nvidia-smi when Docker Hub is unavailable; default
+                                      is nvidia/cuda:12.6.3-base-ubuntu24.04.
     BLUEPRINT_RUNNER_CPU_LIMIT        Best-effort CPU cap (cores) per task
     BLUEPRINT_RUNNER_MEM_LIMIT        Best-effort memory cap per task (e.g. 8g)
     BLUEPRINT_RUNNER_CLI_MAINTENANCE  Host CLI self-maintenance (default: 1;
@@ -3272,8 +3276,15 @@ def _heartbeat_loop(
     ever_authenticated = False
     _llm_cli_last_healthy: dict[tuple[str, str], dict] = {}
     _llm_cli_transient_failures: dict[tuple[str, str], int] = {}
+    # Startup detection already made the first proof. Delay a retry until the
+    # bounded cadence elapses, then refresh only recoverable failures so a cold
+    # image pull or temporary registry/runtime outage does not require restart.
+    _gpu_passthrough_last_retry_at = time.monotonic()
     while not _shutdown_event.is_set():
         try:
+            caps, _gpu_passthrough_last_retry_at = _retry_transient_gpu_passthrough(
+                caps, _gpu_passthrough_last_retry_at
+            )
             with lock:
                 task_ids = list(active_tasks.keys())
             if active_compute_jobs is not None and compute_lock is not None:
@@ -3470,6 +3481,9 @@ def _heartbeat_loop(
                 "hostname": hostname,
                 "version": version,
                 "isolation_backends": isolation_backends,
+                "container_gpu_passthrough": (
+                    caps.container_gpu_passthrough if caps is not None else None
+                ),
                 "agent_backend": agent_backend,
                 "compute_backend": compute_backend,
                 "llm_clis": llm_clis,
@@ -3765,6 +3779,7 @@ def _docker_login(auth: dict, container_image: str | None = None, *, _subprocess
 # ── Isolation capability cache + GPU scheduling ───────────────────────────────
 
 _CAPS_CACHE: "iso.Capabilities | None" = None
+_GPU_PASSTHROUGH_RETRY_SECONDS = 300.0
 
 
 def _get_capabilities() -> "iso.Capabilities":
@@ -3773,6 +3788,18 @@ def _get_capabilities() -> "iso.Capabilities":
     if _CAPS_CACHE is None:
         _CAPS_CACHE = iso.detect_capabilities()
     return _CAPS_CACHE
+
+
+def _retry_transient_gpu_passthrough(
+    caps: "iso.Capabilities | None", last_retry_at: float, *, now: float | None = None
+) -> tuple["iso.Capabilities | None", float]:
+    """Refresh a recoverable container GPU proof at a bounded heartbeat cadence."""
+    if caps is None or not iso.container_gpu_passthrough_needs_retry(caps):
+        return caps, last_retry_at
+    current = time.monotonic() if now is None else now
+    if current - last_retry_at < _GPU_PASSTHROUGH_RETRY_SECONDS:
+        return caps, last_retry_at
+    return iso.refresh_container_gpu_passthrough(caps), current
 
 
 def _make_gpu_state(caps: "iso.Capabilities") -> dict:
@@ -6524,6 +6551,7 @@ def _preflight(
             # Isolation-backend inventory + selected backends so `--check`
             # populates the fleet view the same way the running heartbeat does.
             "isolation_backends": iso.capabilities_inventory(caps),
+            "container_gpu_passthrough": caps.container_gpu_passthrough,
             "agent_backend": iso.decide_agent_backend(
                 caps, agent_binary_present=agent_binary is not None,
                 agent_image=agent_image,

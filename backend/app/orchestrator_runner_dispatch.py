@@ -298,6 +298,7 @@ from app.runner_eligibility import (  # noqa: F401
     _runner_at_compute_capacity,
     _runner_gpu_capable,
     _runner_gpu_in_container_capable,
+    _runner_gpu_passthrough_blocker,
     _runner_handles_task_type,
     _runner_has_container_capability,
     _runner_has_free_disk,
@@ -1073,9 +1074,8 @@ async def _diagnose_strict_runner_pin_hold(
             return (
                 "missing_gpu_in_container_capability",
                 f"job declares both container_image {container_image!r} and "
-                f"{gpu_req} but the runner's container backend "
-                "cannot expose GPUs inside the container (no CDI and no "
-                "nvidia-hook for docker; no native GPU-capable container runtime)",
+                f"{gpu_req} but GPU passthrough is not verified: "
+                f"{_runner_gpu_passthrough_blocker(snapshot)}",
             )
         return ("not_eligible", "runner failed dispatch eligibility this cycle")
 
@@ -1948,11 +1948,30 @@ async def _dispatch_compute_experiment_directly(
             session, task.project_id, forced_id
         )
         target_label = forced_hostname or forced_id
-        hold_msg = (
-            f"Waiting for forced runner {target_label}: this compute experiment is "
-            "hard-pinned to that runner and will not run on any other runner or in "
-            "the cloud until it is live and eligible."
+        reason_code, detail = await _diagnose_strict_runner_pin_hold(
+            session,
+            active_runners_cache,
+            task.project_id,
+            forced_id,
+            "compute_experiment",
+            accelerator,
+            container_image,
+            runner_pins_this_cycle,
+            min_compute_capability=min_compute_capability,
+            vram_gb=vram_gb,
         )
+        if reason_code == "missing_gpu_in_container_capability":
+            hold_msg = (
+                f"Waiting for forced runner {target_label}: this compute experiment "
+                "is hard-pinned to that runner; GPU inside the container cannot be "
+                f"fulfilled because {detail}."
+            )
+        else:
+            hold_msg = (
+                f"Waiting for forced runner {target_label}: this compute experiment is "
+                "hard-pinned to that runner and will not run on any other runner or in "
+                f"the cloud until it is live and eligible ({reason_code}: {detail})."
+            )
         ctx = dict(task.context or {})
         changed = ctx.pop("runner_target_id", None) is not None
         if not ctx.get(AWAITING_FORCED_RUNNER_CONTEXT_KEY):
@@ -1967,9 +1986,11 @@ async def _dispatch_compute_experiment_directly(
             await session.commit()
         logger.info(
             "[RUNNERS] Holding compute_experiment %s: forced runner %s not eligible "
-            "this cycle (offline/at-capacity/ineligible) — not dispatching elsewhere",
+            "this cycle (%s: %s) — not dispatching elsewhere",
             task.id,
             target_label,
+            reason_code,
+            detail,
         )
         return "held"
 
@@ -1977,24 +1998,6 @@ async def _dispatch_compute_experiment_directly(
     require_local = bool(
         project is not None and resolve_project_require_local_runner(project)
     )
-
-    # ── Enforce-local hold: require_local + no runner → keep QUEUED, never cloud ─
-    if runner is None and require_local:
-        ctx = dict(task.context or {})
-        changed = ctx.pop("runner_target_id", None) is not None  # drop any stale pin
-        if not ctx.get(LOCAL_RUNNER_HOLD_CONTEXT_KEY):
-            ctx[LOCAL_RUNNER_HOLD_CONTEXT_KEY] = _utcnow().isoformat()
-            changed = True
-        if changed:
-            task.context = ctx
-            session.add(task)
-            await session.commit()
-        logger.info(
-            "[RUNNERS] Holding compute_experiment %s: require_local_runner set, "
-            "no live eligible runner",
-            task.id,
-        )
-        return "held"
 
     # ── GPU-arch hold: a min_compute_capability floor is declared and at least one
     # live runner has a GPU but its architecture is too OLD to run the image
@@ -2105,21 +2108,59 @@ async def _dispatch_compute_experiment_directly(
         accelerator, container_image, vram_gb
     ):
         project_runners = active_runners_cache.get(task.project_id) or []
-        gpu_in_container_blocked = any(
-            _runner_has_container_capability(r)
-            and not _runner_gpu_in_container_capable(r)
+        # Keep the proof-specific diagnosis scoped to runners that survived every
+        # selection gate *before* passthrough proof. A proof on a CPU-only,
+        # wrong-task-type, full, runtime-less, or disk-full runner cannot make
+        # the generic hold more truthful: it is not a runner this job could use
+        # even if its proof were valid. This deliberately mirrors the ordering in
+        # _select_eligible_runner; the passthrough and later VRAM/architecture
+        # gates remain outside this subset because this branch diagnoses the
+        # missing passthrough prerequisite specifically.
+        disk_floor = _container_image_min_free_disk_bytes()
+        pre_passthrough_eligible = [
+            r
             for r in project_runners
+            if _runner_handles_task_type(r, "compute_experiment")
+            and not _runner_at_capacity(
+                r, runner_pins_this_cycle.get(r.id, 0), "compute_experiment"
+            )
+            and (not accelerator or _runner_gpu_capable(r))
+            and _runner_has_container_capability(r)
+            and _runner_has_free_disk(r, disk_floor)
+        ]
+        # Capacity is deliberately excluded from this companion subset. A full
+        # runner with functional proof demonstrates that the fleet CAN satisfy
+        # the runtime requirement; the accurate wait reason is capacity, not a
+        # false claim that no selected runtime has proof. Task type, host GPU,
+        # runtime and disk gates remain required, since proof on a runner that
+        # fails one of those can never satisfy this job.
+        pre_passthrough_capable = [
+            r
+            for r in project_runners
+            if _runner_handles_task_type(r, "compute_experiment")
+            and (not accelerator or _runner_gpu_capable(r))
+            and _runner_has_container_capability(r)
+            and _runner_has_free_disk(r, disk_floor)
+        ]
+        gpu_in_container_blocked = any(
+            not _runner_gpu_in_container_capable(r)
+            for r in pre_passthrough_eligible
         )
-        if gpu_in_container_blocked:
+        fleet_has_verified_proof = any(
+            _runner_gpu_in_container_capable(r) for r in pre_passthrough_capable
+        )
+        if gpu_in_container_blocked and not fleet_has_verified_proof:
+            blockers = sorted({
+                _runner_gpu_passthrough_blocker(r)
+                for r in pre_passthrough_eligible
+                if not _runner_gpu_in_container_capable(r)
+            })
             gpu_req = "an accelerator" if accelerator else f"vram_gb={vram_gb!r}"
             hold_msg = (
                 "Waiting for a runner that can expose a GPU inside the container: "
                 f"job declares both container_image={container_image!r} and "
-                f"{gpu_req}, but every container-capable runner lacks GPU-in-"
-                "container passthrough (no CDI daemon and no verified nvidia docker "
-                "hook). Docker/the container runtime IS present — enable CDI "
-                "(nvidia-ctk) or the nvidia container runtime so the GPU can be "
-                "passed into the container."
+                f"{gpu_req}, but no selected runtime has functional passthrough "
+                f"proof ({'; '.join(blockers[:3])})."
             )
             ctx = dict(task.context or {})
             changed = ctx.pop("runner_target_id", None) is not None
@@ -2144,19 +2185,55 @@ async def _dispatch_compute_experiment_directly(
             )
             return "held"
 
-    # ── Container-image hold: image declared + registered runners but none
-    # container-capable → keep QUEUED with an honest reason, never cloud-dispatch.
+    # ── Enforce-local hold: require_local + no runner → keep QUEUED, never cloud ─
+    # Keep this after the proof-specific hold above: a local-only GPU image job
+    # whose live runner fails functional passthrough needs the actionable runtime
+    # diagnosis, not the generic "no live eligible runner" message.
+    if runner is None and require_local:
+        ctx = dict(task.context or {})
+        changed = ctx.pop("runner_target_id", None) is not None  # drop any stale pin
+        if not ctx.get(LOCAL_RUNNER_HOLD_CONTEXT_KEY):
+            ctx[LOCAL_RUNNER_HOLD_CONTEXT_KEY] = _utcnow().isoformat()
+            changed = True
+        hold_msg = "Waiting for a live eligible local runner."
+        if task.latest_status_message != hold_msg:
+            task.latest_status_message = hold_msg
+            changed = True
+        if changed:
+            task.context = ctx
+            session.add(task)
+            await session.commit()
+        logger.info(
+            "[RUNNERS] Holding compute_experiment %s: require_local_runner set, "
+            "no live eligible runner",
+            task.id,
+        )
+        return "held"
+
+    # ── Container-image hold: image declared + registered runners but none is
+    # currently eligible → keep QUEUED with an honest reason, never cloud-dispatch.
+    # Distinguish a fleet with no runtime from one whose runtime-equipped runners
+    # are blocked by capacity or another gate; never claim Docker is absent when
+    # verified passthrough exists on a temporarily ineligible runner.
     # Only fires when the project has at least one live runner (runners exist but
     # lack the runtime); when no runners are registered at all we fall through to
     # the cloud backend so the job is not silently wedged.
     if runner is None and container_image:
         project_runners = active_runners_cache.get(task.project_id) or []
         if project_runners:
-            hold_msg = (
-                "Waiting for a container-capable runner: job declares "
-                f"container_image={container_image!r} but no live runner "
-                "has docker_usable capability."
-            )
+            if any(_runner_has_container_capability(r) for r in project_runners):
+                hold_msg = (
+                    "Waiting for an eligible container-capable runner: job declares "
+                    f"container_image={container_image!r}; a container runtime is "
+                    "present, but every such runner is at capacity or fails another "
+                    "job requirement."
+                )
+            else:
+                hold_msg = (
+                    "Waiting for a container-capable runner: job declares "
+                    f"container_image={container_image!r} but no live runner "
+                    "has docker_usable capability."
+                )
             ctx = dict(task.context or {})
             changed = ctx.pop("runner_target_id", None) is not None
             if not ctx.get(CONTAINER_RUNNER_HOLD_CONTEXT_KEY):

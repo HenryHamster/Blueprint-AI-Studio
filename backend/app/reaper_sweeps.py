@@ -13,7 +13,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, or_
+from sqlalchemy import and_, or_
 from sqlmodel import select
 from app.task_capabilities import BACKEND_MANAGED_TASK_TYPES
 
@@ -49,7 +49,11 @@ from app.blocked_task_unblock_sweeps import (
     event_driven_unblock_on_knowledge,
     event_driven_unblock_on_capability_proof,
 )
-from app.compute_backends import GCP_BACKEND_NAME, RUNNER_SUBPROCESS_BACKEND_NAME
+from app.compute_backends import (
+    GCP_BACKEND_NAME,
+    RUNNER_SUBPROCESS_BACKEND_NAME,
+    resolve_project_default_container_image,
+)
 from app.compute_jobs import (
     RUNNER_SILENT_TIMEOUT_SECONDS,
     finalize_silent_compute_job,
@@ -2439,12 +2443,12 @@ async def sweep_protect_referenced_compute_image_digests(
     time-based retention can reclaim the image on a later pass.
 
     A digest is "referenced" when it is the ``container_image`` of a live compute
-    job, of a job completed within the protection window, OR the digest of ANY
-    ``ProjectComputeImage`` row. A ``ProjectComputeImage`` row is a STANDING PIN
-    with no expiry — it maps a project's ``dep_hash`` to a digest and IS the
-    project's (current or historical) default image — so its digest is protected
-    regardless of when the row was last rebuilt, not only when it falls inside the
-    time window that governs job-provenance decay.
+    job, of a job completed within the protection window, OR a usable
+    ``ProjectComputeImage`` that resolves as a project's configured current
+    default. The last case protects that manifest-selected row before its first
+    job lands. Historical rows are deliberately not standing pins: a
+    superseded digest stays protected only while a live/recent job still
+    references it.
 
     Cadence-gated to hourly on an independent timer. Returns a summary dict
     (``applied``/``pruned``/``skipped_cadence``). The caller wraps this so it can
@@ -2458,7 +2462,7 @@ async def sweep_protect_referenced_compute_image_digests(
         protection_tag_for_digest,
     )
     from app.compute_jobs import referenced_compute_image_digests
-    from app.models import ProjectComputeImage
+    from app.models import Project, ProjectComputeImage
 
     _now = now or _utcnow()
     if not _is_cadence_due(
@@ -2476,64 +2480,146 @@ async def sweep_protect_referenced_compute_image_digests(
     cutoff = _now - timedelta(seconds=_COMPUTE_IMAGE_PROTECT_WINDOW_SECONDS)
     referenced = await referenced_compute_image_digests(session, since=cutoff)
 
-    # ORDER BY recency is load-bearing, not cosmetic. This query is capped at
-    # ``max_images`` rows; WITHOUT an order the cap silently drops an arbitrary
-    # subset, and any dropped digest loses its ``inuse-`` protection tag — actively
-    # pruned below and then GC-able out from under the project default that still
-    # points at it. EVERY ``ProjectComputeImage.digest`` is now protection-eligible
-    # (a standing pin, not just rows inside the window), so the cap genuinely
-    # governs which pins get protected on a given pass. Ordering by ``updated_at``
-    # DESC keeps the MOST RECENTLY updated rows under the cap; if the cap drops
-    # rows the truncation warning below fires so an operator can raise
-    # ``max_images`` before a still-pinned digest is reclaimed. Digests referenced
-    # by a LIVE/recent job are protected independently via
-    # ``_referenced_compute_image_repo_digests`` below.
-    image_where = ProjectComputeImage.digest.is_not(None)
-    total_images = (
-        await session.scalar(
-            select(func.count()).select_from(ProjectComputeImage).where(image_where)
-        )
-        or 0
-    )
-    images = (
-        (
-            await session.execute(
-                select(ProjectComputeImage)
-                .where(image_where)
-                .order_by(ProjectComputeImage.updated_at.desc())
-                .limit(max_images)
+    # Read every image row in bounded pages. ``max_images`` is retained as the
+    # page size for callers, not a global cap: silently omitting rows loses both
+    # repositories to prune and old rows needed to map a job-referenced digest
+    # back to its repository. The stable keyset avoids offset drift as the table
+    # grows while keeping each database fetch bounded.
+    page_size = max(1, max_images)
+    images: list[ProjectComputeImage] = []
+    last_updated = None
+    last_id = None
+    while True:
+        page_where = []
+        if last_updated is not None and last_id is not None:
+            page_where.append(
+                or_(
+                    ProjectComputeImage.updated_at < last_updated,
+                    and_(
+                        ProjectComputeImage.updated_at == last_updated,
+                        ProjectComputeImage.id < last_id,
+                    ),
+                )
             )
+        page = (
+            (
+                await session.execute(
+                    select(ProjectComputeImage)
+                    .where(*page_where)
+                    .order_by(
+                        ProjectComputeImage.updated_at.desc(),
+                        ProjectComputeImage.id.desc(),
+                    )
+                    .limit(page_size)
+                )
+            )
+            .scalars()
+            .all()
         )
-        .scalars()
-        .all()
-    )
-    # Truncation must never be silent: if the cap dropped rows, say so (which
-    # rows, how many) so an operator can raise ``max_images`` / paginate rather
-    # than discover the GC trap only after a digest was reclaimed.
-    dropped = total_images - len(images)
-    if dropped > 0:
-        logger.warning(
-            "sweep_protect_referenced_compute_image_digests: %d of %d "
-            "ProjectComputeImage rows (with a digest) exceeded the max_images=%d "
-            "cap and were NOT considered for protection this pass; protected the "
-            "%d most-recently-updated (ORDER BY updated_at DESC). Raise max_images "
-            "or paginate if referenced rows are being dropped.",
-            dropped,
-            total_images,
-            max_images,
-            len(images),
+        if not page:
+            break
+        images.extend(page)
+        last_updated, last_id = page[-1].updated_at, page[-1].id
+        if len(page) < page_size:
+            break
+
+    # Mirror default-image resolution. The resolver reads the configured manifest
+    # and pins its selected build, including an older explicitly tagged row. Do
+    # not retain every per-tag candidate: content-hash build tags are unique, so
+    # that would turn all historical builds into permanent retention pins.
+    latest_by_project: dict[uuid.UUID, set[uuid.UUID]] = {}
+    latest_identities_by_project: dict[uuid.UUID, set[tuple[str, str]]] = {}
+    built_image_ids_by_ref: dict[tuple[uuid.UUID, str, str], uuid.UUID] = {}
+    protection_tags_by_project: dict[uuid.UUID, set[str]] = {}
+    current_ids: set[uuid.UUID] = set()
+    preserved_protection_tags: set[str] = set()
+    for img in images:
+        if not img.built or not img.digest:
+            continue
+        # Images are ordered newest-first. Keep the existing latest-build
+        # fallback only for projects with no declared default image at all.
+        identity = (img.registry_repo, img.image_name)
+        seen = latest_identities_by_project.setdefault(img.project_id, set())
+        if identity not in seen:
+            seen.add(identity)
+            latest_by_project.setdefault(img.project_id, set()).add(img.id)
+        built_image_ids_by_ref.setdefault(
+            (img.project_id, f"{img.registry_repo}/{img.image_name}", img.digest), img.id
+        )
+        protection_tags_by_project.setdefault(img.project_id, set()).add(
+            protection_tag_for_digest(img.digest)
         )
 
-    # Every ProjectComputeImage.digest is a STANDING PIN with no expiry: the row
-    # maps a project's dep_hash -> digest and is the project's (current or
-    # historical) default image, so the digest must stay pullable no matter when
-    # the row was last rebuilt. Protecting only rows rebuilt inside the window
-    # (the old behavior) stranded a stable, un-rebaked project default with no
-    # ``inuse-`` tag and let ``delete-old-tagged`` reclaim it — the follow-up
-    # explicitly flagged in infra/terraform/registry.tf. Protect them all; this
-    # also covers the freshly-(re)built default before its first job lands.
+    project_ids = list(latest_by_project)
+    projects_by_id: dict[uuid.UUID, Project] = {}
+    if project_ids:
+        projects_by_id = {
+            project.id: project
+            for project in (
+                await session.execute(select(Project).where(Project.id.in_(project_ids)))
+            ).scalars()
+        }
+
+    for project_id, latest_ids in latest_by_project.items():
+        project = projects_by_id.get(project_id)
+        default_ref = (
+            await resolve_project_default_container_image(session, project)
+            if project is not None
+            else None
+        )
+        if default_ref is None:
+            # The shared resolver intentionally fails open to ``None`` for both
+            # no manifest declaration and transient manifest/registry errors.
+            # Re-read the declaration to distinguish them: selecting a newer
+            # row after an indeterminate resolution could prune the inuse tag
+            # for an older explicit manifest tag. In that case retain prior
+            # protection tags for this project's rows until a later sweep can
+            # resolve the actual default. Do not stamp all historical rows.
+            has_declared_default: bool | None
+            if project is None:
+                has_declared_default = False
+            else:
+                try:
+                    from app.routers.admin_project_tools import _discover_manifest_tools
+
+                    manifest = await _discover_manifest_tools(project)
+                    # ``_discover_manifest_tools`` caches fetch/token failures
+                    # as a result rather than raising. Those failures are
+                    # indeterminate here, not proof that no default exists.
+                    # Falling back to the newest row could otherwise prune an
+                    # older explicitly configured image's protection tag.
+                    if manifest.get("error"):
+                        has_declared_default = None
+                    else:
+                        compute_image = (manifest.get("compute") or {}).get("image") or {}
+                        has_declared_default = bool(
+                            compute_image.get("name")
+                            if isinstance(compute_image, dict)
+                            else None
+                        )
+                except Exception:  # noqa: BLE001 — preserve prior tags on discovery failure
+                    has_declared_default = None
+            if has_declared_default is False:
+                # Only an affirmative no-image result uses the historical
+                # newest-build fallback.
+                current_ids.update(latest_ids)
+            else:
+                preserved_protection_tags.update(
+                    protection_tags_by_project.get(project_id, set())
+                )
+            continue
+        selected = _split_pinned_ref(default_ref)
+        if selected is None:
+            # A configured image without a matching durable build is not this
+            # project's default row, so it must not pin an unrelated history.
+            continue
+        full_repo, digest = selected
+        image_id = built_image_ids_by_ref.get((project_id, full_repo, digest))
+        if image_id is not None:
+            current_ids.add(image_id)
+
     for img in images:
-        if img.digest:
+        if img.id in current_ids and img.digest:
             referenced.add(img.digest)
 
     protected_tags = {protection_tag_for_digest(d) for d in referenced}
@@ -2563,7 +2649,7 @@ async def sweep_protect_referenced_compute_image_digests(
     target_project: dict[tuple[str, str], uuid.UUID] = {}
 
     for img in images:
-        if img.digest and img.digest in referenced:
+        if img.digest and (img.id in current_ids or img.digest in referenced):
             key = (f"{img.registry_repo}/{img.image_name}", img.digest)
             targets.add(key)
             target_project.setdefault(key, img.project_id)
@@ -2604,9 +2690,10 @@ async def sweep_protect_referenced_compute_image_digests(
         except Exception:  # noqa: BLE001 — registry helpers fail open
             continue
         for tag in existing:
-            if tag not in protected_tags:
-                if await asyncio.to_thread(delete_tag, full_repo, tag):
-                    pruned += 1
+            if tag not in (protected_tags | preserved_protection_tags) and await asyncio.to_thread(
+                delete_tag, full_repo, tag
+            ):
+                pruned += 1
 
     # Surface fail-open apply failures — the whole point is that they are no longer
     # silent. A missing inuse- tag means registry retention can reclaim a digest a

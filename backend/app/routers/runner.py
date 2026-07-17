@@ -568,6 +568,10 @@ class HeartbeatRequest(BaseModel):
     # systemd_run_ok); agent_backend/compute_backend name the backend the runner
     # would use for each class. All ride in capabilities JSONB for the fleet panel.
     isolation_backends: dict | None = None
+    # Additive functional evidence keyed by the runtime jobs will execute, e.g.
+    # {"docker": {"verified": true, "mode": "cdi", "reason": "verified"}}.
+    # Old runners omit it and remain heartbeat-compatible.
+    container_gpu_passthrough: dict | None = None
     agent_backend: str | None = None
     compute_backend: str | None = None
     # Versioned functional evidence for project-authoring verification. Kept raw
@@ -1532,6 +1536,14 @@ async def heartbeat(
     # All optional and tolerated as missing so older runners keep heartbeating.
     if payload.isolation_backends is not None:
         caps["isolation_backends"] = payload.isolation_backends
+    if payload.container_gpu_passthrough is not None:
+        caps["container_gpu_passthrough"] = payload.container_gpu_passthrough
+    elif payload.active_work_report:
+        # A daemon heartbeat from an older/replaced runner is current negative
+        # evidence: retaining proof from a previous process would authorize GPU
+        # image work that this daemon cannot prove it can execute. Non-report
+        # preflights leave the last genuine daemon inventory untouched.
+        caps.pop("container_gpu_passthrough", None)
     if payload.llm_clis is not None:
         caps["llm_clis"] = payload.llm_clis
     if payload.agent_backend is not None:
