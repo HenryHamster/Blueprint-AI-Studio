@@ -9897,6 +9897,161 @@ async def test_unblock_sweep_parks_agent_precondition_after_retry_budget_spent(
 
 
 @pytest.mark.asyncio
+async def test_unblock_sweep_first_retry_needs_no_prior_evidence(reaper_db, mocker):
+    """The first optimistic retry (optimistic_used == 0) requires no prior evidence
+    and stamps _blocked_last_retry_at on the requeued task."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    t = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="precondition",
+        blocked_reason="BLOCKER: ./pr open returned HTTP 500",
+        depends_on=[],
+        blocked_at=now - timedelta(minutes=5),
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "precondition",
+                "reason": "BLOCKER: ./pr open returned HTTP 500",
+            }
+        },
+        recheck_after=now - timedelta(minutes=1),
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 1
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.QUEUED
+    assert t.context.get("_blocked_optimistic_retries") == 1
+    # Evidence timestamp is stamped so subsequent retries can gate on it.
+    assert t.context.get("_blocked_last_retry_at") is not None
+    assert "optimistic" in (t.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_unblock_sweep_retry_gate_holds_when_no_evidence(reaper_db, mocker):
+    """Retry 2+ is withheld when blocked_at has not advanced past the last retry
+    timestamp — no VM run happened since the previous retry was dispatched."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    last_retry_at = now - timedelta(seconds=30)
+    t = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="precondition",
+        blocked_reason="BLOCKER: backend/app/foo.py does not exist on main",
+        depends_on=[],
+        # blocked_at is BEFORE last_retry_at: no new VM run has happened since retry 1.
+        blocked_at=now - timedelta(seconds=60),
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "precondition",
+                "reason": "BLOCKER: backend/app/foo.py does not exist on main",
+            },
+            "_blocked_optimistic_retries": 1,
+            "_blocked_last_retry_at": last_retry_at.isoformat(),
+        },
+        recheck_after=now - timedelta(minutes=1),
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 0
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.BLOCKED
+    # Retry budget unchanged — the slot was NOT consumed.
+    assert t.context.get("_blocked_optimistic_retries") == 1
+    # Backoff was re-armed instead.
+    assert t.recheck_after is not None and t.recheck_after > now
+    assert t.context.get("_blocked_recheck_attempts") == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("last_retry_at", [None, "not-a-timestamp"])
+async def test_unblock_sweep_retry_gate_holds_for_missing_or_malformed_evidence(
+    reaper_db, mocker, last_retry_at
+):
+    """Retry 2+ fails closed when its prior-run timestamp is absent or invalid."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    context = {
+        "blocker": {
+            "source": "agent",
+            "waiting_on": "precondition",
+            "reason": "BLOCKER: backend/app/foo.py does not exist on main",
+        },
+        "_blocked_optimistic_retries": 1,
+    }
+    if last_retry_at is not None:
+        context["_blocked_last_retry_at"] = last_retry_at
+    t = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="precondition",
+        blocked_reason="BLOCKER: backend/app/foo.py does not exist on main",
+        depends_on=[],
+        blocked_at=now - timedelta(seconds=30),
+        context=context,
+        recheck_after=now - timedelta(minutes=1),
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 0
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.BLOCKED
+    assert t.context.get("_blocked_optimistic_retries") == 1
+    assert t.context.get("_blocked_recheck_attempts") == 1
+    assert t.recheck_after is not None and t.recheck_after > now
+
+
+@pytest.mark.asyncio
+async def test_unblock_sweep_retry_gate_allows_when_task_reblocked(reaper_db, mocker):
+    """Retry 2 is allowed when blocked_at is more recent than the last retry
+    timestamp, proving the previous retry ran a VM that then re-blocked."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    last_retry_at = now - timedelta(seconds=60)
+    t = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="precondition",
+        blocked_reason="BLOCKER: backend/app/foo.py does not exist on main",
+        depends_on=[],
+        # blocked_at is AFTER last_retry_at: the previous retry actually ran a VM.
+        blocked_at=now - timedelta(seconds=30),
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "precondition",
+                "reason": "BLOCKER: backend/app/foo.py does not exist on main",
+            },
+            "_blocked_optimistic_retries": 1,
+            "_blocked_last_retry_at": last_retry_at.isoformat(),
+        },
+        recheck_after=now - timedelta(minutes=1),
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 1
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.QUEUED
+    assert t.context.get("_blocked_optimistic_retries") == 2
+    # Evidence timestamp updated to this retry's timestamp.
+    assert t.context.get("_blocked_last_retry_at") is not None
+    assert t.context.get("_blocked_last_retry_at") != last_retry_at.isoformat()
+    assert "optimistic" in (t.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
 async def test_unblock_sweep_resolves_task_need_into_dep_edge_and_requeues(
     reaper_db, mocker
 ):

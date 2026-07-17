@@ -12320,3 +12320,152 @@ def test_acceptance_proof_rate_axes_registered():
     assert AXIS_ACCEPTANCE_SATISFIED_RATE in ALL_AXES
     assert AXIS_ACCEPTANCE_SATISFIED_RATE == "acceptance_satisfied_rate"
     assert AXIS_ACCEPTANCE_SATISFIED_RATE in AXIS_CONSUMERS
+
+
+# ---------------------------------------------------------------------------
+# Tests for fix(metrics): remove silent VM-cost sampling
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_compute_current_axes_exposes_cohort_coverage(db_session):
+    """compute_current_axes must include cohort_task_count (int) and cohort_capped (bool)."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(_make_efficient_task(project.id))
+    db_session.add(_make_efficient_task(project.id, vm_warm_start=True))
+    await db_session.commit()
+
+    axes = await compute_current_axes(db_session, project.id)
+
+    assert "cohort_task_count" in axes, "compute_current_axes must include cohort_task_count"
+    assert "cohort_capped" in axes, "compute_current_axes must include cohort_capped"
+    assert isinstance(axes["cohort_task_count"], int), (
+        f"cohort_task_count must be int, got {type(axes['cohort_task_count'])}"
+    )
+    assert isinstance(axes["cohort_capped"], bool), (
+        f"cohort_capped must be bool, got {type(axes['cohort_capped'])}"
+    )
+    # With only 2 tasks in the window, the cap is not reached.
+    assert axes["cohort_task_count"] == 2
+    assert axes["cohort_capped"] is False
+
+
+@pytest.mark.asyncio
+async def test_compute_current_axes_exposes_blocked_vm_spend(db_session):
+    """compute_current_axes must include blocked_provisioned_vm_spend_usd as a non-negative float."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    # A BLOCKED task that had a VM provisioned and stopped.
+    blocked_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.BLOCKED,
+        vm_provisioned_at=now - timedelta(minutes=3),
+        vm_stopped_at=now,
+        vm_spot=False,
+        vm_runtime_cost_banked_db=99.0,
+        attempt_history_db=[
+            {
+                "vm_provisioned_at": (now - timedelta(days=10)).isoformat(),
+                "vm_stopped_at": (now - timedelta(days=10, minutes=-5)).isoformat(),
+                "vm_runtime_cost_usd": 99.0,
+            }
+        ],
+    )
+    db_session.add(blocked_task)
+    # A terminal task (should be in cohort, not BLOCKED spend).
+    db_session.add(_make_efficient_task(project.id))
+    await db_session.commit()
+
+    axes = await compute_current_axes(db_session, project.id)
+
+    assert "blocked_provisioned_vm_spend_usd" in axes, (
+        "compute_current_axes must include blocked_provisioned_vm_spend_usd"
+    )
+    spend = axes["blocked_provisioned_vm_spend_usd"]
+    assert isinstance(spend, float), (
+        f"blocked_provisioned_vm_spend_usd must be float, got {type(spend)}"
+    )
+    assert spend >= 0.0, "blocked_provisioned_vm_spend_usd must be non-negative"
+    # 3 minutes = 180 seconds at the default on-demand rate. The $99 banked
+    # attempt is outside the seven-day window and must not be attributed here.
+    expected = round(180 * ON_DEMAND_RATE, 6)
+    assert spend == pytest.approx(expected, abs=1e-6), (
+        f"BLOCKED VM spend {spend} does not match expected {expected}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_compute_current_axes_counts_blocked_vm_spend_without_attempt_history(
+    db_session,
+):
+    """A first blocked VM attempt does not require legacy context to be loaded."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.BLOCKED,
+            vm_provisioned_at=now - timedelta(minutes=3),
+            vm_stopped_at=now,
+            vm_spot=False,
+        )
+    )
+    await db_session.commit()
+
+    axes = await compute_current_axes(db_session, project.id)
+
+    expected = round(180 * ON_DEMAND_RATE, 6)
+    assert axes["blocked_provisioned_vm_spend_usd"] == pytest.approx(
+        expected, abs=1e-6
+    )
+
+
+@pytest.mark.asyncio
+async def test_load_recent_tasks_is_terminal_time_ordered(db_session):
+    """_load_recent_tasks must return tasks ordered by updated_at descending."""
+    from app.efficiency_snapshot import _load_recent_tasks  # noqa: PLC0415
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    # Three tasks with distinct updated_at timestamps.
+    t_old = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        updated_at=now - timedelta(days=4),
+    )
+    t_mid = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        updated_at=now - timedelta(days=2),
+    )
+    t_new = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        updated_at=now - timedelta(hours=1),
+    )
+    db_session.add_all([t_old, t_mid, t_new])
+    await db_session.commit()
+
+    tasks = await _load_recent_tasks(db_session, project.id)
+    assert len(tasks) == 3
+    # Must be in descending updated_at order (newest first).
+    dates = [t.updated_at for t in tasks]
+    assert dates == sorted(dates, reverse=True), (
+        "Tasks must be ordered by updated_at descending"
+    )

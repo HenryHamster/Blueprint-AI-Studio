@@ -916,15 +916,14 @@ async def reserve_migration_revisions(
     out distinct monotonic ids under a per-project lock, so once a candidate's
     revision number is locked, concurrent siblings can each author a migration in
     parallel and be linearized at merge time. The slot therefore RELEASES
-    immediately after the number is reserved — this returns ``eligible_ids``
-    UNCHANGED (no deferral). The reserved revision/down_revision rides the agent
-    claim response additively and is consumed verbatim.
+    immediately after the number is reserved. The reserved
+    revision/down_revision rides the agent claim response additively and is
+    consumed verbatim.
 
-    Allocation is best-effort and idempotent: an existing ACTIVE reservation is
-    returned as-is (re-running every cycle never burns a fresh id), and a
-    transient allocation failure is swallowed so it never blocks dispatch — the
-    agent falls back to deriving the next revision locally when no reservation
-    rides the claim.
+    Allocation is idempotent: an existing ACTIVE reservation is returned as-is
+    (re-running every cycle never burns a fresh id). Unknown remote-head failures
+    fail closed because local numbering may be stale; unrelated allocator errors
+    retain the legacy best-effort fallback.
     """
     if not eligible_ids:
         return eligible_ids
@@ -933,15 +932,25 @@ async def reserve_migration_revisions(
     # migration_chain + glob) off the orchestrator import path at module load
     # and mirrors the leaf-import discipline used elsewhere in this module.
     from app.migration_reservations import (  # noqa: PLC0415
+        MigrationHeadUnavailableError,
         allocate_migration_reservation,
     )
 
+    reservable_ids = list(eligible_ids)
     for eid in eligible_ids:
         candidate = next((t for t in candidate_tasks if t.id == eid), None)
         if candidate is None or not _is_migration_task(candidate):
             continue
         try:
             await allocate_migration_reservation(session, candidate)
+        except MigrationHeadUnavailableError:
+            reservable_ids.remove(eid)
+            logger.warning(
+                "[DISPATCH] Deferring migration task %s because its task-base "
+                "migration head cannot be determined safely",
+                eid,
+                exc_info=True,
+            )
         except Exception:
             # Best-effort: a transient allocation failure must not hold a
             # migration task out of dispatch. The agent derives max+1 locally
@@ -953,7 +962,7 @@ async def reserve_migration_revisions(
                 eid,
                 exc_info=True,
             )
-    return eligible_ids
+    return reservable_ids
 
 
 # Task types exempt from SCOPE_EMPTY dispatch pre-emption. A review task

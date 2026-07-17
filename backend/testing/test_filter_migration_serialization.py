@@ -5,8 +5,8 @@ release flow: a dispatchable migration-producing candidate is handed a distinct
 provisional revision id up-front (locking its number) and is NOT held behind a
 sibling's full execution/test lifecycle. These tests prove the slot releases
 immediately after reservation and that distinct, monotonic ids are allocated —
-while non-migration tasks are untouched and a transient allocation failure never
-blocks dispatch.
+while non-migration tasks are untouched and an unknown remote head defers only
+the unsafe migration task.
 
 The on-disk migration head is pinned via ``_current_merged_head`` so these tests
 are independent of the live alembic chain (which grows as migrations land).
@@ -186,19 +186,17 @@ class TestReserveMigrationRevisions:
         assert await reserve_migration_revisions([], [], db_session) == []
 
     @pytest.mark.asyncio
-    async def test_allocation_failure_does_not_block_dispatch(
+    async def test_unknown_remote_head_defers_migration_dispatch(
         self, db_session, monkeypatch
     ):
-        """A transient allocation failure leaves the task dispatchable.
-
-        The agent falls back to deriving max+1 locally when no reservation
-        rides the claim, so a degraded allocator must not strand the task.
-        """
+        """An unknown task-base head must fail closed instead of numbering locally."""
         project = await _project(db_session)
         a = await _task(db_session, project.id, ttype="migrate")
 
         async def _boom(session, task, **kw):
-            raise RuntimeError("allocator unavailable")
+            raise migration_reservations.MigrationHeadUnavailableError(
+                "remote head unavailable"
+            )
 
         monkeypatch.setattr(
             migration_reservations, "allocate_migration_reservation", _boom
@@ -206,7 +204,23 @@ class TestReserveMigrationRevisions:
 
         result = await reserve_migration_revisions([a.id], [a], db_session)
 
-        assert result == [a.id]
+        assert result == []
         assert (
             await get_migration_reservation_for_task(db_session, task_id=a.id) is None
         )
+
+    @pytest.mark.asyncio
+    async def test_unrelated_allocator_failure_retains_best_effort_dispatch(
+        self, db_session, monkeypatch
+    ):
+        project = await _project(db_session)
+        a = await _task(db_session, project.id, ttype="migrate")
+
+        async def _boom(session, task, **kw):
+            raise RuntimeError("database refresh failed")
+
+        monkeypatch.setattr(
+            migration_reservations, "allocate_migration_reservation", _boom
+        )
+
+        assert await reserve_migration_revisions([a.id], [a], db_session) == [a.id]

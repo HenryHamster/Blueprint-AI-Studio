@@ -1123,14 +1123,18 @@ async def agent_fetch_vm_cost(
         compute_vm_cost_by_task_type,
     )
 
+    _COHORT_CAP = 5000
     await _resolve_agent_project(project_id, token, session)
     tasks = await _load_recent_tasks(session, project_id)
     by_task_type = compute_vm_cost_by_task_type(tasks)
+    cohort_task_count = len(tasks)
     return {
         "status": "success",
         "data": {
             "by_task_type": by_task_type,
             "window_days": _AXIS_WINDOW_DAYS,
+            "cohort_task_count": cohort_task_count,
+            "truncated": cohort_task_count >= _COHORT_CAP,
         },
     }
 

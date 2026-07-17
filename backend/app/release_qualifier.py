@@ -7819,7 +7819,10 @@ async def _required_children_terminal(
     smoketest_resolved = "smoketest" in resolved_dims
     merge_grade_resolved = "merge_grade" in resolved_dims
 
-    smoketest_required = bool(qual.get("smoketest_enabled") or qual.get("env_preflight_enabled", False))
+    smoketest_required = bool(
+        qual.get("smoketest_enabled", True)
+        or qual.get("env_preflight_enabled", False)
+    )
     audit_task_id_raw = qual.get("audit_task_id")
     challenge_task_id_raw = qual.get("challenge_task_id")
     smoketest_task_id_raw = qual.get("smoketest_task_id")

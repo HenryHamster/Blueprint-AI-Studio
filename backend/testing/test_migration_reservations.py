@@ -154,7 +154,8 @@ async def test_task_base_lookup_uses_custom_path_and_review_base(db_session, mon
 
 
 @pytest.mark.asyncio
-async def test_task_base_lookup_failure_falls_back_to_local_head(db_session, monkeypatch):
+async def test_task_base_lookup_failure_raises_when_github_configured(db_session, monkeypatch):
+    """GitHub configured + API error must raise, not silently fall back to stale local head."""
     project = await _make_project(db_session)
     project.github_owner = "acme"
     project.github_repo = "widget"
@@ -171,10 +172,41 @@ async def test_task_base_lookup_failure_falls_back_to_local_head(db_session, mon
     monkeypatch.setattr("app.github_auth.get_repo_installation_read_token", token)
     monkeypatch.setattr("app.github.list_versions_at_ref", unavailable)
 
+    with pytest.raises(RuntimeError, match="GitHub unavailable"):
+        await allocate_migration_reservation(db_session, task)
+
+
+@pytest.mark.asyncio
+async def test_no_token_raises_when_github_configured(db_session, monkeypatch):
+    """GitHub configured + no installation token must raise, not fall back to stale local head."""
+    project = await _make_project(db_session)
+    project.github_owner = "acme"
+    project.github_repo = "widget"
+    db_session.add(project)
+    await db_session.commit()
+    task = await _make_task(db_session, project.id)
+
+    async def no_token(*_args):
+        return None
+
+    monkeypatch.setattr("app.github_auth.get_repo_installation_read_token", no_token)
+
+    with pytest.raises(RuntimeError, match="no GitHub installation token"):
+        await allocate_migration_reservation(db_session, task)
+
+
+@pytest.mark.asyncio
+async def test_no_github_config_uses_local_head(db_session):
+    """Project without github_owner falls back to local head — the only safe fallback path."""
+    project = await _make_project(db_session)
+    # No github_owner or github_repo set — local fallback is correct here.
+    task = await _make_task(db_session, project.id)
+
     reservation = await allocate_migration_reservation(db_session, task)
 
     assert reservation.provisional_down_revision == "0151"
     assert reservation.provisional_revision == "0152"
+    assert reservation.status == MigrationReservationStatus.ACTIVE
 
 
 @pytest.mark.asyncio
@@ -234,6 +266,38 @@ async def test_idempotent_reread_returns_same_reservation(db_session):
         .all()
     )
     assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_idempotent_reread_survives_github_outage(db_session, monkeypatch):
+    """A persisted ACTIVE reservation is reclaimable without remote-head I/O."""
+    project = await _make_project(db_session)
+    project.github_owner = "acme"
+    project.github_repo = "widget"
+    db_session.add(project)
+    await db_session.commit()
+    task = await _make_task(db_session, project.id)
+
+    async def token(*_args):
+        return "read-token"
+
+    async def versions(*_args, **_kwargs):
+        return ["0151_head.py"]
+
+    monkeypatch.setattr("app.github_auth.get_repo_installation_read_token", token)
+    monkeypatch.setattr("app.github.list_versions_at_ref", versions)
+    first = await allocate_migration_reservation(db_session, task)
+
+    async def outage(*_args, **_kwargs):
+        raise RuntimeError("GitHub unavailable")
+
+    monkeypatch.setattr(
+        "app.github_auth.get_repo_installation_read_token", outage
+    )
+    second = await allocate_migration_reservation(db_session, task)
+
+    assert second.id == first.id
+    assert second.provisional_revision == "0152"
 
 
 @pytest.mark.asyncio

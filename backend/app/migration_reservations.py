@@ -65,6 +65,10 @@ _TASK_TERMINAL_STATUSES = {
 _PROJECT_LOCKS: dict[str, tuple[object, asyncio.Lock]] = {}
 
 
+class MigrationHeadUnavailableError(RuntimeError):
+    """The configured remote migration head could not be determined safely."""
+
+
 def _project_lock(project_id: uuid.UUID) -> asyncio.Lock:
     loop = asyncio.get_running_loop()
     key = str(project_id)
@@ -194,25 +198,29 @@ def _head_from_migration_filenames(filenames: list[str]) -> str:
 
 
 async def _task_base_migration_head(session, task: Task) -> str | None:
-    """Best-effort remote migration head, deliberately before allocation locking.
+    """Remote migration head for the task's effective base branch.
 
-    The deployed API image can have a stale local Alembic chain.  Reservations
-    must instead follow the task's effective base branch when a read token and
-    project repository are available.  Callers retain the local fallback when
-    this optional read is unavailable.
+    Returns ``None`` when no GitHub repository is configured (caller falls back
+    to the local merged head).  When a repository IS configured, any failure
+    (missing token, network error, API error) propagates — a stale-local-head
+    fallback in that case would recreate the pre-#15085 stale-chain reservation.
     """
     project = await session.get(Project, task.project_id)
     if project is None or not project.github_owner or not project.github_repo:
         return None
-    try:
-        from app.github import list_versions_at_ref
-        from app.github_auth import get_repo_installation_read_token
+    from app.github import list_versions_at_ref
+    from app.github_auth import get_repo_installation_read_token
 
+    try:
         token = await get_repo_installation_read_token(
             project.github_owner, project.github_repo
         )
         if not token:
-            return None
+            raise MigrationHeadUnavailableError(
+                f"no GitHub installation token available for "
+                f"{project.github_owner}/{project.github_repo}; "
+                "cannot safely determine task-base migration head"
+            )
         filenames = await list_versions_at_ref(
             token,
             project.github_owner,
@@ -221,14 +229,14 @@ async def _task_base_migration_head(session, task: Task) -> str | None:
             project_id=str(project.id),
             versions_dir=project.alembic_versions_path,
         )
-        return _head_from_migration_filenames(filenames)
-    except Exception:  # noqa: BLE001 - reservation sourcing must not block dispatch
-        logger.warning(
-            "unable to read task-base migration head for task %s; using local fallback",
-            task.id,
-            exc_info=True,
-        )
-        return None
+    except MigrationHeadUnavailableError:
+        raise
+    except Exception as exc:
+        raise MigrationHeadUnavailableError(
+            f"cannot safely determine task-base migration head for "
+            f"{project.github_owner}/{project.github_repo}: {exc}"
+        ) from exc
+    return _head_from_migration_filenames(filenames)
 
 
 async def allocate_migration_reservation(
@@ -251,12 +259,21 @@ async def allocate_migration_reservation(
     """
     if task.id is None:
         raise ValueError("task must be persisted before reserving a revision")
+    if task.status in _TASK_TERMINAL_STATUSES:
+        raise ValueError("cannot reserve a revision for a terminal task")
     project_id = task.project_id
+
+    # Reclaim is the idempotent fast path and must not depend on GitHub being
+    # available after the reservation has already been persisted. The locked
+    # critical section below repeats this check to close concurrent allocation.
+    existing = await get_migration_reservation_for_task(session, task_id=task.id)
+    if existing is not None:
+        return existing
 
     # Network I/O is intentionally completed before taking either allocator
     # lock: a slow GitHub response must never hold a DB/advisory critical section.
     remote_head = await _task_base_migration_head(session, task)
-    head = remote_head or _current_merged_head(versions_dir)
+    head = remote_head if remote_head is not None else _current_merged_head(versions_dir)
 
     async with _project_lock(project_id):
         # Cross-process serialization on Postgres; a no-op (skipped) on SQLite
@@ -376,4 +393,5 @@ __all__ = [
     "finalize_migration_reservation",
     "expire_migration_reservation",
     "get_migration_reservation_for_task",
+    "MigrationHeadUnavailableError",
 ]

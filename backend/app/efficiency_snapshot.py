@@ -53,6 +53,7 @@ from app.models import (
     Task,
     TaskStatus,
     _utcnow,
+    get_task_current_attempt_vm_cost_usd,
     get_task_total_llm_totals,
     get_task_total_vm_cost_usd,
 )
@@ -378,7 +379,13 @@ _SNAPSHOT_HISTORY_MAX = 7
 #      task-type buckets), the prompt-cache lever's direct-effect signal. Baselined
 #      on the pre-lever codebase so a later prompt-restructuring change is measured
 #      against a frozen denominator.
-METRIC_DEF_VERSION = "v15"
+# v16: _load_recent_tasks now orders by updated_at DESC before applying the 5000-row
+#      cap so the most-recent terminal tasks are selected (terminal-time anchored).
+#      compute_current_axes now exposes cohort_task_count (actual row count),
+#      cohort_capped (bool: True when 5000-row limit was reached), and
+#      blocked_provisioned_vm_spend_usd (VM spend by BLOCKED tasks in the window),
+#      making silent sampling and BLOCKED exclusion explicit.
+METRIC_DEF_VERSION = "v16"
 
 
 async def _load_recent_tasks(
@@ -452,9 +459,56 @@ async def _load_recent_tasks(
                 raiseload=True,
             )
         )
+        .order_by(Task.updated_at.desc())
         .limit(5000)
     )
     return list((await session.execute(stmt)).scalars().all())
+
+
+async def _compute_blocked_vm_spend(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    window_days: int = _AXIS_WINDOW_DAYS,
+) -> float:
+    """Sum timestamped VM attempts for BLOCKED tasks within the window.
+
+    BLOCKED tasks release their VM (vm_stopped_at is stamped on transition), so
+    each current and banked attempt is fully accountable. ``vm_provisioned_at``
+    remains the window anchor, but banked cost is read from attempt history
+    instead of the lifetime scalar so attempts before the cutoff are excluded.
+    Legacy banked cost without a valid timestamp is intentionally unattributed.
+    """
+    cutoff = _utcnow() - timedelta(days=window_days)
+    stmt = select(Task).options(
+        load_only(
+            Task.vm_provisioned_at,
+            Task.vm_stopped_at,
+            Task.vm_spot,
+            Task.vm_machine_type,
+            Task.attempt_history_db,
+            raiseload=True,
+        )
+    ).where(
+        Task.project_id == project_id,
+        Task.status == TaskStatus.BLOCKED,
+        or_(Task.vm_provisioned_at >= cutoff, Task.attempt_history_db.isnot(None)),
+    )
+    tasks = list((await session.execute(stmt)).scalars().all())
+    spend = 0.0
+    for task in tasks:
+        if task.vm_provisioned_at is not None and task.vm_provisioned_at >= cutoff:
+            spend += get_task_current_attempt_vm_cost_usd(task)
+        for attempt in task.attempt_history_db or []:
+            try:
+                provisioned_at = datetime.fromisoformat(attempt["vm_provisioned_at"])
+                if provisioned_at.tzinfo is not None:
+                    provisioned_at = provisioned_at.replace(tzinfo=None)
+                if provisioned_at >= cutoff:
+                    spend += max(0.0, float(attempt.get("vm_runtime_cost_usd") or 0.0))
+            except (KeyError, TypeError, ValueError):
+                continue
+    return spend
 
 
 async def _load_project_lanes(
@@ -2971,6 +3025,10 @@ async def compute_current_axes(
     )
 
     tasks = await _load_recent_tasks(session, project_id)
+    _COHORT_CAP = 5000
+    cohort_task_count = len(tasks)
+    cohort_capped = cohort_task_count >= _COHORT_CAP
+    blocked_vm_spend = await _compute_blocked_vm_spend(session, project_id)
     lanes = await _load_project_lanes(session, project_id)
     pool_metrics = await compute_pool_idle_cost(session, project_id)
     # ComputeJob (GPU experiment) cost for the window: per-task map (fed into the
@@ -3176,6 +3234,17 @@ async def compute_current_axes(
         # the declared tolerance. Non-zero tasks with at least one priced attempt
         # are required for a meaningful check.
         "cost_telemetry_reconciliation": _compute_cost_telemetry_reconciliation(tasks),
+        # Cohort coverage: how many terminal tasks were loaded and whether the
+        # 5000-row cap was reached (cohort_capped=True means the window contains
+        # more tasks than the cap and totals are cohort-scoped, not window-complete).
+        "cohort_task_count": cohort_task_count,
+        "cohort_capped": cohort_capped,
+        # BLOCKED provisioned spend: VM cost incurred by BLOCKED tasks whose VM
+        # was provisioned within the window. BLOCKED tasks are excluded from the
+        # terminal cohort but still consumed real VM spend; surfaced separately
+        # so the admin SQL total (terminal + BLOCKED) can be reconciled against
+        # the cohort-scoped figure.
+        "blocked_provisioned_vm_spend_usd": round(blocked_vm_spend, 6),
         # Acceptance evidence quality trend (direction d-99daddbd): proven_rate
         # (machine-checked proofs / total merges) and satisfied_rate
         # (proven + satisfied_unproven / total merges) persisted as snapshot axes
