@@ -123,6 +123,17 @@ Findings covered here (15-finding capability-proof salvage bundle, 2026-07-17):
   cp-13 — test_capability_proof_gate_enforcement_full_lifecycle exists in test_blocked_need_resolution
   cp-14 — docs/capability-proof-earn-path.md design document exists
   cp-15 — record_capability_named_test_execution_proof mints proven tier; enroll_capability_proof_trial exists
+
+Findings covered here (7-finding creation-path fail-closed audience salvage bundle, 2026-07-17):
+  p1 — design: fail-closed audience contract — design for Alert/message construction fail-closed
+  p2 — fix: research_direction_state + research_completion Alert constructors stamp event_type
+         so operator_visible_alert_filter routes them STRATEGIST_INTERNAL (dedup_deadlock,
+         already_fixed_deadlock, direction_auto_completed are never shown in operator badge)
+  p3 — lifecycle fields consumed (already fixed; see n1-n3 tests above)
+  p4 — attention-driven inbox (already fixed; see m1 tests above)
+  p5 — confirmation chips actionable (already fixed; see m2 tests above)
+  p6 — QUESTION auto-decay (already fixed; see m3 tests above)
+  p7 — notifications converged on attention model (already fixed; see m4 tests above)
 """
 
 from __future__ import annotations
@@ -3435,3 +3446,121 @@ def test_cp15_proven_tier_recorders_and_enroll_exist():
     assert "named_test" in source, (
         "record_capability_named_test_execution_proof must produce a 'named_test' kind proof"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Findings p1/p2 — Alert constructors stamp event_type so they route
+# STRATEGIST_INTERNAL through operator_visible_alert_filter (fail-closed)
+# --------------------------------------------------------------------------- #
+
+
+def test_research_direction_state_direction_auto_completed_alert_stamps_event_type():
+    """research_direction_state Alert for 'Direction auto-completed' must stamp event_type.
+
+    Finding p2: research.direction_auto_completed is registered STRATEGIST_INTERNAL in
+    the audience registry. Without event_type= the Alert has a NULL event_type and the
+    operator_visible_alert_filter retains it (fail-open for NULLs), leaking an internal
+    bookkeeping notice to the operator badge. Stamping event_type= ensures the filter
+    routes it correctly.
+    """
+    import inspect
+    import app.research_direction_state as rds_mod
+
+    source = inspect.getsource(rds_mod)
+    assert 'event_type="research.direction_auto_completed"' in source, (
+        "research_direction_state must pass "
+        'event_type="research.direction_auto_completed" to the Alert constructor so '
+        "operator_visible_alert_filter routes it STRATEGIST_INTERNAL; without it the "
+        "NULL event_type falls through the fail-open read filter and leaks to the operator"
+    )
+
+
+def test_research_direction_state_dedup_deadlock_alert_stamps_event_type():
+    """research_direction_state Alert for 'Dedup deadlock detected' must stamp event_type.
+
+    Finding p2: research.dedup_deadlock is registered STRATEGIST_INTERNAL. Without
+    event_type= the Alert has NULL and leaks to the operator badge via the fail-open
+    filter for NULLs.
+    """
+    import inspect
+    import app.research_direction_state as rds_mod
+
+    source = inspect.getsource(rds_mod)
+    assert 'event_type="research.dedup_deadlock"' in source, (
+        "research_direction_state must pass event_type='research.dedup_deadlock' to "
+        "the Dedup-deadlock Alert constructor so operator_visible_alert_filter hides it "
+        "from the operator badge (research.dedup_deadlock is STRATEGIST_INTERNAL)"
+    )
+
+
+def test_research_direction_state_already_fixed_deadlock_alert_stamps_event_type():
+    """research_direction_state Alert for 'Already-fixed deadlock detected' must stamp event_type.
+
+    Finding p2: research.already_fixed_deadlock is registered STRATEGIST_INTERNAL. Without
+    event_type= the Alert has NULL and leaks to the operator badge.
+    """
+    import inspect
+    import app.research_direction_state as rds_mod
+
+    source = inspect.getsource(rds_mod)
+    assert 'event_type="research.already_fixed_deadlock"' in source, (
+        "research_direction_state must pass event_type='research.already_fixed_deadlock' to "
+        "the Already-fixed-deadlock Alert constructor so operator_visible_alert_filter hides "
+        "it from the operator badge (research.already_fixed_deadlock is STRATEGIST_INTERNAL)"
+    )
+
+
+def test_research_completion_direction_auto_completed_alert_stamps_event_type():
+    """research_completion Alert for 'Direction auto-completed' must stamp event_type.
+
+    Finding p2: research_completion.py builds a 'Direction auto-completed' Alert without
+    event_type, so it has a NULL event_type and leaks through operator_visible_alert_filter.
+    Stamping event_type='research.direction_auto_completed' (STRATEGIST_INTERNAL) ensures
+    the filter gates it out.
+    """
+    import inspect
+    import app.research_completion as rc_mod
+
+    # Get source of the module to check that the Alert constructor has event_type stamped.
+    source = inspect.getsource(rc_mod)
+    # Both research_direction_state and research_completion have direction_auto_completed Alerts.
+    # Count occurrences of event_type="research.direction_auto_completed" — must appear in
+    # research_completion too (not only research_direction_state).
+    count = source.count('event_type="research.direction_auto_completed"')
+    assert count >= 1, (
+        "research_completion.py must pass event_type='research.direction_auto_completed' "
+        "to its 'Direction auto-completed' Alert constructor; found 0 occurrences — "
+        "without this stamp the NULL event_type falls through the fail-open read filter "
+        "and surfaces the internal bookkeeping notice in the operator badge"
+    )
+
+
+def test_strategist_internal_alert_event_types_are_registered():
+    """The three research alert event_types must be registered STRATEGIST_INTERNAL.
+
+    Finding p1/p2: the audience registry is the single source of truth for Alert routing.
+    research.direction_auto_completed, research.dedup_deadlock, and
+    research.already_fixed_deadlock must be present with STRATEGIST_INTERNAL audience so
+    operator_visible_alert_filter reliably excludes them once the emitters stamp event_type.
+    """
+    from app.message_audience import (
+        _EVENT_AUDIENCE_REGISTRY,
+        STRATEGIST_INTERNAL,
+    )
+
+    expected = {
+        "research.direction_auto_completed": STRATEGIST_INTERNAL,
+        "research.dedup_deadlock": STRATEGIST_INTERNAL,
+        "research.already_fixed_deadlock": STRATEGIST_INTERNAL,
+    }
+    for event_type, expected_audience in expected.items():
+        assert event_type in _EVENT_AUDIENCE_REGISTRY, (
+            f"_EVENT_AUDIENCE_REGISTRY must include '{event_type}' so "
+            "operator_visible_alert_filter can gate it; missing entries fall through "
+            "to the fail-open NULL branch and leak internal bookkeeping to the operator"
+        )
+        actual = _EVENT_AUDIENCE_REGISTRY[event_type]
+        assert actual == expected_audience, (
+            f"_EVENT_AUDIENCE_REGISTRY['{event_type}'] must be '{expected_audience}'; "
+            f"got '{actual}' — internal research bookkeeping must never reach the operator badge"
+        )
