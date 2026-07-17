@@ -1827,3 +1827,132 @@ async def test_unchanged_creates_no_drift_alert(db):
         .all()
     )
     assert alerts == [], "no drift alert expected for unchanged/no_config sweep result"
+
+
+# ── ProjectComputeImageBuild model round-trip ─────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_project_compute_image_build_import():
+    """ProjectComputeImageBuild and ComputeImageBuildStatus are importable."""
+    from app.models import ComputeImageBuildStatus, ProjectComputeImageBuild  # noqa: F401
+
+    assert ComputeImageBuildStatus.PENDING.value == "PENDING"
+    assert ComputeImageBuildStatus.BUILDING.value == "BUILDING"
+    assert ComputeImageBuildStatus.SUCCEEDED.value == "SUCCEEDED"
+    assert ComputeImageBuildStatus.FAILED.value == "FAILED"
+    assert ComputeImageBuildStatus.TIMED_OUT.value == "TIMED_OUT"
+
+
+@pytest.mark.asyncio
+async def test_project_compute_image_build_round_trip(db):
+    """ProjectComputeImageBuild inserts and reads back correctly."""
+    from app.models import ComputeImageBuildStatus, ProjectComputeImageBuild
+
+    project = await _make_project(db, name="build-test-proj")
+
+    row = ProjectComputeImageBuild(
+        project_id=project.id,
+        dep_hash="abc123",
+        registry_repo="us-central1-docker.pkg.dev/myproj/compute-images",
+        image_name="compute-myproj",
+        builder_vm_id="builder-vm-001",
+        zone="us-central1-a",
+        status=ComputeImageBuildStatus.PENDING,
+    )
+    db.add(row)
+    await db.commit()
+    await db.refresh(row)
+
+    assert row.id is not None
+    assert row.project_id == project.id
+    assert row.dep_hash == "abc123"
+    assert row.registry_repo == "us-central1-docker.pkg.dev/myproj/compute-images"
+    assert row.image_name == "compute-myproj"
+    assert row.builder_vm_id == "builder-vm-001"
+    assert row.zone == "us-central1-a"
+    assert row.status == ComputeImageBuildStatus.PENDING
+    assert row.started_at is None
+    assert row.deadline_at is None
+    assert row.result_json is None
+    assert row.error_reason is None
+    assert row.created_at is not None
+    assert row.updated_at is not None
+
+    fetched = (
+        await db.execute(
+            select(ProjectComputeImageBuild).where(
+                ProjectComputeImageBuild.id == row.id
+            )
+        )
+    ).scalar_one()
+    assert fetched.dep_hash == "abc123"
+    assert fetched.status == ComputeImageBuildStatus.PENDING
+
+
+@pytest.mark.asyncio
+async def test_project_compute_image_build_terminal_statuses(db):
+    """SUCCEEDED and FAILED rows round-trip with result/error fields."""
+    from app.models import ComputeImageBuildStatus, ProjectComputeImageBuild
+
+    project = await _make_project(db, name="terminal-test-proj")
+
+    succeeded = ProjectComputeImageBuild(
+        project_id=project.id,
+        dep_hash="hash-ok",
+        registry_repo="us-central1-docker.pkg.dev/proj/imgs",
+        image_name="compute-proj",
+        status=ComputeImageBuildStatus.SUCCEEDED,
+        result_json='{"pinned_ref": "registry@sha256:abc"}',
+    )
+    failed = ProjectComputeImageBuild(
+        project_id=project.id,
+        dep_hash="hash-bad",
+        registry_repo="us-central1-docker.pkg.dev/proj/imgs",
+        image_name="compute-proj",
+        status=ComputeImageBuildStatus.FAILED,
+        error_reason="docker build exited with code 1",
+    )
+    db.add(succeeded)
+    db.add(failed)
+    await db.commit()
+    await db.refresh(succeeded)
+    await db.refresh(failed)
+
+    assert succeeded.result_json == '{"pinned_ref": "registry@sha256:abc"}'
+    assert succeeded.error_reason is None
+    assert failed.result_json is None
+    assert failed.error_reason == "docker build exited with code 1"
+
+
+def test_migration_head_matches_expected_schema_revision():
+    """Alembic migration head must equal EXPECTED_SCHEMA_REVISION in main.py."""
+    from pathlib import Path
+
+    from app.main import EXPECTED_SCHEMA_REVISION
+
+    versions_dir = Path(__file__).resolve().parents[1] / "alembic" / "versions"
+    revisions: dict[str, str] = {}
+    down_revisions: set[str] = set()
+
+    for path in versions_dir.glob("*.py"):
+        src = path.read_text()
+        rev = None
+        down_rev = None
+        for line in src.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("revision") and "=" in stripped:
+                rev = stripped.split("=", 1)[1].strip().strip('"').strip("'")
+            elif stripped.startswith("down_revision") and "=" in stripped:
+                val = stripped.split("=", 1)[1].strip().strip('"').strip("'")
+                down_rev = val if val != "None" else None
+        if rev:
+            revisions[rev] = down_rev or ""
+            if down_rev and down_rev != "None":
+                down_revisions.add(down_rev)
+
+    heads = [r for r in revisions if r not in down_revisions]
+    assert len(heads) == 1, f"Expected a single alembic head, got: {heads}"
+    assert heads[0] == EXPECTED_SCHEMA_REVISION, (
+        f"Alembic head '{heads[0]}' != EXPECTED_SCHEMA_REVISION '{EXPECTED_SCHEMA_REVISION}'"
+    )
