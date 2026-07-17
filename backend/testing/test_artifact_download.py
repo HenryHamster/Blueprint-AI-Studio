@@ -489,22 +489,70 @@ def test_media_kind_for_mime_maps_pdf():
     assert storage._media_kind_for_mime("application/octet-stream") == "unknown"
 
 
-def test_svg_excluded_fail_closed_on_both_viewable_surfaces():
-    """Finding 63ee179fc66a7b97: the per-file viewable substrate and the
-    bundle-extraction surface MUST agree on SVG, and the agreed policy is
-    fail-closed exclusion (an SVG served from a signed URL can execute script
-    in the viewer's browsing context)."""
+def test_svg_viewable_on_both_surfaces_after_sanitization():
+    """SVG is accepted on both viewable surfaces now that sanitize_svg_bytes
+    strips <script> elements and on* event attributes before upload.  The two
+    allowlist surfaces must agree (svg_is_viewable returns True)."""
     # Surface 1: the individually-addressable viewable substrate.
-    assert storage.viewable_content_type_for_filename("chart.svg") is None
-    assert "svg" not in storage._VIEWABLE_CONTENT_TYPES
+    assert storage.viewable_content_type_for_filename("chart.svg") == (
+        "image/svg+xml",
+        "image",
+    )
+    assert "svg" in storage._VIEWABLE_CONTENT_TYPES
     # Surface 2: the durable-bundle extraction allowlist.
-    assert ".svg" not in storage.VIEWABLE_COMPUTE_JOB_EXTENSIONS
-    # Both surfaces agree, and they agree on exclusion.
-    assert storage.svg_is_viewable() is False
-    # PDF, by contrast, is present on BOTH surfaces (added alongside the SVG
-    # exclusion, not replacing it) — the two allowlists stay in agreement.
+    assert ".svg" in storage.VIEWABLE_COMPUTE_JOB_EXTENSIONS
+    # Both surfaces agree, and they agree on inclusion.
+    assert storage.svg_is_viewable() is True
+    # PDF is still present on both surfaces.
     assert "pdf" in storage._VIEWABLE_CONTENT_TYPES
     assert ".pdf" in storage.VIEWABLE_COMPUTE_JOB_EXTENSIONS
+
+
+def test_sanitize_svg_bytes_strips_script_and_events():
+    """sanitize_svg_bytes removes <script> elements, on* event attributes, and
+    javascript: hrefs, but preserves valid SVG geometry."""
+    # Script element (namespaced and bare) are removed.
+    svg_with_script = (
+        b"<svg xmlns='http://www.w3.org/2000/svg'>"
+        b"<script>alert(1)</script>"
+        b"<rect width='10' height='10'/>"
+        b"</svg>"
+    )
+    result = storage.sanitize_svg_bytes(svg_with_script)
+    assert b"<script" not in result
+    assert b"alert" not in result
+    assert b"rect" in result  # geometry preserved
+
+    # on* event attributes are stripped.
+    svg_with_event = (
+        b"<svg xmlns='http://www.w3.org/2000/svg'>"
+        b"<circle onclick='evil()' r='5'/>"
+        b"</svg>"
+    )
+    result2 = storage.sanitize_svg_bytes(svg_with_event)
+    assert b"onclick" not in result2
+    assert b"circle" in result2
+
+    # javascript: href is stripped.
+    svg_with_href = (
+        b"<svg xmlns='http://www.w3.org/2000/svg'>"
+        b"<a href='javascript:alert(1)'><text>click</text></a>"
+        b"</svg>"
+    )
+    result3 = storage.sanitize_svg_bytes(svg_with_href)
+    assert b"javascript:" not in result3
+    assert b"text" in result3
+
+    # Malformed XML returns the original bytes unchanged (not an error).
+    bad = b"not xml at all <<< >>>"
+    assert storage.sanitize_svg_bytes(bad) == bad
+
+    # Clean SVG is returned as valid XML bytes.
+    clean = b"<svg xmlns='http://www.w3.org/2000/svg'><rect/></svg>"
+    sanitized = storage.sanitize_svg_bytes(clean)
+    assert b"rect" in sanitized
+    # Idempotent: sanitizing twice does not change the result further.
+    assert storage.sanitize_svg_bytes(sanitized) == sanitized
 
 
 def test_sanitize_viewable_basename_strips_traversal():

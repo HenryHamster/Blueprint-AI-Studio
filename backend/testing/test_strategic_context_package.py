@@ -461,22 +461,26 @@ async def test_signing_failure_falls_back_to_stub(db_session, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_svg_is_never_previewable(db_session, monkeypatch):
-    """svg is excluded from the viewable allowlist (script execution via a
-    signed URL) — no preview and no signing call, whether the svg is the
-    artifact's own storage_uri or a stamped manifest entry."""
+async def test_svg_is_previewable_via_signed_url(db_session, monkeypatch):
+    """SVG is now accepted in the viewable allowlist (sanitized before upload)
+    — a manifest entry with kind='image' and a .svg filename is verified for
+    project ownership and signed just like any other image."""
     project, task = await _make_project_task(db_session, name="PreviewSvg")
+    svg_uri = (
+        f"gs://{ARTIFACT_BUCKET_NAME}/compute-jobs/"
+        f"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/artifacts/viewable/diagram.svg"
+    )
     db_session.add(
         Artifact(
             task_id=task.id,
             artifact_type=ArtifactType.SCREENSHOT,
-            storage_uri=f"gs://{ARTIFACT_BUCKET_NAME}/tasks/{task.id}/chart.svg",
+            storage_uri=svg_uri,
             logs=json.dumps(
                 {
                     "viewable_files": [
                         {
                             "filename": "diagram.svg",
-                            "storage_uri": f"gs://{ARTIFACT_BUCKET_NAME}/tasks/{task.id}/diagram.svg",
+                            "storage_uri": svg_uri,
                             "kind": "image",
                         }
                     ]
@@ -497,9 +501,12 @@ async def test_svg_is_never_previewable(db_session, monkeypatch):
 
     evidence = await load_strategic_context_evidence(db_session, project.id)
     item = evidence["artifacts"]["items"][0]
-    assert "viewable_previews" not in item
-    assert calls == []
-    assert verify_calls == []
+    # SVG is now signed and appears as a viewable preview.
+    assert "viewable_previews" in item
+    assert any(p["filename"] == "diagram.svg" for p in item["viewable_previews"])
+    assert len(verify_calls) == 1
+    assert verify_calls[0] == svg_uri
+    assert len(calls) == 1
 
 
 @pytest.mark.asyncio
@@ -622,12 +629,11 @@ async def test_terminal_linked_compute_job_not_double_surfaced(
 
 
 @pytest.mark.asyncio
-async def test_running_job_manifest_ownership_and_svg_filtered(
+async def test_running_job_manifest_ownership_and_svg_signed(
     db_session, monkeypatch
 ):
     """The running-job pass reuses the shared signer: a foreign-owned entry is
-    skipped and an svg entry is never signed, so only the owned allowlisted
-    file yields a preview."""
+    skipped, but an owned SVG entry IS now signed (sanitized server-side)."""
     project, task = await _make_project_task(db_session, name="RunningFilter")
 
     own_video = (
@@ -670,20 +676,21 @@ async def test_running_job_manifest_ownership_and_svg_filtered(
     items = evidence["artifacts"]["items"]
     assert len(items) == 1
     previews = items[0]["viewable_previews"]
-    # Only the owned video resolved; foreign skipped, svg never signed.
-    assert previews == [
-        {
-            "url": "https://signed.example/rollout.mp4",
-            "storage_uri": own_video,
-            "kind": "video",
-            "filename": "rollout.mp4",
-        }
-    ]
-    assert calls == [(own_video, scp._PREVIEW_SIGNED_URL_MINUTES)]
+    by_filename = {p["filename"]: p for p in previews}
+    # Foreign-owned entry is skipped; both owned (video + svg) are signed.
+    assert "evil.png" not in by_filename
+    assert by_filename["rollout.mp4"]["kind"] == "video"
+    assert by_filename["rollout.mp4"]["url"] == "https://signed.example/rollout.mp4"
+    assert by_filename["diagram.svg"]["kind"] == "image"
+    assert by_filename["diagram.svg"]["url"] == "https://signed.example/diagram.svg"
+    # Both owned URIs were signed (order determined by gather — just check the set).
+    signed_uris = {uri for uri, _ in calls}
+    assert own_video in signed_uris
+    assert svg in signed_uris
 
     descriptor = _artifact_descriptor(items[0])
-    assert descriptor["kind"] == "video"
-    assert descriptor["video"]["url"] == "https://signed.example/rollout.mp4"
+    # descriptor picks the first image preview (SVG) or the video — just check a URL exists
+    assert descriptor.get("kind") in ("image", "video")
 
 
 def test_snapshot_sanitizer_strips_signed_preview_urls():

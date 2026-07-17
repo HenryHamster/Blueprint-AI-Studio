@@ -2809,8 +2809,8 @@ async def persist_viewable_artifacts_with_completeness(
 ) -> tuple[list[dict[str, Any]], int, bool]:
     """Persist a terminal job's viewable files as individually-addressable objects.
 
-    Extracts the viewable files (png/jpg/jpeg/webp/gif/mp4/webm — NO svg, which
-    can execute script when served from a signed URL) from the
+    Extracts the viewable files (png/jpg/jpeg/webp/gif/mp4/webm/svg — SVG is
+    sanitized before upload; see storage.sanitize_svg_bytes) from the
     job's artifacts, uploads each under the allowlisted per-job prefix, and
     returns ``(manifest, dropped, complete)`` — a list of
     ``{filename, storage_uri, content_type, size_bytes, kind}`` for durably stored

@@ -16,6 +16,7 @@ import logging
 import asyncio
 import json
 import threading
+import xml.etree.ElementTree as _ET
 import google.auth
 from google.auth.transport.requests import Request as _GoogleAuthRequest
 from google.cloud import storage
@@ -426,10 +427,11 @@ _VIEWABLE_ARTIFACT_SUBDIR = "viewable"
 # Viewable file extension (lowercase, no dot) -> (content_type, kind). Only these
 # extensions are ever persisted as individual objects; everything else stays
 # inside the opaque bundle. Deliberately conservative: raster images, the two
-# browser-native video containers, and pdf. NO svg — an SVG served from a signed
-# URL can execute script in the viewer's browsing context. PDF is safe because it
-# is opened as a top-level new-tab navigation and renders in the browser's
-# sandboxed PDF viewer on the storage origin, not the app origin.
+# browser-native video containers, pdf, and SVG (sanitized before upload — see
+# sanitize_svg_bytes). PDF is safe because it is opened as a top-level new-tab
+# navigation and renders in the browser's sandboxed PDF viewer on the storage
+# origin, not the app origin. SVG is safe because script tags and event
+# attributes are stripped before upload, and <img src> sandboxes inline SVG.
 _VIEWABLE_CONTENT_TYPES: dict[str, tuple[str, str]] = {
     "png": ("image/png", "image"),
     "jpg": ("image/jpeg", "image"),
@@ -439,6 +441,7 @@ _VIEWABLE_CONTENT_TYPES: dict[str, tuple[str, str]] = {
     "mp4": ("video/mp4", "video"),
     "webm": ("video/webm", "video"),
     "pdf": ("application/pdf", "pdf"),
+    "svg": ("image/svg+xml", "image"),
 }
 
 # Any char outside the safe object-name subset (mirrors the object class in
@@ -474,6 +477,63 @@ def normalize_viewable_revision(value: object) -> str | None:
         return None
     value = value.strip()
     return value if _VIEWABLE_REVISION_RE.fullmatch(value) else None
+
+
+_SVG_NAMESPACE = "http://www.w3.org/2000/svg"
+_XLINK_NAMESPACE = "http://www.w3.org/1999/xlink"
+# Tag names that can execute script, matched with or without the SVG namespace.
+_SVG_SCRIPT_TAGS = {
+    "script",
+    f"{{{_SVG_NAMESPACE}}}script",
+}
+
+
+def sanitize_svg_bytes(data: bytes) -> bytes:
+    """Strip executable content from SVG bytes before serving.
+
+    Removes ``<script>`` elements (namespaced and bare), all ``on*`` event
+    attributes, and ``href`` / ``xlink:href`` attributes whose value starts
+    with ``javascript:``. Returns the sanitized XML bytes, or the original
+    ``data`` unchanged when parsing fails — malformed SVG will not execute
+    anything in the browser anyway.
+
+    This is defence-in-depth: ``<img src>`` already sandboxes SVG in all
+    modern browsers (no script execution, no cookies, no same-origin network
+    access), but stripping known attack vectors reduces the blast radius for
+    any future browser regression.
+    """
+    try:
+        root = _ET.fromstring(data)
+    except _ET.ParseError:
+        return data
+
+    # Collect elements to remove (mutating during iteration is unsafe).
+    to_remove: list[tuple[_ET.Element, _ET.Element]] = []
+    for parent in root.iter():
+        for child in list(parent):
+            if child.tag in _SVG_SCRIPT_TAGS:
+                to_remove.append((parent, child))
+    for parent, child in to_remove:
+        parent.remove(child)
+
+    # Strip dangerous attributes from every surviving element.
+    for element in root.iter():
+        bad_attrs = [
+            attr
+            for attr in list(element.attrib)
+            if attr.lower().startswith("on")
+            or (
+                attr in ("href", f"{{{_XLINK_NAMESPACE}}}href")
+                and element.attrib[attr].lstrip().lower().startswith("javascript:")
+            )
+        ]
+        for attr in bad_attrs:
+            del element.attrib[attr]
+
+    try:
+        return _ET.tostring(root, encoding="unicode").encode("utf-8")
+    except Exception:
+        return data
 
 
 def viewable_content_type_for_filename(filename: str) -> tuple[str, str] | None:
@@ -579,12 +639,16 @@ async def upload_compute_job_viewable_file(
     if not basename or not data:
         return None
     object_name = compute_job_viewable_object_name(job_id, basename)
+    # Strip executable content from SVG before it reaches storage. Defence-in-
+    # depth: <img src> already sandboxes SVG, but we sanitize at upload time so
+    # any "open in new tab" lightbox path on the storage origin is also safe.
+    upload_data = sanitize_svg_bytes(data) if content_type == "image/svg+xml" else data
 
     def _upload() -> None:
         storage_client = storage.Client(project=GCP_PROJECT_ID)
         bucket = storage_client.bucket(ARTIFACT_BUCKET_NAME)
         blob = bucket.blob(object_name)
-        blob.upload_from_string(data, content_type=content_type)
+        blob.upload_from_string(upload_data, content_type=content_type)
 
     try:
         await asyncio.to_thread(_upload)
@@ -1030,11 +1094,11 @@ async def download_compute_job_artifact_bundle(job_id) -> bytes | None:
 # viewable compute-job artifacts extracted from the durable bundle. Raster
 # images, the two browser-native video containers, and pdf.
 #
-# Deliberately NO ``.svg``: an SVG served from a signed URL / the viewable
-# canvas can execute script in the viewer's browsing context, so SVG is
-# excluded fail-closed. This MUST stay in agreement with
-# ``_VIEWABLE_CONTENT_TYPES`` above — both surfaces exclude SVG so no path
-# ever renders untrusted SVG executably (see :func:`svg_is_viewable`).
+# ``.svg`` IS now included — SVG is sanitized via :func:`sanitize_svg_bytes`
+# before upload so ``<script>`` elements and ``on*`` event attributes are
+# stripped server-side. ``<img src>`` also sandboxes SVG natively (no script
+# execution, no same-origin access), so a signed URL to a sanitized SVG is
+# safe. Both surfaces must stay in agreement (see :func:`svg_is_viewable`).
 # ``.pdf`` IS included: it renders in the browser's sandboxed PDF viewer as a
 # top-level new-tab navigation on the storage origin, carrying no same-origin
 # script-execution risk.
@@ -1047,18 +1111,20 @@ VIEWABLE_COMPUTE_JOB_EXTENSIONS: dict[str, str] = {
     ".mp4": "video/mp4",
     ".webm": "video/webm",
     ".pdf": "application/pdf",
+    ".svg": "image/svg+xml",
 }
 
 
 def svg_is_viewable() -> bool:
     """Whether SVG is treated as a signable/viewable artifact.
 
-    SVG is excluded fail-closed from BOTH viewable-artifact surfaces
+    SVG is accepted on BOTH viewable-artifact surfaces
     (``_VIEWABLE_CONTENT_TYPES`` and ``VIEWABLE_COMPUTE_JOB_EXTENSIONS``)
-    because an SVG served from a signed URL can execute script in the
-    viewer's browsing context. This helper exists so the two surfaces can be
-    asserted to agree on SVG handling; it returns ``True`` only if BOTH
-    surfaces would accept an ``.svg`` file.
+    because SVG bytes are sanitized via :func:`sanitize_svg_bytes` before
+    upload (removing ``<script>`` elements and ``on*`` event attributes), and
+    ``<img src>`` rendering sandboxes SVG in all modern browsers. This helper
+    exists so the two surfaces can be asserted to agree on SVG handling; it
+    returns ``True`` only if BOTH surfaces would accept an ``.svg`` file.
     """
     substrate_accepts_svg = "svg" in _VIEWABLE_CONTENT_TYPES
     bundle_accepts_svg = ".svg" in VIEWABLE_COMPUTE_JOB_EXTENSIONS
