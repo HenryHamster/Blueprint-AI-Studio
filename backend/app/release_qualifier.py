@@ -4414,6 +4414,11 @@ _PROMOTION_EXPLICIT_NON_APPLICABLE_STATUSES: dict[str, frozenset[str]] = {
     "merge_grade": frozenset(
         {"not_applicable", "superseded_exempt", "already_on_main_exempt"}
     ),
+    # When no scratch DB is configured the apply gate is permanently skipped
+    # (not transiently deferred).  Record as an explicit non-applicable so
+    # the promotion ledger-completeness check does not treat the missing
+    # gate as an infra hold that blocks the release indefinitely.
+    "migration_apply": frozenset({"scratch_database_not_configured"}),
 }
 
 def _ledger_fact_satisfies_promotion(
@@ -4902,6 +4907,12 @@ async def _dual_write_dimension_results(
             "detail": {
                 "verdict": base_record.get("migration_apply_safety"),
                 "detail": base_record.get("migration_apply_safety_detail"),
+                **(
+                    {"status": base_record.get("migration_apply_safety_detail")}
+                    if base_record.get("migration_apply_safety") == "skipped"
+                    and base_record.get("migration_apply_safety_detail")
+                    else {}
+                ),
             },
             "producing_task_id": None,
         },
@@ -6716,6 +6727,17 @@ async def _finalize_qualification(
         _ma_blocker = "migration_apply_drift" if migration_apply_blocked else None
     # Eager-write migration_apply so a later gate's infra failure cannot
     # discard this verdict before _dual_write_dimension_results is reached.
+    _ma_detail: dict[str, Any] = {
+        "verdict": apply_verdict,
+        "detail": apply_detail,
+        "execution_site": "eager_write",
+    }
+    if apply_verdict == "skipped" and apply_detail:
+        # Include an explicit status so _ledger_fact_satisfies_promotion can
+        # recognise this as a permanent non-applicable outcome rather than a
+        # transient infra hold — keeps the ledger-completeness check from
+        # stalling promotion on a deliberately skipped gate.
+        _ma_detail["status"] = apply_detail
     await _upsert_dimension_result(
         session,
         version,
@@ -6724,11 +6746,7 @@ async def _finalize_qualification(
         status=_ma_status,
         sub_score=None,
         blocker=_ma_blocker,
-        detail={
-            "verdict": apply_verdict,
-            "detail": apply_detail,
-            "execution_site": "eager_write",
-        },
+        detail=_ma_detail,
         origin_attempt_id=attempt_id,
     )
 

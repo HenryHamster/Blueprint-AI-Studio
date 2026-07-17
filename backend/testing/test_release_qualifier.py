@@ -10679,6 +10679,112 @@ async def test_coverage_recovery_backfills_stranded_evidence_before_check(
 
 
 @pytest.mark.asyncio
+async def test_coverage_recovery_runs_rollup_and_unverified_backfills(
+    db_session, mocker
+):
+    """Reconciler calls backfill_rollup_child_changed_files and
+    backfill_unverified_merge_evidence per direction before
+    backfill_direction_merge_evidence.
+
+    The sweep's coverage-recovery path was missing these two backfills,
+    which are what actually flip declared_unsatisfied merges to verified.
+    Without them the v26 candidate strands at criterion_coverage_incomplete
+    with no autonomous recovery path."""
+    from app.acceptance_criteria import get_version_coverage_summary
+    from app.models import Direction
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    candidate_sha = "rlbkvf02" * 5
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": candidate_sha,
+        "blocker": "criterion_coverage_incomplete",
+        "ci_green": True,
+        "confidence": 0.0,
+        "started_at": "2026-05-19T00:00:00",
+        "finalized_at": "2026-05-19T00:05:00",
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    criterion = await _add_version_criterion(
+        db_session, project, version,
+        key="c-rollup-bf", text="Criterion needing rollup backfill",
+    )
+
+    direction = Direction(
+        project_id=project.id,
+        direction_key="d-rollupbf01",
+        data={"id": "d-rollupbf01", "text": "Fix rollup backfill", "status": "active"},
+        status="active",
+        criterion_keys=[criterion.criterion_key],
+    )
+    db_session.add(direction)
+    await db_session.commit()
+
+    # Pre-condition: criterion is uncovered.
+    pre_coverage = await get_version_coverage_summary(db_session, version.id)
+    assert pre_coverage["total"] >= 1
+
+    # Mock the new backfill functions to track calls.
+    rollup_mock = AsyncMock(return_value=0)
+    unverified_mock = AsyncMock(return_value=0)
+    mocker.patch(
+        "app.acceptance_criteria.backfill_rollup_child_changed_files",
+        new=rollup_mock,
+    )
+    mocker.patch(
+        "app.acceptance_criteria.backfill_unverified_merge_evidence",
+        new=unverified_mock,
+    )
+
+    mocker.patch(
+        "app.github.get_branch_sha", new=_branch_sha_mock(automain=candidate_sha)
+    )
+    mocker.patch(
+        "app.release_qualifier._resolve_candidate_ci",
+        new=AsyncMock(
+            return_value={
+                "state": "green",
+                "ci_green": True,
+                "resolved_sha": candidate_sha,
+                "detail": "checks passed",
+            }
+        ),
+    )
+
+    # Seed the ledger with a fully-met verdict so the reconciler clears the gate.
+    from app import category_verdict_ledger as _cvl
+    await _cvl.upsert_category_verdict(
+        db_session,
+        version_id=version.id,
+        candidate_sha=candidate_sha,
+        category_key=criterion.criterion_key,
+        status="met",
+        tier="judged",
+        gap=None,
+        citations=[{"kind": "diff", "ref": "app/mod.py:1"}],
+        grader_run_id="regrade-test",
+    )
+    await db_session.commit()
+
+    reconciled = await rq._reconcile_if_criterion_coverage_now_complete(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert reconciled is True
+
+    # Both new backfills must have been called with the project and direction key.
+    rollup_mock.assert_any_call(
+        db_session, project.id, direction_key="d-rollupbf01"
+    )
+    unverified_mock.assert_any_call(
+        db_session, project.id, direction_key="d-rollupbf01"
+    )
+
+
+@pytest.mark.asyncio
 async def test_coverage_recovery_records_acceptance_window_evidence_before_check(
     db_session, mocker
 ):
@@ -12180,6 +12286,65 @@ async def test_finalize_refreshes_migration_apply_from_ledger(db_session, mocker
     assert "migration_apply" in by_dim
     assert by_dim["migration_apply"].status == "passed"
     assert by_dim["migration_apply"].detail["detail"] == "current-apply"
+
+
+@pytest.mark.asyncio
+async def test_migration_apply_skipped_records_unavailable_in_ledger(db_session, mocker):
+    """When MIGRATION_APPLY_SCRATCH_DATABASE_URL is absent the apply gate returns
+    ('skipped', 'scratch_database_not_configured').  The dual-write ledger must
+    record status='unavailable' — NOT 'passed' — so a skipped gate is never
+    indistinguishable from a gate that genuinely verified the migration."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    mocker.patch(
+        "app.release_qualifier._resolve_migration_identity_at_finalize",
+        new=AsyncMock(return_value=("ok", None)),
+    )
+    # Simulate absent scratch DB config — gate never ran.
+    mocker.patch(
+        "app.release_qualifier._resolve_migration_apply_at_finalize",
+        new=AsyncMock(return_value=("skipped", "scratch_database_not_configured")),
+    )
+    mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    # Finalize must complete (not infra_failure) — the skipped gate is not fatal.
+    assert result.get("status") != "infra_failure", (
+        f"unexpected infra_failure when apply gate skipped: {result}"
+    )
+
+    by_dim = await _dimension_rows_by_dim(db_session, version)
+    assert "migration_apply" in by_dim, "migration_apply ledger row missing"
+    # CRITICAL: skipped must never read as passed — the whole point of the
+    # distinct 'skipped' return value is to avoid a silent pass masquerade.
+    assert by_dim["migration_apply"].status == "unavailable", (
+        f"skipped apply gate wrote status={by_dim['migration_apply'].status!r}; "
+        "expected 'unavailable' so a missing scratch DB cannot masquerade as a pass"
+    )
 
 
 @pytest.mark.asyncio
