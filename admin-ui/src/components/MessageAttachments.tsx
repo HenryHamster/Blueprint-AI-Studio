@@ -99,7 +99,7 @@ function MessageAttachmentChip({ attachment, projectId, messageId, onPreview }: 
       ref={triggerRef}
       type="button"
       onClick={preview}
-      className="inline-flex cursor-pointer items-center gap-1.5 rounded border border-neutral-700/60 bg-neutral-800/40 px-2.5 py-1.5 text-xs text-neutral-300 hover:border-neutral-500/60 transition-colors"
+      className="inline-flex min-h-[44px] cursor-pointer items-center gap-1.5 rounded border border-neutral-700/60 bg-neutral-800/40 px-2.5 py-1.5 text-xs text-neutral-300 hover:border-neutral-500/60 transition-colors"
       aria-label={`Preview ${attachment.name || attachment.mime_type || 'File'}${errorLabel}`}
     >
       <FileText className="h-3.5 w-3.5 shrink-0 text-neutral-500" />
