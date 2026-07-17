@@ -58,6 +58,12 @@ export interface ComputeExperimentForm {
   // Optional runner UUID or hostname to hard-pin this job to a specific runner.
   // Empty string means auto-select (no forced target).
   forcedRunnerId: string;
+  // Optional setup step executed before the main command (bash -lc <value>).
+  setupStep: string;
+  // Optional no-progress watchdog timeout in seconds (empty = use default).
+  noProgressTimeoutSeconds: string;
+  // Optional checkpoint resume: prior compute job ID to rehydrate from.
+  inputArtifactJobId: string;
 }
 
 export const COMPUTE_ACCELERATOR_OPTIONS = [
@@ -98,6 +104,9 @@ export function defaultComputeExperimentForm(): ComputeExperimentForm {
     containerRegistryUsername: '',
     containerRegistryPassword: '',
     forcedRunnerId: '',
+    setupStep: '',
+    noProgressTimeoutSeconds: '',
+    inputArtifactJobId: '',
   };
 }
 
@@ -569,6 +578,11 @@ export function useTaskModal(
       ...(draftNotes ? { draft_notes: draftNotes } : {}),
       ...(cameFromDraft ? { drafted_from_refinement: true } : {}),
       ...(computeExperiment.forcedRunnerId.trim() ? { runner_target_id: computeExperiment.forcedRunnerId.trim() } : {}),
+      ...(computeExperiment.setupStep.trim() ? { setup_step: computeExperiment.setupStep.trim() } : {}),
+      ...(computeExperiment.noProgressTimeoutSeconds.trim() && Number.isInteger(Number(computeExperiment.noProgressTimeoutSeconds)) && Number(computeExperiment.noProgressTimeoutSeconds) > 0
+        ? { no_progress_timeout_seconds: Number(computeExperiment.noProgressTimeoutSeconds) }
+        : {}),
+      ...(computeExperiment.inputArtifactJobId.trim() ? { input_artifact_job_id: computeExperiment.inputArtifactJobId.trim() } : {}),
     };
     try {
       const response = await createComputeExperiment(body);
@@ -793,6 +807,9 @@ export function useTaskModal(
         // Forced runner target is not carried over to clones — the operator
         // must consciously choose a target for each new launch.
         forcedRunnerId: '',
+        setupStep: (payload.setup_step as string) || '',
+        noProgressTimeoutSeconds: payload.no_progress_timeout_seconds != null ? String(payload.no_progress_timeout_seconds) : '',
+        inputArtifactJobId: (payload.input_artifact_job_id as string) || '',
       });
     } else {
       setComputeExperiment(defaultComputeExperimentForm());

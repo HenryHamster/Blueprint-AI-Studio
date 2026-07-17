@@ -1834,3 +1834,66 @@ async def test_running_job_previews_signed_concurrently_across_jobs(
     assert max(gather_calls) == 4, (
         f"Expected one gather with 4 coroutines (2 jobs x 2 files), got: {gather_calls}"
     )
+
+
+def test_artifact_descriptor_chart_progress_series_line():
+    """Chart artifact with a valid progress_series produces a line chart plotting raw values."""
+    item = {
+        "id": "art-chart-1",
+        "artifact_type": "COMPUTE_RESULT",
+        "logical_key": "reward_plot",
+        "label": "Reward Chart",
+        "task_title": "RL run",
+        "task_status": "completed",
+        "progress_series": [
+            {"name": "reward", "value": -1.0, "t": "2026-07-17T00:00:00Z"},
+            {"name": "reward", "value": -0.5, "t": "2026-07-17T00:01:00Z"},
+            {"name": "reward", "value": 0.1, "t": "2026-07-17T00:02:00Z"},
+            # A second, shorter metric group must not win the max() tiebreak.
+            {"name": "loss", "value": 2.0, "t": "2026-07-17T00:00:00Z"},
+        ],
+    }
+    desc = _artifact_descriptor(item)
+    assert desc is not None
+    assert desc["kind"] == "chart"
+    assert desc["chart"]["kind"] == "line"
+    assert desc["chart"]["y_label"] == "reward"
+    # Raw negative values preserved (no Math.abs / abs() applied on the backend).
+    assert [p["value"] for p in desc["chart"]["points"]] == [-1.0, -0.5, 0.1]
+
+
+def test_artifact_descriptor_chart_progress_series_all_non_dict_falls_back_to_bar():
+    """A non-empty progress_series with no dict entries must not crash; falls back to a bar chart."""
+    item = {
+        "id": "art-chart-2",
+        "artifact_type": "COMPUTE_RESULT",
+        "logical_key": "reward_plot",
+        "label": "Reward Chart",
+        "task_title": "RL run",
+        "task_status": "completed",
+        # All entries are non-dicts -> metric_groups stays empty -> must not
+        # raise ValueError from max() on an empty sequence.
+        "progress_series": [1, 2, 3, "not-a-dict"],
+    }
+    desc = _artifact_descriptor(item)
+    assert desc is not None
+    assert desc["kind"] == "chart"
+    assert desc["chart"]["kind"] == "bar"
+    assert desc["chart"]["points"] == [{"label": "artifact", "value": 1}]
+
+
+def test_artifact_descriptor_chart_no_progress_series_falls_back_to_bar():
+    """A chart artifact without any progress_series falls back to a single-bar chart."""
+    item = {
+        "id": "art-chart-3",
+        "artifact_type": "COMPUTE_RESULT",
+        "logical_key": "reward_plot",
+        "label": "Reward Chart",
+        "task_title": "RL run",
+        "task_status": "completed",
+    }
+    desc = _artifact_descriptor(item)
+    assert desc is not None
+    assert desc["kind"] == "chart"
+    assert desc["chart"]["kind"] == "bar"
+    assert desc["chart"]["points"] == [{"label": "artifact", "value": 1}]

@@ -884,6 +884,9 @@ function buildCloneForm(job: ComputeJob): ComputeExperimentForm {
     successMetric: sc?.metric ?? '',
     successOperator: (sc?.operator as ComputeSuccessOperator) ?? '>=',
     successThreshold: sc?.threshold != null ? String(sc.threshold) : '',
+    setupStep: lp.setup_step ?? '',
+    noProgressTimeoutSeconds: lp.no_progress_timeout_seconds != null ? String(lp.no_progress_timeout_seconds) : '',
+    inputArtifactJobId: lp.input_artifact_job_id ?? '',
   };
 }
 

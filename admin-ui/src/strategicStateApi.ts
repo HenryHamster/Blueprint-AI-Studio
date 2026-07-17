@@ -141,6 +141,8 @@ export interface StrategicContextDescriptorDetail {
 export interface StrategicContextDescriptorChartPoint {
   label: string;
   value: number;
+  /** ISO timestamp for time-series (line chart) rendering; absent for bar charts. */
+  t?: string;
 }
 
 export interface StrategicContextRenderableDescriptor {

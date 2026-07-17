@@ -62,6 +62,14 @@ export interface ComputeExperimentLaunchRequest {
   // When set, the job stays QUEUED until that runner is available rather than
   // falling back to another runner or cloud. Omit for auto-selection.
   runner_target_id?: string;
+  // Optional setup step executed as `bash -lc <setup_step>` before the main command.
+  setup_step?: string;
+  // Optional no-progress watchdog window in seconds. When set, a stalled job
+  // writing no progress within this window is torn down early.
+  no_progress_timeout_seconds?: number;
+  // Optional cross-job checkpoint resume: rehydrate a prior job's artifact bundle
+  // into this job's workspace before the command runs.
+  input_artifact_job_id?: string;
 }
 
 /** Response from the dedicated compute_experiment launch endpoint — the created
@@ -872,6 +880,9 @@ export interface ComputeJob {
     deadline_seconds?: number | null;
     require_live_release?: boolean | null;
     require_durable_artifact?: boolean | null;
+    setup_step?: string | null;
+    no_progress_timeout_seconds?: number | null;
+    input_artifact_job_id?: string | null;
     // Provenance persisted at launch time; absent on legacy or manually-configured launches.
     provenance?: {
       idea?: string | null;

@@ -853,6 +853,13 @@ _NON_TERMINAL_COMPUTE_JOB_STATUSES = (
     ComputeJobStatus.POLLING,
 )
 
+_TERMINAL_COMPUTE_JOB_STATUSES = {
+    ComputeJobStatus.SUCCEEDED,
+    ComputeJobStatus.FAILED,
+    ComputeJobStatus.CANCELLED,
+    ComputeJobStatus.TIMED_OUT,
+}
+
 
 async def _running_job_preview_items(
     session: AsyncSession,
@@ -979,6 +986,12 @@ async def _running_job_preview_items(
         dropped = pm.get("viewable_files_dropped")
         if isinstance(dropped, int) and dropped > 0:
             item["viewable_files_dropped"] = dropped
+        # Stamp progress_series from polling_metadata so the strategic canvas can
+        # render a real time-series chart (e.g. eval-reward over env-steps) for
+        # running jobs while the operator watches mid-run evidence accrue.
+        series = pm.get("progress_series")
+        if isinstance(series, list) and series:
+            item["progress_series"] = series
         items.append(item)
     return items[:_RUNNING_JOB_PREVIEW_LIMIT]
 
@@ -1266,6 +1279,41 @@ async def load_strategic_context_evidence(
             provenance = provenance_by_task.get(item.get("task_id") or "")
             if provenance:
                 item.update(provenance)
+
+    # Stamp progress_series from the terminal ComputeJob for each artifact so
+    # _artifact_descriptor can build a real time-series line chart (instead of
+    # the static one-point placeholder). The artifact's task_id maps to a
+    # ComputeJob whose progress_series ring buffer carries the training/eval
+    # metrics recorded mid-run by runner heartbeats. One bounded, batched query
+    # keyed on the same ≤4 artifact task ids (no N+1).
+    if artifact_task_ids:
+        compute_job_rows = (
+            await session.execute(
+                select(
+                    ComputeJob.task_id,
+                    ComputeJob.polling_metadata,
+                )
+                .where(
+                    ComputeJob.task_id.in_(artifact_task_ids),
+                    ComputeJob.project_id == project_id,
+                    ComputeJob.status.in_(_TERMINAL_COMPUTE_JOB_STATUSES),
+                )
+                .order_by(ComputeJob.updated_at.desc())
+            )
+        ).all()
+        terminal_series_by_task: Dict[str, list] = {}
+        for row in compute_job_rows:
+            task_key = str(row.task_id)
+            if task_key in terminal_series_by_task:
+                continue  # newest per task (ordered updated_at desc)
+            pm = row.polling_metadata if isinstance(row.polling_metadata, dict) else {}
+            series = pm.get("progress_series")
+            if isinstance(series, list) and series:
+                terminal_series_by_task[task_key] = series
+        for item in artifact_items:
+            series = terminal_series_by_task.get(item.get("task_id") or "")
+            if series:
+                item["progress_series"] = series
 
     # Sort viewable-bearing terminal-artifact items first so the bounded
     # descriptor cut (_strategic_context_descriptors slices items[:4]) retains
@@ -1742,10 +1790,45 @@ def _artifact_descriptor(artifact: Dict[str, Any]) -> Dict[str, Any] | None:
                 "unsupported_reason"
             ] = "PDF artifact previews require a signed preview URL."
     elif kind == "chart":
-        descriptor["chart"] = {
-            "kind": "bar",
-            "points": [{"label": "artifact", "value": 1}],
-        }
+        artifact_series = artifact.get("progress_series")
+        # Group progress samples by metric name; use the metric with the most
+        # entries (typically the declared progress metric). ``metric_groups``
+        # can end up empty even when ``artifact_series`` is non-empty (e.g. all
+        # entries are non-dicts or the series is malformed), so guard the
+        # ``max()`` call and fall through to the bar-chart fallback below.
+        metric_groups: Dict[str, List[Dict[str, Any]]] = {}
+        if isinstance(artifact_series, list):
+            for sample in artifact_series:
+                if isinstance(sample, dict):
+                    name = str(sample.get("name", "unknown"))
+                    metric_groups.setdefault(name, []).append(sample)
+        if metric_groups:
+            best_metric = max(metric_groups, key=lambda k: len(metric_groups[k]))
+            best_samples = metric_groups[best_metric]
+            # Cap at 300 points to keep the descriptor bounded.
+            sample_count = len(best_samples)
+            if sample_count > 300:
+                step = sample_count // 300
+                best_samples = best_samples[::step]
+            descriptor["chart"] = {
+                "kind": "line",
+                "points": [
+                    {
+                        "label": str(s.get("value", "")),
+                        "value": float(v),
+                        "t": s.get("t", ""),
+                    }
+                    for s in best_samples
+                    if isinstance((v := s.get("value")), (int, float))
+                ],
+                "x_label": "time",
+                "y_label": best_metric,
+            }
+        else:
+            descriptor["chart"] = {
+                "kind": "bar",
+                "points": [{"label": "artifact", "value": 1}],
+            }
     return descriptor
 
 
