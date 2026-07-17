@@ -23,6 +23,16 @@
       "glob": "backend/alembic/versions/**/*.py",
       "sentinels": ["backend/testing/test_migration_chain.py"],
       "why": "test_migration_chain.py::test_migration_files_do_not_import_app_modules AST-scans every migration file in alembic/versions/ for app.* imports — a class of defect (#15100, 0621/0626) that causes ImportError in the promotion apply gate when migration files are executed in the serving process. Migration files never import backend/testing helpers and are not in backend/app/, so the dotted-import reverse-dep scan never selects this guard. Register here so any change to a migration file runs the guard at merge time."
+    },
+    {
+      "glob": "backend/alembic/versions/0621_*.py",
+      "sentinels": ["backend/testing/test_migration_0621_safe_encrypt_backfill.py"],
+      "why": "test_migration_0621_safe_encrypt_backfill.py loads the migration via importlib rather than importing it as an app.* module, so the dotted-import reverse-dep scan cannot select it. Register here so that changes to the migration body (e.g. inlining field_encryption helpers) cause the acceptance tests to run at the task PR rather than only at the promotion matrix."
+    },
+    {
+      "glob": "backend/alembic/versions/0626_*.py",
+      "sentinels": ["backend/testing/test_migration_0626_safe_encrypt_backfill.py"],
+      "why": "Same rationale as 0621: test_migration_0626_safe_encrypt_backfill.py loads the migration via importlib; register here so migration body changes trigger the acceptance tests at the task PR."
     }
   ]
 }
