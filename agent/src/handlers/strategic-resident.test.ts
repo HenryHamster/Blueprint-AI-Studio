@@ -531,7 +531,7 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
     );
 
     // The restored flag drove the corrective frame into the first autonomous prompt.
-    expect(autonomousPrompt).toContain('OPERATOR-DECISION CORRECTIVE');
+    expect(autonomousPrompt).toContain('OPERATOR-DECISION REVIEW');
   });
 
   it('re-clones the vanished workspace with a FRESH READ token, never the session-start push token', async () => {
@@ -717,42 +717,55 @@ describe('recloneResidentWorkspace — fresh READ-scoped credential at the momen
       expect.stringContaining('heartbeat'),
       expect.objectContaining({ handled_message_ids: ['msg-captured'] }),
     );
-    expect(recordOperatorDecisionCapture).toHaveBeenCalledWith(true);
+    expect(recordOperatorDecisionCapture).toHaveBeenCalledWith('captured');
   });
 
-  it('calls recordOperatorDecisionCapture(false) and emits status when operator turn has no marker', async () => {
+  it('keeps an earlier markerless exchange pending when a later marked turn arrives before the corrective tick', async () => {
+    // The later marked turn must not overwrite or consume the first exchange's
+    // durable review, and each completed turn contributes once to marker coverage.
     const OPERATOR_MSG = {
       id: 'msg-nomarker',
       content: 'Try approach Z.',
       created_at: new Date().toISOString(),
       from_type: 'user',
     };
+    const MARKED_MSG = {
+      id: 'msg-marked', content: 'Keep approach Y.',
+      created_at: new Date(Date.now() + 1).toISOString(), from_type: 'user',
+    };
     let pollCount = 0;
+    let heartbeatNote = '';
     mockApiGet.mockImplementation((url: string) => {
       if (url.includes('/api/agent/git-read-token')) {
         return Promise.resolve({ token: 'read-scoped-token' });
       }
       if (url.includes('/messages?')) {
-        if (pollCount++ === 0) return Promise.resolve({ messages: [OPERATOR_MSG] });
-        return Promise.resolve({ messages: [] });
+        const messages = pollCount++ === 0 ? [OPERATOR_MSG]
+          : pollCount === 2 ? [MARKED_MSG] : [];
+        return Promise.resolve({ messages });
       }
       if (url.includes('checkpoint-state')) {
         return Promise.resolve({ problem_model: {}, vision: {}, strategic_memory_notes: [], running_update: '' });
       }
       return Promise.resolve(null);
     });
-    mockApiPost.mockImplementation((url: string) => {
+    mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
       if (url.includes('heartbeat')) {
-        return Promise.resolve({ authority_held: true, stop_requested: true });
+        // The operator-turn heartbeat lands BEFORE we stop; capture its serialized
+        // exam ledger so we can prove the corrective flag was armed.
+        if (typeof body?.note === 'string') heartbeatNote = body.note;
+        return Promise.resolve({ authority_held: true, stop_requested: pollCount >= 2 });
       }
       if (url.includes('strategic')) {
         return Promise.resolve({});
       }
       return Promise.resolve({});
     });
+    let turn = 0;
     const session = makeSession(
-      () => Promise.resolve(turnResult({
-        resultText: 'OK, will use approach Z.',
+      () => Promise.resolve(turnResult({ resultText: turn++ === 0
+        ? 'OK, will examine approach Z.'
+        : 'Confirmed.\nOPERATOR-DECISION: Keep approach Y.',
       })),
       () => true,
     );
@@ -760,14 +773,233 @@ describe('recloneResidentWorkspace — fresh READ-scoped credential at the momen
 
     mockSendWsFrame.mockReset();
     mockSendWsFrame.mockReturnValue(true);
+    vi.mocked(recordOperatorDecisionCapture).mockClear();
 
     await handleStrategicResident(
       'task-nm', {}, { project_metadata: { project_id: 'proj-nm' } },
       'ghtok', 'owner', 'repo', null, { value: '' },
     );
 
-    expect(recordOperatorDecisionCapture).toHaveBeenCalledWith(false);
+    expect(vi.mocked(recordOperatorDecisionCapture).mock.calls).toEqual([
+      ['markerless'], ['captured'],
+    ]);
+    expect(heartbeatNote).toContain('"operatorDecisionCorrective":true');
+    expect(heartbeatNote).toContain('"messageIds":["msg-nomarker"]');
+    expect(heartbeatNote).not.toContain('"messageIds":["msg-marked"]');
   });
+});
+
+// ── Autonomous corrective tick: recover a missed operator decision, reorder
+// heartbeat vs classification/admission (defects 1, 2, 4). Restoring
+// operatorDecisionCorrective=true from the
+// persisted ledger makes the FIRST autonomous tick the marker-miss corrective.
+describe('handleStrategicResident — autonomous marker-miss corrective loop', () => {
+  beforeEach(() => {
+    mockApiGet.mockReset();
+    mockApiPost.mockReset();
+    mockStartSession.mockReset();
+    mockSendLog.mockReset();
+    mockSendWsFrame.mockReset();
+    mockSendWsFrame.mockReturnValue(true);
+    vi.mocked(recordOperatorDecisionCapture).mockClear();
+  });
+
+  /** Build a task whose context restores operatorDecisionCorrective=true so the
+   *  first autonomous tick runs as the marker-miss corrective. */
+  const correctiveTask = (): Record<string, unknown> => ({
+    project_metadata: { project_id: 'proj-corr' },
+    context: {
+      _exam_ledger: JSON.stringify({
+        records: [], tick: 7, corrective: false, operatorDecisionCorrective: true,
+      }),
+    },
+  });
+
+  it('recovers a missed OPERATOR-DECISION from the corrective tick, admits it to the durable register, and the heartbeat carries it (classification+admission run BEFORE the heartbeat)', async () => {
+    const RECOVERED_NOTE = 'operator settled on approach X — was said in chat without the marker';
+    let alive = true;
+    const heartbeatBodies: Array<Record<string, unknown>> = [];
+
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/api/agent/git-read-token')) {
+        return Promise.resolve({ token: 'read-scoped-token' });
+      }
+      if (url.includes('/messages?')) return Promise.resolve({ messages: [] });
+      return Promise.resolve(null);
+    });
+    mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
+      if (url.includes('heartbeat')) {
+        if (body) heartbeatBodies.push(body);
+        return Promise.resolve({ authority_held: true });
+      }
+      return Promise.resolve({});
+    });
+
+    const session = makeSession(
+      () => {
+        // The corrective autonomous tick recovers the decision the operator
+        // forgot to mark. appliedStrategicOp so no trailing pace-sleep; die so the
+        // loop exits after this single tick's heartbeat has landed.
+        alive = false;
+        return Promise.resolve(turnResult({
+          resultText: `Re-checked the recent operator conversation.\nOPERATOR-DECISION: ${RECOVERED_NOTE}`,
+          appliedStrategicOp: true,
+          inputTokens: 0,
+        }));
+      },
+      () => alive,
+    );
+    mockStartSession.mockReturnValue(session);
+
+    await handleStrategicResident(
+      'task-corr', { project_name: 'Proj', open_messages: [] }, correctiveTask(),
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    // A confirmed miss was recorded (evidence-grounded: recovered on the tick).
+    expect(recordOperatorDecisionCapture).not.toHaveBeenCalled();
+
+    // Defect 4: the post-turn heartbeat carries BOTH the just-classified exam
+    // record AND the newly recovered decision — proving classification + admission
+    // ran BEFORE the heartbeat (no restart window).
+    const withDecision = heartbeatBodies.find(
+      (b): b is Record<string, unknown> & { decisions_reg: string; note: string } =>
+        typeof b.decisions_reg === 'string' && b.decisions_reg.includes(RECOVERED_NOTE)
+        && typeof b.note === 'string',
+    );
+    expect(withDecision).toBeDefined();
+    const reg = JSON.parse(withDecision?.decisions_reg ?? '{}') as {
+      entries: Array<{ surfaceKey: string; verdict: string; note: string }>;
+    };
+    const recovered = reg.entries.find((e) => e.surfaceKey === 'operator:message');
+    expect(recovered).toEqual(
+      expect.objectContaining({ verdict: 'operator', note: RECOVERED_NOTE }),
+    );
+    // The same heartbeat's exam ledger carries the just-pushed record (tick 8).
+    const ledger = JSON.parse(withDecision?.note ?? '{}') as { tick: number };
+    expect(ledger.tick).toBe(8);
+  });
+
+  it('records a capture (true) — NOT a miss — when the corrective tick completes cleanly with no recovered decision', async () => {
+    let alive = true;
+    let heartbeatNote = '';
+
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/api/agent/git-read-token')) {
+        return Promise.resolve({ token: 'read-scoped-token' });
+      }
+      if (url.includes('/messages?')) return Promise.resolve({ messages: [] });
+      return Promise.resolve(null);
+    });
+    mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
+      if (url.includes('heartbeat')) {
+        if (typeof body?.note === 'string') heartbeatNote = body.note;
+        return Promise.resolve({ authority_held: true });
+      }
+      return Promise.resolve({});
+    });
+
+    const session = makeSession(
+      () => {
+        alive = false;
+        // Clean completion, no OPERATOR-DECISION marker → the operator's earlier
+        // markerless turn was routine chat; nothing was actually missed.
+        return Promise.resolve(turnResult({
+          resultText: 'Reviewed the recent conversation.\nOPERATOR-DECISION-REVIEW: NO-DECISION\nTICK-VERDICT: CLEAR — nothing actionable',
+          appliedStrategicOp: true,
+          inputTokens: 0,
+        }));
+      },
+      () => alive,
+    );
+    mockStartSession.mockReturnValue(session);
+
+    await handleStrategicResident(
+      'task-corr2', { project_name: 'Proj', open_messages: [] }, correctiveTask(),
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    expect(recordOperatorDecisionCapture).not.toHaveBeenCalled();
+    // The corrective was resolved → the flag is cleared in the serialized ledger.
+    expect(heartbeatNote).toContain('"operatorDecisionCorrective":false');
+  });
+
+  it('keeps operatorDecisionCorrectiveNext armed across an INTERRUPTED corrective tick and fires it again on the next autonomous tick', async () => {
+    // Defect 2: the corrective flag must NOT be consumed before the turn succeeds.
+    // Turn 1 is interrupted (no recovery, inconclusive) → record nothing, flag
+    // survives (re-serialized in the heartbeat) → turn 2 re-runs the corrective.
+    let turn = 0;
+    let alive = true;
+    const autonomousPrompts: string[] = [];
+    let interruptedHeartbeatNote = '';
+    // Increment work_state_rev on every heartbeat so the post-turn rev differs
+    // from the liveness rev observed during gating — deterministically firing the
+    // second autonomous tick without waiting on the floor interval.
+    let rev = 0;
+
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/api/agent/git-read-token')) {
+        return Promise.resolve({ token: 'read-scoped-token' });
+      }
+      if (url.includes('/messages?')) return Promise.resolve({ messages: [] });
+      return Promise.resolve(null);
+    });
+    mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
+      if (url.includes('heartbeat')) {
+        rev += 1;
+        // Capture the exam-ledger note from the FIRST (post-interrupt) heartbeat.
+        if (turn === 1 && typeof body?.note === 'string' && !interruptedHeartbeatNote) {
+          interruptedHeartbeatNote = body.note;
+        }
+        return Promise.resolve({ authority_held: true, work_state_rev: `rev-${rev}` });
+      }
+      return Promise.resolve({});
+    });
+
+    const session = makeSession(
+      (text) => {
+        turn += 1;
+        autonomousPrompts.push(typeof text === 'string' ? text : JSON.stringify(text));
+        if (turn === 1) {
+          // Interrupted mid-thought before it could recover the decision.
+          return Promise.resolve(turnResult({
+            resultText: 'OPERATOR-DECISION: partial marker must not settle',
+            interrupted: true, sawToolUse: false, inputTokens: 0,
+          }));
+        }
+        // Turn 2: complete cleanly (no recovery) and die so the loop exits.
+        alive = false;
+        return Promise.resolve(turnResult({
+          resultText: 'Second look — still nothing pending.\nTICK-VERDICT: CLEAR — nothing actionable',
+          appliedStrategicOp: true, inputTokens: 0,
+        }));
+      },
+      () => alive,
+    );
+    mockStartSession.mockReturnValue(session);
+
+    await handleStrategicResident(
+      'task-corr3',
+      // Small tick intervals keep the between-turn gating wait short.
+      {
+        project_name: 'Proj', open_messages: [],
+        strategic_session_idle_tick_seconds: 1,
+        strategic_session_message_poll_seconds: 0.75,
+      },
+      correctiveTask(),
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    // Two autonomous ticks ran.
+    expect(turn).toBe(2);
+    // Turn 1 was the corrective (restored flag).
+    expect(autonomousPrompts[0]).toContain('OPERATOR-DECISION REVIEW');
+    expect(recordOperatorDecisionCapture).not.toHaveBeenCalled();
+    // Defect 2: the flag survived the interrupt in the serialized ledger…
+    expect(interruptedHeartbeatNote).toContain('"operatorDecisionCorrective":true');
+    // …and re-fired the corrective on the SECOND autonomous tick.
+    expect(autonomousPrompts[1]).toContain('OPERATOR-DECISION REVIEW');
+  }, 10_000);
 });
 
 describe('recloneResidentWorkspace', () => {

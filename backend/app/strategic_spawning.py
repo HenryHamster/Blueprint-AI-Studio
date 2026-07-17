@@ -4100,6 +4100,8 @@ async def _spawn_design_doc_update(
     """
     from app.task_lifecycle import _has_active_strategic_task
 
+    project_id = project.id
+
     # Guard: no design_doc_update or strategic_review already running
     if await _has_active_strategic_task(project.id, session):
         logger.warning(
@@ -4313,7 +4315,7 @@ async def _spawn_design_doc_update(
         logger.warning(
             "[RESIDENT_SHADOW] Aborting legacy phase-1 spawn after Resident ownership flip "
             "(project=%s cycle=%s)",
-            project.id,
+            project_id,
             cycle_id,
         )
         return False

@@ -11,6 +11,8 @@ import {
   MESSAGE_POLL_LIMIT,
   buildSurfaceCatalog, nextFocus, parseTickVerdict, parseAgendaContinue,
   parseOperatorDecision, OPERATOR_DECISION_VERDICT,
+  mergePendingOperatorDecisionReview, advancePendingOperatorDecisionReview,
+  classifyOperatorDecisionReview,
   openFoundLeads, classifyTickOutcome, shouldRunAutonomousTurn,
   AUTONOMOUS_FLOOR_TICK_MS,
   serializeLedger, restoreLedger, refreshSurfaceCatalog,
@@ -25,6 +27,7 @@ import {
   DEFAULT_CONTEXT_LIMIT, COMPACTION_THRESHOLD_RATIO,
   type ExamSurface, type ExamRecord, type ContentBlock,
   type CompactionCheckpointContext, type DecisionsRegisterEntry,
+  type PendingOperatorDecisionReview,
 } from './strategic-resident-lib.js';
 import { buildFetchGuidance, STRATEGIC_FETCH_VERBS } from './strategic-helpers.js';
 
@@ -1054,14 +1057,14 @@ describe('decisionsRegisterText decisions register', () => {
     expect(noReg).not.toContain('Decisions register');
   });
 
-  it('includes OPERATOR-DECISION CORRECTIVE section when operatorDecisionMissing is true', () => {
+  it('includes the explicit operator-decision review protocol when a review is pending', () => {
     const focus: ExamSurface[] = [
       { key: 'direction:d-1', kind: 'direction', label: 'direction d-1', hint: 'check it' },
     ];
     const p = buildAutonomousPrompt(focus, [], [], false, 3, '', true);
-    expect(p).toContain('OPERATOR-DECISION CORRECTIVE');
-    expect(p).toContain('settlement or correction');
-    expect(p).toContain('re-state it as a durable decision');
+    expect(p).toContain('OPERATOR-DECISION REVIEW');
+    expect(p).toContain('OPERATOR-DECISION-REVIEW: NO-DECISION');
+    expect(p).toContain('OPERATOR-DECISION-REVIEW: UNRESOLVED');
   });
 
   it('omits OPERATOR-DECISION CORRECTIVE section when operatorDecisionMissing is false (default)', () => {
@@ -1181,6 +1184,182 @@ describe('parseOperatorDecision (operator-settled corrections)', () => {
     expect(restored?.[0].verdict).toBe(OPERATOR_DECISION_VERDICT);
     expect(restored?.[0].note).toBe('Do NOT re-propose the images-first rewrite.');
     expect(decisionsRegisterText([entry], 20)).toContain('[operator] operator:message');
+  });
+});
+
+describe('pending operator-decision review state machine', () => {
+  const startedAt = '2026-07-16T12:00:00Z';
+
+  it('queues multiple markerless exchanges and advances them one at a time', () => {
+    let review = mergePendingOperatorDecisionReview(null, ['m-1'], startedAt, 'first exchange');
+    review = mergePendingOperatorDecisionReview(review, ['m-2'], startedAt, 'second exchange');
+    review = mergePendingOperatorDecisionReview(review, ['m-3'], startedAt, 'third exchange');
+
+    expect(review.messageIds).toEqual(['m-1']);
+    expect(review.exchangeText).toBe('first exchange');
+    expect(review.queuedExchanges?.map(exchange => exchange.messageIds)).toEqual([
+      ['m-2'],
+      ['m-3'],
+    ]);
+
+    const second = advancePendingOperatorDecisionReview(review);
+    expect(second).toMatchObject({
+      messageIds: ['m-2'], exchangeText: 'second exchange', attempts: 0,
+    });
+    expect(second?.queuedExchanges?.map(exchange => exchange.messageIds)).toEqual([['m-3']]);
+
+    if (second === null) throw new Error('expected the second exchange');
+    const third = advancePendingOperatorDecisionReview(second);
+    expect(third).toMatchObject({
+      messageIds: ['m-3'], exchangeText: 'third exchange', attempts: 0,
+    });
+    expect(third?.queuedExchanges).toBeUndefined();
+    if (third === null) throw new Error('expected the third exchange');
+    expect(advancePendingOperatorDecisionReview(third)).toBeNull();
+  });
+
+  it('ignores duplicate message ids across the current and queued exchanges', () => {
+    const current = mergePendingOperatorDecisionReview(null, ['m-1'], startedAt);
+    const queued = mergePendingOperatorDecisionReview(current, ['m-2'], startedAt);
+
+    expect(mergePendingOperatorDecisionReview(queued, ['m-1', 'm-2'], startedAt)).toBe(queued);
+  });
+
+  it('round-trips the current exchange and ordered queue across a restart', () => {
+    let review = mergePendingOperatorDecisionReview(null, ['m-1'], startedAt, ' first exchange ');
+    review = mergePendingOperatorDecisionReview(
+      review,
+      ['m-2'],
+      '2026-07-16T12:01:00Z',
+      'x'.repeat(500),
+    );
+
+    const restored = restoreLedger(serializeLedger([], 4, false, true, review));
+    expect(restored?.operatorDecisionReview).toEqual(review);
+    expect(restored?.operatorDecisionCorrective).toBe(true);
+    expect(restored?.operatorDecisionReview?.queuedExchanges?.[0]).toMatchObject({
+      messageIds: ['m-2'],
+      exchangeText: 'x'.repeat(384),
+      exchangeTextTruncated: true,
+      startedAt: '2026-07-16T12:01:00Z',
+      attempts: 0,
+    });
+  });
+
+  it('compacts an oversized queue into retained exchanges plus overflow metadata', () => {
+    let review = mergePendingOperatorDecisionReview(null, ['m-current'], startedAt, 'current');
+    for (let i = 0; i < 400; i++) {
+      review = mergePendingOperatorDecisionReview(
+        review,
+        [`m-${i}`],
+        '2026-07-16T12:01:00Z',
+        `queued exchange ${i}`,
+      );
+    }
+
+    const serialized = serializeLedger([], 1, false, true, review);
+    expect(Buffer.byteLength(serialized, 'utf8')).toBeLessThanOrEqual(EXAM_LEDGER_MAX_BYTES);
+    const restored = restoreLedger(serialized)?.operatorDecisionReview;
+    expect(restored?.overflowed).toBe(true);
+    expect(restored?.queuedExchanges?.length).toBeLessThan(400);
+    expect(restored?.overflowExchanges).toBe(
+      400 - (restored?.queuedExchanges?.length ?? 0),
+    );
+
+    if (restored === null || restored === undefined) throw new Error('expected compacted review');
+    const afterAnotherExchange = mergePendingOperatorDecisionReview(
+      restored,
+      ['m-after-overflow'],
+      startedAt,
+    );
+    expect(afterAnotherExchange.queuedExchanges).toEqual(restored.queuedExchanges);
+    expect(afterAnotherExchange.overflowExchanges).toBe((restored.overflowExchanges ?? 0) + 1);
+  });
+
+  it('falls back to an id-less sentinel when even the active exchange cannot fit', () => {
+    const oversized: PendingOperatorDecisionReview = {
+      status: 'pending',
+      messageIds: ['m-current'],
+      exchangeText: 'x'.repeat(EXAM_LEDGER_MAX_BYTES * 2),
+      startedAt,
+      attempts: 3,
+    };
+
+    const serialized = serializeLedger([], 1, false, true, oversized);
+    expect(Buffer.byteLength(serialized, 'utf8')).toBeLessThanOrEqual(EXAM_LEDGER_MAX_BYTES);
+    expect(restoreLedger(serialized)?.operatorDecisionReview).toEqual({
+      status: 'pending',
+      messageIds: [],
+      exchangeTextTruncated: true,
+      startedAt: '',
+      attempts: 3,
+      overflowed: true,
+      overflowExchanges: 1,
+    });
+  });
+
+  it('keeps an overflow sentinel until an explicit overflow outcome covers it', () => {
+    const withExplicitCurrent: PendingOperatorDecisionReview = {
+      status: 'pending', messageIds: ['m-1'], startedAt, attempts: 0, overflowed: true,
+      overflowExchanges: 2,
+    };
+    const sentinel = advancePendingOperatorDecisionReview(withExplicitCurrent);
+    expect(sentinel).toMatchObject({
+      messageIds: [], overflowed: true, overflowExchanges: 2,
+    });
+    if (sentinel === null) throw new Error('expected overflow sentinel');
+    expect(advancePendingOperatorDecisionReview(sentinel)).toBe(sentinel);
+    expect(advancePendingOperatorDecisionReview(sentinel, { coversOverflow: false })).toBe(sentinel);
+    expect(advancePendingOperatorDecisionReview(sentinel, { coversOverflow: true })).toBeNull();
+  });
+});
+
+describe('classifyOperatorDecisionReview', () => {
+  it('classifies valid ordinary and explicit overflow outcomes', () => {
+    expect(classifyOperatorDecisionReview({
+      resultText: 'OPERATOR-DECISION: Keep the table-based path.',
+    })).toEqual({ kind: 'recovered', note: 'Keep the table-based path.' });
+    expect(classifyOperatorDecisionReview({
+      resultText: 'OPERATOR-DECISION-REVIEW: NO-DECISION',
+    })).toEqual({ kind: 'no-decision' });
+    expect(classifyOperatorDecisionReview({
+      resultText: 'OPERATOR-DECISION-REVIEW: OVERFLOW-NO-DECISION',
+    })).toEqual({ kind: 'no-decision', coversOverflow: true });
+    expect(classifyOperatorDecisionReview({
+      resultText: 'OPERATOR-DECISION-REVIEW: OVERFLOW-DECISION: Keep A; reject B.',
+    })).toEqual({ kind: 'recovered', note: 'Keep A; reject B.', coversOverflow: true });
+  });
+
+  it('deduplicates the same streamed marker across final and accumulated text', () => {
+    expect(classifyOperatorDecisionReview({
+      resultText: 'OPERATOR-DECISION-REVIEW: NO-DECISION',
+      accumulatedTurnText: 'preamble\nOPERATOR-DECISION-REVIEW: NO-DECISION',
+    })).toEqual({ kind: 'no-decision' });
+  });
+
+  it.each([
+    ['missing', 'ordinary prose'],
+    ['empty decision', 'OPERATOR-DECISION:   '],
+    ['malformed review', 'OPERATOR-DECISION-REVIEW: MAYBE'],
+    ['empty overflow decision', 'OPERATOR-DECISION-REVIEW: OVERFLOW-DECISION:   '],
+    ['conflicting', 'OPERATOR-DECISION: Keep A.\nOPERATOR-DECISION-REVIEW: NO-DECISION'],
+    ['duplicate', 'OPERATOR-DECISION-REVIEW: NO-DECISION\nOPERATOR-DECISION-REVIEW: NO-DECISION'],
+  ])('retains the review for %s markers', (_case, resultText) => {
+    const outcome = classifyOperatorDecisionReview({ resultText });
+    expect(outcome.kind).toBe('pending');
+    expect(outcome.statusNote).toContain(
+      _case === 'missing' ? 'missing a valid resolution marker' : 'conflicting, duplicate, or malformed',
+    );
+  });
+
+  it('retains an interrupted review even when the output contains a valid marker', () => {
+    expect(classifyOperatorDecisionReview({
+      resultText: 'OPERATOR-DECISION-REVIEW: NO-DECISION',
+      interrupted: true,
+    })).toEqual({
+      kind: 'pending',
+      statusNote: 'operator-decision review interrupted — durable review remains pending',
+    });
   });
 });
 
