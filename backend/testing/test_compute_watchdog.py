@@ -411,16 +411,16 @@ def test_no_progress_stalled_disabled_when_window_seconds_zero(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("samples", "started_offset", "expected_state", "expected_reason"),
+    ("samples", "started_offset", "expected_state", "expected_reason", "expected_stalled"),
     [
-        ([], 7200, "insufficient_history", "no_telemetry"),
-        ([(4000, "val/loss", 1.0), (3900, "val/loss", 1.0)], 7200, "stale_telemetry", "stale_telemetry"),
-        ([(120, "val/loss", 1.0), (60, "val/loss", 1.0), (0, "val/loss", 1.0)], 7200, "insufficient_history", "insufficient_window"),
-        (_flat_samples("other/loss"), 7200, "inert", "metric_name_mismatch"),
+        ([], 7200, "insufficient_history", "no_telemetry", True),
+        ([(4000, "val/loss", 1.0), (3900, "val/loss", 1.0)], 7200, "stale_telemetry", "stale_telemetry", True),
+        ([(120, "val/loss", 1.0), (60, "val/loss", 1.0), (0, "val/loss", 1.0)], 7200, "insufficient_history", "insufficient_window", False),
+        (_flat_samples("other/loss"), 7200, "inert", "metric_name_mismatch", False),
     ],
 )
 def test_watchdog_status_is_honest_for_inert_telemetry(
-    samples, started_offset, expected_state, expected_reason
+    samples, started_offset, expected_state, expected_reason, expected_stalled
 ):
     job, now = _make_stub_job(
         metric="val/loss",
@@ -435,7 +435,8 @@ def test_watchdog_status_is_honest_for_inert_telemetry(
     assert status["watchdog_state"] == expected_state
     assert status["watchdog_active"] is False
     assert status["watchdog_inert_reason"] == expected_reason
-    assert _no_progress_stalled(job, now=now) is False
+    # Missing or stale declared telemetry is enforceable after grace.
+    assert _no_progress_stalled(job, now=now) is expected_stalled
 
 
 def test_watchdog_status_warming_and_malformed_history_are_not_protected():
@@ -470,7 +471,8 @@ def test_watchdog_status_warming_and_malformed_history_are_not_protected():
     assert malformed_status["watchdog_state"] == "insufficient_history"
     assert malformed_status["watchdog_inert_reason"] == "malformed_history"
     assert malformed_status["watchdog_active"] is False
-    assert _no_progress_stalled(malformed, now=now) is False
+    # Malformed declared telemetry cannot bypass an armed watchdog after grace.
+    assert _no_progress_stalled(malformed, now=now) is True
 
 
 def test_no_progress_stalled_terminal_reason_constant_distinct_from_deadline():
