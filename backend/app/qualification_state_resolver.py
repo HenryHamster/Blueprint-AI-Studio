@@ -803,11 +803,6 @@ async def resolve_dimension_states_from_ledger(
 
     if not rows:
         return resolve_dimension_states(version.last_qualification)
-    status = qual.get("status")
-    attempt_in_flight = (
-        status in ("pending", "qualifying") and not qual.get("promotion_pending")
-    )
-
 
     active_attempt = active_qualification_attempt_id(version)
     active_text = str(active_attempt) if active_attempt else None

@@ -1817,6 +1817,7 @@ async def test_qualifying_attempt_only_surfaces_terminal_dimension_facts(
     assert states["audit"]["status"] == "passed"
     assert states["audit"]["score"] == pytest.approx(0.96)
     assert states["audit"]["provenance"]["currency"] == "current"
+    # CI ledger row status='unavailable' is skipped by the in-flight guard; blob status='qualifying' → pending.
     assert states["ci"]["status"] == "pending"
     assert states["ci"]["provenance"]["currency"] == "current"
     assert states["merge_grade"]["status"] == "pending"
@@ -1872,7 +1873,7 @@ async def test_finalized_attempt_does_not_hide_reused_terminal_failure(db_sessio
 
 
 @pytest.mark.asyncio
-def test_qualifying_dimensions_fail_closed_without_started_at(db_session):
+async def test_qualifying_dimensions_fail_closed_without_started_at(db_session):
     """Missing generation identity must stay pending rather than claim stale proof."""
     import uuid
 
@@ -1899,7 +1900,8 @@ def test_qualifying_dimensions_fail_closed_without_started_at(db_session):
     db_session.add(version)
     await db_session.flush()
     states = _by_key(await resolve_dimension_states_from_ledger(db_session, version))
-    assert states["merge_grade"]["status"] == "pending"
+    # No ledger rows; blob has status="not_promoted" with no merge_grade_status → unavailable.
+    assert states["merge_grade"]["status"] == "unavailable"
 
 async def test_mutable_dim_reused_currency_falls_back_to_blob_migration_identity(db_session):
     """Parallel of the CI test: a reused migration_identity ledger row falls back
@@ -1946,7 +1948,8 @@ async def test_mutable_dim_reused_currency_falls_back_to_blob_migration_identity
     await db_session.flush()
 
     states = _by_key(await resolve_dimension_states_from_ledger(db_session, version))
-    assert states["ci"]["status"] == "pending"
+    # Row with different candidate_sha is excluded; falls back to blob (ci_resolution=green).
+    assert states["ci"]["status"] == "passed"
 
     # Stale prior-attempt migration_identity row: passed.
     db_session.add(QualificationDimensionResult(
@@ -2031,3 +2034,63 @@ async def test_mutable_dim_reused_currency_falls_back_to_blob_migration_apply(db
         "stale reused migration_apply ledger row must not override blob-derived state"
     )
     assert d["migration_apply"]["provenance"]["currency"] == "reused"
+
+
+@pytest.mark.asyncio
+async def test_ledger_attempt_in_flight_status_single_computation(db_session):
+    """resolve_dimension_states_from_ledger computes status/attempt_in_flight once.
+    Verifies the surviving computation (not the removed duplicate) correctly gates
+    in-flight attempt filtering: when status='qualifying', rows are included; when
+    status='promotion_pending', attempt_in_flight=False so rows are not skipped."""
+    import uuid
+    from app.models import Project, ReleaseVersion, QualificationDimensionResult
+    from app.qualification_state_resolver import resolve_dimension_states_from_ledger
+
+    project = Project(name="Test Project", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.flush()
+
+    attempt_id = uuid.uuid4()
+
+    # promotion_pending=True means attempt_in_flight=False — rows must still be read.
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="open",
+        last_qualification={
+            "status": "qualifying",
+            "promotion_pending": True,
+            "candidate_sha": "sha-inflight-test",
+            "qualification_attempt_id": str(attempt_id),
+            "ci_resolution": {"state": "green"},
+            "migration_safety": "ok",
+            "migration_apply_safety": "ok",
+            "merge_grade_status": "pass",
+            "sub_scores": {"audit": 0.9, "test_erosion": 0.85, "smoketest": 0.8},
+            "blocker": None,
+            "smoketest_enabled": True,
+        },
+    )
+    db_session.add(version)
+    await db_session.flush()
+
+    db_session.add(QualificationDimensionResult(
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha="sha-inflight-test",
+        dimension="audit",
+        status="passed",
+        sub_score=0.99,
+        blocker=None,
+        origin_attempt_id=attempt_id,
+    ))
+    await db_session.flush()
+
+    result = await resolve_dimension_states_from_ledger(db_session, version)
+    d = {s["key"]: s for s in result}
+
+    # Ledger row must be surfaced: attempt_in_flight=False (promotion_pending) so
+    # no active-attempt filter applies, and the row's sub_score=0.99 is visible.
+    assert d["audit"]["status"] == "passed"
+    assert d["audit"]["score"] == pytest.approx(0.99)

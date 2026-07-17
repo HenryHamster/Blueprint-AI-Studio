@@ -8402,6 +8402,7 @@ _FORCE_PROMOTE_NOOP_STATUSES: frozenset[str] = frozenset(
     }
 )
 
+
 async def _force_promote_locked(
     session: AsyncSession,
     version_id: uuid.UUID,
