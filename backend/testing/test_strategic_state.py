@@ -9499,3 +9499,76 @@ def test_task_summary_caps_latest_status_message():
     # _compact_text truncates to exactly max_chars (max_chars-1 chars + ellipsis).
     assert len(msg) == STATUS_LATEST_MESSAGE_MAX
     assert msg.endswith("…")
+
+
+@pytest.mark.asyncio
+async def test_strategic_state_live_message_preview_interleaved_statuses(
+    client: AsyncClient, db_session
+):
+    """The live-message preview UNION ALL rewrite returns the 12 most-recent
+    open/linked rows across both statuses in created_at DESC order, and excludes
+    resolved rows regardless of recency."""
+    project = await _make_project(db_session)
+    now = _utcnow()
+
+    # 5 open messages, 5 linked messages, 4 resolved messages (>12 total live rows
+    # ensures the LIMIT 12 is exercised; resolved rows test exclusion).
+    msgs = [
+        *[
+            ProjectMessage(
+                project_id=project.id,
+                message_type=MessageType.FEEDBACK,
+                from_type="agent",
+                content=f"open msg {i}",
+                status="open",
+                created_at=now + timedelta(minutes=i),
+            )
+            for i in range(5)
+        ],
+        *[
+            ProjectMessage(
+                project_id=project.id,
+                message_type=MessageType.NOTE,
+                from_type="agent",
+                content=f"linked msg {i}",
+                status="linked",
+                created_at=now + timedelta(minutes=10 + i),
+            )
+            for i in range(5)
+        ],
+        *[
+            ProjectMessage(
+                project_id=project.id,
+                message_type=MessageType.FEEDBACK,
+                from_type="agent",
+                content=f"resolved msg {i}",
+                status="resolved",
+                # Resolved messages are the most recent — must still be excluded.
+                created_at=now + timedelta(minutes=100 + i),
+            )
+            for i in range(4)
+        ],
+    ]
+    for m in msgs:
+        db_session.add(m)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/strategic-state?project_id={project.id}")
+    assert resp.status_code == 200
+    body = resp.json()
+
+    preview = body["messages"]["items"]
+    preview_statuses = {m["status"] for m in preview}
+    # No resolved rows should appear in the preview.
+    assert "resolved" not in preview_statuses, (
+        f"Resolved messages leaked into preview: {[m for m in preview if m['status'] == 'resolved']}"
+    )
+    # Rows are ordered most-recent first.
+    created_ats = [m["created_at"] for m in preview]
+    assert created_ats == sorted(created_ats, reverse=True), (
+        "Preview items are not in created_at DESC order"
+    )
+    # Count does NOT include the resolved messages.
+    counts = body["messages"]["counts"]
+    assert counts.get("open", 0) == 5
+    assert counts.get("linked", 0) == 5

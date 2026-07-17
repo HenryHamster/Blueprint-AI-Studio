@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
-from sqlalchemy import func, or_, and_
+from sqlalchemy import func, or_, and_, union_all
 from typing import Dict, Any
 import uuid
 from sqlalchemy.orm.attributes import flag_modified
@@ -2127,12 +2127,31 @@ async def get_project_strategic_state(
         .where(Task.project_id == project.id, Task.archived.is_(False))
         .group_by(Task.status)
     )
-    _message_rows_res = await session.execute(
+    # Two-branch UNION ALL allows the composite (project_id, status, created_at DESC)
+    # index to serve each branch as a bounded index scan instead of a full
+    # project-id range scan followed by a sort over all resolved rows.
+    _open_branch = (
         select(ProjectMessage)
         .where(
             ProjectMessage.project_id == project.id,
-            ProjectMessage.status.in_([OPEN_STATUS, LINKED_STATUS]),
+            ProjectMessage.status == OPEN_STATUS,
         )
+        .order_by(ProjectMessage.created_at.desc())
+        .limit(12)
+    )
+    _linked_branch = (
+        select(ProjectMessage)
+        .where(
+            ProjectMessage.project_id == project.id,
+            ProjectMessage.status == LINKED_STATUS,
+        )
+        .order_by(ProjectMessage.created_at.desc())
+        .limit(12)
+    )
+    _live_msgs = union_all(_open_branch, _linked_branch).subquery("live_msgs")
+    _message_rows_res = await session.execute(
+        select(ProjectMessage)
+        .join(_live_msgs, ProjectMessage.id == _live_msgs.c.id)
         .order_by(ProjectMessage.created_at.desc())
         .limit(12)
     )
