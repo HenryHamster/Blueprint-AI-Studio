@@ -19,7 +19,20 @@ from app.schemas import redact_command_log_text
 
 
 TaskInspectionKind = Literal["task", "lineage", "logs", "failure", "provider"]
-MAX_LOG_BYTES = 48_000
+# Per-response evidence caps. One inspection response must fit both its projected
+# ``data`` payload and its complete serialized envelope. The router additionally
+# caps a turn to ``MAX_CAPABILITY_REQUESTS_PER_TURN`` (8) distinct inspections, so
+# the evidence a single turn can accrue stays within ``MAX_TURN_EVIDENCE_BYTES``
+# (8 * 5_500 = 44_000 <= 48_000) without threading a running total through the
+# request path.
+MAX_EVIDENCE_DATA_BYTES = 4_800
+MAX_EVIDENCE_RESPONSE_BYTES = 5_500
+MAX_TURN_EVIDENCE_BYTES = 48_000
+# Field-level projection budgets. These bound individual fields but are NOT
+# individually guaranteed to sum under MAX_EVIDENCE_DATA_BYTES, so a task with
+# several large fields still collapses to a checksummed preview via
+# ``_bounded_evidence_data`` (the hard backstop) rather than exceeding the cap.
+MAX_STATUS_LOG_BYTES = 4_000
 MAX_LOG_ENTRY_BYTES = 4_000
 MAX_TEXT_CHARS = 4_000
 MAX_TASK_LABEL_CHARS = 512
@@ -136,7 +149,7 @@ def _bounded_status_log(values: Any, *, limit: int) -> tuple[list[Any], bool]:
     for raw in reversed(source):
         item = _bounded_log_entry(raw)
         item_size = len(json.dumps(item, default=_jsonable).encode()) + 1
-        if kept_reversed and used + item_size > MAX_LOG_BYTES:
+        if kept_reversed and used + item_size > MAX_STATUS_LOG_BYTES:
             break
         kept_reversed.append(item)
         used += item_size
@@ -144,6 +157,114 @@ def _bounded_status_log(values: Any, *, limit: int) -> tuple[list[Any], bool]:
     return kept_reversed, (
         len(source_values) > len(source) or len(kept_reversed) < len(source)
     )
+
+
+def _canonical_json(value: Any) -> bytes:
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        default=_jsonable,
+    ).encode("utf-8")
+
+
+def _bounded_evidence_data(
+    data: dict[str, Any],
+    *,
+    budget: int = MAX_EVIDENCE_DATA_BYTES,
+) -> tuple[dict[str, Any], bytes]:
+    """Hard-cap one evidence payload after all field-level projection."""
+
+    encoded = _canonical_json(data)
+    if len(encoded) <= budget:
+        return data, encoded
+
+    original_checksum = hashlib.sha256(encoded).hexdigest()
+    preserved = {
+        key: data[key]
+        for key in ("task_id", "requested_task_id")
+        if isinstance(data.get(key), str)
+    }
+    preview_source = encoded.decode("utf-8")
+
+    def candidate(preview_chars: int) -> dict[str, Any]:
+        return {
+            **preserved,
+            "evidence_truncated": True,
+            "content_checksum": original_checksum,
+            "preview": preview_source[:preview_chars],
+        }
+
+    best = candidate(0)
+    if len(_canonical_json(best)) > budget:
+        # Degenerate floor: even the empty-preview marker exceeds the budget. Drop
+        # the preserved identity keys so the hard cap always holds unconditionally.
+        best = {"evidence_truncated": True, "content_checksum": original_checksum}
+        return best, _canonical_json(best)
+
+    low = 0
+    high = len(preview_source)
+    while low <= high:
+        midpoint = (low + high) // 2
+        proposed = candidate(midpoint)
+        proposed_encoded = _canonical_json(proposed)
+        if len(proposed_encoded) <= budget:
+            best = proposed
+            low = midpoint + 1
+        else:
+            high = midpoint - 1
+    return best, _canonical_json(best)
+
+
+def _bounded_lineage_tasks(
+    tasks: list[Task],
+    *,
+    root_id: uuid.UUID,
+    budget: int,
+) -> tuple[list[dict[str, Any]], list[Task], bool]:
+    """Project lineage members under a byte budget, always keeping the root.
+
+    The requested root's entry is reserved first — wherever it sits in the
+    ancestor -> root -> descendant order — so a large lineage that overflows the
+    byte budget never truncates away the exact task the Resident asked about.
+    Remaining members fill the budget in lineage order; once it is exhausted the
+    tail is dropped and ``byte_truncated`` is set. Returns the kept entries and
+    the corresponding kept tasks (both in lineage order) plus the truncation flag.
+    """
+
+    projected = [(task, _task_data(task, "lineage", log_limit=1)) for task in tasks]
+    root_reserved = 0
+    for task, entry in projected:
+        if task.id == root_id:
+            root_reserved = len(_canonical_json(entry)) + 1
+            break
+
+    used = 2  # surrounding ``[]``
+    non_root_budget = budget - root_reserved
+    byte_truncated = False
+    exhausted = False
+    keep_flags: list[bool] = []
+    for task, entry in projected:
+        if task.id == root_id:
+            keep_flags.append(True)
+            continue
+        size = len(_canonical_json(entry)) + 1
+        if exhausted or used + size > non_root_budget:
+            byte_truncated = True
+            exhausted = True
+            keep_flags.append(False)
+            continue
+        used += size
+        keep_flags.append(True)
+
+    kept_entries = [
+        entry for (_, entry), keep in zip(projected, keep_flags, strict=True) if keep
+    ]
+    kept_tasks = [
+        task for (task, _), keep in zip(projected, keep_flags, strict=True) if keep
+    ]
+    return kept_entries, kept_tasks, byte_truncated
 
 
 def _task_data(task: Task, kind: TaskInspectionKind, *, log_limit: int) -> dict[str, Any]:
@@ -217,17 +338,38 @@ def _evidence(
     data: dict[str, Any],
     *,
     observed_at: datetime,
+    revision: str | None = None,
 ) -> ResidentTaskEvidence:
-    encoded = json.dumps(data, sort_keys=True, separators=(",", ":"), default=_jsonable).encode()
-    return ResidentTaskEvidence(
-        kind=kind,
-        project_id=task.project_id,
-        source_id=str(task.id),
-        revision=f"task:{task.id}:v{int(task.version)}:{_jsonable(task.updated_at)}",
-        checksum=hashlib.sha256(encoded).hexdigest(),
-        observed_at=observed_at,
-        data=data,
+    resolved_revision = (
+        revision
+        if revision is not None
+        else f"task:{task.id}:v{int(task.version)}:{_jsonable(task.updated_at)}"
     )
+
+    def build(data_budget: int) -> tuple[ResidentTaskEvidence, bytes]:
+        bounded, encoded = _bounded_evidence_data(data, budget=data_budget)
+        return (
+            ResidentTaskEvidence(
+                kind=kind,
+                project_id=task.project_id,
+                source_id=str(task.id),
+                revision=resolved_revision,
+                checksum=hashlib.sha256(encoded).hexdigest(),
+                observed_at=observed_at,
+                data=bounded,
+            ),
+            encoded,
+        )
+
+    evidence, encoded = build(MAX_EVIDENCE_DATA_BYTES)
+    complete = _canonical_json(evidence.model_dump(mode="json"))
+    if len(complete) > MAX_EVIDENCE_RESPONSE_BYTES:
+        # The fixed envelope (kind/ids/revision/64-hex checksum/timestamp) does not
+        # depend on the ``data`` content, so one re-bound against the response
+        # budget minus that envelope guarantees the complete response fits.
+        envelope = len(complete) - len(encoded)
+        evidence, _ = build(max(0, MAX_EVIDENCE_RESPONSE_BYTES - envelope))
+    return evidence
 
 
 async def inspect_project_task(
@@ -296,62 +438,113 @@ async def inspect_project_task_lineage(
             .join(ancestors, Task.id == ancestors.c.id)
             .where(ancestors.c.depth > 0)
             .order_by(ancestors.c.depth.asc())
-            .limit(max_tasks + 1)
+            .limit(max_tasks)
         )
     ).all()
 
-    child_task = aliased(Task)
-    descendants = select(
-        Task.id.label("id"), literal(0).label("depth")
-    ).where(Task.id == task_id, Task.project_id == project_id).cte(
-        "resident_task_descendants", recursive=True
-    )
-    descendants = descendants.union_all(
-        select(
-            child_task.id,
-            (descendants.c.depth + 1).label("depth"),
-        ).where(
-            child_task.parent_task_id == descendants.c.id,
-            child_task.project_id == project_id,
-            descendants.c.depth < max_tasks,
-        )
-    )
-    descendant_rows = (
-        await session.execute(
-            select(Task, descendants.c.depth)
-            .join(descendants, Task.id == descendants.c.id)
-            .where(descendants.c.depth > 0)
-            .order_by(descendants.c.depth.asc(), Task.created_at.asc(), Task.id.asc())
-            .limit(max_tasks + 1)
-        )
-    ).all()
-
+    # The requested root always survives: ancestors take at most ``max_tasks - 1``
+    # slots so the root's own entry is never truncated away, and ``seen`` dedups a
+    # node that a parent cycle would otherwise list as both ancestor and root.
     ancestors_near_first = [row[0] for row in ancestor_rows]
-    descendants_ordered = [row[0] for row in descendant_rows]
-    candidates = [*reversed(ancestors_near_first), root, *descendants_ordered]
-    by_id: dict[uuid.UUID, Task] = {}
+    ancestor_truncated = len(ancestors_near_first) >= max_tasks
+    selected_ancestors = ancestors_near_first[: max_tasks - 1]
+    selected_ancestors.reverse()
+    seen: set[uuid.UUID] = set()
     ordered_tasks: list[Task] = []
-    for candidate in candidates:
-        if candidate.id in by_id:
+    for candidate_task in (*selected_ancestors, root):
+        if candidate_task.id in seen:
             continue
-        by_id[candidate.id] = candidate
-        ordered_tasks.append(candidate)
-    truncated = len(ordered_tasks) > max_tasks
-    ordered_tasks = ordered_tasks[:max_tasks]
+        seen.add(candidate_task.id)
+        ordered_tasks.append(candidate_task)
+
+    # Descendant BFS. Each level fetches the earliest children by (created_at, id)
+    # with ``LIMIT remaining + 1``. ``ORDER BY ... LIMIT`` is a bounded top-N in
+    # Postgres — a heap of at most ``remaining + 1`` rows, not a full sibling-set
+    # materialization — so it stays bounded while returning a DETERMINISTIC subset.
+    # Determinism is required: an unchanged lineage that truncates must still yield
+    # a stable revision/checksum (the trusted-evidence index keys on them). ``seen``
+    # makes descent cycle-safe; truncation is detected from a genuinely dropped
+    # fresh child, never from a raw pre-dedup row count.
+    descendant_truncated = False
+    frontier = [root.id]
+    while frontier and len(ordered_tasks) < max_tasks:
+        remaining = max_tasks - len(ordered_tasks)
+        rows = (
+            await session.execute(
+                select(Task)
+                .where(
+                    Task.project_id == project_id,
+                    Task.parent_task_id.in_(frontier),
+                )
+                .order_by(Task.created_at.asc(), Task.id.asc())
+                .limit(remaining + 1)
+            )
+        ).scalars().all()
+        next_frontier: list[uuid.UUID] = []
+        for child in rows:
+            if child.id in seen:
+                continue
+            if len(ordered_tasks) >= max_tasks:
+                descendant_truncated = True
+                break
+            seen.add(child.id)
+            ordered_tasks.append(child)
+            next_frontier.append(child.id)
+        frontier = next_frontier
+
+    # If descent stopped at the count budget while unexpanded children remain —
+    # including the case where ancestors + root already filled ``max_tasks`` and the
+    # loop never ran — report truncation with one bounded existence probe.
+    if not descendant_truncated and len(ordered_tasks) >= max_tasks and frontier:
+        has_more = (
+            await session.execute(
+                select(Task.id)
+                .where(
+                    Task.project_id == project_id,
+                    Task.parent_task_id.in_(frontier),
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        descendant_truncated = has_more is not None
+
+    projected_tasks, represented_tasks, tasks_byte_truncated = _bounded_lineage_tasks(
+        ordered_tasks, root_id=root.id, budget=MAX_EVIDENCE_DATA_BYTES - 256
+    )
+    truncated = ancestor_truncated or descendant_truncated or tasks_byte_truncated
     data = {
         "requested_task_id": str(task_id),
         "truncated": truncated,
-        "tasks": [_task_data(item, "lineage", log_limit=1) for item in ordered_tasks],
+        "tasks": projected_tasks,
     }
+    # Bind the lineage revision to every member actually represented (id, version,
+    # updated_at) and to the truncation state, so the revision changes whenever the
+    # included ancestor/descendant evidence changes — not only when the root does.
+    member_fingerprint = _canonical_json(
+        {
+            "truncated": truncated,
+            "members": [
+                [str(item.id), int(item.version), _jsonable(item.updated_at)]
+                for item in represented_tasks
+            ],
+        }
+    )
+    revision = (
+        f"lineage:{root.id}:{hashlib.sha256(member_fingerprint).hexdigest()}"
+    )
     return _evidence(
         root,
         "lineage",
         data,
         observed_at=observed_at or datetime.now(timezone.utc),
+        revision=revision,
     )
 
 
 __all__ = [
+    "MAX_EVIDENCE_DATA_BYTES",
+    "MAX_EVIDENCE_RESPONSE_BYTES",
+    "MAX_TURN_EVIDENCE_BYTES",
     "ResidentTaskEvidence",
     "ResidentTaskNotFound",
     "inspect_project_task",

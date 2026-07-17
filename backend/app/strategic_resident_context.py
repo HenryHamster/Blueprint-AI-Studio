@@ -12,6 +12,10 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
+from app.artifact_refs import (
+    RESIDENT_ARTIFACT_REF_GRANTS_KEY,
+    RESIDENT_ARTIFACT_REF_GRANTS_MAX,
+)
 from app.models import (
     MessageSurface,
     Project,
@@ -542,6 +546,74 @@ def _fit_provider_input(value: dict[str, Any]) -> dict[str, Any]:
     return value
 
 
+def _finalized_artifact_ref_grants(
+    provider_input: Mapping[str, Any],
+) -> tuple[str, ...]:
+    """Project exact ArtifactRef authority from the fitted provider context."""
+
+    raw_refs: list[Any] = []
+    lane_context = provider_input.get("lane_context")
+    lane_context = lane_context if isinstance(lane_context, Mapping) else {}
+    messages = lane_context.get("recent_conversation")
+    if isinstance(messages, list):
+        for message in messages:
+            if not isinstance(message, Mapping):
+                continue
+            references = message.get("references")
+            if not isinstance(references, Mapping):
+                continue
+            for values in references.values():
+                if isinstance(values, list):
+                    raw_refs.extend(values)
+    evidence = provider_input.get("evidence")
+    if isinstance(evidence, list):
+        raw_refs.extend(evidence)
+
+    identities: set[uuid.UUID] = set()
+    for ref in raw_refs:
+        if not isinstance(ref, Mapping) or ref.get("artifact_ref_id") is None:
+            continue
+        try:
+            identities.add(uuid.UUID(str(ref["artifact_ref_id"])))
+        except (TypeError, ValueError):
+            raise InactiveTurnAuthority(
+                "Resident provider context contains an invalid ArtifactRef grant",
+                artifact_ref_id=str(ref.get("artifact_ref_id")),
+            ) from None
+    if len(identities) > RESIDENT_ARTIFACT_REF_GRANTS_MAX:
+        raise InactiveTurnAuthority(
+            "Resident provider context exceeds the ArtifactRef grant limit",
+            grant_count=len(identities),
+        )
+    return tuple(sorted(str(identity) for identity in identities))
+
+
+async def _replace_finalized_artifact_ref_grants(
+    session: AsyncSession,
+    *,
+    task: Task,
+    project_id: uuid.UUID,
+    provider_input: Mapping[str, Any],
+) -> tuple[str, ...]:
+    """Replace active-turn grants with the exact stable post-fit projection."""
+
+    grants = _finalized_artifact_ref_grants(provider_input)
+    await validate_durable_ref_ownership(
+        session,
+        [{"artifact_ref_id": identity} for identity in grants],
+        project_id=project_id,
+    )
+    context = dict(task.context or {})
+    if grants:
+        context[RESIDENT_ARTIFACT_REF_GRANTS_KEY] = list(grants)
+    else:
+        context.pop(RESIDENT_ARTIFACT_REF_GRANTS_KEY, None)
+    if context != (task.context or {}):
+        task.context = context
+        session.add(task)
+    return grants
+
+
 async def reconstruct_authoritative_turn_input(
     session: AsyncSession,
     *,
@@ -690,6 +762,13 @@ async def reconstruct_authoritative_turn_input(
         result["lane_context"]["recent_conversation"]
     )
     result["lineage"]["evidence_hash"] = _sha256(result["evidence"])
+    finalized_grants = await _replace_finalized_artifact_ref_grants(
+        session,
+        task=task,
+        project_id=project_id,
+        provider_input=result,
+    )
+    result["lineage"]["artifact_ref_grants_hash"] = _sha256(finalized_grants)
     hash_projection = {
         **result,
         "lineage": {

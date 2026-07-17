@@ -105,9 +105,14 @@ async def get_resident_turn_context(
         )
     except StrategicAuthorityError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    # Reconstruction narrows ArtifactRef authority to the exact post-fit
+    # provider projection. Persist that freeze before returning context so the
+    # agent's next, separately transacted retrieval request observes it.
+    await session.commit()
+    turn_task_version = int(task.version)
     return {
         "provider_input": provider_input,
-        "turn_task_version": int(task.version),
+        "turn_task_version": turn_task_version,
     }
 
 

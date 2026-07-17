@@ -8,6 +8,7 @@ from datetime import timedelta
 import pytest
 import hashlib
 import json
+from fastapi import HTTPException
 
 from app.models import (
     ArtifactRef,
@@ -22,7 +23,11 @@ from app.artifact_refs import (
     RESIDENT_ARTIFACT_REF_GRANTS_KEY,
     resident_artifact_ref_grants,
 )
+from app.database import AsyncSessionLocal
 from app.orchestrator import _agent_executed_task_type_filter
+from app.routers.agent_resident_artifacts import get_resident_turn_artifact
+from app.routers.agent_resident_turn import get_resident_turn_context
+from app.strategic_resident_agent_binding import RESIDENT_CLAIM_NONCE_CONTEXT_KEY
 from app.strategic_resident_checkpointing import initialize_strategic_resident
 from app.strategic_resident_capabilities import compact_capability_catalog
 from app.strategic_resident_context import (
@@ -49,6 +54,24 @@ async def _authoritative_project(db_session):
     db_session.add(resident)
     await db_session.flush()
     return project, resident
+
+
+def _claim_token(task: Task) -> dict[str, str]:
+    return {
+        "sub": str(task.id),
+        "project_id": str(task.project_id),
+        "vm_instance_id": "runner:test",
+        "task_type": "strategic_resident_turn",
+        "claim_nonce": "nonce",
+    }
+
+
+def _mark_claimed(task: Task) -> None:
+    task.status = TaskStatus.IN_PROGRESS
+    task.vm_instance_id = "runner:test"
+    context = dict(task.context or {})
+    context[RESIDENT_CLAIM_NONCE_CONTEXT_KEY] = "nonce"
+    task.context = context
 
 
 @pytest.mark.asyncio
@@ -247,6 +270,13 @@ async def test_oversized_unhandled_conversation_retains_prefix_and_tail_grants(
         provider_input["lineage"]["conversation_hash"]
         == expected_conversation_hash
     )
+    assert resident_artifact_ref_grants(active) == frozenset(
+        refs[index - 1].id for index in retained_sequences
+    )
+    assert not (
+        resident_artifact_ref_grants(active)
+        & frozenset(ref.id for ref in refs[retained_sequences[-1] :])
+    )
 
     successor = await ensure_message_tail_successor(
         db_session,
@@ -262,6 +292,236 @@ async def test_oversized_unhandled_conversation_retains_prefix_and_tail_grants(
     assert resident_artifact_ref_grants(successor) == frozenset(
         ref.id for ref in refs[retained_sequences[-1] :]
     )
+
+
+@pytest.mark.asyncio
+async def test_finalized_context_grants_included_historical_artifact_refs(db_session):
+    project, resident = await _authoritative_project(db_session)
+    refs = [
+        ArtifactRef(
+            project_id=project.id,
+            tool_id=uuid.uuid4(),
+            kind="notes",
+            revision=index,
+            checksum=str(index) * 64,
+        )
+        for index in (1, 2)
+    ]
+    messages = [
+        ProjectMessage(
+            project_id=project.id,
+            actor_user_id="operator",
+            sequence=index,
+            surface=MessageSurface.CONVERSATION,
+            message_type=MessageType.NOTE,
+            from_type="user",
+            content=f"message {index}",
+            context={
+                "artifact_refs": [{"artifact_ref_id": str(refs[index - 1].id)}]
+            },
+        )
+        for index in (1, 2)
+    ]
+    db_session.add_all([*refs, *messages])
+    resident.handled_message_sequence = 1
+    db_session.add(resident)
+    await db_session.flush()
+
+    wake = await coalesce_authoritative_resident_turn(
+        db_session,
+        project_id=project.id,
+        message_sequence=2,
+        artifact_ref_grants=frozenset({refs[1].id}),
+    )
+    active = await db_session.get(Task, wake.task_id)
+    assert resident_artifact_ref_grants(active) == frozenset({refs[1].id})
+
+    first_input = await reconstruct_authoritative_turn_input(
+        db_session,
+        project_id=project.id,
+        turn_task_id=wake.task_id,
+    )
+    first_hash = first_input["lineage"]["context_hash"]
+    assert [
+        message["sequence"]
+        for message in first_input["lane_context"]["recent_conversation"]
+    ] == [1, 2]
+    assert resident_artifact_ref_grants(active) == frozenset(
+        {refs[0].id, refs[1].id}
+    )
+
+    completion_input = await reconstruct_authoritative_turn_input(
+        db_session,
+        project_id=project.id,
+        turn_task_id=wake.task_id,
+    )
+    assert completion_input["lineage"]["context_hash"] == first_hash
+    assert completion_input["lineage"]["artifact_ref_grants_hash"] == first_input[
+        "lineage"
+    ]["artifact_ref_grants_hash"]
+    assert resident_artifact_ref_grants(active) == frozenset(
+        {refs[0].id, refs[1].id}
+    )
+
+
+@pytest.mark.asyncio
+async def test_context_route_persists_historical_artifact_grant_for_retrieval(
+    db_session,
+):
+    project, resident = await _authoritative_project(db_session)
+    refs = [
+        ArtifactRef(
+            project_id=project.id,
+            tool_id=uuid.uuid4(),
+            kind="notes",
+            revision=index,
+            checksum=str(index) * 64,
+            content_snapshot={"text": f"revision {index}"},
+        )
+        for index in (1, 2)
+    ]
+    messages = [
+        ProjectMessage(
+            project_id=project.id,
+            actor_user_id="operator",
+            sequence=index,
+            surface=MessageSurface.CONVERSATION,
+            message_type=MessageType.NOTE,
+            from_type="user",
+            content=f"message {index}",
+            context={
+                "artifact_refs": [{"artifact_ref_id": str(refs[index - 1].id)}]
+            },
+        )
+        for index in (1, 2)
+    ]
+    db_session.add_all([*refs, *messages])
+    resident.handled_message_sequence = 1
+    db_session.add(resident)
+    await db_session.flush()
+    wake = await coalesce_authoritative_resident_turn(
+        db_session,
+        project_id=project.id,
+        message_sequence=2,
+        artifact_ref_grants=frozenset({refs[1].id}),
+    )
+    active = await db_session.get(Task, wake.task_id)
+    _mark_claimed(active)
+    db_session.add(active)
+    await db_session.commit()
+    token = _claim_token(active)
+
+    async with AsyncSessionLocal() as context_session:
+        first = await get_resident_turn_context(
+            None,
+            task_id=active.id,
+            session=context_session,
+            token=token,
+        )
+    async with AsyncSessionLocal() as completion_session:
+        second = await get_resident_turn_context(
+            None,
+            task_id=active.id,
+            session=completion_session,
+            token=token,
+        )
+    assert second["provider_input"]["lineage"]["context_hash"] == first[
+        "provider_input"
+    ]["lineage"]["context_hash"]
+
+    async with AsyncSessionLocal() as retrieval_session:
+        historical = await get_resident_turn_artifact(
+            None,
+            refs[0].id,
+            retrieval_session,
+            token,
+        )
+    assert historical["content"]["text"] == "revision 1"
+    async with AsyncSessionLocal() as verify_session:
+        persisted = await verify_session.get(Task, active.id)
+        assert resident_artifact_ref_grants(persisted) == frozenset(
+            {refs[0].id, refs[1].id}
+        )
+
+
+@pytest.mark.asyncio
+async def test_context_route_persists_omitted_tail_denial(db_session):
+    project, _resident = await _authoritative_project(db_session)
+    message_count = 24
+    refs = [
+        ArtifactRef(
+            project_id=project.id,
+            tool_id=uuid.uuid4(),
+            kind="notes",
+            revision=index,
+            checksum=f"{index % 16:x}" * 64,
+            content_snapshot={"text": f"revision {index}"},
+        )
+        for index in range(1, message_count + 1)
+    ]
+    messages = [
+        ProjectMessage(
+            project_id=project.id,
+            actor_user_id="operator",
+            sequence=index,
+            surface=MessageSurface.CONVERSATION,
+            message_type=MessageType.NOTE,
+            from_type="user",
+            content=f"message-{index:02d}:" + ("x" * 11_900),
+            context={
+                "artifact_refs": [
+                    {"artifact_ref_id": str(refs[index - 1].id)}
+                ]
+            },
+        )
+        for index in range(1, message_count + 1)
+    ]
+    db_session.add_all([*refs, *messages])
+    await db_session.flush()
+    wake = await coalesce_authoritative_resident_turn(
+        db_session,
+        project_id=project.id,
+        message_sequence=message_count,
+        artifact_ref_grants=frozenset(ref.id for ref in refs),
+    )
+    active = await db_session.get(Task, wake.task_id)
+    payload = dict(active.first_payload)
+    payload["message_sequence_start"] = 1
+    payload["message_sequence_end"] = message_count
+    active.payloads = [payload]
+    _mark_claimed(active)
+    db_session.add(active)
+    await db_session.commit()
+    token = _claim_token(active)
+
+    async with AsyncSessionLocal() as context_session:
+        response = await get_resident_turn_context(
+            None,
+            task_id=active.id,
+            session=context_session,
+            token=token,
+        )
+    retained = response["provider_input"]["lane_context"]["recent_conversation"]
+    represented_end = retained[-1]["sequence"]
+    assert represented_end < message_count
+
+    async with AsyncSessionLocal() as denied_session:
+        with pytest.raises(HTTPException) as denied:
+            await get_resident_turn_artifact(
+                None,
+                refs[represented_end].id,
+                denied_session,
+                token,
+            )
+    assert denied.value.status_code == 404
+    async with AsyncSessionLocal() as allowed_session:
+        allowed = await get_resident_turn_artifact(
+            None,
+            refs[represented_end - 1].id,
+            allowed_session,
+            token,
+        )
+    assert allowed["content"]["text"] == f"revision {represented_end}"
 
 
 @pytest.mark.asyncio
