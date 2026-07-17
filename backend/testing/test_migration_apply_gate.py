@@ -84,7 +84,7 @@ def test_scratch_prereq_is_typed_optional_and_boot_safe(monkeypatch):
 
     result = preflight_migration_apply_scratch(None)
     assert isinstance(result, MigrationApplyScratchPreflight)
-    assert result.status == "defer"
+    assert result.status == "absent"
     assert result.code == "scratch_database_url_missing"
     assert "MIGRATION_APPLY_SCRATCH_DATABASE_URL" in (result.detail or "")
 
@@ -1267,6 +1267,43 @@ async def test_scratch_db_url_routes_scratch_provisioning_to_dedicated_target(
     assert provision_ref.database == expected.database, (
         f"_provision_seed_and_detect_drift database {provision_ref.database!r} != {expected.database!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_absent_scratch_config_degrades_not_defers(monkeypatch):
+    """When MIGRATION_APPLY_SCRATCH_DATABASE_URL is absent, the finalize resolver
+    must return ('ok', None) — non-blocking degrade — rather than deferring every
+    candidate indefinitely.  This is the documented intent in required_runtime_env.py:
+    absent qualification env degrades specific gate checks, not holds the release."""
+    from types import SimpleNamespace
+
+    import app.migration_apply_gate as gate_mod
+    from app import release_qualifier as qualifier
+
+    monkeypatch.delenv("MIGRATION_APPLY_SCRATCH_DATABASE_URL", raising=False)
+
+    apply_gate_mock = AsyncMock()
+    monkeypatch.setattr(gate_mod, "run_migration_apply_gate", apply_gate_mock)
+    monkeypatch.setattr(
+        qualifier,
+        "_resolve_github_with_session",
+        AsyncMock(return_value=("token", "owner", "repo")),
+    )
+    monkeypatch.setattr(qualifier, "resolve_async_engine", lambda _: None)
+
+    class _FakeSession:
+        async def get(self, _model, _id):
+            return SimpleNamespace(id="project-id")
+
+    verdict, detail = await qualifier._resolve_migration_apply_at_finalize(
+        _FakeSession(),
+        SimpleNamespace(project_id="project-id", version_number=1),
+        "candidate-sha-abc123",
+    )
+
+    assert verdict == "ok", f"expected ok for absent scratch config, got {verdict!r}: {detail}"
+    assert detail is None
+    apply_gate_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio

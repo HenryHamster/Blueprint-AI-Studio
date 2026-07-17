@@ -3786,6 +3786,12 @@ async def _resolve_migration_apply_at_finalize(
         scratch_preflight = preflight_migration_apply_scratch(
             os.getenv(MIGRATION_APPLY_SCRATCH_ENV)
         )
+        if scratch_preflight.status == "absent":
+            # Config-absent: degrade gate non-blocking rather than holding every
+            # candidate indefinitely.  Documented intent in required_runtime_env.py:
+            # "absent qualification vars should degrade specific gate checks rather
+            # than preventing startup" and qualify as a hold-forever silent blocker.
+            return ("ok", None)
         if scratch_preflight.status != "ready" or scratch_preflight.target is None:
             return ("defer", scratch_preflight.detail)
         prod_engine = resolve_async_engine(session)

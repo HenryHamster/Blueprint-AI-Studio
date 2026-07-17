@@ -132,7 +132,7 @@ def preflight_migration_apply_scratch(
     """
     if raw_url is None or (isinstance(raw_url, str) and not raw_url.strip()):
         return MigrationApplyScratchPreflight(
-            status="defer",
+            status="absent",
             code="scratch_database_url_missing",
             target=None,
             detail=(
