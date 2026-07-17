@@ -1,6 +1,6 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Cpu, Square, AlertTriangle, Clock, ExternalLink, Package, FileText, LayoutGrid, CheckCircle, XCircle, BookOpen, Search, List } from 'lucide-react';
-import { analyzeComputeJob, askComputeJob, fetchAwaitingLocalRunnerHolds, fetchComputeJobsPaged, fetchComputeJobsAggregateSummary, fetchComputeSweepGroups, fetchHeldComputeExperiments, fetchKnowledgeDocument, killComputeJob, rerunComputeExperiment, resolveArtifactDownloadUrl, type AwaitingLocalRunnerHold, type ComputeJob, type ComputeJobCommandLog, type ComputeJobLiveOutput, type ComputeJobsSummary, type ComputeSweepGroupsResponse, type ComputeSuccessOperator, type HeldComputeExperiment, type KnowledgeDocument } from '../api';
+import { analyzeComputeJob, askComputeJob, fetchAwaitingLocalRunnerHolds, fetchComputeJobsPaged, fetchComputeJobsAggregateSummary, fetchComputeSweepGroups, fetchHeldComputeExperiments, fetchKnowledgeDocument, killComputeJob, rerunComputeExperiment, type AwaitingLocalRunnerHold, type ComputeJob, type ComputeJobCommandLog, type ComputeJobLiveOutput, type ComputeJobsSummary, type ComputeSweepGroupsResponse, type ComputeSuccessOperator, type HeldComputeExperiment, type KnowledgeDocument } from '../api';
 import { type ComputeExperimentForm, defaultComputeExperimentForm } from '../hooks/useTaskModal';
 import { usePersistedState } from '../hooks/usePersistedState';
 import { usePoller } from '../hooks/usePoller';
@@ -10,6 +10,7 @@ import { ReleaseEvidenceChip } from './ReleaseEvidence';
 import { asLiveReleaseEvidence } from './ReleaseEvidence.utils';
 import { AcceptanceGradeBadge } from './AcceptanceGradeBadge';
 import { EvidenceTierBadge, MutableImageBadge } from './EvidenceTierBadge';
+import { ComputeArtifactGallery } from './ComputeArtifactGallery';
 import { formatComputeAnalysisCauseLabel } from '../utils/computeAnalysisLabels';
 import {
   isComputeJobActive,
@@ -21,8 +22,6 @@ import {
   computeJobProjectedSpend,
   computeJobMargin,
   computeJobExecutionLocation,
-  computeJobViewableArtifacts,
-  fmtBytes,
   computeJobEvidenceTier,
   computeJobEvidenceGroup,
   computeJobEvidenceTierRank,
@@ -33,17 +32,6 @@ import {
 } from './ComputeJobsPanel.utils';
 
 const POLL_INTERVAL_MS = 10_000;
-
-// Signed artifact URLs expire after ~60 minutes; treat anything older than
-// 50 minutes as stale and re-resolve instead of handing out a dead link.
-const SIGNED_PREVIEW_FRESH_MS = 50 * 60 * 1000;
-const artifactCacheKey = (jobId: string, storageUri: string, revision: string | null) =>
-  `${jobId}:${revision ? `${storageUri}@${revision}` : storageUri}`;
-
-type PreviewResolution =
-  | { state: 'resolving' }
-  | { state: 'resolved'; url: string; resolvedAt: number }
-  | { state: 'error' };
 
 const DIAGNOSTIC_KEYS = new Set(['exit_code', 'error', 'reason', 'stderr_excerpt', 'label', 'note', 'log', 'elapsed_seconds']);
 
@@ -1059,13 +1047,6 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
   const [knowledgeDocs, setKnowledgeDocs] = useState<Record<string, KnowledgeDocument>>({});
   const [sweepGroups, setSweepGroups] = useState<ComputeSweepGroupsResponse['sweep_groups']>({});
   const [expandedDocIds, setExpandedDocIds] = useState<Set<string>>(new Set());
-  // Signed preview URLs keyed by storage identity plus its revision. A runner may
-  // overwrite a durable URI while a gallery is open, so URI alone is not a
-  // preview generation.
-  // Resolved lazily on gallery expand and cached for the session; entries are
-  // re-resolved on click / media error once the signed URL goes stale.
-  const [previewUrls, setPreviewUrls] = useState<Record<string, PreviewResolution>>({});
-  const previewRequestIds = useRef<Record<string, number>>({});
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [askState, setAskState] = usePersistedState<Record<string, AskStateValue>>(
     `compute-ask-state:${projectId}`,
@@ -1137,83 +1118,6 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
     });
   }, []);
 
-  const resolvePreviewUrl = useCallback(async (key: string, storageUri: string): Promise<string | null> => {
-    if (!projectId) return null;
-    const requestId = (previewRequestIds.current[key] ?? 0) + 1;
-    previewRequestIds.current[key] = requestId;
-    setPreviewUrls((prev) => ({ ...prev, [key]: { state: 'resolving' } }));
-    try {
-      const url = await resolveArtifactDownloadUrl(projectId, storageUri);
-      if (previewRequestIds.current[key] === requestId) {
-        setPreviewUrls((prev) => ({ ...prev, [key]: { state: 'resolved', url, resolvedAt: Date.now() } }));
-      }
-      return url;
-    } catch {
-      if (previewRequestIds.current[key] === requestId) {
-        setPreviewUrls((prev) => ({ ...prev, [key]: { state: 'error' } }));
-      }
-      return null;
-    }
-  }, [projectId]);
-
-  const markPreviewError = useCallback((key: string) => {
-    setPreviewUrls((prev) => ({ ...prev, [key]: { state: 'error' } }));
-  }, []);
-
-  const toggleArtifactGallery = useCallback((job: ComputeJob) => {
-    const galleryKey = `gallery-${job.id}`;
-    const wasExpanded = expandedDocIds.has(galleryKey);
-    toggleDocExpanded(galleryKey);
-    if (wasExpanded) return;
-    // Lazy resolution: sign URLs only when the operator expands this job's
-    // gallery, and only for entries without a live resolution in flight.
-    for (const art of computeJobViewableArtifacts(job)) {
-      // PDFs are click-to-open (never rendered inline), so their signed URL is
-      // minted on click by openPreviewFullSize — don't waste a signing round-trip
-      // eagerly on expand.
-      if (art.kind === 'pdf') continue;
-      const key = artifactCacheKey(job.id, art.storage_uri, art.revision);
-      const cached = previewUrls[key];
-      if (cached?.state === 'resolving' || cached?.state === 'resolved') continue;
-      void resolvePreviewUrl(key, art.storage_uri);
-    }
-  }, [expandedDocIds, toggleDocExpanded, previewUrls, resolvePreviewUrl]);
-
-  // Polling can replace a live artifact at the same URI. Keep an already-open
-  // gallery live by signing only the newly observed generation.
-  useEffect(() => {
-    for (const job of jobs) {
-      if (!expandedDocIds.has(`gallery-${job.id}`)) continue;
-      for (const art of computeJobViewableArtifacts(job)) {
-        if (art.kind === 'pdf') continue;
-        const key = artifactCacheKey(job.id, art.storage_uri, art.revision);
-        if (!previewUrls[key]) void resolvePreviewUrl(key, art.storage_uri);
-      }
-    }
-  }, [jobs, expandedDocIds, previewUrls, resolvePreviewUrl]);
-
-  const openPreviewFullSize = useCallback(async (key: string, storageUri: string) => {
-    const cached = previewUrls[key];
-    if (cached?.state === 'resolved' && Date.now() - cached.resolvedAt < SIGNED_PREVIEW_FRESH_MS) {
-      window.open(cached.url, '_blank', 'noopener,noreferrer');
-      return;
-    }
-    // Stale or errored cache — re-resolve, keeping a pending tab open across
-    // the async gap so popup blockers don't eat the navigation (same pattern
-    // as ResolvedReferenceLink in TaskCard).
-    const pendingTab = window.open('', '_blank');
-    const url = await resolvePreviewUrl(key, storageUri);
-    if (!url) {
-      pendingTab?.close();
-      return;
-    }
-    if (pendingTab) {
-      pendingTab.opener = null;
-      pendingTab.location.replace(url);
-    } else {
-      window.open(url, '_blank', 'noopener,noreferrer');
-    }
-  }, [previewUrls, resolvePreviewUrl]);
 
   const load = useCallback(
     async (signal?: AbortSignal, appendOffset?: number) => {
@@ -2413,166 +2317,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                   </ResolvedReferenceLink>
                 </div>
               )}
-              {(() => {
-                const artifacts = computeJobViewableArtifacts(job);
-                const jobIsRunning = job.status === 'RUNNING' || job.status === 'STARTING';
-                const liveOm = jobIsRunning ? job.viewable_artifacts_live_omissions : null;
-                const liveOmTotal = (liveOm?.size_cap ?? 0) + (liveOm?.count_cap ?? 0);
-                const terminalDropped = job.viewable_artifacts_dropped_count ?? 0;
-                const omissionCount = jobIsRunning ? liveOmTotal : terminalDropped;
-                if (artifacts.length === 0 && omissionCount <= 0) return null;
-                const galleryKey = `gallery-${job.id}`;
-                const galleryExpanded = expandedDocIds.has(galleryKey);
-                let omissionDetail: string;
-                if (liveOm && (liveOm.size_cap ?? 0) > 0 && !(liveOm.count_cap ?? 0)) {
-                  omissionDetail = 'exceeded per-file size limit (8 MiB/image · 8 MiB/PDF · 512 MiB/video)';
-                } else if (liveOm && (liveOm.count_cap ?? 0) > 0 && !(liveOm.size_cap ?? 0)) {
-                  omissionDetail = '25-file count limit reached';
-                } else {
-                  omissionDetail = 'preview cap: 25 files · 8 MiB/image · 8 MiB/PDF · 512 MiB/video';
-                }
-                const omittedNote =
-                  omissionCount > 0 ? (
-                    <div
-                      className="text-ui-xs text-amber-400/90 font-mono"
-                      data-testid="compute-artifact-omitted-note"
-                    >
-                      {`${omissionCount} file${omissionCount === 1 ? '' : 's'} omitted (${omissionDetail})`}
-                    </div>
-                  ) : null;
-                if (artifacts.length === 0) {
-                  return (
-                    <div className="mt-1.5" data-testid="compute-artifact-gallery">
-                      {omittedNote}
-                    </div>
-                  );
-                }
-                return (
-                  <div className="mt-1.5" data-testid="compute-artifact-gallery">
-                    <div className="flex items-center gap-1.5 mb-0.5 text-ui-sm text-neutral-500 font-mono">
-                      <span>Artifacts</span>
-                      <button
-                        type="button"
-                        onClick={() => toggleArtifactGallery(job)}
-                        className="min-h-[44px] rounded border border-neutral-700 bg-neutral-800 px-1 py-0.5 text-ui-xs text-sky-400 hover:text-sky-300"
-                        data-testid="compute-artifact-gallery-toggle"
-                      >
-                        {galleryExpanded ? 'Hide previews' : `Show previews (${artifacts.length})`}
-                      </button>
-                    </div>
-                    {omittedNote}
-                    {galleryExpanded && (
-                      <div className="flex flex-wrap gap-2">
-                        {artifacts.map((art) => {
-                          const key = artifactCacheKey(job.id, art.storage_uri, art.revision);
-                          const resolution = previewUrls[key];
-                          const sizeLabel = fmtBytes(art.bytes);
-                          const artLiveBadge = art.live ? (
-                            <span
-                              className="absolute left-1 top-1 z-10 flex items-center gap-1 rounded bg-red-600/90 px-1.5 py-0.5 text-ui-xs font-semibold text-white shadow-sm"
-                              data-testid="live-badge"
-                            >
-                              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-white" />
-                              LIVE
-                            </span>
-                          ) : null;
-                          const caption = (
-                            <div className="max-w-[10rem] truncate text-ui-xs text-neutral-500 font-mono" title={art.name}>
-                              {art.name}{sizeLabel ? ` · ${sizeLabel}` : ''}
-                            </div>
-                          );
-                          if (art.kind === 'pdf') {
-                            // PDFs are never rendered inline on the app origin;
-                            // they open in the browser's sandboxed viewer on the
-                            // storage origin. openPreviewFullSize resolves a fresh
-                            // signed URL and opens it in a new tab.
-                            const pdfBtn = (
-                              <button
-                                type="button"
-                                onClick={() => { void openPreviewFullSize(key, art.storage_uri); }}
-                                disabled={resolution?.state === 'resolving'}
-                                title={`Open ${art.name} in a new tab`}
-                                className="flex h-24 w-32 flex-col items-center justify-center gap-1 rounded border border-neutral-800 bg-neutral-950 px-1 text-center text-ui-xs text-neutral-400 hover:border-sky-500/50 disabled:opacity-70"
-                                data-testid="compute-artifact-pdf"
-                              >
-                                <FileText className="h-8 w-8 text-sky-400" />
-                                <span>
-                                  {resolution?.state === 'resolving'
-                                    ? 'opening…'
-                                    : resolution?.state === 'error'
-                                      ? 'open failed — retry'
-                                      : 'Open PDF'}
-                                </span>
-                              </button>
-                            );
-                            return (
-                              <div key={key} className="flex flex-col gap-0.5" data-testid="compute-viewable-artifact">
-                                {artLiveBadge ? <div className="relative">{pdfBtn}{artLiveBadge}</div> : pdfBtn}
-                                {caption}
-                              </div>
-                            );
-                          }
-                          if (resolution?.state === 'resolved') {
-                            const mediaElem = art.kind === 'video' ? (
-                              <video
-                                controls
-                                preload="metadata"
-                                src={resolution.url}
-                                onError={() => markPreviewError(key)}
-                                className="h-24 max-w-[16rem] rounded border border-neutral-800 bg-neutral-950"
-                                data-testid="compute-artifact-video"
-                              />
-                            ) : (
-                              <button
-                                type="button"
-                                onClick={() => { void openPreviewFullSize(key, art.storage_uri); }}
-                                title={`Open ${art.name} full-size in a new tab`}
-                                className="rounded border border-neutral-800 bg-neutral-950 hover:border-sky-500/50"
-                                data-testid="compute-artifact-thumbnail"
-                              >
-                                <img
-                                  src={resolution.url}
-                                  alt={art.name}
-                                  loading="lazy"
-                                  onError={() => markPreviewError(key)}
-                                  className="h-24 w-auto max-w-[16rem] rounded object-contain"
-                                />
-                              </button>
-                            );
-                            return (
-                              <div key={key} className="flex flex-col gap-0.5" data-testid="compute-viewable-artifact">
-                                {artLiveBadge ? <div className="relative">{mediaElem}{artLiveBadge}</div> : mediaElem}
-                                {caption}
-                              </div>
-                            );
-                          }
-                          const placeholderBtn = (
-                            <button
-                              type="button"
-                              onClick={() => { void resolvePreviewUrl(key, art.storage_uri); }}
-                              disabled={resolution?.state === 'resolving'}
-                              className="flex h-24 w-32 items-center justify-center rounded border border-neutral-800 bg-neutral-950 px-1 text-center text-ui-xs text-neutral-500 hover:border-sky-500/50 disabled:opacity-70"
-                              data-testid="compute-artifact-placeholder"
-                            >
-                              {resolution?.state === 'resolving'
-                                ? 'resolving…'
-                                : resolution?.state === 'error'
-                                  ? 'preview unavailable — retry'
-                                  : 'load preview'}
-                            </button>
-                          );
-                          return (
-                            <div key={key} className="flex flex-col gap-0.5" data-testid="compute-viewable-artifact">
-                              {artLiveBadge ? <div className="relative">{placeholderBtn}{artLiveBadge}</div> : placeholderBtn}
-                              {caption}
-                            </div>
-                          );
-                        })}
-                      </div>
-                    )}
-                  </div>
-                );
-              })()}
+              <ComputeArtifactGallery projectId={projectId} job={job} testIdPrefix="compute" />
               {(() => {
                 const metrics = job.polling_metadata?.result_metrics as Record<string, unknown> | undefined;
                 if (!metrics) return null;

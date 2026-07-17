@@ -24,7 +24,12 @@ const artifactCacheKey = (storageUri: string, revision: string | null) =>
  *  This is the drawer-friendly extraction of ComputeJobsPanel's inline gallery:
  *  it renders nothing (returns null) when the job carries no viewable artifacts,
  *  so it is safe to drop into any per-job row. */
-export function ComputeArtifactGallery({ projectId, job }: { projectId: string; job: ComputeJob }) {
+export function ComputeArtifactGallery({
+  projectId,
+  job,
+  testIdPrefix = 'drawer',
+}: { projectId: string; job: ComputeJob; testIdPrefix?: 'drawer' | 'compute' }) {
+  const testId = (suffix: string) => `${testIdPrefix}-${suffix}`;
   const [expanded, setExpanded] = useState(false);
   const [previewUrls, setPreviewUrls] = useState<Record<string, PreviewResolution>>({});
   const previewRequestIds = useRef<Record<string, number>>({});
@@ -65,12 +70,9 @@ export function ComputeArtifactGallery({ projectId, job }: { projectId: string; 
       return !previewUrls[key];
     });
     if (pending.length === 0) return;
-    const timer = window.setTimeout(() => {
-      for (const art of pending) {
-        void resolvePreviewUrl(artifactCacheKey(art.storage_uri, art.revision), art.storage_uri);
-      }
-    }, 0);
-    return () => window.clearTimeout(timer);
+    for (const art of pending) {
+      void resolvePreviewUrl(artifactCacheKey(art.storage_uri, art.revision), art.storage_uri);
+    }
   }, [artifacts, expanded, previewUrls, resolvePreviewUrl]);
 
   const openPreviewFullSize = useCallback(
@@ -124,7 +126,7 @@ export function ComputeArtifactGallery({ projectId, job }: { projectId: string; 
     omissionCount > 0 ? (
       <div
         className="text-ui-xs text-amber-400/90 font-mono"
-        data-testid="drawer-artifact-omitted-note"
+        data-testid={testId('artifact-omitted-note')}
       >
         {`${omissionCount} file${omissionCount === 1 ? '' : 's'} omitted (${omissionDetail()})`}
       </div>
@@ -134,21 +136,21 @@ export function ComputeArtifactGallery({ projectId, job }: { projectId: string; 
   // note alone (no toggle, nothing to preview) rather than rendering nothing.
   if (artifacts.length === 0) {
     return (
-      <div className="mt-1.5" data-testid="drawer-artifact-gallery">
+      <div className="mt-1.5" data-testid={testId('artifact-gallery')}>
         {omittedNote}
       </div>
     );
   }
 
   return (
-    <div className="mt-1.5" data-testid="drawer-artifact-gallery">
+    <div className="mt-1.5" data-testid={testId('artifact-gallery')}>
       <div className="flex items-center gap-1.5 mb-0.5 text-ui-sm text-neutral-500 font-mono">
         <span>Artifacts</span>
         <button
           type="button"
           onClick={() => setExpanded((value) => !value)}
           className="min-h-[44px] rounded border border-neutral-700 bg-neutral-800 px-1 py-0.5 text-ui-xs text-sky-400 hover:text-sky-300"
-          data-testid="drawer-artifact-gallery-toggle"
+          data-testid={testId('artifact-gallery-toggle')}
         >
           {expanded ? 'Hide previews' : `Show previews (${artifacts.length})`}
         </button>
@@ -186,7 +188,7 @@ export function ComputeArtifactGallery({ projectId, job }: { projectId: string; 
                   disabled={resolution?.state === 'resolving'}
                   title={`Open ${art.name} in a new tab`}
                   className="flex h-24 w-32 flex-col items-center justify-center gap-1 rounded border border-neutral-800 bg-neutral-950 px-1 text-center text-ui-xs text-neutral-400 hover:border-sky-500/50 disabled:opacity-70"
-                  data-testid="drawer-artifact-pdf"
+                  data-testid={testId('artifact-pdf')}
                 >
                   <FileText className="h-8 w-8 text-sky-400" />
                   <span>
@@ -199,7 +201,7 @@ export function ComputeArtifactGallery({ projectId, job }: { projectId: string; 
                 </button>
               );
               return (
-                <div key={key} className="flex flex-col gap-0.5" data-testid="drawer-viewable-artifact">
+                <div key={key} className="flex flex-col gap-0.5" data-testid={testId('viewable-artifact')}>
                   {artLiveBadge ? <div className="relative">{pdfBtn}{artLiveBadge}</div> : pdfBtn}
                   {caption}
                 </div>
@@ -213,7 +215,7 @@ export function ComputeArtifactGallery({ projectId, job }: { projectId: string; 
                   src={resolution.url}
                   onError={() => markPreviewError(key)}
                   className="h-24 max-w-[16rem] rounded border border-neutral-800 bg-neutral-950"
-                  data-testid="drawer-artifact-video"
+                  data-testid={testId('artifact-video')}
                 />
               ) : (
                 <button
@@ -221,7 +223,7 @@ export function ComputeArtifactGallery({ projectId, job }: { projectId: string; 
                   onClick={() => { void openPreviewFullSize(key, art.storage_uri); }}
                   title={`Open ${art.name} full-size in a new tab`}
                   className="rounded border border-neutral-800 bg-neutral-950 hover:border-sky-500/50"
-                  data-testid="drawer-artifact-thumbnail"
+                  data-testid={testId('artifact-thumbnail')}
                 >
                   <img
                     src={resolution.url}
@@ -233,7 +235,7 @@ export function ComputeArtifactGallery({ projectId, job }: { projectId: string; 
                 </button>
               );
               return (
-                <div key={key} className="flex flex-col gap-0.5" data-testid="drawer-viewable-artifact">
+                <div key={key} className="flex flex-col gap-0.5" data-testid={testId('viewable-artifact')}>
                   {artLiveBadge ? <div className="relative">{mediaElem}{artLiveBadge}</div> : mediaElem}
                   {caption}
                 </div>
@@ -245,7 +247,7 @@ export function ComputeArtifactGallery({ projectId, job }: { projectId: string; 
                 onClick={() => { void resolvePreviewUrl(key, art.storage_uri); }}
                 disabled={resolution?.state === 'resolving'}
                 className="flex h-24 w-32 items-center justify-center rounded border border-neutral-800 bg-neutral-950 px-1 text-center text-ui-xs text-neutral-500 hover:border-sky-500/50 disabled:opacity-70"
-                data-testid="drawer-artifact-placeholder"
+                data-testid={testId('artifact-placeholder')}
               >
                 {resolution?.state === 'resolving'
                   ? 'resolving…'
@@ -255,7 +257,7 @@ export function ComputeArtifactGallery({ projectId, job }: { projectId: string; 
               </button>
             );
             return (
-              <div key={key} className="flex flex-col gap-0.5" data-testid="drawer-viewable-artifact">
+              <div key={key} className="flex flex-col gap-0.5" data-testid={testId('viewable-artifact')}>
                 {artLiveBadge ? <div className="relative">{placeholderBtn}{artLiveBadge}</div> : placeholderBtn}
                 {caption}
               </div>
