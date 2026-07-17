@@ -11,6 +11,13 @@ import type { StrategicStateResponse } from '../strategicStateApi';
 import type { StrategicSessionDelta } from '../hooks/useLogViewer';
 import { auth } from '../firebase';
 import * as pendingAttachmentStore from '../utils/pendingAttachmentStore';
+import {
+  dispatchResidentToolHandoff,
+  enqueueResidentToolHandoff,
+  loadQueuedResidentToolHandoffEntries,
+  loadQueuedResidentToolHandoffs,
+} from '../utils/residentToolHandoff';
+import { loadComposerDraft, saveComposerDraft } from '../utils/conversationDraftState';
 
 // Full replacement (NOT a partial mock): the real `../firebase` calls
 // initializeApp()/getAuth() at module load, which we must not run in jsdom.
@@ -783,6 +790,137 @@ describe('MessagesPanel chrome modes', () => {
 
     expect(textarea.value).toBe('What should I research next?');
     expect(el.textContent).toContain('What should I research next?');
+  });
+
+  test('tool handoff survives typing and remount before preserving the exact revision through send', async () => {
+    const el = await renderPanel({ filterChrome: 'minimal' });
+    const artifactRef = {
+      id: 'tool-ref-7',
+      artifact_ref_id: 'tool-ref-7',
+      tool_id: 'notes-1',
+      project_id: 'proj-1',
+      kind: 'notes',
+      revision: 7,
+      checksum: 'a'.repeat(64),
+      author: 'test-user@example.com',
+      timestamp: '2026-07-17T00:00:00Z',
+      retrieval: { capability: 'inline_bounded_text', href: '/artifact-refs/tool-ref-7' },
+    };
+
+    await act(async () => {
+      window.dispatchEvent(new CustomEvent('blueprint:resident-tool-handoff', {
+        detail: {
+          projectId: 'other-project', artifactRef, intent: 'share', prompt: 'wrong project',
+        },
+      }));
+    });
+    expect((el.querySelector('textarea') as HTMLTextAreaElement).value).toBe('');
+
+    await act(async () => {
+      window.dispatchEvent(new CustomEvent('blueprint:resident-tool-handoff', {
+        detail: {
+          projectId: 'proj-1', artifactRef, intent: 'ask', laneOwner: 'operator: board refinement',
+          prompt: 'Review Notes revision 7.',
+        },
+      }));
+    });
+
+    const draft = loadComposerDraft('test-user@example.com', 'proj-1');
+    expect(draft).toMatchObject({
+      content: 'Review Notes revision 7.',
+      artifact_refs: [artifactRef],
+      operator_intent: {
+        kind: 'ask', expected_revision: 7, lane_owner: 'operator: board refinement',
+      },
+    });
+
+    const textarea = el.querySelector('textarea') as HTMLTextAreaElement;
+    await act(async () => {
+      fireEvent.change(textarea, { target: { value: 'Does this change our runner assumptions?' } });
+    });
+    expect(el.querySelector('[aria-label="Remove Notes revision 7"]')).not.toBeNull();
+
+    await act(async () => { root?.unmount(); });
+    root = null;
+    host?.remove();
+    host = null;
+    const remounted = await mountPanel({ filterChrome: 'minimal' });
+    expect((remounted.querySelector('textarea') as HTMLTextAreaElement).value)
+      .toBe('Does this change our runner assumptions?');
+    expect(remounted.querySelector('[aria-label="Remove Notes revision 7"]')).not.toBeNull();
+
+    const send = remounted.querySelector('button[aria-label="Send message"]') as HTMLButtonElement;
+    await act(async () => { send.click(); });
+    await waitFor(() => expect(_strategicSessionMessagePostCalls()).toHaveLength(1));
+    const body = JSON.parse(String(
+      (_strategicSessionMessagePostCalls()[0][1] as RequestInit).body,
+    )) as Record<string, unknown>;
+    expect(body.artifact_refs).toEqual([artifactRef]);
+    expect(body.operator_intent).toEqual({
+      kind: 'ask', expected_revision: 7, lane_owner: 'operator: board refinement',
+    });
+  });
+
+  test('adopts a handoff persisted while the routed conversation listener was absent', async () => {
+    const artifactRef = {
+      id: 'tool-ref-routed', artifact_ref_id: 'tool-ref-routed', tool_id: 'notes-1',
+      project_id: 'proj-1', kind: 'notes' as const, revision: 9, checksum: 'c'.repeat(64),
+      author: 'test-user@example.com', timestamp: '2026-07-17T00:00:00Z',
+      retrieval: { capability: 'inline_bounded_text' as const, href: '/artifact-refs/tool-ref-routed' },
+    };
+    expect(dispatchResidentToolHandoff({
+      projectId: 'proj-1', artifactRef, intent: 'share', prompt: 'Use Notes revision 9.',
+    })).toBe(true);
+
+    const el = await renderPanel({ filterChrome: 'minimal' });
+
+    expect((el.querySelector('textarea') as HTMLTextAreaElement).value).toBe('Use Notes revision 9.');
+    expect(el.querySelector('[aria-label="Remove Notes revision 9"]')).not.toBeNull();
+    expect(loadQueuedResidentToolHandoffs('test-user@example.com', 'proj-1')).toEqual([]);
+  });
+
+  test('drains a matching handoff delivered through another tab storage event', async () => {
+    const el = await renderPanel({ filterChrome: 'minimal' });
+    const artifactRef = {
+      id: 'tool-ref-tab', artifact_ref_id: 'tool-ref-tab', tool_id: 'notes-1',
+      project_id: 'proj-1', kind: 'notes' as const, revision: 10, checksum: 'd'.repeat(64),
+      author: 'test-user@example.com', timestamp: '2026-07-17T00:00:00Z',
+      retrieval: { capability: 'inline_bounded_text' as const, href: '/artifact-refs/tool-ref-tab' },
+    };
+    expect(enqueueResidentToolHandoff('test-user@example.com', 'proj-1', {
+      projectId: 'proj-1', artifactRef, intent: 'ask', prompt: 'Review Notes revision 10.',
+    })).toBe(true);
+    const [entry] = loadQueuedResidentToolHandoffEntries('test-user@example.com', 'proj-1');
+
+    await act(async () => {
+      window.dispatchEvent(new StorageEvent('storage', { key: entry.storageKey }));
+    });
+
+    expect((el.querySelector('textarea') as HTMLTextAreaElement).value).toBe('Review Notes revision 10.');
+    expect(el.querySelector('[aria-label="Remove Notes revision 10"]')).not.toBeNull();
+  });
+
+  test('removing a tool chip clears its linked operator intent from the durable draft', async () => {
+    const el = await renderPanel({ filterChrome: 'minimal' });
+    const artifactRef = {
+      id: 'tool-ref-remove', artifact_ref_id: 'tool-ref-remove', tool_id: 'notes-1',
+      project_id: 'proj-1', kind: 'notes', revision: 8, checksum: 'b'.repeat(64),
+      author: 'test-user@example.com', timestamp: '2026-07-17T00:00:00Z',
+      retrieval: { capability: 'inline_bounded_text', href: '/artifact-refs/tool-ref-remove' },
+    };
+    await act(async () => {
+      window.dispatchEvent(new CustomEvent('blueprint:resident-tool-handoff', {
+        detail: { projectId: 'proj-1', artifactRef, intent: 'share', prompt: 'Use Notes revision 8.' },
+      }));
+    });
+
+    await act(async () => {
+      (el.querySelector('[aria-label="Remove Notes revision 8"]') as HTMLButtonElement).click();
+    });
+    expect(el.querySelector('[aria-label="Remove Notes revision 8"]')).toBeNull();
+    const draft = loadComposerDraft('test-user@example.com', 'proj-1');
+    expect(draft?.artifact_refs).toEqual([]);
+    expect(draft?.operator_intent).toBeUndefined();
   });
 
   test('legacy onClose usage keeps full controls and close action', async () => {
@@ -5952,16 +6090,15 @@ describe('MessagesPanel attachment integration', () => {
     const el = await renderPanel(vi.fn(), { filterChrome: 'minimal' });
     await attachFile(el, 'remove-me.txt', 'temporary bytes', 'text/plain');
     await waitFor(() => expect(el.textContent).toContain('remove-me.txt'));
-    const draftKey = 'messages_composer_draft:test-user@example.com:proj-1';
     const identityKey = 'conversationDraftSend:test-user%40example.com:proj-1';
-    await waitFor(() => expect(JSON.parse(localStorage.getItem(draftKey) ?? '{}').attachment_send_key).toBeTruthy());
+    await waitFor(() => expect(loadComposerDraft('test-user@example.com', 'proj-1')?.attachment_send_key).toBeTruthy());
     expect(sessionStorage.getItem(identityKey)).toBeTruthy();
 
     await act(async () => {
       (el.querySelector('button[aria-label="Remove remove-me.txt"]') as HTMLButtonElement).click();
     });
     await waitFor(() => expect(el.textContent).not.toContain('remove-me.txt'));
-    await waitFor(() => expect(localStorage.getItem(draftKey)).toBeNull());
+    await waitFor(() => expect(loadComposerDraft('test-user@example.com', 'proj-1')).toBeNull());
     expect(sessionStorage.getItem(identityKey)).toBeNull();
 
     await act(async () => { root?.render(<div data-testid="away" />); });
@@ -5978,7 +6115,7 @@ describe('MessagesPanel attachment integration', () => {
     });
     await waitFor(() => expect(el.querySelector('textarea')).toBeTruthy());
     expect(el.textContent).not.toContain('remove-me.txt');
-    expect(localStorage.getItem(draftKey)).toBeNull();
+    expect(loadComposerDraft('test-user@example.com', 'proj-1')).toBeNull();
     expect(sessionStorage.getItem(identityKey)).toBeNull();
   });
 
@@ -7055,12 +7192,10 @@ describe('MessagesPanel composer draft persistence', () => {
       fe.change(textarea, { target: { value: 'draft text to persist' } });
     });
 
-    const draftKey = `messages_composer_draft:test-user@example.com:proj-draft`;
-    const stored = localStorage.getItem(draftKey);
-    expect(stored).not.toBeNull();
-    const parsed = JSON.parse(stored!);
-    expect(parsed.content).toBe('draft text to persist');
-    expect(typeof parsed.type).toBe('string');
+    const parsed = loadComposerDraft('test-user@example.com', 'proj-draft');
+    expect(parsed).not.toBeNull();
+    expect(parsed?.content).toBe('draft text to persist');
+    expect(typeof parsed?.type).toBe('string');
   });
 
   test('composer is explicitly disabled when no project is selected', async () => {
@@ -7134,8 +7269,7 @@ describe('MessagesPanel composer draft persistence', () => {
       fe2.change(textarea, { target: { value: 'about to send' } });
     });
 
-    const draftKey = `messages_composer_draft:test-user@example.com:proj-draft`;
-    await waitFor(() => expect(localStorage.getItem(draftKey)).not.toBeNull());
+    await waitFor(() => expect(loadComposerDraft('test-user@example.com', 'proj-draft')).not.toBeNull());
 
     // Find the send button by its distinctive blue class and click it
     const sendBtn = container.querySelector('button.bg-blue-600') as HTMLButtonElement;
@@ -7147,7 +7281,7 @@ describe('MessagesPanel composer draft persistence', () => {
     });
 
     await waitFor(() => {
-      expect(localStorage.getItem(draftKey)).toBeNull();
+      expect(loadComposerDraft('test-user@example.com', 'proj-draft')).toBeNull();
     });
   });
 
@@ -8615,6 +8749,7 @@ describe('MessagesPanel optimistic-send tab-switch persistence', () => {
       created_at: new Date().toISOString(),
       message_type: 'FEEDBACK',
       state: 'needs_retry',
+      draft_write_id: 'submitted-abandon-write',
       payload: {
         content: 'unrecoverable attachment',
         idempotency_key: 'abandon-key',
@@ -8625,6 +8760,10 @@ describe('MessagesPanel optimistic-send tab-switch persistence', () => {
       },
     };
     sessionStorage.setItem('optimisticSend:test-user%40example.com:proj-abandon', JSON.stringify(seed));
+    saveComposerDraft('test-user@example.com', 'proj-abandon', {
+      type: 'FEEDBACK', content: 'newer draft survives abandon', reply_to: null,
+      source_refs: [], artifact_refs: [], attachment_send_key: null,
+    }, 'newer-abandon-write');
     _suppressSinceLastVisit('test-user@example.com', 'proj-abandon');
     _setupConvMock([]);
     const addToast = vi.fn();
@@ -8638,6 +8777,41 @@ describe('MessagesPanel optimistic-send tab-switch persistence', () => {
     await waitFor(() => expect(sessionStorage.getItem('optimisticSend:test-user%40example.com:proj-abandon')).toBeNull());
     expect((container.querySelector('textarea') as HTMLTextAreaElement).readOnly).toBe(false);
     expect(addToast).toHaveBeenCalledWith('Pending message abandoned after confirming it was not accepted.', 'info');
+    expect(loadComposerDraft('test-user@example.com', 'proj-abandon')).toMatchObject({
+      write_id: 'newer-abandon-write', content: 'newer draft survives abandon',
+    });
+  });
+
+  test('receipt recovery preserves a newer composer write than the submitted snapshot', async () => {
+    const projectId = 'proj-recovery-newer-draft';
+    const identity = 'recovery-newer-key';
+    sessionStorage.setItem(`optimisticSend:test-user%40example.com:${projectId}`, JSON.stringify({
+      actor_user_id: 'test-user@example.com', project_id: projectId,
+      key: identity, content: 'submitted recovery snapshot',
+      created_at: new Date().toISOString(), message_type: 'FEEDBACK',
+      state: 'sending', draft_write_id: 'submitted-recovery-write',
+      payload: {
+        message_type: 'FEEDBACK', content: 'submitted recovery snapshot',
+        idempotency_key: identity, source_refs: [], artifact_refs: [], attachments: [],
+      },
+    }));
+    saveComposerDraft('test-user@example.com', projectId, {
+      type: 'FEEDBACK', content: 'newer draft survives recovery', reply_to: null,
+      source_refs: [], artifact_refs: [], attachment_send_key: null,
+    }, 'newer-recovery-write');
+    _suppressSinceLastVisit('test-user@example.com', projectId);
+    _setupConvMock([makeMsg({
+      id: 'recovered-durable-message', project_id: projectId, from_type: 'user',
+      content: 'submitted recovery snapshot', handling_state: 'pending', idempotency_key: identity,
+    })]);
+
+    const view = render(
+      <MessagesPanel selectedProjectId={projectId} addToast={() => {}} onMessageCountChange={() => {}} filterChrome="minimal" />,
+    );
+    await waitFor(() => expect(view.container.querySelector('[data-send-state="accepted"]')).not.toBeNull());
+    expect(loadComposerDraft('test-user@example.com', projectId)).toMatchObject({
+      write_id: 'newer-recovery-write', content: 'newer draft survives recovery',
+    });
   });
 
   test('wake receipt clears from sessionStorage once the durable message is claimed', async () => {
@@ -8679,5 +8853,482 @@ describe('MessagesPanel optimistic-send tab-switch persistence', () => {
     await waitFor(() => {
       expect(sessionStorage.getItem('optimisticSend:test-user%40example.com:proj-tab-3')).toBeNull();
     });
+  });
+
+  test('queues a tool handoff durably while a send is in flight, then opens it as the next draft', async () => {
+    let finishPost!: (response: Response) => void;
+    const postResponse = new Promise<Response>(resolve => { finishPost = resolve; });
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
+      const urlStr = String(url);
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+      if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
+        return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
+      }
+      if (urlStr.includes('/strategic-session/messages') && method === 'POST') return postResponse;
+      if (urlStr.includes('/strategic-conversation') && method === 'GET') {
+        return new Response(JSON.stringify({
+          conversation: { limit: 20, has_more: false, order: 'oldest_first', items: [] },
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+    _suppressSinceLastVisit('test-user@example.com', 'proj-handoff-sending');
+    const { container } = render(
+      <MessagesPanel selectedProjectId="proj-handoff-sending" addToast={() => {}} onMessageCountChange={() => {}} filterChrome="minimal" />,
+    );
+    const textarea = await waitFor(() => container.querySelector('textarea') as HTMLTextAreaElement);
+    fireEvent.change(textarea, { target: { value: 'first message' } });
+    fireEvent.click(container.querySelector('button[aria-label="Send message"]') as HTMLButtonElement);
+    await waitFor(() => expect(container.querySelector('[data-send-state="sending"]')).not.toBeNull());
+
+    const artifactRef = {
+      id: 'queued-ref-1', artifact_ref_id: 'queued-ref-1', tool_id: 'notes-1',
+      project_id: 'proj-handoff-sending', kind: 'notes', revision: 11, checksum: 'a'.repeat(64),
+      author: 'test-user@example.com', timestamp: '2026-07-17T00:00:00Z',
+      retrieval: { capability: 'inline_bounded_text', href: '/artifact-refs/queued-ref-1' },
+    };
+    fireEvent(window, new CustomEvent('blueprint:resident-tool-handoff', {
+      detail: { projectId: 'proj-handoff-sending', artifactRef, intent: 'ask', prompt: 'Review Notes revision 11.' },
+    }));
+    expect(textarea.value).toBe('first message');
+    expect(loadQueuedResidentToolHandoffs('test-user@example.com', 'proj-handoff-sending'))
+      .toEqual([expect.objectContaining({ artifactRef: expect.objectContaining({ id: 'queued-ref-1' }) })]);
+
+    await act(async () => {
+      finishPost(new Response(JSON.stringify({
+        arming: 'steering', wakeup_state: 'queued',
+        message: makeMsg({
+          id: 'accepted-first', project_id: 'proj-handoff-sending', from_type: 'user',
+          content: 'first message', handling_state: 'pending',
+        }),
+      }), { status: 200 }));
+      await postResponse;
+    });
+    await waitFor(() => expect(textarea.value).toBe('Review Notes revision 11.'));
+    expect(container.querySelector('[aria-label="Remove Notes revision 11"]')).not.toBeNull();
+    expect(loadQueuedResidentToolHandoffs('test-user@example.com', 'proj-handoff-sending')).toEqual([]);
+  });
+
+  test('keeps a tool handoff queued through needs-retry recovery', async () => {
+    let postCount = 0;
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
+      const urlStr = String(url);
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+      if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
+        return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
+      }
+      if (urlStr.includes('/strategic-session/messages') && method === 'POST') {
+        postCount += 1;
+        if (postCount === 1) throw new Error('response lost');
+        return new Response(JSON.stringify({
+          arming: 'steering', wakeup_state: 'queued',
+          message: makeMsg({
+            id: 'accepted-retry', project_id: 'proj-handoff-retry', from_type: 'user',
+            content: 'ambiguous message', handling_state: 'pending',
+          }),
+        }), { status: 200 });
+      }
+      if (urlStr.includes('/strategic-conversation') && method === 'GET') {
+        return new Response(JSON.stringify({
+          conversation: { limit: 20, has_more: false, order: 'oldest_first', items: [] },
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+    _suppressSinceLastVisit('test-user@example.com', 'proj-handoff-retry');
+    const { container } = render(
+      <MessagesPanel selectedProjectId="proj-handoff-retry" addToast={() => {}} onMessageCountChange={() => {}} filterChrome="minimal" />,
+    );
+    const textarea = await waitFor(() => container.querySelector('textarea') as HTMLTextAreaElement);
+    fireEvent.change(textarea, { target: { value: 'ambiguous message' } });
+    fireEvent.click(container.querySelector('button[aria-label="Send message"]') as HTMLButtonElement);
+    await waitFor(() => expect(container.querySelector('[data-send-state="needs_retry"]')).not.toBeNull());
+
+    const artifactRef = {
+      id: 'queued-ref-2', artifact_ref_id: 'queued-ref-2', tool_id: 'wb-1',
+      project_id: 'proj-handoff-retry', kind: 'whiteboard', revision: 12, checksum: 'b'.repeat(64),
+      author: 'test-user@example.com', timestamp: '2026-07-17T00:00:00Z',
+      retrieval: { capability: 'project_tool_rendered_image', href: '/artifact-refs/queued-ref-2' },
+    };
+    fireEvent(window, new CustomEvent('blueprint:resident-tool-handoff', {
+      detail: { projectId: 'proj-handoff-retry', artifactRef, intent: 'share', prompt: 'Use Whiteboard revision 12.' },
+    }));
+    expect(textarea.value).toBe('ambiguous message');
+    expect(container.querySelector('[aria-label="Remove Whiteboard revision 12"]')).toBeNull();
+
+    fireEvent.click(container.querySelector('button[aria-label="Retry message"]') as HTMLButtonElement);
+    await waitFor(() => expect(postCount).toBe(2));
+    await waitFor(() => expect(textarea.value).toBe('Use Whiteboard revision 12.'));
+    expect(container.querySelector('[aria-label="Remove Whiteboard revision 12"]')).not.toBeNull();
+    expect(loadQueuedResidentToolHandoffs('test-user@example.com', 'proj-handoff-retry')).toEqual([]);
+  });
+
+  test('leaves a tool handoff queued on activity and drains it only after conversation opens', async () => {
+    const projectId = 'proj-activity-handoff';
+    const artifactRef = {
+      id: 'activity-ref', artifact_ref_id: 'activity-ref', tool_id: 'notes-activity',
+      project_id: projectId, kind: 'notes' as const, revision: 13, checksum: 'c'.repeat(64),
+      author: 'test-user@example.com', timestamp: '2026-07-17T00:00:00Z',
+      retrieval: { capability: 'inline_bounded_text' as const, href: '/artifact-refs/activity-ref' },
+    };
+    expect(enqueueResidentToolHandoff('test-user@example.com', projectId, {
+      projectId, artifactRef, intent: 'ask', prompt: 'Review Notes revision 13.',
+    })).toBe(true);
+    _suppressSinceLastVisit('test-user@example.com', projectId);
+    _setupConvMock([]);
+    const view = render(
+      <MessagesPanel selectedProjectId={projectId} addToast={() => {}} onMessageCountChange={() => {}} filterChrome="full" />,
+    );
+
+    await waitFor(() => expect(view.container.querySelector('textarea')).not.toBeNull());
+    expect(loadQueuedResidentToolHandoffs('test-user@example.com', projectId)).toHaveLength(1);
+    expect(view.container.querySelector('[aria-label="Remove Notes revision 13"]')).toBeNull();
+
+    view.rerender(
+      <MessagesPanel selectedProjectId={projectId} addToast={() => {}} onMessageCountChange={() => {}} filterChrome="minimal" />,
+    );
+    await waitFor(() => expect((view.container.querySelector('textarea') as HTMLTextAreaElement).value)
+      .toBe('Review Notes revision 13.'));
+    expect(view.container.querySelector('[aria-label="Remove Notes revision 13"]')).not.toBeNull();
+    expect(loadQueuedResidentToolHandoffs('test-user@example.com', projectId)).toEqual([]);
+  });
+
+  test('drains one immutable handoff per composer envelope and preserves the next intent', async () => {
+    const projectId = 'proj-queued-intents';
+    const makeRef = (id: string, revision: number) => ({
+      id, artifact_ref_id: id, tool_id: id,
+      project_id: projectId, kind: 'notes' as const, revision, checksum: 'd'.repeat(64),
+      author: 'test-user@example.com', timestamp: '2026-07-17T00:00:00Z',
+      retrieval: { capability: 'inline_bounded_text' as const, href: `/artifact-refs/${id}` },
+    });
+    expect(enqueueResidentToolHandoff('test-user@example.com', projectId, {
+      projectId, artifactRef: makeRef('first-ref', 14), intent: 'ask',
+      prompt: 'Ask about revision 14.', laneOwner: 'operator',
+    })).toBe(true);
+    expect(enqueueResidentToolHandoff('test-user@example.com', projectId, {
+      projectId, artifactRef: makeRef('second-ref', 15), intent: 'share',
+      prompt: 'Share revision 15.', laneOwner: 'resident',
+    })).toBe(true);
+    _suppressSinceLastVisit('test-user@example.com', projectId);
+    _setupConvMock([]);
+    const view = render(
+      <MessagesPanel selectedProjectId={projectId} addToast={() => {}} onMessageCountChange={() => {}} filterChrome="minimal" />,
+    );
+
+    await waitFor(() => expect((view.container.querySelector('textarea') as HTMLTextAreaElement).value)
+      .toBe('Ask about revision 14.'));
+    expect(view.container.querySelector('[aria-label="Remove Notes revision 14"]')).not.toBeNull();
+    expect(view.container.querySelector('[aria-label="Remove Notes revision 15"]')).toBeNull();
+    expect(loadQueuedResidentToolHandoffs('test-user@example.com', projectId)).toEqual([
+      expect.objectContaining({
+        intent: 'share', prompt: 'Share revision 15.', laneOwner: 'resident',
+        artifactRef: expect.objectContaining({ id: 'second-ref', revision: 15 }),
+      }),
+    ]);
+    expect(loadComposerDraft('test-user@example.com', projectId)?.operator_intent).toEqual({
+      kind: 'ask', expected_revision: 14, lane_owner: 'operator',
+    });
+
+    view.rerender(
+      <MessagesPanel
+        selectedProjectId={projectId} addToast={() => {}} onMessageCountChange={() => {}}
+        filterChrome="minimal" focusComposerSignal={1}
+      />,
+    );
+    fireEvent(window, new StorageEvent('storage', {
+      key: 'resident_tool_handoff_entry:test-user%40example.com:proj-queued-intents:later',
+    }));
+    await new Promise(resolve => window.setTimeout(resolve, 0));
+    expect((view.container.querySelector('textarea') as HTMLTextAreaElement).value).toBe('Ask about revision 14.');
+    expect(view.container.querySelector('[aria-label="Remove Notes revision 14"]')).not.toBeNull();
+    expect(view.container.querySelector('[aria-label="Remove Notes revision 15"]')).toBeNull();
+    expect(loadQueuedResidentToolHandoffs('test-user@example.com', projectId)).toHaveLength(1);
+    expect(loadComposerDraft('test-user@example.com', projectId)?.operator_intent).toEqual({
+      kind: 'ask', expected_revision: 14, lane_owner: 'operator',
+    });
+  });
+
+  test('defers a second live handoff truthfully, then drains it after the first is accepted', async () => {
+    const projectId = 'proj-live-handoff-sequence';
+    const makeRef = (id: string, revision: number) => ({
+      id, artifact_ref_id: id, tool_id: id,
+      project_id: projectId, kind: 'notes' as const, revision, checksum: 'e'.repeat(64),
+      author: 'test-user@example.com', timestamp: '2026-07-17T00:00:00Z',
+      retrieval: { capability: 'inline_bounded_text' as const, href: `/artifact-refs/${id}` },
+    });
+    expect(enqueueResidentToolHandoff('test-user@example.com', projectId, {
+      projectId, artifactRef: makeRef('live-first', 16), intent: 'ask', prompt: 'Ask about revision 16.',
+    })).toBe(true);
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
+      const urlStr = String(url);
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+      if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
+        return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
+      }
+      if (urlStr.includes('/strategic-session/messages') && method === 'POST') {
+        const body = JSON.parse(String((init as RequestInit).body));
+        return new Response(JSON.stringify({
+          message: makeMsg({
+            id: 'accepted-live-first', project_id: projectId, from_type: 'user',
+            content: String(body.content), handling_state: 'pending',
+            idempotency_key: String(body.idempotency_key),
+          }),
+          wakeup_state: 'queued',
+        }), { status: 200 });
+      }
+      if (urlStr.includes('/strategic-conversation') && method === 'GET') {
+        return new Response(JSON.stringify({
+          conversation: { limit: 20, has_more: false, order: 'oldest_first', items: [] },
+          matched_message: null,
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+    _suppressSinceLastVisit('test-user@example.com', projectId);
+    const addToast = vi.fn();
+    const view = render(
+      <MessagesPanel selectedProjectId={projectId} addToast={addToast} onMessageCountChange={() => {}} filterChrome="minimal" />,
+    );
+    const textarea = await waitFor(() => view.container.querySelector('textarea') as HTMLTextAreaElement);
+    await waitFor(() => expect(textarea.value).toBe('Ask about revision 16.'));
+
+    fireEvent(window, new CustomEvent('blueprint:resident-tool-handoff', {
+      detail: {
+        projectId, artifactRef: makeRef('live-second', 17), intent: 'share',
+        prompt: 'Share revision 17.', laneOwner: 'resident',
+      },
+    }));
+    expect(addToast).toHaveBeenCalledWith('Exact tool revision queued for your next Resident message', 'info');
+    expect(textarea.value).toBe('Ask about revision 16.');
+    expect(loadQueuedResidentToolHandoffs('test-user@example.com', projectId)).toHaveLength(1);
+
+    fireEvent.click(view.container.querySelector('button[aria-label="Send message"]') as HTMLButtonElement);
+    await waitFor(() => expect(textarea.value).toBe('Share revision 17.'));
+    expect(view.container.querySelector('[aria-label="Remove Notes revision 17"]')).not.toBeNull();
+    expect(loadQueuedResidentToolHandoffs('test-user@example.com', projectId)).toEqual([]);
+    expect(loadComposerDraft('test-user@example.com', projectId)?.operator_intent).toEqual({
+      kind: 'share', expected_revision: 17, lane_owner: 'resident',
+    });
+  });
+
+  test('restores a text-only retry from its immutable payload and resends that exact identity and payload', async () => {
+    const projectId = 'proj-text-retry';
+    const payload = {
+      message_type: 'FEEDBACK',
+      content: 'immutable retry text',
+      idempotency_key: 'text-retry-key',
+      reply_to_message_id: null,
+      source_refs: [{ kind: 'task', id: 'task-immutable', revision: 4 }],
+      artifact_refs: [{ kind: 'artifact', id: 'artifact-immutable', revision: 8 }],
+      operator_intent: { kind: 'verify', expected_revision: 8 },
+      attachments: [],
+    };
+    sessionStorage.setItem(`optimisticSend:test-user%40example.com:${projectId}`, JSON.stringify({
+      actor_user_id: 'test-user@example.com', project_id: projectId,
+      key: 'text-retry-key', content: 'stale display text',
+      created_at: new Date().toISOString(), message_type: 'FEEDBACK',
+      state: 'needs_retry', payload,
+    }));
+    let posted: Record<string, unknown> | null = null;
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
+      const urlStr = String(url);
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+      if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
+        return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
+      }
+      if (urlStr.includes('/strategic-conversation') && method === 'GET') {
+        return new Response(JSON.stringify({
+          conversation: { limit: 20, has_more: false, order: 'oldest_first', items: [] },
+          matched_message: null,
+        }), { status: 200 });
+      }
+      if (urlStr.includes('/strategic-session/messages') && method === 'POST') {
+        posted = JSON.parse(String((init as RequestInit).body));
+        return new Response(JSON.stringify({
+          message: makeMsg({
+            id: 'accepted-text-retry', project_id: projectId, from_type: 'user',
+            content: payload.content, handling_state: 'pending', idempotency_key: payload.idempotency_key,
+          }),
+          wakeup_state: 'queued',
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+    _suppressSinceLastVisit('test-user@example.com', projectId);
+    const view = render(
+      <MessagesPanel selectedProjectId={projectId} addToast={() => {}} onMessageCountChange={() => {}} filterChrome="minimal" />,
+    );
+    await waitFor(() => expect((view.container.querySelector('textarea') as HTMLTextAreaElement).value)
+      .toBe(payload.content));
+    fireEvent.click(view.container.querySelector('button[aria-label="Retry message"]') as HTMLButtonElement);
+    await waitFor(() => expect(posted).not.toBeNull());
+    expect(posted).toEqual(payload);
+  });
+
+  test('durable acceptance conditionally clears the submitted snapshot but preserves a newer tab draft', async () => {
+    const projectId = 'proj-newer-draft';
+    let finishPost!: (response: Response) => void;
+    const postResponse = new Promise<Response>(resolve => { finishPost = resolve; });
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
+      const urlStr = String(url);
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+      if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
+        return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
+      }
+      if (urlStr.includes('/strategic-session/messages') && method === 'POST') return postResponse;
+      if (urlStr.includes('/strategic-conversation') && method === 'GET') {
+        return new Response(JSON.stringify({ conversation: { limit: 20, has_more: false, items: [] } }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+    _suppressSinceLastVisit('test-user@example.com', projectId);
+    const view = render(
+      <MessagesPanel selectedProjectId={projectId} addToast={() => {}} onMessageCountChange={() => {}} filterChrome="minimal" />,
+    );
+    const textarea = await waitFor(() => view.container.querySelector('textarea') as HTMLTextAreaElement);
+    fireEvent.change(textarea, { target: { value: 'submitted snapshot' } });
+    await waitFor(() => expect(loadComposerDraft('test-user@example.com', projectId)?.content).toBe('submitted snapshot'));
+    fireEvent.click(view.container.querySelector('button[aria-label="Send message"]') as HTMLButtonElement);
+    await waitFor(() => expect(view.container.querySelector('[data-send-state="sending"]')).not.toBeNull());
+    const newerWrite = saveComposerDraft('test-user@example.com', projectId, {
+      type: 'FEEDBACK', content: 'newer tab edit', reply_to: null,
+      source_refs: [], artifact_refs: [], attachment_send_key: null,
+    });
+
+    await act(async () => {
+      finishPost(new Response(JSON.stringify({
+        message: makeMsg({
+          id: 'accepted-old-draft', project_id: projectId, from_type: 'user',
+          content: 'submitted snapshot', handling_state: 'pending',
+        }),
+        wakeup_state: 'queued',
+      }), { status: 200 }));
+      await postResponse;
+    });
+
+    await waitFor(() => expect(loadComposerDraft('test-user@example.com', projectId)).toMatchObject({
+      write_id: newerWrite,
+      content: 'newer tab edit',
+    }));
+  });
+
+  test('an old reply cannot detach the next attachment draft from lost-response recovery', async () => {
+    const projectId = 'proj-overlap-reply';
+    let conversationItems: ReturnType<typeof makeMsg>[] = [];
+    let messagePostCount = 0;
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
+      const urlStr = String(url);
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+      if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
+        return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
+      }
+      if (urlStr.includes('/attachment-upload-url') && method === 'POST') {
+        return new Response(JSON.stringify({
+          upload_url: 'https://storage.googleapis.com/overlap-upload',
+          download_url: 'https://storage.googleapis.com/overlap-download',
+          storage_uri: `gs://bucket/message-attachments/${projectId}/overlap/report.txt`,
+          attachment_id: 'overlap-upload-id',
+          size_bytes: 16,
+        }), { status: 200 });
+      }
+      if (urlStr.includes('/strategic-session/messages') && method === 'POST') {
+        messagePostCount += 1;
+        const body = JSON.parse(String((init as RequestInit).body)) as Record<string, unknown>;
+        if (messagePostCount === 1) {
+          return new Response(JSON.stringify({
+            message: makeMsg({
+              id: 'first-accepted', project_id: projectId, from_type: 'user',
+              content: 'first message', surface: 'conversation', handling_state: 'pending',
+              idempotency_key: String(body.idempotency_key),
+            }),
+            wakeup_state: 'queued',
+          }), { status: 200 });
+        }
+        throw new Error('response lost after second commit');
+      }
+      if (urlStr.includes('/strategic-conversation') && method === 'GET') {
+        return new Response(JSON.stringify({
+          conversation: { limit: 100, has_more: false, order: 'oldest_first', items: conversationItems },
+          matched_message: null,
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+    globalThis.fetch = vi.fn(async (url: RequestInfo | URL) => (
+      String(url).includes('overlap-upload')
+        ? new Response(null, { status: 200 })
+        : new Response('', { status: 404 })
+    ));
+    _suppressSinceLastVisit('test-user@example.com', projectId);
+    const view = render(
+      <MessagesPanel
+        selectedProjectId={projectId}
+        addToast={() => {}}
+        onMessageCountChange={() => {}}
+        filterChrome="minimal"
+        realtimeRefreshSignal={0}
+      />,
+    );
+    const textarea = await waitFor(() => view.container.querySelector('textarea') as HTMLTextAreaElement);
+    fireEvent.change(textarea, { target: { value: 'first message' } });
+    fireEvent.click(view.container.querySelector('button[aria-label="Send message"]') as HTMLButtonElement);
+    await waitFor(() => expect(view.container.querySelector('[data-send-state="accepted"]')).not.toBeNull());
+
+    const file = new File(['next draft bytes'], 'next.txt', { type: 'text/plain' });
+    const transfer = new DataTransfer();
+    transfer.items.add(file);
+    const fileInput = view.container.querySelector<HTMLInputElement>('input[type="file"]');
+    if (!fileInput) throw new Error('expected attachment input');
+    Object.defineProperty(fileInput, 'files', { value: transfer.files, configurable: true });
+    fireEvent.change(fileInput);
+    await waitFor(() => expect(view.container.textContent).toContain('next.txt'));
+    const identityKey = `conversationDraftSend:test-user%40example.com:${projectId}`;
+    const nextIdentity = await waitFor(() => {
+      const value = sessionStorage.getItem(identityKey);
+      expect(value).toBeTruthy();
+      return value as string;
+    });
+
+    conversationItems = [makeMsg({
+      id: 'reply-to-first', project_id: projectId, from_type: 'strategic',
+      content: 'First turn complete', surface: 'conversation', handling_state: 'responded',
+    })];
+    view.rerender(
+      <MessagesPanel
+        selectedProjectId={projectId}
+        addToast={() => {}}
+        onMessageCountChange={() => {}}
+        filterChrome="minimal"
+        realtimeRefreshSignal={1}
+      />,
+    );
+    await waitFor(() => expect(view.container.textContent).toContain('First turn complete'));
+    expect(sessionStorage.getItem(identityKey)).toBe(nextIdentity);
+
+    fireEvent.change(textarea, { target: { value: 'second message' } });
+    fireEvent.click(view.container.querySelector('button[aria-label="Send message"]') as HTMLButtonElement);
+    await waitFor(() => expect(view.container.querySelector('button[aria-label="Retry message"]')).not.toBeNull());
+    const pendingBeforeRemount = JSON.parse(sessionStorage.getItem(
+      `optimisticSend:test-user%40example.com:${projectId}`,
+    ) ?? '{}') as { key?: string };
+    expect(pendingBeforeRemount.key).toBe(nextIdentity);
+
+    view.unmount();
+    const remounted = render(
+      <MessagesPanel
+        selectedProjectId={projectId}
+        addToast={() => {}}
+        onMessageCountChange={() => {}}
+        filterChrome="minimal"
+      />,
+    );
+    await waitFor(() => expect(remounted.container.querySelector('button[aria-label="Retry message"]')).not.toBeNull());
+    await waitFor(() => expect(remounted.container.textContent).toContain('next.txt'));
+    expect(sessionStorage.getItem(
+      `optimisticSend:test-user%40example.com:${projectId}`,
+    )).toContain(nextIdentity);
+
+    remounted.unmount();
+    await pendingAttachmentStore.clearPendingAttachments('test-user@example.com', projectId, nextIdentity);
   });
 });

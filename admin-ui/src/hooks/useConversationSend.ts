@@ -101,6 +101,19 @@ export function useConversationSend(projectId: string | null, actorUserId: strin
     if (actorUserId && projectId) update(actorUserId, projectId, () => EMPTY_ENTRY);
   }, [actorUserId, projectId, update]);
 
+  const clearPending = useCallback(() => {
+    if (!actorUserId || !projectId) return;
+    update(actorUserId, projectId, current => ({
+      pending: null,
+      // A reply/claim may settle an older accepted send after the operator has
+      // already attached files to the next draft. Preserve that newer key.
+      draftIdentity: current.draftIdentity === current.pending?.key
+        ? null
+        : current.draftIdentity,
+      restored: false,
+    }));
+  }, [actorUserId, projectId, update]);
+
   const clearIdentity = useCallback(() => {
     if (actorUserId && projectId) update(actorUserId, projectId, current => ({ ...current, draftIdentity: null }));
   }, [actorUserId, projectId, update]);
@@ -119,6 +132,7 @@ export function useConversationSend(projectId: string | null, actorUserId: strin
     replace,
     transition,
     clear,
+    clearPending,
     clearIdentity,
   };
 }

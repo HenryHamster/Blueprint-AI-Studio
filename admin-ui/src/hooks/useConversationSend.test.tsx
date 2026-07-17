@@ -60,6 +60,20 @@ describe('useConversationSend', () => {
     expect(result.current.identity).toBe('send-2');
   });
 
+  test('settling an older accepted send preserves the next draft identity', () => {
+    const { result } = renderHook(() => useConversationSend('project-a', 'actor-a'));
+    act(() => result.current.begin(pending('send-1', 'first')));
+    act(() => result.current.transition('accepted', 'queued'));
+    act(() => { result.current.ensureIdentity(() => 'send-2'); });
+
+    act(() => result.current.clearPending());
+
+    expect(result.current.pending).toBeNull();
+    expect(result.current.identity).toBe('send-2');
+    expect(sessionStorage.getItem('conversationDraftSend:actor-a:project-a')).toBe('send-2');
+    expect(sessionStorage.getItem('optimisticSend:actor-a:project-a')).toBeNull();
+  });
+
   test('rejects a pending record owned by a different actor', () => {
     savePendingConversationSend(sessionStorage, 'optimisticSend:actor-a:project-a', {
       ...pending('send-1', 'private draft'),

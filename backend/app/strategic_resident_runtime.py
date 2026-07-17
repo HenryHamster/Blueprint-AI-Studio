@@ -7,6 +7,7 @@ from typing import Any, Literal
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.artifact_refs import union_resident_artifact_ref_grants
 from app.models import Project, StrategicResident, Task, TaskHistory, TaskStatus
 from app.payload_schemas import validate_internal_payload
 from app.strategic_resident_turns import (
@@ -173,6 +174,7 @@ async def _create_authoritative_turn(
     message_sequence: int | None,
     project_change_cursor: dict[str, Any] | None,
     input_frozen: bool,
+    artifact_ref_grants: frozenset[uuid.UUID],
 ) -> Task:
     checkpoint_version, checkpoint_hash = await _current_checkpoint_identity(
         session, resident
@@ -260,6 +262,7 @@ async def _create_authoritative_turn(
         requires_approval=False,
         archived=True,
     )
+    union_resident_artifact_ref_grants(task, artifact_ref_grants)
     session.add(task)
     await session.flush()
     session.add(
@@ -287,6 +290,7 @@ async def coalesce_authoritative_resident_turn(
     locked_project: Project | None = None,
     locked_resident: StrategicResident | None = None,
     prelocked_tasks: dict[uuid.UUID, Task] | None = None,
+    artifact_ref_grants: frozenset[uuid.UUID] = frozenset(),
 ) -> ResidentTurnWake:
     if lane == "interactive" and message_sequence is None:
         raise ValueError("interactive Resident turn requires message_sequence")
@@ -337,6 +341,7 @@ async def coalesce_authoritative_resident_turn(
             message_sequence=message_sequence,
             project_change_cursor=project_change_cursor,
             input_frozen=True,
+            artifact_ref_grants=artifact_ref_grants,
         )
         resident.active_turn_task_id = result.id
         resident.active_turn_lane = lane
@@ -355,6 +360,7 @@ async def coalesce_authoritative_resident_turn(
                 message_sequence=message_sequence,
                 project_change_cursor=project_change_cursor,
                 input_frozen=False,
+                artifact_ref_grants=artifact_ref_grants,
             )
             setattr(resident, attr, successor.id)
         else:
@@ -363,6 +369,7 @@ async def coalesce_authoritative_resident_turn(
                 message_sequence=message_sequence,
                 project_change_cursor=project_change_cursor,
             )
+            union_resident_artifact_ref_grants(successor, artifact_ref_grants)
         result = successor
         successor_id = successor.id
         state = "coalesced"
@@ -414,7 +421,9 @@ async def coalesce_resident_turn(
         )
         kwargs["locked_resident"] = resident
     if resident.engine_owner == "legacy":
-        return await coalesce_shadow_resident_turn(session, **kwargs)
+        shadow_kwargs = dict(kwargs)
+        shadow_kwargs.pop("artifact_ref_grants", None)
+        return await coalesce_shadow_resident_turn(session, **shadow_kwargs)
     return await coalesce_authoritative_resident_turn(session, **kwargs)
 
 

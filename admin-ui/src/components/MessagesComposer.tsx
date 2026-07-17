@@ -17,6 +17,14 @@ export interface PendingAttachment {
   size_bytes: number;
 }
 
+export interface ComposerArtifactRef {
+  id?: string;
+  artifact_ref_id?: string;
+  kind?: string;
+  title?: string;
+  revision?: number | string;
+}
+
 export interface MessagesComposerProps {
   textareaRef: RefObject<HTMLTextAreaElement | null>;
   newType: string;
@@ -39,6 +47,7 @@ export interface MessagesComposerProps {
   disabledReason?: string | null;
   pendingAttachments?: PendingAttachment[];
   retainedAttachmentCount?: number;
+  artifactRefs?: ComposerArtifactRef[];
   uploading?: boolean;
   onPickStarterPrompt?: (value: string) => void;
   onOpenStrategicContext?: () => void;
@@ -50,6 +59,7 @@ export interface MessagesComposerProps {
   onSubmit: () => void;
   onAddAttachment?: (file: File) => void | Promise<void>;
   onRemoveAttachment?: (id: string) => void;
+  onRemoveArtifactRef?: (id: string) => void;
   /**
    * Swap the File backing a pending attachment — used by the pre-send preview
    * for canvas-edited (rotate/crop) results and for picker-based replace. When
@@ -86,6 +96,7 @@ export const MessagesComposer = memo(function MessagesComposer({
   disabledReason,
   pendingAttachments,
   retainedAttachmentCount = 0,
+  artifactRefs = [],
   uploading,
   onOpenStrategicContext,
   onOpenCommandPalette,
@@ -97,6 +108,7 @@ export const MessagesComposer = memo(function MessagesComposer({
   onPickStarterPrompt,
   onAddAttachment,
   onRemoveAttachment,
+  onRemoveArtifactRef,
   onReplaceAttachmentFile,
   chrome = 'full',
 }: MessagesComposerProps) {
@@ -333,6 +345,31 @@ export const MessagesComposer = memo(function MessagesComposer({
                   disabled={editingLocked || attachmentLocked}
                   className="absolute right-0 top-1/2 flex min-h-[44px] min-w-[44px] -translate-y-1/2 items-center justify-center rounded text-neutral-500 opacity-0 transition-opacity hover:text-neutral-200 focus-visible:opacity-100 group-hover:opacity-100"
                   aria-label={`Remove ${att.name}`}
+                >
+                  <X className="h-3 w-3" />
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {artifactRefs.length > 0 && (
+        <div className={`${minimal ? minimalColumnClass : ''} mb-1.5 flex flex-wrap gap-2 px-1`} aria-label="Attached Resident sources" role="list">
+          {artifactRefs.map((ref, index) => {
+            const identity = String(ref.artifact_ref_id || ref.id || `artifact-${index}`);
+            const kind = ref.title || (ref.kind === 'whiteboard' ? 'Whiteboard' : ref.kind === 'notes' ? 'Notes' : 'Artifact');
+            const revision = ref.revision == null ? '' : ` revision ${String(ref.revision)}`;
+            const label = `${kind}${revision}`;
+            return (
+              <div key={identity} className="group flex min-h-[44px] items-center gap-1.5 rounded-full border border-sky-700/50 bg-sky-950/35 pl-2.5 pr-1 text-xs text-sky-200" role="listitem">
+                <span>{label}</span>
+                <button
+                  type="button"
+                  onClick={() => onRemoveArtifactRef?.(identity)}
+                  disabled={editingLocked}
+                  aria-label={`Remove ${label}`}
+                  className="flex min-h-[44px] min-w-[44px] items-center justify-center rounded-full text-sky-400 hover:bg-sky-900/60 hover:text-sky-100 disabled:opacity-40"
                 >
                   <X className="h-3 w-3" />
                 </button>

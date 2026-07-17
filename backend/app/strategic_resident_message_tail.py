@@ -7,8 +7,13 @@ from collections.abc import Mapping
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlmodel import select
 
-from app.models import StrategicResident, Task
+from app.artifact_refs import (
+    artifact_ref_grants_from_message_context,
+    union_resident_artifact_ref_grants,
+)
+from app.models import MessageSurface, ProjectMessage, StrategicResident, Task
 from app.payload_schemas import validate_internal_payload
 from app.strategic_operation_authority_validation import (
     StrategicAuthorityError,
@@ -98,6 +103,26 @@ async def ensure_message_tail_successor(
     successor.payloads = [
         validate_internal_payload(payload, "strategic_resident_turn:message_tail")
     ]
+    tail_contexts = (
+        await session.execute(
+            select(ProjectMessage.context).where(
+                ProjectMessage.project_id == resident.project_id,
+                ProjectMessage.surface == MessageSurface.CONVERSATION,
+                ProjectMessage.sequence >= tail_start,
+                ProjectMessage.sequence <= requested_end,
+            )
+        )
+    ).scalars()
+    tail_grants: set[uuid.UUID] = set()
+    for context in tail_contexts:
+        tail_grants.update(
+            artifact_ref_grants_from_message_context(
+                context if isinstance(context, Mapping) else None
+            )
+        )
+    # Preserve only exact refs visible in the omitted tail. Copying every grant
+    # from the active turn would let the successor retrieve already-handled chips.
+    union_resident_artifact_ref_grants(successor, frozenset(tail_grants))
     session.add(successor)
     return successor
 

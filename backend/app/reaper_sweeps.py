@@ -61,6 +61,7 @@ from app.compute_jobs import (
 )
 from app.database import AsyncSessionLocal
 from app.models import (
+    ArtifactRefPromotionIntent,
     ComputeJob,
     ComputeJobFile,
     ComputeJobStatus,
@@ -1121,6 +1122,13 @@ async def sweep_expired_message_attachment_uploads(
                 ProjectMessageAttachmentUpload.consumed_at.is_(None),
                 ProjectMessageAttachmentUpload.message_id.is_(None),
                 ProjectMessageAttachmentUpload.expires_at <= _utcnow(),
+                ~select(ArtifactRefPromotionIntent.id)
+                .where(
+                    ArtifactRefPromotionIntent.receipt_id
+                    == ProjectMessageAttachmentUpload.attachment_id,
+                    ArtifactRefPromotionIntent.state != "settled",
+                )
+                .exists(),
             )
             .order_by(ProjectMessageAttachmentUpload.expires_at.asc())
             .limit(max(1, min(int(batch_size), 100)))

@@ -93,6 +93,8 @@ from app.routers.admin_orchestrator_errors import (
 from app.routers.admin_scope_measurement import router as admin_scope_measurement_router
 from app.routers.agent_status import router as agent_status_router
 from app.routers.agent_resident_turn import router as agent_resident_turn_router
+from app.routers.agent_resident_artifacts import router as agent_resident_artifacts_router
+from app.routers.agent_resident_capabilities import router as agent_resident_capabilities_router
 from app.routers.admin_onboard import router as admin_onboard_router
 from app.routers.admin_agent_ops import router as admin_agent_ops_router
 from app.routers.admin_auth import router as admin_auth_router
@@ -113,7 +115,7 @@ logger = logging.getLogger(__name__)
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0629"
+EXPECTED_SCHEMA_REVISION = "0630"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -955,6 +957,8 @@ app.include_router(admin_orchestrator_errors_router)
 app.include_router(admin_scope_measurement_router)
 app.include_router(agent_status_router)
 app.include_router(agent_resident_turn_router)
+app.include_router(agent_resident_artifacts_router)
+app.include_router(agent_resident_capabilities_router)
 app.include_router(agent_credentials_router)
 app.include_router(agent_compute_jobs_router)
 app.include_router(admin_compute_jobs_router)

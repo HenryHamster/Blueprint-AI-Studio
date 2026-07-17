@@ -155,7 +155,9 @@ resource "google_storage_bucket" "artifacts" {
   # tasks/<uuid>/... and expire at 30 days.  Viewable compute-job media
   # (compute-jobs/<uuid>/artifacts/viewable/...) is deliberately excluded
   # from GCS lifecycle rules — it is retired by the reaper at 180 days
-  # once its owning ComputeJob has been terminal long enough.
+  # once its owning ComputeJob has been terminal long enough. Exact human-tool
+  # revision evidence under artifact-refs/ is likewise not lifecycle-expired
+  # (matched by neither rule) and is retired by bounded project-deletion cleanup.
   lifecycle_rule {
     condition {
       age             = 30

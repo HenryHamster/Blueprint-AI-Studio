@@ -1,5 +1,5 @@
 import type { ConversationDraftReplyTarget } from './conversationDraftState';
-import { saveComposerDraft } from './conversationDraftState';
+import { saveComposerDraft, type ComposerDraftSaveResult } from './conversationDraftState';
 
 export interface ConversationComposerIntent {
   type: string;
@@ -7,6 +7,7 @@ export interface ConversationComposerIntent {
   reply_to: ConversationDraftReplyTarget | null;
   source_refs: Array<Record<string, unknown>>;
   artifact_refs: Array<Record<string, unknown>>;
+  operator_intent?: Record<string, unknown>;
   attachment_send_key: string | null;
 }
 
@@ -22,7 +23,9 @@ export function finalizeLastAttachmentRemoval(
   projectId: string,
   intent: ConversationComposerIntent,
   clearIdentity: () => void,
-): void {
-  saveComposerDraft(actorUserId, projectId, intent);
+  previousWriteId?: string | null,
+): ComposerDraftSaveResult {
+  const result = saveComposerDraft(actorUserId, projectId, intent, undefined, previousWriteId);
   if (!intent.content.trim() && !intent.reply_to) clearIdentity();
+  return result;
 }

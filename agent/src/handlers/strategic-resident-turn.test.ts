@@ -120,6 +120,76 @@ describe('strategic Resident turn handler', () => {
     expect(mocks.apiPost).not.toHaveBeenCalled();
   });
 
+  it('runs a bounded server capability inspection before the final result', async () => {
+    mocks.runClaudeCode
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify({
+          capability_requests: [{
+            capability_id: 'task.inspect',
+            parameters: { task_id: '33333333-3333-3333-3333-333333333333' },
+          }],
+        }),
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify({
+          reply: 'Inspected', facts: [], evidence: [], operations: [], receipts: [],
+          unknown_effects: [], strategic_implications: [], proposed_memory: [],
+          follow_up: null, required_attention: [],
+          reconciliation: {
+            accepted_memory_proposal_ids: [], accepted_implication_ids: [],
+            accepted_open_loop_ids: [], resolved_open_loop_ids: [], evidence_inspections: [],
+          },
+        }),
+      });
+    mocks.apiPost.mockImplementation(async (path: string) => {
+      if (path === '/api/agent/resident-turn/capability') {
+        return { capability_id: 'task.inspect', evidence: { checksum: 'a'.repeat(64) } };
+      }
+      return {};
+    });
+
+    await handleStrategicResidentTurn(
+      'task-id', { _resident_expected_runtime_provider: 'anthropic' }, {}, '', '', '', null, { value: '' },
+    );
+
+    expect(mocks.runClaudeCode).toHaveBeenCalledTimes(2);
+    expect(mocks.apiPost.mock.calls[0]).toEqual([
+      '/api/agent/resident-turn/capability',
+      {
+        capability_id: 'task.inspect',
+        parameters: { task_id: '33333333-3333-3333-3333-333333333333' },
+      },
+    ]);
+    expect(String(mocks.runClaudeCode.mock.calls[1][0])).toContain(
+      'Server-validated capability evidence',
+    );
+    expect(mocks.apiPost.mock.calls[1][0]).toBe('/api/agent/resident-turn/complete');
+  });
+
+  it('fails closed when the provider repeats an identical capability request', async () => {
+    const request = {
+      capability_requests: [{
+        capability_id: 'task.inspect',
+        parameters: { task_id: '33333333-3333-3333-3333-333333333333' },
+      }],
+    };
+    mocks.runClaudeCode.mockResolvedValue({
+      exitCode: 0,
+      allOutput: '',
+      lastResultText: JSON.stringify(request),
+    });
+    mocks.apiPost.mockResolvedValue({ capability_id: 'task.inspect', evidence: {} });
+
+    await expect(handleStrategicResidentTurn(
+      'task-id', { _resident_expected_runtime_provider: 'anthropic' }, {}, '', '', '', null, { value: '' },
+    )).rejects.toThrow('repeated an identical capability request');
+    expect(mocks.apiPost).toHaveBeenCalledTimes(1);
+  });
+
   it('fails closed before context retrieval when the server provider fence is absent', async () => {
     await expect(
       handleStrategicResidentTurn(

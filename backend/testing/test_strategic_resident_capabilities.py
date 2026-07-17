@@ -1,0 +1,582 @@
+import uuid
+from datetime import datetime, timezone
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+from fastapi import HTTPException
+from pydantic import ValidationError
+
+from app.models import Project, Task, TaskStatus
+from app.strategic_operation_authority_validation import OperationPayloadTooLarge
+from app.strategic_resident_capabilities import (
+    CapabilityMode,
+    RESIDENT_CAPABILITIES,
+    capability_for,
+    compact_capability_catalog,
+)
+from app.routers import agent_resident_capabilities as capability_router
+from app.routers.agent_resident_capabilities import ResidentCapabilityRequest
+from app.strategic_resident_capability_invocation import (
+    ResidentCapabilityInvocation,
+    validated_capability_parameters,
+)
+from app.strategic_resident_task_inspection import (
+    ResidentTaskEvidence,
+    ResidentTaskNotFound,
+    inspect_project_task,
+    inspect_project_task_lineage,
+)
+
+
+def test_capability_registry_declares_complete_safety_contracts():
+    assert len({item.capability_id for item in RESIDENT_CAPABILITIES}) == len(
+        RESIDENT_CAPABILITIES
+    )
+    required = {
+        "task.inspect",
+        "task.lineage.inspect",
+        "task.logs.inspect",
+        "task.failure.inspect",
+        "task.provider.inspect",
+        "runner.list",
+        "pipeline.inspect",
+        "qualification.inspect",
+        "pr.diff.inspect",
+        "pr.checks.inspect",
+        "ci.logs.inspect",
+        "deployment.inspect",
+        "task.dispatch",
+        "task.redirect",
+        "task.retry",
+        "task.requeue",
+        "task.cancel",
+        "task.salvage",
+        "task.review_fix_loop",
+        "pr.create",
+        "pr.merge",
+        "qualification.run",
+        "audit.run",
+        "deployment.deploy",
+        "deployment.rollback",
+    }
+    assert required <= {item.capability_id for item in RESIDENT_CAPABILITIES}
+    for item in RESIDENT_CAPABILITIES:
+        assert item.scope == "project"
+        assert item.service
+        assert item.receipt_fields
+        assert tuple(spec.name for spec in item.parameter_specs) == item.required_parameters
+        if item.mode is CapabilityMode.mutate:
+            assert item.evidence_preconditions
+            assert item.idempotency == "operation_id"
+            assert item.reconciliation != "not_required"
+
+
+def test_compact_catalog_omits_verbose_receipt_and_evidence_metadata():
+    catalog = compact_capability_catalog()
+    assert len(catalog) == len(RESIDENT_CAPABILITIES)
+    assert set(catalog[0]) == {
+        "id", "mode", "risk", "parameters", "approval", "availability"
+    }
+    assert capability_for("task.inspect").service == "resident_task_inspection"
+    assert next(item for item in catalog if item["id"] == "task.inspect")["availability"] == "invoke"
+    assert next(item for item in catalog if item["id"] == "pr.inspect")["availability"] == "propose_only"
+
+
+def test_mutation_invocation_requires_authority_evidence_and_approval():
+    base = {
+        "capability_id": "pr.merge",
+        "project_id": uuid.uuid4(),
+        "turn_task_id": uuid.uuid4(),
+        "authority_generation": 4,
+        "parameters": {"pr_number": 12, "expected_head_sha": "abc1234"},
+    }
+    project_id = base["project_id"]
+    with pytest.raises(ValidationError, match="operation_id"):
+        ResidentCapabilityInvocation.model_validate(base)
+    valid = ResidentCapabilityInvocation.model_validate(
+        {
+            **base,
+            "operation_id": "merge-12-abc1234",
+            "expected_revisions": {"task_version": 7},
+            "evidence": tuple(
+                {
+                    "kind": kind,
+                    "project_id": project_id,
+                    "source_id": "pr:12",
+                    "revision": "abc1234",
+                    "checksum": "a" * 64,
+                    "inspected_at": "2026-07-17T12:00:00Z",
+                }
+                for kind in (
+                    "pr_diff",
+                    "pr_checks",
+                    "pr_reviews",
+                    "pr_mergeability",
+                )
+            ),
+            "approval_ref": "approval-message-42",
+        }
+    )
+    assert valid.capability_id == "pr.merge"
+    bool_revision = valid.model_dump()
+    bool_revision["expected_revisions"] = {"task_version": True}
+    with pytest.raises(ValidationError):
+        ResidentCapabilityInvocation.model_validate(bool_revision)
+    excessive_evidence = valid.model_dump()
+    excessive_evidence["evidence"] = excessive_evidence["evidence"] * 13
+    with pytest.raises(ValidationError):
+        ResidentCapabilityInvocation.model_validate(excessive_evidence)
+    with pytest.raises(ValidationError, match="credential scope"):
+        ResidentCapabilityInvocation.model_validate(
+            {**valid.model_dump(), "parameters": {**valid.parameters, "token": "x"}}
+        )
+    foreign = valid.model_dump()
+    foreign["evidence"][0]["project_id"] = uuid.uuid4()
+    with pytest.raises(ValidationError, match="another project"):
+        ResidentCapabilityInvocation.model_validate(foreign)
+    nested_secret = valid.model_dump()
+    nested_secret["parameters"] = {
+        **valid.parameters,
+        "unexpected": {"token": "secret"},
+    }
+    with pytest.raises(ValidationError, match="credential scope"):
+        ResidentCapabilityInvocation.model_validate(nested_secret)
+
+
+def test_unknown_capability_fails_closed():
+    with pytest.raises(ValueError, match="unknown Strategic Resident capability"):
+        capability_for("shell.admin")
+
+
+def test_capability_parameter_contracts_reject_type_and_casefold_bypasses():
+    project_id = uuid.uuid4()
+    turn_task_id = uuid.uuid4()
+    base = {
+        "capability_id": "task.cancel",
+        "project_id": project_id,
+        "turn_task_id": turn_task_id,
+        "authority_generation": 1,
+        "operation_id": "cancel-one",
+        "expected_revisions": {"task": 1},
+        "evidence": ({
+            "kind": "task",
+            "project_id": project_id,
+            "source_id": "task:one",
+            "revision": "v1",
+            "checksum": "a" * 64,
+            "inspected_at": "2026-07-17T12:00:00Z",
+        },),
+    }
+    with pytest.raises(ValidationError, match="task_id must be a UUID string"):
+        ResidentCapabilityInvocation.model_validate(
+            {**base, "parameters": {"task_id": [], "reason": "operator request"}}
+        )
+    with pytest.raises(ValidationError, match="reason must be a string"):
+        ResidentCapabilityInvocation.model_validate(
+            {
+                **base,
+                "parameters": {
+                    "task_id": str(uuid.uuid4()),
+                    "reason": {"safe": "nested"},
+                },
+            }
+        )
+    with pytest.raises(ValidationError, match="credential scope"):
+        ResidentCapabilityInvocation.model_validate(
+            {
+                **base,
+                "parameters": {
+                    "task_id": str(uuid.uuid4()),
+                    "reason": {"Api-Key": "secret"},
+                },
+            }
+        )
+    with pytest.raises(OperationPayloadTooLarge, match="16384 bytes"):
+        validated_capability_parameters(
+            capability_for("task.cancel"),
+            {"task_id": str(uuid.uuid4()), "reason": "x" * 20_000},
+        )
+    with pytest.raises(ValueError, match="control characters"):
+        validated_capability_parameters(
+            capability_for("task.cancel"),
+            {"task_id": str(uuid.uuid4()), "reason": "bad\x00reason"},
+        )
+    with pytest.raises(ValueError, match="reference contains whitespace"):
+        validated_capability_parameters(
+            capability_for("branch.inspect"),
+            {"ref": "main branch"},
+        )
+
+
+def test_capability_rate_limit_identity_is_task_token_scoped_and_hashed():
+    request_one = SimpleNamespace(
+        headers={"x-agent-token": "resident-token-one"},
+        client=SimpleNamespace(host="10.0.0.1"),
+    )
+    request_same = SimpleNamespace(
+        headers={"x-agent-token": "resident-token-one"},
+        client=SimpleNamespace(host="10.0.0.2"),
+    )
+    request_two = SimpleNamespace(
+        headers={"x-agent-token": "resident-token-two"},
+        client=SimpleNamespace(host="10.0.0.1"),
+    )
+    key_one = capability_router._capability_rate_key(request_one)
+    assert key_one == capability_router._capability_rate_key(request_same)
+    assert key_one != capability_router._capability_rate_key(request_two)
+    assert "resident-token" not in key_one
+
+
+@pytest.mark.asyncio
+async def test_exact_task_inspection_is_project_scoped_and_bounded(db_session):
+    project = Project(name="one", user_id="u")
+    other = Project(name="two", user_id="u")
+    db_session.add_all([project, other])
+    await db_session.flush()
+    task = Task(
+        project_id=project.id,
+        title="Exact task",
+        status=TaskStatus.FAILED,
+        payloads=[{"type": "fix", "pr_number": 41, "branch": "fix/41"}],
+        provider="anthropic",
+        model="claude-test",
+        status_log=[{"status": "QUEUED"}, {"status": "FAILED"}],
+        latest_status_message="failed cleanly",
+        context={"failure_category": "test_failed", "error": "focused failure"},
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    observed = datetime(2026, 7, 17, 12, 0, 0, tzinfo=timezone.utc)
+    evidence = await inspect_project_task(
+        db_session,
+        project_id=project.id,
+        task_id=task.id,
+        kind="failure",
+        observed_at=observed,
+    )
+    assert evidence.data["task_id"] == str(task.id)
+    assert evidence.data["failure_category"] == "test_failed"
+    assert evidence.data["error"] == "focused failure"
+    assert evidence.observed_at == observed
+    assert len(evidence.checksum) == 64
+
+    logs = await inspect_project_task(
+        db_session,
+        project_id=project.id,
+        task_id=task.id,
+        kind="logs",
+        log_limit=1,
+    )
+    assert logs.data["status_log"] == [{"status": "FAILED"}]
+    with pytest.raises(ResidentTaskNotFound):
+        await inspect_project_task(
+            db_session,
+            project_id=other.id,
+            task_id=task.id,
+        )
+
+
+@pytest.mark.asyncio
+async def test_log_inspection_is_byte_bounded(db_session):
+    project = Project(name="bounded logs", user_id="u")
+    db_session.add(project)
+    await db_session.flush()
+    task = Task(
+        project_id=project.id,
+        title="large logs",
+        status_log=[{"message": "x" * 100_000, "index": index} for index in range(20)],
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    evidence = await inspect_project_task(
+        db_session,
+        project_id=project.id,
+        task_id=task.id,
+        kind="logs",
+        log_limit=20,
+    )
+    encoded = evidence.model_dump_json().encode()
+    assert len(encoded) < 64_000
+    assert evidence.data["status_log_truncated"] is True
+    assert all(item.get("truncated") is True for item in evidence.data["status_log"])
+
+
+@pytest.mark.asyncio
+async def test_task_metadata_and_log_window_are_bounded(db_session):
+    project = Project(name="bounded metadata", user_id="u")
+    db_session.add(project)
+    await db_session.flush()
+    task = Task(
+        project_id=project.id,
+        title="t" * 20_000,
+        depends_on=[str(uuid.uuid4()) for _ in range(80)],
+        status_log=[{"index": index} for index in range(100)],
+        context={"branch": "b" * 20_000},
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    metadata = await inspect_project_task(
+        db_session,
+        project_id=project.id,
+        task_id=task.id,
+        kind="task",
+    )
+    assert len(metadata.data["title"]) == 512
+    assert len(metadata.data["branch"]) == 512
+    assert len(metadata.data["depends_on"]) == 50
+    assert metadata.data["depends_on_truncated"] is True
+
+    logs = await inspect_project_task(
+        db_session,
+        project_id=project.id,
+        task_id=task.id,
+        kind="logs",
+        log_limit=10,
+    )
+    assert [item["index"] for item in logs.data["status_log"]] == list(range(90, 100))
+    assert logs.data["status_log_truncated"] is True
+
+
+@pytest.mark.asyncio
+async def test_task_evidence_redacts_nested_and_inline_credentials(db_session):
+    project = Project(name="sanitized evidence", user_id="u")
+    db_session.add(project)
+    await db_session.flush()
+    github_token = "ghp_" + "x" * 32
+    jwt_token = "eyJ" + "a" * 24 + ".eyJ" + "b" * 24 + "." + "c" * 24
+    task = Task(
+        project_id=project.id,
+        latest_status_message=f"clone {github_token}",
+        status_log=[
+            {
+                "Token": "short-secret",
+                "nested": {"api-key": "another-secret"},
+                "dsn": "postgresql://user:password@db.example/test",
+                "jwt": jwt_token,
+            }
+        ],
+        context={
+            "error": f"Authorization: Bearer {jwt_token}",
+            "failure_category": {"clientSecret": "hidden-value"},
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    logs = await inspect_project_task(
+        db_session,
+        project_id=project.id,
+        task_id=task.id,
+        kind="logs",
+    )
+    failure = await inspect_project_task(
+        db_session,
+        project_id=project.id,
+        task_id=task.id,
+        kind="failure",
+    )
+    encoded = logs.model_dump_json() + failure.model_dump_json()
+    for secret in (
+        github_token,
+        jwt_token,
+        "short-secret",
+        "another-secret",
+        "password@db.example",
+        "hidden-value",
+    ):
+        assert secret not in encoded
+    assert "[redacted]" in encoded or "***" in encoded
+
+
+@pytest.mark.asyncio
+async def test_task_bound_capability_route_invokes_only_implemented_inspection(
+    db_session, monkeypatch
+):
+    project_id = uuid.uuid4()
+    turn_id = uuid.uuid4()
+    target_id = uuid.uuid4()
+    monkeypatch.setattr(
+        capability_router,
+        "load_live_resident_agent_task_locked",
+        AsyncMock(return_value=SimpleNamespace(project_id=project_id, context={})),
+    )
+    evidence = ResidentTaskEvidence(
+        kind="task",
+        project_id=project_id,
+        source_id=str(target_id),
+        revision="task:v1",
+        checksum="a" * 64,
+        observed_at=datetime.now(timezone.utc),
+        data={"task_id": str(target_id)},
+    )
+    inspect = AsyncMock(return_value=evidence)
+    monkeypatch.setattr(capability_router, "inspect_project_task", inspect)
+    token = {
+        "sub": str(turn_id),
+        "project_id": str(project_id),
+        "vm_instance_id": "vm-1",
+        "task_type": "strategic_resident_turn",
+        "claim_nonce": "nonce-1",
+    }
+    result = await capability_router.invoke_resident_capability(
+        None,
+        ResidentCapabilityRequest(
+            capability_id="task.inspect",
+            parameters={"task_id": str(target_id)},
+        ),
+        db_session,
+        token,
+    )
+    assert result["evidence"]["source_id"] == str(target_id)
+    inspect.assert_awaited_once_with(
+        db_session,
+        project_id=project_id,
+        task_id=target_id,
+        kind="task",
+    )
+
+    with pytest.raises(HTTPException) as unavailable:
+        await capability_router.invoke_resident_capability(
+            None,
+            ResidentCapabilityRequest(
+                capability_id="pr.inspect", parameters={"pr_number": 12}
+            ),
+            db_session,
+            token,
+        )
+    assert unavailable.value.status_code == 501
+
+    with pytest.raises(HTTPException) as mutation:
+        await capability_router.invoke_resident_capability(
+            None,
+            ResidentCapabilityRequest(
+                capability_id="task.cancel",
+                parameters={"task_id": str(target_id), "reason": "operator request"},
+            ),
+            db_session,
+            token,
+        )
+    assert mutation.value.status_code == 501
+
+
+@pytest.mark.asyncio
+async def test_capability_route_enforces_durable_unique_budget_and_retry(
+    db_session, monkeypatch
+):
+    project_id = uuid.uuid4()
+    turn_id = uuid.uuid4()
+    turn = SimpleNamespace(project_id=project_id, context={})
+    load = AsyncMock(return_value=turn)
+    monkeypatch.setattr(
+        capability_router,
+        "load_live_resident_agent_task_locked",
+        load,
+    )
+    evidence = ResidentTaskEvidence(
+        kind="task",
+        project_id=project_id,
+        source_id="task",
+        revision="task:v1",
+        checksum="a" * 64,
+        observed_at=datetime.now(timezone.utc),
+        data={},
+    )
+    inspect = AsyncMock(return_value=evidence)
+    monkeypatch.setattr(capability_router, "inspect_project_task", inspect)
+    token = {
+        "sub": str(turn_id),
+        "project_id": str(project_id),
+        "vm_instance_id": "vm-1",
+        "task_type": "strategic_resident_turn",
+        "claim_nonce": "nonce-1",
+    }
+    targets = [uuid.uuid4() for _ in range(9)]
+
+    async def invoke(target: uuid.UUID):
+        return await capability_router.invoke_resident_capability(
+            None,
+            ResidentCapabilityRequest(
+                capability_id="task.inspect",
+                parameters={"task_id": str(target)},
+            ),
+            db_session,
+            token,
+        )
+
+    for target in targets[:8]:
+        await invoke(target)
+    assert len(turn.context["_strategic_resident_capability_requests"]) == 8
+
+    await invoke(targets[0])
+    assert len(turn.context["_strategic_resident_capability_requests"]) == 8
+    with pytest.raises(HTTPException) as exhausted:
+        await invoke(targets[8])
+    assert exhausted.value.status_code == 429
+    assert inspect.await_count == 9
+
+
+@pytest.mark.asyncio
+async def test_capability_route_rejects_invalid_parameters_before_authority_locks(
+    db_session, monkeypatch
+):
+    load = AsyncMock()
+    monkeypatch.setattr(
+        capability_router,
+        "load_live_resident_agent_task_locked",
+        load,
+    )
+    with pytest.raises(HTTPException) as invalid:
+        await capability_router.invoke_resident_capability(
+            None,
+            ResidentCapabilityRequest(
+                capability_id="task.inspect",
+                parameters={"task_id": "not-a-uuid"},
+            ),
+            db_session,
+            {
+                "sub": str(uuid.uuid4()),
+                "project_id": str(uuid.uuid4()),
+                "vm_instance_id": "vm-1",
+                "task_type": "strategic_resident_turn",
+                "claim_nonce": "nonce-1",
+            },
+        )
+    assert invalid.value.status_code == 400
+    load.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_lineage_inspection_stays_in_project_and_is_stable(db_session):
+    project = Project(name="lineage", user_id="u")
+    other = Project(name="other", user_id="u")
+    db_session.add_all([project, other])
+    await db_session.flush()
+    parent = Task(project_id=project.id, title="parent", payloads=[{"type": "plan"}])
+    db_session.add(parent)
+    await db_session.flush()
+    child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        title="child",
+        payloads=[{"type": "create"}],
+    )
+    foreign = Task(
+        project_id=other.id,
+        parent_task_id=parent.id,
+        title="foreign",
+        payloads=[{"type": "fix"}],
+    )
+    db_session.add_all([child, foreign])
+    await db_session.commit()
+
+    evidence = await inspect_project_task_lineage(
+        db_session,
+        project_id=project.id,
+        task_id=parent.id,
+    )
+    assert [item["title"] for item in evidence.data["tasks"]] == ["parent", "child"]
+    assert "foreign" not in str(evidence.data)
