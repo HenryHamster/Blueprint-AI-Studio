@@ -2083,6 +2083,47 @@ def _if_none_match_hits(if_none_match: object | None, etag: str) -> bool:
     return False
 
 
+async def _load_live_message_preview(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    limit: int = 12,
+) -> list[ProjectMessage]:
+    """Load the newest open/linked messages with bounded per-status scans."""
+    if limit <= 0:
+        return []
+
+    open_branch = (
+        select(ProjectMessage.id)
+        .where(
+            ProjectMessage.project_id == project_id,
+            ProjectMessage.status == OPEN_STATUS,
+        )
+        .order_by(ProjectMessage.created_at.desc())
+        .limit(limit)
+        .subquery("open_live_messages")
+    )
+    linked_branch = (
+        select(ProjectMessage.id)
+        .where(
+            ProjectMessage.project_id == project_id,
+            ProjectMessage.status == LINKED_STATUS,
+        )
+        .order_by(ProjectMessage.created_at.desc())
+        .limit(limit)
+        .subquery("linked_live_messages")
+    )
+    live_message_ids = union_all(
+        select(open_branch.c.id), select(linked_branch.c.id)
+    ).subquery("live_message_ids")
+    result = await session.execute(
+        select(ProjectMessage)
+        .join(live_message_ids, ProjectMessage.id == live_message_ids.c.id)
+        .order_by(ProjectMessage.created_at.desc())
+        .limit(limit)
+    )
+    return list(result.scalars().all())
+
 @router.get("/projects/{project_id}/strategic-state")
 @limiter.limit("30/minute")
 async def get_project_strategic_state(
@@ -2108,53 +2149,36 @@ async def get_project_strategic_state(
     # concurrent coroutine-based calls (asyncpg raises InterfaceError when
     # a second query is issued before the first completes).
     # Both the most-recent active cycle and the most-recent non-active
-    # ("latest") cycle in one round-trip via DISTINCT ON the is-active flag:
-    # Postgres keeps one row per distinct flag value, and the ORDER BY (flag
-    # leading, then phase1_started_at DESC) makes that the newest of each group.
-    # Equivalent to the two prior limit-1 queries but halves the round-trips.
+    # ("latest") cycle in one round-trip. Rank each active-state partition and
+    # retain its newest row. Unlike PostgreSQL DISTINCT ON, this window shape
+    # also preserves the contract in SQLite-backed tests and local development.
     _is_active_cycle = StrategicCycle.outcome.in_(list(strategic_cycle.ACTIVE_OUTCOMES))
+    _cycle_ranked = (
+        select(
+            StrategicCycle.id.label("cycle_id"),
+            func.row_number()
+            .over(
+                partition_by=_is_active_cycle,
+                order_by=StrategicCycle.phase1_started_at.desc(),
+            )
+            .label("cycle_rank"),
+        )
+        .where(StrategicCycle.project_id == project.id)
+        .subquery("cycle_ranked")
+    )
     _cycle_res = await session.execute(
         select(StrategicCycle)
-        .where(StrategicCycle.project_id == project.id)
-        .order_by(
-            _is_active_cycle.desc(),
-            StrategicCycle.phase1_started_at.desc(),
-        )
-        .distinct(_is_active_cycle)
+        .join(_cycle_ranked, StrategicCycle.id == _cycle_ranked.c.cycle_id)
+        .where(_cycle_ranked.c.cycle_rank == 1)
     )
     _task_status_rows_res = await session.execute(
         select(Task.status, func.count())
         .where(Task.project_id == project.id, Task.archived.is_(False))
         .group_by(Task.status)
     )
-    # Two-branch UNION ALL allows the composite (project_id, status, created_at DESC)
-    # index to serve each branch as a bounded index scan instead of a full
-    # project-id range scan followed by a sort over all resolved rows.
-    _open_branch = (
-        select(ProjectMessage)
-        .where(
-            ProjectMessage.project_id == project.id,
-            ProjectMessage.status == OPEN_STATUS,
-        )
-        .order_by(ProjectMessage.created_at.desc())
-        .limit(12)
-    )
-    _linked_branch = (
-        select(ProjectMessage)
-        .where(
-            ProjectMessage.project_id == project.id,
-            ProjectMessage.status == LINKED_STATUS,
-        )
-        .order_by(ProjectMessage.created_at.desc())
-        .limit(12)
-    )
-    _live_msgs = union_all(_open_branch, _linked_branch).subquery("live_msgs")
-    _message_rows_res = await session.execute(
-        select(ProjectMessage)
-        .join(_live_msgs, ProjectMessage.id == _live_msgs.c.id)
-        .order_by(ProjectMessage.created_at.desc())
-        .limit(12)
-    )
+    # Two bounded status branches use the composite index and are merged into
+    # the globally newest preview by the focused loader.
+    message_rows = await _load_live_message_preview(session, project.id)
     _message_count_rows_res = await session.execute(
         select(ProjectMessage.status, func.count())
         .where(
@@ -2183,7 +2207,6 @@ async def get_project_strategic_state(
         None,
     )
     task_status_rows = _task_status_rows_res.all()
-    message_rows = _message_rows_res.scalars().all()
     message_count_rows = _message_count_rows_res.all()
     open_version = _open_version_res.scalars().first()
 

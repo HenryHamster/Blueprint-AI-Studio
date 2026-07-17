@@ -1,7 +1,7 @@
 """Add composite index on ProjectMessage(project_id, status, created_at DESC) for live-message preview.
 
-Revision ID: 0613
-Revises: 0612
+Revision ID: 0624
+Revises: 0623
 Create Date: 2026-07-17
 """
 
@@ -9,8 +9,8 @@ from __future__ import annotations
 
 from alembic import op
 
-revision = "0613"
-down_revision = "0612"
+revision = "0624"
+down_revision = "0623"
 branch_labels = None
 depends_on = None
 
