@@ -17,9 +17,21 @@ from app.resident_agent_rate_limits import (
     resident_remote_rate_key,
     resident_task_token_rate_key,
 )
+from app.strategic_operation_authority import execute_fenced_db_operation
 from app.strategic_operation_authority_validation import (
+    AuthorityBoundaryMutation,
+    AuthorityGenerationMismatch,
+    ExpectedRevisionMismatch,
+    FencedOperationRequest,
+    FencedOperationUsageError,
+    InactiveTurnAuthority,
+    MutationPlanTooLarge,
+    OperationIdentityCollision,
     OperationPayloadTooLarge,
+    OperationResultTooLarge,
+    ResidentEngineOwnerMismatch,
     StrategicAuthorityError,
+    UnsupportedRevisionKey,
 )
 from app.strategic_resident_agent_binding import (
     ResidentAgentAuthorityError,
@@ -30,7 +42,13 @@ from app.strategic_resident_agent_binding import (
 )
 from app.strategic_resident_capabilities import CapabilityMode, capability_for
 from app.strategic_resident_capability_invocation import (
+    ResidentCapabilityInvocation,
     validated_capability_parameters,
+)
+from app.strategic_resident_project_field_mutation import (
+    PROJECT_FIELD_MUTATION_SERVICE,
+    project_field_mutation_callback,
+    project_field_mutation_operation_kind,
 )
 from app.strategic_resident_task_inspection import (
     ResidentTaskNotFound,
@@ -203,6 +221,88 @@ async def invoke_resident_capability(
     return {
         "capability_id": body.capability_id,
         "evidence": evidence.model_dump(mode="json"),
+    }
+
+
+@router.post("/mutate")
+@limiter.limit("600/minute", key_func=resident_remote_rate_key)
+@limiter.limit("60/minute", key_func=_capability_rate_key)
+async def invoke_resident_mutation(
+    request: Request,
+    body: ResidentCapabilityInvocation,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+) -> dict[str, Any]:
+    """Apply one DB-only fenced strategic-memory mutation under the live turn token.
+
+    The invocation envelope has already validated the capability declaration,
+    parameter names/types/size, forbidden-key scope, ``operation_id``, and
+    ``expected_revisions`` shape. Authority (project/turn/generation/CAS) is
+    fenced by ``execute_fenced_db_operation`` in its own owned transaction.
+    """
+
+    binding = _binding(token)
+    spec = capability_for(body.capability_id)
+    if spec.mode is not CapabilityMode.mutate:
+        raise HTTPException(status_code=400, detail="capability is not a mutation")
+    callback = project_field_mutation_callback(body.capability_id)
+    operation_kind = project_field_mutation_operation_kind(body.capability_id)
+    if (
+        spec.service != PROJECT_FIELD_MUTATION_SERVICE
+        or callback is None
+        or operation_kind is None
+    ):
+        raise HTTPException(
+            status_code=501,
+            detail="mutation capability is proposal-only until a fenced adapter exists",
+        )
+    # Authority scope always comes from the signed turn token, never the body.
+    if body.project_id != binding.project_id or body.turn_task_id != binding.task_id:
+        raise HTTPException(
+            status_code=403,
+            detail="mutation envelope does not match the turn token authority",
+        )
+    fenced_request = FencedOperationRequest(
+        project_id=binding.project_id,
+        turn_task_id=binding.task_id,
+        authority_generation=body.authority_generation,
+        operation_id=str(body.operation_id),
+        operation_kind=operation_kind,
+        capability=body.capability_id,
+        risk=spec.risk.value,
+        expected_revisions=dict(body.expected_revisions),
+        request_payload=dict(body.parameters),
+    )
+    try:
+        receipt = await execute_fenced_db_operation(session, fenced_request, callback)
+    except OperationIdentityCollision as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (
+        AuthorityGenerationMismatch,
+        ResidentEngineOwnerMismatch,
+        InactiveTurnAuthority,
+        ExpectedRevisionMismatch,
+        AuthorityBoundaryMutation,
+    ) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (
+        MutationPlanTooLarge,
+        OperationPayloadTooLarge,
+        OperationResultTooLarge,
+    ) as exc:
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
+    except (
+        FencedOperationUsageError,
+        UnsupportedRevisionKey,
+        StrategicAuthorityError,
+        ValueError,
+    ) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "capability_id": body.capability_id,
+        "operation_id": receipt.operation_id,
+        "status": receipt.status,
+        "receipt_id": str(receipt.id),
     }
 
 
