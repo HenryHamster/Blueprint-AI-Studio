@@ -1218,7 +1218,7 @@ async def test_refresh_changed_manifest_builds_and_records(db):
     digest = "sha256:" + "d" * 64
     build_calls: list = []
 
-    async def _build(proj, *, registry_repo, build_config, ref=None):
+    async def _build(proj, *, registry_repo, build_config, ref=None, **_k):
         build_calls.append({"ref": ref, "registry_repo": registry_repo, "name": build_config["name"]})
         return BuildResult(
             pinned_ref=f"{registry_repo}/widget-compute@{digest}",
@@ -1272,7 +1272,7 @@ async def test_refresh_changed_build_digestless_preserves_stored_pin(db):
     )
     await db.commit()
 
-    async def _build(proj, *, registry_repo, build_config, ref=None):
+    async def _build(proj, *, registry_repo, build_config, ref=None, **_k):
         # A registry hiccup: digest could not be resolved (tag-only ref).
         return BuildResult(
             pinned_ref=f"{registry_repo}/widget-compute:{dep_hash}",
@@ -1419,17 +1419,15 @@ async def test_refresh_build_error_is_isolated(db):
 
 @pytest.mark.asyncio
 async def test_refresh_hash_matches_build_and_push_input_keying(db):
-    """The dep_hash keys Dockerfile as 'Dockerfile' and dep files by relative path.
-
-    Same as compute_dependency_hash's contract in build_and_push — so an unchanged
-    manifest always resolves to the SAME tag the real build would produce.
-    """
-    from app.compute_image_build import compute_dependency_hash
+    """The cheap refresh and real build use the same typed fingerprint inputs."""
+    from app.compute_image_build import assemble_fingerprint_inputs, compute_dependency_hash
 
     project = await _make_repo_project(db)
     dockerfile = b"FROM python:3.11-slim\nRUN pip install torch\n"
     reqs = b"torch==2.3.0\nnumpy==1.26\n"
-    expected = compute_dependency_hash({"Dockerfile": dockerfile, "requirements.txt": reqs})
+    expected = compute_dependency_hash(
+        assemble_fingerprint_inputs(dockerfile, {"requirements.txt": reqs})
+    )
 
     seen: list = []
 
@@ -1451,6 +1449,214 @@ async def test_refresh_hash_matches_build_and_push_input_keying(db):
         _record_fn=_record_row,
     )
     assert seen == [expected], "driver dep_hash must match build_and_push keying"
+
+
+@pytest.mark.asyncio
+async def test_refresh_cheap_hash_equals_build_hash_with_parent_and_build_args(db):
+    """refresh_project_compute_image produces the same dep_hash as build_and_push
+    when the manifest has parent and build_args — both paths must call
+    assemble_fingerprint_inputs so they cannot drift.
+    """
+    from app.compute_image_build import assemble_fingerprint_inputs, compute_dependency_hash
+
+    project = await _make_repo_project(db)
+    dockerfile = b"FROM python:3.11-slim\nRUN pip install torch\n"
+    reqs = b"torch==2.3.0\n"
+    parent = "python:3.11-slim"
+    build_args = {"CUDA": "12.4", "PY": "3.11"}
+
+    # Expected: same inputs as assemble_fingerprint_inputs would produce.
+    expected = compute_dependency_hash(
+        assemble_fingerprint_inputs(
+            dockerfile,
+            {"requirements.txt": reqs},
+            parent=parent,
+            build_args=build_args,
+        )
+    )
+
+    manifest = {
+        "compute": {
+            "image": {
+                "name": "widget-compute",
+                "build": {
+                    "dockerfile": ".blueprint/Dockerfile.compute",
+                    "parent": parent,
+                    "build_args": build_args,
+                },
+            }
+        }
+    }
+
+    seen: list = []
+
+    def _tag_exists(full_repo, dep_hash):
+        seen.append(dep_hash)
+        return True
+
+    await _cb.refresh_project_compute_image(
+        db,
+        project,
+        _manifest_fn=lambda _p: _async(manifest),
+        _token_fn=lambda o, r: _async("tok"),
+        _default_branch_fn=lambda t, o, r: _async("main"),
+        _fetch_bytes_fn=_fetch_bytes_stub(
+            {".blueprint/Dockerfile.compute": dockerfile, "requirements.txt": reqs}
+        ),
+        _tag_exists_fn=_tag_exists,
+        _resolve_digest_fn=lambda full_repo, dep_hash: None,
+        _record_fn=_record_row,
+    )
+    assert seen == [expected], (
+        "refresh dep_hash with parent/build_args must equal assemble_fingerprint_inputs output"
+    )
+
+
+@pytest.mark.asyncio
+async def test_refresh_lockfile_less_bare_manifest_changes_hash(db):
+    """When no lockfile is present, the bare manifest (package.json) participates
+    in the cheap hash — a changed bare manifest must yield a different dep_hash.
+    """
+    project = await _make_repo_project(db)
+    dockerfile = b"FROM node:20-slim\n"
+    pkg_v1 = b'{"name": "app", "version": "1.0.0"}\n'
+    pkg_v2 = b'{"name": "app", "version": "2.0.0"}\n'
+
+    hashes: list = []
+
+    for pkg_bytes in (pkg_v1, pkg_v2):
+        seen: list = []
+
+        def _tag_exists(full_repo, dep_hash, _b=pkg_bytes):
+            seen.append(dep_hash)
+            return True
+
+        await _cb.refresh_project_compute_image(
+            db,
+            project,
+            _manifest_fn=lambda _p: _async(_BUILD_MANIFEST),
+            _token_fn=lambda o, r: _async("tok"),
+            _default_branch_fn=lambda t, o, r: _async("main"),
+            _fetch_bytes_fn=_fetch_bytes_stub(
+                {".blueprint/Dockerfile.compute": dockerfile, "package.json": pkg_bytes}
+                # no package-lock.json → bare-manifest fallback kicks in
+            ),
+            _tag_exists_fn=_tag_exists,
+            _resolve_digest_fn=lambda full_repo, dep_hash: None,
+            _record_fn=_record_row,
+        )
+        hashes.append(seen[0])
+
+    assert hashes[0] != hashes[1], (
+        "lockfile-less bare manifest content change must yield different dep_hash"
+    )
+
+
+@pytest.mark.asyncio
+async def test_refresh_explicit_deps_override_defaults(db):
+    """When build_config has 'deps', only those files participate in the cheap hash
+    (not the full _DEFAULT_DEP_FILES discovery).
+    """
+    from app.compute_image_build import assemble_fingerprint_inputs, compute_dependency_hash
+
+    project = await _make_repo_project(db)
+    dockerfile = b"FROM python:3.11-slim\n"
+    explicit_dep = b"numpy==1.26\n"
+
+    manifest = {
+        "compute": {
+            "image": {
+                "name": "widget-compute",
+                "build": {
+                    "dockerfile": ".blueprint/Dockerfile.compute",
+                    "deps": ["packages/api/requirements.txt"],
+                },
+            }
+        }
+    }
+    expected = compute_dependency_hash(
+        assemble_fingerprint_inputs(
+            dockerfile,
+            {"packages/api/requirements.txt": explicit_dep},
+        )
+    )
+
+    seen: list = []
+
+    def _tag_exists(full_repo, dep_hash):
+        seen.append(dep_hash)
+        return True
+
+    await _cb.refresh_project_compute_image(
+        db,
+        project,
+        _manifest_fn=lambda _p: _async(manifest),
+        _token_fn=lambda o, r: _async("tok"),
+        _default_branch_fn=lambda t, o, r: _async("main"),
+        _fetch_bytes_fn=_fetch_bytes_stub(
+            {
+                ".blueprint/Dockerfile.compute": dockerfile,
+                "packages/api/requirements.txt": explicit_dep,
+                # requirements.txt also "present" — must NOT be included when deps explicit
+                "requirements.txt": b"other==1.0\n",
+            }
+        ),
+        _tag_exists_fn=_tag_exists,
+        _resolve_digest_fn=lambda full_repo, dep_hash: None,
+        _record_fn=_record_row,
+    )
+    assert seen == [expected], (
+        "explicit deps must override default discovery; only declared files hash"
+    )
+
+
+@pytest.mark.asyncio
+async def test_refresh_missing_explicit_dep_fails_closed_before_registry_or_build(db):
+    """A partial explicit-dependency fetch must not reuse or record an image."""
+    project = await _make_repo_project(db)
+    manifest = {
+        "compute": {
+            "image": {
+                "name": "widget-compute",
+                "build": {"deps": ["requirements.txt", "missing.lock"]},
+            }
+        }
+    }
+    called = {"tag": 0, "build": 0, "record": 0}
+
+    def _tag_exists(*_args):
+        called["tag"] += 1
+        raise AssertionError("partial explicit dependencies must not query the registry")
+
+    async def _build(*_args, **_kwargs):
+        called["build"] += 1
+        raise AssertionError("partial explicit dependencies must not start a build")
+
+    async def _record(*_args, **_kwargs):
+        called["record"] += 1
+        raise AssertionError("partial explicit dependencies must not record a pin")
+
+    result = await _cb.refresh_project_compute_image(
+        db,
+        project,
+        _manifest_fn=lambda _p: _async(manifest),
+        _token_fn=lambda o, r: _async("tok"),
+        _default_branch_fn=lambda t, o, r: _async("main"),
+        _fetch_bytes_fn=_fetch_bytes_stub(
+            {
+                ".blueprint/Dockerfile.compute": b"FROM python:3.11-slim\n",
+                "requirements.txt": b"numpy==1.26\n",
+            }
+        ),
+        _tag_exists_fn=_tag_exists,
+        _build_fn=_build,
+        _record_fn=_record,
+    )
+    assert result == {
+        "status": "no_config",
+        "reason": "declared dependency file not found: missing.lock",
+    }
+    assert called == {"tag": 0, "build": 0, "record": 0}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1881,3 +2087,142 @@ async def test_unchanged_creates_no_drift_alert(db):
         .all()
     )
     assert alerts == [], "no drift alert expected for unchanged/no_config sweep result"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Cancellation propagation: outer task cancels the build and drains the semaphore
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_progress_cb_cancellation_signals_cancel_event_and_drains_semaphore(db):
+    """Outer cancellation in the progress_cb path sets cancel_event and defers semaphore
+    release until the thread-backed build worker actually finishes.
+
+    Uses a real asyncio.to_thread worker (not an async sleep stub) to verify the
+    fix for the premature-semaphore-release bug: without the fix, _build_task.cancel()
+    marks the asyncio Future done while the OS thread continues, so _drain_and_release
+    would have released the semaphore before the thread stopped.
+    """
+    project = await _make_repo_project(db)
+
+    build_started = asyncio.Event()
+    cancel_events_received: list = []
+    thread_exited = threading.Event()
+
+    def _blocking_thread(cancel_event):
+        # Real thread: polls cancel_event and sets thread_exited when done.
+        while not cancel_event.is_set():
+            import time
+            time.sleep(0.005)
+        thread_exited.set()
+
+    async def _thread_backed_build(*a, cancel_event=None, **k):
+        cancel_events_received.append(cancel_event)
+        build_started.set()
+        await asyncio.to_thread(_blocking_thread, cancel_event)
+
+    sem = asyncio.Semaphore(1)
+
+    refresh_task = asyncio.ensure_future(
+        _cb.refresh_project_compute_image(
+            db,
+            project,
+            progress_cb=lambda: None,
+            build_semaphore=sem,
+            _manifest_fn=lambda _p: _async(_BUILD_MANIFEST),
+            _token_fn=lambda o, r: _async("tok"),
+            _default_branch_fn=lambda t, o, r: _async("main"),
+            _fetch_bytes_fn=_fetch_bytes_stub(
+                {".blueprint/Dockerfile.compute": b"FROM python:3.11-slim\n"}
+            ),
+            _tag_exists_fn=lambda full_repo, dep_hash: False,
+            _build_fn=_thread_backed_build,
+            _record_fn=_record_row,
+        )
+    )
+
+    # Wait for the build thread to actually start before cancelling.
+    await asyncio.wait_for(build_started.wait(), timeout=2.0)
+    refresh_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await refresh_task
+
+    # cancel_event must have been received and set.
+    assert len(cancel_events_received) == 1
+    ev = cancel_events_received[0]
+    assert ev is not None, "cancel_event must be threaded into build_fn"
+    assert ev.is_set(), "cancel_event must be set when outer task is cancelled"
+
+    # Wait for the thread to actually finish (cancel_event causes it to exit).
+    await asyncio.to_thread(thread_exited.wait, 2.0)
+    assert thread_exited.is_set(), "thread must exit after cancel_event is set"
+
+    # Drain task now has a chance to run: give event loop a couple of ticks.
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert sem.locked() is False, "build_semaphore must be released after thread drain"
+
+
+@pytest.mark.asyncio
+async def test_non_progress_cb_cancellation_signals_cancel_event_and_drains_semaphore(db):
+    """Outer cancellation in the direct-await path sets cancel_event and defers semaphore
+    release until the thread-backed build worker finishes.
+
+    Uses a real asyncio.to_thread worker to verify that asyncio.shield prevents premature
+    semaphore release when the outer task is cancelled mid-build.
+    """
+    project = await _make_repo_project(db)
+
+    cancel_events_received: list = []
+    build_started = asyncio.Event()
+    thread_exited = threading.Event()
+
+    def _blocking_thread(cancel_event):
+        while not cancel_event.is_set():
+            import time
+            time.sleep(0.005)
+        thread_exited.set()
+
+    async def _thread_backed_build(*a, cancel_event=None, **k):
+        cancel_events_received.append(cancel_event)
+        build_started.set()
+        await asyncio.to_thread(_blocking_thread, cancel_event)
+
+    sem = asyncio.Semaphore(1)
+
+    refresh_task = asyncio.ensure_future(
+        _cb.refresh_project_compute_image(
+            db,
+            project,
+            progress_cb=None,
+            build_semaphore=sem,
+            _manifest_fn=lambda _p: _async(_BUILD_MANIFEST),
+            _token_fn=lambda o, r: _async("tok"),
+            _default_branch_fn=lambda t, o, r: _async("main"),
+            _fetch_bytes_fn=_fetch_bytes_stub(
+                {".blueprint/Dockerfile.compute": b"FROM python:3.11-slim\n"}
+            ),
+            _tag_exists_fn=lambda full_repo, dep_hash: False,
+            _build_fn=_thread_backed_build,
+            _record_fn=_record_row,
+        )
+    )
+
+    await asyncio.wait_for(build_started.wait(), timeout=2.0)
+    refresh_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await refresh_task
+
+    assert len(cancel_events_received) == 1
+    ev = cancel_events_received[0]
+    assert ev is not None, "cancel_event must be threaded into build_fn"
+    assert ev.is_set(), "cancel_event must be set on cancellation to stop the remote build"
+
+    # Thread exits when cancel_event fires; semaphore must not be released until then.
+    await asyncio.to_thread(thread_exited.wait, 2.0)
+    assert thread_exited.is_set(), "thread must exit after cancel_event is set"
+
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert sem.locked() is False, "build_semaphore must be released after thread drain"
