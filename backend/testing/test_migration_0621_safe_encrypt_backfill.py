@@ -5,10 +5,12 @@ of every column whose source migration no-oped when GITHUB_PAT_ENCRYPTION_KEY
 was absent) but uses SQLAlchemy Table reflection + parameterised sa.select /
 sa.update instead of f-string interpolation into sa.text().
 
-Properties pinned here are the SAME as test_migration_0531_backfill_encryption.py:
+Properties pinned here are the SAME as test_migration_0531_backfill_encryption.py,
+with fail-closed semantics added:
   (a) genuinely-plaintext rows get encrypted and decrypt back in ONE step;
   (b) already-ciphertext rows are left UNTOUCHED (no double-encryption);
-  (c) a keyless environment no-ops without raising and leaves values untouched.
+  (c) keyless environment with ALLOW_PLAINTEXT_CREDENTIALS no-ops without raising;
+  (f) absent or malformed key WITHOUT ALLOW_PLAINTEXT_CREDENTIALS raises RuntimeError.
 
 Additionally pinned:
   (d) the empty-string webhook_url row is skipped (skip_empty_strings guard);
@@ -104,7 +106,7 @@ def test_plaintext_rows_are_encrypted_ciphertext_untouched_keyless_noop(monkeypa
 
     (a) plaintext rows encrypt and decrypt back in ONE step;
     (b) already-ciphertext rows are left byte-for-byte UNTOUCHED (no double-enc);
-    (c) keyless environment no-ops without raising.
+    (c) keyless environment with ALLOW_PLAINTEXT_CREDENTIALS no-ops without raising.
     """
     key = Fernet.generate_key().decode()
     monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", key)
@@ -144,9 +146,9 @@ def test_plaintext_rows_are_encrypted_ciphertext_untouched_keyless_noop(monkeypa
                 f"{t}.{c} no longer decrypts in ONE step after re-run"
             )
 
-    # ---- (c) keyless environment no-ops without raising, values untouched.
+    # ---- (c) keyless + ALLOW_PLAINTEXT_CREDENTIALS: no-op, no raise, values untouched.
     monkeypatch.delenv("GITHUB_PAT_ENCRYPTION_KEY", raising=False)
-    monkeypatch.delenv("ALLOW_PLAINTEXT_CREDENTIALS", raising=False)
+    monkeypatch.setenv("ALLOW_PLAINTEXT_CREDENTIALS", "true")
     assert fe.is_encryption_active() is False
 
     engine2 = sa.create_engine("sqlite:///:memory:")
@@ -154,10 +156,10 @@ def test_plaintext_rows_are_encrypted_ciphertext_untouched_keyless_noop(monkeypa
         _create_schema(conn)
         _seed_plaintext(conn)
         monkeypatch.setattr(mig.op, "get_bind", lambda: conn)
-        mig.upgrade()  # must NOT raise
+        mig.upgrade()  # must NOT raise — dev no-op with explicit opt-in
         for table, column, row_id in _COLUMNS:
             assert _stored(conn, table, column, row_id) == _PLAINTEXTS[column], (
-                f"keyless migrate must leave {table}.{column} untouched"
+                f"keyless+plaintext-opt-in migrate must leave {table}.{column} untouched"
             )
 
 
@@ -196,6 +198,49 @@ def test_downgrade_decrypts_back_and_no_ops_keyless(monkeypatch):
         monkeypatch.setattr(mig.op, "get_bind", lambda: conn)
         mig.downgrade()  # must NOT raise
         assert _stored(conn, "maxplanaccount", "oauth_token", "acct-1") == _PLAINTEXTS["oauth_token"]
+
+
+def test_backfill_fails_closed_when_encryption_expected_but_inactive(monkeypatch):
+    """(f) upgrade() raises RuntimeError before touching any row when encryption
+    is expected but unavailable — absent key without ALLOW_PLAINTEXT_CREDENTIALS,
+    or a malformed key regardless of that flag.
+    """
+    import pytest
+
+    mig = _load_migration("0621", "0621_safe_encrypt_backfill.py")
+
+    # ---- absent key, no opt-in: must raise before op.get_bind() is called.
+    monkeypatch.delenv("GITHUB_PAT_ENCRYPTION_KEY", raising=False)
+    monkeypatch.delenv("ALLOW_PLAINTEXT_CREDENTIALS", raising=False)
+
+    engine = sa.create_engine("sqlite:///:memory:")
+    with engine.begin() as conn:
+        _create_schema(conn)
+        _seed_plaintext(conn)
+        monkeypatch.setattr(mig.op, "get_bind", lambda: conn)
+        with pytest.raises(RuntimeError, match="GITHUB_PAT_ENCRYPTION_KEY"):
+            mig.upgrade()
+        # Rows must be untouched — no data access happened.
+        for table, column, row_id in _COLUMNS:
+            assert _stored(conn, table, column, row_id) == _PLAINTEXTS[column], (
+                f"absent-key upgrade must not touch {table}.{column}"
+            )
+
+    # ---- malformed key: must raise even when ALLOW_PLAINTEXT_CREDENTIALS is set.
+    monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", "not-a-valid-fernet-key")
+    monkeypatch.setenv("ALLOW_PLAINTEXT_CREDENTIALS", "true")
+
+    engine2 = sa.create_engine("sqlite:///:memory:")
+    with engine2.begin() as conn:
+        _create_schema(conn)
+        _seed_plaintext(conn)
+        monkeypatch.setattr(mig.op, "get_bind", lambda: conn)
+        with pytest.raises(RuntimeError, match="GITHUB_PAT_ENCRYPTION_KEY"):
+            mig.upgrade()
+        for table, column, row_id in _COLUMNS:
+            assert _stored(conn, table, column, row_id) == _PLAINTEXTS[column], (
+                f"malformed-key upgrade must not touch {table}.{column}"
+            )
 
 
 def test_no_f_string_sql_in_migration_source():

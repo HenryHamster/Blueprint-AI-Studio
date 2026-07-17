@@ -115,17 +115,27 @@ def backfill_encrypted_columns(bind, decrypt_field, encrypt_field) -> dict[str, 
 
 
 def upgrade() -> None:
-    bind = op.get_bind()
+    from app.field_encryption import (
+        decrypt_field,
+        encrypt_field,
+        is_encryption_active,
+        require_encryption_active,
+    )
 
-    from app.field_encryption import decrypt_field, encrypt_field, is_encryption_active
+    # Fail closed before reading any row: absent key raises RuntimeError unless
+    # ALLOW_PLAINTEXT_CREDENTIALS is explicitly set (development environments).
+    # A malformed key always raises regardless of that flag.
+    require_encryption_active("Migration 0621")
 
     if not is_encryption_active():
+        # ALLOW_PLAINTEXT_CREDENTIALS is set — genuine no-op for keyless dev.
         logger.warning(
-            "0621: field encryption not configured (no GITHUB_PAT_ENCRYPTION_KEY) "
-            "— leaving all encrypted-at-rest columns unchanged (matches 0472's no-op)"
+            "0621: ALLOW_PLAINTEXT_CREDENTIALS is set without an encryption key "
+            "— skipping backfill for keyless development environment"
         )
         return
 
+    bind = op.get_bind()
     updated_by_column = backfill_encrypted_columns(bind, decrypt_field, encrypt_field)
     logger.info("Migration 0621 backfilled encrypted columns: %s", updated_by_column)
 
