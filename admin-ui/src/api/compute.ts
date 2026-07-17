@@ -1784,6 +1784,10 @@ export interface CapabilityProofGateCoverage {
   projects_contributing: number;
   num_projects: number;
   trial_eligible_unproven?: number;
+  /** Whether the coverage sample was truncated by the project cap. */
+  fleet_capped: boolean;
+  /** Total number of projects in the fleet (before sampling). */
+  fleet_total: number;
 }
 
 export interface CapabilityProofTrialProjection {

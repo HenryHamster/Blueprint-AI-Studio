@@ -6192,6 +6192,107 @@ async def test_auto_graduation_refuses_incomplete_fleet_coverage(db):
 
 
 @pytest.mark.asyncio
+async def test_auto_graduation_off_to_observe_on_capped_fleet(db):
+    """Auto-graduation off->observe is blocked when the fleet exceeds the sample cap.
+
+    Even if 100% of the visible slice is proven, the off->observe advance must
+    return SKIPPED when fleet_capped is True so that unseen projects aren't
+    silently subjected to observe-mode logging on incomplete fleet data.
+    """
+    from datetime import timedelta
+
+    now = _utcnow()
+    fresh = (now - timedelta(days=1)).isoformat()
+    cap = {"name": "repo-map", "status": "working", "evidence_refs": [_proven_ref(fresh)]}
+
+    # Create 3 projects with 100% proven coverage, but cap=2 so fleet_capped=True.
+    for _ in range(3):
+        p = await _project(db)
+        p.problem_model = {"capabilities": [cap]}
+        _set_machine_proof_records(p, "repo-map", proved_at=fresh)
+        flag_modified(p, "problem_model")
+        db.add(p)
+    await db.commit()
+
+    # Confirm fleet_capped is detected with a cap of 2.
+    coverage = await mis.compute_fleet_proof_coverage(db, max_projects=2, now=now)
+    assert coverage["fleet_total"] == 3
+    assert coverage["fleet_capped"] is True
+    assert coverage["coverage_ratio"] == pytest.approx(1.0)
+
+    await _seed_auto_graduation_deployment_state(db)
+    _set_auto_graduation_config(mode="off", observe_threshold=0.5)
+    ctx = SweepContext(
+        session=db,
+        now=now,
+        mode="observe",
+        max_projects=2,  # cap below fleet size
+        sample_limit=200,
+        window_days=14,
+    )
+    results = await mis.check_capability_proof_gate_auto_graduation(ctx)
+    assert len(results) == 1
+    r = results[0]
+    assert r.status == CheckStatus.SKIPPED, (
+        f"expected SKIPPED (incomplete fleet), got {r.status}: {r.detail}"
+    )
+    assert "observe" in r.detail
+    assert "cap" in r.detail or "max_projects" in r.detail or "fleet" in r.detail
+    # Gate must NOT have advanced from off.
+    assert _rc.get("capability_proof_gate_mode") == "off"
+
+
+@pytest.mark.asyncio
+async def test_fleet_coverage_summary_exposes_fleet_capped(db):
+    """The coverage summary returned by compute_fleet_proof_coverage includes
+    fleet_capped / fleet_total so the operator-facing settings endpoint can
+    surface whether the coverage ratio was computed on a truncated sample.
+
+    This is the named-test acceptance evidence for the fix: surface
+    fleet_capped to operator capability-proof coverage PR: the settings
+    endpoint forwards these fields from the sweep function to the operator
+    surface, and the auto-graduation guard already reads them to skip the
+    enforce step.
+    """
+    from datetime import timedelta
+
+    now = _utcnow()
+    fresh = (now - timedelta(days=1)).isoformat()
+    cap = {"name": "repo-map", "status": "working", "evidence_refs": [_proven_ref(fresh)]}
+
+    # === Uncapped - fewer projects than max_projects ===
+    p = await _project(db)
+    p.problem_model = {"capabilities": [cap]}
+    _set_machine_proof_records(p, "repo-map", proved_at=fresh)
+    flag_modified(p, "problem_model")
+    await db.commit()
+
+    coverage = await mis.compute_fleet_proof_coverage(db, max_projects=10, now=now)
+    assert coverage["fleet_total"] == 1
+    assert coverage["num_projects"] == 1
+    assert coverage["fleet_capped"] is False, (
+        "should not be capped when fleet (1) is below sample cap (10)"
+    )
+
+    # === Capped - more projects than max_projects ===
+    for _ in range(4):
+        p2 = await _project(db)
+        p2.problem_model = {"capabilities": [cap]}
+        _set_machine_proof_records(p2, "repo-map", proved_at=fresh)
+        flag_modified(p2, "problem_model")
+    await db.commit()
+
+    coverage = await mis.compute_fleet_proof_coverage(db, max_projects=3, now=now)
+    assert coverage["fleet_total"] == 5  # 1 from above + 4 new
+    assert coverage["num_projects"] == 3  # capped at max_projects
+    assert coverage["fleet_capped"] is True, (
+        "fleet_total (5) > max_projects (3) so the sample is truncated"
+    )
+    # coverage_ratio is still valid within the sample
+    assert coverage["coverage_ratio"] == pytest.approx(1.0)
+
+
+@pytest.mark.asyncio
 async def test_auto_graduation_stale_proof_is_not_counted_by_working_status(db):
     """Regression: a proof older than PROOF_FRESHNESS_TTL demotes from 'proven'
     when working_capability_proof_status is called with now=.

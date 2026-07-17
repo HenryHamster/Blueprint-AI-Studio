@@ -479,6 +479,11 @@ async def get_settings(
             "projects_contributing": _cov["projects_contributing"],
             "num_projects": _cov["num_projects"],
             "trial_eligible_unproven": _cov.get("trial_eligible_unproven", 0),
+            # Surface whether the coverage sample is truncated — the
+            # auto-graduation guard already refuses to advance to enforce
+            # when fleet_capped is True, so the operator needs visibility.
+            "fleet_capped": _cov.get("fleet_capped", False),
+            "fleet_total": _cov.get("fleet_total", 0),
         }
     except Exception:
         logger.warning(

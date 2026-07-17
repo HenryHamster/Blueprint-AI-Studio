@@ -915,6 +915,12 @@ export function SettingsOrchestratorSection({
                     {!proofTrialsEnabled && ' — enable execution trials below to earn proof automatically'}
                   </p>
                 )}
+                {cov.fleet_capped && (
+                  <p className="text-xs text-amber-600/70" data-testid="proof-gate-fleet-capped-warning">
+                    Coverage sampled from {cov.num_projects} of {cov.fleet_total} projects
+                    — increase sweep project cap for complete picture
+                  </p>
+                )}
               </div>
             );
           })()}

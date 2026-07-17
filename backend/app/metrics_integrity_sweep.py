@@ -4763,10 +4763,11 @@ async def check_capability_proof_gate_auto_graduation(
     elif current_mode == "observe" and coverage_ratio >= enforce_threshold:
         advance_to = "enforce"
 
-    # Refuse to advance to enforce when the fleet has more projects than the
-    # sample cap: unseen projects may be unproven, so coverage looks artificially
-    # high and graduating to enforce would block tasks for projects never checked.
-    if advance_to == "enforce" and coverage.get("fleet_capped"):
+    # Refuse to advance when the fleet exceeds the sample cap: unseen projects may
+    # be unproven, so coverage looks artificially high. For enforce this would
+    # block tasks for projects never checked; for observe the blast radius is
+    # log-only, but the asymmetry is surprising and the signal is unreliable.
+    if advance_to and coverage.get("fleet_capped"):
         fleet_total = coverage.get("fleet_total", "?")
         return [
             CheckResult(
@@ -4775,7 +4776,7 @@ async def check_capability_proof_gate_auto_graduation(
                 subject="global",
                 detail=(
                     f"fleet has {fleet_total} projects but sample cap is "
-                    f"{ctx.max_projects}; cannot safely graduate to enforce "
+                    f"{ctx.max_projects}; cannot safely graduate to {advance_to} "
                     "without complete fleet coverage — increase "
                     "metrics_integrity_sweep_max_projects or prove all projects "
                     "within the current cap first"

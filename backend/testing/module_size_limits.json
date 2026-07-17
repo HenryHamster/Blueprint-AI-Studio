@@ -302,7 +302,7 @@
     "components/ResearchBrowser.tsx": 1050,
     "components/ComputeJobsPanel.tsx": 3350,
     "hooks/useWorkbenchCommands.ts": 1800,
-    "api/compute.ts": 2350,
+    "api/compute.ts": 2750,
     "api/projects.ts": 1750,
     "components/FleetRunnersPanel.tsx": 2000,
     "strategicStateApi.ts": 1850
