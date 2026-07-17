@@ -48,6 +48,7 @@ from app.review_pipeline import (
     _format_repeating_issues_section,
     build_ci_failure_fix_prompt,
     build_merge_conflict_fix_prompt,
+    build_migration_guard_fix_prompt,
     compute_drift_signal,
     detect_early_nonconvergence,
     detect_fix_all_issue_class,
@@ -102,6 +103,37 @@ class TestMergeConflictFixPrompt:
     def test_omits_merge_error_section_when_absent(self):
         prompt = build_merge_conflict_fix_prompt(7, "main")
         assert "Original merge error" not in prompt
+
+
+class TestMigrationGuardFixPrompt:
+    """The migration repair must distinguish duplicate intent from new work."""
+
+    def test_drops_semantic_duplicate_instead_of_renumbering_it(self):
+        prompt = build_migration_guard_fix_prompt(
+            pr_number=15420,
+            base_branch="automain",
+            guard_reason="duplicate migration revision 0625",
+        )
+
+        assert "PR #15420" in prompt
+        assert "Guard reason: duplicate migration revision 0625" in prompt
+        low = prompt.lower()
+        assert "same schema change" in low
+        assert "drop this pr's semantically duplicate migration" in low
+        assert "do not renumber a semantically duplicate migration" in low
+        assert "do not decide from revision numbers or filenames alone" in low
+
+    def test_renumbers_only_genuinely_new_schema_work(self):
+        prompt = build_migration_guard_fix_prompt(
+            pr_number=15421,
+            base_branch="automain",
+            guard_reason="revision id collides with base",
+        )
+
+        low = prompt.lower()
+        assert "only when the pr contains genuinely new schema work" in low
+        assert "renumber that pr migration" in low
+        assert "rechain each remaining pr migration" in low
 
 
 # ── gh-token prompt pattern ────────────────────────────────────────────────────

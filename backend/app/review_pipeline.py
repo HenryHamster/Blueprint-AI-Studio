@@ -1400,7 +1400,14 @@ def build_migration_guard_fix_prompt(
     base_branch: str,
     guard_reason: str,
 ) -> str:
-    """Prompt for a deterministic Alembic pre-merge guard recovery task."""
+    """Prompt for a deterministic Alembic pre-merge guard recovery task.
+
+    A revision collision does not necessarily mean the PR still has new schema
+    work to land. Another PR may already have shipped the same schema change
+    under a different revision. The repair prompt must make that semantic
+    distinction before suggesting a mechanical renumber; otherwise the fix lane
+    can manufacture a second migration for a change that is already on base.
+    """
     return (
         f"PR #{pr_number} cannot merge into `{base_branch}` because Blueprint's "
         "pre-merge Alembic combined-chain guard found a deterministic migration "
@@ -1409,18 +1416,23 @@ def build_migration_guard_fix_prompt(
         "Your task is only to repair the PR's Alembic migration chain so it is "
         f"valid against the current `{base_branch}` branch.\n\n"
         "  1. Inspect the PR's added/modified files under "
-        "`backend/alembic/versions` and the current migration heads on the base "
-        "branch.\n"
-        "  2. Renumber any PR migration revision that already exists on the base "
-        "branch to the next unused revision id, and update the filename and "
-        "in-file `revision` consistently.\n"
-        "  3. Rechain the PR migration's `down_revision` onto the current base "
-        "head. If the PR contains a sequence of migrations, preserve their "
-        "relative order and rechain each descendant onto the newly renumbered "
-        "predecessor.\n"
-        "  4. Do not edit, delete, or rename migrations that already exist on "
+        "`backend/alembic/versions` and compare each migration's schema intent "
+        "with the migrations and resulting schema already present on the base "
+        "branch; do not decide from revision numbers or filenames alone.\n"
+        "  2. If another PR already landed the same schema change on the base "
+        "branch, drop this PR's semantically duplicate migration and rebase the "
+        "remaining code/tests onto the base implementation. Do not renumber a "
+        "semantically duplicate migration into a second migration.\n"
+        "  3. Only when the PR contains genuinely new schema work whose revision "
+        "id collides with the base, renumber that PR migration to the next unused "
+        "revision id and update its filename and in-file `revision` consistently.\n"
+        "  4. Rechain each remaining PR migration's `down_revision` onto the "
+        "current base head. If the PR contains a sequence of migrations, "
+        "preserve their relative order and rechain each descendant onto its "
+        "updated predecessor.\n"
+        "  5. Do not edit, delete, or rename migrations that already exist on "
         "the base branch; only rewrite this PR's migration files.\n"
-        "  5. Run the relevant Alembic/backend checks, then commit and "
+        "  6. Run the relevant Alembic/backend checks, then commit and "
         "force-push with `--force-with-lease`."
     )
 
