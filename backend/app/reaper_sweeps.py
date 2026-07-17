@@ -1805,15 +1805,23 @@ async def sweep_orphaned_cross_base_children(session, *, batch_size: int = 500) 
 #      resurfaces on failure; the two are disjoint by message_type and together
 #      cover every 'linked' message.
 #   2. sweep_decay_stale_open_messages — auto-resolves an OPEN conversational
-#      (NOTE/FEEDBACK/QUESTION) item with no activity for STALE_OPEN_DECAY_DAYS and
-#      no live linked condition, stamping resolution 'auto-decayed (stale)'.
+#      (NOTE/FEEDBACK) item with no activity for STALE_OPEN_DECAY_DAYS and no
+#      live linked condition, stamping resolution 'auto-decayed (stale)'.
+#      Unanswered QUESTION items age out at a longer window (STALE_QUESTION_DECAY_DAYS)
+#      and receive a distinct resolution reason 'stale_unanswered' so the operator
+#      can distinguish auto-resolved from genuinely-answered questions.
 #      Genuinely-live BLOCKER items are never decayed.
 
-# Decay window (days) after which a stale open conversational message is
+# Decay window (days) after which a stale open NOTE/FEEDBACK message is
 # auto-resolved. Exposed as a module constant so the one-time backlog migration
 # reuses the SAME threshold; overridable at runtime via
 # runtime_config['stale_open_message_decay_days'].
 STALE_OPEN_DECAY_DAYS = 14
+
+# Longer decay window for unanswered QUESTION messages — questions deserve more
+# patience than plain notes. Overridable at runtime via
+# runtime_config['stale_question_decay_days'].
+STALE_QUESTION_DECAY_DAYS = 30
 
 
 async def sweep_resolve_linked_messages(
@@ -1924,17 +1932,21 @@ async def sweep_decay_stale_open_messages(
     *,
     batch_size: int = 200,
 ) -> int:
-    """Auto-resolve dead conversational (NOTE/FEEDBACK) open threads.
+    """Auto-resolve dead conversational (NOTE/FEEDBACK/QUESTION) open threads.
 
-    Ages out any OPEN NOTE/FEEDBACK/QUESTION item with no activity for the decay
-    window (``STALE_OPEN_DECAY_DAYS``, overridable via
-    ``runtime_config['stale_open_message_decay_days']``) and no live linked
-    condition, stamping ``resolution='auto-decayed (stale)'``. Genuinely-live
-    BLOCKER items and any message carrying a live ``_convergence_link`` are left
-    untouched.
+    NOTE/FEEDBACK: aged out after ``STALE_OPEN_DECAY_DAYS`` (overridable via
+    ``runtime_config['stale_open_message_decay_days']``), stamping
+    ``resolution='auto-decayed (stale)'``.
 
-    Fail-safe per message, idempotent (resolution moves status off 'open'), and
-    broadcasts a ``message_updated`` envelope per resolved row.
+    QUESTION: aged out after ``STALE_QUESTION_DECAY_DAYS`` (overridable via
+    ``runtime_config['stale_question_decay_days']``), stamping
+    ``resolution='stale_unanswered'`` so operators can distinguish auto-resolved
+    from genuinely-answered questions.
+
+    Genuinely-live BLOCKER items and any message carrying a live
+    ``_convergence_link`` are left untouched.  Fail-safe per message, idempotent
+    (resolution moves status off 'open'), and broadcasts a ``message_updated``
+    envelope per resolved row.
 
     Returns the number of messages auto-decayed.
     """
@@ -1953,7 +1965,13 @@ async def sweep_decay_stale_open_messages(
     decay_days = int(
         runtime_config.get("stale_open_message_decay_days", STALE_OPEN_DECAY_DAYS)
     )
-    cutoff = now - timedelta(days=decay_days)
+    question_decay_days = int(
+        runtime_config.get("stale_question_decay_days", STALE_QUESTION_DECAY_DAYS)
+    )
+    # Use the shorter cutoff for the DB fetch so we retrieve all candidates;
+    # per-message type logic below applies the correct window per row.
+    min_decay_days = min(decay_days, question_decay_days)
+    cutoff = now - timedelta(days=min_decay_days)
 
     msgs = (
         (
@@ -1982,9 +2000,25 @@ async def sweep_decay_stale_open_messages(
     if not msgs:
         return 0
 
+    question_cutoff = now - timedelta(days=question_decay_days)
     resolved = 0
     pending_broadcasts: list[tuple[str, dict]] = []
     for msg in msgs:
+        # Determine the effective decay window and resolution reason by type.
+        msg_type = (
+            msg.message_type.value
+            if hasattr(msg.message_type, "value")
+            else str(msg.message_type)
+        )
+        if msg_type == "QUESTION":
+            if (msg.created_at or now) > question_cutoff:
+                # Not yet old enough under the longer QUESTION window.
+                continue
+            resolution_reason = "stale_unanswered"
+            effective_decay_days = question_decay_days
+        else:
+            resolution_reason = "auto-decayed (stale)"
+            effective_decay_days = decay_days
         # Never decay an open item that still carries a live linked condition
         # (defensive — open items are normally unlinked, but a resurfaced link
         # can leave the stale forward pointer behind).
@@ -1995,17 +2029,19 @@ async def sweep_decay_stale_open_messages(
         ctx = msg.context or {}
         if ctx.get("audience") == OPERATOR_ACTION_NEEDED:
             continue
-        mark_message_resolved(msg, now, "auto-decayed (stale)")
+        mark_message_resolved(msg, now, resolution_reason)
         session.add(msg)
         resolved += 1
         pending_broadcasts.append(
             (str(msg.project_id), message_updated_event_payload(msg))
         )
         logger.info(
-            "[REAPER] stale-open decay: auto-resolved message %s (no activity "
-            "for >=%dd)",
+            "[REAPER] stale-open decay: auto-resolved %s message %s (no activity "
+            "for >=%dd, reason=%s)",
+            msg_type,
             msg.id,
-            decay_days,
+            effective_decay_days,
+            resolution_reason,
         )
 
     if resolved:
@@ -2924,6 +2960,7 @@ __all__ = [
     "sweep_resolve_linked_messages",
     "sweep_decay_stale_open_messages",
     "STALE_OPEN_DECAY_DAYS",
+    "STALE_QUESTION_DECAY_DAYS",
     "sweep_wake_delivery_stall_alerts",
     "sweep_closed_handmerge_prs",
     "sweep_protect_referenced_compute_image_digests",
