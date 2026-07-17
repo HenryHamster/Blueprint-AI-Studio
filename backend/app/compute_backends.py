@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import contextlib
 import hashlib
 import hmac
 import io
@@ -4076,6 +4077,30 @@ def _git_clone_ref(clone_url: str, ref: str, dest: str) -> None:
             raise RuntimeError(f"git checkout {ref} failed: {(co.stderr or '')[-500:]}")
 
 
+@dataclass(slots=True)
+class AsyncImageBuildDispatch:
+    """Returned by :func:`build_project_compute_image` when a REAL build was
+    handed to the off-orchestrator builder VM rather than run inline.
+
+    The build is NOT finished: the reaper poll sweep
+    (:func:`app.reaper_sweeps.sweep_poll_image_builds`) drives the reserved
+    :class:`ProjectComputeImageBuild` row to a terminal state and records the
+    ``ProjectComputeImage`` pin. Callers MUST treat this as "accepted, in
+    progress" (the admin endpoint returns HTTP 202; the auto-refresh sweep
+    reports ``status="dispatched"``) and NOT as a :class:`BuildResult`.
+
+    ``adopted`` is True when an in-flight build for the same ``(project, dep_hash)``
+    already existed and this trigger re-used it instead of provisioning a second
+    builder VM.
+    """
+
+    build_id: uuid.UUID
+    dep_hash: str
+    builder_vm_id: str | None
+    status: str
+    adopted: bool = False
+
+
 async def build_project_compute_image(
     project: "Project",
     *,
@@ -4087,8 +4112,10 @@ async def build_project_compute_image(
     _token_fn=None,
     _clone_fn=None,
     _build_fn=None,
+    _reserve_fn=None,
+    _backend=None,
 ) -> Any:
-    """Bake (or reuse) the project's compute image, returning a ``BuildResult``.
+    """Bake (or reuse) the project's compute image.
 
     Clones the project repo at *ref* into a temp dir, then delegates to
     ``scripts/build_compute_image.build_and_push`` which content-hashes the
@@ -4096,13 +4123,32 @@ async def build_project_compute_image(
     for platform credentials, and otherwise builds + pushes a digest-pinned
     image. Returns the build script's ``BuildResult`` (carries ``pinned_ref``).
 
+    **Off-orchestrator dispatch (config-gated).** Cloud Run has no docker daemon,
+    so the untrusted ``docker build`` cannot run inline on the deployed engine.
+    When :func:`image_builder_backend_enabled` is on and a REAL build is needed,
+    only the daemon-free work runs in-process here — clone + content-hash + the
+    source-input credential scan + the registry presence/digest check + the
+    ``dry_run`` early return — and the actual build is handed to the configured
+    :class:`ImageBuilderBackend`: a :class:`ProjectComputeImageBuild` row is
+    reserved, the builder VM is started, and this returns an
+    :class:`AsyncImageBuildDispatch` WITHOUT blocking on the build. The reaper
+    poll sweep finalizes it. An already-present image (or a ``dry_run`` request)
+    still returns a :class:`BuildResult` inline. When the flag is off the whole
+    build runs inline exactly as before (the fallback path, kept until the VM
+    lane is proven).
+
     *build_config* is the dict from :func:`resolve_project_compute_image_build`.
-    Hooks (``_token_fn``/``_clone_fn``/``_build_fn``) exist for tests; production
-    resolves an installation token and uses git + the real build script.
+    Hooks (``_token_fn``/``_clone_fn``/``_build_fn``/``_reserve_fn``/``_backend``)
+    exist for tests; production resolves an installation token and uses git + the
+    real build script / builder backend.
     """
     import tempfile as _tempfile
 
     build_fn = _build_fn or compute_image_build.build_and_push
+    # The async lane only makes sense for a REAL build — a dry_run is a pure
+    # daemon-free hash/scan and must stay inline (it is what the drift check and
+    # presence probe rely on).
+    async_dispatch = image_builder_backend_enabled() and not dry_run
 
     owner = (getattr(project, "github_owner", None) or "").strip()
     repo = (getattr(project, "github_repo", None) or "").strip()
@@ -4113,15 +4159,22 @@ async def build_project_compute_image(
         ref or getattr(project, "promotion_target", None) or "main"
     )
     image_name = str(build_config["name"]).rsplit("/", 1)[-1].split(":", 1)[0].split("@", 1)[0]
+    dockerfile = build_config.get("dockerfile") or ".blueprint/Dockerfile.compute"
+    build_args = dict(build_config.get("build_args") or {})
+    parent = build_config.get("parent")
 
     with _tempfile.TemporaryDirectory(prefix="compute-image-build-") as tmp:
         repo_dir = os.path.join(tmp, "repo")
 
         # Resolve a short-lived read token and clone (unless a hook overrides).
+        # The token is hoisted so the off-orchestrator dispatch can hand it to the
+        # builder VM for its own clone.
+        token = None
         if _clone_fn is not None:
             await asyncio.to_thread(_clone_fn, owner, repo, resolved_ref, repo_dir)
+            if _token_fn is not None:
+                token = await _token_fn(project)
         else:
-            token = None
             if _token_fn is not None:
                 token = await _token_fn(project)
             else:
@@ -4143,18 +4196,201 @@ async def build_project_compute_image(
 
         resolved_dep_files = list(dep_files) if dep_files is not None else _discover_dep_files(repo_dir)
 
+        if async_dispatch:
+            # Daemon-free probe: content-hash + source credential scan + registry
+            # presence/digest check, with NO docker build. An already-present
+            # image (or a scan finding, which raises) returns inline; anything
+            # that would actually build is dispatched to the builder VM.
+            probe = await asyncio.to_thread(
+                build_fn,
+                repo_dir=repo_dir,
+                registry_repo=registry_repo,
+                image_name=image_name,
+                dockerfile=dockerfile,
+                dep_files=resolved_dep_files,
+                parent=parent,
+                build_args=dict(build_args),
+                dry_run=True,
+            )
+            if getattr(probe, "already_present", False):
+                return probe
+            return await _dispatch_async_image_build(
+                project=project,
+                registry_repo=registry_repo,
+                image_name=image_name,
+                dep_hash=getattr(probe, "dep_hash", "") or "",
+                owner=owner,
+                repo=repo,
+                ref=resolved_ref,
+                repo_token=token or "",
+                dockerfile=dockerfile,
+                dep_files=resolved_dep_files,
+                build_args=build_args,
+                parent=parent,
+                _reserve_fn=_reserve_fn,
+                _backend=_backend,
+            )
+
         result = await asyncio.to_thread(
             build_fn,
             repo_dir=repo_dir,
             registry_repo=registry_repo,
             image_name=image_name,
-            dockerfile=build_config.get("dockerfile") or ".blueprint/Dockerfile.compute",
+            dockerfile=dockerfile,
             dep_files=resolved_dep_files,
-            parent=build_config.get("parent"),
-            build_args=dict(build_config.get("build_args") or {}),
+            parent=parent,
+            build_args=dict(build_args),
             dry_run=dry_run,
         )
     return result
+
+
+async def reserve_project_compute_image_build(
+    session: Any,
+    *,
+    project_id: uuid.UUID,
+    dep_hash: str,
+    registry_repo: str,
+    image_name: str,
+    deadline_at: datetime | None = None,
+) -> ProjectComputeImageBuild:
+    """Reserve (or adopt) a :class:`ProjectComputeImageBuild` tracking row.
+
+    Idempotent on ``(project_id, dep_hash)``: a re-trigger for the same
+    dependency hash while a build is still ``PENDING``/``BUILDING`` returns the
+    existing row rather than inserting a duplicate — a duplicate would provision
+    a second builder VM (double-spend) and produce two poll-sweep finalizers for
+    one image. A fresh reservation is inserted ``PENDING``; the caller flips it to
+    ``BUILDING`` once the VM is started. Commits the session.
+    """
+    from sqlalchemy import select
+
+    existing = (
+        await session.execute(
+            select(ProjectComputeImageBuild)
+            .where(
+                ProjectComputeImageBuild.project_id == project_id,
+                ProjectComputeImageBuild.dep_hash == dep_hash,
+                ProjectComputeImageBuild.status.in_(
+                    [
+                        ComputeImageBuildStatus.PENDING,
+                        ComputeImageBuildStatus.BUILDING,
+                    ]
+                ),
+            )
+            .order_by(ProjectComputeImageBuild.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        return existing
+
+    row = ProjectComputeImageBuild(
+        project_id=project_id,
+        dep_hash=dep_hash,
+        registry_repo=registry_repo,
+        image_name=image_name,
+        status=ComputeImageBuildStatus.PENDING,
+        deadline_at=deadline_at,
+    )
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    return row
+
+
+async def _dispatch_async_image_build(
+    *,
+    project: "Project",
+    registry_repo: str,
+    image_name: str,
+    dep_hash: str,
+    owner: str,
+    repo: str,
+    ref: str,
+    repo_token: str,
+    dockerfile: str,
+    dep_files: Sequence[str],
+    build_args: dict[str, str],
+    parent: str | None,
+    _reserve_fn=None,
+    _backend=None,
+) -> AsyncImageBuildDispatch:
+    """Reserve a tracking row, start the builder VM, and return without blocking.
+
+    On :meth:`ImageBuilderBackend.start` failure the reserved row is marked
+    ``FAILED`` (so it never lingers ``PENDING``) and a ``RuntimeError`` is raised
+    — the admin endpoint surfaces it as a 422 and the auto-refresh sweep isolates
+    it. The reaper poll sweep is what finalizes a successfully-started build.
+    """
+    from app.database import AsyncSessionLocal
+
+    reserve_fn = _reserve_fn or reserve_project_compute_image_build
+    backend = _backend if _backend is not None else get_image_builder_backend()
+    deadline_at = _utcnow() + timedelta(seconds=_IMAGE_BUILDER_DEADLINE_SECONDS)
+
+    async with AsyncSessionLocal() as session:
+        build_row = await reserve_fn(
+            session,
+            project_id=project.id,
+            dep_hash=dep_hash,
+            registry_repo=registry_repo,
+            image_name=image_name,
+            deadline_at=deadline_at,
+        )
+        # Adopt an already-dispatched in-flight build instead of starting a
+        # second VM for the same dependency hash.
+        if (
+            build_row.status == ComputeImageBuildStatus.BUILDING
+            and build_row.builder_vm_id
+        ):
+            return AsyncImageBuildDispatch(
+                build_id=build_row.id,
+                dep_hash=dep_hash,
+                builder_vm_id=build_row.builder_vm_id,
+                status=ComputeImageBuildStatus.BUILDING.value,
+                adopted=True,
+            )
+
+        request = ImageBuildRequest(
+            build_id=build_row.id,
+            project_id=project.id,
+            dep_hash=dep_hash,
+            registry_repo=registry_repo,
+            image_name=image_name,
+            repo_clone={"owner": owner, "repo": repo, "ref": ref},
+            repo_token=repo_token,
+            dockerfile=dockerfile,
+            dep_files=tuple(dep_files),
+            build_args=dict(build_args or {}),
+            parent=parent,
+            deadline_at=deadline_at,
+        )
+        try:
+            handle = await backend.start(request)
+        except Exception as e:  # noqa: BLE001 — record the failure, don't leak PENDING
+            build_row.status = ComputeImageBuildStatus.FAILED
+            build_row.error_reason = f"builder start failed: {e}"[:2000]
+            build_row.updated_at = _utcnow()
+            session.add(build_row)
+            with contextlib.suppress(Exception):
+                await session.commit()
+            raise RuntimeError(f"image-builder dispatch failed: {e}") from e
+
+        build_row.status = ComputeImageBuildStatus.BUILDING
+        build_row.builder_vm_id = handle.external_id
+        build_row.zone = handle.zone
+        build_row.started_at = handle.started_at
+        build_row.deadline_at = deadline_at
+        build_row.updated_at = _utcnow()
+        session.add(build_row)
+        await session.commit()
+        return AsyncImageBuildDispatch(
+            build_id=build_row.id,
+            dep_hash=dep_hash,
+            builder_vm_id=handle.external_id,
+            status=ComputeImageBuildStatus.BUILDING.value,
+        )
 
 
 def _parse_digest_from_pinned_ref(pinned_ref: str | None) -> str | None:
@@ -4599,6 +4835,27 @@ async def refresh_project_compute_image(
         finally:
             if acquired:
                 build_semaphore.release()
+
+        # Off-orchestrator dispatch: the real build was handed to a builder VM and
+        # is NOT finished — there is nothing to record yet. The reaper poll sweep
+        # (sweep_poll_image_builds) drives the reserved row to terminal and records
+        # the pin. Report the dispatch so the sweep can count it.
+        if isinstance(result, AsyncImageBuildDispatch):
+            logger.info(
+                "[COMPUTE-IMAGE] auto-refresh dispatched async build for "
+                "project=%s dep_hash=%s build_id=%s (adopted=%s)",
+                project_id,
+                dep_hash,
+                result.build_id,
+                result.adopted,
+            )
+            return {
+                "status": "dispatched",
+                "dep_hash": dep_hash,
+                "build_id": str(result.build_id),
+                "builder_vm_id": result.builder_vm_id,
+                "adopted": result.adopted,
+            }
 
         result = await _preserve_existing_digest_pin_cb(session, project_id, result)
         row = await record_fn(

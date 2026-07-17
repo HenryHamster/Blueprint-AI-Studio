@@ -1454,6 +1454,268 @@ async def test_refresh_hash_matches_build_and_push_input_keying(db):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Driver: off-orchestrator async dispatch (build_project_compute_image)
+#
+# When COMPUTE_IMAGE_BUILDER_BACKEND_ENABLED is on and a REAL build is needed,
+# build_project_compute_image runs only the daemon-free work in-process (clone +
+# hash + credential scan + presence probe) and hands the build to the configured
+# ImageBuilderBackend, returning an AsyncImageBuildDispatch WITHOUT blocking.
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class _StubImageBuilderBackend:
+    """Records ``start`` calls and returns a fixed handle (no cloud I/O)."""
+
+    name = "stub"
+
+    def __init__(self, external_id="img-build-stub", zone="us-central1-a"):
+        self._external_id = external_id
+        self._zone = zone
+        self.started: list = []
+
+    def external_id_for(self, request):
+        return self._external_id
+
+    async def start(self, request):
+        self.started.append(request)
+        return _cb.ImageBuildHandle(
+            external_id=self._external_id,
+            zone=self._zone,
+            started_at=_cb._utcnow(),
+            message="stub provisioned",
+        )
+
+
+def _patch_app_session_to(monkeypatch, db):
+    """Point ``app.database.AsyncSessionLocal`` at the test session.
+
+    ``_dispatch_async_image_build`` reserves its tracking row through
+    ``AsyncSessionLocal`` (a fresh session, isolated from the request's), so tests
+    redirect it to the in-memory ``db`` to observe the reserved/updated row.
+    """
+
+    class _CM:
+        async def __aenter__(self):
+            return db
+
+        async def __aexit__(self, *exc):
+            return False
+
+    monkeypatch.setattr("app.database.AsyncSessionLocal", lambda: _CM())
+
+
+def _not_present_build(**kwargs):
+    """A daemon-free probe result: nothing in the registry => a real build needed."""
+    return BuildResult(
+        pinned_ref=f"{kwargs['registry_repo']}/{kwargs['image_name']}:newhash",
+        tag="newhash",
+        dep_hash="newhash",
+        already_present=False,
+        built=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_build_dispatches_async_when_backend_enabled(db, monkeypatch):
+    """Flag on + real build needed => reserve a row, start the VM, return dispatch."""
+    monkeypatch.setenv("COMPUTE_IMAGE_BUILDER_BACKEND_ENABLED", "true")
+    _patch_app_session_to(monkeypatch, db)
+    project = await _make_repo_project(db)
+
+    backend = _StubImageBuilderBackend(external_id="img-build-xyz", zone="us-c1-a")
+
+    def _noop_clone(owner, repo, ref, dest):
+        return None
+
+    result = await _cb.build_project_compute_image(
+        project,
+        registry_repo="reg/compute-images",
+        build_config={"name": "reg/compute-images/widget-compute", "build": {}},
+        _clone_fn=_noop_clone,
+        _token_fn=lambda p: _async("tok"),
+        _build_fn=_not_present_build,
+        _backend=backend,
+    )
+
+    # The dispatch sentinel — NOT a BuildResult.
+    assert isinstance(result, _cb.AsyncImageBuildDispatch)
+    assert result.status == "BUILDING"
+    assert result.builder_vm_id == "img-build-xyz"
+    assert result.adopted is False
+    # The builder VM was started exactly once with the right coordinates.
+    assert len(backend.started) == 1
+    req = backend.started[0]
+    assert req.image_name == "widget-compute"
+    assert req.repo_clone == {"owner": "acme", "repo": "widget", "ref": "main"}
+    assert req.repo_token == "tok"
+
+    # A durable BUILDING tracking row was reserved and updated with VM details.
+    from app.models import ComputeImageBuildStatus, ProjectComputeImageBuild
+
+    rows = (
+        await db.execute(select(ProjectComputeImageBuild))
+    ).scalars().all()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.id == result.build_id
+    assert row.status == ComputeImageBuildStatus.BUILDING
+    assert row.builder_vm_id == "img-build-xyz"
+    assert row.zone == "us-c1-a"
+    assert row.deadline_at is not None
+    assert row.dep_hash == "newhash"
+
+
+@pytest.mark.asyncio
+async def test_build_returns_inline_when_backend_disabled(db, monkeypatch):
+    """Flag off => the whole build runs inline and returns a BuildResult (fallback)."""
+    monkeypatch.delenv("COMPUTE_IMAGE_BUILDER_BACKEND_ENABLED", raising=False)
+    project = await _make_repo_project(db)
+
+    backend = _StubImageBuilderBackend()
+    built = BuildResult(
+        pinned_ref="reg/compute-images/widget-compute@" + _DIGEST_A,
+        tag="newhash",
+        dep_hash="newhash",
+        already_present=False,
+        built=True,
+        digest=_DIGEST_A,
+    )
+
+    def _inline_build(**kwargs):
+        assert kwargs["dry_run"] is False, "flag-off path builds inline, not a probe"
+        return built
+
+    def _noop_clone(owner, repo, ref, dest):
+        return None
+
+    result = await _cb.build_project_compute_image(
+        project,
+        registry_repo="reg/compute-images",
+        build_config={"name": "reg/compute-images/widget-compute", "build": {}},
+        _clone_fn=_noop_clone,
+        _build_fn=_inline_build,
+        _backend=backend,
+    )
+
+    assert result is built
+    assert backend.started == [], "no VM must be provisioned when the flag is off"
+
+
+@pytest.mark.asyncio
+async def test_build_already_present_returns_inline_without_dispatch(db, monkeypatch):
+    """Flag on but image already present => return inline, do NOT start a VM."""
+    monkeypatch.setenv("COMPUTE_IMAGE_BUILDER_BACKEND_ENABLED", "true")
+    _patch_app_session_to(monkeypatch, db)
+    project = await _make_repo_project(db)
+
+    backend = _StubImageBuilderBackend()
+    present = BuildResult(
+        pinned_ref="reg/compute-images/widget-compute@" + _DIGEST_B,
+        tag="oldhash",
+        dep_hash="oldhash",
+        already_present=True,
+        built=False,
+        digest=_DIGEST_B,
+    )
+
+    def _noop_clone(owner, repo, ref, dest):
+        return None
+
+    result = await _cb.build_project_compute_image(
+        project,
+        registry_repo="reg/compute-images",
+        build_config={"name": "reg/compute-images/widget-compute", "build": {}},
+        _clone_fn=_noop_clone,
+        _token_fn=lambda p: _async("tok"),
+        _build_fn=lambda **k: present,
+        _backend=backend,
+    )
+
+    assert result is present, "an already-present image returns the probe inline"
+    assert backend.started == [], "no VM for an already-present image"
+    from app.models import ProjectComputeImageBuild
+
+    rows = (await db.execute(select(ProjectComputeImageBuild))).scalars().all()
+    assert rows == [], "no tracking row reserved when nothing is built"
+
+
+@pytest.mark.asyncio
+async def test_reserve_is_idempotent_for_in_flight_dep_hash(db):
+    """A second reservation for an in-flight (project, dep_hash) adopts the row."""
+    from app.models import ComputeImageBuildStatus, ProjectComputeImageBuild
+
+    project = await _make_repo_project(db)
+
+    first = await _cb.reserve_project_compute_image_build(
+        db,
+        project_id=project.id,
+        dep_hash="h1",
+        registry_repo="reg/compute-images",
+        image_name="widget-compute",
+    )
+    first.status = ComputeImageBuildStatus.BUILDING
+    db.add(first)
+    await db.commit()
+
+    second = await _cb.reserve_project_compute_image_build(
+        db,
+        project_id=project.id,
+        dep_hash="h1",
+        registry_repo="reg/compute-images",
+        image_name="widget-compute",
+    )
+    assert second.id == first.id, "an in-flight build must be adopted, not duplicated"
+    rows = (await db.execute(select(ProjectComputeImageBuild))).scalars().all()
+    assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_refresh_reports_dispatched_when_build_goes_async(db):
+    """When build_fn dispatches async, refresh reports 'dispatched' and records nothing.
+
+    The reaper poll sweep — not the refresh driver — records the pin once the
+    builder VM completes, so a dispatched build must NOT write a ProjectComputeImage
+    row here.
+    """
+    project = await _make_repo_project(db)
+    build_id = uuid.uuid4()
+
+    async def _dispatch_build(proj, *, registry_repo, build_config, ref=None):
+        return _cb.AsyncImageBuildDispatch(
+            build_id=build_id,
+            dep_hash="newhash",
+            builder_vm_id="img-build-async",
+            status="BUILDING",
+        )
+
+    recorded: list = []
+
+    async def _record_spy(session, project_id, registry_repo, image_name, result):
+        recorded.append(result)
+        return await _record_row(session, project_id, registry_repo, image_name, result)
+
+    result = await _cb.refresh_project_compute_image(
+        db,
+        project,
+        _manifest_fn=lambda _p: _async(_BUILD_MANIFEST),
+        _token_fn=lambda o, r: _async("tok"),
+        _default_branch_fn=lambda t, o, r: _async("main"),
+        _fetch_bytes_fn=_fetch_bytes_stub(
+            {".blueprint/Dockerfile.compute": b"FROM python:3.11-slim\n"}
+        ),
+        _tag_exists_fn=lambda full_repo, dep_hash: False,  # absent => rebuild
+        _build_fn=_dispatch_build,
+        _record_fn=_record_spy,
+    )
+    assert result["status"] == "dispatched"
+    assert result["build_id"] == str(build_id)
+    assert result["builder_vm_id"] == "img-build-async"
+    assert recorded == [], "a dispatched build records nothing until the poll sweep"
+    rows = (await db.execute(select(ProjectComputeImage))).scalars().all()
+    assert rows == []
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Sweep: sweep_refresh_project_compute_images
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1564,6 +1826,40 @@ async def test_sweep_caps_builds_per_cycle(db):
     assert result["rebuilt"] == 2
     assert result["deferred"] == 2
     assert result["projects"] == 4
+
+
+@pytest.mark.asyncio
+async def test_sweep_counts_dispatched_and_charges_the_build_budget(db):
+    """An async 'dispatched' result is counted and spends the per-cycle budget.
+
+    A dispatch kicks off a real (off-orchestrator) build, so it must charge the
+    same per-cycle build budget a synchronous rebuild does — otherwise the sweep
+    would fan out unbounded builder VMs in one pass.
+    """
+    for i in range(3):
+        await _make_repo_project(db, name=f"p{i}")
+
+    async def _refresh(session, project, *, allow_build=True, **kwargs):
+        if not allow_build:
+            return {"status": "deferred", "reason": "build_budget_exhausted"}
+        return {
+            "status": "dispatched",
+            "dep_hash": "h",
+            "build_id": str(uuid.uuid4()),
+            "builder_vm_id": "vm",
+        }
+
+    with patch("app.reaper_sweeps._last_compute_image_refresh_sweep", None):
+        result = await sweep_refresh_project_compute_images(
+            db,
+            now=datetime(2026, 6, 1, 12, 0, 0),
+            _refresh_fn=_refresh,
+            _build_semaphore=asyncio.Semaphore(1),
+            max_builds_per_cycle=2,
+        )
+    assert result["dispatched"] == 2
+    assert result["deferred"] == 1, "dispatch charges the budget like a rebuild"
+    assert result["projects"] == 3
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -2818,6 +2818,7 @@ async def sweep_refresh_project_compute_images(
         return {
             "projects": 0,
             "rebuilt": 0,
+            "dispatched": 0,
             "unchanged": 0,
             "no_config": 0,
             "deferred": 0,
@@ -2863,6 +2864,7 @@ async def sweep_refresh_project_compute_images(
     summary = {
         "projects": 0,
         "rebuilt": 0,
+        "dispatched": 0,
         "unchanged": 0,
         "no_config": 0,
         "deferred": 0,
@@ -2918,6 +2920,13 @@ async def sweep_refresh_project_compute_images(
                     project_id,
                     exc_info=True,
                 )
+        elif status == "dispatched":
+            # Off-orchestrator async build kicked off; it counts against the
+            # per-cycle build budget. The reaper poll sweep records the pin (and
+            # any drift alert fires once the pinned_ref is known), so nothing to
+            # record here.
+            summary["dispatched"] += 1
+            builds_done += 1
         elif status == "unchanged":
             summary["unchanged"] += 1
         elif status == "no_config":
@@ -2927,11 +2936,17 @@ async def sweep_refresh_project_compute_images(
         else:  # "error" or an unrecognized status
             summary["errors"] += 1
 
-    if summary["rebuilt"] or summary["deferred"] or summary["errors"]:
+    if (
+        summary["rebuilt"]
+        or summary["dispatched"]
+        or summary["deferred"]
+        or summary["errors"]
+    ):
         logger.info(
-            "[REAPER] compute-image auto-refresh: rebuilt=%d unchanged=%d "
-            "deferred=%d no_config=%d errors=%d (of %d project(s))",
+            "[REAPER] compute-image auto-refresh: rebuilt=%d dispatched=%d "
+            "unchanged=%d deferred=%d no_config=%d errors=%d (of %d project(s))",
             summary["rebuilt"],
+            summary["dispatched"],
             summary["unchanged"],
             summary["deferred"],
             summary["no_config"],

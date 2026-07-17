@@ -50,7 +50,14 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.database import get_session
-from app.models import Project, ProjectComputeImage, ProjectTool, _utcnow
+from app.models import (
+    ComputeImageBuildStatus,
+    Project,
+    ProjectComputeImage,
+    ProjectComputeImageBuild,
+    ProjectTool,
+    _utcnow,
+)
 from app.auth import (
     get_current_user,
     AGENT_JWT_SECRET,
@@ -1560,6 +1567,19 @@ async def trigger_project_compute_image_build(
     ``tag``, ``built``, ``already_present``.  Surfaces build failures (ValueError /
     RuntimeError from the pipeline) as a 422 rather than a 500 traceback.
 
+    **Async build contract (200 vs 202).** When the off-orchestrator builder
+    backend is enabled (``COMPUTE_IMAGE_BUILDER_BACKEND_ENABLED``) and a real
+    build is needed, the build is dispatched to a throwaway builder VM and this
+    returns **202 Accepted** with ``{status, build_id, builder_vm_id, dep_hash,
+    async: true, adopted}`` plus the legacy fields as unresolved placeholders
+    (``pinned_ref``/``digest`` null, ``built`` false). The build is finalized
+    asynchronously by the reaper poll sweep; poll
+    ``GET .../compute-image/status`` (which surfaces in-flight builds under
+    ``active_builds``) to observe completion. An already-present image and a
+    ``dry_run`` request still complete inline and return **200** with the
+    persisted fields. When the backend flag is off the whole build runs inline
+    and always returns 200 (the pre-existing behavior).
+
     **Requires OWNER role.** A build runs docker on the orchestrator host and
     pushes to the shared compute-image registry — a privileged, expensive,
     host-affecting operation, not the member-grade read/save that the rest of
@@ -1675,6 +1695,37 @@ async def trigger_project_compute_image_build(
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    # ASYNC CONTRACT: when the off-orchestrator builder backend is enabled and a
+    # real build is needed, the build was handed to a throwaway builder VM and is
+    # NOT finished — the reaper poll sweep finalizes the ProjectComputeImage pin.
+    # Return 202 with the tracking id instead of the synchronous build record.
+    # An already-present image or a ``dry_run`` request still completes inline and
+    # returns 200 with the persisted fields below, so existing callers that expect
+    # a synchronous result keep working for those cases; a caller that triggers a
+    # real async build MUST handle 202 (the ``async`` flag marks it).
+    if isinstance(result, _cb.AsyncImageBuildDispatch):
+        return Response(
+            content=_json.dumps(
+                {
+                    "status": result.status,
+                    "build_id": str(result.build_id),
+                    "builder_vm_id": result.builder_vm_id,
+                    "dep_hash": result.dep_hash,
+                    "async": True,
+                    "adopted": result.adopted,
+                    # Backward-compat fields the admin-ui already reads — present
+                    # but unresolved because the build has not completed yet.
+                    "pinned_ref": None,
+                    "digest": None,
+                    "tag": result.dep_hash,
+                    "built": False,
+                    "already_present": False,
+                }
+            ),
+            media_type="application/json",
+            status_code=202,
+        )
+
     result = await _preserve_existing_digest_pin(session, project.id, result)
 
     row = await _cb.record_project_compute_image_build(
@@ -1707,6 +1758,54 @@ async def trigger_project_compute_image_build(
 # (identical to the build path's hash computation) to detect staleness.
 
 
+async def _list_active_image_builds(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    registry_repo: str,
+    image_name: str,
+) -> list[Dict[str, Any]]:
+    """Serialize in-flight (PENDING/BUILDING) off-orchestrator builds for an image.
+
+    Returns the async-build tracking rows the reaper poll sweep has not yet
+    finalized, newest first, so the status endpoint can surface a dispatched
+    build before its ``ProjectComputeImage`` pin exists. Empty list when the
+    async builder lane is unused (the common case today).
+    """
+    rows = (
+        (
+            await session.execute(
+                select(ProjectComputeImageBuild)
+                .where(
+                    ProjectComputeImageBuild.project_id == project_id,
+                    ProjectComputeImageBuild.registry_repo == registry_repo,
+                    ProjectComputeImageBuild.image_name == image_name,
+                    ProjectComputeImageBuild.status.in_(
+                        [
+                            ComputeImageBuildStatus.PENDING,
+                            ComputeImageBuildStatus.BUILDING,
+                        ]
+                    ),
+                )
+                .order_by(ProjectComputeImageBuild.created_at.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return [
+        {
+            "build_id": str(b.id),
+            "status": b.status.value if hasattr(b.status, "value") else str(b.status),
+            "dep_hash": b.dep_hash,
+            "builder_vm_id": b.builder_vm_id,
+            "started_at": b.started_at.isoformat() if b.started_at else None,
+            "deadline_at": b.deadline_at.isoformat() if b.deadline_at else None,
+            "created_at": b.created_at.isoformat() if b.created_at else None,
+        }
+        for b in rows
+    ]
+
+
 @router.get("/projects/{project_id}/compute-image/status")
 async def get_project_compute_image_status(
     project_id: uuid.UUID,
@@ -1733,6 +1832,13 @@ async def get_project_compute_image_status(
     when the project does not declare a compute image it reports
     ``no_compute_image_declared`` — both as clean status values, not errors.
 
+    ``active_builds`` (present on ``built`` and ``never_built`` responses) lists
+    any in-flight off-orchestrator builds (PENDING/BUILDING
+    ``ProjectComputeImageBuild`` rows) the reaper poll sweep has not yet
+    finalized — this is how a caller polls an async build dispatched by the
+    trigger endpoint's 202 path. It is an empty list when no async build is in
+    flight (the common case today).
+
     The optional ``?check_drift=true`` param adds a ``drift`` object to the
     response, computed by cloning the project repo and running the same
     dependency-hash computation as the build pipeline (``dry_run=True``).  The
@@ -1752,6 +1858,14 @@ async def get_project_compute_image_status(
     name = compute_image.get("name", "")
     registry_repo, image_name, _ = _cb._split_image_ref(name)
 
+    # In-flight off-orchestrator builds (PENDING/BUILDING) for this exact image,
+    # surfaced alongside the durable ProjectComputeImage record so an operator can
+    # see an async build that has been dispatched but not yet finalized. Additive:
+    # the existing ``status`` values are unchanged.
+    active_builds = await _list_active_image_builds(
+        session, project_id, registry_repo, image_name
+    )
+
     # Query the latest ProjectComputeImage row matching this project/image.
     row = (
         await session.execute(
@@ -1767,7 +1881,7 @@ async def get_project_compute_image_status(
     ).scalar_one_or_none()
 
     if row is None:
-        return {"status": "never_built"}
+        return {"status": "never_built", "active_builds": active_builds}
 
     result: Dict[str, Any] = {
         "status": "built",
@@ -1779,6 +1893,7 @@ async def get_project_compute_image_status(
         "created_at": row.created_at.isoformat() if row.created_at else None,
         "updated_at": row.updated_at.isoformat() if row.updated_at else None,
         "is_digest_pinned": row.digest is not None,
+        "active_builds": active_builds,
     }
 
     if check_drift:

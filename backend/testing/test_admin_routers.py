@@ -32172,6 +32172,64 @@ class TestComputeImageBuildTrigger:
         assert body["built"] is True
 
     @pytest.mark.asyncio
+    async def test_async_dispatch_returns_202_with_build_id(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """A real build handed to the off-orchestrator builder returns 202.
+
+        When ``build_project_compute_image`` returns an ``AsyncImageBuildDispatch``
+        (the off-orchestrator VM lane), the endpoint must NOT block for a
+        synchronous build record — it returns 202 with the tracking id so the
+        caller can poll ``/compute-image/status`` for the reaper-finalized pin.
+        The legacy fields stay present (backward compatibility) but unresolved.
+        """
+        from app.compute_backends import AsyncImageBuildDispatch
+
+        build_id = uuid.uuid4()
+
+        async def dispatch_build(*a, **k):
+            return AsyncImageBuildDispatch(
+                build_id=build_id,
+                dep_hash="deadbeef",
+                builder_vm_id="img-build-abc123",
+                status="BUILDING",
+            )
+
+        apt = self._patch_pipeline(monkeypatch, build_fn=dispatch_build)
+        project = await _make_project(db_session, name="ImgBuild Async")
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/compute-image/build"
+        )
+
+        assert resp.status_code == 202, resp.text
+        body = resp.json()
+        assert body["build_id"] == str(build_id)
+        assert body["status"] == "BUILDING"
+        assert body["builder_vm_id"] == "img-build-abc123"
+        assert body["async"] is True
+        assert body["adopted"] is False
+        assert body["dep_hash"] == "deadbeef"
+        # Legacy fields preserved but unresolved — the build has not completed.
+        assert body["pinned_ref"] is None
+        assert body["digest"] is None
+        assert body["built"] is False
+        assert body["already_present"] is False
+        # No ProjectComputeImage pin is written on the async fast-return path.
+        from app.models import ProjectComputeImage
+
+        rows = (
+            await db_session.execute(
+                select(ProjectComputeImage).where(
+                    ProjectComputeImage.project_id == project.id
+                )
+            )
+        ).scalars().all()
+        assert rows == []
+        # The concurrency slot is released once the (fast) dispatch task ends.
+        assert not apt._compute_image_build_semaphore.locked()
+
+    @pytest.mark.asyncio
     async def test_concurrent_build_is_rejected_with_429(
         self, client: AsyncClient, db_session, monkeypatch
     ):
@@ -32514,7 +32572,67 @@ class TestComputeImageStatus:
         )
 
         assert resp.status_code == 200, resp.text
-        assert resp.json() == {"status": "never_built"}
+        # ``active_builds`` is additive and empty when no async build is in flight.
+        assert resp.json() == {"status": "never_built", "active_builds": []}
+
+    @pytest.mark.asyncio
+    async def test_status_surfaces_in_flight_async_builds(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """PENDING/BUILDING ProjectComputeImageBuild rows appear under active_builds.
+
+        An off-orchestrator build dispatched (202) but not yet finalized by the
+        reaper poll sweep must be visible here so the caller can poll it — and a
+        terminal (SUCCEEDED) row must NOT leak into the in-flight list.
+        """
+        from app.models import ComputeImageBuildStatus, ProjectComputeImageBuild
+
+        self._patch_manifest(
+            monkeypatch,
+            compute_image={
+                "name": "us-docker.pkg.dev/p/compute-images/proj:latest",
+                "build": {"dockerfile": ".blueprint/Dockerfile.compute"},
+            },
+        )
+        project = await _make_project(db_session, name="Active Build Project")
+
+        building = ProjectComputeImageBuild(
+            project_id=project.id,
+            dep_hash="deadbeef",
+            registry_repo="us-docker.pkg.dev/p/compute-images",
+            image_name="proj",
+            builder_vm_id="img-build-xyz",
+            status=ComputeImageBuildStatus.BUILDING,
+        )
+        # A terminal build for the same image must be excluded.
+        finished = ProjectComputeImageBuild(
+            project_id=project.id,
+            dep_hash="cafebabe",
+            registry_repo="us-docker.pkg.dev/p/compute-images",
+            image_name="proj",
+            builder_vm_id="img-build-old",
+            status=ComputeImageBuildStatus.SUCCEEDED,
+        )
+        db_session.add(building)
+        db_session.add(finished)
+        await db_session.commit()
+        await db_session.refresh(building)
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/compute-image/status"
+        )
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        # No ProjectComputeImage pin exists yet, so the durable status is
+        # never_built — but the in-flight build is surfaced alongside it.
+        assert body["status"] == "never_built"
+        assert len(body["active_builds"]) == 1
+        active = body["active_builds"][0]
+        assert active["build_id"] == str(building.id)
+        assert active["status"] == "BUILDING"
+        assert active["dep_hash"] == "deadbeef"
+        assert active["builder_vm_id"] == "img-build-xyz"
 
     @pytest.mark.asyncio
     async def test_status_returns_build_record(
