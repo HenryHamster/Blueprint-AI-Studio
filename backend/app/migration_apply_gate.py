@@ -71,6 +71,8 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.pool import NullPool
 from sqlmodel import SQLModel
 
+from cryptography.fernet import Fernet
+
 import app.github as github
 from app.deploy_smoketest import reflect_schema_drift
 from app.migration_chain import (
@@ -1030,6 +1032,11 @@ async def _run_migration_apply_subprocess(
     env["DATABASE_URL"] = scratch_url
     env["MIGRATION_APPLY_DATABASE_URL"] = scratch_url
     env["MIGRATION_APPLY_SCRIPT_LOCATION"] = script_location
+    # Some migrations (e.g. 0609) call _load_fernet() at import time and raise
+    # without a key — fail-closed by design. The scratch DB is empty and
+    # ephemeral, so no real key is needed; inject a synthetic one scoped only
+    # to this subprocess so the migration body can execute normally.
+    env["GITHUB_PAT_ENCRYPTION_KEY"] = Fernet.generate_key().decode()
     backend_root = os.path.dirname(os.path.dirname(__file__))
     proc = await asyncio.create_subprocess_exec(
         sys.executable,

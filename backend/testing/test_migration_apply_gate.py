@@ -835,7 +835,11 @@ async def test_apply_subprocess_receives_only_scratch_database_url(monkeypatch):
     assert env["MIGRATION_APPLY_DATABASE_URL"] == expected
     assert "prod" not in env["DATABASE_URL"]
     assert "BLUEPRINT_TEST_SECRET" not in env
-    assert "GITHUB_PAT_ENCRYPTION_KEY" not in env
+    # An ephemeral synthetic Fernet key is injected so fail-closed migrations
+    # (e.g. 0609) can execute in the scratch subprocess.  It must be present
+    # but must NOT equal the production value set above.
+    assert "GITHUB_PAT_ENCRYPTION_KEY" in env
+    assert env["GITHUB_PAT_ENCRYPTION_KEY"] != "must-not-leak-either"
     assert observed["kwargs"]["start_new_session"] == (os.name == "posix")
 
 
@@ -2244,6 +2248,102 @@ async def test_candidate_only_app_symbol_import_degrades_not_blocks(monkeypatch)
         f"serving-only import retried {apply_call_count} time(s); must degrade on first attempt"
     )
 
+
+# ---------------------------------------------------------------------------
+# Ephemeral Fernet key injection — regression tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ephemeral_fernet_key_is_injected_into_scratch_subprocess(monkeypatch):
+    """A synthetic Fernet key must be present in the scratch subprocess env so
+    fail-closed migrations (e.g. 0609) can execute.  It must be a valid base64
+    Fernet key (44 chars ending in '='), not the production value."""
+    import base64
+
+    import app.migration_apply_gate as gate_mod
+
+    monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", "production-key-must-not-leak")
+    observed = {}
+
+    class _CompletedProcess:
+        returncode = 0
+        pid = 456
+
+        async def communicate(self, input=None):
+            del input
+            return b"", b""
+
+    async def _spawn(*args, **kwargs):
+        observed["env"] = kwargs["env"]
+        return _CompletedProcess()
+
+    monkeypatch.setattr(gate_mod.asyncio, "create_subprocess_exec", _spawn)
+
+    class _FakeEngine:
+        url = make_url(
+            "postgresql+asyncpg://u:p@scratch-host:5432/ephemeral_fernet_test"
+        )
+
+    await gate_mod._run_migration_apply_subprocess(
+        _FakeEngine(),
+        "/tmp/script_loc",
+        timeout_code="migration_apply_replay_apply_timeout",
+    )
+
+    env = observed["env"]
+
+    # Key must be present (fail-closed migrations need it)
+    assert "GITHUB_PAT_ENCRYPTION_KEY" in env, "ephemeral key must be injected"
+
+    # Must NOT be the production value
+    assert env["GITHUB_PAT_ENCRYPTION_KEY"] != "production-key-must-not-leak", (
+        "production key must not leak into scratch subprocess"
+    )
+
+    # Must be a structurally valid Fernet key (32 raw bytes → 44 base64 chars)
+    raw = base64.urlsafe_b64decode(env["GITHUB_PAT_ENCRYPTION_KEY"] + "==")
+    assert len(raw) == 32, f"Fernet key must be 32 bytes, got {len(raw)}"
+
+
+@pytest.mark.asyncio
+async def test_ephemeral_fernet_key_differs_across_calls(monkeypatch):
+    """Each gate run must generate a FRESH ephemeral key — never reuse."""
+    import app.migration_apply_gate as gate_mod
+
+    monkeypatch.delenv("GITHUB_PAT_ENCRYPTION_KEY", raising=False)
+    keys_seen = []
+
+    class _CompletedProcess:
+        returncode = 0
+        pid = 789
+
+        async def communicate(self, input=None):
+            del input
+            return b"", b""
+
+    async def _spawn(*args, **kwargs):
+        keys_seen.append(kwargs["env"].get("GITHUB_PAT_ENCRYPTION_KEY"))
+        return _CompletedProcess()
+
+    monkeypatch.setattr(gate_mod.asyncio, "create_subprocess_exec", _spawn)
+
+    class _FakeEngine:
+        url = make_url(
+            "postgresql+asyncpg://u:p@scratch-host:5432/ephemeral_fernet_fresh"
+        )
+
+    for _ in range(3):
+        await gate_mod._run_migration_apply_subprocess(
+            _FakeEngine(),
+            "/tmp/script_loc",
+            timeout_code="migration_apply_replay_apply_timeout",
+        )
+
+    assert len(keys_seen) == 3
+    assert len(set(keys_seen)) == 3, (
+        "each gate run must generate a distinct ephemeral Fernet key"
+    )
 
 # --- Keyless-encryption artifact degrade (runs everywhere) --------------------
 #
