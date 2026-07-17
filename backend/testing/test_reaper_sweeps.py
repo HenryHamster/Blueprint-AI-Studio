@@ -1,16 +1,8 @@
-"""Tests for reaper sweep helpers.
-
-Covers:
-- Step 18e: unlinked BLOCKER decay (sweep_decay_stale_unlinked_blocker_messages)
-- Viewable-media retirement (sweep_retire_compute_job_viewable_files)
-"""
-
-import uuid
-from datetime import timedelta
-from unittest.mock import AsyncMock, MagicMock, patch
+"""Tests for reaper bug-message sweep helpers (Step 18e: unlinked BLOCKER decay)."""
 
 import pytest
 import pytest_asyncio
+from datetime import timedelta
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -21,7 +13,6 @@ from app.reaper_bug_message_sweeps import (
     STALE_OPEN_UNLINKED_BLOCKER_DECAY_DAYS,
     sweep_decay_stale_unlinked_blocker_messages,
 )
-from app.reaper_sweeps import sweep_retire_compute_job_viewable_files
 from app.time_utils import _utcnow
 
 
@@ -244,130 +235,3 @@ async def test_blocker_auto_decay_does_not_touch_bug_report(sweep_db):
     assert acted == 0
     await sweep_db.refresh(msg)
     assert msg.status == "open"
-
-
-# ── sweep_retire_compute_job_viewable_files ───────────────────────────────────
-
-
-def _fake_compute_job_file(storage_uri: str) -> MagicMock:
-    """Build a ComputeJobFile-like mock for use in session.execute results."""
-    row = MagicMock(spec_set=["id", "compute_job_id", "safe_relpath", "media_type",
-                               "storage_uri", "content_type", "file_size_bytes"])
-    row.id = uuid.uuid4()
-    row.compute_job_id = uuid.uuid4()
-    row.safe_relpath = "plot.png"
-    row.media_type = "image"
-    row.storage_uri = storage_uri
-    row.content_type = "image/png"
-    row.file_size_bytes = 1024
-    return row
-
-
-def _mock_session_returning(rows):
-    """Return an AsyncMock session whose execute().scalars().all() yields rows."""
-    mock_result = MagicMock()
-    mock_result.scalars.return_value.all.return_value = rows
-    session = AsyncMock()
-    session.execute.return_value = mock_result
-    return session
-
-
-@pytest.mark.asyncio
-async def test_sweep_retire_compute_job_viewable_files():
-    """Old terminal-job viewable files: GCS deleted and DB row removed."""
-    row = _fake_compute_job_file(
-        "gs://bucket/compute-jobs/abc/artifacts/viewable/plot.png"
-    )
-    session = _mock_session_returning([row])
-
-    with patch(
-        "app.reaper_sweeps.delete_storage_uri_best_effort",
-        new_callable=AsyncMock,
-        return_value=True,
-    ) as mock_del:
-        result = await sweep_retire_compute_job_viewable_files(session, batch_size=50)
-
-    assert result == 1
-    mock_del.assert_awaited_once_with(row.storage_uri)
-    session.delete.assert_awaited_once_with(row)
-    session.commit.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_sweep_retire_returns_zero_when_no_eligible_rows():
-    """No rows older than horizon: sweep returns 0 and commits nothing."""
-    session = _mock_session_returning([])
-
-    with patch(
-        "app.reaper_sweeps.delete_storage_uri_best_effort",
-        new_callable=AsyncMock,
-    ) as mock_del:
-        result = await sweep_retire_compute_job_viewable_files(session, batch_size=50)
-
-    assert result == 0
-    mock_del.assert_not_awaited()
-    session.commit.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_sweep_retire_gcs_failure_leaves_db_row():
-    """When GCS delete returns False the DB row must NOT be deleted."""
-    row = _fake_compute_job_file(
-        "gs://bucket/compute-jobs/abc/artifacts/viewable/vid.mp4"
-    )
-    session = _mock_session_returning([row])
-
-    with patch(
-        "app.reaper_sweeps.delete_storage_uri_best_effort",
-        new_callable=AsyncMock,
-        return_value=False,
-    ):
-        result = await sweep_retire_compute_job_viewable_files(session, batch_size=50)
-
-    assert result == 0
-    session.delete.assert_not_awaited()
-    session.commit.assert_not_awaited()
-    session.rollback.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_sweep_retire_batch_size_limits_query():
-    """batch_size=1 restricts the SELECT; only the returned rows are processed."""
-    row_a = _fake_compute_job_file(
-        "gs://bucket/compute-jobs/a/artifacts/viewable/a.png"
-    )
-    # The query honours the cap — simulate by returning only row_a.
-    session = _mock_session_returning([row_a])
-
-    with patch(
-        "app.reaper_sweeps.delete_storage_uri_best_effort",
-        new_callable=AsyncMock,
-        return_value=True,
-    ) as mock_del:
-        result = await sweep_retire_compute_job_viewable_files(session, batch_size=1)
-
-    assert result == 1
-    mock_del.assert_awaited_once_with(row_a.storage_uri)
-
-
-@pytest.mark.asyncio
-async def test_sweep_retire_timeout_rolls_back():
-    """TimeoutError during GCS deletes triggers rollback and returns 0."""
-    row = _fake_compute_job_file(
-        "gs://bucket/compute-jobs/abc/artifacts/viewable/plot.png"
-    )
-    session = _mock_session_returning([row])
-
-    with patch(
-        "app.reaper_sweeps.delete_storage_uri_best_effort",
-        new_callable=AsyncMock,
-        side_effect=TimeoutError,
-    ):
-        result = await sweep_retire_compute_job_viewable_files(
-            session, batch_size=50
-        )
-
-    assert result == 0
-    session.delete.assert_not_awaited()
-    session.commit.assert_not_awaited()
-    session.rollback.assert_awaited_once()

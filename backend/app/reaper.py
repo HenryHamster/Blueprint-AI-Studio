@@ -289,7 +289,6 @@ from app.reaper_sweeps import (
     sweep_stuck_qualifications,
     sweep_evergreen_fill_decision_retention,
     sweep_expired_message_attachment_uploads,
-    sweep_retire_compute_job_viewable_files,
     sweep_routine_message_retention,
     sweep_unblock_blocked_tasks,
     sweep_recover_stranded_transient_blockers,
@@ -2857,19 +2856,6 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(
                         f"[REAPER] Expired message attachment cleanup: {e}",
-                        exc_info=True,
-                    )
-                    with contextlib.suppress(Exception):
-                        await session.rollback()
-
-                # Step 10a2: Retire individually-addressable viewable compute-job
-                # media whose owning job is older than the retention horizon.
-                _mark_reaper_progress()
-                try:
-                    await sweep_retire_compute_job_viewable_files(session)
-                except Exception as e:
-                    logger.error(
-                        f"[REAPER] Viewable-media retirement sweep: {e}",
                         exc_info=True,
                     )
                     with contextlib.suppress(Exception):
