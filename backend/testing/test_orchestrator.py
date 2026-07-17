@@ -738,7 +738,7 @@ def test_select_eligible_runner_requires_explicit_browser_proof():
 
 
 @pytest.mark.asyncio
-async def test_browser_required_task_falls_through_without_runner_proof(db_session):
+async def test_visual_evidence_task_falls_through_without_runner_proof(db_session):
     from app.orchestrator_runner_dispatch import (
         RunnerDispatchSnapshot,
         _try_runner_dispatch,
@@ -751,7 +751,12 @@ async def test_browser_required_task_falls_through_without_runner_proof(db_sessi
     task = make_task(
         project_id=project.id,
         status=TaskStatus.QUEUED,
-        payloads=[{"type": "salvage_bundle", "requires_browser": True}],
+        payloads=[
+            {
+                "type": "refactor",
+                "acceptance_evidence": {"kind": "visual", "component": "Gallery"},
+            }
+        ],
     )
     db_session.add(task)
     await db_session.commit()
