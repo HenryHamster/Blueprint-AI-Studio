@@ -267,6 +267,67 @@ def test_backfill_rejects_ciphertext_encrypted_with_a_different_key(monkeypatch)
         assert _stored(conn, "userintegration", "github_pat", "ui-1") == ciphertext
 
 
+def test_0626_does_not_double_encrypt_rows_already_encrypted_by_prior_migrations(monkeypatch):
+    """Cross-migration ordering proof: 0626 skips rows encrypted by 0531/0609/0621.
+
+    The qualification finding claimed that 0531/0609/0621 running BEFORE 0626's
+    wrong-key ciphertext guard leaves a double-encryption window for old rows.
+
+    This test pins the refutation: 0626's primary idempotency guard
+    (decrypt_field(value) != value, 0626:L208) fires on any ciphertext produced
+    by a prior migration using the SAME key, so no prior migration creates rows
+    that 0626 would re-encrypt.
+
+    Simulation:
+      1. Encrypt rows using 0621 (representing the pre-0626 state).
+      2. Run 0626 upgrade() on the already-encrypted DB.
+      3. Assert that every row is UNCHANGED byte-for-byte (no double-encryption).
+      4. Assert that every value still decrypts in ONE step (not nested ciphertext).
+    """
+    key = Fernet.generate_key().decode()
+    monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", key)
+
+    import app.field_encryption as fe
+
+    mig_0621 = _load_migration("0621", "0621_safe_encrypt_backfill.py")
+    mig_0626 = _load_migration("0626", "0626_safe_encrypt_backfill.py")
+
+    engine = sa.create_engine("sqlite:///:memory:")
+    with engine.begin() as conn:
+        _create_schema(conn)
+        _seed_plaintext(conn)
+
+        # Step 1 — apply 0621 (pre-0626 state, same key).
+        monkeypatch.setattr(mig_0621.op, "get_bind", lambda: conn)
+        mig_0621.upgrade()
+
+        # Step 2 — snapshot the 0621-encrypted values.
+        snapshot = {(t, c, rid): _stored(conn, t, c, rid) for t, c, rid in _COLUMNS}
+
+        # Sanity: values are ciphertext after 0621.
+        for (t, c, rid), value in snapshot.items():
+            assert value != _PLAINTEXTS[c], f"sanity: {t}.{c} must be encrypted before 0626 runs"
+            assert fe.decrypt_field(value) == _PLAINTEXTS[c], (
+                f"sanity: {t}.{c} must decrypt in ONE step after 0621"
+            )
+
+        # Step 3 — run 0626 on the already-encrypted DB.
+        monkeypatch.setattr(mig_0626.op, "get_bind", lambda: conn)
+        mig_0626.upgrade()
+
+        # Step 4 — assert UNCHANGED (no double-encryption) and still single-step decrypt.
+        for (t, c, rid), before in snapshot.items():
+            after = _stored(conn, t, c, rid)
+            assert after == before, (
+                f"{t}.{c} was rewritten by 0626 after 0621 encrypted it — "
+                f"double-encryption window is open"
+            )
+            assert fe.decrypt_field(after) == _PLAINTEXTS[c], (
+                f"{t}.{c} does not decrypt in ONE step after 0626 ran on 0621-encrypted row — "
+                f"nested ciphertext detected"
+            )
+
+
 def test_no_f_string_sql_in_migration_source():
     """Migration 0626 must not use f-string interpolation into sa.text()."""
     path = (
