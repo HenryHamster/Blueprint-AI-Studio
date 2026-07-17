@@ -139,6 +139,7 @@ async def is_candidate_fully_met(
     session: AsyncSession,
     version_id: uuid.UUID,
     candidate_sha: str | None,
+    qualification_attempt_id: uuid.UUID | None = None,
 ) -> bool:
     """True iff every ACTIVE acceptance category is ``met`` and no residual gap.
 
@@ -149,6 +150,10 @@ async def is_candidate_fully_met(
     makes the candidate NOT fully met.  Additionally a non-null/non-empty
     :class:`ResidualVerdict.uncaptured_gap` blocks (a goal aspect no category
     captures).
+
+    When ``qualification_attempt_id`` is provided, only verdicts recorded by
+    that attempt are considered — prevents two attempts each half-meeting
+    different categories from producing a false-positive fully-met result.
 
     Note: with zero active criteria the "every active is met" clause is
     vacuously satisfied, so the result is governed solely by the residual — the
@@ -163,14 +168,20 @@ async def is_candidate_fully_met(
     )
     active_keys = {k for k in active_result.scalars().all() if k is not None}
 
-    verdicts = await get_category_verdicts(session, version_id, candidate_sha)
+    verdicts = await get_category_verdicts(
+        session, version_id, candidate_sha,
+        qualification_attempt_id=qualification_attempt_id,
+    )
     met_keys = {v.category_key for v in verdicts if v.status == "met"}
 
     if not active_keys.issubset(met_keys):
         return False
 
     # A non-empty uncaptured residual gap blocks even when every category is met.
-    residual = await get_residual(session, version_id, candidate_sha)
+    residual = await get_residual(
+        session, version_id, candidate_sha,
+        qualification_attempt_id=qualification_attempt_id,
+    )
     return not residual
 
 
@@ -238,9 +249,15 @@ async def get_residual(
         clauses.append(
             ResidualVerdict.qualification_attempt_id == qualification_attempt_id
         )
+    # Order by recency so that when no attempt filter is applied (multiple rows
+    # possible — e.g. a NULL-attempt_id pre-PR row and a post-PR row) we get
+    # the most recent verdict rather than raising MultipleResultsFound.
     existing = (
         await session.execute(
-            select(ResidualVerdict).where(*clauses)
+            select(ResidualVerdict)
+            .where(*clauses)
+            .order_by(ResidualVerdict.graded_at.desc())
+            .limit(1)
         )
     ).scalar_one_or_none()
     if existing is None:

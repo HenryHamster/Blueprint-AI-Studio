@@ -17,17 +17,17 @@ All new columns are nullable so pre-existing rows (created before this migration
 remain readable and backward-compatible.  Indexes on the attempt columns support
 the attempt-scoped query path in ``category_verdict_ledger``.
 
-Revision ID: 0612
-Revises: 0611
-Create Date: 2026-07-16
+Revision ID: 0613
+Revises: 0612
+Create Date: 2026-07-17
 """
 from alembic import op
 import sqlalchemy as sa
 import sqlmodel
 from sqlalchemy.dialects import postgresql
 
-revision = "0612"
-down_revision = "0611"
+revision = "0613"
+down_revision = "0612"
 branch_labels = None
 depends_on = None
 

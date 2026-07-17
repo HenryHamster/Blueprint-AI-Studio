@@ -314,6 +314,7 @@ const {
     'resetFormatComplianceTelemetry',
     'resetLlmTelemetry',
     'resetOperatorDecisionCaptureTelemetry',
+    'restoreOperatorDecisionCaptureTelemetry',
     'resetResidentTurnLatencyTelemetry',
     'setCurrentPromptFingerprint',
     'setPromptSizeTelemetry',
@@ -556,6 +557,7 @@ vi.mock('./strategic-sections.js', () => ({
 
 vi.mock('../telemetry.js', () => ({
   ...Object.fromEntries(TELEMETRY_EXPORT_NAMES.map((name) => [name, vi.fn()])),
+  restoreOperatorDecisionCaptureTelemetry: vi.fn(),
   buildPromptSizeTelemetry: vi.fn().mockReturnValue({
     prompt_size_bytes: 5000,
     prompt_section_count: 3,

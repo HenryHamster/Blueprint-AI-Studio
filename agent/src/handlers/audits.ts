@@ -694,10 +694,15 @@ export async function handleReleaseAudit(
   }
 
   if (requestedAuditBaseSha) {
+    // Track which verification stage we reached so fallback_reason carries a
+    // machine-readable prefix that the backend can interpret without parsing
+    // the raw git error message.
+    let fallbackCategory = 'cat_file_failed';
     try {
       execFileSync('git', ['cat-file', '-e', `${requestedAuditBaseSha}^{commit}`], {
         cwd: WORKSPACE, stdio: ['ignore', 'ignore', 'pipe'],
       });
+      fallbackCategory = 'ancestor_check_failed';
       execFileSync('git', ['merge-base', '--is-ancestor', requestedAuditBaseSha, candidateSha], {
         cwd: WORKSPACE, stdio: ['ignore', 'ignore', 'pipe'],
       });
@@ -712,7 +717,8 @@ export async function handleReleaseAudit(
       auditScopeFallbackReason = null;
       sendLog(ws, `Using incremental audit range ${diffRange}; prior candidate was clean and is an ancestor.\n`);
     } catch (e) {
-      auditScopeFallbackReason = e instanceof Error ? e.message.slice(0, 500) : String(e).slice(0, 500);
+      const rawMsg = e instanceof Error ? e.message.slice(0, 500) : String(e).slice(0, 500);
+      auditScopeFallbackReason = `${fallbackCategory}: ${rawMsg}`;
       diffRange = fullDiffRange;
       sendLog(ws, `[WARNING] Incremental audit base ${requestedAuditBaseSha.slice(0, 12)} is not usable; falling back to full range ${fullDiffRange}.\n`);
     }
@@ -1010,10 +1016,30 @@ Rules:
       }
       return finding;
     });
+
+    // Build explicit per-path review verdicts grounded in the diff scope actually
+    // reviewed. Every changed path starts as 'clean'; any path that has at least
+    // one finding against it is upgraded to 'finding'. Paths outside the reviewed
+    // scope (not in auditedChangedPaths) are absent — this lets the backend
+    // distinguish "reviewed and cleared" from "not in scope / carried forward".
+    const reviewedPaths: Record<string, 'clean' | 'finding'> = {};
+    for (const p of auditedChangedPaths) {
+      reviewedPaths[p] = 'clean';
+    }
+    if (rawFindings !== null) {
+      for (const f of (findings as Record<string, unknown>[])) {
+        const fpath = typeof f.file === 'string' ? f.file.trim() : '';
+        if (fpath && Object.prototype.hasOwnProperty.call(reviewedPaths, fpath)) {
+          reviewedPaths[fpath] = 'finding';
+        }
+      }
+    }
+
     return {
       ...output,
       ...(rawFindings === null ? {} : { findings }),
       ...(computedTestErosion === null ? {} : { computed_test_erosion: computedTestErosion }),
+      reviewed_paths: reviewedPaths,
       audit_scope: {
         mode: auditScopeMode,
         requested_base_sha: requestedAuditBaseSha,

@@ -52,11 +52,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
         id: filter
-        # Main-targeting PRs intentionally run every leg below, so asking the
-        # GitHub API for their changed-file list is both redundant and a single
-        # point of failure during transient API incidents. Keep path filtering
-        # only for any future non-main PR trigger.
-        if: github.event_name == 'pull_request' && github.base_ref != 'main'
+        if: github.event_name == 'pull_request'
         with:
           filters: |
             frontend:
