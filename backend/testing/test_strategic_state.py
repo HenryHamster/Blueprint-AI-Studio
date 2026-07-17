@@ -9499,3 +9499,66 @@ def test_task_summary_caps_latest_status_message():
     # _compact_text truncates to exactly max_chars (max_chars-1 chars + ellipsis).
     assert len(msg) == STATUS_LATEST_MESSAGE_MAX
     assert msg.endswith("…")
+
+
+@pytest.mark.asyncio
+async def test_strategic_state_live_message_preview_interleaved_statuses(db_session):
+    """The bounded UNION returns the 12 newest live messages across statuses."""
+    from app.routers.admin_project_strategic_session import (
+        _load_live_message_preview,
+    )
+
+    project = await _make_project(db_session)
+    now = _utcnow()
+
+    # Fourteen live rows ensure the global LIMIT 12 is exercised. Resolved rows
+    # are newer than every live row and still must never enter the preview.
+    messages = [
+        *[
+            ProjectMessage(
+                project_id=project.id,
+                message_type=MessageType.FEEDBACK,
+                from_type="agent",
+                content=f"open msg {i}",
+                status="open",
+                created_at=now + timedelta(minutes=i),
+            )
+            for i in range(7)
+        ],
+        *[
+            ProjectMessage(
+                project_id=project.id,
+                message_type=MessageType.NOTE,
+                from_type="agent",
+                content=f"linked msg {i}",
+                status="linked",
+                created_at=now + timedelta(minutes=10 + i),
+            )
+            for i in range(7)
+        ],
+        *[
+            ProjectMessage(
+                project_id=project.id,
+                message_type=MessageType.FEEDBACK,
+                from_type="agent",
+                content=f"resolved msg {i}",
+                status="resolved",
+                created_at=now + timedelta(minutes=100 + i),
+            )
+            for i in range(4)
+        ],
+    ]
+    db_session.add_all(messages)
+    await db_session.commit()
+
+    preview = await _load_live_message_preview(db_session, project.id)
+
+    assert len(preview) == 12
+    assert {message.status for message in preview} <= {"open", "linked"}
+    assert [message.created_at for message in preview] == sorted(
+        (message.created_at for message in preview), reverse=True
+    )
+    assert {message.content for message in preview} == {
+        *(f"linked msg {i}" for i in range(7)),
+        *(f"open msg {i}" for i in range(2, 7)),
+    }

@@ -72,7 +72,7 @@ describe('App workbench wiring', () => {
 
   test('reports each non-chat board navigation after task-fetch completion or paint boundary', () => {
     expect(appSource).toContain('function BoardDataReadyReporter');
-    expect(appSource).toContain('<BoardDataReadyReporter activeTab={activeTab} initialLoading={s.initialLoading} refreshing={s.refreshing} fetchEpoch={s.fetchEpoch} />');
+    expect(appSource).toContain('<BoardDataReadyReporter activeTab={activeTab} initialLoading={boardInitialLoading} refreshing={boardRefreshing} fetchEpoch={boardDataEpoch} />');
     expect(appSource).toMatch(/if \(targetEpochRef\.current !== null && fetchEpoch >= targetEpochRef\.current\) \{[\s\S]*reportUiLoadTiming\(activeTab, Math\.round\(performance\.now\(\) - navigationStartRef\.current\), 'board_data_ready'\)/);
     expect(appSource).toMatch(/navigationStartRef\.current = performance\.now\(\);[\s\S]*reportedRef\.current = false;[\s\S]*targetEpochRef\.current = fetchEpoch \+ 1;/);
   });

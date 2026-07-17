@@ -3508,8 +3508,22 @@ class ProjectMessage(SQLModel, table=True):
         ),
         Index("ix_projectmessage_created_at", "created_at"),
         Index("ix_projectmessage_project_created_at", "project_id", "created_at"),
+        # Composite index for the strategic cold-load live-message preview query
+        # (project_id, status IN ('open','linked'), ORDER BY created_at DESC LIMIT 12).
+        # Two-branch UNION ALL rewrite uses this index for each status branch.
+        Index(
+            "ix_projectmessage_project_status_created",
+            "project_id",
+            "status",
+            "created_at",
+        ),
         Index("ix_projectmessage_from_task_id", "from_task_id"),
         Index("ix_projectmessage_status_from_type", "status", "from_type"),
+        # PostgreSQL migrations create expression indexes for the exact JSONB
+        # scalar predicates.  The metadata entries use the backing column so
+        # the model/migration coverage invariant can track their names.
+        Index("ix_projectmessage_context_event_type", "context"),
+        Index("ix_projectmessage_context_dedupe_key", "context"),
         # Accelerates high-signal message fetches filtered by (project_id, message_type)
         # and ordered by created_at DESC (build_operator_attention, get_operator_message_counts).
         Index(

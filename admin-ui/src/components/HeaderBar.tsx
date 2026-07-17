@@ -1,3 +1,4 @@
+import { memo } from 'react';
 import type { RefObject } from 'react';
 import { useMemo, useState, useRef, useEffect } from 'react';
 import { Activity, Microscope, BookOpen, Command, MoreHorizontal, Search, Settings } from 'lucide-react';
@@ -76,7 +77,7 @@ function tabLabel(tab: PrimaryTab): string {
   return tab === 'chat' ? 'Chat' : tab.charAt(0).toUpperCase() + tab.slice(1);
 }
 
-export function PrimaryTabNav({
+export const PrimaryTabNav = memo(function PrimaryTabNav({
   activeTab,
   onTabChange,
   openMessageCount = 0,
@@ -137,10 +138,10 @@ export function PrimaryTabNav({
       })}
     </nav>
   );
-}
+});
 
 
-export function HeaderBar(props: HeaderBarProps) {
+export const HeaderBar = memo(function HeaderBar(props: HeaderBarProps) {
   const {
     tasks,
     onRefresh,
@@ -425,4 +426,4 @@ export function HeaderBar(props: HeaderBarProps) {
       </header>
     </div>
   );
-}
+});

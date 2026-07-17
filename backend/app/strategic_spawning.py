@@ -4314,13 +4314,13 @@ async def _spawn_design_doc_update(
                 },
             )
     except ShadowResidentOwnershipError:
-        await session.rollback()
         logger.warning(
             "[RESIDENT_SHADOW] Aborting legacy phase-1 spawn after Resident ownership flip "
             "(project=%s cycle=%s)",
             _project_id,
             cycle_id,
         )
+        await session.rollback()
         return False
     except Exception:
         logger.exception(

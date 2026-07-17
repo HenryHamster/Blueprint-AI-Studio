@@ -359,6 +359,23 @@ export default function App() {
     () => s.projects.find(p => p.id === s.selectedProjectId) ?? null,
     [s.projects, s.selectedProjectId],
   );
+
+  // Per-tab data-arrival epochs so board_data_ready fires on each tab's own
+  // primary data, not on the shared tasks fetchEpoch.
+  const [projectDataEpoch, setProjectDataEpoch] = useState(0);
+  const [runtimeDataEpoch, setRuntimeDataEpoch] = useState(0);
+  useEffect(() => {
+    if (selectedProject !== null) setProjectDataEpoch(e => e + 1);
+  }, [selectedProject]);
+  useEffect(() => {
+    if (s.orchestratorHealth !== null) setRuntimeDataEpoch(e => e + 1);
+  }, [s.orchestratorHealth]);
+
+  // Route the correct epoch/loading signals to BoardDataReadyReporter per tab.
+  const boardDataEpoch = activeTab === 'project' ? projectDataEpoch : activeTab === 'runtime' ? runtimeDataEpoch : s.fetchEpoch;
+  const boardInitialLoading = activeTab === 'project' ? !s.projectsLoaded : activeTab === 'runtime' ? s.orchestratorHealth === null : s.initialLoading;
+  const boardRefreshing = (activeTab === 'project' || activeTab === 'runtime') ? false : s.refreshing;
+
   const selectedProjectRepoLabel = selectedProject
     ? `${selectedProject.github_owner}/${selectedProject.github_repo}`
     : null;
@@ -1297,7 +1314,7 @@ export default function App() {
         </Suspense>
       ) : (
         <WorkbenchFrame>
-      <BoardDataReadyReporter activeTab={activeTab} initialLoading={s.initialLoading} refreshing={s.refreshing} fetchEpoch={s.fetchEpoch} />
+      <BoardDataReadyReporter activeTab={activeTab} initialLoading={boardInitialLoading} refreshing={boardRefreshing} fetchEpoch={boardDataEpoch} />
       {s.showUserManagement && s.userRole === 'admin' ? (
         <Suspense fallback={null}>
         <UserManagement
