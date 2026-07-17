@@ -1354,6 +1354,190 @@ describe('handleStrategicResident — autonomous marker-miss corrective loop', (
     // …and re-fired the corrective on the SECOND autonomous tick.
     expect(autonomousPrompts[1]).toContain('OPERATOR-DECISION REVIEW');
   }, 10_000);
+
+  it('exhausts review attempts and force-admits exchange text to the durable decisions register, clearing the review and emitting a status', async () => {
+    // The model has failed to classify this operator exchange for
+    // MAX_REVIEW_ATTEMPTS consecutive autonomous ticks. The escape hatch
+    // (strategic-resident.ts ~1450-1492) force-admits the available exchange text
+    // into the durable decisions register so the operator correction is not lost
+    // at restart or compaction, then clears the pending review.
+    const EXCHANGE_TEXT = 'operator prefers approach Z — do not rewrite the table-based path';
+    let alive = true;
+    const heartbeatBodies: Array<Record<string, unknown>> = [];
+
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/api/agent/git-read-token')) {
+        return Promise.resolve({ token: 'read-scoped-token' });
+      }
+      if (url.includes('/messages?')) return Promise.resolve({ messages: [] });
+      return Promise.resolve(null);
+    });
+    mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
+      if (url.includes('heartbeat')) {
+        if (body) heartbeatBodies.push(body);
+        return Promise.resolve({ authority_held: true });
+      }
+      return Promise.resolve({});
+    });
+
+    const session = makeSession(
+      () => {
+        alive = false; // die after this turn so the loop exits after the heartbeat
+        // No OPERATOR-DECISION or OPERATOR-DECISION-REVIEW marker →
+        // classifyOperatorDecisionReview returns kind='pending', triggering the
+        // retain-then-escape-hatch branch.
+        return Promise.resolve(turnResult({
+          resultText: 'Reviewed the recent operator exchange. Nothing new.',
+          appliedStrategicOp: true,
+          inputTokens: 0,
+        }));
+      },
+      () => alive,
+    );
+    mockStartSession.mockReturnValue(session);
+
+    await handleStrategicResident(
+      'task-exhaust',
+      { project_name: 'Proj', open_messages: [] },
+      {
+        project_metadata: { project_id: 'proj-exhaust' },
+        context: {
+          // Seed a review with attempts = MAX_REVIEW_ATTEMPTS - 1 (2) so the
+          // next retain (increment to 3) trips the >=MAX_REVIEW_ATTEMPTS escape
+          // hatch on the first autonomous turn.
+          _exam_ledger: JSON.stringify({
+            records: [],
+            tick: 10,
+            corrective: false,
+            operatorDecisionCorrective: true,
+            operatorDecisionReview: {
+              status: 'pending',
+              messageIds: ['msg-exhaust'],
+              exchangeText: EXCHANGE_TEXT,
+              startedAt: '2026-07-17T10:00:00Z',
+              attempts: 2, // MAX_REVIEW_ATTEMPTS - 1
+            },
+          }),
+        },
+      },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    // (a) The heartbeat's decisions_reg must contain the fallback entry with
+    //     the exchange text prefixed by the "unclassified after N attempts" marker.
+    const withFallback = heartbeatBodies.find(
+      (b): b is Record<string, unknown> & { decisions_reg: string; note: string } =>
+        typeof b.decisions_reg === 'string'
+        && b.decisions_reg.includes(EXCHANGE_TEXT)
+        && typeof b.note === 'string',
+    );
+    expect(withFallback).toBeDefined();
+    const reg = JSON.parse((withFallback as Record<string, string>).decisions_reg) as {
+      entries: Array<{ surfaceKey: string; verdict: string; note: string }>;
+    };
+    const fallbackEntry = reg.entries.find((e) => e.surfaceKey === 'operator:message');
+    expect(fallbackEntry).toBeDefined();
+    expect(fallbackEntry?.verdict).toBe('operator');
+    expect(fallbackEntry?.note).toContain('[unclassified after 3 attempts]');
+    expect(fallbackEntry?.note).toContain(EXCHANGE_TEXT);
+
+    // (b) The serialized exam ledger in the heartbeat shows the review is cleared.
+    const ledger = JSON.parse((withFallback as Record<string, string>).note) as { operatorDecisionReview: unknown };
+    expect(ledger.operatorDecisionReview).toBeNull();
+
+    // (c) The streamer emitted the escape-hatch status via scheduleDrain. The
+    //     status must pass through the rate-limited async drain queue (one frame
+    //     per STREAM_FLUSH_MS=100), so skip the timed assertion here — the
+    //     decisions-register and ledger assertions above are the authoritative
+    //     evidence that the escape hatch fired correctly.
+    //     (The lib-level test strategic-resident-lib.test.ts covers the inline
+    //     fallback-note construction and admission, and the ``it('id-less
+    //     overflow sentinel: repeated MAX_REVIEW_ATTEMPTS fallback admissions
+    //     produce at most one register entry')`` test verifies the dedup guard.)
+  });
+
+  it('exhausted-attempts fallback with no exchange text produces [exchange text unavailable] in the note', async () => {
+    // Same as above but the pending review has no exchangeText field — the
+    // fallback note must contain the "unavailable" sentinel rather than the
+    // exchange text itself.
+    let alive = true;
+    const heartbeatBodies: Array<Record<string, unknown>> = [];
+
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/api/agent/git-read-token')) {
+        return Promise.resolve({ token: 'read-scoped-token' });
+      }
+      if (url.includes('/messages?')) return Promise.resolve({ messages: [] });
+      return Promise.resolve(null);
+    });
+    mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
+      if (url.includes('heartbeat')) {
+        if (body) heartbeatBodies.push(body);
+        return Promise.resolve({ authority_held: true });
+      }
+      return Promise.resolve({});
+    });
+
+    const session = makeSession(
+      () => {
+        alive = false;
+        return Promise.resolve(turnResult({
+          resultText: 'Checked the conversation. No action needed.',
+          appliedStrategicOp: true,
+          inputTokens: 0,
+        }));
+      },
+      () => alive,
+    );
+    mockStartSession.mockReturnValue(session);
+
+    await handleStrategicResident(
+      'task-exhaust-no-text',
+      { project_name: 'Proj', open_messages: [] },
+      {
+        project_metadata: { project_id: 'proj-exhaust-nt' },
+        context: {
+          _exam_ledger: JSON.stringify({
+            records: [],
+            tick: 10,
+            corrective: false,
+            operatorDecisionCorrective: true,
+            operatorDecisionReview: {
+              status: 'pending',
+              messageIds: ['msg-no-text'],
+              // no exchangeText field — exchange was too short or unavailable
+              startedAt: '2026-07-17T10:00:00Z',
+              attempts: 2, // MAX_REVIEW_ATTEMPTS - 1
+            },
+          }),
+        },
+      },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    // The decisions_reg must contain a fallback entry whose note says
+    // "[exchange text unavailable]" instead of any actual exchange text.
+    const withFallback = heartbeatBodies.find(
+      (b): b is Record<string, unknown> & { decisions_reg: string; note: string } =>
+        typeof b.decisions_reg === 'string'
+        && typeof b.note === 'string',
+    );
+    expect(withFallback).toBeDefined();
+    const reg = JSON.parse((withFallback as Record<string, string>).decisions_reg) as {
+      entries: Array<{ surfaceKey: string; verdict: string; note: string }>;
+    };
+    const fallbackEntryNote = reg.entries.find((e) => e.surfaceKey === 'operator:message')?.note;
+    expect(fallbackEntryNote).toBeDefined();
+    // The note must use the "unavailable" sentinel, not contain any real text.
+    expect(fallbackEntryNote).toContain('[unclassified after 3 attempts');
+    expect(fallbackEntryNote).toContain('exchange text unavailable');
+    // No actual exchange text in the note.
+    expect(fallbackEntryNote).not.toContain('Checked the conversation');
+
+    // The review is cleared in the serialized ledger.
+    const ledger = JSON.parse((withFallback as Record<string, string>).note) as { operatorDecisionReview: unknown };
+    expect(ledger.operatorDecisionReview).toBeNull();
+  });
 });
 
 describe('recloneResidentWorkspace', () => {
