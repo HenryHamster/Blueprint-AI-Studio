@@ -1605,6 +1605,14 @@ async def resolve_artifact_download_url(
             cjf = cjf_result.scalar_one_or_none()
             if cjf is None or cjf.compute_job_id != owning_compute_job_id:
                 raise HTTPException(status_code=404, detail="Artifact not found")
+            # Extension guard: apply the same viewable-extension allowlist that
+            # the manifest build path enforces so the ComputeJobFile signing
+            # branch cannot authorize non-viewable types.
+            from app.storage import (
+                viewable_content_type_for_filename as _vctype,
+            )
+            if _vctype(cjf.safe_relpath) is None:
+                raise HTTPException(status_code=404, detail="Artifact not found")
 
     # 3. Sign. Validation already passed, so any failure here is a storage
     # outage, not a bad reference.

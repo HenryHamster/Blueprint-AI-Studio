@@ -4695,6 +4695,59 @@ async def _record_viewable_job_files(
     return written
 
 
+async def _purge_orphaned_viewable_rows(
+    session, job: ComputeJob, manifest: list[dict[str, Any]]
+) -> int:
+    """Delete ComputeJobFile rows not in the terminal manifest, plus their GCS objects.
+
+    Called only when the terminal extraction is complete (authoritative). Mid-run
+    uploads that were not selected into the top-25 manifest leave orphaned rows and
+    GCS objects; this purge reconciles them to the authoritative manifest surface.
+    Best-effort: never raises.
+    """
+    keep_uris = {
+        entry["storage_uri"]
+        for entry in manifest
+        if isinstance(entry, dict) and isinstance(entry.get("storage_uri"), str)
+    }
+    try:
+        all_rows = (
+            await session.execute(
+                select(ComputeJobFile).where(ComputeJobFile.compute_job_id == job.id)
+            )
+        ).scalars().all()
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[COMPUTE_JOB] failed to query ComputeJobFile rows for orphan purge job=%s",
+            job.id,
+            exc_info=True,
+        )
+        return 0
+
+    purged = 0
+    for row in all_rows:
+        if row.storage_uri in keep_uris:
+            continue
+        try:
+            await storage.delete_storage_uri_best_effort(row.storage_uri)
+            await session.delete(row)
+            purged += 1
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "[COMPUTE_JOB] failed to purge orphaned ComputeJobFile row %s job=%s",
+                row.storage_uri,
+                job.id,
+                exc_info=True,
+            )
+    if purged:
+        logger.info(
+            "[COMPUTE_JOB] purged %d orphaned ComputeJobFile row(s) for job=%s",
+            purged,
+            job.id,
+        )
+    return purged
+
+
 async def persist_viewable_files_for_job(
     session, job: ComputeJob
 ) -> tuple[list[dict[str, Any]], int]:
@@ -4786,6 +4839,9 @@ async def persist_viewable_files_for_job(
         manifest = terminal_manifest + prior_live
 
     await _record_viewable_job_files(session, job, manifest)
+
+    if complete:
+        await _purge_orphaned_viewable_rows(session, job, manifest)
 
     reconciled_meta = dict(job.polling_metadata or {})
     reconciled_meta["viewable_files"] = manifest

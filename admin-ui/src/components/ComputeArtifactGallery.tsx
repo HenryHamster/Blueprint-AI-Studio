@@ -160,6 +160,15 @@ export function ComputeArtifactGallery({ projectId, job }: { projectId: string; 
             const key = artifactCacheKey(art.storage_uri, art.revision);
             const resolution = previewUrls[key];
             const sizeLabel = fmtBytes(art.bytes);
+            const artLiveBadge = art.live ? (
+              <span
+                className="absolute left-1 top-1 z-10 flex items-center gap-1 rounded bg-red-600/90 px-1.5 py-0.5 text-ui-xs font-semibold text-white shadow-sm"
+                data-testid="live-badge"
+              >
+                <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-white" />
+                LIVE
+              </span>
+            ) : null;
             const caption = (
               <div className="max-w-[10rem] truncate text-ui-xs text-neutral-500 font-mono" title={art.name}>
                 {art.name}{sizeLabel ? ` · ${sizeLabel}` : ''}
@@ -170,77 +179,84 @@ export function ComputeArtifactGallery({ projectId, job }: { projectId: string; 
               // the browser's sandboxed viewer on the storage origin.
               // openPreviewFullSize resolves a fresh signed URL and opens it in
               // a new tab.
+              const pdfBtn = (
+                <button
+                  type="button"
+                  onClick={() => { void openPreviewFullSize(key, art.storage_uri); }}
+                  disabled={resolution?.state === 'resolving'}
+                  title={`Open ${art.name} in a new tab`}
+                  className="flex h-24 w-32 flex-col items-center justify-center gap-1 rounded border border-neutral-800 bg-neutral-950 px-1 text-center text-ui-xs text-neutral-400 hover:border-sky-500/50 disabled:opacity-70"
+                  data-testid="drawer-artifact-pdf"
+                >
+                  <FileText className="h-8 w-8 text-sky-400" />
+                  <span>
+                    {resolution?.state === 'resolving'
+                      ? 'opening…'
+                      : resolution?.state === 'error'
+                        ? 'open failed — retry'
+                        : 'Open PDF'}
+                  </span>
+                </button>
+              );
               return (
                 <div key={key} className="flex flex-col gap-0.5" data-testid="drawer-viewable-artifact">
-                  <button
-                    type="button"
-                    onClick={() => { void openPreviewFullSize(key, art.storage_uri); }}
-                    disabled={resolution?.state === 'resolving'}
-                    title={`Open ${art.name} in a new tab`}
-                    className="flex h-24 w-32 flex-col items-center justify-center gap-1 rounded border border-neutral-800 bg-neutral-950 px-1 text-center text-ui-xs text-neutral-400 hover:border-sky-500/50 disabled:opacity-70"
-                    data-testid="drawer-artifact-pdf"
-                  >
-                    <FileText className="h-8 w-8 text-sky-400" />
-                    <span>
-                      {resolution?.state === 'resolving'
-                        ? 'opening…'
-                        : resolution?.state === 'error'
-                          ? 'open failed — retry'
-                          : 'Open PDF'}
-                    </span>
-                  </button>
+                  {artLiveBadge ? <div className="relative">{pdfBtn}{artLiveBadge}</div> : pdfBtn}
                   {caption}
                 </div>
               );
             }
             if (resolution?.state === 'resolved') {
+              const mediaElem = art.kind === 'video' ? (
+                <video
+                  controls
+                  preload="metadata"
+                  src={resolution.url}
+                  onError={() => markPreviewError(key)}
+                  className="h-24 max-w-[16rem] rounded border border-neutral-800 bg-neutral-950"
+                  data-testid="drawer-artifact-video"
+                />
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => { void openPreviewFullSize(key, art.storage_uri); }}
+                  title={`Open ${art.name} full-size in a new tab`}
+                  className="rounded border border-neutral-800 bg-neutral-950 hover:border-sky-500/50"
+                  data-testid="drawer-artifact-thumbnail"
+                >
+                  <img
+                    src={resolution.url}
+                    alt={art.name}
+                    loading="lazy"
+                    onError={() => markPreviewError(key)}
+                    className="h-24 w-auto max-w-[16rem] rounded object-contain"
+                  />
+                </button>
+              );
               return (
                 <div key={key} className="flex flex-col gap-0.5" data-testid="drawer-viewable-artifact">
-                  {art.kind === 'video' ? (
-                    <video
-                      controls
-                      preload="metadata"
-                      src={resolution.url}
-                      onError={() => markPreviewError(key)}
-                      className="h-24 max-w-[16rem] rounded border border-neutral-800 bg-neutral-950"
-                      data-testid="drawer-artifact-video"
-                    />
-                  ) : (
-                    <button
-                      type="button"
-                      onClick={() => { void openPreviewFullSize(key, art.storage_uri); }}
-                      title={`Open ${art.name} full-size in a new tab`}
-                      className="rounded border border-neutral-800 bg-neutral-950 hover:border-sky-500/50"
-                      data-testid="drawer-artifact-thumbnail"
-                    >
-                      <img
-                        src={resolution.url}
-                        alt={art.name}
-                        loading="lazy"
-                        onError={() => markPreviewError(key)}
-                        className="h-24 w-auto max-w-[16rem] rounded object-contain"
-                      />
-                    </button>
-                  )}
+                  {artLiveBadge ? <div className="relative">{mediaElem}{artLiveBadge}</div> : mediaElem}
                   {caption}
                 </div>
               );
             }
+            const placeholderBtn = (
+              <button
+                type="button"
+                onClick={() => { void resolvePreviewUrl(key, art.storage_uri); }}
+                disabled={resolution?.state === 'resolving'}
+                className="flex h-24 w-32 items-center justify-center rounded border border-neutral-800 bg-neutral-950 px-1 text-center text-ui-xs text-neutral-500 hover:border-sky-500/50 disabled:opacity-70"
+                data-testid="drawer-artifact-placeholder"
+              >
+                {resolution?.state === 'resolving'
+                  ? 'resolving…'
+                  : resolution?.state === 'error'
+                    ? 'preview unavailable — retry'
+                    : 'load preview'}
+              </button>
+            );
             return (
               <div key={key} className="flex flex-col gap-0.5" data-testid="drawer-viewable-artifact">
-                <button
-                  type="button"
-                  onClick={() => { void resolvePreviewUrl(key, art.storage_uri); }}
-                  disabled={resolution?.state === 'resolving'}
-                  className="flex h-24 w-32 items-center justify-center rounded border border-neutral-800 bg-neutral-950 px-1 text-center text-ui-xs text-neutral-500 hover:border-sky-500/50 disabled:opacity-70"
-                  data-testid="drawer-artifact-placeholder"
-                >
-                  {resolution?.state === 'resolving'
-                    ? 'resolving…'
-                    : resolution?.state === 'error'
-                      ? 'preview unavailable — retry'
-                      : 'load preview'}
-                </button>
+                {artLiveBadge ? <div className="relative">{placeholderBtn}{artLiveBadge}</div> : placeholderBtn}
                 {caption}
               </div>
             );

@@ -6,6 +6,7 @@ from app.knowledge_completion import (
     _build_compute_experiment_document,
     _compute_evidence_tier,
     _extract_job_terminal_diagnostics,
+    _viewable_compute_citations,
 )
 from testing.factories import make_task
 
@@ -88,6 +89,40 @@ def _base_task():
     return make_task(
         payloads=[{"type": "compute_experiment", "experiment": "bench", "tags": []}]
     )
+
+
+def test_viewable_compute_citations_keep_only_durable_inline_media():
+    """Knowledge docs cite persisted preview objects, not arbitrary manifest data."""
+    job = MagicMock()
+    plot_uri = "gs://blueprint-artifacts/jobs/run/plot.png"
+    video_uri = "gs://blueprint-artifacts/jobs/run/demo.webm"
+    job.polling_metadata = {
+        "viewable_files": [
+            {"storage_uri": plot_uri},
+            {"storage_uri": video_uri},
+            {"storage_uri": plot_uri},  # deduplicated
+            {"storage_uri": "https://signed.example/plot.png"},
+            {"storage_uri": "gs://blueprint-artifacts/jobs/run/result.json"},
+            {"storage_uri": None},
+            "not-a-manifest-entry",
+        ]
+    }
+
+    assert _viewable_compute_citations(job) == [plot_uri, video_uri]
+
+    document = _build_compute_experiment_document(
+        _base_task(),
+        outcome="SUCCESS",
+        cost=0.01,
+        criterion=None,
+        result_reference="gs://blueprint-artifacts/jobs/run/result.tar.gz",
+        viewable_citations=[plot_uri, video_uri, plot_uri],
+    )
+    assert document["citations"] == [
+        "gs://blueprint-artifacts/jobs/run/result.tar.gz",
+        plot_uri,
+        video_uri,
+    ]
 
 
 class TestBuildComputeExperimentDocumentEvidenceTier:

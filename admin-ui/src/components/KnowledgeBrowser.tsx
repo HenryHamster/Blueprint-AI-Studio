@@ -493,16 +493,34 @@ function ViewableMediaInline({
   label: string;
   kind: 'image' | 'video';
 }) {
-  const [signedUrl, setSignedUrl] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  // Bumped when the media element fires onError (e.g. expired signed URL) to
+  // re-resolve a fresh URL. Capped at 1 retry to avoid infinite loops.
+  const [retryCount, setRetryCount] = useState(0);
+  // Track the resolved URL and error keyed by (storageUri + retryCount) so
+  // stale async results from a prior attempt never overwrite a fresh one.
+  const resolveKey = `${storageUri}:${retryCount}`;
+  const [result, setResult] = useState<{ key: string; url: string | null; error: string | null }>({ key: resolveKey, url: null, error: null });
+  const signedUrl = result.key === resolveKey ? result.url : null;
+  const error = result.key === resolveKey ? result.error : null;
 
   useEffect(() => {
     let cancelled = false;
+    const key = resolveKey;
     resolveArtifactDownloadUrl(projectId, storageUri)
-      .then(url => { if (!cancelled) setSignedUrl(url); })
-      .catch(() => { if (!cancelled) setError('Failed to load preview.'); });
+      .then(url => { if (!cancelled) setResult({ key, url, error: null }); })
+      .catch(() => { if (!cancelled) setResult({ key, url: null, error: 'Failed to load preview.' }); });
     return () => { cancelled = true; };
-  }, [projectId, storageUri]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectId, storageUri, retryCount]);
+
+  const handleMediaError = useCallback(() => {
+    setRetryCount(c => {
+      if (c < 1) return c + 1;
+      // Exhausted retries: record terminal error via result state.
+      setResult(r => r.error ? r : { ...r, error: 'Failed to load preview.' });
+      return c;
+    });
+  }, []);
 
   if (error) {
     // Route the fallback href through the same scheme gate as the primary path:
@@ -532,11 +550,10 @@ function ViewableMediaInline({
   }
 
   if (kind === 'video') {
+    // Bind URL to <video src> directly (not a nested <source>) so onError fires
+    // reliably when the signed URL is dead — matching StrategicContextArtifactSlot.
     return (
-      <video controls className="max-h-48 w-full rounded border border-neutral-800 bg-black" aria-label={label}>
-        <source src={signedUrl} />
-        Your browser does not support the video element.
-      </video>
+      <video controls src={signedUrl} onError={handleMediaError} className="max-h-48 w-full rounded border border-neutral-800 bg-black" aria-label={label} />
     );
   }
 
@@ -544,6 +561,7 @@ function ViewableMediaInline({
     <img
       src={signedUrl}
       alt={label}
+      onError={handleMediaError}
       className="max-h-48 w-full rounded border border-neutral-800 bg-neutral-950/45 object-contain"
     />
   );

@@ -223,6 +223,44 @@ describe('StrategicContextArtifactSlot — viewport regression', () => {
     );
   });
 
+  test('renders LIVE badge on a live image descriptor at 900px', async () => {
+    const pkg = makePackage({
+      descriptors: [
+        {
+          schema_version: 1,
+          id: 'art-live',
+          kind: 'image',
+          title: 'Live training frame',
+          summary: 'Mid-run viewable frame',
+          status: 'ready',
+          image: { url: 'https://storage.example.com/frame.png?sig=abc', alt: 'Live frame', live: true },
+          images: [
+            { url: 'https://storage.example.com/frame.png?sig=abc', alt: 'frame.png', filename: 'frame.png', live: true },
+          ],
+        },
+      ],
+    });
+    await expectFullViewportAt(
+      900,
+      async () => {
+        host = document.createElement('div');
+        host.style.padding = '16px';
+        document.body.appendChild(host);
+        const r = createRoot(host);
+        root = r;
+        await act(async () => {
+          r.render(<StrategicContextArtifactSlot contextPackage={pkg} />);
+        });
+        await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 30)); });
+        // Badge is present on the mid-run live image.
+        expect(host.querySelector('[data-testid="live-badge"]')).not.toBeNull();
+        expect(host.textContent).toContain('LIVE');
+        expect(host.textContent).toContain('Live training frame');
+      },
+      { waitMs: 40 },
+    );
+  });
+
   test('renders image descriptor without URL (stub) at 900px', async () => {
     const pkg = makePackage({
       descriptors: [

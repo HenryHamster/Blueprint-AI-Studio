@@ -639,6 +639,165 @@ describe('ArtifactViewablePreviews — inline artifact-evidence thumbnails', () 
     expect(img).not.toBeNull();
     expect(img!.getAttribute('src')).toContain('sig=baked');
   });
+
+  test('renders LIVE badge on an image preview with live=true', async () => {
+    await render(
+      [
+        {
+          url: 'https://storage.example.com/plot.png?sig=baked',
+          kind: 'image',
+          filename: 'plot.png',
+          storage_uri: 'gs://bucket/proj/plot.png',
+          live: true,
+        },
+      ],
+      'proj-1',
+    );
+
+    const badge = host!.querySelector('[data-testid="live-badge"]');
+    expect(badge).not.toBeNull();
+    expect(badge!.textContent).toContain('LIVE');
+  });
+
+  test('renders LIVE badge on a video preview with live=true', async () => {
+    await render(
+      [
+        {
+          url: 'https://storage.example.com/rollout.mp4?sig=baked',
+          kind: 'video',
+          filename: 'rollout.mp4',
+          storage_uri: 'gs://bucket/proj/rollout.mp4',
+          live: true,
+        },
+      ],
+      'proj-1',
+    );
+
+    const badge = host!.querySelector('[data-testid="live-badge"]');
+    expect(badge).not.toBeNull();
+    expect(badge!.textContent).toContain('LIVE');
+  });
+
+  test('does not render LIVE badge when live is false or absent', async () => {
+    await render(
+      [
+        {
+          url: 'https://storage.example.com/plot.png?sig=baked',
+          kind: 'image',
+          filename: 'plot.png',
+          storage_uri: 'gs://bucket/proj/plot.png',
+          live: false,
+        },
+      ],
+      'proj-1',
+    );
+
+    expect(host!.querySelector('[data-testid="live-badge"]')).toBeNull();
+  });
+});
+
+describe('StrategicContextArtifactSlot — line chart descriptor', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+
+  afterEach(() => {
+    const r = root;
+    if (r) { act(() => r.unmount()); root = null; }
+    if (host) { host.remove(); host = null; }
+  });
+
+  async function render(pkg: StrategicContextPackageDescriptor, projectId?: string | null) {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<StrategicContextArtifactSlot contextPackage={pkg} projectId={projectId} />);
+    });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
+  }
+
+  test('renders SVG polyline for a line chart descriptor with points', async () => {
+    const pkg = makePackage({
+      descriptors: [
+        {
+          schema_version: 1,
+          id: 'chart-line',
+          kind: 'chart',
+          title: 'Eval reward',
+          status: 'ready',
+          chart: {
+            kind: 'line',
+            y_label: 'eval_reward',
+            x_label: 'time',
+            points: [
+              { label: '0.5', value: 0.5, t: '2026-01-01T00:00:00' },
+              { label: '0.8', value: 0.8, t: '2026-01-01T01:00:00' },
+              { label: '0.9', value: 0.9, t: '2026-01-01T02:00:00' },
+            ],
+          },
+        },
+      ],
+    });
+
+    await render(pkg, 'proj-1');
+
+    // polyline lives in the LineChart SVG (not the BarChart3 icon SVG)
+    const polylines = host!.querySelectorAll('polyline');
+    expect(polylines.length).toBe(1);
+    expect(polylines[0].getAttribute('points')).toBeTruthy();
+    expect(host!.textContent).toContain('eval_reward');
+    expect(host!.textContent).toContain('3 samples');
+  });
+
+  test('renders fallback for bar chart kind (not line)', async () => {
+    const pkg = makePackage({
+      descriptors: [
+        {
+          schema_version: 1,
+          id: 'chart-bar',
+          kind: 'chart',
+          title: 'Count',
+          status: 'ready',
+          chart: {
+            kind: 'bar',
+            points: [{ label: 'A', value: 10 }, { label: 'B', value: 20 }],
+          },
+        },
+      ],
+    });
+
+    await render(pkg, 'proj-1');
+
+    // Bar chart renders horizontal bars (not SVG polyline sparkline)
+    const polyline = host!.querySelector('polyline');
+    expect(polyline).toBeNull();
+    expect(host!.textContent).toContain('A');
+    expect(host!.textContent).toContain('B');
+    expect(host!.textContent).toContain('10');
+  });
+
+  test('renders empty state for line chart with no points', async () => {
+    const pkg = makePackage({
+      descriptors: [
+        {
+          schema_version: 1,
+          id: 'chart-empty',
+          kind: 'chart',
+          title: 'Empty',
+          status: 'ready',
+          chart: {
+            kind: 'line',
+            points: [],
+          },
+        },
+      ],
+    });
+
+    await render(pkg, 'proj-1');
+
+    expect(host!.textContent).toContain('No chart points yet');
+  });
 });
 
 describe('StrategicContextArtifactSlot — line chart descriptor', () => {

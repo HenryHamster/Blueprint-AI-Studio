@@ -22917,6 +22917,68 @@ async def test_viewable_pipeline_is_idempotent_and_downloads_bundle_once(
 
 
 @pytest.mark.asyncio
+async def test_terminal_extract_purges_orphaned_computejobfile_rows(
+    db_session, monkeypatch
+):
+    """ComputeJobFile rows for mid-run uploads not in the terminal manifest are deleted.
+
+    A file uploaded mid-run but not selected into the terminal top-N manifest leaves
+    an orphaned ComputeJobFile row (still signable via the download-URL endpoint) and
+    an orphaned GCS object. The terminal extraction pass must delete both.
+    """
+    job = await _create_bundle_compute_job(db_session)
+    orphan_uri = storage.compute_job_viewable_uri(job.id, "orphan_live.png")
+    # Pre-populate an orphaned ComputeJobFile row simulating a mid-run upload that
+    # didn't make the terminal cut.
+    orphan_row = ComputeJobFile(
+        compute_job_id=job.id,
+        safe_relpath="orphan_live.png",
+        media_type="image",
+        storage_uri=orphan_uri,
+        content_type="image/png",
+        file_size_bytes=500,
+    )
+    db_session.add(orphan_row)
+    await db_session.commit()
+
+    deleted_uris: list[str] = []
+
+    async def _fake_delete(uri: str) -> bool:
+        deleted_uris.append(uri)
+        return True
+
+    monkeypatch.setattr(storage, "delete_storage_uri_best_effort", _fake_delete)
+
+    # Terminal bundle contains only terminal.png — orphan is NOT in the bundle.
+    bundle = _make_viewable_tar_bundle(
+        {"./terminal.png": b"\x89PNG\r\n\x1a\n" + b"\x00" * 50}
+    )
+    _mock_viewable_storage(monkeypatch, bundle)
+
+    manifest, dropped = await compute_jobs.persist_viewable_files_for_job(
+        db_session, job
+    )
+    await db_session.commit()
+
+    # The terminal manifest contains only the terminal file.
+    assert len(manifest) == 1
+    assert manifest[0]["filename"] == "terminal.png"
+
+    # The orphaned GCS object was deleted.
+    assert orphan_uri in deleted_uris, (
+        "orphaned GCS object must be deleted when not in terminal manifest"
+    )
+
+    # The orphaned ComputeJobFile row was removed from the DB.
+    rows = await _job_files(db_session, job.id)
+    names = {r.safe_relpath for r in rows}
+    assert "orphan_live.png" not in names, (
+        "orphaned ComputeJobFile row must be purged at terminal extract"
+    )
+    assert "terminal.png" in names
+
+
+@pytest.mark.asyncio
 async def test_viewable_pipeline_failsoft_on_empty_or_bad_bundle(
     db_session, monkeypatch
 ):

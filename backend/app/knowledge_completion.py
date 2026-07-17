@@ -1289,6 +1289,47 @@ _DISABLE_LLM_COMPUTE_ANALYSIS_ENV = "DISABLE_LLM_COMPUTE_ANALYSIS"
 # log can never blow up the analysis prompt.
 _COMPUTE_LOG_TEXT_CAP = 4000
 _COMPUTE_MAX_CITATIONS = 20
+_VIEWABLE_COMPUTE_EXTENSIONS = (
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+    ".gif",
+    ".svg",
+    ".mp4",
+    ".webm",
+)
+
+
+def _viewable_compute_citations(job: ComputeJob | None) -> list[str]:
+    """Return the canonical durable media URIs from a job's viewable manifest.
+
+    The manifest is populated only after each file has been persisted and
+    registered for signed download.  Keep this deliberately narrow: knowledge
+    documents cite common inline-preview formats, never arbitrary metadata
+    strings or transient download URLs.
+    """
+    metadata = getattr(job, "polling_metadata", None) or {}
+    manifest = metadata.get("viewable_files") if isinstance(metadata, dict) else None
+    if not isinstance(manifest, list):
+        return []
+
+    citations: list[str] = []
+    seen: set[str] = set()
+    for entry in manifest:
+        uri = entry.get("storage_uri") if isinstance(entry, dict) else None
+        if not isinstance(uri, str):
+            continue
+        uri = uri.strip()
+        path = uri.split("#", 1)[0].split("?", 1)[0].lower()
+        if (
+            uri not in seen
+            and _is_durable_citation(uri)
+            and path.endswith(_VIEWABLE_COMPUTE_EXTENSIONS)
+        ):
+            seen.add(uri)
+            citations.append(uri)
+    return citations[:_COMPUTE_MAX_CITATIONS]
 
 
 def _enrich_per_arm_cost(
@@ -1448,6 +1489,7 @@ def _build_compute_experiment_document(
     result_metrics: dict[str, Any] | None = None,
     arms: Any | None = None,
     evidence_tier: str | None = None,
+    viewable_citations: list[str] | None = None,
 ) -> dict[str, Any]:
     """Build the DETERMINISTIC compute-experiment knowledge document.
 
@@ -1699,11 +1741,12 @@ def _build_compute_experiment_document(
     topic = payload.get("topic") or experiment or benchmark or payload.get("metric")
     topic = str(topic)[:200] if topic else None
 
-    citations = (
-        [result_reference]
-        if result_reference and _is_durable_citation(result_reference)
-        else []
-    )
+    citations = [
+        value
+        for value in [result_reference, *(viewable_citations or [])]
+        if _is_durable_citation(value)
+    ]
+    citations = list(dict.fromkeys(citations))[:_COMPUTE_MAX_CITATIONS]
 
     verdict_record: dict[str, Any] = {
         "strategy": "metric",
@@ -1775,23 +1818,31 @@ async def _compute_citation_grounding_stamp(
     result_reference: str | None,
     logs: str | None,
     session: AsyncSession,
+    *,
+    job: ComputeJob | None = None,
+    viewable_citations: list[str] | None = None,
 ) -> dict[str, Any]:
     """Build a citation-grounding stamp for the deterministic document.
 
-    The deterministic document's only citation is the ``result_reference``. This
-    helper checks whether that reference is backed by a real durable :class:`Artifact`
-    row by loading the :class:`ComputeJob` from ``logs`` and verifying its
-    ``artifact_id``. Returns a ``_citation_grounding`` dict using the same shape
-    as the design / web_research lanes so :func:`_grounding_probe_detail` and
-    :func:`_compute_grounding_miss` apply symmetrically. Never raises — any
-    storage error is treated as unresolved, which is the conservative choice.
+    The document can cite its result bundle and the persisted viewable-file
+    manifest. This helper verifies the former against its :class:`Artifact` row
+    and the latter against the canonical manifest. Returns a
+    ``_citation_grounding`` dict using the same shape as the design / web_research
+    lanes so :func:`_grounding_probe_detail` and :func:`_compute_grounding_miss`
+    apply symmetrically. Never raises — any storage error is unresolved.
     """
-    if not result_reference or not _is_usable_citation(result_reference):
+    citations = [
+        value
+        for value in [result_reference, *(viewable_citations or [])]
+        if _is_durable_citation(value)
+    ]
+    citations = list(dict.fromkeys(citations))
+    if not citations:
         # No citation to probe — 0 checked means the miss gate won't fire.
         return {"checked": True, "file_citations": 0, "grounded": 0, "unresolved": []}
 
-    grounded = 0
-    job = await _load_compute_job_from_logs(logs, session)
+    grounded_citations: set[str] = set()
+    job = job or await _load_compute_job_from_logs(logs, session)
     if job is not None and job.artifact_id is not None:
         try:
             artifact = await session.get(Artifact, job.artifact_id)
@@ -1800,18 +1851,28 @@ async def _compute_citation_grounding_stamp(
                 # durable storage URI — bare artifact-row presence is not enough.
                 storage_prefix = (artifact.storage_uri or "").rstrip("/")
                 ref = (result_reference or "").rstrip("/")
-                if storage_prefix and (
+                if storage_prefix and ref and (
                     ref == storage_prefix or ref.startswith(storage_prefix + "/")
                 ):
-                    grounded = 1
+                    grounded_citations.add(result_reference)
         except Exception:  # noqa: BLE001 — best-effort, never breaks completion
             pass
 
+    # Each accepted viewable URI came from the job's persisted, signed-download
+    # manifest. Confirm membership before treating it as durable evidence.
+    manifest_citations = set(_viewable_compute_citations(job))
+    grounded_citations.update(
+        citation
+        for citation in viewable_citations or []
+        if citation in manifest_citations
+    )
+    unresolved = [citation for citation in citations if citation not in grounded_citations]
+
     return {
         "checked": True,
-        "file_citations": 1,
-        "grounded": grounded,
-        "unresolved": [] if grounded > 0 else [result_reference],
+        "file_citations": len(citations),
+        "grounded": len(grounded_citations),
+        "unresolved": unresolved,
     }
 
 
@@ -1841,6 +1902,7 @@ async def _gather_compute_evidence(
     least one piece of real evidence rather than only re-stating the reference.
     """
     job = await _load_compute_job_from_logs(logs, session)
+    viewable_citations = _viewable_compute_citations(job)
     if job is None:
         return None
 
@@ -1888,11 +1950,11 @@ async def _gather_compute_evidence(
     job_reference = (job.result_reference or "").strip() or None
     artifact_uri = artifact_uri or job_reference or storage_uri
     has_metric_evidence = bool(metrics)
-    if artifact_uri is None and not has_metric_evidence:
+    if artifact_uri is None and not has_metric_evidence and not viewable_citations:
         return None
     if artifact_uri is not None and not _is_durable_citation(artifact_uri):
         return None
-    if file_count <= 0 and not metrics:
+    if file_count <= 0 and not metrics and not viewable_citations:
         # No durable files survived AND no preserved metric — nothing the LLM can
         # honestly analyse beyond the bare verdict; fall back.
         return None
@@ -1925,6 +1987,8 @@ async def _gather_compute_evidence(
         _add_real(artifact_uri)
         if storage_uri and storage_uri != artifact_uri:
             _add_real(storage_uri)
+    for citation in viewable_citations:
+        _add_real(citation)
 
     # Signed download URLs are transient (they expire); include them in the LLM
     # prompt as supplementary context but NOT in real_evidence so a signed URL
@@ -1932,8 +1996,9 @@ async def _gather_compute_evidence(
     try:
         from app import storage as _storage
 
-        signed = await _storage.generate_download_signed_url(artifact_uri)
-        _add_supplementary(signed)
+        if artifact_uri is not None:
+            signed = await _storage.generate_download_signed_url(artifact_uri)
+            _add_supplementary(signed)
     except Exception:  # noqa: BLE001, S110 — signing is optional, nothing to log
         pass
 
@@ -2601,6 +2666,7 @@ async def _prepare_deterministic_compute_document(
 ) -> tuple[dict[str, Any], uuid.UUID | None]:
     """Build the primary deterministic artifact-grounded compute document."""
     job = await _load_compute_job_from_logs(logs, session)
+    viewable_citations = _viewable_compute_citations(job)
     terminal_diagnostics = _extract_job_terminal_diagnostics(job)
     result_metrics = _extract_faithful_result_metrics(job)
     arms = _extract_experiment_arms(result_metrics)
@@ -2615,10 +2681,15 @@ async def _prepare_deterministic_compute_document(
         result_metrics=result_metrics,
         arms=arms,
         evidence_tier=evidence_tier,
+        viewable_citations=viewable_citations,
     )
     try:
         grounding_stamp = await _compute_citation_grounding_stamp(
-            result_reference, logs, session
+            result_reference,
+            logs,
+            session,
+            job=job,
+            viewable_citations=viewable_citations,
         )
         document = dict(document)
         document["_citation_grounding"] = grounding_stamp

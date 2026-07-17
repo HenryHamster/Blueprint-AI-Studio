@@ -850,7 +850,7 @@ async def _make_compute_job_file(
     session, job: ComputeJob, relpath: str = "plot.png", media_type: str = "image"
 ) -> ComputeJobFile:
     """Create a ComputeJobFile row for a viewable file under a compute job's prefix."""
-    storage_uri = f"gs://{BUCKET}/compute-jobs/{job.id}/artifacts/files/{relpath}"
+    storage_uri = storage.compute_job_viewable_uri(job.id, relpath)
     cjf = ComputeJobFile(
         compute_job_id=job.id,
         safe_relpath=relpath,
@@ -899,7 +899,7 @@ async def test_resolve_download_url_compute_job_media_file_wrong_job_404(
 
     # Create a ComputeJobFile whose storage_uri is under job_a's prefix
     # but whose compute_job_id points to job_b.
-    uri_under_a = f"gs://{BUCKET}/compute-jobs/{job_a.id}/artifacts/files/result.png"
+    uri_under_a = storage.compute_job_viewable_uri(job_a.id, "result.png")
     cjf = ComputeJobFile(
         compute_job_id=job_b.id,
         safe_relpath="result.png",
@@ -1125,3 +1125,80 @@ async def test_resolve_download_url_viewable_manifest_and_cjf_both_authorize(
     )
     assert resp.status_code == 200
     assert resp.json()["url"] == "https://signed.example/dual-auth-ok"
+
+
+@pytest.mark.asyncio
+async def test_signable_viewable_set_matches_listed_set(
+    client: AsyncClient, db_session, mocker
+):
+    """The set of URIs the download-url endpoint will sign must equal the set
+    the viewable-files manifest lists — no extra signing via ComputeJobFile rows
+    whose extension is not in the viewable allowlist.
+
+    Concretely: a ComputeJobFile row whose safe_relpath has a non-viewable
+    extension (e.g. '.csv') must be rejected with 404 even though the row
+    exists in the DB.  This verifies the extension guard that was added to the
+    ComputeJobFile signing branch so it matches the manifest build path.
+    """
+    _mock_signing(mocker, url="https://signed.example/lockstep-ok")
+    project = await _make_project(db_session)
+    await _add_member(db_session, project.id)
+    task = await _make_task(db_session, project)
+
+    # A terminal job whose manifest contains one viewable image.
+    job = ComputeJob(
+        task_id=task.id,
+        project_id=project.id,
+        backend="gcp",
+        status=ComputeJobStatus.SUCCEEDED,
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+    )
+    db_session.add(job)
+    await db_session.flush()
+
+    listed_uri = (
+        f"gs://{BUCKET}/compute-jobs/{job.id}/artifacts/viewable/reward.png"
+    )
+    job.polling_metadata = {
+        "viewable_files": [
+            {
+                "filename": "reward.png",
+                "storage_uri": listed_uri,
+                "content_type": "image/png",
+                "size_bytes": 128,
+                "kind": "image",
+            }
+        ]
+    }
+    db_session.add(job)
+
+    # A ComputeJobFile row with a non-viewable extension — must NOT be signable.
+    non_viewable_uri = (
+        f"gs://{BUCKET}/compute-jobs/{job.id}/artifacts/viewable/metrics.csv"
+    )
+    cjf_bad = ComputeJobFile(
+        compute_job_id=job.id,
+        safe_relpath="metrics.csv",
+        media_type="unknown",
+        storage_uri=non_viewable_uri,
+    )
+    db_session.add(cjf_bad)
+    await db_session.commit()
+
+    # Listed URI (in manifest) is signable.
+    resp = await client.get(
+        "/api/admin/artifacts/download-url",
+        params={"storage_uri": listed_uri, "project_id": str(project.id)},
+    )
+    assert resp.status_code == 200, "manifest URI must be signable"
+
+    # Non-viewable-extension ComputeJobFile is NOT signable — signable set
+    # matches listed set; extension guard closes the divergence.
+    resp2 = await client.get(
+        "/api/admin/artifacts/download-url",
+        params={"storage_uri": non_viewable_uri, "project_id": str(project.id)},
+    )
+    assert resp2.status_code == 404, (
+        "non-viewable-extension ComputeJobFile row must not be signable"
+    )

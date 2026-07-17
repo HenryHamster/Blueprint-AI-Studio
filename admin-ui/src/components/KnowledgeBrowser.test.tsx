@@ -1610,4 +1610,58 @@ describe('KnowledgeBrowser — viewable-media error fallback sanitizes citation 
     const openDirectlyLink = anchors.find(a => a.textContent?.includes('open directly'));
     expect(openDirectlyLink).toBeUndefined();
   });
+
+  // When a signed URL resolves successfully but the media element fires onError
+  // (e.g. the URL was already expired by the time the browser fetched it),
+  // ViewableMediaInline must re-resolve a fresh URL rather than silently showing
+  // a broken image. Regression guard for the expired-signed-URL fix.
+  test('re-resolves a fresh signed URL when the media element fires onError (expired URL)', async () => {
+    const gsRef = 'gs://blueprint-agent-artifacts/jobs/job-img/result.png';
+    const { fetchKnowledgeDocument, resolveArtifactDownloadUrl } = await import('../api');
+    vi.mocked(fetchKnowledgeDocument).mockResolvedValueOnce({
+      ...webResearchDoc,
+      body: '# Body',
+      source_citations: [gsRef],
+    } as never);
+    // First resolve returns an expired URL; second resolve returns a fresh one.
+    const freshUrl = 'https://signed.example.com/fresh-url.png';
+    vi.mocked(resolveArtifactDownloadUrl)
+      .mockResolvedValueOnce('https://signed.example.com/expired-url.png')
+      .mockResolvedValueOnce(freshUrl);
+
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <KnowledgeBrowser
+          selectedProjectId="project-test"
+          onClose={() => {}}
+          onNavigateToTask={() => {}}
+        />,
+      );
+    });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+    const docButton = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+      b => b.textContent?.includes('Survey of reachable web sources'),
+    );
+    if (!docButton) throw new Error('expected knowledge document button');
+    await act(async () => { (docButton as HTMLElement).click(); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+
+    // The img renders with the first (expired) URL.
+    const img = (host as HTMLDivElement).querySelector('img[src*="signed.example.com"]');
+    if (!img) throw new Error('expected img element with signed URL');
+
+    // Simulate the browser firing onError on the expired URL.
+    await act(async () => { img.dispatchEvent(new Event('error')); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+
+    // resolveArtifactDownloadUrl must have been called a second time for the retry.
+    expect(vi.mocked(resolveArtifactDownloadUrl).mock.calls.length).toBeGreaterThanOrEqual(2);
+    // The fresh URL is now applied to the img.
+    const imgAfter = (host as HTMLDivElement).querySelector(`img[src="${freshUrl}"]`);
+    expect(imgAfter).not.toBeNull();
+  });
 });

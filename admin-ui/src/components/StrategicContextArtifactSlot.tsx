@@ -188,6 +188,22 @@ function useFreshMediaUrl(
   return { url, status, retry, onMediaError };
 }
 
+/** Pulsing "LIVE" badge for mid-run viewable previews. Renders a small overlay
+ *  chip with a pulsing dot so operators can visually distinguish a still-updating
+ *  preview from a terminal one. Uses the same design in all three rendering
+ *  surfaces (strategic canvas, compute jobs panel, artifact gallery drawer). */
+function LiveBadge() {
+  return (
+    <span
+      className="absolute left-1 top-1 z-10 flex items-center gap-1 rounded bg-red-600/90 px-1.5 py-0.5 text-ui-xs font-semibold text-white shadow-sm"
+      data-testid="live-badge"
+    >
+      <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-white" />
+      LIVE
+    </span>
+  );
+}
+
 /** Full-screen overlay for viewing a single image at full size. Esc / backdrop close. */
 function MediaLightbox({ url, alt, onClose }: { url: string; alt: string; onClose: () => void }) {
   useEffect(() => {
@@ -272,6 +288,7 @@ function ResolvedImage({
   alt,
   className,
   onExpand,
+  live,
 }: {
   projectId?: string | null;
   storageUri?: string | null;
@@ -280,6 +297,7 @@ function ResolvedImage({
   alt: string;
   className: string;
   onExpand: (url: string, alt: string) => void;
+  live?: boolean | null;
 }) {
   const { url, status, retry, onMediaError } = useFreshMediaUrl(projectId, storageUri, revision, bakedUrl);
   if (status === 'loading') return <MediaSkeleton className={className} />;
@@ -297,6 +315,7 @@ function ResolvedImage({
       data-viewport-allow-small-target=""
     >
       <img src={url} alt={alt} loading="lazy" onError={onMediaError} className={className} />
+      {live && <LiveBadge />}
       <span className="pointer-events-none absolute right-1 top-1 rounded bg-black/60 p-1 text-neutral-200 opacity-0 transition-opacity group-hover:opacity-100">
         <Maximize2 className="h-3.5 w-3.5" aria-hidden="true" />
       </span>
@@ -311,6 +330,7 @@ function ResolvedVideo({
   bakedUrl,
   ariaLabel,
   className,
+  live,
 }: {
   projectId?: string | null;
   storageUri?: string | null;
@@ -318,17 +338,27 @@ function ResolvedVideo({
   bakedUrl?: string | null;
   ariaLabel: string;
   className: string;
+  live?: boolean | null;
 }) {
   const { url, status, retry, onMediaError } = useFreshMediaUrl(projectId, storageUri, revision, bakedUrl);
   if (status === 'loading') return <MediaSkeleton className={className} />;
   if (status === 'error' || !url) return <MediaRetry label="Video preview unavailable" onRetry={retry} />;
   // Bind the URL directly to <video src> (not a nested <source>) so `onError`
   // fires reliably when the signed URL is dead — matching ComputeJobsPanel.
-  return (
+  const video = (
     <video controls preload="metadata" src={url} onError={onMediaError} className={className} aria-label={ariaLabel} data-testid="strategic-artifact-video">
       Your browser does not support the video element.
     </video>
   );
+  if (live) {
+    return (
+      <div className="relative inline-flex">
+        {video}
+        <LiveBadge />
+      </div>
+    );
+  }
+  return video;
 }
 
 function ResolvedPdf({
@@ -338,6 +368,7 @@ function ResolvedPdf({
   bakedUrl,
   label,
   className,
+  live,
 }: {
   projectId?: string | null;
   storageUri?: string | null;
@@ -345,6 +376,7 @@ function ResolvedPdf({
   bakedUrl?: string | null;
   label: string;
   className: string;
+  live?: boolean | null;
 }) {
   // PDFs are never embedded inline on the app origin. Resolve a fresh signed URL
   // (re-minted from storage_uri, falling back to the baked url) and open it in a
@@ -353,7 +385,7 @@ function ResolvedPdf({
   const { url, status, retry } = useFreshMediaUrl(projectId, storageUri, revision, bakedUrl);
   if (status === 'loading') return <MediaSkeleton className={className} />;
   if (status === 'error' || !url) return <MediaRetry label="PDF preview unavailable" onRetry={retry} />;
-  return (
+  const button = (
     <button
       type="button"
       onClick={() => window.open(url, '_blank', 'noopener,noreferrer')}
@@ -366,6 +398,15 @@ function ResolvedPdf({
       <ArrowUpRight className="h-3.5 w-3.5 shrink-0 text-neutral-500" aria-hidden="true" />
     </button>
   );
+  if (live) {
+    return (
+      <div className="relative">
+        {button}
+        <LiveBadge />
+      </div>
+    );
+  }
+  return button;
 }
 
 /**
@@ -417,6 +458,7 @@ export function ArtifactViewablePreviews({
               bakedUrl={preview.url}
               ariaLabel={alt}
               className="h-20 w-auto flex-shrink-0"
+              live={preview.live}
             />
           );
         }
@@ -430,6 +472,7 @@ export function ArtifactViewablePreviews({
             alt={alt}
             className="h-20 w-auto flex-shrink-0 object-contain"
             onExpand={onExpand}
+            live={preview.live}
           />
         );
       })}
@@ -477,6 +520,7 @@ function ImageDescriptorBlock({
               alt={img.alt || img.filename || `${descriptor.title} ${i + 1}`}
               className="h-40 w-auto flex-shrink-0 object-contain"
               onExpand={onExpand}
+              live={img.live}
             />
           ))}
         </div>
@@ -489,6 +533,7 @@ function ImageDescriptorBlock({
           alt={descriptor.image?.alt || items[0].alt || descriptor.title}
           className="max-h-80 w-full object-contain"
           onExpand={onExpand}
+          live={items[0].live}
         />
       ) : (
         <div className="px-2 py-2 text-xs text-neutral-500">
@@ -529,6 +574,7 @@ function VideoDescriptorBlock({
               bakedUrl={v.url}
               ariaLabel={v.alt || v.filename || `${descriptor.title} ${i + 1}`}
               className="h-40 w-auto flex-shrink-0"
+              live={v.live}
             />
           ))}
         </div>
@@ -540,6 +586,7 @@ function VideoDescriptorBlock({
           bakedUrl={items[0].url}
           ariaLabel={descriptor.video?.alt || items[0].alt || descriptor.title}
           className="max-h-80 w-full"
+          live={items[0].live}
         />
       ) : (
         <div className="px-2 py-2 text-xs text-neutral-500">
@@ -767,6 +814,7 @@ function DescriptorCard({
                     bakedUrl={doc.url}
                     label={doc.alt || doc.filename || (items.length > 1 ? `${descriptor.title} ${i + 1}` : descriptor.title)}
                     className="flex min-h-11 w-full items-center gap-2 rounded border border-neutral-800 bg-neutral-950/45 px-2 py-1.5 text-left text-sm text-neutral-200 transition-colors hover:border-sky-500/50 hover:bg-neutral-900"
+                    live={doc.live}
                   />
                 ))}
               </div>

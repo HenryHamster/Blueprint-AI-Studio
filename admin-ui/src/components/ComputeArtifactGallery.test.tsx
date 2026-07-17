@@ -437,4 +437,88 @@ describe('ComputeArtifactGallery', () => {
     });
     expect(resolveArtifactDownloadUrl).toHaveBeenCalledTimes(2);
   });
+
+  test('renders LIVE badge on an image artifact with live=true', async () => {
+    resolveArtifactDownloadUrl.mockResolvedValue('https://signed/plot.png');
+    const liveImage = { ...imageArtifact, live: true };
+    const { getByTestId, getAllByTestId } = render(
+      <ComputeArtifactGallery
+        projectId="proj-1"
+        job={makeJob({ status: 'RUNNING', viewable_artifacts: [liveImage] })}
+      />,
+    );
+
+    await act(async () => {
+      fireEvent.click(getByTestId('drawer-artifact-gallery-toggle'));
+    });
+    await waitFor(() => {
+      expect(getByTestId('drawer-artifact-thumbnail')).toBeTruthy();
+    });
+
+    const badges = getAllByTestId('live-badge');
+    expect(badges.length).toBe(1);
+    expect(badges[0].textContent).toContain('LIVE');
+  });
+
+  test('does not render LIVE badge when live is false', async () => {
+    resolveArtifactDownloadUrl.mockResolvedValue('https://signed/plot.png');
+    const terminalImage = { ...imageArtifact, live: false };
+    const { getByTestId, queryByTestId } = render(
+      <ComputeArtifactGallery
+        projectId="proj-1"
+        job={makeJob({ viewable_artifacts: [terminalImage] })}
+      />,
+    );
+
+    await act(async () => {
+      fireEvent.click(getByTestId('drawer-artifact-gallery-toggle'));
+    });
+    await waitFor(() => {
+      expect(getByTestId('drawer-artifact-thumbnail')).toBeTruthy();
+    });
+
+    expect(queryByTestId('live-badge')).toBeNull();
+  });
+
+  test('renders LIVE badge on a video artifact with live=true', async () => {
+    resolveArtifactDownloadUrl.mockResolvedValue('https://signed/rollout.mp4');
+    const liveVideo = { ...videoArtifact, live: true };
+    const { getByTestId, getAllByTestId } = render(
+      <ComputeArtifactGallery
+        projectId="proj-1"
+        job={makeJob({ status: 'RUNNING', viewable_artifacts: [liveVideo] })}
+      />,
+    );
+
+    await act(async () => {
+      fireEvent.click(getByTestId('drawer-artifact-gallery-toggle'));
+    });
+    await waitFor(() => {
+      expect(getByTestId('drawer-artifact-video')).toBeTruthy();
+    });
+
+    const badges = getAllByTestId('live-badge');
+    expect(badges.length).toBe(1);
+    expect(badges[0].textContent).toContain('LIVE');
+  });
+
+  test('renders LIVE badge on a PDF artifact with live=true (pre-resolution placeholder)', async () => {
+    const livePdf = { ...pdfArtifact, live: true };
+    const { getByTestId, getAllByTestId } = render(
+      <ComputeArtifactGallery
+        projectId="proj-1"
+        job={makeJob({ status: 'RUNNING', viewable_artifacts: [livePdf] })}
+      />,
+    );
+
+    await act(async () => {
+      fireEvent.click(getByTestId('drawer-artifact-gallery-toggle'));
+    });
+
+    // PDF renders its Open button immediately (no eager sign), badge should appear.
+    expect(getByTestId('drawer-artifact-pdf')).toBeTruthy();
+    const badges = getAllByTestId('live-badge');
+    expect(badges.length).toBe(1);
+    expect(badges[0].textContent).toContain('LIVE');
+  });
 });
