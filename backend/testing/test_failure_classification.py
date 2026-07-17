@@ -1390,6 +1390,29 @@ class TestClassifyFailureAgentTimeout:
 
         assert ADMIN_CANCEL in INFRA_CLASSES
 
+    def test_admin_cancel_is_non_death_and_clears_timeout_metrics(self):
+        """Durable ADMIN_CANCEL provenance is never an agent-timeout signal."""
+        from app.digest_metrics import compute_timeout_rate
+        from app.failure_classification import is_non_death_cancellation
+        from app.models import TaskStatus
+
+        task = _task(
+            "Cancelled by operator",
+            ctx={
+                "failure_category": ADMIN_CANCEL,
+                "failure_class": ADMIN_CANCEL,
+                "cancelled_by": "USER",
+            },
+        )
+        task.status = TaskStatus.CANCELLED
+        task.started_at = object()
+
+        assert classify_failure(task) == ADMIN_CANCEL
+        assert is_non_death_cancellation(task)
+        result = compute_timeout_rate([task])
+        assert result["timeout_count"] == 0
+        assert result["by_subtype"]["cascade_cancellation"]["count"] == 0
+
     def test_resident_session_stop_failure_category_routes_to_admin_cancel(self):
         """A strategic_review task stopped by the operator should classify as ADMIN_CANCEL.
 

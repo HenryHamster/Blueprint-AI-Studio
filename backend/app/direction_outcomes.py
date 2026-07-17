@@ -15,6 +15,7 @@ from sqlmodel import select
 
 from app.failure_stage import _derive_failure_stage
 from app.failure_classification import (
+    ADMIN_CANCEL,
     CODE_ERROR,
     CO_DEFERRED_SHELVED,
     INFRA_CLASSES,
@@ -113,8 +114,8 @@ def _is_non_genuine_cancelled(task: Task) -> bool:
 
     Covers (a) cascade kills (see ``_is_cascade_cancelled``), (b) the new
     review/rollup non-genuine markers (``pr_closed_non_rejection``,
-    ``cap_exhausted_after_approve``), and (c) REASSIGNED / SCOPE_EMPTY handoffs
-    that land CANCELLED rather than FAILED. A genuine code/review failure never
+    ``cap_exhausted_after_approve``), (c) ADMIN_CANCEL operator actions, and (d)
+    REASSIGNED / SCOPE_EMPTY handoffs that land CANCELLED rather than FAILED. A genuine code/review failure never
     carries any of these signals, so this never hides a real regression.
     """
     if task.status != TaskStatus.CANCELLED:
@@ -128,7 +129,7 @@ def _is_non_genuine_cancelled(task: Task) -> bool:
         return True
     if ctx.get(CO_DEFERRED_SHELVED):
         return True
-    return ctx.get("failure_category") in (REASSIGNED, SCOPE_EMPTY)
+    return ctx.get("failure_category") in (ADMIN_CANCEL, REASSIGNED, SCOPE_EMPTY)
 
 
 def _counts_as_failure(task: Task) -> bool:

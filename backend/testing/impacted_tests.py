@@ -134,18 +134,54 @@ def module_reference_patterns(dotted: str) -> "list[re.Pattern]":
     return pats
 
 
-def _find_app_importers(changed_module: str, repo_root: str) -> "list[str]":
-    """Return dotted names of app modules that directly import ``changed_module``.
+_DOTTED_APP_REFERENCE_RE = re.compile(
+    r"(?<![A-Za-z0-9_.])(app(?:\.[A-Za-z_][A-Za-z0-9_]*)+)"
+)
+_FROM_APP_IMPORT_RE = re.compile(
+    r"from\s+(app(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\s+import\s+([^\n]+)"
+)
 
-    Scans every ``backend/app/**/*.py`` file using the same reference patterns as
-    the test-file scan. Used to surface tests that exercise an indirectly-reached
-    module (e.g. a logic helper imported by a router that a test imports).
+
+def _referenced_app_modules(content: str, known_modules) -> "set[str]":
+    """Return known ``app.*`` modules referenced by one source-file read.
+
+    Extract broad dotted references once and retain every known module prefix.
+    This preserves the historical boundary semantics (``app.foo`` matches
+    ``app.foo.bar`` but not ``app.foobar``) without rescanning the file for
+    every frontier module. The explicit from-import pass preserves references
+    such as ``from app.routers import agent``.
     """
+    known = set(known_modules)
+    referenced: "set[str]" = set()
+    for match in _DOTTED_APP_REFERENCE_RE.finditer(content):
+        parts = match.group(1).split(".")
+        for end in range(2, len(parts) + 1):
+            candidate = ".".join(parts[:end])
+            if candidate in known:
+                referenced.add(candidate)
+    for match in _FROM_APP_IMPORT_RE.finditer(content):
+        parent = match.group(1)
+        if parent in known:
+            referenced.add(parent)
+        for raw_name in match.group(2).split(","):
+            name = raw_name.strip().lstrip("(").rstrip(")")
+            name = re.split(r"\s+as\s+", name, maxsplit=1)[0].strip()
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+                continue
+            candidate = parent + "." + name
+            if candidate in known:
+                referenced.add(candidate)
+    return referenced
+
+
+def _index_app_importers(
+    repo_root: str, changed_modules
+) -> "tuple[dict[str, set[str]], set[str]]":
+    """Build ``referenced module -> direct importers`` in one app-tree scan."""
     app_dir = os.path.join(repo_root, "backend", "app")
     if not os.path.isdir(app_dir):
-        return []
-    patterns = module_reference_patterns(changed_module)
-    importers: "list[str]" = []
+        return {}, set(changed_modules)
+    sources: "dict[str, str]" = {}
     for dirpath, _dirs, filenames in os.walk(app_dir):
         for fname in filenames:
             if not fname.endswith(".py"):
@@ -153,16 +189,20 @@ def _find_app_importers(changed_module: str, repo_root: str) -> "list[str]":
             abs_path = os.path.join(dirpath, fname)
             rel = os.path.relpath(abs_path, repo_root).replace(os.sep, "/")
             importer = app_module_for_path(rel)
-            if importer is None or importer == changed_module:
+            if importer is None:
                 continue
             try:
                 with open(abs_path, encoding="utf-8", errors="replace") as fh:
-                    content = fh.read()
+                    sources[importer] = fh.read()
             except OSError:
                 continue
-            if any(pat.search(content) for pat in patterns):
-                importers.append(importer)
-    return importers
+    known_modules = set(sources) | set(changed_modules)
+    reverse: "dict[str, set[str]]" = {}
+    for importer, content in sources.items():
+        for referenced in _referenced_app_modules(content, known_modules):
+            if referenced != importer:
+                reverse.setdefault(referenced, set()).add(importer)
+    return reverse, known_modules
 
 
 def _glob_to_regex(glob: str) -> "re.Pattern":
@@ -306,7 +346,7 @@ def resolve_impacted(changed_paths, repo_root: str) -> "list[str]":
     changed_list = list(changed_paths)
     testing_dir = os.path.join(repo_root, "backend", "testing")
     impacted: "set[str]" = set()
-    changed_modules: "list[str]" = []
+    initial_changed_modules: "list[str]" = []
 
     for raw in changed_list:
         path = raw.strip()
@@ -320,28 +360,29 @@ def resolve_impacted(changed_paths, repo_root: str) -> "list[str]":
             continue
         dotted = app_module_for_path(path)
         if dotted is not None:
-            changed_modules.append(dotted)
+            initial_changed_modules.append(dotted)
 
-    if changed_modules and os.path.isdir(testing_dir):
+    if initial_changed_modules and os.path.isdir(testing_dir):
+        reverse_importers, known_modules = _index_app_importers(
+            repo_root, initial_changed_modules
+        )
         # Transitive closure (BFS, bounded by MAX_HOPS): app modules that
         # import a changed module — directly or indirectly — are also relevant.
         # ``seen_mods`` provides dedup and guarantees termination even without
         # the cap; the cap bounds scan cost on pathologically deep or cyclic
         # import graphs.
-        seen_mods: "set[str]" = set(changed_modules)
-        frontier = list(changed_modules)
+        seen_mods: "set[str]" = set(initial_changed_modules)
+        frontier = list(initial_changed_modules)
         for _ in range(MAX_HOPS):
             if not frontier:
                 break
             next_frontier: "list[str]" = []
             for mod in frontier:
-                for importer in _find_app_importers(mod, repo_root):
+                for importer in reverse_importers.get(mod, ()):
                     if importer not in seen_mods:
                         seen_mods.add(importer)
-                        changed_modules.append(importer)
                         next_frontier.append(importer)
             frontier = next_frontier
-        pattern_sets = [module_reference_patterns(mod) for mod in changed_modules]
         for name in os.listdir(testing_dir):
             if not (name.startswith("test_") and name.endswith(".py")):
                 continue
@@ -354,10 +395,9 @@ def resolve_impacted(changed_paths, repo_root: str) -> "list[str]":
             except OSError:
                 # Unreadable file: skip rather than crash the whole gate.
                 continue
-            for pats in pattern_sets:
-                if any(pat.search(content) for pat in pats):
-                    impacted.add("backend/testing/" + name)
-                    break
+            referenced = _referenced_app_modules(content, known_modules)
+            if referenced & seen_mods:
+                impacted.add("backend/testing/" + name)
 
     # Surface-glob drift sentinels: select whole-tree/fixed-set sentinels the
     # dotted-import scan structurally cannot reach. Merged into the same set so

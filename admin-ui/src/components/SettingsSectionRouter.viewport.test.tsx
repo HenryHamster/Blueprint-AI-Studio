@@ -1,4 +1,4 @@
-import { afterEach, describe, test, vi } from 'vitest';
+import { afterEach, beforeAll, describe, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { SettingsSectionRouter, type SettingsSectionRouterProps } from './SettingsSectionRouter';
@@ -226,14 +226,38 @@ function makeProps(activeSection: SectionId): SettingsSectionRouterProps {
 // Sections rendered by the router that present operator-facing layout/controls
 // purely from primitive props (no async fetch). These cover the General,
 // Orchestrator, Deploy, and Advanced bodies — the widest forms the router emits.
-const SECTIONS_UNDER_TEST: SectionId[] = ['general', 'orchestrator', 'deploy', 'advanced', 'resource-envelope', 'access'];
+const SECTIONS_UNDER_TEST = ['general', 'orchestrator', 'deploy', 'advanced', 'resource-envelope', 'access'] as const satisfies readonly SectionId[];
+
+// A section-specific marker proves the lazy module has resolved and committed.
+// Without this, the overflow assertion can inspect the Suspense skeleton and let
+// Vitest close the browser while Vite is still resolving that section's mocks.
+const SECTION_READY_MARKER: Record<(typeof SECTIONS_UNDER_TEST)[number], string> = {
+  general: 'Connection Status',
+  orchestrator: 'Pipeline Settings',
+  deploy: 'Deploy Health',
+  advanced: 'Health Check URLs',
+  'resource-envelope': 'Repository',
+  access: 'User Management',
+};
+
+beforeAll(async () => {
+  await Promise.all([
+    import('./SettingsGeneralSection'),
+    import('./SettingsOrchestratorSection'),
+    import('./SettingsDeploySection'),
+    import('./SettingsAdvancedSection'),
+    import('./ProjectResourceEnvelopeSection'),
+  ]);
+});
 
 describe('SettingsSectionRouter — viewport regression', () => {
   let root: Root | null = null;
   let host: HTMLDivElement | null = null;
 
-  afterEach(() => {
-    if (root) act(() => { root?.unmount(); });
+  afterEach(async () => {
+    if (root) {
+      await act(async () => { root?.unmount(); });
+    }
     root = null;
     host?.remove();
     host = null;
@@ -253,6 +277,11 @@ describe('SettingsSectionRouter — viewport regression', () => {
         root = createRoot(host);
         await act(async () => {
           root?.render(<SettingsSectionRouter {...makeProps(section)} />);
+        });
+        await vi.waitFor(() => {
+          if (!host?.textContent?.includes(SECTION_READY_MARKER[section])) {
+            throw new Error(`Settings section "${section}" has not finished loading`);
+          }
         });
       });
     });

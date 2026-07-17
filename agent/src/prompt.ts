@@ -1225,9 +1225,10 @@ export const SHARED_LIFECYCLE_REMAINDER = `- \`./pr open --title "<title>" --bod
 - \`./fail "<reason>"\` — Task fundamentally can't complete (wrong scope,
   conflicting requirements, unknown approach). NOT for transient lint/test
   failures — iterate with \`./check\`.
-- \`./blocked "<reason>"\` — No code edit can fix: (1) \`./check\` fails
-  identically despite changes, (2) toolchain/system error, or (3) repo-wide gate
-  fails on untouched files. Routes to strategic. Does NOT burn iteration cap.
+- For \`GATE-ENVIRONMENT\`/local time or tool limits, do NOT call \`./blocked\`:
+  run cheapest faithful checks, \`./pr open\`, \`./done\`; CI is authoritative.
+  A real assertion/lint/build/test failure still blocks publication and must be fixed.
+- \`./blocked "<reason>"\` — Only when no code edit can fix it; routes to strategic.
 
 Exit: edit -> ./check -> ./pr open -> ./done
 

@@ -748,6 +748,7 @@ def _ledger_status_to_ui(
     valid and no hard blocker fired. The blob resolver has always displayed such
     positive audit scores as passed/scored; preserve that operator-facing meaning
     instead of painting a 0.96 audit red.
+
     """
     if status == "blocked":
         return "failed"
@@ -802,6 +803,11 @@ async def resolve_dimension_states_from_ledger(
 
     if not rows:
         return resolve_dimension_states(version.last_qualification)
+    status = qual.get("status")
+    attempt_in_flight = (
+        status in ("pending", "qualifying") and not qual.get("promotion_pending")
+    )
+
 
     active_attempt = active_qualification_attempt_id(version)
     active_text = str(active_attempt) if active_attempt else None
@@ -877,6 +883,7 @@ async def resolve_dimension_states_from_ledger(
                 # stale prior-attempt fact cannot contradict the active state.
                 if key in _MUTABLE_DIMENSION_KEYS and currency == "reused":
                     entry["provenance"] = provenance
+
                     continue
 
                 entry["status"] = _ledger_status_to_ui(

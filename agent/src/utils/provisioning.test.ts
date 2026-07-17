@@ -15,12 +15,14 @@ vi.mock('fs', () => ({
     existsSync: vi.fn(() => false),
     readFileSync: vi.fn(() => ''),
     readdirSync: vi.fn(() => []),
+    statSync: vi.fn(() => ({ isDirectory: () => true })),
   },
 }));
 
 const mockFs = fs as unknown as {
   existsSync: ReturnType<typeof vi.fn>;
   readdirSync: ReturnType<typeof vi.fn>;
+  statSync: ReturnType<typeof vi.fn>;
 };
 const WORKSPACE = process.env.AGENT_WORKSPACE || '/tmp/workspace';
 
@@ -33,6 +35,8 @@ describe('detectProvisioningSteps', () => {
     // readdir stub never leaks into the next test.
     mockFs.readdirSync.mockReset();
     mockFs.readdirSync.mockReturnValue([]);
+    mockFs.statSync.mockReset();
+    mockFs.statSync.mockReturnValue({ isDirectory: () => true });
   });
 
   it('emits the operator-declared install_cmd as an authoritative step', () => {
@@ -56,6 +60,32 @@ describe('detectProvisioningSteps', () => {
     expect(steps[0].cmd).toBe('bash');
     expect(steps[0].args).toEqual(['-c', 'npm ci && npm run prepare']);
     expect(steps[0].cwd).toBe(`${WORKSPACE}/pkg`);
+  });
+
+  it('skips a stale removed directory while preserving valid sibling provisioning', () => {
+    mockFs.statSync.mockImplementation((p: string) => {
+      if (p === `${WORKSPACE}/local-domexception`) throw new Error('ENOENT');
+      return { isDirectory: () => p === `${WORKSPACE}/agent` };
+    });
+    const buildConfig: BuildConfig = {
+      directories: [
+        { path: 'local-domexception', type: 'node', install_cmd: 'npm ci' },
+        { path: 'agent', type: 'node', install_cmd: 'npm ci' },
+      ],
+    };
+
+    expect(detectProvisioningSteps(buildConfig)).toEqual([
+      expect.objectContaining({ cmd: 'npm', args: ['ci'], cwd: `${WORKSPACE}/agent`, declared: true }),
+    ]);
+  });
+
+  it('skips a configured path that exists but is not a directory', () => {
+    mockFs.statSync.mockReturnValue({ isDirectory: () => false });
+    const buildConfig: BuildConfig = {
+      directories: [{ path: 'package.json', type: 'node', install_cmd: 'npm ci' }],
+    };
+
+    expect(detectProvisioningSteps(buildConfig)).toEqual([]);
   });
 
   it('auto-provisions a pyproject-only Python project with pip install .', () => {

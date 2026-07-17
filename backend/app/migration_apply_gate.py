@@ -54,12 +54,13 @@ import json
 import logging
 import os
 import re
+import signal
 import sys
 import tarfile
 import tempfile
 import textwrap
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from typing import Awaitable, Callable, cast, NamedTuple, TypeVar
 from urllib.parse import quote
@@ -94,13 +95,21 @@ def _safe_tar_extractall(tar: tarfile.TarFile, dest: str) -> None:
     if sys.version_info >= (3, 11, 4):
         tar.extractall(dest, filter="data")
     else:
-        abs_dest = os.path.abspath(dest) + os.sep
+        abs_dest = os.path.abspath(dest)
         safe_members = []
         for member in tar.getmembers():
             member_path = os.path.abspath(os.path.join(dest, member.name))
-            if not member_path.startswith(abs_dest):
+            if os.path.commonpath((abs_dest, member_path)) != abs_dest:
                 raise ValueError(
                     f"tarfile member {member.name!r} would extract outside destination"
+                )
+            if member.issym() or member.islnk():
+                raise ValueError(
+                    f"tarfile link member {member.name!r} is not allowed"
+                )
+            if not (member.isfile() or member.isdir()):
+                raise ValueError(
+                    f"tarfile special member {member.name!r} is not allowed"
                 )
             safe_members.append(member)
         tar.extractall(dest, members=safe_members)
@@ -184,14 +193,44 @@ _ALEMBIC_VERSIONS_DIR = "backend/alembic/versions"
 _CANDIDATE_METADATA_SCRIPT = textwrap.dedent(
     """
     import importlib
+    import io
     import json
     import os
     import pathlib
     import sys
+    import tarfile
 
     from sqlmodel import SQLModel
 
-    repo_root = pathlib.Path(os.environ["CANDIDATE_REPO_ROOT"])
+    work_dir = pathlib.Path(os.environ["CANDIDATE_WORK_DIR"])
+    archive = sys.stdin.buffer.read()
+    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:*") as tar:
+        if sys.version_info >= (3, 11, 4):
+            tar.extractall(work_dir, filter="data")
+        else:
+            abs_dest = str(work_dir.resolve())
+            safe_members = []
+            for member in tar.getmembers():
+                member_path = str((work_dir / member.name).resolve())
+                if os.path.commonpath((abs_dest, member_path)) != abs_dest:
+                    raise ValueError(
+                        f"tarfile member {member.name!r} would extract outside destination"
+                    )
+                if member.issym() or member.islnk():
+                    raise ValueError(
+                        f"tarfile link member {member.name!r} is not allowed"
+                    )
+                if not (member.isfile() or member.isdir()):
+                    raise ValueError(
+                        f"tarfile special member {member.name!r} is not allowed"
+                    )
+                safe_members.append(member)
+            tar.extractall(work_dir, members=safe_members)
+
+    roots = sorted(path for path in work_dir.iterdir() if path.is_dir())
+    if not roots:
+        raise RuntimeError("candidate code snapshot unpacked to no repo root")
+    repo_root = roots[0]
     backend_root = repo_root / "backend"
     app_root = backend_root / "app"
     sys.path.insert(0, str(backend_root))
@@ -223,6 +262,136 @@ _CANDIDATE_METADATA_SCRIPT = textwrap.dedent(
     print(json.dumps(payload, sort_keys=True))
     """
 )
+
+_MIGRATION_APPLY_SCRIPT = textwrap.dedent(
+    """
+    import asyncio
+    import os
+
+    from sqlalchemy.engine import make_url
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from sqlalchemy.pool import NullPool
+
+    from app.migration_apply_gate import (
+        _reconcile_then_upgrade,
+        _scratch_connect_args,
+    )
+
+    async def _main():
+        database_url = os.environ["MIGRATION_APPLY_DATABASE_URL"]
+        script_location = os.environ["MIGRATION_APPLY_SCRIPT_LOCATION"]
+        url = make_url(database_url)
+        engine = create_async_engine(
+            url,
+            poolclass=NullPool,
+            connect_args=_scratch_connect_args(url),
+        )
+        try:
+            async with engine.connect() as conn:
+                await conn.run_sync(
+                    lambda sync_conn: _reconcile_then_upgrade(
+                        sync_conn, script_location
+                    )
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(_main())
+    """
+)
+
+
+# Retry configuration for transient operations — overridable in tests (via
+# monkeypatch) for speed without altering production behavior.
+_TRANSIENT_RETRY_MAX_ATTEMPTS = 3
+_TRANSIENT_RETRY_BASE_DELAY = 1.0
+_TRANSIENT_RETRY_MAX_DELAY = 16.0
+
+# Every external or database-heavy leg is independently bounded. The values are
+# generous relative to CI's observed timings while still bounding one attempt.
+_CANDIDATE_METADATA_TIMEOUT_SECONDS = 60.0
+_MIGRATION_APPLY_SUBPROCESS_TIMEOUT_SECONDS = 180.0
+_MIGRATION_APPLY_LOCK_TIMEOUT_SECONDS = 240.0
+_SCRATCH_CONNECT_TIMEOUT_SECONDS = 10.0
+_SCRATCH_COMMAND_TIMEOUT_SECONDS = 150.0
+_SCRATCH_STATEMENT_TIMEOUT_MS = 120_000
+_SCRATCH_LOCK_TIMEOUT_MS = 15_000
+_SCRATCH_CREATE_TIMEOUT_SECONDS = 30.0
+_SCRATCH_SEED_TIMEOUT_SECONDS = 90.0
+_SCRATCH_REFLECT_TIMEOUT_SECONDS = 30.0
+_SCRATCH_CLEANUP_TIMEOUT_SECONDS = 30.0
+_ENGINE_DISPOSE_TIMEOUT_SECONDS = 10.0
+_SUBPROCESS_REAP_TIMEOUT_SECONDS = 5.0
+_SUBPROCESS_DIAGNOSTIC_MAX_BYTES = 16_384
+_SUBPROCESS_ENV_ALLOWLIST = (
+    "LANG",
+    "LC_ALL",
+    "LD_LIBRARY_PATH",
+    "PATH",
+    "PYTHONHOME",
+    "PYTHONPATH",
+    "SSL_CERT_DIR",
+    "SSL_CERT_FILE",
+    "SYSTEMROOT",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "TZ",
+    "VIRTUAL_ENV",
+    "WINDIR",
+)
+
+
+_T = TypeVar("_T")
+
+
+async def _with_transient_retry(
+    coro_factory: Callable[[], Awaitable[_T]],
+    *,
+    label: str,
+) -> _T:
+    """Invoke *coro_factory* with bounded exponential backoff on exceptions.
+
+    *coro_factory* is a zero-argument awaitable factory — a lambda or closure
+    — because a consumed coroutine cannot be re-awaited.  On each attempt a
+    fresh coroutine is created so the retry observes a clean call stack.
+
+    Reads retry parameters from module-level ``_TRANSIENT_RETRY_*`` constants
+    so tests can monkeypatch them for speed without altering production.
+
+    After exhausting *max_attempts* consecutive failures, re-raises the *last*
+    exception so existing ``try``/``except`` structures around the caller
+    convert it to ``("defer", ...)``.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(1, _TRANSIENT_RETRY_MAX_ATTEMPTS + 1):
+        if attempt > 1:
+            delay = exponential_backoff(
+                attempt - 1,
+                base=_TRANSIENT_RETRY_BASE_DELAY,
+                cap=_TRANSIENT_RETRY_MAX_DELAY,
+                jitter=0.25,
+            )
+            logger.warning(
+                "[MIGRATION_APPLY_GATE] %s attempt %d/%d transient failure; "
+                "retrying in %.1fs: %s",
+                label,
+                attempt - 1,
+                _TRANSIENT_RETRY_MAX_ATTEMPTS,
+                delay,
+                last_exc,
+            )
+            await asyncio.sleep(delay)
+        try:
+            return await coro_factory()
+        except _MigrationApplyTimeout:
+            # A stage watchdog already proved this attempt exceeded its budget.
+            # Re-running it internally only multiplies a deterministic stall.
+            raise
+        except Exception as exc:  # noqa: BLE001 — retry on transient exceptions
+            last_exc = exc
+    # All attempts exhausted — re-raise the last exception.
+    raise cast(Exception, last_exc)
 
 
 # Retry configuration for transient operations — overridable in tests (via
@@ -312,6 +481,151 @@ class _DeterministicMigrationDefect(Exception):
 class _ScratchDatabaseUnavailable(Exception):
     """The dedicated scratch server could not be reached or provision a DB."""
 
+
+
+
+
+class _MigrationApplyTimeout(_MigrationApplyError):
+    """A stable, stage-specific watchdog expiry."""
+
+    def __init__(self, code: str, timeout_seconds: float):
+        self.code = code
+        self.timeout_seconds = timeout_seconds
+        super().__init__(f"{code}: exceeded {timeout_seconds:g}s wall-clock budget")
+
+
+def _scratch_connect_args(url: URL) -> dict[str, object]:
+    """Driver-level backstops for every connection to the scratch server."""
+
+    if url.drivername != "postgresql+asyncpg":
+        return {}
+    return {
+        "timeout": _SCRATCH_CONNECT_TIMEOUT_SECONDS,
+        "command_timeout": _SCRATCH_COMMAND_TIMEOUT_SECONDS,
+        "server_settings": {
+            "statement_timeout": str(_SCRATCH_STATEMENT_TIMEOUT_MS),
+            "lock_timeout": str(_SCRATCH_LOCK_TIMEOUT_MS),
+        },
+    }
+
+
+async def _run_timed_stage(
+    coro_factory: Callable[[], Awaitable[_T]],
+    *,
+    timeout_seconds: float,
+    timeout_code: str,
+) -> _T:
+    try:
+        return await asyncio.wait_for(coro_factory(), timeout=timeout_seconds)
+    except asyncio.TimeoutError as exc:
+        raise _MigrationApplyTimeout(timeout_code, timeout_seconds) from exc
+
+
+def _subprocess_base_env() -> dict[str, str]:
+    """Return only non-secret runtime variables required to launch Python."""
+
+    return {
+        key: value
+        for key in _SUBPROCESS_ENV_ALLOWLIST
+        if (value := os.environ.get(key)) is not None
+    }
+
+
+def _bounded_subprocess_detail(
+    stderr: bytes,
+    stdout: bytes,
+    returncode: int | None,
+    *,
+    sensitive_values: tuple[str, ...] = (),
+) -> str:
+    """Return a bounded diagnostic with credentials and secret assignments redacted."""
+
+    raw = stderr or stdout
+    for value in sorted(filter(None, sensitive_values), key=len, reverse=True):
+        raw = raw.replace(value.encode(), b"<redacted>")
+    truncated = len(raw) > _SUBPROCESS_DIAGNOSTIC_MAX_BYTES
+    text = raw[-_SUBPROCESS_DIAGNOSTIC_MAX_BYTES :].decode(
+        errors="replace"
+    ).strip()
+    text = re.sub(
+        r"(?i)([a-z][a-z0-9+.-]*://)[^/@\s]+(?::[^/@\s]*)?@",
+        r"\1<redacted>@",
+        text,
+    )
+    text = re.sub(
+        r"(?i)\b(password|token|secret|api[_-]?key)\s*([=:])\s*[^\s,;]+",
+        r"\1\2<redacted>",
+        text,
+    )
+    text = re.sub(
+        r"\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b",
+        "<redacted-token>",
+        text,
+    )
+    if truncated:
+        text = f"[truncated to last {_SUBPROCESS_DIAGNOSTIC_MAX_BYTES} bytes] {text}"
+    return text or f"exit {returncode}"
+
+
+async def _kill_and_reap_process(proc: asyncio.subprocess.Process) -> None:
+    """Kill the supervised child and its POSIX process group, then reap it."""
+
+    if proc.returncode is None:
+        try:
+            if os.name == "posix":
+                os.killpg(proc.pid, signal.SIGKILL)
+            else:  # pragma: no cover - production is POSIX
+                proc.kill()
+        except (ProcessLookupError, OSError):
+            if proc.returncode is None:
+                with suppress(ProcessLookupError, OSError):
+                    proc.kill()
+    try:
+        await asyncio.wait_for(
+            proc.communicate(), timeout=_SUBPROCESS_REAP_TIMEOUT_SECONDS
+        )
+    except (asyncio.TimeoutError, ProcessLookupError, OSError):
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=_SUBPROCESS_REAP_TIMEOUT_SECONDS)
+        except (asyncio.TimeoutError, ProcessLookupError, OSError):
+            logger.warning(
+                "[MIGRATION_APPLY_GATE] child pid=%s could not be reaped",
+                getattr(proc, "pid", None),
+            )
+
+
+async def _communicate_bounded(
+    proc: asyncio.subprocess.Process,
+    *,
+    timeout_seconds: float,
+    timeout_code: str,
+    input_bytes: bytes | None = None,
+) -> tuple[bytes, bytes]:
+    try:
+        return await asyncio.wait_for(
+            proc.communicate(input=input_bytes), timeout=timeout_seconds
+        )
+    except asyncio.TimeoutError as exc:
+        await asyncio.shield(_kill_and_reap_process(proc))
+        raise _MigrationApplyTimeout(timeout_code, timeout_seconds) from exc
+    except asyncio.CancelledError:
+        # Shutdown must not orphan candidate Python or delete its temp directory
+        # while the child is still using it.
+        await asyncio.shield(_kill_and_reap_process(proc))
+        raise
+
+
+async def _dispose_engine_bounded(engine: AsyncEngine, *, label: str) -> None:
+    try:
+        await asyncio.wait_for(
+            engine.dispose(), timeout=_ENGINE_DISPOSE_TIMEOUT_SECONDS
+        )
+    except Exception as exc:  # noqa: BLE001 - teardown is best-effort
+        logger.warning(
+            "[MIGRATION_APPLY_GATE] %s engine dispose did not complete: %s",
+            label,
+            exc,
+        )
 
 def _metadata_from_shape(shape: dict[str, list[str]]) -> sa.MetaData:
     """Build minimal metadata from table/column names only.
@@ -408,8 +722,15 @@ async def _read_prod_state(prod_engine: AsyncEngine) -> _ProdState | None:
         _sanitize_reflected_metadata(metadata)
         return _ProdState(revision=str(revision), metadata=metadata)
 
-    async with prod_engine.connect() as conn:
-        return await conn.run_sync(_read)
+    async def _run_read() -> _ProdState | None:
+        async with prod_engine.connect() as conn:
+            return await conn.run_sync(_read)
+
+    return await _run_timed_stage(
+        _run_read,
+        timeout_seconds=_SCRATCH_REFLECT_TIMEOUT_SECONDS,
+        timeout_code="migration_apply_prod_state_timeout",
+    )
 
 
 def _validate_db_name(name: str) -> None:
@@ -425,30 +746,43 @@ def _validate_db_name(name: str) -> None:
 
 
 async def _create_database(base_url: URL, name: str) -> None:
-    """``CREATE DATABASE name`` on *base_url*'s server (AUTOCOMMIT — DDL for a
-    new database cannot run inside a transaction). Creating a SEPARATE database
-    never touches production's schema."""
+    """Create one isolated database under a bounded connect/DDL budget."""
+
     _validate_db_name(name)
     engine = create_async_engine(
-        base_url, isolation_level="AUTOCOMMIT", poolclass=NullPool
+        base_url,
+        isolation_level="AUTOCOMMIT",
+        poolclass=NullPool,
+        connect_args=_scratch_connect_args(base_url),
     )
-    try:
+
+    async def _create() -> None:
         async with engine.connect() as conn:
             await conn.execute(sa.text(f'CREATE DATABASE "{name}"'))
-    except Exception as exc:
-        raise _ScratchDatabaseUnavailable() from exc
+
+
+    try:
+        await _run_timed_stage(
+            _create,
+            timeout_seconds=_SCRATCH_CREATE_TIMEOUT_SECONDS,
+            timeout_code="migration_apply_scratch_provision_timeout",
+        )
     finally:
-        await engine.dispose()
+        await _dispose_engine_bounded(engine, label="scratch provision")
 
 
 async def _drop_database(base_url: URL, name: str) -> None:
-    """Best-effort teardown of an ephemeral scratch database. Terminates any
-    lingering backends first (a still-open connection blocks ``DROP DATABASE``)."""
+    """Best-effort, bounded teardown of an ephemeral scratch database."""
+
     _validate_db_name(name)
     engine = create_async_engine(
-        base_url, isolation_level="AUTOCOMMIT", poolclass=NullPool
+        base_url,
+        isolation_level="AUTOCOMMIT",
+        poolclass=NullPool,
+        connect_args=_scratch_connect_args(base_url),
     )
-    try:
+
+    async def _drop() -> None:
         async with engine.connect() as conn:
             await conn.execute(
                 sa.text(
@@ -458,35 +792,62 @@ async def _drop_database(base_url: URL, name: str) -> None:
                 {"n": name},
             )
             await conn.execute(sa.text(f'DROP DATABASE IF EXISTS "{name}"'))
-    except Exception as exc:  # noqa: BLE001 — teardown is best-effort
+
+    try:
+        await _run_timed_stage(
+            _drop,
+            timeout_seconds=_SCRATCH_CLEANUP_TIMEOUT_SECONDS,
+            timeout_code="migration_apply_scratch_cleanup_timeout",
+        )
+    except Exception as exc:  # noqa: BLE001 - teardown is best-effort
         logger.warning(
-            "[MIGRATION_APPLY_GATE] could not drop scratch database %r (%s)",
+
+            "[MIGRATION_APPLY_GATE] could not drop scratch database %r: %s",
             name,
-            type(exc).__name__,
+            exc,
         )
     finally:
-        await engine.dispose()
+        await _dispose_engine_bounded(engine, label="scratch cleanup")
+
+
+async def _cleanup_ephemeral_database(
+    engine: AsyncEngine | None, base_url: URL, name: str
+) -> None:
+    if engine is not None:
+        await _dispose_engine_bounded(engine, label="ephemeral scratch")
+    await _drop_database(base_url, name)
 
 
 @asynccontextmanager
 async def ephemeral_postgres_database(base_url: URL, *, db_name: str | None = None):
-    """Provision a fresh, fully isolated Postgres database for the duration of the
-    ``async with`` block, yielding ``(engine, name)`` and dropping it on exit.
+    """Yield a fresh database and always make one bounded cleanup attempt."""
 
-    A brand-new database (not a schema, not a transaction) is the cleanest full
-    isolation: it gives a fresh ``public`` schema so the candidate's migrations —
-    including ``CREATE EXTENSION`` / ``CREATE TYPE`` — run exactly as they would
-    on a real deploy target, with zero chance of touching production. Reused by
-    both the gate (for its scratch DB) and the tests (to stand up a prod-sim DB).
-    """
     name = db_name or f"mig_apply_gate_{uuid.uuid4().hex[:16]}"
-    await _create_database(base_url, name)
-    engine = create_async_engine(base_url.set(database=name), poolclass=NullPool)
+    _validate_db_name(name)
+    engine: AsyncEngine | None = None
     try:
+        # Even a timed-out CREATE is ambiguous: the server may have committed it
+        # before the response was lost. The finally block therefore always issues
+        # DROP IF EXISTS for this unique name.
+        await _create_database(base_url, name)
+        scratch_url = base_url.set(database=name)
+        engine = create_async_engine(
+            scratch_url,
+            poolclass=NullPool,
+            connect_args=_scratch_connect_args(scratch_url),
+        )
         yield engine, name
     finally:
-        await engine.dispose()
-        await _drop_database(base_url, name)
+        cleanup_task = asyncio.create_task(
+            _cleanup_ephemeral_database(engine, base_url, name)
+        )
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            # Cleanup is independently bounded. Finish it before propagating the
+            # caller's cancellation so no database or connection is orphaned.
+            await asyncio.shield(cleanup_task)
+            raise
 
 
 async def _seed_scratch(scratch_engine: AsyncEngine, prod_state: _ProdState) -> None:
@@ -508,9 +869,18 @@ async def _seed_scratch(scratch_engine: AsyncEngine, prod_state: _ProdState) -> 
             {"r": prod_state.revision},
         )
 
-    try:
+    async def _run_seed() -> None:
         async with scratch_engine.begin() as conn:
             await conn.run_sync(_seed)
+
+    try:
+        await _run_timed_stage(
+            _run_seed,
+            timeout_seconds=_SCRATCH_SEED_TIMEOUT_SECONDS,
+            timeout_code="migration_apply_scratch_seed_timeout",
+        )
+    except _MigrationApplyTimeout:
+        raise
     except Exception as exc:
         raise _ScratchDatabaseUnavailable() from exc
 
@@ -557,22 +927,11 @@ def _reconcile_then_upgrade(sync_conn: sa.Connection, script_location: str) -> N
     _alembic_upgrade_head(sync_conn, script_location)
 
 
-# Serializes the in-process Alembic apply. Alembic's runtime is PROCESS-GLOBAL:
-# the ``alembic.op`` / ``alembic.context`` module-level proxies are rebound on
-# every ``EnvironmentContext`` enter, so two migration applies running
-# concurrently in THIS process clobber each other's bindings — surfacing as a
-# flaky ``KeyError``/aborted-transaction rather than a deterministic failure.
-# The release qualifier runs this gate PRE-LOCK (before the ReleaseVersion row
-# ``FOR UPDATE``), so two overlapping finalize attempts — e.g. the reaper sweep
-# starting a second finalize while the first is still inside its slow
-# GitHub+scratch-DB gate — execute concurrent applies. On 2026-06-16 that race
-# false-failed a healthy release qualification to ``infra_failure`` (the gate
-# logged "ok (applies cleanly)" on one attempt and ``KeyError: 'config'`` on the
-# overlapping one, minutes apart, for the identical candidate). The lock is
-# recreated whenever the running loop changes (``asyncio.Lock`` binds to the loop
-# it is first awaited on and raises if reused from another loop — every
-# pytest-asyncio test gets a fresh loop); in production the loop is stable, so the
-# same lock serializes every apply. Mirrors ``migration_reservations._project_lock``.
+# Retain one process-wide capacity lock even though Alembic now runs in an
+# isolated child process. It prevents overlapping qualifier finalizers from
+# multiplying full-chain scratch applies and exhausting the dedicated Postgres
+# target. Acquisition and child execution have independent watchdogs, so the
+# lock cannot remain held by a wedged candidate.
 _APPLY_LOCK_BY_LOOP: tuple[object, asyncio.Lock] | None = None
 
 
@@ -597,23 +956,78 @@ def _write_candidate_files(tmp: str, candidate_sources: dict[str, str]) -> str:
     return tmp
 
 
-async def _apply_candidate_migrations(
-    scratch_engine: AsyncEngine, candidate_sources: dict[str, str]
+async def _run_migration_apply_subprocess(
+    scratch_engine: AsyncEngine,
+    script_location: str,
+    *,
+    timeout_code: str,
 ) -> None:
-    """Materialize the candidate's migration files into a temp ``versions/`` dir
-    and apply them (reconcile pre-step + upgrade head) against the scratch DB.
+    """Run candidate migration Python in a supervised, killable process."""
 
-    The apply itself is serialized process-wide via :func:`_apply_lock` because
-    Alembic's runtime is global and not safe for concurrent in-process runs (see
-    that lock's note). Writing the throwaway temp files is per-call and stays
-    outside the lock; only the EnvironmentContext-driven apply is serialized."""
+    scratch_url = scratch_engine.url.render_as_string(hide_password=False)
+    env = _subprocess_base_env()
+    # Candidate migration modules that consult DATABASE_URL must see only the
+    # isolated target. Never expose the production URL to candidate Python.
+    env["HOME"] = script_location
+    env["DATABASE_URL"] = scratch_url
+    env["MIGRATION_APPLY_DATABASE_URL"] = scratch_url
+    env["MIGRATION_APPLY_SCRIPT_LOCATION"] = script_location
+    backend_root = os.path.dirname(os.path.dirname(__file__))
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        _MIGRATION_APPLY_SCRIPT,
+        cwd=backend_root,
+        env=env,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        start_new_session=os.name == "posix",
+    )
+    stdout, stderr = await _communicate_bounded(
+        proc,
+        timeout_seconds=_MIGRATION_APPLY_SUBPROCESS_TIMEOUT_SECONDS,
+        timeout_code=timeout_code,
+    )
+    if proc.returncode != 0:
+        detail = _bounded_subprocess_detail(
+            stderr,
+            stdout,
+            proc.returncode,
+            sensitive_values=(scratch_engine.url.password or "",),
+        )
+
+        raise _MigrationApplyError(
+            "candidate migration subprocess failed to apply against the "
+            f"recorded state: {detail}"
+        )
+
+
+async def _apply_candidate_migrations(
+    scratch_engine: AsyncEngine,
+    candidate_sources: dict[str, str],
+    *,
+    timeout_code: str = "migration_apply_candidate_chain_timeout",
+) -> None:
+    """Write the candidate chain and apply it in a supervised subprocess."""
+
     try:
         with tempfile.TemporaryDirectory() as tmp:
             await asyncio.to_thread(_write_candidate_files, tmp, candidate_sources)
-            async with _apply_lock(), scratch_engine.connect() as conn:
-                await conn.run_sync(
-                    lambda sync_conn: _reconcile_then_upgrade(sync_conn, tmp)
+            lock = _apply_lock()
+            acquired = False
+            try:
+                await _run_timed_stage(
+                    lock.acquire,
+                    timeout_seconds=_MIGRATION_APPLY_LOCK_TIMEOUT_SECONDS,
+                    timeout_code="migration_apply_capacity_timeout",
                 )
+                acquired = True
+                await _run_migration_apply_subprocess(
+                    scratch_engine, tmp, timeout_code=timeout_code
+                )
+            finally:
+                if acquired:
+                    lock.release()
     except _DeterministicMigrationDefect:
         raise  # already classified; propagate without re-wrapping
     except (SyntaxError, ImportError) as exc:
@@ -634,9 +1048,11 @@ async def _apply_candidate_migrations(
             f"candidate migration chain failed to apply against production's "
             f"recorded state: {type(exc).__name__}: {exc}"
         ) from exc
+    except _MigrationApplyTimeout:
+        raise
     except Exception as exc:
         raise _MigrationApplyError(
-            f"candidate migration chain failed to apply against production's "
+            "candidate migration chain failed to apply against production's "
             f"recorded state: {type(exc).__name__}: {exc}"
         ) from exc
 
@@ -680,9 +1096,21 @@ async def _build_candidate_reference_schema(
         # Apply the candidate chain from an EMPTY DB (no prod seed): the
         # reconcile pre-step is a strict no-op on a fresh database, so this is a
         # plain ``alembic upgrade head`` that materializes the full schema.
-        await _apply_candidate_migrations(ref_engine, candidate_sources)
-        async with ref_engine.connect() as conn:
-            return await conn.run_sync(_reflect)
+        await _apply_candidate_migrations(
+            ref_engine,
+            candidate_sources,
+            timeout_code="migration_apply_reference_apply_timeout",
+        )
+
+        async def _run_reflect() -> sa.MetaData:
+            async with ref_engine.connect() as conn:
+                return await conn.run_sync(_reflect)
+
+        return await _run_timed_stage(
+            _run_reflect,
+            timeout_seconds=_SCRATCH_REFLECT_TIMEOUT_SECONDS,
+            timeout_code="migration_apply_reference_reflect_timeout",
+        )
 
 
 async def _download_candidate_repo_archive(
@@ -742,11 +1170,7 @@ async def _build_candidate_required_metadata_from_snapshot(
     candidate_ref: str,
     project_id: str | None,
 ) -> sa.MetaData:
-    """Build candidate code-required metadata out of process from a repo snapshot.
-
-    The snapshot is pinned to ``candidate_ref`` and imported in a subprocess so
-    any SQLAlchemy listeners/mappers the candidate registers cannot leak into the
-    serving process."""
+    """Build candidate code-required metadata in one bounded subprocess."""
 
     archive = await _download_candidate_repo_archive(
         gh_token, owner, repo, candidate_ref, project_id
@@ -757,33 +1181,39 @@ async def _build_candidate_required_metadata_from_snapshot(
         )
 
     with tempfile.TemporaryDirectory() as tmp:
-        repo_root = await asyncio.to_thread(
-            _extract_snapshot_repo_root, tmp, archive
-        )
-
-        env = os.environ.copy()
-        env["CANDIDATE_REPO_ROOT"] = repo_root
+        env = _subprocess_base_env()
+        env["CANDIDATE_WORK_DIR"] = tmp
+        env["HOME"] = tmp
+        # Candidate imports do not need production data. Scrubbing this value
+        # prevents import-time code from accidentally reaching the live database.
+        env["DATABASE_URL"] = "sqlite+aiosqlite:///:memory:"
+        backend_root = os.path.dirname(os.path.dirname(__file__))
         proc = await asyncio.create_subprocess_exec(
             sys.executable,
             "-c",
             _CANDIDATE_METADATA_SCRIPT,
-            cwd=repo_root,
+            cwd=backend_root,
             env=env,
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            start_new_session=os.name == "posix",
         )
-        stdout, stderr = await proc.communicate()
+        stdout, stderr = await _communicate_bounded(
+            proc,
+            timeout_seconds=_CANDIDATE_METADATA_TIMEOUT_SECONDS,
+            timeout_code="migration_apply_candidate_metadata_timeout",
+            input_bytes=archive,
+        )
         if proc.returncode != 0:
-            detail = (
-                stderr.decode(errors="replace").strip()
-                or stdout.decode(errors="replace").strip()
-            )
+            detail = _bounded_subprocess_detail(stderr, stdout, proc.returncode)
+
             raise _MigrationApplyError(
                 f"candidate code snapshot at {candidate_ref!r} could not be imported "
                 f"to derive required metadata: {detail or f'exit {proc.returncode}'}"
             )
         try:
-            shape = await asyncio.to_thread(json.loads, stdout.decode())
+            shape = json.loads(stdout.decode())
         except Exception as exc:
             raise _MigrationApplyError(
                 f"candidate code snapshot at {candidate_ref!r} returned malformed "
@@ -828,12 +1258,46 @@ async def _reflect_scratch_drift(
 ) -> list[str]:
     """Tables/columns *required_metadata* expects that the post-upgrade scratch DB
     lacks — the deterministic drift signal."""
-    async with scratch_engine.connect() as conn:
-        return await conn.run_sync(
-            lambda sync_conn: reflect_schema_drift(
-                sync_conn, metadata=required_metadata
+    async def _run_reflect() -> list[str]:
+        async with scratch_engine.connect() as conn:
+            return await conn.run_sync(
+                lambda sync_conn: reflect_schema_drift(
+                    sync_conn, metadata=required_metadata
+                )
             )
+
+    return await _run_timed_stage(
+        _run_reflect,
+        timeout_seconds=_SCRATCH_REFLECT_TIMEOUT_SECONDS,
+        timeout_code="migration_apply_scratch_reflect_timeout",
+    )
+
+
+async def _provision_seed_and_detect_drift(
+    scratch_base_url: URL,
+    prod_state: _ProdState,
+    candidate_sources: dict[str, str],
+    required_metadata: sa.MetaData,
+) -> list[str]:
+    """Provision an isolated scratch DB, seed with production's recorded state,
+    apply candidate migrations, and return any schema drift.
+
+    Raises ``_MigrationApplyError`` on seed/apply/collision failure (deferrable).
+    Returns an empty list when the post-upgrade schema satisfies all requirements.
+    """
+    async with ephemeral_postgres_database(scratch_base_url) as (scratch_engine, name):
+        # ISOLATION GUARD: never run DDL against the production database.
+        if name == scratch_base_url.database:
+            raise _MigrationApplyError(
+                "scratch database name collided with the scratch server's default database"
+            )
+        await _seed_scratch(scratch_engine, prod_state)
+        await _apply_candidate_migrations(
+            scratch_engine,
+            candidate_sources,
+            timeout_code="migration_apply_replay_apply_timeout",
         )
+        return await _reflect_scratch_drift(scratch_engine, required_metadata)
 
 
 async def _provision_seed_and_detect_drift(
@@ -1169,6 +1633,7 @@ async def run_migration_apply_gate(
     required_metadata: sa.MetaData | None = None,
     candidate_sources: dict[str, str] | None = None,
     scratch_db_url: str | URL | None = None,
+
 ) -> Verdict:
     """Pre-promotion scratch-DB migration-apply gate.
 
@@ -1192,26 +1657,25 @@ async def run_migration_apply_gate(
     from a fresh apply of its own migration chain AND compares that to the
     candidate code's required schema so a forgotten migration still blocks.
 
-    *scratch_db_url* is a qualification-only dedicated Postgres target for
-    ephemeral database provisioning (``CREATE DATABASE``). When provided, the
-    gate creates scratch/reference databases on this server instead of the
-    production Postgres connection. In the deployed environment the production
-    connection is typically a limited-role pool user that cannot
-    ``CREATE DATABASE``, so every candidate would defer with
-    ``migration_apply_check_unavailable``.
-    Supplying a scratch-capable target unblocks the gate pre-promotion. Missing
-    or malformed configuration returns a typed actionable defer before any
-    production read or DDL; the production pool URL is never a fallback.
+
+    *scratch_db_url* is an optional dedicated Postgres target for ephemeral
+    database provisioning (``CREATE DATABASE``). When provided, the gate creates
+    scratch/reference databases on this server instead of the production
+    Postgres connection. In the deployed environment the production connection
+    is typically a limited-role pool user that cannot ``CREATE DATABASE``, so
+    every candidate would defer with ``migration_apply_check_unavailable``.
+    Supplying a scratch-capable target unblocks the gate pre-promotion. When
+    ``None`` (default), the gate falls back to *prod_engine*'s URL — the
+    correct path for dev/test environments where the Postgres user can create
+    databases.
 
     ISOLATION SAFETY: production is only ever read; the scratch database is a
     freshly-provisioned, separately-named Postgres database, and the orchestrator
     asserts its name differs from production's before any DDL.
     """
     prod_url = prod_engine.url
-    scratch_preflight = preflight_migration_apply_scratch(scratch_db_url)
-    if scratch_preflight.status != "ready" or scratch_preflight.target is None:
-        return ("defer", scratch_preflight.detail)
-    scratch_base_url = scratch_preflight.target
+
+    scratch_base_url = make_url(scratch_db_url) if scratch_db_url else prod_url
 
     if not prod_url.get_backend_name().startswith("postgresql"):
         # The renumber-skip class is a Postgres-deploy phenomenon; the gate needs
@@ -1277,6 +1741,9 @@ async def run_migration_apply_gate(
             lambda: _read_prod_state(prod_engine),
             label="read production's recorded state",
         )
+
+    except _MigrationApplyTimeout as exc:
+        return ("defer", str(exc))
     except Exception as exc:  # noqa: BLE001 — indeterminate prod state HOLDS
         return (
             "defer",
@@ -1357,6 +1824,7 @@ async def run_migration_apply_gate(
     except _DeterministicMigrationDefect as exc:
         return ("block", str(exc))
     except _ScratchDatabaseUnavailable:
+
         return (
             "defer",
             "scratch_database_unavailable: MIGRATION_APPLY_SCRATCH_DATABASE_URL "
