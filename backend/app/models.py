@@ -1699,6 +1699,10 @@ class Task(SQLModel, table=True):
             postgresql_using="gin",
             postgresql_ops={"latest_status_message": "gin_trgm_ops"},
         ),
+        # GIN index on payloads JSONB for efficient path queries on any key
+        # (e.g. payloads[0]['type'] filters in get_project_tasks, admin_compute_jobs).
+        # Added via alembic 0614 CONCURRENTLY DDL.
+        Index("ix_task_payloads_gin", "payloads", postgresql_using="gin"),
         # Partial index on (updated_at) for the EVALUATING CI-monitor scan
         # (orchestrator_ci_monitor.py:289-303) which repeatedly selects
         # EVALUATING rows on the leader's hot cycle. The full ix_task_updated_at
@@ -3519,6 +3523,10 @@ class ProjectMessage(SQLModel, table=True):
         ),
         Index("ix_projectmessage_from_task_id", "from_task_id"),
         Index("ix_projectmessage_status_from_type", "status", "from_type"),
+        # GIN index on context JSONB for efficient path queries on event_type,
+        # dedupe_key, and other frequently-filtered context fields.
+        # Added via alembic 0614 CONCURRENTLY DDL.
+        Index("ix_projectmessage_context_gin", "context", postgresql_using="gin"),
         # Accelerates high-signal message fetches filtered by (project_id, message_type)
         # and ordered by created_at DESC (build_operator_attention, get_operator_message_counts).
         Index(

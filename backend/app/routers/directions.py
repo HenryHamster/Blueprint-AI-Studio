@@ -287,16 +287,18 @@ async def get_directions(
         cache_key = await asyncio.to_thread(_direction_metric_cache_key, d)
         cached = _DIRECTION_METRIC_CACHE.get(cache_key)
         if cached is None:
-            generalized_state = await asyncio.to_thread(
-                _compute_lifetime_generalized_outcome_state, d
-            )
-            raw_churn = await asyncio.to_thread(_compute_churn_metrics, d)
-            raw_lifetime = await asyncio.to_thread(_compute_lifetime_burn_metrics, d)
-            merges_per_cycle = await asyncio.to_thread(
-                _compute_direction_merges_per_cycle, d
-            )
-            quality_score = await asyncio.to_thread(
-                _compute_direction_quality_score, d
+            (
+                generalized_state,
+                raw_churn,
+                raw_lifetime,
+                merges_per_cycle,
+                quality_score,
+            ) = await asyncio.gather(
+                asyncio.to_thread(_compute_lifetime_generalized_outcome_state, d),
+                asyncio.to_thread(_compute_churn_metrics, d),
+                asyncio.to_thread(_compute_lifetime_burn_metrics, d),
+                asyncio.to_thread(_compute_direction_merges_per_cycle, d),
+                asyncio.to_thread(_compute_direction_quality_score, d),
             )
             cached = {
                 "merges_per_cycle": merges_per_cycle,
