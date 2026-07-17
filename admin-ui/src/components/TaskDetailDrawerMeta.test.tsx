@@ -1150,9 +1150,7 @@ describe('DetailsTab — Knowledge Document', () => {
     render(<DetailsTab task={knowledgeTask()} />);
     await act(async () => {
       fireEvent.click(screen.getByText('View document'));
-      resolveDocument({ id: 'doc-1', body: '# Full body
-
-Detailed markdown.' });
+      resolveDocument({ id: 'doc-1', body: '# Full body\n\nDetailed markdown.' });
       await fullDocument;
     });
     expect(fetchKnowledgeDocument).toHaveBeenCalledWith('proj-1', 'doc-1');
