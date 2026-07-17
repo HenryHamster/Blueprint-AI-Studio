@@ -34,7 +34,7 @@ from app import ci_resolution
 from app import release_qualifier as rq
 from app import release_qualifier_sweep as rqs
 from app import release_version as rv
-from app.models import Project
+from app.models import Alert, Project
 
 _OLD_SHA = "aaaa1111" * 5
 _NEW_SHA = "bbbb2222" * 5
@@ -409,3 +409,139 @@ async def test_sweep_isolates_a_failing_version(db_session, mocker):
     )
 
     assert seen == [version_b.id]
+
+
+# ===========================================================================
+# Infra-failure redrive cap — operator alert
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_infra_failure_redrive_cap_raises_operator_alert_once(db_session, mocker):
+    """When the infra-failure redrive cap is exhausted, an operator Alert is raised
+    (once).  A subsequent re-drive attempt on the same version does NOT duplicate
+    the alert — the ``infra_failure_loop_escalated`` guard flag prevents that.
+
+    Acceptance evidence for task fix(qualify): alert operator when infra-failure
+    redrive cap exhausts.
+    """
+    from app.release_qualifier_redrive import (
+        _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS,
+        _redrive_infra_failure_qualification,
+    )
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "infra_failure",
+        "candidate_sha": "ca11face" * 5,
+        "error": "migration_apply_check_unavailable",
+        "consecutive_infra_errors": _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # First call: cap is hit -> should return False AND raise an Alert.
+    result_a = await _redrive_infra_failure_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert result_a is False, (
+        "redrive must be blocked when cap is reached"
+    )
+
+    # An operator Alert should have been raised.
+    from sqlalchemy import select as _select
+
+    alerts = (
+        (await db_session.execute(
+            _select(Alert).where(Alert.project_id == project.id)
+        ))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1, "exactly one Alert must be created on first cap hit"
+    assert "infra-failure" in alerts[0].title.lower() or "infra" in alerts[0].title.lower()
+    assert str(version.version_number) in alerts[0].title
+
+    # The escalation guard flag must be set.
+    await db_session.refresh(version)
+    assert version.last_qualification.get("infra_failure_loop_escalated") is True
+
+    # Second call: same cap level, guard flag already set -> no duplicate alert.
+    result_b = await _redrive_infra_failure_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert result_b is False, (
+        "redrive must still be blocked on second attempt"
+    )
+
+    alerts_after = (
+        (await db_session.execute(
+            _select(Alert).where(Alert.project_id == project.id)
+        ))
+        .scalars()
+        .all()
+    )
+    assert len(alerts_after) == 1, (
+        "alert must NOT be duplicated on subsequent cap hits"
+    )
+
+
+@pytest.mark.asyncio
+async def test_infra_failure_cap_alert_persists_failing_dimension_and_signature(
+    db_session, mocker
+):
+    """The infra-failure cap Alert must carry the failing dimension and the
+    infra-failure signature in a PERSISTED field so an operator can see which
+    gate looped and why.
+
+    The Alert model has no JSON ``extra`` column; a prior ``extra={...}`` kwarg
+    was silently dropped on persist.  This test re-reads the Alert row FROM THE
+    DATABASE (a fresh query, not the in-memory instance) and asserts the
+    structured evidence survives readback — i.e. it lives in ``message``, not in
+    a dropped attribute.
+    """
+    from app.release_qualifier_redrive import (
+        _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS,
+        _redrive_infra_failure_qualification,
+    )
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "infra_failure",
+        "candidate_sha": "ca11face" * 5,
+        "error": "boot_prereq_evidence_unavailable",
+        "failing_dimension": "env_preflight",
+        "infra_failure_signature": "env_preflight:boot_prereq_evidence_unavailable",
+        "consecutive_infra_errors": _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    result = await _redrive_infra_failure_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert result is False, "redrive must be blocked when cap is reached"
+
+    from sqlalchemy import select as _select
+
+    alert = (
+        (await db_session.execute(
+            _select(Alert).where(Alert.project_id == project.id)
+        ))
+        .scalars()
+        .one()
+    )
+    # Force a genuine DB reload of the mapped columns — proving the evidence was
+    # persisted, not merely held on the in-memory instance (a dropped ``extra``
+    # kwarg would not survive this round-trip).
+    await db_session.refresh(alert)
+
+    # The structured evidence must have survived persistence in ``message``.
+    assert "env_preflight" in alert.message, (
+        "failing dimension must survive readback in the persisted alert message"
+    )
+    assert "env_preflight:boot_prereq_evidence_unavailable" in alert.message, (
+        "infra-failure signature must survive readback in the persisted alert message"
+    )

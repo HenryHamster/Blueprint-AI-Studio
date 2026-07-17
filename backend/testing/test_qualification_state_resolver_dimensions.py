@@ -608,7 +608,8 @@ def test_merge_grade_not_applicable():
 @pytest.mark.asyncio
 async def test_operator_dimension_state_reads_ledger_when_populated(db_session):
     """When ledger rows exist for the version's candidate SHA, the operator-facing
-    dimension states are derived from the ledger for the 8 overlapping dimensions.
+    dimension states are derived from the ledger for the 10 overlapping dimensions
+    that have ledger rows populated.
     The 2 blob-only dimensions (criterion_coverage, goal_alignment) stay derived
     from last_qualification."""
     from app.models import Project, ReleaseVersion, QualificationDimensionResult
@@ -2094,3 +2095,139 @@ async def test_ledger_attempt_in_flight_status_single_computation(db_session):
     # no active-attempt filter applies, and the row's sub_score=0.99 is visible.
     assert d["audit"]["status"] == "passed"
     assert d["audit"]["score"] == pytest.approx(0.99)
+
+
+@pytest.mark.asyncio
+async def test_mutable_dim_reused_currency_falls_back_to_blob_env_preflight(db_session):
+    """env_preflight is environment-dependent (mutable): a reused ledger row must
+    NOT override the freshly-measured blob state.
+
+    Scenario (defect this task fixes): Attempt-1 BLOCKED env_preflight
+    (boot_prereq_missing).  An operator then repaired the deploy environment and
+    the same-candidate re-drive (Attempt-2) re-measured env_preflight as passed.
+    The ledger still holds the Attempt-1 blocked row marked reused_by=[Attempt-2].
+    The read model must surface the fresh passed blob, NOT the stale blocked row.
+    """
+    import uuid
+    from app.models import Project, ReleaseVersion, QualificationDimensionResult
+    from app.qualification_state_resolver import resolve_dimension_states_from_ledger
+
+    project = Project(name="Test Project", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.flush()
+
+    prior_attempt_id = uuid.uuid4()
+    active_attempt_id = uuid.uuid4()
+
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="open",
+        last_qualification={
+            "status": "not_promoted",
+            "candidate_sha": "sha-reused-envpf",
+            "qualification_attempt_id": str(active_attempt_id),
+            # Fresh re-drive result: env is repaired → env_preflight scores 1.0.
+            "env_preflight_enabled": True,
+            "sub_scores": {"env_preflight": 1.0, "audit": 0.9},
+            "migration_apply_safety": "ok",
+            "smoketest_enabled": True,
+            "blocker": None,
+        },
+    )
+    db_session.add(version)
+    await db_session.flush()
+
+    # Stale prior-attempt env_preflight row: blocked (boot_prereq_missing).
+    db_session.add(QualificationDimensionResult(
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha="sha-reused-envpf",
+        dimension="env_preflight",
+        status="blocked",
+        sub_score=None,
+        blocker="boot_prereq_missing",
+        origin_attempt_id=prior_attempt_id,
+        reused_by_attempt_ids=[str(active_attempt_id)],
+    ))
+    await db_session.flush()
+
+    result = await resolve_dimension_states_from_ledger(db_session, version)
+    d = {s["key"]: s for s in result}
+
+    # The fresh blob state (env_preflight sub_score 1.0) → passed; the stale
+    # reused blocked ledger row must NOT be overlaid.
+    assert d["env_preflight"]["status"] == "passed", (
+        "stale reused env_preflight ledger row must not override the fresh "
+        "blob-derived passed state after the environment was repaired"
+    )
+    assert d["env_preflight"]["provenance"]["currency"] == "reused"
+
+
+@pytest.mark.asyncio
+async def test_mutable_dim_current_currency_uses_ledger_env_preflight(db_session):
+    """A CURRENT env_preflight ledger row (re-measured this attempt) overrides a
+    stale failed blob — the current provenance must not preserve the old failure.
+
+    Scenario: the blob still carries the prior boot_prereq_missing block, but the
+    active attempt re-measured env_preflight and wrote a fresh 'passed' ledger row
+    (origin_attempt_id == active).  The read model must surface passed.
+    """
+    import uuid
+    from app.models import Project, ReleaseVersion, QualificationDimensionResult
+    from app.qualification_state_resolver import resolve_dimension_states_from_ledger
+
+    project = Project(name="Test Project", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.flush()
+
+    active_attempt_id = uuid.uuid4()
+
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="open",
+        last_qualification={
+            "status": "not_promoted",
+            "candidate_sha": "sha-current-envpf",
+            "qualification_attempt_id": str(active_attempt_id),
+            # Stale blob: still shows the prior boot-prereq block.
+            "env_preflight_enabled": True,
+            "sub_scores": {"env_preflight": 0.0, "audit": 0.9},
+            "blocker": "boot_prereq_missing",
+            "migration_apply_safety": "ok",
+            "smoketest_enabled": True,
+        },
+    )
+    db_session.add(version)
+    await db_session.flush()
+
+    # Confirm the blob alone would show env_preflight failed (the stale failure
+    # the current ledger row must supersede).
+    from app.qualification_state_resolver import resolve_dimension_states
+    blob = {s["key"]: s for s in resolve_dimension_states(version.last_qualification)}
+    assert blob["env_preflight"]["status"] == "failed"
+
+    # Fresh CURRENT env_preflight row: origin_attempt_id == active → currency=current.
+    db_session.add(QualificationDimensionResult(
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha="sha-current-envpf",
+        dimension="env_preflight",
+        status="passed",
+        sub_score=1.0,
+        blocker=None,
+        origin_attempt_id=active_attempt_id,
+    ))
+    await db_session.flush()
+
+    result = await resolve_dimension_states_from_ledger(db_session, version)
+    d = {s["key"]: s for s in result}
+
+    # Current ledger row wins over the stale failed blob.
+    assert d["env_preflight"]["status"] == "passed", (
+        "current env_preflight ledger row must override the stale failed blob"
+    )
+    assert d["env_preflight"]["provenance"]["currency"] == "current"

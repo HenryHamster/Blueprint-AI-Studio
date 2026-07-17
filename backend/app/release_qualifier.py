@@ -4830,6 +4830,25 @@ async def _dual_write_dimension_results(
     else:  # enforce
         _cp_status = "blocked" if blocker == "capability_proof_gate_blocked" else "passed"
 
+    # env_preflight ledger status (Slice 3, design 245212a4): mirror the deployed-
+    # side judge semantics used by the state resolver.  DARK by default → the judge
+    # is inert, so no manifest is scored and the row is ``unavailable``.  When the
+    # judge is enabled: a live boot-prereq block (boot_prereq_missing /
+    # boot_prereq_evidence_missing) surfaces via the composite blocker as
+    # ``blocked``; a recorded positive sub_score is ``passed``; a None score (no
+    # candidate manifest seen) is ``unavailable``.  env_preflight is MUTABLE — it is
+    # re-measured live every drive and its reused ledger row is never composed, so
+    # this spec always upserts the freshly-measured fact.
+    _epf_enabled = bool(base_record.get("env_preflight_enabled"))
+    _epf_blocker = _own_blocker({"boot_prereq_missing", "boot_prereq_evidence_missing"})
+    _epf_score = _score("env_preflight")
+    if _epf_blocker is not None:
+        _epf_status = "blocked"
+    elif _epf_enabled and _epf_score is not None and _epf_score > 0.0:
+        _epf_status = "passed"
+    else:
+        _epf_status = "unavailable"
+
     specs: list[dict[str, Any]] = [
         {
             "dimension": "ci",
@@ -4951,6 +4970,19 @@ async def _dual_write_dimension_results(
             "sub_score": None,
             "blocker": _own_blocker({"capability_proof_gate_blocked"}),
             "detail": _cp_detail,
+            "producing_task_id": None,
+        },
+        {
+            "dimension": "env_preflight",
+            "status": _epf_status,
+            # Presence-only sub_score, recorded only when the judge is enabled so a
+            # dark run carries no score into the ledger.
+            "sub_score": _epf_score if _epf_enabled else None,
+            "blocker": _epf_blocker,
+            # Slice 3 verdict blob: {required:[{name,scope}], missing:[names],
+            # deploy_target_scope} — presence-only, None when the judge was disabled
+            # or no candidate manifest was seen.
+            "detail": base_record.get("env_preflight_verdict"),
             "producing_task_id": None,
         },
     ]

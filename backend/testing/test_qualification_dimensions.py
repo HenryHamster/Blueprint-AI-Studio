@@ -47,17 +47,25 @@ _LEGACY_BLOCKER_TO_DIM = {
     "test_file_deleted": "test_erosion",
     "capability_proof_gate_blocked": "capability_proof",
     "boot_prereq_missing": "env_preflight",
+    "boot_prereq_evidence_missing": "env_preflight",
 }
 
 _LEGACY_LEDGER_KEYS = frozenset({
-    "audit", "test_erosion", "smoketest", "ci",
-    "migration_identity", "migration_apply", "merge_grade", "debt_pressure",
-    "capability_proof", "challenge", "acceptance_window",
+    "acceptance_window", "audit", "capability_proof", "challenge", "ci",
+    "debt_pressure", "env_preflight", "merge_grade",
+    "migration_apply", "migration_identity", "smoketest", "test_erosion",
 })
 
+# The pre-consolidation snapshot held only the three candidate-stable-vs-mutable
+# gates.  env_preflight was subsequently promoted to mutable (it is
+# environment-dependent: an operator repairing the deploy environment must take
+# effect on a same-candidate re-drive), so the canonical registry now carries a
+# fourth mutable dimension.  This is an intentional contract change, not drift.
 _LEGACY_MUTABLE_KEYS = frozenset({
     "ci", "migration_identity", "migration_apply",
 })
+
+_EXPECTED_MUTABLE_KEYS = _LEGACY_MUTABLE_KEYS | {"env_preflight"}
 
 _LEGACY_PROMOTION_REQUIRED = (
     "ci", "audit", "test_erosion",
@@ -76,12 +84,15 @@ def test_blocker_to_dimension_matches_legacy():
 
 def test_ledger_dimension_keys_match_legacy():
     assert qd.LEDGER_DIMENSION_KEYS == _LEGACY_LEDGER_KEYS
-    # Exactly 11 dual-written dimensions.
-    assert len(qd.LEDGER_DIMENSION_KEYS) == 11
+    # Exactly 12 dual-written dimensions.
+    assert len(qd.LEDGER_DIMENSION_KEYS) == 12
 
 
 def test_mutable_dimension_keys_match_legacy():
-    assert qd.MUTABLE_DIMENSION_KEYS == _LEGACY_MUTABLE_KEYS
+    # env_preflight joins the three legacy mutable gates — re-measured live each
+    # drive so a repaired environment is honoured on a same-candidate re-drive.
+    assert qd.MUTABLE_DIMENSION_KEYS == _EXPECTED_MUTABLE_KEYS
+    assert "env_preflight" in qd.MUTABLE_DIMENSION_KEYS
 
 
 def test_promotion_required_order_and_set_match_legacy():
@@ -144,7 +155,7 @@ def test_dual_write_spec_covers_exactly_ledger_dimension_keys():
 
 
 def test_dimension_column_includes_capability_proof():
-    """The dimension column docstring/comment lists all 11 ledger keys.
+    """The dimension column docstring/comment lists all 12 ledger keys.
 
     A future operator inspecting the model documentation should see every
     ledger-backed dimension, including capability_proof.

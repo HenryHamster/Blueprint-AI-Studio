@@ -401,6 +401,49 @@ async def _redrive_infra_failure_qualification(
             else int(qual.get("consecutive_infra_errors") or 0)
         )
         if effective_streak >= _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS:
+            # Raise an operator Alert (once) so the cap is visible.  Guard
+            # against duplicate alerts with a flag on last_qualification.
+            if not qual.get("infra_failure_loop_escalated"):
+                # The Alert model has no JSON ``extra`` column, so structured
+                # evidence must live in a persisted field (``message``) to survive
+                # readback — a prior ``extra={...}`` kwarg was silently dropped.
+                # Surface the failing dimension and infra-failure signature so an
+                # operator can see WHICH gate is looping and WHY.
+                _failing_dim_label = _failing_dim or "unknown"
+                _signature = qual.get("infra_failure_signature") or "unavailable"
+                _last_error = qual.get("error") or "unavailable"
+                alert = Alert(
+                    project_id=version.project_id,
+                    severity=AlertSeverity.ERROR,
+                    title=(
+                        f"Release v{version.version_number} infra-failure "
+                        f"re-drive loop halted"
+                    ),
+                    message=(
+                        f"Release v{version.version_number} has failed "
+                        f"{effective_streak} consecutive infra-failure "
+                        f"re-drive(s) in the '{_failing_dim_label}' dimension "
+                        f"(failure signature: {_signature}; last error: "
+                        f"{_last_error}) — autonomous re-qualification halted. "
+                        f"Human review required."
+                    ),
+                )
+                redrive_session.add(alert)
+                version.last_qualification = {
+                    **qual,
+                    "infra_failure_loop_escalated": True,
+                }
+                flag_modified(version, "last_qualification")
+                redrive_session.add(version)
+                await redrive_session.commit()
+                logger.warning(
+                    "[RELEASE_QUALIFIER] sweep: v%d consecutive_infra_errors=%d "
+                    "reached cap=%d — raised operator Alert and halted "
+                    "auto-requalify",
+                    version.version_number,
+                    effective_streak,
+                    _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS,
+                )
             return False
         result = await release_qualifier.run_qualification(
             redrive_session,
@@ -648,6 +691,11 @@ async def _redrive_promotion_failed_qualification(
             # Raise an operator Alert (once) so the cap is visible.  Guard
             # against duplicate alerts with a flag on last_qualification.
             if not qual.get("promotion_loop_escalated"):
+                # The Alert model has no JSON ``extra`` column (a prior
+                # ``extra={...}`` kwarg was silently dropped) — carry the
+                # structured evidence in the persisted ``message`` field so it
+                # survives readback.
+                _last_error = qual.get("error") or "unavailable"
                 alert = Alert(
                     project_id=version.project_id,
                     severity=AlertSeverity.ERROR,
@@ -656,15 +704,10 @@ async def _redrive_promotion_failed_qualification(
                     ),
                     message=(
                         f"Release v{version.version_number} has failed promotion "
-                        f"{failure_count} time(s) — autonomous re-qualification "
-                        f"halted. Human review required before next promote attempt."
+                        f"{failure_count} time(s) (last error: {_last_error}) — "
+                        f"autonomous re-qualification halted. Human review "
+                        f"required before next promote attempt."
                     ),
-                    extra={
-                        "version_id": str(version.id),
-                        "version_number": version.version_number,
-                        "promotion_failure_count": failure_count,
-                        "last_error": qual.get("error"),
-                    },
                 )
                 redrive_session.add(alert)
                 version.last_qualification = {
