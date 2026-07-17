@@ -2500,6 +2500,35 @@ class TestRunnerEndpoints:
             _clear_pool()
 
     @pytest.mark.asyncio
+    async def test_draining_runner_does_not_pull_new_task(
+        self, client: AsyncClient, db_session
+    ):
+        """Drain prevents a race from handing new agent work to the host."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(
+            db_session, project.id, status="draining"
+        )
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "title": "must stay unpulled"}],
+            status=TaskStatus.PROVISIONING,
+            vm_instance_id=f"runner:{runner.id}",
+            context={"runner_target_id": str(runner.id)},
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        response = await client.post(
+            "/api/runner/next-task",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert response.status_code == 204
+        await db_session.refresh(task)
+        assert task.started_at is None
+        assert task.status == TaskStatus.PROVISIONING
+
+    @pytest.mark.asyncio
     async def test_next_task_returns_credentials_when_pool_account_resolved(
         self, client: AsyncClient, db_session
     ):

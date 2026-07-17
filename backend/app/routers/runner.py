@@ -1026,6 +1026,12 @@ async def next_task(
     if not allowed:
         raise HTTPException(status_code=429, headers={"Retry-After": str(retry_after)})
 
+    # A draining runner may finish work it has already pulled, but it must not
+    # receive another agent task while the operator is quiescing the host.
+    if runner.status != "active":
+        response.status_code = status.HTTP_204_NO_CONTENT
+        return response
+
     pinned_vm_id = f"runner:{runner.id}"
     # Skip markers are scoped to the runner that wrote them: routability depends on
     # the runner's own CLI inventory, so another runner's verdict says nothing about
@@ -1901,6 +1907,14 @@ async def next_compute_job(
     allowed, retry_after = await check_runner_rate_limit(str(runner.id), "next_compute_job")
     if not allowed:
         raise HTTPException(status_code=429, headers={"Retry-After": str(retry_after)})
+
+    # Draining is a quiesce state, not a runner failure: already-claimed jobs
+    # keep reporting and finish normally, but no new subprocess may be handed to
+    # this runner.  Return the ordinary empty-poll response so older runners
+    # simply back off while an operator drains the host.
+    if runner.status != "active":
+        response.status_code = status.HTTP_204_NO_CONTENT
+        return response
 
     now = _utcnow()
     # Serve compute jobs for ANY project on this runner's allow-list, not only its
