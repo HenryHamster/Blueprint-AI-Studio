@@ -91,6 +91,25 @@ resource "google_cloud_run_v2_service" "orchestrator" {
         value = var.orchestrator_url
       }
 
+      # ---- Isolated compute-image builder config ----
+      # Mirrors cloudbuild.yaml's --set-env-vars (the source of truth). These
+      # env blocks are drift-readability ONLY — see the WARNING block below;
+      # env changes here are silently ignored on the running revision. The
+      # orchestrator submits regional Cloud Builds that run as this SA and read
+      # from the disposable source bucket (see infra/terraform/iam.tf).
+      env {
+        name  = "COMPUTE_IMAGE_BUILDER_SA"
+        value = google_service_account.compute_image_builder_sa.email
+      }
+      env {
+        name  = "COMPUTE_IMAGE_BUILD_LOCATION"
+        value = var.region
+      }
+      env {
+        name  = "COMPUTE_IMAGE_BUILD_SOURCE_BUCKET"
+        value = google_storage_bucket.compute_build_source.name
+      }
+
       # /health returns 503 when the orchestrator background loop hasn't
       # ticked in 60s (see backend/app/main.py /health). Without this probe
       # a hung instance keeps port 8080 open and never gets replaced —

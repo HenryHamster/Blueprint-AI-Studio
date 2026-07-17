@@ -207,3 +207,87 @@ resource "google_secret_manager_secret_iam_member" "migrator_cloud_sql_password_
   role      = "roles/secretmanager.secretAccessor"
   member    = "serviceAccount:${google_service_account.migrator_sa.email}"
 }
+
+# ------------------------------------------------------------------------------
+# Isolated Compute-Image Builder (regional Cloud Build)
+# ------------------------------------------------------------------------------
+# Project-baked compute images are built by an isolated, regional Cloud Build
+# run — NOT in-process on the orchestrator host (production Cloud Run has no
+# docker daemon, and repo-controlled Dockerfile RUN steps must not execute
+# co-tenant with the orchestrator identity). The build runs as this dedicated,
+# least-privilege service account, which is granted ONLY what a build needs:
+#   - read the disposable, short-retention build-source bucket (its own inputs)
+#   - publish to the compute-images Artifact Registry repo ONLY (see
+#     workload_identity.tf: compute_image_builder_compute_images_writer)
+#   - write its own build logs
+#
+# It is DELIBERATELY denied:
+#   - Secret Manager access (no secretAccessor / secretVersionAdder / creator)
+#   - any platform or runtime credential
+#   - access to the general agent-artifacts bucket
+# A compromised or malicious Dockerfile RUN step therefore cannot read platform
+# secrets, agent payloads/credentials, or general agent artifacts.
+resource "google_service_account" "compute_image_builder_sa" {
+  account_id   = "compute-image-builder-sa"
+  display_name = "Isolated Compute-Image Builder Service Account"
+  description  = "Least-privilege SA for regional Cloud Build project-image builds. No Secret Manager, no platform creds, no agent-artifacts access."
+}
+
+# Disposable, short-retention source store for build contexts. The orchestrator
+# uploads the (untrusted) repo build context here; the regional Cloud Build
+# reads it as the builder SA. Kept SEPARATE from the general agent-artifacts
+# bucket so the builder's read grant is scoped to build inputs only. 1-day
+# lifecycle: source tarballs are consumed at build time and never needed after.
+resource "google_storage_bucket" "compute_build_source" {
+  name                        = "${var.project_id}-compute-build-source"
+  location                    = var.region
+  force_destroy               = false
+  uniform_bucket_level_access = true
+
+  lifecycle_rule {
+    condition { age = 1 }
+    action { type = "Delete" }
+  }
+}
+
+# Builder can read ONLY the disposable build-source bucket (its own inputs).
+# It has NO binding on the general agent-artifacts bucket.
+resource "google_storage_bucket_iam_member" "compute_image_builder_source_reader" {
+  bucket = google_storage_bucket.compute_build_source.name
+  role   = "roles/storage.objectViewer"
+  member = "serviceAccount:${google_service_account.compute_image_builder_sa.email}"
+}
+
+# Orchestrator uploads (and cleans up) build contexts in the disposable
+# source bucket before triggering a build.
+resource "google_storage_bucket_iam_member" "orchestrator_compute_build_source_admin" {
+  bucket = google_storage_bucket.compute_build_source.name
+  role   = "roles/storage.objectAdmin"
+  member = "serviceAccount:${google_service_account.orchestrator_sa.email}"
+}
+
+# Builder can write its own build logs. Nothing else project-wide.
+resource "google_project_iam_member" "compute_image_builder_log_writer" {
+  project = var.project_id
+  role    = "roles/logging.logWriter"
+  member  = "serviceAccount:${google_service_account.compute_image_builder_sa.email}"
+}
+
+# Orchestrator creates/gets/cancels builds in regional Cloud Build.
+# roles/cloudbuild.builds.editor is the predefined role covering
+# cloudbuild.builds.create/get/list/cancel — the orchestrator only ever submits,
+# polls, and cancels project-image builds. It does NOT run builds itself.
+resource "google_project_iam_member" "orchestrator_cloud_build_editor" {
+  project = var.project_id
+  role    = "roles/cloudbuild.builds.editor"
+  member  = "serviceAccount:${google_service_account.orchestrator_sa.email}"
+}
+
+# Orchestrator must actAs the builder SA to submit a build that runs as it.
+# Scoped to the builder SA ONLY (not a project-wide serviceAccountUser grant),
+# so the orchestrator cannot impersonate any other identity.
+resource "google_service_account_iam_member" "orchestrator_act_as_compute_image_builder" {
+  service_account_id = google_service_account.compute_image_builder_sa.name
+  role               = "roles/iam.serviceAccountUser"
+  member             = "serviceAccount:${google_service_account.orchestrator_sa.email}"
+}

@@ -1669,6 +1669,14 @@ async def trigger_project_compute_image_build(
                 f"{_COMPUTE_IMAGE_BUILD_TIMEOUT_SECONDS}s deadline and was aborted"
             ),
         ) from None
+    except asyncio.CancelledError:
+        # Client disconnect / application shutdown: do not abandon the remote
+        # build or release its concurrency slot until Cloud Build has observed
+        # cancellation and the worker has unwound its staged-source cleanup.
+        await asyncio.shield(
+            _abort_and_unwind_image_build(control, build_task, project_id)
+        )
+        raise
     except _cib.BuildNetworkError as exc:
         # The build network could not be proven to block the metadata server.
         raise HTTPException(status_code=422, detail=str(exc)) from exc

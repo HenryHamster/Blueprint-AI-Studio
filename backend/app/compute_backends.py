@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import contextlib
 import hashlib
 import hmac
 import io
@@ -31,6 +32,7 @@ import signal
 import subprocess
 import tarfile
 import tempfile
+import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -3827,6 +3829,7 @@ def _launch_spawn_subprocess(
 # out the repo, and drives the hash-gated build.
 
 from app import compute_image_build  # noqa: E402
+from app import compute_image_remote_build  # noqa: E402
 
 # Files, in priority order, that count as dependency inputs when the manifest
 # does not enumerate them. Any that exist in the checkout are hashed.
@@ -3924,6 +3927,7 @@ async def build_project_compute_image(
     ref: str | None = None,
     dep_files: Sequence[str] | None = None,
     dry_run: bool = False,
+    cancel_event: "threading.Event | None" = None,
     _token_fn=None,
     _clone_fn=None,
     _build_fn=None,
@@ -3942,7 +3946,18 @@ async def build_project_compute_image(
     """
     import tempfile as _tempfile
 
-    build_fn = _build_fn or compute_image_build.build_and_push
+    # Server-side builds must always use the isolated builder.  The local
+    # docker implementation is reserved for its standalone CLI; a partial or
+    # mistyped production configuration must fail closed.
+    build_fn = _build_fn
+    if build_fn is None:
+        if not compute_image_remote_build._remote_build_configured():
+            raise RuntimeError(
+                "Remote compute-image build is not configured: set "
+                "COMPUTE_IMAGE_BUILDER_SA, COMPUTE_IMAGE_BUILD_LOCATION, and "
+                "COMPUTE_IMAGE_BUILD_SOURCE_BUCKET"
+            )
+        build_fn = compute_image_remote_build.remote_build_and_push
 
     owner = (getattr(project, "github_owner", None) or "").strip()
     repo = (getattr(project, "github_repo", None) or "").strip()
@@ -3993,6 +4008,7 @@ async def build_project_compute_image(
             parent=build_config.get("parent"),
             build_args=dict(build_config.get("build_args") or {}),
             dry_run=dry_run,
+            cancel_event=cancel_event,
         )
     return result
 
@@ -4291,8 +4307,33 @@ async def refresh_project_compute_image(
         fetch_bytes_fn = get_file_bytes_at_ref
     else:
         fetch_bytes_fn = _fetch_bytes_fn
-    tag_exists_fn = _tag_exists_fn or compute_image_build.registry_tag_exists
-    resolve_digest_fn = _resolve_digest_fn or compute_image_build._resolve_digest
+    # Use Docker-free tag / digest checks when the remote builder is configured
+    # so the fast-path no-op (unchanged manifest) never needs a local docker daemon.
+    _remote_ok = compute_image_remote_build._remote_build_configured()
+    if (
+        not _remote_ok
+        and _tag_exists_fn is None
+        and _resolve_digest_fn is None
+        and _build_fn is None
+    ):
+        return {
+            "status": "error",
+            "error": "Remote compute-image build is not configured",
+        }
+    if _tag_exists_fn is not None:
+        tag_exists_fn = _tag_exists_fn
+    elif _remote_ok:
+        tag_exists_fn = compute_image_remote_build.remote_registry_tag_exists
+    else:
+        tag_exists_fn = compute_image_build.registry_tag_exists
+
+    if _resolve_digest_fn is not None:
+        resolve_digest_fn = _resolve_digest_fn
+    elif _remote_ok:
+        resolve_digest_fn = compute_image_remote_build._resolve_registry_digest_from_api
+    else:
+        resolve_digest_fn = compute_image_build._resolve_digest
+
     build_fn = _build_fn or build_project_compute_image
     record_fn = _record_fn or record_project_compute_image_build
 
@@ -4354,6 +4395,14 @@ async def refresh_project_compute_image(
             if data is not None:
                 inputs[rel] = data
 
+        parent = build_config.get("parent")
+        build_args = dict(build_config.get("build_args") or {})
+        if parent:
+            inputs["__parent_image__"] = str(parent).encode("utf-8")
+        if build_args:
+            inputs["__build_args__"] = json.dumps(
+                dict(sorted(build_args.items())), sort_keys=True
+            ).encode("utf-8")
         dep_hash = compute_image_build.compute_dependency_hash(inputs)
 
         registry_repo = resolve_compute_image_registry_repo()
@@ -4409,6 +4458,10 @@ async def refresh_project_compute_image(
                     "dep_hash": dep_hash,
                 }
 
+        # A threading.Event lets the remote-build worker detect outer cancellation
+        # and issue a Cloud Build cancel before cleanup.
+        _cancel_event = threading.Event()
+        _build_task = None
         try:
             if progress_cb is not None:
                 # Run the build as a background task with periodic progress
@@ -4420,22 +4473,66 @@ async def refresh_project_compute_image(
                     registry_repo=registry_repo,
                     build_config=build_config,
                     ref=default_branch,
+                    cancel_event=_cancel_event,
                 ))
-                while True:
-                    _done, _pending = await asyncio.wait(
-                        [_build_task], timeout=_HEARTBEAT_INTERVAL
-                    )
-                    if _done:
-                        result = _build_task.result()
-                        break
-                    progress_cb()
+                try:
+                    while True:
+                        _done, _pending = await asyncio.wait(
+                            [_build_task], timeout=_HEARTBEAT_INTERVAL
+                        )
+                        if _done:
+                            result = _build_task.result()
+                            break
+                        progress_cb()
+                except BaseException:
+                    # Signal the remote-build thread so it cancels the Cloud Build
+                    # before cleanup.  Transfer semaphore ownership to a drain task
+                    # so the slot is not released while _build_task is still running.
+                    #
+                    # Do NOT call _build_task.cancel() here.  build_fn wraps
+                    # asyncio.to_thread; cancelling the asyncio Future marks it done
+                    # immediately while the OS thread continues running (Python cannot
+                    # stop threads).  Without cancellation, _drain_and_release's
+                    # ``await _t`` blocks until the thread truly finishes cleanup,
+                    # ensuring the semaphore slot is not released prematurely.
+                    _cancel_event.set()
+                    if acquired and build_semaphore is not None:
+                        _t, _s = _build_task, build_semaphore
+                        async def _drain_and_release(_t=_t, _s=_s):
+                            with contextlib.suppress(BaseException):
+                                await _t
+                            _s.release()
+                        asyncio.ensure_future(_drain_and_release())
+                        acquired = False
+                    raise
             else:
-                result = await build_fn(
+                # Direct-await path (no heartbeat).  Use ensure_future + shield so
+                # outer cancellation does not detach the thread-backed coroutine from
+                # the drain task that owns the semaphore slot.
+                _build_task = asyncio.ensure_future(build_fn(
                     project,
                     registry_repo=registry_repo,
                     build_config=build_config,
                     ref=default_branch,
-                )
+                    cancel_event=_cancel_event,
+                ))
+                try:
+                    result = await asyncio.shield(_build_task)
+                except BaseException:
+                    # Signal the thread so the remote Cloud Build is cancelled.
+                    # Transfer semaphore ownership to a drain task for the same
+                    # reason as the progress path: the thread may still be running
+                    # cleanup even after the shield raised CancelledError.
+                    _cancel_event.set()
+                    if acquired and build_semaphore is not None:
+                        _t, _s = _build_task, build_semaphore
+                        async def _drain_direct(_t=_t, _s=_s):
+                            with contextlib.suppress(BaseException):
+                                await _t
+                            _s.release()
+                        asyncio.ensure_future(_drain_direct())
+                        acquired = False
+                    raise
         finally:
             if acquired:
                 build_semaphore.release()

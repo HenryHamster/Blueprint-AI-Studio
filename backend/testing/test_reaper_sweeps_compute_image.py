@@ -1218,7 +1218,7 @@ async def test_refresh_changed_manifest_builds_and_records(db):
     digest = "sha256:" + "d" * 64
     build_calls: list = []
 
-    async def _build(proj, *, registry_repo, build_config, ref=None):
+    async def _build(proj, *, registry_repo, build_config, ref=None, **_k):
         build_calls.append({"ref": ref, "registry_repo": registry_repo, "name": build_config["name"]})
         return BuildResult(
             pinned_ref=f"{registry_repo}/widget-compute@{digest}",
@@ -1272,7 +1272,7 @@ async def test_refresh_changed_build_digestless_preserves_stored_pin(db):
     )
     await db.commit()
 
-    async def _build(proj, *, registry_repo, build_config, ref=None):
+    async def _build(proj, *, registry_repo, build_config, ref=None, **_k):
         # A registry hiccup: digest could not be resolved (tag-only ref).
         return BuildResult(
             pinned_ref=f"{registry_repo}/widget-compute:{dep_hash}",
@@ -1827,3 +1827,142 @@ async def test_unchanged_creates_no_drift_alert(db):
         .all()
     )
     assert alerts == [], "no drift alert expected for unchanged/no_config sweep result"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Cancellation propagation: outer task cancels the build and drains the semaphore
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_progress_cb_cancellation_signals_cancel_event_and_drains_semaphore(db):
+    """Outer cancellation in the progress_cb path sets cancel_event and defers semaphore
+    release until the thread-backed build worker actually finishes.
+
+    Uses a real asyncio.to_thread worker (not an async sleep stub) to verify the
+    fix for the premature-semaphore-release bug: without the fix, _build_task.cancel()
+    marks the asyncio Future done while the OS thread continues, so _drain_and_release
+    would have released the semaphore before the thread stopped.
+    """
+    project = await _make_repo_project(db)
+
+    build_started = asyncio.Event()
+    cancel_events_received: list = []
+    thread_exited = threading.Event()
+
+    def _blocking_thread(cancel_event):
+        # Real thread: polls cancel_event and sets thread_exited when done.
+        while not cancel_event.is_set():
+            import time
+            time.sleep(0.005)
+        thread_exited.set()
+
+    async def _thread_backed_build(*a, cancel_event=None, **k):
+        cancel_events_received.append(cancel_event)
+        build_started.set()
+        await asyncio.to_thread(_blocking_thread, cancel_event)
+
+    sem = asyncio.Semaphore(1)
+
+    refresh_task = asyncio.ensure_future(
+        _cb.refresh_project_compute_image(
+            db,
+            project,
+            progress_cb=lambda: None,
+            build_semaphore=sem,
+            _manifest_fn=lambda _p: _async(_BUILD_MANIFEST),
+            _token_fn=lambda o, r: _async("tok"),
+            _default_branch_fn=lambda t, o, r: _async("main"),
+            _fetch_bytes_fn=_fetch_bytes_stub(
+                {".blueprint/Dockerfile.compute": b"FROM python:3.11-slim\n"}
+            ),
+            _tag_exists_fn=lambda full_repo, dep_hash: False,
+            _build_fn=_thread_backed_build,
+            _record_fn=_record_row,
+        )
+    )
+
+    # Wait for the build thread to actually start before cancelling.
+    await asyncio.wait_for(build_started.wait(), timeout=2.0)
+    refresh_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await refresh_task
+
+    # cancel_event must have been received and set.
+    assert len(cancel_events_received) == 1
+    ev = cancel_events_received[0]
+    assert ev is not None, "cancel_event must be threaded into build_fn"
+    assert ev.is_set(), "cancel_event must be set when outer task is cancelled"
+
+    # Wait for the thread to actually finish (cancel_event causes it to exit).
+    await asyncio.to_thread(thread_exited.wait, 2.0)
+    assert thread_exited.is_set(), "thread must exit after cancel_event is set"
+
+    # Drain task now has a chance to run: give event loop a couple of ticks.
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert sem.locked() is False, "build_semaphore must be released after thread drain"
+
+
+@pytest.mark.asyncio
+async def test_non_progress_cb_cancellation_signals_cancel_event_and_drains_semaphore(db):
+    """Outer cancellation in the direct-await path sets cancel_event and defers semaphore
+    release until the thread-backed build worker finishes.
+
+    Uses a real asyncio.to_thread worker to verify that asyncio.shield prevents premature
+    semaphore release when the outer task is cancelled mid-build.
+    """
+    project = await _make_repo_project(db)
+
+    cancel_events_received: list = []
+    build_started = asyncio.Event()
+    thread_exited = threading.Event()
+
+    def _blocking_thread(cancel_event):
+        while not cancel_event.is_set():
+            import time
+            time.sleep(0.005)
+        thread_exited.set()
+
+    async def _thread_backed_build(*a, cancel_event=None, **k):
+        cancel_events_received.append(cancel_event)
+        build_started.set()
+        await asyncio.to_thread(_blocking_thread, cancel_event)
+
+    sem = asyncio.Semaphore(1)
+
+    refresh_task = asyncio.ensure_future(
+        _cb.refresh_project_compute_image(
+            db,
+            project,
+            progress_cb=None,
+            build_semaphore=sem,
+            _manifest_fn=lambda _p: _async(_BUILD_MANIFEST),
+            _token_fn=lambda o, r: _async("tok"),
+            _default_branch_fn=lambda t, o, r: _async("main"),
+            _fetch_bytes_fn=_fetch_bytes_stub(
+                {".blueprint/Dockerfile.compute": b"FROM python:3.11-slim\n"}
+            ),
+            _tag_exists_fn=lambda full_repo, dep_hash: False,
+            _build_fn=_thread_backed_build,
+            _record_fn=_record_row,
+        )
+    )
+
+    await asyncio.wait_for(build_started.wait(), timeout=2.0)
+    refresh_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await refresh_task
+
+    assert len(cancel_events_received) == 1
+    ev = cancel_events_received[0]
+    assert ev is not None, "cancel_event must be threaded into build_fn"
+    assert ev.is_set(), "cancel_event must be set on cancellation to stop the remote build"
+
+    # Thread exits when cancel_event fires; semaphore must not be released until then.
+    await asyncio.to_thread(thread_exited.wait, 2.0)
+    assert thread_exited.is_set(), "thread must exit after cancel_event is set"
+
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert sem.locked() is False, "build_semaphore must be released after thread drain"

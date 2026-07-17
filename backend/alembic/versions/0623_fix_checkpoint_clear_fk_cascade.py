@@ -13,15 +13,15 @@ visible to subsequent queries, so the fix is to check whether the row
 referenced by OLD.current_checkpoint_id still exists; if it does not, the
 update was driven by the FK cascade and clearing is safe.
 
-Revision ID: 0612
-Revises: 0611
+Revision ID: 0623
+Revises: 0621
 Create Date: 2026-07-17
 """
 
 from alembic import op
 
-revision = "0612"
-down_revision = "0611"
+revision = "0623"
+down_revision = "0621"
 branch_labels = None
 depends_on = None
 
@@ -160,7 +160,7 @@ def upgrade() -> None:
 def downgrade() -> None:
     bind = op.get_bind()
     if bind.dialect.name == "postgresql":
-        # Restore the pre-0612 function body (without the FK cascade escape).
+        # Restore the pre-0623 function body (without the FK cascade escape).
         op.execute(
             """
             CREATE OR REPLACE FUNCTION fence_strategicresident_checkpoint_rotation()
