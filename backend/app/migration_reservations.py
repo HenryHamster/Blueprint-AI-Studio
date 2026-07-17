@@ -190,8 +190,10 @@ def _effective_task_base_branch(task: Task, project: Project) -> str:
 def _head_from_migration_filenames(filenames: list[str]) -> str | None:
     """Return the numeric migration-id floor advertised by a repository listing.
 
-    Returns ``None`` when no parseable numeric revision ids are found, signalling
-    the caller to fall back to the local merged-chain head.
+    Returns ``None`` when the listing yields no numeric revision filenames
+    (empty directory, 404, or a listing with only non-numeric names) so the
+    caller can fall back to the local merged chain rather than accepting the
+    truthy sentinel ``"0000"`` as an authoritative remote head.
     """
     revisions = [
         name.split("_", 1)[0]

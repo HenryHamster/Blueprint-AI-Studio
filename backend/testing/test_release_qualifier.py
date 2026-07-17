@@ -16372,14 +16372,19 @@ async def test_finalize_holds_when_migration_apply_gate_defers(db_session, mocke
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("scratch_value", "expected_code"),
+    ("scratch_value", "expected_verdict", "expected_code"),
     [
-        (None, "scratch_database_url_missing"),
-        ("malformed://secret-value", "scratch_database_url_invalid"),
+        # Absent config is a permanent operator choice, recorded as a DISTINCT
+        # "skipped" state (never "defer"/"ok") so a gate that was never attempted
+        # can never be mistaken for one that ran and passed.
+        (None, "skipped", "scratch_database_not_configured"),
+        # A malformed URL is a config error the finalizer HOLDS on (defer), with
+        # the offending raw value kept out of every diagnostic.
+        ("malformed://secret-value", "defer", "scratch_database_url_invalid"),
     ],
 )
 async def test_migration_apply_preflight_holds_without_prod_io(
-    db_session, mocker, monkeypatch, scratch_value, expected_code
+    db_session, mocker, monkeypatch, scratch_value, expected_verdict, expected_code
 ):
     _project, version = await _make_project_and_version(
         db_session, phase="stabilize"
@@ -16403,10 +16408,14 @@ async def test_migration_apply_preflight_holds_without_prod_io(
         db_session, version, candidate_sha
     )
 
-    assert verdict == "defer"
+    assert verdict == expected_verdict
     assert expected_code in (detail or "")
-    assert "MIGRATION_APPLY_SCRATCH_DATABASE_URL" in (detail or "")
+    if expected_verdict == "defer":
+        # The defer diagnostic names the env var so operators know what to fix.
+        assert "MIGRATION_APPLY_SCRATCH_DATABASE_URL" in (detail or "")
+    # The raw scratch value must never leak into any diagnostic.
     assert "secret-value" not in (detail or "")
+    # Neither preflight-hold path performs production I/O.
     resolve_engine.assert_not_called()
     apply_gate.assert_not_awaited()
 

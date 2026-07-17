@@ -403,6 +403,18 @@ def test_no_progress_stalled_false_when_window_not_yet_spanned():
     assert _no_progress_stalled(job, now=now) is False
 
 
+def test_no_progress_stalled_true_when_samples_truly_absent_no_legacy():
+    """Contrast: a job with no samples at all (not even legacy ones) IS stalled."""
+    now = datetime(2026, 1, 2, 12, 0, 0)
+    metric = "val/loss"
+    meta = {"declared_metric": metric, "progress_series": []}
+    job = SimpleNamespace(
+        polling_metadata=meta,
+        started_at=now - timedelta(seconds=int(COMPUTE_JOB_NO_PROGRESS_GRACE_SECONDS) + 3600),
+    )
+    assert _no_progress_stalled(job, now=now) is True
+
+
 def test_no_progress_stalled_disabled_when_window_seconds_zero(monkeypatch):
     monkeypatch.setattr(compute_jobs, "COMPUTE_JOB_NO_PROGRESS_WINDOW_SECONDS", 0.0)
     metric = "val/loss"
@@ -459,12 +471,16 @@ def test_watchdog_status_warming_and_malformed_history_are_not_protected():
 
     # Both samples have received_at present but malformed (not parseable).
     # Truly malformed telemetry cannot bypass an armed watchdog after grace.
+    # received_at is server-stamped, so a present-but-bad value means the
+    # ingestion path was bypassed; a parseable runner-authored `t` does not
+    # rescue it (fallback to `t` only happens when received_at is ABSENT).
     malformed = SimpleNamespace(
         polling_metadata={
             "declared_metric": "val/loss",
             "progress_series": [
                 {"t": "2099-01-01", "received_at": "bad", "name": "val/loss", "value": 1.0},
                 {"received_at": "bad", "name": "val/loss", "value": 1.0},
+                {"received_at": "also-bad", "name": "val/loss", "value": 0.5},
             ],
         },
         started_at=now - timedelta(hours=2),
@@ -477,7 +493,8 @@ def test_watchdog_status_warming_and_malformed_history_are_not_protected():
     assert malformed_status["watchdog_state"] == "insufficient_history"
     assert malformed_status["watchdog_inert_reason"] == "malformed_history"
     assert malformed_status["watchdog_active"] is False
-    # Malformed declared telemetry cannot bypass an armed watchdog after grace.
+    # Present-but-bad received_at does not qualify as a legacy pre-upgrade sample
+    # (received_at is server-stamped; bad = ingestion bypass), so still stalled.
     assert _no_progress_stalled(malformed, now=now) is True
 
 

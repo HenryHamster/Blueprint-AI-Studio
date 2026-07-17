@@ -1454,16 +1454,27 @@ export async function handleStrategicResident(
             // Rather than silently losing the operator's exchange at restart or
             // compaction, admit the available exchange text as a best-effort entry
             // and advance past this review so the queue can drain.
+            //
+            // Id-less overflow sentinels have no stable message ids so the same
+            // sentinel can re-trip this branch on every failed autonomous turn.
+            // Guard against crowding the register with duplicate eviction-protected
+            // entries: skip admission if an equivalent fallback entry is already
+            // present (identified by the sentinel's startedAt timestamp in the note).
+            const sentinelKey = activeOverflowSentinel ? `sentinel:${reviewForTurn.startedAt}` : null;
+            const alreadyAdmitted = sentinelKey !== null
+              && decisionsReg.some(e => e.verdict === OPERATOR_DECISION_VERDICT && e.note.includes(sentinelKey));
             const fallbackNote = reviewForTurn.exchangeText
-              ? `[unclassified after ${retained.attempts} attempts] ${reviewForTurn.exchangeText}`
-              : `[unclassified after ${retained.attempts} attempts — exchange text unavailable]`;
-            admitDecisionEntry(decisionsReg, {
-              atTick: examTick,
-              at: upd.record.at,
-              surfaceKey: 'operator:message',
-              verdict: OPERATOR_DECISION_VERDICT,
-              note: fallbackNote,
-            }, DECISIONS_REGISTER_CAP);
+              ? `[unclassified after ${retained.attempts} attempts${sentinelKey ? ` ${sentinelKey}` : ''}] ${reviewForTurn.exchangeText}`
+              : `[unclassified after ${retained.attempts} attempts${sentinelKey ? ` ${sentinelKey}` : ''} — exchange text unavailable]`;
+            if (!alreadyAdmitted) {
+              admitDecisionEntry(decisionsReg, {
+                atTick: examTick,
+                at: upd.record.at,
+                surfaceKey: 'operator:message',
+                verdict: OPERATOR_DECISION_VERDICT,
+                note: fallbackNote,
+              }, DECISIONS_REGISTER_CAP);
+            }
             // Pass coversOverflow:true when the current review IS the id-less
             // overflow sentinel (activeOverflowSentinel) — advancePending returns
             // `current` unchanged when messageIds is empty and coversOverflow is
