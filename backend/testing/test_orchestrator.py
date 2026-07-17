@@ -701,6 +701,74 @@ def test_idle_runner_dispatch_rotates_across_ties():
     )
 
 
+def test_select_eligible_runner_requires_explicit_browser_proof():
+    from app.orchestrator_runner_dispatch import (
+        RunnerDispatchSnapshot,
+        _select_eligible_runner,
+    )
+
+    project_id = uuid.uuid4()
+    incapable = RunnerDispatchSnapshot(
+        uuid.uuid4(), project_id, {"task_types": "all"}
+    )
+    capable = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "playwright_chromium_usable": True,
+        },
+    )
+
+    selected = _select_eligible_runner(
+        {project_id: [incapable, capable]},
+        project_id,
+        "salvage_bundle",
+        None,
+        {},
+        requires_browser=True,
+    )
+    assert selected is not None
+    assert selected.id == capable.id
+
+    legacy = _select_eligible_runner(
+        {project_id: [incapable]}, project_id, "salvage_bundle", None, {}
+    )
+    assert legacy is not None and legacy.id == incapable.id
+
+
+@pytest.mark.asyncio
+async def test_browser_required_task_falls_through_without_runner_proof(db_session):
+    from app.orchestrator_runner_dispatch import (
+        RunnerDispatchSnapshot,
+        _try_runner_dispatch,
+    )
+
+    project = make_project(name="browser-routing", user_id=_TEST_USER)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "salvage_bundle", "requires_browser": True}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    incapable = RunnerDispatchSnapshot(
+        uuid.uuid4(), project.id, {"task_types": "all", "max_concurrent": 1}
+    )
+
+    dispatched = await _try_runner_dispatch(
+        db_session, task, {project.id: [incapable]}, {}
+    )
+
+    assert dispatched is False
+    assert task.status == TaskStatus.QUEUED
+    assert (task.context or {}).get("runner_target_id") is None
+
+
 # ── Container-capability gating in runner dispatch ─────────────────────────────
 
 

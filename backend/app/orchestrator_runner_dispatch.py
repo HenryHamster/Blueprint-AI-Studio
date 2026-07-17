@@ -509,6 +509,7 @@ async def _try_runner_dispatch(
         # pool, and the 900s hold sweep then evicts the task to cloud. While the
         # declines still look transient, re-pick the decliner instead.
         declined_exclusion_advisory=decline_exclusion_is_advisory(task, task_type),
+        requires_browser=payload.get("requires_browser") is True,
     )
     if runner is None:
         return False
@@ -903,6 +904,7 @@ def _select_eligible_runner(
     vram_gb: float | None = None,
     declined_runner_ids: set[str] | None = None,
     declined_exclusion_advisory: bool = False,
+    requires_browser: bool = False,
 ) -> "LocalRunner | RunnerDispatchSnapshot | None":
     """Pick the least-loaded eligible runner for a task/job, or None.
 
@@ -974,6 +976,16 @@ def _select_eligible_runner(
             and (task_type == "compute_experiment" or _runner_agent_available(r))
             and not _runner_at_capacity(r, pins.get(r.id, 0), task_type)
         ]
+        if requires_browser:
+            # Browser-required work is fail-safe: only a current, explicit runner
+            # proof is accepted. Older runners omit this capability and therefore
+            # fall through to the Packer-proven cloud image instead of claiming a
+            # task that will fail after Chromium bootstrap.
+            out = [
+                r
+                for r in out
+                if (r.capabilities or {}).get("playwright_chromium_usable") is True
+            ]
         if accelerator:
             # Trust VERIFIED GPU capability, not the bare self-reported has_gpu bool:
             # a mis-set flag would silently defeat this gate and win GPU jobs the
