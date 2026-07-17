@@ -457,11 +457,13 @@ def test_watchdog_status_warming_and_malformed_history_are_not_protected():
     assert warming_status["watchdog_state"] == "warming_up"
     assert warming_status["watchdog_active"] is False
 
+    # Both samples have received_at present but malformed (not parseable).
+    # Truly malformed telemetry cannot bypass an armed watchdog after grace.
     malformed = SimpleNamespace(
         polling_metadata={
             "declared_metric": "val/loss",
             "progress_series": [
-                {"t": "2099-01-01", "name": "val/loss", "value": 1.0},
+                {"t": "2099-01-01", "received_at": "bad", "name": "val/loss", "value": 1.0},
                 {"received_at": "bad", "name": "val/loss", "value": 1.0},
             ],
         },
@@ -477,6 +479,46 @@ def test_watchdog_status_warming_and_malformed_history_are_not_protected():
     assert malformed_status["watchdog_active"] is False
     # Malformed declared telemetry cannot bypass an armed watchdog after grace.
     assert _no_progress_stalled(malformed, now=now) is True
+
+
+def test_pre_upgrade_samples_without_received_at_do_not_fire_watchdog():
+    """Pre-upgrade samples (no received_at key) fall back to t; watchdog must not fire."""
+    now = datetime(2026, 1, 2, 12, 0, 0)
+    ages = [2000, 1500, 1100, 700, 300, 0]
+    pre_upgrade = SimpleNamespace(
+        polling_metadata={
+            "declared_metric": "val/loss",
+            "progress_series": [
+                {
+                    "t": (now - timedelta(seconds=age)).isoformat(),
+                    "name": "val/loss",
+                    "value": round(0.9 - i * 0.01, 3),
+                }
+                for i, age in enumerate(ages)
+            ],
+        },
+        started_at=now - timedelta(seconds=3000),
+    )
+    # The job is actively advancing — watchdog must not fire.
+    assert _no_progress_stalled(pre_upgrade, now=now) is False
+
+    # Flat pre-upgrade samples (no progress) should still trigger the watchdog
+    # once the window is saturated.
+    flat_pre_upgrade = SimpleNamespace(
+        polling_metadata={
+            "declared_metric": "val/loss",
+            "progress_series": [
+                {
+                    "t": (now - timedelta(seconds=age)).isoformat(),
+                    "name": "val/loss",
+                    "value": 1.0,
+                }
+                for age in ages
+            ],
+        },
+        started_at=now - timedelta(seconds=3000),
+    )
+    assert _no_progress_stalled(flat_pre_upgrade, now=now) is True
 
 
 def test_no_progress_stalled_terminal_reason_constant_distinct_from_deadline():

@@ -1304,8 +1304,11 @@ def _watched_progress_samples(
     """Return receipt-time-sorted samples for the declared metric.
 
     ``received_at`` is written by the authenticated ingestion route and is the
-    only enforcement clock. Runner-authored ``t`` remains presentation metadata.
-    Legacy or malformed entries without a receipt time are skipped fail-open.
+    preferred enforcement clock. When ``received_at`` is *absent* (pre-upgrade
+    samples stored before the field was introduced), the runner-authored ``t``
+    field is used as a fallback so that a rolling deploy cannot convert a
+    healthy in-flight job into TIMED_OUT. Samples where ``received_at`` is
+    *present but malformed* are still skipped.
     """
     series = (job.polling_metadata or {}).get("progress_series")
     if not isinstance(series, list):
@@ -1314,7 +1317,12 @@ def _watched_progress_samples(
     for sample in series:
         if not isinstance(sample, dict) or sample.get("name") != metric:
             continue
-        ts = _parse_naive_iso_datetime(sample.get("received_at"))
+        if "received_at" in sample:
+            ts = _parse_naive_iso_datetime(sample["received_at"])
+        else:
+            # Pre-upgrade sample: received_at was never written; fall back to
+            # the runner-authored timestamp so the sample is not silently dropped.
+            ts = _parse_naive_iso_datetime(sample.get("t"))
         val = _coerce_metric_number(sample.get("value"))
         if ts is None or val is None:
             continue
