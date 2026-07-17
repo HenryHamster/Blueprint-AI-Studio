@@ -8292,6 +8292,34 @@ class DownloadInputArtifactTests(unittest.TestCase):
         self.assertEqual(prov["reason"], "http_404")
         self.assertEqual(os.listdir(self.artifact_dir), [])
 
+    def test_corrupt_extract_never_publishes_staged_predecessor_files(self):
+        """A tar failure after a member write leaves the durable dir empty."""
+        class _PartiallyFailingTar:
+            def getmembers(self):
+                return []
+
+            def extractall(self, destination, members):
+                with open(os.path.join(destination, "checkpoint.pt"), "wb") as fh:
+                    fh.write(b"partial predecessor")
+                raise tarfile.ReadError("corrupt after first member")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        with patch(
+            "local_runner.urllib.request.urlopen",
+            return_value=_FakeResp(200, b"not-a-real-tar"),
+        ), patch("local_runner.tarfile.open", return_value=_PartiallyFailingTar()):
+            prov = local_runner._download_input_artifact(
+                "http://orch", "tok", "job-1", self.artifact_dir
+            )
+        self.assertFalse(prov["ok"])
+        self.assertEqual(prov["reason"], "extract_error:ReadError")
+        self.assertEqual(os.listdir(self.artifact_dir), [])
+
     def test_empty_bundle_reports_failure(self):
         with patch(
             "local_runner.urllib.request.urlopen",

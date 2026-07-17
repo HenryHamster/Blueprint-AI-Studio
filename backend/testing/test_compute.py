@@ -1340,6 +1340,7 @@ def _terminal_record_bytes(
     metrics: dict | None = None,
     command_log: dict | None = None,
     release_sha: str = "",
+    resume_provenance: dict | None = None,
     schema_version: int = 1,
 ) -> bytes:
     """terminal.json bytes exactly as the on-VM terminal_record.py would write."""
@@ -1353,6 +1354,11 @@ def _terminal_record_bytes(
             _b64_text(json.dumps(command_log)) if command_log is not None else ""
         ),
         "release_echo_b64": _b64_text(release_sha) if release_sha else "",
+        "resume_provenance_b64": (
+            _b64_text(json.dumps(resume_provenance))
+            if resume_provenance is not None
+            else ""
+        ),
     }
     return json.dumps(record).encode("utf-8")
 
@@ -1492,6 +1498,131 @@ def test_gcp_startup_script_resume_hydration_is_fail_closed():
     _assert_bash_syntax_ok(script)
 
 
+def _run_gcp_resume_block(
+    monkeypatch, tmp_path, *, members: dict[str, bytes], fail_publication: bool = False
+):
+    """Execute only the generated hydration block with local test fixtures."""
+    import subprocess
+
+    artifact_dir = tmp_path / "artifacts"
+    bundle = tmp_path / "source.tar.gz"
+    with tarfile.open(bundle, "w:gz") as archive:
+        for name, payload in members.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(payload)
+            archive.addfile(info, io.BytesIO(payload))
+
+    monkeypatch.setattr(
+        compute_backends_module, "_GCP_ARTIFACT_DIR_PATH", str(artifact_dir)
+    )
+    source_id = uuid.uuid4()
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="true",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        runtime_deadline_seconds=3600,
+        input_artifact_job_id=str(source_id),
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec,
+        artifact_upload_url="https://storage.example.com/upload",
+        input_artifact_download_url=bundle.as_uri(),
+    )
+    start_marker = "rm -rf /tmp/blueprint_resume_stage; rm -f /tmp/blueprint_resume_bundle.tar.gz"
+    start = script.index(start_marker)
+    end = script.index(start_marker, start + 1) + len(start_marker)
+    block = script[start:end]
+    prelude = (
+        "curl() { return 1; }; upload_artifacts() { :; }; "
+        "poweroff() { :; }; shutdown() { :; }; TTL_PID=; _NP_WATCHDOG_PID=; "
+    )
+    if fail_publication:
+        prelude += "cp() { return 1; }; "
+    proc = subprocess.run(
+        ["bash", "-c", prelude + block],
+        capture_output=True,
+        text=True,
+    )
+    return proc, artifact_dir, source_id
+
+
+def test_gcp_resume_rejects_empty_accepted_archive(monkeypatch, tmp_path):
+    """An archive with no regular files cannot become a successful checkpoint."""
+    proc, artifact_dir, _source_id = _run_gcp_resume_block(
+        monkeypatch, tmp_path, members={}
+    )
+
+    assert proc.returncode == 1
+    assert not (artifact_dir / "resume_hydration.ok").exists()
+    assert (artifact_dir / "resume_hydration.failed").is_file()
+    assert "resume_hydration_failed" in proc.stdout
+
+
+def test_gcp_resume_rejects_archive_with_only_unsafe_member(monkeypatch, tmp_path):
+    """Skipped traversal members cannot count as a hydrated checkpoint."""
+    proc, artifact_dir, _source_id = _run_gcp_resume_block(
+        monkeypatch,
+        tmp_path,
+        members={"../outside/checkpoint.pt": b"weights"},
+    )
+
+    assert proc.returncode == 1
+    assert not (artifact_dir / "resume_hydration.ok").exists()
+    assert (artifact_dir / "resume_hydration.failed").is_file()
+    assert "resume_hydration_failed" in proc.stdout
+
+
+def test_gcp_resume_scrubs_failed_publication(monkeypatch, tmp_path):
+    """A failed staged copy is checked and no partial checkpoint survives."""
+    proc, artifact_dir, _source_id = _run_gcp_resume_block(
+        monkeypatch,
+        tmp_path,
+        members={"checkpoint/model.pt": b"weights"},
+        fail_publication=True,
+    )
+
+    assert proc.returncode == 1
+    assert not (artifact_dir / "checkpoint/model.pt").exists()
+    assert not (artifact_dir / "resume_hydration.ok").exists()
+    assert (artifact_dir / "resume_hydration.failed").is_file()
+
+
+def test_gcp_resume_provenance_is_valid_for_chained_source(monkeypatch, tmp_path):
+    """Successful GCP hydration emits every field the next chain hop requires."""
+    proc, _artifact_dir, source_id = _run_gcp_resume_block(
+        monkeypatch, tmp_path, members={"checkpoint/model.pt": b"weights"}
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    serial = "\n".join(
+        [
+            "BLUEPRINT_COMPUTE_STATUS=RUNNING",
+            next(
+                line
+                for line in proc.stdout.splitlines()
+                if line.startswith(compute_backends_module._SERIAL_RESUME_PREFIX)
+            ),
+        ]
+    )
+    status = compute_backends_module._parse_serial_status(serial)
+    assert status is not None and status.resume_provenance is not None
+    provenance = status.resume_provenance
+    assert provenance["resumed_from_job_id"] == str(source_id)
+    assert provenance["file_count"] == 1
+    assert datetime.fromisoformat(provenance["recorded_at"]).tzinfo is not None
+
+    resumed_gcp_job = MagicMock(
+        backend=compute_backends_module.GCP_BACKEND_NAME,
+        polling_metadata={
+            "input_artifact_job_id": str(source_id),
+            "resume_provenance": provenance,
+        },
+    )
+    assert compute_jobs._has_verified_resume_provenance(resumed_gcp_job) is True
+
+
 def test_gcp_startup_script_emits_resume_serial_marker():
     """The GCP startup script emits _SERIAL_RESUME_PREFIX on both the success and
     failure branches of the resume block so the operator can always distinguish a
@@ -1628,13 +1759,17 @@ async def test_gcp_poll_status_reconciles_terminated_vm_from_durable_success(
     marker is captured; the VM reads TERMINATED with no marker. poll_status must
     reconcile to SUCCEEDED from the durable terminal.json, NOT report FAILURE."""
     backend = GcpComputeBackend()
+    source_id = uuid.uuid4()
     job = ComputeJob(
         id=uuid.uuid4(),
         project_id=uuid.uuid4(),
         backend=backend.name,
         external_compute_id="compute-job-vm-fast0001",
         status=ComputeJobStatus.RUNNING,
-        polling_metadata={"zone": "us-central1-f"},
+        polling_metadata={
+            "zone": "us-central1-f",
+            "input_artifact_job_id": str(source_id),
+        },
     )
 
     # Serial output carries NO terminal marker (lost to the poweroff race).
@@ -1650,6 +1785,12 @@ async def test_gcp_poll_status_reconciles_terminated_vm_from_durable_success(
                 exit_code=0,
                 reason="completed",
                 metrics={"mean_act_gain": 0.16},
+                resume_provenance={
+                    "ok": True,
+                    "file_count": 3,
+                    "recorded_at": "2026-07-15T00:00:00+00:00",
+                    "resumed_from_job_id": str(source_id),
+                },
             )
         }
     )
@@ -1666,6 +1807,9 @@ async def test_gcp_poll_status_reconciles_terminated_vm_from_durable_success(
     assert status.status == ComputeJobStatus.SUCCEEDED
     assert status.exit_code == 0
     assert status.metrics == {"mean_act_gain": 0.16}
+    assert status.resume_provenance is not None
+    assert status.resume_provenance["ok"] is True
+    assert status.resume_provenance["resumed_from_job_id"] == str(source_id)
     assert download_calls == [job.id]
 
 
@@ -2138,6 +2282,9 @@ async def test_runner_report_exit_125_finalizes_no_progress_timeout_through_moni
         classify_compute_terminal_reason(job.terminal_reason, None)
         == NO_PROGRESS_TIMEOUT
     )
+    result = json.loads(compute_jobs.build_compute_result_logs(job))
+    assert result["intentional_terminal"] is True
+    assert result["killed_by"] == "deadline"
 
 
 @pytest.mark.asyncio
@@ -2702,6 +2849,99 @@ async def test_local_backend_resume_records_provenance(monkeypatch):
     assert terminal is not None
     assert terminal.status == ComputeJobStatus.SUCCEEDED
     assert terminal.exit_code == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("adoption_path", ["memory", "persisted_pid", "terminal"])
+async def test_local_resume_adoption_recovers_durable_provenance(
+    monkeypatch, tmp_path, adoption_path
+):
+    """Every idempotent adoption path recovers proof after DB persistence loss."""
+    monkeypatch.setattr(
+        compute_backends_module, "_LOCAL_STATE_ROOT", str(tmp_path / "state")
+    )
+    backend = LocalSubprocessComputeBackend()
+    source_id = uuid.uuid4()
+    job_id = uuid.uuid4()
+    external_id = f"local-{job_id}"
+    os.makedirs(
+        compute_backends_module._local_state_dir_for_external_id(external_id),
+        exist_ok=True,
+    )
+    provenance = {
+        "ok": True,
+        "file_count": 4,
+        "recorded_at": "2026-07-15T00:00:00+00:00",
+        "resumed_from_job_id": str(source_id),
+    }
+    compute_backends_module._write_local_resume_provenance_for_external_id(
+        external_id, provenance
+    )
+
+    if adoption_path == "memory":
+        proc = MagicMock()
+        proc.pid = 4101
+        proc.poll.return_value = None
+        backend._processes[external_id] = compute_backends_module._LocalProcessHandle(
+            proc=proc, started_at=datetime(2026, 7, 15)
+        )
+    elif adoption_path == "persisted_pid":
+        monkeypatch.setattr(
+            compute_backends_module,
+            "_local_subprocess_pid_for_external_id",
+            lambda _external_id: 4102,
+        )
+
+        async def running(_pid):
+            return True
+
+        monkeypatch.setattr(compute_backends_module, "_aio_is_pid_running", running)
+    else:
+        compute_backends_module._write_local_state_text(
+            compute_backends_module._local_terminal_path_for_external_id(external_id),
+            "STATUS=SUCCEEDED\nEXIT_CODE=0",
+        )
+
+    result = await backend.launch(
+        ComputeLaunchSpec(
+            job_id=job_id,
+            external_id=external_id,
+            command="must-not-run",
+            machine_type="e2-standard-2",
+            spend_cap_usd=1.0,
+            deadline_at=None,
+            input_artifact_job_id=str(source_id),
+        )
+    )
+
+    assert result.metadata["resume_provenance"] == provenance
+
+
+def test_local_resume_provenance_recovery_rejects_mismatched_source(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(
+        compute_backends_module, "_LOCAL_STATE_ROOT", str(tmp_path / "state")
+    )
+    external_id = "local-source-match"
+    os.makedirs(
+        compute_backends_module._local_state_dir_for_external_id(external_id),
+        exist_ok=True,
+    )
+    compute_backends_module._write_local_resume_provenance_for_external_id(
+        external_id,
+        {
+            "ok": True,
+            "file_count": 1,
+            "resumed_from_job_id": str(uuid.uuid4()),
+        },
+    )
+    assert (
+        compute_backends_module._read_local_resume_provenance_for_external_id(
+            external_id, uuid.uuid4()
+        )
+        is None
+    )
 
 
 def test_safe_extract_artifact_bundle_rejects_path_traversal(tmp_path):
@@ -15940,7 +16180,11 @@ def test_no_progress_stalled_detects_plateau_and_spares_advancing_metric():
             # Spread the samples evenly across the trailing window.
             t = now - timedelta(seconds=window * (n - 1 - i) / (n - 1))
             meta = append_progress_sample(
-                meta, metric="loss", value=v, t=t.isoformat()
+                meta,
+                metric="loss",
+                value=v,
+                t=t.isoformat(),
+                received_at=t,
             )
         return ComputeJob(
             command="true",
@@ -15994,7 +16238,13 @@ def test_no_progress_stalled_respects_per_job_timeout():
         n = len(values)
         for i, v in enumerate(values):
             t = now - timedelta(seconds=window_seconds * (n - 1 - i) / (n - 1))
-            meta = append_progress_sample(meta, metric="loss", value=v, t=t.isoformat())
+            meta = append_progress_sample(
+                meta,
+                metric="loss",
+                value=v,
+                t=t.isoformat(),
+                received_at=t,
+            )
         return ComputeJob(
             command="true",
             machine_type="e2-standard-2",
@@ -16033,7 +16283,11 @@ def test_no_progress_stalled_respects_per_job_timeout():
     for i, v in enumerate([0.5] * n):
         t = now - timedelta(seconds=per_job_timeout * (n - 1 - i) / (n - 1))
         global_job_meta = append_progress_sample(
-            global_job_meta, metric="loss", value=v, t=t.isoformat()
+            global_job_meta,
+            metric="loss",
+            value=v,
+            t=t.isoformat(),
+            received_at=t,
         )
     global_job = ComputeJob(
         command="true",
@@ -17475,7 +17729,7 @@ async def test_spawn_followup_suppressed_for_engine_authored_task_with_false(db_
     spawn_mock.assert_not_called()
 
 
-# ── Progress-series ring buffer + terminal_kind disposition ──────────────────
+# ── Progress-series compaction + terminal_kind disposition ──────────────────
 
 def test_append_progress_sample_basic():
     """A valid metric+value is appended as {t, name, value} into progress_series."""
@@ -17487,6 +17741,7 @@ def test_append_progress_sample_basic():
     assert len(series) == 1
     assert series[0]["name"] == "loss"
     assert series[0]["value"] == 0.42
+    assert datetime.fromisoformat(series[0]["received_at"]) <= _utcnow()
     assert series[0]["t"] == "2026-01-01T00:00:00"
 
 
@@ -17571,6 +17826,7 @@ def test_merge_progress_report_bridges_new_records_to_progress_series():
             metric=rec["metric"],
             value=rec["value"],
             t=rec.get("ts") or now.isoformat(),
+            received_at=now,
         )
 
     series = meta.get("progress_series", [])
@@ -17785,22 +18041,29 @@ def test_serialize_compute_job_response_safe_absent_on_legacy_rows():
 
 
 def test_serialize_compute_job_response_safe_promotes_watchdog_protection_status():
-    """serialize_compute_job_response_safe promotes the four watchdog-protection status
+    """serialize_compute_job_response_safe promotes watchdog-protection status
     fields as first-class fields on the operator-facing payload.
 
     Three sub-cases:
-    (1) Protected running job: declared metric + effective timeout -> watchdog_active=True,
-        correct no_progress_timeout_seconds, last_progress_at equals newest matching sample.
+    (1) Protected running job: declared metric + enough fresh receipt-time history
+        -> watchdog_active=True and watchdog_state='protected'.
     (2) No declared metric: watchdog_active=False, watchdog_inert_reason='no_declared_metric'.
     (3) Metric-name mismatch: samples exist but none match declared metric ->
         watchdog_inert_reason='metric_name_mismatch'.
     """
     from app.schemas import serialize_compute_job_response_safe
+    from app.models import _utcnow
 
     # --- Case 1: protected job with declared metric and matching samples ---
+    now = _utcnow()
     progress_series = [
-        {"t": "2026-01-01T00:00:00", "name": "reward", "value": 1.0},
-        {"t": "2026-01-01T00:01:00", "name": "reward", "value": 1.1},
+        {
+            "t": "runner-authored",
+            "received_at": (now - timedelta(seconds=age)).isoformat(),
+            "name": "reward",
+            "value": 1.0,
+        }
+        for age in (3600, 2700, 1800, 900, 0)
     ]
     job_protected = ComputeJob(
         id=uuid.uuid4(),
@@ -17808,6 +18071,7 @@ def test_serialize_compute_job_response_safe_promotes_watchdog_protection_status
         backend="local-subprocess",
         status=ComputeJobStatus.RUNNING,
         spend_cap_usd=1.0,
+        started_at=now - timedelta(hours=2),
         polling_metadata={
             "declared_metric": "reward",
             "no_progress_timeout_seconds": 3600,
@@ -17816,8 +18080,9 @@ def test_serialize_compute_job_response_safe_promotes_watchdog_protection_status
     )
     data = serialize_compute_job_response_safe(job_protected)
     assert data["watchdog_active"] is True, "watchdog must be active for a protected job"
+    assert data["watchdog_state"] == "protected"
     assert data["no_progress_timeout_seconds"] == 3600, "per-job timeout must be reported"
-    assert data["last_progress_at"] == "2026-01-01T00:01:00", "must return newest matching sample"
+    assert data["last_progress_at"] == now.isoformat(), "must return newest server receipt time"
     assert data["watchdog_inert_reason"] is None, "no inert reason for an active watchdog"
 
     # --- Case 2: no declared metric ---
@@ -17845,13 +18110,18 @@ def test_serialize_compute_job_response_safe_promotes_watchdog_protection_status
         polling_metadata={
             "declared_metric": "reward",
             "progress_series": [
-                {"t": "2026-01-01T00:00:00", "name": "loss", "value": 0.5},
-                {"t": "2026-01-01T00:01:00", "name": "loss", "value": 0.4},
+                {
+                    "t": "runner-authored",
+                    "received_at": now.isoformat(),
+                    "name": "loss",
+                    "value": 0.5,
+                },
             ],
         },
     )
     data3 = serialize_compute_job_response_safe(job_mismatch)
     assert data3["watchdog_active"] is False
+    assert data3["watchdog_state"] == "inert"
     assert data3["watchdog_inert_reason"] == "metric_name_mismatch"
     assert data3["last_progress_at"] is None
 
@@ -17884,6 +18154,7 @@ def test_runner_bridge_last_progress_at_reflects_written_samples():
             metric=rec["metric"],
             value=rec["value"],
             t=rec.get("ts") or now.isoformat(),
+            received_at=now,
         )
 
     job = ComputeJob(
@@ -17896,13 +18167,15 @@ def test_runner_bridge_last_progress_at_reflects_written_samples():
     )
     data = serialize_compute_job_response_safe(job)
 
-    # The bridge wrote samples under key 'name'; the watchdog reads 'name'.
-    # last_progress_at must reflect the most recent bridged sample.
-    assert data["last_progress_at"] == "2026-06-01T00:01:00", (
-        "last_progress_at must equal the most recent runner-bridged sample timestamp"
+    # The bridge preserves runner-authored t for presentation but the watchdog
+    # exposes authenticated server receipt time as last_progress_at.
+    assert data["progress_series"][-1]["t"] == "2026-06-01T00:01:00"
+    assert data["last_progress_at"] == now.isoformat(), (
+        "last_progress_at must use server receipt time, not the runner timestamp"
     )
-    assert data["watchdog_active"] is True, "watchdog must be active after bridge populates progress_series"
-    assert data["watchdog_inert_reason"] is None
+    assert data["watchdog_active"] is False
+    assert data["watchdog_state"] == "insufficient_history"
+    assert data["watchdog_inert_reason"] == "missing_start_time"
 
 
 @pytest.mark.asyncio
@@ -22686,7 +22959,7 @@ async def test_viewable_pipeline_skips_backends_without_a_bundle(
 
 # ── No-progress watchdog ──────────────────────────────────────────────────────
 #
-# The surfacing half (progress_series ring buffer + declared_metric) already
+# The surfacing half (bounded progress_series + declared_metric) already
 # shipped; these cover the CONSUMER wired in this change: _no_progress_stalled
 # and its enforcement in _process_single_compute_job.
 
@@ -22701,7 +22974,7 @@ def _progress_job(*, metric, samples, started_offset_seconds, extra_meta=None):
     """Build an in-memory job-like object for pure watchdog-trend tests.
 
     ``samples`` is a list of ``(seconds_before_now, name, value)`` tuples for the
-    progress ring buffer; ``started_offset_seconds`` is how long ago the job
+    progress history; ``started_offset_seconds`` is how long ago the job
     started.
     """
     from types import SimpleNamespace
@@ -22713,6 +22986,7 @@ def _progress_job(*, metric, samples, started_offset_seconds, extra_meta=None):
     series = [
         {
             "t": (now - timedelta(seconds=age)).isoformat(),
+            "received_at": (now - timedelta(seconds=age)).isoformat(),
             "name": name,
             "value": value,
         }
@@ -22897,6 +23171,7 @@ async def test_process_compute_jobs_once_cuts_stalled_no_progress_job(
     meta["progress_series"] = [
         {
             "t": (now - timedelta(seconds=age)).isoformat(),
+            "received_at": (now - timedelta(seconds=age)).isoformat(),
             "name": "val/loss",
             "value": 2.71828,
         }
@@ -22978,6 +23253,7 @@ async def test_process_compute_jobs_once_keeps_progressing_job_running(
     meta["progress_series"] = [
         {
             "t": (now - timedelta(seconds=age)).isoformat(),
+            "received_at": (now - timedelta(seconds=age)).isoformat(),
             "name": "val/loss",
             "value": 3.0 - i * 0.15,
         }
@@ -23040,6 +23316,31 @@ def test_build_compute_launch_kwargs_forwards_declared_metric():
         {}, command="python x.py", spend_cap_usd=1.0, deadline_seconds=60
     )
     assert "declared_metric" not in absent
+
+
+def test_build_compute_launch_kwargs_preserves_resume_watchdog_pair_flat_and_nested():
+    """Both supported payload shapes forward a checkpoint resume guard together."""
+    from app.orchestrator_runner_dispatch import _build_compute_launch_kwargs
+
+    predecessor = str(uuid.uuid4())
+    base = {"command": "python x.py", "spend_cap_usd": 1.0, "deadline_seconds": 60}
+    flat = _build_compute_launch_kwargs(
+        {"input_artifact_job_id": predecessor, "no_progress_timeout_seconds": 60},
+        **base,
+    )
+    nested_resume = _build_compute_launch_kwargs(
+        {
+            "compute_experiment": {
+                "input_artifact_job_id": predecessor,
+                "no_progress_timeout_seconds": 60,
+            }
+        },
+        **base,
+    )
+
+    for kwargs in (flat, nested_resume):
+        assert kwargs["input_artifact_job_id"] == predecessor
+        assert kwargs["no_progress_timeout_seconds"] == 60
 
 
 # ── Cross-job checkpoint resume (input_artifact_job_id) ───────────────────────
@@ -23147,9 +23448,9 @@ async def test_compute_job_resume_hydrates_prior_bundle(client, db_session, monk
         machine_type="e2-standard-2",
         spend_cap_usd=1.0,
         deadline_seconds=300,
+        no_progress_timeout_seconds=120,
         input_artifact_job_id=str(predecessor.id),
         declared_metric="loss",
-        no_progress_timeout_seconds=120,
     )
     assert job.backend == compute_backends_module.RUNNER_SUBPROCESS_BACKEND_NAME
     assert job.polling_metadata.get("input_artifact_job_id") == str(predecessor.id)
@@ -23215,6 +23516,32 @@ async def test_compute_job_resume_hydrates_prior_bundle(client, db_session, monk
 
 
 @pytest.mark.asyncio
+async def test_compute_job_resume_requires_explicit_watchdog_before_persisting(
+    db_session, monkeypatch
+):
+    """Direct callers cannot create an unguarded checkpoint successor row."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    task = await _make_compute_task(db_session)
+
+    with pytest.raises(compute_jobs.ComputeLaunchPreconditionFailed) as exc:
+        await compute_jobs.create_compute_job(
+            db_session,
+            task,
+            command="python train.py --resume",
+            machine_type="e2-standard-2",
+            spend_cap_usd=1.0,
+            deadline_seconds=300,
+            input_artifact_job_id=str(uuid.uuid4()),
+        )
+
+    assert exc.value.detail["error"] == "input_artifact_watchdog_required"
+    jobs = (
+        await db_session.execute(select(ComputeJob).where(ComputeJob.task_id == task.id))
+    ).scalars().all()
+    assert jobs == []
+
+
+@pytest.mark.asyncio
 async def test_compute_job_resume_rejects_unknown_input_artifact_job_id(
     db_session, monkeypatch
 ):
@@ -23231,6 +23558,7 @@ async def test_compute_job_resume_rejects_unknown_input_artifact_job_id(
             machine_type="e2-standard-2",
             spend_cap_usd=1.0,
             deadline_seconds=300,
+            no_progress_timeout_seconds=60,
             input_artifact_job_id=str(uuid.uuid4()),
         )
     assert exc.value.detail["error"] == "input_artifact_job_not_found"
@@ -23258,6 +23586,7 @@ async def test_compute_job_resume_rejects_malformed_input_artifact_job_id(
             machine_type="e2-standard-2",
             spend_cap_usd=1.0,
             deadline_seconds=300,
+            no_progress_timeout_seconds=60,
             input_artifact_job_id="not-a-uuid",
         )
     assert exc.value.detail["error"] == "invalid_input_artifact_job_id"
@@ -23287,6 +23616,7 @@ async def test_compute_job_resume_rejects_cross_project_input_artifact(
             machine_type="e2-standard-2",
             spend_cap_usd=1.0,
             deadline_seconds=300,
+            no_progress_timeout_seconds=60,
             input_artifact_job_id=str(foreign.id),
         )
     assert exc.value.detail["error"] == "input_artifact_job_cross_project"
@@ -23312,6 +23642,7 @@ async def test_compute_job_resume_rejects_bundleless_input_artifact(
             machine_type="e2-standard-2",
             spend_cap_usd=1.0,
             deadline_seconds=300,
+            no_progress_timeout_seconds=60,
             input_artifact_job_id=str(predecessor.id),
         )
     assert exc.value.detail["error"] == "input_artifact_job_has_no_bundle"
@@ -23383,6 +23714,7 @@ async def test_compute_job_resume_rejects_non_terminal_source(db_session, monkey
                 machine_type="e2-standard-2",
                 spend_cap_usd=1.0,
                 deadline_seconds=300,
+                no_progress_timeout_seconds=60,
                 input_artifact_job_id=str(job.id),
             )
         assert exc.value.detail["error"] == "input_artifact_job_not_terminal", (
@@ -23442,17 +23774,9 @@ async def test_gcp_startup_script_hydrates_input_artifact_bundle(monkeypatch):
     # Downloads the predecessor bundle and extracts it into the staging dir first,
     # then moves it into the artifact dir (so partial extracts never corrupt it).
     assert "https://storage.example.com/predecessor-bundle" in script
-    resume_stage = shlex.quote(
-        f"{compute_backends_module._GCP_ARTIFACT_DIR_PATH}.resume-staging"
-    )
-    assert (
-        f"tar -C {resume_stage} "
-        f"--no-same-owner -xzf" in script
-    )
-    assert (
-        f"mv {resume_stage} "
-        f"{shlex.quote(compute_backends_module._GCP_ARTIFACT_DIR_PATH)}" in script
-    )
+    assert "/tmp/blueprint_resume_stage" in script
+    assert "tarfile.open" in script
+    assert "m.isreg() or m.isdir()" in script
     assert "resume_hydration.ok" in script
     assert "resume_hydration.failed" in script
 
@@ -23914,6 +24238,105 @@ def test_checkpoint_resume_streams_predecessor_bundle_and_peak_memory_is_bounded
         "predecessor bundle in the orchestrator heap instead of streaming it to "
         "disk (this is the leader OOM on multi-GB checkpoints)"
     )
+
+
+@pytest.mark.parametrize("directory_only", [False, True])
+def test_local_checkpoint_resume_rejects_bundle_without_regular_files(
+    tmp_path, directory_only
+):
+    """Empty and directory-only archives cannot earn successful provenance."""
+    source = tmp_path / "source.tar.gz"
+    with tarfile.open(source, "w:gz") as archive:
+        if directory_only:
+            directory = tarfile.TarInfo("checkpoint/")
+            directory.type = tarfile.DIRTYPE
+            archive.addfile(directory)
+
+    def _fake_stream(_job_id, dest_path):
+        shutil.copyfile(source, dest_path)
+        return True
+
+    dest_dir = tmp_path / "artifacts"
+    with patch.object(
+        compute_backends_module, "_download_artifact_bundle_to_path", _fake_stream
+    ), pytest.raises(RuntimeError, match="contains no resumable files"):
+        asyncio.run(
+            compute_backends_module._rehydrate_input_artifact_bundle(
+                "predecessor-job-id", str(dest_dir)
+            )
+        )
+
+    assert not dest_dir.exists()
+
+
+def test_local_checkpoint_resume_strips_stale_status_files_before_counting(tmp_path):
+    """A bundle containing only predecessor status files is not a checkpoint."""
+    source = tmp_path / "source.tar.gz"
+    with tarfile.open(source, "w:gz") as archive:
+        for name in compute_backends_module._RESUME_STALE_ARTIFACT_FILENAMES:
+            payload = b"stale predecessor status"
+            info = tarfile.TarInfo(name)
+            info.size = len(payload)
+            archive.addfile(info, io.BytesIO(payload))
+
+    def _fake_stream(_job_id, dest_path):
+        shutil.copyfile(source, dest_path)
+        return True
+
+    dest_dir = tmp_path / "artifacts"
+    with patch.object(
+        compute_backends_module, "_download_artifact_bundle_to_path", _fake_stream
+    ), pytest.raises(RuntimeError, match="contains no resumable files"):
+        asyncio.run(
+            compute_backends_module._rehydrate_input_artifact_bundle(
+                "predecessor-job-id", str(dest_dir)
+            )
+        )
+
+    assert not dest_dir.exists()
+
+
+def test_local_checkpoint_resume_cleans_injected_partial_atomic_publication(
+    tmp_path,
+):
+    """A publication error after one entry cannot expose a partial durable tree."""
+    source = tmp_path / "source.tar.gz"
+    with tarfile.open(source, "w:gz") as archive:
+        for name, payload in (("first.ckpt", b"one"), ("second.ckpt", b"two")):
+            info = tarfile.TarInfo(name)
+            info.size = len(payload)
+            archive.addfile(info, io.BytesIO(payload))
+
+    def _fake_stream(_job_id, dest_path):
+        shutil.copyfile(source, dest_path)
+        return True
+
+    dest_dir = tmp_path / "artifacts"
+    dest_dir.mkdir()
+    (dest_dir / "incomplete-from-prior-attempt.ckpt").write_bytes(b"old")
+    real_replace = os.replace
+
+    def _interrupt_atomic_replace(src, dst):
+        if os.path.basename(src).startswith(".bp-resume-stage-"):
+            os.mkdir(dst)
+            first_entry = sorted(os.listdir(src))[0]
+            real_replace(os.path.join(src, first_entry), os.path.join(dst, first_entry))
+            raise OSError("injected interruption after first top-level entry")
+        return real_replace(src, dst)
+
+    with patch.object(
+        compute_backends_module, "_download_artifact_bundle_to_path", _fake_stream
+    ), patch.object(
+        compute_backends_module.os, "replace", _interrupt_atomic_replace
+    ), pytest.raises(RuntimeError, match="could not be published"):
+        asyncio.run(
+            compute_backends_module._rehydrate_input_artifact_bundle(
+                "predecessor-job-id", str(dest_dir)
+            )
+        )
+
+    assert not dest_dir.exists()
+    assert not list(tmp_path.glob("artifacts.bp-incomplete-*"))
 
 
 def test_no_progress_watchdog_escalates_to_sigkill_when_sigterm_is_ignored(

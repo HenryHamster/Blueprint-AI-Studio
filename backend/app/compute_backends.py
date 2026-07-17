@@ -42,6 +42,7 @@ from google.cloud import storage as gcs_storage
 from app import compute
 from app import storage
 from app.compute_experiment_contract import ENV_KEY_RE
+from app.failure_classification import NO_PROGRESS_TIMEOUT_TERMINAL_REASON
 from app.models import ComputeJob, ComputeJobStatus, Project, ProjectComputeImage
 from app.vm_lifecycle import _ensure_vm_deleted
 
@@ -106,6 +107,34 @@ _VIEWABLE_WATCH_B64 = base64.b64encode(
 
 logger = logging.getLogger(__name__)
 
+_RESUME_STALE_ARTIFACT_FILENAMES = (
+    "result.json",
+    "command.log.json",
+    "terminal.json",
+    "live_tail.b64",
+)
+
+# Python one-liner for safe tar extraction on GCP resume VMs.  The literal
+# strings 'tarfile.open' and 'm.isreg() or m.isdir()' are asserted by the
+# test suite so they must appear verbatim in this constant.
+_RESUME_EXTRACTOR_PY = (
+    "import tarfile,os,sys;"
+    "b,d=sys.argv[1],sys.argv[2];"
+    'STALE={"result.json","command.log.json","terminal.json","live_tail.b64"};'
+    "os.makedirs(d,exist_ok=True);"
+    'tf=tarfile.open(b,"r:gz");'
+    "ms=tf.getmembers();"
+    "safe=[m for m in ms if not m.issym() and not m.islnk()"
+    ' and (m.isreg() or m.isdir())'
+    ' and ".." not in m.name.split("/")'
+    ' and not m.name.startswith("/")'
+    ' and not(m.isreg() and m.name.split("/")[-1] in STALE)];'
+    "[tf.extract(m,d) for m in safe];"
+    "fc=sum(1 for m in safe if m.isreg());"
+    "tf.close();"
+    "sys.exit(0 if fc>0 else 1)"
+)
+
 
 def _load_result_json(result_path: str) -> Any:
     """Synchronous helper for run_preflight_smoke — offloaded via asyncio.to_thread
@@ -141,7 +170,11 @@ def _extract_safe_members(tar: tarfile.TarFile, dest_dir: str) -> int:
     malicious or corrupt predecessor bundle can only ever write inside
     ``dest_dir``. Symlink / hardlink members are skipped as well — their targets
     could point outside the destination even when the member name itself is safe.
-    Returns the count of members actually extracted.
+    Stale predecessor run-status files (result.json, terminal.json, etc.) are
+    also skipped so they cannot contaminate the new job's terminal detection.
+    Returns the count of non-stale regular files actually extracted (directories
+    are extracted but not counted, so an archive of only directories or stale
+    files returns 0 — fail-closed).
     """
     os.makedirs(dest_dir, exist_ok=True)
     extracted = 0
@@ -154,8 +187,13 @@ def _extract_safe_members(tar: tarfile.TarFile, dest_dir: str) -> int:
                 member.name,
             )
             continue
+        # Stale run-status files from the predecessor must not contaminate this job.
+        if member.isreg() and os.path.basename(member.name) in _RESUME_STALE_ARTIFACT_FILENAMES:
+            continue
         tar.extract(member, path=dest_dir, filter="data")
-        extracted += 1
+        # Count only regular files — directories are structural scaffolding only.
+        if member.isreg():
+            extracted += 1
     return extracted
 
 
@@ -189,10 +227,11 @@ def _safe_extract_artifact_bundle_path(path: str, dest_dir: str) -> int:
         return _extract_safe_members(tar, dest_dir)
 
 
+
 async def _rehydrate_input_artifact_bundle(
     input_artifact_job_id: str, dest_dir: str
 ) -> int:
-    """Fetch a predecessor's durable bundle and extract it into ``dest_dir``.
+    """Fetch a predecessor bundle and transactionally publish it to ``dest_dir``.
 
     The bundle is STREAMED to a temp file on disk (never materialized whole in
     the orchestrator heap) and extracted from there, so peak memory during a
@@ -209,7 +248,10 @@ async def _rehydrate_input_artifact_bundle(
     """
     handle, tmp_path = tempfile.mkstemp(prefix="bp-resume-", suffix=".tar.gz")
     os.close(handle)
-    staging_dir = f"{dest_dir}.resume-staging"
+    staging_dir = os.path.join(
+        os.path.dirname(dest_dir),
+        f".bp-resume-stage-{os.path.basename(dest_dir)}",
+    )
     await asyncio.to_thread(shutil.rmtree, staging_dir, True)
     await asyncio.to_thread(lambda: os.makedirs(staging_dir, exist_ok=True))
     try:
@@ -239,12 +281,13 @@ async def _rehydrate_input_artifact_bundle(
         if file_count <= 0:
             raise RuntimeError(
                 "input_artifact_rehydration_failed: predecessor bundle for "
-                f"{input_artifact_job_id} contained no checkpoint files"
+                f"{input_artifact_job_id} contains no resumable files"
             )
         try:
             await asyncio.to_thread(shutil.rmtree, dest_dir, True)
             await asyncio.to_thread(os.replace, staging_dir, dest_dir)
         except OSError as exc:
+            shutil.rmtree(dest_dir, ignore_errors=True)
             raise RuntimeError(
                 "input_artifact_rehydration_failed: extracted checkpoint could not "
                 f"be published: {exc}"
@@ -286,7 +329,6 @@ _SERIAL_RESUME_FAILED_B64: str = base64.b64encode(
         separators=(",", ":"),
     ).encode()
 ).decode()
-
 # Well-known env var pointing the launched command at a result file it may write
 # (a small flat JSON object of metric-name -> number). Absence = no metrics.
 RESULT_FILE_ENV = "BLUEPRINT_RESULT_FILE"
@@ -535,6 +577,7 @@ _LOCAL_STATE_ROOT = os.path.join(tempfile.gettempdir(), "blueprint-compute-jobs"
 _LOCAL_PID_FILENAME = "pid"
 _LOCAL_STARTED_AT_FILENAME = "started_at"
 _LOCAL_TERMINAL_FILENAME = "terminal"
+_LOCAL_RESUME_PROVENANCE_FILENAME = "resume_provenance.b64"
 
 
 @dataclass(slots=True)
@@ -888,6 +931,14 @@ class LocalSubprocessComputeBackend:
     async def launch(self, spec: ComputeLaunchSpec) -> ComputeLaunchResult:
         external_id = spec.external_id or f"local-{spec.job_id}"
         artifact_meta = _local_artifact_metadata(external_id)
+        durable_resume_provenance = await asyncio.to_thread(
+            _read_local_resume_provenance_for_external_id,
+            external_id,
+            spec.input_artifact_job_id,
+        )
+        adoption_meta: dict[str, Any] = dict(artifact_meta)
+        if durable_resume_provenance is not None:
+            adoption_meta["resume_provenance"] = durable_resume_provenance
         existing = self._processes.get(external_id)
         if existing is not None and existing.proc.poll() is None:
             # Idempotent re-launch: the reserved id is already running.
@@ -896,7 +947,7 @@ class LocalSubprocessComputeBackend:
                 started_at=existing.started_at,
                 cost_rate_per_second=0.0,
                 message=f"local subprocess already running pid={existing.proc.pid}",
-                metadata=dict(artifact_meta),
+                metadata=dict(adoption_meta),
             )
         persisted_pid = await asyncio.to_thread(
             _local_subprocess_pid_for_external_id, external_id
@@ -912,12 +963,12 @@ class LocalSubprocessComputeBackend:
                 or _utcnow(),
                 cost_rate_per_second=0.0,
                 message=f"adopted existing local subprocess pid={persisted_pid}",
-                metadata={"pid": persisted_pid, **artifact_meta},
+                metadata={"pid": persisted_pid, **adoption_meta},
             )
         if await asyncio.to_thread(
             _read_local_terminal_status_for_external_id, external_id
         ) is not None:
-            metadata: dict[str, Any] = dict(artifact_meta)
+            metadata: dict[str, Any] = dict(adoption_meta)
             if persisted_pid is not None:
                 metadata["pid"] = persisted_pid
             return ComputeLaunchResult(
@@ -951,7 +1002,7 @@ class LocalSubprocessComputeBackend:
         resume_provenance: dict[str, Any] | None = None
         if spec.input_artifact_job_id is not None:
             file_count = await _rehydrate_input_artifact_bundle(
-                spec.input_artifact_job_id,
+                str(spec.input_artifact_job_id),
                 _local_artifact_dir_for_external_id(external_id),
             )
             resume_provenance = {
@@ -960,6 +1011,15 @@ class LocalSubprocessComputeBackend:
                 "recorded_at": _utcnow().isoformat(),
                 "resumed_from_job_id": str(spec.input_artifact_job_id),
             }
+            # Persist proof before spawning the subprocess. If the launch result
+            # cannot be applied to the DB (or the leader restarts), every
+            # idempotent adoption and poll path can recover the same source-matched
+            # proof without rehydrating or launching a duplicate command.
+            await asyncio.to_thread(
+                _write_local_resume_provenance_for_external_id,
+                external_id,
+                resume_provenance,
+            )
         env = {k: os.environ[k] for k in ("PATH", "HOME") if k in os.environ}
         env.update(spec.env or {})
         wrapper_command = _build_local_wrapper_command(
@@ -997,6 +1057,11 @@ class LocalSubprocessComputeBackend:
         )
 
     async def poll_status(self, job: ComputeJob) -> ComputeStatusResult:
+        resume_provenance = await asyncio.to_thread(
+            _read_local_resume_provenance_for_external_id,
+            job.external_compute_id,
+            (job.polling_metadata or {}).get("input_artifact_job_id"),
+        )
         handle = self._processes.get(job.external_compute_id or "")
         if handle is None:
             # Offload sync file I/O to a thread-pool thread
@@ -1014,7 +1079,8 @@ class LocalSubprocessComputeBackend:
                 live_output = await asyncio.to_thread(_read_local_live_tail, job)
                 return ComputeStatusResult(
                     status=ComputeJobStatus.RUNNING,
-                    live_output=live_output
+                    live_output=live_output,
+                    resume_provenance=resume_provenance,
                 )
             terminal = await asyncio.to_thread(_read_local_terminal_status, job)
             if terminal is not None:
@@ -1029,7 +1095,8 @@ class LocalSubprocessComputeBackend:
             live_output = await asyncio.to_thread(_read_local_live_tail, job)
             return ComputeStatusResult(
                 status=ComputeJobStatus.RUNNING,
-                live_output=live_output
+                live_output=live_output,
+                resume_provenance=resume_provenance,
             )
         self._processes.pop(job.external_compute_id or "", None)
         terminal = await asyncio.to_thread(_read_local_terminal_status, job)
@@ -1335,14 +1402,19 @@ class RunnerSubprocessBackend:
                     ).replace(tzinfo=None)
                 except (ValueError, AttributeError):
                     pass
+            no_progress_timeout = exit_code == NO_PROGRESS_WATCHDOG_EXIT_CODE
             cjs = (
                 ComputeJobStatus.SUCCEEDED
                 if runner_exec_status == "succeeded"
-                else ComputeJobStatus.FAILED
+                else (
+                    ComputeJobStatus.TIMED_OUT
+                    if no_progress_timeout
+                    else ComputeJobStatus.FAILED
+                )
             )
             if cjs == ComputeJobStatus.SUCCEEDED:
                 message = "compute job succeeded"
-            elif exit_code == NO_PROGRESS_WATCHDOG_EXIT_CODE:
+            elif no_progress_timeout:
                 # No-progress watchdog kill on the runner. The runner /report
                 # endpoint carries only exec_status/exit_code (no reason field),
                 # so translate the reserved exit code here into a terminal reason
@@ -1350,7 +1422,7 @@ class RunnerSubprocessBackend:
                 # kill collapses to CODE_ERROR (burns retry budget, misattributes
                 # blame) instead of NO_PROGRESS_TIMEOUT — matching the GCP/local
                 # -subprocess paths which emit REASON=no_progress_timeout directly.
-                message = "no_progress_timeout"
+                message = NO_PROGRESS_TIMEOUT_TERMINAL_REASON
             else:
                 message = "compute job failed"
             return ComputeStatusResult(
@@ -1492,11 +1564,15 @@ def _local_subprocess_started_at_for_external_id(
 
 
 def _read_local_terminal_status(job: ComputeJob) -> ComputeStatusResult | None:
-    return _read_local_terminal_status_for_external_id(job.external_compute_id)
+    return _read_local_terminal_status_for_external_id(
+        job.external_compute_id,
+        (job.polling_metadata or {}).get("input_artifact_job_id"),
+    )
 
 
 def _read_local_terminal_status_for_external_id(
     external_id: str | None,
+    expected_source_job_id: object | None = None,
 ) -> ComputeStatusResult | None:
     raw = _read_local_state_text(_local_terminal_path_for_external_id(external_id))
     if raw is None:
@@ -1529,6 +1605,9 @@ def _read_local_terminal_status_for_external_id(
     metrics = _decode_result_metrics(data.get("METRICS"))
     command_log = _decode_command_log(data.get("COMMAND_LOG"))
     echoed_release_sha = _decode_release_echo_sha(data.get("RELEASE_ECHO"))
+    resume_provenance = _read_local_resume_provenance_for_external_id(
+        external_id, expected_source_job_id
+    )
     if raw_status == "SUCCEEDED":
         return ComputeStatusResult(
             status=ComputeJobStatus.SUCCEEDED,
@@ -1538,6 +1617,7 @@ def _read_local_terminal_status_for_external_id(
             metrics=metrics,
             command_log=command_log,
             echoed_release_sha=echoed_release_sha,
+            resume_provenance=resume_provenance,
         )
     if exit_code is None:
         return ComputeStatusResult(
@@ -1547,6 +1627,7 @@ def _read_local_terminal_status_for_external_id(
             metrics=metrics,
             command_log=command_log,
             echoed_release_sha=echoed_release_sha,
+            resume_provenance=resume_provenance,
         )
     return ComputeStatusResult(
         status=ComputeJobStatus.FAILED,
@@ -1556,6 +1637,7 @@ def _read_local_terminal_status_for_external_id(
         metrics=metrics,
         command_log=command_log,
         echoed_release_sha=echoed_release_sha,
+        resume_provenance=resume_provenance,
     )
 
 
@@ -1909,6 +1991,13 @@ def _local_terminal_path_for_external_id(external_id: str | None) -> str:
     return os.path.join(
         _local_state_dir_for_external_id(external_id),
         _LOCAL_TERMINAL_FILENAME,
+    )
+
+
+def _local_resume_provenance_path_for_external_id(external_id: str | None) -> str:
+    return os.path.join(
+        _local_state_dir_for_external_id(external_id),
+        _LOCAL_RESUME_PROVENANCE_FILENAME,
     )
 
 
@@ -2896,6 +2985,36 @@ def _remove_local_terminal_status_for_external_id(external_id: str | None) -> No
         return
 
 
+def _write_local_resume_provenance_for_external_id(
+    external_id: str | None, provenance: dict[str, Any]
+) -> None:
+    encoded = base64.b64encode(
+        json.dumps(provenance, separators=(",", ":")).encode("utf-8")
+    ).decode("ascii")
+    _write_local_state_text(
+        _local_resume_provenance_path_for_external_id(external_id), encoded
+    )
+
+
+def _read_local_resume_provenance_for_external_id(
+    external_id: str | None, expected_source_job_id: object | None
+) -> dict[str, Any] | None:
+    """Recover only proof that matches the launch/job's declared resume source."""
+    if expected_source_job_id in (None, ""):
+        return None
+    raw = _read_local_state_text(
+        _local_resume_provenance_path_for_external_id(external_id)
+    )
+    provenance = _decode_resume_provenance(raw)
+    if provenance is None or provenance.get("ok") is not True:
+        return None
+    if str(provenance.get("resumed_from_job_id") or "") != str(
+        expected_source_job_id
+    ):
+        return None
+    return provenance
+
+
 def _is_pid_running(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -3093,7 +3212,7 @@ def _build_gcp_startup_script(
             f'  echo "{_SERIAL_EXIT_PREFIX}1"\n'
             f"  python3 /tmp/blueprint_terminal_record.py "
             f"{artifact_dir} FAILED 1 repo_clone_failed:$CLONE_CLASS "
-            f"{result_file} {command_log_path} >/dev/null 2>&1 || true\n"
+            f'{result_file} {command_log_path} "$__BP_RESUME_D" >/dev/null 2>&1 || true\n'
             f"  upload_artifacts\n"
             f'  kill "$TTL_PID" "$_NP_WATCHDOG_PID" "$_VIEWABLE_PID" 2>/dev/null || true\n'
             f"  poweroff || shutdown -h now || true\n"
@@ -3134,7 +3253,7 @@ def _build_gcp_startup_script(
             f'  echo "{_SERIAL_EXIT_PREFIX}1"\n'
             f"  python3 /tmp/blueprint_terminal_record.py "
             f"{artifact_dir} FAILED 1 setup_step_failed "
-            f"{result_file} {command_log_path} >/dev/null 2>&1 || true\n"
+            f'{result_file} {command_log_path} "$__BP_RESUME_D" >/dev/null 2>&1 || true\n'
             f"  upload_artifacts\n"
             f'  kill "$TTL_PID" "$_NP_WATCHDOG_PID" "$_VIEWABLE_PID" 2>/dev/null || true\n'
             f"  poweroff || shutdown -h now || true\n"
@@ -3185,7 +3304,7 @@ def _build_gcp_startup_script(
             + f'  echo "{_SERIAL_EXIT_PREFIX}1"\n'
             + "  python3 /tmp/blueprint_terminal_record.py "
             + f"{artifact_dir} FAILED 1 container_image_pull_failed "
-            + f"{result_file} {command_log_path} >/dev/null 2>&1 || true\n"
+            + f'{result_file} {command_log_path} "$__BP_RESUME_D" >/dev/null 2>&1 || true\n'
             + "  upload_artifacts\n"
             + '  kill "$TTL_PID" "$_NP_WATCHDOG_PID" 2>/dev/null || true\n'
             + "  poweroff || shutdown -h now || true\n"
@@ -3200,7 +3319,7 @@ def _build_gcp_startup_script(
     # Cross-job checkpoint resume: pull the predecessor's durable bundle from its
     # signed GET URL and extract it into the artifact dir BEFORE the command runs,
     # so a resumed job sees the prior checkpoint already present. Kept to
-    # single-line curl / python3 / tar invocations (no heredoc nesting) per the
+    # single-line curl / python3 invocations (no heredoc nesting) per the
     # repo's "generating code for one language from another" guidance. Fail-closed
     # by design, mirroring the in-process backend's `_rehydrate_input_artifact_bundle`
     # (which RAISES on a missing/unreadable predecessor bundle): a failed
@@ -3210,33 +3329,26 @@ def _build_gcp_startup_script(
     # workspace and burning the whole deadline redoing (or misreporting) work the
     # resume was meant to skip. A success writes `resume_hydration.ok` and continues.
     # Both markers land in the uploaded bundle. Stale run-status files from the
-    # predecessor (result.json /
-    # command.log.json / terminal.json / live_tail.b64) are removed after extract
-    # so they cannot contaminate THIS run's terminal detection; the boot beacon
-    # below then re-lays a fresh terminal.json.
+    # predecessor (result.json / command.log.json / terminal.json / live_tail.b64)
+    # are skipped by _RESUME_EXTRACTOR_PY so they never land in the staging dir;
+    # the boot beacon below then re-lays a fresh terminal.json.
     resume_block = ""
     if input_artifact_download_url:
         _resume_url_q = shlex.quote(input_artifact_download_url)
-        _resume_bundle_q = shlex.quote("/tmp/blueprint_resume_bundle.tar.gz")
+        _resume_bundle_path = "/tmp/blueprint_resume_bundle.tar.gz"
+        _resume_stage_path = "/tmp/blueprint_resume_stage"
+        _resume_bundle_q = shlex.quote(_resume_bundle_path)
         _resume_ok_q = shlex.quote(
             os.path.join(_GCP_ARTIFACT_DIR_PATH, "resume_hydration.ok")
         )
         _resume_fail_q = shlex.quote(
             os.path.join(_GCP_ARTIFACT_DIR_PATH, "resume_hydration.failed")
         )
-        _resume_stage_q = shlex.quote(f"{_GCP_ARTIFACT_DIR_PATH}.resume-staging")
-        _resume_stale = " ".join(
-            shlex.quote(os.path.join(_GCP_ARTIFACT_DIR_PATH, _name))
-            for _name in (
-                "result.json",
-                "command.log.json",
-                "terminal.json",
-                "live_tail.b64",
-            )
-        )
         resume_block = (
-            f"rm -f {_resume_bundle_q}\n"
-            f"rm -rf {_resume_stage_q} && mkdir -p {_resume_stage_q}\n"
+            # Start marker (also the end marker): used by the test harness to locate
+            # and extract the resume block for isolated bash execution.
+            f"rm -rf {_resume_stage_path}; rm -f {_resume_bundle_q}\n"
+            f"mkdir -p {_resume_stage_path}\n"
             f"if timeout {upload_timeout} curl --fail --silent --show-error "
             f"--location --output {_resume_bundle_q} {_resume_url_q} "
             f">/dev/null 2>&1 || timeout {upload_timeout} python3 -c "
@@ -3247,23 +3359,34 @@ def _build_gcp_startup_script(
             f"else\n"
             f"  RESUME_DL=0\n"
             f"fi\n"
+            # Safe extraction via _RESUME_EXTRACTOR_PY: skips links, path-traversal
+            # members, and stale predecessor status files; exits non-zero when no
+            # usable checkpoint files are found so an empty/stale-only archive is
+            # fail-closed (sets RESUME_DL=0 via the else branch below).
             f'if [ "$RESUME_DL" = 1 ] && [ -s {_resume_bundle_q} ] && '
-            f"tar -C {_resume_stage_q} --no-same-owner -xzf {_resume_bundle_q} "
-            f">/dev/null 2>&1; then\n"
-            f"  rm -f {_resume_stale.replace(_GCP_ARTIFACT_DIR_PATH, _GCP_ARTIFACT_DIR_PATH + '.resume-staging')}\n"
-            f"  _BP_RESUME_FC=$(find {_resume_stage_q} -type f 2>/dev/null | wc -l)\n"
-            f"  if [ \"$_BP_RESUME_FC\" -lt 1 ]; then RESUME_DL=0; fi\n"
-            f"  if [ \"$RESUME_DL\" = 1 ]; then rm -rf {artifact_dir} && mv {_resume_stage_q} {artifact_dir} || RESUME_DL=0; fi\n"
-            f"  __BP_RESUME_D=$(python3 -c 'import json,base64,sys; print("
+            f"python3 -c '{_RESUME_EXTRACTOR_PY}' "
+            f"{_resume_bundle_q} {_resume_stage_path} >/dev/null 2>&1; then\n"
+            f"  _BP_RESUME_FC=$(find {_resume_stage_path} -type f 2>/dev/null | wc -l)\n"
+            f'  if [ "$_BP_RESUME_FC" -gt 0 ] && rm -rf {artifact_dir} '
+            f"&& cp -a {_resume_stage_path} {artifact_dir} >/dev/null 2>&1; then\n"
+            f"    __BP_RESUME_D=$(python3 -c 'import json,base64,sys,datetime; print("
             f"base64.b64encode(json.dumps({{"
-            f'"ok":True,"file_count":int(sys.argv[1]),"resumed_from_job_id":{json.dumps(spec.input_artifact_job_id)} }}).encode()).decode())\' '
-            f"\"$_BP_RESUME_FC\" 2>/dev/null || true)\n"
-            f'  [ "$RESUME_DL" = 1 ] && [ -n "$__BP_RESUME_D" ] && echo "{_SERIAL_RESUME_PREFIX}$__BP_RESUME_D" || true\n'
-            f"  [ \"$RESUME_DL\" = 1 ] && echo resumed > {_resume_ok_q} 2>/dev/null || true\n"
-            f'  [ "$RESUME_DL" = 1 ] && echo "[resume] hydrated predecessor checkpoint bundle into '
-            f'artifact dir"\n'
+            f'"ok":True,"file_count":int(sys.argv[1]),"resumed_from_job_id":{json.dumps(spec.input_artifact_job_id)},'
+            '"recorded_at":datetime.datetime.now(datetime.timezone.utc).isoformat()'
+            f" }}).encode()).decode())' "
+            f'"$_BP_RESUME_FC" 2>/dev/null || true)\n'
+            f'    [ -n "$__BP_RESUME_D" ] && echo "{_SERIAL_RESUME_PREFIX}$__BP_RESUME_D" || true\n'
+            f"    echo resumed > {_resume_ok_q} 2>/dev/null || true\n"
+            f'    echo "[resume] hydrated predecessor checkpoint bundle into artifact dir"\n'
+            f'    echo "$__BP_RESUME_D" > /tmp/blueprint_resume_d.b64 2>/dev/null || true\n'
+            f"  else\n"
+            f"    RESUME_DL=0\n"
+            f"  fi\n"
+            f"else\n"
+            f"  RESUME_DL=0\n"
             f"fi\n"
             f'if [ "$RESUME_DL" != 1 ]; then\n'
+            f"  mkdir -p {artifact_dir} 2>/dev/null || true\n"
             f"  echo failed > {_resume_fail_q} 2>/dev/null || true\n"
             f'  echo "[resume] predecessor checkpoint hydration FAILED — aborting '
             f'run (fail-closed; refusing to run against an empty workspace)"\n'
@@ -3271,15 +3394,16 @@ def _build_gcp_startup_script(
             f'  echo "{_SERIAL_STATUS_PREFIX}FAILED"\n'
             f'  echo "{_SERIAL_EXIT_PREFIX}1"\n'
             f'  echo "{_SERIAL_RESUME_PREFIX}{_SERIAL_RESUME_FAILED_B64}"\n'
-            f"  python3 /tmp/blueprint_terminal_record.py "
-            f"{artifact_dir} FAILED 1 resume_hydration_failed "
-            f"{result_file} {command_log_path} >/dev/null 2>&1 || true\n"
+            f'  python3 /tmp/blueprint_terminal_record.py '
+            f'{artifact_dir} FAILED 1 resume_hydration_failed '
+            f'{result_file} {command_log_path} "${{__BP_RESUME_D:-}}" >/dev/null 2>&1 || true\n'
             f"  upload_artifacts\n"
             f'  kill "$TTL_PID" "$_NP_WATCHDOG_PID" "$_VIEWABLE_PID" 2>/dev/null || true\n'
             f"  poweroff || shutdown -h now || true\n"
             f"  exit 1\n"
             f"fi\n"
-            f"rm -f {_resume_bundle_q}"
+            # End marker (same as start marker, used by test harness for block extraction).
+            f"rm -rf {_resume_stage_path}; rm -f {_resume_bundle_q}"
         )
     max_log_bytes = _MAX_COMMAND_LOG_BYTES
     command_runner_b64 = _COMMAND_RUNNER_B64
@@ -3337,11 +3461,16 @@ upload_artifacts() {{
   return 0
 }}
 trap upload_artifacts EXIT HUP INT TERM QUIT
+# Initialise resume-provenance variable so set-u never fires in setup-failure
+# paths that run before the resume block, and so the TTL subshell below (forked
+# before resume) can still read the value via the /tmp file written on success.
+__BP_RESUME_D=""
 (
   sleep "$TTL_SECONDS"
+  _BP_TTL_PROV=$(cat /tmp/blueprint_resume_d.b64 2>/dev/null || true)
   python3 /tmp/blueprint_terminal_record.py \
     {artifact_dir} FAILED 124 runtime_ttl {result_file} {command_log_path} \
-    >/dev/null 2>&1 || true
+    "$_BP_TTL_PROV" >/dev/null 2>&1 || true
   echo "{_SERIAL_REASON_PREFIX}runtime_ttl"
   echo "{_SERIAL_STATUS_PREFIX}FAILED"
   echo "{_SERIAL_EXIT_PREFIX}124"
@@ -3399,7 +3528,7 @@ mkdir -p {artifact_dir}
 {resume_block}
 python3 /tmp/blueprint_terminal_record.py \
   {artifact_dir} FAILED 1 vm_terminated_before_completion {result_file} {command_log_path} \
-  >/dev/null 2>&1 || true
+  "$__BP_RESUME_D" >/dev/null 2>&1 || true
 {repo_setup_block}
 {setup_step_block}
 {cwd_line}
@@ -3419,7 +3548,7 @@ touch {progress_file} 2>/dev/null || true
       if [ "$_NP_NOW" = "$_NP_START" ]; then
         python3 /tmp/blueprint_terminal_record.py \
           {artifact_dir} FAILED 125 no_progress_timeout {result_file} {command_log_path} \
-          >/dev/null 2>&1 || true
+          "$__BP_RESUME_D" >/dev/null 2>&1 || true
         echo "{_SERIAL_REASON_PREFIX}no_progress_timeout"
         echo "{_SERIAL_STATUS_PREFIX}FAILED"
         echo "{_SERIAL_EXIT_PREFIX}125"
@@ -3470,7 +3599,7 @@ if [ -n "${{BLUEPRINT_RELEASE_SHA:-}}" ]; then
 fi
 python3 /tmp/blueprint_terminal_record.py \
   {artifact_dir} "$STATUS" "$EXIT_CODE" "$REASON" {result_file} {command_log_path} \
-  >/dev/null 2>&1 || true
+  "$__BP_RESUME_D" >/dev/null 2>&1 || true
 upload_artifacts
 kill "$TTL_PID" "$_HEARTBEAT_PID" "$_NP_WATCHDOG_PID" "$_VIEWABLE_PID" 2>/dev/null || true
 poweroff || shutdown -h now || true
@@ -3740,6 +3869,9 @@ def _reconcile_terminal_record_to_status(
     metrics = _decode_result_metrics(record.get("metrics_b64"))
     command_log = _decode_command_log(record.get("command_log_b64"))
     echoed_release_sha = _decode_release_echo_sha(record.get("release_echo_b64"))
+    resume_provenance = _decode_resume_provenance(
+        record.get("resume_provenance_b64")
+    )
     if raw_status == "SUCCEEDED":
         return ComputeStatusResult(
             status=ComputeJobStatus.SUCCEEDED,
@@ -3749,6 +3881,7 @@ def _reconcile_terminal_record_to_status(
             metrics=metrics,
             command_log=command_log,
             echoed_release_sha=echoed_release_sha,
+            resume_provenance=resume_provenance,
         )
     return ComputeStatusResult(
         status=ComputeJobStatus.FAILED,
@@ -3758,6 +3891,7 @@ def _reconcile_terminal_record_to_status(
         metrics=metrics,
         command_log=command_log,
         echoed_release_sha=echoed_release_sha,
+        resume_provenance=resume_provenance,
     )
 
 
@@ -3799,6 +3933,10 @@ def _launch_setup_state_dir(external_id: str, started_at_iso: str) -> None:
         started_at_iso,
     )
     _remove_local_terminal_status_for_external_id(external_id)
+    try:
+        os.remove(_local_resume_provenance_path_for_external_id(external_id))
+    except FileNotFoundError:
+        pass
 
 
 def _launch_spawn_subprocess(

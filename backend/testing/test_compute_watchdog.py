@@ -6,7 +6,7 @@ test_compute_watchdog.py — Consolidated acceptance-proof regression suite for:
 Seams exercised:
   • create_compute_job: clamping + stamping of declared_metric /
     no_progress_timeout_seconds into polling_metadata
-  • append_progress_sample: ring-buffer, validation, immutability
+  • append_progress_sample: bounded compaction, validation, immutability
   • _no_progress_stalled: pure predicate (fail-open, grace period, min-samples,
     window requirement, disabled-when-zero)
   • _build_container_run_prefix / _build_local_wrapper_command: progress env injection
@@ -42,6 +42,7 @@ from app.compute_jobs import (
     _no_progress_stalled,
     _watchdog_metric_name_mismatch,
     append_progress_sample,
+    derive_watchdog_protection_status,
 )
 from app.reaper_sweeps import sweep_silent_runner_compute_jobs
 from app.database import resolve_async_engine
@@ -75,6 +76,7 @@ def _make_stub_job(*, metric, samples, started_offset_seconds, extra_meta=None):
     meta["progress_series"] = [
         {
             "t": (now - timedelta(seconds=age)).isoformat(),
+            "received_at": (now - timedelta(seconds=age)).isoformat(),
             "name": name,
             "value": value,
         }
@@ -111,13 +113,20 @@ def test_progress_file_env_constant_value():
 
 def test_append_progress_sample_roundtrips_valid_entry():
     meta = {}
-    result = append_progress_sample(meta, metric="loss", value=0.42, t="2026-01-01T00:00:00")
+    result = append_progress_sample(
+        meta,
+        metric="loss",
+        value=0.42,
+        t="runner-time",
+        received_at="2026-01-01T00:00:00",
+    )
     series = result["progress_series"]
     assert len(series) == 1
     entry = series[0]
     assert entry["name"] == "loss"
     assert entry["value"] == pytest.approx(0.42)
-    assert entry["t"] == "2026-01-01T00:00:00"
+    assert entry["t"] == "runner-time"
+    assert entry["received_at"] == "2026-01-01T00:00:00"
 
 
 def test_append_progress_sample_drops_nonfinite_values():
@@ -401,6 +410,71 @@ def test_no_progress_stalled_disabled_when_window_seconds_zero(monkeypatch):
     assert _no_progress_stalled(job, now=now) is False
 
 
+@pytest.mark.parametrize(
+    ("samples", "started_offset", "expected_state", "expected_reason", "expected_stalled"),
+    [
+        ([], 7200, "insufficient_history", "no_telemetry", True),
+        ([(4000, "val/loss", 1.0), (3900, "val/loss", 1.0)], 7200, "stale_telemetry", "stale_telemetry", True),
+        ([(120, "val/loss", 1.0), (60, "val/loss", 1.0), (0, "val/loss", 1.0)], 7200, "insufficient_history", "insufficient_window", False),
+        (_flat_samples("other/loss"), 7200, "inert", "metric_name_mismatch", False),
+    ],
+)
+def test_watchdog_status_is_honest_for_inert_telemetry(
+    samples, started_offset, expected_state, expected_reason, expected_stalled
+):
+    job, now = _make_stub_job(
+        metric="val/loss",
+        samples=samples,
+        started_offset_seconds=started_offset,
+    )
+    status = derive_watchdog_protection_status(
+        job.polling_metadata,
+        started_at=job.started_at,
+        now=now,
+    )
+    assert status["watchdog_state"] == expected_state
+    assert status["watchdog_active"] is False
+    assert status["watchdog_inert_reason"] == expected_reason
+    # Missing or stale declared telemetry is enforceable after grace.
+    assert _no_progress_stalled(job, now=now) is expected_stalled
+
+
+def test_watchdog_status_warming_and_malformed_history_are_not_protected():
+    warming, now = _make_stub_job(
+        metric="val/loss",
+        samples=[],
+        started_offset_seconds=60,
+    )
+    warming_status = derive_watchdog_protection_status(
+        warming.polling_metadata,
+        started_at=warming.started_at,
+        now=now,
+    )
+    assert warming_status["watchdog_state"] == "warming_up"
+    assert warming_status["watchdog_active"] is False
+
+    malformed = SimpleNamespace(
+        polling_metadata={
+            "declared_metric": "val/loss",
+            "progress_series": [
+                {"t": "2099-01-01", "name": "val/loss", "value": 1.0},
+                {"received_at": "bad", "name": "val/loss", "value": 1.0},
+            ],
+        },
+        started_at=now - timedelta(hours=2),
+    )
+    malformed_status = derive_watchdog_protection_status(
+        malformed.polling_metadata,
+        started_at=malformed.started_at,
+        now=now,
+    )
+    assert malformed_status["watchdog_state"] == "insufficient_history"
+    assert malformed_status["watchdog_inert_reason"] == "malformed_history"
+    assert malformed_status["watchdog_active"] is False
+    # Malformed declared telemetry cannot bypass an armed watchdog after grace.
+    assert _no_progress_stalled(malformed, now=now) is True
+
+
 def test_no_progress_stalled_terminal_reason_constant_distinct_from_deadline():
     assert NO_PROGRESS_TERMINAL_REASON == "no_progress"
     assert NO_PROGRESS_TERMINAL_REASON != "deadline"
@@ -630,6 +704,7 @@ async def test_process_once_kills_stalled_job_with_no_progress_terminal_kind(
     meta["progress_series"] = [
         {
             "t": (now - timedelta(seconds=age)).isoformat(),
+            "received_at": (now - timedelta(seconds=age)).isoformat(),
             "name": "val/loss",
             "value": 2.71828,  # flat
         }
@@ -693,6 +768,7 @@ async def test_process_once_does_not_kill_advancing_metric_job(db_session, monke
     meta["progress_series"] = [
         {
             "t": (now - timedelta(seconds=age)).isoformat(),
+            "received_at": (now - timedelta(seconds=age)).isoformat(),
             "name": "val/loss",
             "value": 3.0 - i * 0.15,  # steadily improving
         }
@@ -755,6 +831,7 @@ async def test_process_once_surfaces_metric_name_mismatch_without_killing(
     meta["progress_series"] = [
         {
             "t": (now - timedelta(seconds=age)).isoformat(),
+            "received_at": (now - timedelta(seconds=age)).isoformat(),
             "name": "train/loss",
             "value": 2.71828,
         }

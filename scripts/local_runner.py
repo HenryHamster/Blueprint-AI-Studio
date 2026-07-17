@@ -5361,6 +5361,7 @@ def _run_compute_job(
             artifact_delivery=delivery,
         )
 
+
     try:
         # ── Fail-closed gate: refuse anything we cannot sandbox, before any work.
         if iso.decide_compute_backend(caps, has_image, allow_host_fallback=allow_host_fallback) == iso.DECLINE:
@@ -5395,6 +5396,7 @@ def _run_compute_job(
         # Never pre-created — appending code creates it, absence means no progress.
         progress_file = os.path.join(tmpdir, "progress.jsonl")
         os.makedirs(artifact_dir, exist_ok=True)
+        resume_hydration: dict | None = None
 
         # Cross-job checkpoint resume: hydrate the predecessor's durable bundle
         # into the artifact dir BEFORE any command runs (mirrors the repo-clone
@@ -5415,6 +5417,7 @@ def _run_compute_job(
                     f"{provenance.get('bytes')} bytes hydrated)",
                     flush=True,
                 )
+                resume_hydration = provenance
                 _report_compute_job(
                     orchestrator_url,
                     token,
@@ -5430,6 +5433,9 @@ def _run_compute_job(
                     flush=True,
                 )
                 outcome = "failure"
+                # Suppress artifact upload — predecessor fragments must not be
+                # reported as a durable delivery for a job that never ran.
+                artifact_dir = None
                 _report_terminal(
                     exec_status="failed",
                     exit_code=1,
@@ -5470,6 +5476,7 @@ def _run_compute_job(
                         f"failed (exit={clone_rc}); command never started",
                         "truncated": False,
                     },
+                    resume_hydration=resume_hydration,
                 )
                 return
             if not cwd:
@@ -5546,6 +5553,7 @@ def _run_compute_job(
                     "text": f"Runner declined job (fail-closed isolation): {plan.decline_reason}",
                     "truncated": False,
                 },
+                resume_hydration=resume_hydration,
             )
             return
 
@@ -5624,6 +5632,7 @@ def _run_compute_job(
                             "text": terminal_reason,
                             "truncated": False,
                         },
+                        resume_hydration=resume_hydration,
                     )
                     return
             else:
@@ -5680,6 +5689,7 @@ def _run_compute_job(
                     "text": f"[runner] failed to start command: {exc}",
                     "truncated": False,
                 },
+                resume_hydration=resume_hydration,
             )
             return
 
@@ -5688,7 +5698,13 @@ def _run_compute_job(
             f"gpus={assigned_gpus}",
             flush=True,
         )
-        _report_compute_job(orchestrator_url, token, job_id, exec_status="running")
+        _report_compute_job(
+            orchestrator_url,
+            token,
+            job_id,
+            exec_status="running",
+            resume_hydration=resume_hydration,
+        )
 
         # Capture stdout with dedup + head/tail budget (see _BoundedDedupLog).
         log_capture = _BoundedDedupLog(
@@ -5814,6 +5830,7 @@ def _run_compute_job(
                         f"({runtime_deadline_seconds}s) exceeded"
                     ),
                     progress=progress_tail.poll(),
+                    resume_hydration=resume_hydration,
                 )
                 return
 
@@ -5844,6 +5861,7 @@ def _run_compute_job(
                             "update) exceeded"
                         ),
                         progress=progress_tail.poll(),
+                        resume_hydration=resume_hydration,
                     )
                     return
 
@@ -5855,6 +5873,7 @@ def _run_compute_job(
                         "killed by runner: runner shutting down"
                     ),
                     progress=progress_tail.poll(),
+                    resume_hydration=resume_hydration,
                 )
                 return
 
@@ -5868,6 +5887,7 @@ def _run_compute_job(
                 exec_status="running",
                 command_log=_interim_log_tail(),
                 progress=progress_tail.poll(),
+                resume_hydration=resume_hydration,
                 viewable_omissions=_omissions or None,
             )
             if cancel:
@@ -5878,6 +5898,7 @@ def _run_compute_job(
                         "killed by runner: cancel requested by orchestrator"
                     ),
                     progress=progress_tail.poll(),
+                    resume_hydration=resume_hydration,
                 )
                 return
 
@@ -5939,6 +5960,7 @@ def _run_compute_job(
             result_metrics=result_metrics,
             command_log=command_log,
             progress=progress_tail.poll(),
+            resume_hydration=resume_hydration,
         )
         print(f"[compute] job {job_id} command {exec_status_final} (exit={exit_code_val})",
               flush=True)

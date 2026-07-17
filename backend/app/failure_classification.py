@@ -225,6 +225,10 @@ REASSIGNED = "REASSIGNED"
 # message still routes to RATE_LIMIT (block + cooldown) -- that path is unchanged.
 # Lowercase to match the literal failure_category string the agent posts.
 NO_PROGRESS_TIMEOUT = "no_progress_timeout"
+# Compute backends persist this exact terminal reason when their watchdog cuts a
+# command.  Keeping it adjacent to the canonical failure class prevents backend
+# emitters and the completion taxonomy from drifting apart.
+NO_PROGRESS_TIMEOUT_TERMINAL_REASON = NO_PROGRESS_TIMEOUT
 # Agent process is alive (fresh heartbeat) but has made no tool or LLM progress
 # for longer than the scope-aware threshold (8 min small / 12 min medium /
 # 18 min large). Detected by the reaper's progress-staleness sweep, which
@@ -318,7 +322,7 @@ def classify_compute_terminal_reason(
       they somehow reach a failure branch the class must be AGENT_TIMEOUT, not
       CODE_ERROR)
     - reason contains "cancelled" or "operator" → ADMIN_CANCEL
-    - reason contains "no_progress_timeout" → NO_PROGRESS_TIMEOUT
+    - reason contains ``NO_PROGRESS_TIMEOUT_TERMINAL_REASON`` → NO_PROGRESS_TIMEOUT
       (job was cut early by the no-progress watchdog — a configurable platform
       kill, not a code defect)
     - default → CODE_ERROR (genuine command/work defect)
@@ -333,7 +337,7 @@ def classify_compute_terminal_reason(
             return AGENT_TIMEOUT
         if "cancelled" in lower or "operator" in lower:
             return ADMIN_CANCEL
-        if "no_progress_timeout" in lower:
+        if NO_PROGRESS_TIMEOUT_TERMINAL_REASON in lower:
             return NO_PROGRESS_TIMEOUT
     return CODE_ERROR
 

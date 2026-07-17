@@ -2228,7 +2228,8 @@ async def report_compute_job(
                         # useful display data in `progress`, but watchdog timing
                         # must use the server receipt time so a job cannot extend
                         # or backdate its own protection window.
-                        t=now.isoformat(),
+                        t=rec.get("ts") or now.isoformat(),
+                        received_at=now,
                     )
         if payload.exec_status == "running" and isinstance(payload.viewable_omissions, dict):
             omissions: Dict[str, Any] = {}
@@ -2245,8 +2246,20 @@ async def report_compute_job(
             raw = payload.resume_hydration
             provenance: Dict[str, Any] = {}
             src = raw.get("resumed_from_job_id")
-            if isinstance(src, str) and src.strip():
-                provenance["resumed_from_job_id"] = src.strip()[:64]
+            expected_src = meta.get("input_artifact_job_id")
+            try:
+                source_matches = (
+                    bool(expected_src)
+                    and str(uuid.UUID(str(src))) == str(uuid.UUID(str(expected_src)))
+                )
+            except (ValueError, AttributeError, TypeError):
+                source_matches = False
+            if not source_matches:
+                raise HTTPException(
+                    status_code=422,
+                    detail="resume_hydration source does not match job resume source",
+                )
+            provenance["resumed_from_job_id"] = str(uuid.UUID(str(src)))
             if isinstance(raw.get("ok"), bool):
                 provenance["ok"] = raw["ok"]
             for key in ("file_count", "bytes"):

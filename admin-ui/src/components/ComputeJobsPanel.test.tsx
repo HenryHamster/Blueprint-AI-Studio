@@ -151,6 +151,26 @@ describe('ComputeJobsPanel helpers', () => {
     ).toBe('Killed: no progress');
   });
 
+  test('computeJobTerminalLabel recognizes legacy runner no-progress watchdog rows only', () => {
+    expect(
+      computeJobTerminalLabel(makeJob({
+        backend: 'runner-subprocess',
+        status: 'FAILED',
+        outcome: 'FAILURE',
+        terminal_reason: 'no_progress_timeout',
+        exit_code: 125,
+      })),
+    ).toBe('Killed: no progress');
+    expect(
+      computeJobTerminalLabel(makeJob({
+        backend: 'gcp_compute_engine',
+        status: 'FAILED',
+        outcome: 'FAILURE',
+        exit_code: 125,
+      })),
+    ).toBe('Failed');
+  });
+
   test('computeJobTerminalLabel returns Killed: deadline for TIMED_OUT with terminal_kind deadline', () => {
     expect(
       computeJobTerminalLabel(makeJob({ outcome: 'TIMED_OUT', terminal_kind: 'deadline' })),
@@ -622,7 +642,50 @@ describe('ComputeJobsPanel watchdog protection status', () => {
     const warning = el.querySelector('[data-testid="compute-watchdog-inert-warning"]');
     expect(warning).toBeTruthy();
     expect(warning?.textContent).toContain('no_declared_metric');
-    expect(warning?.textContent).toContain('Watchdog will NOT cut this job');
+    expect(warning?.textContent).toContain('Watchdog will not currently cut this job');
+  });
+
+  test.each([
+    ['warming_up', 'Warming up', 'observation window is still warming up'],
+    ['insufficient_history', 'Insufficient history', 'not enough trustworthy receipt-time history'],
+    ['stale_telemetry', 'Stale telemetry', 'progress telemetry is stale'],
+    ['inert', 'Inert', 'metric_name_mismatch'],
+  ] as const)(
+    'watchdog_state:%s explains why the job will not currently be cut',
+    async (watchdogState, label, explanation) => {
+      setupMocks();
+      fetchComputeJobs.mockResolvedValue(wrapJobs([
+        makeJob({
+          status: 'RUNNING',
+          watchdog_active: false,
+          watchdog_state: watchdogState,
+          watchdog_inert_reason: watchdogState === 'inert' ? 'metric_name_mismatch' : watchdogState,
+          no_progress_timeout_seconds: 1800,
+        }),
+      ]));
+      const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+      const el = await findByTestId('compute-watchdog-status');
+      expect(el.querySelector('[data-testid="compute-watchdog-unprotected"]')?.textContent).toContain(label);
+      const warning = el.querySelector('[data-testid="compute-watchdog-inert-warning"]');
+      expect(warning?.textContent).toContain(explanation);
+      expect(warning?.textContent?.toLowerCase()).toContain('will not currently cut');
+    },
+  );
+
+  test('new protected state overrides a contradictory legacy boolean', async () => {
+    setupMocks();
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
+      makeJob({
+        status: 'RUNNING',
+        watchdog_active: false,
+        watchdog_state: 'protected',
+        no_progress_timeout_seconds: 1800,
+      }),
+    ]));
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const el = await findByTestId('compute-watchdog-status');
+    expect(el.querySelector('[data-testid="compute-watchdog-protected"]')?.textContent).toContain('Protected');
+    expect(el.querySelector('[data-testid="compute-watchdog-unprotected"]')).toBeNull();
   });
 
   test('active job without watchdog fields renders no watchdog indicator (backward compat)', async () => {
