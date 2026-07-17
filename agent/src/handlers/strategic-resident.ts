@@ -1464,8 +1464,13 @@ export async function handleStrategicResident(
               verdict: OPERATOR_DECISION_VERDICT,
               note: fallbackNote,
             }, DECISIONS_REGISTER_CAP);
+            // Pass coversOverflow:true when the current review IS the id-less
+            // overflow sentinel (activeOverflowSentinel) — advancePending returns
+            // `current` unchanged when messageIds is empty and coversOverflow is
+            // falsy, so without this the sentinel never clears and every subsequent
+            // autonomous turn re-trips the same escape hatch.
             operatorDecisionReview = advancePendingOperatorDecisionReview(reviewForTurn, {
-              coversOverflow: reviewOutcome.coversOverflow,
+              coversOverflow: activeOverflowSentinel || reviewOutcome.coversOverflow,
             });
             streamer.status(`operator-decision review admitted after ${retained.attempts} failed attempts — exchange text recorded as fallback`);
           } else {

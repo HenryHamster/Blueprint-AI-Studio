@@ -1370,6 +1370,47 @@ describe('pending operator-decision review state machine', () => {
     const restored = restoreDecisionsReg(serializeDecisionsReg(register));
     expect(restored?.some(e => e.verdict === OPERATOR_DECISION_VERDICT && e.note.includes(exchangeText))).toBe(true);
   });
+
+  it('clears id-less overflow sentinel when escape hatch fires (coversOverflow:true)', () => {
+    // Regression: the MAX_REVIEW_ATTEMPTS escape hatch used to pass
+    // coversOverflow:reviewOutcome.coversOverflow (which is false in this branch),
+    // causing advancePendingOperatorDecisionReview to return the sentinel unchanged
+    // (line 1628 in strategic-resident-lib.ts: `return options.coversOverflow ? null : current`).
+    // The fix: the handler passes coversOverflow:activeOverflowSentinel when the
+    // current review IS the id-less sentinel, so the advance returns null and the
+    // escape hatch actually escapes.
+
+    // Build an id-less overflow sentinel (messageIds empty, overflowed:true,
+    // no queuedExchanges) — the state produced when the review queue fully overflows.
+    const sentinel: PendingOperatorDecisionReview = {
+      status: 'pending',
+      messageIds: [],
+      startedAt,
+      attempts: 0,
+      overflowed: true,
+      overflowExchanges: 2,
+    };
+
+    // Confirm the sentinel property that triggers activeOverflowSentinel in the handler.
+    expect(sentinel.messageIds.length).toBe(0);
+    expect(sentinel.overflowed).toBe(true);
+    expect((sentinel.queuedExchanges?.length ?? 0)).toBe(0);
+
+    // Retain to MAX_REVIEW_ATTEMPTS to trigger the escape hatch condition.
+    let retained = sentinel;
+    for (let i = 0; i < MAX_REVIEW_ATTEMPTS; i++) {
+      retained = retainPendingOperatorDecisionReview(retained);
+    }
+    expect(retained.attempts).toBeGreaterThanOrEqual(MAX_REVIEW_ATTEMPTS);
+
+    // WITHOUT the fix: coversOverflow:false → advance returns current (re-trips).
+    const withoutFix = advancePendingOperatorDecisionReview(retained, { coversOverflow: false });
+    expect(withoutFix).toBe(retained); // same object — sentinel not cleared
+
+    // WITH the fix: coversOverflow:true (activeOverflowSentinel path) → returns null.
+    const withFix = advancePendingOperatorDecisionReview(retained, { coversOverflow: true });
+    expect(withFix).toBeNull(); // sentinel cleared — escape hatch can actually escape
+  });
 });
 
 describe('classifyOperatorDecisionReview', () => {
