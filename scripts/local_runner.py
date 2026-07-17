@@ -4284,6 +4284,12 @@ class _ViewableStreamState:
     signature so an unchanged file is not re-sent every cycle while an overwritten
     one (e.g. ``reward_curve.png`` rewritten each eval step) IS re-sent. The
     ``*_logged`` members keep the bounded skip notices to one line each.
+
+    ``scan_start`` tracks the relpath after which the next scan begins to ensure
+    fairness: a frequently-rewritten early-sorted file cannot monopolize every
+    heartbeat slot and starve later files waiting for their first upload. The
+    scan rotates to start just past the last-uploaded relpath so every eligible
+    candidate sees a slot within at most N heartbeats (N = distinct paths).
     """
 
     __slots__ = (
@@ -4293,6 +4299,7 @@ class _ViewableStreamState:
         "budget_logged",
         "oversize_relpaths",
         "count_cap_relpaths",
+        "scan_start",
         "inflight",
         "completed",
         "lock",
@@ -4312,6 +4319,10 @@ class _ViewableStreamState:
         # can see live omissions before the job reaches a terminal state.
         self.oversize_relpaths: set = set()
         self.count_cap_relpaths: set = set()
+        # Round-robin fairness cursor: the relpath of the last successfully
+        # started upload. Next scan begins just past this path so a file whose
+        # relpath sorts first cannot monopolize every heartbeat slot.
+        self.scan_start: str = ""
         self.inflight: tuple | None = None
         self.completed: tuple | None = None
         self.lock = threading.Lock()
@@ -4485,6 +4496,20 @@ def _stream_viewable_files(
             return
     else:
         state.reap()
+
+    # Fairness: rotate the candidate list so scanning starts just past the
+    # relpath of the last uploaded file. Candidates are sorted by relpath, so
+    # rotating ensures each distinct path sees a slot within at most N
+    # heartbeats (N = number of distinct viewable paths). A frequently-rewritten
+    # early-sorted file cannot starve later stable files waiting for upload.
+    if state.scan_start and candidates:
+        start_idx = next(
+            (i for i, c in enumerate(candidates) if c["relpath"] > state.scan_start),
+            0,  # scan_start was the last path or beyond — wrap to beginning
+        )
+        if start_idx:
+            candidates = candidates[start_idx:] + candidates[:start_idx]
+
     for cand in candidates:
         relpath = cand["relpath"]
         kind = cand["kind"]
@@ -4545,6 +4570,9 @@ def _stream_viewable_files(
             if drain:
                 _drain_within_deadline()
             return
+        # Advance the fairness cursor so the next heartbeat starts scanning
+        # after this relpath, giving later-sorted files a chance to upload.
+        state.scan_start = relpath
         if drain:
             if not _drain_within_deadline():
                 return

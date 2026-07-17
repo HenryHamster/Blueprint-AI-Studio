@@ -666,6 +666,16 @@ export function StrategicContextWorkspace({
     () => (contextPackage?.descriptors ?? []).filter(d => d.kind !== 'context_map'),
     [contextPackage?.descriptors],
   );
+  // Artifact IDs already shown as descriptors (strip "artifact:" prefix to get UUID).
+  // Used below to skip rendering duplicate media in the Evidence section.
+  const promotedArtifactIds = useMemo(
+    () => new Set(
+      artifactDescriptors
+        .map(d => (typeof d.id === 'string' && d.id.startsWith('artifact:') ? d.id.slice('artifact:'.length) : null))
+        .filter((id): id is string => id !== null),
+    ),
+    [artifactDescriptors],
+  );
   const canvasResources = useMemo(
     () => resources.filter(r => r.kind === 'canvas'),
     [resources],
@@ -735,6 +745,7 @@ export function StrategicContextWorkspace({
   const tone = contextStatusTone(contextPackage?.status);
   const knowledgeEvidence = contextPackage?.evidence?.knowledge?.items ?? [];
   const artifactEvidence = contextPackage?.evidence?.artifacts?.items ?? [];
+  const artifactLiveCount: number = (contextPackage?.evidence?.artifacts as { live_count?: number } | undefined)?.live_count ?? 0;
   const sessionMode = normalizeStrategicInteractionMode(workbenchState?.interaction_mode ?? workSession?.mode);
   const localRunner = state?.runtime?.local_runner ?? null;
   const runtimeWork = state?.runtime?.work ?? null;
@@ -1178,7 +1189,10 @@ export function StrategicContextWorkspace({
 
             <Section
               title="Evidence"
-              meta={`${knowledgeEvidence.length + artifactEvidence.length}`}
+              meta={[
+                `${knowledgeEvidence.length + artifactEvidence.length}`,
+                artifactLiveCount > 0 ? `${artifactLiveCount} live` : null,
+              ].filter(Boolean).join(' · ')}
               testId="strategic-context-workspace-evidence"
             >
               {knowledgeEvidence.length === 0 && artifactEvidence.length === 0 ? (
@@ -1205,6 +1219,7 @@ export function StrategicContextWorkspace({
                       {artifactEvidence.map(item => {
                         const ref = selectedRefFromArtifactEvidence(item);
                         const label = ref.label ?? 'Artifact';
+                        const isPromoted = promotedArtifactIds.has(String(item.id));
                         return (
                           <div key={`artifact:${item.id}`} className="min-w-0">
                             {renderKeepableRow({
@@ -1215,11 +1230,13 @@ export function StrategicContextWorkspace({
                               target: item.target,
                               ref,
                             })}
-                            <ArtifactViewablePreviews
-                              previews={item.viewable_previews}
-                              projectId={projectId}
-                              label={label}
-                            />
+                            {!isPromoted && (
+                              <ArtifactViewablePreviews
+                                previews={item.viewable_previews}
+                                projectId={projectId}
+                                label={label}
+                              />
+                            )}
                           </div>
                         );
                       })}
