@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 
 from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.models import Task
+from app.time_utils import _utcnow
 
 logger = logging.getLogger("blueprint")
+
+_REPLACEMENT_PUBLICATION_GRACE_SECONDS = 15 * 60
+_REPLACEMENT_WAIT_KEY = "closed_pr_replacement_wait_started"
 
 
 async def reconcile_closed_pr_replacement(
@@ -73,6 +78,36 @@ async def reconcile_closed_pr_replacement(
         else None
     )
     if not replacement_number or replacement_number == pr_number:
+        # A fix agent can finish its bounded local gate seconds before the new
+        # PR is visible. The old closed PR remains in review_loop during that
+        # publication window; terminalizing immediately kills the publishing VM
+        # and strands its corrected branch. Give the authoritative same-head/base
+        # lookup a bounded grace period, persisted across monitor processes.
+        now = _utcnow()
+        started_raw = review_loop.get(_REPLACEMENT_WAIT_KEY)
+        try:
+            started = (
+                datetime.fromisoformat(started_raw)
+                if isinstance(started_raw, str) and started_raw
+                else now
+            )
+        except (TypeError, ValueError):
+            started = now
+        elapsed = max(0.0, (now - started).total_seconds())
+        if elapsed < _REPLACEMENT_PUBLICATION_GRACE_SECONDS:
+            review_loop[_REPLACEMENT_WAIT_KEY] = started.isoformat()
+            review_loop["polls_since_pr_fetch"] = 999
+            remaining = int(_REPLACEMENT_PUBLICATION_GRACE_SECONDS - elapsed)
+            task.latest_status_message = (
+                f"PR #{pr_number} closed; waiting for replacement publication "
+                f"on {closed_head} ({remaining}s grace remaining)"
+            )[:500]
+            task.context = {**(task.context or {}), "review_loop": review_loop}
+            flag_modified(task, "context")
+            session.add(task)
+            await session.commit()
+            return True
+        review_loop.pop(_REPLACEMENT_WAIT_KEY, None)
         return False
 
     replacement_head = ((replacement_pr.get("head") or {}).get("sha") or "")
@@ -85,6 +120,7 @@ async def reconcile_closed_pr_replacement(
     )
     review_loop["ci_waiting"] = True
     review_loop["polls_since_pr_fetch"] = 999
+    review_loop.pop(_REPLACEMENT_WAIT_KEY, None)
     if replacement_head:
         review_loop["head_sha"] = replacement_head
 
