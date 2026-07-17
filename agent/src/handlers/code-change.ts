@@ -2,8 +2,9 @@ import * as fs from 'fs';
 import type WebSocket from 'ws';
 import {
   sanitize, sendLog, runClaudeCode, persistAndPostStatus, git,
-  gitAsync, rotateOAuthCredentialsIfChanged,
+  apiGet, gitAsync, rotateOAuthCredentialsIfChanged,
 } from '../index.js';
+import { writeGitTokenFile } from '../git-credential.js';
 import type { BuildConfig } from '../index.js';
 import { writeCodeChangeHelpers, SELF_REVIEW_PROMPT_VERSION } from '../prompt.js';
 import { buildTaskCheckpointCommitMessage } from '../task-checkpoint.js';
@@ -248,6 +249,24 @@ export async function checkpointUnshippedWork(
     const message = buildTaskCheckpointCommitMessage(opts.taskId, opts.baseCommit);
     const [subject, ...bodyLines] = message.split('\n');
     git(['commit', '--allow-empty', '-m', subject, '-m', bodyLines.join('\n').trim()]);
+    // A code-change session can run close to (or beyond) the installation
+    // token TTL. Refresh at the moment of the emergency push just like ./pr
+    // does, otherwise the durability path can fail precisely for long tasks.
+    try {
+      const fresh = await apiGet(
+        `/api/agent/github/token?task_id=${encodeURIComponent(opts.taskId)}&force_refresh=true`,
+      ) as { data?: { token?: string } };
+      if (fresh.data?.token) writeGitTokenFile(fresh.data.token);
+    } catch (error) {
+      // The credential already in the helper file may still be valid. Preserve
+      // best-effort checkpointing instead of turning refresh availability into
+      // a new way to lose the worktree.
+      sendLog(
+        ws,
+        `[wrapper] WARNING: checkpoint token refresh failed; trying the existing credential: ` +
+        `${error instanceof Error ? error.message : String(error)}\n`,
+      );
+    }
     await gitAsync([
       'push', '--force-with-lease', 'origin',
       `HEAD:refs/heads/${opts.workBranch}`,

@@ -5,6 +5,7 @@ vi.mock('../index.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../index.js')>();
   return {
     ...actual,
+    apiGet: vi.fn().mockResolvedValue({ data: { token: 'fresh-checkpoint-token' } }),
     git: vi.fn(),
     gitAsync: vi.fn().mockResolvedValue(''),
     sendLog: vi.fn(),
@@ -32,9 +33,15 @@ vi.mock('fs', () => {
   return { ...stub, default: stub };
 });
 
+vi.mock('../git-credential.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../git-credential.js')>();
+  return { ...actual, writeGitTokenFile: vi.fn() };
+});
+
 // ── Imports under test ────────────────────────────────────────────────────────
 import { augmentSelfReview, runCodeChangeTask } from './code-change.js';
-import { git, gitAsync, persistAndPostStatus, runClaudeCode } from '../index.js';
+import { apiGet, git, gitAsync, persistAndPostStatus, runClaudeCode } from '../index.js';
+import { writeGitTokenFile } from '../git-credential.js';
 import { writeCodeChangeHelpers } from '../prompt.js';
 import {
   buildTaskCheckpointCommitMessage,
@@ -572,6 +579,10 @@ describe('durable unshipped-work checkpoint retry transition', () => {
       'push', '--force-with-lease', 'origin',
       `HEAD:refs/heads/${workBranch}`,
     ]);
+    expect(vi.mocked(apiGet)).toHaveBeenCalledWith(
+      `/api/agent/github/token?task_id=${taskId}&force_refresh=true`,
+    );
+    expect(vi.mocked(writeGitTokenFile)).toHaveBeenCalledWith('fresh-checkpoint-token');
 
     const failedCall = vi.mocked(persistAndPostStatus).mock.calls.find(
       ([, payload]) => payload.status === 'FAILED',
