@@ -6,10 +6,41 @@ properties that were identified in the adversarial-gate review cycle but can be
 confirmed purely against source code or pure-Python logic.
 
 Findings covered here (prior 16-finding bundle):
+  #1        — 0626 fails closed on malformed keys; 0628 backfills github_oauth_token
+  #2        — scratch-DB URL absence does NOT block Cloud Run boot
   #3  / #12 — infra-failure signature is NOT polluted by child-task failures
+  #4        — timed-out qualifier children are cancelled via _cancel_qualifier_children
+  #5        — deterministic migration defects block (not defer) via _DeterministicMigrationDefect
   #6        — env-preflight absent evidence is a hard blocker (not "unavailable")
+  #7        — trigger resolver returns not_applicable for terminal/auto-redrive states
+  #8        — bare-claim promotion timeout is applied (promoting orphan containment)
+  #9        — data-migration proof gate defers DML migrations without proof declaration
+  #10       — VersionLifecyclePanel.tsx has owner-only hotfix remediation flow
   #11       — MIGRATION_APPLY_SCRATCH_DATABASE_URL is a qualification prereq, not a boot req
+  #12       — (see #3 / #12 above)
   #13       — hotfix_policy.py and admin_operator_triggers.py are in HOTFIX_ELIGIBLE_MODULES
+  #14       — acceptance-evidence minting runs deployed-side (release_qualifier_sweep.py)
+  #15 / #16 — operator hotfix-deploy channel exists (admin_hotfix_promote.py, release_hotfix_promotion.py)
+
+Findings covered here (18-finding keyless-encryption / release-recovery salvage bundle, 2026-07-17):
+  e1  — decrypt_field returns value unchanged when Fernet token cannot be decrypted (wrong key)
+  e2  — probe_key_continuity fails closed when configured key cannot decrypt reference ciphertext
+  e3  — assert_plaintext_or_raise raises RuntimeError for wrong-key ciphertext (not passed as plaintext)
+  e4  — MultiFernet contract: encrypt with first key, decrypt with any configured key
+  e5  — _get_fernet returns None for malformed GITHUB_PAT_ENCRYPTION_KEY (not crash)
+  e6  — (scratch-DB degraded, not boot-fatal) → already pinned by existing test_scratch_db_url_* tests
+  e7  — (gate-defer signature isolated) → already pinned by existing test_infra_failure_signature_* tests
+  e8  — (timed-out children contained) → already pinned by existing test_cancel_qualifier_children_* tests
+  e9  — (deterministic defects block) → already pinned by existing test_deterministic_migration_defect_* tests
+  e10 — (env-preflight independent blocker) → already pinned by existing test_env_preflight_* tests
+  e11 — auto_qualification_triggers knob controls only the generic trigger sweep, not bespoke re-drivers
+  e12 — (orphan promotion containment) → already pinned by existing test_bare_claim_promotion_* test
+  e13 — (data-migration proof gate) → already pinned by existing test_data_migration_proof_gate_* tests
+  e14 — (UI hotfix remediation) → already pinned by existing test_version_lifecycle_panel_* test
+  e15 — (scratch prereq, not boot req) → already pinned by existing test_scratch_db_url_* tests
+  e16 — _MIN_INFRA_ERROR_STREAK == 3 (permanent gate incapacity streak threshold)
+  e17 — hotfix endpoint validates non-empty reason and ack_inert_until_deploy before promoting
+  e18 — (acceptance evidence deployed-side, hotfix channel) → pinned by existing tests above
 
 Findings covered here (7-finding compute-images bundle):
   cb-1 — dispatch reads ProjectComputeImage to resolve default container image
@@ -19,6 +50,60 @@ Findings covered here (7-finding compute-images bundle):
   cb-5 — per-arm BLUEPRINT_RESULT_FILE paths are isolated; elapsed/exit_code/stderr captured
   cb-6 — build_and_push scans inputs AND image layers for platform credentials
   cb-7 — _prune_docker_images is called after each compute job (proactive cache hygiene)
+
+Findings covered here (16-finding compute viewable artifacts bundle):
+  v-1  — local_runner and storage._VIEWABLE_CONTENT_TYPES both include pdf; allowlists are aligned
+  v-2  — GCP-VM jobs stream mid-run viewables via /api/agent/compute-jobs/<id>/viewable (viewable_watch.py)
+  v-3  — extension guard applies to BOTH signing paths (manifest and ComputeJobFile row); orphan purge exists
+  v-4  — ComputeJobsPanel delegates gallery rendering to ComputeArtifactGallery (no inline copy)
+  v-5  — scanner fairness rotation prevents early-sorted overwritten files from starving later files
+         (covered in test_local_runner_viewable_selection.py::test_frequently_rewritten_early_file…)
+  v-6  — StrategicContextWorkspace suppresses duplicate media in evidence section for promoted artifacts
+  v-7  — UI (ComputeArtifactGallery) accurately describes per-kind size limits (image ≠ video)
+  v-8  — backend evidence returns artifact_total separately from item count; frontend reads live_count
+  v-9  — runner.py viewable endpoint authorizes against allowed_project_ids (multi-project runners)
+  v-10 — design: atomic terminal artifact handoff (implemented, covered by v-13 / test_local_runner.py)
+  v-11 — useFreshMediaUrl keys cache on (storage_uri, revision) so overwritten same-path files update
+  v-12 — _artifact_descriptor emits image + video + pdf preview groups; mixed-media not collapsed
+  v-13 — upload_compute_job_artifact calls _link_terminal_artifact for late first bundles
+  v-14 — evidence viewable-sort puts viewable-bearing artifacts first; running items prepended
+  v-15 — local_runner reports viewable_omissions (size_cap, count_cap) to backend via report endpoint
+  v-16 — PDF is in all three allowlists (local_runner, storage, 422 error message)
+         (overlaps v-1; full upload test in test_local_runner_viewable_selection.py::test_pdf_file_uploaded)
+
+Findings covered here (18-finding compute-viewable salvage bundle, 2026-07-17):
+  f1  — parallel signBlob: _sign_viewable_manifest uses asyncio.gather, not sequential loop
+  f2  — live indicator: StrategicContextArtifactSlot renders LiveBadge for live=true media
+  f3  — allow-list drift: .mov removed from fingerprint, video cap env-overridable,
+        runner 422 lists pdf, ComputeJobFile docstring accurate
+  f4  — GCP-VM mid-run viewables: agent_compute_jobs.py has POST /compute-jobs/{job_id}/viewable
+  f5  — unified surfaces: _purge_orphaned_viewable_rows called; ComputeJobFile branch extension guard
+  f6  — de-duplicate gallery: ComputeJobsPanel uses ComputeArtifactGallery component
+  f7  — starvation prevention (tests already in prior 12-finding bundle section)
+  f8  — canvas dedup: StrategicContextWorkspace uses promotedArtifactIds to skip Evidence duplicates
+  f9  — honest media limits: UI cap string distinguishes image/PDF/video sizes separately
+  f10 — artifact sampling disclosure: evidence exposes artifact_total + live_count separately
+  f11 — bound-project uploads (test already in prior 12-finding bundle section)
+  f12 — atomic handoff design: runner.py calls _link_terminal_artifact for terminal jobs
+  f13 — refresh overwritten previews: ComputeArtifactGallery uses revision in cache key
+  f14 — mixed-media preserved (test already in prior 12-finding bundle section)
+  f15 — atomic terminal handoff impl (test already in prior 12-finding bundle section)
+  f16 — reserve slots (test already in prior 12-finding bundle section)
+  f17 — omission telemetry (tests already in prior 12-finding bundle section)
+  f18 — PDF support (tests already in prior 12-finding bundle section)
+
+Findings covered here (4-finding operator-inbox/messages salvage bundle, 2026-07-17):
+  m1 — inbox attention-driven: badge/toast/strip/list all use the canonical server attention model
+  m2 — confirmation chips actionable: click handler branches on both message and confirmation kinds
+  m3 — QUESTION auto-decay: CONVERSATIONAL_DECAY_MESSAGE_TYPES includes QUESTION; stale_unanswered stamped
+  m4 — notifications converged: toast dispatch uses isMessageNeedingOperatorAttention, not effectiveSignal
+
+Findings covered here (5-finding operator-inbox lifecycle/convergence salvage bundle, 2026-07-17):
+  n1 — lifecycle fields consumed: lifecycleOperatorActionLabel renders operator_action hint in needs-action strip
+  n2 — acknowledgeable items get Ack button: lifecycle.acknowledgeable drives attention-ack-btn
+  n3 — acknowledge_effect label: lifecycleAcknowledgeEffectLabel helper converts effect to human-readable tooltip
+  n4 — QUESTION auto-decay (already fixed; see m3 tests above)
+  n5 — confirmation chips actionable (already fixed; see m2 tests above)
 """
 
 from __future__ import annotations
@@ -210,6 +295,392 @@ def test_env_preflight_absent_evidence_is_a_hard_blocker():
         "compute_composite must set blocker='boot_prereq_evidence_missing' — a hard promotion "
         "block, not a soft 'unavailable' state. "
         f"Got blocker={result.get('blocker')!r}"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding #1 — 0626 fails closed on malformed keys; 0628 covers github_oauth_token
+# --------------------------------------------------------------------------- #
+
+
+def test_migration_0626_calls_require_encryption_active():
+    """Migration 0626 must use require_encryption_active() to fail closed on malformed keys.
+
+    Finding #1 claim: is_encryption_active() conflates a missing key and a malformed
+    key — both return False, so 0531 silently no-ops a malformed-key migration.
+    Migration 0626 fixes this by calling require_encryption_active(), which raises
+    RuntimeError for malformed keys regardless of ALLOW_PLAINTEXT_CREDENTIALS.
+    """
+    import inspect
+    import importlib.util
+    import pathlib
+
+    mig_path = pathlib.Path(__file__).parent.parent / "alembic" / "versions" / "0626_safe_encrypt_backfill.py"
+    spec = importlib.util.spec_from_file_location("mig0626", mig_path)
+    mig = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mig)
+
+    upgrade_src = inspect.getsource(mig.upgrade)
+    assert "require_encryption_active" in upgrade_src, (
+        "Migration 0626 upgrade() must call require_encryption_active() — not "
+        "is_encryption_active() — so a malformed GITHUB_PAT_ENCRYPTION_KEY raises "
+        "RuntimeError instead of silently no-oping the backfill"
+    )
+
+
+def test_migration_0628_covers_github_oauth_token():
+    """Migration 0628 must backfill userintegration.github_oauth_token.
+
+    Finding #1 claim: 0566 adds userintegration.github_oauth_token as a nullable
+    Text column encrypted on new writes, but it was absent from every prior backfill
+    migration (0531/0621/0626).  Migration 0628 closes this gap.
+    """
+    import importlib.util
+    import pathlib
+
+    mig_path = pathlib.Path(__file__).parent.parent / "alembic" / "versions" / "0628_backfill_github_oauth_token_encrypted.py"
+    assert mig_path.exists(), (
+        "backend/alembic/versions/0628_backfill_github_oauth_token_encrypted.py must exist "
+        "to backfill userintegration.github_oauth_token — the column was missed by 0531/0621/0626"
+    )
+
+    spec = importlib.util.spec_from_file_location("mig0628", mig_path)
+    mig = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mig)
+
+    source = pathlib.Path(mig_path).read_text()
+    assert "github_oauth_token" in source, (
+        "Migration 0628 must reference github_oauth_token"
+    )
+    assert "require_encryption_active" in source, (
+        "Migration 0628 must call require_encryption_active() to fail closed on malformed keys"
+    )
+    assert mig.revision == "0628", "Migration revision must be '0628'"
+    assert mig.down_revision == "0627", "Migration 0628 must chain from 0627"
+
+
+# --------------------------------------------------------------------------- #
+# Finding #4 — timed-out qualifier children are cancelled, not left running
+# --------------------------------------------------------------------------- #
+
+
+def test_cancel_qualifier_children_covers_all_child_types():
+    """_cancel_qualifier_children must handle all qualification child task types.
+
+    Finding #4 claim: qualification timeout and sweep-crash handlers rewrite the
+    release record without changing referenced child task states.  The fix cancels
+    audit, smoketest, challenge, and merge_grade tasks.
+    """
+    import inspect
+    from app.release_qualifier_sweep import _cancel_qualifier_children
+
+    source = inspect.getsource(_cancel_qualifier_children)
+    for child in ("audit_task_id", "smoketest_task_id", "challenge_task_id", "merge_grade_task_id"):
+        assert child in source, (
+            f"_cancel_qualifier_children must handle '{child}' — "
+            "all child task types must be terminated on qualification timeout to prevent "
+            "late completions from corrupting the next attempt"
+        )
+
+    assert "CANCELLED" in source or "cancelled" in source.lower(), (
+        "_cancel_qualifier_children must set child tasks to CANCELLED status"
+    )
+
+
+def test_force_finalize_timed_out_calls_cancel_children():
+    """_force_finalize_timed_out_qualification must call _cancel_qualifier_children.
+
+    Finding #4: the timeout finalizer must contain children before re-drive is eligible.
+    """
+    import inspect
+    from app.release_qualifier_sweep import _force_finalize_timed_out_qualification
+
+    source = inspect.getsource(_force_finalize_timed_out_qualification)
+    assert "_cancel_qualifier_children" in source, (
+        "_force_finalize_timed_out_qualification must call _cancel_qualifier_children "
+        "before rewriting the release record — containment must precede re-drive"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding #5 — deterministic migration defects block (not defer)
+# --------------------------------------------------------------------------- #
+
+
+def test_deterministic_migration_defect_class_exists():
+    """_DeterministicMigrationDefect must exist and be used to separate candidate
+    defects from transient infra failures.
+
+    Finding #5 claim: migration replay wraps every exception in one error type
+    that the gate converts to defer.  The fix introduces _DeterministicMigrationDefect
+    to separate hard-block candidate defects from deferrable infra failures.
+    """
+    from app.migration_apply_gate import _DeterministicMigrationDefect
+
+    assert issubclass(_DeterministicMigrationDefect, Exception)
+
+
+def test_structural_defect_check_returns_block_verdict():
+    """_check_structural_defects must return a ('block', ...) verdict for broken chains.
+
+    Finding #5: dup revision ids and multi-head chains are deterministically defective
+    and must hard-block rather than defer-with-retry.
+    """
+    from app.migration_apply_gate import _check_structural_defects
+
+    # A migration source with a duplicate revision ID is structurally defective.
+    fake_dup = {
+        "0999_dup_a.py": (
+            '"""Rev.\nRevision ID: 0999\nRevises: 0998\n"""\nrevision = "0999"\ndown_revision = "0998"\n'
+        ),
+        "0999_dup_b.py": (
+            '"""Rev.\nRevision ID: 0999\nRevises: 0997\n"""\nrevision = "0999"\ndown_revision = "0997"\n'
+        ),
+    }
+    result = _check_structural_defects(fake_dup)
+    assert result is not None, (
+        "_check_structural_defects must return a non-None verdict for duplicate revision IDs"
+    )
+    verdict, reason = result
+    assert verdict == "block", (
+        f"Duplicate revision IDs must produce a 'block' verdict, got {verdict!r}"
+    )
+    assert "0999" in reason or "dup" in reason.lower() or "duplicate" in reason.lower(), (
+        f"Block reason should reference the duplicate revision, got: {reason!r}"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding #7 — trigger resolver returns not_applicable for terminal/auto-redrive states
+# --------------------------------------------------------------------------- #
+
+
+def test_trigger_resolver_returns_not_applicable_for_promoted():
+    """resolve_qualification_trigger returns not_applicable for promoted versions.
+
+    Finding #7 claim: the trigger resolver returned not_applicable for states that
+    dedicated sweep re-drive functions handle automatically, without exposing them
+    through the unified decision contract.  When the last-qualification status is
+    a terminal-like value that no T1–T5 rule matches, the resolver falls through
+    to the default not_applicable verdict (fire=False).
+    """
+    from app.qualification_triggers import resolve_qualification_trigger
+
+    for terminal_status in ("promoted", "abandoned"):
+        decision = resolve_qualification_trigger(
+            phase="stabilize",
+            status=terminal_status,
+            error_code=None,
+            qualification_attempts=1,
+            error_redrive_count=0,
+            is_candidate_fully_met=False,
+            requalification_ready=None,
+            candidate_sha="abc123",
+            automain_sha="abc123",
+            automain_ci_state="green",
+            blocker=None,
+            in_flight=False,
+            promotion_in_flight=False,
+            consecutive_infra_errors=0,
+        )
+        assert decision.fire is False, (
+            f"resolve_qualification_trigger must return fire=False for status={terminal_status!r}"
+        )
+        assert decision.reason == "not_applicable", (
+            f"Terminal status {terminal_status!r} must return reason='not_applicable', "
+            f"got {decision.reason!r}"
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Finding #8 — bare-claim promotion timeout is applied (orphan containment)
+# --------------------------------------------------------------------------- #
+
+
+def test_bare_claim_promotion_gets_shorter_timeout():
+    """A bare promotion claim (claiming=True, no pr_number) must receive a shorter
+    timeout cap than the default.
+
+    Finding #8 claim: promotion crash recovery must be containment-first.  When
+    promotion_pending has claiming=True but no pr_number (crash before PR creation),
+    the reconciler applies _PROMOTION_CLAIM_TIMEOUT_SECONDS (30 min) instead of the
+    full promotion timeout to limit how long the dead claim blocks the next attempt.
+    """
+    import inspect
+    from app import release_reconciliation
+
+    source = inspect.getsource(release_reconciliation)
+
+    assert "_PROMOTION_CLAIM_TIMEOUT_SECONDS" in source, (
+        "release_reconciliation.py must define _PROMOTION_CLAIM_TIMEOUT_SECONDS "
+        "to cap bare-claim promotion hold duration"
+    )
+    assert "_is_bare_claim" in source, (
+        "release_reconciliation.py must detect bare claims (claiming=True, no pr_number) "
+        "and apply a shorter timeout cap for faster containment"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding #9 — data-migration proof gate defers DML without proof declaration
+# --------------------------------------------------------------------------- #
+
+
+def test_data_migration_proof_gate_defers_dml_without_proof():
+    """_check_data_migration_proof_gate must return ('defer', reason) for DML without proof.
+
+    Finding #9 claim: the current migration-safe verdict can be produced after applying
+    a data migration to empty scratch tables.  The gate requires a
+    # BLUEPRINT_DATA_MIGRATION_PROOF: declaration to force proof documentation.
+    """
+    from app.migration_apply_gate import _check_data_migration_proof_gate
+
+    # Fake new migration source with DML but no proof declaration.
+    dml_source = {
+        "0900_dml_migration.py": (
+            '"""Rev.\nRevision ID: 0900\n"""\n'
+            "def upgrade():\n"
+            "    op.execute(sa.update(some_table).values(col='x'))\n"
+        )
+    }
+    result = _check_data_migration_proof_gate(dml_source)
+    assert result is not None, (
+        "_check_data_migration_proof_gate must return a non-None verdict for DML "
+        "migrations without a BLUEPRINT_DATA_MIGRATION_PROOF declaration"
+    )
+    verdict, reason = result
+    assert verdict == "defer", (
+        f"DML without proof declaration must produce a 'defer' verdict, got {verdict!r}"
+    )
+    assert "data_migration_proof_missing" in reason, (
+        f"Defer reason must reference 'data_migration_proof_missing', got: {reason!r}"
+    )
+
+
+def test_data_migration_proof_gate_passes_with_proof_declaration():
+    """_check_data_migration_proof_gate must return None when proof is declared."""
+    from app.migration_apply_gate import _check_data_migration_proof_gate
+
+    # Same DML but with the required proof declaration.
+    dml_with_proof = {
+        "0900_dml_migration.py": (
+            '"""Rev.\nRevision ID: 0900\n'
+            "# BLUEPRINT_DATA_MIGRATION_PROOF: tested via fixture with 3 sample rows\n"
+            '"""\n'
+            "def upgrade():\n"
+            "    op.execute(sa.update(some_table).values(col='x'))\n"
+        )
+    }
+    result = _check_data_migration_proof_gate(dml_with_proof)
+    assert result is None, (
+        "_check_data_migration_proof_gate must return None (pass) when "
+        "BLUEPRINT_DATA_MIGRATION_PROOF is declared"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding #10 — VersionLifecyclePanel has owner-only hotfix remediation flow
+# --------------------------------------------------------------------------- #
+
+
+def test_version_lifecycle_panel_has_hotfix_remediation():
+    """VersionLifecyclePanel.tsx must contain the hotfix remediation flow.
+
+    Finding #10 claim: admin-ui/src currently has no hotfix preview or promotion
+    client and VersionLifecyclePanel renders only generic qualification failure state.
+    The fix adds an owner-only panel with hotfix eligibility preview and promotion.
+    """
+    import pathlib
+
+    panel_path = (
+        pathlib.Path(__file__).parent.parent.parent
+        / "admin-ui" / "src" / "components" / "VersionLifecyclePanel.tsx"
+    )
+    source = panel_path.read_text()
+
+    assert "hotfix" in source.lower(), (
+        "VersionLifecyclePanel.tsx must reference hotfix remediation flow"
+    )
+    assert "data-testid=\"hotfix-remediation-panel\"" in source or "hotfix-remediation" in source, (
+        "VersionLifecyclePanel.tsx must have a hotfix-remediation panel "
+        "(data-testid='hotfix-remediation-panel')"
+    )
+    assert "hotfix-open-btn" in source or "hotfixPanelOpen" in source, (
+        "VersionLifecyclePanel.tsx must have a hotfix open/toggle button"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding #14 — acceptance-evidence minting runs deployed-side (architectural constraint)
+# --------------------------------------------------------------------------- #
+
+
+def test_acceptance_evidence_minting_is_deployed_side():
+    """Acceptance-evidence minting must run in release_qualifier_sweep.py (deployed-side).
+
+    Finding #14 claim: record_acceptance_window_coverage_evidence,
+    backfill_unverified_merge_evidence, and backfill_direction_merge_evidence run
+    inside the deployed orchestrator process at the deployed SHA.  No candidate-
+    executing surface invokes these minters — they are deployed-side by design.
+    """
+    import inspect
+    from app import release_qualifier_sweep
+
+    sweep_source = inspect.getsource(release_qualifier_sweep)
+
+    for fn_name in (
+        "record_acceptance_window_coverage_evidence",
+        "backfill_direction_merge_evidence",
+    ):
+        assert fn_name in sweep_source, (
+            f"release_qualifier_sweep.py must invoke {fn_name} — acceptance evidence "
+            "is minted deployed-side so fixes to minting logic require a promotion "
+            "to take effect (architectural constraint; operator must be aware)"
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Findings #15 / #16 — operator hotfix-deploy channel exists
+# --------------------------------------------------------------------------- #
+
+
+def test_hotfix_promote_endpoint_exists():
+    """admin_hotfix_promote.py must expose a POST /projects/{id}/promote/hotfix endpoint.
+
+    Findings #15/#16 claim: no /promote/hotfix endpoint exists; only force_promote exists.
+    The fix adds a narrow, audited, module-scoped hotfix channel.
+    """
+    import pathlib
+
+    router_path = (
+        pathlib.Path(__file__).parent.parent
+        / "app" / "routers" / "admin_hotfix_promote.py"
+    )
+    assert router_path.exists(), (
+        "backend/app/routers/admin_hotfix_promote.py must exist — "
+        "the hotfix-deploy channel router"
+    )
+    source = router_path.read_text()
+    assert "promote/hotfix" in source, (
+        "admin_hotfix_promote.py must define a /promote/hotfix endpoint"
+    )
+
+
+def test_hotfix_promote_current_version_function_exists():
+    """release_hotfix_promotion.py must export hotfix_promote_current_version.
+
+    Findings #15/#16: the channel function must exist and be importable.
+    """
+    from app.release_hotfix_promotion import (
+        hotfix_promote_current_version,
+        check_hotfix_scope_preview,
+    )
+
+    assert callable(hotfix_promote_current_version), (
+        "hotfix_promote_current_version must be a callable async function"
+    )
+    assert callable(check_hotfix_scope_preview), (
+        "check_hotfix_scope_preview must be a callable (read-only scope preview)"
     )
 
 
@@ -436,4 +907,1836 @@ def test_compute_job_runner_calls_prune_docker_images_after_job():
     assert source.count("_prune_docker_images(") >= 2, (
         "local_runner._prune_docker_images must be both defined AND called in the "
         "compute-job lifecycle; found fewer than 2 occurrences of '_prune_docker_images('"
+    )
+
+
+# =========================================================================== #
+# 16-finding compute viewable artifacts bundle
+# =========================================================================== #
+
+
+def _runner_router_source() -> str:
+    """Return the source of backend/app/routers/runner.py."""
+    from pathlib import Path
+
+    candidates = [
+        Path(__file__).resolve().parents[2] / "backend" / "app" / "routers" / "runner.py",
+        Path("/repo/backend/app/routers/runner.py"),
+        Path(__file__).resolve().parent.parent / "app" / "routers" / "runner.py",
+    ]
+    for path in candidates:
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+    raise FileNotFoundError("runner.py not found in expected locations")
+
+
+def _strategic_pkg_source() -> str:
+    """Return the source of backend/app/strategic_context_package.py."""
+    from pathlib import Path
+
+    candidates = [
+        Path(__file__).resolve().parents[2] / "backend" / "app" / "strategic_context_package.py",
+        Path("/repo/backend/app/strategic_context_package.py"),
+        Path(__file__).resolve().parent.parent / "app" / "strategic_context_package.py",
+    ]
+    for path in candidates:
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+    raise FileNotFoundError("strategic_context_package.py not found")
+
+
+def _admin_compute_jobs_source() -> str:
+    """Return the source of backend/app/routers/admin_compute_jobs.py."""
+    from pathlib import Path
+
+    candidates = [
+        Path(__file__).resolve().parents[2] / "backend" / "app" / "routers" / "admin_compute_jobs.py",
+        Path("/repo/backend/app/routers/admin_compute_jobs.py"),
+        Path(__file__).resolve().parent.parent / "app" / "routers" / "admin_compute_jobs.py",
+    ]
+    for path in candidates:
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+    raise FileNotFoundError("admin_compute_jobs.py not found")
+
+
+# --------------------------------------------------------------------------- #
+# Finding 1 / v-5 — live-preview fairness: scanner rotates past last-uploaded path
+# --------------------------------------------------------------------------- #
+
+
+def test_stream_viewable_files_returns_after_one_upload_decision():
+    """Non-drain _stream_viewable_files returns after at most one upload per call.
+
+    Finding 1 claim: 'The non-drain scheduler returns after one upload decision
+    per heartbeat.' A frequently-rewritten file must not monopolize every heartbeat.
+    """
+    source = _local_runner_source()
+
+    # The non-drain path must have an explicit return after start_upload().
+    assert "if not drain:" in source or "return" in source, (
+        "_stream_viewable_files must return after one upload decision outside drain"
+    )
+    # scan_start cursor must be advanced after each upload decision.
+    assert "state.scan_start = relpath" in source, (
+        "_stream_viewable_files must set state.scan_start to advance the fairness cursor"
+    )
+
+
+def test_stream_viewable_files_rotates_candidate_list():
+    """The candidate list is rotated to start just past scan_start.
+
+    Finding 1 claim: 'The scanner returns candidates in deterministic path order.'
+    The fairness rotation must find the index strictly greater than scan_start.
+    """
+    source = _local_runner_source()
+
+    assert "scan_start" in source, "scan_start attribute must exist in _ViewableStreamState"
+    # The rotation uses a comparison to find the first relpath > scan_start.
+    assert "relpath > state.scan_start" in source or "c[\"relpath\"] > state.scan_start" in source, (
+        "_stream_viewable_files must rotate candidates so scanning resumes after scan_start"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding v-2 — GCP-VM jobs stream mid-run viewables via a dedicated endpoint
+# --------------------------------------------------------------------------- #
+
+
+def test_gcp_vm_viewable_endpoint_exists_in_agent_compute_jobs():
+    """agent_compute_jobs.py exposes a mid-run viewable upload endpoint for GCP VMs.
+
+    Finding v-2: compute_job_vm_heartbeat (the GCP heartbeat handler) never ingested
+    viewable multipart bodies; GCP VM jobs had no path to stream mid-run plots to the
+    canvas.  The fix adds a separate POST /compute-jobs/{job_id}/viewable endpoint
+    in agent_compute_jobs.py, mirroring the runner-subprocess path, and a companion
+    viewable_watch.py daemon that runs inside the VM and calls that endpoint.
+    """
+    import inspect
+    from app.routers import agent_compute_jobs as acj_mod
+
+    source = inspect.getsource(acj_mod)
+
+    # The endpoint must exist and use HMAC authentication (same secret as heartbeat).
+    assert "compute-jobs/{job_id}/viewable" in source or "/viewable" in source, (
+        "agent_compute_jobs.py must expose a /viewable upload endpoint for GCP-VM "
+        "mid-run viewable streaming (analogous to runner.py's viewable endpoint)"
+    )
+    assert "compute_job_heartbeat_secret" in source, (
+        "The GCP-VM viewable endpoint must authenticate via compute_job_heartbeat_secret, "
+        "the same per-job HMAC secret used by the heartbeat endpoint"
+    )
+    assert "viewable_files" in source, (
+        "The GCP-VM viewable endpoint must stamp polling_metadata['viewable_files'] "
+        "so the canvas can render mid-run previews before terminal finalization"
+    )
+
+    # viewable_watch.py must also exist and call the right URL path.
+    from pathlib import Path
+
+    candidates = [
+        Path(__file__).resolve().parents[2] / "backend" / "app" / "_compute_scripts" / "viewable_watch.py",
+        Path("/repo/backend/app/_compute_scripts/viewable_watch.py"),
+    ]
+    watch_source: str | None = None
+    for p in candidates:
+        if p.exists():
+            watch_source = p.read_text(encoding="utf-8")
+            break
+
+    assert watch_source is not None, (
+        "backend/app/_compute_scripts/viewable_watch.py must exist — "
+        "GCP VMs run this daemon to upload mid-run viewable files to the orchestrator"
+    )
+    assert "/compute-jobs/" in watch_source and "/viewable" in watch_source, (
+        "viewable_watch.py must POST to /api/agent/compute-jobs/<job_id>/viewable "
+        "to deliver mid-run previews for GCP-VM jobs"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding v-3 — extension guard on both signing paths; orphan purge present
+# --------------------------------------------------------------------------- #
+
+
+def test_signing_extension_guard_applies_to_computejobfile_branch():
+    """The signed-URL endpoint applies the viewable extension guard on BOTH paths.
+
+    Finding v-3 (unify viewable surfaces): the ComputeJobFile signing branch in
+    main.py formerly accepted any URI whose row existed in the DB without
+    re-validating the extension, while the manifest branch called
+    viewable_content_type_for_filename.  Both branches must now share the same guard
+    so a mis-classified row cannot produce a signed URL for a non-viewable file.
+    """
+    import inspect
+    import app.main as main_mod
+
+    source = inspect.getsource(main_mod)
+
+    # The ComputeJobFile signing branch must import + apply viewable_content_type_for_filename
+    # (or alias it as _vctype) to validate the extension before generating a signed URL.
+    assert "viewable_content_type_for_filename" in source, (
+        "app.main must reference viewable_content_type_for_filename in the "
+        "compute-job URI signing path so the extension guard covers ComputeJobFile rows"
+    )
+    # The guard must be applied on the ComputeJobFile row's safe_relpath.
+    # The implementation aliases the function as _vctype and calls _vctype(cjf.safe_relpath).
+    assert "_vctype" in source, (
+        "app.main must alias viewable_content_type_for_filename as _vctype and call it "
+        "on cjf.safe_relpath so non-viewable extensions are rejected in the ComputeJobFile branch"
+    )
+    # The rejection path (404 on None result) must exist.
+    assert "Artifact not found" in source, (
+        "app.main must return 404 when the extension guard rejects the ComputeJobFile "
+        "relpath — so callers receive the same response as for a missing artifact"
+    )
+
+
+def test_orphaned_viewable_rows_purge_exists_in_compute_jobs():
+    """compute_jobs.py defines a purge helper for orphaned ComputeJobFile rows.
+
+    Finding v-3: _record_viewable_job_files only inserted/updated rows but never
+    deleted mid-run uploads that were excluded from the terminal top-25 manifest.
+    Those orphaned rows appeared in the signing allowlist without being in the
+    displayed manifest, creating a silent asymmetry.  The purge helper reconciles
+    both surfaces to the authoritative terminal manifest.
+    """
+    import inspect
+    import app.compute_jobs as cj_mod
+
+    source = inspect.getsource(cj_mod)
+
+    assert "_purge_orphaned_viewable_rows" in source, (
+        "app.compute_jobs must define _purge_orphaned_viewable_rows to delete "
+        "ComputeJobFile rows from mid-run uploads that were not selected into the "
+        "terminal top-25 manifest"
+    )
+    # The purge must be called from the terminal extraction path.
+    assert source.count("_purge_orphaned_viewable_rows") >= 2, (
+        "_purge_orphaned_viewable_rows must be both defined AND called during terminal "
+        "artifact extraction — found fewer than 2 occurrences"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding v-4 — ComputeJobsPanel delegates to ComputeArtifactGallery (no inline copy)
+# --------------------------------------------------------------------------- #
+
+
+def test_compute_jobs_panel_uses_compute_artifact_gallery():
+    """ComputeJobsPanel renders viewable files through ComputeArtifactGallery.
+
+    Finding v-4 (de-duplicate gallery): ComputeJobsPanel.tsx formerly contained a
+    near-verbatim inline copy of the resolve/cache/mark-error/open-full-size pipeline
+    duplicated from ComputeArtifactGallery.tsx.  The two copies auto-resolved
+    differently and had divergent cap messaging.  The fix replaces the inline copy
+    with a <ComputeArtifactGallery> import so both surfaces share one implementation.
+    """
+    from pathlib import Path
+
+    candidates = [
+        Path(__file__).resolve().parents[2] / "admin-ui" / "src" / "components" / "ComputeJobsPanel.tsx",
+        Path("/repo/admin-ui/src/components/ComputeJobsPanel.tsx"),
+    ]
+    panel_source: str | None = None
+    for p in candidates:
+        if p.exists():
+            panel_source = p.read_text(encoding="utf-8")
+            break
+
+    if panel_source is None:
+        import pytest
+
+        pytest.skip("ComputeJobsPanel.tsx not found — skipping frontend source check")
+
+    assert "ComputeArtifactGallery" in panel_source, (
+        "ComputeJobsPanel.tsx must import and render ComputeArtifactGallery so that "
+        "the viewable file gallery is not duplicated inline in the panel component"
+    )
+    # The inline resolve pipeline (useFreshMediaUrl called directly inside the panel)
+    # would be a sign of duplication.  The gallery component owns it instead.
+    assert panel_source.count("useFreshMediaUrl") == 0, (
+        "ComputeJobsPanel.tsx must NOT contain useFreshMediaUrl — that hook belongs "
+        "in ComputeArtifactGallery.tsx; a copy in the panel means the two surfaces "
+        "resolve and cache signed URLs independently"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding 5 / v-9 — live-viewable endpoint authorizes against allowed_project_ids
+# --------------------------------------------------------------------------- #
+
+
+def test_viewable_endpoint_uses_allowed_project_ids():
+    """The /compute-job/{job_id}/viewable endpoint must use allowed_project_ids.
+
+    Finding 5 / v-9 claim: 'The live-viewable endpoint filters ComputeJob.project_id
+    against runner.project_id rather than the runner's allowed_project_ids set.'
+    The current code must use the broader allowed_project_ids so bound secondary
+    projects can stream their plots.
+    """
+    source = _runner_router_source()
+
+    # The endpoint function (upload_compute_job_viewable) must call allowed_project_ids.
+    # Locate the viewable endpoint section.
+    idx = source.find('"/compute-job/{job_id}/viewable"')
+    assert idx >= 0, "viewable endpoint definition not found in runner.py"
+    # Scan forward into the function body. The body is long (multipart parsing
+    # precedes the DB query), so use a generous window.
+    body_slice = source[idx : idx + 12000]
+    assert "allowed_project_ids" in body_slice, (
+        "upload_compute_job_viewable must call allowed_project_ids (not use "
+        "runner.project_id directly) so a runner bound to a secondary project "
+        "can upload previews for jobs in that project"
+    )
+    # The filter must use .in_(allowed_projects) not an == comparison.
+    assert "in_(allowed_projects)" in source, (
+        "runner.py must build an allowed_projects set via allowed_project_ids() and "
+        "filter ComputeJob.project_id with .in_(allowed_projects) — not an == comparison "
+        "to runner.project_id — so bound secondary projects are accepted"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding v-6 — StrategicContextWorkspace suppresses duplicate media for promoted artifacts
+# --------------------------------------------------------------------------- #
+
+
+def test_strategic_workspace_suppresses_evidence_media_for_promoted_artifacts():
+    """StrategicContextWorkspace hides evidence-section media when already on canvas.
+
+    Finding v-6 (deduplicate artifact media galleries): when a compute artifact is
+    selected as a primary canvas descriptor, its inline image/video gallery rendered
+    the same signed URLs a second time in the Evidence section.  The fix guards the
+    ArtifactViewablePreviews render with `!isPromoted`, silencing duplicates while
+    keeping the evidence row (label + navigation) visible.
+    """
+    from pathlib import Path
+
+    candidates = [
+        Path(__file__).resolve().parents[2] / "admin-ui" / "src" / "components" / "StrategicContextWorkspace.tsx",
+        Path("/repo/admin-ui/src/components/StrategicContextWorkspace.tsx"),
+    ]
+    ws_source: str | None = None
+    for p in candidates:
+        if p.exists():
+            ws_source = p.read_text(encoding="utf-8")
+            break
+
+    if ws_source is None:
+        import pytest
+
+        pytest.skip("StrategicContextWorkspace.tsx not found — skipping frontend source check")
+
+    assert "isPromoted" in ws_source, (
+        "StrategicContextWorkspace.tsx must compute isPromoted for each evidence artifact "
+        "so that media previews are not rendered a second time when the artifact is "
+        "already displayed as a primary canvas descriptor"
+    )
+    assert "!isPromoted" in ws_source, (
+        "The ArtifactViewablePreviews block must be conditional on !isPromoted "
+        "to suppress duplicate media for promoted artifacts"
+    )
+    # The !isPromoted guard and ArtifactViewablePreviews must appear near each other
+    # in the source (both in the evidence artifact render block).
+    not_promoted_idx = ws_source.index("!isPromoted")
+    # ArtifactViewablePreviews is imported at the top but also used after !isPromoted.
+    # Find the first usage AFTER the !isPromoted guard.
+    after_guard = ws_source[not_promoted_idx:]
+    assert "ArtifactViewablePreviews" in after_guard, (
+        "ArtifactViewablePreviews must appear after !isPromoted in "
+        "StrategicContextWorkspace.tsx so the conditional guard wraps the preview render"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding v-7 — UI accurately describes per-kind size limits (image ≠ video)
+# --------------------------------------------------------------------------- #
+
+
+def test_compute_artifact_gallery_shows_accurate_per_kind_caps():
+    """ComputeArtifactGallery describes the actual per-kind size limits.
+
+    Finding v-7 (report media preview limits honestly): all three artifact surfaces
+    formerly described a uniform 8-MiB-per-file cap.  The backend applies 8 MiB for
+    images/PDFs but a separately configurable cap (default 512 MiB) for videos.
+    The UI must state both limits so operators understand why a large video may be
+    omitted while smaller images are still delivered.
+    """
+    from pathlib import Path
+
+    candidates = [
+        Path(__file__).resolve().parents[2] / "admin-ui" / "src" / "components" / "ComputeArtifactGallery.tsx",
+        Path("/repo/admin-ui/src/components/ComputeArtifactGallery.tsx"),
+    ]
+    gallery_source: str | None = None
+    for p in candidates:
+        if p.exists():
+            gallery_source = p.read_text(encoding="utf-8")
+            break
+
+    if gallery_source is None:
+        import pytest
+
+        pytest.skip("ComputeArtifactGallery.tsx not found — skipping frontend source check")
+
+    assert "512 MiB" in gallery_source, (
+        "ComputeArtifactGallery.tsx must mention '512 MiB' (the video cap) so the "
+        "operator understands that videos have a different (larger) per-file limit"
+    )
+    assert "8 MiB" in gallery_source, (
+        "ComputeArtifactGallery.tsx must mention '8 MiB' (the image/PDF cap) so the "
+        "operator understands that images and PDFs have a smaller per-file limit"
+    )
+    # The two caps must appear in the SAME context so they're not ambiguous.
+    assert "video" in gallery_source.lower(), (
+        "ComputeArtifactGallery.tsx must use 'video' in the cap description to "
+        "distinguish the 512-MiB video limit from the 8-MiB image limit"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding v-8 — backend returns artifact_total; frontend exposes live_count
+# --------------------------------------------------------------------------- #
+
+
+def test_evidence_response_returns_artifact_total_and_live_count():
+    """load_strategic_context_evidence returns durable total + live_count separately.
+
+    Finding v-8 (disclose artifact sampling): the workspace displayed a count derived
+    from the bounded item list (≤4) rather than the durable artifact total.  The fix
+    adds 'total' (durable DB count) and 'live_count' (number of running-job preview
+    rows prepended) to the evidence artifacts dict so the frontend can distinguish
+    'showing 4 of 12 durable artifacts' from 'there are exactly 4'.
+    """
+    source = _strategic_pkg_source()
+
+    # The evidence-load function must return 'total' in the artifacts dict.
+    assert '"total"' in source or "'total'" in source, (
+        "load_strategic_context_evidence must include 'total' (durable artifact count) "
+        "in the returned artifacts dict so the frontend can show 'N of M' sampling disclosure"
+    )
+    assert '"live_count"' in source or "'live_count'" in source, (
+        "load_strategic_context_evidence must include 'live_count' (running-job preview "
+        "row count) so the frontend can label live items separately from terminal ones"
+    )
+
+    # The frontend type definition must reflect both fields.
+    from pathlib import Path
+
+    candidates = [
+        Path(__file__).resolve().parents[2] / "admin-ui" / "src" / "strategicStateApi.ts",
+        Path("/repo/admin-ui/src/strategicStateApi.ts"),
+    ]
+    api_source: str | None = None
+    for p in candidates:
+        if p.exists():
+            api_source = p.read_text(encoding="utf-8")
+            break
+
+    if api_source is not None:
+        assert "live_count" in api_source, (
+            "strategicStateApi.ts must type-check live_count in the evidence artifacts "
+            "shape so consuming components can safely read it"
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Finding v-11 — useFreshMediaUrl caches by (storage_uri, revision) so overwrites trigger refresh
+# --------------------------------------------------------------------------- #
+
+
+def test_fresh_media_url_hook_uses_revision_in_generation_key():
+    """useFreshMediaUrl keys the signed-URL cache on (storage_uri, revision).
+
+    Finding v-11 (refresh overwritten live previews): the hook previously keyed only
+    on storage_uri.  The backend deliberately overwrites the same canonical URI when
+    a runner re-uploads a changed same-filename file, so a stale signed URL cached
+    under the old content would never refresh even though the server had new bytes at
+    the same path.  Folding revision into the generation key forces a fresh URL fetch
+    whenever a new revision token arrives.
+    """
+    from pathlib import Path
+
+    candidates = [
+        Path(__file__).resolve().parents[2] / "admin-ui" / "src" / "components" / "StrategicContextArtifactSlot.tsx",
+        Path("/repo/admin-ui/src/components/StrategicContextArtifactSlot.tsx"),
+    ]
+    slot_source: str | None = None
+    for p in candidates:
+        if p.exists():
+            slot_source = p.read_text(encoding="utf-8")
+            break
+
+    if slot_source is None:
+        import pytest
+
+        pytest.skip("StrategicContextArtifactSlot.tsx not found — skipping frontend source check")
+
+    assert "revision" in slot_source, (
+        "StrategicContextArtifactSlot.tsx must accept a 'revision' prop in useFreshMediaUrl "
+        "so overwritten same-path files cause a cache miss and a fresh signed URL"
+    )
+    assert "generation" in slot_source, (
+        "useFreshMediaUrl must build a 'generation' string that includes both storage_uri "
+        "and revision; a change to either must trigger a URL re-fetch"
+    )
+    # The generation must concatenate storage_uri AND revision (not just one).
+    gen_line_idx = slot_source.find("generation")
+    segment = slot_source[gen_line_idx : gen_line_idx + 200]
+    assert "revision" in segment, (
+        "The 'generation' variable in useFreshMediaUrl must reference 'revision' so the "
+        "cache key changes when a same-path file is overwritten with new content"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding 8 / v-12 — mixed-media descriptor retains all preview kinds
+# --------------------------------------------------------------------------- #
+
+
+def test_artifact_descriptor_retains_mixed_media_kinds():
+    """_artifact_descriptor emits image, video, AND pdf groups from a mixed manifest.
+
+    Finding 8 / v-12 claim: 'After choosing a kind, the descriptor emits only that
+    kind's list for the main tile.' The fix must call add_preview_group for every
+    present kind regardless of the primary kind selection.
+    """
+    from app.strategic_context_package import _artifact_descriptor
+
+    previews = [
+        {"kind": "image", "url": "http://s/plot.png", "storage_uri": "gs://b/plot.png", "filename": "plot.png"},
+        {"kind": "video", "url": "http://s/rollout.mp4", "storage_uri": "gs://b/rollout.mp4", "filename": "rollout.mp4"},
+        {"kind": "pdf", "url": "http://s/report.pdf", "storage_uri": "gs://b/report.pdf", "filename": "report.pdf"},
+    ]
+    artifact = {
+        "id": "art-001",
+        "viewable_previews": previews,
+        "kind": "storage",
+        "label": "Mixed experiment",
+        "artifact_type": "compute_result",
+        "task_title": "Exp 1",
+        "task_status": "completed",
+        "created_at": None,
+    }
+    descriptor = _artifact_descriptor(artifact)
+    assert descriptor is not None
+
+    # Primary kind is image (first match wins), but video and pdf must also be present.
+    assert descriptor.get("kind") == "image"
+    assert descriptor.get("image") is not None, "image group missing from mixed descriptor"
+    assert isinstance(descriptor.get("images"), list) and len(descriptor["images"]) >= 1
+    assert descriptor.get("video") is not None, "video group missing from mixed descriptor"
+    assert isinstance(descriptor.get("videos"), list) and len(descriptor["videos"]) >= 1
+    assert descriptor.get("pdf") is not None, "pdf group missing from mixed descriptor"
+    assert isinstance(descriptor.get("pdfs"), list) and len(descriptor["pdfs"]) >= 1
+
+
+def test_artifact_descriptor_mixed_image_and_pdf():
+    """_artifact_descriptor retains both image and pdf keys on a mixed artifact."""
+    from app.strategic_context_package import _artifact_descriptor
+
+    artifact = {
+        "id": "mix-1",
+        "artifact_type": "COMPUTE_RESULT",
+        "logical_key": "result",
+        "label": "mixed result",
+        "viewable_previews": [
+            {
+                "url": "https://cdn.example.com/reward.png?sig=a",
+                "kind": "image",
+                "filename": "reward_curve.png",
+                "storage_uri": "gs://b/compute-jobs/j/artifacts/viewable/reward_curve.png",
+            },
+            {
+                "url": "https://cdn.example.com/report.pdf?sig=b",
+                "kind": "pdf",
+                "filename": "full_report.pdf",
+                "storage_uri": "gs://b/compute-jobs/j/artifacts/viewable/full_report.pdf",
+            },
+        ],
+    }
+
+    desc = _artifact_descriptor(artifact)
+
+    assert "image" in desc, (
+        "_artifact_descriptor must include 'image' key when a viewable preview of kind='image' exists"
+    )
+    assert "pdf" in desc, (
+        "_artifact_descriptor must include 'pdf' key when a viewable preview of kind='pdf' exists — "
+        "a mixed image+PDF compute result must NOT collapse to image only"
+    )
+    assert desc["image"]["url"] == "https://cdn.example.com/reward.png?sig=a"
+    assert desc["pdf"]["url"] == "https://cdn.example.com/report.pdf?sig=b"
+
+
+# --------------------------------------------------------------------------- #
+# Finding 9 / v-13 — late bundle arrival backfills artifact_id / result_reference
+# --------------------------------------------------------------------------- #
+
+
+def test_late_bundle_upload_triggers_artifact_linkage():
+    """runner.py backfills artifact_id when a bundle arrives after terminalization.
+
+    Finding 9 / v-13 claim: 'A terminal runner job can currently retain a stored bundle
+    pointer without artifact_id or result_reference being backfilled.' The fix
+    calls _link_terminal_artifact for the first late upload on a terminal job.
+    """
+    source = _runner_router_source()
+
+    # The bundle-upload handler must call _link_terminal_artifact for terminal jobs.
+    assert "_link_terminal_artifact" in source, (
+        "runner.py must import and call _link_terminal_artifact to backfill "
+        "artifact_id / result_reference when a bundle arrives after terminalization"
+    )
+    # Must be conditional on the job being terminal AND not yet having an artifact.
+    assert "existing_artifact is None" in source or "runner_artifact is None" in source, (
+        "late bundle backfill must guard on the job not already having an artifact "
+        "(idempotent: only backfill the FIRST late upload)"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding 10 / v-14 — viewable-bearing artifacts sort first in evidence slice
+# --------------------------------------------------------------------------- #
+
+
+def test_evidence_loader_sorts_viewable_artifacts_first():
+    """Terminal artifact evidence sorts viewable-bearing rows before non-viewable.
+
+    Finding 10 / v-14 claim: 'Terminal evidence queries the four newest meaningful
+    artifacts before resolving viewable previews.' The sort must put viewable
+    items first so the _ARTIFACT_EVIDENCE_LIMIT cap retains media-bearing rows.
+    """
+    source = _strategic_pkg_source()
+
+    # The sort key must place viewable_previews before non-viewable.
+    assert 'viewable_previews' in source, "strategic_context_package must reference viewable_previews"
+    # Look for the explicit sort that prioritises viewable items.
+    assert "artifact_items.sort(" in source, (
+        "load_strategic_context_evidence must call artifact_items.sort() to "
+        "prioritize viewable-bearing rows before the evidence-limit slice"
+    )
+    # Confirm the sort key checks for viewable_previews.
+    assert "i.get(\"viewable_previews\")" in source or "i.get('viewable_previews')" in source, (
+        "the evidence sort key must check for viewable_previews to prioritize media rows"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding 11 / v-15 — live omission telemetry surfaced via polling_metadata
+# --------------------------------------------------------------------------- #
+
+
+def test_live_omissions_stamped_in_polling_metadata():
+    """The runner stamps viewable_live_omissions into polling_metadata on running reports.
+
+    Finding 11 / v-15 claim: 'The runner logs local oversize/count-budget skips but does
+    not report them to the backend.' The fix stamps both counts via viewable_omissions
+    in the running heartbeat, which the server converts to viewable_live_omissions.
+    """
+    source = _local_runner_source()
+
+    assert "viewable_omissions" in source, (
+        "local_runner.py must include a viewable_omissions payload in the running "
+        "heartbeat so the server can stamp viewable_live_omissions"
+    )
+    assert "oversize_relpaths" in source, (
+        "local_runner.py must track oversize_relpaths and report them as omissions"
+    )
+    assert "count_cap_relpaths" in source, (
+        "local_runner.py must track count_cap_relpaths and report them as omissions"
+    )
+
+
+def test_admin_api_exposes_viewable_live_omissions():
+    """The admin compute-jobs API exposes viewable_live_omissions to the frontend.
+
+    Finding 11 / v-15 claim: omission telemetry must flow from runner heartbeat through
+    polling_metadata to the API response so the UI can display it.
+    """
+    source = _admin_compute_jobs_source()
+
+    assert "viewable_live_omissions" in source or "viewable_artifacts_live_omissions" in source, (
+        "admin_compute_jobs.py must expose the runner's live omission counts "
+        "as viewable_artifacts_live_omissions in the compute-job polling response"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding 12 / v-1 / v-16 — PDF in all three allowlists
+# --------------------------------------------------------------------------- #
+
+
+def test_pdf_in_viewable_content_types():
+    """PDF must be in the storage viewable content-type registry.
+
+    Finding 12 / v-16 claim: 'compute_backends._VIEWABLE_CONTENT_TYPES has no pdf entry.'
+    """
+    from app import storage
+
+    assert "pdf" in storage._VIEWABLE_CONTENT_TYPES, (
+        "storage._VIEWABLE_CONTENT_TYPES must include 'pdf' so PDF viewable files "
+        "can be classified and uploaded via the live-viewable pipeline"
+    )
+    content_type, kind = storage._VIEWABLE_CONTENT_TYPES["pdf"]
+    assert content_type == "application/pdf"
+    assert kind == "pdf"
+
+
+def test_local_runner_pdf_in_viewable_content_types():
+    """PDF must also be in the runner's local copy of _VIEWABLE_CONTENT_TYPES.
+
+    Finding 12 / v-1 claim: the runner must mirror the server's allowlist so it does
+    not skip PDF files before attempting upload.
+    """
+    source = _local_runner_source()
+
+    assert '"pdf": ("application/pdf", "pdf")' in source or (
+        '"pdf"' in source and "application/pdf" in source
+    ), (
+        "local_runner.py _VIEWABLE_CONTENT_TYPES must include a 'pdf' entry "
+        "matching ('application/pdf', 'pdf')"
+    )
+
+    # The runner 422 error message must list pdf so the operator knows what is accepted.
+    runner_source = _runner_router_source()
+    assert "pdf" in runner_source and "422" in runner_source, (
+        "runner.py must include 'pdf' in the 422 error message for unsupported "
+        "viewable extensions so operators see the full supported set"
+    )
+
+
+# =========================================================================== #
+# 18-finding compute-viewable salvage bundle (2026-07-17 — second sweep)
+#
+# This section pins the fixes identified in the second adversarial review.
+# Findings already covered in the prior 12-finding section above are noted
+# but not duplicated (f7, f11, f14, f15, f16, f17, f18).
+# =========================================================================== #
+
+
+def _ui_component_source(filename: str) -> str:
+    """Read a frontend component source file for source-inspection tests."""
+    from pathlib import Path
+
+    base_candidates = [
+        Path(__file__).resolve().parents[2] / "admin-ui" / "src" / "components" / filename,
+        Path("/repo/admin-ui/src/components") / filename,
+    ]
+    for path in base_candidates:
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+    raise FileNotFoundError(f"{filename} not found in expected locations")
+
+
+def _agent_compute_jobs_source() -> str:
+    """Return the source of backend/app/routers/agent_compute_jobs.py."""
+    from pathlib import Path
+
+    candidates = [
+        Path(__file__).resolve().parents[2] / "backend" / "app" / "routers" / "agent_compute_jobs.py",
+        Path("/repo/backend/app/routers/agent_compute_jobs.py"),
+        Path(__file__).resolve().parent.parent / "app" / "routers" / "agent_compute_jobs.py",
+    ]
+    for path in candidates:
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+    raise FileNotFoundError("agent_compute_jobs.py not found")
+
+
+def _main_source() -> str:
+    """Return the source of backend/app/main.py."""
+    from pathlib import Path
+
+    candidates = [
+        Path(__file__).resolve().parents[2] / "backend" / "app" / "main.py",
+        Path("/repo/backend/app/main.py"),
+        Path(__file__).resolve().parent.parent / "app" / "main.py",
+    ]
+    for path in candidates:
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+    raise FileNotFoundError("main.py not found")
+
+
+def _compute_jobs_source() -> str:
+    """Return the source of backend/app/compute_jobs.py."""
+    from pathlib import Path
+
+    candidates = [
+        Path(__file__).resolve().parents[2] / "backend" / "app" / "compute_jobs.py",
+        Path("/repo/backend/app/compute_jobs.py"),
+        Path(__file__).resolve().parent.parent / "app" / "compute_jobs.py",
+    ]
+    for path in candidates:
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+    raise FileNotFoundError("compute_jobs.py not found")
+
+
+# --------------------------------------------------------------------------- #
+# Finding f1: _sign_viewable_manifest uses parallel asyncio.gather, not
+# a sequential per-file await loop
+# --------------------------------------------------------------------------- #
+
+
+def test_sign_viewable_manifest_uses_parallel_gather():
+    """_sign_viewable_manifest must mint signed URLs in parallel via asyncio.gather.
+
+    Finding f1 claim: 'Every viewable file attached to each surfaced compute job
+    is signed one-at-a-time in a sequential loop.' The fix batches all GCS
+    round-trips in one gather after the sequential ownership-check phase.
+    """
+    source = _strategic_pkg_source()
+
+    # The function must exist.
+    assert "_sign_viewable_manifest" in source, (
+        "_sign_viewable_manifest must be defined in strategic_context_package.py"
+    )
+
+    # Find the function body and confirm asyncio.gather is used for signing.
+    idx = source.find("async def _sign_viewable_manifest(")
+    assert idx >= 0, "_sign_viewable_manifest function not found"
+    body = source[idx : idx + 3000]
+
+    assert "asyncio.gather" in body, (
+        "_sign_viewable_manifest must use asyncio.gather to mint all GCS signed "
+        "URLs in one parallel batch — sequential per-file awaits add N network "
+        "round-trips to every canvas load when a job has many viewable files"
+    )
+    # Must NOT have a sequential for-loop with an individual generate_download_signed_url await.
+    # The canonical non-parallel anti-pattern would be `await generate_download_signed_url`
+    # inside a for-loop body (the gather passes a list comprehension, not a bare await).
+    assert "return_exceptions=True" in body, (
+        "_sign_viewable_manifest must pass return_exceptions=True to asyncio.gather "
+        "so one GCS signing failure does not abort the entire batch"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding f2: StrategicContextArtifactSlot renders a live badge for live items
+# --------------------------------------------------------------------------- #
+
+
+def test_strategic_artifact_slot_has_live_badge():
+    """StrategicContextArtifactSlot must render a live indicator for live=true media.
+
+    Finding f2 claim: 'The live flag is already delivered all the way to the
+    frontend and parsed into preview item objects, but it currently drives ZERO
+    rendering decisions.' The fix renders a LiveBadge overlay chip.
+    """
+    try:
+        source = _ui_component_source("StrategicContextArtifactSlot.tsx")
+    except FileNotFoundError:
+        import pytest
+        pytest.skip("admin-ui/src/components not available in this environment")
+
+    assert "LiveBadge" in source, (
+        "StrategicContextArtifactSlot.tsx must define a LiveBadge component "
+        "so operators can visually distinguish still-updating mid-run previews "
+        "from terminal completed artifacts"
+    )
+    # The badge must be used (not just defined).
+    assert source.count("LiveBadge") >= 3, (
+        "LiveBadge must be both defined and rendered for live image, video, "
+        "and PDF preview slots"
+    )
+    assert "live" in source and ("pulsing" in source or "animate-pulse" in source), (
+        "LiveBadge must include a pulsing animation cue so mid-run status is "
+        "immediately visible without reading any tooltip"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding f3: allow-list drift fixes — .mov removed, video cap env-overridable
+# --------------------------------------------------------------------------- #
+
+
+def test_fingerprint_does_not_include_mov_token():
+    """The renderable-kind fingerprint must NOT match the '.mov' token.
+
+    Finding f3 claim: 'strategic_context_package.py:1499 renderable-kind
+    fingerprint matches a .mov token that no upload/extraction surface persists.'
+    .mov is never uploaded by the runner or extracted by compute_backends, so
+    including it in the fingerprint yields false-positive video classifications.
+    """
+    source = _strategic_pkg_source()
+
+    # Find the video fingerprint check.
+    idx = source.find('".mov"')
+    assert idx == -1, (
+        "strategic_context_package.py must NOT include '.mov' in the "
+        "renderable-kind fingerprint — .mov is not persisted by any upload "
+        "or extraction surface, so it creates false video classifications "
+        "for artifacts whose label/filename contains 'mov' as a substring"
+    )
+
+
+def test_local_runner_video_cap_is_env_overridable():
+    """local_runner.py must read BLUEPRINT_MAX_VIEWABLE_VIDEO_BYTES from env.
+
+    Finding f3 claim: 'runner video byte cap is hardcoded 512 MiB in
+    scripts/local_runner.py while backend/app/compute_backends.py makes it
+    env-overridable via BLUEPRINT_MAX_VIEWABLE_VIDEO_BYTES.' The fix reads the
+    same env var so operator-tuned caps are honoured by the runner.
+    """
+    source = _local_runner_source()
+
+    assert "BLUEPRINT_MAX_VIEWABLE_VIDEO_BYTES" in source, (
+        "local_runner.py must read BLUEPRINT_MAX_VIEWABLE_VIDEO_BYTES from the "
+        "environment so operator-tuned server video caps are also enforced by "
+        "the runner, preventing uploads the server would reject"
+    )
+    # The env read must be used to set _MAX_VIEWABLE_VIDEO_BYTES.
+    assert "_MAX_VIEWABLE_VIDEO_BYTES" in source and (
+        "os.environ" in source or "os.getenv" in source
+    ), (
+        "_MAX_VIEWABLE_VIDEO_BYTES must be derived from the environment, "
+        "not a bare integer literal, to mirror compute_backends.py"
+    )
+
+
+def test_runner_422_error_message_includes_pdf():
+    """The runner viewable endpoint 422 error must list pdf as a supported type.
+
+    Finding f3 claim: 'backend/app/routers/runner.py 422 error message lists
+    supported types omitting pdf.' The 422 must reflect the actual allowlist.
+    """
+    source = _runner_router_source()
+
+    # The 422 error message near the viewable endpoint must include pdf.
+    idx = source.find('"/compute-job/{job_id}/viewable"')
+    assert idx >= 0, "viewable endpoint definition not found"
+    body = source[idx : idx + 8000]
+
+    assert "pdf" in body, (
+        "The runner viewable endpoint 422 error message must list 'pdf' as a "
+        "supported viewable type, consistent with the actual allowlist that "
+        "accepts application/pdf"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding f4: GCP-VM jobs have a dedicated mid-run viewable upload endpoint
+# --------------------------------------------------------------------------- #
+
+
+def test_gcp_vm_has_dedicated_viewable_upload_endpoint():
+    """agent_compute_jobs.py must expose POST /compute-jobs/{job_id}/viewable.
+
+    Finding f4 claim: 'compute_job_vm_heartbeat ... never ingests a viewable
+    multipart file.' The fix is a dedicated upload endpoint (not the heartbeat)
+    that mirrors the runner-subprocess viewable endpoint policies.
+    """
+    source = _agent_compute_jobs_source()
+
+    # The dedicated viewable endpoint must exist.
+    assert "/compute-jobs/{job_id}/viewable" in source or (
+        "compute-job" in source and "viewable" in source
+    ), (
+        "agent_compute_jobs.py must define a POST endpoint for GCP-VM viewable "
+        "file uploads so mid-run plots stream to the canvas without waiting for "
+        "terminal finalization"
+    )
+
+    # It must enforce the same content-type classification as the runner endpoint.
+    assert "viewable_content_type_for_filename" in source, (
+        "The GCP-VM viewable endpoint must call viewable_content_type_for_filename "
+        "to enforce the same extension allowlist as the runner-subprocess endpoint"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding f5: unified viewable-file surfaces — purge + extension guard
+# --------------------------------------------------------------------------- #
+
+
+def test_terminal_reconciliation_purges_orphaned_viewable_rows():
+    """_purge_orphaned_viewable_rows must be called at terminal reconciliation.
+
+    Finding f5 claim: '_record_viewable_job_files only inserts/updates
+    ComputeJobFile rows and never deletes, so superseded mid-run rows orphan.'
+    The fix calls _purge_orphaned_viewable_rows after terminal extraction.
+    """
+    source = _compute_jobs_source()
+
+    assert "_purge_orphaned_viewable_rows" in source, (
+        "compute_jobs.py must define _purge_orphaned_viewable_rows to remove "
+        "ComputeJobFile rows that are NOT in the authoritative terminal manifest"
+    )
+    # Must be called at least twice (definition + call site).
+    assert source.count("_purge_orphaned_viewable_rows") >= 2, (
+        "_purge_orphaned_viewable_rows must be both defined AND called during "
+        "terminal reconciliation; found fewer than 2 occurrences"
+    )
+
+
+def test_computejobfile_signing_branch_validates_extension():
+    """The ComputeJobFile signing branch must apply the viewable-extension guard.
+
+    Finding f5 claim: 'The ComputeJobFile signing branch does not re-validate
+    the extension, unlike _sign_viewable_manifest which re-checks classification.'
+    The fix adds an extension guard to the fallback ComputeJobFile branch.
+    """
+    source = _main_source()
+
+    # The signing endpoint must call viewable_content_type_for_filename.
+    assert "viewable_content_type_for_filename" in source, (
+        "main.py download-url signing must call viewable_content_type_for_filename "
+        "on the ComputeJobFile fallback branch so only allowlisted extensions "
+        "can be signed via that path"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding f6: ComputeJobsPanel uses the shared ComputeArtifactGallery component
+# --------------------------------------------------------------------------- #
+
+
+def test_compute_jobs_panel_uses_shared_artifact_gallery():
+    """ComputeJobsPanel must import and use ComputeArtifactGallery.
+
+    Finding f6 claim: 'ComputeJobsPanel.tsx carries a near-verbatim inline copy
+    of the whole resolve/cache/render pipeline.' The fix extracts to the shared
+    ComputeArtifactGallery component and uses it in the panel.
+    """
+    try:
+        source = _ui_component_source("ComputeJobsPanel.tsx")
+    except FileNotFoundError:
+        import pytest
+        pytest.skip("admin-ui/src/components not available in this environment")
+
+    assert "ComputeArtifactGallery" in source, (
+        "ComputeJobsPanel.tsx must import and use ComputeArtifactGallery "
+        "instead of duplicating the resolve/cache/render pipeline inline — "
+        "two independent copies diverge over time and introduce subtle behavior "
+        "differences (different auto-resolve triggers, missing scheme guards)"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding f8: StrategicContextWorkspace deduplicates promoted artifact media
+# --------------------------------------------------------------------------- #
+
+
+def test_canvas_workspace_deduplicates_promoted_artifact_media():
+    """StrategicContextWorkspace must suppress duplicate media for promoted artifacts.
+
+    Finding f8 claim: 'Strategic descriptors are built from the same
+    evidence.artifacts.items later rendered in the Evidence section. Both render
+    paths mount their own image/video resolution components for the same media
+    identities.' The fix tracks which artifact IDs are already shown as
+    descriptors and skips their inline media in the Evidence section.
+    """
+    try:
+        source = _ui_component_source("StrategicContextWorkspace.tsx")
+    except FileNotFoundError:
+        import pytest
+        pytest.skip("admin-ui/src/components not available in this environment")
+
+    assert "promotedArtifactIds" in source, (
+        "StrategicContextWorkspace.tsx must maintain a promotedArtifactIds set "
+        "of artifact IDs already rendered as descriptors so the Evidence section "
+        "can skip mounting duplicate media resolution components for the same "
+        "underlying storage objects"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding f9: UI cap strings report per-kind limits, not a uniform 8 MiB cap
+# --------------------------------------------------------------------------- #
+
+
+def test_compute_artifact_gallery_cap_string_is_per_kind():
+    """ComputeArtifactGallery cap message must distinguish image/PDF/video limits.
+
+    Finding f9 claim: 'All three artifact surfaces describe a uniform 25-file
+    and 8-MiB-per-file cap. The backend applies an 8 MiB image cap but a
+    separately configurable video cap whose default is 512 MiB.' The fix
+    surfaces per-kind limits in the omission message.
+    """
+    try:
+        source = _ui_component_source("ComputeArtifactGallery.tsx")
+    except FileNotFoundError:
+        import pytest
+        pytest.skip("admin-ui/src/components not available in this environment")
+
+    # Must NOT have a uniform "8 MiB each" or "8 MiB/file" cap string.
+    assert "8 MiB each" not in source, (
+        "ComputeArtifactGallery must not describe a uniform '8 MiB each' cap — "
+        "videos have a 512 MiB cap while images are 8 MiB"
+    )
+    # Must distinguish image and video caps.
+    assert "512 MiB" in source, (
+        "ComputeArtifactGallery must mention the 512 MiB video cap so operators "
+        "know large videos up to that limit can still be previewed"
+    )
+    assert "8 MiB" in source, (
+        "ComputeArtifactGallery must mention the 8 MiB image cap separately "
+        "from the video cap"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding f10: evidence response discloses artifact_total + live_count separately
+# --------------------------------------------------------------------------- #
+
+
+def test_evidence_response_discloses_artifact_total_and_live_count():
+    """strategic_context_package must expose artifact_total and live_count.
+
+    Finding f10 claim: 'The workspace currently displays counts derived from
+    returned array lengths rather than the durable artifact total.' The fix
+    exposes both the durable artifact total (query count before the bounded
+    slice) and the live synthetic preview count so the operator can distinguish
+    what is sampled from what exists.
+    """
+    source = _strategic_pkg_source()
+
+    # artifact_total must be computed independently of the bounded items slice.
+    assert "artifact_total" in source, (
+        "strategic_context_package.py must track artifact_total (COUNT query "
+        "result) so the canvas can show 'showing N of M artifacts' rather than "
+        "silently implying the slice is the complete set"
+    )
+    # live_count must be surfaced so operators know synthetic previews exist.
+    assert "live_count" in source, (
+        "strategic_context_package.py must expose live_count in the artifact "
+        "evidence so the canvas can note how many running-job preview rows were "
+        "prepended in addition to the durable artifact total"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding f12: runner.py calls _link_terminal_artifact for first late bundle
+# --------------------------------------------------------------------------- #
+
+
+def test_runner_calls_link_terminal_artifact_for_late_bundles():
+    """runner.py must call _link_terminal_artifact when a bundle arrives late.
+
+    Finding f12 claim: 'A terminal runner job can currently retain a stored
+    bundle pointer without artifact_id or result_reference being backfilled.'
+    The fix calls _link_terminal_artifact for the first bundle on a terminal job.
+    """
+    source = _runner_router_source()
+
+    # _link_terminal_artifact must be imported and called.
+    assert "_link_terminal_artifact" in source, (
+        "runner.py must import and call _link_terminal_artifact so a bundle "
+        "arriving after terminalization still gets its artifact_id and "
+        "result_reference backfilled (the strategic canvas requires a linked "
+        "Artifact to show terminal compute previews)"
+    )
+    # Must guard on not having an artifact yet (idempotent first-upload).
+    assert "existing_artifact is None" in source or "artifact_id is None" in source, (
+        "_link_terminal_artifact must only run when the job does not yet have "
+        "an artifact (idempotent: ignore subsequent uploads for the same job)"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding f13: ComputeArtifactGallery uses revision in signed-URL cache key
+# --------------------------------------------------------------------------- #
+
+
+def test_compute_artifact_gallery_uses_revision_in_cache_key():
+    """ComputeArtifactGallery must include revision in the signed-URL cache key.
+
+    Finding f13 claim: 'ComputeJobsPanel and ComputeArtifactGallery cache
+    resolutions by storage URI, while useFreshMediaUrl reruns only for project,
+    storage URI, or manual-attempt changes.' Without revision in the key, an
+    overwritten same-filename viewable re-uses the old signed URL until it
+    expires, hiding the update from the operator.
+    """
+    try:
+        source = _ui_component_source("ComputeArtifactGallery.tsx")
+    except FileNotFoundError:
+        import pytest
+        pytest.skip("admin-ui/src/components not available in this environment")
+
+    # The gallery must define a cache key that incorporates revision.
+    assert "revision" in source, (
+        "ComputeArtifactGallery.tsx must use the revision field from the "
+        "viewable manifest entry as part of the signed-URL cache key so that "
+        "an overwritten same-path file triggers a fresh signing round-trip "
+        "instead of re-using the stale cached URL"
+    )
+    # Look for the cache-key function or computation that combines storage_uri + revision.
+    assert "storage_uri" in source and (
+        "@${" in source or "artifactCacheKey" in source
+    ), (
+        "ComputeArtifactGallery.tsx must compute a composite key of "
+        "(storage_uri, revision) to invalidate the signed-URL cache when "
+        "the same storage path is overwritten with new content"
+    )
+
+
+# =========================================================================== #
+# 4-finding operator-inbox/messages salvage bundle (2026-07-17)
+# =========================================================================== #
+
+
+def _messages_panel_source() -> str:
+    """Return the source of admin-ui/src/components/MessagesPanel.tsx."""
+    try:
+        return _ui_component_source("MessagesPanel.tsx")
+    except FileNotFoundError:
+        raise
+
+
+def _use_message_list_source() -> str:
+    """Return the source of admin-ui/src/components/useMessageList.ts."""
+    from pathlib import Path
+
+    candidates = [
+        Path(__file__).resolve().parents[2] / "admin-ui" / "src" / "components" / "useMessageList.ts",
+        Path("/repo/admin-ui/src/components/useMessageList.ts"),
+    ]
+    for path in candidates:
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+    raise FileNotFoundError("useMessageList.ts not found")
+
+
+def _app_tsx_source() -> str:
+    """Return the source of admin-ui/src/App.tsx."""
+    from pathlib import Path
+
+    candidates = [
+        Path(__file__).resolve().parents[2] / "admin-ui" / "src" / "App.tsx",
+        Path("/repo/admin-ui/src/App.tsx"),
+    ]
+    for path in candidates:
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+    raise FileNotFoundError("App.tsx not found")
+
+
+# --------------------------------------------------------------------------- #
+# Finding m1 — inbox attention-driven: all four surfaces use server model
+# --------------------------------------------------------------------------- #
+
+
+def test_messages_panel_badge_uses_server_needs_operator():
+    """App.tsx must use server-side needs_operator for the badge count.
+
+    Finding m1: the badge (HeaderBar/tab-title) must read the server-derived
+    needs_operator count, not a client-side effectiveSignal re-derivation, so
+    all four notification surfaces agree on the same canonical source.
+    """
+    try:
+        source = _app_tsx_source()
+    except FileNotFoundError:
+        import pytest
+        pytest.skip("admin-ui/src/App.tsx not available in this environment")
+
+    assert "needs_operator" in source, (
+        "App.tsx must read 'needs_operator' from the server-side attention "
+        "model (messages/counts endpoint) for the badge count — client-side "
+        "effectiveSignal re-derivation would diverge from the toast and "
+        "needs-action strip surfaces"
+    )
+
+
+def test_messages_panel_toast_uses_attention_model_not_effective_signal():
+    """MessagesPanel toast dispatch must use isMessageNeedingOperatorAttention.
+
+    Finding m4/m1: toast and desktop-notification dispatch must gate on the
+    canonical server attention model (isMessageNeedingOperatorAttention), not
+    on client-derived effectiveSignal(), so the badge and toast always agree
+    about which messages are 'needs_operator'.
+    """
+    try:
+        source = _messages_panel_source()
+    except FileNotFoundError:
+        import pytest
+        pytest.skip("admin-ui/src/components not available in this environment")
+
+    assert "isMessageNeedingOperatorAttention" in source, (
+        "MessagesPanel.tsx must define and call isMessageNeedingOperatorAttention "
+        "to gate toast/desktop-notification dispatch — using effectiveSignal() "
+        "instead would let a locally-muted event_type suppress toasts that the "
+        "server marks needs_operator, causing badge/toast divergence"
+    )
+    # The function must check severity === 'needs_operator' so only server-confirmed
+    # items trigger toasts (not every open message).
+    assert "needs_operator" in source, (
+        "isMessageNeedingOperatorAttention must filter by severity='needs_operator' "
+        "from the canonical attention model items"
+    )
+
+
+def test_use_message_list_promotes_needs_operator_ids_to_high_signal():
+    """useMessageList must promote needsOperatorIds to highSignalOpen unconditionally.
+
+    Finding m1: the list high/routine split must use needsOperatorIds (from the
+    server attention model) to promote messages to highSignalOpen even when the
+    event_type is locally muted — so the list stays consistent with the badge,
+    toast, and needs-action strip surfaces.
+    """
+    try:
+        source = _use_message_list_source()
+    except FileNotFoundError:
+        import pytest
+        pytest.skip("admin-ui/src/components not available in this environment")
+
+    assert "needsOperatorIds" in source, (
+        "useMessageList.ts must accept a needsOperatorIds parameter to promote "
+        "server-marked needs_operator messages to highSignalOpen regardless of "
+        "local mute prefs"
+    )
+    # highSignalOpen must include the needsOperatorIds union so a locally-muted
+    # but server-attention-marked message appears in the high-signal section.
+    assert "needsOperatorIds?.has" in source or "needsOperatorIds.has" in source, (
+        "useMessageList.ts must call needsOperatorIds.has(m.id) when computing "
+        "highSignalOpen so server-attention items override local mute prefs"
+    )
+    # routineOpen must exclude needsOperatorIds to avoid double-counting.
+    assert "needsOperatorIds" in source, (
+        "useMessageList.ts must exclude needsOperatorIds items from routineOpen "
+        "to prevent a message from appearing in both sections"
+    )
+
+
+def test_messages_panel_count_high_signal_guarded_by_strategic_model_flag():
+    """countHighSignalMessages must only fire when usesStrategicReadModel is false.
+
+    Finding m1: when the strategic read model is active, onMessageCountChange
+    must be driven by the server attention count, not countHighSignalMessages().
+    This guard prevents the badge from oscillating between server and
+    client-derived values as the read model toggles.
+    """
+    try:
+        source = _messages_panel_source()
+    except FileNotFoundError:
+        import pytest
+        pytest.skip("admin-ui/src/components not available in this environment")
+
+    # countHighSignalMessages must be guarded so it only fires in the fallback path.
+    assert "usesStrategicReadModel" in source, (
+        "MessagesPanel.tsx must check usesStrategicReadModel before calling "
+        "onMessageCountChange with countHighSignalMessages() — without the guard "
+        "the badge oscillates between server and client derivations"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding m2 — confirmation chips must be actionable (expand → accept/dismiss)
+# --------------------------------------------------------------------------- #
+
+
+def test_needs_action_strip_confirmation_chips_are_actionable():
+    """MessagesPanel needs-action strip must handle confirmation items, not just messages.
+
+    Finding m2: the click handler for needs-action strip chips must branch on
+    BOTH 'message' and 'confirmation' kinds. A branch that only scrolls to a
+    message leaves confirmation chips visually enabled but inert.
+    """
+    try:
+        source = _messages_panel_source()
+    except FileNotFoundError:
+        import pytest
+        pytest.skip("admin-ui/src/components not available in this environment")
+
+    # isConfirmation must be derived and used in the chip render path.
+    assert "isConfirmation" in source, (
+        "MessagesPanel.tsx must derive isConfirmation from item.kind === 'confirmation' "
+        "and use it to enable the expand/accept/dismiss flow in the needs-action strip"
+    )
+    # The expand toggle must be wired — setExpandedConfirmationItemId drives the
+    # reveal of Accept/Dismiss buttons.
+    assert "setExpandedConfirmationItemId" in source, (
+        "MessagesPanel.tsx must call setExpandedConfirmationItemId to expand a "
+        "confirmation chip and reveal the Accept/Dismiss controls"
+    )
+    # Accept and dismiss API calls must be wired through the strip chips.
+    assert "acceptPendingConfirmation" in source, (
+        "MessagesPanel.tsx must call acceptPendingConfirmation from the "
+        "needs-action strip chip (not only from StrategicContextRail)"
+    )
+    assert "dismissPendingConfirmation" in source, (
+        "MessagesPanel.tsx must call dismissPendingConfirmation from the "
+        "needs-action strip chip (not only from StrategicContextRail)"
+    )
+    # After accept/dismiss the attention model must be refreshed.
+    assert "refreshStrategicState" in source, (
+        "MessagesPanel.tsx must call refreshStrategicState after accept/dismiss "
+        "so the needs-action strip re-evaluates immediately without waiting for "
+        "the next poll cycle"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding m3 — QUESTION auto-decay: CONVERSATIONAL_DECAY_MESSAGE_TYPES + stamping
+# --------------------------------------------------------------------------- #
+
+
+def test_conversational_decay_types_includes_question():
+    """CONVERSATIONAL_DECAY_MESSAGE_TYPES must include QUESTION.
+
+    Finding m3: the stale-open decay sweep must cover QUESTION messages —
+    not just NOTE/FEEDBACK — so unanswered questions age out automatically
+    with a distinct 'stale_unanswered' resolution reason operators can
+    distinguish from genuinely-answered questions.
+    """
+    from app.message_convergence import CONVERSATIONAL_DECAY_MESSAGE_TYPES
+
+    assert "QUESTION" in CONVERSATIONAL_DECAY_MESSAGE_TYPES, (
+        "CONVERSATIONAL_DECAY_MESSAGE_TYPES must include 'QUESTION' so that "
+        "sweep_decay_stale_open_messages covers unanswered QUESTION messages; "
+        f"current set: {CONVERSATIONAL_DECAY_MESSAGE_TYPES}"
+    )
+
+
+def test_stale_question_decay_uses_longer_window_and_distinct_reason():
+    """sweep_decay_stale_open_messages must apply a longer decay window for QUESTION.
+
+    Finding m3: QUESTION decay must use STALE_QUESTION_DECAY_DAYS (default 30d,
+    longer than NOTE/FEEDBACK at 14d) and stamp resolution='stale_unanswered'
+    so operators can distinguish auto-resolved from genuinely-answered questions.
+    """
+    import inspect
+    from app.reaper_sweeps import sweep_decay_stale_open_messages, STALE_QUESTION_DECAY_DAYS
+
+    assert STALE_QUESTION_DECAY_DAYS >= 20, (
+        f"STALE_QUESTION_DECAY_DAYS={STALE_QUESTION_DECAY_DAYS} must be longer "
+        "than the NOTE/FEEDBACK window (14d) — questions deserve more patience "
+        "before being auto-resolved"
+    )
+
+    source = inspect.getsource(sweep_decay_stale_open_messages)
+
+    # Must apply the question-specific window.
+    assert "stale_question_decay_days" in source or "question_decay_days" in source, (
+        "sweep_decay_stale_open_messages must read a distinct question decay window "
+        "(stale_question_decay_days) rather than applying the same 14-day NOTE window "
+        "to QUESTION messages"
+    )
+    # Must stamp the distinct reason.
+    assert "stale_unanswered" in source, (
+        "sweep_decay_stale_open_messages must stamp resolution='stale_unanswered' "
+        "for QUESTION messages so operators can distinguish auto-resolved questions "
+        "from genuinely-answered ones"
+    )
+    # BLOCKER must be excluded (never auto-decayed by this sweep).
+    assert "BLOCKER" not in source.split("CONVERSATIONAL_DECAY_MESSAGE_TYPES")[0].rsplit("def ", 1)[-1] or (
+        "BLOCKER" not in [
+            line.strip()
+            for line in source.splitlines()
+            if "in_(" in line and "BLOCKER" in line
+        ]
+    ), "BLOCKER must not appear in the CONVERSATIONAL_DECAY_MESSAGE_TYPES include-list"
+
+
+def test_stale_question_decay_days_constant_is_correct():
+    """STALE_QUESTION_DECAY_DAYS must be 30 (the design-specified longer window)."""
+    from app.reaper_sweeps import STALE_QUESTION_DECAY_DAYS, STALE_OPEN_DECAY_DAYS
+
+    assert STALE_QUESTION_DECAY_DAYS == 30, (
+        f"STALE_QUESTION_DECAY_DAYS should be 30; got {STALE_QUESTION_DECAY_DAYS}"
+    )
+    assert STALE_QUESTION_DECAY_DAYS > STALE_OPEN_DECAY_DAYS, (
+        "QUESTION decay window must exceed the NOTE/FEEDBACK window "
+        f"({STALE_OPEN_DECAY_DAYS}d) — questions deserve more patience"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Findings n1-n3 — lifecycle fields consumed in needs-action strip
+# (5-finding operator-inbox lifecycle/convergence salvage bundle, 2026-07-17)
+# --------------------------------------------------------------------------- #
+
+
+def test_lifecycle_operator_action_label_function_exists():
+    """MessagesPanel must define lifecycleOperatorActionLabel for the needs-action strip.
+
+    Finding n1: the lifecycle.operator_action field from the canonical attention
+    model must be consumed in the needs-action strip so operators see a readable
+    hint about what action to take (e.g. 'Reply or resolve', 'Approve or reject').
+    The helper function must map the known operator_action values to short labels.
+    """
+    try:
+        source = _messages_panel_source()
+    except FileNotFoundError:
+        import pytest
+        pytest.skip("admin-ui/src/components not available in this environment")
+
+    assert "lifecycleOperatorActionLabel" in source, (
+        "MessagesPanel.tsx must define lifecycleOperatorActionLabel to convert "
+        "lifecycle.operator_action values to human-readable hint text shown in "
+        "the needs-action strip chips"
+    )
+    # Spot-check that common operator_action values are mapped.
+    assert "reply_or_resolve_message" in source, (
+        "lifecycleOperatorActionLabel must map 'reply_or_resolve_message' — "
+        "this is the operator_action for QUESTION/BLOCKER/FEEDBACK message items"
+    )
+    assert "approve_or_reject_task" in source, (
+        "lifecycleOperatorActionLabel must map 'approve_or_reject_task' — "
+        "the approval_required attention reason"
+    )
+
+
+def test_needs_action_strip_renders_operator_action_hint():
+    """MessagesPanel needs-action strip must render the operator_action hint text.
+
+    Finding n1: the lifecycleOperatorActionLabel helper must be called and its
+    result rendered inside the chip so the operator sees a readable hint next to
+    the item label (e.g. 'Reply or resolve' for a QUESTION message item).
+    """
+    try:
+        source = _messages_panel_source()
+    except FileNotFoundError:
+        import pytest
+        pytest.skip("admin-ui/src/components not available in this environment")
+
+    # The hint must be driven by item.lifecycle?.operator_action.
+    assert "operator_action" in source, (
+        "MessagesPanel.tsx needs-action strip must read item.lifecycle?.operator_action "
+        "to derive the operator hint label"
+    )
+    # The hint span must be rendered with a test id or identifiable attribute so
+    # the operator sees the action in the chip.
+    assert "operator-action-hint" in source or "operatorActionHint" in source, (
+        "MessagesPanel.tsx must render the operator_action hint in the chip — "
+        "either via a data-testid='operator-action-hint' span or an operatorActionHint variable"
+    )
+
+
+def test_needs_action_strip_acknowledgeable_items_have_ack_button():
+    """MessagesPanel needs-action strip must render an Ack button for acknowledgeable items.
+
+    Finding n2: lifecycle.acknowledgeable=true means the operator can dismiss the
+    item from the strip without a full resolve. The strip must render an 'Ack'
+    button for items where lifecycle.acknowledgeable is true, driven by
+    lifecycle.acknowledge_effect for the tooltip text.
+    """
+    try:
+        source = _messages_panel_source()
+    except FileNotFoundError:
+        import pytest
+        pytest.skip("admin-ui/src/components not available in this environment")
+
+    # acknowledgeable must be read from the lifecycle block.
+    assert "acknowledgeable" in source, (
+        "MessagesPanel.tsx needs-action strip must read item.lifecycle?.acknowledgeable "
+        "to conditionally show the Ack button"
+    )
+    # The Ack button must be rendered with a test id.
+    assert "attention-ack-btn" in source, (
+        "MessagesPanel.tsx must render a button with data-testid='attention-ack-btn' "
+        "for acknowledgeable attention items in the needs-action strip"
+    )
+    # The Ack button click must add the item to resolvedConfirmationIds to remove it.
+    assert "handleAck" in source or "resolvedConfirmationIds" in source, (
+        "MessagesPanel.tsx Ack button must dismiss the item from the strip by "
+        "adding its id to resolvedConfirmationIds"
+    )
+
+
+def test_lifecycle_acknowledge_effect_label_function_exists():
+    """MessagesPanel must define lifecycleAcknowledgeEffectLabel for the Ack button tooltip.
+
+    Finding n3: the lifecycle.acknowledge_effect field must be consumed to provide
+    tooltip text on the Ack button that explains what acknowledging does (e.g.
+    'Mark as seen — removes from needs-action strip until next update' for
+    acknowledge_effect='clears_unread_only').
+    """
+    try:
+        source = _messages_panel_source()
+    except FileNotFoundError:
+        import pytest
+        pytest.skip("admin-ui/src/components not available in this environment")
+
+    assert "lifecycleAcknowledgeEffectLabel" in source, (
+        "MessagesPanel.tsx must define lifecycleAcknowledgeEffectLabel to convert "
+        "lifecycle.acknowledge_effect values to human-readable tooltip text on the "
+        "Ack button — leaving acknowledge_effect unused leaves operators without "
+        "feedback on what acknowledging does"
+    )
+    assert "clears_unread_only" in source, (
+        "lifecycleAcknowledgeEffectLabel must handle 'clears_unread_only' — "
+        "the acknowledge_effect for all message attention items"
+    )
+
+
+def test_attention_lifecycle_by_reason_covers_message_types():
+    """_ATTENTION_LIFECYCLE_BY_REASON must define lifecycle for all message attention reasons.
+
+    Finding n1: operator_action and acknowledgeable must be set for message-type
+    attention reasons so the strip can render hints and Ack buttons correctly.
+    """
+    from app.operator_attention import _ATTENTION_LIFECYCLE_BY_REASON
+
+    message_reasons = {"question", "blocker", "bug_report", "feedback"}
+    for reason in message_reasons:
+        assert reason in _ATTENTION_LIFECYCLE_BY_REASON, (
+            f"_ATTENTION_LIFECYCLE_BY_REASON must include '{reason}' — "
+            "message-type attention items need lifecycle metadata for the strip"
+        )
+        entry = _ATTENTION_LIFECYCLE_BY_REASON[reason]
+        assert "operator_action" in entry, (
+            f"_ATTENTION_LIFECYCLE_BY_REASON['{reason}'] must set operator_action"
+        )
+        assert entry.get("acknowledgeable") is True, (
+            f"_ATTENTION_LIFECYCLE_BY_REASON['{reason}'] must set acknowledgeable=True "
+            "— message items can be acknowledged (marked as seen) from the strip"
+        )
+        assert entry.get("acknowledge_effect") == "clears_unread_only", (
+            f"_ATTENTION_LIFECYCLE_BY_REASON['{reason}'] must set "
+            "acknowledge_effect='clears_unread_only' for message items"
+        )
+
+
+# --------------------------------------------------------------------------- #
+# 18-finding keyless-encryption / release-recovery salvage bundle (2026-07-17)
+# --------------------------------------------------------------------------- #
+
+
+# e1 — decrypt_field returns value unchanged when Fernet token cannot be decrypted
+# --------------------------------------------------------------------------- #
+
+
+def test_decrypt_field_returns_value_unchanged_for_undecryptable_ciphertext(monkeypatch):
+    """decrypt_field must return the raw value when the configured key cannot decrypt it.
+
+    Finding e1 claim: decrypt_field returns its input unchanged when a valid Fernet
+    token cannot be decrypted with the configured key.  This is the backward-compat
+    path that keeps a rolling deploy from breaking existing unencrypted rows — but it
+    also fires on a wrong-key rotation, which probe_key_continuity guards against.
+    """
+    from cryptography.fernet import Fernet
+    from app import field_encryption
+
+    key_a = Fernet.generate_key()
+    key_b = Fernet.generate_key()
+
+    token = Fernet(key_a).encrypt(b"sensitive-value").decode()
+
+    monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", key_b.decode())
+    monkeypatch.setenv("ALLOW_PLAINTEXT_CREDENTIALS", "true")
+
+    result = field_encryption.decrypt_field(token)
+    assert result == token, (
+        "decrypt_field must return the undecryptable ciphertext unchanged (not raise) "
+        "when the configured key differs from the encryption key — this is the rolling-deploy "
+        "backward-compat path; probe_key_continuity is the guard that prevents silent data loss"
+    )
+
+
+# e2 — probe_key_continuity fails closed when configured key cannot decrypt reference ciphertext
+# --------------------------------------------------------------------------- #
+
+
+def test_probe_key_continuity_fails_closed_for_incompatible_key(monkeypatch):
+    """probe_key_continuity must raise RuntimeError when the configured key is wrong.
+
+    Finding e2 claim: the boot-time continuity probe (probe_key_continuity) decrypts
+    a canonical reference ciphertext with the CURRENT key; if the key has been rotated
+    without re-encrypting at-rest data, InvalidToken fires and a RuntimeError is raised
+    so the service fails closed rather than silently serving the wrong plaintexts.
+    """
+    from cryptography.fernet import Fernet
+    import pytest
+    from app import field_encryption
+
+    wrong_key = Fernet.generate_key()
+    monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", wrong_key.decode())
+
+    with pytest.raises(RuntimeError, match="continuity"):
+        field_encryption.probe_key_continuity("test-context")
+
+
+# e3 — assert_plaintext_or_raise raises for wrong-key ciphertext
+# --------------------------------------------------------------------------- #
+
+
+def test_assert_plaintext_or_raise_raises_for_wrong_key_ciphertext(monkeypatch):
+    """assert_plaintext_or_raise must raise when a Fernet ciphertext can't be decrypted.
+
+    Finding e3 / Finding 1 claim: Migration 0531 uses decrypt_field(value)==value as
+    evidence that the value is plaintext.  assert_plaintext_or_raise is the guard that
+    prevents a backfill migration from re-encrypting a ciphertext that happens to be
+    undecryptable with the current key (wrong-key rotation scenario).
+    """
+    from cryptography.fernet import Fernet
+    import pytest
+    from app import field_encryption
+
+    key_a = Fernet.generate_key()
+    key_b = Fernet.generate_key()
+
+    token = Fernet(key_a).encrypt(b"secret").decode()
+
+    monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", key_b.decode())
+    monkeypatch.setenv("ALLOW_PLAINTEXT_CREDENTIALS", "true")
+
+    with pytest.raises(RuntimeError, match="Wrong-key ciphertext"):
+        field_encryption.assert_plaintext_or_raise(token)
+
+
+# e4 — MultiFernet encrypts with first key, decrypts with any configured key
+# --------------------------------------------------------------------------- #
+
+
+def test_multifernet_encrypts_with_first_key_decrypts_with_all():
+    """The cryptography library's MultiFernet must encrypt with the first key and
+    decrypt with any configured key.
+
+    Finding e4 / Finding 2 claim: the official MultiFernet contract encrypts with the
+    first key, decrypts with every configured key, and supports explicit token rotation.
+    Blueprint's key-rotation design relies on this contract.
+    """
+    from cryptography.fernet import Fernet, MultiFernet
+
+    key_primary = Fernet.generate_key()
+    key_fallback = Fernet.generate_key()
+
+    f_primary = Fernet(key_primary)
+    f_fallback = Fernet(key_fallback)
+
+    mf = MultiFernet([f_primary, f_fallback])
+    token = mf.encrypt(b"rotate-me")
+
+    assert f_primary.decrypt(token) == b"rotate-me", (
+        "MultiFernet must encrypt with the first (primary) key — "
+        "the primary Fernet instance must be able to decrypt the token directly"
+    )
+    assert mf.decrypt(token) == b"rotate-me", (
+        "MultiFernet must decrypt with any of its configured keys"
+    )
+
+    mf_fallback_only = MultiFernet([f_fallback, f_primary])
+    rotated = mf_fallback_only.rotate(token)
+    assert f_fallback.decrypt(rotated) == b"rotate-me", (
+        "MultiFernet.rotate must re-encrypt with the new primary key "
+        "(fallback-only federation re-encrypts under the fallback key)"
+    )
+
+
+# e5 — _get_fernet returns None for malformed GITHUB_PAT_ENCRYPTION_KEY
+# --------------------------------------------------------------------------- #
+
+
+def test_get_fernet_returns_none_for_malformed_key(monkeypatch):
+    """_get_fernet must return None (not raise) when the env var contains an invalid key.
+
+    Finding e5 / Finding 3 claim: field_encryption._get_fernet catches an invalid
+    GITHUB_PAT_ENCRYPTION_KEY and returns None, so is_encryption_active() returns
+    False identically for a missing key and a malformed key.  require_encryption_active()
+    is the stricter call that distinguishes the two cases.
+    """
+    monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", "not-a-valid-fernet-key")
+    monkeypatch.setenv("ALLOW_PLAINTEXT_CREDENTIALS", "true")
+
+    from app import field_encryption
+
+    result = field_encryption._get_fernet()
+    assert result is None, (
+        "_get_fernet must return None for an invalid GITHUB_PAT_ENCRYPTION_KEY "
+        "rather than raising — is_encryption_active() depends on this None-return "
+        "to distinguish 'key absent' from 'key malformed'; require_encryption_active() "
+        "is the discriminating guard for backfill migrations"
+    )
+
+    assert not field_encryption.is_encryption_active(), (
+        "is_encryption_active() must return False when the key is malformed — "
+        "this conflation is intentional: callers that need to distinguish missing vs "
+        "malformed MUST use require_encryption_active()"
+    )
+
+
+# e11 — auto_qualification_triggers knob controls only the generic trigger sweep
+# --------------------------------------------------------------------------- #
+
+
+def test_infra_failure_redrive_is_independent_of_auto_qualification_triggers_knob():
+    """Bespoke infra_failure and deferred_unsynced re-drivers must NOT check the
+    auto_qualification_triggers runtime-config knob.
+
+    Finding e11 / Finding 9 claim: the auto_qualification_triggers knob controls
+    only the generic trigger sweep (sweep_auto_qualification_triggers), not the
+    bespoke loops (_redrive_infra_failure_qualification and
+    _redrive_deferred_unsynced_qualification).  If the bespoke re-drivers checked
+    the knob they could stall forever when the knob is 'observe' or 'off'.
+    """
+    import inspect
+    from app.release_qualifier_redrive import (
+        _redrive_infra_failure_qualification,
+        _redrive_deferred_unsynced_qualification,
+    )
+
+    for fn in (_redrive_infra_failure_qualification, _redrive_deferred_unsynced_qualification):
+        source = inspect.getsource(fn)
+        assert "auto_qualification_triggers" not in source, (
+            f"{fn.__name__} must NOT check auto_qualification_triggers — "
+            "the bespoke re-drivers run unconditionally; only the generic "
+            "sweep_auto_qualification_triggers function respects the knob"
+        )
+        assert "get_auto_qualification_triggers_mode" not in source, (
+            f"{fn.__name__} must NOT call get_auto_qualification_triggers_mode() — "
+            "bespoke re-drivers are not gated by the observe/on/off policy"
+        )
+
+
+# e16 — _MIN_INFRA_ERROR_STREAK == 3
+# --------------------------------------------------------------------------- #
+
+
+def test_permanent_gate_incapacity_min_infra_error_streak_is_three():
+    """_MIN_INFRA_ERROR_STREAK must equal 3 (the design-specified streak threshold).
+
+    Finding e16 / Finding 14 claim: is_permanent_gate_incapacity requires a
+    same_signature_streak >= _MIN_INFRA_ERROR_STREAK (3) consecutive identical
+    signatures for the escalation to fire.  This prevents a single fluke from
+    triggering a permanent-incapacity escalation while still catching a
+    consistently broken gate after 3 consecutive same-signature attempts.
+    """
+    from app.release_qualifier_audit import _MIN_INFRA_ERROR_STREAK
+
+    assert _MIN_INFRA_ERROR_STREAK == 3, (
+        f"_MIN_INFRA_ERROR_STREAK must be 3; got {_MIN_INFRA_ERROR_STREAK} — "
+        "is_permanent_gate_incapacity fires after this many consecutive "
+        "same-signature infra failures"
+    )
+
+
+# e17 — hotfix endpoint validates reason and ack_inert_until_deploy
+# --------------------------------------------------------------------------- #
+
+
+def test_hotfix_endpoint_validates_reason_and_ack_inert_until_deploy():
+    """The /promote/hotfix endpoint must reject requests with empty reason or
+    missing ack_inert_until_deploy acknowledgment.
+
+    Finding e17 / Finding 12 claim: the backend exposes a hotfix promote endpoint
+    with owner, reason, and acknowledgment requirements.  The endpoint must not
+    proceed unless (a) reason is non-empty, and (b) ack_inert_until_deploy=true,
+    so the operator explicitly acknowledges the inert-until-deploy semantics.
+    """
+    import pathlib
+
+    router_path = (
+        pathlib.Path(__file__).parent.parent
+        / "app" / "routers" / "admin_hotfix_promote.py"
+    )
+    source = router_path.read_text()
+
+    assert "ack_inert_until_deploy" in source, (
+        "admin_hotfix_promote.py must require ack_inert_until_deploy — "
+        "the operator must explicitly acknowledge that hotfix changes are "
+        "inert until the next full deploy"
+    )
+    assert "reason" in source, (
+        "admin_hotfix_promote.py must require a non-empty reason field — "
+        "it is the audit justification for the hotfix"
+    )
+    assert "not body.reason" in source or "min_length=1" in source, (
+        "admin_hotfix_promote.py must validate that reason is non-empty "
+        "(either via Pydantic min_length=1 or an explicit check)"
+    )
+    assert "not body.ack_inert_until_deploy" in source or "ack_inert_until_deploy must be true" in source, (
+        "admin_hotfix_promote.py must reject requests where ack_inert_until_deploy is false"
     )

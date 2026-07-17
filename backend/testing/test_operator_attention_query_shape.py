@@ -7,11 +7,15 @@ import uuid
 import pytest
 from sqlalchemy.dialects import postgresql
 
+from app.message_audience import OPERATOR_ACTION_NEEDED
+from app.message_convergence import RESOLVED_STATUS, derive_needs_action
 from app.models import (
     Alert,
     AlertSeverity,
+    MessageType,
     Project,
     ProjectMember,
+    ProjectMessage,
     Task,
     TaskStatus,
 )
@@ -140,3 +144,42 @@ async def test_strategist_internal_alerts_excluded_from_operator_attention(db_se
     assert message_counts["active_alerts"] == 2, (
         "badge count excludes both strategist-internal alerts"
     )
+
+
+def _pm(*, message_type: MessageType, status: str = "open", context: dict | None = None) -> ProjectMessage:
+    msg = ProjectMessage(
+        project_id=uuid.uuid4(),
+        from_type="agent",
+        message_type=message_type,
+        status=status,
+        body="test",
+        context=context or {},
+    )
+    return msg
+
+
+def test_derive_needs_action_single_source_of_truth():
+    """derive_needs_action is the single predicate for operator needs-action:
+    QUESTION/BLOCKER open → True; resolved → False; audience-routed open → True;
+    NOTE/FEEDBACK → False; audience-routed but resolved → False.
+    """
+    assert derive_needs_action(_pm(message_type=MessageType.QUESTION)) is True
+    assert derive_needs_action(_pm(message_type=MessageType.BLOCKER)) is True
+    assert (
+        derive_needs_action(_pm(message_type=MessageType.QUESTION, status=RESOLVED_STATUS))
+        is False
+    )
+    assert (
+        derive_needs_action(_pm(message_type=MessageType.BLOCKER, status=RESOLVED_STATUS))
+        is False
+    )
+    assert derive_needs_action(_pm(message_type=MessageType.NOTE)) is False
+    assert derive_needs_action(_pm(message_type=MessageType.FEEDBACK)) is False
+    # Audience-routed action messages (non-QUESTION/BLOCKER type) are also needs-action.
+    assert derive_needs_action(
+        _pm(message_type=MessageType.NOTE, context={"audience": OPERATOR_ACTION_NEEDED})
+    ) is True
+    # But not when resolved.
+    assert derive_needs_action(
+        _pm(message_type=MessageType.NOTE, status=RESOLVED_STATUS, context={"audience": OPERATOR_ACTION_NEEDED})
+    ) is False

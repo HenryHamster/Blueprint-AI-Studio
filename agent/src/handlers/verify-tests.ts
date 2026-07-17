@@ -480,14 +480,14 @@ async function attachDeclaredBuildProbe(
 const MAX_DOCUMENTED_COMMAND_RUNS = MAX_DOCUMENTED_COMMANDS;
 
 // Filter detected runners to only those in directories touched by the PR diff.
-// Root runners (cwd == workspace root) always run. Falls back to all runners
-// when diff is null (unavailable) or when every runner would be filtered out.
+// Root runners (cwd == workspace root) always run. Authoritative empty/root-only
+// diffs never expand back to unrelated directory runners.
 function filterRunnersByDiff(
   runners: TestRunner[],
   diff: PrDiff | null,
   ws: WebSocket | null,
 ): TestRunner[] {
-  if (!diff || diff.changedFiles.length === 0) return runners;
+  if (!diff) return [];
   const changedDirs = new Set(diff.changedFiles.map(f => f.split('/')[0]));
   // Use the env var directly so this works correctly even when the module-level
   // WORKSPACE constant has been overridden in test environments.
@@ -497,7 +497,6 @@ function filterRunnersByDiff(
     // Root runners (path '') always run; directory runners run only when touched.
     return relDir === '' || changedDirs.has(relDir.split('/')[0]);
   });
-  if (filtered.length === 0) return runners;
   const skipped = runners.filter(r => !filtered.includes(r));
   if (skipped.length > 0) {
     sendLog(ws, `Diff-aware runner filter: skipping ${skipped.map(r => r.label).join(', ')} (no files changed in their directories).\n`);
@@ -509,7 +508,8 @@ function filterRunnersByDiff(
 // both diff-aware probes (documented-command + newly-disabled-tests) share a
 // single pair of `git diff` passes. Three-dot diff uses the merge-base, so only
 // the PR's own additions count. Returns null when the base ref is unavailable or
-// the diff can't be computed — callers then degrade silently (omit their field).
+// the diff can't be computed. Callers that need runner scoping must fail safely
+// instead of expanding an unknown diff to every configured stack.
 async function computePrDiff(
   ws: WebSocket | null,
   baseBranch: string,
@@ -517,9 +517,20 @@ async function computePrDiff(
   const baseRef = `origin/${baseBranch}`;
   const addedLinesByFile: Record<string, string[]> = {};
   try {
-    // Early health check: verify git and base ref are available before computing full diff.
-    // Fails fast if the repo is not properly initialized (e.g., shallow clone without origin).
-    await execFileAsync('git', ['rev-parse', baseRef], { cwd: WORKSPACE, timeoutMs: GENERIC_PROBE_TIMEOUT });
+    // Cold role clones only fetch the PR head. Establish the authoritative base
+    // explicitly before runner filtering; otherwise a backend-only PR silently
+    // expands to every configured stack on every fresh verify VM.
+    try {
+      await execFileAsync('git', ['rev-parse', '--verify', baseRef], { cwd: WORKSPACE, timeoutMs: GENERIC_PROBE_TIMEOUT });
+    } catch {
+      sendLog(ws, `Diff-aware probe: ${baseRef} is missing — fetching the authoritative base ref.\n`);
+      await execFileAsync(
+        'git',
+        ['fetch', 'origin', `+refs/heads/${baseBranch}:refs/remotes/origin/${baseBranch}`],
+        { cwd: WORKSPACE, timeoutMs: GENERIC_PROBE_TIMEOUT },
+      );
+      await execFileAsync('git', ['rev-parse', '--verify', baseRef], { cwd: WORKSPACE, timeoutMs: GENERIC_PROBE_TIMEOUT });
+    }
 
     const namesOut = await execFileAsync('git', ['diff', '--name-only', `${baseRef}...HEAD`], { cwd: WORKSPACE, timeoutMs: GENERIC_PROBE_TIMEOUT });
     const changedFiles = namesOut.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
@@ -543,8 +554,8 @@ async function computePrDiff(
       if (currentFile) (addedLinesByFile[currentFile] ??= []).push(line);
     }
     return { changedFiles, addedLines, addedLinesByFile };
-  } catch {
-    sendLog(ws, `Diff-aware probe: could not compute PR diff against ${baseRef} — skipping (fall-open).\n`);
+  } catch (error) {
+    sendLog(ws, `Diff-aware probe: could not establish authoritative diff provenance against ${baseRef}: ${error instanceof Error ? error.message : String(error)}.\n`);
     return null;
   }
 }
@@ -1104,20 +1115,33 @@ export async function handleVerifyTests(
     });
   } else {
     // Compute the PR diff early so we can filter runners to only the directories
-    // touched by this PR. Fall back to all runners when the diff is unavailable.
+    // touched by this PR. Unknown provenance must never expand to all runners:
+    // that turns a backend-only PR into three unrelated, timeout-prone suites.
     earlyPrDiff = await computePrDiff(ws, baseBranch);
+    if (!earlyPrDiff) {
+      sendLog(ws, '\nCould not establish authoritative PR diff provenance — refusing to run an unscoped all-stack test gate.\n');
+      statusRef.value = 'Running cheap acceptance probe (PR diff unavailable)...';
+      await postVerifySetupFailure(taskId, owner, repo, ws,
+        `Could not establish authoritative PR diff against origin/${baseBranch}; refusing to run an unscoped all-stack test gate.`, buildConfig);
+      return;
+    }
     const activeRunners = filterRunnersByDiff(runners, earlyPrDiff, ws);
+    if (activeRunners.length === 0) {
+      sendLog(ws, 'Authoritative PR diff matches no configured test stack — refusing to run unrelated runners.\n');
+      statusRef.value = 'Running cheap acceptance probe (no matching test stack)...';
+      await postVerifySetupFailure(taskId, owner, repo, ws,
+        'No configured test runner matches the authoritative PR diff; refusing to run unrelated stacks.', buildConfig);
+      return;
+    }
     sendLog(ws, `Detected test runner(s): ${activeRunners.map(r => r.label).join(', ')}\n`);
     statusRef.value = 'Running detected test suite...';
     // Compute changed-line counts from the PR diff for diff-aware coverage
     // measurement.  Null-safe: without the diff, total-coverage is used.
-    const changedLineCounts = earlyPrDiff
-      ? Object.fromEntries(
-          Object.entries(earlyPrDiff.addedLinesByFile).map(
-            ([f, lines]) => [f, lines.length],
-          ),
-        )
-      : undefined;
+    const changedLineCounts = Object.fromEntries(
+      Object.entries(earlyPrDiff.addedLinesByFile).map(
+        ([f, lines]) => [f, lines.length],
+      ),
+    );
     // Single no-fix run: maxFixAttempts 0 means testFixLoop runs each runner
     // once and returns a verdict without ever invoking Claude to repair code.
     const loop = await runVerifyLoop(

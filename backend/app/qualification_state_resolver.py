@@ -716,11 +716,9 @@ def resolve_dimension_states(
     return result
 
 
-# Dimensions the QualificationDimensionResult ledger writes (11 total, 11 of which
-# overlap with the 14 UI dimensions). The 3 UI-only dimensions NOT in the ledger
-# (criterion_coverage, goal_alignment, env_preflight) must still be derived from
-# the blob — env_preflight (Slice 3) is blob-only until the Slice-5 M0 alignment
-# promotes it to a per-(candidate_sha, dimension) ledger dimension.
+# Dimensions the QualificationDimensionResult ledger writes (12 total, 12 of which
+# overlap with the 14 UI dimensions). The 2 UI-only dimensions NOT in the ledger
+# (criterion_coverage, goal_alignment) must still be derived from the blob.
 # Sourced from the canonical dimension registry (see qualification_dimensions).
 _LEDGER_DIMENSION_KEYS: frozenset[str] = LEDGER_DIMENSION_KEYS
 
@@ -748,6 +746,7 @@ def _ledger_status_to_ui(
     valid and no hard blocker fired. The blob resolver has always displayed such
     positive audit scores as passed/scored; preserve that operator-facing meaning
     instead of painting a 0.96 audit red.
+
     """
     if status == "blocked":
         return "failed"
@@ -769,11 +768,11 @@ async def resolve_dimension_states_from_ledger(
     """Resolve per-dimension qualification state from the QualificationDimensionResult ledger.
 
     When ledger rows exist for the version's current ``candidate_sha``, derive
-    dimension states from the ledger for the 11 overlapping dimensions (audit,
+    dimension states from the ledger for the 12 overlapping dimensions (audit,
     test_erosion, smoketest, ci, migration_identity, migration_apply, merge_grade,
-    debt_pressure, capability_proof, challenge, acceptance_window) plus the
-    synchronous blob derivation for the 3 dimensions the ledger does not write
-    (criterion_coverage, goal_alignment, env_preflight). When no ledger rows exist for this
+    debt_pressure, capability_proof, challenge, acceptance_window, env_preflight)
+    plus the synchronous blob derivation for the 2 dimensions the ledger does not
+    write (criterion_coverage, goal_alignment). When no ledger rows exist for this
     candidate SHA, fall back entirely to the original
     :func:`resolve_dimension_states` (pure, from ``last_qualification``).
 
@@ -825,8 +824,8 @@ async def resolve_dimension_states_from_ledger(
             return resolve_dimension_states(version.last_qualification)
 
     # Start with the full blob-derived state (all 14 dimensions). Then overwrite
-    # the 11 ledger-backed dimensions with ledger data. The 3 blob-only dimensions
-    # (criterion_coverage, goal_alignment, env_preflight) are preserved from the blob.
+    # the 12 ledger-backed dimensions with ledger data. The 2 blob-only dimensions
+    # (criterion_coverage, goal_alignment) are preserved from the blob.
     result = resolve_dimension_states(version.last_qualification)
     ledger_map = {row.dimension: row for row in rows}
 
@@ -877,6 +876,7 @@ async def resolve_dimension_states_from_ledger(
                 # stale prior-attempt fact cannot contradict the active state.
                 if key in _MUTABLE_DIMENSION_KEYS and currency == "reused":
                     entry["provenance"] = provenance
+
                     continue
 
                 entry["status"] = _ledger_status_to_ui(

@@ -270,15 +270,34 @@ async def _sweep_stranded_sidecar_sources() -> None:
 
             retried = 0
             cleared = 0
+            # Batch-fetch terminal status for all pending sidecars in one query
+            # instead of N individual session.get calls.
+            _terminal_statuses = {
+                TaskStatus.COMPLETED,
+                TaskStatus.FAILED,
+                TaskStatus.CANCELLED,
+            }
+            _all_sidecar_uuids = [su for _, _, su in _pending_sources]
+            _terminal_sidecar_ids: set = set()
+            if _all_sidecar_uuids:
+                _terminal_rows = (
+                    await session.execute(
+                        select(Task.id).where(
+                            Task.id.in_(_all_sidecar_uuids),
+                            Task.status.in_(list(_terminal_statuses)),
+                        )
+                    )
+                ).scalars().all()
+                _terminal_sidecar_ids = set(_terminal_rows)
             for _source_id, marker, sidecar_uuid in _pending_sources:
+                if sidecar_uuid not in _terminal_sidecar_ids:
+                    continue
+                # Re-fetch via session.get so the object is fresh after any
+                # prior rollback (rollbacks expire all cached ORM instances).
                 sidecar = await session.get(
                     Task, sidecar_uuid, populate_existing=True
                 )
-                if sidecar is None or sidecar.status not in {
-                    TaskStatus.COMPLETED,
-                    TaskStatus.FAILED,
-                    TaskStatus.CANCELLED,
-                }:
+                if sidecar is None or sidecar.status not in _terminal_statuses:
                     continue
                 logger.warning(
                     "[SIDECAR-RECOVERY] Source %s has unapplied side-car verdict "

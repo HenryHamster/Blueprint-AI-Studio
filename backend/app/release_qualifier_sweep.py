@@ -588,6 +588,8 @@ async def _reconcile_if_criterion_coverage_now_complete(
     from app import github, release_qualifier
     from app.acceptance_criteria import (
         backfill_direction_merge_evidence,
+        backfill_rollup_child_changed_files,
+        backfill_unverified_merge_evidence,
         direction_matches_criterion_release_version,
         get_version_coverage_summary,
         record_acceptance_window_coverage_evidence,
@@ -659,6 +661,18 @@ async def _reconcile_if_criterion_coverage_now_complete(
                         if dkeys & set(uncovered_with_mapping):
                             keys_to_backfill.add(direction.direction_key)
                     for dk in keys_to_backfill:
+                        # Rollup-child changed-files reconcile and unverified-merge
+                        # backfill run BEFORE direction merge evidence, matching the
+                        # admin reconcile endpoint ordering: rollup children newly
+                        # stamped here are picked up by the unverified-merge pass
+                        # within the SAME sweep cycle, and both populate the evidence
+                        # pool that direction merge evidence then reflects.
+                        await backfill_rollup_child_changed_files(
+                            session, version.project_id, direction_key=dk
+                        )
+                        await backfill_unverified_merge_evidence(
+                            session, version.project_id, direction_key=dk
+                        )
                         await backfill_direction_merge_evidence(
                             session, version.project_id, dk
                         )

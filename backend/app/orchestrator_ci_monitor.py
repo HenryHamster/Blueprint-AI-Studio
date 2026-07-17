@@ -1929,7 +1929,16 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
                         "fail", ci_loop.get("verify_tests_output", "")
                     )
                 elif not _v_task_id:
-                    # First encounter: spawn verify_tests on PR head.
+                    if not need_pr_fetch:
+                        ci_loop["polls_since_pr_fetch"] = 999
+                        ci_loop["ci_poll_interval"] = min(ci_poll_interval, 30)
+                        ci_loop["ci_last_polled"] = _utcnow().isoformat()
+                        ci_task.latest_status_message = f"PR #{ci_pr_number} — refreshing live PR state before detected-test spawn"
+                        ci_task.context = {**(ci_task.context or {}), "review_loop": ci_loop}
+                        flag_modified(ci_task, "context")
+                        session.add(ci_task)
+                        await session.commit()
+                        continue                    # First encounter: spawn verify_tests on PR head.
                     _v_branch = _resolve_ci_fix_branch(
                         ci_loop, ci_task.first_payload, pr_data
                     )

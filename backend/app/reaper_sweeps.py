@@ -2843,10 +2843,10 @@ async def sweep_refresh_project_compute_images(
     else:
         build_semaphore = _build_semaphore
 
-    project_ids = (
+    _prefetched_projects = (
         (
             await session.execute(
-                select(Project.id)
+                select(Project)
                 .where(
                     Project.github_owner.is_not(None),
                     Project.github_repo.is_not(None),
@@ -2857,6 +2857,8 @@ async def sweep_refresh_project_compute_images(
         .scalars()
         .all()
     )
+    # Extract IDs as plain scalars so they survive a session rollback below.
+    project_ids = [p.id for p in _prefetched_projects]
 
     summary = {
         "projects": 0,
@@ -2872,9 +2874,10 @@ async def sweep_refresh_project_compute_images(
         summary["projects"] += 1
         try:
             # A prior project's failed driver may roll back the shared session,
-            # expiring every loaded ORM instance. Load each project only when it
-            # is about to run so one rollback cannot make the remaining loop
-            # trigger synchronous lazy I/O (MissingGreenlet).
+            # expiring ORM instances. session.get() returns the already-loaded
+            # project from the identity map (no extra round-trip) unless a
+            # rollback expired it, in which case it re-fetches — preserving
+            # the same isolation guarantee as the prior IDs-only approach.
             project = await session.get(Project, project_id)
             if project is None:
                 summary["errors"] += 1

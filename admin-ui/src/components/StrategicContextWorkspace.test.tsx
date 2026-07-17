@@ -684,4 +684,60 @@ describe('StrategicContextWorkspace', () => {
     expect(artifactsSection).not.toBeNull();
     expect(artifactsSection?.querySelector('[data-testid="strategic-artifact-viewable-previews"]')).toBeNull();
   });
+
+  test('evidence section shows durable total count when available items equal total', () => {
+    // STATE fixture has total:1 for both knowledge and artifacts, items.length=1 each → total=2.
+    const { host } = mount();
+    const evidenceSection = host.querySelector('[data-testid="strategic-context-workspace-evidence"]');
+    expect(evidenceSection).not.toBeNull();
+    // No truncation marker — displayed count equals total.
+    expect(evidenceSection?.textContent).not.toContain('showing');
+    expect(evidenceSection?.textContent).not.toContain('of');
+  });
+
+  test('evidence section shows "showing N of M" when durable total exceeds rendered items', () => {
+    const contextPackage = STATE.context_package!;
+    const stateWithTruncation = {
+      ...STATE,
+      context_package: {
+        ...contextPackage,
+        evidence: {
+          knowledge: {
+            total: 10,
+            pending_count: 0,
+            items: contextPackage.evidence!.knowledge!.items,
+          },
+          artifacts: {
+            total: 25,
+            items: contextPackage.evidence!.artifacts!.items,
+          },
+        },
+      },
+    } as StrategicStateResponse;
+
+    const { host } = mount({ state: stateWithTruncation });
+    const evidenceSection = host.querySelector('[data-testid="strategic-context-workspace-evidence"]');
+    expect(evidenceSection).not.toBeNull();
+    // knowledge.items.length(1) + artifacts.items.length(1) = 2 displayed; total = 10+25 = 35.
+    expect(evidenceSection?.textContent).toContain('showing 2 of 35');
+  });
+
+  test('evidence section shows live count alongside total when running jobs present', () => {
+    const contextPackage = STATE.context_package!;
+    const stateWithLive = {
+      ...STATE,
+      context_package: {
+        ...contextPackage,
+        evidence: {
+          knowledge: { total: 1, items: contextPackage.evidence!.knowledge!.items },
+          artifacts: { total: 3, live_count: 2, items: contextPackage.evidence!.artifacts!.items },
+        },
+      },
+    } as StrategicStateResponse;
+
+    const { host } = mount({ state: stateWithLive });
+    const evidenceSection = host.querySelector('[data-testid="strategic-context-workspace-evidence"]');
+    expect(evidenceSection).not.toBeNull();
+    expect(evidenceSection?.textContent).toContain('2 live');
+  });
 });

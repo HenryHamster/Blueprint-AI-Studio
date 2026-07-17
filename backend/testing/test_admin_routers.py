@@ -19536,6 +19536,98 @@ class TestModifyTaskApplySeam:
         assert "requires_approval" in result
 
     @pytest.mark.asyncio
+    async def test_admin_cancel_persists_provenance_and_cascades_dependents(
+        self, db_session
+    ):
+        """Manual cancellation is durable and cannot become AGENT_TIMEOUT later."""
+        from fastapi import BackgroundTasks
+
+        from app.admin_helpers import modify_task_apply
+        from app.failure_classification import (
+            ADMIN_CANCEL,
+            classify_failure,
+            is_non_death_cancellation,
+        )
+        from app.models import TaskHistory
+
+        project = await _make_project(db_session)
+        task = await self._make_task(db_session, project.id, TaskStatus.IN_PROGRESS)
+        child = Task(
+            project_id=project.id,
+            parent_task_id=task.id,
+            title="Active child",
+            status=TaskStatus.IN_PROGRESS,
+            created_by="ORCHESTRATOR",
+        )
+        dependent = Task(
+            project_id=project.id,
+            title="Waiting dependent",
+            status=TaskStatus.QUEUED,
+            depends_on=[str(task.id)],
+            created_by="ORCHESTRATOR",
+        )
+        unrelated = Task(
+            project_id=project.id,
+            title="Unrelated queued task",
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+        )
+        db_session.add_all([child, dependent, unrelated])
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.admin_task_mutations.broadcast_to_project",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.task_lifecycle.close_orphan_pr_if_any",
+                new_callable=AsyncMock,
+            ),
+        ):
+            await modify_task_apply(
+                task=task,
+                payload={"status": TaskStatus.CANCELLED.value},
+                background_tasks=BackgroundTasks(),
+                session=db_session,
+            )
+
+        for row in (task, child, dependent, unrelated):
+            await db_session.refresh(row)
+
+        assert task.status == TaskStatus.CANCELLED
+        assert task.context["failure_category"] == ADMIN_CANCEL
+        assert task.context["failure_class"] == ADMIN_CANCEL
+        assert task.context["cancelled_by"] == "USER"
+        assert classify_failure(task) == ADMIN_CANCEL
+        assert is_non_death_cancellation(task)
+
+        for cascaded in (child, dependent):
+            assert cascaded.status == TaskStatus.CANCELLED
+            assert cascaded.context["failure_category"] == ADMIN_CANCEL
+            assert cascaded.context["failure_class"] == ADMIN_CANCEL
+            assert cascaded.context["cancelled_by"] == "USER"
+            assert cascaded.context["cancelled_by_task_id"] == str(task.id)
+            assert is_non_death_cancellation(cascaded)
+        assert dependent.latest_status_message.startswith("Cancelled: dependency task")
+        assert unrelated.status == TaskStatus.QUEUED
+
+        histories = (
+            (
+                await db_session.execute(
+                    select(TaskHistory).where(TaskHistory.task_id == task.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert any(
+            history.action == "MODIFIED"
+            and (history.details or {}).get("modified_by") == "USER"
+            for history in histories
+        )
+
+    @pytest.mark.asyncio
     async def test_rollup_pr_approval_skips_pr_merged_on_promotion_target(
         self, db_session, mocker
     ):
@@ -20641,6 +20733,58 @@ class TestRequeueClearsBlockerMetadata:
         # Clean attempt: counter reset like any leaf requeue.
         assert task.attempt_count == 0
 
+    @pytest.mark.asyncio
+    async def test_requeue_preserves_capability_execution_requirement(self, db_session):
+        """Generic manual/bulk retry strips ordinary blocker metadata but must NOT
+        strip the durable capability-execution requirement — otherwise a retry
+        would bypass the execution-authority fence and let the task run without
+        current platform proof. The requirement survives the fresh attempt so the
+        fence re-blocks it at the next dispatch/claim."""
+        from fastapi import BackgroundTasks
+
+        from app.admin_task_mutations import modify_task_apply
+        from app.capability_execution_fence import (
+            CAPABILITY_EXECUTION_REQUIREMENTS_KEY,
+            block_task_for_capability_proof,
+        )
+        from app.task_blocked import BLOCKER_CONTEXT_KEY
+
+        project = await _make_project(db_session)
+        cap_need = {"kind": "capability", "ref": "forged-cap"}
+        task = Task(
+            project_id=project.id,
+            title="Fence-blocked then requeued",
+            payloads=[{"type": "create", "prompt": "x"}],
+            status=TaskStatus.QUEUED,
+            vm_instance_id="agent-vm-old",
+            context={CAPABILITY_EXECUTION_REQUIREMENTS_KEY: [cap_need]},
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        # The fence parks it BLOCKED with the capability need.
+        block_task_for_capability_proof(task, [cap_need], source="cold dispatch")
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.BLOCKED
+
+        await modify_task_apply(
+            task,
+            {"status": TaskStatus.QUEUED.value},
+            BackgroundTasks(),
+            db_session,
+        )
+        await db_session.refresh(task)
+
+        # Ordinary blocker metadata cleared, but the durable requirement survives.
+        assert task.status == TaskStatus.QUEUED
+        assert BLOCKER_CONTEXT_KEY not in (task.context or {})
+        assert (task.context or {}).get(CAPABILITY_EXECUTION_REQUIREMENTS_KEY) == [
+            cap_need
+        ]
+
 
 class TestManualRequeueGuidance:
     @pytest.mark.asyncio
@@ -21014,6 +21158,7 @@ class TestTriggerForcePromote:
             )
         assert exc_info.value.status_code == 409
         assert "4242" in exc_info.value.detail
+
 
 
 class TestHotfixScopePreview:

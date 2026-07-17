@@ -56,7 +56,7 @@ from app.routers.runner import (
     _parse_multipart_form_stream,
 )
 from app.runner_config import config_generation, live_safe_config
-from app.task_capabilities import STRATEGIC_TASK_TYPES
+from app.task_capabilities import STRATEGIC_LOCAL_AGENT_TASK_TYPES, STRATEGIC_TASK_TYPES
 from app.workbench_state import (
     STRATEGIC_LOCAL_CONTINUATION_KEY,
     STRATEGIC_LOCAL_CONTINUATION_TTL_SECONDS,
@@ -1151,7 +1151,7 @@ class TestAdminRunnerEndpoints:
         assert row is not None
         assert row.capabilities["runner_preset"] == "strategic_local"
         assert row.capabilities["workload"] == "strategic"
-        assert row.capabilities["task_types"] == sorted(STRATEGIC_TASK_TYPES)
+        assert row.capabilities["task_types"] == sorted(STRATEGIC_LOCAL_AGENT_TASK_TYPES)
         assert row.capabilities["max_concurrent"] == 1
 
     @pytest.mark.asyncio
@@ -2286,7 +2286,7 @@ class TestRunnerConfigChannel:
         caps = patch.json()["capabilities"]
         assert caps["gpu_indices_allowed"] == [0]
         assert caps["max_concurrent"] == 1
-        assert caps["task_types"] == sorted(STRATEGIC_TASK_TYPES)
+        assert caps["task_types"] == sorted(STRATEGIC_LOCAL_AGENT_TASK_TYPES)
         # The config block reflects the clamped values, not the requested ones.
         assert patch.json()["config"]["desired"]["max_concurrent"] == 1
 
@@ -8514,6 +8514,7 @@ class TestLocalRunnerStatusForStrategist:
                     "enroot_ok": False,
                     "systemd_run_ok": False,
                 },
+                "container_gpu_passthrough": {"docker": {"verified": True, "mode": "cdi"}},
                 "active_task_ids": ["t-1"],
                 "active_compute_job_ids": [],
             },
@@ -10300,6 +10301,7 @@ class TestDirectComputeExperimentDispatch:
                 "gpu_count": 1,
                 "max_concurrent": 2,
                 "isolation_backends": {"docker_usable": True, "docker_cdi_gpu": False},
+                "container_gpu_passthrough": {"docker": {"verified": True, "mode": "hook"}},
             },
         )
         task = Task(
@@ -10341,6 +10343,7 @@ class TestDirectComputeExperimentDispatch:
                 "gpu_free_vram_mib": [40960],  # plenty of free VRAM
                 "max_concurrent": 2,
                 "isolation_backends": {"docker_usable": True, "docker_cdi_gpu": False},
+                "container_gpu_passthrough": {"docker": {"verified": True, "mode": "hook"}},
             },
         )
         task = Task(
@@ -11630,7 +11633,7 @@ class TestMidRunViewableUpload:
         with patch.object(
             compute_jobs_mod,
             "persist_viewable_artifacts_with_completeness",
-            new=AsyncMock(return_value=(terminal_manifest, 0, True)),
+            new=AsyncMock(return_value=(terminal_manifest, 0, True, 0)),
         ):
             final_manifest, dropped = (
                 await compute_jobs_mod.persist_viewable_files_for_job(db_session, job)
@@ -11742,7 +11745,7 @@ class TestMidRunViewableUpload:
         with patch.object(
             compute_jobs_mod,
             "persist_viewable_artifacts_with_completeness",
-            new=AsyncMock(return_value=(terminal_manifest, 0, True)),
+            new=AsyncMock(return_value=(terminal_manifest, 0, True, 0)),
         ):
             manifest, dropped = (
                 await compute_jobs_mod.persist_viewable_files_for_job(
@@ -11791,6 +11794,113 @@ class TestMidRunViewableUpload:
             f"viewable_file_count must be stamped by the terminal pass, got "
             f"{meta.get('viewable_file_count')!r}"
         )
+
+    @pytest.mark.asyncio
+    async def test_pdf_viewable_upload_accepted(self, client, db_session):
+        """PDF files are a supported viewable kind and must be accepted by the endpoint.
+
+        Finding 12: PDF artifacts should be uploadable via the live viewable
+        pipeline (storage.py classifies .pdf as kind='pdf') and the endpoint
+        must store the entry with the correct content_type/kind.
+        """
+        _project, _runner, token, job = await self._make_running_job(db_session)
+        safe_name = "report.pdf"
+        fake_uri = self._fake_uri(job.id, safe_name)
+
+        with patch(
+            "app.storage.upload_compute_job_viewable_file",
+            return_value=fake_uri,
+        ):
+            resp = await client.post(
+                f"/api/runner/compute-job/{job.id}/viewable",
+                data={"filename": safe_name},
+                files={
+                    "file": (safe_name, b"%PDF-1.4 tiny", "application/pdf")
+                },
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        assert resp.status_code == 200, (
+            f"PDF viewable upload should be accepted, got {resp.status_code}: {resp.text}"
+        )
+        body = resp.json()
+        assert body["ok"] is True
+        assert body["entry"]["kind"] == "pdf"
+        assert body["entry"]["content_type"] == "application/pdf"
+        assert body["entry"]["storage_uri"] == fake_uri
+
+        await db_session.refresh(job)
+        vf = (job.polling_metadata or {}).get("viewable_files", [])
+        assert len(vf) == 1
+        assert vf[0]["kind"] == "pdf"
+
+    @pytest.mark.asyncio
+    async def test_bound_secondary_project_viewable_upload_allowed(
+        self, client, db_session
+    ):
+        """A runner bound to a secondary project can upload viewable files for jobs in that project.
+
+        Finding 5: the live-viewable endpoint must authorize against
+        allowed_project_ids (the runner's enrollment project UNION its explicit
+        bindings), not just runner.project_id. A runner enrolled in project A but
+        explicitly bound to project B must be able to push previews for a job in B.
+        """
+        from app import runner_project_binding as rpb
+
+        # Runner is enrolled in project A.
+        _project_a, runner, token, _job_a = await self._make_running_job(db_session)
+
+        # Create project B and a job in it, pinned to this runner.
+        project_b = await _make_project(db_session, name="ProjectB")
+        job_b = ComputeJob(
+            project_id=project_b.id,
+            backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+            status=ComputeJobStatus.RUNNING,
+            polling_metadata={"runner_target_id": str(runner.id)},
+        )
+        db_session.add(job_b)
+        await db_session.commit()
+        await db_session.refresh(job_b)
+
+        # Upload to job_b BEFORE binding — must be rejected (runner not on allow-list).
+        safe_name = "reward.png"
+        fake_uri = self._fake_uri(job_b.id, safe_name)
+        with patch(
+            "app.storage.upload_compute_job_viewable_file",
+            return_value=fake_uri,
+        ):
+            resp_before = await client.post(
+                f"/api/runner/compute-job/{job_b.id}/viewable",
+                data={"filename": safe_name},
+                files={"file": (safe_name, b"px", "image/png")},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        assert resp_before.status_code == 404, (
+            f"Upload to unbound project should be 404, got {resp_before.status_code}"
+        )
+
+        # Bind the runner to project B.
+        await rpb.add_binding(db_session, runner.id, project_b.id)
+        await db_session.commit()
+
+        # Now upload must succeed.
+        with patch(
+            "app.storage.upload_compute_job_viewable_file",
+            return_value=fake_uri,
+        ):
+            resp_after = await client.post(
+                f"/api/runner/compute-job/{job_b.id}/viewable",
+                data={"filename": safe_name},
+                files={"file": (safe_name, b"px", "image/png")},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        assert resp_after.status_code == 200, (
+            f"Upload to bound project should succeed, got "
+            f"{resp_after.status_code}: {resp_after.text}"
+        )
+        body = resp_after.json()
+        assert body["ok"] is True
+        assert body["entry"]["kind"] == "image"
 
 
 # ── Capability proof trial: runner job + result ingestion (design 84021e2d §2) ─
@@ -12233,6 +12343,93 @@ async def test_capability_proof_trial_extra_test_refs_rejected(db_session):
     await db_session.refresh(project)
     assert cap not in (project.capability_proof_records or {})
     assert working_capability_proof_status(project.problem_model).get(cap) != "proven"
+    await db_session.refresh(task)
+    contradiction = (task.context or {})["capability_proof_trial_contradiction"]
+    assert contradiction["reason"] == "test_refs_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_trial_missing_head_sha_is_rejected(db_session):
+    """A green receipt without the enrolled revision cannot mint a proof."""
+    import json as _json
+
+    from app.task_completion import _handle_capability_proof_trial_completion
+
+    cap = "missing-sha-guard-cap"
+    test_refs = ["backend/testing/test_prompt.py"]
+    project = await _make_trial_project(db_session, cap)
+    task = _make_trial_task(project, cap, test_refs, head_sha="abc123")
+    db_session.add(task)
+    await db_session.commit()
+
+    receipt_without_sha = {
+        "type": "capability_proof_trial", "cap": cap,
+        "test_refs": test_refs, "ran": True, "passed": True, "could_not_run": False,
+    }
+    with _TrialFlag(True):
+        await _handle_capability_proof_trial_completion(
+            task, _json.dumps(receipt_without_sha), db_session
+        )
+
+    await db_session.refresh(project)
+    await db_session.refresh(task)
+    assert cap not in (project.capability_proof_records or {})
+    contradiction = (task.context or {})["capability_proof_trial_contradiction"]
+    assert contradiction["reason"] == "head_sha_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_trial_incomplete_receipt_records_nothing(db_session):
+    """A trial result with an empty test_refs or a proper subset of enrolled refs
+    must NOT mint proof — the agent must report the complete executed suite."""
+    import json as _json
+
+    from app.capability_registry import working_capability_proof_status
+    from app.task_completion import _handle_capability_proof_trial_completion
+
+    cap = "incomplete-refs-cap"
+    enrolled_refs = [
+        "backend/testing/test_prompt.py::test_map",
+        "backend/testing/test_prompt.py::test_search",
+    ]
+    project = await _make_trial_project(db_session, cap)
+    task = _make_trial_task(project, cap, enrolled_refs, head_sha="deadbeef")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    base_result = {
+        "type": "capability_proof_trial",
+        "cap": cap,
+        "head_sha": "deadbeef",
+        "ran": True,
+        "passed": True,
+        "could_not_run": False,
+    }
+
+    # Case 1: empty test_refs — bypasses validation entirely without this fix.
+    empty_refs_result = dict(base_result, test_refs=[])
+    with _TrialFlag(True):
+        await _handle_capability_proof_trial_completion(
+            task, _json.dumps(empty_refs_result), db_session
+        )
+    await db_session.refresh(project)
+    assert cap not in (project.capability_proof_records or {}), (
+        "empty test_refs must not mint proof"
+    )
+    assert working_capability_proof_status(project.problem_model).get(cap) != "proven"
+
+    # Case 2: proper subset — only one of two enrolled refs reported.
+    partial_refs_result = dict(base_result, test_refs=[enrolled_refs[0]])
+    with _TrialFlag(True):
+        await _handle_capability_proof_trial_completion(
+            task, _json.dumps(partial_refs_result), db_session
+        )
+    await db_session.refresh(project)
+    assert cap not in (project.capability_proof_records or {}), (
+        "partial test_refs subset must not mint proof"
+    )
+    assert working_capability_proof_status(project.problem_model).get(cap) != "proven"
 
 
 @pytest.mark.asyncio
@@ -12268,6 +12465,89 @@ async def test_capability_proof_trial_mismatched_head_sha_rejected(db_session):
     await db_session.refresh(project)
     assert cap not in (project.capability_proof_records or {})
     assert working_capability_proof_status(project.problem_model).get(cap) != "proven"
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_trial_missing_sha_records_nothing(db_session):
+    """A trial result that omits head_sha must NOT mint proof when the enrollment
+    specified a head_sha — missing executed SHA is a receipt defect."""
+    import json as _json
+
+    from app.capability_registry import working_capability_proof_status
+    from app.task_completion import _handle_capability_proof_trial_completion
+
+    cap = "incomplete-receipt-cap"
+    test_refs = ["backend/testing/test_prompt.py"]
+    project = await _make_trial_project(db_session, cap)
+    # Enroll with a head_sha so the check is active.
+    task = _make_trial_task(project, cap, test_refs, head_sha="abc123")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Agent reports a result WITHOUT head_sha (None / missing).
+    incomplete = {
+        "type": "capability_proof_trial",
+        "cap": cap,
+        # head_sha intentionally absent
+        "test_refs": test_refs,
+        "ran": True, "passed": True, "could_not_run": False,
+    }
+
+    with _TrialFlag(True):
+        await _handle_capability_proof_trial_completion(task, _json.dumps(incomplete), db_session)
+
+    await db_session.refresh(project)
+    assert cap not in (project.capability_proof_records or {})
+    assert working_capability_proof_status(project.problem_model).get(cap) != "proven"
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_trial_records_reported_sha_not_enrolled_sha(db_session):
+    """When the enrollment has no head_sha but the agent reports one, the ledger
+    records the agent-reported SHA (the actual executed revision), not an empty
+    string or None."""
+    import json as _json
+
+    from app.task_completion import _handle_capability_proof_trial_completion
+
+    cap = "sha-fallback-cap"
+    test_refs = ["backend/testing/test_prompt.py::test_map"]
+    project = await _make_trial_project(db_session, cap)
+    # Enroll WITHOUT a head_sha (head_sha_enrolled = None).
+    task = Task(
+        project_id=project.id,
+        title=f"Capability proof trial: {cap}",
+        payloads=[{
+            "type": "capability_proof_trial",
+            "cap": cap,
+            "test_refs": test_refs,
+            # deliberately omit head_sha
+        }],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    green = {
+        "type": "capability_proof_trial",
+        "cap": cap,
+        "head_sha": "reported-sha-abc",
+        "test_refs": test_refs,
+        "ran": True, "passed": True, "could_not_run": False,
+        "skipped_summary": {"total": 3, "skipped": 0},
+    }
+
+    with _TrialFlag(True):
+        await _handle_capability_proof_trial_completion(task, _json.dumps(green), db_session)
+
+    await db_session.refresh(project)
+    entries = project.capability_proof_records.get(cap, [])
+    assert len(entries) == 1
+    # The recorded SHA is the agent-reported revision, not None or empty.
+    assert entries[0]["commit_sha"] == "reported-sha-abc"
 
 
 @pytest.mark.asyncio
@@ -12645,3 +12925,176 @@ class TestRunnerResumeFail_Closed:
             "bytes": 1024,
             "resumed_from_job_id": "pred-job-003",
         }
+
+
+# ---------------------------------------------------------------------------
+# local_runner._scan_viewable_files — scan cap
+# ---------------------------------------------------------------------------
+
+
+class TestScanViewableFilesCap:
+    """_scan_viewable_files respects _VIEWABLE_SCAN_FILE_CAP."""
+
+    @staticmethod
+    def _import_local_runner():
+        import sys
+        import pathlib
+        scripts_dir = pathlib.Path(__file__).parents[2] / "scripts"
+        sys.path.insert(0, str(scripts_dir))
+        import local_runner
+        return local_runner
+
+    def test_scan_returns_all_when_under_cap(self, tmp_path):
+        """Fewer files than _VIEWABLE_SCAN_FILE_CAP → all viewable files returned."""
+        local_runner = self._import_local_runner()
+        art = tmp_path / "artifacts"
+        art.mkdir()
+        for i in range(5):
+            (art / f"plot{i}.png").write_bytes(b"PNG")
+        for i in range(3):
+            (art / f"notes{i}.txt").write_bytes(b"txt")
+
+        candidates = local_runner._scan_viewable_files(str(art))
+        assert len(candidates) == 5  # only viewable files in the result
+        relpaths = {c["relpath"] for c in candidates}
+        assert all(r.endswith(".png") for r in relpaths)
+
+    def test_scan_stops_at_cap(self, tmp_path):
+        """When total entries exceed _VIEWABLE_SCAN_FILE_CAP, scan stops early.
+
+        The cap is on total entries (viewable + non-viewable), so a directory
+        flooded with non-viewable files triggers an early return. The returned
+        list must be <= the cap size (it may be smaller since most files are
+        non-viewable). Critically, the function must NOT walk all files.
+        """
+        local_runner = self._import_local_runner()
+        cap = local_runner._VIEWABLE_SCAN_FILE_CAP
+        art = tmp_path / "artifacts"
+        art.mkdir()
+
+        # Write cap+1 non-viewable files + 1 viewable file.
+        for i in range(cap + 1):
+            (art / f"checkpoint_{i:05d}.bin").write_bytes(b"X")
+        (art / "reward.png").write_bytes(b"PNG")
+
+        walks: list = []
+        real_walk = os.walk
+
+        def counting_walk(*args, **kw):
+            for entry in real_walk(*args, **kw):
+                walks.append(entry[2])  # filenames list per dir
+                yield entry
+
+        with patch("os.walk", side_effect=counting_walk):
+            candidates = local_runner._scan_viewable_files(str(art))
+
+        total_scanned = sum(len(fnames) for fnames in walks)
+        assert total_scanned <= cap + 5, (
+            f"scan walked {total_scanned} entries, expected to stop near cap={cap}"
+        )
+        # The function must return without error even when capped.
+        assert isinstance(candidates, list)
+
+    def test_scan_returns_sorted_candidates(self, tmp_path):
+        """Candidates are sorted by relpath even when the scan is capped."""
+        local_runner = self._import_local_runner()
+        art = tmp_path / "artifacts"
+        art.mkdir()
+        for name in ("zzz.png", "aaa.png", "mmm.webp"):
+            (art / name).write_bytes(b"X")
+
+        candidates = local_runner._scan_viewable_files(str(art))
+        relpaths = [c["relpath"] for c in candidates]
+        assert relpaths == sorted(relpaths)
+
+
+# ---------------------------------------------------------------------------
+# local_runner._stream_viewable_files — oversize/count accounting reset
+# ---------------------------------------------------------------------------
+
+
+class TestStreamViewableAccountingReset:
+    """oversize_relpaths and count_cap_relpaths are reset on each scan cycle."""
+
+    @staticmethod
+    def _import_local_runner():
+        import sys
+        import pathlib
+        scripts_dir = pathlib.Path(__file__).parents[2] / "scripts"
+        sys.path.insert(0, str(scripts_dir))
+        import local_runner
+        return local_runner
+
+    def test_oversize_relpaths_reset_per_scan(self, tmp_path):
+        """A file that was oversize in a prior scan is not counted if now gone.
+
+        _stream_viewable_files resets oversize_relpaths at the start of each
+        call so the omission count reflects the CURRENT scan, not cumulative
+        history.  Verifies the reset by calling _stream_viewable_files twice:
+        the first call adds a file to oversize_relpaths; the second call with an
+        empty dir must report 0 oversize files.
+        """
+        local_runner = self._import_local_runner()
+        art = tmp_path / "artifacts"
+        art.mkdir()
+
+        state = local_runner._ViewableStreamState()
+        image_cap = local_runner._MAX_VIEWABLE_IMAGE_BYTES
+
+        # First scan: one oversized image.
+        oversized = art / "big.png"
+        oversized.write_bytes(b"X" * (image_cap + 1))
+
+        local_runner._stream_viewable_files(
+            "https://orch.example.com", "tok", "job-acct", str(art), state
+        )
+
+        assert len(state.oversize_relpaths) == 1, (
+            "first scan should record the oversize file"
+        )
+
+        # Second scan: the file is gone (removed between heartbeats).
+        oversized.unlink()
+
+        local_runner._stream_viewable_files(
+            "https://orch.example.com", "tok", "job-acct", str(art), state
+        )
+
+        assert len(state.oversize_relpaths) == 0, (
+            "second scan with no oversize files should reset the counter to 0, "
+            f"got {len(state.oversize_relpaths)}"
+        )
+
+    def test_count_cap_relpaths_reset_per_scan(self, tmp_path):
+        """count_cap_relpaths is cleared at the start of each scan call."""
+        local_runner = self._import_local_runner()
+        art = tmp_path / "artifacts"
+        art.mkdir()
+
+        state = local_runner._ViewableStreamState()
+        # Simulate already-sent 25 files so any new file gets count-capped.
+        for i in range(local_runner._MAX_VIEWABLE_FILE_COUNT):
+            state.sent[f"file{i}.png"] = (0, 0, 0)
+
+        # Write one new viewable file that will be count-capped.
+        (art / "extra.png").write_bytes(b"X")
+
+        local_runner._stream_viewable_files(
+            "https://orch.example.com", "tok", "job-cnt", str(art), state
+        )
+
+        assert len(state.count_cap_relpaths) == 1, (
+            "count-capped file should appear in count_cap_relpaths"
+        )
+
+        # Second scan: the extra file is removed.
+        (art / "extra.png").unlink()
+
+        local_runner._stream_viewable_files(
+            "https://orch.example.com", "tok", "job-cnt", str(art), state
+        )
+
+        assert len(state.count_cap_relpaths) == 0, (
+            "second scan with no new files should reset count_cap_relpaths to 0, "
+            f"got {len(state.count_cap_relpaths)}"
+        )

@@ -771,6 +771,10 @@ export function StrategicContextWorkspace({
   const knowledgeEvidence = contextPackage?.evidence?.knowledge?.items ?? [];
   const artifactEvidence = contextPackage?.evidence?.artifacts?.items ?? [];
   const artifactLiveCount: number = contextPackage?.evidence?.artifacts?.live_count ?? 0;
+  const knowledgeDurableTotal: number = contextPackage?.evidence?.knowledge?.total ?? knowledgeEvidence.length;
+  const artifactDurableTotal: number = contextPackage?.evidence?.artifacts?.total ?? artifactEvidence.length;
+  const evidenceDisplayedCount = knowledgeEvidence.length + artifactEvidence.length;
+  const evidenceDurableTotal = knowledgeDurableTotal + artifactDurableTotal;
   const sessionMode = normalizeStrategicInteractionMode(workbenchState?.interaction_mode ?? workSession?.mode);
   const localRunner = state?.runtime?.local_runner ?? null;
   const runtimeWork = state?.runtime?.work ?? null;
@@ -1216,7 +1220,9 @@ export function StrategicContextWorkspace({
             <Section
               title="Evidence"
               meta={[
-                `${knowledgeEvidence.length + artifactEvidence.length}`,
+                evidenceDurableTotal > evidenceDisplayedCount
+                  ? `showing ${evidenceDisplayedCount} of ${evidenceDurableTotal}`
+                  : `${evidenceDisplayedCount}`,
                 artifactLiveCount > 0 ? `${artifactLiveCount} live` : null,
               ].filter(Boolean).join(' · ')}
               testId="strategic-context-workspace-evidence"

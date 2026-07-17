@@ -244,7 +244,9 @@ async def test_merge_pull_request_already_merged(mocker):
         text="Pull Request is not mergeable",
     )
 
-    result = await merge_pull_request("token", "owner", "repo", 42)
+    result = await merge_pull_request(
+        "token", "owner", "repo", 42, allow_changes_requested=True
+    )
 
     assert result["merged"] is False
     assert result.get("conflict") is False
@@ -266,7 +268,9 @@ async def test_merge_pull_request_conflict(mocker):
         text="Merge conflict",
     )
 
-    result = await merge_pull_request("token", "owner", "repo", 42)
+    result = await merge_pull_request(
+        "token", "owner", "repo", 42, allow_changes_requested=True
+    )
 
     assert result["merged"] is False
     assert result["conflict"] is True
@@ -854,7 +858,9 @@ async def test_merge_pull_request_rate_limit_retries_then_propagates(mocker):
     mocker.patch("asyncio.sleep", return_value=None)
 
     with pytest.raises(HTTPException) as exc_info:
-        await merge_pull_request("token", "owner", "repo", 42)
+        await merge_pull_request(
+            "token", "owner", "repo", 42, allow_changes_requested=True
+        )
 
     assert exc_info.value.status_code >= 400
     # Should have retried (3 attempts total)
@@ -5456,4 +5462,7 @@ async def test_commit_file_changes_identical_tree_creates_no_empty_commit(mocker
     assert req.await_count == 4
     urls = [call.args[1] for call in req.await_args_list]
     assert not any(url.endswith("/git/commits") for url in urls)
+
     assert not any("/git/refs/heads/" in url for url in urls)
+    assert not any("/git/refs/heads/" in url for url in urls)
+

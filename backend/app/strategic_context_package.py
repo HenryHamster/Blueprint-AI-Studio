@@ -1615,7 +1615,7 @@ def _artifact_renderable_kind(artifact: Dict[str, Any]) -> str:
         return "image"
     if any(
         token in fingerprint
-        for token in ["video", ".mp4", ".webm", ".mov"]
+        for token in ["video", ".mp4", ".webm"]
     ):
         return "video"
     if any(token in fingerprint for token in ["pdf", ".pdf"]):

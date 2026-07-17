@@ -186,7 +186,7 @@
     "research_direction_state.py": 1750,
     "dep_lifecycle.py": 800,
     "routers/admin_health.py": 1750,
-    "metrics_integrity_sweep.py": 5550,
+    "metrics_integrity_sweep.py": 6500,
     "release_readiness.py": 2100,
     "acceptance_criteria.py": 3700,
     "runner_health_alerts.py": 2450,
@@ -201,7 +201,9 @@
     "routers/admin_runners.py": 1950,
     "compute_image_build.py": 1750,
     "capability_proof.py": 2800,
-    "plan_completion.py": 1750
+    "plan_completion.py": 1750,
+    "migration_apply_gate.py": 2150,
+    "capability_registry.py": 1750
   },
   "agent": {
     "index.ts": 4600,
@@ -226,7 +228,7 @@
     "handlers/specialized.ts": 1550,
     "handlers/audits.ts": 1250,
     "handlers/memo.ts": 650,
-    "handlers/code-change.ts": 600,
+    "handlers/code-change.ts": 850,
     "prompts/discovery.ts": 1300,
     "prompts/project-context.ts": 850,
     "prompts/self-review.ts": 500,

@@ -1951,7 +1951,11 @@ async def test_runner_subprocess_poll_status_exit_125_classifies_no_progress():
         },
     )
     result = await backend.poll_status(job)
-    assert result.status == ComputeJobStatus.FAILED
+    # Exit 125 is the reserved no-progress watchdog code: poll_status terminalizes
+    # it as TIMED_OUT (matching the end-to-end monitor finalize path asserted in
+    # test_runner_report_exit_125_finalizes_no_progress_through_monitor), not a
+    # generic FAILED — otherwise the platform kill misattributes to the command.
+    assert result.status == ComputeJobStatus.TIMED_OUT
     assert result.exit_code == 125
     assert "no_progress_timeout" in result.message
     assert (
@@ -16435,11 +16439,114 @@ async def test_create_compute_job_registry_auth_password_accepted_for_runner_sub
     )
 
     assert job.backend == RUNNER_SUBPROCESS_BACKEND_NAME
+    from app.field_encryption import decrypt_field
+
     persisted_auth = (job.polling_metadata or {}).get("container_registry_auth")
     assert persisted_auth is not None
     assert persisted_auth["server"] == "nvcr.io"
     assert persisted_auth["username"] == "$oauthtoken"
-    assert persisted_auth["password"] == "s3cr3t-ngc-api-key"
+    # Password is stored encrypted; decrypt to verify the round-trip.
+    assert decrypt_field(persisted_auth["password"]) == "s3cr3t-ngc-api-key"
+
+
+@pytest.mark.asyncio
+async def test_create_compute_job_registry_auth_password_encrypted_at_rest(
+    db_session, monkeypatch
+):
+    """Registry password must be stored as Fernet ciphertext when a real key is configured."""
+    from app import auth as auth_mod
+    from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
+    from app.field_encryption import FERNET_CIPHERTEXT_PREFIX, decrypt_field
+    from app.models import LocalRunner
+    from cryptography.fernet import Fernet
+
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    # Use a real Fernet key so encrypt_field produces actual ciphertext.
+    real_key = Fernet.generate_key().decode()
+    monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", real_key)
+    monkeypatch.delenv("ALLOW_PLAINTEXT_CREDENTIALS", raising=False)
+
+    project = Project(name="Registry Auth Encrypt Test", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    token = auth_mod.create_runner_token(uuid.uuid4())
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash=auth_mod.hash_runner_token(token),
+        capabilities={"task_types": "all", "has_gpu": False},
+    )
+    db_session.add(runner)
+    await db_session.commit()
+    await db_session.refresh(runner)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+        context={"runner_target_id": str(runner.id)},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        container_image="nvcr.io/nvidia/tensorflow:25.01-tf2-py3",
+        container_registry_auth={
+            "server": "nvcr.io",
+            "username": "$oauthtoken",
+            "password": "s3cr3t-ngc-api-key",
+        },
+    )
+
+    assert job.backend == RUNNER_SUBPROCESS_BACKEND_NAME
+    persisted_auth = (job.polling_metadata or {}).get("container_registry_auth")
+    assert persisted_auth is not None
+    assert persisted_auth["server"] == "nvcr.io"
+    assert persisted_auth["username"] == "$oauthtoken"
+    # Password must be stored as Fernet ciphertext, not plaintext.
+    assert persisted_auth["password"] != "s3cr3t-ngc-api-key"
+    assert persisted_auth["password"].startswith(FERNET_CIPHERTEXT_PREFIX)
+    # Decryption must recover the original value.
+    assert decrypt_field(persisted_auth["password"]) == "s3cr3t-ngc-api-key"
+
+
+def test_decrypt_registry_auth_decrypts_password(monkeypatch):
+    """_decrypt_registry_auth must decrypt a Fernet-encrypted password field."""
+    from app.routers.runner import _decrypt_registry_auth
+    from app.field_encryption import encrypt_field, FERNET_CIPHERTEXT_PREFIX
+    from cryptography.fernet import Fernet
+
+    key = Fernet.generate_key().decode()
+    monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", key)
+    monkeypatch.delenv("ALLOW_PLAINTEXT_CREDENTIALS", raising=False)
+
+    encrypted = encrypt_field("secret-pw")
+    assert encrypted is not None and encrypted.startswith(FERNET_CIPHERTEXT_PREFIX)
+    auth = {"server": "nvcr.io", "username": "$oauthtoken", "password": encrypted}
+    result = _decrypt_registry_auth(auth)
+    assert result is not None
+    assert result["password"] == "secret-pw"
+    assert result["server"] == "nvcr.io"
+    assert result["username"] == "$oauthtoken"
+
+
+def test_decrypt_registry_auth_handles_no_password():
+    """_decrypt_registry_auth must pass through auth dicts without a password field."""
+    from app.routers.runner import _decrypt_registry_auth
+
+    auth_no_pw = {"server": "nvcr.io", "username": "$oauthtoken"}
+    result = _decrypt_registry_auth(auth_no_pw)
+    assert result == auth_no_pw
+
+    assert _decrypt_registry_auth(None) is None
 
 
 # ── Runner-subprocess backend tests ──────────────────────────────────────────
@@ -18456,6 +18563,296 @@ def test_dependency_hash_filename_matters():
 def test_dependency_hash_empty_raises():
     with pytest.raises(ValueError):
         _bci.compute_dependency_hash({})
+
+
+# ---------------------------------------------------------------------------
+# assemble_fingerprint_inputs / bare_manifest_fallback_files
+# ---------------------------------------------------------------------------
+
+
+def test_assemble_fingerprint_inputs_parent_changes_hash():
+    """Changing the parent image changes the fingerprint hash."""
+    h1 = _bci.compute_dependency_hash(
+        _bci.assemble_fingerprint_inputs(b"FROM x\n", {}, parent="python:3.11-slim")
+    )
+    h2 = _bci.compute_dependency_hash(
+        _bci.assemble_fingerprint_inputs(b"FROM x\n", {}, parent="python:3.12-slim")
+    )
+    assert h1 != h2
+
+
+def test_assemble_fingerprint_inputs_no_parent_differs_from_with_parent():
+    """No parent and some parent produce different hashes."""
+    h_no = _bci.compute_dependency_hash(
+        _bci.assemble_fingerprint_inputs(b"FROM x\n", {})
+    )
+    h_yes = _bci.compute_dependency_hash(
+        _bci.assemble_fingerprint_inputs(b"FROM x\n", {}, parent="python:3.11-slim")
+    )
+    assert h_no != h_yes
+
+
+def test_assemble_fingerprint_inputs_build_args_order_independent():
+    """build_args hash is stable regardless of insertion order."""
+    h1 = _bci.compute_dependency_hash(
+        _bci.assemble_fingerprint_inputs(
+            b"FROM x\n", {}, build_args={"A": "1", "B": "2"}
+        )
+    )
+    h2 = _bci.compute_dependency_hash(
+        _bci.assemble_fingerprint_inputs(
+            b"FROM x\n", {}, build_args={"B": "2", "A": "1"}
+        )
+    )
+    assert h1 == h2
+
+
+def test_assemble_fingerprint_inputs_build_args_value_changes_hash():
+    """Changing a build-arg value changes the hash."""
+    h1 = _bci.compute_dependency_hash(
+        _bci.assemble_fingerprint_inputs(b"FROM x\n", {}, build_args={"CUDA": "12.4"})
+    )
+    h2 = _bci.compute_dependency_hash(
+        _bci.assemble_fingerprint_inputs(b"FROM x\n", {}, build_args={"CUDA": "12.5"})
+    )
+    assert h1 != h2
+
+
+def test_assemble_fingerprint_inputs_empty_build_args_same_as_none():
+    """Empty build_args dict does not add a pseudo-key (same hash as no build_args)."""
+    h_none = _bci.compute_dependency_hash(
+        _bci.assemble_fingerprint_inputs(b"FROM x\n", {})
+    )
+    h_empty = _bci.compute_dependency_hash(
+        _bci.assemble_fingerprint_inputs(b"FROM x\n", {}, build_args={})
+    )
+    assert h_none == h_empty
+
+
+def test_assemble_fingerprint_inputs_nested_dep_file_changes_hash():
+    """A declared dep file at a nested path changes the hash when its content changes."""
+    h1 = _bci.compute_dependency_hash(
+        _bci.assemble_fingerprint_inputs(
+            b"FROM x\n",
+            {"packages/api/requirements.txt": b"numpy==1.26\n"},
+        )
+    )
+    h2 = _bci.compute_dependency_hash(
+        _bci.assemble_fingerprint_inputs(
+            b"FROM x\n",
+            {"packages/api/requirements.txt": b"numpy==2.0\n"},
+        )
+    )
+    assert h1 != h2
+
+
+@pytest.mark.parametrize("reserved_name", ["Dockerfile", "__parent_image__", "__build_args__"])
+def test_assemble_fingerprint_inputs_reserved_looking_dep_is_typed(reserved_name):
+    """Valid dependency names cannot overwrite Dockerfile or metadata inputs."""
+    base = _bci.assemble_fingerprint_inputs(
+        b"FROM x\n",
+        {reserved_name: b"one"},
+        parent="python:3.11-slim",
+        build_args={"CUDA": "12.4"},
+    )
+    changed = _bci.assemble_fingerprint_inputs(
+        b"FROM x\n",
+        {reserved_name: b"two"},
+        parent="python:3.11-slim",
+        build_args={"CUDA": "12.4"},
+    )
+    assert _bci.compute_dependency_hash(base) != _bci.compute_dependency_hash(changed)
+    assert base["\x00dockerfile"] == b"FROM x\n"
+    assert base["\x00parent_image"] == b"python:3.11-slim"
+    assert base["\x00build_args"] == b'{"CUDA": "12.4"}'
+    assert base[f"\x00dep:{reserved_name}"] == b"one"
+
+
+def test_build_and_push_includes_parent_in_hash(tmp_path):
+    """build_and_push uses assemble_fingerprint_inputs: parent affects the dep_hash."""
+    (tmp_path / ".blueprint").mkdir()
+    (tmp_path / ".blueprint" / "Dockerfile.compute").write_bytes(b"FROM scratch\n")
+    (tmp_path / "requirements.txt").write_bytes(b"torch==2.3\n")
+
+    seen_hashes: list[str] = []
+
+    def fake_run(cmd, **kw):
+        class P:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        return P()
+
+    for p in ("python:3.11", "python:3.12"):
+        result = _bci.build_and_push(
+            repo_dir=str(tmp_path),
+            registry_repo="reg/repo",
+            image_name="img",
+            dockerfile=".blueprint/Dockerfile.compute",
+            dep_files=["requirements.txt"],
+            parent=p,
+            _run=fake_run,
+            _tag_exists=lambda *a, **k: True,
+        )
+        seen_hashes.append(result.dep_hash)
+
+    assert seen_hashes[0] != seen_hashes[1], "different parent must yield different dep_hash"
+
+
+def test_bare_manifest_fallback_files_includes_package_json_when_no_lockfile():
+    """package.json is a candidate when no node lockfile is in the resolved set."""
+    result = _bci.bare_manifest_fallback_files(frozenset())
+    assert "package.json" in result
+
+
+def test_bare_manifest_fallback_files_excludes_package_json_when_lockfile_present():
+    """package.json is NOT a candidate when a node lockfile is in the resolved set."""
+    for lockfile in ("package-lock.json", "yarn.lock", "pnpm-lock.yaml"):
+        result = _bci.bare_manifest_fallback_files(frozenset([lockfile]))
+        assert "package.json" not in result, f"package.json must be skipped when {lockfile} present"
+
+
+def test_bare_manifest_fallback_files_includes_pipfile_when_no_lock():
+    result = _bci.bare_manifest_fallback_files(frozenset())
+    assert "Pipfile" in result
+
+
+def test_bare_manifest_fallback_files_excludes_pipfile_when_lock_present():
+    result = _bci.bare_manifest_fallback_files(frozenset(["Pipfile.lock"]))
+    assert "Pipfile" not in result
+
+
+def test_bare_manifest_fallback_files_all_lockfiles_present_returns_nothing():
+    """When every ecosystem has a lockfile, no bare manifests are candidates."""
+    all_lockfiles = frozenset(
+        ["package-lock.json", "Pipfile.lock", "requirements.txt"]
+    )
+    result = _bci.bare_manifest_fallback_files(all_lockfiles)
+    assert result == []
+
+
+def test_bare_manifest_lockfile_less_content_changes_hash():
+    """A bare manifest's content changes the fingerprint hash when no lockfile is present."""
+    # package.json present, no node lockfile => package.json is a hash input
+    h1 = _bci.compute_dependency_hash(
+        _bci.assemble_fingerprint_inputs(
+            b"FROM x\n",
+            {"package.json": b'{"name": "my-app", "version": "1.0.0"}\n'},
+        )
+    )
+    h2 = _bci.compute_dependency_hash(
+        _bci.assemble_fingerprint_inputs(
+            b"FROM x\n",
+            {"package.json": b'{"name": "my-app", "version": "2.0.0"}\n'},
+        )
+    )
+    assert h1 != h2
+
+
+# ---------------------------------------------------------------------------
+# Manifest compute.image.build: deps field
+# ---------------------------------------------------------------------------
+
+
+def test_manifest_compute_image_build_deps_valid():
+    from app.routers.admin_project_tools import (
+        _validate_manifest_compute_image,
+        _normalize_manifest_compute_image,
+    )
+
+    spec = {
+        "name": "reg/img:tag",
+        "build": {"deps": ["packages/api/requirements.txt", "shared/pyproject.toml"]},
+    }
+    assert _validate_manifest_compute_image(spec) is None
+    norm = _normalize_manifest_compute_image(spec)
+    assert norm["build"]["deps"] == [
+        "packages/api/requirements.txt",
+        "shared/pyproject.toml",
+    ]
+
+
+def test_manifest_compute_image_build_deps_empty_list():
+    from app.routers.admin_project_tools import (
+        _validate_manifest_compute_image,
+        _normalize_manifest_compute_image,
+    )
+
+    spec = {"name": "reg/img:tag", "build": {"deps": []}}
+    assert _validate_manifest_compute_image(spec) is None
+    norm = _normalize_manifest_compute_image(spec)
+    assert norm["build"]["deps"] == []
+
+
+def test_manifest_compute_image_build_deps_absent_defaults_empty():
+    from app.routers.admin_project_tools import _normalize_manifest_compute_image
+
+    norm = _normalize_manifest_compute_image({"name": "reg/img:tag", "build": {}})
+    assert norm["build"]["deps"] == []
+
+
+def test_manifest_compute_image_build_deps_traversal_rejected():
+    from app.routers.admin_project_tools import _validate_manifest_compute_image
+
+    err = _validate_manifest_compute_image(
+        {"name": "reg/img:t", "build": {"deps": ["../etc/passwd"]}}
+    )
+    assert err is not None
+    assert "deps" in err
+
+
+def test_manifest_compute_image_build_deps_absolute_path_rejected():
+    from app.routers.admin_project_tools import _validate_manifest_compute_image
+
+    err = _validate_manifest_compute_image(
+        {"name": "reg/img:t", "build": {"deps": ["/etc/secret"]}}
+    )
+    assert err is not None
+    assert "deps" in err
+
+
+def test_manifest_compute_image_build_deps_whitespace_absolute_path_rejected():
+    from app.routers.admin_project_tools import _validate_manifest_compute_image
+
+    err = _validate_manifest_compute_image(
+        {"name": "reg/img:t", "build": {"deps": [" /etc/passwd"]}}
+    )
+    assert err is not None
+    assert "deps" in err
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["C:\\secrets\\token", "C:/secrets/token", "\\secrets\\token", "\\\\server\\share\\token", "//server/share/token", "lib\\..\\secret"],
+)
+def test_manifest_compute_image_build_deps_non_repo_relative_paths_rejected(path):
+    from app.routers.admin_project_tools import _validate_manifest_compute_image
+
+    err = _validate_manifest_compute_image(
+        {"name": "reg/img:t", "build": {"deps": [path]}}
+    )
+    assert err is not None
+    assert "deps" in err
+
+
+def test_manifest_compute_image_build_deps_non_string_rejected():
+    from app.routers.admin_project_tools import _validate_manifest_compute_image
+
+    err = _validate_manifest_compute_image(
+        {"name": "reg/img:t", "build": {"deps": [123]}}
+    )
+    assert err is not None
+    assert "deps" in err
+
+
+def test_manifest_compute_image_build_deps_not_list_rejected():
+    from app.routers.admin_project_tools import _validate_manifest_compute_image
+
+    err = _validate_manifest_compute_image(
+        {"name": "reg/img:t", "build": {"deps": "requirements.txt"}}
+    )
+    assert err is not None
+    assert "deps" in err
 
 
 # ---------------------------------------------------------------------------
@@ -21634,6 +22031,118 @@ async def _fake_viewable_upload(job_id, basename, data, content_type, *, calls):
     return (
         f"gs://test-bucket/compute-jobs/{job_id}/artifacts/viewable/{basename}"
     )
+
+
+@pytest.mark.asyncio
+async def test_gcp_vm_viewable_upload_large_video_uses_streaming_seam(
+    client, db_session, monkeypatch
+):
+    """A video body above the spool threshold is uploaded via the STREAMING seam.
+
+    The whole point of the spool+streaming path: a multi-hundred-MiB video must
+    never be buffered whole in the orchestrator heap.  The test shrinks the spool
+    threshold to a trivially small value so the test payload (a few KB) rolls to
+    disk and the streaming branch activates, then asserts that
+    ``upload_compute_job_viewable_stream`` is called with a file-like object that
+    reads back the exact file bytes — while ``upload_compute_job_viewable_file``
+    (the OOM vector) is never called.
+    """
+    from app.routers import agent_compute_jobs as agent_mod
+
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+
+    project = Project(name="GCP VM Stream Viewable", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python3 train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        backend_name="local-subprocess",
+    )
+    job.status = ComputeJobStatus.RUNNING
+    await db_session.commit()
+
+    token = compute_backends_module.compute_job_heartbeat_secret(job.id)
+    video_bytes = b"\x00\x01FAKE-MP4-PAYLOAD" * 64  # ~1 KiB, distinctive
+
+    captured: dict = {}
+    fake_uri = (
+        f"gs://test-bucket/compute-jobs/{job.id}/artifacts/viewable/rollout.mp4"
+    )
+
+    async def _fake_stream(job_id, basename, fileobj, content_type, *, size=None):
+        captured["read"] = fileobj.read()
+        captured["size"] = size
+        captured["content_type"] = content_type
+        captured["basename"] = basename
+        return fake_uri
+
+    body, content_type = _build_viewable_multipart_body(video_bytes, "rollout.mp4")
+
+    # Shrink the spool threshold so the modest test payload rolls to disk and
+    # activates the streaming branch.  The in-memory seam MUST NOT be touched.
+    with monkeypatch.context() as mp:
+        mp.setattr(agent_mod, "_MAX_VIEWABLE_FILE_BYTES", 8)
+        mp.setattr(agent_mod, "_MULTIPART_BODY_MARGIN", 8)
+        monkeypatch.setattr(
+            storage,
+            "upload_compute_job_viewable_stream",
+            _fake_stream,
+        )
+        monkeypatch.setattr(
+            storage,
+            "upload_compute_job_viewable_file",
+            AsyncMock(
+                side_effect=AssertionError(
+                    "rolled video must not use the in-memory upload seam"
+                )
+            ),
+        )
+
+        resp = await client.post(
+            f"/api/agent/compute-jobs/{job.id}/viewable",
+            content=body,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": content_type,
+            },
+        )
+
+    assert resp.status_code == 200, (
+        f"Expected 200 for streamed video, got {resp.status_code}: {resp.text}"
+    )
+    body_json = resp.json()
+    assert body_json["ok"] is True
+    assert body_json["entry"]["kind"] == "video"
+    assert body_json["entry"]["storage_uri"] == fake_uri
+    assert body_json["entry"]["size_bytes"] == len(video_bytes)
+
+    # The streamed bytes are EXACTLY the file part — no multipart framing.
+    assert captured["read"] == video_bytes, (
+        "streaming seam must yield exactly the file part bytes, no multipart framing"
+    )
+    assert captured["size"] == len(video_bytes)
+    assert captured["content_type"] == "video/mp4"
+
+    # DB row + manifest recorded with the streamed size.
+    await db_session.refresh(job)
+    vf = (job.polling_metadata or {}).get("viewable_files", [])
+    assert len(vf) == 1 and vf[0]["size_bytes"] == len(video_bytes)
 
 
 @pytest.mark.asyncio
@@ -24962,3 +25471,539 @@ def test_compute_image_registry_iam(monkeypatch, tmp_path):
     assert any(
         ar_repo in str(c) for c in delete_cmds
     ), f"Expected tags delete to target AR repo {ar_repo}"
+
+
+# ---------------------------------------------------------------------------
+# test_compute_image_builder_least_privilege_contract — drift guard for the
+# isolated regional Cloud Build builder IAM/config contract. The builder can
+# publish compute images and read its own disposable source bucket, but must
+# have NO Secret Manager access, NO platform/runtime credential, and NO access
+# to the general agent-artifacts bucket. The orchestrator keeps only the
+# permissions to create/get/cancel builds and actAs the builder — while its
+# existing compute-image protection-tag write and agent image-pull grants stay
+# intact. Config values must be wired into both cloudbuild.yaml (source of
+# truth) and cloud_run.tf (drift mirror).
+# ---------------------------------------------------------------------------
+
+
+def _infra_repo_root():
+    """Locate the repo root that contains infra/terraform + backend/cloudbuild.yaml.
+
+    Resolves across environments:
+      - the Docker backend test harness, which mounts the repo read-only at /repo
+        (see scripts/test-backend.sh) while backend/ is the container WORKDIR;
+      - a local full checkout, where backend/testing/ is two levels below root.
+    Returns None when no such root is reachable (e.g. a stripped-down image with
+    neither mount), in which case the drift guard skips rather than false-fails.
+    """
+    from pathlib import Path
+
+    marker = Path("infra") / "terraform" / "iam.tf"
+    candidates = [Path("/repo"), Path(__file__).resolve().parents[2]]
+    candidates += list(Path(__file__).resolve().parents)
+    seen = set()
+    for root in candidates:
+        if root in seen:
+            continue
+        seen.add(root)
+        if (root / marker).is_file():
+            return root
+    return None
+
+
+def _read_infra_file(relative_name: str) -> str:
+    root = _infra_repo_root()
+    if root is None:
+        pytest.skip("infra/terraform not present in this test image")
+    return (root / relative_name).read_text()
+
+
+def test_compute_image_builder_least_privilege_contract():
+    iam = _read_infra_file("infra/terraform/iam.tf")
+    wi = _read_infra_file("infra/terraform/workload_identity.tf")
+    cloudbuild = _read_infra_file("backend/cloudbuild.yaml")
+    cloud_run = _read_infra_file("infra/terraform/cloud_run.tf")
+
+    # (a) A dedicated builder SA exists.
+    assert 'resource "google_service_account" "compute_image_builder_sa"' in iam
+    assert 'account_id   = "compute-image-builder-sa"' in iam
+
+    # (b) A dedicated, disposable, short-retention build-source bucket exists,
+    #     separate from the general agent-artifacts bucket.
+    assert 'resource "google_storage_bucket" "compute_build_source"' in iam
+    assert '"${var.project_id}-compute-build-source"' in iam
+    # Short retention (age = 1 day) so build inputs are not durably retained.
+    source_block = iam.split('resource "google_storage_bucket" "compute_build_source"', 1)[1]
+    source_block = source_block.split("resource ", 1)[0]
+    assert "age = 1" in source_block, "build-source bucket must have a 1-day delete lifecycle"
+
+    # (c) Builder reads ONLY its own source bucket, and never the general
+    #     agent-artifacts bucket. Collect every IAM member block that grants the
+    #     builder SA a role and assert the permitted set is exactly:
+    #       storage.objectViewer (on compute_build_source),
+    #       logging.logWriter,
+    #       artifactregistry.writer (on compute_images_repo, in workload_identity.tf).
+    builder_member = "google_service_account.compute_image_builder_sa.email"
+
+    # The builder's storage grant references the disposable source bucket, not
+    # the artifacts bucket.
+    reader_block = iam.split(
+        'resource "google_storage_bucket_iam_member" "compute_image_builder_source_reader"',
+        1,
+    )[1].split("resource ", 1)[0]
+    assert "google_storage_bucket.compute_build_source.name" in reader_block
+    assert 'role   = "roles/storage.objectViewer"' in reader_block
+    assert builder_member in reader_block
+
+    # No binding anywhere grants the builder any Secret Manager role or access to
+    # the agent-artifacts bucket. Scan every resource block that names the builder
+    # as its member.
+    def _blocks_naming_builder(text: str) -> list[str]:
+        blocks = []
+        for chunk in text.split("resource ")[1:]:
+            body = "resource " + chunk
+            if builder_member in body:
+                blocks.append(body)
+        return blocks
+
+    for body in _blocks_naming_builder(iam) + _blocks_naming_builder(wi):
+        assert "secretmanager" not in body, (
+            "builder SA must have NO Secret Manager access; offending block:\n" + body
+        )
+        # The builder must not be bound onto the agent-artifacts bucket. The
+        # artifacts bucket is google_storage_bucket.artifacts; the builder's only
+        # storage binding is on compute_build_source.
+        assert "google_storage_bucket.artifacts" not in body, (
+            "builder SA must not be granted access to the agent-artifacts bucket; "
+            "offending block:\n" + body
+        )
+
+    # (d) Builder can publish to compute_images_repo (writer) and write logs.
+    assert (
+        'resource "google_artifact_registry_repository_iam_member" "compute_image_builder_compute_images_writer"'
+        in wi
+    )
+    writer_block = wi.split(
+        'resource "google_artifact_registry_repository_iam_member" "compute_image_builder_compute_images_writer"',
+        1,
+    )[1].split("resource ", 1)[0]
+    assert "google_artifact_registry_repository.compute_images_repo.name" in writer_block
+    assert 'role       = "roles/artifactregistry.writer"' in writer_block
+    assert builder_member in writer_block
+
+    log_block = iam.split(
+        'resource "google_project_iam_member" "compute_image_builder_log_writer"', 1
+    )[1].split("resource ", 1)[0]
+    assert 'role    = "roles/logging.logWriter"' in log_block
+    assert builder_member in log_block
+
+    # (e) Orchestrator can create/get/cancel builds and actAs the builder SA.
+    orch_member = "google_service_account.orchestrator_sa.email"
+    editor_block = iam.split(
+        'resource "google_project_iam_member" "orchestrator_cloud_build_editor"', 1
+    )[1].split("resource ", 1)[0]
+    assert 'role    = "roles/cloudbuild.builds.editor"' in editor_block
+    assert orch_member in editor_block
+
+    actas_block = iam.split(
+        'resource "google_service_account_iam_member" "orchestrator_act_as_compute_image_builder"',
+        1,
+    )[1].split("resource ", 1)[0]
+    assert "google_service_account.compute_image_builder_sa.name" in actas_block
+    assert 'role               = "roles/iam.serviceAccountUser"' in actas_block
+    assert orch_member in actas_block
+
+    # (f) Pre-existing orchestrator/agent compute-image grants are preserved:
+    #     orchestrator keeps its compute-image protection-tag write permission,
+    #     and the agent keeps its image-pull (reader) permission.
+    assert (
+        'resource "google_artifact_registry_repository_iam_member" "orchestrator_compute_images_writer"'
+        in wi
+    )
+    assert (
+        'resource "google_artifact_registry_repository_iam_member" "agent_compute_images_reader"'
+        in wi
+    )
+
+    # (g) The three builder config values are wired into BOTH the cloudbuild.yaml
+    #     source of truth and the cloud_run.tf drift mirror.
+    for key in (
+        "COMPUTE_IMAGE_BUILDER_SA",
+        "COMPUTE_IMAGE_BUILD_LOCATION",
+        "COMPUTE_IMAGE_BUILD_SOURCE_BUCKET",
+    ):
+        assert key in cloudbuild, f"{key} missing from cloudbuild.yaml --set-env-vars"
+        assert key in cloud_run, f"{key} missing from cloud_run.tf drift mirror"
+
+    # cloudbuild.yaml points the config at the dedicated SA and disposable bucket.
+    assert "compute-image-builder-sa@$PROJECT_ID.iam.gserviceaccount.com" in cloudbuild
+    assert "COMPUTE_IMAGE_BUILD_SOURCE_BUCKET=$PROJECT_ID-compute-build-source" in cloudbuild
+
+
+# ── Remote build path (compute_image_remote_build) ─────────────────────────
+
+
+def test_remote_registry_tag_exists_present(monkeypatch):
+    """remote_registry_tag_exists returns True when gcloud finds the tag."""
+    from app.compute_image_remote_build import remote_registry_tag_exists
+
+    def fake_run(cmd, **kw):
+        class P:
+            returncode = 0
+            stdout = '[{"tag": "abc123", "version": "sha256:deadbeef"}]'
+            stderr = ""
+        return P()
+
+    assert remote_registry_tag_exists("reg/repo/img", "abc123", _run=fake_run) is True
+
+
+def test_remote_registry_tag_exists_absent(monkeypatch):
+    """remote_registry_tag_exists returns False when gcloud finds no match."""
+    from app.compute_image_remote_build import remote_registry_tag_exists
+
+    def fake_run(cmd, **kw):
+        class P:
+            returncode = 0
+            stdout = "[]"
+            stderr = ""
+        return P()
+
+    assert remote_registry_tag_exists("reg/repo/img", "abc123", _run=fake_run) is False
+
+
+def test_remote_registry_tag_exists_fail_open_on_error(monkeypatch):
+    """remote_registry_tag_exists returns False (not-so-present) on any error."""
+    from app.compute_image_remote_build import remote_registry_tag_exists
+
+    def fake_run(cmd, **kw):
+        raise OSError("gcloud not found")
+
+    # Fail-open: treat as "not present" so caller falls through to a build.
+    assert remote_registry_tag_exists("reg/repo/img", "abc123", _run=fake_run) is False
+
+
+def test_remote_resolve_digest_from_api(monkeypatch):
+    """_resolve_registry_digest_from_api returns the digest from gcloud output."""
+    from app.compute_image_remote_build import _resolve_registry_digest_from_api
+
+    def fake_run(cmd, **kw):
+        class P:
+            returncode = 0
+            stdout = '[{"tag": "abc123", "version": "sha256:baadf00dbaadf00dbaadf00dbaadf00dbaadf00dbaadf00dbaadf00dbaadf00d"}]'
+            stderr = ""
+        return P()
+
+    digest = _resolve_registry_digest_from_api("reg/repo/img", "abc123", _run=fake_run)
+    assert digest is not None and digest.startswith("sha256:")
+
+
+def test_remote_resolve_digest_from_api_not_found(monkeypatch):
+    """_resolve_registry_digest_from_api returns None when tag is absent."""
+    from app.compute_image_remote_build import _resolve_registry_digest_from_api
+
+    def fake_run(cmd, **kw):
+        class P:
+            returncode = 0
+            stdout = "[]"
+            stderr = ""
+        return P()
+
+    assert _resolve_registry_digest_from_api("reg/repo/img", "nonexistent", _run=fake_run) is None
+
+
+def test_remote_build_and_push_fast_path_skips_when_tag_exists(tmp_path, monkeypatch):
+    """Remote build skips submission when the hash-tagged image already exists."""
+    from app.compute_image_remote_build import remote_build_and_push
+
+    monkeypatch.setenv("COMPUTE_IMAGE_BUILDER_SA", "builder-sa@proj.iam.gserviceaccount.com")
+    monkeypatch.setenv("COMPUTE_IMAGE_BUILD_LOCATION", "us-central1")
+    monkeypatch.setenv("COMPUTE_IMAGE_BUILD_SOURCE_BUCKET", "proj-compute-build-source")
+
+    repo = _write_repo(tmp_path)
+    run_calls = []
+
+    def fake_run(cmd, **kw):
+        run_calls.append(cmd)
+        class P:
+            returncode = 0
+            stdout = '[{"tag": "abc123", "version": "sha256:baadf00d"}]'
+            stderr = ""
+        return P()
+
+    result = remote_build_and_push(
+        repo_dir=repo,
+        registry_repo="reg/repo",
+        image_name="img",
+        dockerfile=".blueprint/Dockerfile.compute",
+        dep_files=["requirements.txt"],
+        _run=fake_run,
+        _tag_exists_fn=lambda repo_tag, tag, _run=None: True,
+    )
+    assert result.already_present is True
+    assert result.built is False
+    # No Cloud Build submission was made.
+    assert not any("builds submit" in " ".join(c) for c in run_calls)
+
+
+def test_remote_build_and_push_credential_leak_fails_before_submission(tmp_path, monkeypatch):
+    """Input credential scan fails the remote build BEFORE Cloud Build is invoked."""
+    from app.compute_image_remote_build import remote_build_and_push
+    from app.compute_image_build import CredentialLeakError
+
+    monkeypatch.setenv("COMPUTE_IMAGE_BUILDER_SA", "builder-sa@proj.iam.gserviceaccount.com")
+    monkeypatch.setenv("COMPUTE_IMAGE_BUILD_LOCATION", "us-central1")
+    monkeypatch.setenv("COMPUTE_IMAGE_BUILD_SOURCE_BUCKET", "proj-compute-build-source")
+
+    # Dockerfile with a literal GitHub PAT baked into an ENV.
+    dockerfile = b"FROM python:3.11-slim\nENV GITHUB_APP_PRIVATE_KEY=ghs_deadbeefdeadbeefdeadbeef\n"
+    repo = _write_repo(tmp_path, dockerfile=dockerfile)
+    run_calls = []
+
+    def fake_run(cmd, **kw):
+        run_calls.append(cmd)
+        class P:
+            returncode = 0
+            stdout = "[]"
+            stderr = ""
+        return P()
+
+    with pytest.raises(CredentialLeakError, match="credential scan failed"):
+        remote_build_and_push(
+            repo_dir=repo,
+            registry_repo="reg/repo",
+            image_name="img",
+            dockerfile=".blueprint/Dockerfile.compute",
+            dep_files=["requirements.txt"],
+            _run=fake_run,
+            _tag_exists_fn=lambda *a, **k: False,
+        )
+    # No Cloud Build was ever submitted — the credential gate fired first.
+    assert not any("builds submit" in " ".join(c) for c in run_calls)
+
+
+def test_remote_build_and_push_dry_run_does_not_submit(tmp_path, monkeypatch):
+    """dry_run=True skips Cloud Build submission, returns hash-only result."""
+    from app.compute_image_remote_build import remote_build_and_push
+
+    monkeypatch.setenv("COMPUTE_IMAGE_BUILDER_SA", "builder-sa@proj.iam.gserviceaccount.com")
+    monkeypatch.setenv("COMPUTE_IMAGE_BUILD_LOCATION", "us-central1")
+    monkeypatch.setenv("COMPUTE_IMAGE_BUILD_SOURCE_BUCKET", "proj-compute-build-source")
+
+    repo = _write_repo(tmp_path)
+    run_calls = []
+
+    def fake_run(cmd, **kw):
+        run_calls.append(cmd)
+        class P:
+            returncode = 0
+            stdout = "[]"
+            stderr = ""
+        return P()
+
+    result = remote_build_and_push(
+        repo_dir=repo,
+        registry_repo="reg/repo",
+        image_name="img",
+        dockerfile=".blueprint/Dockerfile.compute",
+        dep_files=["requirements.txt"],
+        dry_run=True,
+        _run=fake_run,
+        _tag_exists_fn=lambda *a, **k: False,
+    )
+    assert result.already_present is False
+    assert result.built is False
+    # No Cloud Build submission on dry_run.
+    assert not any("builds submit" in " ".join(c) for c in run_calls)
+    # But we do get a dep_hash and a pinned_ref (tag-only in dry_run).
+    assert result.dep_hash
+    assert result.pinned_ref.endswith(result.dep_hash)
+
+
+def test_remote_build_and_push_cancellation_reaches_cloud_build(tmp_path, monkeypatch):
+    """When BuildControl is aborted, the Cloud Build is cancelled."""
+    from app.compute_image_remote_build import remote_build_and_push
+    from app.compute_image_build import BuildControl, BuildAborted, set_build_control
+
+    monkeypatch.setenv("COMPUTE_IMAGE_BUILDER_SA", "builder-sa@proj.iam.gserviceaccount.com")
+    monkeypatch.setenv("COMPUTE_IMAGE_BUILD_LOCATION", "us-central1")
+    monkeypatch.setenv("COMPUTE_IMAGE_BUILD_SOURCE_BUCKET", "proj-compute-build-source")
+    monkeypatch.setenv("GCP_PROJECT_ID", "test-proj")
+
+    repo = _write_repo(tmp_path)
+    run_calls = []
+
+    # Simulate a Cloud Build that stays WORKING (never finishes).
+    poll_count = [0]
+
+    def fake_run(cmd, **kw):
+        cmd_str = " ".join(cmd)
+        run_calls.append(cmd_str)
+
+        class P:
+            returncode = 0
+            stderr = ""
+
+        if "builds submit" in cmd_str:
+            # Return a build ID.
+            P.stdout = '{"id": "build-12345", "logUrl": "https://..."}'
+            P.returncode = 0
+        elif "builds describe" in cmd_str:
+            # Stay WORKING until we trigger cancellation.
+            poll_count[0] += 1
+            if poll_count[0] >= 3:
+                # After a few polls, signal cancellation via BuildControl.
+                # (In real life the admin endpoint's timeout fires control.abort().)
+                control = _bci.current_build_control()
+                if control is not None:
+                    control.abort()
+            P.stdout = '{"id": "build-12345", "status": "WORKING"}'
+            P.returncode = 0
+        elif "builds cancel" in cmd_str:
+            # Cancellation was requested — good.
+            P.stdout = "{}"
+            P.returncode = 0
+        elif "builds" in cmd_str:
+            P.stdout = "[]"
+            P.returncode = 0
+        else:
+            P.stdout = ""
+            P.returncode = 0
+        return P()
+
+    control = BuildControl()
+    token = set_build_control(control)
+    try:
+        with pytest.raises(BuildAborted, match="cancelled"):
+            remote_build_and_push(
+                repo_dir=repo,
+                registry_repo="reg/repo",
+                image_name="img",
+                dockerfile=".blueprint/Dockerfile.compute",
+                dep_files=["requirements.txt"],
+                _run=fake_run,
+                _tag_exists_fn=lambda *a, **k: False,
+            )
+    finally:
+        _bci.reset_build_control(token)
+
+    # The cancellation reached the Cloud Build job.
+    cancel_calls = [c for c in run_calls if "builds cancel" in c]
+    assert len(cancel_calls) >= 1, f"Expected 'gcloud builds cancel' call, got: {run_calls}"
+
+
+def test_remote_build_and_push_succeeds_without_local_docker(tmp_path, monkeypatch):
+    """Remote build succeeds even when docker is unavailable locally.
+
+    This is the key acceptance test: the remote path never calls docker,
+    only gcloud.  The runner proves a changed image succeeds with the local
+    Docker runner unavailable.
+    """
+    from app.compute_image_remote_build import remote_build_and_push
+
+    monkeypatch.setenv("COMPUTE_IMAGE_BUILDER_SA", "builder-sa@proj.iam.gserviceaccount.com")
+    monkeypatch.setenv("COMPUTE_IMAGE_BUILD_LOCATION", "us-central1")
+    monkeypatch.setenv("COMPUTE_IMAGE_BUILD_SOURCE_BUCKET", "proj-compute-build-source")
+    monkeypatch.setenv("GCP_PROJECT_ID", "test-proj")
+
+    repo = _write_repo(tmp_path)
+    run_calls = []
+
+    # Simulate: tag does NOT exist, submit succeeds, poll returns SUCCESS.
+    call_seq = iter(["tag_check", "submit", "poll", "poll_success", "digest"])
+
+    def fake_run(cmd, **kw):
+        cmd_str = " ".join(cmd)
+        run_calls.append(cmd_str)
+        kind = next(call_seq, "extra")
+
+        class P:
+            returncode = 0
+            stderr = ""
+
+        if kind == "tag_check":
+            P.stdout = "[]"
+        elif kind == "submit":
+            P.stdout = '{"id": "build-abc", "logUrl": "https://..."}'
+        elif kind == "poll":
+            P.stdout = '{"id": "build-abc", "status": "WORKING"}'
+        elif kind == "poll_success":
+            P.stdout = '{"id": "build-abc", "status": "SUCCESS"}'
+        elif kind == "digest":
+            P.stdout = '[{"tag": "abc123", "version": "sha256:ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"}]'
+        else:
+            P.stdout = "[]"
+        return P()
+
+    result = remote_build_and_push(
+        repo_dir=repo,
+        registry_repo="reg/repo",
+        image_name="img",
+        dockerfile=".blueprint/Dockerfile.compute",
+        dep_files=["requirements.txt"],
+        _run=fake_run,
+        _tag_exists_fn=lambda *a, **k: False,
+    )
+
+    assert result.built is True
+    assert result.already_present is False
+    assert result.pinned_ref.startswith("reg/repo/img@sha256:")
+    # Docker was never invoked.
+    assert not any("docker " in c for c in run_calls), f"docker called: {run_calls}"
+    # Cloud Build was submitted.
+    assert any("builds submit" in c for c in run_calls)
+
+
+def test_remote_build_and_push_not_configured_raises(tmp_path, monkeypatch):
+    """When env vars are missing, the remote path raises a clear error."""
+    from app.compute_image_remote_build import remote_build_and_push
+
+    # Deliberately do NOT set the required env vars.
+    repo = _write_repo(tmp_path)
+
+    with pytest.raises(RuntimeError, match="not configured"):
+        remote_build_and_push(
+            repo_dir=repo,
+            registry_repo="reg/repo",
+            image_name="img",
+            dockerfile=".blueprint/Dockerfile.compute",
+            dep_files=["requirements.txt"],
+        )
+
+
+def test_remote_build_and_push_unchanged_hash_avoids_submission(tmp_path, monkeypatch):
+    """When the dep hash exists in the registry, no Cloud Build is submitted.
+
+    This is the acceptance evidence for: 'unchanged hashes avoid submission.'
+    """
+    from app.compute_image_remote_build import remote_build_and_push
+
+    monkeypatch.setenv("COMPUTE_IMAGE_BUILDER_SA", "builder-sa@proj.iam.gserviceaccount.com")
+    monkeypatch.setenv("COMPUTE_IMAGE_BUILD_LOCATION", "us-central1")
+    monkeypatch.setenv("COMPUTE_IMAGE_BUILD_SOURCE_BUCKET", "proj-compute-build-source")
+
+    repo = _write_repo(tmp_path)
+    run_calls = []
+
+    def fake_run(cmd, **kw):
+        run_calls.append(" ".join(cmd))
+        class P:
+            returncode = 0
+            stdout = '[{"tag": "abc123", "version": "sha256:ccdd"}]'
+            stderr = ""
+        return P()
+
+    # The tag_exists function simulates the image already being present.
+    result = remote_build_and_push(
+        repo_dir=repo,
+        registry_repo="reg/repo",
+        image_name="img",
+        dockerfile=".blueprint/Dockerfile.compute",
+        dep_files=["requirements.txt"],
+        _run=fake_run,
+        _tag_exists_fn=lambda *a, **k: True,
+    )
+
+    assert result.already_present is True
+    assert result.built is False
+    # No build submission occurred — fast path.
+    assert not any("builds submit" in c for c in run_calls)

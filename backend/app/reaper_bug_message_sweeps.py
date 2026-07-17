@@ -1176,20 +1176,24 @@ async def sweep_deliver_task_wakes(
         .scalars()
         .all()
     )
-    for task in stranded:
-        live = (
+    task_ids = [task.id for task in stranded]
+    live_task_ids: set = set()
+    if task_ids:
+        live_rows = (
             await session.execute(
-                select(TaskWakeRegistration.id)
+                select(TaskWakeRegistration.task_id)
                 .where(
-                    TaskWakeRegistration.task_id == task.id,
+                    TaskWakeRegistration.task_id.in_(task_ids),
                     TaskWakeRegistration.delivery_state.in_(
                         [WakeDeliveryState.PENDING, WakeDeliveryState.FIRED]
                     ),
                 )
-                .limit(1)
+                .distinct()
             )
-        ).first()
-        if live is not None:
+        ).scalars().all()
+        live_task_ids = set(live_rows)
+    for task in stranded:
+        if task.id in live_task_ids:
             continue
         touched = True
         stranded_count += 1
@@ -1550,27 +1554,36 @@ async def sweep_wake_delivery_stall_alerts(
     create path (commits inside after the loop); the resolve path commits
     per-project inside :func:`alert_dispatch._resolve_wake_delivery_stall_alert`.
     """
-    from app.alert_dispatch import (
-        _WAKE_DELIVERY_STALL_ALERT_TITLE,
-        _maybe_create_wake_delivery_stall_alert,
-        _resolve_wake_delivery_stall_alert,
-    )
-    from app.models import Alert, TaskWakeRegistration, WakeDeliveryState
+    from app.alert_dispatch import _WAKE_DELIVERY_STALL_ALERT_TITLE
+    from app.broadcast import broadcast_to_project as _bcast
+    from app.models import Alert, AlertSeverity, TaskWakeRegistration, WakeDeliveryState
+    from app.time_utils import _utcnow
 
     if not delivery_stalled:
         # Delivery has recovered — dismiss open stall alerts fleet-wide.
-        result = await session.execute(
-            select(Alert.project_id)
-            .distinct()
-            .where(
-                Alert.dismissed_at.is_(None),
-                Alert.title == _WAKE_DELIVERY_STALL_ALERT_TITLE,
+        # Batch-load all open stall alerts in a single query instead of N per-project SELECTs.
+        open_alerts = (
+            await session.execute(
+                select(Alert).where(
+                    Alert.dismissed_at.is_(None),
+                    Alert.title == _WAKE_DELIVERY_STALL_ALERT_TITLE,
+                )
             )
-        )
-        project_ids = result.scalars().all()
+        ).scalars().all()
         dismissed = 0
-        for pid in project_ids:
-            dismissed += await _resolve_wake_delivery_stall_alert(session, pid)
+        if open_alerts:
+            now = _utcnow()
+            for alert in open_alerts:
+                alert.dismissed_at = now
+                session.add(alert)
+            await session.commit()
+            for alert in open_alerts:
+                await _bcast(
+                    str(alert.project_id),
+                    "alert_dismissed",
+                    {"alert_id": str(alert.id), "title": alert.title},
+                )
+            dismissed = len(open_alerts)
         if dismissed:
             logger.info(
                 "[REAPER] resolved wake-delivery-stall alert on %d project(s)",
@@ -1585,13 +1598,53 @@ async def sweep_wake_delivery_stall_alerts(
         .where(TaskWakeRegistration.delivery_state == WakeDeliveryState.FIRED)
     )
     project_ids = result.scalars().all()
-    created = 0
+    if not project_ids:
+        return 0
+
+    # Batch-check which project_ids already have an open stall alert.
+    existing_pids = set(
+        (
+            await session.execute(
+                select(Alert.project_id).where(
+                    Alert.project_id.in_(project_ids),
+                    Alert.dismissed_at.is_(None),
+                    Alert.title == _WAKE_DELIVERY_STALL_ALERT_TITLE,
+                )
+            )
+        ).scalars().all()
+    )
+    title = _WAKE_DELIVERY_STALL_ALERT_TITLE
+    msg = (
+        f"The wake-delivery sweep has made no progress against the FIRED "
+        f"registration backlog for {stall_cycles} consecutive reaper cycles. "
+        f"Parked tasks whose wake sources have fired are not being advanced — "
+        f"check for a wedged or crashed delivery path."
+    )[:1000]
+    new_alerts = []
     for pid in project_ids:
-        created += await _maybe_create_wake_delivery_stall_alert(
-            session, pid, stall_cycles=stall_cycles
+        if pid in existing_pids:
+            continue
+        alert = Alert(
+            project_id=pid,
+            severity=AlertSeverity.WARNING,
+            title=title,
+            message=msg,
         )
+        session.add(alert)
+        new_alerts.append(alert)
+    created = len(new_alerts)
     if created:
         await session.commit()
+        for alert in new_alerts:
+            await _bcast(
+                str(alert.project_id),
+                "alert_created",
+                {
+                    "alert_id": str(alert.id),
+                    "severity": AlertSeverity.WARNING.value,
+                    "title": alert.title,
+                },
+            )
         logger.info(
             "[REAPER] raised wake-delivery-stall alert on %d project(s)",
             created,

@@ -486,6 +486,49 @@ def test_depth_bound_terminates_on_circular_import(tmp_path):
     assert result == []
 
 
+def test_resolver_reads_each_app_and_test_source_once(tmp_path, monkeypatch):
+    """Transitive expansion is indexed; hop count never multiplies file scans."""
+    root = str(tmp_path)
+    _make_tree(root)
+    _write(root, "backend/app/leaf.py", "def leaf(): pass\n")
+    previous = "leaf"
+    for hop in range(impacted_tests.MAX_HOPS):
+        current = f"layer_{hop}"
+        _write(
+            root,
+            f"backend/app/{current}.py",
+            f"from app.{previous} import value\n",
+        )
+        previous = current
+    for index in range(5):
+        _write(
+            root,
+            f"backend/testing/test_scan_{index}.py",
+            f"from app.{previous} import value\n",
+        )
+
+    opened_py: "dict[str, int]" = {}
+    real_open = open
+
+    def counting_open(path, *args, **kwargs):
+        normalized = os.path.normpath(os.fspath(path))
+        if normalized.endswith(".py"):
+            opened_py[normalized] = opened_py.get(normalized, 0) + 1
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", counting_open)
+    impacted_tests.resolve_impacted(["backend/app/leaf.py"], root)
+
+    app_and_test_sources = [
+        path
+        for path in opened_py
+        if os.sep + "backend" + os.sep + "app" + os.sep in path
+        or os.sep + "backend" + os.sep + "testing" + os.sep in path
+    ]
+    assert app_and_test_sources
+    assert all(opened_py[path] == 1 for path in app_and_test_sources), opened_py
+
+
 def test_main_reads_stdin_and_writes_stdout(tmp_path, monkeypatch, capsys):
     root = str(tmp_path)
     _make_tree(root)

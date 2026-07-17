@@ -50,6 +50,7 @@ vi.mock('./audit-challenge.js', () => ({
 
 vi.mock('./strategic-resident-turn.js', () => ({
   handleStrategicResidentTurn: residentTurnHandlerMock,
+  residentProviderSupportsNoTools: vi.fn().mockReturnValue(true),
 }));
 
 // Mock fs and child_process so handler files that import them at module level

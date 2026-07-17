@@ -586,4 +586,7 @@ async def test_preflight_idempotent_commit_result_does_not_rearm_bump(
 
     assert verdict == "ok"
     assert reason is None
+
     mock_commit.assert_awaited_once()
+    mock_commit.assert_awaited_once()
+

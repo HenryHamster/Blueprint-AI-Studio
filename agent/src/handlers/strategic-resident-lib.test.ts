@@ -1371,6 +1371,55 @@ describe('pending operator-decision review state machine', () => {
     expect(restored?.some(e => e.verdict === OPERATOR_DECISION_VERDICT && e.note.includes(exchangeText))).toBe(true);
   });
 
+  it('id-less overflow sentinel: repeated MAX_REVIEW_ATTEMPTS fallback admissions produce at most one register entry', () => {
+    // Simulate the id-less overflow sentinel (overflowed=true, messageIds=[], no queuedExchanges).
+    const sentinelStartedAt = '2026-01-01T00:00:00Z';
+    const sentinel: PendingOperatorDecisionReview = {
+      status: 'pending', messageIds: [], startedAt: sentinelStartedAt, attempts: 0,
+      overflowed: true, overflowExchanges: 3,
+    };
+    // Exhaust retry attempts to reach the MAX_REVIEW_ATTEMPTS fallback branch.
+    let retained = sentinel;
+    for (let i = 0; i < MAX_REVIEW_ATTEMPTS; i++) {
+      retained = retainPendingOperatorDecisionReview(retained);
+    }
+    expect(retained.attempts).toBeGreaterThanOrEqual(MAX_REVIEW_ATTEMPTS);
+
+    // The handler logic: sentinelKey is non-null for id-less overflow sentinel.
+    const sentinelKey = `sentinel:${retained.startedAt}`;
+    const buildFallbackNote = (r: PendingOperatorDecisionReview) =>
+      r.exchangeText
+        ? `[unclassified after ${r.attempts} attempts ${sentinelKey}] ${r.exchangeText}`
+        : `[unclassified after ${r.attempts} attempts ${sentinelKey} — exchange text unavailable]`;
+
+    const register: DecisionsRegisterEntry[] = [];
+
+    // First invocation — should admit exactly one entry.
+    const alreadyAdmitted1 = register.some(e => e.verdict === OPERATOR_DECISION_VERDICT && e.note.includes(sentinelKey));
+    if (!alreadyAdmitted1) {
+      admitDecisionEntry(register, {
+        atTick: 10, at: sentinelStartedAt,
+        surfaceKey: 'operator:message', verdict: OPERATOR_DECISION_VERDICT,
+        note: buildFallbackNote(retained),
+      }, DECISIONS_REGISTER_CAP);
+    }
+    expect(register).toHaveLength(1);
+    expect(register[0].note).toContain(sentinelKey);
+
+    // Second invocation (re-trip on next failed autonomous turn) — guard fires, no new entry.
+    retained = retainPendingOperatorDecisionReview(retained);
+    const alreadyAdmitted2 = register.some(e => e.verdict === OPERATOR_DECISION_VERDICT && e.note.includes(sentinelKey));
+    if (!alreadyAdmitted2) {
+      admitDecisionEntry(register, {
+        atTick: 11, at: sentinelStartedAt,
+        surfaceKey: 'operator:message', verdict: OPERATOR_DECISION_VERDICT,
+        note: buildFallbackNote(retained),
+      }, DECISIONS_REGISTER_CAP);
+    }
+    // Still exactly one entry — genuine operator decisions are not crowded out.
+    expect(register).toHaveLength(1);
+  });
+
   it('clears id-less overflow sentinel when escape hatch fires (coversOverflow:true)', () => {
     // Regression: the MAX_REVIEW_ATTEMPTS escape hatch used to pass
     // coversOverflow:reviewOutcome.coversOverflow (which is false in this branch),

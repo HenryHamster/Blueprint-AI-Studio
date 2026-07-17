@@ -85,6 +85,19 @@ resource "google_artifact_registry_repository_iam_member" "agent_compute_images_
   member     = "serviceAccount:${google_service_account.agent_sa.email}"
 }
 
+# Isolated compute-image builder SA (see iam.tf) needs artifactregistry.writer
+# on compute_images_repo so the regional Cloud Build can publish project-baked
+# images. This repo is the builder's ONLY publish target — it holds no writer
+# role on the orchestrator (blueprint-repo) or agent-images repos, so a
+# malicious build cannot overwrite the orchestrator's own deploy image.
+resource "google_artifact_registry_repository_iam_member" "compute_image_builder_compute_images_writer" {
+  project    = google_artifact_registry_repository.compute_images_repo.project
+  location   = google_artifact_registry_repository.compute_images_repo.location
+  repository = google_artifact_registry_repository.compute_images_repo.name
+  role       = "roles/artifactregistry.writer"
+  member     = "serviceAccount:${google_service_account.compute_image_builder_sa.email}"
+}
+
 resource "google_project_iam_member" "github_actions_run_admin" {
   count   = var.enable_cicd ? 1 : 0
   project = var.project_id

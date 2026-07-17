@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, type ReactNode } from 'react';
+import { useState, useEffect, useRef, useCallback, type ReactNode } from 'react';
 import { AlertTriangle, ArrowUpRight, BarChart3, FileImage, FileText, FileVideo, Gauge, Maximize2, Network, RefreshCw, Table2, X } from 'lucide-react';
 import type {
   StrategicContextArtifactViewablePreview,
@@ -95,7 +95,10 @@ interface FreshMedia {
   /** Best usable URL — the freshly minted signed URL when available, else the baked one. */
   url: string | null;
   status: MediaStatus;
-  /** Re-mint the signed URL (or, for baked-only media, re-attempt the current URL). */
+  /** True when a storage_uri + projectId is available to re-mint a fresh signed URL.
+   *  False for baked-only media — retry() cannot produce a different URL in that case. */
+  canRetry: boolean;
+  /** Re-mint the signed URL. Only meaningful when canRetry is true. */
   retry: () => void;
   /** Call from the media element's `onError` when the loaded URL turns out to be dead. */
   onMediaError: () => void;
@@ -132,6 +135,13 @@ function useFreshMediaUrl(
   const [loadError, setLoadError] = useState(false);
   // Bumped by retry() to force the resolver effect to re-run for the same ref.
   const [attempt, setAttempt] = useState(0);
+  // Ref holding the generation value for which an automatic error-retry has
+  // already been consumed. Compared against the current generation in
+  // onMediaError so each distinct media item (new storage_uri or revision) gets
+  // exactly one automatic re-resolve before the manual retry button appears.
+  // Written only inside a callback — never during render — to satisfy the
+  // react-hooks/refs lint rule.
+  const autoRetriedForGenerationRef = useRef<string | null>(null);
 
   const canResolve = Boolean(projectId && storageUri);
 
@@ -183,9 +193,24 @@ function useFreshMediaUrl(
     }
   }, [canResolve]);
 
-  const onMediaError = useCallback(() => { setLoadError(true); }, []);
+  const onMediaError = useCallback(() => {
+    // When the media element's URL fails (e.g. expired signed URL) and we have
+    // a stable storage_uri to re-resolve from, attempt one automatic re-resolve
+    // before surfacing the manual retry button — mirroring KnowledgeBrowser.
+    if (canResolve && autoRetriedForGenerationRef.current !== generation) {
+      autoRetriedForGenerationRef.current = generation;
+      setAttempt(a => a + 1);
+    } else {
+      setLoadError(true);
+    }
+  }, [canResolve, generation]);
 
-  return { url, status, retry, onMediaError };
+  // After a fresh signed URL is successfully re-minted (auto-retry) but the
+  // media element still fails, the underlying GCS object is gone (7-day
+  // lifecycle reap) — re-minting another URL would be futile.  Only offer
+  // retry when signing itself failed (which may recover) or no load error yet.
+  const retryWouldHelp = !loadError || outcome?.failed === true;
+  return { url, status, canRetry: canResolve && retryWouldHelp, retry, onMediaError };
 }
 
 /** Pulsing "LIVE" badge for mid-run viewable previews. Renders a small overlay
@@ -266,6 +291,18 @@ function MediaSkeleton({ className }: { className: string }) {
   );
 }
 
+function MediaExpired({ label }: { label: string }) {
+  return (
+    <div
+      className="flex w-full items-center justify-center gap-1.5 px-2 py-2 text-xs text-neutral-500"
+      data-testid="strategic-artifact-expired"
+    >
+      <AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+      {label} — URL expired
+    </div>
+  );
+}
+
 function MediaRetry({ label, onRetry }: { label: string; onRetry: () => void }) {
   return (
     <button
@@ -299,9 +336,13 @@ function ResolvedImage({
   onExpand: (url: string, alt: string) => void;
   live?: boolean | null;
 }) {
-  const { url, status, retry, onMediaError } = useFreshMediaUrl(projectId, storageUri, revision, bakedUrl);
+  const { url, status, canRetry, retry, onMediaError } = useFreshMediaUrl(projectId, storageUri, revision, bakedUrl);
   if (status === 'loading') return <MediaSkeleton className={className} />;
-  if (status === 'error' || !url) return <MediaRetry label="Image preview unavailable" onRetry={retry} />;
+  if (status === 'error' || !url) {
+    return canRetry
+      ? <MediaRetry label="Image preview unavailable" onRetry={retry} />
+      : <MediaExpired label="Image preview unavailable" />;
+  }
   return (
     <button
       type="button"
@@ -340,9 +381,13 @@ function ResolvedVideo({
   className: string;
   live?: boolean | null;
 }) {
-  const { url, status, retry, onMediaError } = useFreshMediaUrl(projectId, storageUri, revision, bakedUrl);
+  const { url, status, canRetry, retry, onMediaError } = useFreshMediaUrl(projectId, storageUri, revision, bakedUrl);
   if (status === 'loading') return <MediaSkeleton className={className} />;
-  if (status === 'error' || !url) return <MediaRetry label="Video preview unavailable" onRetry={retry} />;
+  if (status === 'error' || !url) {
+    return canRetry
+      ? <MediaRetry label="Video preview unavailable" onRetry={retry} />
+      : <MediaExpired label="Video preview unavailable" />;
+  }
   // Bind the URL directly to <video src> (not a nested <source>) so `onError`
   // fires reliably when the signed URL is dead — matching ComputeJobsPanel.
   const video = (
@@ -382,9 +427,13 @@ function ResolvedPdf({
   // (re-minted from storage_uri, falling back to the baked url) and open it in a
   // new tab so the browser renders it in its own sandboxed viewer on the storage
   // origin.
-  const { url, status, retry } = useFreshMediaUrl(projectId, storageUri, revision, bakedUrl);
+  const { url, status, canRetry, retry } = useFreshMediaUrl(projectId, storageUri, revision, bakedUrl);
   if (status === 'loading') return <MediaSkeleton className={className} />;
-  if (status === 'error' || !url) return <MediaRetry label="PDF preview unavailable" onRetry={retry} />;
+  if (status === 'error' || !url) {
+    return canRetry
+      ? <MediaRetry label="PDF preview unavailable" onRetry={retry} />
+      : <MediaExpired label="PDF preview unavailable" />;
+  }
   const button = (
     <button
       type="button"
@@ -435,9 +484,10 @@ export function ArtifactViewablePreviews({
 
   // A preview is renderable from EITHER a baked url or a re-resolvable
   // storage_uri — never filter on url alone, or an expired baked url would drop
-  // a still-resolvable preview.
+  // a still-resolvable preview. PDF previews are included alongside images and
+  // videos so mixed-media artifacts surface all supported kinds in the strip.
   const items = (previews ?? []).filter(
-    preview => (preview.kind === 'image' || preview.kind === 'video') && (preview.url || preview.storage_uri),
+    preview => (preview.kind === 'image' || preview.kind === 'video' || preview.kind === 'pdf') && (preview.url || preview.storage_uri),
   );
   if (items.length === 0) return null;
 
@@ -458,6 +508,20 @@ export function ArtifactViewablePreviews({
               bakedUrl={preview.url}
               ariaLabel={alt}
               className="h-20 w-auto flex-shrink-0"
+              live={preview.live}
+            />
+          );
+        }
+        if (preview.kind === 'pdf') {
+          return (
+            <ResolvedPdf
+              key={preview.revision ? `${preview.storage_uri || preview.url}@${preview.revision}` : preview.storage_uri || preview.url || i}
+              projectId={projectId}
+              storageUri={preview.storage_uri}
+              revision={preview.revision}
+              bakedUrl={preview.url}
+              label={alt}
+              className="flex h-20 w-32 flex-shrink-0 flex-col items-center justify-center gap-1 rounded border border-neutral-700 bg-neutral-900 p-1 text-xs text-neutral-300 hover:text-sky-300"
               live={preview.live}
             />
           );

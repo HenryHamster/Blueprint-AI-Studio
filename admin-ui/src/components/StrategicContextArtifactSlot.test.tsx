@@ -236,7 +236,7 @@ describe('StrategicContextArtifactSlot — lazy signed-URL resolution', () => {
     expect(host.querySelector('img')).not.toBeNull();
   });
 
-  test('an image load error surfaces a retry that re-mints the signed URL', async () => {
+  test('an image load error auto-re-resolves once then shows expired state (GCS object reaped)', async () => {
     const { resolveArtifactDownloadUrl } = await import('../api');
     const pkg = makePackage({ descriptors: [imageDescriptor()] });
     await render(pkg, 'proj-1');
@@ -244,19 +244,24 @@ describe('StrategicContextArtifactSlot — lazy signed-URL resolution', () => {
 
     const img = host!.querySelector('img');
     expect(img).not.toBeNull();
-    // Simulate the signed URL going dead — the <img> fails to load.
+
+    // First error — should trigger an automatic re-resolve (no retry button yet).
     await act(async () => { img!.dispatchEvent(new Event('error')); });
-
-    // The image is replaced by a retry affordance.
-    const retry = host!.querySelector<HTMLButtonElement>('[data-testid="strategic-artifact-retry"]');
-    expect(retry).not.toBeNull();
-    expect(host!.querySelector('img')).toBeNull();
-
-    // Clicking retry re-mints the URL and restores the preview.
-    await act(async () => { retry!.click(); });
     await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 10)); });
     expect(vi.mocked(resolveArtifactDownloadUrl)).toHaveBeenCalledTimes(2);
+    // Auto-resolved: image is restored, no retry button.
     expect(host!.querySelector('img')).not.toBeNull();
+    expect(host!.querySelector('[data-testid="strategic-artifact-retry"]')).toBeNull();
+
+    // Second error (auto-retry already consumed, fresh signed URL also failed) —
+    // the GCS object is reaped; show 'expired' state, not a futile retry button.
+    const img2 = host!.querySelector('img');
+    await act(async () => { img2!.dispatchEvent(new Event('error')); });
+    expect(host!.querySelector('[data-testid="strategic-artifact-expired"]')).not.toBeNull();
+    expect(host!.querySelector('[data-testid="strategic-artifact-retry"]')).toBeNull();
+    expect(host!.querySelector('img')).toBeNull();
+    // No further re-mint attempts — the object is gone.
+    expect(vi.mocked(resolveArtifactDownloadUrl)).toHaveBeenCalledTimes(2);
   });
 
   test('clicking an image opens a full-size lightbox that Escape and backdrop close', async () => {
@@ -287,7 +292,7 @@ describe('StrategicContextArtifactSlot — lazy signed-URL resolution', () => {
     expect(host!.querySelector('[data-testid="strategic-artifact-lightbox"]')).toBeNull();
   });
 
-  test('a video load error surfaces a retry that re-mints the signed URL', async () => {
+  test('a video load error auto-re-resolves once then shows expired state (GCS object reaped)', async () => {
     const { resolveArtifactDownloadUrl } = await import('../api');
     const pkg = makePackage({
       descriptors: [
@@ -309,14 +314,23 @@ describe('StrategicContextArtifactSlot — lazy signed-URL resolution', () => {
 
     const video = host!.querySelector('[data-testid="strategic-artifact-video"]');
     expect(video).not.toBeNull();
-    await act(async () => { video!.dispatchEvent(new Event('error')); });
 
-    const retry = host!.querySelector<HTMLButtonElement>('[data-testid="strategic-artifact-retry"]');
-    expect(retry).not.toBeNull();
-    await act(async () => { retry!.click(); });
+    // First error — auto-re-resolves without showing a retry button.
+    await act(async () => { video!.dispatchEvent(new Event('error')); });
     await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 10)); });
     expect(vi.mocked(resolveArtifactDownloadUrl)).toHaveBeenCalledTimes(2);
     expect(host!.querySelector('[data-testid="strategic-artifact-video"]')).not.toBeNull();
+    expect(host!.querySelector('[data-testid="strategic-artifact-retry"]')).toBeNull();
+
+    // Second error (auto-retry already consumed, fresh signed URL also failed) —
+    // the GCS object is reaped; show 'expired' state, not a futile retry button.
+    const video2 = host!.querySelector('[data-testid="strategic-artifact-video"]');
+    await act(async () => { video2!.dispatchEvent(new Event('error')); });
+    expect(host!.querySelector('[data-testid="strategic-artifact-expired"]')).not.toBeNull();
+    expect(host!.querySelector('[data-testid="strategic-artifact-retry"]')).toBeNull();
+    expect(host!.querySelector('[data-testid="strategic-artifact-video"]')).toBeNull();
+    // No further re-mint attempts — the object is gone.
+    expect(vi.mocked(resolveArtifactDownloadUrl)).toHaveBeenCalledTimes(2);
   });
 
   test('a multi-image gallery renders each image with an expand control', async () => {
@@ -504,6 +518,42 @@ describe('StrategicContextArtifactSlot — lazy signed-URL resolution', () => {
     expect(host!.querySelector('[data-testid="strategic-artifact-omitted-note"]')).toBeNull();
   });
 
+  test('baked-only image in error state shows expired message, not a retry button', async () => {
+    // Arrange: descriptor with only a baked URL (no storage_uri, no projectId)
+    // so canRetry is false — retry() cannot re-mint a different URL.
+    const pkg = makePackage({
+      descriptors: [
+        {
+          schema_version: 1,
+          id: 'art-baked-only',
+          kind: 'image',
+          title: 'Baked-only plot',
+          status: 'ready',
+          image: { url: 'https://storage.example.com/expired.png', alt: 'Baked-only plot' },
+          images: [
+            { url: 'https://storage.example.com/expired.png', alt: 'expired.png', filename: 'expired.png' },
+          ],
+        },
+      ],
+    });
+
+    // Render without projectId so canRetry = false
+    await render(pkg, null);
+
+    const img = host!.querySelector('img');
+    expect(img).not.toBeNull();
+
+    // Simulate the baked URL being dead (e.g. expired signed URL).
+    await act(async () => { img!.dispatchEvent(new Event('error')); });
+
+    // Should show the expired message, NOT the retry button.
+    const expired = host!.querySelector('[data-testid="strategic-artifact-expired"]');
+    expect(expired).not.toBeNull();
+    expect(expired!.textContent).toContain('URL expired');
+    // No retry button — clicking it would just re-render the same dead URL.
+    expect(host!.querySelector('[data-testid="strategic-artifact-retry"]')).toBeNull();
+  });
+
   test('omits the omitted-files note when descriptor kind is not media', async () => {
     const pkg = makePackage({
       descriptors: [
@@ -609,16 +659,36 @@ describe('ArtifactViewablePreviews — inline artifact-evidence thumbnails', () 
     expect(host!.querySelector('[data-testid="strategic-artifact-viewable-previews"]')).toBeNull();
   });
 
-  test('ignores non-image/video kinds and previews with neither url nor storage_uri', async () => {
+  test('ignores previews with neither url nor storage_uri; unsupported kinds self-hide the strip', async () => {
     await render(
       [
         { url: '', kind: 'image', filename: 'empty.png', storage_uri: null },
-        { url: 'https://storage.example.com/doc.pdf?sig=baked', kind: 'pdf', filename: 'doc.pdf', storage_uri: null },
+        { url: '', kind: 'pdf', filename: 'no-url.pdf', storage_uri: null },
       ],
       'proj-1',
     );
-    // Neither entry is renderable → the strip self-hides entirely.
+    // Both entries lack a usable URL and storage_uri → strip self-hides.
     expect(host!.querySelector('[data-testid="strategic-artifact-viewable-previews"]')).toBeNull();
+  });
+
+  test('renders a PDF preview as an open-in-new-tab button', async () => {
+    await render(
+      [
+        {
+          url: 'https://storage.example.com/report.pdf?sig=baked',
+          kind: 'pdf',
+          filename: 'report.pdf',
+          storage_uri: 'gs://bucket/proj/report.pdf',
+        },
+      ],
+      'proj-1',
+    );
+    const strip = host!.querySelector('[data-testid="strategic-artifact-viewable-previews"]');
+    expect(strip).not.toBeNull();
+    // PDF renders as a link/button, not as <img> or <video>.
+    expect(strip!.querySelector('[data-testid="strategic-context-pdf-open"]')).not.toBeNull();
+    expect(strip!.querySelector('img')).toBeNull();
+    expect(strip!.querySelector('video')).toBeNull();
   });
 
   test('falls back to the baked URL when no projectId is available', async () => {

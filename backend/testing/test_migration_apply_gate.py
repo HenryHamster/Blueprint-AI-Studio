@@ -31,6 +31,7 @@ from app.migration_apply_gate import (
     _check_data_migration_proof_gate,
     _create_database,
     _drop_database,
+    _looks_like_serving_only_import,
     _migration_has_data_ops,
     _migration_has_proof_declaration,
     _new_migration_sources,
@@ -523,52 +524,365 @@ async def test_candidate_sources_read_from_tarball_no_contents_calls(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_concurrent_applies_are_serialized():
-    """Alembic's runtime is PROCESS-GLOBAL — the ``op``/``context`` proxies are
-    module-level singletons rebound on every ``EnvironmentContext`` enter — so two
-    in-process migration applies running concurrently corrupt each other. That is
-    the flaky ``KeyError: 'config'`` that false-failed a release qualification to
-    ``infra_failure`` on 2026-06-16: the qualifier runs this gate PRE-LOCK, so two
-    overlapping finalize attempts genuinely invoke it at the same time.
+async def test_concurrent_applies_are_serialized(monkeypatch):
+    """The retained capacity lock admits only one migration subprocess at a time."""
 
-    ``_apply_candidate_migrations`` must therefore serialize the apply so no two
-    are ever live at once. The fake connection models the real apply, whose
-    greenlet-bridged DDL yields to the event loop at each statement — the exact
-    window a concurrent apply would interleave into and clobber the global proxy.
-    Without the lock, ``active`` would exceed 1."""
     import app.migration_apply_gate as gate_mod
 
     state = {"active": 0, "max": 0}
+    first_entered = asyncio.Event()
+    release = asyncio.Event()
 
-    class _FakeConn:
-        async def run_sync(self, _fn):
-            state["active"] += 1
-            state["max"] = max(state["max"], state["active"])
-            await asyncio.sleep(0.02)  # yield: a concurrent apply could interleave
-            state["active"] -= 1
+    async def _fake_runner(_engine, _script_location, *, timeout_code):
+        del timeout_code
+        state["active"] += 1
+        state["max"] = max(state["max"], state["active"])
+        first_entered.set()
+        await release.wait()
+        state["active"] -= 1
 
-    @contextlib.asynccontextmanager
-    async def _fake_connect():
-        yield _FakeConn()
+    monkeypatch.setattr(
+        gate_mod, "_run_migration_apply_subprocess", _fake_runner
+    )
 
     class _FakeEngine:
-        def connect(self):
-            return _fake_connect()
+        pass
 
-    sources = {"0001_init.py": "revision = '0001'\ndown_revision = None\n"}
-    await asyncio.gather(
-        *(
+    sources = {
+        "0001_init.py": """revision = '0001'
+down_revision = None
+"""
+    }
+    tasks = [
+        asyncio.create_task(
             gate_mod._apply_candidate_migrations(_FakeEngine(), sources)
-            for _ in range(3)
+        )
+        for _ in range(3)
+    ]
+    await first_entered.wait()
+    await asyncio.sleep(0)
+    assert state["max"] == 1
+    release.set()
+    await asyncio.gather(*tasks)
+    assert state["max"] == 1
+
+
+class _HangingProcess:
+    def __init__(self):
+        self.pid = 424242
+        self.returncode = None
+        self.entered = asyncio.Event()
+        self.communicate_calls = 0
+        self.killed = False
+
+    async def communicate(self, input=None):
+        del input
+        self.communicate_calls += 1
+        if self.communicate_calls == 1:
+            self.entered.set()
+            await asyncio.Event().wait()
+        return b"", b""
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
+
+    async def wait(self):
+        return self.returncode
+
+
+@pytest.mark.asyncio
+async def test_candidate_metadata_timeout_kills_and_reaps(monkeypatch):
+    import app.migration_apply_gate as gate_mod
+
+    proc = _HangingProcess()
+    monkeypatch.setattr(gate_mod, "_CANDIDATE_METADATA_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(
+        gate_mod,
+        "_download_candidate_repo_archive",
+        AsyncMock(return_value=b"archive"),
+    )
+    monkeypatch.setattr(
+        gate_mod.asyncio,
+        "create_subprocess_exec",
+        AsyncMock(return_value=proc),
+    )
+    monkeypatch.setattr(
+        gate_mod.os,
+        "killpg",
+        lambda _pid, _sig: proc.kill(),
+        raising=False,
+    )
+
+    with pytest.raises(
+        gate_mod._MigrationApplyTimeout,
+        match="migration_apply_candidate_metadata_timeout",
+    ):
+        await gate_mod._build_candidate_required_metadata_from_snapshot(
+            "token", "owner", "repo", "sha", None
+        )
+
+    assert proc.killed is True
+    assert proc.communicate_calls == 2
+    assert proc.returncode == -9
+
+
+@pytest.mark.asyncio
+async def test_candidate_metadata_subprocess_happy_path(monkeypatch):
+    import app.migration_apply_gate as gate_mod
+
+    archive = _make_tar_bytes(
+        [
+            ("repo/backend/app/__init__.py", b""),
+            (
+                "repo/backend/app/models.py",
+                b"""from sqlmodel import Field, SQLModel
+class Widget(SQLModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+""",
+            ),
+        ]
+    )
+    monkeypatch.setattr(
+        gate_mod,
+        "_download_candidate_repo_archive",
+        AsyncMock(return_value=archive),
+    )
+
+    metadata = await gate_mod._build_candidate_required_metadata_from_snapshot(
+        "token", "owner", "repo", "sha", None
+    )
+
+    assert "widget" in metadata.tables
+    assert list(metadata.tables["widget"].columns.keys()) == ["id"]
+
+@pytest.mark.asyncio
+async def test_subprocess_cancellation_kills_and_reaps(monkeypatch):
+    import app.migration_apply_gate as gate_mod
+
+    proc = _HangingProcess()
+    monkeypatch.setattr(
+        gate_mod.os,
+        "killpg",
+        lambda _pid, _sig: proc.kill(),
+        raising=False,
+    )
+    task = asyncio.create_task(
+        gate_mod._communicate_bounded(
+            proc,
+            timeout_seconds=60,
+            timeout_code="migration_apply_test_timeout",
         )
     )
+    await proc.entered.wait()
+    task.cancel()
 
-    assert state["max"] == 1, (
-        f"concurrent in-process Alembic applies observed (max={state['max']}); the "
-        "apply must be serialized to protect Alembic's process-global op/context "
-        "proxies"
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert proc.killed is True
+    assert proc.communicate_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_create_timeout_still_attempts_drop(monkeypatch):
+    import app.migration_apply_gate as gate_mod
+
+    timeout = gate_mod._MigrationApplyTimeout(
+        "migration_apply_scratch_provision_timeout", 0.01
+    )
+    monkeypatch.setattr(
+        gate_mod, "_create_database", AsyncMock(side_effect=timeout)
+    )
+    drop = AsyncMock()
+    monkeypatch.setattr(gate_mod, "_drop_database", drop)
+
+    with pytest.raises(gate_mod._MigrationApplyTimeout):
+        async with gate_mod.ephemeral_postgres_database(
+            make_url("postgresql+asyncpg://u:p@localhost/postgres")
+        ):
+            raise AssertionError("unreachable")
+
+    drop.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_ephemeral_cleanup_finishes_before_cancellation_propagates(
+    monkeypatch,
+):
+    import app.migration_apply_gate as gate_mod
+
+    body_entered = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    allow_cleanup = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+
+    monkeypatch.setattr(gate_mod, "_create_database", AsyncMock())
+    monkeypatch.setattr(
+        gate_mod, "create_async_engine", lambda *_args, **_kwargs: object()
     )
 
+    async def _cleanup(_engine, _base_url, _name):
+        cleanup_started.set()
+        await allow_cleanup.wait()
+        cleanup_finished.set()
+
+    monkeypatch.setattr(gate_mod, "_cleanup_ephemeral_database", _cleanup)
+
+    async def _use_database():
+        async with gate_mod.ephemeral_postgres_database(
+            make_url("postgresql+asyncpg://u:p@localhost/postgres")
+        ):
+            body_entered.set()
+            await asyncio.Event().wait()
+
+    task = asyncio.create_task(_use_database())
+    await body_entered.wait()
+    task.cancel()
+    await cleanup_started.wait()
+    assert not task.done()
+    allow_cleanup.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert cleanup_finished.is_set()
+
+@pytest.mark.asyncio
+async def test_timeout_is_not_retried_internally():
+    import app.migration_apply_gate as gate_mod
+
+    calls = 0
+
+    async def _timeout():
+        nonlocal calls
+        calls += 1
+        raise gate_mod._MigrationApplyTimeout(
+            "migration_apply_replay_apply_timeout", 0.01
+        )
+
+    with pytest.raises(gate_mod._MigrationApplyTimeout):
+        await gate_mod._with_transient_retry(_timeout, label="test timeout")
+
+    assert calls == 1
+
+@pytest.mark.asyncio
+async def test_apply_timeout_releases_capacity_lock(monkeypatch):
+    import app.migration_apply_gate as gate_mod
+
+    calls = 0
+
+    async def _runner(_engine, _script_location, *, timeout_code):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise gate_mod._MigrationApplyTimeout(timeout_code, 0.01)
+
+    monkeypatch.setattr(
+        gate_mod, "_run_migration_apply_subprocess", _runner
+    )
+
+    class _FakeEngine:
+        pass
+
+    sources = {"0001_init.py": "revision = '0001'"}
+    with pytest.raises(gate_mod._MigrationApplyTimeout):
+        await gate_mod._apply_candidate_migrations(_FakeEngine(), sources)
+
+    # A timeout must release the capacity lock before temp-file cleanup. If it
+    # did not, this second call would wait for the 240-second lock watchdog.
+    await gate_mod._apply_candidate_migrations(_FakeEngine(), sources)
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_apply_subprocess_receives_only_scratch_database_url(monkeypatch):
+    import app.migration_apply_gate as gate_mod
+
+    monkeypatch.setenv("BLUEPRINT_TEST_SECRET", "must-not-leak")
+    monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", "must-not-leak-either")
+    observed = {}
+
+    class _CompletedProcess:
+        returncode = 0
+        pid = 123
+
+        async def communicate(self, input=None):
+            del input
+            return b"", b""
+
+    async def _spawn(*args, **kwargs):
+        observed["args"] = args
+        observed["kwargs"] = kwargs
+        return _CompletedProcess()
+
+    monkeypatch.setattr(gate_mod.asyncio, "create_subprocess_exec", _spawn)
+
+    class _FakeEngine:
+        url = make_url(
+            "postgresql+asyncpg://scratch_user:scratch_secret@"
+            "scratch-host:5432/mig_apply_gate_test"
+        )
+
+    await gate_mod._run_migration_apply_subprocess(
+        _FakeEngine(),
+        "candidate-versions",
+        timeout_code="migration_apply_replay_apply_timeout",
+    )
+
+    env = observed["kwargs"]["env"]
+    expected = _FakeEngine.url.render_as_string(hide_password=False)
+    assert env["DATABASE_URL"] == expected
+    assert env["MIGRATION_APPLY_DATABASE_URL"] == expected
+    assert "prod" not in env["DATABASE_URL"]
+    assert "BLUEPRINT_TEST_SECRET" not in env
+    # An ephemeral synthetic Fernet key is injected so fail-closed migrations
+    # (e.g. 0609) can execute in the scratch subprocess.  It must be present
+    # but must NOT equal the production value set above.
+    assert "GITHUB_PAT_ENCRYPTION_KEY" in env
+    assert env["GITHUB_PAT_ENCRYPTION_KEY"] != "must-not-leak-either"
+    assert observed["kwargs"]["start_new_session"] == (os.name == "posix")
+
+
+def test_subprocess_diagnostic_is_bounded_and_redacted():
+    import app.migration_apply_gate as gate_mod
+
+    password = "super-secret-password"
+    token = "ghp_abcdefghijklmnopqrstuvwxyz123456"
+    stderr = (
+        b"x" * (gate_mod._SUBPROCESS_DIAGNOSTIC_MAX_BYTES + 100)
+        + f" postgresql+asyncpg://user:{password}@host/db bearer {token}".encode()
+    )
+
+    detail = gate_mod._bounded_subprocess_detail(
+        stderr, b"", 1, sensitive_values=(password,)
+    )
+
+    assert password not in detail
+    assert token not in detail
+    assert "<redacted>" in detail
+    assert "<redacted-token>" in detail
+    assert detail.startswith("[truncated to last ")
+    assert len(detail.encode()) < gate_mod._SUBPROCESS_DIAGNOSTIC_MAX_BYTES + 100
+
+
+@pytest.mark.parametrize("member_type", [tarfile.SYMTYPE, tarfile.LNKTYPE])
+def test_legacy_tar_fallback_rejects_link_escape(
+    monkeypatch, member_type
+):
+    import app.migration_apply_gate as gate_mod
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        link = tarfile.TarInfo("repo/link")
+        link.type = member_type
+        link.linkname = "../../outside"
+        tar.addfile(link)
+
+    monkeypatch.setattr(gate_mod.sys, "version_info", (3, 11, 3))
+    with tempfile.TemporaryDirectory() as tmp:
+        with tarfile.open(fileobj=io.BytesIO(buf.getvalue()), mode="r:") as tar:
+            with pytest.raises(ValueError, match="link member"):
+                gate_mod._safe_tar_extractall(tar, tmp)
 
 # --- Fail-safe cases that need no scratch DB (run everywhere) ---------------
 
@@ -1033,102 +1347,163 @@ async def test_repeatable_candidate_migration_failure_blocks(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_apply_candidate_migrations_classifies_syntax_error(monkeypatch):
-    """``SyntaxError`` raised during Alembic migration import must be classified
+    """``SyntaxError`` escaping the apply subprocess must be classified
     as ``_DeterministicMigrationDefect``, not wrapped as ``_MigrationApplyError``."""
     import app.migration_apply_gate as gate_mod
 
-    class _FakeConn:
-        async def run_sync(self, fn):
-            fn(self)  # propagates SyntaxError raised by the patched upgrader
-
-    @contextlib.asynccontextmanager
-    async def _fake_connect():
-        yield _FakeConn()
-
-    class _FakeEngine:
-        def connect(self):
-            return _fake_connect()
-
-    def _syntax_error_upgrade(sync_conn, script_location):
+    async def _raise_syntax_error(scratch_engine, script_location, *, timeout_code):
         raise SyntaxError("invalid syntax", ("<migration_0001>", 3, 1, "def upgrade(\n"))
 
-    monkeypatch.setattr(gate_mod, "_reconcile_then_upgrade", _syntax_error_upgrade)
+    monkeypatch.setattr(gate_mod, "_run_migration_apply_subprocess", _raise_syntax_error)
 
-    with pytest.raises(gate_mod._DeterministicMigrationDefect) as exc_info:
-        await gate_mod._apply_candidate_migrations(
-            _FakeEngine(),
-            {"0001_bad.py": "revision='0001'\ndown_revision=None\n"},
-        )
+    engine = create_async_engine(
+        "postgresql+asyncpg://scratch_user:s@scratch-db:5432/scratch"
+    )
+    try:
+        with pytest.raises(gate_mod._DeterministicMigrationDefect) as exc_info:
+            await gate_mod._apply_candidate_migrations(
+                engine,
+                {"0001_bad.py": "revision='0001'\ndown_revision=None\n"},
+            )
+    finally:
+        await engine.dispose()
 
     assert "SyntaxError" in str(exc_info.value)
 
 
 @pytest.mark.asyncio
 async def test_apply_candidate_migrations_classifies_import_error(monkeypatch):
-    """``ImportError`` raised during Alembic migration import must be classified
+    """``ImportError`` (non-app.*) escaping the apply subprocess must be classified
     as ``_DeterministicMigrationDefect``."""
     import app.migration_apply_gate as gate_mod
 
-    class _FakeConn:
-        async def run_sync(self, fn):
-            fn(self)
-
-    @contextlib.asynccontextmanager
-    async def _fake_connect():
-        yield _FakeConn()
-
-    class _FakeEngine:
-        def connect(self):
-            return _fake_connect()
-
-    def _import_error_upgrade(sync_conn, script_location):
+    async def _raise_import_error(scratch_engine, script_location, *, timeout_code):
         raise ImportError("No module named 'nonexistent_dep_xyz'")
 
-    monkeypatch.setattr(gate_mod, "_reconcile_then_upgrade", _import_error_upgrade)
+    monkeypatch.setattr(gate_mod, "_run_migration_apply_subprocess", _raise_import_error)
 
-    with pytest.raises(gate_mod._DeterministicMigrationDefect) as exc_info:
-        await gate_mod._apply_candidate_migrations(
-            _FakeEngine(),
-            {"0001_bad.py": "revision='0001'\ndown_revision=None\n"},
-        )
+    engine = create_async_engine(
+        "postgresql+asyncpg://scratch_user:s@scratch-db:5432/scratch"
+    )
+    try:
+        with pytest.raises(gate_mod._DeterministicMigrationDefect) as exc_info:
+            await gate_mod._apply_candidate_migrations(
+                engine,
+                {"0001_bad.py": "revision='0001'\ndown_revision=None\n"},
+            )
+    finally:
+        await engine.dispose()
 
     assert "ImportError" in str(exc_info.value)
+
+
+# --- _looks_like_serving_only_import -----------------------------------------
+
+
+def test_looks_like_serving_only_import_matched_by_name_attribute():
+    """``_looks_like_serving_only_import`` returns True when the ``ImportError``
+    has a ``.name`` attribute starting with ``"app."`` — the ``ModuleNotFoundError``
+    pattern when a candidate-side app module is absent from the serving engine."""
+    exc = ImportError("No module named 'app.field_encryption'")
+    exc.name = "app.field_encryption"  # type: ignore[attr-defined]
+    assert _looks_like_serving_only_import(exc) is True
+
+
+def test_looks_like_serving_only_import_matched_by_from_in_message():
+    """``_looks_like_serving_only_import`` returns True when the error message
+    contains ``"from 'app."`` — the ``ImportError`` pattern when a symbol from
+    an existing ``app.*`` module cannot be found in the serving engine."""
+    exc = ImportError(
+        "cannot import name 'require_encryption_active' "
+        "from 'app.field_encryption'"
+    )
+    assert _looks_like_serving_only_import(exc) is True
+
+
+def test_looks_like_serving_only_import_matched_by_no_module_in_message():
+    """``_looks_like_serving_only_import`` returns True when the error message
+    contains ``"No module named 'app."`` — the ``ModuleNotFoundError`` pattern
+    when a candidate-side app submodule is entirely absent from the serving engine
+    and ``.name`` attribute is absent."""
+    exc = ImportError("No module named 'app.new_compute_module'")
+    assert _looks_like_serving_only_import(exc) is True
+
+
+def test_looks_like_serving_only_import_rejects_third_party_import():
+    """A non-app third-party ``ImportError`` (e.g. ``nonexistent_package``) must
+    return False — these are genuine dependency defects, not serving-only artifacts."""
+    exc = ImportError("No module named 'nonexistent_package'")
+    assert _looks_like_serving_only_import(exc) is False
+
+
+def test_looks_like_serving_only_import_rejects_stdlib_module():
+    """An ``ImportError`` for a stdlib module that happens to exist only on newer
+    Python must return False — it is NOT an ``app.*`` serving-only artifact."""
+    exc = ImportError("No module named 'tomllib'")
+    assert _looks_like_serving_only_import(exc) is False
+
+
+# --- Serving-only ImportError degrade (unit: _apply_candidate_migrations) -----
+
+
+@pytest.mark.asyncio
+async def test_apply_candidate_migrations_classifies_app_import_as_serving_only(
+    monkeypatch,
+):
+    """An ``ImportError`` for a candidate-side ``app.*`` module during migration
+    import must be classified as ``_ServingOnlyImportError`` (degrade), not
+    ``_DeterministicMigrationDefect`` (block)."""
+    import app.migration_apply_gate as gate_mod
+
+    async def _app_import_error_apply(scratch_engine, script_location, *, timeout_code):
+        raise ImportError(
+            "cannot import name 'require_encryption_active' "
+            "from 'app.field_encryption'"
+        )
+
+    monkeypatch.setattr(
+        gate_mod, "_run_migration_apply_subprocess", _app_import_error_apply
+    )
+
+    with pytest.raises(gate_mod._ServingOnlyImportError) as exc_info:
+        await gate_mod._apply_candidate_migrations(
+            object(),
+            {"0001_app_dep.py": "revision='0001'\ndown_revision=None\n"},
+        )
+
+    assert "app.field_encryption" in str(exc_info.value)
+
+
+# --- Deterministic defect blocking (runs everywhere) ---------------------------
 
 
 @pytest.mark.asyncio
 async def test_apply_candidate_migrations_classifies_class42_sql_error(monkeypatch):
     """A class-42 ``ProgrammingError`` (SQL syntax / undefined table / invalid
-    schema) must be classified as ``_DeterministicMigrationDefect``."""
+    schema) escaping the apply subprocess must be classified as
+    ``_DeterministicMigrationDefect``."""
     import app.migration_apply_gate as gate_mod
-
-    class _FakeConn:
-        async def run_sync(self, fn):
-            fn(self)
-
-    @contextlib.asynccontextmanager
-    async def _fake_connect():
-        yield _FakeConn()
-
-    class _FakeEngine:
-        def connect(self):
-            return _fake_connect()
 
     class _FakeOrig(Exception):
         pgcode = "42601"  # syntax_error
 
-    def _sql_error_upgrade(sync_conn, script_location):
+    async def _raise_sql_error(scratch_engine, script_location, *, timeout_code):
         orig = _FakeOrig("syntax error at or near 'BORK'")
-        raise sa.exc.ProgrammingError(
-            "syntax error at or near 'BORK'", {}, orig
-        )
+        raise sa.exc.ProgrammingError("syntax error at or near 'BORK'", {}, orig)
 
-    monkeypatch.setattr(gate_mod, "_reconcile_then_upgrade", _sql_error_upgrade)
+    monkeypatch.setattr(gate_mod, "_run_migration_apply_subprocess", _raise_sql_error)
 
-    with pytest.raises(gate_mod._DeterministicMigrationDefect) as exc_info:
-        await gate_mod._apply_candidate_migrations(
-            _FakeEngine(),
-            {"0001_bad.py": "revision='0001'\ndown_revision=None\n"},
-        )
+    engine = create_async_engine(
+        "postgresql+asyncpg://scratch_user:s@scratch-db:5432/scratch"
+    )
+    try:
+        with pytest.raises(gate_mod._DeterministicMigrationDefect) as exc_info:
+            await gate_mod._apply_candidate_migrations(
+                engine,
+                {"0001_bad.py": "revision='0001'\ndown_revision=None\n"},
+            )
+    finally:
+        await engine.dispose()
 
     assert "42601" in str(exc_info.value)
 
@@ -1165,8 +1540,6 @@ async def test_apply_candidate_migrations_non_class42_sql_error_defers(monkeypat
             _FakeEngine(),
             {"0001_ok.py": "revision='0001'\ndown_revision=None\n"},
         )
-
-
 # --- scratch_db_url routing -------------------------------------------------
 
 
@@ -1269,7 +1642,32 @@ async def test_scratch_db_url_routes_scratch_provisioning_to_dedicated_target(
     )
 
 
-@pytest.mark.asyncio
+async def test_scratch_db_url_none_is_blocked_as_unsafe(monkeypatch):
+    """When ``scratch_db_url`` is ``None`` (default), the gate resolves it to the
+    production URL — which is then caught as unsafe and deferred before any I/O."""
+    import app.migration_apply_gate as gate_mod
+
+    read_prod = AsyncMock()
+    monkeypatch.setattr(gate_mod, "_read_prod_state", read_prod)
+
+    engine = create_async_engine(
+        "postgresql+asyncpg://prod_user:p@prod-db:5432/proddb"
+    )
+    try:
+        verdict, detail = await run_migration_apply_gate(
+            prod_engine=engine,
+            candidate_sources={"0001_init.py": "revision='0001'\ndown_revision=None\n"},
+            # scratch_db_url omitted — resolves to prod URL → safety block
+        )
+    finally:
+        await engine.dispose()
+
+    assert verdict == "defer", detail
+    assert "scratch_database_url_unsafe" in (detail or "")
+    read_prod.assert_not_awaited()
+
+
+
 async def test_absent_scratch_config_degrades_not_defers(monkeypatch):
     """When MIGRATION_APPLY_SCRATCH_DATABASE_URL is absent, the finalize resolver
     must return ('ok', None) — non-blocking degrade — rather than deferring every
@@ -1301,10 +1699,8 @@ async def test_absent_scratch_config_degrades_not_defers(monkeypatch):
         "candidate-sha-abc123",
     )
 
-    assert verdict == "ok", f"expected ok for absent scratch config, got {verdict!r}: {detail}"
-    assert detail is None
+    assert verdict == "skipped", f"expected skipped for absent scratch config, got {verdict!r}: {detail}"
     apply_gate_mock.assert_not_awaited()
-
 
 @pytest.mark.asyncio
 async def test_missing_scratch_url_defers_without_production_io(monkeypatch):
@@ -1330,7 +1726,7 @@ async def test_missing_scratch_url_defers_without_production_io(monkeypatch):
         await engine.dispose()
 
     assert verdict == "defer"
-    assert "scratch_database_url_missing" in (detail or "")
+    assert "scratch_database_url_unsafe" in (detail or "")
     assert "secret" not in (detail or "")
     read_prod.assert_not_awaited()
     fetch_sources.assert_not_awaited()
@@ -1763,6 +2159,363 @@ async def test_run_migration_apply_gate_does_not_flag_existing_data_migrations(
     finally:
         await engine.dispose()
 
-    # Already-applied data migration must NOT trigger the proof gate.
-    assert verdict == "ok"
+    assert verdict == "ok", detail
     assert detail is None
+
+
+# --- Serving-only import degrade (runs everywhere) --------------------------
+
+
+@pytest.mark.asyncio
+async def test_candidate_only_app_symbol_import_degrades_not_blocks(monkeypatch):
+    """An ImportError for an app.* symbol during migration replay is a
+    serving-engine artifact: the candidate's own app code is not present in the
+    serving process, but WILL be present on the real deploy target.
+
+    The gate must degrade to ``('ok', None)`` — not hard-block — so qualification
+    is not permanently wedged by a self-reference contract violation.  This
+    exercises ``_ServingOnlyImportError``, its no-retry classification, and the
+    ``except _ServingOnlyImportError`` handler that returns ``("ok", None)`` in
+    ``run_migration_apply_gate``.
+    """
+    import app.migration_apply_gate as gate_mod
+
+    monkeypatch.setattr(gate_mod, "_TRANSIENT_RETRY_BASE_DELAY", 0.001)
+    monkeypatch.setattr(gate_mod, "_TRANSIENT_RETRY_MAX_DELAY", 0.01)
+
+    prod_meta = sa.MetaData()
+    sa.Table("widget", prod_meta, sa.Column("id", sa.Integer, primary_key=True))
+    monkeypatch.setattr(
+        gate_mod,
+        "_read_prod_state",
+        AsyncMock(
+            return_value=gate_mod._ProdState(revision="a01", metadata=prod_meta)
+        ),
+    )
+
+    @contextlib.asynccontextmanager
+    async def _fake_ephemeral(_base_url, db_name=None):
+        yield object(), "scratch-gate"
+
+    monkeypatch.setattr(gate_mod, "ephemeral_postgres_database", _fake_ephemeral)
+    monkeypatch.setattr(gate_mod, "_seed_scratch", AsyncMock())
+
+    apply_call_count = 0
+
+    async def _serving_only_import_apply(scratch_engine, candidate_sources, **kwargs):
+        nonlocal apply_call_count
+        apply_call_count += 1
+        # Mirrors the error raised when migration 0621 imports require_encryption_active
+        # from app.field_encryption, which doesn't exist in the serving-engine codebase.
+        exc = ImportError(
+            "cannot import name 'require_encryption_active' from 'app.field_encryption'"
+        )
+        exc.name = "app.field_encryption"
+        raise gate_mod._ServingOnlyImportError(
+            f"candidate migration imports a candidate-only app symbol "
+            f"(serving-engine artifact, not deploy-fatal): {exc}"
+        ) from exc
+
+    monkeypatch.setattr(gate_mod, "_apply_candidate_migrations", _serving_only_import_apply)
+
+    engine = create_async_engine(
+        "postgresql+asyncpg://prod_user:secret@prod-db:5432/proddb"
+    )
+    try:
+        verdict, detail = await run_migration_apply_gate(
+            prod_engine=engine,
+            candidate_sources={
+                "a01_init.py": _MIG_A01,
+                "0621_encrypt.py": (
+                    "revision='0621'\ndown_revision='a01'\n"
+                    "from app.field_encryption import require_encryption_active\n"
+                    "def upgrade(): require_encryption_active()\n"
+                    "def downgrade(): pass\n"
+                ),
+            },
+            required_metadata=prod_meta,
+            scratch_db_url=(
+                "postgresql+asyncpg://scratch_user:scratch-secret@scratch-db:5432/control"
+            ),
+        )
+    finally:
+        await engine.dispose()
+
+    assert verdict == "ok", (
+        f"expected 'ok' for candidate-only app symbol ImportError, got {verdict!r}: {detail}"
+    )
+    assert apply_call_count == 1, (
+        f"serving-only import retried {apply_call_count} time(s); must degrade on first attempt"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Ephemeral Fernet key injection — regression tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ephemeral_fernet_key_is_injected_into_scratch_subprocess(monkeypatch):
+    """A synthetic Fernet key must be present in the scratch subprocess env so
+    fail-closed migrations (e.g. 0609) can execute.  It must be a valid base64
+    Fernet key (44 chars ending in '='), not the production value."""
+    import base64
+
+    import app.migration_apply_gate as gate_mod
+
+    monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", "production-key-must-not-leak")
+    observed = {}
+
+    class _CompletedProcess:
+        returncode = 0
+        pid = 456
+
+        async def communicate(self, input=None):
+            del input
+            return b"", b""
+
+    async def _spawn(*args, **kwargs):
+        observed["env"] = kwargs["env"]
+        return _CompletedProcess()
+
+    monkeypatch.setattr(gate_mod.asyncio, "create_subprocess_exec", _spawn)
+
+    class _FakeEngine:
+        url = make_url(
+            "postgresql+asyncpg://u:p@scratch-host:5432/ephemeral_fernet_test"
+        )
+
+    await gate_mod._run_migration_apply_subprocess(
+        _FakeEngine(),
+        "/tmp/script_loc",
+        timeout_code="migration_apply_replay_apply_timeout",
+    )
+
+    env = observed["env"]
+
+    # Key must be present (fail-closed migrations need it)
+    assert "GITHUB_PAT_ENCRYPTION_KEY" in env, "ephemeral key must be injected"
+
+    # Must NOT be the production value
+    assert env["GITHUB_PAT_ENCRYPTION_KEY"] != "production-key-must-not-leak", (
+        "production key must not leak into scratch subprocess"
+    )
+
+    # Must be a structurally valid Fernet key (32 raw bytes → 44 base64 chars)
+    raw = base64.urlsafe_b64decode(env["GITHUB_PAT_ENCRYPTION_KEY"] + "==")
+    assert len(raw) == 32, f"Fernet key must be 32 bytes, got {len(raw)}"
+
+
+@pytest.mark.asyncio
+async def test_ephemeral_fernet_key_differs_across_calls(monkeypatch):
+    """Each gate run must generate a FRESH ephemeral key — never reuse."""
+    import app.migration_apply_gate as gate_mod
+
+    monkeypatch.delenv("GITHUB_PAT_ENCRYPTION_KEY", raising=False)
+    keys_seen = []
+
+    class _CompletedProcess:
+        returncode = 0
+        pid = 789
+
+        async def communicate(self, input=None):
+            del input
+            return b"", b""
+
+    async def _spawn(*args, **kwargs):
+        keys_seen.append(kwargs["env"].get("GITHUB_PAT_ENCRYPTION_KEY"))
+        return _CompletedProcess()
+
+    monkeypatch.setattr(gate_mod.asyncio, "create_subprocess_exec", _spawn)
+
+    class _FakeEngine:
+        url = make_url(
+            "postgresql+asyncpg://u:p@scratch-host:5432/ephemeral_fernet_fresh"
+        )
+
+    for _ in range(3):
+        await gate_mod._run_migration_apply_subprocess(
+            _FakeEngine(),
+            "/tmp/script_loc",
+            timeout_code="migration_apply_replay_apply_timeout",
+        )
+
+    assert len(keys_seen) == 3
+    assert len(set(keys_seen)) == 3, (
+        "each gate run must generate a distinct ephemeral Fernet key"
+    )
+
+# --- Keyless-encryption artifact degrade (runs everywhere) --------------------
+#
+# Migration 0609 fail-closes with RuntimeError when GITHUB_PAT_ENCRYPTION_KEY is
+# absent.  The scratch subprocess intentionally withholds this key, so 0609
+# ALWAYS fails in the replay.  The artifact must degrade to ('ok', None) —
+# mirroring _ServingOnlyImportError — rather than deferring forever.
+
+
+def test_looks_like_keyless_encryption_artifact():
+    """The predicate helper must identify the deliberate keyless fail-closed
+    artifact and reject unrelated migration failures."""
+    import app.migration_apply_gate as gate_mod
+
+    # True positive: the error message from migration 0609 when the encryption
+    # key is deliberately withheld in the scratch subprocess.
+    fail_closed_detail = (
+        "Traceback (most recent call last):\n"
+        "  ...\n"
+        "RuntimeError: Migration 0609 requires GITHUB_PAT_ENCRYPTION_KEY "
+        "to be set to the live Fernet key before encrypted-column "
+        "reconciliation; ALLOW_PLAINTEXT_CREDENTIALS does not permit "
+        "this migration to stamp."
+    )
+    assert gate_mod._looks_like_keyless_encryption_artifact(fail_closed_detail), (
+        "must identify the deliberate keyless fail-closed artifact"
+    )
+
+    # False positive: an unrelated RuntimeError that does NOT reference the
+    # withheld env var — a genuinely broken migration must NOT be degraded.
+    unrelated_runtime_error = (
+        "RuntimeError: could not connect to the database server: "
+        "connection refused"
+    )
+    assert not gate_mod._looks_like_keyless_encryption_artifact(unrelated_runtime_error), (
+        "must NOT swallow an unrelated RuntimeError"
+    )
+
+    # False positive: a mention of the env var WITHOUT a RuntimeError (e.g. a
+    # log line that happens to name the var, or a different exception type).
+    env_var_mention = (
+        "psycopg.errors.NotNullViolation: GITHUB_PAT_ENCRYPTION_KEY "
+        "column violates not-null constraint"
+    )
+    assert not gate_mod._looks_like_keyless_encryption_artifact(env_var_mention), (
+        "must NOT match the env var name alone without a RuntimeError"
+    )
+
+    # False positive: a bare non-RuntimeError migration failure with no env-var
+    # reference — the most common case for a genuinely broken migration.
+    sql_defect_detail = (
+        "psycopg.errors.UndefinedTable: relation \"widget\" does not exist\n"
+        "LINE 1: INSERT INTO widget (id) VALUES (1)"
+    )
+    assert not gate_mod._looks_like_keyless_encryption_artifact(sql_defect_detail), (
+        "must NOT swallow a genuine SQL defect with no env-var reference"
+    )
+
+
+def test_looks_like_keyless_encryption_artifact_rejects_accumulated_chain_stderr():
+    """Accumulated chain stderr from earlier no-op migrations emits the env-var
+    name to stderr, so a real RuntimeError from an *unrelated* broken migration
+    that follows a 0531-style warning must NOT be classified as the 0609
+    keyless fail-closed artifact.
+
+    This test catches the regression where the predicate matched on the
+    env-var name + RuntimeError alone (too broad) instead of requiring the
+    0609-specific error message marker.
+    """
+    import app.migration_apply_gate as gate_mod
+
+    # Simulates accumulated chain stderr: the 0531 no-op migration emits the
+    # env-var name as a warning, and then an *unrelated* migration fails with
+    # a RuntimeError that has nothing to do with the keyless fail-closed.
+    accumulated_chain_stderr = (
+        "INFO:root:GITHUB_PAT_ENCRYPTION_KEY not set — "
+        "migration 0531 is a no-op and will stamp without encrypting.\n"
+        "Traceback (most recent call last):\n"
+        "  File \"/app/alembic/versions/0612_add_widget_table.py\", line 42, in upgrade\n"
+        "    op.add_column('widget', sa.Column('size', sa.Integer, nullable=False))\n"
+        "RuntimeError: Column 'size' violates a domain constraint unrelated to encryption"
+    )
+    assert not gate_mod._looks_like_keyless_encryption_artifact(accumulated_chain_stderr), (
+        "must NOT classify accumulated chain stderr (0531 warning + unrelated RuntimeError) "
+        "as the 0609 keyless fail-closed artifact — env-var name appears only in a "
+        "prior no-op warning, not in the RuntimeError that follows"
+    )
+
+
+@pytest.mark.asyncio
+async def test_keyless_encryption_migration_replay_degrades_not_defers(monkeypatch):
+    """The keyless-encryption fail-closed artifact in the scratch subprocess
+    must degrade to ``('ok', None)`` — mirroring ``_ServingOnlyImportError`` —
+    so qualification is not permanently wedged when the gate deliberately
+    withholds GITHUB_PAT_ENCRYPTION_KEY from the secret-free replay.
+
+    This exercises ``_KeylessEncryptionArtifact``, its no-retry classification,
+    and the ``except _KeylessEncryptionArtifact`` handler in
+    ``run_migration_apply_gate`` that returns ``("ok", None)``.
+    """
+    import app.migration_apply_gate as gate_mod
+
+    monkeypatch.setattr(gate_mod, "_TRANSIENT_RETRY_BASE_DELAY", 0.001)
+    monkeypatch.setattr(gate_mod, "_TRANSIENT_RETRY_MAX_DELAY", 0.01)
+
+    prod_meta = sa.MetaData()
+    sa.Table("widget", prod_meta, sa.Column("id", sa.Integer, primary_key=True))
+    monkeypatch.setattr(
+        gate_mod,
+        "_read_prod_state",
+        AsyncMock(
+            return_value=gate_mod._ProdState(revision="a01", metadata=prod_meta)
+        ),
+    )
+
+    @contextlib.asynccontextmanager
+    async def _fake_ephemeral(_base_url, db_name=None):
+        yield object(), "scratch-gate"
+
+    monkeypatch.setattr(gate_mod, "ephemeral_postgres_database", _fake_ephemeral)
+    monkeypatch.setattr(gate_mod, "_seed_scratch", AsyncMock())
+
+    apply_call_count = 0
+
+    async def _keyless_encryption_artifact_apply(
+        scratch_engine, candidate_sources, **kwargs
+    ):
+        nonlocal apply_call_count
+        apply_call_count += 1
+        # Mirrors the error raised when migration 0609 fail-closes because the
+        # gate deliberately withholds GITHUB_PAT_ENCRYPTION_KEY from the scratch
+        # subprocess environment.
+        raise gate_mod._KeylessEncryptionArtifact(
+            "candidate encryption migration fail-closed because "
+            "GITHUB_PAT_ENCRYPTION_KEY is deliberately withheld from "
+            "the secret-free scratch replay subprocess (not deploy-fatal)"
+        )
+
+    monkeypatch.setattr(
+        gate_mod, "_apply_candidate_migrations", _keyless_encryption_artifact_apply
+    )
+
+    engine = create_async_engine(
+        "postgresql+asyncpg://prod_user:secret@prod-db:5432/proddb"
+    )
+    try:
+        verdict, detail = await run_migration_apply_gate(
+            prod_engine=engine,
+            candidate_sources={
+                "a01_init.py": _MIG_A01,
+                "0609_encrypt.py": (
+                    "revision='0609'\ndown_revision='a01'\n"
+                    "def upgrade():\n"
+                    "    import os\n"
+                    "    key = os.environ.get('GITHUB_PAT_ENCRYPTION_KEY')\n"
+                    "    if not key:\n"
+                    "        raise RuntimeError('requires GITHUB_PAT_ENCRYPTION_KEY')\n"
+                    "def downgrade(): pass\n"
+                ),
+            },
+            required_metadata=prod_meta,
+            scratch_db_url=(
+                "postgresql+asyncpg://scratch_user:scratch-secret@scratch-db:5432/control"
+            ),
+        )
+    finally:
+        await engine.dispose()
+
+    assert verdict == "ok", (
+        f"expected 'ok' for keyless-encryption artifact, got {verdict!r}: {detail}"
+    )
+    assert apply_call_count == 1, (
+        f"keyless-encryption artifact retried {apply_call_count} time(s); "
+        "must degrade on first attempt"
+    )

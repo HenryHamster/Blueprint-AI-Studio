@@ -19,6 +19,7 @@ from app.messages_last_seen import (
     upsert_messages_last_seen,
 )
 from app.messages_noise_prefs_store import get_messages_noise_prefs_row
+from app.message_audience import stamp_message_audience
 from app.models import Alert, MESSAGE_CONTENT_MAX, MessageType, ProjectMessage, _utcnow
 from app.project_message_creation import build_project_message
 from app.strategic_trigger import (
@@ -460,21 +461,24 @@ async def _persist_failed_command_receipt(
         message_type=MessageType.NOTE,
         from_type="system",
         content=_failed_receipt_content(label, receipt_result),
-        context={
-            "event_type": OPERATOR_COMMAND_EVENT_TYPE,
-            OPERATOR_COMMAND_EVENT_TYPE: {
-                "version": 1,
-                "command_id": command_id,
-                "label": label,
-                "status": "failed",
-                "operator_user_id": user_id,
-                "executed_at": now.isoformat(),
-                "failed_at": now.isoformat(),
-                "target": _safe_command_target(command),
-                "refetch_surfaces": _command_refetch_surfaces(command),
-                "result": _bounded_mapping(receipt_result) or {},
+        context=stamp_message_audience(
+            {
+                "event_type": OPERATOR_COMMAND_EVENT_TYPE,
+                OPERATOR_COMMAND_EVENT_TYPE: {
+                    "version": 1,
+                    "command_id": command_id,
+                    "label": label,
+                    "status": "failed",
+                    "operator_user_id": user_id,
+                    "executed_at": now.isoformat(),
+                    "failed_at": now.isoformat(),
+                    "target": _safe_command_target(command),
+                    "refetch_surfaces": _command_refetch_surfaces(command),
+                    "result": _bounded_mapping(receipt_result) or {},
+                },
             },
-        },
+            OPERATOR_COMMAND_EVENT_TYPE,
+        ),
         status="resolved",
         resolved_at=now,
         idempotency_key=idempotency_key,
@@ -584,20 +588,23 @@ async def execute_work_session_command(
         message_type=MessageType.NOTE,
         from_type="system",
         content=content,
-        context={
-            "event_type": OPERATOR_COMMAND_EVENT_TYPE,
-            OPERATOR_COMMAND_EVENT_TYPE: {
-                "version": 1,
-                "command_id": command_id,
-                "label": label,
-                "status": "succeeded",
-                "operator_user_id": user_id,
-                "executed_at": now.isoformat(),
-                "target": target,
-                "refetch_surfaces": refetch_surfaces,
-                "result": _bounded_mapping(receipt_result) or {},
+        context=stamp_message_audience(
+            {
+                "event_type": OPERATOR_COMMAND_EVENT_TYPE,
+                OPERATOR_COMMAND_EVENT_TYPE: {
+                    "version": 1,
+                    "command_id": command_id,
+                    "label": label,
+                    "status": "succeeded",
+                    "operator_user_id": user_id,
+                    "executed_at": now.isoformat(),
+                    "target": target,
+                    "refetch_surfaces": refetch_surfaces,
+                    "result": _bounded_mapping(receipt_result) or {},
+                },
             },
-        },
+            OPERATOR_COMMAND_EVENT_TYPE,
+        ),
         status="resolved",
         resolved_at=now,
         idempotency_key=idem_key,

@@ -2591,9 +2591,15 @@ def _merge_agent_owned_collections(
         return p
 
     def _merge_friction_preserving(c: Friction, p: Friction) -> Friction:
+        merged = p.model_copy(deep=True)
+        # Make friction status monotonic: once a friction entry is terminal
+        # (resolved/mitigated), a stale concurrent write must NOT regress it
+        # back to active.
+        if _is_evictable_friction(c) and merged.status == "active":
+            merged.status = c.status
         if friction_floored:
-            _restore_floored_fields(c, p, _FRICTION_FLOOR_FIELDS)
-        return p
+            _restore_floored_fields(c, merged, _FRICTION_FLOOR_FIELDS)
+        return merged
 
     archived_gap_ids = {g.id for g in proposed.archived_gaps}
     current_live_gaps = [g for g in current.gaps if g.id not in archived_gap_ids]

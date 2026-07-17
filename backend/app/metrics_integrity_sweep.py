@@ -4507,6 +4507,10 @@ async def compute_fleet_proof_coverage(
         )
     ).all()
 
+    fleet_total: int = (
+        await session.execute(select(func.count(Project.id)))
+    ).scalar_one()
+
     total_non_exempt_working = 0
     total_proven = 0
     projects_contributing = 0
@@ -4567,6 +4571,8 @@ async def compute_fleet_proof_coverage(
 
     return {
         "num_projects": len(projects),
+        "fleet_total": fleet_total,
+        "fleet_capped": len(projects) == max_projects and fleet_total > max_projects,
         "projects_contributing": projects_contributing,
         "contributing_project_ids": contributing_project_ids,
         "total_non_exempt_working": total_non_exempt_working,
@@ -4756,6 +4762,26 @@ async def check_capability_proof_gate_auto_graduation(
         advance_to = "observe"
     elif current_mode == "observe" and coverage_ratio >= enforce_threshold:
         advance_to = "enforce"
+
+    # Refuse to advance to enforce when the fleet has more projects than the
+    # sample cap: unseen projects may be unproven, so coverage looks artificially
+    # high and graduating to enforce would block tasks for projects never checked.
+    if advance_to == "enforce" and coverage.get("fleet_capped"):
+        fleet_total = coverage.get("fleet_total", "?")
+        return [
+            CheckResult(
+                check="capability_proof_gate_auto_graduation",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail=(
+                    f"fleet has {fleet_total} projects but sample cap is "
+                    f"{ctx.max_projects}; cannot safely graduate to enforce "
+                    "without complete fleet coverage — increase "
+                    "metrics_integrity_sweep_max_projects or prove all projects "
+                    "within the current cap first"
+                ),
+            )
+        ]
 
     if advance_to is None:
         # Coverage below the threshold for the next step — no advancement.

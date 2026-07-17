@@ -3834,14 +3834,14 @@ class TestRevokeStaleExecutionProof:
 
         assert result is False
 
-    def test_revoke_leaves_non_exec_entries(self):
-        """Revocation only removes the named_test_exec: entry; other proof
-        entries (e.g. merge-gate proofs) are left intact."""
+    def test_revoke_leaves_non_named_test_entries(self):
+        """Revocation removes ALL named_test-kind entries; non-named_test proof
+        entries (e.g. backing_path, downstream_artifact) are preserved."""
         from app.capability_proof import revoke_stale_execution_proof
 
         cap = "repo-map"
         project = self._project_with_exec_proof(cap)
-        # Add a merge-gate proof entry.
+        # Add a merge-gate named_test proof (now also removed by RED).
         project.capability_proof_records["repo-map"].append(
             {
                 "task_id": "merge-gate-task-id",
@@ -3850,12 +3850,120 @@ class TestRevokeStaleExecutionProof:
                 "commit_sha": "abc123",
             }
         )
+        # Add a backing_path proof (structural, not affected by RED revocation).
+        project.capability_proof_records["repo-map"].append(
+            {
+                "task_id": "backing:repo-map",
+                "proved_at": "2026-07-12T00:00:00",
+                "proof_kind": "backing_path",
+                "commit_sha": "",
+            }
+        )
         with patch("app.capability_proof.flag_modified"):
             revoke_stale_execution_proof(project, cap)
 
         entries = project.capability_proof_records.get("repo-map") or []
+        # Only the backing_path entry survives — both named_test entries are gone.
         assert len(entries) == 1
-        assert entries[0]["task_id"] == "merge-gate-task-id"
+        assert entries[0]["proof_kind"] == "backing_path"
+        assert not any(e.get("proof_kind") == "named_test" for e in entries)
+
+
+def test_current_red_invalidates_older_revision_proofs():
+    """A definitive RED trial supersedes an older merge-gate named_test proof.
+
+    Scenario: a capability was proven by a prior green PR (merge-gate named_test
+    proof, task_id = some UUID). A later execution trial runs the same tests at the
+    current HEAD and FAILS. revoke_stale_execution_proof must remove the older
+    merge-gate proof so the capability is no longer seen as proven — not wait for
+    the 30-day TTL to expire.
+
+    Without this fix the gate is cleared by superseded evidence: the merge-gate
+    proof survives revocation and the enforce gate reads 'proven' even though the
+    capability is demonstrably broken at HEAD.
+    """
+    from app.capability_proof import revoke_stale_execution_proof
+    from app.capability_registry import normalize_capability_name
+
+    cap = "capability-proof-gate"
+    norm = normalize_capability_name(cap)
+
+    # Merge-gate proof written when a prior PR passed named_test acceptance evidence.
+    # This is the OLD proof that should be superseded by a current RED trial.
+    merge_gate_task_id = "task-prior-green-merge-abc123"
+    merge_gate_proof = {
+        "task_id": merge_gate_task_id,
+        "proved_at": "2026-01-01T00:00:00Z",
+        "proof_kind": _PROOF_KIND_NAMED_TEST,
+        "proof_ref": "backend/testing/test_capability_proof.py::test_cap",
+        "commit_sha": "old-sha-before-regression",
+    }
+
+    project = MagicMock()
+    project.capability_proof_records = {norm: [merge_gate_proof]}
+    project.problem_model = {
+        "capabilities": [
+            {
+                "name": cap,
+                "status": "working",
+                "evidence_refs": [
+                    {
+                        "kind": _PROOF_KIND_NAMED_TEST,
+                        "ref": "backend/testing/test_capability_proof.py::test_cap",
+                        "proven": True,
+                        "source_id": merge_gate_task_id,
+                        "recorded_at": "2026-01-01T00:00:00Z",
+                    }
+                ],
+            }
+        ]
+    }
+
+    # Pre-condition: the merge-gate proof makes the capability 'proven'.
+    vocab = [{"name": cap, "status": "working"}]
+    before = annotate_capability_proof_status(vocab, project.capability_proof_records)
+    assert before[0]["proof_status"] == "proven", (
+        "precondition: merge-gate named_test proof must make capability 'proven' before RED"
+    )
+
+    # Definitive RED trial fires — tests ran and failed at current HEAD.
+    with patch("app.capability_proof.flag_modified"):
+        revoked = revoke_stale_execution_proof(project, cap)
+
+    # The revocation must succeed even though there is no named_test_exec entry
+    # — only an older merge-gate proof is present.
+    assert revoked is True, (
+        "revoke_stale_execution_proof must return True when an older merge-gate "
+        "named_test proof is present; a definitive RED supersedes it immediately"
+    )
+
+    # All named_test proof records must be gone from capability_proof_records.
+    remaining = project.capability_proof_records.get(norm) or []
+    named_test_remaining = [
+        e for e in remaining
+        if isinstance(e, dict) and e.get("proof_kind") == _PROOF_KIND_NAMED_TEST
+    ]
+    assert not named_test_remaining, (
+        "all named_test proof records must be removed by a definitive RED; "
+        f"still present: {named_test_remaining}"
+    )
+
+    # After revocation: the capability must no longer be seen as 'proven'.
+    after = annotate_capability_proof_status(vocab, project.capability_proof_records)
+    assert after[0]["proof_status"] != "proven", (
+        "capability must not be 'proven' after a definitive RED removes the "
+        f"merge-gate proof; got proof_status={after[0]['proof_status']!r}"
+    )
+
+    # evidence_refs must also be cleared of named_test refs.
+    cap_data = project.problem_model["capabilities"][0]
+    named_test_refs = [
+        r for r in cap_data.get("evidence_refs", [])
+        if isinstance(r, dict) and r.get("kind") == _PROOF_KIND_NAMED_TEST
+    ]
+    assert not named_test_refs, (
+        "named_test evidence_refs must be removed from problem_model on definitive RED"
+    )
 
 
 class TestCapabilityProofFreshnessExpiry:
@@ -6053,3 +6161,154 @@ async def test_resolve_gap_discovery_degrades_gracefully():
     assert result["resolved"] is False
     assert result["proof_kind"] is None
     assert result["discovery_suggestions"] == []
+
+
+# ── enroll_capability_proof_trial unit tests ──────────────────────────────────
+
+
+class TestEnrollCapabilityProofTrialGuards:
+    """Unit tests for enroll_capability_proof_trial guards and dedup logic.
+
+    Tests run against the real function with a mocked SQLAlchemy session so
+    the DB-dependent paths are exercised without a live DB.
+    """
+
+    @staticmethod
+    def _make_session(scalar_result=None):
+        """Return an async-capable mock session.
+
+        scalar_result: value returned by scalar_one_or_none() (None = no match).
+        """
+        execute_result = MagicMock()
+        execute_result.scalar_one_or_none.return_value = scalar_result
+        session = AsyncMock()
+        session.execute = AsyncMock(return_value=execute_result)
+        session.add = MagicMock()
+        session.commit = AsyncMock()
+        session.refresh = AsyncMock()
+        return session
+
+    @staticmethod
+    def _make_project(project_id=None):
+        p = MagicMock()
+        p.id = project_id or uuid.uuid4()
+        return p
+
+    @pytest.mark.asyncio
+    async def test_empty_refs_after_cap_returns_none(self):
+        """Belt-and-suspenders: refs empty after [:MAX_CAPABILITY_PROOF_TRIAL_TEST_FILES]
+        returns None instead of enrolling an empty-refs trial."""
+        from app.capability_proof import enroll_capability_proof_trial
+
+        session = self._make_session()
+        project = self._make_project()
+        rc = {"capability_proof_execution_trials_enabled": True}
+
+        with patch("app.shared_state.runtime_config", new=rc), \
+                patch("app.capability_proof.MAX_CAPABILITY_PROOF_TRIAL_TEST_FILES", 0):
+            result = await enroll_capability_proof_trial(
+                session,
+                project,
+                cap_name="test-capability",
+                test_refs=["backend/testing/test_foo.py"],
+            )
+
+        assert result is None
+        # Nothing should have been committed.
+        session.commit.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_in_flight_trial_blocks_enrollment(self):
+        """Dedup guard: an existing in-flight (non-terminal) trial returns None
+        without creating a second task."""
+        from app.capability_proof import enroll_capability_proof_trial
+
+        existing_id = uuid.uuid4()
+        session = self._make_session(scalar_result=existing_id)
+        project = self._make_project()
+        rc = {"capability_proof_execution_trials_enabled": True}
+
+        with patch("app.shared_state.runtime_config", new=rc):
+            result = await enroll_capability_proof_trial(
+                session,
+                project,
+                cap_name="test-capability",
+                test_refs=["backend/testing/test_foo.py"],
+            )
+
+        assert result is None
+        session.add.assert_not_called()
+        session.commit.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_completed_trial_does_not_block_reenrollment(self):
+        """Dedup guard only blocks on in-flight statuses — a COMPLETED trial must
+        allow re-enrollment so a fresh commit can trigger a new run."""
+        from app.capability_proof import enroll_capability_proof_trial
+
+        # session.execute returns no in-flight match (COMPLETED not in the set)
+        session = self._make_session(scalar_result=None)
+        project = self._make_project()
+        rc = {"capability_proof_execution_trials_enabled": True}
+
+        task_mock = MagicMock()
+        task_mock.id = uuid.uuid4()
+        session.refresh = AsyncMock(side_effect=lambda t: setattr(t, "id", task_mock.id))
+
+        with patch("app.shared_state.runtime_config", new=rc):
+            await enroll_capability_proof_trial(
+                session,
+                project,
+                cap_name="test-capability",
+                test_refs=["backend/testing/test_foo.py"],
+                head_sha="abc123",
+            )
+
+        # A new task must have been added and committed.
+        session.add.assert_called_once()
+        session.commit.assert_awaited_once()
+        added_task = session.add.call_args[0][0]
+        assert added_task.payloads[0]["cap"] == "test-capability"
+        assert added_task.payloads[0]["head_sha"] == "abc123"
+        assert added_task.payloads[0]["test_refs"] == ["backend/testing/test_foo.py"]
+
+    @pytest.mark.asyncio
+    async def test_flag_off_returns_none(self):
+        """When capability_proof_execution_trials_enabled is False, enrollment
+        is a no-op regardless of inputs."""
+        from app.capability_proof import enroll_capability_proof_trial
+
+        session = self._make_session()
+        project = self._make_project()
+        rc = {"capability_proof_execution_trials_enabled": False}
+
+        with patch("app.shared_state.runtime_config", new=rc):
+            result = await enroll_capability_proof_trial(
+                session,
+                project,
+                cap_name="test-capability",
+                test_refs=["backend/testing/test_foo.py"],
+            )
+
+        assert result is None
+        session.commit.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_empty_test_refs_input_returns_none(self):
+        """No usable refs at all (empty list) returns None without DB access."""
+        from app.capability_proof import enroll_capability_proof_trial
+
+        session = self._make_session()
+        project = self._make_project()
+        rc = {"capability_proof_execution_trials_enabled": True}
+
+        with patch("app.shared_state.runtime_config", new=rc):
+            result = await enroll_capability_proof_trial(
+                session,
+                project,
+                cap_name="test-capability",
+                test_refs=[],
+            )
+
+        assert result is None
+        session.commit.assert_not_awaited()

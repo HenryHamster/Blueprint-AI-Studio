@@ -77,7 +77,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
-from app import github, hotfix_policy, release_version
+from app import github, release_version
 from app.database import AsyncSessionLocal, resolve_async_engine
 from app.failure_classification import (
     AGENT_TIMEOUT,
@@ -259,7 +259,7 @@ from app.release_qualifier_sweep import (
     _redrive_deferred_unsynced_qualification,  # noqa: F401 — re-exported for tests
     _redrive_dry_run_candidate,  # noqa: F401 — re-exported for tests
     _redrive_not_promoted_qualification,  # noqa: F401 — re-exported for tests
-    _reconcile_hotfix_audit_trail,
+    _reconcile_hotfix_audit_trail,  # noqa: F401
     sweep_stuck_qualifications,  # noqa: F401 — re-exported for reaper + tests
 )
 from app.migration_apply_gate import (
@@ -313,7 +313,6 @@ _CONCLUSIVE_VERDICT_STATUSES: frozenset[str] = frozenset(
     {"promoted", "not_promoted", "dry_run"}
 )
 
-
 _NEVER_GRADED_GAP = (
     "No merge-grade verdict exists for this candidate — the acceptance contract "
     "was never graded (a merge-grade runs only for a version with a usable, "
@@ -322,7 +321,6 @@ _NEVER_GRADED_GAP = (
 
 _RUBRIC_PROVENANCE_VERSION = 1
 _MAX_RUBRIC_DIFF_KEYS = 20
-
 
 def _canonicalize_rubric(raw: Any) -> list[dict[str, str]]:
     if not isinstance(raw, list):
@@ -340,7 +338,6 @@ def _canonicalize_rubric(raw: Any) -> list[dict[str, str]]:
         seen.add(key)
     return canonical
 
-
 def _rubric_fingerprint(snapshot: list[dict[str, str]]) -> str:
     encoded = json.dumps(
         _canonicalize_rubric(snapshot),
@@ -348,7 +345,6 @@ def _rubric_fingerprint(snapshot: list[dict[str, str]]) -> str:
         separators=(",", ":"),
     )
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-
 
 def _qualification_attempt_id(
     version: release_version.ReleaseVersion,
@@ -358,7 +354,6 @@ def _qualification_attempt_id(
     if raw is None:
         raw = (version.last_qualification or {}).get("qualification_attempt_id")
     return str(raw) if raw not in (None, "") else None
-
 
 def _rubric_provenance(
     snapshot: list[dict[str, str]],
@@ -374,7 +369,6 @@ def _rubric_provenance(
         "qualification_attempt_id": qualification_attempt_id,
     }
 
-
 def _rubric_detail_provenance(detail: Any) -> dict[str, Any] | None:
     if not isinstance(detail, dict):
         return None
@@ -386,7 +380,6 @@ def _rubric_detail_provenance(detail: Any) -> dict[str, Any] | None:
     ):
         return detail
     return None
-
 
 def _rubric_dimension_reusable(
     detail: Any,
@@ -405,7 +398,6 @@ def _rubric_dimension_reusable(
     if qualification_attempt_id is None or stored_attempt_id in (None, ""):
         return False
     return stored_attempt_id == qualification_attempt_id
-
 
 async def _snapshot_qualification_rubric(
     session: AsyncSession,
@@ -428,7 +420,6 @@ async def _snapshot_qualification_rubric(
         if row.criterion_key
     ]
     return active, lifecycle
-
 
 async def _resolve_launched_rubric(
     session: AsyncSession,
@@ -472,7 +463,6 @@ async def _resolve_launched_rubric(
         return None, None, "merge_grade_task_payload_has_no_rubric"
 
     return None, None, "pending_attempt_has_no_rubric_snapshot_or_grade_payload"
-
 
 def _bounded_rubric_drift(
     launched: list[dict[str, str]],
@@ -528,7 +518,6 @@ def _bounded_rubric_drift(
         "live_fingerprint": _rubric_fingerprint(live),
     }
 
-
 def _never_graded_category_verdicts(active_keys: set[str]) -> list[dict[str, Any]]:
     """Fail-CLOSED verdicts for a candidate that was NEVER graded.
 
@@ -556,7 +545,6 @@ def _never_graded_category_verdicts(active_keys: set[str]) -> list[dict[str, Any
         for key in sorted(k for k in active_keys if k)
     ]
 
-
 def _coerce_ledger_category_verdict(v: Any) -> dict[str, Any]:
     """Coerce a category-verdict row read back from the ledger into a plain dict.
 
@@ -580,7 +568,6 @@ def _coerce_ledger_category_verdict(v: Any) -> dict[str, Any]:
         ),
     }
 
-
 def _fail_closed_category_verdicts(
     active_keys: set[str | None],
 ) -> list[dict[str, Any]] | None:
@@ -600,7 +587,6 @@ def _fail_closed_category_verdicts(
         for k in sorted(k for k in active_keys if k)
     ]
     return verdicts or None
-
 
 def _is_audited_surface_path(path: str) -> bool:
     """True when a file is part of the code surface a release audit judges.
@@ -625,7 +611,6 @@ def _is_audited_surface_path(path: str) -> bool:
         return False
     return not p.endswith(".md")
 
-
 def compute_audited_surface_hash(tree_entries: list[dict] | None) -> str | None:
     """Content hash of the audited code surface at a candidate ref.
 
@@ -642,7 +627,6 @@ def compute_audited_surface_hash(tree_entries: list[dict] | None) -> str | None:
     """
     return _audited_surface_hash_from_map(audited_surface_path_map(tree_entries))
 
-
 def _audited_surface_hash_from_map(surface: dict[str, str]) -> str | None:
     """Hash an already-normalized audited-surface map."""
     relevant = sorted(surface.items())
@@ -655,7 +639,6 @@ def _audited_surface_hash_from_map(surface: dict[str, str]) -> str | None:
         h.update(sha.encode("utf-8"))
         h.update(b"\n")
     return h.hexdigest()
-
 
 def audited_surface_path_map(tree_entries: list[dict] | None) -> dict[str, str]:
     """Return the durable ``path -> blob_sha`` identity of an audited tree."""
@@ -670,7 +653,6 @@ def audited_surface_path_map(tree_entries: list[dict] | None) -> dict[str, str]:
         and _is_audited_surface_path(str(entry["path"]))
     }
 
-
 def _changed_audited_surface_paths(
     prior: dict[str, str],
     current: dict[str, str],
@@ -681,7 +663,6 @@ def _changed_audited_surface_paths(
         for path in set(prior) | set(current)
         if prior.get(path) != current.get(path)
     )
-
 
 def _audit_detail_surface_map(detail: Any) -> dict[str, str] | None:
     """Read and validate a persisted per-path audited-surface identity."""
@@ -698,7 +679,6 @@ def _audit_detail_surface_map(detail: Any) -> dict[str, str] | None:
             return None
         normalized[path] = blob_sha
     return normalized
-
 
 def _audit_detail_is_delta_reusable(detail: Any) -> bool:
     """True when detail contains a complete, path-addressable audit fact."""
@@ -720,7 +700,6 @@ def _audit_detail_is_delta_reusable(detail: Any) -> bool:
         ]
     )
 
-
 def _audit_report_raw_findings(report: Any) -> list[Any]:
     if not isinstance(report, dict):
         return []
@@ -728,7 +707,6 @@ def _audit_report_raw_findings(report: Any) -> list[Any]:
     if not isinstance(findings, list):
         findings = report.get("issues")
     return list(findings) if isinstance(findings, list) else []
-
 
 def _audit_finding_identity(finding: Any) -> str:
     if not isinstance(finding, dict):
@@ -752,13 +730,11 @@ def _audit_finding_identity(finding: Any) -> str:
         )
     )
 
-
 def _audit_finding_path(finding: Any) -> str | None:
     if not isinstance(finding, dict):
         return None
     path = str(finding.get("file") or finding.get("path") or "").strip()
     return path or None
-
 
 def _reviewed_audit_paths(report: Any) -> set[str]:
     """Return the paths explicitly superseded by a scoped audit report."""
@@ -782,7 +758,6 @@ def _reviewed_audit_paths(report: Any) -> set[str]:
         return set()
     return {str(path) for path in changed if isinstance(path, str) and path}
 
-
 def _audit_report_confirms_incremental_base(report: Any, expected_base_sha: str) -> bool:
     scope = report.get("audit_scope") if isinstance(report, dict) else None
     return bool(
@@ -791,7 +766,6 @@ def _audit_report_confirms_incremental_base(report: Any, expected_base_sha: str)
         and expected_base_sha
         and str(scope.get("effective_base_sha") or "").strip() == expected_base_sha
     )
-
 
 def _carried_finding_as_report_item(
     finding: dict[str, Any],
@@ -810,7 +784,6 @@ def _carried_finding_as_report_item(
     else:
         item.pop("verification_note", None)
     return item
-
 
 def _merge_scoped_audit_report_with_prior_fact(
     scored_report: dict[str, Any] | None,
@@ -881,7 +854,6 @@ def _merge_scoped_audit_report_with_prior_fact(
     }
     return merged_scored, merged_original
 
-
 def _merge_scoped_test_erosion_with_prior_fact(
     report: dict[str, Any], prior_detail: Any, *, prior_blocked: bool
 ) -> tuple[float | None, dict[str, Any] | None]:
@@ -948,7 +920,6 @@ def _merge_scoped_test_erosion_with_prior_fact(
         score = None
     return score, merged if merged else None
 
-
 def _audit_dimension_detail(
     *,
     surface_paths: Any,
@@ -976,7 +947,6 @@ def _audit_dimension_detail(
         "audit_missing_reason": audit_missing_reason,
         "audit_scope": audit_scope,
     }
-
 
 def _incremental_audit_base_sha(
     prior_qualification: dict[str, Any] | None,
@@ -1025,7 +995,6 @@ def _incremental_audit_base_sha(
         return None
     return prior_sha
 
-
 def _promotion_failed_reuse_eligible(
     qual: dict[str, Any] | None, candidate_diff_hash: str | None
 ) -> bool:
@@ -1055,7 +1024,6 @@ def _promotion_failed_reuse_eligible(
     prior_hash = qual.get("candidate_diff_hash")
     return bool(candidate_diff_hash and prior_hash and candidate_diff_hash == prior_hash)
 
-
 # ---------------------------------------------------------------------------
 # Policy — the trusted core.  weights + threshold come from a human-owned file.
 # The hardcoded fallback rubric (_DEFAULT_POLICY) and the scoring math live in
@@ -1065,7 +1033,6 @@ def _promotion_failed_reuse_eligible(
 # promotion_policy.yaml lives at backend/promotion_policy.yaml — two parents up
 # from this file (backend/app/release_qualifier.py).
 _POLICY_PATH = Path(__file__).resolve().parent.parent / "promotion_policy.yaml"
-
 
 def _policy_from_runtime_config() -> dict[str, Any] | None:
     """Return the live promotion rubric from runtime_config, or None.
@@ -1125,7 +1092,6 @@ def _policy_from_runtime_config() -> dict[str, Any] | None:
         )
         return None
 
-
 # A project's per-project promotion threshold is clamped to this floor so a
 # project can never set a near-zero bar that silently disables its own gate.
 _SAFE_PROMOTION_THRESHOLD_FLOOR = 0.5
@@ -1136,7 +1102,6 @@ _MIN_AUDIT_WEIGHT = 0.2
 # Margin by which the threshold is clamped above (1 - audit_weight) so a
 # zero-audit candidate strictly fails the composite (audit can always veto).
 _AUDIT_VETO_MARGIN = 0.05
-
 
 def _policy_from_build_config(project: Project | None) -> dict[str, Any] | None:
     """Resolve a per-project promotion rubric from ``Project.build_config``.
@@ -1211,13 +1176,11 @@ def _policy_from_build_config(project: Project | None) -> dict[str, Any] | None:
         )
         return None
 
-
 # The operator-facing graduation gate for the completion-debt pressure signal.
 # ``completion_debt_weight_mode`` is a real runtime_config key (default
 # "observe"); only "enforce" lets the configured completion_debt weight reach
 # the composite blend.
 _COMPLETION_DEBT_WEIGHT_MODES: frozenset[str] = frozenset({"off", "observe", "enforce"})
-
 
 def _resolve_completion_debt_weight_mode() -> str:
     """Return the live ``completion_debt_weight_mode`` (default "observe").
@@ -1227,7 +1190,6 @@ def _resolve_completion_debt_weight_mode() -> str:
     """
     mode = str(_runtime_config.get("completion_debt_weight_mode", "observe")).strip().lower()
     return mode if mode in _COMPLETION_DEBT_WEIGHT_MODES else "observe"
-
 
 def _apply_completion_debt_weight_mode(policy: dict[str, Any]) -> dict[str, Any]:
     """Mode-gate a resolved policy's ``weights["completion_debt"]`` blend factor.
@@ -1268,7 +1230,6 @@ def _apply_completion_debt_weight_mode(policy: dict[str, Any]) -> dict[str, Any]
     gated["weights"] = weights
     return gated
 
-
 def _resolve_policy_with_provenance(
     project: Project | None = None,
 ) -> tuple[dict[str, Any], str, str | None]:
@@ -1296,7 +1257,6 @@ def _resolve_policy_with_provenance(
         merged["threshold"] = overrides["threshold"]
         return _apply_completion_debt_weight_mode(merged), "build_config", fleet_error
     return _apply_completion_debt_weight_mode(fleet_policy), fleet_source, fleet_error
-
 
 def _resolve_fleet_policy_with_provenance() -> tuple[dict[str, Any], str, str | None]:
     """Resolve the FLEET promotion rubric (no per-project override): live
@@ -1373,7 +1333,6 @@ def _resolve_fleet_policy_with_provenance() -> tuple[dict[str, Any], str, str | 
             error,
         )
 
-
 def _load_policy(project: Project | None = None) -> dict[str, Any]:
     """Resolve the promotion rubric: project build_config → runtime_config → YAML → defaults.
 
@@ -1406,7 +1365,6 @@ def _load_policy(project: Project | None = None) -> dict[str, Any]:
     policy, _, _ = _resolve_policy_with_provenance(project)
     return policy
 
-
 def _resolve_configured_completion_debt_weight(
     project: Project | None = None,
 ) -> float:
@@ -1433,7 +1391,6 @@ def _resolve_configured_completion_debt_weight(
     fleet_policy, _, _ = _resolve_fleet_policy_with_provenance()
     return coerce_completion_debt_weight(fleet_policy["weights"])
 
-
 # Terminal task statuses — a qualifier child in any of these has finished
 # (whether it succeeded, failed, was cancelled, or is BLOCKED on a precondition
 # and so will not progress without intervention). BLOCKED is included so a
@@ -1453,7 +1410,6 @@ _INFRA_FAILURE_TERMINAL_STATUSES: frozenset[TaskStatus] = frozenset(
         TaskStatus.BLOCKED,
     }
 )
-
 
 async def _qualification_in_flight(
     session: AsyncSession,
@@ -1527,7 +1483,6 @@ async def _qualification_in_flight(
     # status == "pending" but every child already terminated → not in flight.
     return any(r.status not in _TERMINAL_STATUSES for r in rows)
 
-
 def _promotion_in_flight_result(
     version: release_version.ReleaseVersion,
     *,
@@ -1584,7 +1539,6 @@ def _promotion_in_flight_result(
         return result
     return None
 
-
 def _coerce_qualification_attempt_id(value: Any) -> uuid.UUID | None:
     """Return a UUID attempt identity, accepting legacy string projections."""
     if value is None:
@@ -1593,7 +1547,6 @@ def _coerce_qualification_attempt_id(value: Any) -> uuid.UUID | None:
         return uuid.UUID(str(value))
     except (ValueError, TypeError, AttributeError):
         return None
-
 
 def _qualification_attempt_for_record(
     version: release_version.ReleaseVersion,
@@ -1615,7 +1568,6 @@ def _qualification_attempt_for_record(
         )
     )
     return uuid.uuid5(uuid.NAMESPACE_URL, f"blueprint:qualification:{legacy_key}")
-
 
 async def _record_attempt_projection_atomic(
     session: AsyncSession,
@@ -1641,7 +1593,6 @@ async def _record_attempt_projection_atomic(
         .values(**values)
     )
 
-
 # ---------------------------------------------------------------------------
 # Qualifier-scoped CI resolution — the real-green-build gate.
 #
@@ -1664,7 +1615,6 @@ async def _record_attempt_projection_atomic(
 # candidate carries no checks of its own.  The shared helper's global
 # fail-open behaviour is unchanged for every other caller.
 # ---------------------------------------------------------------------------
-
 
 async def _resolve_candidate_ci(
     token: str,
@@ -1935,7 +1885,6 @@ async def _resolve_candidate_ci(
         "detail": "no check-runs on candidate or associated PR heads",
     }
 
-
 async def _annotate_absent_ci_integration_topology(
     *,
     token: str,
@@ -1999,7 +1948,6 @@ async def _annotate_absent_ci_integration_topology(
         topology["detail"] = "integration topology check was indeterminate"
     return {**ci_resolution, "integration_branch_topology": topology}
 
-
 def _ci_required_for_finalize(
     project: Project | None,
     ci_resolution: dict[str, Any],
@@ -2022,7 +1970,6 @@ def _ci_required_for_finalize(
     if topology.get("candidate_reachable_from_integration") is not True:
         return True
     return not proceed_on_no_checks(project, integration_branch)
-
 
 async def _resolve_ci_at_finalize(
     session: AsyncSession,
@@ -2114,11 +2061,9 @@ async def _resolve_ci_at_finalize(
         return False, degenerate_resolution
 
 
-
 # ---------------------------------------------------------------------------
 # run_qualification — the coordinator (phase 1: spawn).
 # ---------------------------------------------------------------------------
-
 
 async def _is_target_absorbed(
     token: str,
@@ -2140,7 +2085,6 @@ async def _is_target_absorbed(
     return await github.is_ancestor_of(
         token, owner, repo, target_head, candidate_sha, project_id=project_id
     )
-
 
 async def _check_lts_sync_gate(
     session: AsyncSession,
@@ -2272,7 +2216,6 @@ async def _check_lts_sync_gate(
         fall_through_min,
     )
     return {"status": "deferred_unsynced", "candidate_sha": candidate_sha}
-
 
 async def run_qualification(
     session: AsyncSession,
@@ -3420,7 +3363,6 @@ async def run_qualification(
         "merge_grade_task_id": merge_grade_task_id,
     }
 
-
 # ---------------------------------------------------------------------------
 # _finalize_qualification — phase 2: collect + decide.
 # The child-task spawn / artifact-read / infra-failure seam lives in
@@ -3445,7 +3387,6 @@ _AUDIT_CHALLENGE_BINDING_HOLDS: frozenset[str] = frozenset(
         "audit_challenge_empty_verdicts",
     }
 )
-
 
 def _advance_qualification_retry_episode(
     version: release_version.ReleaseVersion,
@@ -3505,7 +3446,6 @@ _BLOCKER_LABELS: dict[str, str] = {
     # re-add a label without an emitter — see test_blocker_labels_have_emitters.
 }
 
-
 def _primary_findings_for_challenge_retry(
     audit_report: dict[str, Any] | None,
 ) -> list[dict[str, str]]:
@@ -3557,7 +3497,6 @@ def _primary_findings_for_challenge_retry(
     primary_findings.sort(key=lambda d: _SEVERITY_RANK.get(d["severity"], 99))
     return primary_findings
 
-
 def _audit_task_matches_candidate(task: Task | None, candidate_sha: str | None) -> bool:
     """Return True when the completed audit task is pinned to the candidate."""
     if task is None or task.status != TaskStatus.COMPLETED or not candidate_sha:
@@ -3567,7 +3506,6 @@ def _audit_task_matches_candidate(task: Task | None, candidate_sha: str | None) 
         return context_sha == candidate_sha
     payload_sha = str((task.first_payload or {}).get("candidate_sha") or "").strip()
     return bool(payload_sha and payload_sha == candidate_sha)
-
 
 def _build_audit_leg_proof(
     *,
@@ -3625,7 +3563,6 @@ def _build_audit_leg_proof(
         "reconciliation_status": reconciliation_status,
         "reconciliation_reason": reconciliation_reason,
     }
-
 
 async def _resolve_migration_identity_at_finalize(
     session: AsyncSession,
@@ -3704,6 +3641,7 @@ async def _resolve_migration_identity_at_finalize(
         )
         if verdict != "defer":
             return verdict, detail
+
         # First attempt deferred — retry once with freshly-resolved credentials.
         # _resolve_github_with_session returns a fresh token if the cache was
         # invalidated by a 401 during the first attempt.
@@ -3743,6 +3681,24 @@ async def _resolve_migration_identity_at_finalize(
         )
         return ("defer", f"migration-identity gate error: {exc}")
 
+def _migration_apply_timeout_detail(detail: str | None) -> bool:
+    """Return whether detail starts with one stable migration watchdog code."""
+
+    if not detail:
+        return False
+    code = detail.partition(":")[0].strip()
+    return code.startswith("migration_apply_") and code.endswith("_timeout")
+
+def _migration_apply_infra_error(detail: str | None) -> str:
+    """Preserve stable timeout codes; retain the legacy code for other defers."""
+
+    if _migration_apply_timeout_detail(detail):
+        return str(detail)
+    return (
+        f"migration_apply_check_unavailable: {detail}"
+        if detail
+        else "migration_apply_check_unavailable"
+    )
 
 async def _resolve_migration_apply_at_finalize(
     session: AsyncSession,
@@ -3803,6 +3759,7 @@ async def _resolve_migration_apply_at_finalize(
             return ("defer", scratch_preflight.detail)
         prod_engine = resolve_async_engine(session)
         scratch_db_url = scratch_preflight.target
+
         try:
             verdict, detail = await run_migration_apply_gate(
                 prod_engine=prod_engine,
@@ -3830,6 +3787,11 @@ async def _resolve_migration_apply_at_finalize(
             detail or "applies cleanly",
         )
         if verdict != "defer":
+            return verdict, detail
+        if _migration_apply_timeout_detail(detail):
+            # Fresh credentials cannot repair a wedged import, lock, or database
+            # stage. The next qualification cycle may retry; this finalize must
+            # not blindly double the watchdog budget.
             return verdict, detail
         # First attempt deferred — retry once with freshly-resolved credentials.
         logger.info(
@@ -3867,7 +3829,6 @@ async def _resolve_migration_apply_at_finalize(
             exc,
         )
         return ("defer", f"migration-apply gate error: {exc}")
-
 
 async def _compute_acceptance_window_aggregate(
     session: AsyncSession,
@@ -3976,7 +3937,6 @@ async def _compute_acceptance_window_aggregate(
         "acceptance_window_inferred_test_cochange_task_ids": inferred_task_ids,
     }
 
-
 async def _collect_verified_merge_test_evidence(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
@@ -4026,7 +3986,6 @@ async def _collect_verified_merge_test_evidence(
             else:
                 seam_files.add(p.strip())
     return {"test_files": sorted(test_files), "seam_files": sorted(seam_files)}
-
 
 async def _guard_ci_unresolved_promotion_in_flight(
     session: AsyncSession,
@@ -4197,7 +4156,6 @@ async def _guard_ci_unresolved_promotion_in_flight(
         "managed_check_wait": is_migration_pr,
     }
 
-
 async def _merged_pr_numbers_for_version(
     session: AsyncSession,
     version_obj: release_version.ReleaseVersion,
@@ -4237,7 +4195,6 @@ async def _merged_pr_numbers_for_version(
         if isinstance(pn, int) and pn > 0 and pn not in pr_numbers:
             pr_numbers.append(pn)
     return sorted(pr_numbers)
-
 
 async def _candidate_already_on_main_at_finalize(
     session: AsyncSession,
@@ -4284,7 +4241,6 @@ async def _candidate_already_on_main_at_finalize(
         )
         return False
 
-
 async def _count_project_actionable_open_completion_debt(
     session: AsyncSession, project_id: Any
 ) -> int:
@@ -4302,7 +4258,6 @@ async def _count_project_actionable_open_completion_debt(
         )
     )
     return int((await session.execute(stmt)).scalar_one() or 0)
-
 
 async def _upsert_dimension_result(
     session: AsyncSession,
@@ -4437,7 +4392,6 @@ async def _upsert_dimension_result(
             exc,
         )
 
-
 # Per-dimension ledger status vocabulary (design doc "From Batch Attempts to a
 # Per-Dimension Fact Ledger", section 3).  A dimension is RESOLVED when its gate
 # reached a real pass/fail/blocked outcome.  ``unavailable`` is deliberately
@@ -4455,8 +4409,12 @@ _PROMOTION_EXPLICIT_NON_APPLICABLE_STATUSES: dict[str, frozenset[str]] = {
     "merge_grade": frozenset(
         {"not_applicable", "superseded_exempt", "already_on_main_exempt"}
     ),
+    # When no scratch DB is configured the apply gate is permanently skipped
+    # (not transiently deferred).  Record as an explicit non-applicable so
+    # the promotion ledger-completeness check does not treat the missing
+    # gate as an infra hold that blocks the release indefinitely.
+    "migration_apply": frozenset({"scratch_database_not_configured"}),
 }
-
 
 def _ledger_fact_satisfies_promotion(
     dimension: str,
@@ -4479,14 +4437,12 @@ def _ledger_fact_satisfies_promotion(
         dimension, frozenset()
     )
 
-
 # Gates that must every one have a terminal fact at the SAME candidate_sha before
 # a promotion may compose from the ledger — the informational dimensions
 # (challenge / acceptance_window / debt_pressure) never gate promotion and are
 # excluded.  smoketest is required only when the run had it enabled (audit H3).
 # Sourced from the canonical dimension registry (see qualification_dimensions).
 _PROMOTION_REQUIRED_DIMENSIONS: tuple[str, ...] = PROMOTION_REQUIRED_DIMENSIONS
-
 
 async def _load_prior_dimension_results(
     session: AsyncSession,
@@ -4527,7 +4483,6 @@ async def _load_prior_dimension_results(
         return {}
     return {r.dimension: r for r in rows}
 
-
 async def _load_dimension_result(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
@@ -4557,7 +4512,6 @@ async def _load_dimension_result(
             exc,
         )
         return None
-
 
 async def _load_latest_prior_audit_dimension(
     session: AsyncSession,
@@ -4602,7 +4556,6 @@ async def _load_latest_prior_audit_dimension(
         None,
     )
 
-
 async def _carry_dimension_fact_to_candidate(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
@@ -4634,7 +4587,6 @@ async def _carry_dimension_fact_to_candidate(
         reused_by_attempt_ids=reused,
     )
 
-
 async def _mark_dimensions_reused_by_attempt(
     session: AsyncSession,
     rows: list[QualificationDimensionResult],
@@ -4663,7 +4615,6 @@ async def _mark_dimensions_reused_by_attempt(
             attempt_id,
             exc,
         )
-
 
 async def _record_infra_dimension_unavailable(
     session: AsyncSession,
@@ -4743,7 +4694,6 @@ async def _record_infra_dimension_unavailable(
     )
     return new_streak
 
-
 async def _promotion_dimension_ledger_complete(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
@@ -4771,7 +4721,6 @@ async def _promotion_dimension_ledger_complete(
         if dim not in prior or not _ledger_fact_satisfies_promotion(dim, prior[dim])
     ]
     return (not missing, missing)
-
 
 async def _dual_write_dimension_results(
     session: AsyncSession,
@@ -4881,6 +4830,25 @@ async def _dual_write_dimension_results(
     else:  # enforce
         _cp_status = "blocked" if blocker == "capability_proof_gate_blocked" else "passed"
 
+    # env_preflight ledger status (Slice 3, design 245212a4): mirror the deployed-
+    # side judge semantics used by the state resolver.  DARK by default → the judge
+    # is inert, so no manifest is scored and the row is ``unavailable``.  When the
+    # judge is enabled: a live boot-prereq block (boot_prereq_missing /
+    # boot_prereq_evidence_missing) surfaces via the composite blocker as
+    # ``blocked``; a recorded positive sub_score is ``passed``; a None score (no
+    # candidate manifest seen) is ``unavailable``.  env_preflight is MUTABLE — it is
+    # re-measured live every drive and its reused ledger row is never composed, so
+    # this spec always upserts the freshly-measured fact.
+    _epf_enabled = bool(base_record.get("env_preflight_enabled"))
+    _epf_blocker = _own_blocker({"boot_prereq_missing", "boot_prereq_evidence_missing"})
+    _epf_score = _score("env_preflight")
+    if _epf_blocker is not None:
+        _epf_status = "blocked"
+    elif _epf_enabled and _epf_score is not None and _epf_score > 0.0:
+        _epf_status = "passed"
+    else:
+        _epf_status = "unavailable"
+
     specs: list[dict[str, Any]] = [
         {
             "dimension": "ci",
@@ -4953,6 +4921,12 @@ async def _dual_write_dimension_results(
             "detail": {
                 "verdict": base_record.get("migration_apply_safety"),
                 "detail": base_record.get("migration_apply_safety_detail"),
+                **(
+                    {"status": base_record.get("migration_apply_safety_detail")}
+                    if base_record.get("migration_apply_safety") == "skipped"
+                    and base_record.get("migration_apply_safety_detail")
+                    else {}
+                ),
             },
             "producing_task_id": None,
         },
@@ -4996,6 +4970,19 @@ async def _dual_write_dimension_results(
             "sub_score": None,
             "blocker": _own_blocker({"capability_proof_gate_blocked"}),
             "detail": _cp_detail,
+            "producing_task_id": None,
+        },
+        {
+            "dimension": "env_preflight",
+            "status": _epf_status,
+            # Presence-only sub_score, recorded only when the judge is enabled so a
+            # dark run carries no score into the ledger.
+            "sub_score": _epf_score if _epf_enabled else None,
+            "blocker": _epf_blocker,
+            # Slice 3 verdict blob: {required:[{name,scope}], missing:[names],
+            # deploy_target_scope} — presence-only, None when the judge was disabled
+            # or no candidate manifest was seen.
+            "detail": base_record.get("env_preflight_verdict"),
             "producing_task_id": None,
         },
     ]
@@ -5059,7 +5046,6 @@ async def _dual_write_dimension_results(
             origin_attempt_id=base_record.get("qualification_attempt_id"),
         )
 
-
 async def _build_env_preflight_evidence_for_candidate(
     session: AsyncSession,
     project: Project,
@@ -5107,7 +5093,6 @@ async def _build_env_preflight_evidence_for_candidate(
         smoketest_yaml_source=smoketest_yaml,
     )
 
-
 def _deployed_env_presence_snapshot(
     env_preflight_artifact: dict[str, Any] | None,
 ) -> dict[str, bool]:
@@ -5136,7 +5121,6 @@ def _deployed_env_presence_snapshot(
                     names.add(name)
     # PRESENCE-ONLY: bool(...) — never the value itself.
     return {name: bool(os.getenv(name)) for name in names}
-
 
 async def _record_rubric_provenance_outcome(
     session: AsyncSession,
@@ -5236,7 +5220,6 @@ async def _record_rubric_provenance_outcome(
         "rubric_drift": rubric_drift,
         "rubric_provenance_error": provenance_error,
     }
-
 
 async def _finalize_qualification(
     session: AsyncSession,
@@ -6757,9 +6740,8 @@ async def _finalize_qualification(
             session,
             version,
             qual,
-            f"migration_apply_check_unavailable: {apply_detail}"
-            if apply_detail
-            else "migration_apply_check_unavailable",
+
+            _migration_apply_infra_error(apply_detail),
         )
     migration_apply_blocked = apply_verdict == "block"
     if apply_verdict == "skipped":
@@ -6772,6 +6754,17 @@ async def _finalize_qualification(
         _ma_blocker = "migration_apply_drift" if migration_apply_blocked else None
     # Eager-write migration_apply so a later gate's infra failure cannot
     # discard this verdict before _dual_write_dimension_results is reached.
+    _ma_detail: dict[str, Any] = {
+        "verdict": apply_verdict,
+        "detail": apply_detail,
+        "execution_site": "eager_write",
+    }
+    if apply_verdict == "skipped" and apply_detail:
+        # Include an explicit status so _ledger_fact_satisfies_promotion can
+        # recognise this as a permanent non-applicable outcome rather than a
+        # transient infra hold — keeps the ledger-completeness check from
+        # stalling promotion on a deliberately skipped gate.
+        _ma_detail["status"] = apply_detail
     await _upsert_dimension_result(
         session,
         version,
@@ -6780,11 +6773,7 @@ async def _finalize_qualification(
         status=_ma_status,
         sub_score=None,
         blocker=_ma_blocker,
-        detail={
-            "verdict": apply_verdict,
-            "detail": apply_detail,
-            "execution_site": "eager_write",
-        },
+        detail=_ma_detail,
         origin_attempt_id=attempt_id,
     )
 
@@ -7776,11 +7765,9 @@ async def _finalize_qualification(
         base_record=base_record,
     )
 
-
 # ---------------------------------------------------------------------------
 # maybe_finalize_qualification — task-completion hook (coordination glue).
 # ---------------------------------------------------------------------------
-
 
 async def _required_children_terminal(
     session: AsyncSession,
@@ -7977,7 +7964,6 @@ async def _required_children_terminal(
     )
     return True
 
-
 async def _maybe_reconcile_after_promotion_conflict(
     version_id: uuid.UUID,
     result: dict[str, Any] | None,
@@ -8032,7 +8018,6 @@ async def _maybe_reconcile_after_promotion_conflict(
             exc,
         )
 
-
 # Qualification outcomes after which the strategic agent should re-plan: a
 # settled verdict (a promote, any flavour of miss, or a terminal infra
 # failure). Excludes the in-flight (``pending_auto_merge``), transient
@@ -8048,7 +8033,6 @@ _STRATEGIC_RETRIGGER_STATUSES: frozenset[str] = frozenset(
         "infra_failure",
     }
 )
-
 
 async def _maybe_trigger_strategic_after_qualification(
     version_id: uuid.UUID,
@@ -8154,7 +8138,6 @@ async def _maybe_trigger_strategic_after_qualification(
             version_id,
             exc,
         )
-
 
 async def _finalize_in_dedicated_session(
     version_id: uuid.UUID,
@@ -8263,7 +8246,6 @@ async def _finalize_in_dedicated_session(
     )
     return result
 
-
 async def _reattempt_promotion_failed_locked(
     session: AsyncSession,
     version_id: uuid.UUID,
@@ -8358,7 +8340,6 @@ async def _reattempt_promotion_failed_locked(
     await session.commit()
     return result
 
-
 async def _reattempt_promotion_failed_in_dedicated_session(
     version_id: uuid.UUID,
     candidate_sha: str,
@@ -8433,7 +8414,6 @@ async def _reattempt_promotion_failed_in_dedicated_session(
             version_id, result, session_factory=session_factory
         )
     return result
-
 
 # ---------------------------------------------------------------------------
 # Operator FORCE-PROMOTE — skip the audit gate, still open the PR + wait for CI.
@@ -8533,7 +8513,6 @@ async def _force_promote_locked(
     await session.commit()
     return result
 
-
 async def _force_promote_in_dedicated_session(
     version_id: uuid.UUID,
     candidate_sha: str,
@@ -8575,7 +8554,6 @@ async def _force_promote_in_dedicated_session(
             version_id, result, session_factory=session_factory
         )
     return result
-
 
 async def force_promote_current_version(
     session: AsyncSession,
@@ -8661,520 +8639,6 @@ async def force_promote_current_version(
     )
 
 
-# ── Operator hotfix-deploy channel (design d-ae60ffe3, knowledge f69ffbff) ────
-# A NARROW, OWNER-approved, fail-closed sibling of force-promote: it fast-tracks
-# a release-machinery fix ahead of the normal qualification gate, but — unlike
-# force-promote, which ships the WHOLE candidate tree — it may ONLY ship the
-# allowlisted release-machinery files (backend/app/hotfix_policy.py). The diff
-# allowlist is computed from the candidate SHA's ACTUAL changed files, never from
-# the operator's declared scope_modules, and it fails closed on anything
-# unexpected. Like force-promote it skips the AUDIT/scoring gate ONLY — not CI,
-# not promote()'s merge-time migration-chain backstop.
-
-
-# Statuses from ``promote()`` where the hotfix bypass ACTUALLY took effect: the
-# candidate merged outright (``promoted``) or a promotion PR was opened with
-# auto-merge / a managed-check wait armed (``pending_auto_merge`` /
-# ``pending_managed_check_wait`` — the CI-gated primary flow). Each skipped the
-# audit/scoring gate and is owed normal-gate re-qualification, so the audit
-# trail (completion-debt backfill + operator Alert) MUST be recorded for every
-# one of them, not only the already-merged ``promoted`` case. A
-# ``promotion_failed`` / no-op result deployed nothing, so it owes nothing.
-_HOTFIX_PROMOTE_ATTEMPTED_STATUSES: frozenset[str] = frozenset(
-    {"promoted", "pending_auto_merge", "pending_managed_check_wait"}
-)
-
-
-async def _hotfix_promote_locked(
-    session: AsyncSession,
-    version_id: uuid.UUID,
-    candidate_sha: str,
-    candidate_diff_hash: str | None,
-    actor: str | None,
-    reason: str | None,
-    scope_modules: list[str] | None,
-    diff_file_list: list[str],
-    prior_deployed_sha: str | None,
-) -> dict[str, Any]:
-    """Lock + HOTFIX-promote an open version on a dedicated session (no audit).
-
-    Body of ``_hotfix_promote_in_dedicated_session``.  Mirrors
-    ``_force_promote_locked`` invariant-for-invariant — same FOR UPDATE lock, same
-    open/in-flight refusals, same commit discipline — but marks the base_record
-    with ``hotfix_promote`` and carries the operator's actor/reason/scope_modules
-    justification instead of the forced_promote_* provenance.  The scope check has
-    ALREADY passed (pre-lock, in ``hotfix_promote_current_version``); this body
-    only performs the audited promote.
-    """
-    version = (
-        (
-            await session.execute(
-                select(release_version.ReleaseVersion)
-                .where(release_version.ReleaseVersion.id == version_id)
-                .with_for_update()
-                .execution_options(populate_existing=True)
-            )
-        )
-        .scalars()
-        .first()
-    )
-    if version is None:
-        return {"status": "version_not_found"}
-    if version.status != "open":
-        return {"status": "not_open", "version_status": version.status}
-    from app.qualification_state_resolver import resolve_newest_qualification_verdict
-
-    _latest_verdict = await resolve_newest_qualification_verdict(session, version)
-    _promo = _promotion_in_flight_result(version, latest_verdict=_latest_verdict)
-    if _promo is not None:
-        return _promo
-    now = _utcnow()
-    _scope_modules = list(scope_modules or [])
-    # Hotfix composite: NO audit score (like force-promote); promote() only reads
-    # ``confidence`` for the PR body, so omit it.
-    composite: dict[str, Any] = {"promote": True, "hotfix_promote": True}
-    base_record: dict[str, Any] = {
-        "candidate_sha": candidate_sha,
-        "candidate_diff_hash": candidate_diff_hash,
-        "confidence": None,
-        "hotfix_promote": True,
-        "hotfix_promote_by": actor,
-        "hotfix_promote_at": now.isoformat(),
-        "hotfix_promote_reason": reason,
-        "hotfix_promote_scope_modules": _scope_modules,
-        # These are committed with the bypass itself so the sweep can recreate
-        # its promised audit trail if the request session dies after promotion.
-        "hotfix_promote_diff_file_list": list(diff_file_list),
-        "hotfix_promote_prior_deployed_sha": prior_deployed_sha,
-        "started_at": now.isoformat(),
-        "finalized_at": now.isoformat(),
-    }
-    logger.warning(
-        "[RELEASE_QUALIFIER] HOTFIX-PROMOTE: v%d cutting release branch + opening "
-        "promotion PR at candidate %s (audit gate SKIPPED; CI + merge-time "
-        "migration guard still apply) — actor=%s reason=%s scope_modules=%s",
-        version.version_number,
-        candidate_sha[:8],
-        actor,
-        reason,
-        _scope_modules,
-    )
-    result = await promote(
-        session,
-        version,
-        candidate_sha,
-        composite=composite,
-        base_record=base_record,
-    )
-    await session.commit()
-    return result
-
-
-async def _hotfix_promote_in_dedicated_session(
-    version_id: uuid.UUID,
-    candidate_sha: str,
-    candidate_diff_hash: str | None,
-    actor: str | None,
-    *,
-    reason: str | None,
-    scope_modules: list[str] | None,
-    diff_file_list: list[str],
-    prior_deployed_sha: str | None,
-    session_factory=None,
-) -> dict[str, Any]:
-    """Run HOTFIX-promote on a DEDICATED session (mirrors the force-promote path).
-
-    A dedicated ``AsyncSessionLocal`` is required because ``promote()`` issues an
-    intermediate lock-releasing commit.  Runs the same post-commit reconcile /
-    strategic hooks the force/finalize paths run, but only when a promotion
-    actually attempted.
-    """
-    factory = session_factory or AsyncSessionLocal
-    async with factory() as session:
-        try:
-            result = await _hotfix_promote_locked(
-                session,
-                version_id,
-                candidate_sha,
-                candidate_diff_hash,
-                actor,
-                reason,
-                scope_modules,
-                diff_file_list,
-                prior_deployed_sha,
-            )
-        except Exception:
-            try:
-                await session.rollback()
-            except Exception:
-                logger.exception(
-                    "[RELEASE_QUALIFIER] hotfix-promote: rollback failed for "
-                    "version %s",
-                    version_id,
-                )
-            raise
-
-    if result.get("status") not in _FORCE_PROMOTE_NOOP_STATUSES:
-        await _maybe_reconcile_after_promotion_conflict(
-            version_id, result, session_factory=session_factory
-        )
-        await _maybe_trigger_strategic_after_qualification(
-            version_id, result, session_factory=session_factory
-        )
-    return result
-
-
-async def _record_hotfix_audit_trail(
-    session: AsyncSession,
-    project_id: uuid.UUID,
-    *,
-    candidate_sha: str,
-    actor: str | None,
-    reason: str | None,
-    scope_modules: list[str] | None,
-    diff_file_list: list[str] | None,
-    prior_deployed_sha: str | None,
-    record_debt: bool = True,
-    record_alert: bool = True,
-) -> None:
-    """Durable, append-only audit trail for a hotfix promote that took effect.
-
-    Recorded for every status in ``_HOTFIX_PROMOTE_ATTEMPTED_STATUSES`` — the
-    already-merged ``promoted`` case AND the CI-gated ``pending_auto_merge`` /
-    ``pending_managed_check_wait`` cases where the promotion PR is open with
-    auto-merge armed but not yet landed. All three bypassed the audit gate and
-    are equally owed re-qualification.
-
-    Reuses existing primitives (design §2.3 prefers this over a new table):
-
-      * a ``hotfix_deploy_pending_backfill`` :class:`CompletionDebtEntry` — the
-        bypass is owed follow-through, so it stays open (contributing to the
-        debt-pressure sub-score) until the NORMAL gate re-qualifies the same
-        content; and
-      * a WARNING :class:`Alert` so the operator sees the hotfix-deploy event.
-
-    Best-effort: the completion-debt recorder never raises, and a failure to add
-    the Alert must not undo the (already-committed) promotion.  The shared
-    request/sweep reconciliation caller owns the surrounding version lock and
-    commits this session.
-    """
-    from app.completion_debt import (
-        KIND_HOTFIX_DEPLOY_PENDING_BACKFILL,
-        arecord_completion_debt,
-        hotfix_deploy_alert_dedupe_key,
-        hotfix_deploy_debt_dedupe_key,
-    )
-    from app.models import Alert, AlertSeverity
-
-    _scope_modules = list(scope_modules or [])
-    _diff_files = list(diff_file_list or [])
-    detail = {
-        "candidate_sha": candidate_sha,
-        "actor": str(actor) if actor is not None else None,
-        "reason": reason,
-        "scope_modules": _scope_modules,
-        "diff_file_list": _diff_files,
-        "prior_deployed_sha": prior_deployed_sha,
-    }
-    if record_debt:
-        await arecord_completion_debt(
-            session,
-            dedupe_key=hotfix_deploy_debt_dedupe_key(project_id, candidate_sha),
-            kind=KIND_HOTFIX_DEPLOY_PENDING_BACKFILL,
-            title=(
-                f"Hotfix-deploy of release machinery at {candidate_sha[:8]} owes "
-                "normal-gate re-qualification"
-            ),
-            project_id=project_id,
-            source="hotfix_promote",
-            detail=detail,
-        )
-    if not record_alert:
-        return
-    try:
-        alert_key = hotfix_deploy_alert_dedupe_key(project_id, candidate_sha)
-        existing_alert = (
-            await session.execute(
-                select(Alert).where(
-                    Alert.project_id == project_id,
-                    Alert.dedupe_key == alert_key,
-                )
-            )
-        ).scalar_one_or_none()
-        if existing_alert is None:
-            session.add(
-                Alert(
-                    project_id=project_id,
-                    severity=AlertSeverity.WARNING,
-                    title=f"Hotfix-deploy: release machinery fast-tracked at {candidate_sha[:8]}",
-                    message=(
-                        f"An OWNER hotfix-deploy fast-tracked candidate {candidate_sha[:8]} "
-                        "(release machinery only) ahead of the normal qualification gate. "
-                        f"Actor={actor} reason={reason!r}. This bypass is owed re-qualification "
-                        "by the normal gate (tracked as open completion debt)."
-                    ),
-                    source="hotfix_promote",
-                    dedupe_key=alert_key,
-                )
-            )
-    except Exception:  # noqa: BLE001 — an Alert failure must not undo the promotion
-        logger.warning(
-            "[RELEASE_QUALIFIER] hotfix-promote: failed to stage operator Alert "
-            "for project %s candidate %s",
-            project_id,
-            candidate_sha[:8],
-            exc_info=True,
-        )
-
-
-async def hotfix_promote_current_version(
-    session: AsyncSession,
-    project_id: uuid.UUID,
-    *,
-    candidate_sha: str | None = None,
-    actor: str | None = None,
-    reason: str | None = None,
-    scope_modules: list[str] | None = None,
-    session_factory=None,
-) -> dict[str, Any]:
-    """Operator HOTFIX-PROMOTE the project's open version — a NARROW force-promote.
-
-    Fast-tracks a release-machinery fix ahead of the normal qualification gate,
-    but — unlike ``force_promote_current_version`` — only when the candidate's
-    ACTUAL changed files are all allowlisted release machinery
-    (:mod:`app.hotfix_policy`).  Skips the AUDIT/scoring gate ONLY; CI and
-    promote()'s merge-time migration-chain backstop still gate the merge.
-
-    Resolves the candidate (explicit SHA else integration-branch HEAD) and the
-    prior deployed SHA (promotion-target HEAD) + credentials on the request
-    session, computes the candidate's changed files relative to the promotion
-    target via a GitHub compare, and runs the FAIL-CLOSED scope check.  On a
-    scope rejection it returns ``{"status": "scope_rejected", ...}`` WITHOUT
-    cutting any branch.  On success it re-enters ``promote()`` in a DEDICATED
-    session and records a durable audit trail (completion debt + Alert).
-    """
-    version = await release_version.current_open_version(session, project_id)
-    if version is None:
-        return {"status": "no_open_version"}
-    project = await session.get(Project, project_id)
-    if project is None:
-        return {"status": "project_not_found"}
-    resolved = await _resolve_github_with_session(session, project)
-    if resolved is None:
-        return {"status": "no_credentials"}
-    token, owner, repo = resolved
-    integration_branch, promotion_target = _lts_branch_names(project)
-    if not candidate_sha:
-        try:
-            candidate_sha = await github.get_branch_sha(
-                token, owner, repo, integration_branch, live=True
-            )
-        except Exception as exc:  # noqa: BLE001 — a missing branch / API error is recoverable
-            return {"status": "sha_error", "detail": f"{type(exc).__name__}: {exc}"[:300]}
-    if not candidate_sha:
-        return {"status": "sha_error", "detail": "empty candidate sha"}
-    # The prior deployed SHA is BOTH the diff base and an audit-trail field.
-    try:
-        prior_deployed_sha = await github.get_branch_sha(
-            token, owner, repo, promotion_target, live=True
-        )
-    except Exception as exc:  # noqa: BLE001
-        return {"status": "sha_error", "detail": f"{type(exc).__name__}: {exc}"[:300]}
-    if not prior_deployed_sha:
-        return {"status": "sha_error", "detail": "empty promotion-target sha"}
-
-    # Compute the candidate's ACTUAL changed files (a GitHub compare) — the WHOLE
-    # safety of the lane.  NEVER trust the operator-declared scope_modules as the
-    # authorization source; it is only cross-checked/audited.
-    from app import github_refs
-
-    changed = await github_refs.get_changed_files_with_patches_between_refs(
-        token, owner, repo, prior_deployed_sha, candidate_sha, project_id=str(project_id)
-    )
-    if changed is None:
-        # Fail-closed: an indeterminate diff is not an empty change set.
-        return {
-            "status": "scope_rejected",
-            "offending_files": [],
-            "reason": (
-                "could not resolve the candidate diff against the promotion target "
-                "(GitHub compare failed) — refusing fail-closed"
-            ),
-        }
-    changed_files = [f["filename"] for f in changed]
-    main_py_patch = next(
-        (f.get("patch") for f in changed if f["filename"] == hotfix_policy.MAIN_PY_PATH),
-        None,
-    )
-    verdict = hotfix_policy.evaluate_hotfix_scope(
-        changed_files, main_py_patch=main_py_patch
-    )
-    if not verdict.eligible:
-        logger.warning(
-            "[RELEASE_QUALIFIER] HOTFIX-PROMOTE scope REJECTED: project %s candidate "
-            "%s actor=%s — %s (offending=%s)",
-            project_id,
-            candidate_sha[:8],
-            actor,
-            verdict.reason,
-            verdict.offending_files,
-        )
-        return {
-            "status": "scope_rejected",
-            "offending_files": verdict.offending_files,
-            "reason": verdict.reason,
-        }
-
-    candidate_diff_hash = compute_audited_surface_hash(
-        await github.list_repo_tree_paths_at_ref(
-            token, owner, repo, candidate_sha, project_id=str(project_id)
-        )
-    )
-    # Explicitly resolve CI before opening the PR — the bypass skips AUDIT only.
-    ci_green, ci_resolution = await _resolve_ci_at_finalize(session, version, candidate_sha)
-    ci_required = _ci_required_for_finalize(project, ci_resolution)
-    if ci_required and not ci_green:
-        logger.warning(
-            "[RELEASE_QUALIFIER] HOTFIX-PROMOTE blocked: project %s v%d candidate %s "
-            "CI is not green (state=%s) — actor=%s reason=%s",
-            project_id,
-            version.version_number,
-            candidate_sha[:8],
-            ci_resolution.get("state"),
-            actor,
-            reason,
-        )
-        return {"status": "ci_not_green", "ci_resolution": ci_resolution}
-    logger.warning(
-        "[RELEASE_QUALIFIER] HOTFIX-PROMOTE requested: project %s v%d candidate %s "
-        "actor=%s reason=%s scope_modules=%s changed=%s — SKIPPING the audit/scoring "
-        "gate (CI + merge-time migration guard still apply)",
-        project_id,
-        version.version_number,
-        candidate_sha[:8],
-        actor,
-        reason,
-        list(scope_modules or []),
-        changed_files,
-    )
-    result = await _hotfix_promote_in_dedicated_session(
-        version.id,
-        candidate_sha,
-        candidate_diff_hash,
-        actor,
-        reason=reason,
-        scope_modules=scope_modules,
-        diff_file_list=changed_files,
-        prior_deployed_sha=prior_deployed_sha,
-        session_factory=session_factory,
-    )
-    if result.get("status") in _HOTFIX_PROMOTE_ATTEMPTED_STATUSES:
-        # Request completion and crash recovery use the same version-locked
-        # repair path.  This serializes their Alert check+insert and commits the
-        # audit independently of the caller's transaction.
-        try:
-            await _reconcile_hotfix_audit_trail(
-                version.id,
-                session_factory=session_factory,
-            )
-        except Exception:  # noqa: BLE001 — promotion already committed; sweep repairs
-            logger.warning(
-                "[RELEASE_QUALIFIER] hotfix-promote: immediate audit repair failed "
-                "for version %s; periodic recovery will retry",
-                version.id,
-                exc_info=True,
-            )
-    return result
-
-
-async def check_hotfix_scope_preview(
-    session: AsyncSession,
-    project_id: uuid.UUID,
-    *,
-    candidate_sha: str | None = None,
-) -> dict[str, Any]:
-    """Read-only preview: report whether the current open version's candidate diff
-    is hotfix-eligible WITHOUT promoting.
-
-    Returns a dict with keys:
-      ``status``         — one of 'eligible', 'ineligible', 'no_open_version',
-                           'no_credentials', 'sha_error', 'diff_unavailable'
-      ``eligible``       — bool (present when status is 'eligible' or 'ineligible')
-      ``changed_files``  — list of all changed file paths (present on success)
-      ``offending_files``— list of paths that failed the scope check (empty if eligible)
-      ``reason``         — human-readable verdict string (present on success)
-      ``candidate_sha``  — resolved candidate SHA (present on success)
-      ``prior_deployed_sha`` — promotion-target HEAD SHA (present on success)
-
-    This shares the credential-resolution and diff-fetch logic with
-    ``hotfix_promote_current_version`` but makes NO mutations: no branch is cut,
-    no PR is opened, no audit trail is written.
-    """
-    version = await release_version.current_open_version(session, project_id)
-    if version is None:
-        return {"status": "no_open_version"}
-    project = await session.get(Project, project_id)
-    if project is None:
-        return {"status": "no_open_version"}
-    resolved = await _resolve_github_with_session(session, project)
-    if resolved is None:
-        return {"status": "no_credentials"}
-    token, owner, repo = resolved
-    integration_branch, promotion_target = _lts_branch_names(project)
-    if not candidate_sha:
-        try:
-            candidate_sha = await github.get_branch_sha(
-                token, owner, repo, integration_branch, live=True
-            )
-        except Exception as exc:  # noqa: BLE001
-            return {"status": "sha_error", "detail": f"{type(exc).__name__}: {exc}"[:300]}
-    if not candidate_sha:
-        return {"status": "sha_error", "detail": "empty candidate sha"}
-    try:
-        prior_deployed_sha = await github.get_branch_sha(
-            token, owner, repo, promotion_target, live=True
-        )
-    except Exception as exc:  # noqa: BLE001
-        return {"status": "sha_error", "detail": f"{type(exc).__name__}: {exc}"[:300]}
-    if not prior_deployed_sha:
-        return {"status": "sha_error", "detail": "empty promotion-target sha"}
-
-    from app import github_refs
-
-    changed = await github_refs.get_changed_files_with_patches_between_refs(
-        token, owner, repo, prior_deployed_sha, candidate_sha, project_id=str(project_id)
-    )
-    if changed is None:
-        return {
-            "status": "diff_unavailable",
-            "eligible": False,
-            "changed_files": [],
-            "offending_files": [],
-            "reason": (
-                "could not resolve the candidate diff against the promotion target "
-                "(GitHub compare failed)"
-            ),
-            "candidate_sha": candidate_sha,
-            "prior_deployed_sha": prior_deployed_sha,
-        }
-    changed_files = [f["filename"] for f in changed]
-    main_py_patch = next(
-        (f.get("patch") for f in changed if f["filename"] == hotfix_policy.MAIN_PY_PATH),
-        None,
-    )
-    verdict = hotfix_policy.evaluate_hotfix_scope(
-        changed_files, main_py_patch=main_py_patch
-    )
-    return {
-        "status": "eligible" if verdict.eligible else "ineligible",
-        "eligible": verdict.eligible,
-        "changed_files": changed_files,
-        "offending_files": verdict.offending_files,
-        "reason": verdict.reason,
-        "candidate_sha": candidate_sha,
-        "prior_deployed_sha": prior_deployed_sha,
-    }
-
 
 def _qualification_timeout_age_seconds(
     version: release_version.ReleaseVersion,
@@ -9200,7 +8664,6 @@ def _qualification_timeout_age_seconds(
     if timeout_clock is None:
         return None
     return (timeout_now - timeout_clock).total_seconds()
-
 
 async def _finalize_locked_version(
     session: AsyncSession,
@@ -9432,7 +8895,6 @@ async def _finalize_locked_version(
     await session.commit()
     return result
 
-
 async def maybe_finalize_qualification(
     completed_task: Task,
     *,
@@ -9517,3 +8979,19 @@ async def maybe_finalize_qualification(
         session_factory=session_factory,
         expected_attempt_id=context.get("qualification_attempt_id"),
     )
+
+
+# ── Deferred re-export: break the release_qualifier ⟷ release_hotfix_promotion
+# circular import ─────────────────────────────────────────────────────────────
+# release_hotfix_promotion imports many symbols from THIS module at its own top
+# level (_FORCE_PROMOTE_NOOP_STATUSES, promote, compute_audited_surface_hash,
+# …). If we imported it at the top of release_qualifier, rhp would run while
+# this module was only partially initialized and fail to find those names. By
+# importing it at the very bottom — after every symbol rhp needs is defined —
+# rhp sees a fully-initialized release_qualifier. The two names remain
+# module-level attributes so `release_qualifier.hotfix_promote_current_version`
+# / `.check_hotfix_scope_preview` keep working for admin_hotfix_promote.
+from app.release_hotfix_promotion import (  # noqa: E402
+    check_hotfix_scope_preview as check_hotfix_scope_preview,
+    hotfix_promote_current_version as hotfix_promote_current_version,
+)

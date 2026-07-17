@@ -276,6 +276,7 @@ export const TASK_TYPES_WITHOUT_HINT: ReadonlySet<string> = new Set([
   'repo_bootstrap',          // Uses specialized.ts bespoke prompt assembly (external-repo first-cycle bootstrap)
   'salvage_bundle',          // Uses standard.ts handleSalvageBundle bespoke prompt assembly (consolidated fix batch)
   'capability_proof_trial',  // Uses capability-proof-trial.ts; runs the targeted covering tests directly, no Claude prompt
+  'strategic_resident_turn', // Uses strategic-resident-turn.ts bespoke prompt assembly (no-clone resident loop)
 ]);
 
 // ── Dynamic Task Type Hints (based on project build configuration) ───────────
@@ -1225,9 +1226,10 @@ export const SHARED_LIFECYCLE_REMAINDER = `- \`./pr open --title "<title>" --bod
 - \`./fail "<reason>"\` — Task fundamentally can't complete (wrong scope,
   conflicting requirements, unknown approach). NOT for transient lint/test
   failures — iterate with \`./check\`.
-- \`./blocked "<reason>"\` — No code edit can fix: (1) \`./check\` fails
-  identically despite changes, (2) toolchain/system error, or (3) repo-wide gate
-  fails on untouched files. Routes to strategic. Does NOT burn iteration cap.
+- For \`GATE-ENVIRONMENT\`/local time or tool limits, do NOT call \`./blocked\`:
+  run cheapest faithful checks, \`./pr open\`, \`./done\`; CI is authoritative.
+  A real assertion/lint/build/test failure still blocks publication and must be fixed.
+- \`./blocked "<reason>"\` — Only when no code edit can fix it; routes to strategic.
 
 Exit: edit -> ./check -> ./pr open -> ./done
 

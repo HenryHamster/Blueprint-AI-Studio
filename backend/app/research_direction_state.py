@@ -28,6 +28,7 @@ from app.models import (
     Task,
     TaskStatus,
 )
+from app.message_audience import stamp_message_audience
 from app.project_message_creation import build_project_message
 from app.broadcast import broadcast_to_project
 from app.direction_metrics import (
@@ -824,11 +825,14 @@ async def apply_post_spawn_state(
                                     + "Consider resetting the direction or waiting for "
                                     "blocked tasks to complete."
                                 ),
-                                context={
-                                    "source": "dedup_deadlock",
-                                    "direction_id": did,
-                                    "consecutive_empty_cycles": _consec,
-                                },
+                                context=stamp_message_audience(
+                                    {
+                                        "source": "dedup_deadlock",
+                                        "direction_id": did,
+                                        "consecutive_empty_cycles": _consec,
+                                    },
+                                    "research.dedup_deadlock",
+                                ),
                             )
                             session.add(_deadlock_msg)
                             logger.warning(
@@ -925,11 +929,14 @@ async def apply_post_spawn_state(
                                     f"done on HEAD). Consider resetting the direction's scope "
                                     f"or retiring it if the goal is fully achieved."
                                 ),
-                                context={
-                                    "source": "already_fixed_deadlock",
-                                    "direction_id": did,
-                                    "consecutive_noop_cycles": _af_consec,
-                                },
+                                context=stamp_message_audience(
+                                    {
+                                        "source": "already_fixed_deadlock",
+                                        "direction_id": did,
+                                        "consecutive_noop_cycles": _af_consec,
+                                    },
+                                    "research.already_fixed_deadlock",
+                                ),
                             )
                             session.add(_af_msg)
                             logger.warning(
@@ -1571,10 +1578,13 @@ async def _apply_terminal_transition(
                 from_type="agent",
                 from_task_id=task.id,
                 content=note,
-                context={
-                    "source": "research_zero_children",
-                    "direction_id": str(direction_id),
-                },
+                context=stamp_message_audience(
+                    {
+                        "source": "research_zero_children",
+                        "direction_id": str(direction_id),
+                    },
+                    "research.zero_children",
+                ),
             )
             session.add(msg)
 

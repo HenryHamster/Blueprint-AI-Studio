@@ -3774,6 +3774,15 @@ async def _handle_capability_proof_trial_completion(
         strategist visibility only (it does NOT touch the capability's
         proof-scoring evidence_refs, so an existing ``proven`` is untouched).
 
+    **Receipt completeness requirement**: a GREEN receipt must identify the
+    *complete* enrolled test suite (``test_refs`` must equal the enrolled set
+    exactly — neither a strict subset nor a superset) and the *actual checkout
+    revision* (``head_sha`` must match the enrolled SHA when one was specified).
+    Any mismatch records NO proof.  The recorded ``commit_sha`` uses the
+    agent-reported ``head_sha`` (actual executed revision) in preference to the
+    enrollment-time estimate, falling back to the enrolled SHA only when the
+    agent omitted it.
+
     Operator-disableable + fail-open: the
     ``capability_proof_execution_trials_enabled`` runtime flag defaults to True,
     and any parse/lookup/record error leaves the capability at its existing proof,
@@ -3824,6 +3833,25 @@ async def _handle_capability_proof_trial_completion(
             )
             return
 
+        async def _record_receipt_contradiction(reason: str) -> None:
+            """Persist an auditable rejection without changing proof state.
+
+            A receipt-contract failure is neither a test failure nor authority to
+            revoke an existing proof.  It must nevertheless be visible to the
+            stalled-trial health surface rather than disappearing into logs.
+            """
+            ctx = dict(task.context or {})
+            ctx["capability_proof_trial_contradiction"] = {
+                "reason": reason,
+                "ran": bool(result.get("ran")),
+                "passed": bool(result.get("passed")),
+                "could_not_run": bool(result.get("could_not_run")),
+                "recorded_at": _utcnow().isoformat(),
+            }
+            task.context = ctx
+            flag_modified(task, "context")
+            await session.commit()
+
         # --- Validate agent-reported result against enrollment contract ---
         # The enrollment (task.first_payload) is the orchestrator-authored contract
         # written by enroll_capability_proof_trial. The agent must not be able to
@@ -3867,26 +3895,33 @@ async def _handle_capability_proof_trial_completion(
                 cap_normalized,
                 cap_enrolled,
             )
+            await _record_receipt_contradiction("capability_mismatch")
             return
 
-        # (2) Reported test_refs must be a subset of the enrolled test_refs so
-        #     the runner cannot claim green for refs that were never enrolled.
+        # (2) The receipt must name exactly the enrolled target set.  A subset
+        #     would let a compromised runner omit a hard test, then have its
+        #     green aggregate recorded as though the complete suite had run.
+        #     Belt-and-suspenders: guard empty refs explicitly.
         reported_refs_set = set(refs)
         enrolled_refs_set = set(refs_enrolled)
-        if not reported_refs_set.issubset(enrolled_refs_set):
+        if not refs or reported_refs_set != enrolled_refs_set:
             extra = sorted(reported_refs_set - enrolled_refs_set)
+            missing = sorted(enrolled_refs_set - reported_refs_set)
             logger.warning(
                 "[CAP_TRIAL] test_refs mismatch for task %s — "
-                "extra unenrolled refs: %s — ingesting nothing",
+                "extra=%s missing=%s — ingesting nothing",
                 task.id,
                 extra,
+                missing,
             )
+            await _record_receipt_contradiction("test_refs_mismatch")
             return
 
-        # (3) Reported head_sha must match the enrolled head_sha when the
-        #     enrollment specifies one (head_sha_enrolled=None == skip check).
+        # (3) Reported head_sha must exactly match the enrolled revision.  In
+        #     particular, an empty/missing reported SHA cannot turn an enrolled
+        #     revision-bound trial into an unbound proof receipt.
         reported_sha = head_sha if isinstance(head_sha, str) else None
-        if head_sha_enrolled and reported_sha and reported_sha != head_sha_enrolled:
+        if head_sha_enrolled and reported_sha != head_sha_enrolled:
             logger.warning(
                 "[CAP_TRIAL] head_sha mismatch for task %s — "
                 "reported=%s, enrolled=%s — ingesting nothing",
@@ -3894,15 +3929,19 @@ async def _handle_capability_proof_trial_completion(
                 reported_sha,
                 head_sha_enrolled,
             )
+            await _record_receipt_contradiction("head_sha_mismatch")
             return
 
         # --- Enrollment validated — use enrolled values for recording ---
+        # Prefer reported_sha (the actual executed revision) over the enrollment-time
+        # estimate; fall back to head_sha_enrolled when the agent omits head_sha.
+        commit_sha_to_record = reported_sha or head_sha_enrolled
         if capability_proof_trial_is_green(result):
             recorded = record_capability_named_test_execution_proof(
                 project,
                 cap_enrolled,
                 refs_enrolled,
-                head_sha_enrolled,
+                commit_sha_to_record,
                 suite_verifying=True,
             )
             if recorded:
@@ -3912,7 +3951,7 @@ async def _handle_capability_proof_trial_completion(
                     "cap=%s (task %s, sha=%s, refs=%s)",
                     cap_enrolled,
                     task.id,
-                    head_sha_enrolled,
+                    commit_sha_to_record,
                     refs_enrolled,
                 )
                 # The proof is durable before waking waiters. The shared resolver

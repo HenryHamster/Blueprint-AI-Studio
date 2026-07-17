@@ -1631,14 +1631,19 @@ describe('writeCheckHelper — impacted-test merge-time gate', () => {
     expect(script).toContain('python3 backend/testing/impacted_tests.py');
     // Capped run, overflow deferred to CI (never silently dropped).
     expect(script).toContain('IMPACTED_TEST_CAP=8');
+    expect(script).toContain('IMPACTED_RESOLVER_TIMEOUT_SECS=30');
+    expect(script).toContain('IMPACTED_GATE_TIMEOUT_SECS=120');
     expect(script).toContain('deferred-to-CI:');
-    // Runs the impacted files under the sanctioned Postgres harness, routed
-    // through `run` so a failure lands in FAILED and ./pr open (gates on
-    // ./check) cannot push.
-    expect(script).toContain('run "impacted-test gate" bash -c ');
+    // Both resolver and sanctioned Postgres harness are bounded; the harness
+    // emits progress while it runs so an operator can distinguish work from a wedge.
+    expect(script).toContain('timeout --foreground --signal=TERM');
+    expect(script).toContain('impacted-test gate: still running');
     expect(script).toContain('scripts/test-backend.sh --postgres');
-    // Graceful no-Docker skip writes the taskId-scoped GATE-ENVIRONMENT marker.
+    // Timeouts/unavailability write the taskId-scoped GATE-ENVIRONMENT marker,
+    // but an ordinary non-zero test exit remains a blocking failure.
+    expect(script).toContain('124|137)');
     expect(script).toContain('/tmp/check_gate_env_impacted-1.txt');
+    expect(script).toContain('FAILED+=("impacted-test gate")');
     // It is ADDITIVE — the standalone smoke run is untouched and still present.
     expect(script).toContain('scripts/test-backend.sh --standalone --no-postgres');
     // The block lives INSIDE the WITH_TESTS merge-time backend gate, right after
@@ -1744,7 +1749,7 @@ describe('writeCheckHelper — impacted-test merge-time gate', () => {
     expect(script).not.toContain('python3 backend/testing/impacted_tests.py 2>/dev/null || true');
     // Crash detection: capture exit code and surface non-zero exits as failures.
     expect(script).toContain('_it_rc=$?');
-    expect(script).toContain('if [ "$_it_rc" -ne 0 ]');
+    expect(script).toContain('case "$_it_rc" in');
     expect(script).toContain('FAILED+=("impacted-test resolver crash")');
     // A crash prints stderr content so operators can diagnose.
     expect(script).toContain('cat "$_it_stderr_f"');

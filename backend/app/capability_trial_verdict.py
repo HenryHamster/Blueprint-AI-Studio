@@ -794,6 +794,7 @@ async def raise_capability_verdict_notice(
     fires a new notice while repeated re-evaluations of the same standing decided
     verdict are silent.
     """
+    from app.message_audience import stamp_message_audience
     from app.models import MessageType
     from app.project_message_creation import build_project_message
 
@@ -828,17 +829,20 @@ async def raise_capability_verdict_notice(
             message_type=MessageType.NOTE,
             from_type="system",
             content=content,
-            context={
-                "event_type": "capability_verdict_decided",
-                "dedupe_key": dedupe_key,
-                "cap_name": cap_name,
-                "prior_verdict": prior_verdict,
-                "new_verdict": new_verdict,
-                "verdict_reason": verdict_reason,
-                "lift": lift,
-                "n_with": n_with,
-                "n_without": n_without,
-            },
+            context=stamp_message_audience(
+                {
+                    "event_type": "capability_verdict_decided",
+                    "dedupe_key": dedupe_key,
+                    "cap_name": cap_name,
+                    "prior_verdict": prior_verdict,
+                    "new_verdict": new_verdict,
+                    "verdict_reason": verdict_reason,
+                    "lift": lift,
+                    "n_with": n_with,
+                    "n_without": n_without,
+                },
+                "capability_verdict_decided",
+            ),
         )
     )
 
@@ -1207,6 +1211,7 @@ async def raise_stalled_trial_notice(
 
     Returns True when a new notice was written, False when the dedupe key already existed.
     """
+    from app.message_audience import stamp_message_audience
     from app.models import MessageType
     from app.project_message_creation import build_project_message
 
@@ -1238,18 +1243,21 @@ async def raise_stalled_trial_notice(
             message_type=MessageType.NOTE,
             from_type="system",
             content=content,
-            context={
-                "event_type": "capability_trial_stalled",
-                "dedupe_key": dedupe_key,
-                "cap_name": cap_name,
-                "with_7d": with_7d,
-                "without_7d": without_7d,
-                "window_days": window_days,
-                "holdback_fraction": holdback_fraction,
-                "without_assigned": without_assigned,
-                "min_n": min_n,
-                "alternative_projections": alternative_projections,
-            },
+            context=stamp_message_audience(
+                {
+                    "event_type": "capability_trial_stalled",
+                    "dedupe_key": dedupe_key,
+                    "cap_name": cap_name,
+                    "with_7d": with_7d,
+                    "without_7d": without_7d,
+                    "window_days": window_days,
+                    "holdback_fraction": holdback_fraction,
+                    "without_assigned": without_assigned,
+                    "min_n": min_n,
+                    "alternative_projections": alternative_projections,
+                },
+                "capability_trial_stalled",
+            ),
         )
     )
     return True
@@ -1361,6 +1369,7 @@ async def raise_ambiguous_lift_escalation_notice(
 
     Returns True when a new notice was written, False when the dedupe key already existed.
     """
+    from app.message_audience import stamp_message_audience
     from app.models import MessageType
     from app.project_message_creation import build_project_message
 
@@ -1387,16 +1396,19 @@ async def raise_ambiguous_lift_escalation_notice(
             message_type=MessageType.NOTE,
             from_type="system",
             content=content,
-            context={
-                "event_type": "capability_trial_ambiguous_lift_escalation",
-                "dedupe_key": dedupe_key,
-                "cap_name": cap_name,
-                "ambiguous_lift_since": since_str,
-                "lift": lift,
-                "n_with": n_with,
-                "n_without": n_without,
-                "min_n": min_n,
-            },
+            context=stamp_message_audience(
+                {
+                    "event_type": "capability_trial_ambiguous_lift_escalation",
+                    "dedupe_key": dedupe_key,
+                    "cap_name": cap_name,
+                    "ambiguous_lift_since": since_str,
+                    "lift": lift,
+                    "n_with": n_with,
+                    "n_without": n_without,
+                    "min_n": min_n,
+                },
+                "capability_trial_ambiguous_lift_escalation",
+            ),
         )
     )
     return True

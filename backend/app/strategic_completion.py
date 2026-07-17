@@ -48,6 +48,7 @@ from app.models import (
     TaskStatus,
 )
 from app.broadcast import broadcast_to_project
+from app.message_audience import stamp_message_audience
 from app.project_message_creation import build_project_message
 from app.project_message_projection import message_event_payload
 from app.shared_state import runtime_config as _runtime_config
@@ -4820,6 +4821,20 @@ async def _handle_strategic_completion(
                 for d in (project.directions or [])
                 if d.get("status") not in RETIRED_DIRECTION_STATUSES
             )
+            # Strip agent-owned collections from the proposed problem model when
+            # they are unchanged from the cycle baseline.  The strategic completion
+            # path does not independently edit friction, gaps, capabilities, or
+            # pending_user_confirmation — the agent may echo stale copies that
+            # would overwrite newer concurrent state.  Unchanged collections are
+            # safely preserved through the merge's omission=keep logic inside
+            # apply_agent_update, which also handles the non-trivial gap history
+            # union and per-gap compaction watermarks.
+            if pm_baseline is not None:
+                for _ckey in ("friction", "gaps", "capabilities", "pending_user_confirmation"):
+                    pv = new_problem_model.get(_ckey)
+                    bv = pm_baseline.get(_ckey)
+                    if pv is not None and bv is not None and pv == bv:
+                        new_problem_model.pop(_ckey)
             try:
                 new_pm_raw, pm_diff = apply_agent_update(
                     current_raw=project.problem_model,
@@ -6383,6 +6398,7 @@ async def _handle_strategic_completion(
             if warning:
                 _msg_ctx = {**_msg_ctx, "_provenance_warnings": warning}
         _event_type = _msg_ctx.get("event_type")
+        _msg_ctx = stamp_message_audience(_msg_ctx, _event_type or "strategic_message")
         _conversation_reply = _event_type not in _ROUTINE_EVENT_TYPES
         _reply_to_id: uuid.UUID | None = None
         _raw_reply_to = _msg_ctx.get("reply_to")

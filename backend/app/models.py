@@ -2324,7 +2324,7 @@ class ComputeJob(SQLModel, table=True):
 class ComputeJobFile(SQLModel, table=True):
     """Individually-addressable viewable file extracted from a compute job bundle.
 
-    Each row records one file (png, jpg, webp, gif, svg, mp4, webm) that was
+    Each row records one file (png, jpg, webp, gif, pdf, mp4, webm) that was
     extracted from the job's opaque ``bundle.tar.gz`` at completion time, so it
     can be signed and rendered inline without downloading the full tarball.
     """

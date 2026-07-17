@@ -1450,14 +1450,14 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
         </div>
       )}
 
-      {lifetimeSummary && lifetimeSummary.total_jobs > 0 && (
+      {lifetimeSummary && (lifetimeSummary.total_jobs_all_time ?? lifetimeSummary.total_jobs) > 0 && (
         <div
           className="mb-2 flex flex-wrap gap-x-4 gap-y-0.5 text-ui-sm font-mono text-neutral-400"
           data-testid="compute-lifetime-summary"
         >
           <span className="text-neutral-500 text-xs uppercase tracking-widest">Lifetime</span>
           <span>
-            <span className="text-neutral-500">total</span> {lifetimeSummary.total_jobs}
+            <span className="text-neutral-500">total</span> {lifetimeSummary.total_jobs_all_time ?? lifetimeSummary.total_jobs}
           </span>
           {lifetimeSummary.total_spend_usd > 0 && (
             <span>

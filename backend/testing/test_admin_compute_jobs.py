@@ -1479,14 +1479,18 @@ async def test_list_compute_jobs_redacts_credentials_in_result_metrics(
 
 
 @pytest.mark.asyncio
-async def test_aggregate_summary_endpoint_returns_all_jobs(
+async def test_aggregate_summary_endpoint_excludes_old_jobs_but_reports_alltime(
     client: AsyncClient, db_session
 ):
-    """The /compute-jobs/summary endpoint returns totals over ALL jobs regardless of age."""
+    """The /compute-jobs/summary endpoint uses a 90-day window for aggregate stats.
+
+    Jobs older than 90 days are excluded from total_jobs/spend/outcome_breakdown
+    but the cheap all-time count is returned in total_jobs_all_time.
+    """
     project = await _make_project(db_session, name="Agg Summary Project")
     await _add_member(db_session, project.id, "viewer")
 
-    # Old terminal job (would be outside any include_finished_minutes window).
+    # Old terminal job outside the 90-day window.
     old_task = Task(
         project_id=project.id,
         title="old task",
@@ -1510,7 +1514,7 @@ async def test_aggregate_summary_endpoint_returns_all_jobs(
     db_session.add(old_job)
     await db_session.commit()
 
-    # Recent running job.
+    # Recent running job (within the 90-day window).
     new_task = Task(
         project_id=project.id,
         title="new task",
@@ -1536,16 +1540,18 @@ async def test_aggregate_summary_endpoint_returns_all_jobs(
     assert resp.status_code == 200
     body = resp.json()
 
-    # Both jobs are included (old terminal + new running).
-    assert body["total_jobs"] == 2
+    # Only the recent running job is in the 90-day window.
+    assert body["total_jobs"] == 1, "only in-window jobs counted in total_jobs"
     assert body["active_jobs"] == 1
-    assert body["terminal_jobs"] == 1
-    assert body["total_spend_usd"] == pytest.approx(2.5)  # 2.0 final + 0.5 accrued
-    assert body["outcome_breakdown"][ComputeJobStatus.SUCCEEDED.value] == 1
-    assert body["outcome_breakdown"][ComputeJobStatus.RUNNING.value] == 1
-    # old_task has criterion data.
-    assert body["criterion_measured"] == 1
-    assert body["criterion_met"] == 1
+    assert body["terminal_jobs"] == 0
+    assert body["total_spend_usd"] == pytest.approx(0.5)  # only accrued from new_job
+    assert ComputeJobStatus.RUNNING.value in body["outcome_breakdown"]
+    assert ComputeJobStatus.SUCCEEDED.value not in body["outcome_breakdown"]
+    # criterion_measured: old_task is outside the window; new_task has no criterion.
+    assert body["criterion_measured"] == 0
+    assert body["criterion_met"] == 0
+    # All-time count includes both jobs.
+    assert body["total_jobs_all_time"] == 2, "all-time count must include the old job"
 
 
 @pytest.mark.asyncio

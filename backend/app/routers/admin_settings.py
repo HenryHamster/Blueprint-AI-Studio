@@ -246,6 +246,67 @@ _KNOWN_SETTINGS_KEYS = frozenset(
     }
 )
 
+# Operator-selectable notification event universe.  Only events in this set
+# may appear in ``notification_config.enabled_events``; the external-webhook
+# audience registry (``_WEBHOOK_EVENT_AUDIENCE`` in ``message_audience``) must
+# contain a matching entry for every event here, or ``route_external_webhook_event``
+# silently fails closed and the operator never receives it.
+# Completeness is guarded by ``test_message_audience.test_valid_notification_events_all_present_in_webhook_registry``.
+_VALID_NOTIFICATION_EVENTS = frozenset(
+    [
+        "TASK_FAILED",
+        "TASK_COMPLETED",
+        "APPROVAL_NEEDED",
+        "DEPLOY_HEALTH_ALERT",
+        "PR_MERGED",
+        "BUDGET_EXCEEDED",
+        "AUTO_FIX_SPAWNED",
+        "AUTO_FIX_MERGED",
+        "AUTO_FIX_ESCALATED",
+        "REMEDIATION_ESCALATED",
+        "DIRECTION_MILESTONE",
+        # Residual remediation lifecycle (mirrors AUTO_FIX_*).
+        # SPAWNED/MERGED are noisier — opt-in only. ESCALATED is BLOCKER
+        # severity and joins the default-on list per the
+        # direction-milestone-webhook-pattern playbook.
+        "RESIDUAL_FIX_SPAWNED",
+        "RESIDUAL_FIX_MERGED",
+        "RESIDUAL_FIX_ESCALATED",
+        # Recovery event: operator manually unsuspends a suspended fingerprint.
+        # Opt-in only (not in default list) — informational, not urgent.
+        "RESIDUAL_FIX_UNSUSPENDED",
+        # Escalation fired when a case is deferred by audit too many times.
+        "RESIDUAL_FIX_AUDIT_DEFERRED",
+        # Direction auto-paused for lifetime burn (non-merging finished
+        # tasks beyond the rolling-window threshold). BLOCKER severity /
+        # manual-intervention-required, so it joins the default-on list.
+        "DIRECTION_BURN_PAUSE",
+        # No-CI repo merged a PR without test verification (UNVERIFIED-merge
+        # fallback). The operator who turned off required CI checks needs to
+        # know when a merge proceeds without tests, so it is default-on.
+        "MERGE_UNVERIFIED",
+        # A task was held out of dispatch for a DELIBERATE spend/budget
+        # decision (requires_approval + approval_hold_reason="spend_budget").
+        # CREATED fires when the hold is first seen; EXPIRING fires once as
+        # the configured spend_approval_timeout_hours window nears its end.
+        # Both are operator-actionable, so they join the default-on list.
+        "SPEND_HOLD_CREATED",
+        "SPEND_HOLD_EXPIRING",
+        # Runner-health fleet incidents dispatched by runner_health_alerts.
+        # These are operator-actionable outages (a runner or the whole
+        # fleet is down, out of disk, or an outage has aged past the
+        # re-page threshold), so they join the default-on list below.
+        "RUNNER_DEACTIVATED",
+        "RUNNER_DEGRADED",
+        "RUNNER_DEGRADED_ESCALATED",
+        "RUNNER_FLEET_OFFLINE",
+        "RUNNER_LOW_DISK",
+        "RUNNER_OUTAGE_ESCALATED",
+        "RUNNER_LOCAL_HOLD",
+        "RUNNER_CONTAINER_HOLD",
+    ]
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -3090,60 +3151,6 @@ async def _apply_settings(
                     status_code=400,
                     detail=f"notification_config.webhook_url is not allowed: {reason}",
                 )
-        _VALID_NOTIFICATION_EVENTS = frozenset(
-            [
-                "TASK_FAILED",
-                "TASK_COMPLETED",
-                "APPROVAL_NEEDED",
-                "DEPLOY_HEALTH_ALERT",
-                "PR_MERGED",
-                "BUDGET_EXCEEDED",
-                "AUTO_FIX_SPAWNED",
-                "AUTO_FIX_MERGED",
-                "AUTO_FIX_ESCALATED",
-                "REMEDIATION_ESCALATED",
-                "DIRECTION_MILESTONE",
-                # Residual remediation lifecycle (mirrors AUTO_FIX_*).
-                # SPAWNED/MERGED are noisier — opt-in only. ESCALATED is BLOCKER
-                # severity and joins the default-on list per the
-                # direction-milestone-webhook-pattern playbook.
-                "RESIDUAL_FIX_SPAWNED",
-                "RESIDUAL_FIX_MERGED",
-                "RESIDUAL_FIX_ESCALATED",
-                # Recovery event: operator manually unsuspends a suspended fingerprint.
-                # Opt-in only (not in default list) — informational, not urgent.
-                "RESIDUAL_FIX_UNSUSPENDED",
-                # Escalation fired when a case is deferred by audit too many times.
-                "RESIDUAL_FIX_AUDIT_DEFERRED",
-                # Direction auto-paused for lifetime burn (non-merging finished
-                # tasks beyond the rolling-window threshold). BLOCKER severity /
-                # manual-intervention-required, so it joins the default-on list.
-                "DIRECTION_BURN_PAUSE",
-                # No-CI repo merged a PR without test verification (UNVERIFIED-merge
-                # fallback). The operator who turned off required CI checks needs to
-                # know when a merge proceeds without tests, so it is default-on.
-                "MERGE_UNVERIFIED",
-                # A task was held out of dispatch for a DELIBERATE spend/budget
-                # decision (requires_approval + approval_hold_reason="spend_budget").
-                # CREATED fires when the hold is first seen; EXPIRING fires once as
-                # the configured spend_approval_timeout_hours window nears its end.
-                # Both are operator-actionable, so they join the default-on list.
-                "SPEND_HOLD_CREATED",
-                "SPEND_HOLD_EXPIRING",
-                # Runner-health fleet incidents dispatched by runner_health_alerts.
-                # These are operator-actionable outages (a runner or the whole
-                # fleet is down, out of disk, or an outage has aged past the
-                # re-page threshold), so they join the default-on list below.
-                "RUNNER_DEACTIVATED",
-                "RUNNER_DEGRADED",
-                "RUNNER_DEGRADED_ESCALATED",
-                "RUNNER_FLEET_OFFLINE",
-                "RUNNER_LOW_DISK",
-                "RUNNER_OUTAGE_ESCALATED",
-                "RUNNER_LOCAL_HOLD",
-                "RUNNER_CONTAINER_HOLD",
-            ]
-        )
         enabled_events = val.get(
             "enabled_events",
             [

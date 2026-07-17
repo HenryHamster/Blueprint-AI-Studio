@@ -902,6 +902,10 @@ export interface ComputeJob {
    *  Only populated at terminal time; use viewable_artifacts_live_omissions
    *  for running jobs. */
   viewable_artifacts_dropped_count?: number | null;
+  /** Count of .svg files produced by this job that were excluded from the
+   *  viewable-artifact gallery for XSS security reasons (SVG can execute
+   *  script when served from a signed URL). Absent when zero. */
+  viewable_artifacts_svg_omitted_count?: number | null;
   /** Live omission telemetry for RUNNING jobs. Contains the count of unique
    *  artifact files the runner skipped due to the per-kind size cap
    *  ("size_cap": images ≤ 8 MiB, videos ≤ 512 MiB) or the 25-file count
@@ -961,6 +965,7 @@ export interface ComputeJob {
 
 export interface ComputeJobsSummary {
   total_jobs: number;
+  total_jobs_all_time?: number;
   active_jobs: number;
   terminal_jobs: number;
   total_spend_usd: number;

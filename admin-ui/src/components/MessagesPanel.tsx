@@ -139,6 +139,47 @@ function attentionTextTone(level?: string | null): string {
   if (level === 'watch') return 'text-neutral-300';
   return 'text-emerald-300';
 }
+/** Human-readable short label for an attention item's lifecycle.operator_action. */
+function lifecycleOperatorActionLabel(operatorAction?: string | null): string {
+  if (!operatorAction) return '';
+  const labels: Record<string, string> = {
+    reply_or_resolve_message: 'Reply or resolve',
+    inspect_or_resolve_message: 'Inspect or resolve',
+    approve_or_reject_task: 'Approve or reject',
+    hand_merge_or_archive_task: 'Hand-merge or archive',
+    connect_or_select_local_runner: 'Connect or select runner',
+    recover_runner_or_retarget_task: 'Recover runner or retarget',
+    recover_or_remove_runner: 'Recover or remove runner',
+    inspect_runtime_or_requeue_task: 'Inspect runtime or requeue',
+    inspect_dependency_or_requeue_task: 'Inspect dependency or requeue',
+    remap_or_attest_criterion: 'Remap or attest',
+    update_direction: 'Update direction',
+    provide_credentials_or_dismiss: 'Provide credentials',
+    grant_access_or_dismiss: 'Grant access',
+    confirm_intent_change_or_dismiss: 'Confirm intent',
+    answer_decision_or_dismiss: 'Answer decision',
+    remap_direction_or_attest_criterion: 'Remap or attest',
+    monitor_active_direction_progress: 'Monitor progress',
+    register_criteria_or_correct_referenced_keys: 'Register criteria',
+    re_attest_or_provide_evidence: 'Re-attest or provide evidence',
+    re_attest_or_provide_machine_evidence: 'Re-attest or provide evidence',
+    re_attest_or_provide_evidence_or_retry: 'Re-attest or retry',
+    link_task_or_resolve_debt: 'Link or resolve debt',
+    dismiss_or_fix_alert_source: 'Dismiss or fix',
+    inspect_blocked_task: 'Inspect blocked task',
+    inspect_parked_task: 'Inspect parked task',
+    inspect_failed_task: 'Inspect failed task',
+    inspect_experiment_result: 'Inspect result',
+    inspect_source: 'Inspect source',
+  };
+  return labels[operatorAction] ?? operatorAction.replace(/_/g, ' ');
+}
+/** Human-readable label for an attention item's lifecycle.acknowledge_effect. */
+function lifecycleAcknowledgeEffectLabel(effect?: string | null): string {
+  if (!effect || effect === 'none') return 'Acknowledge';
+  if (effect === 'clears_unread_only') return 'Mark as seen — removes from needs-action strip until next update';
+  return `Acknowledge (${effect.replace(/_/g, ' ')})`;
+}
 /** Human-readable label for an attention item's lifecycle.clears_when. */
 function lifecycleClearsLabel(clearsWhen?: string | null): string {
   if (!clearsWhen) return '';
@@ -2674,29 +2715,58 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
                     addToast?.('Failed to dismiss — try again', 'error');
                   }
                 };
+                const handleAck = () => {
+                  // Client-side dismiss: removes the item from the strip for this session.
+                  // No server-side effect — the item reappears if still needs_operator after
+                  // the next attention poll. Driven by lifecycle.acknowledgeable=true.
+                  setResolvedConfirmationIds(prev => new Set(prev).add(item.id));
+                };
+                const isAcknowledgeable = isMessage && (item.lifecycle?.acknowledgeable ?? false);
+                const operatorActionHint = item.lifecycle?.operator_action
+                  ? lifecycleOperatorActionLabel(item.lifecycle.operator_action)
+                  : null;
                 return (
                   <div key={item.id} className="flex flex-col gap-1">
-                    <button
-                      type="button"
-                      onClick={handleClick}
-                      disabled={!isMessage && !isConfirmation}
-                      title={item.lifecycle?.clears_when ? lifecycleClearsLabel(item.lifecycle.clears_when) : undefined}
-                      className={`inline-flex min-h-[44px] items-center gap-1.5 rounded-md border px-2 py-1 text-left text-xs transition-colors ${
-                        isMessage
-                          ? 'border-amber-700/50 bg-amber-950/50 hover:border-amber-600 hover:bg-amber-900/50 cursor-pointer'
-                          : isConfirmation
-                          ? 'border-amber-700/50 bg-amber-950/50 hover:border-amber-600 hover:bg-amber-900/50 cursor-pointer'
-                          : 'border-neutral-800 bg-neutral-950/50 cursor-default'
-                      }`}
-                    >
-                      <span className="shrink-0 text-sm leading-none" aria-hidden="true">{attentionItemIcon(item.kind)}</span>
-                      <span className="truncate max-w-[220px] font-medium text-amber-100">{item.label}</span>
-                      {item.lifecycle?.clears_when && (
-                        <span className="shrink-0 hidden sm:inline text-neutral-500" title={lifecycleClearsLabel(item.lifecycle.clears_when)}>
-                          auto-clears
-                        </span>
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        type="button"
+                        onClick={handleClick}
+                        disabled={!isMessage && !isConfirmation}
+                        title={item.lifecycle?.clears_when ? lifecycleClearsLabel(item.lifecycle.clears_when) : undefined}
+                        className={`inline-flex min-h-[44px] items-center gap-1.5 rounded-md border px-2 py-1 text-left text-xs transition-colors ${
+                          isMessage
+                            ? 'border-amber-700/50 bg-amber-950/50 hover:border-amber-600 hover:bg-amber-900/50 cursor-pointer'
+                            : isConfirmation
+                            ? 'border-amber-700/50 bg-amber-950/50 hover:border-amber-600 hover:bg-amber-900/50 cursor-pointer'
+                            : 'border-neutral-800 bg-neutral-950/50 cursor-default'
+                        }`}
+                      >
+                        <span className="shrink-0 text-sm leading-none" aria-hidden="true">{attentionItemIcon(item.kind)}</span>
+                        <span className="truncate max-w-[220px] font-medium text-amber-100">{item.label}</span>
+                        {operatorActionHint && (
+                          <span className="shrink-0 hidden sm:inline text-neutral-400 text-ui-sm" data-testid="operator-action-hint">
+                            {operatorActionHint}
+                          </span>
+                        )}
+                        {item.lifecycle?.clears_when && (
+                          <span className="shrink-0 hidden sm:inline text-neutral-500" title={lifecycleClearsLabel(item.lifecycle.clears_when)}>
+                            auto-clears
+                          </span>
+                        )}
+                      </button>
+                      {isAcknowledgeable && (
+                        /* eslint-disable-next-line viewport/min-touch-target */
+                        <button
+                          type="button"
+                          onClick={handleAck}
+                          title={lifecycleAcknowledgeEffectLabel(item.lifecycle?.acknowledge_effect)}
+                          className="shrink-0 rounded border border-neutral-700/60 bg-neutral-900/40 px-1.5 py-0.5 text-ui-sm font-medium text-neutral-400 hover:bg-neutral-800/50 hover:text-neutral-200 transition-colors"
+                          data-testid="attention-ack-btn"
+                        >
+                          Ack
+                        </button>
                       )}
-                    </button>
+                    </div>
                     {isExpanded && (
                       <div className="flex gap-1.5 pl-1" data-testid="confirmation-chip-actions">
                         {/* eslint-disable-next-line viewport/min-touch-target */}

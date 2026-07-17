@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 from fastapi import HTTPException
 from sqlmodel import select
 
+from app.message_audience import OPERATOR_ACTION_NEEDED
 from app.models import MessageType, ProjectMessage
 from app.project_message_projection import enum_value
 from app.time_utils import _utcnow
@@ -220,14 +221,17 @@ def derive_needs_action(msg: "ProjectMessage") -> bool:
     """Return True when *msg* is an unresolved operator needs-action item.
 
     ``needs_action`` is DERIVED (never persisted): a message needs operator
-    action iff its ``message_type`` is QUESTION or BLOCKER AND it has not been
-    terminally resolved. Flipping a linked/open item to ``resolved`` therefore
-    clears its needs-action derivation with no schema change — exactly what the
-    generalized auto-resolve and stale-decay sweeps rely on.
+    action when either (a) its ``message_type`` is QUESTION or BLOCKER, or
+    (b) its audience context is ``operator-action-needed``; AND it has not been
+    terminally resolved. This is the single source of truth consumed by both
+    the in-memory attention model and the audience-routing layer.
     """
-    if _message_type_value(msg) not in NEEDS_ACTION_MESSAGE_TYPES:
+    if _message_status_value(msg) == RESOLVED_STATUS:
         return False
-    return _message_status_value(msg) != RESOLVED_STATUS
+    if _message_type_value(msg) in NEEDS_ACTION_MESSAGE_TYPES:
+        return True
+    context = msg.context if isinstance(msg.context, dict) else {}
+    return context.get("audience") == OPERATOR_ACTION_NEEDED
 
 
 def mark_message_resolved(

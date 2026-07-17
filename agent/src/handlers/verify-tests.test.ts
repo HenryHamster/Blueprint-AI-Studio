@@ -1,4 +1,5 @@
 import { vi, describe, it, expect, beforeEach } from 'vitest';
+import { expectCalledWith } from '../utils/typed-mock-call.js';
 
 // Mock ../index.js so module-level imports resolve and main() never runs.
 // Keep strVal/sanitize/resolveBaseBranch real (pure helpers the handler relies
@@ -62,7 +63,6 @@ import { handleVerifyTests } from './verify-tests.js';
 import { persistAndPostStatus, execFileAsync } from '../index.js';
 import { detectTestRunners, detectAutoTestRunners, detectAcceptanceProbes, discoverDocumentedCommands } from '../utils/test-runners.js';
 import { testFixLoop } from '../utils/test-fix-loop.js';
-
 // Must match process.env.AGENT_WORKSPACE so describeRunnerDirectory (which reads
 // that env var at module load time in test-runners.ts) strips the right prefix.
 const WORKSPACE = process.env.AGENT_WORKSPACE || '/tmp/workspace';
@@ -514,7 +514,9 @@ describe('handleVerifyTests', () => {
     });
     vi.mocked(detectAcceptanceProbes).mockReturnValue([PY_PROBE]);
     const err = Object.assign(new Error('SyntaxError: invalid syntax'), { stderr: 'SyntaxError: invalid syntax', status: 1 });
-    vi.mocked(execFileAsync).mockRejectedValue(err);
+    vi.mocked(execFileAsync).mockImplementation((cmd: unknown) =>
+      cmd === 'git' ? Promise.resolve('') : Promise.reject(err),
+    );
 
     await handleVerifyTests('p4', payload, task, 'tok', 'o', 'r', null, { value: '' });
 
@@ -963,11 +965,11 @@ describe('handleVerifyTests', () => {
       expect(verdictWithDisabled().disabledTests).toBeUndefined();
     });
 
-    it('omits disabledTests when the PR diff cannot be computed (base ref unavailable)', async () => {
+    it('fails setup safely when the PR diff cannot be computed', async () => {
       vi.mocked(detectTestRunners).mockReturnValue([RUNNER]);
       vi.mocked(testFixLoop).mockResolvedValue({ passed: true, testFailuresDetected: false });
-      // The shared diff fails: the --name-only pass rejects → both diff-aware
-      // probes degrade to fall-open and the field is absent.
+      // A resolved base ref whose actual diff still fails is not authoritative
+      // provenance. It must not silently expand to an unscoped suite.
       vi.mocked(execFileAsync).mockImplementation((cmd: unknown, args: unknown) => {
         if (cmd === 'git' && (args as string[]).includes('--name-only')) {
           return Promise.reject(new Error('unknown revision origin/main'));
@@ -977,9 +979,11 @@ describe('handleVerifyTests', () => {
 
       await handleVerifyTests('dt3', payload, task, 'tok', 'o', 'r', null, { value: '' });
 
-      const verdict = verdictWithDisabled();
-      expect(verdict.detected).toBe(true);
-      expect(verdict.passed).toBe(true);
+      expect(vi.mocked(testFixLoop)).not.toHaveBeenCalled();
+      expect(lastPostedPayload().status).toBe('FAILED');
+      const verdict = verdictWithDisabled() as VerdictWithDisabled & { setupFailed?: boolean; output: string };
+      expect(verdict.setupFailed).toBe(true);
+      expect(verdict.output).toContain('authoritative PR diff');
       expect(verdict.disabledTests).toBeUndefined();
     });
   });
@@ -1160,6 +1164,7 @@ describe('handleVerifyTests — diff-aware runner filtering', () => {
   const AGENT_RUNNER = { cmd: 'npx', args: ['vitest'], cwd: `${WORKSPACE}/agent`, label: 'vitest (agent)' };
   const BACKEND_RUNNER = { cmd: 'pytest', args: [], cwd: `${WORKSPACE}/backend`, label: 'pytest (backend)' };
   const FRONTEND_RUNNER = { cmd: 'npm', args: ['run', 'build'], cwd: `${WORKSPACE}/admin-ui`, label: 'npm run build (admin-ui)' };
+  const ROOT_RUNNER = { cmd: 'npm', args: ['test'], cwd: WORKSPACE, label: 'npm test (root)' };
 
   function mockDiff(changedFiles: string[]): void {
     vi.mocked(execFileAsync).mockImplementation((cmd: unknown, args: unknown) => {
@@ -1197,6 +1202,28 @@ describe('handleVerifyTests — diff-aware runner filtering', () => {
     expect(runnersUsed()).toEqual([BACKEND_RUNNER.label]);
   });
 
+  it('an authoritative empty diff runs root runners only', async () => {
+    vi.mocked(detectTestRunners).mockReturnValue([ROOT_RUNNER, AGENT_RUNNER, BACKEND_RUNNER]);
+    mockDiff([]);
+
+    await handleVerifyTests('df-empty', payload, {}, 'tok', 'o', 'r', null, { value: '' });
+
+    expect(runnersUsed()).toEqual([ROOT_RUNNER.label]);
+  });
+
+  it('a diff with no matching configured stack fails safely instead of expanding', async () => {
+    vi.mocked(detectTestRunners).mockReturnValue([AGENT_RUNNER, BACKEND_RUNNER]);
+    mockDiff(['README.md']);
+
+    await handleVerifyTests('df-docs', payload, {}, 'tok', 'o', 'r', null, { value: '' });
+
+    expect(runnersUsed()).toEqual([]);
+    expect(lastPostedPayload().status).toBe('FAILED');
+    const verdict = parsedVerdict() as ReturnType<typeof parsedVerdict> & { setupFailed?: boolean; output: string };
+    expect(verdict.setupFailed).toBe(true);
+    expect(verdict.output).toContain('No configured test runner matches the authoritative PR diff');
+  });
+
   it('runs only agent runner when only agent/ files changed', async () => {
     vi.mocked(detectTestRunners).mockReturnValue([AGENT_RUNNER, BACKEND_RUNNER, FRONTEND_RUNNER]);
     mockDiff(['agent/src/handlers/foo.ts']);
@@ -1206,18 +1233,51 @@ describe('handleVerifyTests — diff-aware runner filtering', () => {
     expect(runnersUsed()).toEqual([AGENT_RUNNER.label]);
   });
 
-  it('falls back to all runners when diff is unavailable', async () => {
+  it('fails setup safely instead of running every stack when diff is unavailable', async () => {
     vi.mocked(detectTestRunners).mockReturnValue([AGENT_RUNNER, BACKEND_RUNNER]);
     vi.mocked(execFileAsync).mockImplementation((cmd: unknown, args: unknown) => {
       if (cmd === 'git' && (args as string[]).includes('--name-only')) {
-        return Promise.reject(new Error('unknown revision origin/main'));
+        return Promise.reject(new Error('could not compute merge-base'));
       }
       return Promise.resolve('');
     });
 
     await handleVerifyTests('df3', payload, {}, 'tok', 'o', 'r', null, { value: '' });
 
-    expect(runnersUsed()).toEqual([AGENT_RUNNER.label, BACKEND_RUNNER.label]);
+    expect(runnersUsed()).toEqual([]);
+    expect(lastPostedPayload().status).toBe('FAILED');
+    const verdict = parsedVerdict() as ReturnType<typeof parsedVerdict> & { setupFailed?: boolean; output: string };
+    expect(verdict.setupFailed).toBe(true);
+    expect(verdict.output).toContain('refusing to run an unscoped all-stack test gate');
+  });
+
+  it('fetches a missing base ref before filtering a backend-only PR', async () => {
+    vi.mocked(detectTestRunners).mockReturnValue([AGENT_RUNNER, BACKEND_RUNNER, FRONTEND_RUNNER]);
+    let revParseCalls = 0;
+    vi.mocked(execFileAsync).mockImplementation((cmd: unknown, args: unknown) => {
+      if (cmd !== 'git') return Promise.resolve('');
+      const gitArgs = args as string[];
+      if (gitArgs[0] === 'rev-parse') {
+        revParseCalls += 1;
+        return revParseCalls === 1
+          ? Promise.reject(new Error('unknown revision origin/main'))
+          : Promise.resolve('base-sha');
+      }
+      if (gitArgs[0] === 'fetch') return Promise.resolve('');
+      if (gitArgs.includes('--name-only')) return Promise.resolve('backend/app/foo.py\nbackend/testing/test_foo.py');
+      if (gitArgs.includes('--unified=0')) return Promise.resolve('');
+      return Promise.resolve('');
+    });
+
+    await handleVerifyTests('df-fetch', payload, {}, 'tok', 'o', 'r', null, { value: '' });
+
+    expectCalledWith(execFileAsync,
+      'git',
+      ['fetch', 'origin', '+refs/heads/main:refs/remotes/origin/main'],
+      expect.objectContaining({ cwd: '/tmp/workspace' }),
+    );
+    expect(revParseCalls).toBe(2);
+    expect(runnersUsed()).toEqual([BACKEND_RUNNER.label]);
   });
 
   it('MERGE_TEST_RESULT.tests contains only activeRunners, not skipped-by-path runners', async () => {

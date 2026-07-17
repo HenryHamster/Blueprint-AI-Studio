@@ -25,6 +25,7 @@ from sqlalchemy import func, or_, and_
 from sqlalchemy.orm import selectinload
 from sqlmodel import select
 
+from app.field_encryption import encrypt_field
 from app.compute_backends import (
     GCP_BACKEND_NAME,
     LOCAL_GPU_BACKEND_NAME,
@@ -853,7 +854,7 @@ async def create_compute_job(
                     registry_meta["server"] = str(container_registry_auth["server"])
                 if container_registry_auth.get("username"):
                     registry_meta["username"] = str(container_registry_auth["username"])
-                registry_meta["password"] = str(container_registry_auth["password"])
+                registry_meta["password"] = encrypt_field(str(container_registry_auth["password"]))
                 polling_metadata["container_registry_auth"] = registry_meta
             else:
                 # No password: persist only server + username — password is never
@@ -2435,11 +2436,13 @@ async def referenced_compute_image_digests(
 
 
 _COMPUTE_JOB_BATCH_SIZE = 50
+_COMPUTE_JOB_POLL_CONCURRENCY = 10
 
 
 async def process_compute_jobs_once(session_factory=AsyncSessionLocal) -> None:
     last_created_at = None
     last_id = None
+    _sem = asyncio.Semaphore(_COMPUTE_JOB_POLL_CONCURRENCY)
 
     while True:
         async with session_factory() as session:
@@ -2474,15 +2477,18 @@ async def process_compute_jobs_once(session_factory=AsyncSessionLocal) -> None:
         if not jobs:
             break
 
-        for job in jobs:
-            try:
-                await _process_single_compute_job(job, session_factory=session_factory)
-            except Exception as exc:  # noqa: PERF203
-                logger.exception(
-                    "[COMPUTE_JOB] monitor failed for job=%s: %s",
-                    job.id,
-                    exc,
-                )
+        async def _run_job(job):
+            async with _sem:
+                try:
+                    await _process_single_compute_job(job, session_factory=session_factory)
+                except Exception as exc:
+                    logger.exception(
+                        "[COMPUTE_JOB] monitor failed for job=%s: %s",
+                        job.id,
+                        exc,
+                    )
+
+        await asyncio.gather(*[_run_job(job) for job in jobs])
 
         if len(jobs) < _COMPUTE_JOB_BATCH_SIZE:
             break
@@ -4563,17 +4569,28 @@ async def _record_viewable_job_files(
     if not manifest:
         return 0
     written = 0
-    for entry in manifest:
-        if not isinstance(entry, dict):
-            continue
+    # Pre-filter to valid entries so we can batch-fetch existing rows in one
+    # query instead of N individual SELECTs (N ≤ 25 due to per-job cap).
+    valid_entries = [
+        e for e in manifest
+        if isinstance(e, dict)
+        and isinstance(e.get("storage_uri"), str) and e.get("storage_uri")
+        and isinstance(e.get("filename"), str) and e.get("filename")
+    ]
+    if not valid_entries:
+        return 0
+    all_uris = [e["storage_uri"] for e in valid_entries]
+    existing_rows_result = await session.execute(
+        select(ComputeJobFile).where(ComputeJobFile.storage_uri.in_(all_uris))
+    )
+    existing_by_uri: dict[str, ComputeJobFile] = {
+        row.storage_uri: row for row in existing_rows_result.scalars().all()
+    }
+    for entry in valid_entries:
         storage_uri = entry.get("storage_uri")
         filename = entry.get("filename")
         content_type = entry.get("content_type")
         size_bytes = entry.get("size_bytes")
-        if not isinstance(storage_uri, str) or not storage_uri:
-            continue
-        if not isinstance(filename, str) or not filename:
-            continue
         # ``kind`` comes straight from the shared extension classifier
         # ("image"/"video"); fall back to the MIME mapping only if it is absent.
         media_type = entry.get("kind")
@@ -4584,13 +4601,7 @@ async def _record_viewable_job_files(
                 else "unknown"
             )
         try:
-            existing_row = (
-                await session.execute(
-                    select(ComputeJobFile).where(
-                        ComputeJobFile.storage_uri == storage_uri
-                    )
-                )
-            ).scalars().first()
+            existing_row = existing_by_uri.get(storage_uri)
             if existing_row is not None:
                 # Mid-run registration already created the signing row.
                 # Reconcile its mutable metadata to the authoritative terminal
@@ -4726,8 +4737,9 @@ async def persist_viewable_files_for_job(
         )
 
     complete = False
+    svg_count = 0
     try:
-        manifest, dropped, complete = (
+        manifest, dropped, complete, svg_count = (
             await persist_viewable_artifacts_with_completeness(job)
         )
     except Exception:  # noqa: BLE001
@@ -4788,6 +4800,10 @@ async def persist_viewable_files_for_job(
         # live omission count and incomplete-pass diagnostic.
         reconciled_meta["viewable_file_count"] = len(manifest)
         reconciled_meta["viewable_files_dropped"] = dropped
+        if svg_count:
+            reconciled_meta["viewable_files_svg_excluded"] = svg_count
+        else:
+            reconciled_meta.pop("viewable_files_svg_excluded", None)
         reconciled_meta.pop("viewable_terminal_reconciliation_incomplete", None)
     else:
         # Leave viewable_file_count absent so the next terminal call retries.

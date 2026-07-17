@@ -36,11 +36,17 @@ _VIEWABLE_EXTENSIONS = frozenset({
     ".mp4", ".webm", ".svg",
 })
 
-# Uploads smaller than this are sent as a single POST (in-memory).  Larger
-# files use a chunked transfer strategy so a multi-hundred-MiB video does not
-# need to be read into the Python heap before being sent.  Matches the image
-# cap from compute_backends._MAX_VIEWABLE_FILE_BYTES.
+# Maximum bytes this watcher will read into memory for an image file.  Files
+# above this cap are skipped — the server enforces the same limit with HTTP 413
+# so uploading would fail anyway.  Matches compute_backends._MAX_VIEWABLE_FILE_BYTES.
 _IN_MEMORY_BYTES = 8 * 1024 * 1024  # 8 MiB
+
+# Equivalent cap for video files (mp4/webm).  Matches
+# compute_backends._MAX_VIEWABLE_VIDEO_BYTES.
+_MAX_VIDEO_BYTES = 512 * 1024 * 1024  # 512 MiB
+
+# Extensions treated as video for the purpose of the per-kind size cap.
+_VIDEO_EXTENSIONS = frozenset({".mp4", ".webm"})
 
 # Fixed polling interval so the watcher does not hammer CPU on an empty dir.
 _POLL_INTERVAL_SECONDS = 30
@@ -102,11 +108,28 @@ def _upload_file(orchestrator_url, job_id, token, relpath, abspath):
     url = f"{orchestrator_url}/api/agent/compute-jobs/{job_id}/viewable"
     boundary = b"----blueprintViewableUpload" + os.urandom(16).hex().encode("ascii")
 
+    # Guard: check file size before reading so we never pull an arbitrarily
+    # large file into the heap.  Files that exceed the per-kind cap would be
+    # rejected by the server with HTTP 413 anyway, so treat them as a permanent
+    # skip (return True) instead of wasting a network round-trip.
+    ext = os.path.splitext(abspath)[1].lower()
+    size_cap = _MAX_VIDEO_BYTES if ext in _VIDEO_EXTENSIONS else _IN_MEMORY_BYTES
     try:
-        with open(abspath, "rb") as f:
-            file_data = f.read()
+        file_size = os.path.getsize(abspath)
     except OSError:
         return False
+    if file_size > size_cap:
+        return True  # permanent skip — server enforces the same cap with 413
+
+    try:
+        with open(abspath, "rb") as f:
+            # Read up to cap+1 bytes; the extra byte detects a file that grew
+            # between the stat and the open without re-reading beyond the limit.
+            file_data = f.read(size_cap + 1)
+    except OSError:
+        return False
+    if len(file_data) > size_cap:
+        return True  # file grew past cap since size check; permanent skip
 
     filename_b = relpath.encode("utf-8")
 
