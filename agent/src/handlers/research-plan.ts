@@ -300,7 +300,7 @@ export async function handlePlan(
   // greenfield conclusion is drawn below — a successful-but-empty clone of a
   // repo the durable signal says is NOT empty must fail loudly, not be
   // misread as a greenfield bootstrap.
-  verifyCloneDelivered(task, baseBranch);
+  await verifyCloneDelivered(task, baseBranch);
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
   // The plan prompt advertises `./design-doc get <key>` for architectural
@@ -553,7 +553,7 @@ export async function handleResearch(
   // greenfield/empty-repo guidance gate runs — a successful-but-empty clone of
   // a repo the durable signal says is NOT empty must fail loudly, not be
   // misread as greenfield.
-  verifyCloneDelivered(task, baseBranch);
+  await verifyCloneDelivered(task, baseBranch);
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
   // The research prompt advertises `./design-doc get <key>` for architectural

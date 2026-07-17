@@ -8,6 +8,7 @@ vi.mock('../index.js', () => ({
   normalizeClaudeConfigContent: vi.fn((_path: string, content: string) => content),
   WORKSPACE: '/tmp/workspace',
   sendLog: vi.fn(),
+  apiPost: vi.fn().mockResolvedValue({}),
 }));
 
 vi.mock('fs', () => ({
@@ -21,6 +22,7 @@ import { execFileSync } from 'child_process';
 import fs from 'fs';
 import { countSourceFiles, detectGreenfield, isGreenfieldRepo, buildGreenfieldCitationGuidance, verifyCloneDelivered, buildRepoMap, clearTrackedFilesCache, clearRepoMapCache } from './discovery.js';
 import { GREENFIELD_SOURCE_FILE_THRESHOLD } from '../constants.js';
+import { apiPost } from '../index.js';
 
 const setLsFiles = (files: string[]) =>
   vi.mocked(execFileSync).mockReturnValue(files.join('\n'));
@@ -208,6 +210,7 @@ describe('verifyCloneDelivered', () => {
     vi.clearAllMocks();
     clearTrackedFilesCache();
     clearRepoMapCache();
+    vi.mocked(apiPost).mockResolvedValue({});
   });
 
   // Route the execFileSync mock by the git subcommand verifyCloneDelivered runs:
@@ -241,99 +244,103 @@ describe('verifyCloneDelivered', () => {
   const populatedTree = Array.from({ length: GREENFIELD_SOURCE_FILE_THRESHOLD + 5 }, (_, i) => `src/m${i}.ts`);
   const nearEmptyTree = ['package.json', 'README.md', '.gitignore'];
 
-  it('passes for a populated tree whose HEAD matches origin/<branch>', () => {
+  it('passes for a populated tree whose HEAD matches origin/<branch>', async () => {
     routeGit({ head: 'abc123', originHead: 'abc123', lsFiles: populatedTree });
-    expect(() => { verifyCloneDelivered({ repo_is_empty: false }, 'main'); }).not.toThrow();
+    await expect(verifyCloneDelivered({ repo_is_empty: false }, 'main')).resolves.toBeUndefined();
   });
 
-  it('throws clone_failed when the durable signal says non-empty but the tree is empty', () => {
+  it('throws clone_failed when the durable signal says non-empty but the tree is empty', async () => {
     // The core bug: a successful-but-empty clone of a known-non-empty repo must
     // be treated as a clone problem, NOT a greenfield repo.
     routeGit({ head: 'abc123', originHead: 'abc123', lsFiles: nearEmptyTree });
-    try {
-      verifyCloneDelivered({ repo_is_empty: false }, 'main');
-      throw new Error('expected verifyCloneDelivered to throw');
-    } catch (e) {
-      expect((e as Error & { failureCategory?: string }).failureCategory).toBe('clone_failed');
-      expect((e as Error).message).toContain('did not deliver');
-    }
+    let caught: (Error & { failureCategory?: string }) | null = null;
+    try { await verifyCloneDelivered({ repo_is_empty: false }, 'main'); } catch (e) { caught = e as Error & { failureCategory?: string }; }
+    expect(caught?.failureCategory).toBe('clone_failed');
+    expect(caught?.message).toContain('did not deliver');
   });
 
-  it('passes for a genuinely empty repo when the durable signal is absent', () => {
+  it('reports observed_repo_is_empty=true to backend before throwing on durable/live mismatch', async () => {
+    routeGit({ head: 'abc123', originHead: 'abc123', lsFiles: nearEmptyTree });
+    let caughtCategory: string | undefined;
+    try { await verifyCloneDelivered({ repo_is_empty: false }, 'main'); } catch (e) { caughtCategory = (e as Error & { failureCategory?: string }).failureCategory; }
+    expect(caughtCategory).toBe('clone_failed');
+    expect(vi.mocked(apiPost)).toHaveBeenCalledWith(
+      '/api/agent/build-config-discovery',
+      { observed_repo_is_empty: true },
+    );
+  });
+
+  it('still throws clone_failed even when the backend report fails', async () => {
+    routeGit({ head: 'abc123', originHead: 'abc123', lsFiles: nearEmptyTree });
+    vi.mocked(apiPost).mockRejectedValue(new Error('network error'));
+    let caughtCategory: string | undefined;
+    try { await verifyCloneDelivered({ repo_is_empty: false }, 'main'); } catch (e) { caughtCategory = (e as Error & { failureCategory?: string }).failureCategory; }
+    expect(caughtCategory).toBe('clone_failed');
+  });
+
+  it('passes for a genuinely empty repo when the durable signal is absent', async () => {
     // repo_is_empty absent → no durable disagreement → empty tree is allowed
     // (the live greenfield detector legitimately concludes greenfield).
     routeGit({ head: 'abc123', originHead: 'abc123', lsFiles: nearEmptyTree });
-    expect(() => { verifyCloneDelivered({}, 'main'); }).not.toThrow();
+    await expect(verifyCloneDelivered({}, 'main')).resolves.toBeUndefined();
   });
 
-  it('passes for a genuinely empty repo when the durable signal says empty', () => {
+  it('passes for a genuinely empty repo when the durable signal says empty', async () => {
     routeGit({ head: 'abc123', originHead: 'abc123', lsFiles: nearEmptyTree });
-    expect(() => { verifyCloneDelivered({ repo_is_empty: true }, 'main'); }).not.toThrow();
+    await expect(verifyCloneDelivered({ repo_is_empty: true }, 'main')).resolves.toBeUndefined();
   });
 
-  it('throws clone_failed when HEAD does not match origin/<branch> (partial/wrong checkout)', () => {
+  it('throws clone_failed when HEAD does not match origin/<branch> (partial/wrong checkout)', async () => {
     routeGit({ head: 'abc123', originHead: 'def456', lsFiles: populatedTree });
-    try {
-      verifyCloneDelivered({ repo_is_empty: false }, 'main');
-      throw new Error('expected verifyCloneDelivered to throw');
-    } catch (e) {
-      expect((e as Error & { failureCategory?: string }).failureCategory).toBe('clone_failed');
-      expect((e as Error).message).toContain('does not match');
-    }
+    let caught: (Error & { failureCategory?: string }) | null = null;
+    try { await verifyCloneDelivered({ repo_is_empty: false }, 'main'); } catch (e) { caught = e as Error & { failureCategory?: string }; }
+    expect(caught?.failureCategory).toBe('clone_failed');
+    expect(caught?.message).toContain('does not match');
   });
 
-  it('throws clone_failed when HEAD cannot be resolved at all', () => {
+  it('throws clone_failed when HEAD cannot be resolved at all', async () => {
     routeGit({ head: () => { throw new Error('fatal: not a git repository'); } });
-    try {
-      verifyCloneDelivered({ repo_is_empty: false }, 'main');
-      throw new Error('expected verifyCloneDelivered to throw');
-    } catch (e) {
-      expect((e as Error & { failureCategory?: string }).failureCategory).toBe('clone_failed');
-      expect((e as Error).message).toContain('no resolvable HEAD');
-    }
+    let caught: (Error & { failureCategory?: string }) | null = null;
+    try { await verifyCloneDelivered({ repo_is_empty: false }, 'main'); } catch (e) { caught = e as Error & { failureCategory?: string }; }
+    expect(caught?.failureCategory).toBe('clone_failed');
+    expect(caught?.message).toContain('no resolvable HEAD');
   });
 
-  it('does not fail on a missing origin/<branch> ref alone (durable check is the net)', () => {
+  it('does not fail on a missing origin/<branch> ref alone (durable check is the net)', async () => {
     // origin ref absent (rev-parse --verify throws) but tree is populated and
     // durable says non-empty → no clone failure.
     routeGit({ head: 'abc123', originHead: () => { throw new Error('unknown revision'); }, lsFiles: populatedTree });
-    expect(() => { verifyCloneDelivered({ repo_is_empty: false }, 'main'); }).not.toThrow();
+    await expect(verifyCloneDelivered({ repo_is_empty: false }, 'main')).resolves.toBeUndefined();
   });
 
-  it('does not claim a clone failure when the ls-files scan itself fails', () => {
+  it('does not claim a clone failure when the ls-files scan itself fails', async () => {
     // countSourceFiles() → null (scan unavailable); we must not throw on a
     // failed scan, only on a confirmed empty tree.
     routeGit({ head: 'abc123', originHead: 'abc123', lsFiles: () => { throw new Error('git unavailable'); } });
-    expect(() => { verifyCloneDelivered({ repo_is_empty: false }, 'main'); }).not.toThrow();
+    await expect(verifyCloneDelivered({ repo_is_empty: false }, 'main')).resolves.toBeUndefined();
   });
 
-  it('skips the branch check when no branch is provided', () => {
+  it('skips the branch check when no branch is provided', async () => {
     routeGit({ head: 'abc123', lsFiles: populatedTree });
-    expect(() => { verifyCloneDelivered({ repo_is_empty: false }); }).not.toThrow();
+    await expect(verifyCloneDelivered({ repo_is_empty: false })).resolves.toBeUndefined();
   });
 
-  it('quotes the persisted authoritative source_file_count in the clone_failed message', () => {
+  it('quotes the persisted authoritative source_file_count in the clone_failed message', async () => {
     // The backend persisted a real count; on a durable/live disagreement the
     // failure names that count so the mismatch is explicit and like-for-like.
     routeGit({ head: 'abc123', originHead: 'abc123', lsFiles: nearEmptyTree });
-    try {
-      verifyCloneDelivered({ repo_is_empty: false, source_file_count: 42 }, 'main');
-      throw new Error('expected verifyCloneDelivered to throw');
-    } catch (e) {
-      expect((e as Error & { failureCategory?: string }).failureCategory).toBe('clone_failed');
-      expect((e as Error).message).toContain('the onboarding scan counted 42 source file(s)');
-      expect((e as Error).message).toContain('under the same exclusion rules');
-    }
+    let caught: (Error & { failureCategory?: string }) | null = null;
+    try { await verifyCloneDelivered({ repo_is_empty: false, source_file_count: 42 }, 'main'); } catch (e) { caught = e as Error & { failureCategory?: string }; }
+    expect(caught?.failureCategory).toBe('clone_failed');
+    expect(caught?.message).toContain('the onboarding scan counted 42 source file(s)');
+    expect(caught?.message).toContain('under the same exclusion rules');
   });
 
-  it('falls back to the boolean basis when no persisted count is present', () => {
+  it('falls back to the boolean basis when no persisted count is present', async () => {
     routeGit({ head: 'abc123', originHead: 'abc123', lsFiles: nearEmptyTree });
-    try {
-      verifyCloneDelivered({ repo_is_empty: false }, 'main');
-      throw new Error('expected verifyCloneDelivered to throw');
-    } catch (e) {
-      expect((e as Error).message).toContain('the durable onboarding signal says the repo is NOT empty');
-    }
+    let caughtMessage: string | undefined;
+    try { await verifyCloneDelivered({ repo_is_empty: false }, 'main'); } catch (e) { caughtMessage = (e as Error).message; }
+    expect(caughtMessage).toContain('the durable onboarding signal says the repo is NOT empty');
   });
 });
 

@@ -112,7 +112,7 @@ describe('handleDesign', () => {
     vi.mocked(runClaudeCode).mockResolvedValue({
       exitCode: 0, allOutput: '', lastResultText: '',
     });
-    vi.mocked(verifyCloneDelivered).mockImplementation(() => undefined);
+    vi.mocked(verifyCloneDelivered).mockResolvedValue(undefined);
     vi.mocked(readHandlerOutput).mockReturnValue(null);
     // Citations ground by default so tests not targeting the grounding-repair
     // reopen never trigger it incidentally.
@@ -155,7 +155,7 @@ describe('handleDesign', () => {
       new Error('clone_failed: cloned tree disagrees with durable non-empty signal'),
       { failureCategory: 'clone_failed' },
     );
-    vi.mocked(verifyCloneDelivered).mockImplementation(() => { throw cloneFailure; });
+    vi.mocked(verifyCloneDelivered).mockRejectedValue(cloneFailure);
 
     await expect(handleDesign(
       TASK_ID, { prompt: 'Design how X should work' },

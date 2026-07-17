@@ -1,7 +1,7 @@
 import fs from 'fs';
 import { execFileSync } from 'child_process';
 import type WebSocket from 'ws';
-import { sendLog, WORKSPACE } from '../index.js';
+import { sendLog, WORKSPACE, apiPost } from '../index.js';
 import type { BuildConfig, FailureCategory } from '../index.js';
 import { GREENFIELD_SOURCE_FILE_THRESHOLD } from '../constants.js';
 
@@ -250,7 +250,7 @@ The files this design describes do NOT exist in the repository yet, so you CANNO
  * ref or an unreadable `git ls-files` (countSourceFiles → null) is NOT treated as
  * a clone failure on its own — only an explicit durable/live disagreement is.
  */
-export function verifyCloneDelivered(task: Record<string, unknown>, branch?: string): void {
+export async function verifyCloneDelivered(task: Record<string, unknown>, branch?: string): Promise<void> {
   const cloneFailure = (message: string): Error & { failureCategory: FailureCategory } => {
     const err = new Error(message) as Error & { failureCategory: FailureCategory };
     err.failureCategory = 'clone_failed';
@@ -300,6 +300,15 @@ export function verifyCloneDelivered(task: Record<string, unknown>, branch?: str
   if (task.repo_is_empty === false) {
     const sourceFileCount = countSourceFiles();
     if (sourceFileCount !== null && sourceFileCount <= GREENFIELD_SOURCE_FILE_THRESHOLD) {
+      // Self-heal: report the live-empty observation to the backend so it can
+      // re-run authoritative detection and flip the stale repo_is_empty=False
+      // signal.  This breaks the infinite clone_failed loop: the first task
+      // fails as expected (a durable/live disagreement IS a clone problem), but
+      // the backend re-detects and the NEXT task sees the corrected signal.
+      // Best-effort — never let a reporting failure suppress the clone_failed.
+      try {
+        await apiPost('/api/agent/build-config-discovery', { observed_repo_is_empty: true });
+      } catch { /* best-effort; do not mask the real clone_failed below */ }
       const durableCount = typeof task.source_file_count === 'number'
         ? task.source_file_count
         : null;

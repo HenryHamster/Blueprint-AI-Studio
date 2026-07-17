@@ -272,7 +272,7 @@ export async function handleDesign(
   // non-empty/live-empty disagreement must surface as clone_failed so the
   // backend can self-heal the stale onboarding signal instead of emitting an
   // ungrounded design that later fails citation validation.
-  verifyCloneDelivered(task, baseBranch);
+  await verifyCloneDelivered(task, baseBranch);
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
   // The design prompt advertises `./design-doc get <key>` for architectural
