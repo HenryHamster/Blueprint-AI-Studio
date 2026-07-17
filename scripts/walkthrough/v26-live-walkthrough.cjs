@@ -145,6 +145,17 @@ async function navigateToProjectTools(page) {
 }
 
 /**
+ * Navigate to the Runtime → Compute surface where ComputeJobsPanel renders.
+ * Clicks the "Runtime" primary tab, then the "Compute" sub-tab.
+ */
+async function navigateToComputeJobs(page) {
+  await page.locator('[data-testid="primary-tab-nav"] button').filter({ hasText: 'Runtime' }).click();
+  await page.waitForSelector('nav[aria-label="Runtime sections"]', { timeout: 8000 });
+  await page.locator('nav[aria-label="Runtime sections"] button').filter({ hasText: 'Compute' }).click();
+  await page.waitForTimeout(2000);
+}
+
+/**
  * Navigate to the Chat (MessagesPanel) surface.
  * Clicks the "Chat" primary tab and waits for a MessagesPanel-specific selector.
  */
@@ -729,6 +740,112 @@ async function main() {
       'Unit test: admin-ui/src/components/PrimaryTabNav.test.tsx — 13 assertions cover all tab+alert combos',
     ], alertIndicatorScreenshot);
 
+    // ── FLOW 4: Compute viewable artifacts (c-compute-viewable-artifacts) ───
+    console.log('\n[FLOW 4] Compute viewable artifacts — seeded terminal job...');
+    const COMPUTE_JOB_SEED_ID = '00000000-0000-4000-8000-000000000030';
+
+    // 4a. List endpoint — find seeded job and assert viewable_artifacts
+    const jobsResp = await apiGet(
+      `/api/admin/projects/${PROJECT_ID}/compute-jobs?all_terminal=true&limit=200`
+    );
+    const computeJobs = jobsResp.body?.compute_jobs ?? [];
+    const seededJob = Array.isArray(computeJobs)
+      ? computeJobs.find(j => j.id === COMPUTE_JOB_SEED_ID)
+      : null;
+    const viewableArtifacts = seededJob?.viewable_artifacts ?? [];
+    const droppedCount = seededJob?.viewable_artifacts_dropped_count ?? null;
+
+    const hasImage = viewableArtifacts.some(a => a.kind === 'image' && a.content_type === 'image/png');
+    const hasVideo = viewableArtifacts.some(a => a.kind === 'video' && a.content_type === 'video/mp4');
+    const hasPdf   = viewableArtifacts.some(a => a.kind === 'pdf'   && a.content_type === 'application/pdf');
+    const allKindsPresent = hasImage && hasVideo && hasPdf;
+    const droppedIsZero = droppedCount === 0;
+    const flow4aPass = jobsResp.status === 200 && seededJob !== null && allKindsPresent && droppedIsZero;
+
+    step('4a. Compute jobs list — seeded job has image/video/pdf viewable_artifacts', flow4aPass ? 'PASS' : 'FAIL', [
+      `GET /api/admin/projects/${PROJECT_ID}/compute-jobs?all_terminal=true → ${jobsResp.status}`,
+      `Total jobs returned: ${computeJobs.length}`,
+      `Seeded job (${COMPUTE_JOB_SEED_ID}): ${seededJob ? 'FOUND' : 'NOT FOUND'}`,
+      seededJob ? `status: ${seededJob.status}, outcome: ${seededJob.outcome}` : '',
+      `viewable_artifacts count: ${viewableArtifacts.length}`,
+      `has image/png: ${hasImage}`,
+      `has video/mp4: ${hasVideo}`,
+      `has application/pdf: ${hasPdf}`,
+      `viewable_artifacts_dropped_count: ${droppedCount} (expected 0)`,
+      allKindsPresent ? '✓ All three kinds present with correct content_types' : '✗ One or more kinds missing',
+      droppedIsZero ? '✓ viewable_artifacts_dropped_count === 0' : '✗ dropped_count not zero',
+    ]);
+
+    // 4b. Single job detail endpoint — assert viewable_artifacts on GET /api/admin/compute-jobs/{id}
+    const jobDetailResp = await apiGet(`/api/admin/compute-jobs/${COMPUTE_JOB_SEED_ID}`);
+    const detailJob = jobDetailResp.body?.compute_job ?? null;
+    const detailArtifacts = detailJob?.viewable_artifacts ?? [];
+    const detailHasAll = detailArtifacts.some(a => a.kind === 'image') &&
+                         detailArtifacts.some(a => a.kind === 'video') &&
+                         detailArtifacts.some(a => a.kind === 'pdf');
+    const flow4bPass = jobDetailResp.status === 200 && detailJob !== null && detailHasAll;
+
+    step('4b. Single compute job detail — viewable_artifacts present', flow4bPass ? 'PASS' : 'FAIL', [
+      `GET /api/admin/compute-jobs/${COMPUTE_JOB_SEED_ID} → ${jobDetailResp.status}`,
+      `compute_job returned: ${detailJob !== null}`,
+      `viewable_artifacts count: ${detailArtifacts.length}`,
+      detailHasAll ? '✓ All three kinds present on detail endpoint' : '✗ Missing kinds on detail endpoint',
+      `viewable_artifacts_dropped_count: ${detailJob?.viewable_artifacts_dropped_count ?? 'N/A'}`,
+    ]);
+
+    // 4c. Signed download URL endpoint — auth-only check; tolerate 404/500 when
+    // object storage (ARTIFACT_BUCKET_NAME / gs://) is unconfigured on this VM.
+    // Pattern mirrors Flow 2b: non-auth failure is noted but does not fail the flow.
+    const imageUri = viewableArtifacts.find(a => a.kind === 'image')?.storage_uri
+      ?? `gs://walkthrough-bucket/compute-jobs/${COMPUTE_JOB_SEED_ID}/figure.png`;
+    const dlResp = await apiGet(
+      `/api/admin/artifacts/download-url?storage_uri=${encodeURIComponent(imageUri)}&project_id=${PROJECT_ID}`
+    );
+    const dlAuthOk = dlResp.status !== 401 && dlResp.status !== 403;
+    const dlStorageAvail = dlResp.status === 200;
+    step('4c. Viewable file download-URL endpoint — auth passes', dlAuthOk ? 'PASS' : 'FAIL', [
+      `GET /api/admin/artifacts/download-url?storage_uri=<image_uri>&project_id=${PROJECT_ID} → ${dlResp.status}`,
+      `Auth result: ${dlAuthOk ? 'PASS (not 401/403)' : 'FAIL (auth rejected)'}`,
+      dlStorageAvail
+        ? '✓ 200 — signed URL minted (object storage configured on this VM)'
+        : `${dlResp.status} = auth passed; object storage unconfigured or bucket unreachable on this VM (acceptable)`,
+      `Detail: ${JSON.stringify(dlResp.body).slice(0, 200)}`,
+    ]);
+
+    // 4d. UI: navigate to Runtime → Compute and capture the compute artifact gallery
+    console.log('\n[FLOW 4d] Navigating to Runtime → Compute surface...');
+    let computeNavError = null;
+    try {
+      await selectWalkthroughProject(page);
+      await navigateToComputeJobs(page);
+    } catch (navErr) {
+      computeNavError = String(navErr);
+      console.log(`   [WARN] Compute navigation error: ${computeNavError}`);
+    }
+
+    // Wait for the compute artifact gallery to appear (rendered when viewable_artifacts.length > 0)
+    let galleryVisible = false;
+    let artifactItemCount = 0;
+    try {
+      await page.waitForSelector('[data-testid="compute-artifact-gallery"]', { timeout: 10000 });
+      galleryVisible = true;
+      artifactItemCount = await page.locator('[data-testid="compute-viewable-artifact"]').count().catch(() => 0);
+    } catch (_) {
+      // Tolerate — gallery may not be visible if project context hasn't loaded
+    }
+    const computeBodyText = await page.locator('body').innerText().catch(() => '');
+    const computeScreenshot = await takeScreenshot(page, 'flow4-compute-artifacts');
+    const flow4dVerdict = galleryVisible ? 'PASS' : 'DEAD_END';
+    step('4d. Compute artifact gallery renders viewable media inline', flow4dVerdict, [
+      flow4dVerdict === 'PASS'
+        ? `Runtime → Compute surface reached; compute-artifact-gallery rendered`
+        : 'Compute artifact gallery not found — screenshot may not show the target surface',
+      computeNavError ? `Navigation error: ${computeNavError}` : 'Navigation completed without error',
+      `[data-testid="compute-artifact-gallery"] visible: ${galleryVisible}`,
+      `[data-testid="compute-viewable-artifact"] items: ${artifactItemCount}`,
+      `Body excerpt (first 300 chars): ${computeBodyText.slice(0, 300).replace(/\n/g, ' ')}`,
+    ], computeScreenshot);
+
   } catch (err) {
     step('Walkthrough execution error', 'FAIL', [
       String(err),
@@ -911,6 +1028,21 @@ function writeReport(startTs, integrityResult) {
   lines.push('- Message resolve (self-clearing) ✅ CONFIRMED');
   lines.push('- Resolved message removed from open list ✅ CONFIRMED');
   lines.push('- MessagesPanel UI rendering ⚠️ requires project context in live UI');
+  lines.push('');
+  lines.push('### c-compute-viewable-artifacts — Compute viewable output artifacts (Flow 4)');
+  const step4a = results.find(r => r.name.includes('4a.'));
+  const step4b = results.find(r => r.name.includes('4b.'));
+  const step4c = results.find(r => r.name.includes('4c.'));
+  const step4d = results.find(r => r.name.includes('4d.'));
+  const verdict4a = step4a?.verdict === 'PASS' ? '✅ CONFIRMED' : step4a ? `⚠️ ${step4a.verdict}` : '⚠️ NOT RUN';
+  const verdict4b = step4b?.verdict === 'PASS' ? '✅ CONFIRMED' : step4b ? `⚠️ ${step4b.verdict}` : '⚠️ NOT RUN';
+  const verdict4c = step4c?.verdict === 'PASS' ? '✅ CONFIRMED' : step4c ? `⚠️ ${step4c.verdict}` : '⚠️ NOT RUN';
+  const verdict4d = step4d?.verdict === 'PASS' ? '✅ CONFIRMED' : step4d ? `⚠️ ${step4d.verdict}` : '⚠️ NOT RUN';
+  lines.push(`- Compute jobs list API returns seeded terminal job with image/video/pdf viewable_artifacts ${verdict4a}`);
+  lines.push(`- Single compute job detail endpoint carries viewable_artifacts descriptor ${verdict4b}`);
+  lines.push(`- Download-URL endpoint auth passes for viewable file storage_uri ${verdict4c}`);
+  lines.push(`- Compute artifact gallery renders inline in Runtime → Compute UI ${verdict4d}`);
+  lines.push('- Acceptance evidence: viewable_artifacts contains image, video, and pdf kinds; viewable_artifacts_dropped_count === 0');
   lines.push('');
   lines.push('### c-5214996f — Real walkthrough criterion');
   lines.push('> This document IS the real walkthrough. Execution evidence:');

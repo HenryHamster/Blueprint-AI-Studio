@@ -978,6 +978,7 @@ async def sweep_proof_earn_loop(session, now=None) -> dict[str, Any]:
         "still_unproven": [],
         "path_proven_stuck": [],
         "named_test_executed": [],
+        "execution_proven": [],
     }
 
     for project in rows:
@@ -1040,6 +1041,9 @@ async def sweep_proof_earn_loop(session, now=None) -> dict[str, Any]:
                 combined["path_proven_stuck"].extend(result.get("path_proven_stuck", []))
                 combined["named_test_executed"].extend(
                     result.get("named_test_executed", [])
+                )
+                combined["execution_proven"].extend(
+                    result.get("execution_proven", [])
                 )
                 if result["earned"] > 0:
                     session.add(project)
@@ -2084,12 +2088,14 @@ async def sweep_decay_stale_open_messages(
 # test_reaper.py, etc.) keeps working without any change.
 from app.reaper_bug_message_sweeps import (  # noqa: E402
     STALE_OPEN_BUG_CLASS_DECAY_DAYS,
+    STALE_OPEN_UNLINKED_BLOCKER_DECAY_DAYS,
     WakeSweepResult,
     _WAKE_DELIVERY_STALL_CYCLE_THRESHOLD,
     get_wake_delivery_stall_cycles,
     reset_wake_delivery_stall_state,
     sweep_converge_linked_bug_messages,
     sweep_decay_stale_open_bug_messages,
+    sweep_decay_stale_unlinked_blocker_messages,
     sweep_deliver_task_wakes,
     sweep_resolve_open_owned_bug_messages,
     sweep_resolve_stale_open_bug_messages,
@@ -3070,6 +3076,8 @@ __all__ = [
     "reset_wake_delivery_stall_state",
     "sweep_converge_linked_bug_messages",
     "sweep_decay_stale_open_bug_messages",
+    "sweep_decay_stale_unlinked_blocker_messages",
+    "STALE_OPEN_UNLINKED_BLOCKER_DECAY_DAYS",
     "sweep_deliver_task_wakes",
     "sweep_resolve_open_owned_bug_messages",
     "sweep_resolve_stale_open_bug_messages",

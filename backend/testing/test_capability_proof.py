@@ -2143,6 +2143,7 @@ def test_exempt_capability_skipped_in_earn_loop():
         "path_proven_stuck": [],
         "named_test_earned": [],
         "named_test_executed": [],
+        "execution_proven": [],
     }
 
     # Now test with a mix: one exempt unproven cap, one real unproven cap.
@@ -3696,6 +3697,64 @@ class TestEarnLoopExecutionTrialEnrollment:
         assert not _fresh_executed_proof_covers_head(
             project, "capability-proof-gate", "newsha222", now=now
         )
+
+    @pytest.mark.asyncio
+    async def test_earn_loop_executed_proof_path(self):
+        """ACCEPTANCE: when _maybe_enroll_proof_trial returns "fresh" (cadence guard:
+        a green executed proof already covers HEAD), the earn loop routes the cap into
+        ``execution_proven``, NOT into ``earned``, ``named_test_executed``,
+        ``named_test_earned``, ``path_proven_stuck``, or ``still_unproven``.
+
+        This exercises the full earn-loop executed-proof path end-to-end: the "fresh"
+        outcome from the cadence guard is the signal that the cap already holds a
+        ``proven``-tier (enforce-gate-clearing) proof this sweep — previously this
+        information was silently dropped (the loop continued without recording it
+        anywhere). The fix routes it into ``execution_proven`` so callers can see
+        which caps currently clear the enforce gate via an executed proof.
+
+        To force the cap into the main loop despite its proven status (otherwise
+        the revision-stale supplement would exclude it), we patch
+        ``_maybe_enroll_proof_trial`` to return "fresh" directly, which is exactly
+        the code path this production fix adds to.
+        """
+        project, demand = self._project_and_demand(
+            ["backend/app/capability_proof.py"],
+        )
+        # Patch compute_unproven_demanded_capabilities to inject the cap directly
+        # into the main loop (bypassing the proven-status filter), and patch
+        # _maybe_enroll_proof_trial to return "fresh" so we exercise that branch.
+        forced_demand = [{"kind": "capability", "ref": self._CAP}]
+        rc = {"capability_proof_execution_trials_enabled": True}
+
+        fresh_trial = AsyncMock(return_value="fresh")
+        rec = MagicMock(return_value=False)
+
+        with patch("app.capability_proof.flag_modified"), \
+                patch("app.shared_state.runtime_config", new=rc), \
+                patch(
+                    "app.capability_demand.compute_unproven_demanded_capabilities",
+                    return_value=forced_demand,
+                ), \
+                patch("app.capability_proof._maybe_enroll_proof_trial", fresh_trial), \
+                patch("app.capability_proof.record_capability_named_test_proof", rec):
+            result = await commission_proof_earn_loop(
+                project, demand, project.problem_model,
+                verify_path=self._verify, read_head=self._read,
+                session=object(),
+            )
+
+        # _maybe_enroll_proof_trial was called and returned "fresh".
+        fresh_trial.assert_awaited_once()
+        # No static proof downgrade — "fresh" suppresses the static recorder.
+        rec.assert_not_called()
+        # The cap surfaces in execution_proven (enforce-gate-clearing proof present).
+        assert result["execution_proven"] == [self._CAP]
+        # The cap is absent from all other buckets.
+        assert result["earned"] == 0
+        assert result["named_test_executed"] == []
+        assert result["named_test_earned"] == []
+        assert result["path_proven_stuck"] == []
+        assert result["still_unproven"] == []
 
 
 class TestRevokeStaleExecutionProof:

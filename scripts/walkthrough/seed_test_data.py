@@ -140,6 +140,102 @@ async def seed():
         )
         print(f"✓ Alert (ERROR, undismissed, event_type=NULL, for flow 3f): {alert_id}")
 
+        # 7. Seed a terminal SUCCEEDED ComputeJob with three viewable output files
+        # (image/png, video/mp4, application/pdf) for Flow 4 — compute viewable
+        # artifacts acceptance evidence.  polling_metadata.viewable_files is the
+        # manifest read by _viewable_artifacts_descriptor() in admin_compute_jobs.py.
+        import json as _json
+        compute_job_id = uuid.UUID("00000000-0000-4000-8000-000000000030")
+        _gs_base = f"gs://walkthrough-bucket/compute-jobs/{compute_job_id}"
+        _viewable_files = [
+            {
+                "filename": "figure.png",
+                "storage_uri": f"{_gs_base}/figure.png",
+                "content_type": "image/png",
+                "size_bytes": 12345,
+                "kind": "image",
+                "revision": "terminal",
+                "live": False,
+            },
+            {
+                "filename": "recording.mp4",
+                "storage_uri": f"{_gs_base}/recording.mp4",
+                "content_type": "video/mp4",
+                "size_bytes": 987654,
+                "kind": "video",
+                "revision": "terminal",
+                "live": False,
+            },
+            {
+                "filename": "report.pdf",
+                "storage_uri": f"{_gs_base}/report.pdf",
+                "content_type": "application/pdf",
+                "size_bytes": 54321,
+                "kind": "pdf",
+                "revision": "terminal",
+                "live": False,
+            },
+        ]
+        _polling_metadata = _json.dumps({
+            "viewable_files": _viewable_files,
+            "viewable_file_count": len(_viewable_files),
+            "viewable_files_dropped": 0,
+        })
+        await conn.execute(
+            """
+            INSERT INTO computejob (
+                id, project_id, task_id, backend, status, outcome,
+                created_at, updated_at, started_at, completed_at,
+                poll_attempt_count, final_cost_usd, terminal_reason,
+                polling_metadata
+            )
+            VALUES (
+                $1, $2, NULL, 'local_runner', 'SUCCEEDED', 'SUCCESS',
+                $3, $3, $3, $3,
+                1, 0.12, 'walkthrough_seed',
+                $4::jsonb
+            )
+            ON CONFLICT (id) DO UPDATE SET
+                status = 'SUCCEEDED',
+                outcome = 'SUCCESS',
+                polling_metadata = $4::jsonb,
+                updated_at = $3
+            """,
+            compute_job_id,
+            PROJECT_ID,
+            now,
+            _polling_metadata,
+        )
+        print(f"✓ ComputeJob (SUCCEEDED, 3 viewable files, for flow 4): {compute_job_id}")
+
+        # 8. Seed matching ComputeJobFile rows so the signing allowlist recognises
+        # each viewable storage_uri.  storage_uri has a UNIQUE constraint so use
+        # ON CONFLICT DO UPDATE to keep the rows current across re-runs.
+        _cjf_rows = [
+            (uuid.UUID("00000000-0000-4000-8000-000000000031"), "figure.png",     "image", f"{_gs_base}/figure.png",    "image/png",       12345),
+            (uuid.UUID("00000000-0000-4000-8000-000000000032"), "recording.mp4",  "video", f"{_gs_base}/recording.mp4", "video/mp4",       987654),
+            (uuid.UUID("00000000-0000-4000-8000-000000000033"), "report.pdf",     "pdf",   f"{_gs_base}/report.pdf",    "application/pdf", 54321),
+        ]
+        for _cjf_id, _relpath, _media_type, _uri, _ct, _size in _cjf_rows:
+            await conn.execute(
+                """
+                INSERT INTO computejobfile (
+                    id, compute_job_id, safe_relpath, media_type,
+                    storage_uri, content_type, file_size_bytes, created_at
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                ON CONFLICT (storage_uri) DO UPDATE SET
+                    compute_job_id = $2,
+                    safe_relpath = $3,
+                    media_type = $4,
+                    content_type = $6,
+                    file_size_bytes = $7
+                """,
+                _cjf_id, compute_job_id, _relpath, _media_type,
+                _uri, _ct, _size, now,
+            )
+        print(f"✓ ComputeJobFile rows (3 viewable files for flow 4): {[str(r[0]) for r in _cjf_rows]}")
+
     finally:
         await conn.close()
 

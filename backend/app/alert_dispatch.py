@@ -32,6 +32,7 @@ from app.models import (
     Task,  # used in the "Task" string annotation on _maybe_create_failure_alert
     Alert,
     AlertSeverity,
+    ComputeJob,  # used in the "ComputeJob" string annotation
 )
 from app.alert_policy import create_project_alert_if_allowed
 from app.notification import _send_webhook_notification
@@ -2020,4 +2021,80 @@ async def _create_strategic_alert(
         str(project_id),
         "alert_created",
         {"alert_id": str(alert.id), "severity": "WARNING", "title": title},
+    )
+
+
+# Stable title for per-compute-job no-progress watchdog alert. Kept CONSTANT so
+# a persistent stall across monitor cycles dedups to exactly ONE alert per job.
+_NO_PROGRESS_WATCHDOG_ALERT_TITLE = (
+    "Compute job stalled — no progress detected"
+)
+
+
+async def _maybe_create_no_progress_watchdog_alert(
+    session: AsyncSession,
+    job: "ComputeJob",
+    *,
+    now: datetime,
+    watched_metric: str | None = None,
+) -> None:
+    """Create a WARNING alert when the no-progress watchdog is about to cut a job.
+
+    Fires BEFORE the terminate call so the operator sees a progressive
+    notification in the Alerts banner rather than learning about the cut only
+    after the job reaches TIMED_OUT. Deduplicates on (project_id, task_id, title)
+    — an undismissed alert with the stable title for this project+task means
+    earlier cycle(s) already raised one, so we skip. The caller owns the commit;
+    this helper commits only its own ``Alert`` row and broadcasts. Stamps
+    ``no_progress_warned_at`` in the job's polling_metadata so the monitor cycle
+    can cheaply skip re-alerting without a DB query on subsequent ticks (e.g.
+    when terminate fails and the job stays RUNNING).
+    """
+    # Cheap in-memory dedup: if this job was already warned on a prior cycle
+    # (e.g. terminate failed and the job is still RUNNING), skip the DB query.
+    if (job.polling_metadata or {}).get("no_progress_warned_at"):
+        return
+
+    existing = await session.execute(
+        select(Alert).where(
+            Alert.project_id == job.project_id,
+            Alert.task_id == job.task_id,
+            Alert.dismissed_at.is_(None),
+            Alert.title == _NO_PROGRESS_WATCHDOG_ALERT_TITLE,
+        )
+    )
+    if existing.scalars().first() is not None:
+        return
+
+    metric_label = watched_metric or (job.polling_metadata or {}).get(
+        "declared_metric", "unknown"
+    )
+    message = (
+        f"Compute job {str(job.id)[:8]} has made no measurable progress on "
+        f"declared metric '{metric_label}' and will be terminated early. "
+        f"Check the job logs or adjust the no-progress timeout if this is expected."
+    )[:1000]
+
+    alert = Alert(
+        project_id=job.project_id,
+        task_id=job.task_id,
+        severity=AlertSeverity.WARNING,
+        title=_NO_PROGRESS_WATCHDOG_ALERT_TITLE,
+        message=message,
+    )
+    session.add(alert)
+    # Stamp in-memory dedup marker so the caller doesn't re-alert if the
+    # monitor cycle re-enters this path before the job is terminated.
+    if job.polling_metadata is None:
+        job.polling_metadata = {}
+    job.polling_metadata["no_progress_warned_at"] = now.isoformat()
+    await session.commit()
+    await broadcast_to_project(
+        str(job.project_id),
+        "alert_created",
+        {
+            "alert_id": str(alert.id),
+            "severity": AlertSeverity.WARNING.value,
+            "title": alert.title,
+        },
     )

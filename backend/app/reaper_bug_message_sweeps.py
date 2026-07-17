@@ -1396,6 +1396,142 @@ async def sweep_decay_stale_open_bug_messages(
     return resolved
 
 
+# ── Step 18e: age-based decay for unlinked OPEN BLOCKER messages (all authors) ─
+#
+# Step 18d decays system/agent-authored BUG_REPORT and BLOCKER messages that
+# have no owning context after 30 days.  Operator-authored ("user") BLOCKERs
+# are deliberately excluded from that sweep — an operator who files a BLOCKER
+# is not a machine-generated finding and should not be auto-decayed on the
+# short window.
+#
+# However, a user-authored BLOCKER with no convergence link, no direction_id,
+# and no pr_number+source_task_id is a dead thread: there is no automated
+# mechanism to resolve it, and it persists in the operator inbox forever.
+# This sweep closes that gap with a conservative 60-day threshold (default,
+# configurable via runtime_config['stale_open_unlinked_blocker_decay_days']).
+#
+# Disjoint from Step 18d (which only handles system/agent authors), from
+# Step 17 (which requires ownership context), and from Step 15 (which requires
+# a live _convergence_link in status == 'linked').  Like Step 18d, owned or
+# linked messages are skipped so the appropriate sweep owns the terminal
+# transition.
+
+# Default decay window for unlinked OPEN BLOCKER messages (all authors).
+STALE_OPEN_UNLINKED_BLOCKER_DECAY_DAYS = 60
+
+
+async def sweep_decay_stale_unlinked_blocker_messages(
+    session,
+    now: datetime,
+    *,
+    batch_size: int = 200,
+) -> int:
+    """Step 18e: age-out unlinked OPEN BLOCKER messages (all authors).
+
+    Selects up to ``batch_size`` OPEN BLOCKER messages (any ``from_type``,
+    including "user") with no live ``_convergence_link``, no creation-time
+    ownership context (``direction_id`` or ``pr_number`` + ``source_task_id``),
+    and ``created_at`` older than ``STALE_OPEN_UNLINKED_BLOCKER_DECAY_DAYS``
+    (configurable via ``runtime_config['stale_open_unlinked_blocker_decay_days']``).
+    Resolves each with ``resolution='auto-decayed (unlinked dead thread)'``.
+
+    This is the counterpart to Step 18d: where 18d restricts to system/agent
+    authors and a 30-day threshold, this sweep catches user-authored dead
+    threads at a longer (60-day) conservative threshold.
+
+    Disjoint from Step 17 (ownership context present) and Step 15 (linked
+    status). Fail-safe per message, idempotent (resolution moves status off
+    'open'), and broadcasts a ``message_updated`` envelope per resolved row.
+
+    Returns the number of messages auto-decayed.
+    """
+    from app.broadcast import broadcast_to_project as _bcast
+    from app.models import MessageType, ProjectMessage
+    from app.message_convergence import (
+        OPEN_STATUS,
+        get_message_link,
+        mark_message_resolved,
+    )
+    from app.project_message_projection import message_updated_event_payload
+    from app.shared_state import runtime_config
+
+    decay_days = int(
+        runtime_config.get(
+            "stale_open_unlinked_blocker_decay_days",
+            STALE_OPEN_UNLINKED_BLOCKER_DECAY_DAYS,
+        )
+    )
+    cutoff = now - timedelta(days=decay_days)
+
+    msgs = (
+        (
+            await session.execute(
+                select(ProjectMessage)
+                .where(
+                    ProjectMessage.status == OPEN_STATUS,
+                    ProjectMessage.message_type == MessageType.BLOCKER.value,
+                    ProjectMessage.created_at <= cutoff,
+                )
+                .order_by(ProjectMessage.created_at)
+                .limit(batch_size)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if len(msgs) >= batch_size:
+        logger.warning(
+            "[REAPER] stale-unlinked-blocker decay sweep hit cap=%d open BLOCKER "
+            "messages — result truncated; next cycle continues",
+            batch_size,
+        )
+    if not msgs:
+        return 0
+
+    resolved = 0
+    pending_broadcasts: list[tuple[str, dict]] = []
+    for msg in msgs:
+        # Skip messages that still carry a live convergence link — Step 15 owns them.
+        if get_message_link(msg) is not None:
+            continue
+        # Skip messages with creation-time ownership context — Step 17 owns them.
+        ctx = msg.context if isinstance(msg.context, dict) else {}
+        if ctx.get("direction_id") or (
+            ctx.get("pr_number") and ctx.get("source_task_id")
+        ):
+            continue
+        mark_message_resolved(msg, now, "auto-decayed (unlinked dead thread)")
+        session.add(msg)
+        resolved += 1
+        pending_broadcasts.append(
+            (str(msg.project_id), message_updated_event_payload(msg))
+        )
+        logger.info(
+            "[REAPER] Step 18e: auto-decayed unlinked BLOCKER %s "
+            "(no activity for >=%dd, from_type=%s)",
+            msg.id,
+            decay_days,
+            msg.from_type,
+        )
+
+    if resolved:
+        await session.commit()
+        for project_id, payload in pending_broadcasts:
+            try:
+                await _bcast(project_id, "message_updated", payload)
+            except Exception as _bcast_err:  # noqa: BLE001
+                logger.warning(
+                    "[REAPER] Step 18e: broadcast failed for message %s: %s",
+                    payload.get("message_id"),
+                    _bcast_err,
+                )
+        logger.info(
+            "[REAPER] Step 18e: auto-decayed %d unlinked open BLOCKER message(s)",
+            resolved,
+        )
+    return resolved
+
+
 async def sweep_wake_delivery_stall_alerts(
     session,
     *,

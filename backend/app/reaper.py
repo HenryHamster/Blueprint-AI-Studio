@@ -299,6 +299,7 @@ from app.reaper_sweeps import (
     sweep_resolve_linked_messages,
     sweep_decay_stale_open_messages,
     sweep_decay_stale_open_bug_messages,
+    sweep_decay_stale_unlinked_blocker_messages,
     sweep_deliver_task_wakes,
     sweep_wake_delivery_stall_alerts,
     sweep_orphaned_cross_base_children,
@@ -3144,6 +3145,22 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(
                         f"[REAPER] Stale-open-bug decay sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 18e: Unlinked BLOCKER decay — age out OPEN BLOCKER messages
+                # (all authors, including user) that have no convergence link and
+                # no creation-time ownership context, after a conservative 60-day
+                # window. Complements Step 18d (which handles system/agent authors
+                # at 30 days). Fail-safe per message.
+                _mark_reaper_progress()
+                try:
+                    await sweep_decay_stale_unlinked_blocker_messages(session, now)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Stale-unlinked-blocker decay sweep error: {e}",
                         exc_info=True,
                     )
                     with contextlib.suppress(Exception):

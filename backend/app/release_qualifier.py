@@ -4815,6 +4815,7 @@ async def _dual_write_dimension_results(
     blocker = composite.get("blocker")
     ci_green = bool(base_record.get("ci_green"))
     smoketest_enabled = bool(base_record.get("smoketest_enabled", True))
+    env_preflight_enabled = bool(base_record.get("env_preflight_enabled", False))
 
     def _score(key: str) -> float | None:
         v = sub_scores.get(key)
@@ -4913,6 +4914,22 @@ async def _dual_write_dimension_results(
             "sub_score": _score("smoketest") if smoketest_enabled else None,
             "blocker": _own_blocker({"smoketest_startup_failed"}),
             "detail": base_record.get("smoketest_detail"),
+            "producing_task_id": base_record.get("smoketest_task_id"),
+        },
+        {
+            "dimension": "env_preflight",
+            "status": (
+                "unavailable"
+                if not env_preflight_enabled
+                else "blocked"
+                if blocker in {"boot_prereq_missing", "boot_prereq_evidence_missing"}
+                else "passed"
+            ),
+            "sub_score": _score("env_preflight") if env_preflight_enabled else None,
+            "blocker": _own_blocker(
+                {"boot_prereq_missing", "boot_prereq_evidence_missing"}
+            ),
+            "detail": base_record.get("env_preflight_verdict"),
             "producing_task_id": base_record.get("smoketest_task_id"),
         },
         {

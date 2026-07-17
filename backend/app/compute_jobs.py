@@ -58,6 +58,7 @@ from app.artifact_prerequisites import (
     downstream_artifact_logical_key,
     stamp_artifact_logical_key,
 )
+from app.alert_dispatch import _maybe_create_no_progress_watchdog_alert
 from app.database import AsyncSessionLocal
 from app.compute_result_metrics import (
     coerce_metric_number as _coerce_metric_number,
@@ -3360,6 +3361,21 @@ async def _process_single_compute_job(
     # nothing. Runs AFTER the deadline/budget hard limits so those always win.
     if _no_progress_stalled(job, now=now):
         watched_metric = _declared_progress_metric(job)
+        # Progressive operator notification BEFORE the cut — fires a WARNING
+        # alert so the operator learns about the stall from the Alerts banner,
+        # not only after the job reaches TIMED_OUT. Best-effort: a failure to
+        # create the alert (e.g. DB blip) must not prevent the terminate from
+        # proceeding — the job is still stalled and should be cut.
+        try:
+            async with session_factory() as _alert_session:
+                await _maybe_create_no_progress_watchdog_alert(
+                    _alert_session, job, now=now, watched_metric=watched_metric
+                )
+        except Exception:
+            logger.exception(
+                "[COMPUTE_JOB] no-progress alert creation failed for job=%s (proceeding to terminate)",
+                job.id,
+            )
         started_at = _utcnow()
         terminate_diagnostic = None
         try:

@@ -11527,6 +11527,7 @@ async def test_finalize_dual_writes_per_dimension_ledger(db_session, mocker):
         "audit",
         "test_erosion",
         "smoketest",
+        "env_preflight",
         "challenge",
         "migration_identity",
         "migration_apply",
@@ -11551,6 +11552,9 @@ async def test_finalize_dual_writes_per_dimension_ledger(db_session, mocker):
     assert by_dim["migration_apply"].status == "passed"
     # No version goal / merge-grade child was seeded → not-applicable → unavailable.
     assert by_dim["merge_grade"].status == "unavailable"
+    # env_preflight defaults dark (no runtime_config toggle) → unavailable.
+    assert by_dim["env_preflight"].status == "unavailable"
+    assert by_dim["env_preflight"].blocker is None
 
     # Failure-isolation (Phase 1b enabler): re-recording ONE dimension for the
     # SAME candidate tree upserts that dimension's row in place (no duplicate) and
@@ -11644,6 +11648,137 @@ async def test_dual_write_tags_blocked_dimension_execution_site(db_session):
     assert by_dim["ci"].status == "passed"
     assert by_dim["ci"].blocker is None
     assert (by_dim["migration_apply"].detail or {}).get("execution_site") is None
+
+
+@pytest.mark.asyncio
+async def test_env_preflight_dimension_in_ledger(db_session):
+    """env_preflight is written to the per-dimension ledger by _dual_write_dimension_results.
+
+    Three sub-cases:
+    - Dark (env_preflight_enabled=False) → status='unavailable', no blocker.
+    - Enabled, boot prereq missing → status='blocked', blocker='boot_prereq_missing'.
+    - Enabled, all prereqs present → status='passed', sub_score populated.
+
+    Acceptance evidence: this is the named test declared in the task's acceptance
+    criteria (testing/test_release_qualifier.py::test_env_preflight_dimension_in_ledger).
+    """
+    from sqlalchemy import select
+
+    candidate_sha = "cafebabe" * 5  # 40-char candidate SHA
+
+    # --- Sub-case 1: dark mode (env_preflight_enabled=False) → unavailable ---
+    project, version = await _make_project_and_version(db_session)
+
+    base_record_dark = {
+        "candidate_sha": candidate_sha,
+        "ci_green": True,
+        "smoketest_enabled": False,
+        "sub_scores": {},
+        "env_preflight_enabled": False,
+        "env_preflight_verdict": None,
+        "smoketest_task_id": None,
+    }
+    await rq._dual_write_dimension_results(
+        db_session, version, base_record_dark, {"blocker": None}
+    )
+    await db_session.commit()
+
+    rows = (
+        (
+            await db_session.execute(
+                select(QualificationDimensionResult).where(
+                    QualificationDimensionResult.release_version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    by_dim = {r.dimension: r for r in rows}
+    assert "env_preflight" in by_dim, "env_preflight row must be written even in dark mode"
+    assert by_dim["env_preflight"].status == "unavailable"
+    assert by_dim["env_preflight"].blocker is None
+    assert by_dim["env_preflight"].sub_score is None
+
+    # --- Sub-case 2: enabled, boot prereq missing → blocked ---
+    project2, version2 = await _make_project_and_version(db_session)
+
+    verdict_blocked = {
+        "required": [{"name": "GITHUB_PAT_ENCRYPTION_KEY", "scope": "cloud_run"}],
+        "missing": ["GITHUB_PAT_ENCRYPTION_KEY"],
+        "deploy_target_scope": "cloud_run",
+    }
+    base_record_blocked = {
+        "candidate_sha": candidate_sha,
+        "ci_green": True,
+        "smoketest_enabled": False,
+        "sub_scores": {},
+        "env_preflight_enabled": True,
+        "env_preflight_verdict": verdict_blocked,
+        "smoketest_task_id": None,
+    }
+    await rq._dual_write_dimension_results(
+        db_session, version2, base_record_blocked, {"blocker": "boot_prereq_missing"}
+    )
+    await db_session.commit()
+
+    rows2 = (
+        (
+            await db_session.execute(
+                select(QualificationDimensionResult).where(
+                    QualificationDimensionResult.release_version_id == version2.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    by_dim2 = {r.dimension: r for r in rows2}
+    assert "env_preflight" in by_dim2
+    assert by_dim2["env_preflight"].status == "blocked"
+    assert by_dim2["env_preflight"].blocker == "boot_prereq_missing"
+    # detail carries the verdict blob with the missing prerequisite names.
+    detail2 = by_dim2["env_preflight"].detail or {}
+    assert "GITHUB_PAT_ENCRYPTION_KEY" in (detail2.get("missing") or [])
+
+    # --- Sub-case 3: enabled, all prereqs present → passed ---
+    project3, version3 = await _make_project_and_version(db_session)
+
+    verdict_passed = {
+        "required": [{"name": "GITHUB_PAT_ENCRYPTION_KEY", "scope": "cloud_run"}],
+        "missing": [],
+        "deploy_target_scope": "cloud_run",
+    }
+    base_record_passed = {
+        "candidate_sha": candidate_sha,
+        "ci_green": True,
+        "smoketest_enabled": False,
+        "sub_scores": {"env_preflight": 1.0},
+        "env_preflight_enabled": True,
+        "env_preflight_verdict": verdict_passed,
+        "smoketest_task_id": None,
+    }
+    await rq._dual_write_dimension_results(
+        db_session, version3, base_record_passed, {"blocker": None}
+    )
+    await db_session.commit()
+
+    rows3 = (
+        (
+            await db_session.execute(
+                select(QualificationDimensionResult).where(
+                    QualificationDimensionResult.release_version_id == version3.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    by_dim3 = {r.dimension: r for r in rows3}
+    assert "env_preflight" in by_dim3
+    assert by_dim3["env_preflight"].status == "passed"
+    assert by_dim3["env_preflight"].blocker is None
+    assert by_dim3["env_preflight"].sub_score == pytest.approx(1.0)
 
 
 # ---------------------------------------------------------------------------

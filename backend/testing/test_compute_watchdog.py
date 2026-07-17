@@ -22,8 +22,10 @@ from types import SimpleNamespace
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlmodel import select
 
 from app import compute_jobs
+from app.alert_dispatch import _NO_PROGRESS_WATCHDOG_ALERT_TITLE
 from app.compute_backends import (
     GCP_BACKEND_NAME,
     PROGRESS_FILE_ENV,
@@ -47,6 +49,8 @@ from app.compute_jobs import (
 from app.reaper_sweeps import sweep_silent_runner_compute_jobs
 from app.database import resolve_async_engine
 from app.models import (
+    Alert,
+    AlertSeverity,
     ComputeJobOutcome,
     ComputeJobStatus,
     Project,
@@ -747,6 +751,107 @@ async def test_process_once_kills_stalled_job_with_no_progress_terminal_kind(
     assert job.outcome == ComputeJobOutcome.TIMED_OUT
     assert job.polling_metadata.get("terminal_kind") == NO_PROGRESS_TERMINAL_REASON
     assert "no measurable progress" in (job.terminal_reason or "")
+
+    # Verify the progressive WARNING alert was created before termination
+    alert_rows = (
+        await db_session.execute(
+            select(Alert).where(
+                Alert.project_id == job.project_id,
+                Alert.task_id == job.task_id,
+                Alert.severity == AlertSeverity.WARNING,
+                Alert.title == _NO_PROGRESS_WATCHDOG_ALERT_TITLE,
+            )
+        )
+    ).scalars().all()
+    assert len(alert_rows) == 1, (
+        "expected exactly one no-progress watchdog alert"
+    )
+    assert "no measurable progress" in (alert_rows[0].message or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_watchdog_progressive_notification(
+    db_session, monkeypatch
+):
+    """The no-progress watchdog creates a WARNING alert before terminating the job.
+    Acceptance proof: a stalled job triggers both an Alert row and a TIMED_OUT
+    transition with terminal_kind='no_progress' in a single monitor cycle."""
+    task = await _setup_task(db_session)
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python train.py",
+        spend_cap_usd=1.0,
+        deadline_seconds=86400,
+        declared_metric="val/loss",
+    )
+    now = _utcnow()
+    meta = dict(job.polling_metadata or {})
+    meta["preflight_smoke_done"] = True
+    meta["runtime_deadline_at"] = (now + timedelta(hours=20)).isoformat()
+    meta["progress_series"] = [
+        {
+            "t": (now - timedelta(seconds=age)).isoformat(),
+            "received_at": (now - timedelta(seconds=age)).isoformat(),
+            "name": "val/loss",
+            "value": 2.71828,  # flat — no progress
+        }
+        for age in _SPAN_AGES_SECONDS
+    ]
+    job.polling_metadata = meta
+    job.status = ComputeJobStatus.RUNNING
+    job.external_compute_id = "prog-notif-job-xyz"
+    job.started_at = now - timedelta(hours=5)
+    await db_session.commit()
+
+    terminate_reasons: list[str] = []
+
+    class _FakeBackend:
+        def external_id_for(self, j):
+            return "prog-notif-job-xyz"
+
+        async def poll_cost(self, j, *, as_of):
+            return ComputeCostResult(total_cost_usd=0.01, measured_at=as_of)
+
+        async def poll_status(self, j):
+            return ComputeStatusResult(status=ComputeJobStatus.RUNNING)
+
+        async def terminate(self, j, *, reason):
+            terminate_reasons.append(reason)
+            return True
+
+    monkeypatch.setattr(compute_jobs, "get_compute_backend", lambda _: _FakeBackend())
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+
+    await db_session.refresh(job)
+    assert terminate_reasons == ["no_progress"]
+    assert job.status == ComputeJobStatus.TIMED_OUT
+    assert job.outcome == ComputeJobOutcome.TIMED_OUT
+    assert job.polling_metadata.get("terminal_kind") == NO_PROGRESS_TERMINAL_REASON
+    assert "no measurable progress" in (job.terminal_reason or "")
+
+    # Core acceptance assertion: a WARNING alert was created before the cut
+    alerts = (
+        await db_session.execute(
+            select(Alert).where(
+                Alert.project_id == job.project_id,
+                Alert.task_id == job.task_id,
+                Alert.severity == AlertSeverity.WARNING,
+                Alert.title == _NO_PROGRESS_WATCHDOG_ALERT_TITLE,
+            )
+        )
+    ).scalars().all()
+    assert len(alerts) == 1, (
+        "expected exactly one no-progress watchdog alert"
+    )
+    assert "no measurable progress" in (alerts[0].message or "").lower()
+    assert alerts[0].task_id == job.task_id
 
 
 @pytest.mark.asyncio

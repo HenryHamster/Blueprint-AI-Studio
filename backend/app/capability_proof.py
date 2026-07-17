@@ -2098,9 +2098,13 @@ async def commission_proof_earn_loop(
     A summary dict:
     ``{"total_demanded_unproven": int, "earned": int, "no_backing_paths": list[str],
       "still_unproven": list[str], "path_proven_stuck": list[str],
-      "named_test_earned": list[str], "named_test_executed": list[str]}``.
+      "named_test_earned": list[str], "named_test_executed": list[str],
+      "execution_proven": list[str]}``.
     ``named_test_executed`` is the subset of caps that enrolled a real execution
     trial this sweep (flag on) — the path that earns the ``proven`` tier.
+    ``execution_proven`` is the subset of caps that already carry a fresh green
+    executed proof covering HEAD — these caps currently clear the enforce gate and
+    did not need re-enrollment this sweep.
     Total entries found, count of newly-recorded proofs (named_test_present +
     backing_path), capability names with no backing_paths, remaining unproven
     names (failed path check), already-recorded (stuck) names that were not newly
@@ -2108,7 +2112,8 @@ async def commission_proof_earn_loop(
     ``named_test_present`` proof (a convention test file is present at HEAD).
     NOTE: both recorded tiers are graded ``path_proven`` — neither clears the
     enforce gate; a capability reaches ``proven`` only via a real green
-    merge-test acceptance verdict (:func:`record_capability_proof`).
+    merge-test acceptance verdict (:func:`record_capability_proof`). Caps in
+    ``execution_proven`` already cleared the gate via a prior real execution.
     """
     from app.capability_demand import compute_unproven_demanded_capabilities
     from app.source_ref_validation import (
@@ -2208,6 +2213,7 @@ async def commission_proof_earn_loop(
             "path_proven_stuck": [],
             "named_test_earned": [],
             "named_test_executed": [],
+            "execution_proven": [],
         }
 
     # Step 1b: defensive filter — skip platform-exempt capabilities (the
@@ -2231,6 +2237,7 @@ async def commission_proof_earn_loop(
                 "path_proven_stuck": [],
                 "named_test_earned": [],
                 "named_test_executed": [],
+                "execution_proven": [],
             }
 
     # Build a lookup: canonical-name -> (raw_name, backing_paths).
@@ -2254,6 +2261,7 @@ async def commission_proof_earn_loop(
     earned_names: list[str] = []
     named_test_earned: list[str] = []
     named_test_executed: list[str] = []
+    execution_proven: list[str] = []
     no_backing_paths: list[str] = []
     still_unproven: list[str] = []
     path_proven_stuck: list[str] = []
@@ -2278,11 +2286,14 @@ async def commission_proof_earn_loop(
                 project=project,
             )
             if gap_result.get("resolved"):
-                earned_names.append(canonical)
-                if gap_result.get("named_test_earned"):
-                    named_test_earned.append(canonical)
-                if gap_result.get("trial_enrolled"):
-                    named_test_executed.append(canonical)
+                if gap_result.get("trial_fresh"):
+                    execution_proven.append(canonical)
+                else:
+                    earned_names.append(canonical)
+                    if gap_result.get("named_test_earned"):
+                        named_test_earned.append(canonical)
+                    if gap_result.get("trial_enrolled"):
+                        named_test_executed.append(canonical)
             else:
                 no_backing_paths.append(canonical)
             continue
@@ -2306,11 +2317,14 @@ async def commission_proof_earn_loop(
                 project=project,
             )
             if gap_result.get("resolved"):
-                earned_names.append(canonical)
-                if gap_result.get("named_test_earned"):
-                    named_test_earned.append(canonical)
-                if gap_result.get("trial_enrolled"):
-                    named_test_executed.append(canonical)
+                if gap_result.get("trial_fresh"):
+                    execution_proven.append(canonical)
+                else:
+                    earned_names.append(canonical)
+                    if gap_result.get("named_test_earned"):
+                        named_test_earned.append(canonical)
+                    if gap_result.get("trial_enrolled"):
+                        named_test_executed.append(canonical)
             else:
                 no_backing_paths.append(canonical)
             continue
@@ -2361,6 +2375,7 @@ async def commission_proof_earn_loop(
                 if trial_outcome == "fresh":
                     # A fresh green executed proof already covers HEAD — nothing
                     # to re-verify. Do NOT downgrade to the static proof.
+                    execution_proven.append(canonical)
                     continue
 
                 recorded = record_capability_named_test_proof(
@@ -2393,13 +2408,15 @@ async def commission_proof_earn_loop(
     logger.info(
         "[CAPABILITY_PROOF] commission_proof_earn_loop: "
         "total_demanded_unproven=%d earned=%d named_test_earned=%d "
-        "named_test_executed=%d no_backing_paths=%d still_unproven=%d",
+        "named_test_executed=%d no_backing_paths=%d still_unproven=%d "
+        "execution_proven=%d",
         len(demanded_unproven),
         len(earned_names),
         len(named_test_earned),
         len(named_test_executed),
         len(no_backing_paths),
         len(still_unproven),
+        len(execution_proven),
     )
 
     return {
@@ -2410,4 +2427,5 @@ async def commission_proof_earn_loop(
         "path_proven_stuck": path_proven_stuck,
         "named_test_earned": named_test_earned,
         "named_test_executed": named_test_executed,
+        "execution_proven": execution_proven,
     }
