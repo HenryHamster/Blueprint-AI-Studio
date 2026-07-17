@@ -27,8 +27,9 @@ import {
   WORKSPACE, strVal, sanitize, sanitizeError, sendLog, validateBranchName, readHandlerOutput,
   persistAndPostStatus, git, runClaudeCode, sendHeartbeatSync,
   setCurrentPromptFingerprint, listOpenPullRequestsForBranch, deriveTaskBranch, matchesRateLimit,
-  resolveBaseBranch, resolveTaskBranchNamespace, prepareTaskWorkBranch,
+  resolveBaseBranch, resolveTaskBranchNamespace,
 } from '../index.js';
+import { prepareTaskWorkBranch } from '../task-checkpoint.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import type { BuildConfig } from '../index.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';

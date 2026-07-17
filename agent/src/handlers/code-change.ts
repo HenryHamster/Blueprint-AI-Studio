@@ -240,7 +240,7 @@ function workspaceHasChanges(baseCommit: string): boolean {
  * base. force-with-lease permits a second failed retry to replace the previous
  * checkpoint while refusing to clobber an unexpected concurrent branch update.
  */
-export async function checkpointUnshippedWork(
+async function checkpointUnshippedWork(
   opts: Pick<CodeChangeTaskOpts, 'taskId' | 'workBranch' | 'baseCommit'>,
   ws: WebSocket | null,
 ): Promise<boolean> {
@@ -249,9 +249,7 @@ export async function checkpointUnshippedWork(
     const message = buildTaskCheckpointCommitMessage(opts.taskId, opts.baseCommit);
     const [subject, ...bodyLines] = message.split('\n');
     git(['commit', '--allow-empty', '-m', subject, '-m', bodyLines.join('\n').trim()]);
-    // A code-change session can run close to (or beyond) the installation
-    // token TTL. Refresh at the moment of the emergency push just like ./pr
-    // does, otherwise the durability path can fail precisely for long tasks.
+    // Refresh here: a long session may outlive its installation token.
     try {
       const fresh = await apiGet(
         `/api/agent/github/token?task_id=${encodeURIComponent(opts.taskId)}&force_refresh=true`,

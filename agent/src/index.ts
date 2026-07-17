@@ -56,11 +56,6 @@ import {
   detectLoopDivergence,
 } from './utils/diff-detection.js';
 import { prepareTaskWorkBranch } from './task-checkpoint.js';
-export {
-  buildTaskCheckpointCommitMessage,
-  parseTaskCheckpointCommitMessage,
-  prepareTaskWorkBranch,
-} from './task-checkpoint.js';
 import {
   type BuildConfig, type TestRunner,
   detectTestRunners,
