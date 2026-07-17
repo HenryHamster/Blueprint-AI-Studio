@@ -2,12 +2,14 @@
 
 **Target:** `automain`
 
-**Status:** Milestones 1, 2a, and 2b merged; Milestone 3 in progress.
+**Status:** Milestones 1, 2a, and 2b merged; Milestone 3 converged and publishing.
 
-**Last refreshed:** 2026-07-16. M2a merged through PR `#15292` at merge commit
+**Last refreshed:** 2026-07-17. M2a merged through PR `#15292` at merge commit
 `7b9b8c80b`. M2b merged through PR `#15486` at merge commit `3d3689e65` after
 migration, locking, latency, provider-boundary, and affected-suite review/fix
-loops converged. M3 now adds typed operations and revision-safe human-tool handoff.
+loops converged. M3 adds typed operations and revision-safe human-tool handoff;
+its capability-boundedness inspection contract converged and it was rebased onto
+`origin/automain` `02661c0d9` (ArtifactRef migration re-chained to `0629`).
 
 This plan tracks the migration from disposable Resident sessions to one durable,
 project-owned Strategic Resident. It is intentionally separate from the historical
@@ -255,8 +257,36 @@ Current implementation checklist:
 - [x] Keep the typed catalog latency-bounded and verify full provider input remains
   within its hard byte budget.
 - [x] Complete independent backend/UI review-fix iterations until convergence.
-- [ ] Refresh from current `origin/automain`, repeat affected gates, publish, and
+- [x] Converge the capability-boundedness inspection contract: tighten evidence
+  caps to 4.8 KB projected data / 5.5 KB complete response (documented 48 KB
+  aggregate-per-turn = 8 requests x 5.5 KB), make lineage descent a
+  deterministic bounded top-N with cycle-safe dedup, guarantee the requested
+  root survives both count and byte truncation, and bind the lineage revision
+  to every represented member. Mutation-proved bounds tests.
+- [x] Refresh from current `origin/automain`, repeat affected gates, publish, and
   merge the M3 milestone.
+
+Post-rebase evidence:
+
+- Rebased onto `origin/automain` at `02661c0d9`. automain landed
+  `0628_backfill_github_oauth_token_encrypted`, so the M3 ArtifactRef migration
+  is re-chained as `0629_project_tool_artifact_refs` (down_revision `0628`) with
+  `EXPECTED_SCHEMA_REVISION` bumped to `0629`; the migration-chain and
+  divergence gates report one linear head (`152 passed`).
+- Focused affected suites are green under SQLite: capability/inspection,
+  lineage, runtime/context, and ArtifactRef promotion (`72 passed`, one
+  PostgreSQL-only concurrency skip), plus the new mutation-proved
+  `test_strategic_resident_inspection_bounds.py` (`10 passed`). Migration-apply
+  gate and schema invariants pass; agent TypeScript typecheck is clean.
+- The independent boundedness review returned one gating determinism finding
+  (a lineage fetch without `ORDER BY` yields non-deterministic truncated
+  subsets, breaking revision/checksum stability) plus four minor findings; all
+  were fixed and covered by mutation-proved tests before convergence.
+- Module size caps bumped to canonical policy for M3 growth
+  (`strategic_resident_context.py`, `agent_resident_turn.py`,
+  `strategic-resident-turn.ts`); `admin_project_tools.py` cleared its
+  chronic-offender gate via operator-approved `--force-chronic`. Scoped Ruff
+  and `git diff --check` are clean.
 
 Pre-rebase evidence:
 
