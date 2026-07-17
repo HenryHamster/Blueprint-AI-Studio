@@ -2230,6 +2230,7 @@ async def commission_proof_earn_loop(
                 "still_unproven": [],
                 "path_proven_stuck": [],
                 "named_test_earned": [],
+                "named_test_executed": [],
             }
 
     # Build a lookup: canonical-name -> (raw_name, backing_paths).

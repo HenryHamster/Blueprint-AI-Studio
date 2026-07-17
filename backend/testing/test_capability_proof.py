@@ -2116,6 +2116,35 @@ def test_exempt_capability_skipped_in_earn_loop():
         "return dict must include empty path_proven_stuck"
     )
 
+    # Exercise the defensive filter itself.  The authoritative demand builder
+    # normally excludes operator-exempt capabilities before this point, but the
+    # earn loop deliberately re-checks the ledger so stale/precomputed demand
+    # cannot accidentally earn proof for an exempt capability.  That early
+    # return must preserve the function's documented summary shape.
+    forced_demand = [{"kind": "capability", "ref": "exempt-no-proof"}]
+    with patch(
+        "app.capability_demand.compute_unproven_demanded_capabilities",
+        return_value=forced_demand,
+    ), patch("app.capability_proof.flag_modified"):
+        defensive_result = asyncio.get_event_loop().run_until_complete(
+            commission_proof_earn_loop(
+                project,
+                demand_result={"total": 1, "demands": forced_demand},
+                problem_model=project.problem_model,
+                verify_path=_verify,
+            )
+        )
+
+    assert defensive_result == {
+        "total_demanded_unproven": 0,
+        "earned": 0,
+        "no_backing_paths": [],
+        "still_unproven": [],
+        "path_proven_stuck": [],
+        "named_test_earned": [],
+        "named_test_executed": [],
+    }
+
     # Now test with a mix: one exempt unproven cap, one real unproven cap.
     # The exempt cap is never demanded (proven), the real one is.
     project2 = MagicMock()
