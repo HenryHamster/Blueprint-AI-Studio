@@ -218,6 +218,40 @@ describe('FIX_TASK_FOCUS — content invariants', () => {
     expect(FIX_TASK_FOCUS).toContain('./done --reproduced');
     expect(FIX_TASK_FOCUS).toContain('./done --indeterminate');
   });
+
+  describe('push-and-CI-verify contract when local test gate is unavailable', () => {
+    it('forbids ./blocked when holding a complete fix with no local test runtime', async () => {
+      const { FIX_TASK_FOCUS } = await import('./task-type-focus.js');
+      expect(FIX_TASK_FOCUS).toContain('do NOT call `./blocked`');
+    });
+
+    it('names standalone or non-DB verification as the cheapest available backend check', async () => {
+      const { FIX_TASK_FOCUS } = await import('./task-type-focus.js');
+      expect(FIX_TASK_FOCUS).toContain('standalone');
+    });
+
+    it('requires pushing the completed branch via ./pr open before ./done', async () => {
+      const { FIX_TASK_FOCUS } = await import('./task-type-focus.js');
+      expect(FIX_TASK_FOCUS).toContain('./pr open');
+      // Must explicitly call ./done after pushing (not ./blocked)
+      expect(FIX_TASK_FOCUS).toContain('Call `./done`');
+    });
+
+    it('names CI as the authoritative gate when local runtime is unavailable', async () => {
+      const { FIX_TASK_FOCUS } = await import('./task-type-focus.js');
+      expect(FIX_TASK_FOCUS).toContain('CI runs the full suite on this PR');
+    });
+
+    it('identifies the GATE-ENVIRONMENT note as the signal to switch to push-and-CI-verify', async () => {
+      const { FIX_TASK_FOCUS } = await import('./task-type-focus.js');
+      expect(FIX_TASK_FOCUS).toContain('GATE-ENVIRONMENT');
+    });
+
+    it('describes a stranded delivery as the consequence of blocking instead of pushing', async () => {
+      const { FIX_TASK_FOCUS } = await import('./task-type-focus.js');
+      expect(FIX_TASK_FOCUS).toContain('stranded');
+    });
+  });
 });
 
 describe('DOCS_TASK_FOCUS — content invariants', () => {

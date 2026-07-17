@@ -162,6 +162,23 @@ failing, and scope creep into unrelated files. Apply these additional checks:
    Write to \`/tmp/self_review_<YOUR_task_id>.json\` using the CURRENT task ID from the
    ORCHESTRATOR env — never a prior task's ID.
 5. ${CROSS_FILE_CONSISTENCY_FOCUS}
+6. **Push-and-let-CI-verify when local test gate is unavailable** — if your fix is
+   complete but the VM cannot run the full DB-backed or Docker-backed test suite
+   (e.g. Postgres not running, Docker daemon absent, \`GATE-ENVIRONMENT\` note emitted
+   by \`./check test\`), do NOT call \`./blocked\`. Instead:
+   (a) Run the cheapest available verification for the stacks you touched: the
+       project's linter, the TypeScript type checker (\`npx tsc --noEmit\`), and
+       any standalone or non-DB test pass the project supports (e.g. the backend
+       standalone smoke that skips Postgres entirely). See the \`./check\`
+       description above for the commands specific to this project.
+   (b) Run \`./pr open\` to push the completed branch.
+   (c) Call \`./done\` and note the runtime limitation in the PR body, naming CI
+       as the authoritative gate: "Local DB/Docker unavailable; standalone smoke
+       passed; CI runs the full suite on this PR."
+   A complete fix sitting unpushed because tests cannot run locally is a stranded
+   delivery — push it and let CI verify. \`./blocked\` is only for cases where
+   no code edit can fix the problem (e.g. a missing upstream dependency or a
+   repo-wide gate failure on files you did not touch).
 `;
 
 export const DOCS_TASK_FOCUS = `
